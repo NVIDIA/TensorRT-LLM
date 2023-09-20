@@ -1,0 +1,24 @@
+__pycache__/
+.vscode
+*.engine
+*.engine.config
+*.cache
+*.nsys-rep
+.VSCodeCounter
+build*/
+*.so
+*.egg-info/
+.coverage
+*.csv
+*.onnx
+tmp/
+venv/
+.venv/
+.local/
+.hypothesis/
+.idea/
+cpp/cmake-build-*
+
+# Testing
+.coverage.*
+results_trt/
