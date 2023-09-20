@@ -1,0 +1,14 @@
+ARG BASE_IMAGE_WITH_TAG
+
+FROM ${BASE_IMAGE_WITH_TAG} as base
+
+# Alternative user
+ARG USER_ID=0
+ARG USER_NAME=root
+ARG GROUP_ID=0
+ARG GROUP_NAME=root
+
+RUN (getent group ${GROUP_ID} || groupadd --gid ${GROUP_ID} ${GROUP_NAME}) && \
+    (getent passwd ${USER_ID} || useradd --gid ${GROUP_ID} --uid ${USER_ID} --create-home --no-log-init --shell /bin/bash ${USER_NAME})
+
+USER ${USER_NAME}

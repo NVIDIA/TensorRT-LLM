@@ -1,0 +1,11 @@
+build
+cpp/*build*
+cpp/tests/resources/models
+tensorrt_llm/libs
+**/__pycache__
+examples/**/.git
+examples/**/*.bin
+examples/**/*.engine
+examples/**/*.onnx
+examples/**/c-model
+examples/gpt/gpt*

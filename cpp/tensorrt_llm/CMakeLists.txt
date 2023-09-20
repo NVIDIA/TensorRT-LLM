@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION &
+# AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not
+# use this file except in compliance with the License. You may obtain a copy of
+# the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations under
+# the License.
+set(TARGET_NAME tensorrt_llm)
+set(SHARED_TARGET ${TARGET_NAME})
+set(SHARED_TARGET
+    ${SHARED_TARGET}
+    PARENT_SCOPE)
+set(STATIC_TARGET ${TARGET_NAME}_static)
+set(STATIC_TARGET
+    ${STATIC_TARGET}
+    PARENT_SCOPE)
+set(API_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
+
+find_package(MPI REQUIRED)
+message(STATUS "Using MPI_INCLUDE_PATH: ${MPI_INCLUDE_PATH}")
+message(STATUS "Using MPI_LIBRARIES: ${MPI_LIBRARIES}")
+
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cutlass_extensions/include
+                    ${API_INCLUDE_DIR} ${MPI_INCLUDE_PATH})
+
+add_subdirectory(common)
+add_subdirectory(kernels)
+add_subdirectory(layers)
+add_subdirectory(runtime)
+
+if(BUILD_BATCH_MANAGER)
+  add_subdirectory(batch_manager)
+else()
+  add_library(tensorrt_llm_batch_manager_static STATIC IMPORTED)
+  execute_process(
+    COMMAND ${Python3_EXECUTABLE} "-c"
+            "import torch; print(torch.compiled_with_cxx11_abi(),end='');"
+    RESULT_VARIABLE _PYTHON_SUCCESS
+    OUTPUT_VARIABLE USE_CXX11_ABI)
+
+  message(STATUS "USE_CXX11_ABI: ${USE_CXX11_ABI}")
+  if(USE_CXX11_ABI)
+    set_property(
+      TARGET tensorrt_llm_batch_manager_static
+      PROPERTY
+        IMPORTED_LOCATION
+        "${CMAKE_CURRENT_SOURCE_DIR}/batch_manager/libtensorrt_llm_batch_manager_static.a"
+    )
+  else()
+    set_property(
+      TARGET tensorrt_llm_batch_manager_static
+      PROPERTY
+        IMPORTED_LOCATION
+        "${CMAKE_CURRENT_SOURCE_DIR}/batch_manager/libtensorrt_llm_batch_manager_static.pre_cxx11.a"
+    )
+  endif()
+endif()
+
+set(TRTLLM_LINK_LIBS
+    ${CUBLAS_LIB}
+    ${CUBLASLT_LIB}
+    ${CUDART_LIB}
+    ${CUDNN_LIB}
+    ${CMAKE_DL_LIBS}
+    ${MPI_LIBRARIES}
+    ${TRT_LIB}
+    common_src
+    kernels_src
+    layers_src
+    runtime_src
+    tensorrt_llm_batch_manager_static)
+
+# ################################# SHARED LIBRARY
+# ##############################################################################
+
+add_library(${SHARED_TARGET} SHARED)
+
+set_target_properties(
+  ${SHARED_TARGET} PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES"
+                              CXX_EXTENSIONS "NO")
+
+target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS}
+                                              "-Wl,--no-undefined")
+
+# ################################# STATIC LIBRARY
+# ##############################################################################
+
+add_library(${STATIC_TARGET} STATIC)
+
+set_target_properties(
+  ${STATIC_TARGET} PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES"
+                              CXX_EXTENSIONS "NO" POSITION_INDEPENDENT_CODE ON)
+
+target_link_libraries(${STATIC_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
+
+if(BUILD_PYT)
+  add_subdirectory(thop)
+endif()
+
+add_subdirectory(plugins)

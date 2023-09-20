@@ -1,0 +1,65 @@
+# Multi-stage Dockerfile
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
+ARG BASE_TAG=23.07-py3
+
+FROM ${BASE_IMAGE}:${BASE_TAG} as base
+
+FROM base as devel
+
+# Install addtional packages for development
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git-lfs gdb && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Python packages
+COPY requirements-dev.txt /tmp/
+RUN --mount=type=cache,target=/root/.cache \
+    pip install -r /tmp/requirements-dev.txt  --extra-index-url https://pypi.ngc.nvidia.com && \
+    rm /tmp/requirements-dev.txt
+
+# Remove previous TRT installation
+RUN --mount=type=cache,target=/root/.cache \
+    apt-get remove --purge -y libnvinfer* tensorrt* && \
+    pip uninstall -y tensorrt
+
+# Download & install internal TRT release
+ARG TENSOR_RT_VERSION="9.0.1.4"
+ARG CUDA_VERSION="12.2"
+ARG RELEASE_URL_TRT=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/secure/9.0.1/tars/TensorRT-${TENSOR_RT_VERSION}.Linux.x86_64-gnu.cuda-${CUDA_VERSION}.tar.gz
+RUN --mount=type=cache,target=/root/.cache \
+    wget --no-verbose ${RELEASE_URL_TRT} -P /workspace && \
+    tar -xf /workspace/TensorRT-${TENSOR_RT_VERSION}.Linux.x86_64-gnu.cuda-${CUDA_VERSION}.tar.gz -C /usr/local/ && \
+    mv /usr/local/TensorRT-${TENSOR_RT_VERSION} /usr/local/tensorrt && \
+    pip install /usr/local/tensorrt/python/tensorrt-9.0.1*cp310-none-linux_x86_64.whl && \
+    rm -rf /workspace/TensorRT-${TENSOR_RT_VERSION}.Linux.x86_64-gnu.cuda-${CUDA_VERSION}.tar.gz
+ENV LD_LIBRARY_PATH=/usr/local/tensorrt/lib:${LD_LIBRARY_PATH}
+
+# Install latest Polygraphy
+ARG RELEASE_URL_PG=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/secure/9.0.1/tars/polygraphy-0.48.1-py2.py3-none-any.whl
+RUN --mount=type=cache,target=/root/.cache \
+    pip uninstall -y polygraphy && \
+    pip install ${RELEASE_URL_PG}
+
+
+FROM devel as wheel
+
+WORKDIR /src/tensorrt_llm
+COPY cpp cpp
+COPY scripts scripts
+COPY tensorrt_llm tensorrt_llm
+COPY 3rdparty 3rdparty
+COPY setup.py requirements.txt ./
+
+ARG BUILD_WHEEL_ARGS="--clean --trt_root /usr/local/tensorrt"
+RUN python3 scripts/build_wheel.py ${BUILD_WHEEL_ARGS}
+
+
+FROM devel as release
+
+WORKDIR /app/tensorrt_llm
+COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl .
+RUN pip install tensorrt_llm*.whl && \
+    rm tensorrt_llm*.whl
+COPY README.md ./
+COPY examples examples

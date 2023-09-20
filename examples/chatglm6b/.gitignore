@@ -1,0 +1,12 @@
+__pycache__/
+ftModel/
+llm/
+pyTorchModel/
+trtModel/
+
+*.engine
+*.engine.config
+*.cache
+*.nsys-rep
+*.npy
+*.npz

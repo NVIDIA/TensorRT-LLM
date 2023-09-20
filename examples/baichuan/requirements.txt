@@ -1,0 +1,5 @@
+datasets~=2.3.2
+rouge_score~=0.1.2
+sentencepiece~=0.1.99
+cpm-kernels~=1.0.11
+transformers_stream_generator~=0.0.4
