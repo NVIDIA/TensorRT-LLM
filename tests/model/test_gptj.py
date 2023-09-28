@@ -105,8 +105,7 @@ class TestGPTJ(unittest.TestCase):
                                   use_refit,
                                   use_ln_gemm_plugin,
                                   context_fmha_flag=ContextFMHAType.disabled,
-                                  enable_remove_input_padding=False,
-                                  use_in_flight_batching=False):
+                                  enable_remove_input_padding=False):
         tensorrt_llm.logger.set_level('error')
         mapping = tensorrt_llm.Mapping(world_size, rank, tp_size=world_size)
 
@@ -123,8 +122,6 @@ class TestGPTJ(unittest.TestCase):
                 network.plugin_config.set_layernorm_plugin(dtype)
             if enable_remove_input_padding:
                 network.plugin_config.enable_remove_input_padding()
-            if use_in_flight_batching:
-                network.plugin_config.enable_in_flight_batching()
             network.plugin_config.set_context_fmha(context_fmha_flag)
 
             self._gen_tensorrt_llm_network(network, hf_gpt, gpt_config,
@@ -153,23 +150,14 @@ class TestGPTJ(unittest.TestCase):
             product([
                 ContextFMHAType.disabled, ContextFMHAType.enabled,
                 ContextFMHAType.enabled_with_fp32_acc
-            ], [False, True], [False]))
-
-        # Add several cases for inflight batching
-        test_cases.append((ContextFMHAType.disabled, True, True))
+            ], [False, True]))
 
         return test_cases
 
     @parameterized.expand(load_test_cases)
-    def test_gptj_plugin(self,
-                         context_fmha_flag,
-                         enable_remove_input_padding,
-                         use_in_flight_batching=False):
-        if use_in_flight_batching:
-            # inflight batching mode can only works with remove_input_padding
-            assert enable_remove_input_padding
+    def test_gptj_plugin(self, context_fmha_flag, enable_remove_input_padding):
 
-            # Skip tests that are not supported in pre-ampere architecture
+        # Skip tests that are not supported in pre-ampere architecture
         if getSMVersion() < 80:
             if context_fmha_flag == ContextFMHAType.enabled:
                 pytest.skip(
@@ -211,8 +199,7 @@ class TestGPTJ(unittest.TestCase):
             use_refit,
             use_ln_gemm_plugin,
             context_fmha_flag,
-            enable_remove_input_padding=enable_remove_input_padding,
-            use_in_flight_batching=use_in_flight_batching)
+            enable_remove_input_padding=enable_remove_input_padding)
 
         key_value_cache_buffers = []
         head_size = gpt_config.n_embd // gpt_config.n_head
@@ -228,7 +215,8 @@ class TestGPTJ(unittest.TestCase):
                             dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
                             device='cuda'))
 
-        def run_engine(input_ids,
+        def run_engine(context,
+                       input_ids,
                        context_lengths,
                        host_request_types,
                        position_ids,
@@ -262,7 +250,6 @@ class TestGPTJ(unittest.TestCase):
                 for key, buffer in ctx_buffer.items()
             }
 
-            context = runtime.context_0
             runtime._set_shape(context, ctx_shape)
             runtime._set_buffer(context, ctx_buffer)
 
@@ -329,6 +316,7 @@ class TestGPTJ(unittest.TestCase):
             ) if enable_remove_input_padding else None
 
             res = run_engine(
+                context=runtime.ctx_context,
                 input_ids=ctx_ids,
                 context_lengths=ctx_context_lengths,
                 position_ids=ctx_position_ids,
@@ -408,6 +396,7 @@ class TestGPTJ(unittest.TestCase):
             sequence_length_buffer = torch.add(ctx_context_lengths, 1)
 
             res = run_engine(
+                context=runtime.context_1,
                 input_ids=step1_id,
                 # note we should pass context length for generation phase.
                 context_lengths=ctx_context_lengths,

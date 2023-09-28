@@ -30,12 +30,11 @@ void topK_softMax_kernelLauncher(const T* log_probs, const T* bias, const bool* 
     const int temp_storage_size, BeamHypotheses* beam_hyps, const int batch_size, const int beam_width,
     const int vocab_size, const int* end_ids, T diversity_rate, const float length_penalty, cudaStream_t stream);
 
-#define CASE_K(K, MAX_K)                                                                                               \
-    case K ... MAX_K:                                                                                                  \
-        topK_softMax_kernelLauncher<T, MAX_K>(log_probs, bias, finished, sequence_lengths, cum_log_probs,              \
-            output_log_probs, output_ids_ptr, temp_storage, temp_storage_size, beam_hyps, batch_size, beam_width,      \
-            vocab_size, end_ids, diversity_rate, length_penalty, stream);                                              \
-        break;
+#define CASE_K(MAX_K)                                                                                                  \
+    topK_softMax_kernelLauncher<T, MAX_K>(log_probs, bias, finished, sequence_lengths, cum_log_probs,                  \
+        output_log_probs, output_ids_ptr, temp_storage, temp_storage_size, beam_hyps, batch_size, beam_width,          \
+        vocab_size, end_ids, diversity_rate, length_penalty, stream);                                                  \
+    break;
 
 template <typename T>
 void invokeTopkSoftMax(const T* log_probs, const T* bias, const bool* finished, const int* sequence_lengths,
@@ -44,13 +43,25 @@ void invokeTopkSoftMax(const T* log_probs, const T* bias, const bool* finished, 
     const int vocab_size, const int* end_ids, const float diversity_rate, const float length_penalty,
     cudaStream_t stream)
 {
-    switch (beam_width)
+    int log_beam_width(0);
+    int recursor(beam_width - 1);
+    while (recursor >>= 1)
+        ++log_beam_width;
+
+    switch (log_beam_width)
     {
-        CASE_K(1, 4);
-        CASE_K(5, 8);
-        CASE_K(9, 16);
-        CASE_K(17, 32);
-        CASE_K(33, 64);
+    // 0 < beam_width <= 4
+    case 0: // 1, 2
+    case 1: // 3, 4
+        CASE_K(4)
+    case 2: // 4 < beam_width <= 8
+        CASE_K(8)
+    case 3: // 9 < beam_width <= 16
+        CASE_K(16)
+    case 4: // 16 < beam_width <= 32
+        CASE_K(32)
+    case 5: // 32 < beam_width <= 64
+        CASE_K(64)
     default: throw std::runtime_error(fmtstr("Topk kernel of beam search does not support beam_width=%d", beam_width));
     }
 }

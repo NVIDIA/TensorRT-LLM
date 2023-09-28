@@ -146,7 +146,8 @@ void invokeBanRepeatNgram(T* logits, const int** output_ids_buf, const bool* fin
 
     // step (current generated length, except start token) is from 1 ~ max_seq_len
     dim3 block, grid;
-    block.x = min(((step + 32 - 1) / 32) * 32, 256UL);
+    constexpr size_t max_blocks{256};
+    block.x = min(((step + 32 - 1) / 32) * 32, max_blocks);
     grid.x = (step + block.x - 1) / block.x;
     grid.y = local_batch_size * beam_width;
 

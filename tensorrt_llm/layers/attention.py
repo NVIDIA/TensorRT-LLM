@@ -13,21 +13,88 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+from typing import List
 
 import numpy as np
 import tensorrt as trt
 
 from .._common import default_net, precision
-from ..functional import (AttentionMaskType, PositionEmbeddingType, Tensor,
-                          cast, clip, concat, constant, expand_mask,
-                          generate_alibi_biases, generate_alibi_slopes,
-                          gpt_attention, matmul, round, shape, slice, softmax,
-                          split)
+from ..functional import (AttentionMaskType, PositionEmbeddingType,
+                          RotaryScalingType, Tensor, cast, clip, concat,
+                          constant, expand_mask, generate_alibi_biases,
+                          generate_alibi_slopes, gpt_attention, matmul, round,
+                          shape, slice, softmax, split)
 from ..module import Module
 from ..parameter import Parameter
 from ..quantization import QuantMode
 from ..quantization.layers import FP8Linear, FP8RowLinear
 from .linear import ColumnLinear, RowLinear
+
+
+class AttentionParams(object):
+
+    def __init__(self,
+                 sequence_length: Tensor = None,
+                 context_lengths: Tensor = None,
+                 host_context_lengths: Tensor = None,
+                 max_context_length: int = None,
+                 host_request_types: Tensor = None):
+        self.sequence_length = sequence_length
+        self.context_lengths = context_lengths
+        self.host_context_lengths = host_context_lengths
+        # max allowed context length. Required to
+        # compute scratch memory size.
+        self.max_context_length = max_context_length
+        self.host_request_types = host_request_types
+
+    def is_valid(self, gpt_attention_plugin, remove_input_padding):
+        if gpt_attention_plugin:
+            if self.sequence_length is None:
+                return False
+            if self.context_lengths is None:
+                return False
+            if self.host_request_types is None:
+                return False
+            if self.max_context_length is None:
+                return False
+
+        if remove_input_padding:
+            if self.host_context_lengths is None:
+                return False
+
+        return True
+
+
+class KeyValueCacheParams(object):
+
+    def __init__(self,
+                 past_key_value: List[Tensor] = None,
+                 host_past_key_value_lengths: Tensor = None,
+                 kv_cache_block_pointers: List[Tensor] = None,
+                 cache_indirection: Tensor = None):
+        self.past_key_value = past_key_value
+        self.host_past_key_value_lengths = host_past_key_value_lengths
+        self.kv_cache_block_pointers = kv_cache_block_pointers
+        self.cache_indirection = cache_indirection
+
+    def get_first_past_key_value(self):
+        if self.past_key_value is None:
+            return None
+        return self.past_key_value[0]
+
+    def get_first_kv_cache_block_pointers(self):
+        if self.kv_cache_block_pointers is None:
+            return None
+        return self.kv_cache_block_pointers[0]
+
+    def is_valid(self, gpt_attention_plugin):
+        if gpt_attention_plugin:
+            if self.host_past_key_value_lengths is None:
+                return False
+            if self.cache_indirection is None:
+                return False
+
+        return True
 
 
 class Attention(Module):
@@ -43,6 +110,8 @@ class Attention(Module):
                  bias=True,
                  dtype=None,
                  position_embedding_type=PositionEmbeddingType.learned_absolute,
+                 rotary_embedding_base=10000.0,
+                 rotary_embedding_scaling=None,
                  use_int8_kv_cache=False,
                  rotary_embedding_percentage=1.0,
                  tp_group=None,
@@ -80,6 +149,15 @@ class Attention(Module):
         self.position_embedding_type = position_embedding_type
         self.multi_block_mode = multi_block_mode
 
+        self.rotary_embedding_base = rotary_embedding_base
+        self.rotary_embedding_scale_type = RotaryScalingType.none
+        self.rotary_embedding_scale = 1.0
+        if rotary_embedding_scaling is not None:
+            assert rotary_embedding_scaling["type"] in ["linear", "dynamic"]
+            self.rotary_embedding_scale_type = RotaryScalingType.linear if rotary_embedding_scaling[
+                "type"] == "linear" else RotaryScalingType.dynamic
+            self.rotary_embedding_scale = rotary_embedding_scaling["factor"]
+            assert self.rotary_embedding_scale > 1.0
         self.rotary_embedding_dim = 0
         if self.position_embedding_type.is_rope():
             self.rotary_embedding_dim = int(self.attention_head_size *
@@ -143,18 +221,9 @@ class Attention(Module):
         self,
         hidden_states: Tensor,
         attention_mask=None,
-        past_key_value=None,
-        sequence_length=None,
-        host_past_key_value_lengths: Tensor = None,
         use_cache=False,
-        cache_indirection=None,
-        kv_cache_block_pointers=None,
-        context_lengths: Tensor = None,
-        host_context_lengths: Tensor = None,
-        host_request_types=None,
-        # max allowed context length. Required to
-        # compute scratch memory size.
-        max_context_length: int = None,
+        kv_cache_params=None,
+        attention_params=None,
     ):
 
         assert isinstance(hidden_states, Tensor)
@@ -169,20 +238,21 @@ class Attention(Module):
             if default_net().plugin_config.gpt_attention_plugin:
                 dtype = hidden_states.dtype
             alibi_scale = 1. / self.norm_factor if self.scale_alibi_bias else 1.
-            alibi_slopes = alibi_scale * generate_alibi_slopes(
-                self.num_attention_heads * self.tp_size,
-                dtype=dtype,
-                tp_size=self.tp_size,
-                tp_rank=self.tp_rank)
+            alibi_slopes = generate_alibi_slopes(self.num_attention_heads *
+                                                 self.tp_size,
+                                                 dtype=dtype,
+                                                 tp_size=self.tp_size,
+                                                 tp_rank=self.tp_rank,
+                                                 alibi_scale=alibi_scale)
 
         qkv = self.qkv(hidden_states)
 
         if default_net().plugin_config.gpt_attention_plugin:
-            assert sequence_length is not None
-            assert host_past_key_value_lengths is not None
-            assert cache_indirection is not None
-            assert context_lengths is not None
-            assert host_request_types is not None
+            assert attention_params.is_valid(
+                default_net().plugin_config.gpt_attention_plugin,
+                default_net().plugin_config.remove_input_padding)
+            assert kv_cache_params.is_valid(
+                default_net().plugin_config.gpt_attention_plugin)
             assert self.attention_mask_type in [
                 AttentionMaskType.causal, AttentionMaskType.bidirectional
             ], 'Plugin only support masked MHA.'
@@ -190,32 +260,36 @@ class Attention(Module):
             ) else None
             kv_quant_orig_scale = self.kv_quant_orig_scale.value if self.quant_mode.has_kv_cache_quant(
             ) else None
-            if default_net().plugin_config.remove_input_padding:
-                assert host_context_lengths is not None
             context, past_key_value = gpt_attention(
-                qkv,
-                past_key_value,
-                sequence_length,
+                tensor=qkv,
+                past_key_value=kv_cache_params.get_first_past_key_value(),
+                sequence_length=attention_params.sequence_length,
+                host_past_key_value_lengths=kv_cache_params.
                 host_past_key_value_lengths,
-                context_lengths,
-                cache_indirection,
-                host_request_types,
-                self.num_attention_heads,
-                self.num_attention_kv_heads,
-                self.q_scaling,
-                self.rotary_embedding_dim,
-                self.position_embedding_type,
-                self.multi_block_mode,
-                kv_orig_quant_scale,
-                kv_quant_orig_scale,
-                self.quant_mode,
-                max_context_length,
-                self.attention_mask_type,
+                context_lengths=attention_params.context_lengths,
+                cache_indirection=kv_cache_params.cache_indirection,
+                host_request_types=attention_params.host_request_types,
+                num_heads=self.num_attention_heads,
+                num_kv_heads=self.num_attention_kv_heads,
+                q_scaling=self.q_scaling,
+                rotary_embedding_dim=self.rotary_embedding_dim,
+                rotary_embedding_base=self.rotary_embedding_base,
+                rotary_embedding_scale_type=self.rotary_embedding_scale_type,
+                rotary_embedding_scale=self.rotary_embedding_scale,
+                rotary_embedding_max_positions=self.max_position_embeddings,
+                position_embedding_type=self.position_embedding_type,
+                multi_block_mode=self.multi_block_mode,
+                kv_orig_quant_scale=kv_orig_quant_scale,
+                kv_quant_orig_scale=kv_quant_orig_scale,
+                kv_cache_quant_mode=self.quant_mode,
+                max_context_length=attention_params.max_context_length,
+                mask_type=self.attention_mask_type,
                 alibi_slopes=alibi_slopes,
                 tp_size=self.tp_size,
                 tp_rank=self.tp_rank,
-                kv_cache_block_pointers=kv_cache_block_pointers,
-                host_context_lengths=host_context_lengths)
+                kv_cache_block_pointers=kv_cache_params.
+                get_first_kv_cache_block_pointers(),
+                host_context_lengths=attention_params.host_context_lengths)
 
         else:
             assert default_net().plugin_config.paged_kv_cache == False
@@ -241,6 +315,8 @@ class Attention(Module):
             key = transpose_for_scores(key, is_kv=True)
             value = transpose_for_scores(value, is_kv=True)
 
+            past_key_value = None if kv_cache_params is None else kv_cache_params.get_first_past_key_value(
+            )
             if past_key_value is not None:
 
                 def dequantize_tensor(x, scale):

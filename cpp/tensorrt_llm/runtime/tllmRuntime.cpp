@@ -15,6 +15,7 @@
  */
 #include "tllmRuntime.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tensor.h"
 #include "tllmBuffers.h"
@@ -99,20 +100,24 @@ void TllmRuntime::clearContexts()
     mContexts.clear();
 }
 
-bool TllmRuntime::executeContext(SizeType contextIndex)
+bool TllmRuntime::executeContext(SizeType contextIndex) const
 {
+    NVTX3_FUNC_RANGE();
     auto& context = getContext(contextIndex);
     return context.enqueueV3(mStream->get());
 }
 
 void TllmRuntime::setInputTensors(SizeType contextIndex, TensorMap const& tensorMap)
 {
+    NVTX3_FUNC_RANGE();
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto& context = getContext(contextIndex);
     for (std::int32_t i = 0; i < mEngine->getNbIOTensors(); ++i)
     {
         auto const name = mEngine->getIOTensorName(i);
         if (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT)
         {
+            NVTX3_SCOPED_RANGE(input_tensor);
             auto pos = tensorMap.find(name);
             if (pos == tensorMap.end())
             {
@@ -126,14 +131,14 @@ void TllmRuntime::setInputTensors(SizeType contextIndex, TensorMap const& tensor
             auto const shapeProvided = tensor->getShape();
             TLLM_CHECK_WITH_INFO(shapeExpected.nbDims == shapeProvided.nbDims,
                 tc::fmtstr("%s: expected %d dims, provided %d dims", name, shapeExpected.nbDims, shapeProvided.nbDims));
-            for (SizeType i = 0; i < shapeExpected.nbDims; ++i)
+            for (SizeType j = 0; j < shapeExpected.nbDims; ++j)
             {
-                auto const dimExpected = shapeExpected.d[i];
-                auto const dimProvided = shapeProvided.d[i];
+                auto const dimExpected = shapeExpected.d[j];
+                auto const dimProvided = shapeProvided.d[j];
                 if (dimExpected >= 0 && dimExpected != dimProvided)
                 {
                     TLLM_LOG_WARNING(
-                        "%s: expected dim[%d] = %d, provided dim[%d] = %d", name, i, dimExpected, i, dimProvided);
+                        "%s: expected dim[%d] = %d, provided dim[%d] = %d", name, j, dimExpected, j, dimProvided);
                 }
             }
             TLLM_CHECK_WITH_INFO(context.setInputShape(name, shapeProvided), name);
@@ -155,30 +160,37 @@ void TllmRuntime::setInputTensors(SizeType contextIndex, TensorMap const& tensor
         }
     }
 
-    char const* missing;
-    auto const nbMissing = context.inferShapes(1, &missing);
-    if (nbMissing > 0)
     {
-        TLLM_THROW("Input shape not specified: %s", missing);
-    }
-    else if (nbMissing < 0)
-    {
-        TLLM_THROW("Invalid input shape");
+        NVTX3_SCOPED_RANGE(infer_shapes);
+        char const* missing;
+        auto const nbMissing = context.inferShapes(1, &missing);
+        if (nbMissing > 0)
+        {
+            TLLM_THROW("Input shape not specified: %s", missing);
+        }
+        else if (nbMissing < 0)
+        {
+            TLLM_THROW("Invalid input shape");
+        }
     }
 
-    TLLM_CHECK_WITH_INFO(context.allInputDimensionsSpecified(), "Input dimensions not specified");
-    TLLM_CHECK_WITH_INFO(context.allInputShapesSpecified(), "Input shapes not specified");
+    {
+        NVTX3_SCOPED_RANGE(final_checks);
+        TLLM_CHECK_WITH_INFO(context.allInputDimensionsSpecified(), "Input dimensions not specified");
+        TLLM_CHECK_WITH_INFO(context.allInputShapesSpecified(), "Input shapes not specified");
+    }
 }
 
 void TllmRuntime::setOutputTensors(SizeType contextIndex, TensorMap& tensorMap)
 {
-
+    NVTX3_FUNC_RANGE();
     auto& context = getContext(contextIndex);
     for (std::int32_t i = 0; i < mEngine->getNbIOTensors(); ++i)
     {
         auto const name = mEngine->getIOTensorName(i);
         if (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kOUTPUT)
         {
+            NVTX3_SCOPED_RANGE(output_tensor);
             auto const dims = context.getTensorShape(name);
             auto const type = mEngine->getTensorDataType(name);
             auto pos = tensorMap.find(name);

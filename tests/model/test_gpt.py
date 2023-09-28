@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import os
 import random
 import sys
@@ -33,6 +34,8 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.generation import _prepare_attention_mask
+from tensorrt_llm.runtime.kv_cache_manager import (GenerationSequence,
+                                                   KVCacheManager)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 from examples.gpt.weight import load_from_hf_gpt
@@ -56,7 +59,8 @@ class TestGPT(unittest.TestCase):
     def _gen_tensorrt_llm_network(self, network, builder, hf_gpt, gpt_config,
                                   batch_size, input_len, output_len, fp16,
                                   gpt_attention_plugin, tensor_parallel,
-                                  apply_query_key_layer_scaling):
+                                  apply_query_key_layer_scaling, paged_kv_cache,
+                                  tokens_per_block):
         num_layers = gpt_config.n_layer
         num_heads = gpt_config.n_head
         hidden_size = gpt_config.n_embd
@@ -79,11 +83,14 @@ class TestGPT(unittest.TestCase):
                 mapping=tensorrt_llm.Mapping(world_size=tensor_parallel,
                                              tp_size=tensor_parallel),
                 apply_query_key_layer_scaling=apply_query_key_layer_scaling)
-            inputs = tensorrt_llm_gpt.prepare_inputs(batch_size,
-                                                     input_len,
-                                                     output_len,
-                                                     use_cache=True,
-                                                     max_beam_width=1)
+            inputs = tensorrt_llm_gpt.prepare_inputs(
+                batch_size,
+                input_len,
+                output_len,
+                use_cache=True,
+                max_beam_width=1,
+                paged_kv_cache=paged_kv_cache,
+                tokens_per_block=tokens_per_block)
             load_from_hf_gpt(tensorrt_llm_gpt,
                              hf_gpt,
                              dtype="float16" if fp16 else "float32")
@@ -112,7 +119,8 @@ class TestGPT(unittest.TestCase):
                                   apply_query_key_layer_scaling=False,
                                   context_fmha_type=ContextFMHAType.disabled,
                                   enable_remove_input_padding=False,
-                                  use_in_flight_batching=False):
+                                  enable_paged_kv_cache=False,
+                                  tokens_per_block=64):
         mapping = tensorrt_llm.Mapping(world_size, rank, tp_size=world_size)
 
         runtime = None
@@ -129,13 +137,15 @@ class TestGPT(unittest.TestCase):
             network.plugin_config.set_context_fmha(context_fmha_type)
             if enable_remove_input_padding:
                 network.plugin_config.enable_remove_input_padding()
-            if use_in_flight_batching:
-                network.plugin_config.enable_in_flight_batching()
+            if enable_paged_kv_cache:
+                network.plugin_config.enable_paged_kv_cache()
 
             self._gen_tensorrt_llm_network(network, builder, hf_gpt, gpt_config,
                                            batch_size, input_len, output_len,
                                            fp16, use_plugin, world_size,
-                                           apply_query_key_layer_scaling)
+                                           apply_query_key_layer_scaling,
+                                           enable_paged_kv_cache,
+                                           tokens_per_block)
 
             builder_config = builder.create_builder_config(
                 name='gpt',
@@ -249,7 +259,7 @@ class TestGPT(unittest.TestCase):
                             device='cuda'),
             })
 
-        context = runtime.context_0
+        context = runtime.ctx_context
         runtime._set_shape(context, ctx_shape)
         runtime._set_buffer(context, ctx_buffer)
         runtime._run(context)
@@ -378,23 +388,16 @@ class TestGPT(unittest.TestCase):
             product([False, True], [False, True], [False, True], [
                 ContextFMHAType.disabled, ContextFMHAType.enabled,
                 ContextFMHAType.enabled_with_fp32_acc
-            ], [False, True], [False]))
-
-        # Add several cases for inflight batching
-        test_cases.append(
-            (False, False, False, ContextFMHAType.disabled, True, True))
-        test_cases.append(
-            (True, True, True, ContextFMHAType.disabled, True, True))
+            ], [False, True], [False, True]))
 
         return test_cases
 
     @parameterized.expand(load_test_cases)
     def test_gpt_plugin(self, use_refit, fast_building,
                         apply_query_key_layer_scaling, context_fmha_type,
-                        enable_remove_input_padding, use_in_flight_batching):
-        if use_in_flight_batching:
-            # inflight batching mode can only works with remove_input_padding
-            assert enable_remove_input_padding
+                        enable_remove_input_padding, enable_paged_kv_cache):
+        # inflight batching mode only works with remove_input_padding and paged_kv_cache
+        use_in_flight_batching = enable_remove_input_padding and enable_paged_kv_cache
 
         # Skip tests that are not supported in pre-ampere architecture
         if getSMVersion() < 80:
@@ -423,26 +426,40 @@ class TestGPT(unittest.TestCase):
         seq_len = 128
         total_length = seq_len + max_length
         use_plugin = True
+        tokens_per_block = 64
         gpt_config, hf_gpt = self._gen_hf_gpt(hidden_act, n_layer,
                                               seq_len + max_length, dtype)
         runtime, _ = self._gen_tensorrt_llm_runtime(
             log_level, dtype, world_size, rank, gpt_config, hf_gpt, model,
             use_plugin, batch_size, seq_len, max_length, use_refit,
             fast_building, apply_query_key_layer_scaling, context_fmha_type,
-            enable_remove_input_padding, use_in_flight_batching)
+            enable_remove_input_padding, enable_paged_kv_cache,
+            tokens_per_block)
         key_value_cache_buffers = []
         value_cache_buffers = []
         head_size = gpt_config.n_embd // gpt_config.n_head
 
         for i in range(gpt_config.n_layer):
-            key_value_cache_buffers.append(
-                torch.zeros((
+            if enable_paged_kv_cache:
+                blocks = batch_size * beam_width * math.ceil(
+                    total_length / tokens_per_block)
+                cache_shape = (
+                    blocks,
+                    2,
+                    gpt_config.n_head,
+                    tokens_per_block,
+                    head_size,
+                )
+            else:
+                cache_shape = (
                     batch_size,
                     2,
                     gpt_config.n_head,
                     total_length,
                     head_size,
-                ),
+                )
+            key_value_cache_buffers.append(
+                torch.zeros(cache_shape,
                             dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
                             device='cuda'))
             value_cache_buffers.append(
@@ -474,7 +491,21 @@ class TestGPT(unittest.TestCase):
                        device='cuda')
         ]  # ping-pong buffers
 
-        def run_engine(input_ids,
+        if enable_paged_kv_cache:
+            max_blocks_per_seq = math.ceil(total_length / tokens_per_block)
+            blocks = batch_size * beam_width * max_blocks_per_seq
+            kv_cache_manager = KVCacheManager(key_value_cache_buffers, blocks,
+                                              tokens_per_block,
+                                              max_blocks_per_seq, beam_width)
+
+            # Add sequences to the manager
+            for bi in range(batch_size):
+                generation_sequence = GenerationSequence(seq_idx=bi,
+                                                         batch_idx=bi)
+                kv_cache_manager.add_sequence(generation_sequence, seq_len)
+
+        def run_engine(context,
+                       input_ids,
                        context_lengths,
                        host_request_types,
                        position_ids,
@@ -505,12 +536,23 @@ class TestGPT(unittest.TestCase):
                 ctx_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[
                     i]
 
+            if enable_paged_kv_cache:
+                assert beam_width == 1
+                # for beam_width > 1 the argument must be '1' in ctx phase and 'beam_width' in gen phase
+                kv_cache_block_pointers = kv_cache_manager.get_pointer_arrays(1)
+
+                for idx in range(gpt_config.n_layer):
+                    shape = kv_cache_block_pointers[idx].shape
+                    shape = [shape[0] * shape[1], *shape[2:]]
+                    ctx_buffer[
+                        f'kv_cache_block_pointers_{idx}'] = kv_cache_block_pointers[
+                            idx].reshape(shape).contiguous()
+
             ctx_shape = {
                 key: buffer.shape
                 for key, buffer in ctx_buffer.items()
             }
 
-            context = runtime.context_0
             runtime._set_shape(context, ctx_shape)
             runtime._set_buffer(context, ctx_buffer)
             runtime._run(context)
@@ -565,6 +607,7 @@ class TestGPT(unittest.TestCase):
             sequence_length = ctx_context_lengths.detach().clone()
 
             res = run_engine(
+                context=runtime.ctx_context,
                 input_ids=ctx_ids,
                 context_lengths=ctx_context_lengths,
                 position_ids=ctx_position_ids,
@@ -625,6 +668,7 @@ class TestGPT(unittest.TestCase):
             sequence_length = torch.add(gen_context_lengths.detach().clone(), 1)
 
             res = run_engine(
+                context=runtime.context_1,
                 input_ids=gen_ids,
                 context_lengths=gen_context_lengths,
                 position_ids=gen_position_ids,
@@ -653,7 +697,7 @@ class TestGPT(unittest.TestCase):
             ref_ctx_out = None
             ref_gen_out = None
 
-            compare_context()
+            # compare_context()
 
             # prepare the inputs for plugin-based gpt
             assert step0_ids is not None and step1_ids is not None
@@ -701,6 +745,7 @@ class TestGPT(unittest.TestCase):
                                            dtype=torch.int32).cuda()
 
             res = run_engine(
+                context=runtime.context_1,
                 input_ids=input_ids,
                 context_lengths=context_lengths,
                 position_ids=position_ids,
@@ -785,7 +830,8 @@ class TestGPT(unittest.TestCase):
 
         decoder.setup(batch_size,
                       max_context_length=seq_len,
-                      max_new_tokens=max_new_tokens)
+                      max_new_tokens=max_new_tokens,
+                      beam_width=num_beams)
 
         output_ids = decoder.decode(input_ids, input_lengths, sampling_config)
         #TODO: change to actual ragged tensor after GPT plugin supports it

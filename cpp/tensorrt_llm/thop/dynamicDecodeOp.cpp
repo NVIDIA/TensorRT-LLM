@@ -139,7 +139,7 @@ void FtDynamicDecode<T>::setup(size_t batch_size, size_t beam_width, th::optiona
 
 template <typename T>
 void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width, hidden_size)
-    int step, int max_input_length, uint ite, int local_batch_size, th::Tensor end_id,
+    int step, int max_input_length, uint64_t ite, int local_batch_size, th::Tensor end_id,
     th::optional<th::Tensor> embedding_bias_opt, th::optional<th::Tensor> input_lengths_opt,
     th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
     th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
@@ -342,7 +342,7 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
 
     dynamic_decode_->forward(
         // Inputs
-        logits, static_cast<int>(step), static_cast<int>(max_input_length), static_cast<uint>(ite),
+        logits, static_cast<int>(step), static_cast<int>(max_input_length), static_cast<uint32_t>(ite),
         static_cast<int>(local_batch_size), end_id, embedding_bias_opt, input_lengths_opt, sequence_limit_length_opt,
         stop_words_list_opt, bad_words_list_opt, no_repeat_ngram_size_opt, src_cache_indirection_opt,
         // Outputs

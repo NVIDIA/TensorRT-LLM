@@ -14,9 +14,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TRT_GPT_ATTENTION_COMMON_H
-#define TRT_GPT_ATTENTION_COMMON_H
-#include "NvInferPlugin.h"
+#pragma once
+
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmhaRunner.h"
@@ -28,12 +27,10 @@
 #include <string>
 #include <vector>
 
-namespace nvinfer1
-{
-namespace plugin
+namespace tensorrt_llm::plugins
 {
 
-class GPTAttentionPluginCommon : public IPluginV2DynamicExt
+class GPTAttentionPluginCommon : public BasePlugin
 {
 public:
     GPTAttentionPluginCommon() = delete;
@@ -41,7 +38,8 @@ public:
     GPTAttentionPluginCommon(int num_heads, int num_kv_heads, int unidirectional, float q_scaling,
         tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
-        int tp_size, int tp_rank, // for ALiBi
+        float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
+        float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
         tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
         bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
         nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled);
@@ -71,15 +69,13 @@ public:
 
     static size_t getCommonSerializationSize() noexcept;
     void serializeCommon(void* buffer) const noexcept;
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
-    const char* getPluginNamespace() const noexcept override;
     const int getHeadSize(bool checkInit = true) const;
 
 protected:
     int getMaxSeqLenTile(int elemSize) const;
-    size_t getWorkspaceSizeForContext(DataType type, int32_t nbReq, int32_t max_input_length) const noexcept;
+    size_t getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t nbReq, int32_t max_input_length) const noexcept;
     // total_num_seq is the sum of beam_width for multiple requests
-    size_t getWorkspaceSizeForGeneration(DataType type, int32_t total_num_seq) const noexcept;
+    size_t getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t total_num_seq) const noexcept;
 
     template <typename T, typename KVCacheBuffer>
     struct EnqueueContextParams
@@ -142,9 +138,26 @@ protected:
             || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPT_NEOX;
     }
 
+    inline void update_rotary_params(int32_t kv_seq_len, float& base, float& scale)
+    {
+        base = mRotaryEmbeddingBase;
+        scale = 1.0f / mRotaryEmbeddingScale; // do the division here so that we can avoid it in the kernel
+        if (mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPT_NEOX
+            && mRotaryEmbeddingScaleType == tensorrt_llm::kernels::RotaryScalingType::kDYNAMIC)
+        {
+            if (kv_seq_len > mRotaryEmbeddingMaxPositions)
+            {
+                const float b
+                    = (mRotaryEmbeddingScale * kv_seq_len / mRotaryEmbeddingMaxPositions) - (mRotaryEmbeddingScale - 1);
+                const float p = static_cast<float>(mRotaryEmbeddingDim) / (mRotaryEmbeddingDim - 2);
+                base = mRotaryEmbeddingBase * pow(b, p);
+            }
+            scale = 1.0f; // scale factor is already used in updated base
+        }
+    }
+
 protected:
     const std::string mLayerName;
-    std::string mNamespace;
 
     int mNumHeads;
     int mNumKVHeads;
@@ -152,6 +165,10 @@ protected:
     int mUnidirectional;
     float mQScaling;
     int mRotaryEmbeddingDim;
+    float mRotaryEmbeddingBase;
+    tensorrt_llm::kernels::RotaryScalingType mRotaryEmbeddingScaleType;
+    float mRotaryEmbeddingScale;
+    int mRotaryEmbeddingMaxPositions;
     tensorrt_llm::kernels::PositionEmbeddingType mPositionEmbeddingType;
     bool mRemovePadding = false;
     tensorrt_llm::kernels::AttentionMaskType mMaskType;
@@ -178,7 +195,7 @@ protected:
     tensorrt_llm::common::cublasMMWrapper* mCublasWrapper;
 };
 
-class GPTAttentionPluginCreatorCommon : public IPluginCreator
+class GPTAttentionPluginCreatorCommon : public BaseCreator
 {
 public:
     GPTAttentionPluginCreatorCommon();
@@ -188,17 +205,9 @@ public:
     template <typename T>
     T* deserializePluginImpl(const char* name, const void* serialData, size_t serialLength) noexcept;
 
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
-
-    const char* getPluginNamespace() const noexcept override;
-
 protected:
-    std::vector<PluginField> mPluginAttributes;
-    PluginFieldCollection mFC{};
-    std::string mNamespace;
+    std::vector<nvinfer1::PluginField> mPluginAttributes;
+    nvinfer1::PluginFieldCollection mFC{};
 };
 
-} // namespace plugin
-} // namespace nvinfer1
-
-#endif // TRT_GPT_ATTENTION_COMMON_H
+} // namespace tensorrt_llm::plugins

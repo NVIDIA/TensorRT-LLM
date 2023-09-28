@@ -25,12 +25,12 @@
 #include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
+#include <NvInferRuntime.h>
+
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
-
-#include <NvInferRuntime.h>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
@@ -47,6 +47,7 @@ std::vector<uint8_t> loadEngine(std::string const& enginePath);
 
 class TllmRuntime;
 class IStatefulGptDecoder;
+class NcclCommunicator;
 class RuntimeBuffers;
 
 class GptSession
@@ -109,6 +110,9 @@ private:
     void createContexts();
     void createDecoder(bool decoderPerRequest);
 
+    bool executeDecoderStep(ITensor::SharedPtr& outputIds, ITensor::SharedPtr& newTokens, SizeType decoderStep);
+    void finalizeOutputIds(ITensor& outputIds);
+
     class CudaGraphExecutor
     {
     public:
@@ -131,13 +135,15 @@ private:
             return mInstance != nullptr;
         }
 
+        void clear();
+        void prepareNextGraph(TllmRuntime const& runtime, SizeType nextContextId);
+        void launch(CudaStream const& stream);
+
+    private:
         void create(cudaGraph_t const& graph);
         bool update(cudaGraph_t const& graph);
         void uploadToStream(CudaStream const& stream);
-        void launch(CudaStream const& stream);
-        void clear();
 
-    private:
         using cudaGraphExecPtr = cudaGraphExec_t;
         cudaGraphExecPtr mInstance;
     };
@@ -146,6 +152,7 @@ private:
     GptModelConfig const mModelConfig;
     WorldConfig const mWorldConfig;
     int mDevice{-1};
+    std::shared_ptr<NcclCommunicator> mPipelineComm;
 
     SizeType mDecoderMaxSequenceLength{};
 

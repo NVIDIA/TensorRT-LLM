@@ -168,7 +168,8 @@ def main(args):
         with torch.no_grad():
             tensorrt_llm_bloom.setup(line_encoded.size(0),
                                      max_context_length=line_encoded.size(1),
-                                     max_new_tokens=output_len)
+                                     max_new_tokens=output_len,
+                                     beam_width=num_beams)
 
             output_ids = tensorrt_llm_bloom.decode(
                 line_encoded,

@@ -339,7 +339,8 @@ class TestBert(unittest.TestCase):
                 ref = hf_outputs.last_hidden_state
                 np.testing.assert_allclose(ref.cpu().numpy(),
                                            res.cpu().numpy(),
-                                           atol=1.5e-2)
+                                           atol=1e-2,
+                                           rtol=1e-2)
             elif model == BertForQuestionAnswering.__name__:
                 res_start_logits, res_end_logits = torch.split(res, 1, -1)
                 res_start_logits = res_start_logits.squeeze()

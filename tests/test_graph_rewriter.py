@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import unittest
-from copy import copy
 
 import numpy as np
 import tensorrt as trt
@@ -116,13 +115,13 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
             else:
                 position_embedding_type = PositionEmbeddingType.learned_absolute
             outputs = tensorrt_llm.functional.gpt_attention(
-                qkv,
-                past_key_value_tensor,
-                sequence_length_tensor,
-                host_past_key_value_lengths_tensor,
-                context_lengths_tensor,
-                cache_indirection_tensor,
-                host_request_types_tensor,
+                tensor=qkv,
+                past_key_value=past_key_value_tensor,
+                sequence_length=sequence_length_tensor,
+                host_past_key_value_lengths=host_past_key_value_lengths_tensor,
+                context_lengths=context_lengths_tensor,
+                cache_indirection=cache_indirection_tensor,
+                host_request_types=host_request_types_tensor,
                 num_heads=num_heads,
                 num_kv_heads=1 if enable_multi_query_attention else num_heads,
                 q_scaling=1.0,
@@ -290,21 +289,21 @@ class NaivePatternRewriter_ReplaceAddWithSub(PatternRewriter):
         with net_guard(layer.network):
             # There are several stages to replace some subgraph with another subgraph:
 
-            # Stage 1: Get the input tensors and output tensors of the subgraph to replace.
+            # Step 1: Get the input tensors and output tensors of the subgraph to replace.
             # - For elementwise_SUM, there are two inputs and one output.
             a, b = layer.get_inputs(0, 1)
             o = layer.get_outputs(0)[0]
 
-            # Stage 2: Create a new subgraph that takes the old one's inputs
+            # Step 2: Create a new subgraph that takes the old one's inputs
             # - here we insert an elementwise_SUB layer, and c is the output
             c = a - b
 
-            # Stage 3: Redirect all the layers depending on the outputs of the old subgraph to the new subgraph's.
+            # Step 3: Redirect all the layers depending on the outputs of the old subgraph to the new subgraph's.
             # - After this, the SUM become dangling, and will be pruned by TensorRT when building the engine.
             # - Note that, there is no API in TensorRT python to remove a layer explicitly, the `replace_all_uses_with` is the only way to "remove" a layer.
             o.replace_all_uses_with(c)
 
-            # Stage 4: Mark the all the layers in the old subgraph as removed.
+            # Step 4: Mark the all the layers in the old subgraph as removed.
             # - This helps the PatternRewriter to skip the removed layers
             layer.mark_as_removed()
 
@@ -408,23 +407,23 @@ class GPTAttentionPluginRemovePaddingRewritePass(PatternRewriter):
             return False
 
         flayer = FLayerInfoMemo.instance().get(layer.name)
-        tensor_input: Tensor = flayer.raw_inputs['tensor']
-        if tensor_input.shape[0] == 1:  # already on remove padding
+        assert flayer
+        tensor_input: Tensor = flayer.get_input('tensor')
+        if tensor_input.shape[0] == 1:  # already on remove-padding mode
             return False
 
         self.log_info(f'hit gpt_attention plugin: {layer.name}')
 
-        assert self.args is not None
-        batch_size = self.args['batch_size']
-        in_len = self.args['in_len']
-        hidden_size = self.args['hidden_size']
+        assert self.args is not None, "args should be passed in from RewritePatternManager.rewrite()"
+        batch_size, in_len, hidden_size = self.args['batch_size'], self.args[
+            'in_len'], self.args['hidden_size']
 
         # record the times of rewriting
         self.count += 1
 
-        new_inputs = copy(flayer.raw_inputs)
+        new_inputs = flayer.clone_inputs()
         with net_guard(layer.network):
-            # step 1: create new inputs and repalce the original arglist
+            # Step 1: create new inputs and repalce the original arglist
             input = Tensor(
                 name='tensor',
                 dtype=trt.float16,
@@ -432,14 +431,16 @@ class GPTAttentionPluginRemovePaddingRewritePass(PatternRewriter):
             )
             new_inputs['tensor'] = input
 
-            # step 2: create a new plugin instance
+            # Step 2: create a new plugin instance
             new_outs = gpt_attention(**new_inputs)
 
-            # step 3: deprive all the users of the old plugin instance
-            flayer.replace_output_users_with(layer.network, new_outs)
+            # Step 3: deprive all the users of the old plugin instance
+            flayer.replace_outputs_uses_with(layer.network, new_outs)
 
-            # step 4: remove the old plugin instance
+            # Step 4: remove the old plugin instance
             layer.mark_as_removed()
+
+        return True
 
 
 class TestGPTAttentionPluginRemovePaddingRewritePass(unittest.TestCase):

@@ -224,6 +224,20 @@ def parse_arguments(args):
     args = parser.parse_args(args)
     logger.set_level(args.log_level)
 
+    if args.use_inflight_batching:
+        if not args.use_gpt_attention_plugin:
+            args.use_gpt_attention_plugin = 'float16'
+            logger.info(
+                f"Using GPT attention plugin for inflight batching mode. Setting to default '{args.use_gpt_attention_plugin}'"
+            )
+        if not args.remove_input_padding:
+            args.remove_input_padding = True
+            logger.info(
+                "Using remove input padding for inflight batching mode.")
+        if not args.paged_kv_cache:
+            args.paged_kv_cache = True
+            logger.info("Using paged KV cache for inflight batching mode.")
+
     args.bias = not args.no_bias
     if args.inter_size is None:
         args.inter_size = 4 * args.n_embd
@@ -393,6 +407,8 @@ def build_rank_engine(builder: Builder,
             tokens_per_block=args.tokens_per_block,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size)
         tensorrt_llm_gpt(*inputs)
+
+    tensorrt_llm.graph_rewriting.optimize(network)
 
     engine = None
 

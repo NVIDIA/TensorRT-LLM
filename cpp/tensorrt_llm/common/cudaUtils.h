@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmException.h"
+#include <cinttypes>
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -268,6 +269,15 @@ inline int getDeviceCount()
     return count;
 }
 
+/// Get the memory info
+/// \return The free and total amount of memory in bytes
+inline std::tuple<size_t, size_t> getDeviceMemoryInfo()
+{
+    size_t free, total;
+    check_cuda_error(cudaMemGetInfo(&free, &total));
+    return {free, total};
+}
+
 inline int getMultiProcessorCount()
 {
     int device_id;
@@ -301,8 +311,15 @@ inline int divUp(int a, int n)
     return (a + n - 1) / n;
 }
 
+template <typename T, typename U, typename = std::enable_if_t<std::is_integral<T>::value>,
+    typename = std::enable_if_t<std::is_integral<U>::value>>
+auto constexpr ceilDiv(T numerator, U denominator)
+{
+    return (numerator + denominator - 1) / denominator;
+}
+
 template <typename T>
-void printAbsMean(const T* buf, uint size, cudaStream_t stream, std::string name = "")
+void printAbsMean(const T* buf, uint64_t size, cudaStream_t stream, std::string name = "")
 {
     if (buf == nullptr)
     {
@@ -319,7 +336,7 @@ void printAbsMean(const T* buf, uint size, cudaStream_t stream, std::string name
     uint64_t zero_count = 0;
     float max_val = -1e10;
     bool find_inf = false;
-    for (uint i = 0; i < size; i++)
+    for (uint64_t i = 0; i < size; i++)
     {
         if (std::isinf((float) (h_tmp[i])))
         {
@@ -412,19 +429,24 @@ inline void print_element_(__nv_bfloat16 x)
     print_float_((float) x);
 }
 #endif
-inline void print_element_(unsigned long long ull)
+inline void print_element_(uint32_t ul)
 {
-    printf("%7llu ", ull);
+    printf("%7" PRIu32, ul);
 }
 
-inline void print_element_(int i)
+inline void print_element_(uint64_t ull)
 {
-    printf("%7d ", i);
+    printf("%7" PRIu64, ull);
 }
 
-inline void print_element_(size_t s)
+inline void print_element_(int32_t il)
 {
-    printf("%7ld ", s);
+    printf("%7" PRId32, il);
+}
+
+inline void print_element_(int64_t ill)
+{
+    printf("%7" PRId64, ill);
 }
 
 template <typename T>
@@ -478,9 +500,9 @@ template void printMatrix(const half* ptr, int m, int k, int stride, bool is_dev
 #ifdef ENABLE_BF16
 template void printMatrix(const __nv_bfloat16* ptr, int m, int k, int stride, bool is_device_ptr);
 #endif
-template void printMatrix(const unsigned long long* ptr, int m, int k, int stride, bool is_device_ptr);
+template void printMatrix(const uint32_t* ptr, int m, int k, int stride, bool is_device_ptr);
+template void printMatrix(const uint64_t* ptr, int m, int k, int stride, bool is_device_ptr);
 template void printMatrix(const int* ptr, int m, int k, int stride, bool is_device_ptr);
-template void printMatrix(const size_t* ptr, int m, int k, int stride, bool is_device_ptr);
 
 } // namespace tensorrt_llm::common
 

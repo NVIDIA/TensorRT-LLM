@@ -14,20 +14,20 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/plugins/rmsnormPlugin/rmsnormPlugin.h"
+#include "rmsnormPlugin/rmsnormPlugin.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/kernels/rmsnormKernels.h"
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
-using nvinfer1::plugin::RmsnormPluginCreator;
-using nvinfer1::plugin::RmsnormPlugin;
+using tensorrt_llm::plugins::RmsnormPluginCreator;
+using tensorrt_llm::plugins::RmsnormPlugin;
 
 static const char* RMSNORM_PLUGIN_VERSION{"1"};
 static const char* RMSNORM_PLUGIN_NAME{"Rmsnorm"};
 PluginFieldCollection RmsnormPluginCreator::mFC{};
-std::vector<PluginField> RmsnormPluginCreator::mPluginAttributes;
+std::vector<nvinfer1::PluginField> RmsnormPluginCreator::mPluginAttributes;
 
 RmsnormPlugin::RmsnormPlugin(float eps, nvinfer1::DataType type)
     : mEps(eps)
@@ -43,7 +43,7 @@ RmsnormPlugin::RmsnormPlugin(const void* data, size_t length)
     const char *d = reinterpret_cast<const char*>(data), *a = d;
     read(d, mEps);
     read(d, mType);
-    PLUGIN_ASSERT(d == a + length);
+    TLLM_CHECK(d == a + length);
     TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16), "Unsupported data type");
 }
 
@@ -64,7 +64,7 @@ nvinfer1::DimsExprs RmsnormPlugin::getOutputDimensions(
 bool RmsnormPlugin::supportsFormatCombination(
     int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
 {
-    PLUGIN_ASSERT(0 <= pos && pos < 5);
+    TLLM_CHECK(0 <= pos && pos < 5);
     return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
 }
 
@@ -173,16 +173,6 @@ void RmsnormPlugin::destroy() noexcept
     delete this;
 }
 
-void RmsnormPlugin::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* RmsnormPlugin::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
-}
-
 ///////////////
 
 RmsnormPluginCreator::RmsnormPluginCreator()
@@ -221,12 +211,12 @@ IPluginV2* RmsnormPluginCreator::createPlugin(const char* name, const PluginFiel
         const char* attrName = fields[i].name;
         if (!strcmp(attrName, "eps"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kFLOAT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kFLOAT32);
             eps = static_cast<float>(*(static_cast<const float*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "type_id"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
         }
     }
@@ -259,14 +249,4 @@ IPluginV2* RmsnormPluginCreator::deserializePlugin(
         caughtError(e);
     }
     return nullptr;
-}
-
-void RmsnormPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* RmsnormPluginCreator::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
 }

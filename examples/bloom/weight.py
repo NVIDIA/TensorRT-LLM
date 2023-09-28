@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -97,13 +98,21 @@ def get_weight_and_bias(config, prefix, dtype):
     return get_weight(config, prefix, dtype), get_bias(config, prefix, dtype)
 
 
+def check_embedding_share(dir_path):
+    share_embedding_table = False
+    if Path(dir_path).exists():
+        share_embedding_table = True
+    return share_embedding_table
+
+
 def load_from_hf_bloom(tensorrt_llm_bloom,
                        hf_bloom,
                        rank=0,
                        tensor_parallel=1,
                        fp16=False,
                        use_parallel_embedding=False,
-                       sharding_dim=0):
+                       sharding_dim=0,
+                       share_embedding_table=False):
     tensorrt_llm.logger.info('Loading weights from HF BLOOM...')
     tik = time.time()
 
@@ -157,16 +166,16 @@ def load_from_hf_bloom(tensorrt_llm_bloom,
         tensorrt_llm_bloom.layers[l].post_layernorm.bias.value = post_ln_bias
 
     embed_w = get_weight(model_params, 'transformer.word_embeddings', dtype)
+    if not share_embedding_table:
+        tensorrt_llm_bloom.lm_head.weight.value = split_matrix_tp(
+            embed_w.copy(), tensor_parallel, rank, dim=0)
+
     if not use_parallel_embedding:
-        tensorrt_llm_bloom.embedding.weight.value = embed_w.copy()
+        tensorrt_llm_bloom.embedding.weight.value = embed_w
     else:
         assert hf_bloom.config.vocab_size % tensor_parallel == 0
-        tensorrt_llm_bloom.embedding.weight.value = np.ascontiguousarray(
-            split(embed_w.copy(), tensor_parallel, rank, dim=sharding_dim))
-    tensorrt_llm_bloom.lm_head.weight.value = split_matrix_tp(embed_w,
-                                                              tensor_parallel,
-                                                              rank,
-                                                              dim=0)
+        tensorrt_llm_bloom.embedding.weight.value = split_matrix_tp(
+            embed_w, tensor_parallel, rank, dim=sharding_dim)
 
     embed_f_w, embed_f_b = get_weight_and_bias(
         model_params, 'transformer.word_embeddings_layernorm', dtype)

@@ -12,6 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .plugin import _TRT_LLM_PLUGIN_NAMESPACE, PluginConfig, _load_plugin_lib
+from .plugin import (TRT_LLM_PLUGIN_NAMESPACE, PluginConfig, _load_plugin_lib,
+                     plugin_lib_path)
 
-__all__ = ['_TRT_LLM_PLUGIN_NAMESPACE', '_load_plugin_lib', 'PluginConfig']
+__all__ = [
+    'TRT_LLM_PLUGIN_NAMESPACE', '_load_plugin_lib', 'PluginConfig',
+    'plugin_lib_path'
+]

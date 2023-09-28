@@ -14,10 +14,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TRT_PLUGIN_H
-#define TRT_PLUGIN_H
-#include "NvInferPlugin.h"
+
+#pragma once
+
+#include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/plugins/common/checkMacrosPlugin.h"
+
+#include <NvInferRuntime.h>
+
 #include <cstring>
 #include <cublasLt.h>
 #include <cublas_v2.h>
@@ -34,38 +38,10 @@
 #include <string>
 #include <unordered_map>
 
-typedef enum
-{
-    STATUS_SUCCESS = 0,
-    STATUS_FAILURE = 1,
-    STATUS_BAD_PARAM = 2,
-    STATUS_NOT_SUPPORTED = 3,
-    STATUS_NOT_INITIALIZED = 4
-} pluginStatus_t;
-
-namespace nvinfer1
+namespace tensorrt_llm::plugins
 {
 
-namespace pluginInternal
-{
-
-class BasePlugin : public IPluginV2
-{
-protected:
-    void setPluginNamespace(const char* libNamespace) noexcept override
-    {
-        mNamespace = libNamespace;
-    }
-
-    const char* getPluginNamespace() const noexcept override
-    {
-        return mNamespace.c_str();
-    }
-
-    std::string mNamespace;
-};
-
-class BaseCreator : public IPluginCreator
+class BasePlugin : public nvinfer1::IPluginV2DynamicExt
 {
 public:
     void setPluginNamespace(const char* libNamespace) noexcept override
@@ -73,19 +49,31 @@ public:
         mNamespace = libNamespace;
     }
 
-    const char* getPluginNamespace() const noexcept override
+    [[nodiscard]] char const* getPluginNamespace() const noexcept override
     {
         return mNamespace.c_str();
     }
 
 protected:
-    std::string mNamespace;
+    std::string mNamespace{api::kDefaultNamespace};
 };
 
-} // namespace pluginInternal
-
-namespace plugin
+class BaseCreator : public nvinfer1::IPluginCreator
 {
+public:
+    void setPluginNamespace(const char* libNamespace) noexcept override
+    {
+        mNamespace = libNamespace;
+    }
+
+    [[nodiscard]] char const* getPluginNamespace() const noexcept override
+    {
+        return mNamespace.c_str();
+    }
+
+protected:
+    std::string mNamespace{api::kDefaultNamespace};
+};
 
 // Write values into buffer
 template <typename T>
@@ -103,59 +91,41 @@ void read(const char*& buffer, T& val)
     buffer += sizeof(T);
 }
 
-inline int32_t getTrtSMVersionDec(int32_t smVersion)
-{
-    // Treat SM89 as SM86 temporarily.
-    return (smVersion == 89) ? 86 : smVersion;
-}
-
-inline int32_t getTrtSMVersionDec(int32_t majorVersion, int32_t minorVersion)
-{
-    return getTrtSMVersionDec(majorVersion * 10 + minorVersion);
-}
-
-inline int32_t elementSize(DataType type) noexcept
+inline cudaDataType_t trtToCublasDtype(nvinfer1::DataType type)
 {
     switch (type)
     {
-    case DataType::kFLOAT: return 4;
-    case DataType::kHALF: return 2;
-    case DataType::kINT8: return 1;
-    case DataType::kINT32: return 4;
-    case DataType::kBOOL: return 1;
-    case DataType::kUINT8: return 1;
-    case DataType::kFP8: return 1;
+    case nvinfer1::DataType::kFLOAT: return CUDA_R_32F;
+    case nvinfer1::DataType::kHALF: return CUDA_R_16F;
 #if defined(NV_TENSORRT_MAJOR) && NV_TENSORRT_MAJOR >= 9
-    case DataType::kBF16: return 2;
-    case DataType::kINT64: return 8;
+    case nvinfer1::DataType::kBF16: return CUDA_R_16BF;
 #endif
+    default: TLLM_THROW("Not supported data type for cuBLAS");
     }
-    PLUGIN_FAIL("unreachable code path");
 }
+
+std::uintptr_t constexpr kCudaMemAlign = 128;
 
 int8_t* alignPtr(int8_t* ptr, uintptr_t to);
 
-int8_t* nextWorkspacePtr(int8_t* const base, uintptr_t& offset, const uintptr_t size);
+int8_t* nextWorkspacePtrCommon(int8_t* ptr, uintptr_t previousWorkspaceSize, const uintptr_t alignment);
+
+int8_t* nextWorkspacePtr(
+    int8_t* const base, uintptr_t& offset, const uintptr_t size, const uintptr_t alignment = kCudaMemAlign);
 
 int8_t* nextWorkspacePtr(int8_t* ptr, uintptr_t previousWorkspaceSize);
 
-size_t calculateTotalWorkspaceSize(size_t* workspaces, int count);
+int8_t* nextWorkspacePtrWithAlignment(int8_t* ptr, uintptr_t previousWorkspaceSize, const uintptr_t alignment);
 
-} // namespace plugin
-} // namespace nvinfer1
+size_t calculateTotalWorkspaceSize(size_t* workspaces, int count, const uintptr_t alignment = kCudaMemAlign);
+
+} // namespace tensorrt_llm::plugins
 
 inline bool isBuilding()
 {
-    std::string const& key = "IS_BUILDING";
-    char* val = getenv(key.c_str());
-    if (val == nullptr || std::string(val) != "1")
-    {
-        return false;
-    }
-    else
-    {
-        return true;
-    }
+    auto constexpr key = "IS_BUILDING";
+    auto const val = getenv(key);
+    return val != nullptr && std::string(val) == "1";
 }
 
 #define MPICHECK(cmd)                                                                                                  \
@@ -309,5 +279,3 @@ private:
 
     std::unordered_map<std::string_view, Record> mMap;
 };
-
-#endif // TRT_PLUGIN_H

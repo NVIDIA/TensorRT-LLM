@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/torchUtils.h"
 
 #include <ATen/ATen.h>
 #include <torch/types.h>

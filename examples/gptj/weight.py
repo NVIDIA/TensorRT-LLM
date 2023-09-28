@@ -334,14 +334,14 @@ def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
         [vocab_size, k] = weight.shape
         new_weight = torch.zeros([pad_vocab_size, k])
         new_weight[:vocab_size, :] = weight
-        new_weight = new_weight.T.continugous()
+        new_weight = new_weight.T.contiguous()
         amax = awq_gpt_j['lm_head.weight_quantizer._amax'].reshape(
-            [vocab_size, k / group_size])
-        new_amax = torch.ones([pad_vocab_size, k / group_size])
+            [vocab_size, int(k / group_size)])
+        new_amax = torch.ones([pad_vocab_size, int(k / group_size)])
         new_amax[:vocab_size, :] = amax
-        new_amax = new_amax.T.continugous()
+        new_amax = new_amax.T.contiguous()
         new_scale = new_amax / 8
-        tensorrt_llm_gpt_j.lm_head.weight.value = AWQ_quantize_pack_preprocess(
+        tensorrt_llm_gpt_j.lm_head.qweight.value = AWQ_quantize_pack_preprocess(
             new_weight, new_scale, group_size, packer, preprocessor)
         tensorrt_llm_gpt_j.lm_head.scale.value = new_scale.to(
             torch_dtype).cpu().numpy()

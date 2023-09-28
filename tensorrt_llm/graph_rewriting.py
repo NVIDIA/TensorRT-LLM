@@ -1,4 +1,5 @@
 import inspect
+from copy import copy
 from dataclasses import dataclass, field
 from functools import wraps
 from typing import (Any, Callable, ClassVar, Dict, List, Optional, Set, Tuple,
@@ -357,7 +358,16 @@ class FLayerInfo:
     def set_outputs(self, outputs: List[Any]):
         self.raw_outputs = outputs
 
-    def replace_with_tensor_from_input(self, src, dst):
+    def get_input(self, name: str) -> Any:
+        return self.raw_inputs[name]
+
+    def clone_inputs(self):
+        '''
+        Get a shallow copy of the inputs.
+        '''
+        return copy(self.raw_inputs)
+
+    def replace_input_with(self, src, dst):
         '''
         Replace the input `src` with the input `dst` in the raw_inputs.
 
@@ -379,7 +389,7 @@ class FLayerInfo:
 
         replace(self.raw_inputs)
 
-    def replace_output_users_with(self, net: Network, new_outs: List[Any]):
+    def replace_outputs_uses_with(self, net: Network, new_outs: List[Any]):
         '''
         Replace the output users with the new outputs.
 
@@ -625,7 +635,7 @@ class FuseAttentionWithBiasPass(PatternRewriter):
             plugin_flayer.raw_inputs['qkv_bias'] = eltwise_const_inputs[0]
             from .functional import gpt_attention
             new_outputs = gpt_attention(**plugin_flayer.raw_inputs)
-            plugin_flayer.replace_output_users_with(layer.network, new_outputs)
+            plugin_flayer.replace_outputs_uses_with(layer.network, new_outputs)
         return True
 
 

@@ -86,7 +86,14 @@ void BufferManager::copy(void const* src, IBuffer& dst) const
 {
     if (dst.getSizeInBytes() > 0)
     {
-        TLLM_CUDA_CHECK(cudaMemcpyAsync(dst.data(), src, dst.getSizeInBytes(), cudaMemcpyDefault, mStream->get()));
+        if (IBuffer::memoryType(src) != MemoryType::kGPU && dst.getMemoryType() != MemoryType::kGPU)
+        {
+            std::memcpy(dst.data(), src, dst.getSizeInBytes());
+        }
+        else
+        {
+            TLLM_CUDA_CHECK(cudaMemcpyAsync(dst.data(), src, dst.getSizeInBytes(), cudaMemcpyDefault, mStream->get()));
+        }
     }
 }
 
@@ -94,7 +101,14 @@ void BufferManager::copy(IBuffer const& src, void* dst) const
 {
     if (src.getSizeInBytes() > 0)
     {
-        TLLM_CUDA_CHECK(cudaMemcpyAsync(dst, src.data(), src.getSizeInBytes(), cudaMemcpyDefault, mStream->get()));
+        if (IBuffer::memoryType(dst) != MemoryType::kGPU && src.getMemoryType() != MemoryType::kGPU)
+        {
+            std::memcpy(dst, src.data(), src.getSizeInBytes());
+        }
+        else
+        {
+            TLLM_CUDA_CHECK(cudaMemcpyAsync(dst, src.data(), src.getSizeInBytes(), cudaMemcpyDefault, mStream->get()));
+        }
     }
 }
 

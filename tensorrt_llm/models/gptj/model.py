@@ -21,8 +21,8 @@ from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
 from ...functional import (PositionEmbeddingType, Tensor, assertion,
                            gather_last_token_logits, shape)
-from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, LayerNorm)
+from ...layers import (MLP, Attention, AttentionMaskType, AttentionParams,
+                       ColumnLinear, Embedding, KeyValueCacheParams, LayerNorm)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
 from ...quantization import QuantMode
@@ -79,16 +79,9 @@ class GPTJDecoderLayer(Module):
     def forward(self,
                 hidden_states: Tensor,
                 attention_mask=None,
-                past_key_value=None,
-                sequence_length=None,
-                host_past_key_value_lengths=None,
                 use_cache=False,
-                cache_indirection=None,
-                kv_cache_block_pointers=None,
-                context_lengths=None,
-                host_context_lengths=None,
-                host_request_types=None,
-                max_context_length=None):
+                kv_cache_params=None,
+                attention_params=None):
         if not default_net(
         ).plugin_config.layernorm_plugin and trt.__version__[:3] == '8.6':
             raise AssertionError(
@@ -98,19 +91,11 @@ class GPTJDecoderLayer(Module):
 
         hidden_states = self.input_layernorm(hidden_states)
 
-        attention_output = self.attention(
-            hidden_states,
-            attention_mask=attention_mask,
-            past_key_value=past_key_value,
-            sequence_length=sequence_length,
-            host_past_key_value_lengths=host_past_key_value_lengths,
-            use_cache=use_cache,
-            cache_indirection=cache_indirection,
-            kv_cache_block_pointers=kv_cache_block_pointers,
-            context_lengths=context_lengths,
-            host_context_lengths=host_context_lengths,
-            host_request_types=host_request_types,
-            max_context_length=max_context_length)
+        attention_output = self.attention(hidden_states,
+                                          attention_mask=attention_mask,
+                                          use_cache=use_cache,
+                                          kv_cache_params=kv_cache_params,
+                                          attention_params=attention_params)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -154,40 +139,32 @@ class GPTJModel(Module):
         self.ln_f = LayerNorm(normalized_shape=hidden_size, dtype=dtype)
 
     def forward(self,
-                input_ids=None,
-                past_key_value=None,
-                sequence_length=None,
-                host_past_key_value_lengths=None,
+                input_ids: Tensor,
                 use_cache=False,
-                cache_indirection=None,
-                kv_cache_block_pointers_list=None,
-                context_lengths=None,
-                host_context_lengths=None,
-                host_request_types=None,
-                max_context_length=None):
+                kv_cache_params=None,
+                attention_params=None):
 
         hidden_states = self.embedding(input_ids)
 
-        if past_key_value is None:
-            past_key_value = tuple([None] * len(self.layers))
+        if kv_cache_params.past_key_value is None:
+            kv_cache_params.past_key_value = tuple([None] * len(self.layers))
 
         if use_cache:
             presents = []
 
-        for idx, (layer, past, pointers) in enumerate(
-                zip(self.layers, past_key_value, kv_cache_block_pointers_list)):
+        for layer, past, pointer in zip(
+                self.layers, kv_cache_params.past_key_value,
+                kv_cache_params.kv_cache_block_pointers):
             hidden_states = layer(
                 hidden_states,
-                past_key_value=past,
-                sequence_length=sequence_length,
-                host_past_key_value_lengths=host_past_key_value_lengths,
                 use_cache=use_cache,
-                cache_indirection=cache_indirection,
-                kv_cache_block_pointers=pointers,
-                context_lengths=context_lengths,
-                host_context_lengths=host_context_lengths,
-                host_request_types=host_request_types,
-                max_context_length=max_context_length)
+                kv_cache_params=KeyValueCacheParams(
+                    past_key_value=[past],
+                    host_past_key_value_lengths=kv_cache_params.
+                    host_past_key_value_lengths,
+                    kv_cache_block_pointers=[pointer],
+                    cache_indirection=kv_cache_params.cache_indirection),
+                attention_params=attention_params)
 
             if use_cache:
                 presents.append(hidden_states[1])
@@ -250,32 +227,14 @@ class GPTJForCausalLM(GPTJModel):
                                     gather_output=True)
 
     def forward(self,
-                input_ids=None,
+                input_ids: Tensor,
                 position_ids=None,
-                past_key_value=None,
-                sequence_length=None,
-                host_past_key_value_lengths=None,
                 use_cache=False,
                 last_token_ids=None,
-                cache_indirection=None,
-                kv_cache_block_pointers_list=None,
-                context_lengths=None,
-                host_context_lengths=None,
-                host_request_types=None,
-                max_context_length=None):
-
-        hidden_states = super().forward(
-            input_ids,
-            past_key_value,
-            sequence_length,
-            host_past_key_value_lengths,
-            use_cache,
-            cache_indirection,
-            kv_cache_block_pointers_list,
-            context_lengths=context_lengths,
-            host_context_lengths=host_context_lengths,
-            host_request_types=host_request_types,
-            max_context_length=max_context_length)
+                kv_cache_params=None,
+                attention_params=None):
+        hidden_states = super().forward(input_ids, use_cache, kv_cache_params,
+                                        attention_params)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -494,8 +453,15 @@ class GPTJForCausalLM(GPTJModel):
                                        ('max_seq_len', max_len_range),
                                    ]))
 
-        return (input_ids, position_ids, past_key_value, sequence_length,
-                host_past_key_value_lengths, True, last_token_ids,
-                cache_indirection, kv_cache_block_pointers_list,
-                context_lengths, host_context_lengths, host_request_types,
-                max_input_len)
+        return (input_ids, position_ids, True, last_token_ids,
+                KeyValueCacheParams(
+                    past_key_value=past_key_value,
+                    host_past_key_value_lengths=host_past_key_value_lengths,
+                    kv_cache_block_pointers=kv_cache_block_pointers_list,
+                    cache_indirection=cache_indirection,
+                ),
+                AttentionParams(sequence_length=sequence_length,
+                                context_lengths=context_lengths,
+                                host_context_lengths=host_context_lengths,
+                                max_context_length=max_input_len,
+                                host_request_types=host_request_types))

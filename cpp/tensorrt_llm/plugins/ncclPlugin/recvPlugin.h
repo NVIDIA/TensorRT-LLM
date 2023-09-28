@@ -14,9 +14,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TRT_RECV_PLUGIN_H
-#define TRT_RECV_PLUGIN_H
-#include "NvInferPlugin.h"
+#pragma once
+
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include <cassert>
 #include <mpi.h>
@@ -24,12 +23,10 @@
 #include <string>
 #include <vector>
 
-namespace nvinfer1
-{
-namespace plugin
+namespace tensorrt_llm::plugins
 {
 
-class RecvPlugin : public IPluginV2DynamicExt
+class RecvPlugin : public BasePlugin
 {
 public:
     RecvPlugin(int srcRank, nvinfer1::DataType type);
@@ -64,17 +61,14 @@ public:
     size_t getSerializationSize() const noexcept override;
     void serialize(void* buffer) const noexcept override;
     void destroy() noexcept override;
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
-    const char* getPluginNamespace() const noexcept override;
 
 private:
-    std::string mNamespace;
     ncclComm_t mComm; // TODO: (kaiyu) Remove this
     int mSrcRank;
     nvinfer1::DataType mType;
 };
 
-class RecvPluginCreator : public IPluginCreator
+class RecvPluginCreator : public BaseCreator
 {
 public:
     RecvPluginCreator();
@@ -90,17 +84,9 @@ public:
     nvinfer1::IPluginV2* deserializePlugin(
         const char* name, const void* serialData, size_t serialLength) noexcept override;
 
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
-
-    const char* getPluginNamespace() const noexcept override;
-
 private:
-    static PluginFieldCollection mFC;
-    static std::vector<PluginField> mPluginAttributes;
-    std::string mNamespace;
+    static nvinfer1::PluginFieldCollection mFC;
+    static std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
-} // namespace plugin
-} // namespace nvinfer1
-
-#endif // TRT_RECV_PLUGIN_H
+} // namespace tensorrt_llm::plugins

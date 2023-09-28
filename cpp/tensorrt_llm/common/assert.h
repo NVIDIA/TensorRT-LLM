@@ -30,7 +30,11 @@ namespace tensorrt_llm::common
 
 } // namespace tensorrt_llm::common
 
+#if defined(_WIN32)
+#define TLLM_LIKELY(x) (__assume((x) == 1), (x))
+#else
 #define TLLM_LIKELY(x) __builtin_expect((x), 1)
+#endif
 
 #define TLLM_CHECK(val)                                                                                                \
     do                                                                                                                 \

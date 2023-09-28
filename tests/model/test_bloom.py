@@ -271,7 +271,7 @@ class TestBloom(unittest.TestCase):
                             device='cuda'),
             })
 
-        context = runtime.context_0
+        context = runtime.ctx_context
         runtime._set_shape(context, ctx_shape)
         runtime._set_buffer(context, ctx_buffer)
         runtime._run(context)
@@ -444,7 +444,8 @@ class TestBloom(unittest.TestCase):
 
         decoder.setup(batch_size,
                       max_context_length=seq_len,
-                      max_new_tokens=max_new_tokens)
+                      max_new_tokens=max_new_tokens,
+                      beam_width=num_beams)
 
         output_ids = decoder.decode(input_ids, context_lengths, sampling_config)
         # TODO: change to actual ragged tensor after BLOOM plugin supports it

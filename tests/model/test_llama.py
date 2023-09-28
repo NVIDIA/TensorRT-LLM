@@ -71,8 +71,10 @@ class TestLLaMA(unittest.TestCase):
             load_from_hf_llama(tensorrt_llm_llama,
                                hf_llama,
                                dtype=dtype,
-                               rank=rank,
-                               tensor_parallel=tensor_parallel)
+                               mapping=tensorrt_llm.Mapping(
+                                   world_size=tensor_parallel,
+                                   rank=rank,
+                                   tp_size=tensor_parallel))
             # Prepare
             network.set_named_parameters(tensorrt_llm_llama.named_parameters())
             inputs = tensorrt_llm_llama.prepare_inputs(batch_size, input_len,
@@ -322,7 +324,7 @@ class TestLLaMA(unittest.TestCase):
         ctx_buffer['host_past_key_value_lengths'] = torch.tensor(
             [0] * batch_size, dtype=torch.int32)
 
-        context = runtime.context_0
+        context = runtime.ctx_context
         runtime._set_shape(context, ctx_shape)
         runtime._set_buffer(context, ctx_buffer)
         runtime._run(context)
@@ -502,8 +504,9 @@ class TestLLaMA(unittest.TestCase):
         # print_layers(tensorrt_llm_llama_wHF)
         load_from_hf_llama(tensorrt_llm_llama_wHF,
                            hf_llama,
-                           rank=rank,
-                           tensor_parallel=tp_size,
+                           mapping=tensorrt_llm.Mapping(world_size=tp_size,
+                                                        rank=rank,
+                                                        tp_size=tp_size),
                            dtype=dtype)
         # print_layers(tensorrt_llm_llama_wHF)
 
@@ -526,8 +529,9 @@ class TestLLaMA(unittest.TestCase):
         # print_layers(tensorrt_llm_llama_wMETA)
         load_from_meta_llama(tensorrt_llm_llama_wMETA,
                              meta_path,
-                             rank=rank,
-                             tensor_parallel=tp_size,
+                             mapping=tensorrt_llm.Mapping(world_size=tp_size,
+                                                          rank=rank,
+                                                          tp_size=tp_size),
                              dtype=dtype)
         # print_layers(tensorrt_llm_llama_wMETA)
         # token embedding

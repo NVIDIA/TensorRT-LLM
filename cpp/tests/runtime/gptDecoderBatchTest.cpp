@@ -92,9 +92,11 @@ void verifyResults(BufferManager& manager, GptDecoderBatch const& decoder,
 
 void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> const& samplingConfigs, int maxBeamWidth)
 {
-    SizeType constexpr worldSize{1};
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    SizeType constexpr tensorParallelism{1};
+    SizeType constexpr pipelineParallelism{1};
     SizeType constexpr localRank{0};
-    WorldConfig constexpr worldConfig{worldSize, localRank};
+    WorldConfig constexpr worldConfig{tensorParallelism, pipelineParallelism, localRank};
 
     SizeType constexpr vocabSize{51200};
     SizeType constexpr nbLayers{2};
@@ -122,6 +124,14 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> con
     decoder.setup(batchSize, maxBeamWidth, maxSeqLength, modelConfig.getDataType());
 
     std::vector<SizeType> const inputLengths{4, 5, 6, 7};
+    std::vector<SizeType> tiledInputLengths;
+    for (int batch_id = 0; batch_id < inputLengths.size(); batch_id++)
+    {
+        for (int beam_id = 0; beam_id < maxBeamWidth; beam_id++)
+        {
+            tiledInputLengths.push_back(inputLengths.at(batch_id));
+        }
+    }
 
     // set up inputs
     auto logits = std::shared_ptr(
@@ -147,6 +157,10 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> con
         manager.setZero(*tgtCacheIndirection);
         outputs.cacheIndirection = tgtCacheIndirection;
     }
+    auto sequenceLengths
+        = std::shared_ptr(manager.gpu(ITensor::makeShape({batchSize * maxBeamWidth}), TRTDataType<SizeType>::value));
+    manager.copy(tiledInputLengths.data(), *sequenceLengths);
+    outputs.sequenceLengths = sequenceLengths;
 
     auto constexpr tokenId = 1;
     std::vector<decoder_batch::Input::TensorPtr> inputIds;
@@ -198,9 +212,11 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> con
 void testDecoderWavefront(
     nvinfer1::DataType const dtype, std::vector<SamplingConfig> const& samplingConfigs, int maxBeamWidth)
 {
-    SizeType constexpr worldSize{1};
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    SizeType constexpr tensorParallelism{1};
+    SizeType constexpr pipelineParallelism{1};
     SizeType constexpr localRank{0};
-    WorldConfig constexpr worldConfig{worldSize, localRank};
+    WorldConfig constexpr worldConfig{tensorParallelism, pipelineParallelism, localRank};
 
     SizeType constexpr vocabSize{51200};
     SizeType constexpr nbLayers{2};
@@ -228,6 +244,14 @@ void testDecoderWavefront(
     decoder.setup(batchSize, maxBeamWidth, maxSeqLength, modelConfig.getDataType());
 
     std::vector<SizeType> const inputLengths{4, 5, 6, 7};
+    std::vector<SizeType> tiledInputLengths;
+    for (int batch_id = 0; batch_id < inputLengths.size(); batch_id++)
+    {
+        for (int beam_id = 0; beam_id < maxBeamWidth; beam_id++)
+        {
+            tiledInputLengths.push_back(inputLengths.at(batch_id));
+        }
+    }
 
     // set up inputs
     auto logits = std::shared_ptr(
@@ -253,6 +277,10 @@ void testDecoderWavefront(
         manager.setZero(*tgtCacheIndirection);
         outputs.cacheIndirection = tgtCacheIndirection;
     }
+    auto sequenceLengths
+        = std::shared_ptr(manager.gpu(ITensor::makeShape({batchSize * maxBeamWidth}), TRTDataType<SizeType>::value));
+    manager.copy(tiledInputLengths.data(), *sequenceLengths);
+    outputs.sequenceLengths = sequenceLengths;
 
     auto const& nbSteps = decoder.getNbSteps();
     EXPECT_EQ(nbSteps.size(), batchSize);

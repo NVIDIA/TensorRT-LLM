@@ -657,42 +657,6 @@ class SmoothQuantMLP(Module):
         return output
 
 
-class FP8RowLinear(RowLinear):
-
-    def __init__(self,
-                 in_features,
-                 out_features,
-                 bias=True,
-                 dtype=None,
-                 tp_group=None,
-                 tp_size=1):
-        super().__init__(in_features,
-                         out_features,
-                         bias=bias,
-                         dtype=dtype,
-                         tp_group=tp_group,
-                         tp_size=tp_size)
-        self.activation_scaling_factor = Parameter(shape=(1, ),
-                                                   dtype=trt.float32)
-        self.weights_scaling_factor = Parameter(shape=(1, ), dtype=trt.float32)
-
-    def forward(self, x):
-        act_cast_out = cast(x, 'float32')
-
-        quantized_out = quantize(act_cast_out,
-                                 self.activation_scaling_factor.value, 'fp8')
-        dequantized_out = dequantize(quantized_out,
-                                     self.activation_scaling_factor.value)
-
-        w_cast_out = cast(self.weight.value, 'float32')
-
-        w_quant_out = quantize(w_cast_out, self.weights_scaling_factor.value,
-                               'fp8')
-        w_deq_out = dequantize(w_quant_out, self.weights_scaling_factor.value)
-
-        return self.multiply_reduce(dequantized_out, w_deq_out, False)
-
-
 class Int8SmoothQuantRowLinear(RowLinear):
 
     def __init__(self,
@@ -810,18 +774,116 @@ class FP8Linear(Linear):
         self.weights_scaling_factor = Parameter(shape=(1, ), dtype=trt.float32)
 
     def forward(self, x):
-        act_cast_out = cast(x, 'float32')
-        quantized_out = quantize(act_cast_out,
-                                 self.activation_scaling_factor.value, 'fp8')
+        if default_net().strongly_typed:
+            assert x.dtype == self.dtype
+            assert x.dtype == self.weight.value.dtype
+        if default_net(
+        ).strongly_typed and self.activation_scaling_factor.value.dtype != self.dtype:
+            x = cast(x, self.activation_scaling_factor.value.dtype)
+            quantized_out = quantize(x, self.activation_scaling_factor.value,
+                                     'fp8')
+        else:
+            quantized_out = quantize(x, self.activation_scaling_factor.value,
+                                     'fp8')
+
         dequantized_out = dequantize(quantized_out,
-                                     self.activation_scaling_factor.value)
+                                     self.activation_scaling_factor.value, -1,
+                                     self.activation_scaling_factor.value.dtype)
 
-        w_cast_out = cast(self.weight.value, 'float32')
-        w_quant_out = quantize(w_cast_out, self.weights_scaling_factor.value,
-                               'fp8')
-        w_deq_out = dequantize(w_quant_out, self.weights_scaling_factor.value)
+        if default_net(
+        ).strongly_typed and self.activation_scaling_factor.value.dtype != self.dtype:
+            dequantized_out = cast(dequantized_out, self.dtype)
 
-        return self.multiply_gather(dequantized_out, w_deq_out, False)
+        if default_net(
+        ).strongly_typed and self.weights_scaling_factor.value.dtype != self.dtype:
+            cast_weight = cast(self.weight.value,
+                               self.weights_scaling_factor.value.dtype)
+
+            w_quant_out = quantize(cast_weight,
+                                   self.weights_scaling_factor.value, 'fp8')
+        else:
+
+            w_quant_out = quantize(self.weight.value,
+                                   self.weights_scaling_factor.value, 'fp8')
+
+        w_deq_out = dequantize(w_quant_out, self.weights_scaling_factor.value,
+                               -1, self.weights_scaling_factor.value.dtype)
+
+        if default_net(
+        ).strongly_typed and self.weights_scaling_factor.value.dtype != self.dtype:
+            w_deq_out = cast(w_deq_out, self.dtype)
+
+        # TODO(nkorobov): allow gemm plugin default_net().plugin_config.gemm_plugin
+        return self.multiply_gather(dequantized_out,
+                                    w_deq_out,
+                                    False,
+                                    use_fp8=True)
+
+
+class FP8RowLinear(RowLinear):
+
+    def __init__(self,
+                 in_features,
+                 out_features,
+                 bias=True,
+                 dtype=None,
+                 tp_group=None,
+                 tp_size=1):
+        super().__init__(in_features,
+                         out_features,
+                         bias=bias,
+                         dtype=dtype,
+                         tp_group=tp_group,
+                         tp_size=tp_size)
+        self.activation_scaling_factor = Parameter(shape=(1, ),
+                                                   dtype=trt.float32)
+        self.weights_scaling_factor = Parameter(shape=(1, ), dtype=trt.float32)
+
+    def forward(self, x):
+        if default_net().strongly_typed:
+            assert x.dtype == self.dtype
+            assert x.dtype == self.weight.value.dtype
+
+        if default_net(
+        ).strongly_typed and self.activation_scaling_factor.value.dtype != self.dtype:
+            x = cast(x, self.activation_scaling_factor.value.dtype)
+            quantized_out = quantize(x, self.activation_scaling_factor.value,
+                                     'fp8')
+        else:
+            quantized_out = quantize(x, self.activation_scaling_factor.value,
+                                     'fp8')
+
+        dequantized_out = dequantize(quantized_out,
+                                     self.activation_scaling_factor.value, -1,
+                                     self.activation_scaling_factor.value.dtype)
+
+        if default_net(
+        ).strongly_typed and self.activation_scaling_factor.value.dtype != self.dtype:
+            dequantized_out = cast(dequantized_out, self.dtype)
+
+        if default_net(
+        ).strongly_typed and self.weights_scaling_factor.value.dtype != self.dtype:
+            cast_weight = cast(self.weight.value,
+                               self.weights_scaling_factor.value.dtype)
+
+            w_quant_out = quantize(cast_weight,
+                                   self.weights_scaling_factor.value, 'fp8')
+        else:
+            w_quant_out = quantize(self.weight.value,
+                                   self.weights_scaling_factor.value, 'fp8')
+
+        w_deq_out = dequantize(w_quant_out, self.weights_scaling_factor.value,
+                               -1, self.weights_scaling_factor.value.dtype)
+
+        if default_net(
+        ).strongly_typed and self.weights_scaling_factor.value.dtype != self.dtype:
+            w_deq_out = cast(w_deq_out, self.dtype)
+
+        # TODO(nkorobov): allow gemm plugin default_net().plugin_config.gemm_plugin
+        return self.multiply_reduce(dequantized_out,
+                                    w_deq_out,
+                                    False,
+                                    use_fp8=True)
 
 
 class SmoothQuantGatedMLP(SmoothQuantMLP):
@@ -969,16 +1031,9 @@ class SmoothQuantAttention(Module):
     def forward(self,
                 hidden_states: Tensor,
                 attention_mask=None,
-                past_key_value=None,
-                sequence_length=None,
-                host_past_key_value_lengths=None,
                 use_cache=False,
-                cache_indirection=None,
-                kv_cache_block_pointers=None,
-                context_lengths=None,
-                host_context_lengths=None,
-                host_request_types=None,
-                max_context_length=None):
+                kv_cache_params=None,
+                attention_params=None):
         # TODO(nkorobov) add in-flight batching to SmoothQuant
         if default_net().plugin_config.smooth_quant_gemm_plugin:
             qkv = self.qkv(hidden_states)
@@ -988,39 +1043,40 @@ class SmoothQuantAttention(Module):
             raise ValueError("gpt_attention_plugin is not set")
 
         if default_net().plugin_config.gpt_attention_plugin:
-            assert sequence_length is not None
-            assert host_past_key_value_lengths is not None
+
+            assert attention_params.is_valid(
+                default_net().plugin_config.gpt_attention_plugin,
+                default_net().plugin_config.remove_input_padding)
+            assert kv_cache_params.is_valid(
+                default_net().plugin_config.gpt_attention_plugin)
             assert self.attention_mask_type == AttentionMaskType.causal, \
                 'Plugin only support masked MHA.'
-            assert context_lengths is not None
-            assert host_request_types is not None
-            if default_net().plugin_config.remove_input_padding:
-                assert host_context_lengths is not None
-
             kv_quant_scale = self.kv_orig_quant_scale.value if self.quant_mode.has_int8_kv_cache(
             ) else None
             kv_dequant_scale = self.kv_quant_orig_scale.value if self.quant_mode.has_int8_kv_cache(
             ) else None
             context, past_key_value = gpt_attention(
-                qkv,
-                past_key_value,
-                sequence_length,
+                tensor=qkv,
+                past_key_value=kv_cache_params.get_first_past_key_value(),
+                sequence_length=attention_params.sequence_length,
+                host_past_key_value_lengths=kv_cache_params.
                 host_past_key_value_lengths,
-                context_lengths,
-                cache_indirection,
-                host_request_types,
-                self.num_attention_heads,
-                self.num_kv_heads,
-                self.q_scaling,
-                self.rotary_embedding_dim,
-                self.position_embedding_type,
-                self.multi_block_mode,
-                kv_quant_scale,
-                kv_dequant_scale,
-                self.quant_mode,
-                max_context_length,
-                kv_cache_block_pointers=kv_cache_block_pointers,
-                host_context_lengths=host_context_lengths)
+                context_lengths=attention_params.context_lengths,
+                cache_indirection=kv_cache_params.cache_indirection,
+                host_request_types=attention_params.host_request_types,
+                num_heads=self.num_attention_heads,
+                num_kv_heads=self.num_kv_heads,
+                q_scaling=self.q_scaling,
+                rotary_embedding_dim=self.rotary_embedding_dim,
+                position_embedding_type=self.position_embedding_type,
+                multi_block_mode=self.multi_block_mode,
+                kv_orig_quant_scale=kv_quant_scale,
+                kv_quant_orig_scale=kv_dequant_scale,
+                kv_cache_quant_mode=self.quant_mode,
+                max_context_length=attention_params.max_context_length,
+                kv_cache_block_pointers=kv_cache_params.
+                get_first_kv_cache_block_pointers(),
+                host_context_lengths=attention_params.host_context_lengths)
         else:
             assert self.paged_kv_cache == False
 
@@ -1037,6 +1093,7 @@ class SmoothQuantAttention(Module):
             key = transpose_for_scores(key)
             value = transpose_for_scores(value)
 
+            past_key_value = kv_cache_params.get_first_past_key_value()
             if past_key_value is not None:
 
                 def dequantize_tensor(x, scale):

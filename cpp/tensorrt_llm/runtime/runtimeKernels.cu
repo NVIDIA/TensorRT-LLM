@@ -35,9 +35,10 @@ namespace
 template <typename T>
 __global__ void fill(T* data, std::size_t size, T const value)
 {
-    auto const idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    auto const tidx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    auto const stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
 
-    if (idx < size)
+    for (auto idx = tidx; idx < size; idx += stride)
     {
         data[idx] = value;
     }
@@ -49,14 +50,17 @@ void invokeFill(IBuffer& buffer, T const value, CudaStream const& stream)
 {
     auto data = bufferCast<T>(buffer);
     auto const size = buffer.getSize();
-    dim3 const blockSize(256);
-    dim3 const gridSize((size + blockSize.x - 1) / blockSize.x);
+    dim3 const blockSize{256};
+    std::size_t const gridx{tc::ceilDiv(size, blockSize.x)};
+    std::size_t const gridMax{std::numeric_limits<std::uint32_t>::max()};
+    dim3 const gridSize{static_cast<std::uint32_t>(std::min(gridx, gridMax))};
 
     fill<<<gridSize, blockSize, 0, stream.get()>>>(data, size, value);
 }
 
 // template instantiation
-template void invokeFill(IBuffer&, SizeType, CudaStream const&);
+template void invokeFill(IBuffer&, std::int32_t, CudaStream const&);
+template void invokeFill(IBuffer&, std::int8_t, CudaStream const&);
 template void invokeFill(IBuffer&, float, CudaStream const&);
 
 namespace
@@ -64,9 +68,10 @@ namespace
 template <typename T>
 __global__ void add(T* data, std::size_t size, T const value)
 {
-    auto const idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    auto const tidx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    auto const stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
 
-    if (idx < size)
+    for (auto idx = tidx; idx < size; idx += stride)
     {
         data[idx] += value;
     }
@@ -78,13 +83,17 @@ void invokeAdd(IBuffer& buffer, T const value, CudaStream const& stream)
 {
     auto data = bufferCast<T>(buffer);
     auto const size = buffer.getSize();
-    dim3 const blockSize(256);
-    dim3 const gridSize((size + blockSize.x - 1) / blockSize.x);
+    dim3 const blockSize{256};
+    std::size_t const gridx{tc::ceilDiv(size, blockSize.x)};
+    std::size_t const gridMax{std::numeric_limits<std::uint32_t>::max()};
+    dim3 const gridSize{static_cast<std::uint32_t>(std::min(gridx, gridMax))};
 
     add<<<gridSize, blockSize, 0, stream.get()>>>(data, size, value);
 }
 
-template void invokeAdd(IBuffer&, SizeType, CudaStream const&);
+template void invokeAdd(IBuffer&, std::int32_t, CudaStream const&);
+template void invokeAdd(IBuffer&, std::int8_t, CudaStream const&);
+template void invokeAdd(IBuffer&, float, CudaStream const&);
 
 namespace
 {
@@ -572,19 +581,21 @@ void invokeCopyPackedInputToOutput(ITensor& outputIds, ITensor const& inputIds, 
 namespace
 {
 template <typename T>
-__global__ void scatterTensor(T* output, T const* input, SizeType const batchSize, SizeType const inputRowSize,
-    SizeType const outputRowSize, SizeType const beamWidth)
+__global__ void scatterTensor(T* output, T const* input, std::uint32_t const batchSize,
+    std::uint32_t const inputRowSize, std::size_t const outputRowSize, std::uint32_t const beamWidth)
 {
-    SizeType const tidx = blockIdx.x * blockDim.x + threadIdx.x;
-    SizeType const tidy = blockIdx.y * blockDim.y + threadIdx.y;
+    auto const tidx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    auto const tidy = static_cast<std::size_t>(blockIdx.y) * blockDim.y + threadIdx.y;
+    auto const stridex = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    auto const stridey = static_cast<std::size_t>(blockDim.y) * gridDim.y;
 
-    for (SizeType batchIdx = tidy; batchIdx < batchSize; batchIdx += blockDim.y * gridDim.y)
+    for (auto batchIdx = tidy; batchIdx < batchSize; batchIdx += stridey)
     {
-        for (SizeType columnIdx = tidx; columnIdx < inputRowSize; columnIdx += blockDim.x * gridDim.x)
+        for (auto columnIdx = tidx; columnIdx < inputRowSize; columnIdx += stridex)
         {
             auto const inputIdx = batchIdx * inputRowSize + columnIdx;
             auto const value = input[inputIdx];
-            SizeType constexpr beamIdx = 0;
+            std::size_t constexpr beamIdx{0};
             auto const outputIdx = (batchIdx * beamWidth + beamIdx) * outputRowSize + columnIdx;
             output[outputIdx] = value;
         }
@@ -592,19 +603,21 @@ __global__ void scatterTensor(T* output, T const* input, SizeType const batchSiz
 }
 
 template <typename T>
-__global__ void tileTensor(T* output, T const* input, SizeType const batchSize, SizeType const inputRowSize,
-    SizeType const outputRowSize, SizeType const beamWidth)
+__global__ void tileTensor(T* output, T const* input, std::uint32_t const batchSize, std::size_t const inputRowSize,
+    std::size_t const outputRowSize, std::uint32_t const beamWidth)
 {
-    SizeType const tidx = blockIdx.x * blockDim.x + threadIdx.x;
-    SizeType const tidy = blockIdx.y * blockDim.y + threadIdx.y;
+    auto const tidx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    auto const tidy = static_cast<std::size_t>(blockIdx.y) * blockDim.y + threadIdx.y;
+    auto const stridex = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    auto const stridey = static_cast<std::size_t>(blockDim.y) * gridDim.y;
 
-    for (SizeType batchIdx = tidy; batchIdx < batchSize; batchIdx += blockDim.y * gridDim.y)
+    for (auto batchIdx = tidy; batchIdx < batchSize; batchIdx += stridey)
     {
-        for (SizeType columnIdx = tidx; columnIdx < inputRowSize; columnIdx += blockDim.x * gridDim.x)
+        for (auto columnIdx = tidx; columnIdx < inputRowSize; columnIdx += stridex)
         {
             auto const inputIdx = batchIdx * inputRowSize + columnIdx;
             auto const value = input[inputIdx];
-            for (SizeType beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+            for (std::size_t beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
             {
                 auto const outputIdx = (batchIdx * beamWidth + beamIdx) * outputRowSize + columnIdx;
                 output[outputIdx] = value;
@@ -615,18 +628,20 @@ __global__ void tileTensor(T* output, T const* input, SizeType const batchSize, 
 
 template <typename T>
 __global__ void tileTensorInPlace(
-    T* inputOutput, SizeType const batchSize, SizeType const inputOutputRowSize, SizeType const beamWidth)
+    T* inputOutput, std::uint32_t const batchSize, std::size_t const inputOutputRowSize, std::uint32_t const beamWidth)
 {
-    SizeType const tidx = blockIdx.x * blockDim.x + threadIdx.x;
-    SizeType const tidy = blockIdx.y * blockDim.y + threadIdx.y;
+    auto const tidx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    auto const tidy = static_cast<std::size_t>(blockIdx.y) * blockDim.y + threadIdx.y;
+    auto const stridex = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    auto const stridey = static_cast<std::size_t>(blockDim.y) * gridDim.y;
 
-    for (SizeType batchIdx = tidy; batchIdx < batchSize; batchIdx += blockDim.y * gridDim.y)
+    for (auto batchIdx = tidy; batchIdx < batchSize; batchIdx += stridey)
     {
-        for (SizeType columnIdx = tidx; columnIdx < inputOutputRowSize; columnIdx += blockDim.x * gridDim.x)
+        for (auto columnIdx = tidx; columnIdx < inputOutputRowSize; columnIdx += stridex)
         {
             auto const inputIdx = (batchIdx * beamWidth + 0) * inputOutputRowSize + columnIdx;
             auto const value = inputOutput[inputIdx];
-            for (SizeType beamIdx = 1; beamIdx < beamWidth; ++beamIdx)
+            for (std::size_t beamIdx = 1; beamIdx < beamWidth; ++beamIdx)
             {
                 auto const outputIdx = (batchIdx * beamWidth + beamIdx) * inputOutputRowSize + columnIdx;
                 inputOutput[outputIdx] = value;
@@ -641,22 +656,24 @@ template <typename T>
 void invokeScatterTensor(ITensor& output, ITensor const& input, SizeType beamWidth, CudaStream const& stream)
 {
     auto const& inputShape = input.getShape();
-    auto const nbInputRows = inputShape.d[0];
-    auto const inputRowSize = static_cast<SizeType>(input.getSize()) / nbInputRows;
+    auto const nbInputRows = static_cast<std::uint32_t>(inputShape.d[0]);
+    auto const inputRowSize = input.getSize() / static_cast<std::size_t>(nbInputRows);
     auto const& outputShape = output.getShape();
-    auto const nbOutputRows = outputShape.d[0];
-    auto const outputRowSize = static_cast<SizeType>(output.getSize()) / nbOutputRows;
+    auto const nbOutputRows = static_cast<std::uint32_t>(outputShape.d[0]);
+    auto const outputRowSize = output.getSize() / static_cast<std::size_t>(nbOutputRows);
 
     TLLM_CHECK_WITH_INFO(nbOutputRows == beamWidth * nbInputRows,
         common::fmtstr(
             "nbOutputRows (%d) must be beamWidth (%d) times nbInputRows (%d)", nbOutputRows, beamWidth, nbInputRows));
     TLLM_CHECK_WITH_INFO(outputRowSize >= inputRowSize,
-        common::fmtstr("output row size (%d) must be at least input row size (%d)", outputRowSize, inputRowSize));
+        common::fmtstr("output row size (%ld) must be at least input row size (%ld)", outputRowSize, inputRowSize));
 
-    dim3 const blockSize(256, 1);
-    dim3 const gridSize((inputRowSize + blockSize.x - 1) / blockSize.x, nbInputRows);
-    scatterTensor<<<gridSize, blockSize, 0, stream.get()>>>(
-        bufferCast<T>(output), bufferCast<T const>(input), nbInputRows, inputRowSize, outputRowSize, beamWidth);
+    dim3 const blockSize{256, 1};
+    std::size_t const gridx{tc::ceilDiv(inputRowSize, blockSize.x)};
+    std::size_t const gridMax{std::numeric_limits<std::uint32_t>::max()};
+    dim3 const gridSize{static_cast<std::uint32_t>(std::min(gridx, gridMax)), nbInputRows};
+    scatterTensor<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<T>(output), bufferCast<T const>(input),
+        nbInputRows, inputRowSize, outputRowSize, static_cast<uint32_t>(beamWidth));
 }
 
 void scatterTensor(ITensor& output, ITensor const& input, SizeType beamWidth, CudaStream const& stream)
@@ -676,22 +693,24 @@ template <typename T>
 void invokeTileTensor(ITensor& output, ITensor const& input, SizeType const beamWidth, CudaStream const& stream)
 {
     auto const& inputShape = input.getShape();
-    auto const nbInputRows = inputShape.d[0];
-    auto const inputRowSize = static_cast<SizeType>(input.getSize()) / nbInputRows;
+    auto const nbInputRows = static_cast<std::uint32_t>(inputShape.d[0]);
+    auto const inputRowSize = input.getSize() / static_cast<std::size_t>(nbInputRows);
     auto const& outputShape = output.getShape();
-    auto const nbOutputRows = outputShape.d[0];
-    auto const outputRowSize = static_cast<SizeType>(output.getSize()) / nbOutputRows;
+    auto const nbOutputRows = static_cast<std::uint32_t>(outputShape.d[0]);
+    auto const outputRowSize = output.getSize() / static_cast<std::size_t>(nbOutputRows);
 
     TLLM_CHECK_WITH_INFO(nbOutputRows == beamWidth * nbInputRows,
         common::fmtstr(
             "nbOutputRows (%d) must be beamWidth (%d) times nbInputRows (%d)", nbOutputRows, beamWidth, nbInputRows));
     TLLM_CHECK_WITH_INFO(outputRowSize >= inputRowSize,
-        common::fmtstr("output row size (%d) must be at least input row size (%d)", outputRowSize, inputRowSize));
+        common::fmtstr("output row size (%ld) must be at least input row size (%ld)", outputRowSize, inputRowSize));
 
-    dim3 const blockSize(256, 1);
-    dim3 const gridSize((inputRowSize + blockSize.x - 1) / blockSize.x, nbInputRows);
-    tileTensor<<<gridSize, blockSize, 0, stream.get()>>>(
-        bufferCast<T>(output), bufferCast<T const>(input), nbInputRows, inputRowSize, outputRowSize, beamWidth);
+    dim3 const blockSize{256, 1};
+    std::size_t const gridx{tc::ceilDiv(inputRowSize, blockSize.x)};
+    std::size_t const gridMax{std::numeric_limits<std::uint32_t>::max()};
+    dim3 const gridSize{static_cast<std::uint32_t>(std::min(gridx, gridMax)), nbInputRows};
+    tileTensor<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<T>(output), bufferCast<T const>(input), nbInputRows,
+        inputRowSize, outputRowSize, static_cast<uint32_t>(beamWidth));
 }
 
 void tileTensor(ITensor& output, ITensor const& input, SizeType beamWidth, CudaStream const& stream)
@@ -711,14 +730,16 @@ template <typename T>
 void invokeTileTensorInPlace(ITensor& inputOutput, SizeType const beamWidth, CudaStream const& stream)
 {
     auto const& inputOutputShape = inputOutput.getShape();
-    auto const nbOutputRows = inputOutputShape.d[0];
-    auto const nbInputRows = nbOutputRows / beamWidth;
-    auto const inputOutputRowSize = static_cast<SizeType>(inputOutput.getSize()) / nbOutputRows;
+    auto const nbOutputRows = static_cast<std::uint32_t>(inputOutputShape.d[0]);
+    auto const nbInputRows = nbOutputRows / static_cast<std::uint32_t>(beamWidth);
+    auto const inputOutputRowSize = inputOutput.getSize() / static_cast<std::size_t>(nbOutputRows);
 
-    dim3 const blockSize(256, 1);
-    dim3 const gridSize((inputOutputRowSize + blockSize.x - 1) / blockSize.x, nbInputRows);
+    dim3 const blockSize{256, 1};
+    std::size_t const gridx{tc::ceilDiv(inputOutputRowSize, blockSize.x)};
+    std::size_t const gridMax{std::numeric_limits<std::uint32_t>::max()};
+    dim3 const gridSize{static_cast<std::uint32_t>(std::min(gridx, gridMax)), nbInputRows};
     tileTensorInPlace<<<gridSize, blockSize, 0, stream.get()>>>(
-        bufferCast<T>(inputOutput), nbInputRows, inputOutputRowSize, beamWidth);
+        bufferCast<T>(inputOutput), nbInputRows, inputOutputRowSize, static_cast<std::uint32_t>(beamWidth));
 }
 
 void tileTensorInplace(ITensor& tensor, SizeType beamWidth, CudaStream const& stream)

@@ -63,6 +63,23 @@ python3 build.py --dtype=float16 \
                  --max_output_len=128  \
                  --output_dir=gptj_engine_dummy_weights 2>&1 | tee build.log
 
+# Build an int4 weight only quantization engine using awq int4 weight only quantized weights.
+# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
+
+python3 build.py --dtype=float16 \
+                 --log_level=verbose  \
+                 --use_gpt_attention_plugin float16 \
+                 --use_gemm_plugin float16 \
+                 --use_layernorm_plugin float16 \
+                 --max_batch_size=32 \
+                 --max_input_len=1919 \
+                 --max_output_len=128  \
+                 --output_dir=gptj_engine \
+                 --use_weight_only \
+                 --per_group \
+                 --weight_only_precision=int4 \
+                 --model_dir=awq_int4_weight_only_quantized_models 2>&1 | tee build.log
+
 ```
 #### Fused MultiHead Attention (FMHA)
 
@@ -79,6 +96,19 @@ One can enable FP8 for KV cache to reduce memory footprint used by KV cache and 
 - `--enable_fp8` enables FP8 GEMMs in the network.
 - `--fp8_kv_cache` to enable FP8 accurancy for KV cache.
 - `--quantized_fp8_model_path` to provide path to the quantized model calibrated for FP8. For more details see [quantization docs](../quantization/README.md).
+
+#### AWQ INT4 weight only quantization
+
+One can enable AWQ INT4 weight only quantization with these 3 options when building engine with `build.py`:
+
+- `--use_weight_only` enables weight only GEMMs in the network.
+- `--per_group` enable groupwise weight only quantization, for GPT-J example, we support AWQ with the group size default as 128.
+- `--weight_only_precision=int4` the precision of weight only quantization. Only int4 is supported for groupwise weight only quantization.
+
+The linear layer in the AWQ int4 weight only quantized weights should have 3 parameters:
+1. FP16 smoothed_weights (=weights/pre_quant_scale) with shape [n, k] ;
+2. FP16 amax (the max abs values of the smoothed_weights) with shape [n, k/group_size];
+3. FP16 pre_quant_scale (the smooth scales used to multiply by activation) with shape [k];
 
 ### 3. Run
 

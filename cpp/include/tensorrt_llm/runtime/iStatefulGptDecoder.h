@@ -61,6 +61,7 @@ public:
 
     // parameters for beam search
     TensorPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen], mandatory in beam search, on gpu
+    TensorPtr sequenceLengths;  // [batchSize, maxBeamWidth], mandatory, on gpu
 };
 } // namespace decoder
 

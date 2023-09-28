@@ -165,7 +165,10 @@ def generate(
                 END_ID).cuda()
 
     max_input_length = torch.max(input_lengths).item()
-    decoder.setup(input_lengths.size(0), max_input_length, max_output_len)
+    decoder.setup(input_lengths.size(0),
+                  max_input_length,
+                  max_output_len,
+                  beam_width=num_beams)
 
     ptuning_args = []
     if use_prompt_tuning:

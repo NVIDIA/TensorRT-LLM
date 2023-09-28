@@ -17,17 +17,18 @@ import tensorrt as trt
 
 from .._common import default_net, default_trtnet
 from .._utils import int32_array, str_dtype_to_trt
-from ..functional import (Tensor, _create_tensor, allgather, allreduce, concat,
-                          constant, matmul, shape, slice)
+from ..functional import (Tensor, _create_tensor, allgather, allreduce, cast,
+                          concat, constant, matmul, shape, slice)
 from ..module import Module
 from ..parameter import Parameter
-from ..plugin import _TRT_LLM_PLUGIN_NAMESPACE as TRT_LLM_PLUGIN_NAMESPACE
+from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
 
 
 def _gemm_plugin(input: Tensor,
                  mat2: Tensor,
                  transa: bool = False,
-                 transb: bool = False) -> Tensor:
+                 transb: bool = False,
+                 use_fp8: bool = False) -> Tensor:
     plg_creator = trt.get_plugin_registry().get_plugin_creator(
         'Gemm', '1', TRT_LLM_PLUGIN_NAMESPACE)
     assert plg_creator is not None
@@ -38,11 +39,15 @@ def _gemm_plugin(input: Tensor,
     transb = 1 if transb else 0
     transb = trt.PluginField("transb", np.array(transb, dtype=np.int32),
                              trt.PluginFieldType.INT32)
+    use_fp8 = 1 if use_fp8 else 0
+    use_fp8 = trt.PluginField("use_fp8", np.array(use_fp8, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+
     p_dtype = default_net().plugin_config.gemm_plugin
     pf_type = trt.PluginField(
         "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
         trt.PluginFieldType.INT32)
-    pfc = trt.PluginFieldCollection([transa, transb, pf_type])
+    pfc = trt.PluginFieldCollection([transa, transb, pf_type, use_fp8])
     gemm_plug = plg_creator.create_plugin("gemm", pfc)
     plug_inputs = [input.trt_tensor, mat2.trt_tensor]
     layer = default_trtnet().add_plugin_v2(plug_inputs, gemm_plug)
@@ -80,13 +85,15 @@ class Linear(Module):
         else:
             self.register_parameter('bias', None)
 
-    def multiply_gather(self, x, weight, gemm_plugin):
+    def multiply_gather(self, x, weight, gemm_plugin, use_fp8=False):
         if gemm_plugin:
-            x = _gemm_plugin(x, weight, transb=True)
+            x = _gemm_plugin(x, weight, transb=True, use_fp8=use_fp8)
         else:
             x = matmul(x, weight, transb=True)
 
         if self.bias is not None:
+            if x.dtype != self.bias.value.dtype:
+                x = cast(x, self.bias.value.dtype)
             x = x + self.bias.value
 
         if self.gather_output and self.tp_size > 1 and self.tp_group is not None:
@@ -142,9 +149,9 @@ class RowLinear(Module):
         self.tp_group = tp_group
         self.tp_size = tp_size
 
-    def multiply_reduce(self, x, weight, gemm_plugin):
+    def multiply_reduce(self, x, weight, gemm_plugin, use_fp8=False):
         if gemm_plugin:
-            x = _gemm_plugin(x, weight, transb=True)
+            x = _gemm_plugin(x, weight, transb=True, use_fp8=use_fp8)
         else:
             x = matmul(x, weight, transb=True)
 
@@ -152,6 +159,9 @@ class RowLinear(Module):
             x = allreduce(x, self.tp_group)
 
         if self.bias is not None:
+            if x.dtype != self.bias.value.dtype:
+                x = cast(x, self.bias.value.dtype)
+
             x = x + self.bias.value
 
         return x

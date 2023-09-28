@@ -36,11 +36,13 @@ def read_config(config_path: Path):
     use_gpt_attention_plugin = config['plugin_config']['gpt_attention_plugin']
     remove_input_padding = config['plugin_config']['remove_input_padding']
     dtype = config['builder_config']['precision']
-    world_size = config['builder_config']['tensor_parallel']
+    tp_size = config['builder_config']['tensor_parallel']
+    pp_size = config['builder_config']['pipeline_parallel']
+    world_size = tp_size * pp_size
     assert world_size == tensorrt_llm.mpi_world_size(), \
         f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
-    num_heads = config['builder_config']['num_heads'] // world_size
-    hidden_size = config['builder_config']['hidden_size'] // world_size
+    num_heads = config['builder_config']['num_heads'] // tp_size
+    hidden_size = config['builder_config']['hidden_size'] // tp_size
     vocab_size = config['builder_config']['vocab_size']
     num_layers = config['builder_config']['num_layers']
     num_kv_heads = config['builder_config'].get('num_kv_heads', num_heads)
@@ -51,7 +53,7 @@ def read_config(config_path: Path):
             "`multi_query_mode` config is deprecated. Please rebuild the engine."
         )
         num_kv_heads = 1
-    num_kv_heads = (num_kv_heads + world_size - 1) // world_size
+    num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
 
     model_config = ModelConfig(num_heads=num_heads,
                                num_kv_heads=num_kv_heads,
@@ -63,7 +65,7 @@ def read_config(config_path: Path):
                                tokens_per_block=tokens_per_block,
                                remove_input_padding=remove_input_padding)
 
-    return model_config, world_size, dtype
+    return model_config, tp_size, pp_size, dtype
 
 
 def parse_input(input_text: str, input_file: str, tokenizer, end_id: int,
@@ -184,12 +186,15 @@ def generate(
 
     engine_dir = Path(engine_dir)
     config_path = engine_dir / 'config.json'
-    model_config, world_size, dtype = read_config(config_path)
+    model_config, tp_size, pp_size, dtype = read_config(config_path)
+    assert pp_size == 1, 'Python runtime does not support pipeline parallelism'
+    world_size = tp_size * pp_size
 
     runtime_rank = tensorrt_llm.mpi_rank()
     runtime_mapping = tensorrt_llm.Mapping(world_size,
                                            runtime_rank,
-                                           tp_size=world_size)
+                                           tp_size=tp_size,
+                                           pp_size=pp_size)
     torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
 
     tokenizer = LlamaTokenizer.from_pretrained(tokenizer_dir, legacy=False)
@@ -198,7 +203,8 @@ def generate(
                                      pad_id=PAD_TOKEN,
                                      num_beams=num_beams)
 
-    engine_name = get_engine_name('llama', dtype, world_size, runtime_rank)
+    engine_name = get_engine_name('llama', dtype, tp_size, pp_size,
+                                  runtime_rank)
     serialize_path = engine_dir / engine_name
     with open(serialize_path, 'rb') as f:
         engine_buffer = f.read()

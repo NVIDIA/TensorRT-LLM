@@ -32,10 +32,12 @@ namespace tensorrt_llm::runtime
 class GptJsonConfig
 {
 public:
-    GptJsonConfig(std::string name, std::string precision, SizeType worldSize, GptModelConfig const& modelConfig)
+    GptJsonConfig(std::string name, std::string precision, SizeType tensorParallelism, SizeType pipelineParallelism,
+        GptModelConfig const& modelConfig)
         : mName(std::move(name))
         , mPrecision(std::move(precision))
-        , mWorldSize{worldSize}
+        , mTensorParallelism{tensorParallelism}
+        , mPipelineParallelism{pipelineParallelism}
         , mGptModelConfig(modelConfig)
     {
     }
@@ -61,9 +63,19 @@ public:
         return mPrecision;
     }
 
-    [[nodiscard]] SizeType const& getWorldSize() const
+    [[nodiscard]] SizeType constexpr getTensorParallelism() const
     {
-        return mWorldSize;
+        return mTensorParallelism;
+    }
+
+    [[nodiscard]] SizeType constexpr getPipelineParallelism() const
+    {
+        return mPipelineParallelism;
+    }
+
+    [[nodiscard]] SizeType constexpr getWorldSize() const
+    {
+        return mTensorParallelism * mPipelineParallelism;
     }
 
     [[nodiscard]] std::string engineFilename(WorldConfig const& worldConfig, std::string const& model) const;
@@ -76,7 +88,8 @@ public:
 private:
     std::string const mName;
     std::string const mPrecision;
-    SizeType const mWorldSize;
+    SizeType const mTensorParallelism;
+    SizeType const mPipelineParallelism;
     GptModelConfig const mGptModelConfig;
 };
 

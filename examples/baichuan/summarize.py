@@ -181,7 +181,8 @@ def main(args):
         with torch.no_grad():
             tensorrt_llm_baichuan.setup(batch_size,
                                         max_context_length=max_length,
-                                        max_new_tokens=output_len)
+                                        max_new_tokens=output_len,
+                                        beam_width=num_beams)
             if tensorrt_llm_baichuan.remove_input_padding:
                 output_ids = tensorrt_llm_baichuan.decode_batch(
                     line_encoded, sampling_config)

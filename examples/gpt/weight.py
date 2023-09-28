@@ -232,7 +232,7 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
                                     constant_values=0)
         tensorrt_llm_gpt.lm_head.weight.value = np.ascontiguousarray(
             split(lm_head_weight, tensor_parallel, rank))
-
+    fake_fp8_sf_dt = np.float32
     for i in range(n_layer):
         c_attn_out_dim = (3 * n_embd //
                           tensor_parallel) if not multi_query_mode else (
@@ -282,10 +282,10 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
         if enable_fp8_qdq:
             tensorrt_llm_gpt.layers[
                 i].attention.qkv.activation_scaling_factor.value = np.array(
-                    [scaling_factors['qkv_act'][i]], dtype=np.float32)
+                    [scaling_factors['qkv_act'][i]], dtype=fake_fp8_sf_dt)
             tensorrt_llm_gpt.layers[
                 i].attention.qkv.weights_scaling_factor.value = np.array(
-                    [scaling_factors['qkv_weights'][i]], dtype=np.float32)
+                    [scaling_factors['qkv_weights'][i]], dtype=fake_fp8_sf_dt)
             tensorrt_llm_gpt.layers[
                 i].attention.kv_orig_quant_scale.value = np.array(
                     [scaling_factors['qkv_output'][i]], dtype=np.float32)
@@ -329,10 +329,10 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
         if enable_fp8_qdq:
             tensorrt_llm_gpt.layers[
                 i].attention.dense.activation_scaling_factor.value = np.array(
-                    [scaling_factors['dense_act'][i]], dtype=np.float32)
+                    [scaling_factors['dense_act'][i]], dtype=fake_fp8_sf_dt)
             tensorrt_llm_gpt.layers[
                 i].attention.dense.weights_scaling_factor.value = np.array(
-                    [scaling_factors['dense_weights'][i]], dtype=np.float32)
+                    [scaling_factors['dense_weights'][i]], dtype=fake_fp8_sf_dt)
 
         dst = tensorrt_llm_gpt.layers[i].post_layernorm.weight
         dst.value = fromfile(
@@ -387,10 +387,10 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
         if enable_fp8_qdq:
             tensorrt_llm_gpt.layers[
                 i].mlp.fc.activation_scaling_factor.value = np.array(
-                    [scaling_factors['fc_act'][i]], dtype=np.float32)
+                    [scaling_factors['fc_act'][i]], dtype=fake_fp8_sf_dt)
             tensorrt_llm_gpt.layers[
                 i].mlp.fc.weights_scaling_factor.value = np.array(
-                    [scaling_factors['fc_weights'][i]], dtype=np.float32)
+                    [scaling_factors['fc_weights'][i]], dtype=fake_fp8_sf_dt)
 
         t = fromfile(
             dir_path,
@@ -437,10 +437,10 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
         if enable_fp8_qdq:
             tensorrt_llm_gpt.layers[
                 i].mlp.proj.activation_scaling_factor.value = np.array(
-                    [scaling_factors['proj_act'][i]], dtype=np.float32)
+                    [scaling_factors['proj_act'][i]], dtype=fake_fp8_sf_dt)
             tensorrt_llm_gpt.layers[
                 i].mlp.proj.weights_scaling_factor.value = np.array(
-                    [scaling_factors['proj_weights'][i]], dtype=np.float32)
+                    [scaling_factors['proj_weights'][i]], dtype=fake_fp8_sf_dt)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

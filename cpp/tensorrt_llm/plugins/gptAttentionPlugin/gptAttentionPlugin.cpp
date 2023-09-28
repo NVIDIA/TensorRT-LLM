@@ -14,14 +14,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h"
-#include "checkMacrosPlugin.h"
-#include "gptAttentionCommon.h"
-#include "gptAttentionCommon/gptAttentionCommonImpl.h"
-#include "plugin.h"
+#include "gptAttentionPlugin.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
+#include "tensorrt_llm/plugins/common/checkMacrosPlugin.h"
+#include "tensorrt_llm/plugins/common/plugin.h"
+#include "tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.h"
+#include "tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommonImpl.h"
 #include <algorithm>
 #include <cstdint>
 #include <functional>
@@ -29,9 +29,8 @@
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::kernels;
-using namespace tensorrt_llm::common;
-using nvinfer1::plugin::GPTAttentionPluginCreator;
-using nvinfer1::plugin::GPTAttentionPlugin;
+using tensorrt_llm::plugins::GPTAttentionPluginCreator;
+using tensorrt_llm::plugins::GPTAttentionPlugin;
 
 static const char* GPT_ATTENTION_PLUGIN_VERSION{"1"};
 static const char* GPT_ATTENTION_PLUGIN_NAME{"GPTAttention"};
@@ -39,27 +38,21 @@ static const char* GPT_ATTENTION_PLUGIN_NAME{"GPTAttention"};
 GPTAttentionPlugin::GPTAttentionPlugin(int num_heads, int num_kv_heads, int unidirectional, float q_scaling,
     tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
     int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
-    int tp_size, int tp_rank, // for ALiBi
+    float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
+    float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
     tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
     bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
-    nvinfer1::DataType type, bool in_flight_batching, int32_t max_context_length, bool qkv_bias_enabled)
+    nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled)
     : GPTAttentionPluginCommon(num_heads, num_kv_heads, unidirectional, q_scaling, position_embedding_type,
-        rotary_embedding_dim, tp_size, tp_rank, context_fmha_type, multi_block_mode, kv_cache_quant_mode,
+        rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale,
+        rotary_embedding_max_positions, tp_size, tp_rank, context_fmha_type, multi_block_mode, kv_cache_quant_mode,
         remove_input_padding, mask_type, paged_kv_cache, type, max_context_length, qkv_bias_enabled)
-    , mInFlightBatching(in_flight_batching)
 {
-    TLLM_CHECK(!mInFlightBatching || mRemovePadding);
 }
 
 GPTAttentionPlugin::GPTAttentionPlugin(const void* data, size_t length)
-    : GPTAttentionPluginCommon(data, GPTAttentionPluginCommon::getCommonSerializationSize())
+    : GPTAttentionPluginCommon(data, length)
 {
-    const char *d = reinterpret_cast<const char*>(data), *a = d;
-    d += GPTAttentionPluginCommon::getCommonSerializationSize();
-
-    read(d, mInFlightBatching);
-    TLLM_CHECK(d == a + length);
-    TLLM_CHECK(!mInFlightBatching || mRemovePadding);
 }
 
 // IPluginV2DynamicExt Methods
@@ -157,49 +150,56 @@ int GPTAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc,
     cudaStream_t stream)
 {
     int32_t const nbSeq = inputDesc[getContextLengthsIdx()].dims.d[0];
-    if (!mInFlightBatching)
-    {
-        enqueueSome<T, KVCacheBuffer>(0, nbSeq, 0, inputDesc, outputDesc, inputs, outputs, workspace, stream);
-        return 0;
-    }
-    // In-flight batching code path
     int32_t const beam_width = inputDesc[getCacheIndirIdx()].dims.d[1];
     RequestType const* reqTypes = static_cast<RequestType const*>(inputs[getRequestTypesIdx()]);
 
     int32_t nbContextRequests = 0;
     int32_t contextTokenIdxEnd = 0;
     // count context requests
-    for (int32_t i = 0; i < nbSeq; i++)
+    for (int32_t seqIdx = 0; seqIdx < nbSeq; seqIdx++)
     {
-        if (reqTypes[i] != RequestType::kCONTEXT)
+        if (reqTypes[seqIdx] != RequestType::kCONTEXT)
         {
             break;
         }
         ++nbContextRequests;
-        contextTokenIdxEnd += (mRemovePadding ? getInputLength(inputs, i) : inputDesc[getInputTensorIdx()].dims.d[1]);
+        contextTokenIdxEnd += mRemovePadding ? static_cast<int32_t const*>(inputs[getHostContextLengthsIdx()])[seqIdx]
+                                             : inputDesc[getInputTensorIdx()].dims.d[1];
     }
-    for (int32_t i = nbContextRequests; i < nbSeq; i++)
+    for (int32_t seqIdx = nbContextRequests; seqIdx < nbSeq; seqIdx++)
     {
-        TLLM_CHECK(reqTypes[i] == RequestType::kGENERATION);
+        TLLM_CHECK(reqTypes[seqIdx] == RequestType::kGENERATION);
+    }
+
+    // mixed requests require mRemovePadding and mPagedKVCache
+    if (nbContextRequests != 0 && nbContextRequests != nbSeq)
+    {
+        TLLM_CHECK(mRemovePadding && mPagedKVCache);
     }
 
     if (nbContextRequests > 0)
     {
-        enqueueSome<T, KVCacheBuffer>(
-            0, nbContextRequests, 0, inputDesc, outputDesc, inputs, outputs, workspace, stream);
+        auto seqIdxBeg = 0;
+        auto tokenIdxBeg = 0;
+        auto localNbTokens = contextTokenIdxEnd;
+        enqueueSome<T, KVCacheBuffer>(seqIdxBeg, nbContextRequests, tokenIdxBeg, localNbTokens, inputDesc, outputDesc,
+            inputs, outputs, workspace, stream);
     }
 
-    if (nbSeq - nbContextRequests > 0)
+    if (auto nbGenerationSeq = nbSeq - nbContextRequests; nbGenerationSeq > 0)
     {
-        enqueueSome<T, KVCacheBuffer>(nbContextRequests, nbSeq - nbContextRequests, contextTokenIdxEnd, inputDesc,
-            outputDesc, inputs, outputs, workspace, stream);
+        auto seqIdxBeg = nbContextRequests;
+        auto tokenIdxBeg = contextTokenIdxEnd;
+        auto localNbTokens = nbGenerationSeq;
+        enqueueSome<T, KVCacheBuffer>(seqIdxBeg, nbGenerationSeq, tokenIdxBeg, localNbTokens, inputDesc, outputDesc,
+            inputs, outputs, workspace, stream);
     }
 
     return 0;
 }
 
 template <typename T, typename KVCacheBuffer>
-int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32_t tokenIdxBeg,
+int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32_t tokenIdxBeg, int32_t localNbTokens,
     const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
     const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream)
 {
@@ -217,12 +217,6 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
     auto const reqTypeInBatchPtr = static_cast<RequestType const*>(inputs[getRequestTypesIdx()]) + seqIdxBeg;
     bool const is_context = (reqTypeInBatchPtr[0] == RequestType::kCONTEXT);
-    TLLM_CHECK(std::all_of(reqTypeInBatchPtr, reqTypeInBatchPtr + localNbSeq,
-        [is_context](RequestType reqType)
-        {
-            TLLM_CHECK(reqType == RequestType::kCONTEXT || reqType == RequestType::kGENERATION);
-            return is_context == (reqType == RequestType::kCONTEXT);
-        }));
 
     const int* context_lengths = reinterpret_cast<const int*>(inputs[getContextLengthsIdx()]) + seqIdxBeg;
     // Note we still need context length during generation for MMHA optimziation.
@@ -235,7 +229,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         auto const host_context_lengths = static_cast<int32_t const*>(inputs[getHostContextLengthsIdx()]) + seqIdxBeg;
         return *std::max_element(host_context_lengths, host_context_lengths + localNbSeq);
     }();
-    PLUGIN_ASSERT(max_context_len <= mMaxContextLength);
+    TLLM_CHECK(max_context_len <= mMaxContextLength);
 
     const float* kv_scale_orig_quant = nullptr;
     const float* kv_scale_quant_orig = nullptr;
@@ -276,29 +270,10 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     if (is_context) // context stage
     {
         const int batch_size = localNbSeq;
-        const int request_batch_size = batch_size;
-        const int request_seq_len = max_context_len;
-        // num of total tokens (without paddings when remove paddings).
-        int num_tokens = 0;
-        if (!mRemovePadding)
-        {
-            num_tokens = request_batch_size * request_seq_len;
-        }
-        else if (mInFlightBatching)
-        {
-            auto const host_context_lengths
-                = static_cast<int32_t const*>(inputs[getHostContextLengthsIdx()]) + seqIdxBeg;
-            num_tokens = std::accumulate(host_context_lengths, host_context_lengths + localNbSeq, 0);
-        }
-        else
-        {
-            num_tokens = inputDesc[getInputTensorIdx()].dims.d[1];
-        }
-
         enqueueContext<T, KVCacheBuffer>(
             EnqueueContextParams<T, KVCacheBuffer>{attention_input, qkv_bias, max_context_len, maxSeqLen,
                 context_lengths, kv_scale_orig_quant, kv_scale_quant_orig, alibi_slopes, context_buf_, key_value_cache,
-                block_pointers, batch_size, num_tokens, tokens_per_block, max_blocks_per_sequence, workspace},
+                block_pointers, batch_size, localNbTokens, tokens_per_block, max_blocks_per_sequence, workspace},
             stream);
     }
     else // generation stage; input_seq_len == 1
@@ -387,16 +362,12 @@ int GPTAttentionPlugin::getNbOutputs() const noexcept
 
 size_t GPTAttentionPlugin::getSerializationSize() const noexcept
 {
-    return GPTAttentionPluginCommon::getCommonSerializationSize() + sizeof(mInFlightBatching);
+    return GPTAttentionPluginCommon::getCommonSerializationSize();
 }
 
 void GPTAttentionPlugin::serialize(void* buffer) const noexcept
 {
-    char *d = static_cast<char*>(buffer), *a = d;
     GPTAttentionPluginCommon::serializeCommon(buffer);
-    d += GPTAttentionPluginCommon::getCommonSerializationSize();
-    write(d, mInFlightBatching);
-    PLUGIN_ASSERT(d == a + getSerializationSize());
 }
 
 ///////////////
@@ -435,7 +406,10 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(const char* name, const Plugi
             p.getScalar<int32_t>("num_kv_heads").value(), p.getScalar<int32_t>("unidirectional").value(),
             p.getScalar<float>("q_scaling").value(),
             static_cast<PositionEmbeddingType>(p.getScalar<int8_t>("position_embedding_type").value()),
-            p.getScalar<int32_t>("rotary_embedding_dim").value(),
+            p.getScalar<int32_t>("rotary_embedding_dim").value(), p.getScalar<float>("rotary_embedding_base").value(),
+            static_cast<RotaryScalingType>(p.getScalar<int8_t>("rotary_embedding_scale_type").value()),
+            p.getScalar<float>("rotary_embedding_scale").value(),
+            p.getScalar<int32_t>("rotary_embedding_max_positions").value(),
             static_cast<int32_t>(p.getScalar<int32_t>("tp_size").value()),
             static_cast<int32_t>(p.getScalar<int32_t>("tp_rank").value()),
             static_cast<ContextFMHAType>(p.getScalar<int8_t>("context_fmha_type").value()),
@@ -445,7 +419,7 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(const char* name, const Plugi
             static_cast<AttentionMaskType>(p.getScalar<int32_t>("mask_type").value()),
             static_cast<bool>(p.getScalar<int32_t>("paged_kv_cache").value()),
             static_cast<nvinfer1::DataType>(p.getScalar<int32_t>("type_id").value()),
-            p.getScalar<int32_t>("in_flight_batching").value(), p.getScalar<int32_t>("max_context_length").value(),
+            p.getScalar<int32_t>("max_context_length").value(),
             static_cast<bool>(p.getScalar<int8_t>("qkv_bias_enabled").value()));
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
@@ -473,14 +447,4 @@ IPluginV2* GPTAttentionPluginCreator::deserializePlugin(
         caughtError(e);
     }
     return nullptr;
-}
-
-void GPTAttentionPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* GPTAttentionPluginCreator::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
 }

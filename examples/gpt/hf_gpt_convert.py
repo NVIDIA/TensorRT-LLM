@@ -19,6 +19,7 @@ import argparse
 import configparser
 import dataclasses
 import os
+import platform
 from pathlib import Path
 
 import torch
@@ -281,6 +282,12 @@ def hf_gpt_converter(args: ProgArgs):
 
 
 def run_conversion(args: ProgArgs):
+    if args.processes > 1 and platform.system() == "Windows":
+        print(
+            "Resetting processes to 1 because multi-process on Windows is not implemented."
+        )
+        args = dataclasses.replace(args, processes=1)
+
     print("\n=============== Arguments ===============")
     for key, value in vars(args).items():
         print(f"{key}: {value}")

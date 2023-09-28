@@ -14,16 +14,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/plugins/ncclPlugin/recvPlugin.h"
+#include "recvPlugin.h"
 
 using namespace nvinfer1;
-using nvinfer1::plugin::RecvPluginCreator;
-using nvinfer1::plugin::RecvPlugin;
+using tensorrt_llm::plugins::RecvPluginCreator;
+using tensorrt_llm::plugins::RecvPlugin;
 
 static const char* RECV_PLUGIN_VERSION{"1"};
 static const char* RECV_PLUGIN_NAME{"Recv"};
 PluginFieldCollection RecvPluginCreator::mFC{};
-std::vector<PluginField> RecvPluginCreator::mPluginAttributes;
+std::vector<nvinfer1::PluginField> RecvPluginCreator::mPluginAttributes;
 
 RecvPlugin::RecvPlugin(int srcRank, nvinfer1::DataType type)
     : mSrcRank(srcRank)
@@ -37,7 +37,7 @@ RecvPlugin::RecvPlugin(const void* data, size_t length)
     const char *d = reinterpret_cast<const char*>(data), *a = d;
     read(d, mType);
     read(d, mSrcRank);
-    PLUGIN_ASSERT(d == a + length);
+    TLLM_CHECK(d == a + length);
 }
 
 // IPluginV2DynamicExt Methods
@@ -158,16 +158,6 @@ void RecvPlugin::destroy() noexcept
     delete this;
 }
 
-void RecvPlugin::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* RecvPlugin::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
-}
-
 ///////////////
 
 RecvPluginCreator::RecvPluginCreator()
@@ -207,12 +197,12 @@ IPluginV2* RecvPluginCreator::createPlugin(const char* name, const PluginFieldCo
         const char* attrName = fields[i].name;
         if (!strcmp(attrName, "src_rank"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             srcRank = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "type_id"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
         }
     }
@@ -245,14 +235,4 @@ IPluginV2* RecvPluginCreator::deserializePlugin(const char* name, const void* se
         caughtError(e);
     }
     return nullptr;
-}
-
-void RecvPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* RecvPluginCreator::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
 }

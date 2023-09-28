@@ -14,16 +14,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/plugins/identityPlugin/identityPlugin.h"
+#include "identityPlugin.h"
 
 using namespace nvinfer1;
-using nvinfer1::plugin::IdentityPluginCreator;
-using nvinfer1::plugin::IdentityPlugin;
+using tensorrt_llm::plugins::IdentityPluginCreator;
+using tensorrt_llm::plugins::IdentityPlugin;
 
 static const char* IDENTITY_PLUGIN_VERSION{"1"};
 static const char* IDENTITY_PLUGIN_NAME{"Identity"};
 PluginFieldCollection IdentityPluginCreator::mFC{};
-std::vector<PluginField> IdentityPluginCreator::mPluginAttributes;
+std::vector<nvinfer1::PluginField> IdentityPluginCreator::mPluginAttributes;
 
 IdentityPlugin::IdentityPlugin() {}
 
@@ -31,7 +31,7 @@ IdentityPlugin::IdentityPlugin() {}
 IdentityPlugin::IdentityPlugin(const void* data, size_t length)
 {
     const char *d = reinterpret_cast<const char*>(data), *a = d;
-    PLUGIN_ASSERT(d == a + length);
+    TLLM_CHECK(d == a + length);
 }
 
 // IPluginV2DynamicExt Methods
@@ -152,16 +152,6 @@ void IdentityPlugin::destroy() noexcept
     delete this;
 }
 
-void IdentityPlugin::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* IdentityPlugin::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
-}
-
 ///////////////
 
 IdentityPluginCreator::IdentityPluginCreator()
@@ -218,14 +208,4 @@ IPluginV2* IdentityPluginCreator::deserializePlugin(
         caughtError(e);
     }
     return nullptr;
-}
-
-void IdentityPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* IdentityPluginCreator::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
 }

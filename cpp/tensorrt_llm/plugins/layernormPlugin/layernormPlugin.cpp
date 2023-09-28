@@ -15,20 +15,20 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/plugins/layernormPlugin/layernormPlugin.h"
+#include "layernormPlugin.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/kernels/layernormKernels.h"
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
-using nvinfer1::plugin::LayernormPluginCreator;
-using nvinfer1::plugin::LayernormPlugin;
+using tensorrt_llm::plugins::LayernormPluginCreator;
+using tensorrt_llm::plugins::LayernormPlugin;
 
 static const char* LAYERNORM_PLUGIN_VERSION{"1"};
 static const char* LAYERNORM_PLUGIN_NAME{"Layernorm"};
 PluginFieldCollection LayernormPluginCreator::mFC{};
-std::vector<PluginField> LayernormPluginCreator::mPluginAttributes;
+std::vector<nvinfer1::PluginField> LayernormPluginCreator::mPluginAttributes;
 
 LayernormPlugin::LayernormPlugin(float eps, bool useDiffOfSquares, nvinfer1::DataType type)
     : mEps(eps)
@@ -46,7 +46,7 @@ LayernormPlugin::LayernormPlugin(const void* data, size_t length)
     read(d, mEps);
     read(d, mUseDiffOfSquares);
     read(d, mType);
-    PLUGIN_ASSERT(d == a + length);
+    TLLM_CHECK(d == a + length);
     TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16), "Unsupported data type");
 }
 
@@ -67,7 +67,7 @@ nvinfer1::DimsExprs LayernormPlugin::getOutputDimensions(
 bool LayernormPlugin::supportsFormatCombination(
     int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
 {
-    PLUGIN_ASSERT(0 <= pos && pos < 5);
+    TLLM_CHECK(0 <= pos && pos < 5);
     return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
 }
 
@@ -181,16 +181,6 @@ void LayernormPlugin::destroy() noexcept
     delete this;
 }
 
-void LayernormPlugin::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* LayernormPlugin::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
-}
-
 ///////////////
 
 LayernormPluginCreator::LayernormPluginCreator()
@@ -231,17 +221,17 @@ IPluginV2* LayernormPluginCreator::createPlugin(const char* name, const PluginFi
         const char* attrName = fields[i].name;
         if (!strcmp(attrName, "eps"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kFLOAT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kFLOAT32);
             eps = static_cast<float>(*(static_cast<const float*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "use_diff_of_squares"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             useDiffOfSquares = static_cast<bool>(*(static_cast<const bool*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "type_id"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
         }
     }
@@ -274,14 +264,4 @@ IPluginV2* LayernormPluginCreator::deserializePlugin(
         caughtError(e);
     }
     return nullptr;
-}
-
-void LayernormPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* LayernormPluginCreator::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
 }

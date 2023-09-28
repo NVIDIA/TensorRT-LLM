@@ -28,6 +28,14 @@ project(tensorrt_llm LANGUAGES CXX)
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
 option(BUILD_TESTS "Build Google tests" ON)
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
+option(NVTX_DISABLE "Disable all NVTX features" ON)
+
+if(NVTX_DISABLE)
+  add_compile_definitions("NVTX_DISABLE")
+  message(STATUS "NVTX is disabled")
+else()
+  message(STATUS "NVTX is enabled")
+endif()
 
 if(EXISTS
    "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/batch_manager/CMakeLists.txt")
@@ -67,15 +75,35 @@ endif()
 check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
   message(STATUS "CUDA compiler: ${CMAKE_CUDA_COMPILER}")
-  execute_process(
-    COMMAND
-      "bash" "-c"
-      "${CMAKE_CUDA_COMPILER} --version | egrep -o 'V[0-9]+.[0-9]+.[0-9]+' | cut -c2-"
-    RESULT_VARIABLE _BASH_SUCCESS
-    OUTPUT_VARIABLE CMAKE_CUDA_COMPILER_VERSION
-    OUTPUT_STRIP_TRAILING_WHITESPACE)
-  if(NOT _BASH_SUCCESS EQUAL 0)
-    message(FATAL_ERROR "Failed to determine CUDA version")
+  if(NOT WIN32) # Linux
+    execute_process(
+      COMMAND
+        "bash" "-c"
+        "${CMAKE_CUDA_COMPILER} --version | egrep -o 'V[0-9]+.[0-9]+.[0-9]+' | cut -c2-"
+      RESULT_VARIABLE _BASH_SUCCESS
+      OUTPUT_VARIABLE CMAKE_CUDA_COMPILER_VERSION
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+    if(NOT _BASH_SUCCESS EQUAL 0)
+      message(FATAL_ERROR "Failed to determine CUDA version")
+    endif()
+
+  else() # Windows
+    execute_process(
+      COMMAND ${CMAKE_CUDA_COMPILER} --version
+      OUTPUT_VARIABLE versionString
+      RESULT_VARIABLE versionResult)
+
+    if(versionResult EQUAL 0 AND versionString MATCHES
+                                 "V[0-9]+\\.[0-9]+\\.[0-9]+")
+      string(REGEX REPLACE "V" "" version ${CMAKE_MATCH_0})
+      set(CMAKE_CUDA_COMPILER_VERSION "${version}")
+    else()
+      message(FATAL_ERROR "Failed to determine CUDA version")
+    endif()
+
+    # Export shared libs as both `.lib` and `.dll` to avoid linking errors.
+    set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
   endif()
 else()
   message(FATAL_ERROR "No CUDA compiler found")
@@ -102,70 +130,71 @@ message(STATUS "GPU architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
 enable_language(CUDA)
 
-# TODO: FindCUDA is deprecated and should be replaced by FindCUDAToolkit
-# https://cmake.org/cmake/help/latest/module/FindCUDA.html
-find_package(CUDA ${CUDA_REQUIRED_VERSION} REQUIRED)
-
-message(STATUS "CUDA_TOOLKIT_ROOT_DIR: ${CUDA_TOOLKIT_ROOT_DIR}")
+find_package(CUDAToolkit REQUIRED)
 
 find_library(
   CUDNN_LIB cudnn
-  HINTS ${CUDA_TOOLKIT_ROOT_DIR} ${CUDNN_ROOT_DIR}
-  PATH_SUFFIXES lib64 lib)
+  HINTS ${CUDNN_ROOT_DIR} ${CUDAToolkit_LIBRARY_DIR}
+  PATH_SUFFIXES lib64 lib lib/x64)
 find_library(
   CUBLAS_LIB cublas
-  HINTS ${CUDA_TOOLKIT_ROOT_DIR}
+  HINTS ${CUDAToolkit_LIBRARY_DIR}
   PATH_SUFFIXES lib64 lib lib/stubs)
 find_library(
   CUBLASLT_LIB cublasLt
-  HINTS ${CUDA_TOOLKIT_ROOT_DIR}
+  HINTS ${CUDAToolkit_LIBRARY_DIR}
   PATH_SUFFIXES lib64 lib lib/stubs)
 find_library(
-  CUDART_LIB cudart
-  HINTS ${CUDA_TOOLKIT_ROOT_DIR}
-  PATH_SUFFIXES lib lib64)
-find_library(
   CUDA_DRV_LIB cuda
-  HINTS ${CUDA_TOOLKIT_ROOT_DIR}
-  PATH_SUFFIXES lib lib64 lib/stubs lib64/stubs)
-set(CUDA_LIBRARIES ${CUDART_LIB})
+  HINTS ${CUDAToolkit_LIBRARY_DIR}
+  PATH_SUFFIXES stubs lib lib64 lib/stubs lib64/stubs)
+
+set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
 find_library(RT_LIB rt)
 
 set_ifndef(ENABLE_MULTI_DEVICE 1)
 if(ENABLE_MULTI_DEVICE EQUAL 1)
   # NCCL dependencies
-  set_ifndef(NCCL_LIB_DIR /usr/lib/x86_64-linux-gnu/)
+  set_ifndef(NCCL_LIB_DIR /usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu/)
   set_ifndef(NCCL_INCLUDE_DIR /usr/include/)
   find_library(NCCL_LIB nccl HINTS ${NCCL_LIB_DIR})
 endif()
 
-set(3RDPARTY_DIR ../3rdparty)
-include_directories(${CUDA_INCLUDE_DIRS} ${CUDNN_ROOT_DIR}/include
-                    ${NCCL_INCLUDE_DIR} ${3RDPARTY_DIR}/cutlass/include)
+get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_SOURCE_DIR} PATH)
+
+set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
+include_directories(
+  ${CUDA_INCLUDE_DIRS} ${CUDNN_ROOT_DIR}/include ${NCCL_INCLUDE_DIR}
+  ${3RDPARTY_DIR}/cutlass/include ${3RDPARTY_DIR}/NVTX/include)
 
 # TRT dependencies
 set_ifndef(TRT_LIB_DIR ${CMAKE_BINARY_DIR})
-set_ifndef(TRT_INCLUDE_DIR /usr/include/x86_64-linux-gnu)
+set_ifndef(TRT_INCLUDE_DIR /usr/include/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
 set(TRT_LIB nvinfer)
 find_library_create_target(${TRT_LIB} nvinfer SHARED ${TRT_LIB_DIR})
 find_library_create_target(nvuffparser nvparsers SHARED ${TRT_LIB_DIR})
 
-if(${CUDA_VERSION} VERSION_GREATER_EQUAL "11")
+if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")
   message(
     STATUS
-      "CUDA_VERSION ${CUDA_VERSION_MAJOR}.${CUDA_VERSION_MINOR} is greater or equal than 11.0, enable -DENABLE_BF16 flag"
+      "CUDAToolkit_VERSION ${CUDAToolkit_VERSION_MAJOR}.${CUDAToolkit_VERSION_MINOR} is greater or equal than 11.0, enable -DENABLE_BF16 flag"
   )
 endif()
 
-if(${CUDA_VERSION} VERSION_GREATER_EQUAL "11.8")
+if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11.8")
   add_definitions("-DENABLE_FP8")
   message(
     STATUS
-      "CUDA_VERSION ${CUDA_VERSION_MAJOR}.${CUDA_VERSION_MINOR} is greater or equal than 11.8, enable -DENABLE_FP8 flag"
+      "CUDAToolkit_VERSION ${CUDAToolkit_VERSION_MAJOR}.${CUDAToolkit_VERSION_MINOR} is greater or equal than 11.8, enable -DENABLE_FP8 flag"
   )
 endif()
+
+# MPI MPI isn't used until tensorrt_llm/CMakeLists.txt is invoked. However, if
+# it's not called before "CMAKE_CXX_FLAGS" is set, it breaks on Windows for some
+# reason, so we just call it here as a workaround.
+find_package(MPI REQUIRED)
 
 # C++17
 set(CMAKE_CXX_STANDARD 17)
@@ -173,14 +202,22 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(CMAKE_CXX_FLAGS
-    "-Wno-deprecated-declarations ${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss -DENABLE_MULTI_DEVICE=${ENABLE_MULTI_DEVICE}"
+    "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss -DENABLE_MULTI_DEVICE=${ENABLE_MULTI_DEVICE}"
 )
+
+# Disable deprecated declarations warnings
+if(NOT WIN32)
+  set(CMAKE_CXX_FLAGS "-Wno-deprecated-declarations ${CMAKE_CXX_FLAGS}")
+else()
+  # /wd4996 is the Windows equivalent to turn off warnings for deprecated
+  # declarations
+  set(CMAKE_CXX_FLAGS "/wd4996 ${CMAKE_CXX_FLAGS}")
+endif()
 
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
-set(CUDA_PATH ${CUDA_TOOLKIT_ROOT_DIR})
 
-set(COMMON_HEADER_DIRS ${PROJECT_SOURCE_DIR} ${CUDA_PATH}/include)
+set(COMMON_HEADER_DIRS ${PROJECT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIR})
 message(STATUS "COMMON_HEADER_DIRS: ${COMMON_HEADER_DIRS}")
 
 if(BUILD_PYT)
@@ -277,5 +314,6 @@ if(BUILD_TESTS)
 endif()
 
 if(BUILD_BENCHMARKS)
-  add_subdirectory(benchmarks)
+  add_subdirectory(${TRT_LLM_ROOT_DIR}/benchmarks/cpp
+                   ${CMAKE_BINARY_DIR}/benchmarks)
 endif()

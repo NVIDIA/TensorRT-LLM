@@ -31,7 +31,8 @@ from utils.util import getSMVersion
 import tensorrt_llm
 from tensorrt_llm import Tensor
 from tensorrt_llm._utils import str_dtype_to_torch, torch_to_numpy
-from tensorrt_llm.layers import PositionEmbeddingType
+from tensorrt_llm.layers import (AttentionParams, KeyValueCacheParams,
+                                 PositionEmbeddingType)
 
 
 class TestLayer(unittest.TestCase):
@@ -744,15 +745,17 @@ class TestLayer(unittest.TestCase):
             if use_plugin:
                 output, present_key_value = attn_layer(
                     input_tensor,
-                    past_key_value=past_key_value_tensor,
-                    sequence_length=sequence_length_tensor,
-                    host_past_key_value_lengths=
-                    host_past_key_value_lengths_tensor,
                     use_cache=True,
-                    cache_indirection=cache_indirection_tensor,
-                    context_lengths=context_lengths_tensor,
-                    host_request_types=host_request_types_tensor,
-                    max_context_length=seq_len)
+                    kv_cache_params=KeyValueCacheParams(
+                        past_key_value=[past_key_value_tensor],
+                        host_past_key_value_lengths=
+                        host_past_key_value_lengths_tensor,
+                        cache_indirection=cache_indirection_tensor),
+                    attention_params=AttentionParams(
+                        sequence_length=sequence_length_tensor,
+                        context_lengths=context_lengths_tensor,
+                        host_request_types=host_request_types_tensor,
+                        max_context_length=seq_len))
                 assert isinstance(output, Tensor)
                 output = output
                 present_key_value.mark_output(

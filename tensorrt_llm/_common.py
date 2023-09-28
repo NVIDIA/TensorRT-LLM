@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+import platform
 from pathlib import Path
 
 import torch
@@ -40,7 +41,10 @@ def _init(log_level=None):
 
     # load FT decoder layer
     project_dir = str(Path(__file__).parent.absolute())
-    ft_decoder_lib = project_dir + '/libs/libth_common.so'
+    if platform.system() == "Windows":
+        ft_decoder_lib = project_dir + '/libs/th_common.dll'
+    else:
+        ft_decoder_lib = project_dir + '/libs/libth_common.so'
     if ft_decoder_lib == '':
         raise ImportError('FT decoder layer is unavailable')
     torch.classes.load_library(ft_decoder_lib)

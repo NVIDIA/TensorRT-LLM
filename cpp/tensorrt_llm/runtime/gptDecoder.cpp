@@ -131,6 +131,7 @@ template <typename T>
 typename tl::DynamicDecodeLayer<T>::OutputParams prepareOutputs(
     DecodingOutput& output, DecodingInput::TensorPtr const& inputLengths)
 {
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     typename tl::DynamicDecodeLayer<T>::OutputParams outputParams(tcc::toTllmTensor(*output.ids));
 
     outputParams.newTokens = tcc::toTllmTensor(*output.newTokens);
@@ -271,6 +272,7 @@ template class GptDecoder<half>;
 void IGptDecoder::gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput,
     DecodingInput const& decodingInput, BufferManager const& manager)
 {
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto const& finalOutputIdsShape = finalOutputIds.getShape();
     auto const& decodingOutputIdsShape = decodingOutput.ids->getShape();
     auto const batchSize = finalOutputIdsShape.d[0];
@@ -322,39 +324,12 @@ void IGptDecoder::gatherTree(ITensor& finalOutputIds, DecodingOutput const& deco
             nullptr, // output_logs
             beamHypotheses.output_ids_tgt, beamHypotheses.sequence_lengths_tgt, beamHypotheses.normed_scores,
             beamHypotheses.cum_log_probs, beamHypotheses.log_probs, beamHypotheses.num_beams,
-            beamHypotheses.input_lengths, beamWidth, maxSeqLength, batchSize, decodingInput.maxLength, stream.get());
+            beamHypotheses.input_lengths, beamWidth, maxSeqLength, batchSize, stream.get());
         sync_check_cuda_error();
     }
     else
     {
-        auto workspace = manager.gpu(batchSize * beamWidth * maxSeqLength, nvinfer1::DataType::kINT32);
-        manager.setZero(*workspace);
-
-        // For sampling, it is equivalent to all parent ids are 0.
-        tensorrt_llm::kernels::gatherTreeParam param;
-        param.beams = bufferCast<SizeType>(*workspace);
-        // Remove prompt length if possible
-        param.sequence_lengths = bufferCast<SizeType>(*decodingOutput.lengths);
-        // add sequence_length 1 here because the sequence_length of time step t is t - 1
-        param.max_sequence_length_final_step = 1;
-        // response input lengths (used to slice the ids during postprocessing), used in interactive generation
-        // This feature is not supported yet, setting it to nullptr temporarily.
-        param.response_input_lengths = nullptr;
-        param.max_seq_len = maxSeqLength;
-        param.batch_size = batchSize;
-        param.beam_width = beamWidth;
-        param.step_ids = bufferCast<TokenIdType>(*decodingOutput.ids);
-        param.parent_ids = nullptr;
-        param.end_tokens = bufferCast<TokenIdType>(*decodingInput.endIds);
-        param.max_input_length = decodingInput.maxLength;
-        param.input_lengths = bufferCast<SizeType>(*decodingInput.lengths);
-        // decoder output has padding
-        param.has_padding = true;
-
-        param.output_ids = bufferCast<TokenIdType>(finalOutputIds);
-        param.stream = stream.get();
-        param.cum_log_probs = bufferCast<float>(*decodingOutput.cumLogProbs);
-        param.length_penalty = 1.0f;
-        tensorrt_llm::kernels::invokeGatherTree(param);
+        manager.copy(*decodingOutput.ids, finalOutputIds);
+        sync_check_cuda_error();
     }
 }

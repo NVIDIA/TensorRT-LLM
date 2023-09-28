@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include <cuda_fp16.h>
+#include <cuda_runtime_api.h>
 
 namespace tensorrt_llm
 {
@@ -198,6 +199,7 @@ inline __device__ __nv_bfloat162 bf16exp2(const __nv_bfloat162 x)
 }
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+#if defined(CUDART_VERSION) && (CUDART_VERSION < 12020)
 inline __device__ __nv_bfloat162 operator*(const __nv_bfloat162 x, const __nv_bfloat162 y)
 {
     return bf16hmul2(x, y);
@@ -215,7 +217,7 @@ inline __device__ __nv_bfloat162 make_bfloat162(const __nv_bfloat16 x, const __n
     t.y = y;
     return t;
 }
-
+#endif
 #endif
 
 inline __device__ __nv_bfloat16 bf16hadd(__nv_bfloat16 a, __nv_bfloat16 b, __nv_bfloat16 c)

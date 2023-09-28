@@ -28,7 +28,7 @@ namespace layers
 
 __global__ void update_indir_cache_kernel(int* tgt_indir_cache, const int* src_indir_cache, const int** parent_ids,
     const bool* finished, const int* sequence_lengths, const int* input_lengths, int batch_dim, int local_batch_size,
-    int beam_width, int max_seq_len, int max_input_length)
+    int beam_width, int max_seq_len)
 {
     int time_step = threadIdx.x + blockIdx.x * blockDim.x;
     int bb_id = threadIdx.y + blockIdx.y * blockDim.y;
@@ -36,34 +36,31 @@ __global__ void update_indir_cache_kernel(int* tgt_indir_cache, const int* src_i
     const int input_length{input_lengths == nullptr ? 0 : input_lengths[bb_id]};
     const int batch_id = bb_id / beam_width;
     const int beam_id = bb_id % beam_width;
-    if (bb_id >= beam_width * local_batch_size || time_step < input_length || time_step < max_input_length
-        || finished[bb_id])
+    if (bb_id >= beam_width * local_batch_size || time_step < input_length || finished[bb_id])
     {
         return;
     }
     int time_step_circ = time_step % max_seq_len;
     // FIXME: we will remove all paddings later (@boyang)
     // Skip input paddings when updating the indir cache table.
-    const int pad_len = max_input_length - input_length;
-    time_step_circ = time_step_circ >= max_input_length ? (time_step_circ - pad_len) : time_step_circ;
 
     const int src_beam = parent_ids[batch_id][beam_id * max_seq_len + current_step];
 
-    const uint tgt_offset = batch_id * beam_width * max_seq_len + beam_id * max_seq_len + time_step_circ;
-    const uint src_offset = batch_id * beam_width * max_seq_len + src_beam * max_seq_len + time_step_circ;
+    const uint32_t tgt_offset = batch_id * beam_width * max_seq_len + beam_id * max_seq_len + time_step_circ;
+    const uint32_t src_offset = batch_id * beam_width * max_seq_len + src_beam * max_seq_len + time_step_circ;
 
     tgt_indir_cache[tgt_offset] = (time_step == current_step) ? beam_id : src_indir_cache[src_offset];
 }
 
 void update_indir_cache_kernelLauncher(int* tgt_indir_cache, const int* src_indir_cache, const int** parent_ids,
     const bool* finished, const int* sequence_lengths, const int* input_lengths, int batch_dim, int local_batch_size,
-    int beam_width, int max_seq_len, int max_input_length, cudaStream_t stream)
+    int beam_width, int max_seq_len, cudaStream_t stream)
 {
     const dim3 block(32);
     // Update indirections steps [input_length[bb_id], sequence_lengths[bb_id]], included
     const dim3 grid((max_seq_len + block.x - 1) / block.x, local_batch_size * beam_width);
     update_indir_cache_kernel<<<grid, block, 0, stream>>>(tgt_indir_cache, src_indir_cache, parent_ids, finished,
-        sequence_lengths, input_lengths, batch_dim, local_batch_size, beam_width, max_seq_len, max_input_length);
+        sequence_lengths, input_lengths, batch_dim, local_batch_size, beam_width, max_seq_len);
 }
 
 template <typename T>
@@ -129,16 +126,16 @@ void BaseBeamSearchLayer<T>::forward(BeamSearchOutputParams& outputs, ForwardPar
     TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
     Tensor& output_ids_ptr = outputs.output_ids_ptr;
 
-    const int batch_size{output_ids_ptr.shape[0]};
-    const int beam_width{output_ids_ptr.shape[1]};
-    const int max_seq_len{output_ids_ptr.shape[2]};
+    const auto batch_size = static_cast<std::int32_t>(output_ids_ptr.shape[0]);
+    const auto beam_width = static_cast<std::int32_t>(output_ids_ptr.shape[1]);
+    const auto max_seq_len = static_cast<std::int32_t>(output_ids_ptr.shape[2]);
     allocateBuffer(batch_size, beam_width);
 
     TLLM_CHECK_WITH_INFO(params.ite == 0, "Pipeline Parallelism is not supported yet !");
 
     const int ite{params.ite};
     Tensor const& logits = params.logits;
-    const int local_batch_size = logits.shape[0];
+    const auto local_batch_size = logits.shape[0];
 
     const T* embedding_bias = params.embedding_bias ? params.embedding_bias->template getPtr<const T>() : nullptr;
 
@@ -148,8 +145,8 @@ void BaseBeamSearchLayer<T>::forward(BeamSearchOutputParams& outputs, ForwardPar
 
     invokeAddBiasApplyPenalties(logits.getPtr<T>(), output_ids_ptr.template getPtr<const int*>(),
         outputs.parent_ids_ptr.template getPtr<const int*>(), input_lengths, sequence_length, embedding_bias, ite,
-        params.max_input_length, local_batch_size, batch_size, beam_width, vocab_size_, vocab_size_padded_, end_ids,
-        mTemperature, mRepetitionPenalty, mRepetitionPenaltyType, mMinLength, max_seq_len, stream_);
+        local_batch_size, batch_size, beam_width, vocab_size_, vocab_size_padded_, end_ids, mTemperature,
+        mRepetitionPenalty, mRepetitionPenaltyType, mMinLength, max_seq_len, stream_);
     sync_check_cuda_error();
 
     invokeSoftMax(outputs, params);
@@ -159,8 +156,7 @@ void BaseBeamSearchLayer<T>::forward(BeamSearchOutputParams& outputs, ForwardPar
         update_indir_cache_kernelLauncher(outputs.tgt_cache_indirection.template getPtr<int>(),
             params.src_cache_indirection.template getPtr<const int>(),
             outputs.parent_ids_ptr.template getPtr<const int*>(), outputs.finished->template getPtr<const bool>(),
-            sequence_length, input_lengths, batch_size, local_batch_size, beam_width, max_seq_len,
-            params.max_input_length, stream_);
+            sequence_length, input_lengths, batch_size, local_batch_size, beam_width, max_seq_len, stream_);
         sync_check_cuda_error();
     }
     sync_check_cuda_error();

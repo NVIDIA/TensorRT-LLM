@@ -55,9 +55,10 @@ GptJsonConfig parseJson(InputType&& i)
     auto const& builderConfig = json.at("builder_config");
     auto const name = builderConfig.at("name").template get<std::string>();
     auto const precision = builderConfig.at("precision").template get<std::string>();
-    auto const worldSize = builderConfig.at("tensor_parallel").template get<SizeType>();
-    auto const numHeads = builderConfig.at("num_heads").template get<SizeType>() / worldSize;
-    auto const hiddenSize = builderConfig.at("hidden_size").template get<SizeType>() / worldSize;
+    auto const tensorParallelism = builderConfig.at("tensor_parallel").template get<SizeType>();
+    auto const pipelineParallelism = parseJsonFieldOr(builderConfig, "pipeline_parallel", 1);
+    auto const numHeads = builderConfig.at("num_heads").template get<SizeType>() / tensorParallelism;
+    auto const hiddenSize = builderConfig.at("hidden_size").template get<SizeType>() / tensorParallelism;
     auto const vocabSize = builderConfig.at("vocab_size").template get<SizeType>();
     auto const numLayers = builderConfig.at("num_layers").template get<SizeType>();
 
@@ -74,33 +75,41 @@ GptJsonConfig parseJson(InputType&& i)
     auto const pagedKvCache = parseJsonFieldOr(builderConfig, "paged_kv_cache", false);
     auto const tokensPerBlock = parseJsonFieldOr(builderConfig, "tokens_per_block", 0);
     auto const quantMode = tc::QuantMode(parseJsonFieldOr(builderConfig, "quant_mode", tc::QuantMode::none().value()));
-    auto const numKvHeads = parseJsonFieldOr(builderConfig, "num_kv_heads", numHeads * worldSize) / worldSize;
+    auto const numKvHeads
+        = parseJsonFieldOr(builderConfig, "num_kv_heads", numHeads * tensorParallelism) / tensorParallelism;
+    auto const maxBatchSize = parseJsonFieldOr(builderConfig, "max_batch_size", 0);
+    auto const maxInputLen = parseJsonFieldOr(builderConfig, "max_input_len", 0);
+    auto const maxOutputLen = parseJsonFieldOr(builderConfig, "max_output_len", 0);
 
     auto const& pluginConfig = json.at("plugin_config");
     auto const& gptAttentionPlugin = pluginConfig.at("gpt_attention_plugin");
     auto const useGptAttentionPlugin = !gptAttentionPlugin.is_boolean() || gptAttentionPlugin.template get<bool>();
     auto const removeInputPadding = pluginConfig.at("remove_input_padding").template get<bool>();
-    auto const inflightBatching = pluginConfig.at("in_flight_batching").template get<bool>();
 
     auto modelConfig = GptModelConfig{vocabSize, numLayers, numHeads, hiddenSize, dataType};
     modelConfig.useGptAttentionPlugin(useGptAttentionPlugin);
     modelConfig.usePackedInput(removeInputPadding);
     modelConfig.usePagedKvCache(pagedKvCache);
-    modelConfig.useInflightBatching(inflightBatching);
     modelConfig.setTokensPerBlock(tokensPerBlock);
     modelConfig.setQuantMode(quantMode);
     modelConfig.setNbKvHeads(numKvHeads);
 
-    return GptJsonConfig{name, precision, worldSize, modelConfig};
+    modelConfig.setMaxBatchSize(maxBatchSize);
+    modelConfig.setMaxInputLen(maxInputLen);
+    modelConfig.setMaxOutputLen(maxOutputLen);
+
+    return GptJsonConfig{name, precision, tensorParallelism, pipelineParallelism, modelConfig};
 }
 
 } // namespace
 
 std::string GptJsonConfig::engineFilename(WorldConfig const& worldConfig, std::string const& model) const
-
 {
-    TLLM_CHECK_WITH_INFO(getWorldSize() == worldConfig.getSize(), "world size mismatch");
-    return model + "_" + getPrecision() + "_tp" + std::to_string(worldConfig.getSize()) + "_rank"
+    TLLM_CHECK_WITH_INFO(getTensorParallelism() == worldConfig.getTensorParallelism(), "tensor parallelism mismatch");
+    TLLM_CHECK_WITH_INFO(
+        getPipelineParallelism() == worldConfig.getPipelineParallelism(), "pipeline parallelism mismatch");
+    auto pp = worldConfig.isPipelineParallel() ? "_pp" + std::to_string(worldConfig.getPipelineParallelism()) : "";
+    return model + "_" + getPrecision() + "_tp" + std::to_string(worldConfig.getTensorParallelism()) + pp + "_rank"
         + std::to_string(worldConfig.getRank()) + ".engine";
 }
 

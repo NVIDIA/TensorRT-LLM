@@ -39,10 +39,10 @@ std::vector<Tensor> e4m3_quantize_helper(Tensor input, QuantizeMode quantize_mod
     TORCH_CHECK(_st == torch::kFloat32 || _st == torch::kFloat16 || _st == torch::kBFloat16,
         "Invalid datatype. input must be FP16 or BF16 or FP32");
 
-    std::vector<long int> quantized_input_shape;
+    std::vector<int64_t> quantized_input_shape;
     for (int i = 0; i < input.dim(); i++)
         quantized_input_shape.push_back(input.size(i));
-    std::vector<long int> scale_shape;
+    std::vector<int64_t> scale_shape;
     if (quantize_mode == QuantizeMode::PER_TOKEN)
     {
         for (int i = 0; i < input.dim() - 1; i++)
@@ -113,7 +113,7 @@ Tensor e4m3_dequantize_helper(Tensor input, Tensor scales, QuantizeMode quantize
 
     TORCH_CHECK(input.scalar_type() == torch::kInt8, "Invalid datatype. input must be Int8 (Fp8)");
 
-    std::vector<long int> dequantized_input_shape;
+    std::vector<int64_t> dequantized_input_shape;
     for (int i = 0; i < input.dim(); i++)
         dequantized_input_shape.push_back(input.size(i));
     TORCH_CHECK(scales.dim() == input.dim());

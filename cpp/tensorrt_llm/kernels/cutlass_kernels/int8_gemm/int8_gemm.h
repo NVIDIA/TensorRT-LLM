@@ -40,8 +40,6 @@ namespace cutlass_kernels
   Weights are assumed to be column-major.
 */
 
-using perfMapType = std::unordered_map<int, tkc::CutlassGemmConfig>;
-
 class CutlassInt8GemmRunnerInterface
 {
 public:
@@ -50,52 +48,19 @@ public:
     virtual ~CutlassInt8GemmRunnerInterface() {}
 
     virtual void gemm(const int8_t* A, const int8_t* B, tk::QuantMode quantOption, const float* alphaCol,
-        const float* alphaRow, void* C, int m, int n, int k, char* workspacePtr, const size_t workspaceBytes,
-        cudaStream_t stream)
-        = 0;
-
-    virtual void profileGemms(tk::QuantMode quantOption, int minM, int maxM, int n, int k, int8_t* A, int8_t* B,
-        void* C, float* alphaCol, float* alphaRow, char* workspace)
+        const float* alphaRow, void* C, int m, int n, int k, tkc::CutlassGemmConfig gemmConfig, char* workspacePtr,
+        const size_t workspaceBytes, cudaStream_t stream)
         = 0;
 
     // Returns desired workspace size in bytes.
-    virtual int getWorkspaceSize(const int m, const int n, const int k) = 0;
+    virtual size_t getWorkspaceSize(const int m, const int n, const int k) = 0;
 
-    // Returns True if tactics has already been selected
-    bool hasSelectedTactics() const
-    {
-        return mTacticsMap.size() > 0;
-    }
-
-    void setSelectedTactics(const perfMapType& tacticsMap)
-    {
-        mTacticsMap = tacticsMap;
-    }
-
-    const perfMapType& getSelectedTactics() const
-    {
-        return mTacticsMap;
-    }
-
-    void setMaxM(int maxM)
-    {
-        mMaxM = maxM;
-    }
-
-    int getMaxM() const
-    {
-        return mMaxM;
-    }
+    virtual std::vector<tkc::CutlassGemmConfig> getConfigs() const = 0;
 
 protected:
     static constexpr int SPLIT_K_LIMIT = 7;
-    static constexpr int MAX_STEP_M = 32768;
     static constexpr int MIN_M_TILE = 32;
     static constexpr int MIN_N_TILE = 64;
-
-    int mMaxM;
-
-    perfMapType mTacticsMap;
 };
 
 template <typename T>
@@ -106,24 +71,18 @@ public:
     ~CutlassInt8GemmRunner();
 
     void gemm(const int8_t* A, const int8_t* B, tk::QuantMode quantOption, const float* alphaCol, const float* alphaRow,
-        void* C, int m, int n, int k, char* workspacePtr, const size_t workspaceBytes, cudaStream_t stream) override;
-
-    void profileGemms(tk::QuantMode quantOption, int minM, int maxM, int n, int k, int8_t* A, int8_t* B, void* C,
-        float* alphaCol, float* alphaRow, char* workspace) override;
+        void* C, int m, int n, int k, tkc::CutlassGemmConfig gemmConfig, char* workspacePtr,
+        const size_t workspaceBytes, cudaStream_t stream) override;
 
     // Returns desired workspace size in bytes.
-    int getWorkspaceSize(const int m, const int n, const int k) override;
+    size_t getWorkspaceSize(const int m, const int n, const int k) override;
+
+    std::vector<tkc::CutlassGemmConfig> getConfigs() const override;
 
 private:
     void dispatchToArch(const int8_t* A, const int8_t* B, tk::QuantMode quantOption, const float* alphaCol,
         const float* alphaRow, T* C, int m, int n, int k, tkc::CutlassGemmConfig gemmConfig, char* workspacePtr,
         const size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr);
-
-    tkc::CutlassGemmConfig profileGemm(tk::QuantMode quant_option, int m, int n, int k, int8_t* A, int8_t* B, void* C,
-        float* alphaCol, float* alphaRow, char* workspace);
-
-    float profileConfig(const tkc::CutlassGemmConfig& config, tk::QuantMode quantOption, int m, int n, int k, int8_t* A,
-        int8_t* B, void* C, float* alphaCol, float* alphaRow, char* workspace);
 
     int mSm;
     int mMultiProcessorCount;

@@ -20,9 +20,9 @@ from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
 from ...functional import (Tensor, gather_last_token_logits,
                            is_gated_activation, non_gated_version)
-from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, GatedMLP, LayerNorm, PositionEmbeddingType,
-                       PromptTuningEmbedding)
+from ...layers import (MLP, Attention, AttentionMaskType, AttentionParams,
+                       ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
+                       LayerNorm, PositionEmbeddingType, PromptTuningEmbedding)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
 from ...quantization import QuantMode
@@ -159,16 +159,9 @@ class GPTDecoderLayer(Module):
     def forward(self,
                 hidden_states: Tensor,
                 attention_mask=None,
-                past_key_value=None,
-                sequence_length=None,
-                host_past_key_value_lengths=None,
                 use_cache=False,
-                cache_indirection=None,
-                kv_cache_block_pointers=None,
-                context_lengths=None,
-                host_context_lengths=None,
-                host_request_types=None,
-                max_context_length=None):
+                kv_cache_params=None,
+                attention_params=None):
 
         assert isinstance(hidden_states, Tensor)
 
@@ -176,19 +169,11 @@ class GPTDecoderLayer(Module):
 
         hidden_states = self.input_layernorm(hidden_states)
 
-        attention_output = self.attention(
-            hidden_states,
-            attention_mask=attention_mask,
-            past_key_value=past_key_value,
-            sequence_length=sequence_length,
-            host_past_key_value_lengths=host_past_key_value_lengths,
-            use_cache=use_cache,
-            cache_indirection=cache_indirection,
-            kv_cache_block_pointers=kv_cache_block_pointers,
-            context_lengths=context_lengths,
-            host_context_lengths=host_context_lengths,
-            host_request_types=host_request_types,
-            max_context_length=max_context_length)
+        attention_output = self.attention(hidden_states,
+                                          attention_mask=attention_mask,
+                                          use_cache=use_cache,
+                                          kv_cache_params=kv_cache_params,
+                                          attention_params=attention_params)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -268,46 +253,38 @@ class GPTModel(Module):
     def forward(self,
                 input_ids,
                 position_ids,
-                past_key_value=None,
-                sequence_length=None,
-                host_past_key_value_lengths=None,
                 use_cache=False,
                 attention_mask=None,
-                cache_indirection=None,
-                kv_cache_block_pointers=None,
+                kv_cache_params=None,
+                attention_params=None,
                 prompt_embedding_table=None,
                 prompt_tasks=None,
-                prompt_vocab_size=None,
-                context_lengths=None,
-                host_context_lengths=None,
-                host_request_types=None,
-                max_context_length=None):
+                prompt_vocab_size=None):
 
         hidden_states = self.embedding(input_ids, position_ids,
                                        prompt_embedding_table, prompt_tasks,
                                        prompt_vocab_size)
 
-        if past_key_value is None:
-            past_key_value = tuple([None] * len(self.layers))
+        if kv_cache_params.past_key_value is None:
+            kv_cache_params.past_key_value = tuple([None] * len(self.layers))
 
         if use_cache:
             presents = []
 
-        for (layer, past, pointers) in zip(self.layers, past_key_value,
-                                           kv_cache_block_pointers):
+        for layer, past, pointer in zip(
+                self.layers, kv_cache_params.past_key_value,
+                kv_cache_params.kv_cache_block_pointers):
             hidden_states = layer(
                 hidden_states,
-                past_key_value=past,
-                sequence_length=sequence_length,
-                host_past_key_value_lengths=host_past_key_value_lengths,
                 use_cache=use_cache,
                 attention_mask=attention_mask,
-                cache_indirection=cache_indirection,
-                kv_cache_block_pointers=pointers,
-                context_lengths=context_lengths,
-                host_context_lengths=host_context_lengths,
-                host_request_types=host_request_types,
-                max_context_length=max_context_length)
+                kv_cache_params=KeyValueCacheParams(
+                    past_key_value=[past],
+                    host_past_key_value_lengths=kv_cache_params.
+                    host_past_key_value_lengths,
+                    kv_cache_block_pointers=[pointer],
+                    cache_indirection=kv_cache_params.cache_indirection),
+                attention_params=attention_params)
 
             if use_cache:
                 presents.append(hidden_states[1])
@@ -397,31 +374,23 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                                     share_weight=share_weight)
 
     def forward(self,
-                input_ids,
-                position_ids,
-                past_key_value=None,
-                sequence_length=None,
-                host_past_key_value_lengths=None,
+                input_ids: Tensor,
+                position_ids=None,
                 use_cache=False,
                 last_token_ids=None,
                 attention_mask=None,
-                cache_indirection=None,
-                kv_cache_block_pointers=None,
+                kv_cache_params=None,
+                attention_params=None,
                 prompt_embedding_table=None,
                 prompt_tasks=None,
-                prompt_vocab_size=None,
-                context_lengths=None,
-                host_context_lengths=None,
-                host_request_types=None,
-                max_context_length=None):
+                prompt_vocab_size=None):
 
         assert last_token_ids is not None, "Expecting last token ids to be not None"
-        hidden_states = super().forward(
-            input_ids, position_ids, past_key_value, sequence_length,
-            host_past_key_value_lengths, use_cache, attention_mask,
-            cache_indirection, kv_cache_block_pointers, prompt_embedding_table,
-            prompt_tasks, prompt_vocab_size, context_lengths,
-            host_context_lengths, host_request_types, max_context_length)
+        hidden_states = super().forward(input_ids, position_ids, use_cache,
+                                        attention_mask, kv_cache_params,
+                                        attention_params,
+                                        prompt_embedding_table, prompt_tasks,
+                                        prompt_vocab_size)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -463,6 +432,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
         remove_input_padding = default_net().plugin_config.remove_input_padding
         use_gpt_attention_plugin = default_net(
         ).plugin_config.gpt_attention_plugin
+        use_gemm_plugin = default_net().plugin_config.gemm_plugin
 
         model_inputs = self.prepare_basic_inputs(
             max_batch_size,
@@ -475,63 +445,93 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             self._kv_dtype,
             remove_input_padding=remove_input_padding,
             use_gpt_attention_plugin=use_gpt_attention_plugin,
+            use_gemm_plugin=use_gemm_plugin,
             paged_kv_cache=paged_kv_cache,
             tokens_per_block=tokens_per_block)
 
-        bb_range = [
+        bb_range_cxt = [1, (max_batch_size + 1) // 2, max_batch_size]
+        bb_range_gen = [
             1, (max_batch_size * max_beam_width + 1) // 2,
             max_batch_size * max_beam_width
         ]
-        p_embedding_range = [
+        _p_embedding_range = [
             1, prompt_embedding_table_size // 2, prompt_embedding_table_size
         ]
-        num_tokens_range = [
+        inlen_range_cxt = [1, (max_input_len + 1) // 2, max_input_len]
+        _num_tokens_range = [
             1, max_batch_size * max_beam_width,
             max(max_input_len * max_batch_size, max_beam_width * max_batch_size)
         ]
-        inlen_range = [1, 1, max_input_len]
+
+        enable_two_optimization_profiles = False
+        if use_gpt_attention_plugin == False or use_gemm_plugin == False:
+            use_in_flight_batching = use_gpt_attention_plugin and remove_input_padding and paged_kv_cache
+            enable_two_optimization_profiles = not use_in_flight_batching
+        if enable_two_optimization_profiles:
+            bb_range = [bb_range_cxt, bb_range_gen]
+            p_embedding_range = [_p_embedding_range, _p_embedding_range]
+            num_tokens_range = [_num_tokens_range, _num_tokens_range]
+            input_len_task_range = [inlen_range_cxt, inlen_range_cxt]
+        else:
+            bb_range = [bb_range_gen]
+            p_embedding_range = [_p_embedding_range]
+            num_tokens_range = [_num_tokens_range]
+            input_len_task_range = [inlen_range_cxt]
 
         prompt_embedding_table = None
         tasks = None
         prompt_vocab_size = None
         if self._use_prompt_tuning:
-            prompt_embedding_table = Tensor(name='prompt_embedding_table',
-                                            dtype=self._dtype,
-                                            shape=[-1, self._hidden_size],
-                                            dim_range=OrderedDict([
-                                                ('prompt_embedding_table_size',
-                                                 [p_embedding_range]),
-                                                ('hidden_size',
-                                                 [self._hidden_size]),
-                                            ]))
+            prompt_embedding_table = Tensor(
+                name='prompt_embedding_table',
+                dtype=self._dtype,
+                shape=[-1, self._hidden_size],
+                dim_range=OrderedDict([
+                    ('prompt_embedding_table_size', p_embedding_range),
+                    ('hidden_size', [self._hidden_size, self._hidden_size] if
+                     enable_two_optimization_profiles else [self._hidden_size]),
+                ]))
             if remove_input_padding:
-                tasks = Tensor(name='tasks',
-                               dtype=trt.int32,
-                               shape=[1, -1],
-                               dim_range=OrderedDict([
-                                   ('batch_size_fake', [1]),
-                                   ('input_len_task', [num_tokens_range]),
-                               ]))
+                tasks = Tensor(
+                    name='tasks',
+                    dtype=trt.int32,
+                    shape=[1, -1],
+                    dim_range=OrderedDict([
+                        ('batch_size_fake',
+                         [1, 1] if enable_two_optimization_profiles else [1]),
+                        ('input_len_task', num_tokens_range),
+                    ]))
             else:
                 tasks = Tensor(name='tasks',
                                dtype=trt.int32,
                                shape=[-1, -1],
                                dim_range=OrderedDict([
-                                   ('batch_size_beam_width', [bb_range]),
-                                   ('input_len_task', [inlen_range]),
+                                   ('batch_size_beam_width', bb_range),
+                                   ('input_len_task', input_len_task_range),
                                ]))
-            prompt_vocab_size = Tensor(name='prompt_vocab_size',
-                                       dtype=trt.int32,
-                                       shape=[1],
-                                       dim_range=OrderedDict([('size', [1])]))
+            prompt_vocab_size = Tensor(
+                name='prompt_vocab_size',
+                dtype=trt.int32,
+                shape=[1],
+                dim_range=OrderedDict([
+                    ('size',
+                     [1, 1] if enable_two_optimization_profiles else [1])
+                ]))
 
-        return (model_inputs['input_ids'], model_inputs['position_ids'],
-                model_inputs['past_key_value'], model_inputs['sequence_length'],
-                model_inputs['host_past_key_value_lengths'], True,
+        return (model_inputs['input_ids'], model_inputs['position_ids'], True,
                 model_inputs['last_token_ids'], model_inputs['attention_mask'],
-                model_inputs['cache_indirection'],
-                model_inputs['kv_cache_block_pointers_list'],
-                prompt_embedding_table, tasks, prompt_vocab_size,
-                model_inputs['context_lengths'],
-                model_inputs['host_context_lengths'],
-                model_inputs['host_request_types'], max_input_len)
+                KeyValueCacheParams(
+                    past_key_value=model_inputs['past_key_value'],
+                    host_past_key_value_lengths=model_inputs[
+                        'host_past_key_value_lengths'],
+                    kv_cache_block_pointers=model_inputs[
+                        'kv_cache_block_pointers_list'],
+                    cache_indirection=model_inputs['cache_indirection'],
+                ),
+                AttentionParams(
+                    sequence_length=model_inputs['sequence_length'],
+                    context_lengths=model_inputs['context_lengths'],
+                    host_context_lengths=model_inputs['host_context_lengths'],
+                    max_context_length=max_input_len,
+                    host_request_types=model_inputs['host_request_types']),
+                prompt_embedding_table, tasks, prompt_vocab_size)

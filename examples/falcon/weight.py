@@ -22,6 +22,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.logger as logger
+from tensorrt_llm.mapping import Mapping
 
 
 def split(weight: np.ndarray, tp_size: int, rank: int = 0, dim: int = 0):
@@ -130,10 +131,15 @@ def split_qkv_weight(trtllm_falcon: tensorrt_llm.models.FalconModel,
                                         num_kv_heads=num_kv_heads,
                                         tp_size=tp_size,
                                         is_bias=is_bias)
+
+    # Copy a sliced tensor to prevent memory leak. A sliced tensor shares the
+    # memory buffer of the original tensor. So, returning without copying makes
+    # the buffer of a loaded "qkv" be referenced, resulting GC can't release
+    # those weights until the whole process ends.
     if not is_bias:
-        return np.ascontiguousarray(weight[rank, ...])
+        return np.ascontiguousarray(weight[rank, ...].copy())
     else:
-        return weight[rank, ...].ravel()
+        return weight[rank, ...].ravel().copy()
 
 
 def split_matrix(weight: np.ndarray, tp_size: int, rank: int, dim: int):
@@ -160,8 +166,7 @@ def get_weight_and_bias(params: Dict, prefix: str, dtype: torch.dtype):
 
 def load_from_hf_falcon(trtllm_falcon: tensorrt_llm.models.FalconForCausalLM,
                         hf_falcon,
-                        rank: int = 0,
-                        tensor_parallel: int = 1,
+                        mapping=Mapping(),
                         dtype: Union[str, torch.dtype] = torch.float32):
     logger.info('Loading weights from HF Falcon...')
     tik = time.time()
@@ -171,15 +176,17 @@ def load_from_hf_falcon(trtllm_falcon: tensorrt_llm.models.FalconForCausalLM,
         dtype = tensorrt_llm._utils.str_dtype_to_torch(dtype)
     num_kv_heads = trtllm_falcon.num_kv_heads
 
-    for i in range(trtllm_falcon.num_layers):
+    layers_range = trtllm_falcon.get_transformer_layers(
+        trtllm_falcon.mapping, trtllm_falcon.num_layers)
+    for i in layers_range:
         prefix = f'transformer.h.{i}'
-        layer = trtllm_falcon.layers[i]
+        layer = trtllm_falcon.layers[i - layers_range[0]]
         qkv_weight, qkv_bias = get_weight_and_bias(
             model_params, f'{prefix}.self_attention.query_key_value', dtype)
         qkv_w = split_qkv_weight(trtllm_falcon,
                                  qkv_weight,
-                                 tensor_parallel,
-                                 rank,
+                                 mapping.tp_size,
+                                 mapping.tp_rank,
                                  is_bias=False,
                                  num_kv_heads=num_kv_heads)
         layer.attention.qkv.weight.value = qkv_w
@@ -187,8 +194,8 @@ def load_from_hf_falcon(trtllm_falcon: tensorrt_llm.models.FalconForCausalLM,
             layer.attention.qkv.bias.value = split_qkv_weight(
                 trtllm_falcon,
                 qkv_bias,
-                tensor_parallel,
-                rank,
+                mapping.tp_size,
+                mapping.tp_rank,
                 is_bias=True,
                 num_kv_heads=num_kv_heads)
 
@@ -196,8 +203,8 @@ def load_from_hf_falcon(trtllm_falcon: tensorrt_llm.models.FalconForCausalLM,
         attn_dense_weight, attn_dense_bias = get_weight_and_bias(
             model_params, f'{prefix}.self_attention.dense', dtype)
         layer.attention.dense.weight.value = split_matrix(attn_dense_weight,
-                                                          tensor_parallel,
-                                                          rank,
+                                                          mapping.tp_size,
+                                                          mapping.tp_rank,
                                                           dim=1)
         if attn_dense_bias is not None:
             layer.attention.dense.bias.value = attn_dense_bias
@@ -206,21 +213,21 @@ def load_from_hf_falcon(trtllm_falcon: tensorrt_llm.models.FalconForCausalLM,
         mlp_fc_weight, mlp_fc_bias = get_weight_and_bias(
             model_params, f'{prefix}.mlp.dense_h_to_4h', dtype)
         layer.mlp.fc.weight.value = split_matrix(mlp_fc_weight,
-                                                 tensor_parallel,
-                                                 rank,
+                                                 mapping.tp_size,
+                                                 mapping.tp_rank,
                                                  dim=0)
         if mlp_fc_bias is not None:
             layer.mlp.fc.bias.value = split_matrix(mlp_fc_bias,
-                                                   tensor_parallel,
-                                                   rank,
+                                                   mapping.tp_size,
+                                                   mapping.tp_rank,
                                                    dim=0)
 
         logger.debug(f'Layer {i}: Loading MLP Proj weights...')
         mlp_proj_weight, mlp_proj_bias = get_weight_and_bias(
             model_params, f'{prefix}.mlp.dense_4h_to_h', dtype)
         layer.mlp.proj.weight.value = split_matrix(mlp_proj_weight,
-                                                   tensor_parallel,
-                                                   rank,
+                                                   mapping.tp_size,
+                                                   mapping.tp_rank,
                                                    dim=1)
         if mlp_proj_bias is not None:
             layer.mlp.proj.bias.value = mlp_proj_bias
@@ -255,17 +262,19 @@ def load_from_hf_falcon(trtllm_falcon: tensorrt_llm.models.FalconForCausalLM,
                     layer.post_layernorm.bias.value = post_ln_bias
 
     embed_w = get_weight(model_params, 'transformer.word_embeddings', dtype)
-    trtllm_falcon.embedding.weight.value = embed_w.copy()
-    trtllm_falcon.lm_head.weight.value = split_matrix(embed_w,
-                                                      tensor_parallel,
-                                                      rank,
-                                                      dim=0)
+    if mapping.is_first_pp_rank():
+        trtllm_falcon.embedding.weight.value = embed_w.copy()
+    if mapping.is_last_pp_rank():
+        trtllm_falcon.lm_head.weight.value = split_matrix(embed_w,
+                                                          mapping.tp_size,
+                                                          mapping.tp_rank,
+                                                          dim=0)
 
-    ln_f_w, ln_f_b = get_weight_and_bias(model_params, 'transformer.ln_f',
-                                         dtype)
-    trtllm_falcon.ln_f.weight.value = ln_f_w
-    if ln_f_b is not None:
-        trtllm_falcon.ln_f.bias.value = ln_f_b
+        ln_f_w, ln_f_b = get_weight_and_bias(model_params, 'transformer.ln_f',
+                                             dtype)
+        trtllm_falcon.ln_f.weight.value = ln_f_w
+        if ln_f_b is not None:
+            trtllm_falcon.ln_f.bias.value = ln_f_b
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
@@ -310,19 +319,21 @@ def retrieved_layer_index_from_name(name: str) -> Optional[int]:
     return int(res.group()) if res is not None else res
 
 
-def iterate_shard_files(model_dir: Path):
-    for file in model_dir.glob('*.bin'):
-        yield file
-    for file in model_dir.glob('*.safetensors'):
-        yield file
+def iterate_shard_files(model_dir: Path, rank: int):
+    import tqdm
+
+    shard_files = list(model_dir.glob('*.bin')) + list(
+        model_dir.glob('*.safetensors'))
+    desc = f'Rank [{rank}] Loading weights'
+    for shard_file in tqdm.tqdm(shard_files, desc=desc, position=rank):
+        yield shard_file
 
 
 def load_from_hf_checkpoint(
-    trtllm_falcon: tensorrt_llm.models.FalconForCausalLM,
-    model_dir: Union[str, Path],
-    rank: int = 0,
-    tensor_parallel: int = 1,
-    dtype: Union[str, torch.dtype] = torch.float32,
+        trtllm_falcon: tensorrt_llm.models.FalconForCausalLM,
+        model_dir: Union[str, Path],
+        mapping=Mapping(),
+        dtype: Union[str, torch.dtype] = torch.float32,
 ):
     logger.info('Loading weights from HF Falcon...')
     tik = time.time()
@@ -334,53 +345,60 @@ def load_from_hf_checkpoint(
     def is_bias(_name):
         return 'bias' in _name
 
-    for model_file in iterate_shard_files(model_dir):
+    layers_range = trtllm_falcon.get_transformer_layers(
+        trtllm_falcon.mapping, trtllm_falcon.num_layers)
+    for model_file in iterate_shard_files(model_dir, mapping.tp_rank):
         logger.debug(f'Loading file {str(model_file)}...')
         state_dict = load_state_dict(model_file, dtype)
         for name, param in state_dict.items():
             logger.debug(f'Converting weight {name}...')
             i = retrieved_layer_index_from_name(name)
-            layer = trtllm_falcon.layers[i] if i is not None else None
+            if i is None:
+                layer = None
+            else:
+                if i not in layers_range:
+                    continue
+                layer = trtllm_falcon.layers[i - layers_range[0]]
 
             if 'self_attention.query_key_value' in name:
                 if not is_bias(name):
                     layer.attention.qkv.weight.value = split_qkv_weight(
                         trtllm_falcon,
                         param,
-                        tensor_parallel,
-                        rank,
+                        mapping.tp_size,
+                        mapping.tp_rank,
                         is_bias=False,
                         num_kv_heads=trtllm_falcon.num_kv_heads)
                 else:
                     layer.attention.qkv.bias.value = split_qkv_weight(
                         trtllm_falcon,
                         param,
-                        tensor_parallel,
-                        rank,
+                        mapping.tp_size,
+                        mapping.tp_rank,
                         is_bias=True,
                         num_kv_heads=trtllm_falcon.num_kv_heads)
             elif 'self_attention.dense' in name:
                 if not is_bias(name):
                     layer.attention.dense.weight.value = split_matrix(
-                        param, tensor_parallel, rank, dim=1)
+                        param, mapping.tp_size, mapping.tp_rank, dim=1)
                 else:
                     layer.attention.dense.bias.value = param
             elif 'mlp.dense_h_to_4h' in name:
                 if not is_bias(name):
                     layer.mlp.fc.weight.value = split_matrix(param,
-                                                             tensor_parallel,
-                                                             rank,
+                                                             mapping.tp_size,
+                                                             mapping.tp_rank,
                                                              dim=0)
                 else:
                     layer.mlp.fc.bias.value = split_matrix(param,
-                                                           tensor_parallel,
-                                                           rank,
+                                                           mapping.tp_size,
+                                                           mapping.tp_rank,
                                                            dim=0)
             elif 'mlp.dense_4h_to_h' in name:
                 if not is_bias(name):
                     layer.mlp.proj.weight.value = split_matrix(param,
-                                                               tensor_parallel,
-                                                               rank,
+                                                               mapping.tp_size,
+                                                               mapping.tp_rank,
                                                                dim=1)
                 else:
                     layer.mlp.proj.bias.value = param
@@ -402,14 +420,17 @@ def load_from_hf_checkpoint(
                 else:
                     layer.post_layernorm.bias.value = param
             elif 'word_embeddings' in name:
-                trtllm_falcon.embedding.weight.value = param.copy()
-                trtllm_falcon.lm_head.weight.value = split_matrix(
-                    param, tensor_parallel, rank, dim=0)
+                if mapping.is_first_pp_rank():
+                    trtllm_falcon.embedding.weight.value = param.copy()
+                if mapping.is_last_pp_rank():
+                    trtllm_falcon.lm_head.weight.value = split_matrix(
+                        param, mapping.tp_size, mapping.tp_rank, dim=0)
             elif 'ln_f' in name:
-                if not is_bias(name):
-                    trtllm_falcon.ln_f.weight.value = param
-                else:
-                    trtllm_falcon.ln_f.bias.value = param
+                if mapping.is_last_pp_rank():
+                    if not is_bias(name):
+                        trtllm_falcon.ln_f.weight.value = param
+                    else:
+                        trtllm_falcon.ln_f.bias.value = param
         del state_dict
 
     tok = time.time()

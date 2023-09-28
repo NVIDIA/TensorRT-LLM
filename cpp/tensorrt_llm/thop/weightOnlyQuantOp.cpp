@@ -164,17 +164,17 @@ std::vector<Tensor> symmetric_quantize_helper(
     const size_t input_mat_size = num_rows * num_cols;
     const size_t quantized_mat_size = num_rows * bytes_per_out_col;
 
-    std::vector<long int> quantized_weight_shape;
-    std::vector<long int> scale_shape;
+    std::vector<int64_t> quantized_weight_shape;
+    std::vector<int64_t> scale_shape;
     if (weight.dim() == 2)
     {
-        quantized_weight_shape = {long(num_rows), long(bytes_per_out_col)};
-        scale_shape = {long(num_cols)};
+        quantized_weight_shape = {int64_t(num_rows), int64_t(bytes_per_out_col)};
+        scale_shape = {int64_t(num_cols)};
     }
     else if (weight.dim() == 3)
     {
-        quantized_weight_shape = {long(num_experts), long(num_rows), long(bytes_per_out_col)};
-        scale_shape = {long(num_experts), long(num_cols)};
+        quantized_weight_shape = {int64_t(num_experts), int64_t(num_rows), int64_t(bytes_per_out_col)};
+        scale_shape = {int64_t(num_experts), int64_t(num_cols)};
     }
     else
     {
@@ -273,7 +273,7 @@ Tensor unpack_int4_packed_tensor_to_int8(Tensor weight)
     TORCH_CHECK(weight.numel() != 0, "weight should not be empty tensor");
     TORCH_CHECK(weight.dtype() == torch::kInt8, "Weight must be a packed int8 tensor");
 
-    std::vector<long int> int8_tensor_size(weight.dim());
+    std::vector<int64_t> int8_tensor_size(weight.dim());
     for (int i = 0; i < weight.dim(); ++i)
     {
         int8_tensor_size[i] = weight.size(i);
@@ -307,7 +307,7 @@ Tensor pack_int8_tensor_to_packed_int4(Tensor weight)
     TORCH_CHECK(weight.numel() != 0, "weight should not be empty tensor");
     TORCH_CHECK(weight.dtype() == torch::kInt8, "Weight must be a int8 tensor");
 
-    std::vector<long int> packed_tensor_size(weight.dim());
+    std::vector<int64_t> packed_tensor_size(weight.dim());
     for (int i = 0; i < weight.dim(); ++i)
     {
         packed_tensor_size[i] = weight.size(i);

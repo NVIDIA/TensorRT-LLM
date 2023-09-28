@@ -239,16 +239,25 @@ def parse_arguments(args):
     if args.fp8_kv_cache:
         assert (
             args.use_gpt_attention_plugin
-        ), "You have to use GPT attention plugin or inflight batching plugin when fp8 KV cache is set"
+        ), "You have to use GPT attention plugin when fp8 KV cache is set"
         args.quant_mode = args.quant_mode.set_fp8_kv_cache()
 
     if args.enable_fp8:
         args.quant_mode = args.quant_mode.set_fp8_qdq()
 
     if args.use_inflight_batching:
-        assert args.use_gpt_attention_plugin, "You have to use GPT attention plugin for in-flight batching mode"
-        assert args.paged_kv_cache, "You have to use paged kv cache for in-flight batching mode"
-        assert args.remove_input_padding, "You have to remove input padding for in-flight batching"
+        if not args.use_gpt_attention_plugin:
+            args.use_gpt_attention_plugin = 'float16'
+            logger.info(
+                f"Using GPT attention plugin for inflight batching mode. Setting to default '{args.use_gpt_attention_plugin}'"
+            )
+        if not args.remove_input_padding:
+            args.remove_input_padding = True
+            logger.info(
+                "Using remove input padding for inflight batching mode.")
+        if not args.paged_kv_cache:
+            args.paged_kv_cache = True
+            logger.info("Using paged KV cache for inflight batching mode.")
 
     if args.remove_input_padding or args.use_inflight_batching or args.paged_kv_cache:
         assert (
@@ -513,8 +522,6 @@ def build_rank_engine(builder: Builder,
         network.plugin_config.set_nccl_plugin(args.dtype)
     if args.remove_input_padding:
         network.plugin_config.enable_remove_input_padding()
-    if args.use_inflight_batching:
-        network.plugin_config.enable_in_flight_batching()
     if args.paged_kv_cache:
         network.plugin_config.enable_paged_kv_cache()
 
@@ -534,6 +541,8 @@ def build_rank_engine(builder: Builder,
             paged_kv_cache=args.paged_kv_cache,
             tokens_per_block=args.tokens_per_block)
         tensorrt_llm_gpt(*inputs)
+
+    tensorrt_llm.graph_rewriting.optimize(network)
 
     engine = None
 

@@ -14,12 +14,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.h"
-#include "checkMacrosPlugin.h"
+#include "gptAttentionCommon.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
+#include "tensorrt_llm/plugins/common/checkMacrosPlugin.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
 #include <NvInferRuntimePlugin.h>
 #include <algorithm>
 #include <cstdint>
@@ -27,10 +28,9 @@
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::kernels;
-using namespace tensorrt_llm::common;
-using nvinfer1::plugin::GPTAttentionPluginCreatorCommon;
-using nvinfer1::plugin::GPTAttentionPluginCommon;
-using nvinfer1::plugin::nextWorkspacePtr;
+namespace tc = tensorrt_llm::common;
+using tensorrt_llm::plugins::GPTAttentionPluginCreatorCommon;
+using tensorrt_llm::plugins::GPTAttentionPluginCommon;
 
 template <typename KVCacheBuffer>
 struct KVCacheBufferDataType
@@ -78,6 +78,8 @@ struct FusedQKVMaskedAttentionDispatchParams
     int kv_head_num;
     int size_per_head;
     int rotary_embedding_dim;
+    float rotary_embedding_base;
+    float rotary_embedding_scale;
     PositionEmbeddingType position_embedding_type;
     int max_seq_len;
     const int* input_lengths;
@@ -90,7 +92,7 @@ struct FusedQKVMaskedAttentionDispatchParams
     const T* ia3_value_weights;
     const float* qkv_scale_out;
     const float* attention_out_scale;
-    QuantMode quant_option;
+    tc::QuantMode quant_option;
     bool multi_block_mode;
     int max_seq_len_tile;
     T* partial_out;
@@ -99,7 +101,7 @@ struct FusedQKVMaskedAttentionDispatchParams
     int* block_counter;
     const float* kv_scale_orig_quant;
     const float* kv_scale_quant_orig;
-    QuantMode kv_cache_quant_mode;
+    tc::QuantMode kv_cache_quant_mode;
     int multi_processor_count;
     KVCacheBuffer kv_block_array;
 };
@@ -157,6 +159,8 @@ void fusedQKV_masked_attention_dispatch(
     params.num_kv_heads = input_params.kv_head_num;
     params.hidden_size_per_head = input_params.size_per_head;
     params.rotary_embedding_dim = input_params.rotary_embedding_dim;
+    params.rotary_embedding_base = input_params.rotary_embedding_base;
+    params.rotary_embedding_scale = input_params.rotary_embedding_scale;
     params.position_embedding_type = input_params.position_embedding_type;
     // Note: keep norm factor (sqrt(K_dim)) when adopting megatron T5 structure (may adjust)
     params.inv_sqrt_dh = 1.F / (sqrtf((float) params.hidden_size_per_head) * input_params.q_scaling);
@@ -214,7 +218,8 @@ template void fusedQKV_masked_attention_dispatch(
 GPTAttentionPluginCommon::GPTAttentionPluginCommon(int num_heads, int num_kv_heads, int unidirectional, float q_scaling,
     tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
     int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
-    int tp_size, int tp_rank, // for ALiBi
+    float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
+    float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
     tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
     bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
     nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled)
@@ -224,6 +229,10 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int num_heads, int num_kv_hea
     , mUnidirectional(unidirectional)
     , mQScaling(q_scaling)
     , mRotaryEmbeddingDim(rotary_embedding_dim)
+    , mRotaryEmbeddingBase(rotary_embedding_base)
+    , mRotaryEmbeddingScaleType(rotary_embedding_scale_type)
+    , mRotaryEmbeddingScale(rotary_embedding_scale)
+    , mRotaryEmbeddingMaxPositions(rotary_embedding_max_positions)
     , mPositionEmbeddingType(position_embedding_type)
     , mEnableContextFMHA(context_fmha_type != ContextFMHAType::DISABLED)
     , mFMHAForceFP32Acc(context_fmha_type == ContextFMHAType::ENABLED_WITH_FP32_ACC || type == DataType::kBF16)
@@ -239,8 +248,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int num_heads, int num_kv_hea
     , mQKVBiasEnabled(qkv_bias_enabled)
 {
     mEnableContextFMHA = mEnableContextFMHA && (mType == DataType::kHALF || mType == DataType::kBF16);
-    PLUGIN_ASSERT(isRoPE() == (rotary_embedding_dim != 0));
-    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16),
+    TLLM_CHECK(isRoPE() == (rotary_embedding_dim != 0));
+    TLLM_CHECK_WITH_INFO((tc::getSMVersion() >= 80) || (mType != DataType::kBF16),
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
 }
 
@@ -266,6 +275,10 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(const void* data, size_t leng
     read(d, mQScaling);
     read(d, mPositionEmbeddingType);
     read(d, mRotaryEmbeddingDim);
+    read(d, mRotaryEmbeddingBase);
+    read(d, mRotaryEmbeddingScaleType);
+    read(d, mRotaryEmbeddingScale);
+    read(d, mRotaryEmbeddingMaxPositions);
     read(d, mTpSize);
     read(d, mTpRank);
     read(d, mEnableContextFMHA);
@@ -279,10 +292,10 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(const void* data, size_t leng
     read(d, mMaxContextLength);
     read(d, mQKVBiasEnabled);
 
-    mKVCacheQuantMode = QuantMode(kvCacheQuantMode);
+    mKVCacheQuantMode = tc::QuantMode(kvCacheQuantMode);
 
-    PLUGIN_ASSERT(d == a + length);
-    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16),
+    TLLM_CHECK(d == a + length);
+    TLLM_CHECK_WITH_INFO((tc::getSMVersion() >= 80) || (mType != DataType::kBF16),
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
 }
 
@@ -293,7 +306,7 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(
     const int local_hidden_units_qo = mNumHeads * getHeadSize();
     const int local_hidden_units_kv = mNumKVHeads * getHeadSize();
 
-    size_t const size = elementSize(type);
+    auto const size = tensorrt_llm::runtime::BufferDataType(type).getSize();
 
     size_t context_workspace_size = 0;
 
@@ -322,7 +335,7 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(
     workspaces[7] = qkv_buf_2_size;
     workspaces[8] = qk_buf_float_size;
     workspaces[9] = padding_offset_size;
-    context_workspace_size = plugin::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
+    context_workspace_size = tensorrt_llm::plugins::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
     return context_workspace_size;
 }
 
@@ -331,7 +344,7 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForGeneration(DataType type, in
     const int local_hidden_units_qo = mNumHeads * getHeadSize();
     const int local_hidden_units_kv = mNumKVHeads * getHeadSize();
 
-    size_t const size = elementSize(type);
+    auto const size = tensorrt_llm::runtime::BufferDataType(type).getSize();
 
     size_t context_workspace_size = 0;
     size_t generation_workspace_size = 0;
@@ -350,7 +363,7 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForGeneration(DataType type, in
     workspaces[1] = partial_sum_size;
     workspaces[2] = partial_max_size;
     workspaces[3] = block_counter_size;
-    generation_workspace_size = plugin::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
+    generation_workspace_size = tensorrt_llm::plugins::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
     return generation_workspace_size;
 }
 
@@ -402,7 +415,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
         kv_cache_buffer.data = reinterpret_cast<BufferDataType*>(params.key_value_cache);
     }
 
-    const QuantMode quant_option = QuantMode::fromDescription();
+    const auto quant_option = tc::QuantMode::fromDescription();
     const float* qkv_scale_out = nullptr;
     const float* attention_out_scale = nullptr;
 
@@ -421,7 +434,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
     const int request_seq_length = params.input_seq_length;
 
     auto cublasHandle = mCublasWrapper->getCublasHandle();
-    PLUGIN_CUBLASASSERT(cublasSetStream(cublasHandle, stream));
+    TLLM_CUDA_CHECK(cublasSetStream(cublasHandle, stream));
     mCublasWrapper->setStream(stream);
     mCublasWrapper->setWorkspace(params.workspace);
     if constexpr (std::is_same_v<T, half>)
@@ -490,11 +503,15 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
     //  Otherwise, we could do cudaMemsetAsync(k_buf_2_, 0, k_buf_2_size + v_buf_2_size, stream);
     cudaMemsetAsync(
         k_buf_2_, 0, reinterpret_cast<int8_t*>(v_buf_2_) - reinterpret_cast<int8_t*>(k_buf_2_) + v_buf_2_size, stream);
+    float rotary_base, rotary_scale;
+    const int32_t kv_seq_len = params.input_seq_length;
+    update_rotary_params(kv_seq_len, rotary_base, rotary_scale);
 
     invokeAddFusedQKVBiasTranspose(q_buf_2_, k_buf_2_, v_buf_2_, const_cast<T*>(params.attention_input),
         const_cast<T*>(params.qkv_bias), params.context_lengths, mRemovePadding ? padding_offset : nullptr,
         request_batch_size, request_seq_length, params.num_tokens, mNumHeads, mNumKVHeads, getHeadSize(),
-        mEnableContextFMHA, mRotaryEmbeddingDim, position_embedding_type, (float*) nullptr, 0, stream);
+        mEnableContextFMHA, mRotaryEmbeddingDim, rotary_base, rotary_scale, position_embedding_type, (float*) nullptr,
+        0, stream);
 
     sync_check_cuda_error();
 
@@ -506,7 +523,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
         params.context_lengths, stream);
     sync_check_cuda_error();
 
-    const cudaDataType_t gemm_data_type = CudaDataType<T>::value;
+    const cudaDataType_t gemm_data_type = tc::CudaDataType<T>::value;
     const int attention_seq_len_1 = request_seq_length; // q length
     const int attention_seq_len_2 = request_seq_length; // kv length
     const T qk_scale = static_cast<T>(1.0f / (sqrtf(getHeadSize() * 1.0f) * q_scaling));
@@ -734,7 +751,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     const bool* finished = nullptr;
     const bool has_ia3 = false;
 
-    const QuantMode quant_option = QuantMode::fromDescription();
+    const auto quant_option = tc::QuantMode::fromDescription();
     const float* qkv_scale_out = nullptr;
     const float* attention_out_scale = nullptr;
 
@@ -761,7 +778,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     int* block_counter = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, block_counter_size));
     if (mMultiBlockMode)
     {
-        PLUGIN_CUASSERT(cudaMemsetAsync(block_counter, 0, block_counter_size, stream));
+        TLLM_CUDA_CHECK(cudaMemsetAsync(block_counter, 0, block_counter_size, stream));
     }
 
     KVCacheBuffer kv_cache_buffer;
@@ -824,6 +841,8 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     dispatch_params.kv_scale_quant_orig = params.kv_scale_quant_orig;
     dispatch_params.kv_block_array = kv_cache_buffer;
     dispatch_params.multi_processor_count = mMultiProcessorCount;
+    const int32_t kv_seq_len = step;
+    update_rotary_params(kv_seq_len, dispatch_params.rotary_embedding_base, dispatch_params.rotary_embedding_scale);
     fusedQKV_masked_attention_dispatch(dispatch_params, stream);
     sync_check_cuda_error();
     return 0;
@@ -856,10 +875,10 @@ int GPTAttentionPluginCommon::initialize() noexcept
     auto cublasHandle = getCublasHandle();
     auto cublasLtHandle = getCublasLtHandle();
 
-    mCublasAlgoMap = new cublasAlgoMap(GEMM_CONFIG);
+    mCublasAlgoMap = new tc::cublasAlgoMap(GEMM_CONFIG);
     mCublasWrapperMutex = new std::mutex();
     mCublasWrapper
-        = new cublasMMWrapper(cublasHandle, cublasLtHandle, nullptr, mCublasAlgoMap, mCublasWrapperMutex, nullptr);
+        = new tc::cublasMMWrapper(cublasHandle, cublasLtHandle, nullptr, mCublasAlgoMap, mCublasWrapperMutex, nullptr);
     if (mEnableContextFMHA)
     {
         // Pre-checked during constructing.
@@ -906,9 +925,10 @@ void GPTAttentionPluginCommon::destroy() noexcept
 size_t GPTAttentionPluginCommon::getCommonSerializationSize() noexcept
 {
     return sizeof(mNumHeads) + sizeof(mNumKVHeads) + sizeof(mHeadSize) + sizeof(mUnidirectional) + sizeof(mQScaling)
-        + sizeof(mPositionEmbeddingType) + sizeof(mRotaryEmbeddingDim) + sizeof(mTpSize) + sizeof(mTpRank)
-        + sizeof(mEnableContextFMHA) + sizeof(mFMHAForceFP32Acc) + sizeof(mMultiBlockMode)
-        + sizeof(unsigned int) // mKVCacheQuantMode
+        + sizeof(mPositionEmbeddingType) + sizeof(mRotaryEmbeddingDim) + sizeof(mRotaryEmbeddingBase)
+        + sizeof(mRotaryEmbeddingScaleType) + sizeof(mRotaryEmbeddingScale) + sizeof(mRotaryEmbeddingMaxPositions)
+        + sizeof(mTpSize) + sizeof(mTpRank) + sizeof(mEnableContextFMHA) + sizeof(mFMHAForceFP32Acc)
+        + sizeof(mMultiBlockMode) + sizeof(unsigned int) // mKVCacheQuantMode
         + sizeof(mRemovePadding) + sizeof(mMaskType) + sizeof(mPagedKVCache) + sizeof(mType) + sizeof(mMaxContextLength)
         + sizeof(mQKVBiasEnabled);
 }
@@ -923,6 +943,10 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mQScaling);
     write(d, mPositionEmbeddingType);
     write(d, mRotaryEmbeddingDim);
+    write(d, mRotaryEmbeddingBase);
+    write(d, mRotaryEmbeddingScaleType);
+    write(d, mRotaryEmbeddingScale);
+    write(d, mRotaryEmbeddingMaxPositions);
     write(d, mTpSize);
     write(d, mTpRank);
     write(d, mEnableContextFMHA);
@@ -943,16 +967,6 @@ void GPTAttentionPluginCommon::terminate() noexcept
     // Do nothing, destroy will always be called, so release the resources there.
 }
 
-void GPTAttentionPluginCommon::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* GPTAttentionPluginCommon::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
-}
-
 ///////////////
 
 GPTAttentionPluginCreatorCommon::GPTAttentionPluginCreatorCommon()
@@ -965,6 +979,10 @@ GPTAttentionPluginCreatorCommon::GPTAttentionPluginCreatorCommon()
     mPluginAttributes.emplace_back(PluginField("q_scaling", nullptr, PluginFieldType::kFLOAT32, 1.0));
     mPluginAttributes.emplace_back(PluginField("position_embedding_type", nullptr, PluginFieldType::kINT8, 0));
     mPluginAttributes.emplace_back(PluginField("rotary_embedding_dim", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("rotary_embedding_base", nullptr, PluginFieldType::kFLOAT32, 0));
+    mPluginAttributes.emplace_back(PluginField("rotary_embedding_scale_type", nullptr, PluginFieldType::kINT8, 0));
+    mPluginAttributes.emplace_back(PluginField("rotary_embedding_scale", nullptr, PluginFieldType::kFLOAT32, 0));
+    mPluginAttributes.emplace_back(PluginField("rotary_embedding_max_positions", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("tp_size", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("tp_rank", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("context_fmha_type", nullptr, PluginFieldType::kINT8, 0));
@@ -983,14 +1001,4 @@ GPTAttentionPluginCreatorCommon::GPTAttentionPluginCreatorCommon()
 const PluginFieldCollection* GPTAttentionPluginCreatorCommon::getFieldNames() noexcept
 {
     return &mFC;
-}
-
-void GPTAttentionPluginCreatorCommon::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* GPTAttentionPluginCreatorCommon::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
 }

@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 
+#ifndef _WIN32
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
+#endif // #ifndef _WIN32
 
 #include "cutlass/gemm/device/gemm_universal_base.h"
 #include "cutlass/gemm/kernel/default_gemm.h"
@@ -27,7 +29,10 @@
 #include "cutlass_extensions/gemm/threadblock/default_mma.h"
 #include "cutlass_extensions/gemm_configs.h"
 
+#ifndef _WIN32
 #pragma GCC diagnostic pop
+#endif // #ifndef _WIN32
+
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -384,31 +389,6 @@ void CutlassFpAIntBGemmRunner<T, WeightType, QuantOp>::dispatch_to_arch<Epilogue
     }
 }
 
-template <typename T, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp>
-template <typename EpilogueTag>
-void CutlassFpAIntBGemmRunner<T, WeightType, QuantOp>::run_gemm<EpilogueTag>(const T* A, const WeightType* B,
-    const T* weight_scales, const T* weight_zero_points, const T* biases, T* C, int m, int n, int k,
-    const int group_size, char* workspace_ptr, const size_t workspace_bytes, cudaStream_t stream)
-{
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    static constexpr bool is_weight_only = !std::is_same<T, WeightType>::value;
-    std::vector<tkc::CutlassGemmConfig> candidate_configs = get_candidate_configs(sm_, is_weight_only, false);
-    std::vector<int> occupancies(candidate_configs.size());
-
-    for (size_t ii = 0; ii < candidate_configs.size(); ++ii)
-    {
-        dispatch_to_arch<EpilogueTag>(A, B, weight_scales, weight_zero_points, biases, C, m, n, k, group_size,
-            candidate_configs[ii], workspace_ptr, workspace_bytes, stream, &occupancies[ii]);
-    }
-    // Standard GEMM, so 1 "expert". We use the same function for MoE and regular FFN.
-    static constexpr int num_experts = 1;
-    tkc::CutlassGemmConfig chosen_config = estimate_best_config_from_occupancies(candidate_configs, occupancies, m, n,
-        k, num_experts, split_k_limit, workspace_bytes, multi_processor_count_, is_weight_only);
-
-    dispatch_to_arch<EpilogueTag>(A, B, weight_scales, weight_zero_points, biases, C, m, n, k, group_size,
-        chosen_config, workspace_ptr, workspace_bytes, stream);
-}
-
 // Disabled since the fused GEMM, activation kernels will not be used in v1.
 
 // template <typename T, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp>
@@ -447,15 +427,15 @@ void CutlassFpAIntBGemmRunner<T, WeightType, QuantOp>::run_gemm<EpilogueTag>(con
 template <typename T, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp>
 void CutlassFpAIntBGemmRunner<T, WeightType, QuantOp>::gemm(const void* A, const void* B, const void* weight_scales,
     const void* weight_zero_points, const void* biases, void* C, int m, int n, int k, const int group_size,
-    char* workspace_ptr, const size_t workspace_bytes, cudaStream_t stream)
+    tkc::CutlassGemmConfig gemmConfig, char* workspace_ptr, const size_t workspace_bytes, cudaStream_t stream)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     if constexpr ((QuantOp == cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS)
         || (QuantOp == cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY))
     {
-        run_gemm<tkc::EpilogueOpBias>((const T*) A, (const WeightType*) B, (const T*) weight_scales,
-            (const T*) weight_zero_points, (const T*) biases, (T*) C, m, n, k, group_size, workspace_ptr,
-            workspace_bytes, stream);
+        dispatch_to_arch<tkc::EpilogueOpBias>((const T*) A, (const WeightType*) B, (const T*) weight_scales,
+            (const T*) weight_zero_points, (const T*) biases, (T*) C, m, n, k, group_size, gemmConfig, workspace_ptr,
+            workspace_bytes, stream, nullptr);
     }
     else
     {
@@ -466,14 +446,15 @@ void CutlassFpAIntBGemmRunner<T, WeightType, QuantOp>::gemm(const void* A, const
 
 template <typename T, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp>
 void CutlassFpAIntBGemmRunner<T, WeightType, QuantOp>::gemm(const void* A, const void* B, const void* weight_scales,
-    void* C, int m, int n, int k, char* workspace_ptr, const size_t workspace_bytes, cudaStream_t stream)
+    void* C, int m, int n, int k, tkc::CutlassGemmConfig gemmConfig, char* workspace_ptr, const size_t workspace_bytes,
+    cudaStream_t stream)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
 
     if constexpr (QuantOp == cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY)
     {
-        run_gemm<tkc::EpilogueOpNoBias>((const T*) A, (const WeightType*) B, (const T*) weight_scales, nullptr, nullptr,
-            (T*) C, m, n, k, k, workspace_ptr, workspace_bytes, stream);
+        dispatch_to_arch<tkc::EpilogueOpNoBias>((const T*) A, (const WeightType*) B, (const T*) weight_scales, nullptr,
+            nullptr, (T*) C, m, n, k, k, gemmConfig, workspace_ptr, workspace_bytes, stream, nullptr);
     }
     else
     {
@@ -482,14 +463,22 @@ void CutlassFpAIntBGemmRunner<T, WeightType, QuantOp>::gemm(const void* A, const
 }
 
 template <typename T, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp>
-int CutlassFpAIntBGemmRunner<T, WeightType, QuantOp>::getWorkspaceSize(const int m, const int n, const int k)
+std::vector<tkc::CutlassGemmConfig> CutlassFpAIntBGemmRunner<T, WeightType, QuantOp>::getConfigs() const
+{
+    static constexpr bool is_weight_only = !std::is_same<T, WeightType>::value;
+    std::vector<tkc::CutlassGemmConfig> candidateConfigs = get_candidate_configs(sm_, is_weight_only, false);
+    return candidateConfigs;
+}
+
+template <typename T, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp>
+size_t CutlassFpAIntBGemmRunner<T, WeightType, QuantOp>::getWorkspaceSize(const int m, const int n, const int k)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     // These are the min tile sizes for each config, which would launch the maximum number of blocks
-    const int max_grid_m = (m + 31) / 32;
-    const int max_grid_n = (n + 127) / 128;
+    const int max_grid_m = cutlass::ceil_div(m, MIN_M_TILE);
+    const int max_grid_n = cutlass::ceil_div(n, MIN_N_TILE);
     // We need 4 bytes per block in the worst case. We launch split_k_limit in z dim.
-    return max_grid_m * max_grid_n * split_k_limit * 4;
+    return static_cast<size_t>(max_grid_m * max_grid_n * SPLIT_K_LIMIT * 4);
 }
 
 } // namespace cutlass_kernels

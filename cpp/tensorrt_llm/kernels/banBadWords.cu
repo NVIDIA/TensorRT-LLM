@@ -98,7 +98,8 @@ void invokeBanBadWords(T* logits, const int** output_ids_ptr, const int** parent
     int vocab_size_padded, const int* sequence_lengths, int max_seq_len, cudaStream_t stream)
 {
     dim3 block, grid;
-    block.x = min(((bad_words_len + 32 - 1) / 32) * 32, 256UL);
+    constexpr size_t max_blocks{256};
+    block.x = min(((bad_words_len + 32 - 1) / 32) * 32, max_blocks);
     grid.x = (bad_words_len + block.x - 1) / block.x;
     grid.y = local_batch_size * beam_width;
 

@@ -14,18 +14,18 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/plugins/quantizePerTokenPlugin/quantizePerTokenPlugin.h"
+#include "quantizePerTokenPlugin.h"
 #include "tensorrt_llm/kernels/quantization.h"
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::kernels;
-using nvinfer1::plugin::QuantizePerTokenPluginCreator;
-using nvinfer1::plugin::QuantizePerTokenPlugin;
+using tensorrt_llm::plugins::QuantizePerTokenPluginCreator;
+using tensorrt_llm::plugins::QuantizePerTokenPlugin;
 
 static const char* QUANTIZE_PER_TOKEN_PLUGIN_VERSION{"1"};
 static const char* QUANTIZE_PER_TOKEN_PLUGIN_NAME{"QuantizePerToken"};
 PluginFieldCollection QuantizePerTokenPluginCreator::mFC{};
-std::vector<PluginField> QuantizePerTokenPluginCreator::mPluginAttributes;
+std::vector<nvinfer1::PluginField> QuantizePerTokenPluginCreator::mPluginAttributes;
 
 QuantizePerTokenPlugin::QuantizePerTokenPlugin() {}
 
@@ -33,7 +33,7 @@ QuantizePerTokenPlugin::QuantizePerTokenPlugin() {}
 QuantizePerTokenPlugin::QuantizePerTokenPlugin(const void* data, size_t length)
 {
     const char *d = reinterpret_cast<const char*>(data), *a = d;
-    PLUGIN_ASSERT(d == a + length);
+    TLLM_CHECK(d == a + length);
 }
 
 // IPluginV2DynamicExt Methods
@@ -49,8 +49,8 @@ nvinfer1::DimsExprs QuantizePerTokenPlugin::getOutputDimensions(
 {
     try
     {
-        PLUGIN_ASSERT(nbInputs == 1);
-        PLUGIN_ASSERT(outputIndex < 2);
+        TLLM_CHECK(nbInputs == 1);
+        TLLM_CHECK(outputIndex < 2);
         if (outputIndex == 0)
         {
             // Quantized input
@@ -142,8 +142,8 @@ int QuantizePerTokenPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
 nvinfer1::DataType QuantizePerTokenPlugin::getOutputDataType(
     int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
 {
-    PLUGIN_ASSERT(nbInputs == 1);
-    PLUGIN_ASSERT(index < 2);
+    TLLM_CHECK(nbInputs == 1);
+    TLLM_CHECK(index < 2);
     return index == 0 ? nvinfer1::DataType::kINT8 : nvinfer1::DataType::kFLOAT;
 }
 
@@ -186,16 +186,6 @@ void QuantizePerTokenPlugin::destroy() noexcept
 {
     // This gets called when the network containing plugin is destroyed
     delete this;
-}
-
-void QuantizePerTokenPlugin::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* QuantizePerTokenPlugin::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
 }
 
 ///////////////
@@ -254,14 +244,4 @@ IPluginV2* QuantizePerTokenPluginCreator::deserializePlugin(
         caughtError(e);
     }
     return nullptr;
-}
-
-void QuantizePerTokenPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* QuantizePerTokenPluginCreator::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
 }

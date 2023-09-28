@@ -41,13 +41,10 @@ struct gatherTreeParam
     const int* step_ids = nullptr;   // [max_seq_len, batch_size, beam_width]
     const int* parent_ids = nullptr; // [max_seq_len, batch_size, beam_width]
     const int* end_tokens = nullptr; // [batch_size], end token ids of each query
-    int max_input_length = 0;        // max(input_lengths)
     int* output_ids = nullptr;       // the buffer to put finalized ids
-    // True if we have virtual padding tokens to fill up to max_input_len
-    bool has_padding = true;
     cudaStream_t stream;
-    float* cum_log_probs = nullptr; // [batch_size, beam_width]
-    float length_penalty = 1.0f;    // on cpu
+    float* cum_log_probs = nullptr;  // [batch_size, beam_width]
+    float length_penalty = 1.0f;     // on cpu
 };
 
 /*
@@ -58,8 +55,7 @@ void invokeGatherTree(gatherTreeParam param);
 void invokeFinalize(int* output_ids, int* sequence_lengths, float* cum_log_probs, float* output_log_probs,
     const int* topk_output_ids, const int* topk_sequence_lengths, const float* scores, const float* topk_cum_log_probs,
     const float* topk_log_probs, const int* num_beams, const int* input_lengths, const int beam_width,
-    const int max_seq_len, const int batch_size, const int max_input_length, cudaStream_t stream,
-    bool do_remove_padding = true);
+    const int max_seq_len, const int batch_size, cudaStream_t stream);
 
 void invokeInitializeOutput(int* output_ids, const int* end_ids, int batch_beam, int max_seq_len, cudaStream_t stream);
 

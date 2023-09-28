@@ -19,6 +19,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
@@ -40,7 +41,7 @@ public:
     // general
     TensorPtr contextLengthsHost;
     TensorPtr contextLengthsDevice;
-    TensorPtr inputOffsets;
+    TensorPtr inputOffsets; // helper for packed input
 
     // engine
     TensorPtr logits;
@@ -49,15 +50,21 @@ public:
     TensorPtr attentionMask;       // without attention plugin
     TensorPtr positionIds;
     TensorPtr lastTokenIds;
-    TensorPtr requestTypes; // with attention plugin and inflight batching. Host tensor
+    TensorPtr requestTypes; // with attention plugin. Host tensor
 
     std::vector<TensorPtr> presentKeysVals;
     std::vector<TensorPtr> presentKeysValsAlt; // without attention plugin
-    std::vector<TensorPtr> kvCacheBlockPointers;
+    TensorPtr kvCacheBlockPointers;            // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
 
     // beam search (shared between engine and decoder)
     TensorPtr cacheIndirectionDecoderInput;
     TensorPtr cacheIndirectionDecoderOutput;
+
+    // decoder
+    TensorPtr shouldStop;
+
+    // pipeline parallelism
+    TensorPtr hiddenStates;
 
     bool allocated{false};
 
@@ -91,24 +98,28 @@ public:
 public:
     void clear();
 
-    void create(TllmRuntime& runtime, GptModelConfig const& modelConfig);
+    void create(TllmRuntime& runtime, GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
-    void reshape(GenerationConfig const& generationConfig, GptModelConfig const& modelConfig, SizeType worldSize);
+    void reshape(
+        GenerationConfig const& generationConfig, GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
-    void postContextStep(
-        BufferManager& manager, GenerationConfig const& generationConfig, GptModelConfig const& modelConfig);
+    void postContextStep(BufferManager& manager, GenerationConfig const& generationConfig,
+        GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void prepareContextStep(TensorPtr const& inputIds, TokenIdType padId, BufferManager& manager,
-        KvCacheManager& kvCacheManager, GenerationConfig const& generationConfig, GptModelConfig const& modelConfig);
+        KvCacheManager& kvCacheManager, GenerationConfig const& generationConfig, GptModelConfig const& modelConfig,
+        WorldConfig const& worldConfig);
     TensorPtr prepareNextStep(SizeType step, TensorPtr const& outputIds, BufferManager& manager,
-        KvCacheManager& kvCacheManager, GenerationConfig const& generationConfig, GptModelConfig const& modelConfig);
+        KvCacheManager& kvCacheManager, GenerationConfig const& generationConfig, GptModelConfig const& modelConfig,
+        WorldConfig const& worldConfig);
 
     void getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outputBuffers, SizeType step, TensorPtr const& inputIds,
-        KvCacheManager& kvCacheManager, GptModelConfig const& modelConfig) const;
+        KvCacheManager& kvCacheManager, GptModelConfig const& modelConfig, WorldConfig const& worldConfig) const;
 
 private:
     // Some tensors are properly tiled, some are just reshaped.
-    void tile(BufferManager& manager, GenerationConfig const& generationConfig, GptModelConfig const& modelConfig);
+    void tile(BufferManager& manager, GenerationConfig const& generationConfig, GptModelConfig const& modelConfig,
+        WorldConfig const& worldConfig);
 };
 
 } // namespace tensorrt_llm::runtime

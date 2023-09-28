@@ -98,12 +98,12 @@ void OnlineBeamSearchLayer<T>::invokeSoftMax(BeamSearchOutputParams& outputs, So
 {
     TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
     Tensor const& output_ids_ptr = outputs.output_ids_ptr;
-    const int batch_size{output_ids_ptr.shape[0]};
-    const int beam_width{output_ids_ptr.shape[1]};
-    const int max_seq_len{output_ids_ptr.shape[2]};
+    const auto batch_size = static_cast<std::int32_t>(output_ids_ptr.shape[0]);
+    const auto beam_width = static_cast<std::int32_t>(output_ids_ptr.shape[1]);
+    const auto max_seq_len = static_cast<std::int32_t>(output_ids_ptr.shape[2]);
     const int ite{params.ite};
     Tensor const& logits{params.logits};
-    const int local_batch_size = logits.shape[0];
+    const auto local_batch_size = logits.shape[0];
 
     BeamHypotheses beamHypotheses;
     auto* const end_ids = params.end_ids.template getPtr<const int>();

@@ -18,9 +18,7 @@
 
 #include <NvInferRuntime.h>
 
-namespace tensorrt_llm
-{
-namespace runtime
+namespace tensorrt_llm::runtime
 {
 
 class TllmLogger : public nvinfer1::ILogger
@@ -33,5 +31,4 @@ public:
     void setLevel(Severity level);
 };
 
-} // namespace runtime
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::runtime

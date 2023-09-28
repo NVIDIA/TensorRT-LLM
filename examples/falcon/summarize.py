@@ -26,25 +26,36 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization import QuantMode
 
 from build import get_engine_name  # isort:skip
 
 
 def TRTFalcon(args, config):
-    dtype = config['builder_config']['precision']
-    world_size = config['builder_config']['tensor_parallel']
-    assert world_size == tensorrt_llm.mpi_world_size(), \
-        f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
+    builder_config = config['builder_config']
+    plugin_config = config['plugin_config']
 
-    world_size = config['builder_config']['tensor_parallel']
-    num_heads = config['builder_config']['num_heads'] // world_size
-    hidden_size = config['builder_config']['hidden_size'] // world_size
-    vocab_size = config['builder_config']['vocab_size']
-    num_layers = config['builder_config']['num_layers']
-    use_gpt_attention_plugin = bool(
-        config['plugin_config']['gpt_attention_plugin'])
-    num_kv_heads = config['builder_config'].get('num_kv_heads', num_heads)
-    num_kv_heads = (num_kv_heads + world_size - 1) // world_size
+    dtype = builder_config['precision']
+    tp_size = builder_config['tensor_parallel']
+    pp_size = builder_config['pipeline_parallel']
+    world_size = tp_size * pp_size
+    assert world_size == tensorrt_llm.mpi_world_size(), \
+        f'Engine world size ({world_size}) != Runtime world size '\
+        f'({tensorrt_llm.mpi_world_size()})'
+    assert pp_size == 1, 'Python runtime does not support pipeline parallelism'
+
+    num_heads = builder_config['num_heads'] // tp_size
+    hidden_size = builder_config['hidden_size'] // tp_size
+    vocab_size = builder_config['vocab_size']
+    num_layers = builder_config['num_layers']
+    num_kv_heads = builder_config.get('num_kv_heads', num_heads)
+    num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
+    tokens_per_block = config['builder_config']['tokens_per_block']
+    quant_mode = QuantMode(builder_config['quant_mode'])
+
+    use_gpt_attention_plugin = bool(plugin_config['gpt_attention_plugin'])
+    paged_kv_cache = plugin_config['paged_kv_cache']
+    remove_input_padding = plugin_config['remove_input_padding']
 
     model_config = tensorrt_llm.runtime.ModelConfig(
         vocab_size=vocab_size,
@@ -52,15 +63,21 @@ def TRTFalcon(args, config):
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         hidden_size=hidden_size,
-        gpt_attention_plugin=use_gpt_attention_plugin)
+        gpt_attention_plugin=use_gpt_attention_plugin,
+        paged_kv_cache=paged_kv_cache,
+        tokens_per_block=tokens_per_block,
+        remove_input_padding=remove_input_padding,
+        quant_mode=quant_mode)
 
     runtime_rank = tensorrt_llm.mpi_rank()
     runtime_mapping = tensorrt_llm.Mapping(world_size,
                                            runtime_rank,
-                                           tp_size=world_size)
+                                           tp_size=tp_size,
+                                           pp_size=pp_size)
     torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
 
-    engine_name = get_engine_name('falcon', dtype, world_size, runtime_rank)
+    engine_name = get_engine_name('falcon', dtype, tp_size, pp_size,
+                                  runtime_rank)
     serialize_path = os.path.join(args.engine_dir, engine_name)
 
     profiler.start('load tensorrt_llm engine')
@@ -171,9 +188,7 @@ def main(args):
                 pad_size = max_length - input_lengths[i]
 
                 pad = torch.ones([1, pad_size]).type(torch.int32) * pad_id
-                line_encoded[i] = torch.cat(
-                    [torch.tensor(line_encoded[i], dtype=torch.int32), pad],
-                    axis=-1)
+                line_encoded[i] = torch.cat([line_encoded[i], pad], axis=-1)
 
             line_encoded = torch.cat(line_encoded, axis=0).cuda()
             input_lengths = torch.tensor(input_lengths,
@@ -188,9 +203,10 @@ def main(args):
             repetition_penalty=repetition_penalty)
 
         with torch.no_grad():
-            tensorrt_llm_falcon.setup(line_encoded.size(0),
-                                      max_context_length=line_encoded.size(1),
-                                      max_new_tokens=output_len)
+            tensorrt_llm_falcon.setup(batch_size,
+                                      max_context_length=max_length,
+                                      max_new_tokens=output_len,
+                                      beam_width=num_beams)
 
             if tensorrt_llm_falcon.remove_input_padding:
                 output_ids = tensorrt_llm_falcon.decode_batch(
@@ -225,10 +241,8 @@ def main(args):
             line[i] = line[i].strip()
             line[i] = line[i].replace(" n't", "n't")
 
-        line_encoded = tokenizer(line,
-                                 return_tensors='pt',
-                                 padding=True,
-                                 truncation=True)["input_ids"].long()
+        line_encoded = tokenizer(line, return_tensors='pt',
+                                 padding=True)["input_ids"].long()
 
         line_encoded = line_encoded[:, -test_token_num:]
         line_encoded = line_encoded.cuda()

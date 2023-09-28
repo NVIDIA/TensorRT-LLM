@@ -24,6 +24,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/runtime/gptDecoderBatch.h"
+#include "tensorrt_llm/runtime/ncclCommunicator.h"
 #include "tensorrt_llm/runtime/runtimeBuffers.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/statefulGptDecoder.h"
@@ -50,32 +51,52 @@ GptSession::GptSession(GptModelConfig const& modelConfig, WorldConfig const& wor
     , mBuffers{std::make_shared<RuntimeBuffers>()}
     , mCudaGraphInstances{}
 {
-    TLLM_CHECK_WITH_INFO(mRuntime->getNbProfiles() == 1, "GPT only expects one optimization profile");
     createContexts();
-    mBuffers->create(*mRuntime, mModelConfig);
+    mBuffers->create(*mRuntime, mModelConfig, mWorldConfig);
+
+    if (mWorldConfig.isPipelineParallel())
+    {
+        mPipelineComm = NcclCommunicator::createPipelineComm(mWorldConfig, *mLogger);
+    }
+
     // TODO compare expected and runtime tensor names?
 }
 
-nvinfer1::ILogger& tensorrt_llm::runtime::GptSession::getLogger() const
+nvinfer1::ILogger& GptSession::getLogger() const
 {
     return *mLogger;
 }
 
-BufferManager& tensorrt_llm::runtime::GptSession::getBufferManager() const
+BufferManager& GptSession::getBufferManager() const
 {
     return mRuntime->getBufferManager();
 }
 
 void GptSession::createContexts()
 {
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     mRuntime->clearContexts();
+    auto numProfiles = mRuntime->getNbProfiles();
+    TLLM_CHECK_WITH_INFO(
+        numProfiles == 1 || numProfiles == 2, "GPT only expects one optimization profile or two optimization profiles");
     // Instantiate two contexts for flip-flopping
-    mRuntime->addContext(0);
-    mRuntime->addContext(0);
+    if (numProfiles == 1)
+    {
+        mRuntime->addContext(0);
+        mRuntime->addContext(0);
+    }
+    else
+    {
+        mRuntime->addContext(1);
+        mRuntime->addContext(1);
+        mRuntime->addContext(0);
+    }
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
 void GptSession::createDecoder(bool decoderPerRequest)
 {
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto const vocabSize = mModelConfig.getVocabSize();
     auto const vocabSizePadded = mModelConfig.getVocabSizePadded(mWorldConfig.getSize());
     auto const& stream = mRuntime->getStreamPtr();
@@ -84,6 +105,7 @@ void GptSession::createDecoder(bool decoderPerRequest)
         mDecoder = std::make_shared<GptDecoderBatch>(vocabSize, vocabSizePadded, stream);
     else
         mDecoder = std::make_shared<StatefulGptDecoder>(vocabSize, vocabSizePadded, stream);
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
 void GptSession::setup(SizeType const batchSize, SizeType const beamWidth, SizeType const maxSequenceLength,
@@ -116,14 +138,17 @@ void GptSession::setup(SizeType const batchSize, SizeType const beamWidth, SizeT
             tokensPerBlock, maxNumBlocks, batchSize, kvDtype, mRuntime->getStreamPtr());
     }
 
-    auto const logitsType = utils::getTensorDataType(mRuntime->getEngine(), "logits");
-
-    createDecoder(decoderPerRequest);
-    mDecoder->setup(batchSize, beamWidth, maxSequenceLength, logitsType);
+    if (mWorldConfig.isLastPipelineParallelRank())
+    {
+        auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
+        createDecoder(decoderPerRequest);
+        mDecoder->setup(batchSize, beamWidth, maxSequenceLength, logitsType);
+    }
 
     // reshape does not care about maxInputLength or maxNewTokens
     auto const generationConfig = RuntimeBuffers::GenerationConfig{batchSize, beamWidth, 0, 0, maxSequenceLength};
-    mBuffers->reshape(generationConfig, mModelConfig, mWorldConfig.getSize());
+    mBuffers->reshape(generationConfig, mModelConfig, mWorldConfig);
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
 void GptSession::generate(
@@ -151,20 +176,11 @@ void GptSession::generate(
     auto const beamWidth = generationConfig.beamWidth;
     auto const maxInputLength = generationConfig.maxInputLength;
     auto const maxNewTokens = generationConfig.maxNewTokens;
-    auto const maxSeqLength = generationConfig.maxSeqLength;
-    auto finalSeqLength = maxSeqLength;
 
     TLLM_CHECK_WITH_INFO(buffers.allocated, "Buffers not allocated, please call setup first!");
 
-    buffers.reshape(generationConfig, mModelConfig, mWorldConfig.getSize());
+    buffers.reshape(generationConfig, mModelConfig, mWorldConfig);
 
-    if (mModelConfig.usePackedInput())
-    {
-        buffers.inputOffsets->reshape(ITensor::makeShape({batchSize + 1}));
-        manager.setZero(*buffers.inputOffsets);
-        kernels::invokeInclusiveSum(
-            *ITensor::slice(buffers.inputOffsets, 1), *buffers.contextLengthsDevice, manager, stream);
-    }
     if (mModelConfig.usePagedKvCache())
     {
         auto const contextLengthsHost = bufferCast<SizeType const>(*buffers.contextLengthsHost);
@@ -174,23 +190,39 @@ void GptSession::generate(
         }
     }
 
-    mDecoder->newBatch(inputs, samplingConfig);
-
     RuntimeBuffers::TensorMap inputBuffers[2];
     RuntimeBuffers::TensorMap outputBuffers[2];
     auto& onTokenGenerated = outputs.onTokenGenerated;
+    outputs.ids->reshape(ITensor::makeShape({batchSize, beamWidth, mDecoderMaxSequenceLength}));
+    ITensor::SharedPtr newTokens;
+    if (mWorldConfig.isLastPipelineParallelRank())
+    {
+        mDecoder->newBatch(inputs, samplingConfig);
+        newTokens = mDecoder->getNewTokens();
+    }
+    else if (mWorldConfig.isFirstPipelineParallelRank())
+    {
+        newTokens = manager.gpu(ITensor::makeShape({batchSize, beamWidth}), nvinfer1::DataType::kINT32);
+    }
 
     for (SizeType step = 0; step < maxNewTokens; ++step)
     {
         auto const contextId = step % 2;
+        bool enqueueSuccessful = false;
         if (step == 0)
         {
+            SizeType contextIdForContextPhase = 0;
+            if (mRuntime->getNbProfiles() == 2)
+            {
+                contextIdForContextPhase = 2;
+            }
             buffers.prepareContextStep(
-                inputs.ids, inputs.padId, manager, *mKvCacheManager, generationConfig, mModelConfig);
-            buffers.getRuntimeBuffers(
-                inputBuffers[contextId], outputBuffers[contextId], step, inputs.ids, *mKvCacheManager, mModelConfig);
-            mRuntime->setInputTensors(contextId, inputBuffers[contextId]);
-            mRuntime->setOutputTensors(contextId, outputBuffers[contextId]);
+                inputs.ids, inputs.padId, manager, *mKvCacheManager, generationConfig, mModelConfig, mWorldConfig);
+            buffers.getRuntimeBuffers(inputBuffers[contextId], outputBuffers[contextId], step, inputs.ids,
+                *mKvCacheManager, mModelConfig, mWorldConfig);
+            mRuntime->setInputTensors(contextIdForContextPhase, inputBuffers[contextId]);
+            mRuntime->setOutputTensors(contextIdForContextPhase, outputBuffers[contextId]);
+
             if (isCudaGraphMode())
             {
                 for (auto& instance : mCudaGraphInstances)
@@ -198,16 +230,19 @@ void GptSession::generate(
                     instance.clear();
                 }
             }
-        }
-        bool enqueueSuccessful = false;
-        if (isCudaGraphMode() && mCudaGraphInstances[contextId].hasInstance())
-        {
-            mCudaGraphInstances[contextId].launch(stream);
-            enqueueSuccessful = true;
+            enqueueSuccessful = mRuntime->executeContext(contextIdForContextPhase);
         }
         else
         {
-            enqueueSuccessful = mRuntime->executeContext(contextId);
+            if (isCudaGraphMode() && mCudaGraphInstances[contextId].hasInstance())
+            {
+                mCudaGraphInstances[contextId].launch(stream);
+                enqueueSuccessful = true;
+            }
+            else
+            {
+                enqueueSuccessful = mRuntime->executeContext(contextId);
+            }
         }
 
         TLLM_CHECK_WITH_INFO(enqueueSuccessful, "Executing TRT engine failed!");
@@ -215,50 +250,25 @@ void GptSession::generate(
 
         if (step == 0)
         {
-            buffers.postContextStep(manager, generationConfig, mModelConfig);
+            buffers.postContextStep(manager, generationConfig, mModelConfig, mWorldConfig);
         }
 
         std::swap(buffers.cacheIndirectionDecoderInput, buffers.cacheIndirectionDecoderOutput);
-
-        decoder::Input decodingInput{buffers.logits};
-        decoder::Output decodingOutput{};
-        decodingInput.cacheIndirection = buffers.cacheIndirectionDecoderInput;
-        decodingOutput.cacheIndirection = buffers.cacheIndirectionDecoderOutput;
 
         if (step < maxNewTokens - 1)
         {
             auto const nextStep = step + 1;
             auto const nextContextId = nextStep % 2;
             auto nextInputIds = buffers.prepareNextStep(
-                step, mDecoder->getNewTokens(), manager, *mKvCacheManager, generationConfig, mModelConfig);
+                step, newTokens, manager, *mKvCacheManager, generationConfig, mModelConfig, mWorldConfig);
             buffers.getRuntimeBuffers(inputBuffers[nextContextId], outputBuffers[nextContextId], nextStep, nextInputIds,
-                *mKvCacheManager, mModelConfig);
+                *mKvCacheManager, mModelConfig, mWorldConfig);
             mRuntime->setInputTensors(nextContextId, inputBuffers[nextContextId]);
             mRuntime->setOutputTensors(nextContextId, outputBuffers[nextContextId]);
 
             if (isCudaGraphMode())
             {
-                // capture cuda graph
-                cudaGraph_t next_graph;
-                TLLM_CUDA_CHECK(cudaStreamBeginCapture(stream.get(), cudaStreamCaptureModeThreadLocal));
-                mRuntime->executeContext(nextContextId);
-                TLLM_CUDA_CHECK(cudaStreamEndCapture(stream.get(), &next_graph));
-
-                if (mCudaGraphInstances[nextContextId].hasInstance())
-                {
-                    if (mCudaGraphInstances[nextContextId].update(next_graph))
-                    {
-                        mCudaGraphInstances[nextContextId].clear();
-                        mCudaGraphInstances[nextContextId].create(next_graph);
-                    }
-                }
-                else
-                {
-                    mCudaGraphInstances[nextContextId].create(next_graph);
-                }
-
-                TLLM_CUDA_CHECK(cudaGraphDestroy(next_graph));
-                mCudaGraphInstances[nextContextId].uploadToStream(stream);
+                mCudaGraphInstances[nextContextId].prepareNextGraph(*mRuntime, nextContextId);
             }
         }
 
@@ -267,17 +277,21 @@ void GptSession::generate(
         // FIXME(nkorobov): this synchronize is important to get logits right
         // manager.getStream().synchronize();
 
-        auto const shouldStop = mDecoder->forward(decodingOutput, decodingInput);
+        auto shouldStop = executeDecoderStep(outputs.ids, newTokens, maxInputLength + step);
 
-        if (onTokenGenerated)
+        if (mWorldConfig.isFirstPipelineParallelRank())
         {
-            // TODO(rkobus) use getNewTokens(), remove step from Callback?
-            onTokenGenerated(mDecoder->getOutputIds(), step, shouldStop || step == maxNewTokens - 1);
+            if (onTokenGenerated)
+            {
+                // TODO(rkobus) use getNewTokens(), remove step from Callback?
+                ITensor::SharedPtr outputIds
+                    = mWorldConfig.isPipelineParallel() ? outputs.ids : mDecoder->getOutputIds();
+                onTokenGenerated(outputIds, step, shouldStop || step == maxNewTokens - 1);
+            }
         }
 
         if (shouldStop)
         {
-            finalSeqLength = maxInputLength + step + 1;
             mLogger->log(nvinfer1::ILogger::Severity::kVERBOSE, "GPT decoding finished early");
             break;
         }
@@ -291,38 +305,161 @@ void GptSession::generate(
         }
     }
 
-    outputs.ids->reshape(ITensor::makeShape({batchSize, beamWidth, finalSeqLength}));
-    manager.copy(*mDecoder->getFinalOutputIds(), *outputs.ids);
+    finalizeOutputIds(*outputs.ids);
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+}
+
+bool GptSession::executeDecoderStep(ITensor::SharedPtr& outputIds, ITensor::SharedPtr& newTokens, SizeType decoderStep)
+{
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    auto& stream = mRuntime->getStream();
+    auto& buffers = *mBuffers;
+
+    auto shouldStopPtr = bufferCast<std::uint8_t>(*buffers.shouldStop);
+    auto& shouldStop = *shouldStopPtr;
+    shouldStop = false;
+    if (mWorldConfig.isLastPipelineParallelRank())
+    {
+        decoder::Input decodingInput{buffers.logits};
+        decoder::Output decodingOutput{};
+        decodingInput.cacheIndirection = buffers.cacheIndirectionDecoderInput;
+        decodingOutput.cacheIndirection = buffers.cacheIndirectionDecoderOutput;
+        decodingOutput.sequenceLengths = buffers.sequenceLengths;
+
+        shouldStop = mDecoder->forward(decodingOutput, decodingInput);
+    }
+
+    if (mWorldConfig.isPipelineParallel())
+    {
+        if (mWorldConfig.isLastPipelineParallelRank())
+        {
+            for (auto peer = 0; peer < mWorldConfig.getPipelineParallelism() - 1; ++peer)
+            {
+                mPipelineComm->send(shouldStopPtr, 1, peer, stream, *mLogger);
+            }
+            mPipelineComm->send(bufferCast<std::int32_t>(*newTokens), newTokens->getSize(), 0, stream, *mLogger);
+        }
+        else
+        {
+            auto const peer = mWorldConfig.getPipelineParallelism() - 1;
+            mPipelineComm->receive(shouldStopPtr, 1, peer, stream, *mLogger);
+
+            if (mWorldConfig.isFirstPipelineParallelRank())
+            {
+                mPipelineComm->receive(
+                    bufferCast<std::int32_t>(*newTokens), newTokens->getSize(), peer, stream, *mLogger);
+
+                auto const& newTokensShape = newTokens->getShape();
+                auto newTokensView
+                    = ITensor::view(outputIds, ITensor::makeShape({1, newTokensShape.d[0] * newTokensShape.d[1]}));
+                auto const& outputIdsShape = outputIds->getShape();
+                auto outputIdsView = ITensor::view(
+                    outputIds, ITensor::makeShape({outputIdsShape.d[0] * outputIdsShape.d[1], outputIdsShape.d[2]}));
+                kernels::invokeTransposeWithOutputOffset(*outputIdsView, *newTokensView, decoderStep, stream);
+            }
+        }
+    }
     sync_check_cuda_error();
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    return shouldStop;
+}
+
+void GptSession::finalizeOutputIds(ITensor& outputIds)
+{
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    auto& manager = mRuntime->getBufferManager();
+    auto& stream = mRuntime->getStream();
+
+    ITensor::SharedPtr finalOutputIds;
+    if (mWorldConfig.isLastPipelineParallelRank())
+    {
+        finalOutputIds = mDecoder->getFinalOutputIds();
+        if (mWorldConfig.isPipelineParallel())
+        {
+            mPipelineComm->send(
+                bufferCast<std::int32_t>(*finalOutputIds), finalOutputIds->getSize(), 0, stream, *mLogger);
+        }
+    }
+    if (mWorldConfig.isFirstPipelineParallelRank())
+    {
+        if (mWorldConfig.isPipelineParallel())
+        {
+            auto const peer = mWorldConfig.getPipelineParallelism() - 1;
+            mPipelineComm->receive(bufferCast<std::int32_t>(outputIds), outputIds.getSize(), peer, stream, *mLogger);
+        }
+        else
+        {
+            manager.copy(*finalOutputIds, outputIds);
+        }
+    }
+    sync_check_cuda_error();
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
 void GptSession::CudaGraphExecutor::create(cudaGraph_t const& graph)
 {
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     assert(mInstance == nullptr);
     TLLM_CUDA_CHECK(cudaGraphInstantiate(&mInstance, graph, nullptr, nullptr, 0));
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
 void GptSession::CudaGraphExecutor::uploadToStream(CudaStream const& stream)
 {
-    assert(mInstance.hasInstance());
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    assert(hasInstance());
     TLLM_CUDA_CHECK(cudaGraphUpload(mInstance, stream.get()));
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
 void GptSession::CudaGraphExecutor::launch(CudaStream const& stream)
 {
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     TLLM_CUDA_CHECK(cudaGraphLaunch(mInstance, stream.get()));
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
 bool GptSession::CudaGraphExecutor::update(cudaGraph_t const& graph)
 {
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     return cudaGraphExecUpdate(mInstance, graph, nullptr) != cudaSuccess;
 }
 
 void GptSession::CudaGraphExecutor::clear()
 {
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     if (mInstance != nullptr)
     {
         TLLM_CUDA_CHECK(cudaGraphExecDestroy(mInstance));
         mInstance = nullptr;
     }
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+}
+
+void GptSession::CudaGraphExecutor::prepareNextGraph(TllmRuntime const& runtime, SizeType nextContextId)
+{
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    auto& stream = runtime.getStream();
+
+    cudaGraph_t nextGraph;
+    TLLM_CUDA_CHECK(cudaStreamBeginCapture(stream.get(), cudaStreamCaptureModeThreadLocal));
+    runtime.executeContext(nextContextId);
+    TLLM_CUDA_CHECK(cudaStreamEndCapture(stream.get(), &nextGraph));
+
+    if (hasInstance())
+    {
+        if (update(nextGraph))
+        {
+            clear();
+            create(nextGraph);
+        }
+    }
+    else
+    {
+        create(nextGraph);
+    }
+
+    TLLM_CUDA_CHECK(cudaGraphDestroy(nextGraph));
+    uploadToStream(stream);
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }

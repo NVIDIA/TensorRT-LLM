@@ -177,7 +177,7 @@ void BaseSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams 
     auto const local_batch_size = params.logits.shape[0];
     auto const ite = params.ite;
     auto const step = params.step;
-    auto const max_input_length = params.max_input_length;
+    auto* const input_lengths = params.input_lengths ? params.input_lengths->template getPtr<const int>() : nullptr;
 
     auto* logits = params.logits.template getPtr<T>();
 
@@ -219,24 +219,16 @@ void BaseSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams 
                 = params.input_lengths ? params.input_lengths->template getPtr<const int>() : nullptr;
             invokeBatchApplyRepetitionPenalty(logits, repetition_penalty_buf_ + ite * local_batch_size,
                 outputs.output_ids_ptr.template getPtr<const int*>(), outputs.sequence_length->getPtr<const int>(),
-                batch_size, local_batch_size, vocab_size_padded_, input_lengths, max_input_length,
-                repetition_penalty_type_, params.max_seq_len, stream_);
+                batch_size, local_batch_size, vocab_size_padded_, input_lengths, repetition_penalty_type_,
+                params.max_seq_len, stream_);
             sync_check_cuda_error();
         }
     }
 
-    const int num_generated_tokens = step - max_input_length;
-    const auto min_lengths = std::begin(mMinLengths) + ite * local_batch_size;
-    const bool invoke_min_length_penalty = std::any_of(
-        min_lengths, min_lengths + local_batch_size, [&](int min_length) { return min_length > num_generated_tokens; });
-    if (invoke_min_length_penalty)
-    {
-        auto* end_ids = params.end_ids.template getPtr<const int>();
-        invokeMinLengthPenalty(logits, min_lengths_buf_ + ite * local_batch_size, end_ids,
-            outputs.sequence_length->getPtr<const int>(), max_input_length, local_batch_size, vocab_size_padded_,
-            stream_);
-        sync_check_cuda_error();
-    }
+    auto* end_ids = params.end_ids.template getPtr<const int>();
+    invokeMinLengthPenalty(logits, min_lengths_buf_ + ite * local_batch_size, end_ids,
+        outputs.sequence_length->getPtr<const int>(), input_lengths, local_batch_size, vocab_size_padded_, stream_);
+    sync_check_cuda_error();
 #undef ALL_OF
 
     runSampling(outputs, params);

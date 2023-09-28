@@ -16,27 +16,98 @@
  */
 #ifndef TRT_GEMM_PLUGIN_H
 #define TRT_GEMM_PLUGIN_H
-#include "NvInferPlugin.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
+#include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include <cassert>
 #include <set>
 #include <string>
 #include <vector>
 
-namespace nvinfer1
-{
-namespace plugin
+namespace tensorrt_llm::plugins
 {
 
-class GemmPlugin : public IPluginV2DynamicExt
+using CublasGemmWrapper = tensorrt_llm::common::cublasMMWrapper;
+using CublasGemmWrapperPtr = std::shared_ptr<CublasGemmWrapper>;
+
+class GemmIdCublas
 {
 public:
+    GemmIdCore gemmIdCore{};
+    bool transA{};
+    bool transB{};
+
+    GemmIdCublas(const GemmIdCore& gemmIdCore_, bool transA_, bool transB_)
+        : gemmIdCore(gemmIdCore_)
+        , transA(transA_)
+        , transB(transB_)
+    {
+    }
+
+    GemmIdCublas() {}
+
+    bool operator==(const GemmIdCublas& id) const
+    {
+        return gemmIdCore == id.gemmIdCore && transA == id.transA && transB == id.transB;
+    }
+
+    friend std::ostream& operator<<(std::ostream& out, const GemmIdCublas& id)
+    {
+        out << "Core ID = {" << id.gemmIdCore << "}";
+        out << " transA=" << id.transA;
+        out << " transB=" << id.transB;
+        return out;
+    }
+};
+
+// Hash of GemmIdCublas
+struct GemmIdCublasHash
+{
+    std::size_t operator()(const GemmIdCublas& id) const
+    {
+        auto h1 = GemmIdCoreHash()(id.gemmIdCore);
+        auto h2 = std::hash<bool>{}(id.transA);
+        auto h3 = std::hash<bool>{}(id.transB);
+        return h1 ^ h2 ^ h3;
+    }
+};
+
+class CublasLtGemmPluginProfiler
+    : public GemmPluginProfiler<cublasLtMatmulHeuristicResult_t, CublasGemmWrapperPtr, GemmIdCublas, GemmIdCublasHash>
+{
+public:
+    using Config = cublasLtMatmulHeuristicResult_t;
+
+    void setTranspose(bool transposeA, bool transposeB)
+    {
+        mTransA = transposeA;
+        mTransB = transposeB;
+    }
+
+protected:
+    void runTactic(int m, int n, int k, const Config& tactic, char* workspace, const cudaStream_t& stream) override;
+
+    void computeTmpSize(int maxM, int n, int k) override;
+
+    bool checkTactic(int m, int n, int k, const Config& tactic) const override;
+
+private:
+    bool mTransA;
+    bool mTransB;
+
+    static constexpr size_t ALIGNMENT = 256;
+};
+
+class GemmPlugin : public BasePlugin
+{
+public:
+    using PluginProfilerPtr = std::shared_ptr<CublasLtGemmPluginProfiler>;
+
     GemmPlugin() = delete;
 
-    GemmPlugin(int transA, int transB, nvinfer1::DataType type);
+    GemmPlugin(int transA, int transB, nvinfer1::DataType type, bool useFp8, const PluginProfilerPtr& profiler);
 
-    GemmPlugin(const void* data, size_t length);
+    GemmPlugin(const void* data, size_t length, const PluginProfilerPtr& profiler);
 
     ~GemmPlugin() override = default;
 
@@ -66,23 +137,31 @@ public:
     size_t getSerializationSize() const noexcept override;
     void serialize(void* buffer) const noexcept override;
     void destroy() noexcept override;
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
-    const char* getPluginNamespace() const noexcept override;
+
+private:
+    void init();
+    void configGemm();
+    void setGemmConfig();
 
 private:
     const std::string mLayerName;
-    std::string mNamespace;
 
     int mTransA;
     int mTransB;
     nvinfer1::DataType mType;
 
-    tensorrt_llm::common::cublasAlgoMap* mCublasAlgoMap;
-    std::mutex* mCublasWrapperMutex;
-    tensorrt_llm::common::cublasMMWrapper* mCublasWrapper;
+    std::shared_ptr<tensorrt_llm::common::cublasAlgoMap> mCublasAlgoMap;
+    std::shared_ptr<std::mutex> mCublasWrapperMutex;
+    CublasGemmWrapperPtr mCublasWrapper;
+
+    GemmDims mDims{};
+    GemmIdCublas mGemmId{};
+    bool mUseFp8{false};
+
+    PluginProfilerPtr mPluginProfiler;
 };
 
-class GemmPluginCreator : public IPluginCreator
+class GemmPluginCreator : public BaseCreator
 {
 public:
     GemmPluginCreator();
@@ -98,17 +177,12 @@ public:
     nvinfer1::IPluginV2* deserializePlugin(
         const char* name, const void* serialData, size_t serialLength) noexcept override;
 
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
-
-    const char* getPluginNamespace() const noexcept override;
-
 private:
-    static PluginFieldCollection mFC;
-    static std::vector<PluginField> mPluginAttributes;
-    std::string mNamespace;
+    GemmPluginProfilerManager<CublasLtGemmPluginProfiler> gemmPluginProfileManager;
+    static nvinfer1::PluginFieldCollection mFC;
+    static std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
-} // namespace plugin
-} // namespace nvinfer1
+} // namespace tensorrt_llm::plugins
 
 #endif // TRT_GEMM_PLUGIN_H

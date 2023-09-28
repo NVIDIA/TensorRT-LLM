@@ -14,8 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "NvInfer.h"
-#include "NvInferPlugin.h"
+#include "NvInferRuntime.h"
 #include "TritonFlashAttentionPlugin.h"
 
 #include <algorithm>
@@ -25,12 +24,6 @@
 #include <mutex>
 #include <stack>
 #include <unordered_set>
-
-using namespace nvinfer1;
-using namespace nvinfer1::plugin;
-
-namespace nvinfer1
-{
 
 namespace
 {
@@ -86,12 +79,12 @@ public:
         {
             if (!errorMsg.empty())
             {
-                trtLogger->log(ILogger::Severity::kERROR, errorMsg.c_str());
+                trtLogger->log(nvinfer1::ILogger::Severity::kERROR, errorMsg.c_str());
             }
 
             if (!verboseMsg.empty())
             {
-                trtLogger->log(ILogger::Severity::kVERBOSE, verboseMsg.c_str());
+                trtLogger->log(nvinfer1::ILogger::Severity::kVERBOSE, verboseMsg.c_str());
             }
         }
     }
@@ -112,7 +105,7 @@ private:
     TritonPluginCreatorRegistry() {}
 
     std::mutex mRegistryLock;
-    std::stack<std::unique_ptr<IPluginCreator>> mRegistry;
+    std::stack<std::unique_ptr<nvinfer1::IPluginCreator>> mRegistry;
     std::unordered_set<std::string> mRegistryList;
 
 public:
@@ -127,15 +120,14 @@ void initializeTritonPlugin(void* logger, const char* libNamespace)
 }
 
 } // namespace
-} // namespace nvinfer1
 
 // New Plugin APIs
 
 extern "C"
 {
-    bool initLibNvInferPlugins(void* logger, const char* libNamespace)
+    bool initOpenAiTritonPlugins(void* logger, const char* libNamespace)
     {
-        nvinfer1::initializeTritonPlugin<nvinfer1::plugin::TritonFlashAttentionPluginCreator>(logger, libNamespace);
+        initializeTritonPlugin<openai_triton::plugin::TritonFlashAttentionPluginCreator>(logger, libNamespace);
         return true;
     }
 } // extern "C"

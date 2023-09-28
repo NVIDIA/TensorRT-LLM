@@ -18,9 +18,10 @@ import tensorrt as trt
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
-from ...functional import Tensor, gather_last_token_logits
-from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, LayerNorm, PositionEmbeddingType)
+from ...functional import Tensor, gather_last_token_logits, recv, send
+from ...layers import (MLP, Attention, AttentionMaskType, AttentionParams,
+                       ColumnLinear, Embedding, KeyValueCacheParams, LayerNorm,
+                       PositionEmbeddingType)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
 from ...quantization import QuantMode
@@ -79,6 +80,7 @@ class FalconDecoderLayer(Module):
             tp_size=tp_size,
             use_int8_kv_cache=quant_mode.has_int8_kv_cache(),
             scale_alibi_bias=True,
+            quant_mode=quant_mode,
         )
 
         if mlp_hidden_size is None:
@@ -102,6 +104,7 @@ class FalconDecoderLayer(Module):
             bias=bias,
             tp_group=tp_group,
             tp_size=tp_size,
+            quant_mode=quant_mode,
         )
         if self.new_decoder_architecture or self.parallel_attn:
             self.post_layernorm = None
@@ -112,15 +115,9 @@ class FalconDecoderLayer(Module):
     def forward(self,
                 hidden_states: Tensor,
                 attention_mask=None,
-                past_key_value=None,
-                sequence_length=None,
-                host_past_key_value_lengths=None,
                 use_cache=False,
-                cache_indirection=None,
-                context_lengths=None,
-                host_context_lengths=None,
-                host_request_types=None,
-                max_context_length=None):
+                kv_cache_params=None,
+                attention_params=None):
         assert isinstance(hidden_states, Tensor)
 
         residual = hidden_states
@@ -129,18 +126,11 @@ class FalconDecoderLayer(Module):
             mlp_ln_output = self.mlp_layernorm(hidden_states)
         hidden_states = self.input_layernorm(hidden_states)
         input_ln_output = hidden_states
-        attention_output = self.attention(
-            hidden_states,
-            attention_mask=attention_mask,
-            past_key_value=past_key_value,
-            sequence_length=sequence_length,
-            host_past_key_value_lengths=host_past_key_value_lengths,
-            use_cache=use_cache,
-            cache_indirection=cache_indirection,
-            context_lengths=context_lengths,
-            host_context_lengths=host_context_lengths,
-            host_request_types=host_request_types,
-            max_context_length=max_context_length)
+        attention_output = self.attention(hidden_states,
+                                          attention_mask=attention_mask,
+                                          use_cache=use_cache,
+                                          kv_cache_params=kv_cache_params,
+                                          attention_params=attention_params)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -192,22 +182,25 @@ class FalconModel(Module):
         self.num_kv_heads = num_kv_heads or num_heads
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
+        self.mapping = mapping
 
         # Falcon variants
         self.parallel_attention = parallel_attention
         self.new_decoder_architecture = new_decoder_architecture
 
+        self.quant_mode = quant_mode
         assert isinstance(dtype, (str, trt.DataType))
         if isinstance(dtype, str):
             self.dtype = str_dtype_to_trt(dtype)
         else:
             self.dtype = dtype
-        if quant_mode.has_int8_kv_cache():
+        if self.quant_mode.has_int8_kv_cache():
             self.kv_dtype = str_dtype_to_trt('int8')
         else:
             self.kv_dtype = self.dtype
 
-        self.embedding = Embedding(vocab_size, hidden_size, dtype=dtype)
+        if self.mapping.is_first_pp_rank():
+            self.embedding = Embedding(vocab_size, hidden_size, dtype=dtype)
 
         self.layers = ModuleList([
             FalconDecoderLayer(
@@ -216,7 +209,7 @@ class FalconModel(Module):
                 max_position_embeddings=max_position_embeddings,
                 dtype=dtype,
                 bias=bias,
-                quant_mode=quant_mode,
+                quant_mode=self.quant_mode,
                 hidden_act=hidden_act,
                 num_attention_kv_heads=self.num_kv_heads,
                 mlp_hidden_size=mlp_hidden_size,
@@ -226,51 +219,55 @@ class FalconModel(Module):
                 tp_group=mapping.tp_group,
                 tp_size=mapping.tp_size,
                 layer_id=i,
-            ) for i in range(num_layers)
+            ) for i in self.get_transformer_layers(self.mapping, num_layers)
         ])
 
-        self.ln_f = LayerNorm(normalized_shape=hidden_size, dtype=dtype)
+        if self.mapping.is_last_pp_rank():
+            self.ln_f = LayerNorm(normalized_shape=hidden_size, dtype=dtype)
 
     def forward(self,
                 input_ids: Tensor,
                 position_ids=None,
-                past_key_value=None,
-                sequence_length=None,
-                host_past_key_value_lengths=None,
                 use_cache=False,
                 attention_mask=None,
-                cache_indirection=None,
-                context_lengths=None,
-                host_context_lengths=None,
-                host_request_types=None,
-                max_context_length: int = None):
-        hidden_states = self.embedding(input_ids)
+                kv_cache_params=None,
+                attention_params=None,
+                hidden_states=None):
 
-        if past_key_value is None:
-            past_key_value = tuple([None] * len(self.layers))
+        if kv_cache_params.past_key_value is None:
+            kv_cache_params.past_key_value = tuple([None] * len(self.layers))
 
         if use_cache:
             presents = []
 
-        for layer, past in zip(self.layers, past_key_value):
+        if self.mapping.is_first_pp_rank():
+            hidden_states = self.embedding(input_ids)
+        else:
+            hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
+
+        for layer, past, pointer in zip(
+                self.layers, kv_cache_params.past_key_value,
+                kv_cache_params.kv_cache_block_pointers):
             hidden_states = layer(
                 hidden_states,
-                past_key_value=past,
-                sequence_length=sequence_length,
-                host_past_key_value_lengths=host_past_key_value_lengths,
                 use_cache=use_cache,
                 attention_mask=attention_mask,
-                cache_indirection=cache_indirection,
-                context_lengths=context_lengths,
-                host_context_lengths=host_context_lengths,
-                host_request_types=host_request_types,
-                max_context_length=max_context_length)
+                kv_cache_params=KeyValueCacheParams(
+                    past_key_value=[past],
+                    host_past_key_value_lengths=kv_cache_params.
+                    host_past_key_value_lengths,
+                    kv_cache_block_pointers=[pointer],
+                    cache_indirection=kv_cache_params.cache_indirection),
+                attention_params=attention_params)
 
             if use_cache:
                 presents.append(hidden_states[1])
                 hidden_states = hidden_states[0]
 
-        hidden_states = self.ln_f(hidden_states)
+        if self.mapping.is_last_pp_rank():
+            hidden_states = self.ln_f(hidden_states)
+        else:
+            hidden_states = send(hidden_states, self.mapping.next_pp_rank())
 
         if use_cache:
             return (hidden_states, tuple(presents))
@@ -311,16 +308,21 @@ class FalconForCausalLM(FalconModel, GenerationMixin):
                          use_alibi=use_alibi,
                          parallel_attention=parallel_attention,
                          new_decoder_architecture=new_decoder_architecture)
+
+        # TODO: For compatibility to quantization modules. Remove it later.
+        self._num_layers = num_layers
+
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
-        self.lm_head = ColumnLinear(
-            hidden_size,
-            vocab_size_padded,
-            bias=False,
-            dtype=dtype,
-            tp_group=mapping.tp_group,
-            tp_size=mapping.tp_size,
-            gather_output=True,
-        )
+        if self.mapping.is_last_pp_rank():
+            self.lm_head = ColumnLinear(
+                hidden_size,
+                vocab_size_padded,
+                bias=False,
+                dtype=dtype,
+                tp_group=mapping.tp_group,
+                tp_size=mapping.tp_size,
+                gather_output=True,
+            )
         if isinstance(logits_dtype, str):
             self.logits_dtype = str_dtype_to_trt(logits_dtype)
         else:
@@ -330,57 +332,58 @@ class FalconForCausalLM(FalconModel, GenerationMixin):
     def forward(self,
                 input_ids: Tensor,
                 position_ids=None,
-                past_key_value=None,
-                sequence_length=None,
-                host_past_key_value_lengths=None,
                 use_cache=False,
                 last_token_ids=None,
                 attention_mask=None,
-                cache_indirection=None,
-                context_lengths=None,
-                host_context_lengths=None,
-                host_request_types=None,
-                max_context_length=None):
-        hidden_states = super().forward(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            sequence_length=sequence_length,
-            host_past_key_value_lengths=host_past_key_value_lengths,
-            use_cache=use_cache,
-            attention_mask=attention_mask,
-            cache_indirection=cache_indirection,
-            context_lengths=context_lengths,
-            host_context_lengths=host_context_lengths,
-            host_request_types=host_request_types,
-            max_context_length=max_context_length)
+                kv_cache_params=None,
+                attention_params=None,
+                hidden_states=None):
+
+        hidden_states = super().forward(input_ids=input_ids,
+                                        position_ids=position_ids,
+                                        use_cache=use_cache,
+                                        attention_mask=attention_mask,
+                                        kv_cache_params=kv_cache_params,
+                                        attention_params=attention_params,
+                                        hidden_states=hidden_states)
 
         if use_cache:
             hidden_states, presents = hidden_states
 
-        hidden_states = gather_last_token_logits(
-            hidden_states,
-            last_token_ids,
-            default_net().plugin_config.remove_input_padding,
-        )
+        if self.mapping.is_last_pp_rank():
+            hidden_states = gather_last_token_logits(
+                hidden_states,
+                last_token_ids,
+                default_net().plugin_config.remove_input_padding,
+            )
 
-        # [batch_size, hidden_size] -> [batch_size, vocab_size]
-        lm_logits = self.lm_head(hidden_states)
-        lm_logits.mark_output('logits', self.logits_dtype)
+            # [batch_size, hidden_size] -> [batch_size, vocab_size]
+            lm_logits = self.lm_head(hidden_states)
+            lm_logits.mark_output('logits', self.logits_dtype)
+        else:
+            hidden_states.mark_output('hidden_states_output', self.dtype)
 
         if use_cache:
             for i, present in enumerate(presents):
                 present.mark_output(f'present_key_value_{i}', self.kv_dtype)
-            return lm_logits, presents
-
-        return lm_logits
+            if self.mapping.is_last_pp_rank():
+                return lm_logits, presents
+            else:
+                return hidden_states, presents
+        else:
+            if self.mapping.is_last_pp_rank():
+                return lm_logits
+            else:
+                return hidden_states
 
     def prepare_inputs(self,
-                       max_batch_size,
-                       max_input_len,
-                       max_new_tokens,
-                       use_cache,
-                       max_beam_width: int = 1):
+                       max_batch_size: int,
+                       max_input_len: int,
+                       max_new_tokens: int,
+                       use_cache: bool,
+                       max_beam_width: int = 1,
+                       paged_kv_cache: bool = False,
+                       tokens_per_block: int = 64):
         '''
 
         @brief: Prepare inputs Tensors for the model, the given sizes are used
@@ -391,7 +394,6 @@ class FalconForCausalLM(FalconModel, GenerationMixin):
 
         # Prepare inputs
         head_size = self.hidden_size // self.num_heads
-        num_kv_heads = self.layers[0].attention.num_attention_kv_heads
 
         plugin_config = default_net().plugin_config
         use_gpt_attention_plugin = plugin_config.gpt_attention_plugin
@@ -402,19 +404,37 @@ class FalconForCausalLM(FalconModel, GenerationMixin):
             max_beam_width=max_beam_width,
             max_input_len=max_input_len,
             max_new_tokens=max_new_tokens,
-            num_heads=num_kv_heads,
+            num_kv_heads=self.num_kv_heads,
             head_size=head_size,
             num_layers=self.num_layers,
             kv_dtype=self.kv_dtype,
             use_gpt_attention_plugin=use_gpt_attention_plugin,
             remove_input_padding=remove_input_padding,
+            paged_kv_cache=paged_kv_cache,
+            tokens_per_block=tokens_per_block,
+            dtype=self.dtype,
+            num_heads=self.num_heads,
+            mapping=self.mapping,
         )
 
-        return (model_inputs['input_ids'], model_inputs['position_ids'],
-                model_inputs['past_key_value'], model_inputs['sequence_length'],
-                model_inputs['host_past_key_value_lengths'], use_cache,
-                model_inputs['last_token_ids'], model_inputs['attention_mask'],
-                model_inputs['cache_indirection'],
-                model_inputs['context_lengths'],
-                model_inputs['host_context_lengths'],
-                model_inputs['host_request_types'], max_input_len)
+        return (
+            model_inputs['input_ids'],
+            model_inputs['position_ids'],
+            use_cache,
+            model_inputs['last_token_ids'],
+            model_inputs['attention_mask'],
+            KeyValueCacheParams(
+                past_key_value=model_inputs['past_key_value'],
+                host_past_key_value_lengths=model_inputs[
+                    'host_past_key_value_lengths'],
+                kv_cache_block_pointers=model_inputs[
+                    'kv_cache_block_pointers_list'],
+                cache_indirection=model_inputs['cache_indirection']),
+            AttentionParams(
+                sequence_length=model_inputs['sequence_length'],
+                context_lengths=model_inputs['context_lengths'],
+                host_context_lengths=model_inputs['host_context_lengths'],
+                max_context_length=max_input_len,
+                host_request_types=model_inputs['host_request_types']),
+            model_inputs['hidden_states_input'],
+        )

@@ -415,12 +415,12 @@ public:
             "");
 
         multiplies<ExpandedMmaOperandB> mul_op;
-        plus<ExpandedMmaOperandB> plus_op;
-
         ExpandedMmaOperandB* operand_frag_ptr = reinterpret_cast<ExpandedMmaOperandB*>(&operand_frag);
 
         if constexpr (hasZero(QuantOp))
         {
+            plus<ExpandedMmaOperandB> plus_op;
+
             CUTLASS_PRAGMA_UNROLL
             for (int mma_n_iter = 0; mma_n_iter < MmaOperator::MmaIterations::kColumn; ++mma_n_iter)
             {

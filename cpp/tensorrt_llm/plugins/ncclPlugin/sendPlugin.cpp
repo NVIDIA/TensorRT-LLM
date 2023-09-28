@@ -14,16 +14,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/plugins/ncclPlugin/sendPlugin.h"
+#include "sendPlugin.h"
 
 using namespace nvinfer1;
-using nvinfer1::plugin::SendPluginCreator;
-using nvinfer1::plugin::SendPlugin;
+using tensorrt_llm::plugins::SendPluginCreator;
+using tensorrt_llm::plugins::SendPlugin;
 
 static const char* SEND_PLUGIN_VERSION{"1"};
 static const char* SEND_PLUGIN_NAME{"Send"};
 PluginFieldCollection SendPluginCreator::mFC{};
-std::vector<PluginField> SendPluginCreator::mPluginAttributes;
+std::vector<nvinfer1::PluginField> SendPluginCreator::mPluginAttributes;
 
 SendPlugin::SendPlugin(int tgtRank, nvinfer1::DataType type)
     : mTgtRank(tgtRank)
@@ -37,7 +37,7 @@ SendPlugin::SendPlugin(const void* data, size_t length)
     const char *d = reinterpret_cast<const char*>(data), *a = d;
     read(d, mType);
     read(d, mTgtRank);
-    PLUGIN_ASSERT(d == a + length);
+    TLLM_CHECK(d == a + length);
 }
 
 // IPluginV2DynamicExt Methods
@@ -159,16 +159,6 @@ void SendPlugin::destroy() noexcept
     delete this;
 }
 
-void SendPlugin::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* SendPlugin::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
-}
-
 ///////////////
 
 SendPluginCreator::SendPluginCreator()
@@ -208,12 +198,12 @@ IPluginV2* SendPluginCreator::createPlugin(const char* name, const PluginFieldCo
         const char* attrName = fields[i].name;
         if (!strcmp(attrName, "tgt_rank"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             tgtRank = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "type_id"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
         }
     }
@@ -246,14 +236,4 @@ IPluginV2* SendPluginCreator::deserializePlugin(const char* name, const void* se
         caughtError(e);
     }
     return nullptr;
-}
-
-void SendPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* SendPluginCreator::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
 }

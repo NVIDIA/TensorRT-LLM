@@ -16,9 +16,10 @@ import tensorrt as trt
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
-from ...functional import Tensor, gather_last_token_logits
-from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
-                       GatedMLP, PositionEmbeddingType, RmsNorm)
+from ...functional import gather_last_token_logits, recv, send
+from ...layers import (Attention, AttentionMaskType, AttentionParams,
+                       ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
+                       PositionEmbeddingType, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
 from ...quantization import QuantMode
@@ -37,10 +38,13 @@ class LLaMADecoderLayer(Module):
                  attention_mask_type=AttentionMaskType.causal,
                  hidden_act='silu',
                  position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
+                 rotary_base=10000.0,
+                 rotary_scaling=None,
                  mlp_hidden_size=None,
                  tp_group=None,
                  tp_size=1,
-                 quant_mode=QuantMode(0)):
+                 quant_mode=QuantMode(0),
+                 rms_norm_eps=1e-06):
         super().__init__()
         self._layer_id = layer_id  # useful for debugging
         # used for quantizing model
@@ -56,6 +60,7 @@ class LLaMADecoderLayer(Module):
         self.attention_mask_type = attention_mask_type
         self.position_embedding_type = position_embedding_type
         self.input_layernorm = RmsNorm(normalized_shape=hidden_size,
+                                       eps=rms_norm_eps,
                                        dtype=dtype)
 
         self.attention = Attention(
@@ -67,6 +72,8 @@ class LLaMADecoderLayer(Module):
             attention_mask_type=AttentionMaskType.causal,
             bias=False,
             position_embedding_type=position_embedding_type,
+            rotary_embedding_base=rotary_base,
+            rotary_embedding_scaling=rotary_scaling,
             tp_group=tp_group,
             tp_size=tp_size,
             use_int8_kv_cache=quant_mode.has_int8_kv_cache(),
@@ -81,37 +88,24 @@ class LLaMADecoderLayer(Module):
                             tp_group=tp_group,
                             tp_size=tp_size,
                             quant_mode=quant_mode)
-        self.post_layernorm = RmsNorm(normalized_shape=hidden_size, dtype=dtype)
+        self.post_layernorm = RmsNorm(normalized_shape=hidden_size,
+                                      eps=rms_norm_eps,
+                                      dtype=dtype)
 
     def forward(self,
-                hidden_states: Tensor,
+                hidden_states,
                 attention_mask=None,
-                past_key_value=None,
-                sequence_length=None,
-                host_past_key_value_lengths=None,
                 use_cache=False,
-                cache_indirection=None,
-                kv_cache_block_pointers=None,
-                context_lengths=None,
-                host_context_lengths=None,
-                host_request_types=None,
-                max_context_length=None):
+                kv_cache_params=None,
+                attention_params=None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        attention_output = self.attention(
-            hidden_states,
-            attention_mask=attention_mask,
-            past_key_value=past_key_value,
-            sequence_length=sequence_length,
-            host_past_key_value_lengths=host_past_key_value_lengths,
-            use_cache=use_cache,
-            cache_indirection=cache_indirection,
-            kv_cache_block_pointers=kv_cache_block_pointers,
-            context_lengths=context_lengths,
-            host_context_lengths=host_context_lengths,
-            host_request_types=host_request_types,
-            max_context_length=max_context_length)
+        attention_output = self.attention(hidden_states,
+                                          attention_mask=attention_mask,
+                                          use_cache=use_cache,
+                                          kv_cache_params=kv_cache_params,
+                                          attention_params=attention_params)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -142,20 +136,26 @@ class LLaMAModel(Module):
                  dtype,
                  mlp_hidden_size=None,
                  position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
+                 rotary_base=10000.0,
+                 rotary_scaling=None,
                  mapping=Mapping(),
                  quant_mode=QuantMode(0),
                  use_parallel_embedding=False,
-                 embedding_sharding_dim=0):
+                 embedding_sharding_dim=0,
+                 rms_norm_eps=1e-06):
         super().__init__()
-        self.vocab_embedding = Embedding(
-            num_embeddings=vocab_size,
-            embedding_dim=hidden_size,
-            dtype=dtype,
-            tp_size=mapping.tp_size if use_parallel_embedding else 1,
-            tp_group=mapping.tp_group if use_parallel_embedding else None,
-            sharding_dim=embedding_sharding_dim,
-            tp_rank=mapping.tp_rank)
-        self.num_layers = num_layers
+        self.mapping = mapping
+
+        if self.mapping.is_first_pp_rank():
+            self.vocab_embedding = Embedding(
+                num_embeddings=vocab_size,
+                embedding_dim=hidden_size,
+                dtype=dtype,
+                tp_size=mapping.tp_size if use_parallel_embedding else 1,
+                tp_group=mapping.tp_group if use_parallel_embedding else None,
+                sharding_dim=embedding_sharding_dim,
+                tp_rank=mapping.tp_rank)
+
         self.layers = ModuleList([
             LLaMADecoderLayer(layer_id=i,
                               hidden_size=hidden_size,
@@ -166,57 +166,63 @@ class LLaMAModel(Module):
                               hidden_act=hidden_act,
                               mlp_hidden_size=mlp_hidden_size,
                               position_embedding_type=position_embedding_type,
+                              rotary_base=rotary_base,
+                              rotary_scaling=rotary_scaling,
                               tp_group=mapping.tp_group,
                               tp_size=mapping.tp_size,
-                              quant_mode=quant_mode) for i in range(num_layers)
+                              quant_mode=quant_mode,
+                              rms_norm_eps=rms_norm_eps)
+            for i in self.get_transformer_layers(self.mapping, num_layers)
         ])
 
-        self.ln_f = RmsNorm(normalized_shape=hidden_size, dtype=dtype)
+        if self.mapping.is_last_pp_rank():
+            self.ln_f = RmsNorm(normalized_shape=hidden_size,
+                                eps=rms_norm_eps,
+                                dtype=dtype)
 
     def forward(self,
-                input_ids: Tensor,
+                input_ids,
                 position_ids=None,
-                past_key_value=None,
-                sequence_length=None,
-                host_past_key_value_lengths=None,
                 use_cache=False,
                 attention_mask=None,
-                cache_indirection=None,
-                kv_cache_block_pointers=None,
-                context_lengths=None,
-                host_context_lengths=None,
-                host_request_types=None,
-                max_context_length=None):
+                kv_cache_params=None,
+                attention_params=None,
+                hidden_states=None):
 
-        hidden_states = self.vocab_embedding(input_ids)
-
-        if past_key_value is None:
-            past_key_value = tuple([None] * len(self.layers))
+        if kv_cache_params.past_key_value is None:
+            tuple([None] * len(self.layers))
 
         if use_cache:
             presents = []
 
-        for layer, past, pointers in zip(self.layers, past_key_value,
-                                         kv_cache_block_pointers):
+        if self.mapping.is_first_pp_rank():
+            hidden_states = self.vocab_embedding(input_ids)
+        else:
+            hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
+
+        for layer, past, pointer in zip(
+                self.layers, kv_cache_params.past_key_value,
+                kv_cache_params.kv_cache_block_pointers):
             hidden_states = layer(
                 hidden_states,
-                past_key_value=past,
-                sequence_length=sequence_length,
-                host_past_key_value_lengths=host_past_key_value_lengths,
                 use_cache=use_cache,
                 attention_mask=attention_mask,
-                cache_indirection=cache_indirection,
-                kv_cache_block_pointers=pointers,
-                context_lengths=context_lengths,
-                host_context_lengths=host_context_lengths,
-                host_request_types=host_request_types,
-                max_context_length=max_context_length)
+                kv_cache_params=KeyValueCacheParams(
+                    past_key_value=[past],
+                    host_past_key_value_lengths=kv_cache_params.
+                    host_past_key_value_lengths,
+                    kv_cache_block_pointers=[pointer],
+                    cache_indirection=kv_cache_params.cache_indirection),
+                attention_params=attention_params)
 
             if use_cache:
                 presents.append(hidden_states[1])
                 hidden_states = hidden_states[0]
 
-        hidden_states = self.ln_f(hidden_states)
+        if self.mapping.is_last_pp_rank():
+            hidden_states = self.ln_f(hidden_states)
+        else:
+            hidden_states = send(hidden_states, self.mapping.next_pp_rank())
 
         if use_cache:
             return (hidden_states, tuple(presents))
@@ -237,23 +243,27 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                  logits_dtype="float32",
                  mlp_hidden_size=None,
                  position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
+                 rotary_base=10000.0,
+                 rotary_scaling=None,
                  mapping=Mapping(),
                  quant_mode=QuantMode(0),
                  use_parallel_embedding=False,
-                 embedding_sharding_dim=0):
+                 embedding_sharding_dim=0,
+                 rms_norm_eps=1e-06):
 
         if isinstance(dtype, str):
-            self._kv_dtype = str_dtype_to_trt(dtype)
+            self.dtype = str_dtype_to_trt(dtype)
         else:
             assert isinstance(dtype, trt.DataType)
-            self._kv_dtype = dtype
+            self.dtype = dtype
+
         if isinstance(logits_dtype, str):
-            self._logits_dtype = str_dtype_to_trt(logits_dtype)
+            self.logits_dtype = str_dtype_to_trt(logits_dtype)
         else:
             assert isinstance(logits_dtype, trt.DataType)
-            self._logits_dtype = logits_dtype
+            self.logits_dtype = logits_dtype
 
-        self._num_layers = num_layers
+        self.num_layers = num_layers
         self.num_heads = num_heads
         if num_kv_heads is None or num_kv_heads <= 0:
             num_kv_heads = num_heads
@@ -261,65 +271,71 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self.tp_size = mapping.tp_size
+
+        self.kv_dtype = self.dtype
         if quant_mode.has_int8_kv_cache():
-            self._kv_dtype = str_dtype_to_trt('int8')
+            self.kv_dtype = str_dtype_to_trt('int8')
+
         self.quant_mode = quant_mode
         self.use_parallel_embedding = use_parallel_embedding
         self.embedding_sharding_dim = embedding_sharding_dim
 
         super().__init__(num_layers, num_heads, num_kv_heads, hidden_size,
                          vocab_size, hidden_act, max_position_embeddings, dtype,
-                         mlp_hidden_size, position_embedding_type, mapping,
-                         quant_mode, use_parallel_embedding,
-                         embedding_sharding_dim)
+                         mlp_hidden_size, position_embedding_type, rotary_base,
+                         rotary_scaling, mapping, quant_mode,
+                         use_parallel_embedding, embedding_sharding_dim,
+                         rms_norm_eps)
 
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
-        self.lm_head = ColumnLinear(hidden_size,
-                                    vocab_size_padded,
-                                    bias=False,
-                                    dtype=dtype,
-                                    tp_group=mapping.tp_group,
-                                    tp_size=mapping.tp_size,
-                                    gather_output=True)
+        if self.mapping.is_last_pp_rank():
+            self.lm_head = ColumnLinear(hidden_size,
+                                        vocab_size_padded,
+                                        bias=False,
+                                        dtype=dtype,
+                                        tp_group=mapping.tp_group,
+                                        tp_size=mapping.tp_size,
+                                        gather_output=True)
 
     def forward(self,
-                input_ids: Tensor,
+                input_ids,
                 position_ids=None,
-                past_key_value=None,
-                sequence_length=None,
-                host_past_key_value_lengths=None,
                 use_cache=False,
                 last_token_ids=None,
                 attention_mask=None,
-                cache_indirection=None,
-                kv_cache_block_pointers=None,
-                context_lengths=None,
-                host_context_lengths=None,
-                host_request_types=None,
-                max_context_length=None):
-        hidden_states = super().forward(
-            input_ids, position_ids, past_key_value, sequence_length,
-            host_past_key_value_lengths, use_cache, attention_mask,
-            cache_indirection, kv_cache_block_pointers, context_lengths,
-            host_context_lengths, host_request_types, max_context_length)
+                kv_cache_params=None,
+                attention_params=None,
+                hidden_states=None):
+        hidden_states = super().forward(input_ids, position_ids, use_cache,
+                                        attention_mask, kv_cache_params,
+                                        attention_params, hidden_states)
 
         if use_cache:
             hidden_states, presents = hidden_states
 
-        hidden_states = gather_last_token_logits(
-            hidden_states, last_token_ids,
-            default_net().plugin_config.remove_input_padding)
+        if self.mapping.is_last_pp_rank():
+            hidden_states = gather_last_token_logits(
+                hidden_states, last_token_ids,
+                default_net().plugin_config.remove_input_padding)
 
-        # [batch_size, hidden_size] -> [batch_size, vocab_size]
-        lm_logits = self.lm_head(hidden_states)
-        lm_logits.mark_output('logits', self._logits_dtype)
+            # [batch_size, hidden_size] -> [batch_size, vocab_size]
+            lm_logits = self.lm_head(hidden_states)
+            lm_logits.mark_output('logits', self.logits_dtype)
+        else:
+            hidden_states.mark_output('hidden_states_output', self.dtype)
 
         if use_cache:
-            for i, present in enumerate(presents):
-                present.mark_output(f'present_key_value_{i}', self._kv_dtype)
-            return (lm_logits, presents)
-
-        return lm_logits
+            for i, present in zip(
+                    self.get_transformer_layers(self.mapping, self.num_layers),
+                    presents):
+                present.mark_output(f'present_key_value_{i}', self.kv_dtype)
+            if self.mapping.is_last_pp_rank():
+                return (lm_logits, presents)
+            return (hidden_states, presents)
+        else:
+            if self.mapping.is_last_pp_rank():
+                return lm_logits
+            return hidden_states
 
     def prepare_inputs(self,
                        max_batch_size,
@@ -337,31 +353,43 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
 
         # Prepare inputs
         head_size = self.hidden_size // self.num_heads
-        num_heads_kv = (self.num_kv_heads + self.tp_size - 1) // self.tp_size
         remove_input_padding = default_net().plugin_config.remove_input_padding
         use_gpt_attention_plugin = default_net(
         ).plugin_config.gpt_attention_plugin
+        use_gemm_plugin = default_net().plugin_config.gemm_plugin
 
         model_inputs = self.prepare_basic_inputs(
             max_batch_size,
             max_beam_width,
             max_input_len,
             max_new_tokens,
-            num_heads_kv,
+            self.num_kv_heads,
             head_size,
-            self._num_layers,
-            self._kv_dtype,
+            self.num_layers,
+            self.kv_dtype,
             remove_input_padding=remove_input_padding,
             use_gpt_attention_plugin=use_gpt_attention_plugin,
+            use_gemm_plugin=use_gemm_plugin,
             paged_kv_cache=paged_kv_cache,
-            tokens_per_block=tokens_per_block)
+            tokens_per_block=tokens_per_block,
+            dtype=self.dtype,
+            num_heads=self.num_heads,
+            mapping=self.mapping)
 
-        return (model_inputs['input_ids'], model_inputs['position_ids'],
-                model_inputs['past_key_value'], model_inputs['sequence_length'],
-                model_inputs['host_past_key_value_lengths'], True,
+        return (model_inputs['input_ids'], model_inputs['position_ids'], True,
                 model_inputs['last_token_ids'], model_inputs['attention_mask'],
-                model_inputs['cache_indirection'],
-                model_inputs['kv_cache_block_pointers_list'],
-                model_inputs['context_lengths'],
-                model_inputs['host_context_lengths'],
-                model_inputs['host_request_types'], max_input_len)
+                KeyValueCacheParams(
+                    past_key_value=model_inputs['past_key_value'],
+                    host_past_key_value_lengths=model_inputs[
+                        'host_past_key_value_lengths'],
+                    kv_cache_block_pointers=model_inputs[
+                        'kv_cache_block_pointers_list'],
+                    cache_indirection=model_inputs['cache_indirection'],
+                ),
+                AttentionParams(
+                    sequence_length=model_inputs['sequence_length'],
+                    context_lengths=model_inputs['context_lengths'],
+                    host_context_lengths=model_inputs['host_context_lengths'],
+                    max_context_length=max_input_len,
+                    host_request_types=model_inputs['host_request_types']),
+                model_inputs['hidden_states_input'])

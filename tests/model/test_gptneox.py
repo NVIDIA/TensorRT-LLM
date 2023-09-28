@@ -301,7 +301,7 @@ class TestGPTNeoX(unittest.TestCase):
         ctx_shape['host_past_key_value_lengths'] = ctx_buffer[
             'host_past_key_value_lengths'].shape
 
-        context = runtime.context_0
+        context = runtime.ctx_context
         runtime._set_shape(context, ctx_shape)
         runtime._set_buffer(context, ctx_buffer)
 

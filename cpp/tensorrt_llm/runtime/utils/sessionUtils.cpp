@@ -50,29 +50,18 @@ std::vector<uint8_t> loadEngine(std::string const& enginePath)
     return engineBlob;
 }
 
-void insertTensorVector(StringPtrMap<ITensor>& map, std::string const& key, std::vector<ITensor::SharedPtr> const& vec)
-{
-    for (std::size_t i = 0; i < vec.size(); ++i)
-        map.insert_or_assign(key + std::to_string(i), vec[i]);
-}
-
-nvinfer1::DataType getTensorDataType(nvinfer1::ICudaEngine const& engine, std::string const& name)
-{
-    return engine.getTensorDataType(name.c_str());
-}
-
-std::vector<ITensor::SharedPtr> createBufferVector(
-    TllmRuntime const& runtime, SizeType const numBuffers, std::string const& prefix, MemoryType memType)
+std::vector<ITensor::SharedPtr> createBufferVector(TllmRuntime const& runtime, SizeType const indexOffset,
+    SizeType const numBuffers, std::string const& prefix, MemoryType memType)
 {
     auto const& manager = runtime.getBufferManager();
     auto const& engine = runtime.getEngine();
 
     std::vector<ITensor::SharedPtr> vector;
 
-    for (SizeType i = 0; i < numBuffers; ++i)
+    for (SizeType i = indexOffset; i < indexOffset + numBuffers; ++i)
     {
         std::string name{prefix + std::to_string(i)};
-        auto type = getTensorDataType(engine, name);
+        auto type = engine.getTensorDataType(name.c_str());
         vector.emplace_back(manager.emptyTensor(memType, type));
     }
     return vector;
@@ -83,6 +72,25 @@ void reshapeBufferVector(std::vector<ITensor::SharedPtr>& vector, nvinfer1::Dims
     for (auto& buffer : vector)
     {
         buffer->reshape(shape);
+    }
+}
+
+void insertTensorVector(StringPtrMap<ITensor>& map, std::string const& key, std::vector<ITensor::SharedPtr> const& vec,
+    SizeType const indexOffset)
+{
+    for (std::size_t i = 0; i < vec.size(); ++i)
+        map.insert_or_assign(key + std::to_string(indexOffset + i), vec[i]);
+}
+
+void insertTensorSlices(
+    StringPtrMap<ITensor>& map, std::string const& key, ITensor::SharedPtr const& tensor, SizeType const indexOffset)
+{
+    auto const numSlices = tensor->getShape().d[0];
+    for (SizeType i = 0; i < numSlices; ++i)
+    {
+        ITensor::SharedPtr slice = ITensor::slice(tensor, i, 1);
+        slice->squeeze(0);
+        map.insert_or_assign(key + std::to_string(indexOffset + i), slice);
     }
 }
 

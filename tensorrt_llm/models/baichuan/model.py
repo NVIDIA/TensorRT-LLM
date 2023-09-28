@@ -17,8 +17,9 @@ import tensorrt as trt
 from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
 from ...functional import Tensor, gather_last_token_logits
-from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
-                       GatedMLP, RmsNorm)
+from ...layers import (Attention, AttentionMaskType, AttentionParams,
+                       ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
+                       RmsNorm)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
 from ..generation_mixin import GenerationMixin
@@ -67,32 +68,17 @@ class BaichuanDecoderLayer(Module):
     def forward(self,
                 hidden_states: Tensor,
                 attention_mask=None,
-                past_key_value=None,
-                sequence_length=None,
-                host_past_key_value_lengths=None,
                 use_cache=False,
-                cache_indirection=None,
-                kv_cache_block_pointers=None,
-                context_lengths=None,
-                host_context_lengths=None,
-                host_request_types=None,
-                max_context_length: int = None):
+                kv_cache_params=None,
+                attention_params=None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        attention_output = self.attention(
-            hidden_states,
-            attention_mask=attention_mask,
-            past_key_value=past_key_value,
-            sequence_length=sequence_length,
-            host_past_key_value_lengths=host_past_key_value_lengths,
-            use_cache=use_cache,
-            cache_indirection=cache_indirection,
-            kv_cache_block_pointers=kv_cache_block_pointers,
-            context_lengths=context_lengths,
-            host_context_lengths=host_context_lengths,
-            host_request_types=host_request_types,
-            max_context_length=max_context_length)
+        attention_output = self.attention(hidden_states,
+                                          attention_mask=attention_mask,
+                                          use_cache=use_cache,
+                                          kv_cache_params=kv_cache_params,
+                                          attention_params=attention_params)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -146,41 +132,33 @@ class BaichuanModel(Module):
     def forward(self,
                 input_ids: Tensor,
                 position_ids=None,
-                past_key_value=None,
-                sequence_length=None,
-                host_past_key_value_lengths=None,
                 use_cache=False,
                 attention_mask=None,
-                cache_indirection=None,
-                kv_cache_block_pointers=None,
-                context_lengths=None,
-                host_context_lengths=None,
-                host_request_types=None,
-                max_context_length: int = None):
+                kv_cache_params=None,
+                attention_params=None):
 
         hidden_states = self.vocab_embedding(input_ids)
 
-        if past_key_value is None:
-            past_key_value = tuple([None] * len(self.layers))
+        if kv_cache_params.past_key_value is None:
+            kv_cache_params.past_key_value = tuple([None] * len(self.layers))
 
         if use_cache:
             presents = []
 
-        for layer, past, pointers in zip(self.layers, past_key_value,
-                                         kv_cache_block_pointers):
+        for layer, past, pointer in zip(
+                self.layers, kv_cache_params.past_key_value,
+                kv_cache_params.kv_cache_block_pointers):
             hidden_states = layer(
                 hidden_states,
-                past_key_value=past,
-                sequence_length=sequence_length,
-                host_past_key_value_lengths=host_past_key_value_lengths,
                 use_cache=use_cache,
                 attention_mask=attention_mask,
-                cache_indirection=cache_indirection,
-                kv_cache_block_pointers=pointers,
-                context_lengths=context_lengths,
-                host_context_lengths=host_context_lengths,
-                host_request_types=host_request_types,
-                max_context_length=max_context_length)
+                kv_cache_params=KeyValueCacheParams(
+                    past_key_value=[past],
+                    host_past_key_value_lengths=kv_cache_params.
+                    host_past_key_value_lengths,
+                    kv_cache_block_pointers=[pointer],
+                    cache_indirection=kv_cache_params.cache_indirection),
+                attention_params=attention_params)
 
             if use_cache:
                 presents.append(hidden_states[1])
@@ -233,23 +211,14 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
     def forward(self,
                 input_ids: Tensor,
                 position_ids=None,
-                past_key_value=None,
-                sequence_length=None,
-                host_past_key_value_lengths=None,
                 use_cache=False,
                 last_token_ids=None,
                 attention_mask=None,
-                cache_indirection=None,
-                kv_cache_block_pointers=None,
-                context_lengths=None,
-                host_context_lengths=None,
-                host_request_types=None,
-                max_context_length: int = None):
-        hidden_states = super().forward(
-            input_ids, position_ids, past_key_value, sequence_length,
-            host_past_key_value_lengths, use_cache, attention_mask,
-            cache_indirection, kv_cache_block_pointers, context_lengths,
-            host_context_lengths, host_request_types, max_context_length)
+                kv_cache_params=None,
+                attention_params=None):
+        hidden_states = super().forward(input_ids, position_ids, use_cache,
+                                        attention_mask, kv_cache_params,
+                                        attention_params)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -290,6 +259,7 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
         remove_input_padding = default_net().plugin_config.remove_input_padding
         use_gpt_attention_plugin = default_net(
         ).plugin_config.gpt_attention_plugin
+        use_gemm_plugin = default_net().plugin_config.gemm_plugin
 
         model_inputs = self.prepare_basic_inputs(
             max_batch_size,
@@ -302,15 +272,23 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
             self._kv_dtype,
             remove_input_padding=remove_input_padding,
             use_gpt_attention_plugin=use_gpt_attention_plugin,
+            use_gemm_plugin=use_gemm_plugin,
             paged_kv_cache=paged_kv_cache,
             tokens_per_block=tokens_per_block)
 
-        return (model_inputs['input_ids'], model_inputs['position_ids'],
-                model_inputs['past_key_value'], model_inputs['sequence_length'],
-                model_inputs['host_past_key_value_lengths'], True,
+        return (model_inputs['input_ids'], model_inputs['position_ids'], True,
                 model_inputs['last_token_ids'], model_inputs['attention_mask'],
-                model_inputs['cache_indirection'],
-                model_inputs['kv_cache_block_pointers_list'],
-                model_inputs['context_lengths'],
-                model_inputs['host_context_lengths'],
-                model_inputs['host_request_types'], max_input_len)
+                KeyValueCacheParams(
+                    past_key_value=model_inputs['past_key_value'],
+                    host_past_key_value_lengths=model_inputs[
+                        'host_past_key_value_lengths'],
+                    kv_cache_block_pointers=model_inputs[
+                        'kv_cache_block_pointers_list'],
+                    cache_indirection=model_inputs['cache_indirection'],
+                ),
+                AttentionParams(
+                    sequence_length=model_inputs['sequence_length'],
+                    context_lengths=model_inputs['context_lengths'],
+                    host_context_lengths=model_inputs['host_context_lengths'],
+                    max_context_length=max_input_len,
+                    host_request_types=model_inputs['host_request_types']))

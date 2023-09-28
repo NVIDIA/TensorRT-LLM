@@ -14,10 +14,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TRT_QUANTIZE_TENSOR_PLUGIN_H
-#define TRT_QUANTIZE_TENSOR_PLUGIN_H
+#pragma once
 
-#include "NvInferPlugin.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include <cassert>
@@ -26,12 +24,10 @@
 #include <string>
 #include <vector>
 
-namespace nvinfer1
-{
-namespace plugin
+namespace tensorrt_llm::plugins
 {
 
-class QuantizeTensorPlugin : public IPluginV2DynamicExt
+class QuantizeTensorPlugin : public BasePlugin
 {
 public:
     QuantizeTensorPlugin();
@@ -66,16 +62,13 @@ public:
     size_t getSerializationSize() const noexcept override;
     void serialize(void* buffer) const noexcept override;
     void destroy() noexcept override;
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
-    const char* getPluginNamespace() const noexcept override;
 
 private:
     const std::string mLayerName;
-    std::string mNamespace;
     cudaDeviceProp mProp;
 };
 
-class QuantizeTensorPluginCreator : public IPluginCreator
+class QuantizeTensorPluginCreator : public BaseCreator
 {
 public:
     QuantizeTensorPluginCreator();
@@ -91,17 +84,9 @@ public:
     nvinfer1::IPluginV2* deserializePlugin(
         const char* name, const void* serialData, size_t serialLength) noexcept override;
 
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
-
-    const char* getPluginNamespace() const noexcept override;
-
 private:
-    static PluginFieldCollection mFC;
-    static std::vector<PluginField> mPluginAttributes;
-    std::string mNamespace;
+    static nvinfer1::PluginFieldCollection mFC;
+    static std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
-} // namespace plugin
-} // namespace nvinfer1
-
-#endif // TRT_QUANTIZE_TENSOR_PLUGIN_H
+} // namespace tensorrt_llm::plugins

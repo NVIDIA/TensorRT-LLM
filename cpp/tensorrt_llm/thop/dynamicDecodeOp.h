@@ -38,7 +38,7 @@ public:
         = 0;
 
     virtual void forward(th::Tensor& logits, // (batch_size, beam_width, hidden_size)
-        int step, int max_input_length, uint ite, int local_batch_size, th::Tensor end_id,
+        int step, int max_input_length, uint64_t ite, int local_batch_size, th::Tensor end_id,
         th::optional<th::Tensor> embedding_bias_opt, th::optional<th::Tensor> input_lengths_opt,
         th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
         th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
@@ -76,7 +76,7 @@ public:
         th::optional<th::Tensor> top_p_reset_ids_opt) override;
 
     void forward(th::Tensor& logits, // (batch_size, beam_width, hidden_size)
-        int step, int max_input_length, uint ite, int local_batch_size, th::Tensor end_id,
+        int step, int max_input_length, uint64_t ite, int local_batch_size, th::Tensor end_id,
         th::optional<th::Tensor> embedding_bias_opt, th::optional<th::Tensor> input_lengths_opt,
         th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
         th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,

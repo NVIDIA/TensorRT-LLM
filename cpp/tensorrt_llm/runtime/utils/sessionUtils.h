@@ -37,14 +37,16 @@ int initDevice(WorldConfig const& worldConfig);
 
 std::vector<uint8_t> loadEngine(std::string const& enginePath);
 
-void insertTensorVector(StringPtrMap<ITensor>& map, std::string const& key, std::vector<ITensor::SharedPtr> const& vec);
-
-nvinfer1::DataType getTensorDataType(nvinfer1::ICudaEngine const& engine, std::string const& name);
-
-std::vector<ITensor::SharedPtr> createBufferVector(
-    TllmRuntime const& runtime, SizeType const numBuffers, std::string const& prefix, MemoryType memType);
+std::vector<ITensor::SharedPtr> createBufferVector(TllmRuntime const& runtime, SizeType indexOffset,
+    SizeType numBuffers, std::string const& prefix, MemoryType memType);
 
 void reshapeBufferVector(std::vector<ITensor::SharedPtr>& vector, nvinfer1::Dims const& shape);
+
+void insertTensorVector(StringPtrMap<ITensor>& map, std::string const& key, std::vector<ITensor::SharedPtr> const& vec,
+    SizeType indexOffset);
+
+void insertTensorSlices(
+    StringPtrMap<ITensor>& map, std::string const& key, ITensor::SharedPtr const& tensor, SizeType indexOffset);
 
 void setRawPointers(ITensor& pointers, ITensor::SharedPtr const& input, int32_t pointersSlot, int32_t inputSlot);
 

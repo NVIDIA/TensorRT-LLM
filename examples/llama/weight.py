@@ -22,6 +22,7 @@ from safetensors import safe_open
 
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_torch, torch_to_numpy
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import LLaMAForCausalLM
 from tensorrt_llm.quantization import QuantMode
 
@@ -83,9 +84,8 @@ def parse_ft_config(ini_file):
 
 def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                        hf_llama,
-                       rank=0,
-                       tensor_parallel=1,
-                       dtype="float32"):
+                       mapping=Mapping(),
+                       dtype='float32'):
     tensorrt_llm.logger.info('Loading weights from HF LLaMA...')
     tik = time.time()
 
@@ -106,14 +106,14 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
         v_weight = model_params[prefix + 'v_proj.weight']
         if not mha_mode:
             head_size = tensorrt_llm_llama.hidden_size // tensorrt_llm_llama.num_heads
-            if num_kv_heads < tensor_parallel:
+            if num_kv_heads < mapping.tp_size:
                 # duplicate the KV heads up to tensor_parallel
                 k_weight = dup_kv_weight(k_weight, num_kv_heads,
-                                         tensor_parallel)
+                                         mapping.tp_size)
                 v_weight = dup_kv_weight(v_weight, num_kv_heads,
-                                         tensor_parallel)
-            assert (k_weight.shape[0] % (tensor_parallel * head_size)) == 0
-            assert (v_weight.shape[0] % (tensor_parallel * head_size)) == 0
+                                         mapping.tp_size)
+            assert (k_weight.shape[0] % (mapping.tp_size * head_size)) == 0
+            assert (v_weight.shape[0] % (mapping.tp_size * head_size)) == 0
             qkv_weight = [q_weight, k_weight, v_weight]
         else:
             qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
@@ -121,6 +121,10 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
         model_params[prefix + 'qkv_proj.weight'] = qkv_weight
 
     torch_dtype = str_dtype_to_torch(dtype)
+    layers_per_pipeline_stage = hf_llama.config.num_hidden_layers // mapping.pp_size
+    layers_range = list(
+        range(mapping.pp_rank * layers_per_pipeline_stage,
+              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
     for k, v in model_params.items():
         if isinstance(v, list):
             v = [torch_to_numpy(vv.to(torch_dtype).detach().cpu()) for vv in v]
@@ -128,19 +132,22 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
             v = torch_to_numpy(v.to(torch_dtype).detach().cpu())
         if 'model.embed_tokens.weight' in k:
             if tensorrt_llm_llama.use_parallel_embedding:
-                v = split(v, tensor_parallel, rank,
+                v = split(v, mapping.tp_size, mapping.tp_rank,
                           tensorrt_llm_llama.embedding_sharding_dim)
-            tensorrt_llm_llama.vocab_embedding.weight.value = v
+            if mapping.is_first_pp_rank():
+                tensorrt_llm_llama.vocab_embedding.weight.value = v
         elif 'model.norm.weight' in k:
-            tensorrt_llm_llama.ln_f.weight.value = v
+            if mapping.is_last_pp_rank():
+                tensorrt_llm_llama.ln_f.weight.value = v
         elif 'lm_head.weight' in k:
-            tensorrt_llm_llama.lm_head.weight.value = np.ascontiguousarray(
-                split(v, tensor_parallel, rank))
+            if mapping.is_last_pp_rank():
+                tensorrt_llm_llama.lm_head.weight.value = np.ascontiguousarray(
+                    split(v, mapping.tp_size, mapping.tp_rank))
         else:
             layer_idx = extract_layer_idx(k)
-            if layer_idx is None:
+            if layer_idx is None or int(layer_idx) not in layers_range:
                 continue
-            idx = int(layer_idx)
+            idx = int(layer_idx) - mapping.pp_rank * layers_per_pipeline_stage
             if idx >= tensorrt_llm_llama.num_layers:
                 continue
             if 'input_layernorm.weight' in k:
@@ -152,20 +159,21 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                 dst = tensorrt_llm_llama.layers[idx].attention.qkv.weight
                 if not mha_mode:
                     assert isinstance(v, list) and len(v) == 3
-                    wq = split(v[0], tensor_parallel, rank)
-                    wk = split(v[1], tensor_parallel, rank)
-                    wv = split(v[2], tensor_parallel, rank)
+                    wq = split(v[0], mapping.tp_size, mapping.tp_rank)
+                    wk = split(v[1], mapping.tp_size, mapping.tp_rank)
+                    wv = split(v[2], mapping.tp_size, mapping.tp_rank)
                     split_v = np.concatenate((wq, wk, wv))
                 else:
                     q_emb = v.shape[0] // 3
                     model_emb = v.shape[1]
                     v = v.reshape(3, q_emb, model_emb)
-                    split_v = split(v, tensor_parallel, rank, dim=1)
-                    split_v = split_v.reshape(3 * (q_emb // tensor_parallel),
+                    split_v = split(v, mapping.tp_size, mapping.tp_rank, dim=1)
+                    split_v = split_v.reshape(3 * (q_emb // mapping.tp_size),
                                               model_emb)
                 if use_weight_only:
                     v = np.ascontiguousarray(split_v.transpose())
-                    processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                    processed_torch_weights, torch_weight_scales = \
+                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
                     # workaround for trt not supporting int8 inputs in plugins currently
                     dst.value = processed_torch_weights.view(
@@ -177,10 +185,11 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     dst.value = np.ascontiguousarray(split_v)
             elif 'self_attn.o_proj.weight' in k:
                 dst = tensorrt_llm_llama.layers[idx].attention.dense.weight
-                split_v = split(v, tensor_parallel, rank, dim=1)
+                split_v = split(v, mapping.tp_size, mapping.tp_rank, dim=1)
                 if use_weight_only:
                     v = np.ascontiguousarray(split_v.transpose())
-                    processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                    processed_torch_weights, torch_weight_scales = \
+                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
                     # workaround for trt not supporting int8 inputs in plugins currently
                     dst.value = processed_torch_weights.view(
@@ -192,10 +201,11 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     dst.value = np.ascontiguousarray(split_v)
             elif 'mlp.up_proj.weight' in k:
                 dst = tensorrt_llm_llama.layers[idx].mlp.gate.weight
-                split_v = split(v, tensor_parallel, rank, dim=0)
+                split_v = split(v, mapping.tp_size, mapping.tp_rank, dim=0)
                 if use_weight_only:
                     v = np.ascontiguousarray(split_v.transpose())
-                    processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                    processed_torch_weights, torch_weight_scales = \
+                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
                     # workaround for trt not supporting int8 inputs in plugins currently
                     dst.value = processed_torch_weights.view(
@@ -207,10 +217,11 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     dst.value = np.ascontiguousarray(split_v)
             elif 'mlp.down_proj.weight' in k:
                 dst = tensorrt_llm_llama.layers[idx].mlp.proj.weight
-                split_v = split(v, tensor_parallel, rank, dim=1)
+                split_v = split(v, mapping.tp_size, mapping.tp_rank, dim=1)
                 if use_weight_only:
                     v = np.ascontiguousarray(split_v.transpose())
-                    processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                    processed_torch_weights, torch_weight_scales = \
+                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
                     # workaround for trt not supporting int8 inputs in plugins currently
                     dst.value = processed_torch_weights.view(
@@ -222,10 +233,11 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     dst.value = np.ascontiguousarray(split_v)
             elif 'mlp.gate_proj.weight' in k:
                 dst = tensorrt_llm_llama.layers[idx].mlp.fc.weight
-                split_v = split(v, tensor_parallel, rank, dim=0)
+                split_v = split(v, mapping.tp_size, mapping.tp_rank, dim=0)
                 if use_weight_only:
                     v = np.ascontiguousarray(split_v.transpose())
-                    processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                    processed_torch_weights, torch_weight_scales = \
+                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
                     # workaround for trt not supporting int8 inputs in plugins currently
                     dst.value = processed_torch_weights.view(
@@ -245,8 +257,7 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
 def load_from_meta_llama(
         tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
         meta_ckpt_dir,
-        rank=0,
-        tensor_parallel=1,
+        mapping=Mapping(),
         dtype="float32"):
     torch_dtype = str_dtype_to_torch(dtype)
 
@@ -270,12 +281,12 @@ def load_from_meta_llama(
                 d = 1
             if "norm" in k or "rope" in k:  # no TP
                 split_ckpt[k] = ckpt[k].clone()
-            elif tensorrt_llm_llama.num_kv_heads < tensor_parallel and any(
+            elif tensorrt_llm_llama.num_kv_heads < mapping.tp_size and any(
                 [n in k for n in ["wk", "wv"]]):
-                assert tensor_parallel % tensorrt_llm_llama.num_kv_heads == 0
+                assert mapping.tp_size % tensorrt_llm_llama.num_kv_heads == 0
                 # special case: we need to duplicate KV head
                 tmp = dup_kv_weight(ckpt[k], tensorrt_llm_llama.num_kv_heads,
-                                    tensor_parallel)
+                                    mapping.tp_size)
                 split_ckpt[k] = torch.split(tmp,
                                             tmp.shape[d] // ranks_per_ckpt,
                                             dim=d)[ckpt_rank].clone()
@@ -286,11 +297,11 @@ def load_from_meta_llama(
         return split_ckpt
 
     def get_current_weights(num_ckpts):
-        if num_ckpts > tensor_parallel:
+        if num_ckpts > mapping.tp_size:
             # combine ckpts
-            assert (num_ckpts % tensor_parallel) == 0
-            nf = num_ckpts // tensor_parallel
-            fs = nf * rank
+            assert (num_ckpts % mapping.tp_size) == 0
+            nf = num_ckpts // mapping.tp_size
+            fs = nf * mapping.tp_rank
             file_ids = list(range(fs, fs + nf))
             ckpts = []
             for f in file_ids:
@@ -299,12 +310,12 @@ def load_from_meta_llama(
                                   map_location="cpu")
                 ckpts.append(ckpt)
             return gather_ckpts(ckpts)
-        elif num_ckpts < tensor_parallel:
+        elif num_ckpts < mapping.tp_size:
             # split ckpt
-            assert (tensor_parallel % num_ckpts) == 0
-            ranks_per_ckpt = tensor_parallel // num_ckpts
-            ckpt_fid = rank // ranks_per_ckpt
-            ckpt_rank = rank % ranks_per_ckpt
+            assert (mapping.tp_size % num_ckpts) == 0
+            ranks_per_ckpt = mapping.tp_size // num_ckpts
+            ckpt_fid = mapping.tp_rank // ranks_per_ckpt
+            ckpt_rank = mapping.tp_rank % ranks_per_ckpt
             nH_per_ckpt = tensorrt_llm_llama.num_heads // num_ckpts
             assert (nH_per_ckpt % ranks_per_ckpt) == 0
             ckpt = torch.load(Path(meta_ckpt_dir,
@@ -313,7 +324,8 @@ def load_from_meta_llama(
             return split_ckpt(ckpt, ranks_per_ckpt, ckpt_rank)
 
         # num_ckpts == tensor_parallel, 1:1 mapping from files to TP
-        return torch.load(Path(meta_ckpt_dir, f"consolidated.{rank:02d}.pth"),
+        return torch.load(Path(meta_ckpt_dir,
+                               f"consolidated.{mapping.tp_rank:02d}.pth"),
                           map_location="cpu")
 
     def permute(w, nH, d, dH):
@@ -324,7 +336,7 @@ def load_from_meta_llama(
         load_from_meta_llama.saved_embed = None
 
     def gather_embedding(cur_embed, name: str, num_ckpts):
-        if tensor_parallel == 1:
+        if mapping.tp_size == 1:
             # even if num_ckpts > 1, get_current_weights will already have it gathered
             return cur_embed
         if load_from_meta_llama.saved_embed is None:
@@ -359,18 +371,22 @@ def load_from_meta_llama(
 
     head_size = tensorrt_llm_llama.hidden_size // tensorrt_llm_llama.num_heads
     ckpt = get_current_weights(num_ckpts)
-    for l in range(tensorrt_llm_llama.num_layers):
+    layers_range = list(
+        range(mapping.pp_rank * tensorrt_llm_llama.num_layers,
+              (mapping.pp_rank + 1) * tensorrt_llm_llama.num_layers, 1))
+
+    for l in layers_range:
         prefix = f'layers.{l}.attention.'
         q_weight = permute(ckpt[prefix + 'wq.weight'].clone(),
-                           nH=(tensorrt_llm_llama.num_heads // tensor_parallel),
+                           nH=(tensorrt_llm_llama.num_heads // mapping.tp_size),
                            d=tensorrt_llm_llama.hidden_size,
                            dH=head_size)
-        if num_kv_heads < tensor_parallel and num_ckpts >= tensor_parallel:
-            assert tensor_parallel % num_kv_heads == 0
+        if num_kv_heads < mapping.tp_size and num_ckpts >= mapping.tp_size:
+            assert mapping.tp_size % num_kv_heads == 0
             assert False, "Not supported yet"
         k_weight = permute(ckpt[prefix + 'wk.weight'].clone(),
-                           nH=((num_kv_heads + tensor_parallel - 1) //
-                               tensor_parallel),
+                           nH=((num_kv_heads + mapping.tp_size - 1) //
+                               mapping.tp_size),
                            d=tensorrt_llm_llama.hidden_size,
                            dH=head_size)
         v_weight = ckpt[prefix + 'wv.weight'].clone()
@@ -386,18 +402,22 @@ def load_from_meta_llama(
             elif tensorrt_llm_llama.embedding_sharding_dim == 0:
                 # this needs a gather and then resplit along different dims
                 v = gather_embedding(v, k, num_ckpts)
-                v = split(v, tensor_parallel, rank, 0)
-            tensorrt_llm_llama.vocab_embedding.weight.value = v
+                v = split(v, mapping.tp_size, mapping.tp_rank, 0)
+            if mapping.is_first_pp_rank():
+                tensorrt_llm_llama.vocab_embedding.weight.value = v
         elif "output" in k:
-            tensorrt_llm_llama.lm_head.weight.value = v
+            if mapping.is_last_pp_rank():
+                tensorrt_llm_llama.lm_head.weight.value = v
         elif k == "norm.weight":
-            tensorrt_llm_llama.ln_f.weight.value = v
+            if mapping.is_last_pp_rank():
+                tensorrt_llm_llama.ln_f.weight.value = v
         else:
             # layer specific weights
             layer_idx = extract_layer_idx(k)
             if layer_idx is None:
                 continue
-            idx = int(layer_idx)
+            idx = int(
+                layer_idx) - mapping.pp_rank * tensorrt_llm_llama.num_layers
             if idx >= tensorrt_llm_llama.num_layers:
                 continue
             if 'attention_norm.weight' in k:
@@ -423,8 +443,7 @@ def load_from_meta_llama(
 
 def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
                      dir_path,
-                     rank=0,
-                     tensor_parallel=1,
+                     mapping=Mapping(),
                      fp16=False,
                      multi_query_mode=False):
     tensorrt_llm.logger.info('Loading weights from FT...')
@@ -488,6 +507,10 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
 
     # Determine the quantization mode.
     quant_mode = getattr(tensorrt_llm_llama, "quant_mode", QuantMode(0))
+    if quant_mode.is_int8_weight_only():
+        plugin_weight_only_quant_type = torch.int8
+    elif quant_mode.is_int4_weight_only():
+        plugin_weight_only_quant_type = torch.quint4x2
     # Do we use SmoothQuant?
     use_smooth_quant = quant_mode.has_act_and_weight_quant()
     # Do we use quantization per token?
@@ -496,7 +519,7 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
     quant_per_channel = quant_mode.has_per_channel_scaling()
 
     # Do we use INT4/INT8 weight-only?
-    quant_mode.is_weight_only()
+    use_weight_only = quant_mode.is_weight_only()
 
     # Int8 KV cache
     use_int8_kv_cache = quant_mode.has_int8_kv_cache()
@@ -505,149 +528,205 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
         return x.view(np.float32) if use_smooth_quant else x
 
     # Debug
-    suffix = gen_suffix(rank, use_smooth_quant, quant_per_channel)
+    suffix = gen_suffix(mapping.tp_rank, use_smooth_quant, quant_per_channel)
     # The type of weights.
     w_type = np_dtype if not use_smooth_quant else np.int8
 
-    tensorrt_llm_llama.vocab_embedding.weight.value = (fromfile(
-        dir_path, 'vocab_embedding.weight.bin', [vocab_size, n_embd]))
+    if mapping.is_first_pp_rank():
+        tensorrt_llm_llama.vocab_embedding.weight.value = (fromfile(
+            dir_path, 'vocab_embedding.weight.bin', [vocab_size, n_embd]))
 
-    tensorrt_llm_llama.ln_f.weight.value = (fromfile(dir_path,
-                                                     'ln_f.weight.bin'))
+    if mapping.is_last_pp_rank():
+        tensorrt_llm_llama.ln_f.weight.value = (fromfile(
+            dir_path, 'ln_f.weight.bin'))
     # share input embedding
     lm_head_weight = fromfile(dir_path, 'lm_head.weight.bin',
                               [vocab_size, n_embd])
 
-    if vocab_size % tensor_parallel != 0:
+    if vocab_size % mapping.tp_size != 0:
         # padding
-        vocab_size_padded = tensorrt_llm_llama.lm_head.out_features * tensor_parallel
+        vocab_size_padded = tensorrt_llm_llama.lm_head.out_features * mapping.tp_size
         pad_width = vocab_size_padded - vocab_size
         lm_head_weight = np.pad(lm_head_weight, ((0, pad_width), (0, 0)),
                                 'constant',
                                 constant_values=0)
-    tensorrt_llm_llama.lm_head.weight.value = np.ascontiguousarray(
-        split(lm_head_weight, tensor_parallel, rank))
+    if mapping.is_last_pp_rank():
+        tensorrt_llm_llama.lm_head.weight.value = np.ascontiguousarray(
+            split(lm_head_weight, mapping.tp_size, mapping.tp_rank))
 
-    for i in range(n_layer):
+    layers_range = list(
+        range(mapping.pp_rank * tensorrt_llm_llama.num_layers,
+              (mapping.pp_rank + 1) * tensorrt_llm_llama.num_layers, 1))
+
+    for i in layers_range:
         c_attn_out_dim = (3 * n_embd //
-                          tensor_parallel) if not multi_query_mode else (
-                              n_embd // tensor_parallel +
+                          mapping.tp_size) if not multi_query_mode else (
+                              n_embd // mapping.tp_size +
                               (n_embd // n_head) * 2)
-        tensorrt_llm_llama.layers[i].input_layernorm.weight.value = (fromfile(
+        idx = i - mapping.pp_rank * tensorrt_llm_llama.num_layers
+        tensorrt_llm_llama.layers[idx].input_layernorm.weight.value = (fromfile(
             dir_path, 'model.layers.' + str(i) + '.input_layernorm.weight.bin'))
         t = fromfile(
             dir_path, 'model.layers.' + str(i) +
             '.attention.query_key_value.weight.' + suffix,
             [n_embd, c_attn_out_dim], w_type)
         if t is not None:
-            dst = tensorrt_llm_llama.layers[i].attention.qkv.weight
+            dst = tensorrt_llm_llama.layers[idx].attention.qkv.weight
             if use_smooth_quant:
                 dst.value = sq_trick(
                     np.ascontiguousarray(np.transpose(t, [1, 0])))
                 set_smoothquant_scale_factors(
-                    tensorrt_llm_llama.layers[i].attention.qkv,
-                    tensorrt_llm_llama.layers[i].input_layernorm.scale_to_int,
+                    tensorrt_llm_llama.layers[idx].attention.qkv,
+                    tensorrt_llm_llama.layers[idx].input_layernorm.scale_to_int,
                     dir_path,
                     'model.layers.' + str(i) + '.attention.query_key_value.',
                     [1, c_attn_out_dim],
                     quant_per_token_dyn,
                     quant_per_channel,
-                    rank=rank,
+                    rank=mapping.tp_rank,
                     is_qkv=True)
+            elif use_weight_only:
+                processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                    torch.tensor(t), plugin_weight_only_quant_type)
+                # workaround for trt not supporting int8 inputs in plugins currently
+                dst.value = processed_torch_weights.view(
+                    dtype=torch.float32).numpy()
+                scales = tensorrt_llm_llama.layers[
+                    i].attention.qkv.per_channel_scale
+                scales.value = torch_weight_scales.numpy()
             else:
                 dst.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
 
-        dst = tensorrt_llm_llama.layers[i].attention.dense.weight
+        dst = tensorrt_llm_llama.layers[idx].attention.dense.weight
         t = fromfile(
             dir_path,
             'model.layers.' + str(i) + '.attention.dense.weight.' + suffix,
-            [n_embd // tensor_parallel, n_embd], w_type)
+            [n_embd // mapping.tp_size, n_embd], w_type)
         if use_smooth_quant:
             dst.value = sq_trick(np.ascontiguousarray(np.transpose(t, [1, 0])))
-            dense_scale = getattr(tensorrt_llm_llama.layers[i].attention,
+            dense_scale = getattr(tensorrt_llm_llama.layers[idx].attention,
                                   "quantization_scaling_factor", None)
             set_smoothquant_scale_factors(
-                tensorrt_llm_llama.layers[i].attention.dense, dense_scale,
+                tensorrt_llm_llama.layers[idx].attention.dense, dense_scale,
                 dir_path, 'model.layers.' + str(i) + '.attention.dense.',
                 [1, n_embd], quant_per_token_dyn, quant_per_channel)
-            set_smoother(tensorrt_llm_llama.layers[i].attention.dense, dir_path,
+            set_smoother(tensorrt_llm_llama.layers[idx].attention.dense,
+                         dir_path,
                          'model.layers.' + str(i) + '.attention.dense',
-                         [1, n_embd // tensor_parallel], rank)
+                         [1, n_embd // mapping.tp_size], mapping.tp_rank)
+        elif use_weight_only:
+            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                torch.tensor(t), plugin_weight_only_quant_type)
+            # workaround for trt not supporting int8 inputs in plugins currently
+            dst.value = processed_torch_weights.view(
+                dtype=torch.float32).numpy()
+            scales = tensorrt_llm_llama.layers[
+                i].attention.dense.per_channel_scale
+            scales.value = torch_weight_scales.numpy()
         else:
             dst.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
 
-        dst = tensorrt_llm_llama.layers[i].post_layernorm.weight
+        dst = tensorrt_llm_llama.layers[idx].post_layernorm.weight
         dst.value = fromfile(
             dir_path, 'model.layers.' + str(i) + '.post_layernorm.weight.bin')
 
         t = fromfile(dir_path,
                      'model.layers.' + str(i) + '.mlp.fc.weight.' + suffix,
-                     [n_embd, inter_size // tensor_parallel], w_type)
+                     [n_embd, inter_size // mapping.tp_size], w_type)
 
         if use_smooth_quant:
-            tensorrt_llm_llama.layers[i].mlp.fc.weight.value = sq_trick(
+            tensorrt_llm_llama.layers[idx].mlp.fc.weight.value = sq_trick(
                 np.ascontiguousarray(np.transpose(t, [1, 0])))
             set_smoothquant_scale_factors(
-                tensorrt_llm_llama.layers[i].mlp.fc,
-                tensorrt_llm_llama.layers[i].post_layernorm.scale_to_int,
+                tensorrt_llm_llama.layers[idx].mlp.fc,
+                tensorrt_llm_llama.layers[idx].post_layernorm.scale_to_int,
                 dir_path,
                 'model.layers.' + str(i) + '.mlp.fc.',
-                [1, inter_size // tensor_parallel],
+                [1, inter_size // mapping.tp_size],
                 quant_per_token_dyn,
                 quant_per_channel,
-                rank=rank)
+                rank=mapping.tp_rank)
+        elif use_weight_only:
+            dst = tensorrt_llm_llama.layers[i].mlp.fc.weight
+            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                torch.tensor(t), plugin_weight_only_quant_type)
+            # workaround for trt not supporting int8 inputs in plugins currently
+            dst.value = processed_torch_weights.view(
+                dtype=torch.float32).numpy()
+            scales = tensorrt_llm_llama.layers[i].mlp.fc.per_channel_scale
+            scales.value = torch_weight_scales.numpy()
         else:
             tensorrt_llm_llama.layers[
-                i].mlp.fc.weight.value = np.ascontiguousarray(
+                idx].mlp.fc.weight.value = np.ascontiguousarray(
                     np.transpose(t, [1, 0]))
 
         t = fromfile(dir_path,
                      'model.layers.' + str(i) + '.mlp.gate.weight.' + suffix,
-                     [n_embd, inter_size // tensor_parallel], w_type)
+                     [n_embd, inter_size // mapping.tp_size], w_type)
         if use_smooth_quant:
-            tensorrt_llm_llama.layers[i].mlp.gate.weight.value = sq_trick(
+            tensorrt_llm_llama.layers[idx].mlp.gate.weight.value = sq_trick(
                 np.ascontiguousarray(np.transpose(t, [1, 0])))
             set_smoothquant_scale_factors(
-                tensorrt_llm_llama.layers[i].mlp.gate,
-                tensorrt_llm_llama.layers[i].post_layernorm.scale_to_int,
+                tensorrt_llm_llama.layers[idx].mlp.gate,
+                tensorrt_llm_llama.layers[idx].post_layernorm.scale_to_int,
                 dir_path,
                 'model.layers.' + str(i) + '.mlp.gate.',
-                [1, inter_size // tensor_parallel],
+                [1, inter_size // mapping.tp_size],
                 quant_per_token_dyn,
                 quant_per_channel,
-                rank=rank)
+                rank=mapping.tp_rank)
+        elif use_weight_only:
+            dst = tensorrt_llm_llama.layers[i].mlp.gate.weight
+            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                torch.tensor(t), plugin_weight_only_quant_type)
+            # workaround for trt not supporting int8 inputs in plugins currently
+            dst.value = processed_torch_weights.view(
+                dtype=torch.float32).numpy()
+            scales = tensorrt_llm_llama.layers[i].mlp.gate.per_channel_scale
+            scales.value = torch_weight_scales.numpy()
         else:
             tensorrt_llm_llama.layers[
-                i].mlp.gate.weight.value = np.ascontiguousarray(
+                idx].mlp.gate.weight.value = np.ascontiguousarray(
                     np.transpose(t, [1, 0]))
 
         t = fromfile(dir_path,
                      'model.layers.' + str(i) + '.mlp.proj.weight.' + suffix,
-                     [inter_size // tensor_parallel, n_embd], w_type)
+                     [inter_size // mapping.tp_size, n_embd], w_type)
         if use_smooth_quant:
-            tensorrt_llm_llama.layers[i].mlp.proj.weight.value = sq_trick(
+            tensorrt_llm_llama.layers[idx].mlp.proj.weight.value = sq_trick(
                 np.ascontiguousarray(np.transpose(t, [1, 0])))
-            proj_scale = getattr(tensorrt_llm_llama.layers[i].mlp,
+            proj_scale = getattr(tensorrt_llm_llama.layers[idx].mlp,
                                  "quantization_scaling_factor", None)
             set_smoothquant_scale_factors(
-                tensorrt_llm_llama.layers[i].mlp.proj, proj_scale, dir_path,
+                tensorrt_llm_llama.layers[idx].mlp.proj, proj_scale, dir_path,
                 'model.layers.' + str(i) + '.mlp.proj.', [1, n_embd],
                 quant_per_token_dyn, quant_per_channel)
-            set_smoother(tensorrt_llm_llama.layers[i].mlp.proj, dir_path,
+            set_smoother(tensorrt_llm_llama.layers[idx].mlp.proj, dir_path,
                          'model.layers.' + str(i) + '.mlp.proj',
-                         [1, inter_size // tensor_parallel], rank)
+                         [1, inter_size // mapping.tp_size], mapping.tp_rank)
+        elif use_weight_only:
+            dst = tensorrt_llm_llama.layers[i].mlp.proj.weight
+            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                torch.tensor(t), plugin_weight_only_quant_type)
+            # workaround for trt not supporting int8 inputs in plugins currently
+            dst.value = processed_torch_weights.view(
+                dtype=torch.float32).numpy()
+            scales = tensorrt_llm_llama.layers[i].mlp.proj.per_channel_scale
+            scales.value = torch_weight_scales.numpy()
         else:
-            tensorrt_llm_llama.layers[i].mlp.proj.weight.value = (
+            tensorrt_llm_llama.layers[idx].mlp.proj.weight.value = (
                 np.ascontiguousarray(np.transpose(t, [1, 0])))
 
+        assert use_int8_kv_cache
         if use_int8_kv_cache:
             t = fromfile(
                 dir_path, 'model.layers.' + str(i) +
                 '.attention.query_key_value.scale_y_quant_orig.bin', [1],
                 np.float32)
             tensorrt_llm_llama.layers[
-                i].attention.kv_orig_quant_scale.value = 1.0 / t
-            tensorrt_llm_llama.layers[i].attention.kv_quant_orig_scale.value = t
+                idx].attention.kv_orig_quant_scale.value = 1.0 / t
+            tensorrt_llm_llama.layers[
+                idx].attention.kv_quant_orig_scale.value = t
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
@@ -656,8 +735,7 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
 
 def load_from_groupwise_safetensors_llama(tensorrt_llm_llama,
                                           quant_safetensors_path,
-                                          rank=0,
-                                          tensor_parallel=1,
+                                          mapping=Mapping(),
                                           dtype="float32",
                                           multi_query_mode=False):
     tensorrt_llm.logger.info(
@@ -721,7 +799,13 @@ def load_from_groupwise_safetensors_llama(tensorrt_llm_llama,
     num_kv_heads = tensorrt_llm_llama.num_kv_heads
     mha_mode = (num_kv_heads == tensorrt_llm_llama.num_heads)
     suffixs = ['qweight', 'qzeros', 'scales']
-    for l in range(num_hidden_layers):
+
+    layers_per_pipeline_stage = num_hidden_layers // mapping.pp_size
+    layers_range = list(
+        range(mapping.pp_rank * layers_per_pipeline_stage,
+              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
+
+    for l in layers_range:
         prefix = f'model.layers.{l}.self_attn.'
         split_qkv_suf = []
 
@@ -732,7 +816,8 @@ def load_from_groupwise_safetensors_llama(tensorrt_llm_llama,
             qkv_part = torch.cat([q_part, k_part, v_part], dim=0)
             dim = qkv_part.shape
             qkv_part = qkv_part.reshape(3, dim[0] // 3, dim[1])
-            split_qkv = qkv_part.split(dim[1] // tensor_parallel, dim=2)[rank]
+            split_qkv = qkv_part.split(dim[1] // mapping.tp_size,
+                                       dim=2)[mapping.tp_rank]
             split_qkv = torch.cat([
                 split_qkv[0, :, :].squeeze(0), split_qkv[1, :, :].squeeze(0),
                 split_qkv[2, :, :].squeeze(0)
@@ -743,31 +828,40 @@ def load_from_groupwise_safetensors_llama(tensorrt_llm_llama,
         th_qweight, th_zero, th_scale = preprocess_groupwise_weight_params(
             None, split_qkv_suf[0], split_qkv_suf[1], split_qkv_suf[2])
 
+        idx = l - mapping.pp_rank * layers_per_pipeline_stage
         tensorrt_llm_llama.layers[
-            l].attention.qkv.qweight.value = th_qweight.numpy()
-        tensorrt_llm_llama.layers[l].attention.qkv.scale.value = th_zero.numpy()
-        tensorrt_llm_llama.layers[l].attention.qkv.zero.value = th_scale.numpy()
+            idx].attention.qkv.qweight.value = th_qweight.numpy()
+        tensorrt_llm_llama.layers[
+            idx].attention.qkv.scale.value = th_zero.numpy()
+        tensorrt_llm_llama.layers[
+            idx].attention.qkv.zero.value = th_scale.numpy()
 
     torch_dtype = str_dtype_to_torch(dtype)
+
     for k, v in model_params.items():
         if isinstance(v, list):
             v = [torch_to_numpy(vv.to(torch_dtype).detach().cpu()) for vv in v]
         else:
             v = torch_to_numpy(v.to(torch_dtype).detach().cpu())
         if 'model.embed_tokens.weight' in k:
-            tensorrt_llm_llama.vocab_embedding.weight.value = v
+            if mapping.is_first_pp_rank():
+                tensorrt_llm_llama.vocab_embedding.weight.value = v
         elif 'model.norm.weight' in k:
-            tensorrt_llm_llama.ln_f.weight.value = v
+            if mapping.is_last_pp_rank():
+                tensorrt_llm_llama.ln_f.weight.value = v
         elif 'lm_head.weight' in k:
-            tensorrt_llm_llama.lm_head.weight.value = np.ascontiguousarray(
-                split(v, tensor_parallel, rank))
+            if mapping.is_last_pp_rank():
+                tensorrt_llm_llama.lm_head.weight.value = np.ascontiguousarray(
+                    split(v, mapping.tp_size, mapping.tp_rank))
         else:
             layer_idx = extract_layer_idx(k)
             if layer_idx is None:
                 continue
             idx = int(layer_idx)
-            if idx >= tensorrt_llm_llama.num_layers:
+            if idx not in layers_range:
                 continue
+            idx = idx - mapping.pp_rank * layers_per_pipeline_stage
+
             if 'input_layernorm.weight' in k:
                 tensorrt_llm_llama.layers[idx].input_layernorm.weight.value = v
             elif 'post_attention_layernorm.weight' in k:
@@ -776,8 +870,8 @@ def load_from_groupwise_safetensors_llama(tensorrt_llm_llama,
                 split_v_suf = []
                 for suf in suffixs:
                     v = model_params[k[:-7] + suf].cpu()
-                    split_v = v.split(v.shape[0] // tensor_parallel,
-                                      dim=0)[rank]
+                    split_v = v.split(v.shape[0] // mapping.tp_size,
+                                      dim=0)[mapping.tp_rank]
                     split_v_suf.append(split_v)
                 th_qweight, th_zero, th_scale = preprocess_groupwise_weight_params(
                     None, split_v_suf[0], split_v_suf[1], split_v_suf[2])
@@ -791,8 +885,8 @@ def load_from_groupwise_safetensors_llama(tensorrt_llm_llama,
                 split_v_suf = []
                 for suf in suffixs:
                     v = model_params[k[:-7] + suf].cpu()
-                    split_v = v.split(v.shape[1] // tensor_parallel,
-                                      dim=1)[rank]
+                    split_v = v.split(v.shape[1] // mapping.tp_size,
+                                      dim=1)[mapping.tp_rank]
                     split_v_suf.append(split_v)
                 th_qweight, th_zero, th_scale = preprocess_groupwise_weight_params(
                     None, split_v_suf[0], split_v_suf[1], split_v_suf[2])
@@ -806,8 +900,8 @@ def load_from_groupwise_safetensors_llama(tensorrt_llm_llama,
                 split_v_suf = []
                 for suf in suffixs:
                     v = model_params[k[:-7] + suf].cpu()
-                    split_v = v.split(v.shape[0] // tensor_parallel,
-                                      dim=0)[rank]
+                    split_v = v.split(v.shape[0] // mapping.tp_size,
+                                      dim=0)[mapping.tp_rank]
                     split_v_suf.append(split_v)
                 th_qweight, th_zero, th_scale = preprocess_groupwise_weight_params(
                     None, split_v_suf[0], split_v_suf[1], split_v_suf[2])
@@ -821,8 +915,8 @@ def load_from_groupwise_safetensors_llama(tensorrt_llm_llama,
                 split_v_suf = []
                 for suf in suffixs:
                     v = model_params[k[:-7] + suf].cpu()
-                    split_v = v.split(v.shape[1] // tensor_parallel,
-                                      dim=1)[rank]
+                    split_v = v.split(v.shape[1] // mapping.tp_size,
+                                      dim=1)[mapping.tp_rank]
                     split_v_suf.append(split_v)
                 th_qweight, th_zero, th_scale = preprocess_groupwise_weight_params(
                     None, split_v_suf[0], split_v_suf[1], split_v_suf[2])

@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 
+#ifndef _WIN32
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
+#endif // #ifndef _WIN32
 
 // clang-format off
 #include <cutlass/gemm/device/default_gemm_configuration.h>
@@ -33,7 +35,9 @@
 #include "cutlass_extensions/gemm/kernel/default_int8_traits.h"
 #include "cutlass_extensions/gemm/kernel/gemm_with_epilogue_visitor.h"
 
+#ifndef _WIN32
 #pragma GCC diagnostic pop
+#endif // #ifndef _WIN32
 
 #include "tensorrt_llm/common/allocator.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -60,7 +64,6 @@ void genericInt8GemmKernelLauncher(const int8_t* A, const int8_t* B, tk::QuantMo
     size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    // #ifdef BUILD_CUTLASS_MIXED_GEMM
 
     using ElementInput = int8_t;
 
@@ -165,11 +168,6 @@ void genericInt8GemmKernelLauncher(const int8_t* A, const int8_t* B, tk::QuantMo
             = "Failed to run cutlass int8 gemm. Error: " + std::string(cutlassGetStatusString(runStatus));
         throw std::runtime_error("[TensorRT-LLM Error][int8gemm Runner] " + errMsg);
     }
-    // #else
-    //     throw std::runtime_error(
-    //         "[TensorRT-LLM Error][int8gemm] TensorRT-LLM was built was mixed gemm support off. Please rebuild with
-    //         cmake option -DBUILD_CUTLASS_MIXED_GEMM=ON");
-    // #endif
 }
 
 template <typename T, typename arch, typename ThreadblockShape, typename WarpShape, int Stages, typename Enable = void>
@@ -355,136 +353,33 @@ void CutlassInt8GemmRunner<T>::dispatchToArch(const int8_t* A, const int8_t* B, 
 
 template <typename T>
 void CutlassInt8GemmRunner<T>::gemm(const int8_t* A, const int8_t* B, tk::QuantMode quantOption, const float* alphaCol,
-    const float* alphaRow, void* C, int m, int n, int k, char* workspacePtr, const size_t workspaceBytes,
-    cudaStream_t stream)
+    const float* alphaRow, void* C, int m, int n, int k, tkc::CutlassGemmConfig gemmConfig, char* workspacePtr,
+    const size_t workspaceBytes, cudaStream_t stream)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    int mRounded = cutlass::round_up(m, MAX_STEP_M);
-    if (m < MAX_STEP_M)
-    {
-        mRounded = mmha::next_power_of_two(m);
-    }
-    mRounded = std::min(mMaxM, mRounded);
-    dispatchToArch(A, B, quantOption, alphaCol, alphaRow, reinterpret_cast<T*>(C), m, n, k, mTacticsMap[mRounded],
-        workspacePtr, workspaceBytes, stream);
+    dispatchToArch(A, B, quantOption, alphaCol, alphaRow, reinterpret_cast<T*>(C), m, n, k, gemmConfig, workspacePtr,
+        workspaceBytes, stream);
 }
 
 template <typename T>
-float CutlassInt8GemmRunner<T>::profileConfig(const tkc::CutlassGemmConfig& config, tk::QuantMode quantOption, int m,
-    int n, int k, int8_t* A, int8_t* B, void* C, float* alphaCol, float* alphaRow, char* workspace)
+std::vector<tkc::CutlassGemmConfig> CutlassInt8GemmRunner<T>::getConfigs() const
 {
-    constexpr int warmup = 3;
-    constexpr int runs = 10;
-
-    const auto workspaceBytes = getWorkspaceSize(m, n, k);
-
-    cudaStream_t stream = cudaStreamDefault;
-    for (int i = 0; i < warmup; ++i)
-    {
-        dispatchToArch(A, B, quantOption, alphaCol, alphaRow, reinterpret_cast<T*>(C), m, n, k, config, workspace,
-            workspaceBytes, stream);
-    }
-
-    cudaEvent_t start;
-    cudaEvent_t stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaDeviceSynchronize();
-    cudaEventRecord(start, 0);
-    std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
-
-    for (int i = 0; i < runs; ++i)
-    {
-        dispatchToArch(A, B, quantOption, alphaCol, alphaRow, reinterpret_cast<T*>(C), m, n, k, config, workspace,
-            workspaceBytes, stream);
-    }
-
-    cudaEventRecord(stop, 0);
-
-    cudaEventSynchronize(stop);
-
-    float elapsed;
-    cudaEventElapsedTime(&elapsed, start, stop);
-
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-
-    return elapsed / runs;
-}
-
-template <typename T>
-tkc::CutlassGemmConfig CutlassInt8GemmRunner<T>::profileGemm(tk::QuantMode quantOption, int m, int n, int k, int8_t* A,
-    int8_t* B, void* C, float* alphaCol, float* alphaRow, char* workspace)
-{
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     static constexpr bool isWeightOnly = false;
     std::vector<tkc::CutlassGemmConfig> candidateConfigs
         = get_candidate_configs(mSm, isWeightOnly, mSm <= 70, /* SIMT configs */
             true);                                            /* INT8 configs */
-
-    float bestTime = std::numeric_limits<float>::max();
-    tkc::CutlassGemmConfig bestConfig;
-    bool foundOne = false;
-
-    for (int ii = 0; ii < candidateConfigs.size(); ++ii)
-    {
-        tkc::CutlassGemmConfig candidateConfig = candidateConfigs[ii];
-        float time = std::numeric_limits<float>::max();
-        try
-        {
-            time = profileConfig(candidateConfig, quantOption, m, n, k, A, B, C, alphaCol, alphaRow, workspace);
-            foundOne = true;
-        }
-        catch (...)
-        {
-            std::ostringstream msg;
-            msg << "Cannot profile configuration " << ii << " (for"
-                << " m=" << m << ", n=" << n << ", k=" << k << "). Skipped";
-            TLLM_LOG_DEBUG(msg.str());
-        }
-
-        if (time < bestTime)
-        {
-            bestConfig = candidateConfig;
-            bestTime = time;
-        }
-    }
-
-    if (!foundOne)
-    {
-        TLLM_LOG_ERROR("Have not found any valid GEMM config. Abort.");
-    }
-
-    return bestConfig;
+    return candidateConfigs;
 }
 
 template <typename T>
-void CutlassInt8GemmRunner<T>::profileGemms(tk::QuantMode quantOption, int minM, int maxM, int n, int k, int8_t* A,
-    int8_t* B, void* C, float* alphaCol, float* alphaRow, char* workspace)
-{
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-
-    const int startMinMRounded = mmha::next_power_of_two(minM);
-    for (int m = startMinMRounded; m < maxM;)
-    {
-        mTacticsMap[m] = profileGemm(quantOption, m, n, k, A, B, C, alphaCol, alphaRow, workspace);
-        // Profile different Ms increasing it in powers of 2 up to MAX_STEP_M
-        // From there step linearly with MAX_STEP_M step
-        m += min(m, MAX_STEP_M);
-    }
-    // Profile the largest possible M
-    mTacticsMap[maxM] = profileGemm(quantOption, maxM, n, k, A, B, C, alphaCol, alphaRow, workspace);
-}
-
-template <typename T>
-int CutlassInt8GemmRunner<T>::getWorkspaceSize(const int m, const int n, const int k)
+size_t CutlassInt8GemmRunner<T>::getWorkspaceSize(const int m, const int n, const int k)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     // These are the min tile sizes for each config, which would launch the maximum number of blocks
     const int maxGridM = cutlass::ceil_div(m, MIN_M_TILE);
     const int maxGridN = cutlass::ceil_div(m, MIN_N_TILE);
     // We need 4 bytes per block in the worst case. We launch SPLIT_K_LIMIT in z dim.
-    return maxGridM * maxGridN * SPLIT_K_LIMIT * 4;
+    return static_cast<size_t>(maxGridM * maxGridN * SPLIT_K_LIMIT * 4);
 }
 
 } // namespace cutlass_kernels

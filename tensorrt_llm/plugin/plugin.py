@@ -13,27 +13,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ctypes
+import platform
 from enum import IntEnum
 from pathlib import Path
 
 from tensorrt_llm.logger import logger
 
-_TRT_LLM_PLUGIN_NAMESPACE = 'tensorrt_llm'
+TRT_LLM_PLUGIN_NAMESPACE = 'tensorrt_llm'
 
 
-def _load_plugin_lib():
+def plugin_lib_path():
     project_dir = str(Path(__file__).parent.parent.absolute())
 
     # load tensorrt_llm plugin
-    plugin_lib = project_dir + '/libs/libnvinfer_plugin_tensorrt_llm.so'
-    handle = ctypes.CDLL(plugin_lib, mode=ctypes.RTLD_GLOBAL)
+    if platform.system() != "Windows":
+        return project_dir + '/libs/libnvinfer_plugin_tensorrt_llm.so'
+    else:  # Windows
+        return project_dir + '/libs/nvinfer_plugin_tensorrt_llm.dll'
+
+
+def _load_plugin_lib():
+    handle = ctypes.CDLL(plugin_lib_path(), mode=ctypes.RTLD_GLOBAL)
     if handle is None:
         raise ImportError('TensorRT-LLM Plugin is unavailable')
 
-    handle.initLibNvInferPlugins.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-    handle.initLibNvInferPlugins.restype = ctypes.c_bool
-    assert handle.initLibNvInferPlugins(
-        None, _TRT_LLM_PLUGIN_NAMESPACE.encode('utf-8'))
+    handle.initTrtLlmPlugins.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    handle.initTrtLlmPlugins.restype = ctypes.c_bool
+    assert handle.initTrtLlmPlugins(None,
+                                    TRT_LLM_PLUGIN_NAMESPACE.encode('utf-8'))
 
 
 class ContextFMHAType(IntEnum):
@@ -69,7 +76,6 @@ class PluginConfig(object):
         self.quantize_tensor_plugin = False
         self.paged_kv_cache = False
         self.lookup_plugin = False
-        self.in_flight_batching = False
 
     def enable_qk_half_accum(self):
         self.attention_qk_half_accumulation = True
@@ -96,11 +102,6 @@ class PluginConfig(object):
     def enable_paged_kv_cache(self):
         self.paged_kv_cache = True
         logger.info(f"Paged KV Cache Enabled")
-        return self
-
-    def enable_in_flight_batching(self):
-        self.in_flight_batching = True
-        logger.info(f"In-Flight Batching Enabled")
         return self
 
     def set_gpt_attention_plugin(self, dtype='float16'):

@@ -14,16 +14,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/plugins/ncclPlugin/allgatherPlugin.h"
+#include "allgatherPlugin.h"
 
 using namespace nvinfer1;
-using nvinfer1::plugin::AllgatherPluginCreator;
-using nvinfer1::plugin::AllgatherPlugin;
+using tensorrt_llm::plugins::AllgatherPluginCreator;
+using tensorrt_llm::plugins::AllgatherPlugin;
 
 static const char* ALLGATHER_PLUGIN_VERSION{"1"};
 static const char* ALLGATHER_PLUGIN_NAME{"AllGather"};
 PluginFieldCollection AllgatherPluginCreator::mFC{};
-std::vector<PluginField> AllgatherPluginCreator::mPluginAttributes;
+std::vector<nvinfer1::PluginField> AllgatherPluginCreator::mPluginAttributes;
 
 AllgatherPlugin::AllgatherPlugin(std::set<int> group, nvinfer1::DataType type)
     : mGroup(group)
@@ -43,7 +43,7 @@ AllgatherPlugin::AllgatherPlugin(const void* data, size_t length)
         read(d, groupItem);
         mGroup.insert(groupItem);
     }
-    PLUGIN_ASSERT(d == a + length);
+    TLLM_CHECK(d == a + length);
 }
 
 // IPluginV2DynamicExt Methods
@@ -200,16 +200,6 @@ void AllgatherPlugin::destroy() noexcept
     delete this;
 }
 
-void AllgatherPlugin::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* AllgatherPlugin::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
-}
-
 ///////////////
 
 AllgatherPluginCreator::AllgatherPluginCreator()
@@ -248,7 +238,7 @@ IPluginV2* AllgatherPluginCreator::createPlugin(const char* name, const PluginFi
         const char* attrName = fields[i].name;
         if (!strcmp(attrName, "group"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             const auto* r = static_cast<const int*>(fields[i].data);
             for (int j = 0; j < fields[i].length; ++j)
             {
@@ -258,7 +248,7 @@ IPluginV2* AllgatherPluginCreator::createPlugin(const char* name, const PluginFi
         }
         else if (!strcmp(attrName, "type_id"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
         }
     }
@@ -292,14 +282,4 @@ IPluginV2* AllgatherPluginCreator::deserializePlugin(
         caughtError(e);
     }
     return nullptr;
-}
-
-void AllgatherPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* AllgatherPluginCreator::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
 }

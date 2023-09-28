@@ -14,9 +14,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TRT_BERT_ATTENTION_PLUGIN_H
-#define TRT_BERT_ATTENTION_PLUGIN_H
-#include "NvInferPlugin.h"
+#pragma once
+
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmhaRunner.h"
@@ -27,12 +26,10 @@
 #include <string>
 #include <vector>
 
-namespace nvinfer1
-{
-namespace plugin
+namespace tensorrt_llm::plugins
 {
 
-class BertAttentionPlugin : public IPluginV2DynamicExt
+class BertAttentionPlugin : public BasePlugin
 {
 public:
     BertAttentionPlugin() = delete;
@@ -74,12 +71,9 @@ public:
     size_t getSerializationSize() const noexcept override;
     void serialize(void* buffer) const noexcept override;
     void destroy() noexcept override;
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
-    const char* getPluginNamespace() const noexcept override;
 
 private:
     const std::string mLayerName;
-    std::string mNamespace;
 
     int mNumHeads;
     int mHeadSize;
@@ -101,7 +95,7 @@ private:
     tensorrt_llm::common::cublasMMWrapper* mCublasWrapper;
 };
 
-class BertAttentionPluginCreator : public IPluginCreator
+class BertAttentionPluginCreator : public BaseCreator
 {
 public:
     BertAttentionPluginCreator();
@@ -117,17 +111,9 @@ public:
     nvinfer1::IPluginV2* deserializePlugin(
         const char* name, const void* serialData, size_t serialLength) noexcept override;
 
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
-
-    const char* getPluginNamespace() const noexcept override;
-
 private:
-    static PluginFieldCollection mFC;
-    static std::vector<PluginField> mPluginAttributes;
-    std::string mNamespace;
+    static nvinfer1::PluginFieldCollection mFC;
+    static std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
-} // namespace plugin
-} // namespace nvinfer1
-
-#endif // TRT_BERT_ATTENTION_PLUGIN_H
+} // namespace tensorrt_llm::plugins

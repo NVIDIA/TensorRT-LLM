@@ -14,7 +14,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#if !defined(_WIN32)
 #include <dlfcn.h>
+#endif // !defined(_WIN32)
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -24,6 +26,7 @@
 template <typename tSymbolSignature>
 tSymbolSignature getTrtLLMFunction(std::string libFileSoName, std::string symbol)
 {
+#if !defined(_WIN32)
     std::cout << "Trying to load " << libFileSoName << " ..." << std::endl;
 
     // 1. Defining a handle to the library
@@ -51,4 +54,9 @@ tSymbolSignature getTrtLLMFunction(std::string libFileSoName, std::string symbol
     }
 
     return symbolFctn;
+#else  // on windows
+    throw std::runtime_error(
+        "`tSymbolSignature getTrtLLMFunction(std::string, std::string)` is not implemented on Windows.");
+    return nullptr;
+#endif // !defined(_WIN32)
 }

@@ -15,7 +15,7 @@
 import csv
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import tensorrt as trt
@@ -244,19 +244,20 @@ class SamplingConfig:
     pad_id: int
 
     num_beams: int = field(default=1)
-    temperature: float = field(default=1.0)
-    top_k: int = field(default=1)
-    top_p: float = field(default=0.0)
-    length_penalty: float = field(default=1.0)
-    repetition_penalty: float = field(default=1.0)
-    min_length: int = field(default=1)
-    presence_penalty: float = field(default=0.0)
+    temperature: Union[float, torch.Tensor] = field(default=1.0)
+    top_k: Union[int, torch.Tensor] = field(default=1)
+    top_p: Union[float, torch.Tensor] = field(default=0.0)
+    length_penalty: Union[float, torch.Tensor] = field(default=1.0)
+    repetition_penalty: Union[float, torch.Tensor] = field(default=1.0)
+    min_length: Union[int, torch.Tensor] = field(default=1)
+    presence_penalty: Union[float, torch.Tensor] = field(default=0.0)
     use_beam_hyps: bool = field(default=True)
 
     ## None here means user didn't set it, and dynamicDecodeOp.cpp take optional value
     ## The real default value is set in dynamicDecodeOp.cpp when it's None
-    beam_search_diversity_rate: float = field(init=False, default=None)
-    random_seed: int = field(init=False, default=None)
+    beam_search_diversity_rate: Union[float, torch.Tensor] = field(init=False,
+                                                                   default=None)
+    random_seed: Union[int, torch.Tensor] = field(init=False, default=None)
     output_cum_log_probs: bool = field(init=False, default=False)
     output_log_probs: bool = field(init=False, default=False)
 
@@ -417,32 +418,81 @@ class GenerationSession(object):
         '''
         batch_size = host_context_lengths.shape[0]
         scfg = sampling_config  # just to make a shorter name, no other meaning
-        self.top_k = torch.full([batch_size], scfg.top_k, dtype=torch.int32)
-        self.top_p = torch.full([batch_size], scfg.top_p, dtype=torch.float32)
-        self.temperature = torch.full([batch_size],
-                                      scfg.temperature,
-                                      dtype=torch.float32)
-        self.repetition_penalty = torch.full([batch_size],
-                                             scfg.repetition_penalty,
-                                             dtype=torch.float32)
-        if scfg.repetition_penalty == 1.0:
+        if isinstance(scfg.top_k, torch.Tensor):
+            assert scfg.top_k.dtype == torch.int32, f"scfg.top_k.dtype ({scfg.top_k.dtype}) must be torch.int32"
+            assert scfg.top_k.shape[
+                0] == batch_size, f"scfg.top_k.shape[0] ({scfg.top_k.shape[0]}) must equal to batch_size ({batch_size})"
+            self.top_k = scfg.top_k
+        else:
+            self.top_k = torch.full([batch_size], scfg.top_k, dtype=torch.int32)
+
+        if isinstance(scfg.top_p, torch.Tensor):
+            assert scfg.top_p.dtype == torch.float32, f"scfg.top_p.dtype ({scfg.top_p.dtype}) must be torch.float32"
+            assert scfg.top_p.shape[
+                0] == batch_size, f"scfg.top_p.shape[0] ({top_p.shape[0]}) must equal to batch_size ({batch_size})"
+            self.top_p = scfg.top_p
+        else:
+            self.top_p = torch.full([batch_size],
+                                    scfg.top_p,
+                                    dtype=torch.float32)
+
+        if isinstance(scfg.temperature, torch.Tensor):
+            assert scfg.temperature.dtype == torch.float32, f"scfg.temperature.dtype ({scfg.temperature.dtype}) must be torch.float32"
+            assert scfg.temperature.shape[
+                0] == batch_size, f"scfg.temperature.shape[0] ({scfg.temperature.shape[0]}) must equal to batch_size ({batch_size})"
+            self.temperature = scfg.temperature
+        else:
+            self.temperature = torch.full([batch_size],
+                                          scfg.temperature,
+                                          dtype=torch.float32)
+
+        if isinstance(scfg.repetition_penalty, torch.Tensor):
+            assert scfg.repetition_penalty.dtype == torch.float32, f"scfg.repetition_penalty.dtype ({scfg.repetition_penalty.dtype}) must be torch.float32"
+            assert scfg.repetition_penalty.shape[
+                0] == batch_size, f"scfg.repetition_penalty.shape[0] ({scfg.repetition_penalty.shape[0]}) must equal to batch_size ({batch_size})"
+            self.repetition_penalty = scfg.repetition_penalty
+        elif scfg.repetition_penalty == 1.0:
             self.repetition_penalty = None
+        else:
+            self.repetition_penalty = torch.full([batch_size],
+                                                 scfg.repetition_penalty,
+                                                 dtype=torch.float32)
 
-        self.length_penalty = torch.FloatTensor([scfg.length_penalty])
+        self.length_penalty = torch.FloatTensor([scfg.length_penalty
+                                                 ])  # only support scalar now
 
-        self.presence_penalty = torch.full([batch_size],
-                                           scfg.presence_penalty,
-                                           dtype=torch.float32)
-        if scfg.presence_penalty == 0.0:
+        if isinstance(scfg.presence_penalty, torch.Tensor):
+            assert scfg.presence_penalty.dtype == torch.float32, f"scfg.presence_penalty.dtype ({scfg.presence_penalty.dtype}) must be torch.float32"
+            assert scfg.presence_penalty.shape[
+                0] == batch_size, f"scfg.presence_penalty.shape[0] ({scfg.presence_penalty.shape[0]}) must equal to batch_size ({batch_size})"
+            self.presence_penalty = scfg.presence_penalty
+        elif scfg.presence_penalty == 0.0:
             self.presence_penalty = None
+        else:
+            self.presence_penalty = torch.full([batch_size],
+                                               scfg.presence_penalty,
+                                               dtype=torch.float32)
+
         assert (
             scfg.presence_penalty == 0.0 or scfg.repetition_penalty == 0.0
         ), f"presence_penalty({scfg.presence_penalty}) and repetition_penalty({scfg.repetition_penalty}) cannot be larger than 0.0 at the same time."
-        self.min_length = torch.full([batch_size],
-                                     scfg.min_length,
-                                     dtype=torch.int32)
 
-        if scfg.beam_search_diversity_rate is not None:
+        if isinstance(scfg.min_length, torch.Tensor):
+            assert scfg.min_length.dtype == torch.int32, f"scfg.min_length.dtype ({scfg.min_length.dtype}) must be torch.int32"
+            assert scfg.min_length.shape[
+                0] == batch_size, f"scfg.min_length.shape[0] ({scfg.min_length.shape[0]}) must equal to batch_size ({batch_size})"
+            self.min_length = scfg.min_length
+        else:
+            self.min_length = torch.full([batch_size],
+                                         scfg.min_length,
+                                         dtype=torch.int32)
+
+        if isinstance(scfg.beam_search_diversity_rate, torch.Tensor):
+            assert scfg.beam_search_diversity_rate.dtype == torch.float32, f"scfg.beam_search_diversity_rate.dtype ({scfg.beam_search_diversity_rate.dtype}) must be torch.float32"
+            assert scfg.beam_search_diversity_rate.shape[
+                0] == batch_size, f"scfg.beam_search_diversity_rate.shape[0] ({scfg.beam_search_diversity_rate.shape[0]}) must equal to batch_size ({batch_size})"
+            self.beam_search_diversity_rate = scfg.beam_search_diversity_rate
+        elif scfg.beam_search_diversity_rate is not None:
             self.beam_search_diversity_rate = torch.full(
                 [batch_size],
                 scfg.beam_search_diversity_rate,
@@ -450,7 +500,12 @@ class GenerationSession(object):
         else:
             self.beam_search_diversity_rate = None
 
-        if scfg.random_seed is not None:
+        if isinstance(scfg.random_seed, torch.Tensor):
+            assert scfg.random_seed.dtype == torch.int64, f"scfg.random_seed.dtype ({scfg.random_seed.dtype}) must be torch.int64"
+            assert scfg.random_seed.shape[
+                0] == batch_size, f"scfg.random_seed.shape[0] ({scfg.random_seed.shape[0]}) must equal to batch_size ({batch_size})"
+            self.random_seed = scfg.random_seed
+        elif scfg.random_seed is not None:
             self.random_seed = torch.full([batch_size],
                                           scfg.random_seed,
                                           dtype=torch.int64)
@@ -493,19 +548,20 @@ class GenerationSession(object):
             tiled_input_ids.permute(2, 0, 1)
             self.output_ids = torch.cat(
                 (tiled_input_ids,
-                 torch.zeros(batch_size,
-                             scfg.num_beams,
-                             self.max_seq_length - max_context_length,
-                             dtype=padded_input_ids.dtype,
-                             device=padded_input_ids.device)),
+                 torch.full((batch_size, scfg.num_beams,
+                             self.max_seq_length - max_context_length),
+                            scfg.end_id,
+                            dtype=padded_input_ids.dtype,
+                            device=padded_input_ids.device)),
                 axis=-1)
         else:
             self.output_ids = torch.cat(
                 (padded_input_ids,
-                 torch.zeros(batch_size,
-                             self.max_seq_length - max_context_length,
-                             dtype=padded_input_ids.dtype,
-                             device=padded_input_ids.device)),
+                 torch.full(
+                     (batch_size, self.max_seq_length - max_context_length),
+                     scfg.end_id,
+                     dtype=padded_input_ids.dtype,
+                     device=padded_input_ids.device)),
                 axis=-1)
 
         self.parent_ids = torch.zeros(
@@ -600,6 +656,7 @@ class GenerationSession(object):
         self.max_context_length = max_context_length
         self.max_new_tokens = max_new_tokens
         self.max_seq_length = max_context_length + max_new_tokens
+        self.beam_width = beam_width
 
         self.buffer = {
             'logits':
@@ -978,6 +1035,9 @@ class GenerationSession(object):
         assert max_context_length == self.max_context_length, \
             "Given input length is large then the one used in setup()," \
             "rerun the setup function with the new max_context_length to avoid buffer overflow."
+        assert beam_width == self.beam_width, \
+            "Given beam width is different from the one used in setup()," \
+            "rerun the setup function with the new beam width to avoid buffer overflow."
         ite = 0  # index of local batches, will always be 0 if pp_size = 1
 
         self.__setup_decoder(input_ids, scfg, host_context_lengths)
@@ -1120,16 +1180,9 @@ class GenerationSession(object):
                 self.buffer['logits'] = _tile_beam_width(
                     self.buffer['logits'], beam_width)
 
-            # Handle sequence_lengths.
-            if self.use_gpt_attention_plugin:
-                # Initialize sequence_lengths (no paddings) for the generation phase.
-                if step == 0:
-                    self.sequence_length_buffer = torch.add(
-                        context_lengths.detach().clone(), 1)
-                # + 1 for each new step.
-                else:
-                    self.sequence_length_buffer = torch.add(
-                        self.sequence_length_buffer, 1)
+            # Initialize sequence_lengths (no paddings) for the generation phase.
+            if step == 0:
+                self.sequence_length_buffer = context_lengths.detach().clone()
 
             if not step == self.max_new_tokens - 1:
                 # Set shape and address for the next step
@@ -1203,7 +1256,7 @@ class GenerationSession(object):
                     context_lengths, sequence_limit_lengths, stop_words_list,
                     bad_words_list, no_repeat_ngram_size,
                     this_src_cache_indirection, self.output_ids,
-                    self.new_tokens, self.finished, sequence_lengths,
+                    self.new_tokens, self.finished, self.sequence_length_buffer,
                     self.cum_log_probs, self.log_probs, self.parent_ids,
                     this_tgt_cache_indirection, self.beam_hyps_output_ids_tgt,
                     self.beam_hyps_sequence_lengths_tgt,
@@ -1220,19 +1273,18 @@ class GenerationSession(object):
 
                     # output shape of self.gather_tree: [batch_size, beam_width, output_len]
                     final_output_ids = self.gather_tree(
-                        sequence_lengths, self.output_ids, self.parent_ids,
-                        self.end_ids, context_lengths, self.cum_log_probs,
-                        self.beam_hyps_output_ids_tgt,
+                        self.sequence_length_buffer, self.output_ids,
+                        self.parent_ids, self.end_ids, context_lengths,
+                        self.cum_log_probs, self.beam_hyps_output_ids_tgt,
                         self.beam_hyps_sequence_lengths_tgt,
                         self.beam_hyps_cum_log_probs,
                         self.beam_hyps_normed_scores, self.beam_hyps_log_probs,
                         self.beam_hyps_min_normed_scores,
                         self.beam_hyps_num_beams, self.beam_hyps_is_done,
                         self.finished, self.length_penalty, batch_size,
-                        beam_width, max_context_length, self.max_seq_length,
-                        scfg.use_beam_hyps)
+                        beam_width, self.max_seq_length, scfg.use_beam_hyps)
                     if do_return_sequence_length:
-                        return final_output_ids, sequence_lengths.reshape(
+                        return final_output_ids, self.sequence_length_buffer.reshape(
                             [batch_size, beam_width])
                     else:
                         return final_output_ids
@@ -1251,17 +1303,17 @@ class GenerationSession(object):
 
         # output shape of self.gather_tree: [batch_size, beam_width, output_len]
         final_output_ids = self.gather_tree(
-            sequence_lengths, self.output_ids, self.parent_ids, self.end_ids,
-            context_lengths, self.cum_log_probs, self.beam_hyps_output_ids_tgt,
-            self.beam_hyps_sequence_lengths_tgt, self.beam_hyps_cum_log_probs,
-            self.beam_hyps_normed_scores, self.beam_hyps_log_probs,
-            self.beam_hyps_min_normed_scores, self.beam_hyps_num_beams,
-            self.beam_hyps_is_done, self.finished, self.length_penalty,
-            batch_size, beam_width, max_context_length, self.max_seq_length,
+            self.sequence_length_buffer, self.output_ids, self.parent_ids,
+            self.end_ids, context_lengths, self.cum_log_probs,
+            self.beam_hyps_output_ids_tgt, self.beam_hyps_sequence_lengths_tgt,
+            self.beam_hyps_cum_log_probs, self.beam_hyps_normed_scores,
+            self.beam_hyps_log_probs, self.beam_hyps_min_normed_scores,
+            self.beam_hyps_num_beams, self.beam_hyps_is_done, self.finished,
+            self.length_penalty, batch_size, beam_width, self.max_seq_length,
             scfg.use_beam_hyps)
 
         if do_return_sequence_length:
-            return final_output_ids, sequence_lengths.reshape(
+            return final_output_ids, self.sequence_length_buffer.reshape(
                 [batch_size, beam_width])
         else:
             return final_output_ids

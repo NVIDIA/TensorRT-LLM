@@ -149,8 +149,11 @@ Note `--enable_context_fmha` / `--enable_context_fmha_fp32_acc` has to be used t
 
 #### In-flight batching and paged KV cache
 
-If one wants to use [in-flight batching in C++ runtime](../../docs/in_flight_batching.md), the engine must be built accordingly. In-flight batching is enabled by
-adding `--use_inflight_batching` to the invocation of `build.py`. Note that in-flight batching in C++ runtime works only with attention plugin `--use_gpt_attention_plugin=float16`, paged KV cache `--paged_kv_cache` and with packed data `--remove_input_padding`. One can additionally control the size of the block in paged KV cache using `--tokens_per_block=N`.
+If one wants to use [in-flight batching in C++ runtime](../../docs/in_flight_batching.md), the engine must be built accordingly.
+In-flight batching is enabled by adding `--use_inflight_batching` to the invocation of `build.py`.
+Note that in-flight batching in C++ runtime works only with attention plugin `--use_gpt_attention_plugin=float16`, paged KV cache `--paged_kv_cache` and with packed data `--remove_input_padding`.
+Adding `--use_inflight_batching` will enable these three flags if not already enabled. It is possible to choose a different precision for `--use_gpt_attention_plugin` if the flag is provided separately.
+One can additionally control the size of the block in paged KV cache using `--tokens_per_block=N`.
 
 ### 4. Run
 

@@ -60,10 +60,14 @@ add_subdirectory(common)
 # Set gencodes
 list(APPEND PLUGIN_SOURCES "${PLUGIN_CU_SOURCES}")
 
-list(APPEND PLUGIN_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/api/InferPlugin.cpp")
+list(APPEND PLUGIN_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/api/tllmPlugin.cpp")
 
 # ################################# SHARED LIBRARY
 # ##############################################################################
+
+if(MSVC)
+  set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS 1)
+endif()
 
 add_library(${PLUGIN_SHARED_TARGET} SHARED ${PLUGIN_SOURCES})
 
@@ -85,12 +89,14 @@ set_target_properties(
              LIBRARY_OUTPUT_DIRECTORY "${TRT_OUT_DIR}"
              RUNTIME_OUTPUT_DIRECTORY "${TRT_OUT_DIR}")
 
-set_target_properties(
-  ${PLUGIN_SHARED_TARGET}
-  PROPERTIES
-    LINK_FLAGS
-    "-Wl,--exclude-libs,ALL -Wl,--version-script=${PLUGIN_EXPORT_MAP} -Wl,--no-undefined"
-)
+if(NOT MSVC)
+  set_target_properties(
+    ${PLUGIN_SHARED_TARGET}
+    PROPERTIES
+      LINK_FLAGS
+      "-Wl,--exclude-libs,ALL -Wl,--version-script=${PLUGIN_EXPORT_MAP} ${UNDEFINED_FLAG}"
+  )
+endif()
 
 set_target_properties(
   ${PLUGIN_SHARED_TARGET} PROPERTIES VERSION ${TRT_VERSION} SOVERSION
@@ -102,7 +108,6 @@ target_link_libraries(
   ${PLUGIN_SHARED_TARGET}
   ${CUBLAS_LIB}
   ${CUBLASLT_LIB}
-  ${CUDART_LIB}
   ${CUDNN_LIB}
   nvinfer
   ${CUDA_DRV_LIB}

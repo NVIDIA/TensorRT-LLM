@@ -26,6 +26,7 @@ import torch
 from .logger import logger
 
 fp32_array = partial(np.array, dtype=np.float32)
+fp16_array = partial(np.array, dtype=np.float16)
 int32_array = partial(np.array, dtype=np.int32)
 
 # numpy doesn't know bfloat16, define abstract binary type instead

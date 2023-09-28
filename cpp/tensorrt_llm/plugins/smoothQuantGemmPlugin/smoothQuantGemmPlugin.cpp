@@ -14,28 +14,68 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/plugins/smoothQuantGemmPlugin/smoothQuantGemmPlugin.h"
+#include "smoothQuantGemmPlugin.h"
 #include <numeric>
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels::cutlass_kernels;
-using nvinfer1::plugin::SmoothQuantGemmPluginCreator;
-using nvinfer1::plugin::SmoothQuantGemmPlugin;
+using tensorrt_llm::plugins::SmoothQuantGemmPluginCreator;
+using tensorrt_llm::plugins::SmoothQuantGemmPlugin;
+using tensorrt_llm::plugins::SmoothQuantGemmPluginProfiler;
+using tensorrt_llm::plugins::read;
+using tensorrt_llm::plugins::write;
 
 static const char* SQ_GEMM_PLUGIN_VERSION{"1"};
 static const char* SQ_GEMM_PLUGIN_NAME{"SmoothQuantGemm"};
 PluginFieldCollection SmoothQuantGemmPluginCreator::mFC{};
-std::vector<PluginField> SmoothQuantGemmPluginCreator::mPluginAttributes;
+std::vector<nvinfer1::PluginField> SmoothQuantGemmPluginCreator::mPluginAttributes;
 
-SmoothQuantGemmPlugin::SmoothQuantGemmPlugin(QuantMode quantMode, nvinfer1::DataType type)
+void SmoothQuantGemmPluginProfiler::runTactic(int m, int n, int k, const SmoothQuantGemmPluginProfiler::Config& tactic,
+    char* workspace, const cudaStream_t& stream)
+{
+    int8_t* aTmp = reinterpret_cast<int8_t*>(workspace);
+    int8_t* bTmp = nextWorkspacePtr(aTmp, m * k * sizeof(int8_t));
+    void* cTmp = reinterpret_cast<void*>(nextWorkspacePtr(bTmp, n * k * sizeof(int8_t)));
+    float* alphaRowTmp = reinterpret_cast<float*>(
+        nextWorkspacePtr(reinterpret_cast<int8_t*>(cTmp), m * n * (mType == nvinfer1::DataType::kFLOAT ? 4 : 2)));
+    float* alphaColTmp
+        = reinterpret_cast<float*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(alphaRowTmp), m * sizeof(float)));
+    char* workspaceTmp
+        = reinterpret_cast<char*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(alphaColTmp), n * sizeof(float)));
+
+    const int wsSize = mRunner->getWorkspaceSize(m, n, k);
+
+    mRunner->gemm(
+        aTmp, bTmp, mQuantMode, alphaColTmp, alphaRowTmp, cTmp, m, n, k, tactic, workspaceTmp, wsSize, stream);
+}
+
+void SmoothQuantGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
+{
+    std::vector<size_t> workspaces = {
+        maxM * k * sizeof(int8_t),                                  // A
+        n * k * sizeof(int8_t),                                     // B
+        maxM * n * (mType == nvinfer1::DataType::kFLOAT ? 4u : 2u), // C
+        maxM * sizeof(float),                                       // alphaRow
+        n * sizeof(float),                                          // alphaCol
+        mRunner->getWorkspaceSize(maxM, n, k)                       // workspace
+    };
+    size_t bytes = calculateTotalWorkspaceSize(workspaces.data(), workspaces.size());
+    setTmpWorkspaceSizeInBytes(bytes);
+}
+
+SmoothQuantGemmPlugin::SmoothQuantGemmPlugin(
+    QuantMode quantMode, nvinfer1::DataType type, const SmoothQuantGemmPlugin::PluginProfilerPtr& pluginProfiler)
     : mQuantMode(quantMode)
+    , mPluginProfiler(pluginProfiler)
 {
     init(type);
 }
 
 // Parameterized constructor
-SmoothQuantGemmPlugin::SmoothQuantGemmPlugin(const void* data, size_t length)
+SmoothQuantGemmPlugin::SmoothQuantGemmPlugin(
+    const void* data, size_t length, const SmoothQuantGemmPlugin::PluginProfilerPtr& pluginProfiler)
+    : mPluginProfiler(pluginProfiler)
 {
     const char *d = reinterpret_cast<const char*>(data), *a = d;
     bool perChannelScaling = false, perTokenScaling = false;
@@ -43,29 +83,15 @@ SmoothQuantGemmPlugin::SmoothQuantGemmPlugin(const void* data, size_t length)
     unsigned int quantMode;
     read(d, quantMode);
     read(d, type);
-    read(d, mMinM);
-    read(d, mMaxM);
-    read(d, mN);
-    read(d, mK);
-    int selectedMapSize;
-    read(d, selectedMapSize);
-    perfMapType selectedTacticsMap;
-    for (int ii = 0; ii < selectedMapSize; ++ii)
-    {
-        std::pair<int, tensorrt_llm::cutlass_extensions::CutlassGemmConfig> config;
-        read(d, config);
-        selectedTacticsMap.insert(config);
-    }
-    mQuantMode = QuantMode(quantMode);
-    init(type);
-    m_sqGemmRunner->setSelectedTactics(selectedTacticsMap);
-    m_sqGemmRunner->setMaxM(mMaxM);
-    PLUGIN_ASSERT(d == a + length);
-}
+    read(d, mDims);
 
-void SmoothQuantGemmPlugin::setSelectedTactics(const perfMapType& selectedTacticsMap)
-{
-    m_sqGemmRunner->setSelectedTactics(selectedTacticsMap);
+    mQuantMode = QuantMode(quantMode);
+
+    init(type);
+
+    mPluginProfiler->deserialize(d, mDims, mGemmId);
+
+    TLLM_CHECK(d == a + length);
 }
 
 void SmoothQuantGemmPlugin::init(nvinfer1::DataType type)
@@ -86,25 +112,19 @@ void SmoothQuantGemmPlugin::init(nvinfer1::DataType type)
     else
     {
         // TODO (nkorobov): add bf16 support
-        PLUGIN_ASSERT(false);
+        TLLM_THROW("Support for bf16 is missing");
     }
+
+    mPluginProfiler->setQuantMode(mQuantMode);
+
+    mGemmId = GemmIdCore(mDims.n, mDims.k, mType);
 }
 
 // IPluginV2DynamicExt Methods
 nvinfer1::IPluginV2DynamicExt* SmoothQuantGemmPlugin::clone() const noexcept
 {
-    auto* plugin = new SmoothQuantGemmPlugin(mQuantMode, mType);
-    plugin->setPluginNamespace(mNamespace.c_str());
-    plugin->setProblemSize(mMinM, mMaxM, mN, mK);
-    plugin->setSelectedTactics(m_sqGemmRunner->getSelectedTactics());
-    plugin->setMaxM(m_sqGemmRunner->getMaxM());
+    auto* plugin = new SmoothQuantGemmPlugin(*this);
     return plugin;
-}
-
-void SmoothQuantGemmPlugin::setMaxM(int maxM)
-{
-    mMaxM = maxM;
-    m_sqGemmRunner->setMaxM(maxM);
 }
 
 nvinfer1::DimsExprs SmoothQuantGemmPlugin::getOutputDimensions(
@@ -112,10 +132,10 @@ nvinfer1::DimsExprs SmoothQuantGemmPlugin::getOutputDimensions(
 {
     try
     {
-        PLUGIN_ASSERT(nbInputs == 4);
-        PLUGIN_ASSERT(outputIndex == 0);
+        TLLM_CHECK(nbInputs == 4);
+        TLLM_CHECK(outputIndex == 0);
         const int nbDimsA = inputs[0].nbDims;
-        PLUGIN_ASSERT(nbDimsA >= 2);
+        TLLM_CHECK(nbDimsA >= 2);
         DimsExprs ret;
         ret.nbDims = nbDimsA;
         for (int ii = 0; ii < nbDimsA - 1; ++ii)
@@ -167,8 +187,8 @@ bool SmoothQuantGemmPlugin::supportsFormatCombination(
 void SmoothQuantGemmPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
     const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
 {
-    mMinM = std::accumulate(in[0].min.d, in[0].min.d + in[0].min.nbDims - 1, 1, std::multiplies<int>());
-    mMaxM = std::accumulate(in[0].max.d, in[0].max.d + in[0].max.nbDims - 1, 1, std::multiplies<int>());
+    const auto minM = std::accumulate(in[0].min.d, in[0].min.d + in[0].min.nbDims - 1, 1, std::multiplies<int>());
+    const auto maxM = std::accumulate(in[0].max.d, in[0].max.d + in[0].max.nbDims - 1, 1, std::multiplies<int>());
 
     const int maxK = in[0].max.d[in[0].max.nbDims - 1];
     const int maxN = in[1].max.d[0];
@@ -178,10 +198,13 @@ void SmoothQuantGemmPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorD
     TLLM_CHECK_WITH_INFO(minN == maxN, "Variable out channels is not allowed");
     TLLM_CHECK_WITH_INFO(minK == maxK, "Variable in channels is not allowed");
 
-    mK = maxK;
-    mN = maxN;
+    if (!mDims.isInitialized())
+    {
+        mDims = {minM, maxM, maxN, maxK};
+    }
+    mGemmId = {maxN, maxK, mType};
 
-    m_workspaceMaxSize = m_sqGemmRunner->getWorkspaceSize(mMaxM, maxN, maxK);
+    m_workspaceMaxSize = m_sqGemmRunner->getWorkspaceSize(maxM, maxN, maxK);
 }
 
 size_t SmoothQuantGemmPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
@@ -210,9 +233,11 @@ int SmoothQuantGemmPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
     const int k = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
     const int wsSize = m_sqGemmRunner->getWorkspaceSize(m, n, k);
 
+    const auto& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
+    TLLM_CHECK_WITH_INFO(bestTactic, "No valid SQ GEMM tactic");
     m_sqGemmRunner->gemm(reinterpret_cast<const int8_t*>(inputs[0]), reinterpret_cast<const int8_t*>(inputs[1]),
         mQuantMode, reinterpret_cast<const float*>(inputs[3]), reinterpret_cast<const float*>(inputs[2]),
-        reinterpret_cast<void*>(outputs[0]), m, n, k, reinterpret_cast<char*>(workspace), wsSize, stream);
+        reinterpret_cast<void*>(outputs[0]), m, n, k, *bestTactic, reinterpret_cast<char*>(workspace), wsSize, stream);
 
     return 0;
 }
@@ -221,7 +246,7 @@ int SmoothQuantGemmPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
 nvinfer1::DataType SmoothQuantGemmPlugin::getOutputDataType(
     int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
 {
-    PLUGIN_ASSERT(index == 0);
+    TLLM_CHECK(index == 0);
     return mType;
 }
 
@@ -252,14 +277,10 @@ void SmoothQuantGemmPlugin::terminate() noexcept {}
 
 size_t SmoothQuantGemmPlugin::getSerializationSize() const noexcept
 {
-    const auto& selectedTactics = m_sqGemmRunner->getSelectedTactics();
-    return sizeof(unsigned int) +    // QuantMode
-        sizeof(nvinfer1::DataType) + // dtype
-        4 * sizeof(int) +            // Problem sizes (minM, maxM, N, K)
-        sizeof(int) +                // selected tactics constainer num of elems
-        selectedTactics.size()
-        * sizeof(
-            std::pair<int, tensorrt_llm::cutlass_extensions::CutlassGemmConfig>); // selected tactics container size
+    return sizeof(unsigned int) +                       // QuantMode
+        sizeof(nvinfer1::DataType) +                    // dtype
+        sizeof(mDims) +                                 // Dimensions
+        mPluginProfiler->getSerializationSize(mGemmId); // selected tactics container size
 }
 
 void SmoothQuantGemmPlugin::serialize(void* buffer) const noexcept
@@ -267,16 +288,9 @@ void SmoothQuantGemmPlugin::serialize(void* buffer) const noexcept
     char *d = static_cast<char*>(buffer), *a = d;
     write(d, mQuantMode.value());
     write(d, mType);
-    write(d, mMinM);
-    write(d, m_sqGemmRunner->getMaxM());
-    write(d, mN);
-    write(d, mK);
-    const auto& selectedTacticsMap = m_sqGemmRunner->getSelectedTactics();
-    write(d, static_cast<int>(selectedTacticsMap.size()));
-    for (const auto& pair : selectedTacticsMap)
-    {
-        write(d, pair);
-    }
+    write(d, mDims);
+
+    mPluginProfiler->serialize(d, mGemmId);
     assert(d == a + getSerializationSize());
 }
 
@@ -286,58 +300,9 @@ void SmoothQuantGemmPlugin::destroy() noexcept
     delete this;
 }
 
-void SmoothQuantGemmPlugin::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* SmoothQuantGemmPlugin::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
-}
-
-void SmoothQuantGemmPlugin::setProblemSize(int minM, int maxM, int n, int k)
-{
-    mMinM = minM;
-    mMaxM = maxM;
-    mN = n;
-    mK = k;
-}
-
-void SmoothQuantGemmPlugin::allocateTmpData()
-{
-    cudaMalloc(&mATmp, mMaxM * mK * sizeof(int8_t));
-    cudaMalloc(&mBTmp, mN * mK * sizeof(int8_t));
-    cudaMalloc(&mCTmp, mMaxM * mN * (mType == nvinfer1::DataType::kFLOAT ? 4 : 2));
-    cudaMalloc(&mAlphaRowTmp, mMaxM * sizeof(float));
-    cudaMalloc(&mAlphaColTmp, mN * sizeof(float));
-    cudaMalloc(&mWorkspaceTmp, m_sqGemmRunner->getWorkspaceSize(mMaxM, mN, mK));
-}
-
-void SmoothQuantGemmPlugin::freeTmpData()
-{
-    cudaFree(mATmp);
-    cudaFree(mBTmp);
-    cudaFree(mCTmp);
-    cudaFree(mAlphaRowTmp);
-    cudaFree(mAlphaColTmp);
-    cudaFree(mWorkspaceTmp);
-}
-
 void SmoothQuantGemmPlugin::configGemm()
 {
-    if (mMaxM == -1 || mMinM == -1 || mN == -1 || mK == -1)
-    {
-        return;
-    }
-    if (!m_sqGemmRunner->hasSelectedTactics())
-    {
-        allocateTmpData();
-        m_sqGemmRunner->profileGemms(
-            mQuantMode, mMinM, mMaxM, mN, mK, mATmp, mBTmp, mCTmp, mAlphaColTmp, mAlphaRowTmp, mWorkspaceTmp);
-        m_sqGemmRunner->setMaxM(mMaxM);
-        freeTmpData();
-    }
+    mPluginProfiler->profileTactics(m_sqGemmRunner->getConfigs(), m_sqGemmRunner, mType, mDims, mGemmId);
 }
 
 ///////////////
@@ -379,24 +344,27 @@ IPluginV2* SmoothQuantGemmPluginCreator::createPlugin(const char* name, const Pl
         const char* attrName = fields[i].name;
         if (!strcmp(attrName, "has_per_channel_scaling"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             perChannelScaling = static_cast<bool>(*(static_cast<const int*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "has_per_token_scaling"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             perTokenScaling = static_cast<bool>(*(static_cast<const int*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "type_id"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
         }
     }
     try
     {
+        // SmoothQuantGemmPluginCreator is unique and shared for an engine generation
+        // Create plugin profiler with shared tactics map
+        auto pluginProfiler = gemmPluginProfileManager.createGemmPluginProfiler(/* inference */ false);
         QuantMode quantMode = QuantMode::fromDescription(true, true, perTokenScaling, perChannelScaling);
-        auto* obj = new SmoothQuantGemmPlugin(quantMode, type);
+        auto* obj = new SmoothQuantGemmPlugin(quantMode, type, pluginProfiler);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
@@ -414,7 +382,9 @@ IPluginV2* SmoothQuantGemmPluginCreator::deserializePlugin(
     // call SmoothQuantGemmPlugin::destroy()
     try
     {
-        auto* obj = new SmoothQuantGemmPlugin(serialData, serialLength);
+        // Create plugin profiler with private tactics map which is read from the serialized engine
+        auto pluginProfiler = gemmPluginProfileManager.createGemmPluginProfiler(/* inference */ true);
+        auto* obj = new SmoothQuantGemmPlugin(serialData, serialLength, pluginProfiler);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
@@ -423,14 +393,4 @@ IPluginV2* SmoothQuantGemmPluginCreator::deserializePlugin(
         caughtError(e);
     }
     return nullptr;
-}
-
-void SmoothQuantGemmPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* SmoothQuantGemmPluginCreator::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
 }

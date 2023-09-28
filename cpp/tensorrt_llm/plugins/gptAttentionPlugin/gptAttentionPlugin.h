@@ -14,9 +14,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TRT_GPT_ATTENTION_PLUGIN_H
-#define TRT_GPT_ATTENTION_PLUGIN_H
-#include "NvInferPlugin.h"
+#pragma once
+
 #include "checkMacrosPlugin.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/quantization.h"
@@ -31,9 +30,7 @@
 #include <string>
 #include <vector>
 
-namespace nvinfer1
-{
-namespace plugin
+namespace tensorrt_llm::plugins
 {
 // batch_size = num_ctx_requests + num_gen_requests * beam_width
 // num_ctx_requests = number of context requests (single sequence per request).
@@ -70,10 +67,11 @@ public:
     GPTAttentionPlugin(int num_heads, int num_kv_heads, int unidirectional, float q_scaling,
         tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
-        int tp_size, int tp_rank, // for ALiBi
+        float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
+        float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
         tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
         bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
-        nvinfer1::DataType type, bool in_flight_batching, int32_t max_context_length, bool qkv_bias_enabled);
+        nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled);
 
     GPTAttentionPlugin(const void* data, size_t length);
 
@@ -120,16 +118,12 @@ public:
     enum class RequestType : int32_t
     {
         kCONTEXT = 0,
-        kGENERATION = 1,
-        kNONE = 2
+        kGENERATION = 1
     };
 
 private:
-    bool mInFlightBatching = false;
-
-private:
     template <typename T, typename KVCacheBuffer>
-    int enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32_t tokenIdxBeg,
+    int enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32_t tokenIdxBeg, int32_t localNbTokens,
         const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
         const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
 
@@ -192,27 +186,15 @@ private:
 
     IndexType getHostContextLengthsIdx() const
     {
-        PLUGIN_ASSERT(mRemovePadding);
+        TLLM_CHECK(mRemovePadding);
         return (mKVCacheQuantMode.hasKvCacheQuant() ? 9 : 7) + (mPagedKVCache ? 1 : 0) + (isALiBi() ? 1 : 0);
     }
 
     IndexType getQKVBiasTensorIdx() const
     {
-        PLUGIN_ASSERT(mQKVBiasEnabled);
+        TLLM_CHECK(mQKVBiasEnabled);
         return (mKVCacheQuantMode.hasInt8KvCache() ? 9 : 7) + (mPagedKVCache ? 1 : 0) + (isALiBi() ? 1 : 0)
             + (mRemovePadding ? 1 : 0);
-    }
-
-    int32_t getInputLength(const void* const* inputs, int32_t seqIdx) const
-    {
-        auto const reqType = static_cast<RequestType const*>(inputs[getRequestTypesIdx()])[seqIdx];
-        switch (reqType)
-        {
-        case RequestType::kCONTEXT: return static_cast<int32_t const*>(inputs[getHostContextLengthsIdx()])[seqIdx];
-        case RequestType::kGENERATION: return 1;
-        case RequestType::kNONE: return 0;
-        }
-        PLUGIN_ASSERT(!"Unexpected request type");
     }
 };
 
@@ -231,13 +213,6 @@ public:
 
     nvinfer1::IPluginV2* deserializePlugin(
         const char* name, const void* serialData, size_t serialLength) noexcept override;
-
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
-
-    const char* getPluginNamespace() const noexcept override;
 };
 
-} // namespace plugin
-} // namespace nvinfer1
-
-#endif // TRT_GPT_ATTENTION_PLUGIN_H
+} // namespace tensorrt_llm::plugins
