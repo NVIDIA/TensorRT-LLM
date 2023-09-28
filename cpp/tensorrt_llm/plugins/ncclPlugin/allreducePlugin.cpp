@@ -14,16 +14,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/plugins/ncclPlugin/allreducePlugin.h"
+#include "allreducePlugin.h"
 
 using namespace nvinfer1;
-using nvinfer1::plugin::AllreducePluginCreator;
-using nvinfer1::plugin::AllreducePlugin;
+using tensorrt_llm::plugins::AllreducePluginCreator;
+using tensorrt_llm::plugins::AllreducePlugin;
 
 static const char* ALLREDUCE_PLUGIN_VERSION{"1"};
 static const char* ALLREDUCE_PLUGIN_NAME{"AllReduce"};
 PluginFieldCollection AllreducePluginCreator::mFC{};
-std::vector<PluginField> AllreducePluginCreator::mPluginAttributes;
+std::vector<nvinfer1::PluginField> AllreducePluginCreator::mPluginAttributes;
 
 AllreducePlugin::AllreducePlugin(std::set<int> group, nvinfer1::DataType type)
     : mGroup(group)
@@ -43,7 +43,7 @@ AllreducePlugin::AllreducePlugin(const void* data, size_t length)
         read(d, groupItem);
         mGroup.insert(groupItem);
     }
-    PLUGIN_ASSERT(d == a + length);
+    TLLM_CHECK(d == a + length);
 }
 
 // IPluginV2DynamicExt Methods
@@ -196,16 +196,6 @@ void AllreducePlugin::destroy() noexcept
     delete this;
 }
 
-void AllreducePlugin::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* AllreducePlugin::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
-}
-
 ///////////////
 
 AllreducePluginCreator::AllreducePluginCreator()
@@ -244,7 +234,7 @@ IPluginV2* AllreducePluginCreator::createPlugin(const char* name, const PluginFi
         const char* attrName = fields[i].name;
         if (!strcmp(attrName, "group"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             const auto* r = static_cast<const int*>(fields[i].data);
             for (int j = 0; j < fields[i].length; ++j)
             {
@@ -254,7 +244,7 @@ IPluginV2* AllreducePluginCreator::createPlugin(const char* name, const PluginFi
         }
         else if (!strcmp(attrName, "type_id"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
         }
     }
@@ -288,14 +278,4 @@ IPluginV2* AllreducePluginCreator::deserializePlugin(
         caughtError(e);
     }
     return nullptr;
-}
-
-void AllreducePluginCreator::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* AllreducePluginCreator::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
 }

@@ -40,9 +40,8 @@ hf_gpt = None
 
 class StateDict():
 
-    def __init__(self, model_dir):
-        self.model_state_dict = safe_open(model_dir +
-                                          '/gptneox-20b-4bit-gs128.safetensors',
+    def __init__(self, quant_ckpt_dir):
+        self.model_state_dict = safe_open(quant_ckpt_dir,
                                           framework="pt",
                                           device=0)
 
@@ -52,7 +51,7 @@ class StateDict():
 
 class GPTQModel():
 
-    def __init__(self, model_dir):
+    def __init__(self, model_dir, quant_ckpt_dir):
         with open(model_dir + '/config.json', 'r') as f:
             model_config = json.load(f)
             self.config = GPTNeoXConfig()
@@ -74,7 +73,7 @@ class GPTQModel():
             self.config.eos_token_id = model_config['eos_token_id']
             self.config.tie_word_embeddings = model_config[
                 'tie_word_embeddings']
-        self.model_state_dict = StateDict(model_dir)
+        self.model_state_dict = StateDict(quant_ckpt_dir)
 
     def state_dict(self):
         return self.model_state_dict
@@ -157,6 +156,13 @@ def parse_arguments():
                         type=str,
                         default=False,
                         choices=['float16'])
+    parser.add_argument(
+        '--groupwise_quant_safetensors_path',
+        type=str,
+        default=None,
+        help=
+        "The path to groupwise quantized GPT-NeoX model / checkpoints to read weights from."
+    )
     parser.add_argument('--use_layernorm_plugin',
                         nargs='?',
                         const='float16',
@@ -198,10 +204,14 @@ def parse_arguments():
             args.vocab_size = hf_gpt.config.vocab_size
             args.rotary_pct = hf_gpt.config.rotary_pct
         else:
+            assert (
+                args.groupwise_quant_safetensors_path is not None
+            ), f'Please set the path to the groupwise quantized GPT-NeoX checkpoints with --groupwise_quant_safetensors_path'
             logger.info(
-                f'Loading GPTQ quantized HF GPT-NeoX model from {args.model_dir}...'
+                f'Loading GPTQ quantized HF GPT-NeoX model from {args.groupwise_quant_safetensors_path}...'
             )
-            hf_gpt = GPTQModel(args.model_dir)
+            hf_gpt = GPTQModel(args.model_dir,
+                               args.groupwise_quant_safetensors_path)
             args.n_embd = hf_gpt.config.hidden_size
             args.n_head = hf_gpt.config.num_attention_heads
             args.n_layer = hf_gpt.config.num_hidden_layers
@@ -301,6 +311,8 @@ def build_rank_engine(builder: Builder,
                                                  args.max_output_len, True,
                                                  args.max_beam_width)
         tensorrt_llm_gpt(*inputs)
+
+    tensorrt_llm.graph_rewriting.optimize(network)
 
     engine = None
 

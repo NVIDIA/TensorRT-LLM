@@ -267,8 +267,7 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
     }
 
     // common inputs
-    auto const max_input_length = params.max_input_length;
-    auto const& end_id = params.end_ids;
+    auto const& end_ids = params.end_ids;
 
     // dynamic decode GPT
     if (beam_width > 1)
@@ -286,7 +285,7 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
         const size_t dynamic_decode_batch_size = has_diff_runtime_args_ ? 1 : local_batch_size;
         const int dynamic_decode_total_iteration = local_batch_size / dynamic_decode_batch_size;
 
-        for (uint dynamic_ite = ite * dynamic_decode_total_iteration;
+        for (uint32_t dynamic_ite = ite * dynamic_decode_total_iteration;
              dynamic_ite < (ite + 1) * dynamic_decode_total_iteration; ++dynamic_ite)
         {
             const int dynamic_id_offset = dynamic_ite * dynamic_decode_batch_size * beam_width;
@@ -295,9 +294,9 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
             auto const logits_offset = logits.slice(
                 {dynamic_decode_batch_size, logits.shape[1], logits.shape[2]}, dynamic_decode_vocab_size_units_offset);
             auto const end_id_offset
-                = end_id.slice({dynamic_decode_batch_size}, dynamic_ite * dynamic_decode_batch_size);
-            typename BaseBeamSearchLayer<T>::ForwardParams dynamic_decode_input_tensors{
-                step, ite, max_input_length, logits_offset, end_id_offset, *params.src_cache_indirection, max_seq_len};
+                = end_ids.slice({dynamic_decode_batch_size}, dynamic_ite * dynamic_decode_batch_size);
+            typename BaseBeamSearchLayer<T>::ForwardParams dynamic_decode_input_tensors{step, ite, logits_offset,
+                end_id_offset, *params.src_cache_indirection, static_cast<std::int32_t>(max_seq_len)};
 
             dynamic_decode_input_tensors.embedding_bias = params.embedding_bias;
 
@@ -337,9 +336,9 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
 
         Tensor const logits_slice{
             logits.slice({local_batch_size, beam_width, logits.shape[2]}, local_batch_offset * logits.shape[2])};
-        Tensor const end_id_slice{end_id.slice({local_batch_size}, ite * local_batch_size)};
+        Tensor const end_id_slice{end_ids.slice({local_batch_size}, ite * local_batch_size)};
         typename BaseSamplingLayer<T>::ForwardParams decode_input_tensors{
-            step, ite, max_input_length, logits_slice, end_id_slice, max_seq_len};
+            step, ite, logits_slice, end_id_slice, static_cast<std::int32_t>(max_seq_len)};
 
         decode_input_tensors.embedding_bias = params.embedding_bias;
 
@@ -368,11 +367,13 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
         }
         if (outputs.output_log_probs)
         {
+            auto const generationStep = step - params.max_input_length;
+            TLLM_CHECK(generationStep >= 0);
             Tensor& output_log_probs = outputs.output_log_probs.value();
-            size_t step_offset = (step - max_input_length) * batch_size * beam_width;
-            decode_outputs.output_log_probs = output_log_probs.slice(
-                {output_log_probs.shape[0] - (step - max_input_length), local_batch_size * beam_width},
-                step_offset + local_batch_offset);
+            size_t step_offset = generationStep * batch_size * beam_width;
+            decode_outputs.output_log_probs
+                = output_log_probs.slice({output_log_probs.shape[0] - generationStep, local_batch_size * beam_width},
+                    step_offset + local_batch_offset);
         }
 
         // Run topk / topp decode layers.

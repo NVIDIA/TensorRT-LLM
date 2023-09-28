@@ -26,16 +26,9 @@ namespace kernels
 {
 
 template <typename T>
-void invokeApplyRepetitionPenalty(T* logits, const float penalty, const int* start_ids, int* output_ids,
-    const int batch_size, const int local_batch_size, const int vocab_size, const int vocab_size_padd,
-    const int* input_lengths, const int max_input_len, const int step, const RepetitionPenaltyType penalty_type,
-    cudaStream_t stream);
-
-template <typename T>
 void invokeBatchApplyRepetitionPenalty(T* logits, const float* penalties, const int** output_ids,
     const int* sequence_lengths, const int batch_size, const int local_batch_size, const int vocab_size,
-    const int* input_lengths, const int max_input_length, const RepetitionPenaltyType penalty_type, int max_seq_len,
-    cudaStream_t stream);
+    const int* input_lengths, const RepetitionPenaltyType penalty_type, int max_seq_len, cudaStream_t stream);
 
 template <typename T>
 void invokeApplyTemperaturePenalty(T* logits, const T* bias, const float temperature, const int batch_size,
@@ -47,7 +40,7 @@ void invokeBatchApplyTemperaturePenalty(T* logits, const T* bias, const float* t
 
 template <typename T>
 void invokeMinLengthPenalty(T* logits, const int* min_lengths, const int* end_ids, const int* sequnece_lengths,
-    const int max_input_length, const int batch_size, const int vocab_size_padded, cudaStream_t stream);
+    const int* input_lengths, const int batch_size, const int vocab_size_padded, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

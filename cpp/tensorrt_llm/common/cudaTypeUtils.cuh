@@ -19,8 +19,12 @@
 #include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
+#include <assert.h>
 #include <cuda.h>
 #include <cuda_fp16.h>
+#if ENABLE_BF16
+#include <cuda_bf16.h>
+#endif
 
 namespace tensorrt_llm
 {
@@ -508,7 +512,11 @@ __device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, half2>(half2 val)
 #endif // ENABLE BF16
 
 template <typename T>
-__device__ inline T cuda_abs(T val);
+__device__ inline T cuda_abs(T val)
+{
+    assert(false);
+    return {};
+}
 
 template <>
 __device__ inline float cuda_abs(float val)
@@ -547,18 +555,6 @@ template <>
 __device__ inline __nv_bfloat162 cuda_abs(__nv_bfloat162 val)
 {
     return __habs2(val);
-}
-#else
-template <>
-__device__ inline __nv_bfloat16 cuda_abs(__nv_bfloat16 val)
-{
-    return fabs(val);
-}
-
-template <>
-__device__ inline __nv_bfloat162 cuda_abs(__nv_bfloat162 val)
-{
-    return make_bfloat162(fabs(val.x), fabs(val.y));
 }
 #endif
 

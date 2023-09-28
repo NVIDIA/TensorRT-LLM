@@ -14,12 +14,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TRT_SMOOTH_QUANT_GEMM_PLUGIN_H
-#define TRT_SMOOTH_QUANT_GEMM_PLUGIN_H
+#pragma once
 
-#include "NvInferPlugin.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/int8_gemm/int8_gemm.h"
+#include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include <cassert>
 #include <memory>
@@ -27,21 +26,43 @@
 #include <string>
 #include <vector>
 
-namespace nvinfer1
-{
-namespace plugin
+namespace tensorrt_llm::plugins
 {
 
 using perfMapType = std::unordered_map<int, tensorrt_llm::cutlass_extensions::CutlassGemmConfig>;
+using SqGemmRunnerPtr = std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassInt8GemmRunnerInterface>;
 
-class SmoothQuantGemmPlugin : public IPluginV2DynamicExt
+class SmoothQuantGemmPluginProfiler : public GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
+                                          SqGemmRunnerPtr, GemmIdCore, GemmIdCoreHash>
 {
 public:
+    using Config = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
+
+    void setQuantMode(const tensorrt_llm::common::QuantMode& quantMode)
+    {
+        mQuantMode = quantMode;
+    }
+
+protected:
+    void runTactic(int m, int n, int k, const Config& tactic, char* workspace, const cudaStream_t& stream) override;
+
+    void computeTmpSize(int maxM, int n, int k) override;
+
+private:
+    tensorrt_llm::common::QuantMode mQuantMode;
+};
+
+class SmoothQuantGemmPlugin : public BasePlugin
+{
+public:
+    using PluginProfilerPtr = std::shared_ptr<SmoothQuantGemmPluginProfiler>;
+
     SmoothQuantGemmPlugin() = delete;
 
-    SmoothQuantGemmPlugin(tensorrt_llm::common::QuantMode quantMode, nvinfer1::DataType type);
+    SmoothQuantGemmPlugin(
+        tensorrt_llm::common::QuantMode quantMode, nvinfer1::DataType type, const PluginProfilerPtr& pluginProfiler);
 
-    SmoothQuantGemmPlugin(const void* data, size_t length);
+    SmoothQuantGemmPlugin(const void* data, size_t length, const PluginProfilerPtr& pluginProfiler);
 
     ~SmoothQuantGemmPlugin() override = default;
 
@@ -71,43 +92,28 @@ public:
     size_t getSerializationSize() const noexcept override;
     void serialize(void* buffer) const noexcept override;
     void destroy() noexcept override;
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
-    const char* getPluginNamespace() const noexcept override;
 
 private:
     void init(nvinfer1::DataType type);
 
-    void setProblemSize(int minM, int maxM, int n, int k);
     void configGemm();
-    void setSelectedTactics(const perfMapType& selected_tactics_map);
-    void setMaxM(int maxM);
-
-    void allocateTmpData();
-    void freeTmpData();
 
 private:
     const std::string mLayerName;
-    std::string mNamespace;
 
-    std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassInt8GemmRunnerInterface> m_sqGemmRunner;
+    SqGemmRunnerPtr m_sqGemmRunner;
     tensorrt_llm::common::QuantMode mQuantMode;
     int m_workspaceMaxSize;
-    int mMaxM{-1};
-    int mMinM{-1};
-    int mN{-1};
-    int mK{-1};
 
-    int8_t* mATmp{nullptr};
-    int8_t* mBTmp{nullptr};
-    void* mCTmp{nullptr};
-    float* mAlphaRowTmp{nullptr};
-    float* mAlphaColTmp{nullptr};
-    char* mWorkspaceTmp{nullptr};
+    GemmDims mDims{};
+    GemmIdCore mGemmId{};
+
+    PluginProfilerPtr mPluginProfiler;
 
     nvinfer1::DataType mType;
 };
 
-class SmoothQuantGemmPluginCreator : public IPluginCreator
+class SmoothQuantGemmPluginCreator : public BaseCreator
 {
 public:
     SmoothQuantGemmPluginCreator();
@@ -123,17 +129,10 @@ public:
     nvinfer1::IPluginV2* deserializePlugin(
         const char* name, const void* serialData, size_t serialLength) noexcept override;
 
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
-
-    const char* getPluginNamespace() const noexcept override;
-
 private:
-    static PluginFieldCollection mFC;
-    static std::vector<PluginField> mPluginAttributes;
-    std::string mNamespace;
+    GemmPluginProfilerManager<SmoothQuantGemmPluginProfiler> gemmPluginProfileManager;
+    static nvinfer1::PluginFieldCollection mFC;
+    static std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
-} // namespace plugin
-} // namespace nvinfer1
-
-#endif // TRT_SMOOTH_QUANT_GEMM_PLUGIN_H
+} // namespace tensorrt_llm::plugins

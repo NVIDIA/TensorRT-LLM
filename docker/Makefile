@@ -42,7 +42,7 @@ endef
 
 %_build:
 	@echo "Building docker image: $(IMAGE_WITH_TAG)"
-	docker build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
+	DOCKER_BUILDKIT=1 docker build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
 		--progress $(DOCKER_PROGRESS) \
 		$(if $(BASE_IMAGE), --build-arg BASE_IMAGE=$(BASE_IMAGE)) \
 		$(if $(BASE_TAG), --build-arg BASE_TAG=$(BASE_TAG)) \
@@ -77,7 +77,7 @@ endif
     		--workdir $(CODE_DIR) \
     		--hostname $(shell hostname)-$* \
     		--name $(CONTAINER_NAME)-$*-$(USER_NAME) \
-			--tmpfs /tmp \
+			--tmpfs /tmp:exec \
     		$(IMAGE_WITH_TAG)$(IMAGE_TAG_SUFFIX) $(RUN_CMD)
 
 devel_%: STAGE = devel

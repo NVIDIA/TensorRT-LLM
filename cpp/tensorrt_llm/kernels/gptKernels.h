@@ -42,6 +42,13 @@ enum class PositionEmbeddingType : int8_t
     kALIBI = 3
 };
 
+enum class RotaryScalingType : int8_t
+{
+    kNONE = 0,
+    kLINEAR = 1,
+    kDYNAMIC = 2,
+};
+
 template <typename AttentionMaskDataType>
 struct BuildDecoderInfoParams
 {

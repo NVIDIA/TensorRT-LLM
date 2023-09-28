@@ -25,6 +25,7 @@ set(SRCS
     iBuffer.cpp
     iTensor.cpp
     memoryCounters.cpp
+    ncclCommunicator.cpp
     runtimeBuffers.cpp
     runtimeKernels.cu
     statefulGptDecoder.cpp
@@ -34,6 +35,7 @@ set(SRCS
 
 include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)
 
+add_compile_options(-Wall)
 add_library(runtime_src OBJECT ${SRCS})
 set_property(TARGET runtime_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
@@ -43,4 +45,9 @@ target_include_directories(runtime_src PRIVATE ${MPI_INCLUDE_PATH})
 set(JSON_SRC_DIR ${PROJECT_SOURCE_DIR}/../3rdparty/json)
 add_subdirectory(${JSON_SRC_DIR} ${CMAKE_CURRENT_BINARY_DIR}/json)
 
-target_link_libraries(runtime_src PUBLIC nlohmann_json::nlohmann_json)
+if(ENABLE_MULTI_DEVICE EQUAL 1)
+  target_link_libraries(runtime_src PUBLIC nlohmann_json::nlohmann_json
+                                           ${NCCL_LIB})
+else()
+  target_link_libraries(runtime_src PUBLIC nlohmann_json::nlohmann_json)
+endif()

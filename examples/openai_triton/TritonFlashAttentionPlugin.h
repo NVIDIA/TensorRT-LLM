@@ -14,18 +14,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TRT_TRITON_FLASH_ATTENTION_PLUGIN_H
-#define TRT_TRITON_FLASH_ATTENTION_PLUGIN_H
-#include "NvInferPlugin.h"
+#pragma once
 
-#include "tensorrt_llm/plugins/common/plugin.h"
-
-// Import a generated header to use generated triton kernels.
-extern "C"
-{
-#include "aot/fmha_kernel_fp16.h"
-#include "aot/fmha_kernel_fp32.h"
-}
+#include <NvInferRuntime.h>
 
 #include <cassert>
 #include <set>
@@ -35,12 +26,10 @@ extern "C"
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-namespace nvinfer1
-{
-namespace plugin
+namespace openai_triton::plugin
 {
 
-class TritonFlashAttentionPlugin : public IPluginV2DynamicExt
+class TritonFlashAttentionPlugin : public nvinfer1::IPluginV2DynamicExt
 {
 public:
     TritonFlashAttentionPlugin(int numHeads, int headSize, float softmaxScale, nvinfer1::DataType type);
@@ -95,7 +84,7 @@ private:
     CUfunction mKernel;
 };
 
-class TritonFlashAttentionPluginCreator : public IPluginCreator
+class TritonFlashAttentionPluginCreator : public nvinfer1::IPluginCreator
 {
 public:
     TritonFlashAttentionPluginCreator();
@@ -116,12 +105,9 @@ public:
     const char* getPluginNamespace() const noexcept override;
 
 private:
-    static PluginFieldCollection mFC;
-    static std::vector<PluginField> mPluginAttributes;
+    static nvinfer1::PluginFieldCollection mFC;
+    static std::vector<nvinfer1::PluginField> mPluginAttributes;
     std::string mNamespace;
 };
 
-} // namespace plugin
-} // namespace nvinfer1
-
-#endif // TRT_TRITON_FLASH_ATTENTION_PLUGIN_H
+} // namespace openai_triton::plugin

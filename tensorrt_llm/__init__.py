@@ -16,8 +16,9 @@ import tensorrt_llm.functional as functional
 import tensorrt_llm.models as models
 import tensorrt_llm.quantization as quantization
 import tensorrt_llm.runtime as runtime
+import tensorrt_llm.tools as tools
 
-from ._common import default_net, default_trtnet, precision
+from ._common import _init, default_net, default_trtnet, precision
 # Disable flake8 on the line below because mpi_rank is not used in tensorrt_llm project
 # but may be called in dependencies (such as examples)
 from ._utils import mpi_rank, mpi_world_size, str_dtype_to_trt  # NOQA
@@ -51,6 +52,7 @@ __all__ = [
     'functional',
     'models',
     'quantization',
+    'tools',
 ]
 
-_common._init(log_level="error")
+_init(log_level="error")

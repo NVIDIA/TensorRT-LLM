@@ -14,18 +14,18 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/plugins/quantizeTensorPlugin/quantizeTensorPlugin.h"
+#include "quantizeTensorPlugin.h"
 #include "tensorrt_llm/kernels/quantization.h"
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::kernels;
-using nvinfer1::plugin::QuantizeTensorPluginCreator;
-using nvinfer1::plugin::QuantizeTensorPlugin;
+using tensorrt_llm::plugins::QuantizeTensorPluginCreator;
+using tensorrt_llm::plugins::QuantizeTensorPlugin;
 
 static const char* QUANTIZE_TENSOR_PLUGIN_VERSION{"1"};
 static const char* QUANTIZE_TENSOR_PLUGIN_NAME{"QuantizeTensor"};
 PluginFieldCollection QuantizeTensorPluginCreator::mFC{};
-std::vector<PluginField> QuantizeTensorPluginCreator::mPluginAttributes;
+std::vector<nvinfer1::PluginField> QuantizeTensorPluginCreator::mPluginAttributes;
 
 QuantizeTensorPlugin::QuantizeTensorPlugin() {}
 
@@ -33,7 +33,7 @@ QuantizeTensorPlugin::QuantizeTensorPlugin() {}
 QuantizeTensorPlugin::QuantizeTensorPlugin(const void* data, size_t length)
 {
     const char *d = reinterpret_cast<const char*>(data), *a = d;
-    PLUGIN_ASSERT(d == a + length);
+    TLLM_CHECK(d == a + length);
 }
 
 // IPluginV2DynamicExt Methods
@@ -47,8 +47,8 @@ nvinfer1::DimsExprs QuantizeTensorPlugin::getOutputDimensions(
 {
     try
     {
-        PLUGIN_ASSERT(nbInputs == 2);
-        PLUGIN_ASSERT(outputIndex < 1);
+        TLLM_CHECK(nbInputs == 2);
+        TLLM_CHECK(outputIndex < 1);
         // Quantized input
         return inputs[0];
     }
@@ -76,7 +76,7 @@ bool QuantizeTensorPlugin::supportsFormatCombination(
         return inOut[pos].type == nvinfer1::DataType::kINT8 && inOut[pos].format == TensorFormat::kLINEAR;
     default:
         // Never should be here
-        PLUGIN_ASSERT(false);
+        TLLM_CHECK(false);
         return false;
     }
 }
@@ -126,8 +126,8 @@ int QuantizeTensorPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
 nvinfer1::DataType QuantizeTensorPlugin::getOutputDataType(
     int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
 {
-    PLUGIN_ASSERT(nbInputs == 2);
-    PLUGIN_ASSERT(index == 0);
+    TLLM_CHECK(nbInputs == 2);
+    TLLM_CHECK(index == 0);
     return nvinfer1::DataType::kINT8;
 }
 
@@ -173,16 +173,6 @@ void QuantizeTensorPlugin::destroy() noexcept
 {
     // This gets called when the network containing plugin is destroyed
     delete this;
-}
-
-void QuantizeTensorPlugin::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* QuantizeTensorPlugin::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
 }
 
 ///////////////
@@ -241,14 +231,4 @@ IPluginV2* QuantizeTensorPluginCreator::deserializePlugin(
         caughtError(e);
     }
     return nullptr;
-}
-
-void QuantizeTensorPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* QuantizeTensorPluginCreator::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
 }

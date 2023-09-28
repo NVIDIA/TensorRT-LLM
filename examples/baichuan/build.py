@@ -224,9 +224,18 @@ def parse_arguments():
         args.quant_mode = QuantMode(0)
 
     if args.use_inflight_batching:
-        assert args.use_gpt_attention_plugin, "You have to use GPT attention plugin for inflight batching mode"
-        assert args.paged_kv_cache, "You have to use paged kv cache for inflight batching mode"
-        assert args.remove_input_padding, "You have to remove input padding for in-flight batching"
+        if not args.use_gpt_attention_plugin:
+            args.use_gpt_attention_plugin = 'float16'
+            logger.info(
+                f"Using GPT attention plugin for inflight batching mode. Setting to default '{args.use_gpt_attention_plugin}'"
+            )
+        if not args.remove_input_padding:
+            args.remove_input_padding = True
+            logger.info(
+                "Using remove input padding for inflight batching mode.")
+        if not args.paged_kv_cache:
+            args.paged_kv_cache = True
+            logger.info("Using paged KV cache for inflight batching mode.")
 
     if args.model_dir is not None:
         hf_config = AutoConfig.from_pretrained(args.model_dir,
@@ -343,8 +352,6 @@ def build_rank_engine(builder: Builder,
             dtype=args.use_gpt_attention_plugin)
     if args.use_gemm_plugin:
         network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
-    if args.use_inflight_batching:
-        network.plugin_config.enable_in_flight_batching()
     assert not (args.enable_context_fmha and args.enable_context_fmha_fp32_acc)
     if args.enable_context_fmha:
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
@@ -385,6 +392,8 @@ def build_rank_engine(builder: Builder,
         if args.visualize:
             model_path = os.path.join(args.output_dir, 'test.onnx')
             to_onnx(network.trt_network, model_path)
+
+    tensorrt_llm.graph_rewriting.optimize(network)
 
     engine = None
 

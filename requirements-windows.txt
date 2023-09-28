@@ -1,0 +1,20 @@
+build
+--pre --extra-index-url https://download.pytorch.org/whl/nightly/cu121
+# torch is CPU-only on Windows, so need to specify a torch version with GPU support
+torch==2.1.0.dev20230828+cu121
+torchvision==0.16.0.dev20230828
+torchdata==0.7.0.dev20230828
+torchtext==0.16.0.dev20230828
+tokenizers==0.13.3
+transformers==4.31.0
+diffusers==0.15.0
+accelerate==0.20.3
+colored
+polygraphy
+onnx>=1.12.0
+mpi4py
+numpy
+cuda-python==12.2.0
+sentencepiece>=0.1.99
+wheel
+pypiwin32

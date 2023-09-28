@@ -36,9 +36,9 @@ def _load_triton_plugin_lib():
     handle = ctypes.CDLL(plugin_lib, mode=ctypes.RTLD_GLOBAL)
     if handle is None:
         raise ImportError('TensorRT-LLM Triton Plugin is unavailable')
-    handle.initLibNvInferPlugins.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-    handle.initLibNvInferPlugins.restype = ctypes.c_bool
-    assert handle.initLibNvInferPlugins(
+    handle.initOpenAiTritonPlugins.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    handle.initOpenAiTritonPlugins.restype = ctypes.c_bool
+    assert handle.initOpenAiTritonPlugins(
         None, TRT_LLM_PLUGIN_NAMESPACE.encode('utf-8'))
 
 

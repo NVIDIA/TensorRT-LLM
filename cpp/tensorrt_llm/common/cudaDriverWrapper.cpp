@@ -16,10 +16,17 @@
 
 #define CUDA_LIB_NAME "cuda"
 
+#if defined(_WIN32)
+#include <windows.h>
+#define dllOpen(name) LoadLibrary("nv" name ".dll")
+#define dllClose(handle) FreeLibrary(static_cast<HMODULE>(handle))
+#define dllGetSym(handle, name) static_cast<void*>(GetProcAddress(static_cast<HMODULE>(handle), name))
+#else // For non-Windows platforms
 #include <dlfcn.h>
 #define dllOpen(name) dlopen("lib" name ".so.1", RTLD_LAZY)
 #define dllClose(handle) dlclose(handle)
 #define dllGetSym(handle, name) dlsym(handle, name)
+#endif // defined(_WIN32)
 
 #include "cudaDriverWrapper.h"
 #include "tensorrt_llm/common/assert.h"

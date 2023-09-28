@@ -691,11 +691,11 @@ template void invokeTopkBeamSearch(void* workspace, size_t& workspace_size, floa
 
 template <typename T>
 __global__ void tileEncoderResults(T* tiled_output, int* tiled_sequence_length, const T* output,
-    const int* sequence_length, const uint batch_size, const uint beam_width, const uint d_model)
+    const int* sequence_length, const uint32_t batch_size, const uint32_t beam_width, const uint32_t d_model)
 {
     if (blockIdx.x == 0)
     {
-        for (uint i = threadIdx.x; i < batch_size * beam_width; i += blockDim.x)
+        for (uint32_t i = threadIdx.x; i < batch_size * beam_width; i += blockDim.x)
         {
             tiled_sequence_length[i] = sequence_length[i / beam_width];
         }
@@ -704,7 +704,7 @@ __global__ void tileEncoderResults(T* tiled_output, int* tiled_sequence_length, 
     int tgt_offset
         = blockIdx.x * gridDim.y * gridDim.z * d_model + blockIdx.y * gridDim.z * d_model + blockIdx.z * d_model;
     int src_offset = blockIdx.x * gridDim.z * d_model + blockIdx.z * d_model;
-    for (uint i = threadIdx.x; i < d_model; i += blockDim.x)
+    for (uint32_t i = threadIdx.x; i < d_model; i += blockDim.x)
     {
         tiled_output[i + tgt_offset] = output[i + src_offset];
     }
@@ -785,29 +785,16 @@ __global__ void insertUnfinishedPath(BeamHypotheses beam_hyps, const bool* finis
             int prev_id = beam_hyps.parent_ids_src[src_beam_idx * max_seq_len + last_token_idx];
             for (int token_idx = last_token_idx - 1; token_idx >= 0; token_idx--)
             {
-                int src_offset;
-                // skip the padding between inputs and outputs
-                if (token_idx > max_seq_len)
-                {
-                    src_offset = max_seq_len - beam_hyps.input_lengths[src_beam_idx];
-                }
-                else
-                {
-                    src_offset = 0;
-                }
                 // output_ids_tgt need to use max_seq_len + 1 because its shape is
                 // [bs, beam_width, max_seq_len + 1]
                 beam_hyps.output_ids_tgt[tgt_beam_idx * max_seq_len + token_idx]
-                    = beam_hyps.output_ids_src[bid * beam_width * max_seq_len + prev_id * max_seq_len + token_idx
-                        + src_offset];
+                    = beam_hyps.output_ids_src[bid * beam_width * max_seq_len + prev_id * max_seq_len + token_idx];
                 if (beam_hyps.log_probs != nullptr && beam_hyps.log_probs_src != nullptr)
                 {
                     beam_hyps.log_probs[tgt_beam_idx * max_seq_len + token_idx]
-                        = beam_hyps.log_probs_src[token_idx * batch_size * beam_width + bid * beam_width + prev_id
-                            + src_offset];
+                        = beam_hyps.log_probs_src[token_idx * batch_size * beam_width + bid * beam_width + prev_id];
                 }
-                prev_id = beam_hyps.parent_ids_src[bid * beam_width * max_seq_len + prev_id * max_seq_len + token_idx
-                    + src_offset];
+                prev_id = beam_hyps.parent_ids_src[bid * beam_width * max_seq_len + prev_id * max_seq_len + token_idx];
             }
             beam_hyps.sequence_lengths_tgt[tgt_beam_idx] = last_token_idx + 1;
 

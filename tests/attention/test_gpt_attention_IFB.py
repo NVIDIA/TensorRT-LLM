@@ -71,7 +71,7 @@ class TestFunctional(unittest.TestCase):
         test_cases = list(
             product(['gpt2_attention', 'llama_attention', 'gptj_attention'],
                     [ContextFMHAType.disabled], ['float16'], [2], [128], [4],
-                    [64], [0], [False], [False], [1], [False], [True, False]))
+                    [64], [0], [False], [False], [1], [True, False]))
 
         # TODO: add more unit tests
         test_cases += list(
@@ -79,20 +79,20 @@ class TestFunctional(unittest.TestCase):
                 ContextFMHAType.disabled, ContextFMHAType.enabled,
                 ContextFMHAType.enabled_with_fp32_acc
             ], ['float16'], [2], [90], [4], [32], [0], [False], [False], [1],
-                    [False], [False]))
+                    [False]))
 
         # Test cases for the multi-block MMHA.
         test_cases += list(
             product(['llama_attention'], [
                 ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
             ], ['float16', 'float32'], [2], [2048], [4], [64], [0], [True],
-                    [False], [1], [False], [True, False]))
+                    [False], [1], [True, False]))
 
         # Test cases for the int8 K/V cache.
         test_cases += list(
             product(['gpt2_attention'], [ContextFMHAType.disabled],
                     ['float16', 'float32'], [2], [128], [4], [64], [0], [False],
-                    [True], [1], [False, True], [False]))
+                    [True], [1], [False]))
 
         # test cases for multi-query attention
         test_cases += list(
@@ -100,19 +100,18 @@ class TestFunctional(unittest.TestCase):
                 ContextFMHAType.disabled, ContextFMHAType.enabled,
                 ContextFMHAType.enabled_with_fp32_acc
             ], ['float16'], [2], [128], [4], [64], [1], [False], [False], [1],
-                    [False, True], [False]))
+                    [False]))
 
         # test cases for beam search
         test_cases += list(
             product(['gpt2_attention'], [ContextFMHAType.disabled], ['float16'],
-                    [2], [128], [4], [64], [0], [False], [False], [4],
-                    [False, True], [False]))
+                    [2], [128], [4], [64], [0], [False], [False], [4], [False]))
 
         # test cases for grouped-query attention
         test_cases += list(
             product(['llama_attention'], [ContextFMHAType.disabled],
                     ['float16'], [2], [128], [8], [32], [2, 4], [False],
-                    [False], [1], [False], [False]))
+                    [False], [1], [False]))
         return test_cases
 
     def custom_name_func(testcase_func, param_num, param):
@@ -125,8 +124,7 @@ class TestFunctional(unittest.TestCase):
     def test_gpt_attention_IFB(self, attention_type, context_fmha_type, dtype,
                                batch_size, in_len, num_heads, head_size,
                                num_kv_heads, enable_multi_block_mmha,
-                               use_int8_kv_cache, beam_width, paged_kv_cache,
-                               fuse_bias):
+                               use_int8_kv_cache, beam_width, fuse_bias):
         if num_kv_heads == 0:
             num_kv_heads = num_heads
 
@@ -142,10 +140,8 @@ class TestFunctional(unittest.TestCase):
             # Fixing seed to avoid flakiness in tests with quantization
             torch.manual_seed(42)
 
-        if beam_width != 1 and paged_kv_cache:
-            pytest.skip(
-                "Beam search and paged kv cache are not supported in this test yet"
-            )
+        if beam_width != 1:
+            pytest.skip("Beam search is not supported in this test yet")
 
         # Skip tests that are not supported in pre-ampere architecture
         if getSMVersion() < 80:
@@ -158,9 +154,8 @@ class TestFunctional(unittest.TestCase):
                     "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
                 )
 
-        tokens_per_block = 16 if paged_kv_cache else -1
+        tokens_per_block = 16
 
-        in_flight_batching = True
         remove_input_padding = True
 
         def _construct_execution(session, input_tensor, weight, bias,
@@ -178,9 +173,7 @@ class TestFunctional(unittest.TestCase):
             net.plugin_config.set_gpt_attention_plugin(dtype)
             net.plugin_config.set_context_fmha(context_fmha_type)
             net.plugin_config.enable_remove_input_padding()
-            net.plugin_config.enable_in_flight_batching()
-            if paged_kv_cache:
-                net.plugin_config.enable_paged_kv_cache()
+            net.plugin_config.enable_paged_kv_cache()
 
             with tensorrt_llm.net_guard(net):
                 x_tensor = Tensor(name='input',
@@ -217,12 +210,10 @@ class TestFunctional(unittest.TestCase):
                         name='kv_int8_dequant_scale',
                         shape=(1, ),
                         dtype=tensorrt_llm.str_dtype_to_trt('float32'))
-                pointer_array_tensor = None
-                if paged_kv_cache:
-                    pointer_array_tensor = Tensor(
-                        name='kv_cache_block_pointers',
-                        shape=tuple(pointer_array.shape),
-                        dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+                pointer_array_tensor = Tensor(
+                    name='kv_cache_block_pointers',
+                    shape=tuple(pointer_array.shape),
+                    dtype=tensorrt_llm.str_dtype_to_trt('int32'))
 
                 host_context_lengths_tensor = None
                 if remove_input_padding:
@@ -271,13 +262,14 @@ class TestFunctional(unittest.TestCase):
                 else:
                     position_embedding_type = PositionEmbeddingType.learned_absolute
                 outputs = tensorrt_llm.functional.gpt_attention(
-                    qkv,
-                    past_key_value_tensor,
-                    sequence_length_tensor,
+                    tensor=qkv,
+                    past_key_value=past_key_value_tensor,
+                    sequence_length=sequence_length_tensor,
+                    host_past_key_value_lengths=
                     host_past_key_value_lengths_tensor,
-                    input_lengths_tensor,
-                    cache_indirection_tensor,
-                    host_request_types_tensor,
+                    context_lengths=input_lengths_tensor,
+                    cache_indirection=cache_indirection_tensor,
+                    host_request_types=host_request_types_tensor,
                     num_heads=num_heads,
                     num_kv_heads=num_kv_heads,
                     q_scaling=1.0,
@@ -308,14 +300,12 @@ class TestFunctional(unittest.TestCase):
                 'host_past_key_value_lengths': host_past_key_value_lengths,
                 'context_lengths': context_lengths,
                 'cache_indirection': cache_indirection,
-                'host_request_types': host_request_types
+                'host_request_types': host_request_types,
+                'kv_cache_block_pointers': pointer_array
             }
             if use_int8_kv_cache:
                 inputs['kv_int8_quant_scale'] = kv_int8_quant_scale
                 inputs['kv_int8_dequant_scale'] = kv_int8_dequant_scale
-
-            if paged_kv_cache:
-                inputs['kv_cache_block_pointers'] = pointer_array
 
             if remove_input_padding:
                 inputs['host_context_lengths'] = host_context_lengths
@@ -359,15 +349,10 @@ class TestFunctional(unittest.TestCase):
             'bias': (qkv_hidden_size, ),
             'kv_int8_quant_scale': (1, ),
             'kv_int8_dequant_scale': (1, ),
-            'cache_indirection': (num_req, beam_width, max_seq_len)
+            'cache_indirection': (num_req, beam_width, max_seq_len),
+            'past_key_value':
+            (blocks, 2, plugin_kv_num_heads, tokens_per_block, head_size)
         }
-        if paged_kv_cache:
-            shape_dict['past_key_value'] = (blocks, 2, plugin_kv_num_heads,
-                                            tokens_per_block, head_size)
-        else:
-            shape_dict['past_key_value'] = (num_req * beam_width, 2,
-                                            plugin_kv_num_heads, max_seq_len,
-                                            head_size)
         shape_dict['present_key_value'] = shape_dict['past_key_value']
 
         ordered_key_value = torch.zeros(
@@ -637,13 +622,12 @@ class TestFunctional(unittest.TestCase):
             torch.cuda.synchronize()
             return torch_output, torch_present
 
-        if paged_kv_cache:
-            # Init KV cache block manager
-            kv_cache_manager = KVCacheManager([ordered_key_value],
-                                              blocks,
-                                              tokens_per_block,
-                                              max_blocks_per_seq,
-                                              beam_width=beam_width)
+        # Init KV cache block manager
+        kv_cache_manager = KVCacheManager([ordered_key_value],
+                                          blocks,
+                                          tokens_per_block,
+                                          max_blocks_per_seq,
+                                          beam_width=beam_width)
 
         torch_cache_list = [None] * num_req
         cache_num_req = 0
@@ -691,19 +675,16 @@ class TestFunctional(unittest.TestCase):
 
             num_seq = num_context_req + num_generation_req * beam_width
 
-            dense_pointer_arrays = None
-            if paged_kv_cache:
-                # Check if new sequence arrived
-                if iteration < num_req:
-                    # Add sequence to the manager
-                    sequence = GenerationSequence(seq_idx=iteration,
-                                                  batch_idx=iteration)
-                    kv_cache_manager.add_sequence(sequence, in_len)
+            # Check if new sequence arrived
+            if iteration < num_req:
+                # Add sequence to the manager
+                sequence = GenerationSequence(seq_idx=iteration,
+                                              batch_idx=iteration)
+                kv_cache_manager.add_sequence(sequence, in_len)
 
-                # Get arrays of pointers to the "pages" of KV values
-                pointer_arrays = kv_cache_manager.get_pointer_arrays(
-                    beam_width)[0]
-                dense_pointer_arrays = pointer_arrays[sequence_selection]
+            # Get arrays of pointers to the "pages" of KV values
+            pointer_arrays = kv_cache_manager.get_pointer_arrays(beam_width)[0]
+            dense_pointer_arrays = pointer_arrays[sequence_selection]
 
             host_input_lengths = np.concatenate(input_length_list)
             host_input_lengths = torch.tensor(host_input_lengths,
@@ -730,17 +711,14 @@ class TestFunctional(unittest.TestCase):
             local_shape_dict = {
                 'input': (1, total_num_tokens, hidden_size),
                 'output': (1, total_num_tokens, hidden_size),
-                'past_key_value': (blocks, 2, num_kv_heads, tokens_per_block,
-                                   head_size) if paged_kv_cache else
-                (num_seq, 2, num_kv_heads, max_seq_len, head_size),
+                'past_key_value':
+                (blocks, 2, num_kv_heads, tokens_per_block, head_size),
                 'sequence_length': (num_seq, ),
                 'host_context_lengths': (num_seq, ),
                 'host_request_types': (num_seq, ),
                 'context_lengths': (num_seq, ),
                 'cache_indir': (num_req, beam_width, max_seq_len),
-                'block_pointers':
-                (num_req, beam_width, 2,
-                 max_blocks_per_seq) if paged_kv_cache else None,
+                'block_pointers': (num_req, beam_width, 2, max_blocks_per_seq),
                 'host_request_type': (num_seq),
                 'kv_int8_quant_scale': (1, ),
                 'kv_int8_dequant_scale': (1, )
@@ -820,13 +798,12 @@ class TestFunctional(unittest.TestCase):
                     atol=1e-3 if step == 0 else 2E-3)
                 offset = offset_next
 
-            if paged_kv_cache:
-                # Due to the design of the test we do not remove finished sequences, but keep them as "none" instead
-                cache_num_req = min(iteration + 1, num_req)
-                finished = [False for _ in range(cache_num_req)]
-                # Iterate to the next step. Increase number of tokens for all unfinished sequences
-                # And allocate new blocks if needed
-                kv_cache_manager.step(finished)
+            # Due to the design of the test we do not remove finished sequences, but keep them as "none" instead
+            cache_num_req = min(iteration + 1, num_req)
+            finished = [False for _ in range(cache_num_req)]
+            # Iterate to the next step. Increase number of tokens for all unfinished sequences
+            # And allocate new blocks if needed
+            kv_cache_manager.step(finished)
 
 
 if __name__ == "__main__":

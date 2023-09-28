@@ -15,13 +15,16 @@
 # limitations under the License.
 
 import os
+import platform
+import sys
 from argparse import ArgumentParser
 from contextlib import contextmanager
 from functools import partial
 from multiprocessing import cpu_count
 from pathlib import Path
 from shutil import copy, rmtree
-from subprocess import run
+from subprocess import check_output, run
+from typing import List
 
 
 @contextmanager
@@ -40,7 +43,7 @@ def main(build_type: str = "Release",
          dist_dir: Path = None,
          cuda_architectures: str = None,
          job_count: int = None,
-         extra_cmake_vars: str = "",
+         extra_cmake_vars: List[str] = list(),
          extra_make_targets: str = "",
          trt_root: str = None,
          nccl_root: str = None,
@@ -56,27 +59,58 @@ def main(build_type: str = "Release",
     if not (project_dir / "3rdparty/cutlass/.git").exists():
         build_run('git submodule update --init --recursive')
 
+    requirements_filename = "requirements-windows.txt" if platform.system(
+    ) == "Windows" else "requirements.txt"
     build_run(
-        'pip install -r requirements.txt --extra-index-url https://pypi.ngc.nvidia.com'
+        f"{sys.executable} -m pip install -r {requirements_filename} --extra-index-url https://pypi.ngc.nvidia.com"
     )
+    # Ensure TRT is installed on windows to prevent surprises.
+    reqs = check_output([sys.executable, "-m", "pip", "freeze"])
+    installed_packages = [r.decode().split("==")[0] for r in reqs.split()]
+    if "tensorrt" not in installed_packages:
+        error_msg = "TensorRT was not installed properly."
+        if platform.system() == "Windows":
+            error_msg += (
+                " Please download the TensorRT zip file manually,"
+                " install it and relaunch build_wheel.py."
+                " See https://docs.nvidia.com/deeplearning/tensorrt/install-guide/index.html#installing-zip for more details."
+            )
+        else:
+            error_msg += " Please run `pip install tensorrt` manually and relaunch build_wheel.py"
+        raise RuntimeError(error_msg)
 
     cmake_cuda_architectures = (
-        f'-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}'
+        f'"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}"'
         if cuda_architectures is not None else "")
 
     cmake_def_args = []
+
+    hardware_arch = platform.machine()
 
     if job_count is None:
         job_count = cpu_count()
 
     if len(extra_cmake_vars):
-        extra_cmake_vars = extra_cmake_vars.split(";")
-        extra_cmake_vars = ["-D" + var for var in extra_cmake_vars]
+        # Backwards compatibility, we also support semicolon expansion for each value.
+        # However, it is best to use flag multiple-times due to issues with spaces in CLI.
+        expanded_args = []
+        for var in extra_cmake_vars:
+            expanded_args += var.split(";")
+
+        extra_cmake_vars = ["\"-D{}\"".format(var) for var in expanded_args]
         cmake_def_args.extend(extra_cmake_vars)
 
     if trt_root is not None:
-        cmake_def_args.append(
-            f"-DTRT_LIB_DIR={trt_root}/targets/x86_64-linux-gnu/lib")
+        trt_root = trt_root.replace("\\", "/")
+        trt_lib_dir_candidates = (
+            f"{trt_root}/targets/{hardware_arch}-linux-gnu/lib",
+            f"{trt_root}/lib")
+        try:
+            trt_lib_dir = next(
+                filter(lambda x: Path(x).exists(), trt_lib_dir_candidates))
+        except StopIteration:
+            trt_lib_dir = trt_lib_dir_candidates[0]
+        cmake_def_args.append(f"-DTRT_LIB_DIR={trt_lib_dir}")
         cmake_def_args.append(f"-DTRT_INCLUDE_DIR={trt_root}/include")
 
     if nccl_root is not None:
@@ -108,10 +142,10 @@ def main(build_type: str = "Release",
         cmake_def_args = " ".join(cmake_def_args)
         if clean or first_build:
             build_run(
-                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" "{cmake_cuda_architectures}"'
+                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" {cmake_cuda_architectures}'
                 f' {cmake_def_args} -S "{source_dir}"')
         build_run(
-            f'make -j{job_count} tensorrt_llm tensorrt_llm_static nvinfer_plugin_tensorrt_llm {th_common_lib} '
+            f'cmake --build . --config {build_type} --parallel {job_count} --target tensorrt_llm tensorrt_llm_static nvinfer_plugin_tensorrt_llm {th_common_lib} '
             f'{" ".join(extra_make_targets)}')
 
     if cpp_only:
@@ -122,10 +156,20 @@ def main(build_type: str = "Release",
     if lib_dir.exists():
         rmtree(lib_dir)
     lib_dir.mkdir(parents=True)
-    copy(build_dir / "tensorrt_llm/thop/libth_common.so",
-         lib_dir / "libth_common.so")
-    copy(build_dir / "tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so",
-         lib_dir / "libnvinfer_plugin_tensorrt_llm.so")
+    if platform.system() == "Windows":
+        copy(build_dir / f"tensorrt_llm/thop/{build_type}/th_common.dll",
+             lib_dir / "th_common.dll")
+        copy(
+            build_dir /
+            f"tensorrt_llm/plugins/{build_type}/nvinfer_plugin_tensorrt_llm.dll",
+            lib_dir / "nvinfer_plugin_tensorrt_llm.dll")
+    else:
+        copy(build_dir / "tensorrt_llm/thop/libth_common.so",
+             lib_dir / "libth_common.so")
+        copy(
+            build_dir /
+            "tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so",
+            lib_dir / "libnvinfer_plugin_tensorrt_llm.so")
 
     if dist_dir is None:
         dist_dir = project_dir / "build"
@@ -140,7 +184,7 @@ def main(build_type: str = "Release",
         )
 
     if install:
-        build_run('pip install -e .')
+        build_run(f"{sys.executable} -m pip install -e .")
 
 
 if __name__ == "__main__":
@@ -169,9 +213,11 @@ if __name__ == "__main__":
         help="Only build the C++ library without Python dependencies")
     parser.add_argument(
         "--extra-cmake-vars",
+        "-D",
+        action="append",
         help=
-        "A list of cmake variable definition, example: \"key1=value1;key2=value2\"",
-        default="")
+        "Extra cmake variable definition which can be specified multiple times, example: -D \"key1=value1\" -D \"key2=value2\"",
+        default=[])
     parser.add_argument(
         "--extra-make-targets",
         help="A list of additional make targets, example: \"target_1 target_2\"",

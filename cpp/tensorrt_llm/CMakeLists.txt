@@ -24,8 +24,8 @@ set(STATIC_TARGET
 set(API_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
 
 find_package(MPI REQUIRED)
-message(STATUS "Using MPI_INCLUDE_PATH: ${MPI_INCLUDE_PATH}")
-message(STATUS "Using MPI_LIBRARIES: ${MPI_LIBRARIES}")
+message(STATUS "Using MPI_CXX_INCLUDE_DIRS: ${MPI_CXX_INCLUDE_DIRS}")
+message(STATUS "Using MPI_CXX_LIBRARIES: ${MPI_CXX_LIBRARIES}")
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cutlass_extensions/include
                     ${API_INCLUDE_DIR} ${MPI_INCLUDE_PATH})
@@ -66,10 +66,9 @@ endif()
 set(TRTLLM_LINK_LIBS
     ${CUBLAS_LIB}
     ${CUBLASLT_LIB}
-    ${CUDART_LIB}
     ${CUDNN_LIB}
     ${CMAKE_DL_LIBS}
-    ${MPI_LIBRARIES}
+    ${MPI_CXX_LIBRARIES}
     ${TRT_LIB}
     common_src
     kernels_src
@@ -86,8 +85,14 @@ set_target_properties(
   ${SHARED_TARGET} PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES"
                               CXX_EXTENSIONS "NO")
 
+if(NOT MSVC) # Unix-like compilers
+  set(ALLOW_UNDEFINED_FLAG "-Wl, --no-undefined")
+else() # MSVC
+  set(UNDEFINED_FLAG "")
+endif()
+
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS}
-                                              "-Wl,--no-undefined")
+                                              ${UNDEFINED_FLAG})
 
 # ################################# STATIC LIBRARY
 # ##############################################################################

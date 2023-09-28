@@ -35,7 +35,7 @@ import tensorrt_llm
 from tensorrt_llm import Tensor
 from tensorrt_llm._utils import (str_dtype_to_np, str_dtype_to_torch,
                                  torch_to_numpy)
-from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import GenerationSequence, KVCacheManager
@@ -81,11 +81,12 @@ class TestFunctional(unittest.TestCase):
                     [True], [1], [False], [True, False]))
 
         # Test cases for the multi-block MMHA.
+        # NOTE: With long in_len=2048, beam_width=4 runs into OOM issue.
         test_cases += list(
             product(['llama_attention'], [
                 ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
             ], ['float16', 'bfloat16'], [2], [2048], [4], [64], [0], [True],
-                    [False], [False], [1, 4], [False], [False]))
+                    [False], [False], [1], [False], [False]))
 
         # Test cases for the int8 K/V cache.
         test_cases += list(
@@ -111,6 +112,62 @@ class TestFunctional(unittest.TestCase):
                     [1], [165], [32], [128], [4], [False], [False], [False],
                     [1], [False], [False]))
 
+        # test cases for RoPE base and scaling
+        test_cases += list(
+            product(
+                ['llama_attention'],
+                [ContextFMHAType.disabled],
+                ['bfloat16', 'float16'],
+                [2],
+                [4],
+                [8],
+                [32],
+                [2, 4],
+                [False],
+                [False],
+                [False],
+                [1],
+                [False],
+                [False],
+                [10000.0, 1000000.0],  # rope base
+                [  # rope scaling
+                    {
+                        "type": "linear",
+                        "factor": 2.0
+                    },
+                    {
+                        "type": "dynamic",
+                        "factor": 3.0
+                    },
+                ]))
+        test_cases += list(
+            product(
+                ['llama_attention'],
+                [ContextFMHAType.enabled],
+                ['float32'],
+                [1],
+                [165],
+                [32],
+                [128],
+                [4],
+                [False],
+                [False],
+                [False],
+                [1],
+                [False],
+                [False],
+                [10000.0, 1000000.0],  # rope base
+                [  # rope scaling
+                    {
+                        "type": "linear",
+                        "factor": 3.0
+                    },
+                    {
+                        "type": "dynamic",
+                        "factor": 2.0
+                    },
+                ]))
+
         return test_cases
 
     def custom_name_func(testcase_func, param_num, param):
@@ -120,11 +177,23 @@ class TestFunctional(unittest.TestCase):
         )
 
     @parameterized.expand(load_test_cases, name_func=custom_name_func)
-    def test_gpt_attention(self, attention_type, context_fmha_type, dtype,
-                           batch_size, in_len, num_heads, head_size,
-                           num_kv_heads, enable_multi_block_mmha,
-                           use_int8_kv_cache, enable_remove_input_padding,
-                           beam_width, paged_kv_cache, fuse_bias):
+    def test_gpt_attention(self,
+                           attention_type,
+                           context_fmha_type,
+                           dtype,
+                           batch_size,
+                           in_len,
+                           num_heads,
+                           head_size,
+                           num_kv_heads,
+                           enable_multi_block_mmha,
+                           use_int8_kv_cache,
+                           enable_remove_input_padding,
+                           beam_width,
+                           paged_kv_cache,
+                           fuse_bias,
+                           rope_base=10000.0,
+                           rope_scaling=None):
         # if attention_type != "gpt_bigcode_attention" and attention_type != "llama_attention":
         #     assert num_kv_heads == 0 # safe guard against bad test case configs
 
@@ -163,14 +232,13 @@ class TestFunctional(unittest.TestCase):
 
         tokens_per_block = 16 if paged_kv_cache else -1
 
-        def _construct_execution(session, input_tensor, weight, bias,
-                                 past_key_value, pointer_array, sequence_length,
-                                 host_past_key_value_lengths, context_lengths,
-                                 host_context_lengths, cache_indirection,
-                                 host_request_types, num_heads, hidden_size,
-                                 num_kv_heads, output, dtype,
-                                 max_context_length, shape_dict,
-                                 kv_int8_quant_scale, kv_int8_dequant_scale):
+        def _construct_execution(
+                session, input_tensor, weight, bias, past_key_value,
+                pointer_array, sequence_length, host_past_key_value_lengths,
+                context_lengths, host_context_lengths, cache_indirection,
+                host_request_types, num_heads, hidden_size, num_kv_heads,
+                output, dtype, max_context_length, shape_dict,
+                kv_int8_quant_scale, kv_int8_dequant_scale, configuration):
             head_size = hidden_size // num_heads
             # construct trt network
             builder = tensorrt_llm.Builder()
@@ -270,18 +338,35 @@ class TestFunctional(unittest.TestCase):
                 else:
                     position_embedding_type = PositionEmbeddingType.learned_absolute
 
+                rope_base = 10000.0
+                rope_scale_type = RotaryScalingType.none
+                rope_scale = 1.0
+                if attention_type == "llama_attention":
+                    rope_base = configuration.rope_theta
+                    if configuration.rope_scaling is not None:
+                        rope_scale_type = {
+                            "linear": RotaryScalingType.linear,
+                            "dynamic": RotaryScalingType.dynamic
+                        }[configuration.rope_scaling["type"]]
+                        rope_scale = configuration.rope_scaling["factor"]
                 outputs = tensorrt_llm.functional.gpt_attention(
-                    qkv,
-                    past_key_value_tensor,
-                    sequence_length_tensor,
+                    tensor=qkv,
+                    past_key_value=past_key_value_tensor,
+                    sequence_length=sequence_length_tensor,
+                    host_past_key_value_lengths=
                     host_past_key_value_lengths_tensor,
-                    context_lengths_tensor,
-                    cache_indirection_tensor,
-                    host_request_types_tensor,
+                    context_lengths=context_lengths_tensor,
+                    cache_indirection=cache_indirection_tensor,
+                    host_request_types=host_request_types_tensor,
                     num_heads=num_heads,
                     num_kv_heads=num_kv_heads,
                     q_scaling=1.0,
                     rotary_embedding_dim=rotary_embedding_dim,
+                    rotary_embedding_base=rope_base,
+                    rotary_embedding_scale_type=rope_scale_type,
+                    rotary_embedding_scale=rope_scale,
+                    rotary_embedding_max_positions=configuration.
+                    max_position_embeddings,
                     position_embedding_type=position_embedding_type,
                     multi_block_mode=enable_multi_block_mmha,
                     kv_orig_quant_scale=kv_int8_quant_scale_tensor,
@@ -439,6 +524,17 @@ class TestFunctional(unittest.TestCase):
         )
         if attention_type == 'llama_attention':
             configuration.num_key_value_heads = num_kv_heads
+            configuration.rope_theta = rope_base
+            configuration.rope_scaling = rope_scaling
+            if rope_scaling is not None:
+                # scaling is typically used for supporting longer seq lens than max_position_embeddings
+                # so we set the max_position_embeddings to be smaller than total seq len
+                # the following will use default path (no scaling) when generating half of the outputs
+                # the other half will use activate the scaling
+                # NOTE: in_len is also halved because the other half is treated as padding.
+                #       See input_lengths below.
+                configuration.max_position_embeddings = (
+                    in_len // 2) + out_len - (out_len // 2)
         attention = AttentionCls(configuration).cuda().eval()
         if attention_type == 'gpt2_attention':
             attention.c_attn.weight = torch.nn.parameter.Parameter(
@@ -758,7 +854,7 @@ class TestFunctional(unittest.TestCase):
                     host_context_lengths, cache_indirection, host_request_types,
                     num_heads, hidden_size, num_kv_heads, output, dtype,
                     max_context_length, shape_dict, kv_int8_quant_scale,
-                    kv_int8_dequant_scale)
+                    kv_int8_dequant_scale, configuration)
                 del session
                 session = None
 
@@ -860,24 +956,21 @@ class TestFunctional(unittest.TestCase):
 
                 torch.cuda.synchronize()
 
-                if step == 1:
-                    tiled_input_tensor = tile_beam_width(
-                        input_tensor, beam_width)
-                    tiled_attention_mask = tile_beam_width(
-                        attention_mask, beam_width)
-                    tiled_input_lengths = tile_beam_width(
-                        input_lengths, beam_width)
-                    tiled_host_context_lengths = tiled_input_lengths.cpu(
-                    ) if enable_remove_input_padding else None
-                    tiled_host_past_key_value_lengths = tile_beam_width(
-                        host_past_key_value_lengths, beam_width)
-                    tiled_host_request_types = tile_beam_width(
-                        host_request_types, beam_width)
-                    tiled_present_key_value = tile_beam_width(
-                        present_key_value,
-                        beam_width) if not paged_kv_cache else present_key_value
-                    tiled_sequence_length = tile_beam_width(
-                        sequence_length, beam_width)
+                tiled_input_tensor = tile_beam_width(input_tensor, beam_width)
+                tiled_attention_mask = tile_beam_width(attention_mask,
+                                                       beam_width)
+                tiled_input_lengths = tile_beam_width(input_lengths, beam_width)
+                tiled_host_context_lengths = tiled_input_lengths.cpu(
+                ) if enable_remove_input_padding else None
+                tiled_host_past_key_value_lengths = tile_beam_width(
+                    host_past_key_value_lengths, beam_width)
+                tiled_host_request_types = tile_beam_width(
+                    host_request_types, beam_width)
+                tiled_present_key_value = tile_beam_width(
+                    present_key_value,
+                    beam_width) if not paged_kv_cache else present_key_value
+                tiled_sequence_length = tile_beam_width(sequence_length,
+                                                        beam_width)
 
                 if enable_remove_input_padding:
                     shape_dict['input'] = (1, batch_size, hidden_size)
@@ -888,17 +981,15 @@ class TestFunctional(unittest.TestCase):
                 output = torch.zeros(shape_dict['output'],
                                      dtype=str_dtype_to_torch(dtype),
                                      device='cuda')
-                if step == 1:
-                    input_tensor = input_tensor.reshape(
-                        [batch_size, hidden_size])
-                    tiled_input_tensor = tile_beam_width(
-                        input_tensor, beam_width)
-                    tiled_input_tensor = tiled_input_tensor.reshape(
-                        [1, batch_size * beam_width, hidden_size])
-                    output = output.reshape([batch_size, hidden_size])
-                    tiled_output = tile_beam_width(output, beam_width)
-                    tiled_output = tiled_output.reshape(
-                        [1, batch_size * beam_width, hidden_size])
+
+                input_tensor = input_tensor.reshape([batch_size, hidden_size])
+                tiled_input_tensor = tile_beam_width(input_tensor, beam_width)
+                tiled_input_tensor = tiled_input_tensor.reshape(
+                    [1, batch_size * beam_width, hidden_size])
+                output = output.reshape([batch_size, hidden_size])
+                tiled_output = tile_beam_width(output, beam_width)
+                tiled_output = tiled_output.reshape(
+                    [1, batch_size * beam_width, hidden_size])
 
                 session, tiled_output, present_key_value = _construct_execution(
                     session, tiled_input_tensor, weight_plugin, bias_plugin,
@@ -908,7 +999,7 @@ class TestFunctional(unittest.TestCase):
                     cache_indirection, tiled_host_request_types, num_heads,
                     hidden_size, num_kv_heads, tiled_output, dtype,
                     max_context_length, shape_dict, kv_int8_quant_scale,
-                    kv_int8_dequant_scale)
+                    kv_int8_dequant_scale, configuration)
 
                 del session
                 session = None
@@ -923,6 +1014,7 @@ class TestFunctional(unittest.TestCase):
                 # Iterate to the next step. Increase number of tokens for all unfinished sequences
                 # And allocate new blocks if needed
                 manager.step([False] * batch_size)
+        return
 
 
 if __name__ == "__main__":

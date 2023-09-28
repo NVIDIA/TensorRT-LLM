@@ -105,8 +105,11 @@ def to_onnx(network, path):
     onnx.save(onnx_model, path)
 
 
-def get_engine_name(model, dtype, tp_size, rank):
-    return '{}_{}_tp{}_rank{}.engine'.format(model, dtype, tp_size, rank)
+def get_engine_name(model, dtype, tp_size, pp_size, rank):
+    if pp_size == 1:
+        return '{}_{}_tp{}_rank{}.engine'.format(model, dtype, tp_size, rank)
+    return '{}_{}_tp{}_pp{}_rank{}.engine'.format(model, dtype, tp_size,
+                                                  pp_size, rank)
 
 
 def serialize_engine(engine, path):
@@ -121,10 +124,9 @@ def serialize_engine(engine, path):
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--world_size',
-                        type=int,
-                        default=1,
-                        help='world size, only support tensor parallelism now')
+    parser.add_argument('--world_size', type=int, default=1)
+    parser.add_argument('--tp_size', type=int, default=1)
+    parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument('--model_dir', type=str, default=None)
     parser.add_argument('--ft_model_dir', type=str, default=None)
     parser.add_argument('--meta_ckpt_dir', type=str, default=None)
@@ -151,10 +153,13 @@ def parse_arguments():
     parser.add_argument('--ffn_dim_multiplier', type=float, default=1.0)
     parser.add_argument('--inter_size', type=int, default=None)
     parser.add_argument('--hidden_act', type=str, default='silu')
+    parser.add_argument('--rms_norm_eps', type=float, default=1e-06)
     parser.add_argument('--max_batch_size', type=int, default=8)
     parser.add_argument('--max_input_len', type=int, default=2048)
     parser.add_argument('--max_output_len', type=int, default=512)
     parser.add_argument('--max_beam_width', type=int, default=1)
+    parser.add_argument('--rotary_base', type=float, default=10000.0)
+    parser.add_argument('--rotary_scaling', nargs=2, type=str, default=None)
     parser.add_argument('--use_gpt_attention_plugin',
                         nargs='?',
                         const='float16',
@@ -251,7 +256,7 @@ def parse_arguments():
         choices=[0, 1],
         help=
         'By default the embedding lookup table is sharded along vocab dimension (embedding_sharding_dim=0). '
-        'To shard it along hiddem dimension, set embedding_sharding_dim=1'
+        'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
     parser.add_argument(
@@ -309,9 +314,18 @@ def parse_arguments():
     ), "You cannot enable both SmoothQuant and INT8 weight-only together."
 
     if args.use_inflight_batching:
-        assert args.use_gpt_attention_plugin, "You have to use GPT attention plugin for in-flight batching mode"
-        assert args.paged_kv_cache, "You have to use paged kv cache for in-flight batching mode"
-        assert args.remove_input_padding, "You have to remove input padding for in-flight batching"
+        if not args.use_gpt_attention_plugin:
+            args.use_gpt_attention_plugin = 'float16'
+            logger.info(
+                f"Using GPT attention plugin for inflight batching mode. Setting to default '{args.use_gpt_attention_plugin}'"
+            )
+        if not args.remove_input_padding:
+            args.remove_input_padding = True
+            logger.info(
+                "Using remove input padding for inflight batching mode.")
+        if not args.paged_kv_cache:
+            args.paged_kv_cache = True
+            logger.info("Using paged KV cache for inflight batching mode.")
 
     if args.use_smooth_quant:
         args.quant_mode = QuantMode.use_smooth_quant(args.per_token,
@@ -338,6 +352,17 @@ def parse_arguments():
     if args.enable_fp8:
         args.quant_mode = args.quant_mode.set_fp8_qdq()
 
+    if args.rotary_scaling is not None:
+        rotary_scaling = {
+            "type": args.rotary_scaling[0],
+            "factor": float(args.rotary_scaling[1])
+        }
+        assert rotary_scaling["type"] in ["linear", "dynamic"]
+        assert rotary_scaling["factor"] > 1.0
+        args.rotary_scaling = rotary_scaling
+        if rotary_scaling["type"] == "dynamic":
+            assert not args.remove_input_padding, "TODO: Not supported yet"
+
     if args.inter_size is None:
         # this should not be need when loading a real model
         # but it is helpful when creating a dummy model without loading any real weights
@@ -361,6 +386,7 @@ def parse_arguments():
         args.n_positions = hf_config.max_position_embeddings
         args.vocab_size = hf_config.vocab_size
         args.hidden_act = hf_config.hidden_act
+        args.rms_norm_eps = hf_config.rms_norm_eps
     elif args.meta_ckpt_dir is not None:
         with open(Path(args.meta_ckpt_dir, "params.json")) as fp:
             meta_config: dict = json.load(fp)
@@ -374,6 +400,7 @@ def parse_arguments():
         args.inter_size = args.multiple_of * (
             (int(n_embd * args.ffn_dim_multiplier) + args.multiple_of - 1) //
             args.multiple_of)
+        args.rms_norm_eps = meta_config["norm_eps"]
     elif args.ft_model_dir is not None:
         n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size = parse_ft_config(
             Path(args.ft_model_dir) / "config.ini")
@@ -384,18 +411,22 @@ def parse_arguments():
         args.n_positions = n_positions
         args.vocab_size = vocab_size
         args.hidden_act = hidden_act
+        args.rms_norm_eps = 1e-06
+        logger.warning("Set rms_norm_eps to 1e-06 directly.")
     assert args.use_gpt_attention_plugin, "LLaMa must use gpt attention plugin"
     if args.n_kv_head is None:
         args.n_kv_head = args.n_head
     elif args.n_kv_head != args.n_head:
         assert (args.n_head % args.n_kv_head) == 0, \
             "MQA/GQA requires the number of heads to be divisible by the number of K/V heads."
-        assert (args.n_kv_head % args.world_size) == 0 or (args.world_size % args.n_kv_head) == 0, \
-            "MQA/GQA requires either the number of K/V heads to be divisible by the number of GPUs OR " \
-            "the number of GPUs to be divisible by the number of K/V heads."
+        assert (args.n_kv_head % args.tp_size) == 0 or (args.tp_size % args.n_kv_head) == 0, \
+            "MQA/GQA requires either the number of K/V heads to be divisible by the tensor parallelism size OR " \
+            "the tensor parallelism size to be divisible by the number of K/V heads."
 
     if args.dtype == 'bfloat16':
         assert args.use_gemm_plugin, "Please use gemm plugin when dtype is bfloat16"
+
+    assert args.pp_size * args.tp_size == args.world_size
 
     return args
 
@@ -409,7 +440,11 @@ def build_rank_engine(builder: Builder,
        @param args: The cmd line arguments.
        @return: The built engine.
     '''
-    kv_dtype = str_dtype_to_trt(args.dtype)
+    dtype = str_dtype_to_trt(args.dtype)
+    mapping = Mapping(world_size=args.world_size,
+                      rank=rank,
+                      tp_size=args.tp_size,
+                      pp_size=args.pp_size)
 
     # Initialize Module
     tensorrt_llm_llama = tensorrt_llm.models.LLaMAForCausalLM(
@@ -420,21 +455,22 @@ def build_rank_engine(builder: Builder,
         vocab_size=args.vocab_size,
         hidden_act=args.hidden_act,
         max_position_embeddings=args.n_positions,
-        dtype=kv_dtype,
+        dtype=dtype,
         mlp_hidden_size=args.inter_size,
         position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
-        mapping=Mapping(world_size=args.world_size,
-                        rank=rank,
-                        tp_size=args.world_size),  # TP only
+        mapping=mapping,
+        rotary_base=args.rotary_base,
+        rotary_scaling=args.rotary_scaling,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
-        quant_mode=args.quant_mode)
+        quant_mode=args.quant_mode,
+        rms_norm_eps=args.rms_norm_eps)
     if args.use_smooth_quant:
         tensorrt_llm_llama = smooth_quantize(tensorrt_llm_llama,
                                              args.quant_mode)
     elif args.use_weight_only and args.weight_only_precision == 'int8':
         tensorrt_llm_llama = weight_only_quantize(tensorrt_llm_llama,
-                                                  QuantMode.use_weight_only())
+                                                  args.quant_mode)
     elif args.use_weight_only and args.weight_only_precision == 'int4':
         if args.per_group:
             tensorrt_llm_llama = weight_only_groupwise_quantize(
@@ -449,9 +485,8 @@ def build_rank_engine(builder: Builder,
                 group_size=128,
                 zero=True)
         else:
-            tensorrt_llm_llama = weight_only_quantize(
-                tensorrt_llm_llama,
-                QuantMode.use_weight_only(use_int4_weights=True))
+            tensorrt_llm_llama = weight_only_quantize(tensorrt_llm_llama,
+                                                      args.quant_mode)
     elif args.enable_fp8 or args.fp8_kv_cache:
         # Dummy scales only
         tensorrt_llm_llama = fp8_quantize(tensorrt_llm_llama, args.quant_mode)
@@ -460,12 +495,11 @@ def build_rank_engine(builder: Builder,
         load_from_groupwise_safetensors_llama(
             tensorrt_llm_llama=tensorrt_llm_llama,
             quant_safetensors_path=args.quant_safetensors_path,
-            tensor_parallel=args.world_size,
-            rank=rank,
+            mapping=mapping,
             dtype="float16")
     elif args.meta_ckpt_dir is not None:
-        load_from_meta_llama(tensorrt_llm_llama, args.meta_ckpt_dir, rank,
-                             args.world_size, args.dtype)
+        load_from_meta_llama(tensorrt_llm_llama, args.meta_ckpt_dir, mapping,
+                             args.dtype)
     elif args.model_dir is not None:
         logger.info(f'Loading HF LLaMA ... from {args.model_dir}')
         tik = time.time()
@@ -481,16 +515,14 @@ def build_rank_engine(builder: Builder,
         logger.info(f'HF LLaMA loaded. Total time: {t}')
         load_from_hf_llama(tensorrt_llm_llama,
                            hf_llama,
-                           rank,
-                           args.world_size,
+                           mapping=mapping,
                            dtype=args.dtype)
         del hf_llama
     elif args.ft_model_dir is not None:
         # TODO add multi_query_mode
         load_from_binary(tensorrt_llm_llama,
                          args.ft_model_dir,
-                         rank,
-                         args.world_size,
+                         mapping,
                          fp16=(args.dtype == 'float16'),
                          multi_query_mode=(args.n_kv_head != args.n_head))
 
@@ -504,9 +536,6 @@ def build_rank_engine(builder: Builder,
         network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
     if args.use_rmsnorm_plugin:
         network.plugin_config.set_rmsnorm_plugin(dtype=args.use_rmsnorm_plugin)
-
-    if args.use_inflight_batching:
-        network.plugin_config.enable_in_flight_batching()
 
     # Quantization plugins.
     if args.use_smooth_quant:
@@ -554,10 +583,12 @@ def build_rank_engine(builder: Builder,
                 v = v.trt_tensor
                 v.name = k
                 network.trt_network.mark_output(v)
-                v.dtype = kv_dtype
+                v.dtype = dtype
         if args.visualize:
             model_path = os.path.join(args.output_dir, 'test.onnx')
             to_onnx(network.trt_network, model_path)
+
+    tensorrt_llm.graph_rewriting.optimize(network)
 
     engine = None
 
@@ -587,7 +618,8 @@ def build(rank, args):
             name=MODEL_NAME,
             precision=args.dtype,
             timing_cache=args.timing_cache if cache is None else cache,
-            tensor_parallel=args.world_size,  # TP only
+            tensor_parallel=args.tp_size,
+            pipeline_parallel=args.pp_size,
             parallel_build=args.parallel_build,
             num_layers=args.n_layer,
             num_heads=args.n_head,
@@ -605,8 +637,8 @@ def build(rank, args):
             opt_level=args.builder_opt,
             paged_kv_cache=args.paged_kv_cache,
             tokens_per_block=args.tokens_per_block)
-        engine_name = get_engine_name(MODEL_NAME, args.dtype, args.world_size,
-                                      cur_rank)
+        engine_name = get_engine_name(MODEL_NAME, args.dtype, args.tp_size,
+                                      args.pp_size, cur_rank)
         engine = build_rank_engine(builder, builder_config, engine_name,
                                    cur_rank, args)
         assert engine is not None, f'Failed to build engine for rank {cur_rank}'

@@ -21,8 +21,8 @@ from ..._utils import pad_vocab_size, str_dtype_to_trt
 from ...functional import (PositionEmbeddingType, Tensor, concat, constant,
                            expand, expand_dims, gather, gpt_attention,
                            index_select, select, shape, slice, split)
-from ...layers import (MLP, AttentionMaskType, ColumnLinear, Embedding, RmsNorm,
-                       RowLinear)
+from ...layers import (MLP, AttentionMaskType, AttentionParams, ColumnLinear,
+                       Embedding, KeyValueCacheParams, RmsNorm, RowLinear)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
 from ...parameter import Parameter
@@ -166,22 +166,12 @@ class ChatGLM2Attention(Module):
                                tp_group=tp_group,
                                tp_size=tp_size)
 
-    def forward(
-        self,
-        hidden_states: Tensor,
-        rotary_pos_emb,
-        past_key_value=None,
-        sequence_length=None,
-        host_past_key_value_lengths=None,
-        cache_indirection=None,
-        use_cache=True,
-        kv_cache_block_pointers=None,
-        context_lengths: Tensor = None,
-        host_context_lengths: Tensor = None,
-        host_request_types=None,
-        # max allowed context length. Required to
-        # compute scratch memory size.
-        max_context_length: int = None):
+    def forward(self,
+                hidden_states: Tensor,
+                rotary_pos_emb,
+                use_cache=True,
+                kv_cache_params=None,
+                attention_params=None):
         if not default_net().plugin_config.gpt_attention_plugin:
             raise ValueError(
                 'ChatGLM2 is only supported with GPTAttention plugin,pleas build it with --use_gpt_attention_plugin argument.'
@@ -258,20 +248,22 @@ class ChatGLM2Attention(Module):
         qkv = qkv.view(
             concat([shape(qkv, 0),
                     shape(qkv, 1), self.hidden_size * 3]))
-        assert sequence_length is not None
-        assert host_past_key_value_lengths is not None
-        assert cache_indirection is not None
-        assert context_lengths is not None
+        assert attention_params.is_valid(
+            default_net().plugin_config.gpt_attention_plugin,
+            default_net().plugin_config.remove_input_padding)
+        assert kv_cache_params.is_valid(
+            default_net().plugin_config.gpt_attention_plugin)
         kv_orig_quant_scale = self.kv_orig_quant_scale.value if self.use_int8_kv_cache else None
         kv_quant_orig_scale = self.kv_quant_orig_scale.value if self.use_int8_kv_cache else None
         context, past_key_value = gpt_attention(
             tensor=qkv,
-            past_key_value=past_key_value,
-            sequence_length=sequence_length,
-            host_past_key_value_lengths=host_past_key_value_lengths,
-            context_lengths=context_lengths,
-            cache_indirection=cache_indirection,
-            host_request_types=host_request_types,
+            past_key_value=kv_cache_params.get_first_past_key_value(),
+            sequence_length=attention_params.sequence_length,
+            host_past_key_value_lengths=kv_cache_params.
+            host_past_key_value_lengths,
+            context_lengths=attention_params.context_lengths,
+            cache_indirection=kv_cache_params.cache_indirection,
+            host_request_types=attention_params.host_request_types,
             num_heads=self.num_attention_heads,
             num_kv_heads=self.
             num_attention_heads,  # since self.multi_query_mode is set to False
@@ -283,9 +275,10 @@ class ChatGLM2Attention(Module):
             kv_quant_orig_scale=kv_quant_orig_scale,
             kv_cache_quant_mode=QuantMode.INT8_KV_CACHE
             if self.use_int8_kv_cache else QuantMode(0),
-            kv_cache_block_pointers=kv_cache_block_pointers,
-            max_context_length=max_context_length,
-            host_context_lengths=host_context_lengths)
+            kv_cache_block_pointers=kv_cache_params.
+            get_first_kv_cache_block_pointers(),
+            max_context_length=attention_params.max_context_length,
+            host_context_lengths=attention_params.host_context_lengths)
         # dense layer after self-attention
         context = self.dense(context)
         if use_cache:
@@ -345,22 +338,12 @@ class ChatGLM2Block(Module):
         self.mlp = MLP(self.hidden_size, ffn_hiden_size, act_func, linear_bias,
                        dtype)
 
-    def forward(
-        self,
-        hidden_states,
-        rotary_pos_emb,
-        past_key_value,
-        sequence_length,
-        host_past_key_value_lengths,
-        cache_indirection,
-        use_cache=True,
-        kv_cache_block_pointers=None,
-        context_lengths: Tensor = None,
-        host_context_lengths: Tensor = None,
-        host_request_types=None,
-        # max allowed context length. Required to
-        # compute scratch memory size.
-        max_context_length: int = None):
+    def forward(self,
+                hidden_states,
+                rotary_pos_emb,
+                use_cache=True,
+                kv_cache_params=None,
+                attention_params=None):
         # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
@@ -370,16 +353,10 @@ class ChatGLM2Block(Module):
         attention_output, kv_cache = self.self_attention(
             layernorm_output,
             rotary_pos_emb,
-            past_key_value,
-            sequence_length,
-            host_past_key_value_lengths,
-            cache_indirection=cache_indirection,
             use_cache=use_cache,
-            kv_cache_block_pointers=kv_cache_block_pointers,
-            context_lengths=context_lengths,
-            host_context_lengths=host_context_lengths,
-            host_request_types=host_request_types,
-            max_context_length=max_context_length)
+            kv_cache_params=kv_cache_params,
+            attention_params=attention_params)
+
         # Residual connection.
         if self.apply_residual_connection_post_layernorm:
             residual = layernorm_output
@@ -455,42 +432,30 @@ class ChatGLM2Transformer(Module):
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
 
-    def forward(
-        self,
-        hidden_states,
-        rotary_pos_emb,
-        past_key_value,
-        sequence_length,
-        host_past_key_value_lengths,
-        cache_indirection,
-        use_cache=True,
-        kv_cache_block_pointers=None,
-        context_lengths: Tensor = None,
-        host_context_lengths: Tensor = None,
-        host_request_types=None,
-        # max allowed context length. Required to
-        # compute scratch memory size.
-        max_context_length: int = None):
+    def forward(self,
+                hidden_states,
+                rotary_pos_emb,
+                use_cache=True,
+                kv_cache_params=None,
+                attention_params=None):
 
         presents = []
         for index in range(self.num_layers):
             layer = self._get_layer(index)
-            layer_past_key_value = past_key_value[index]
             hidden_states, kv_cache = layer(
                 hidden_states,
                 rotary_pos_emb,
-                layer_past_key_value,
-                sequence_length,
-                host_past_key_value_lengths,
-                cache_indirection,
                 use_cache=use_cache,
-                kv_cache_block_pointers=kv_cache_block_pointers,
-                context_lengths=context_lengths,
-                host_context_lengths=host_context_lengths,
-                host_request_types=host_request_types,
-                max_context_length=max_context_length)
+                kv_cache_params=KeyValueCacheParams(
+                    past_key_value=[kv_cache_params.past_key_value[index]],
+                    kv_cache_block_pointers=[
+                        kv_cache_params.kv_cache_block_pointers[index]
+                    ],
+                    host_past_key_value_lengths=kv_cache_params.
+                    host_past_key_value_lengths,
+                    cache_indirection=kv_cache_params.cache_indirection),
+                attention_params=attention_params)
             presents.append(kv_cache)
-            # hidden_states.mark_output(f'hidden_states{index}',trt.float16)
 
         if self.post_layer_norm:
             hidden_states = self.final_layernorm(hidden_states)
@@ -542,18 +507,10 @@ class ChatGLM2Model(Module):
         self,
         input_ids: Tensor,
         position_ids,
-        past_key_value,
-        sequence_length,
-        host_past_key_value_lengths,
-        cache_indirection,
         use_cache=True,
-        kv_cache_block_pointers=None,
-        context_lengths: Tensor = None,
-        host_context_lengths: Tensor = None,
-        host_request_types=None,
-        # max allowed context length. Required to
-        # compute scratch memory size.
-        max_context_length: int = None):
+        kv_cache_params=None,
+        attention_params=None,
+    ):
 
         inputs_embeds = self.embedding(input_ids)
         # Rotary positional embeddings
@@ -579,17 +536,10 @@ class ChatGLM2Model(Module):
         hidden_states, presents = self.encoder(
             inputs_embeds,
             selected_pos_emb,
-            past_key_value,
-            sequence_length,
-            host_past_key_value_lengths,
-            cache_indirection,
-            use_cache,
-            kv_cache_block_pointers,
-            context_lengths=context_lengths,
-            host_context_lengths=host_context_lengths,
-            host_request_types=host_request_types,
-            max_context_length=max_context_length)
-
+            use_cache=use_cache,
+            kv_cache_params=kv_cache_params,
+            attention_params=attention_params,
+        )
         return hidden_states, presents
 
 
@@ -647,28 +597,17 @@ class ChatGLM2HeadModel(ChatGLM2Model, GenerationMixin):
                                     tp_size=mapping.tp_size,
                                     gather_output=True)
 
-    def forward(
-        self,
-        input_ids=None,
-        position_ids=None,
-        past_key_value=None,
-        sequence_length=None,
-        host_past_key_value_lengths=None,
-        last_token_ids=None,
-        cache_indirection=None,
-        context_lengths: Tensor = None,
-        host_context_lengths: Tensor = None,
-        host_request_types=None,
-        # max allowed context length. Required to
-        # compute scratch memory size.
-        max_context_length: int = None):
+    def forward(self,
+                input_ids=None,
+                position_ids=None,
+                last_token_ids=None,
+                kv_cache_params=None,
+                attention_params=None):
+
         assert last_token_ids is not None, "Expecting last token ids to be not None"
 
-        hidden_states = super().forward(
-            input_ids, position_ids, past_key_value, sequence_length,
-            host_past_key_value_lengths, cache_indirection, self.use_cache,
-            self.kv_cache_block_pointers, context_lengths, host_context_lengths,
-            host_request_types, max_context_length)
+        hidden_states = super().forward(input_ids, position_ids, self.use_cache,
+                                        kv_cache_params, attention_params)
 
         if self.use_cache:
             hidden_states, presents = hidden_states
@@ -711,16 +650,34 @@ class ChatGLM2HeadModel(ChatGLM2Model, GenerationMixin):
         remove_input_padding = default_net().plugin_config.remove_input_padding
         use_gpt_attention_plugin = default_net(
         ).plugin_config.gpt_attention_plugin
+        use_gemm_plugin = default_net().plugin_config.gemm_plugin
 
         model_inputs = self.prepare_basic_inputs(
-            max_batch_size, max_beam_width, max_input_len, max_new_tokens,
-            num_heads, head_size, self.num_layers, self._kv_dtype,
-            remove_input_padding, use_gpt_attention_plugin)
+            max_batch_size,
+            max_beam_width,
+            max_input_len,
+            max_new_tokens,
+            num_heads,
+            head_size,
+            self.num_layers,
+            self._kv_dtype,
+            remove_input_padding,
+            use_gpt_attention_plugin,
+            use_gemm_plugin=use_gemm_plugin)
+
         return (model_inputs['input_ids'], model_inputs['position_ids'],
-                model_inputs['past_key_value'], model_inputs['sequence_length'],
-                model_inputs['host_past_key_value_lengths'],
                 model_inputs['last_token_ids'],
-                model_inputs['cache_indirection'],
-                model_inputs['context_lengths'],
-                model_inputs['host_context_lengths'],
-                model_inputs['host_request_types'], max_input_len)
+                KeyValueCacheParams(
+                    past_key_value=model_inputs['past_key_value'],
+                    host_past_key_value_lengths=model_inputs[
+                        'host_past_key_value_lengths'],
+                    kv_cache_block_pointers=model_inputs[
+                        'kv_cache_block_pointers_list'],
+                    cache_indirection=model_inputs['cache_indirection'],
+                ),
+                AttentionParams(
+                    sequence_length=model_inputs['sequence_length'],
+                    context_lengths=model_inputs['context_lengths'],
+                    host_context_lengths=model_inputs['host_context_lengths'],
+                    max_context_length=max_input_len,
+                    host_request_types=model_inputs['host_request_types']))

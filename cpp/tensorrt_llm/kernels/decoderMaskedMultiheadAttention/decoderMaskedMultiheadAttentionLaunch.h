@@ -117,10 +117,10 @@ inline size_t multi_block_grid_setup(
 #define MMHA_LAUNCH_CHECK(DYNAMIC_THDS_PER_BLOCK)                                                                      \
     std::size_t const dynamic_smem_sz{                                                                                 \
         mmha::smem_size_in_bytes<T, Dh, DO_MULTI_BLOCK>(params, DYNAMIC_THDS_PER_BLOCK)};                              \
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&available_blocks,                                                   \
+    TLLM_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&available_blocks,                                   \
         mmha::masked_multihead_attention_kernel<T, T_cache, KVCacheBuffer, Dh, DYNAMIC_THDS_PER_BLOCK, HAS_BEAMS,      \
             DO_MULTI_BLOCK>,                                                                                           \
-        DYNAMIC_THDS_PER_BLOCK, dynamic_smem_sz);
+        DYNAMIC_THDS_PER_BLOCK, dynamic_smem_sz));
 
 #define MMHA_KERNEL(DYNAMIC_THDS_PER_BLOCK)                                                                            \
     std::size_t const dynamic_smem_sz{                                                                                 \
@@ -191,10 +191,10 @@ void mmha_launch_kernel_ex(
         // Tune block size based on batchxhead to increase occupancy.
         int num_blocks_per_sm = -1;
         std::size_t const smem_sz{mmha::smem_size_in_bytes<T, Dh, DO_MULTI_BLOCK>(params, THDS_PER_BLOCK)};
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm,
+        TLLM_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm,
             mmha::masked_multihead_attention_kernel<T, T_cache, KVCacheBuffer, Dh, THDS_PER_BLOCK, HAS_BEAMS,
                 DO_MULTI_BLOCK>,
-            THDS_PER_BLOCK, smem_sz);
+            THDS_PER_BLOCK, smem_sz));
         TLLM_CHECK_WITH_INFO(
             num_blocks_per_sm >= 1, "Sequence Length is too long for the MMHA kernel (not enough shared memory).");
 

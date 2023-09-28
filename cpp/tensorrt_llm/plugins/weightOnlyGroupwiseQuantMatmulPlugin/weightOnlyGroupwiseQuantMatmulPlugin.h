@@ -14,16 +14,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TRT_WEIGHT_ONLY_GROUPWISE_QUANT_MATMUL_PLUGIN_H
-#define TRT_WEIGHT_ONLY_GROUPWISE_QUANT_MATMUL_PLUGIN_H
+#pragma once
 
-#include "NvInferPlugin.h"
-#include "cutlass/numeric_types.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
 #include "tensorrt_llm/kernels/preQuantScaleKernel.h"
-#include "tensorrt_llm/kernels/weightOnlyGroupwiseMatrixVectorMultiplication.h"
+#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/kernelLauncher.h"
+#include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
+
+#include <cutlass/numeric_types.h>
+
 #include <cassert>
 #include <memory>
 #include <set>
@@ -34,19 +35,50 @@
 // breaking dependencies
 #include "cutlass/integer_subbyte.h"
 
-namespace nvinfer1
-{
-namespace plugin
+namespace tensorrt_llm::plugins
 {
 
-class WeightOnlyGroupwiseQuantMatmulPlugin : public IPluginV2DynamicExt
+using WeightOnlyGemmRunner = tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunnerInterface;
+using WeightOnlyGemmRunnerPtr = std::shared_ptr<WeightOnlyGemmRunner>;
+
+class WeightOnlyGroupwiseQuantGemmPluginProfiler
+    : public GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig, WeightOnlyGemmRunnerPtr,
+          GemmIdCore, GemmIdCoreHash>
 {
 public:
+    using Config = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
+
+    void setQuantAlgo(int quantAlgo)
+    {
+        mQuantAlgo = quantAlgo;
+    }
+
+    void setGroupSize(int groupSize)
+    {
+        mGroupSize = groupSize;
+    }
+
+protected:
+    void runTactic(int m, int n, int k, const Config& tactic, char* workspace, const cudaStream_t& stream) override;
+
+    void computeTmpSize(int maxM, int n, int k) override;
+
+private:
+    int mQuantAlgo;
+    int mGroupSize;
+};
+
+class WeightOnlyGroupwiseQuantMatmulPlugin : public BasePlugin
+{
+public:
+    using PluginProfilerPtr = std::shared_ptr<WeightOnlyGroupwiseQuantGemmPluginProfiler>;
+
     WeightOnlyGroupwiseQuantMatmulPlugin() = delete;
 
-    WeightOnlyGroupwiseQuantMatmulPlugin(nvinfer1::DataType type, int quant_algo, int group_size);
+    WeightOnlyGroupwiseQuantMatmulPlugin(
+        nvinfer1::DataType type, int quant_algo, int group_size, const PluginProfilerPtr& profiler);
 
-    WeightOnlyGroupwiseQuantMatmulPlugin(const void* data, size_t length);
+    WeightOnlyGroupwiseQuantMatmulPlugin(const void* data, size_t length, const PluginProfilerPtr& profiler);
 
     ~WeightOnlyGroupwiseQuantMatmulPlugin() override = default;
 
@@ -76,34 +108,26 @@ public:
     size_t getSerializationSize() const noexcept override;
     void serialize(void* buffer) const noexcept override;
     void destroy() noexcept override;
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
-    const char* getPluginNamespace() const noexcept override;
 
 private:
     // group_size: 64, 128
     void init(nvinfer1::DataType type, int quant_algo, int group_size);
 
+    void configGemm();
+
 private:
     const std::string mLayerName;
-    std::string mNamespace;
 
-    std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunnerInterface>
-        m_weightOnlyGroupwiseGemmRunner;
+    WeightOnlyGemmRunnerPtr m_weightOnlyGroupwiseGemmRunner;
     int m_workspaceMaxSize;
     nvinfer1::DataType mType;
+    int mSM = tensorrt_llm::common::getSMVersion();
 
     // When M is smaller than this value, we trigger a fast path
     // I.e. a tailored kernel instead of cutlass.
     static constexpr int SMALL_M_FAST_PATH = 5;
 
     int mQuantAlgo;
-
-    // Flags for indicating whether the corresponding inputs are applied in mQuantAlgo
-    // mQuantAlgo = pre_quant_scale * PRE_SCALE_QUANT + zero * ZER0 + bias * BIAS
-    // Here pre_quant_scale, zero and bias are boolean type
-    static constexpr int BIAS = int(1) << 0;
-    static constexpr int ZER0 = int(1) << 1;
-    static constexpr int PRE_SCALE_QUANT = int(1) << 2;
 
     int mGroupSize;
 
@@ -112,9 +136,14 @@ private:
     int mScalesInputIdx;
     int mZerosInputIdx;
     int mBiasesInputIdx;
+
+    GemmDims mDims{};
+    GemmIdCore mGemmId{};
+
+    PluginProfilerPtr mPluginProfiler;
 };
 
-class WeightOnlyGroupwiseQuantMatmulPluginCreator : public IPluginCreator
+class WeightOnlyGroupwiseQuantMatmulPluginCreator : public BaseCreator
 {
 public:
     WeightOnlyGroupwiseQuantMatmulPluginCreator();
@@ -130,17 +159,10 @@ public:
     nvinfer1::IPluginV2* deserializePlugin(
         const char* name, const void* serialData, size_t serialLength) noexcept override;
 
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
-
-    const char* getPluginNamespace() const noexcept override;
-
 private:
-    static PluginFieldCollection mFC;
-    static std::vector<PluginField> mPluginAttributes;
-    std::string mNamespace;
+    GemmPluginProfilerManager<WeightOnlyGroupwiseQuantGemmPluginProfiler> gemmPluginProfileManager;
+    static nvinfer1::PluginFieldCollection mFC;
+    static std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
-} // namespace plugin
-} // namespace nvinfer1
-
-#endif // TRT_WEIGHT_ONLY_GROUPWISE_QUANT_MATMUL_PLUGIN_H
+} // namespace tensorrt_llm::plugins

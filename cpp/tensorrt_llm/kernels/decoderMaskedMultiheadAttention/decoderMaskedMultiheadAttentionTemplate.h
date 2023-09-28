@@ -1246,7 +1246,8 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
     case PositionEmbeddingType::kALIBI: break;
     case PositionEmbeddingType::kROPE_GPTJ:
     {
-        apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, tlength);
+        apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, params.rotary_embedding_base,
+            params.rotary_embedding_scale, tlength);
         break;
     }
     case PositionEmbeddingType::kROPE_GPT_NEOX:
@@ -1278,7 +1279,8 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
             mmha::vec_from_smem_transpose(q, q_smem_, transpose_idx, smem_pitch);
             mmha::vec_from_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
 
-            mmha::apply_rotary_embedding(q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim, tlength);
+            mmha::apply_rotary_embedding(q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim,
+                params.rotary_embedding_base, params.rotary_embedding_scale, tlength);
 
             mmha::write_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
             mmha::write_smem_transpose(q, q_smem_, transpose_idx, smem_pitch);

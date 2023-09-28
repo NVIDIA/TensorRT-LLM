@@ -182,7 +182,10 @@ def generate(
                 EOS_TOKEN).cuda()
 
     max_input_length = torch.max(input_lengths).item()
-    decoder.setup(input_lengths.size(0), max_input_length, max_output_len)
+    decoder.setup(input_lengths.size(0),
+                  max_input_length,
+                  max_output_len,
+                  beam_width=num_beams)
 
     output_ids = decoder.decode(input_ids, input_lengths, sampling_config)
     torch.cuda.synchronize()

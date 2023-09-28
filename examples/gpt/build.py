@@ -247,7 +247,7 @@ def parse_arguments(args):
         choices=[0, 1],
         help=
         'By default the embedding lookup table is sharded along vocab dimension (embedding_sharding_dim=0). '
-        'To shard it along hiddem dimension, set embedding_sharding_dim=1'
+        'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
     parser.add_argument(
@@ -272,6 +272,14 @@ def parse_arguments(args):
         action="store_true",
         help=
         'By default, we use dtype for KV cache. fp8_kv_cache chooses fp8 quantization for KV'
+    )
+
+    parser.add_argument(
+        '--strongly_typed',
+        default=False,
+        action="store_true",
+        help=
+        'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
     )
     args = parser.parse_args(args)
     logger.set_level(args.log_level)
@@ -311,9 +319,18 @@ def parse_arguments(args):
     ), "You cannot enable both SmoothQuant and INT8 weight-only together."
 
     if args.use_inflight_batching:
-        assert args.use_gpt_attention_plugin, "You have to use GPT attention plugin for in-flight batching mode"
-        assert args.paged_kv_cache, "You have to use paged kv cache for in-flight batching mode"
-        assert args.remove_input_padding, "You have to remove input padding for in-flight batching"
+        if not args.use_gpt_attention_plugin:
+            args.use_gpt_attention_plugin = 'float16'
+            logger.info(
+                f"Using GPT attention plugin for inflight batching mode. Setting to default '{args.use_gpt_attention_plugin}'"
+            )
+        if not args.remove_input_padding:
+            args.remove_input_padding = True
+            logger.info(
+                "Using remove input padding for inflight batching mode.")
+        if not args.paged_kv_cache:
+            args.paged_kv_cache = True
+            logger.info("Using paged KV cache for inflight batching mode.")
 
     if args.use_smooth_quant:
         args.quant_mode = QuantMode.use_smooth_quant(args.per_token,
@@ -329,7 +346,7 @@ def parse_arguments(args):
     if args.fp8_kv_cache:
         assert (
             args.use_gpt_attention_plugin or args.use_inflight_batching
-        ), "You have to use GPT attention plugin or inflight batching plugin when fp8 KV cache is set"
+        ), "You have to use GPT attention plugin when fp8 KV cache is set"
         args.quant_mode = args.quant_mode.set_fp8_kv_cache()
 
     if args.enable_fp8:
@@ -364,7 +381,6 @@ def build_rank_engine(builder: Builder,
 
         if not share_embedding_table:
             logger.warning(f'Cannot share the embedding lookup table.')
-    #args.use_lookup_plugin and args.use_gemm_plugin and args.model_dir is not None and args.use_lookup_plugin and args.use_gemm_plugin and
 
     if share_embedding_table:
         logger.info(
@@ -448,9 +464,6 @@ def build_rank_engine(builder: Builder,
     if args.paged_kv_cache:
         network.plugin_config.enable_paged_kv_cache()
 
-    if args.use_inflight_batching:
-        network.plugin_config.enable_in_flight_batching()
-
     # Quantization plugins.
     if args.use_smooth_quant:
         network.plugin_config.set_smooth_quant_gemm_plugin(dtype=args.dtype)
@@ -487,6 +500,8 @@ def build_rank_engine(builder: Builder,
             tokens_per_block=args.tokens_per_block,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size)
         tensorrt_llm_gpt(*inputs)
+
+    tensorrt_llm.graph_rewriting.optimize(network)
 
     engine = None
 
@@ -533,6 +548,7 @@ def build(rank, args):
             multi_query_mode=args.multi_query_mode,
             paged_kv_cache=args.paged_kv_cache,
             tokens_per_block=args.tokens_per_block,
+            strongly_typed=args.strongly_typed,
             use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
             fp8=args.enable_fp8,
             use_parallel_embedding=args.use_parallel_embedding)

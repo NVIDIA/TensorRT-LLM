@@ -69,6 +69,8 @@ class Network(object):
         self._plugin_config = PluginConfig()
         self._module_call_stack = _TrtLlmModuleCallStack()
         self._registered_ndarrays = []
+        self._strongly_typed = trt.INetworkDefinition.get_flag(
+            self._trt_network, trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
 
         return self
 
@@ -88,6 +90,10 @@ class Network(object):
     @property
     def plugin_config(self) -> PluginConfig:
         return self._plugin_config
+
+    @property
+    def strongly_typed(self) -> bool:
+        return self._strongly_typed
 
     def _add_input(self,
                    tensor,
@@ -112,9 +118,22 @@ class Network(object):
         self._inputs[name] = tensor
 
     def _mark_output(self, tensor, name, dtype):
-        self.trt_network.mark_output(tensor.trt_tensor)
-        tensor.trt_tensor.name = name
-        tensor.trt_tensor.dtype = dtype
+        from .functional import cast
+
+        if self.strongly_typed:
+            if tensor.trt_tensor.dtype != dtype:
+                # If stronglyTyped mode is enabled and inferred output dtype does not match desired dtype, add a cast.
+                cast_output = cast(tensor, dtype)
+                self.trt_network.mark_output(cast_output.trt_tensor)
+                cast_output.trt_tensor.name = name
+            else:
+                # Otherwise, mark the tensor as network output. We should not set tensor dtype in stronglyTyped mode.
+                self.trt_network.mark_output(tensor.trt_tensor)
+                tensor.trt_tensor.name = name
+        else:
+            self.trt_network.mark_output(tensor.trt_tensor)
+            tensor.trt_tensor.name = name
+            tensor.trt_tensor.dtype = dtype
         logger.debug(f'Mark output: {name}, dtype: {dtype}')
 
     def set_named_parameters(self, named_parameters):
@@ -427,12 +446,15 @@ class Network(object):
 
 @contextlib.contextmanager
 def net_guard(network):
+    from ._common import net
     assert isinstance(
         network, Network
     ), f"Invalid network, can only guard Network instance, got: {network}"
+
+    old_net = net
     set_network(network)
     yield
-    set_network(None)
+    set_network(old_net)
 
 
 class _TrtLlmModuleCallStack(object):

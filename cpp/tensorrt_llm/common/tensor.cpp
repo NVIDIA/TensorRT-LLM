@@ -23,7 +23,6 @@
 #include "stdlib.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
-#include <dirent.h>
 #include <numeric>
 #include <stdlib.h>
 #include <string>
@@ -31,6 +30,10 @@
 #include <sys/types.h>
 #include <unordered_map>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <dirent.h>
+#endif // !defined(_WIN32)
 
 namespace tensorrt_llm
 {
@@ -152,7 +155,7 @@ Tensor Tensor::loadNpy(const std::string& npy_file, const MemoryType where)
     parseNpyIntro(f_ptr, header_len, start_data);
     parseNpyHeader(f_ptr, header_len, type, shape);
 
-    const size_t size = std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<size_t>());
+    const size_t size = std::accumulate(shape.begin(), shape.end(), size_t{1}, std::multiplies<size_t>());
     void* data_cpu = malloc(size * Tensor::getTypeSize(type));
     void* data = data_cpu;
 
@@ -338,7 +341,7 @@ Tensor Tensor::slice(std::vector<size_t> shape, size_t offset) const
     if (this->data != nullptr)
     {
         size_t n_elts = this->size();
-        size_t n_sliced_elts = std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<size_t>());
+        size_t n_sliced_elts = std::accumulate(shape.begin(), shape.end(), size_t{1}, std::multiplies<size_t>());
         TLLM_CHECK_WITH_INFO(n_sliced_elts + offset <= n_elts,
             fmtstr("The number (%ld) of elements of sliced tensor exceeds that (%ld) of the original tensor",
                 n_sliced_elts + offset, n_elts));
@@ -418,6 +421,7 @@ std::string TensorMap::toString()
 
 TensorMap TensorMap::fromNpyFolder(const std::string& base_folder)
 {
+#if !defined(_WIN32)
     DIR* dir_p = opendir(base_folder.c_str());
     TLLM_CHECK_WITH_INFO(dir_p != nullptr, fmtstr("Could not open folder %s. ", base_folder.c_str()));
     struct dirent* dp;
@@ -460,10 +464,15 @@ TensorMap TensorMap::fromNpyFolder(const std::string& base_folder)
     closedir(dir_p);
 
     return ret_tensor;
+#else
+    throw std::runtime_error("TensorMap::fromNpyFolder is not implemented on Windows.");
+    return {};
+#endif // !defined(_WIN32)
 }
 
 void TensorMap::saveNpy(const std::string& base_folder)
 {
+#if !defined(_WIN32)
     mode_t mode_0755 = S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH;
     int ret = mkdir(base_folder.c_str(), mode_0755);
     TLLM_CHECK_WITH_INFO(ret == 0 || errno == EEXIST, fmtstr("Could not create folder %s.\n", base_folder.c_str()));
@@ -472,6 +481,9 @@ void TensorMap::saveNpy(const std::string& base_folder)
     {
         item.second.saveNpy(base_folder + "/" + item.second.whereToString() + "-" + item.first + ".npy");
     }
+#else
+    throw std::runtime_error("TensorMap::saveNpy is not implemented on Windows.");
+#endif // !defined(_WIN32)
 }
 
 } // namespace common

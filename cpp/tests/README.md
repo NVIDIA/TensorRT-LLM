@@ -26,6 +26,12 @@ Single tests can be executed from `CPP_BUILD_DIR/tests`, e.g.
 
 ### Build engines
 
+To avoid discrepancy in the reference and tests data set `SKIP_GEMM_PLUGIN_PROFILINGS=1` to disable GEMM tactic profiling in GEMM plugins.
+
+```bash
+export SKIP_GEMM_PLUGIN_PROFILINGS=1
+```
+
 [Scripts](resources/scripts) are provided that download the GPT2 and GPT-J models from Huggingface and convert them to TensorRT engines.
 The weights and built engines are stored under [cpp/tests/resources/models](resources/models).
 To build the engines from the top-level directory:
@@ -33,6 +39,7 @@ To build the engines from the top-level directory:
 ```bash
 PYTHONPATH=examples/gpt python3 cpp/tests/resources/scripts/build_gpt_engines.py
 PYTHONPATH=examples/gptj python3 cpp/tests/resources/scripts/build_gptj_engines.py
+PYTHONPATH=examples/llama python3 cpp/tests/resources/scripts/build_llama_engines.py
 ```
 
 ### Generate expected output
@@ -42,6 +49,7 @@ End-to-end tests read inputs and expected outputs from Numpy files located at [c
 ```bash
 PYTHONPATH=examples/gpt python3 cpp/tests/resources/scripts/generate_expected_gpt_output.py
 PYTHONPATH=examples/gptj python3 cpp/tests/resources/scripts/generate_expected_gptj_output.py
+PYTHONPATH=examples/llama python3 cpp/tests/resources/scripts/generate_expected_llama_output.py
 ```
 
 ### Run test

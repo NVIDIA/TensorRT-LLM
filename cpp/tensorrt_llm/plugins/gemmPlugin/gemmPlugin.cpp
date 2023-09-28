@@ -14,41 +14,192 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
+#include "gemmPlugin.h"
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::common;
-using nvinfer1::plugin::GemmPluginCreator;
-using nvinfer1::plugin::GemmPlugin;
+using tensorrt_llm::plugins::GemmPluginCreator;
+using tensorrt_llm::plugins::GemmPlugin;
+using tensorrt_llm::plugins::CublasLtGemmPluginProfiler;
+using tensorrt_llm::plugins::CublasGemmWrapperPtr;
+using tensorrt_llm::plugins::read;
+using tensorrt_llm::plugins::write;
 
 static const char* GEMM_PLUGIN_VERSION{"1"};
 static const char* GEMM_PLUGIN_NAME{"Gemm"};
 PluginFieldCollection GemmPluginCreator::mFC{};
-std::vector<PluginField> GemmPluginCreator::mPluginAttributes;
+std::vector<nvinfer1::PluginField> GemmPluginCreator::mPluginAttributes;
 
-GemmPlugin::GemmPlugin(int transA, int transB, nvinfer1::DataType type)
+void getProblemParams(cublasOperation_t& transa, cublasOperation_t& transb, int& m, int& n, int& k, int& lda, int& ldb,
+    int& ldc, bool transA, bool transB, int M, int N, int K)
+{
+    transa = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
+    transb = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
+    m = N;
+    n = M;
+    k = K;
+    lda = transB ? K : N;
+    ldb = transA ? M : K;
+    ldc = N;
+}
+
+void runGemm(const int M, const int N, const int K, const bool transA, const bool transB, const nvinfer1::DataType type,
+    const CublasGemmWrapperPtr& cublasWrapperPtr, const void* act, const void* weight, void* output,
+    const std::optional<cublasLtMatmulHeuristicResult_t>& heuristic, void* workspace, cudaStream_t stream)
+{
+    auto cublasHandle = cublasWrapperPtr->getCublasHandle();
+    TLLM_CUDA_CHECK(cublasSetStream(cublasHandle, stream));
+    cublasWrapperPtr->setStream(stream);
+    cublasWrapperPtr->setWorkspace(workspace);
+    cublasOperation_t transa, transb;
+    int m, n, k;
+    int lda, ldb, ldc;
+    getProblemParams(transa, transb, m, n, k, lda, ldb, ldc, transA, transB, M, N, K);
+    cublasWrapperPtr->Gemm(transa, transb, m, n, k, weight, lda, act, ldb, output, ldc, heuristic);
+}
+
+void CublasLtGemmPluginProfiler::runTactic(
+    int m, int n, int k, const CublasLtGemmPluginProfiler::Config& tactic, char* workspace, const cudaStream_t& stream)
+{
+    size_t dataSize = sizeof(half);
+    if (mType == DataType::kFLOAT)
+    {
+        dataSize = sizeof(float);
+    }
+
+    void* actPtr = reinterpret_cast<void*>(workspace);
+    void* weightPtr = reinterpret_cast<void*>(
+        nextWorkspacePtrWithAlignment(reinterpret_cast<int8_t*>(actPtr), m * k * dataSize, ALIGNMENT));
+    void* outputPtr = reinterpret_cast<void*>(
+        nextWorkspacePtrWithAlignment(reinterpret_cast<int8_t*>(weightPtr), n * k * dataSize, ALIGNMENT));
+    char* workspacePtr = reinterpret_cast<char*>(
+        nextWorkspacePtrWithAlignment(reinterpret_cast<int8_t*>(outputPtr), m * n * dataSize, ALIGNMENT));
+    runGemm(m, n, k, mTransA, mTransB, mType, mRunner, actPtr, weightPtr, outputPtr, {tactic}, workspacePtr, stream);
+}
+
+bool CublasLtGemmPluginProfiler::checkTactic(int m, int n, int k, const Config& tactic) const
+{
+    cublasOperation_t transa, transb;
+    int M, N, K;
+    int lda, ldb, ldc;
+    getProblemParams(transa, transb, m, n, k, lda, ldb, ldc, mTransA, mTransB, n, m, k);
+
+    return mRunner->checkTactic(transa, transb, m, n, k, lda, ldb, ldc, tactic);
+}
+
+void CublasLtGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
+{
+    size_t dataSize = sizeof(half);
+    if (mType == DataType::kFLOAT)
+    {
+        dataSize = sizeof(float);
+    }
+
+    std::vector<size_t> workspaces = {
+        maxM * k * dataSize,  // A
+        n * k * dataSize,     // B
+        maxM * n * dataSize,  // C
+        CUBLAS_WORKSPACE_SIZE // workspace
+    };
+    size_t bytes = calculateTotalWorkspaceSize(workspaces.data(), workspaces.size(), ALIGNMENT);
+    setTmpWorkspaceSizeInBytes(bytes);
+}
+
+GemmPlugin::GemmPlugin(
+    int transA, int transB, nvinfer1::DataType type, bool useFp8, const GemmPlugin::PluginProfilerPtr& pluginProfiler)
     : mTransA(transA)
     , mTransB(transB)
     , mType(type)
+    , mUseFp8(useFp8)
+    , mPluginProfiler(pluginProfiler)
 {
+    init();
 }
 
 // Parameterized constructor
-GemmPlugin::GemmPlugin(const void* data, size_t length)
+GemmPlugin::GemmPlugin(const void* data, size_t length, const GemmPlugin::PluginProfilerPtr& pluginProfiler)
+    : mPluginProfiler(pluginProfiler)
 {
     const char *d = reinterpret_cast<const char*>(data), *a = d;
     read(d, mTransA);
     read(d, mTransB);
     read(d, mType);
-    PLUGIN_ASSERT(d == a + length);
+    read(d, mUseFp8);
+    read(d, mDims);
+
+    init();
+
+    mPluginProfiler->deserialize(d, mDims, mGemmId);
+
+    TLLM_CHECK(d == a + length);
+}
+
+void GemmPlugin::init()
+{
+    auto cublasHandle = getCublasHandle();
+    auto cublasLtHandle = getCublasLtHandle();
+    mCublasAlgoMap = std::make_shared<cublasAlgoMap>(GEMM_CONFIG);
+    mCublasWrapperMutex = std::make_shared<std::mutex>();
+    mCublasWrapper = std::make_shared<cublasMMWrapper>(
+        cublasHandle, cublasLtHandle, nullptr, mCublasAlgoMap.get(), mCublasWrapperMutex.get(), nullptr);
+
+    mPluginProfiler->setTranspose(mTransA, mTransB);
+
+    mGemmId = GemmIdCublas(GemmIdCore(mDims.n, mDims.k, mType), mTransA, mTransB);
+}
+
+void GemmPlugin::setGemmConfig()
+{
+    if (mType == DataType::kHALF)
+    {
+        mCublasWrapper->setFP16GemmConfig();
+    }
+    else if (mType == DataType::kFLOAT)
+    {
+        mCublasWrapper->setFP32GemmConfig();
+    }
+#ifdef ENABLE_BF16
+    else if (mType == DataType::kBF16)
+    {
+        mCublasWrapper->setBF16GemmConfig();
+    }
+#endif
+
+#ifdef ENABLE_FP8
+    if (mUseFp8)
+    {
+        mCublasWrapper->setFP8GemmConfig(trtToCublasDtype(mType));
+    }
+#endif
+}
+
+void GemmPlugin::configGemm()
+{
+    if (!mDims.isInitialized())
+    {
+        return;
+    }
+
+    setGemmConfig();
+
+    std::vector<cublasLtMatmulHeuristicResult_t> totalHeruistics;
+    for (int mCur = mDims.minM; mCur < mDims.maxM; mCur *= 2)
+    {
+        cublasOperation_t transa, transb;
+        int m, n, k;
+        int lda, ldb, ldc;
+        getProblemParams(transa, transb, m, n, k, lda, ldb, ldc, mTransA, mTransB, mCur, mDims.n, mDims.k);
+        const auto heruistics = mCublasWrapper->getTactics(transa, transb, m, n, k, lda, ldb, ldc);
+
+        totalHeruistics.insert(totalHeruistics.end(), heruistics.begin(), heruistics.end());
+    }
+    mPluginProfiler->profileTactics(totalHeruistics, mCublasWrapper, mType, mDims, mGemmId);
 }
 
 // IPluginV2DynamicExt Methods
 nvinfer1::IPluginV2DynamicExt* GemmPlugin::clone() const noexcept
 {
     auto* plugin = new GemmPlugin(*this);
-    plugin->setPluginNamespace(mNamespace.c_str());
-    plugin->initialize();
     return plugin;
 }
 
@@ -57,8 +208,8 @@ nvinfer1::DimsExprs GemmPlugin::getOutputDimensions(
 {
     try
     {
-        PLUGIN_ASSERT(nbInputs == 2);
-        PLUGIN_ASSERT(outputIndex == 0);
+        TLLM_CHECK(nbInputs == 2);
+        TLLM_CHECK(outputIndex == 0);
         const int nbDimsA = inputs[0].nbDims;
         const int nbDimsB = inputs[1].nbDims;
         DimsExprs ret;
@@ -107,9 +258,62 @@ bool GemmPlugin::supportsFormatCombination(
     return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
 }
 
+int32_t computeMDimension(bool transA, const int32_t nbDims, const int32_t* dims)
+{
+    int32_t M = 1;
+    if (transA)
+    {
+        for (int i = nbDims - 1; i > 0; --i)
+        {
+            M *= dims[i];
+        }
+    }
+    else
+    {
+        for (int i = 0; i < nbDims - 1; ++i)
+        {
+            M *= dims[i];
+        }
+    }
+    return M;
+}
+
+int32_t computeNDimension(bool transB, const int32_t nbDims, const int32_t* dims)
+{
+    int32_t N = 1;
+    if (transB)
+    {
+        for (int i = 0; i < nbDims - 1; ++i)
+        {
+            N *= dims[i];
+        }
+    }
+    else
+    {
+        for (int i = nbDims - 1; i > 0; --i)
+        {
+            N *= dims[i];
+        }
+    }
+    return N;
+}
+
 void GemmPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
     const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
 {
+    const int nbDimsA = in[0].max.nbDims;
+    const int nbDimsB = in[1].max.nbDims;
+
+    const auto minM = computeMDimension(mTransA, nbDimsA, in[0].min.d);
+    const auto maxM = computeMDimension(mTransA, nbDimsA, in[0].max.d);
+    const auto N = computeNDimension(mTransB, nbDimsB, in[1].max.d);
+    const auto K = mTransA ? in[0].max.d[0] : in[0].max.d[nbDimsA - 1];
+
+    if (!mDims.isInitialized())
+    {
+        mDims = {minM, maxM, N, K};
+    }
+    mGemmId.gemmIdCore = {N, K, mType};
 }
 
 size_t GemmPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
@@ -127,68 +331,19 @@ int GemmPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinf
     // outputs
     //     mat [M, N]
 
-    auto cublasHandle = mCublasWrapper->getCublasHandle();
-    PLUGIN_CUBLASASSERT(cublasSetStream(cublasHandle, stream));
-    mCublasWrapper->setStream(stream);
-    mCublasWrapper->setWorkspace(workspace);
-    if (mType == DataType::kHALF)
-    {
-        mCublasWrapper->setFP16GemmConfig();
-    }
-    else if (mType == DataType::kFLOAT)
-    {
-        mCublasWrapper->setFP32GemmConfig();
-    }
-#ifdef ENABLE_BF16
-    else if (mType == DataType::kBF16)
-    {
-        mCublasWrapper->setBF16GemmConfig();
-    }
-#endif
+    setGemmConfig();
 
     const int nbDimsA = inputDesc[0].dims.nbDims;
-    int M = 1, N = 1;
-    const int K = mTransA ? inputDesc[0].dims.d[0] : inputDesc[0].dims.d[nbDimsA - 1];
-    if (mTransA)
-    {
-        for (int i = nbDimsA - 1; i > 0; --i)
-        {
-            M *= inputDesc[0].dims.d[i];
-        }
-    }
-    else
-    {
-        for (int i = 0; i < nbDimsA - 1; ++i)
-        {
-            M *= inputDesc[0].dims.d[i];
-        }
-    }
     const int nbDimsB = inputDesc[1].dims.nbDims;
-    if (mTransB)
-    {
-        for (int i = 0; i < nbDimsB - 1; ++i)
-        {
-            N *= inputDesc[1].dims.d[i];
-        }
-    }
-    else
-    {
-        for (int i = nbDimsB - 1; i > 0; --i)
-        {
-            N *= inputDesc[1].dims.d[i];
-        }
-    }
+    const auto M = computeMDimension(mTransA, nbDimsA, inputDesc[0].dims.d);
+    const auto N = computeNDimension(mTransB, nbDimsB, inputDesc[1].dims.d);
+    const int K = mTransA ? inputDesc[0].dims.d[0] : inputDesc[0].dims.d[nbDimsA - 1];
 
-    cublasOperation_t transa = mTransB ? CUBLAS_OP_T : CUBLAS_OP_N;
-    cublasOperation_t transb = mTransA ? CUBLAS_OP_T : CUBLAS_OP_N;
-    const int m = N;
-    const int n = M;
-    const int k = K;
-    const auto lda = mTransB ? K : N;
-    const auto ldb = mTransA ? M : K;
-    const auto ldc = N;
-    mCublasWrapper->Gemm(transa, transb, m, n, k, inputs[1], lda, inputs[0], ldb, outputs[0], ldc);
-
+    // FIXME(nkorobov): enable best config selection
+    // const auto& bestTactic = mPluginProfiler->getBestConfig(M, mGemmId);
+    const std::optional<CublasLtGemmPluginProfiler::Config> bestTactic = {};
+    runGemm(M, N, K, mTransA, mTransB, mType, mCublasWrapper, inputs[0], inputs[1], outputs[0], bestTactic, workspace,
+        stream);
     return 0;
 }
 
@@ -196,7 +351,7 @@ int GemmPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinf
 nvinfer1::DataType GemmPlugin::getOutputDataType(
     int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
 {
-    PLUGIN_ASSERT(index == 0);
+    TLLM_CHECK(index == 0);
     return inputTypes[0];
 }
 
@@ -219,30 +374,16 @@ int GemmPlugin::getNbOutputs() const noexcept
 
 int GemmPlugin::initialize() noexcept
 {
-    auto cublasHandle = getCublasHandle();
-    auto cublasLtHandle = getCublasLtHandle();
-    mCublasAlgoMap = new cublasAlgoMap(GEMM_CONFIG);
-    mCublasWrapperMutex = new std::mutex();
-    mCublasWrapper
-        = new cublasMMWrapper(cublasHandle, cublasLtHandle, nullptr, mCublasAlgoMap, mCublasWrapperMutex, nullptr);
+    configGemm();
     return 0;
 }
 
-void GemmPlugin::destroy() noexcept
-{
-    delete mCublasAlgoMap;
-    delete mCublasWrapperMutex;
-    delete mCublasWrapper;
-
-    mCublasAlgoMap = nullptr;
-    mCublasWrapperMutex = nullptr;
-    mCublasWrapper = nullptr;
-    delete this;
-}
+void GemmPlugin::destroy() noexcept {}
 
 size_t GemmPlugin::getSerializationSize() const noexcept
 {
-    return sizeof(mTransA) + sizeof(mTransB) + sizeof(mType);
+    return sizeof(mTransA) + sizeof(mTransB) + sizeof(mType) + sizeof(mDims) + sizeof(mUseFp8)
+        + mPluginProfiler->getSerializationSize(mGemmId); // selected tactics container size
 }
 
 void GemmPlugin::serialize(void* buffer) const noexcept
@@ -251,20 +392,14 @@ void GemmPlugin::serialize(void* buffer) const noexcept
     write(d, mTransA);
     write(d, mTransB);
     write(d, mType);
+    write(d, mUseFp8);
+    write(d, mDims);
+    mPluginProfiler->serialize(d, mGemmId);
+
     assert(d == a + getSerializationSize());
 }
 
 void GemmPlugin::terminate() noexcept {}
-
-void GemmPlugin::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* GemmPlugin::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
-}
 
 ///////////////
 
@@ -275,6 +410,7 @@ GemmPluginCreator::GemmPluginCreator()
     mPluginAttributes.emplace_back(PluginField("transA", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("transB", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("use_fp8", nullptr, PluginFieldType::kINT32, 0));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -299,29 +435,38 @@ IPluginV2* GemmPluginCreator::createPlugin(const char* name, const PluginFieldCo
     const PluginField* fields = fc->fields;
     int transA, transB;
     nvinfer1::DataType type;
+    int useFp8;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
         const char* attrName = fields[i].name;
         if (!strcmp(attrName, "transa"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             transA = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "transb"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             transB = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "type_id"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
+        }
+        else if (!strcmp(attrName, "use_fp8"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            useFp8 = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
         }
     }
     try
     {
-        auto* obj = new GemmPlugin(transA, transB, type);
+        // GemmPluginCreator is unique and shared for an engine generation
+        // Create plugin profiler with shared tactics map
+        auto pluginProfiler = gemmPluginProfileManager.createGemmPluginProfiler(/* inference */ false);
+        auto* obj = new GemmPlugin(transA, transB, type, useFp8, pluginProfiler);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
@@ -338,7 +483,10 @@ IPluginV2* GemmPluginCreator::deserializePlugin(const char* name, const void* se
     // call GemmPlugin::destroy()
     try
     {
-        auto* obj = new GemmPlugin(serialData, serialLength);
+        // GemmPluginCreator is unique and shared for an engine generation
+        // Create plugin profiler with shared tactics map
+        auto pluginProfiler = gemmPluginProfileManager.createGemmPluginProfiler(/* inference */ true);
+        auto* obj = new GemmPlugin(serialData, serialLength, pluginProfiler);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
@@ -347,14 +495,4 @@ IPluginV2* GemmPluginCreator::deserializePlugin(const char* name, const void* se
         caughtError(e);
     }
     return nullptr;
-}
-
-void GemmPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* GemmPluginCreator::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
 }

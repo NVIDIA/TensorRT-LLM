@@ -156,3 +156,7 @@ class TestSmoothQuantGemm(unittest.TestCase):
                     TypeError,
                     "Smooth Quant GEMM is only supported with plugin"):
                 smooth_quant_gemm(None, None, None, None, False, False)
+
+
+if __name__ == '__main__':
+    unittest.main()

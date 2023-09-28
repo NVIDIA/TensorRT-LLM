@@ -14,19 +14,19 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/plugins/layernormQuantizationPlugin/layernormQuantizationPlugin.h"
+#include "layernormQuantizationPlugin.h"
 #include "tensorrt_llm/kernels/layernormKernels.h"
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
-using nvinfer1::plugin::LayernormQuantizationPluginCreator;
-using nvinfer1::plugin::LayernormQuantizationPlugin;
+using tensorrt_llm::plugins::LayernormQuantizationPluginCreator;
+using tensorrt_llm::plugins::LayernormQuantizationPlugin;
 
 static const char* LAYERNORM_QUANTIZATION_PLUGIN_VERSION{"1"};
 static const char* LAYERNORM_QUANTIZATION_PLUGIN_NAME{"LayernormQuantization"};
 PluginFieldCollection LayernormQuantizationPluginCreator::mFC{};
-std::vector<PluginField> LayernormQuantizationPluginCreator::mPluginAttributes;
+std::vector<nvinfer1::PluginField> LayernormQuantizationPluginCreator::mPluginAttributes;
 
 LayernormQuantizationPlugin::LayernormQuantizationPlugin(
     float eps, bool useDiffOfSquares, bool dynamicActivationScaling, nvinfer1::DataType type)
@@ -45,7 +45,7 @@ LayernormQuantizationPlugin::LayernormQuantizationPlugin(const void* data, size_
     read(d, mUseDiffOfSquares);
     read(d, mDynActScaling);
     read(d, mType);
-    PLUGIN_ASSERT(d == a + length);
+    TLLM_CHECK(d == a + length);
 }
 
 // IPluginV2DynamicExt Methods
@@ -68,7 +68,7 @@ nvinfer1::DimsExprs LayernormQuantizationPlugin::getOutputDimensions(
     // Dynamic scaling output if enabled
     try
     {
-        PLUGIN_ASSERT(outputIndex == 1);
+        TLLM_CHECK(outputIndex == 1);
         DimsExprs ret;
         ret.nbDims = inputs[0].nbDims;
         for (int di = 0; di < ret.nbDims - 1; ++di)
@@ -89,8 +89,8 @@ bool LayernormQuantizationPlugin::supportsFormatCombination(
     int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
 {
     const int totalPoses = 6 + static_cast<int>(mDynActScaling);
-    PLUGIN_ASSERT(0 <= pos && pos < totalPoses);
-    PLUGIN_ASSERT(nbInputs == 4);
+    TLLM_CHECK(0 <= pos && pos < totalPoses);
+    TLLM_CHECK(nbInputs == 4);
     if (pos < nbInputs)
     {
         switch (pos)
@@ -224,16 +224,6 @@ void LayernormQuantizationPlugin::destroy() noexcept
     delete this;
 }
 
-void LayernormQuantizationPlugin::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* LayernormQuantizationPlugin::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
-}
-
 ///////////////
 
 LayernormQuantizationPluginCreator::LayernormQuantizationPluginCreator()
@@ -276,22 +266,22 @@ IPluginV2* LayernormQuantizationPluginCreator::createPlugin(const char* name, co
         const char* attrName = fields[i].name;
         if (!strcmp(attrName, "eps"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kFLOAT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kFLOAT32);
             eps = static_cast<float>(*(static_cast<const float*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "type_id"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "dyn_act_scaling"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             dynamicActivationScaling = static_cast<bool>(*(static_cast<const bool*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "use_diff_of_squares"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             useDiffOfSquares = static_cast<bool>(*(static_cast<const bool*>(fields[i].data)));
         }
     }
@@ -324,14 +314,4 @@ IPluginV2* LayernormQuantizationPluginCreator::deserializePlugin(
         caughtError(e);
     }
     return nullptr;
-}
-
-void LayernormQuantizationPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* LayernormQuantizationPluginCreator::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
 }

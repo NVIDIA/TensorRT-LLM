@@ -19,6 +19,8 @@
 #include "tensorrt_llm/runtime/common.h"
 
 #include <NvInferRuntime.h>
+#include <optional>
+#include <vector>
 
 namespace tensorrt_llm::runtime
 {
@@ -27,9 +29,10 @@ class WorldConfig
 public:
     static SizeType constexpr kDefaultGpusPerNode = 8;
 
-    constexpr explicit WorldConfig(
-        SizeType worldSize = 1, SizeType rank = 0, SizeType gpusPerNode = kDefaultGpusPerNode)
-        : mSize{worldSize}
+    constexpr explicit WorldConfig(SizeType tensorParallelism = 1, SizeType pipelineParallelism = 1, SizeType rank = 0,
+        SizeType gpusPerNode = kDefaultGpusPerNode)
+        : mTensorParallelism{tensorParallelism}
+        , mPipelineParallelism{pipelineParallelism}
         , mRank{rank}
         , mGpusPerNode{gpusPerNode}
     {
@@ -37,7 +40,22 @@ public:
 
     [[nodiscard]] SizeType constexpr getSize() const noexcept
     {
-        return mSize;
+        return mTensorParallelism * mPipelineParallelism;
+    }
+
+    [[nodiscard]] SizeType constexpr getTensorParallelism() const noexcept
+    {
+        return mTensorParallelism;
+    }
+
+    [[nodiscard]] SizeType constexpr getPipelineParallelism() const noexcept
+    {
+        return mPipelineParallelism;
+    }
+
+    [[nodiscard]] bool constexpr isPipelineParallel() const noexcept
+    {
+        return mPipelineParallelism > 1;
     }
 
     [[nodiscard]] SizeType constexpr getRank() const noexcept
@@ -55,12 +73,39 @@ public:
         return mRank % mGpusPerNode;
     }
 
-    static WorldConfig mpi(nvinfer1::ILogger& logger, SizeType gpusPerNode = kDefaultGpusPerNode);
+    [[nodiscard]] SizeType constexpr getPipelineParallelRank() const noexcept
+    {
+        return mRank / mTensorParallelism;
+    }
 
-    static WorldConfig mpi(SizeType gpusPerNode = kDefaultGpusPerNode);
+    [[nodiscard]] SizeType constexpr getTensorParallelRank() const noexcept
+    {
+        return mRank % mTensorParallelism;
+    }
+
+    [[nodiscard]] bool constexpr isFirstPipelineParallelRank() const noexcept
+    {
+        return getPipelineParallelRank() == 0;
+    }
+
+    [[nodiscard]] bool constexpr isLastPipelineParallelRank() const noexcept
+    {
+        return getPipelineParallelRank() == getPipelineParallelism() - 1;
+    }
+
+    [[nodiscard]] std::vector<SizeType> getPipelineParallelGroup() const;
+
+    static WorldConfig mpi(nvinfer1::ILogger& logger, SizeType gpusPerNode = kDefaultGpusPerNode,
+        std::optional<SizeType> tensorParallelism = std::nullopt,
+        std::optional<SizeType> pipelineParallelism = std::nullopt);
+
+    static WorldConfig mpi(SizeType gpusPerNode = kDefaultGpusPerNode,
+        std::optional<SizeType> tensorParallelism = std::nullopt,
+        std::optional<SizeType> pipelineParallelism = std::nullopt);
 
 private:
-    SizeType mSize;
+    SizeType mTensorParallelism;
+    SizeType mPipelineParallelism;
     SizeType mRank;
     SizeType mGpusPerNode;
 };

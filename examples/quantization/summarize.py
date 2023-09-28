@@ -215,7 +215,8 @@ def main(args):
         with torch.no_grad():
             tensorrt_llm_gpt.setup(batch_size,
                                    max_context_length=max_length,
-                                   max_new_tokens=output_len)
+                                   max_new_tokens=output_len,
+                                   beam_width=num_beams)
 
             if tensorrt_llm_gpt.remove_input_padding:
                 output_ids = tensorrt_llm_gpt.decode_batch(

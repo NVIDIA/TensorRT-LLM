@@ -17,20 +17,20 @@
 
 #include <cstdio>
 
+#include "lookupPlugin.h"
 #include "tensorrt_llm/kernels/lookupKernels.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
-#include "tensorrt_llm/plugins/lookupPlugin/lookupPlugin.h"
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
-using nvinfer1::plugin::LookupPluginCreator;
-using nvinfer1::plugin::LookupPlugin;
+using tensorrt_llm::plugins::LookupPluginCreator;
+using tensorrt_llm::plugins::LookupPlugin;
 
 static const char* LOOKUP_PLUGIN_VERSION{"1"};
 static const char* LOOKUP_PLUGIN_NAME{"Lookup"};
 PluginFieldCollection LookupPluginCreator::mFC{};
-std::vector<PluginField> LookupPluginCreator::mPluginAttributes;
+std::vector<nvinfer1::PluginField> LookupPluginCreator::mPluginAttributes;
 
 LookupPlugin::LookupPlugin(nvinfer1::DataType type, int rank)
     : mType(type)
@@ -44,7 +44,7 @@ LookupPlugin::LookupPlugin(const void* data, size_t length)
     const char *d = reinterpret_cast<const char*>(data), *a = d;
     read(d, mType);
     read(d, mRank);
-    PLUGIN_ASSERT(d == a + length);
+    TLLM_CHECK(d == a + length);
 }
 
 // IPluginV2DynamicExt Methods
@@ -61,8 +61,8 @@ nvinfer1::DimsExprs LookupPlugin::getOutputDimensions(
 {
     try
     {
-        PLUGIN_ASSERT(nbInputs == 2);
-        PLUGIN_ASSERT(outputIndex == 0);
+        TLLM_CHECK(nbInputs == 2);
+        TLLM_CHECK(outputIndex == 0);
         DimsExprs ret;
         const int nbDimsInput = inputs[0].nbDims;
         const int nbDimsWeight = inputs[1].nbDims;
@@ -157,7 +157,7 @@ int LookupPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvi
 nvinfer1::DataType LookupPlugin::getOutputDataType(
     int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
 {
-    PLUGIN_ASSERT(index == 0);
+    TLLM_CHECK(index == 0);
     return inputTypes[1];
 }
 
@@ -204,16 +204,6 @@ void LookupPlugin::serialize(void* buffer) const noexcept
 
 void LookupPlugin::terminate() noexcept {}
 
-void LookupPlugin::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* LookupPlugin::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
-}
-
 ///////////////
 
 LookupPluginCreator::LookupPluginCreator()
@@ -252,12 +242,12 @@ IPluginV2* LookupPluginCreator::createPlugin(const char* name, const PluginField
         const char* attrName = fields[i].name;
         if (!strcmp(attrName, "type_id"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "rank"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             rank = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
         }
     }
@@ -290,14 +280,4 @@ IPluginV2* LookupPluginCreator::deserializePlugin(
         caughtError(e);
     }
     return nullptr;
-}
-
-void LookupPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* LookupPluginCreator::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
 }

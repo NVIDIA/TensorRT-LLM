@@ -54,80 +54,87 @@ protected:
     BufferManager::CudaStreamPtr mStream;
 };
 
-TEST_F(RuntimeKernelTest, FillInt32)
+namespace
 {
-    SizeType constexpr value{3};
-    SizeType constexpr size{123};
-    auto buffer = mManager->gpu(size, nvinfer1::DataType::kINT32);
-    kernels::invokeFill(*buffer, value, *mStream);
-    auto bufferHost = mManager->copyFrom(*buffer, MemoryType::kCPU);
-    auto bufferPtr = bufferCast<SizeType>(*bufferHost);
-    std::vector<SizeType> expected(buffer->getSize(), value);
+template <typename T>
+void testFill(IBuffer& buffer, BufferManager& manager, CudaStream& stream)
+{
+    T constexpr value{3};
+    kernels::invokeFill(buffer, value, stream);
+    auto bufferHost = manager.copyFrom(buffer, MemoryType::kCPU);
+    auto bufferPtr = bufferCast<T>(*bufferHost);
+    auto constexpr expected = value;
 
     auto anyMismatch = false;
-    for (std::size_t i = 0; i < buffer->getSize(); ++i)
+    for (std::size_t i = 0; i < buffer.getSize(); ++i)
     {
-        EXPECT_EQ(bufferPtr[i], expected[i]) << "Error at index " << i;
-        anyMismatch |= bufferPtr[i] != expected[i];
+        EXPECT_EQ(bufferPtr[i], expected) << "Error at index " << i;
+        anyMismatch |= bufferPtr[i] != expected;
     }
-    buffer.release();
-    ASSERT_FALSE(anyMismatch);
-
-    auto tensor = mManager->gpu(ITensor::makeShape({size, size}), nvinfer1::DataType::kINT32);
-    kernels::invokeFill(*tensor, value, *mStream);
-    auto tensorHost = mManager->copyFrom(*tensor, MemoryType::kCPU);
-    auto tensorPtr = bufferCast<SizeType>(*tensorHost);
-    expected.clear();
-    expected.resize(tensor->getSize(), value);
-
-    anyMismatch = false;
-    for (std::size_t i = 0; i < tensor->getSize(); ++i)
-    {
-        EXPECT_EQ(tensorPtr[i], expected[i]) << "Error at index " << i;
-        anyMismatch |= tensorPtr[i] != expected[i];
-    }
-    tensor.release();
     ASSERT_FALSE(anyMismatch);
 }
+} // namespace
 
-TEST_F(RuntimeKernelTest, AddInt32)
+TEST_F(RuntimeKernelTest, FillBufferInt8)
+{
+    for (auto size : {123llu, 1025llu, 1llu << 32})
+    {
+        auto buffer = mManager->gpu(size, nvinfer1::DataType::kINT8);
+        testFill<std::int8_t>(*buffer, *mManager, *mStream);
+        buffer.release();
+    }
+}
+
+TEST_F(RuntimeKernelTest, FillTensorInt8)
+{
+    for (auto size : {123, 1025, std::numeric_limits<SizeType>::max()})
+    {
+        auto tensor = mManager->gpu(ITensor::makeShape({size, 2}), nvinfer1::DataType::kINT8);
+        testFill<std::int8_t>(*tensor, *mManager, *mStream);
+        tensor.release();
+    }
+}
+
+namespace
+{
+void testAdd(IBuffer& buffer, BufferManager& manager, CudaStream& stream)
 {
     SizeType constexpr value{3};
-    SizeType constexpr size{123};
-    auto buffer = mManager->gpu(size, nvinfer1::DataType::kINT32);
-    mManager->setZero(*buffer);
-    kernels::invokeAdd(*buffer, value, *mStream);
-    kernels::invokeAdd(*buffer, value, *mStream);
-    auto bufferHost = mManager->copyFrom(*buffer, MemoryType::kCPU);
+    manager.setZero(buffer);
+    kernels::invokeAdd(buffer, value, stream);
+    kernels::invokeAdd(buffer, value, stream);
+    auto bufferHost = manager.copyFrom(buffer, MemoryType::kCPU);
     auto bufferPtr = bufferCast<SizeType>(*bufferHost);
-    std::vector<SizeType> expected(buffer->getSize(), 2 * value);
+    auto constexpr expected = 2 * value;
 
     auto anyMismatch = false;
-    for (std::size_t i = 0; i < buffer->getSize(); ++i)
+    for (std::size_t i = 0; i < buffer.getSize(); ++i)
     {
-        EXPECT_EQ(bufferPtr[i], expected[i]) << "Error at index " << i;
-        anyMismatch |= bufferPtr[i] != expected[i];
+        EXPECT_EQ(bufferPtr[i], expected) << "Error at index " << i;
+        anyMismatch |= bufferPtr[i] != expected;
     }
-    buffer.release();
     ASSERT_FALSE(anyMismatch);
+}
+} // namespace
 
-    auto tensor = mManager->gpu(ITensor::makeShape({size, size}), nvinfer1::DataType::kINT32);
-    mManager->setZero(*tensor);
-    kernels::invokeAdd(*tensor, value, *mStream);
-    kernels::invokeAdd(*tensor, value, *mStream);
-    auto tensorHost = mManager->copyFrom(*tensor, MemoryType::kCPU);
-    auto tensorPtr = bufferCast<SizeType>(*tensorHost);
-    expected.clear();
-    expected.resize(tensor->getSize(), 2 * value);
-
-    anyMismatch = false;
-    for (std::size_t i = 0; i < tensor->getSize(); ++i)
+TEST_F(RuntimeKernelTest, AddBufferInt32)
+{
+    for (auto size : {123, 1025})
     {
-        EXPECT_EQ(tensorPtr[i], expected[i]) << "Error at index " << i;
-        anyMismatch |= tensorPtr[i] != expected[i];
+        auto buffer = mManager->gpu(size, nvinfer1::DataType::kINT32);
+        testAdd(*buffer, *mManager, *mStream);
+        buffer.release();
     }
-    tensor.release();
-    ASSERT_FALSE(anyMismatch);
+}
+
+TEST_F(RuntimeKernelTest, AddTensorInt32)
+{
+    for (auto size : {123, 1025})
+    {
+        auto tensor = mManager->gpu(ITensor::makeShape({size, size}), nvinfer1::DataType::kINT32);
+        testAdd(*tensor, *mManager, *mStream);
+        tensor.release();
+    }
 }
 
 TEST_F(RuntimeKernelTest, Transpose)
@@ -623,6 +630,35 @@ TEST_F(RuntimeKernelTest, ScatterHalf)
     }
 }
 
+namespace
+{
+template <typename T>
+void verifyTiling(std::vector<T> const& input, ITensor const& outputTensor, BufferManager& manager)
+{
+    auto outputHost = manager.copyFrom(outputTensor, MemoryType::kCPU);
+    auto outputPtr = bufferCast<T>(*outputHost);
+
+    auto const& shape = outputTensor.getShape();
+    auto batchSize = static_cast<std::size_t>(shape.d[0]);
+    auto beamWidth = static_cast<std::size_t>(shape.d[1]);
+    auto inputLength = outputTensor.getSize() / batchSize / beamWidth;
+
+    for (std::size_t b = 0; b < batchSize; ++b)
+    {
+        for (std::size_t beam = 0; beam < beamWidth; ++beam)
+        {
+            for (std::size_t i = 0; i < inputLength; ++i)
+            {
+                auto const inputIdx = tc::flat_index2(b, i, inputLength);
+                auto const outputIdx = tc::flat_index3(b, beam, i, beamWidth, inputLength);
+                EXPECT_EQ(outputPtr[outputIdx], input[inputIdx])
+                    << "Error at index (" << b << ',' << beam << ',' << i << ')';
+            }
+        }
+    }
+}
+} // namespace
+
 TEST_F(RuntimeKernelTest, TileInt32)
 {
     SizeType const beamWidth{3};
@@ -637,22 +673,9 @@ TEST_F(RuntimeKernelTest, TileInt32)
     auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kINT32);
 
     kernels::tileTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
-    auto outputHost = mManager->copyFrom(*outputTensor, MemoryType::kCPU);
-    auto outputPtr = bufferCast<SizeType>(*outputHost);
 
-    for (SizeType b = 0; b < batchSize; ++b)
-    {
-        for (SizeType beam = 0; beam < beamWidth; ++beam)
-        {
-            for (SizeType i = 0; i < inputLength; ++i)
-            {
-                auto const inputIdx = tc::flat_index2(b, i, inputLength);
-                auto const outputIdx = tc::flat_index3(b, beam, i, beamWidth, inputLength);
-                EXPECT_EQ(outputPtr[outputIdx], input[inputIdx])
-                    << "Error at index (" << b << ',' << beam << ',' << i << ')';
-            }
-        }
-    }
+    outputTensor->reshape(ITensor::makeShape({batchSize, beamWidth, inputLength}));
+    verifyTiling(input, *outputTensor, *mManager);
 }
 
 TEST_F(RuntimeKernelTest, TileHalf)
@@ -670,22 +693,9 @@ TEST_F(RuntimeKernelTest, TileHalf)
     auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kHALF);
 
     kernels::tileTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
-    auto outputHost = mManager->copyFrom(*outputTensor, MemoryType::kCPU);
-    auto outputPtr = bufferCast<half>(*outputHost);
 
-    for (SizeType b = 0; b < batchSize; ++b)
-    {
-        for (SizeType beam = 0; beam < beamWidth; ++beam)
-        {
-            for (SizeType i = 0; i < inputLength; ++i)
-            {
-                auto const inputIdx = tc::flat_index2(b, i, inputLength);
-                auto const outputIdx = tc::flat_index3(b, beam, i, beamWidth, inputLength);
-                EXPECT_EQ(outputPtr[outputIdx], input[inputIdx])
-                    << "Error at index (" << b << ',' << beam << ',' << i << ')';
-            }
-        }
-    }
+    outputTensor->reshape(ITensor::makeShape({batchSize, beamWidth, inputLength}));
+    verifyTiling(input, *outputTensor, *mManager);
 }
 
 TEST_F(RuntimeKernelTest, TileInplaceInt32)
@@ -703,22 +713,9 @@ TEST_F(RuntimeKernelTest, TileInplaceInt32)
 
     kernels::scatterTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
     kernels::tileTensorInplace(*outputTensor, beamWidth, *mStream);
-    auto outputHost = mManager->copyFrom(*outputTensor, MemoryType::kCPU);
-    auto outputPtr = bufferCast<SizeType>(*outputHost);
 
-    for (SizeType b = 0; b < batchSize; ++b)
-    {
-        for (SizeType beam = 0; beam < beamWidth; ++beam)
-        {
-            for (SizeType i = 0; i < inputLength; ++i)
-            {
-                auto const inputIdx = tc::flat_index2(b, i, inputLength);
-                auto const outputIdx = tc::flat_index3(b, beam, i, beamWidth, inputLength);
-                EXPECT_EQ(outputPtr[outputIdx], input[inputIdx])
-                    << "Error at index (" << b << ',' << beam << ',' << i << ')';
-            }
-        }
-    }
+    outputTensor->reshape(ITensor::makeShape({batchSize, beamWidth, inputLength}));
+    verifyTiling(input, *outputTensor, *mManager);
 }
 
 TEST_F(RuntimeKernelTest, TileInplaceHalf)
@@ -737,20 +734,62 @@ TEST_F(RuntimeKernelTest, TileInplaceHalf)
 
     kernels::scatterTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
     kernels::tileTensorInplace(*outputTensor, beamWidth, *mStream);
-    auto outputHost = mManager->copyFrom(*outputTensor, MemoryType::kCPU);
-    auto outputPtr = bufferCast<half>(*outputHost);
 
-    for (SizeType b = 0; b < batchSize; ++b)
+    outputTensor->reshape(ITensor::makeShape({batchSize, beamWidth, inputLength}));
+    verifyTiling(input, *outputTensor, *mManager);
+}
+
+TEST_F(RuntimeKernelTest, TileInt8Large)
+{
+    std::int8_t constexpr value{3};
+    SizeType constexpr batchSize{1};
+    SizeType constexpr beamWidth{2};
+
+    SizeType const d2{2};
+    auto const d3 = std::numeric_limits<SizeType>::max();
+    auto const inputShape = ITensor::makeShape({batchSize, d2, d3});
+    auto const outputShape = ITensor::makeShape({batchSize * beamWidth, d2, d3});
+
+    auto inputTensor = mManager->gpu(inputShape, nvinfer1::DataType::kINT8);
+    kernels::invokeFill(*inputTensor, value, *mStream);
+    mStream->synchronize();
+
+    auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kINT8);
+    kernels::tileTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
+    mStream->synchronize();
+
+    auto bufferHost = mManager->copyFrom(*outputTensor, MemoryType::kCPU);
+    auto bufferPtr = bufferCast<std::int8_t>(*bufferHost);
+    auto constexpr expected = value;
+    for (std::size_t i = 0; i < bufferHost->getSize(); ++i)
     {
-        for (SizeType beam = 0; beam < beamWidth; ++beam)
-        {
-            for (SizeType i = 0; i < inputLength; ++i)
-            {
-                auto const inputIdx = tc::flat_index2(b, i, inputLength);
-                auto const outputIdx = tc::flat_index3(b, beam, i, beamWidth, inputLength);
-                EXPECT_EQ(outputPtr[outputIdx], input[inputIdx])
-                    << "Error at index (" << b << ',' << beam << ',' << i << ')';
-            }
-        }
+        EXPECT_EQ(bufferPtr[i], expected) << "Error at index " << i;
+    }
+}
+
+TEST_F(RuntimeKernelTest, TileInplaceInt8Large)
+{
+    std::int8_t constexpr value{3};
+    SizeType constexpr batchSize{1};
+    SizeType constexpr beamWidth{2};
+
+    SizeType const d2{2};
+    auto const d3 = std::numeric_limits<SizeType>::max();
+    auto const inputShape = ITensor::makeShape({batchSize, d2, d3});
+    auto const outputShape = ITensor::makeShape({batchSize * beamWidth, d2, d3});
+
+    auto inputTensor = mManager->gpu(inputShape, nvinfer1::DataType::kINT8);
+    kernels::invokeFill(*inputTensor, value, *mStream);
+
+    auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kINT8);
+    kernels::scatterTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
+    kernels::tileTensorInplace(*outputTensor, beamWidth, *mStream);
+
+    auto bufferHost = mManager->copyFrom(*outputTensor, MemoryType::kCPU);
+    auto bufferPtr = bufferCast<std::int8_t>(*bufferHost);
+    auto constexpr expected = value;
+    for (std::size_t i = 0; i < bufferHost->getSize(); ++i)
+    {
+        EXPECT_EQ(bufferPtr[i], expected) << "Error at index " << i;
     }
 }

@@ -30,6 +30,30 @@ from transformers import LlamaForCausalLM, LlamaTokenizer
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 
+def merge_qkv_scales(q_name, hf_model, scales, llama_qkv_para):
+    layer_name_q = q_name.replace(".weight", "")
+    layer_name_k = layer_name_q.replace("q_proj", "k_proj")
+    layer_name_v = layer_name_q.replace("q_proj", "v_proj")
+    layer_name_qkv = layer_name_q.replace("q_proj", "qkv_proj")
+
+    q = hf_model.state_dict()[layer_name_q + ".weight"]
+    k = hf_model.state_dict()[layer_name_k + ".weight"]
+    v = hf_model.state_dict()[layer_name_v + ".weight"]
+
+    weight = torch.cat([q, k, v], dim=0)
+
+    scales[layer_name_qkv]["x"] = scales[layer_name_q]["x"]
+    scales[layer_name_qkv]["w"] = weight.abs().max(dim=1)[0]
+    print(scales[layer_name_q])
+    scales[layer_name_qkv]["y"] = torch.cat([
+        scales[layer_name_q]["y"], scales[layer_name_k]["y"],
+        scales[layer_name_v]["y"]
+    ],
+                                            dim=0)
+
+    llama_qkv_para[layer_name_qkv] = weight.transpose(0, 1)
+
+
 @torch.no_grad()
 def smooth_llama_model(model, scales, alpha, llama_qkv_para, llama_smoother):
     # Smooth the activation and weights with smoother = $\diag{s}$
@@ -213,6 +237,7 @@ def hf_gpt_converter(args):
         elif ft_name.split('.')[-2] == 'query_key_value':
             # Is there other ways to get local_dim? local_dim = hidden_size in llama2
             local_dim = model.config.hidden_size if args.multi_query_mode else None
+            merge_qkv_scales(name, model, act_range, llama_qkv_para)
             qkv = (0, saved_dir, infer_tp, ft_name,
                    llama_qkv_para.get(
                        name.replace(".weight", "").replace(

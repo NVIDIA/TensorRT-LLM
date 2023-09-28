@@ -16,8 +16,10 @@
 
 #pragma once
 
+#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
 #include <NvInferRuntime.h>
@@ -25,11 +27,6 @@
 #include <list>
 #include <memory>
 #include <vector>
-
-namespace tensorrt_llm::runtime
-{
-class GptModelConfig;
-}
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
@@ -158,7 +155,6 @@ public:
         return mFreeBlocks.size();
     }
 
-private:
     [[nodiscard]] bool hasFreeBlocks(std::size_t numRequired = 1) const
     {
         return getNumFreeBlocks() >= numRequired;
@@ -203,6 +199,17 @@ public:
         return mBlockManager;
     }
 
+    /// @brief  Function that computes the number of KV cache blocks needed to advance a request by one iteration
+    /// @param req The request for which we need to calculate the number of needed KV cache blocks
+    /// @return  The number of blocks
+    SizeType getNeededBlocksOneStep(const LlmRequest& req) const;
+
+    /// @brief  Function that computes the number of KV cache blocks needed to advance a request to completion (i.e. for
+    /// maxNewTokens)
+    /// @param req The request for which we need to calculate the number of needed KV cache blocks
+    /// @return  The number of blocks
+    SizeType getNeededBlocksToCompletion(const LlmRequest& req) const;
+
     [[nodiscard]] std::vector<runtime::ITensor::SharedPtr> const& getMemoryPools() const
     {
         return mPools;
@@ -217,15 +224,21 @@ public:
     [[nodiscard]] std::vector<runtime::ITensor::UniquePtr> getBlockPointersOfSlot(
         SizeType batchSlotIdx, SizeType beamWidth, SizeType maxBlocksPerSeq) const;
 
-    [[nodiscard]] std::vector<runtime::ITensor::UniquePtr> getBlockPointersOfBatch(
+    [[nodiscard]] runtime::ITensor::UniquePtr getBlockPointersOfBatch(
         SizeType batchSize, SizeType beamWidth, SizeType maxBlocksPerSeq) const;
 
     // Volume of [2, numKvHeads, tokensPerBlock, sizePerHead]
-    [[nodiscard]] static SizeType constexpr calculatePageSize(tensorrt_llm::runtime::GptModelConfig const& modelConfig);
+    [[nodiscard]] static SizeType constexpr calculatePageSize(tensorrt_llm::runtime::GptModelConfig const& modelConfig)
+    {
+        return 2 * modelConfig.getNbKvHeads() * modelConfig.getTokensPerBlock() * modelConfig.getSizePerHead();
+    }
 
     // numLayers * 2 * numKvHeads * sizePerHead
     [[nodiscard]] static SizeType constexpr calculateCacheSizePerToken(
-        tensorrt_llm::runtime::GptModelConfig const& modelConfig);
+        tensorrt_llm::runtime::GptModelConfig const& modelConfig)
+    {
+        return modelConfig.getNbLayers() * 2 * modelConfig.getNbKvHeads() * modelConfig.getSizePerHead();
+    }
 
 private:
     // Number of elements per one blocks

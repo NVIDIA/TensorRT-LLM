@@ -29,7 +29,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
-from weight import load_from_hf_bloom  # isort:skip
+from weight import load_from_hf_bloom, check_embedding_share  # isort:skip
 
 MODEL_NAME = "bloom"
 
@@ -181,9 +181,16 @@ def parse_arguments():
         choices=[0, 1],
         help=
         'By default the embedding lookup table is sharded along vocab dimension (embedding_sharding_dim=0). '
-        'To shard it along hiddem dimension, set embedding_sharding_dim=1'
+        'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
+    parser.add_argument(
+        '--use_embedding_sharing',
+        action="store_true",
+        default=False,
+        help=
+        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
+        'Note: the flag might not take effect when the criteria are not met.')
     parser.add_argument(
         '--use_lookup_plugin',
         nargs='?',
@@ -217,6 +224,26 @@ def build_rank_engine(builder: Builder,
     '''
     kv_dtype = str_dtype_to_trt(args.dtype)
 
+    # Share_embedding_table can be set True only when:
+    # 1) the weight for lm_head() does not exist while other weights exist
+    # 2) For multiple-processes, use_parallel_embedding=True and embedding_sharding_dim == 0.
+    # Besides, for TensorRT 9.0, we can observe the engine size reduction when the lookup and gemm plugin are enabled.
+    share_embedding_table = False
+    if args.use_embedding_sharing:
+        if args.world_size > 1:
+            if args.model_dir is not None and args.embedding_sharding_dim == 0 and args.use_parallel_embedding:
+                share_embedding_table = check_embedding_share(args.model_dir)
+        else:
+            if args.model_dir is not None:
+                share_embedding_table = check_embedding_share(args.model_dir)
+
+        if not share_embedding_table:
+            logger.warning(f'Cannot share the embedding lookup table.')
+
+    if share_embedding_table:
+        logger.info(
+            'Engine will share embedding and language modeling weights.')
+
     # Initialize Module
     tensorrt_llm_bloom = tensorrt_llm.models.BloomForCausalLM(
         num_layers=args.n_layer,
@@ -229,7 +256,9 @@ def build_rank_engine(builder: Builder,
                         rank=rank,
                         tp_size=args.world_size),  # TP only
         use_parallel_embedding=args.use_parallel_embedding,
-        embedding_sharding_dim=args.embedding_sharding_dim)
+        embedding_sharding_dim=args.embedding_sharding_dim,
+        share_embedding_table=share_embedding_table)
+
     if args.model_dir is not None:
         logger.info(f'Loading HF BLOOM ... from {args.model_dir}')
         tik = time.time()
@@ -245,8 +274,8 @@ def build_rank_engine(builder: Builder,
                            args.world_size,
                            fp16=(args.dtype == 'float16'),
                            use_parallel_embedding=args.use_parallel_embedding,
-                           sharding_dim=args.embedding_sharding_dim)
-        del hf_bloom
+                           sharding_dim=args.embedding_sharding_dim,
+                           share_embedding_table=share_embedding_table)
 
     # Module -> Network
     network = builder.create_network()
@@ -287,6 +316,8 @@ def build_rank_engine(builder: Builder,
         if args.visualize:
             model_path = os.path.join(args.output_dir, 'test.onnx')
             to_onnx(network.trt_network, model_path)
+
+    tensorrt_llm.graph_rewriting.optimize(network)
 
     engine = None
 

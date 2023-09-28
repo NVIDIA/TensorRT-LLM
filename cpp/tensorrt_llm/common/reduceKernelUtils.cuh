@@ -72,7 +72,7 @@ __device__ inline void copy(const void* local, void* data)
     *out = *in;
 }
 
-static const float HALF_FLT_MAX = 65504.F;
+static float constexpr HALF_FLT_MAX = 65504.F;
 #define FINAL_MASK 0xffffffff
 
 template <typename T>

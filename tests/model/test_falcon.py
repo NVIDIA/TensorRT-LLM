@@ -117,8 +117,10 @@ class TestFalcon(unittest.TestCase):
                                                  max_beam_width=beam_width)
             load_from_hf_falcon(trtllm_model,
                                 hf_model,
-                                rank=rank,
-                                tensor_parallel=tensor_parallel,
+                                mapping=tensorrt_llm.Mapping(
+                                    world_size=tensor_parallel,
+                                    rank=rank,
+                                    tp_size=tensor_parallel),
                                 dtype=dtype)
 
             # Prepare
@@ -383,7 +385,7 @@ class TestFalcon(unittest.TestCase):
                 ctx_buffer[f'past_key_value_{i}'] = torch.zeros(
                     (1, ), dtype=str_dtype_to_torch(kv_dtype), device=device)
 
-        context = runtime.context_0
+        context = runtime.ctx_context
         runtime._set_shape(context, ctx_shape)
         runtime._set_buffer(context, ctx_buffer)
         runtime._run(context)

@@ -54,15 +54,13 @@ public:
     class ForwardParams : public DecodingParams
     {
     public:
-        ForwardParams(int step, int ite, int max_input_length, tc::Tensor logits, tc::Tensor end_ids, int max_seq_len)
+        ForwardParams(int step, int ite, tc::Tensor logits, tc::Tensor end_ids, int max_seq_len)
             : DecodingParams{step, ite, std::move(logits), std::move(end_ids)}
-            , max_input_length{max_input_length}
             , max_seq_len{max_seq_len}
         {
         }
 
         // mandatory parameters
-        int max_input_length;
         int max_seq_len;
 
         // optional parameters

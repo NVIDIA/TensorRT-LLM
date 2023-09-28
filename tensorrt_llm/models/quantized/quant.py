@@ -17,7 +17,8 @@ from typing import Union
 import numpy as np
 
 from ...layers import ColumnLinear, RowLinear
-from ...models import GPTJForCausalLM, GPTLMHeadModel, LLaMAForCausalLM
+from ...models import (FalconForCausalLM, GPTJForCausalLM, GPTLMHeadModel,
+                       LLaMAForCausalLM)
 from ...quantization import QuantMode
 
 # isort: off
@@ -293,7 +294,10 @@ def _default_fp8_quantize(model: Union[GPTLMHeadModel, LLaMAForCausalLM,
     This is used by benchmark script and therefore is intentionally decoupled from AMMO toolkit
     """
     if quant_scales is None:
-        quant_scales = get_dummy_quant_scales(model._num_layers)
+        num_layers = getattr(model, '_num_layers',
+                             getattr(model, 'num_layers', None))
+        assert num_layers is not None
+        quant_scales = get_dummy_quant_scales(num_layers)
 
     assert model.quant_mode == quant_mode, "Quant setting not consistent with model init setting"
 
@@ -307,11 +311,9 @@ def _default_fp8_quantize(model: Union[GPTLMHeadModel, LLaMAForCausalLM,
 
 
 def fp8_quantize(model, quant_mode: QuantMode, quant_scales: dict = None):
-    if isinstance(model, LLaMAForCausalLM):
+    if isinstance(
+            model,
+        (FalconForCausalLM, GPTJForCausalLM, GPTLMHeadModel, LLaMAForCausalLM)):
         return _default_fp8_quantize(model, quant_mode, quant_scales)
-    elif isinstance(model, GPTJForCausalLM):
-        return _default_fp8_quantize(model, quant_mode, quant_scales)
-    elif isinstance(model, GPTLMHeadModel):
-        return _default_fp8_quantize(model, quant_mode, quant_scales)
-    else:
-        assert False, f"Model {model} is not implemented by fp8_quantize yet"
+    raise NotImplementedError(
+        f"Model {model} is not implemented by fp8_quantize yet")

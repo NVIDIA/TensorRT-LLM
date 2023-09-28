@@ -26,7 +26,6 @@
 #include <cstdlib>
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
-#include <dirent.h>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -98,11 +97,13 @@ struct TensorDataType<std::uint64_t>
     static constexpr DataType value = TYPE_UINT64;
 };
 
+#if !defined(_WIN32)
 template <>
 struct TensorDataType<unsigned long long>
 {
     static constexpr DataType value = TYPE_UINT64;
 };
+#endif // !defined(_WIN32)
 
 static_assert(sizeof(std::uint64_t) == sizeof(unsigned long long), "");
 

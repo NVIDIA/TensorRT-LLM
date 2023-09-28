@@ -48,6 +48,12 @@ std::string fmtstr(char const* format, ...);
 std::string fmtstr(char const* format, ...) __attribute__((format(printf, 1, 2)));
 #endif
 
+// __PRETTY_FUNCTION__ is used for neat debugging printing but is not supported on Windows
+// The alternative is __FUNCSIG__, which is similar but not identical
+#if defined(_WIN32)
+#define __PRETTY_FUNCTION__ __FUNCSIG__
+#endif
+
 template <typename U, typename TStream, typename T>
 inline TStream& arr2outCasted(TStream& out, T* arr, size_t size)
 {

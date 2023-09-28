@@ -20,13 +20,14 @@ from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import tensorrt as trt
+import torch
 
 from . import graph_rewriting as gw
 from ._common import default_net, default_trtnet, precision
-from ._utils import (dim_resolve_negative, dim_to_trt_axes, fp32_array,
-                     int32_array, np_dtype_to_trt, str_dtype_to_np,
-                     str_dtype_to_trt, trt_dtype_to_np)
-from .plugin import _TRT_LLM_PLUGIN_NAMESPACE as TRT_LLM_PLUGIN_NAMESPACE
+from ._utils import (dim_resolve_negative, dim_to_trt_axes, fp16_array,
+                     fp32_array, int32_array, np_dtype_to_trt, str_dtype_to_np,
+                     str_dtype_to_trt, torch_to_numpy, trt_dtype_to_torch)
+from .plugin import TRT_LLM_PLUGIN_NAMESPACE
 from .quantization import QuantMode
 
 
@@ -490,7 +491,7 @@ class Tensor(object):
 
             # update the FLayerMetadata as well
             flayer = gw.FLayerInfoMemo.instance().get(user.name)
-            flayer and flayer.replace_with_tensor_from_input(self, new_tensor)
+            flayer and flayer.replace_input_with(self, new_tensor)
 
     def is_trt_wrapper(self):
         '''
@@ -552,7 +553,7 @@ def _create_tensor(trt_tensor: trt.ITensor,
     # centralized location to pass the name from
     # module space to the TRT IR
     default_net()._set_layer_name(producer)
-    if default_net().dtype is not None:
+    if default_net().dtype is not None and not default_net().strongly_typed:
         if producer.type not in [
                 trt.LayerType.CONSTANT, trt.LayerType.GATHER,
                 trt.LayerType.CONCATENATION
@@ -564,6 +565,12 @@ def _create_tensor(trt_tensor: trt.ITensor,
         gw.FLayerInfoMemo.instance().cur_flayer.layer_name = producer.name
 
     return tensor
+
+
+class RotaryScalingType(IntEnum):
+    none = 0
+    linear = 1
+    dynamic = 2
 
 
 class PositionEmbeddingType(IntEnum):
@@ -668,6 +675,22 @@ def swiglu(input: Tensor) -> Tensor:
     return silu(gate) * x
 
 
+def squared_relu(x: Tensor) -> Tensor:
+    '''
+    Add a Squared ReLU operation.
+
+    This function applies ReLU and squares the output.
+
+    Parameters:
+        input : Tensor
+            The input tensor on which the activation function is applied.
+
+    Returns:
+        The tensor produced by the activation layer.
+    '''
+    return pow(relu(x), 2.0)
+
+
 def cast(input: Tensor, dtype: Union[str, trt.DataType]):
     '''
     Add a cast operation.
@@ -698,7 +721,8 @@ def cast(input: Tensor, dtype: Union[str, trt.DataType]):
         raise TypeError("%s is not supported" % type(dtype))
 
     layer = default_trtnet().add_cast(input.trt_tensor, cvt_dtype)
-    layer.set_output_type(0, cvt_dtype)
+    if not default_net().strongly_typed:
+        layer.set_output_type(0, cvt_dtype)
     output = _create_tensor(layer.get_output(0), layer)
     if input.dtype == str_dtype_to_trt('int8'):
         layer.get_input(0).set_dynamic_range(-127, 127)
@@ -903,7 +927,8 @@ def constant(ndarray: np.ndarray) -> Tensor:
     # Prevent underlying numpy array from going out of scope
     default_net().register_ndarray(ndarray)
     layer = default_trtnet().add_constant(trt.Dims(ndarray.shape), weights)
-    layer.set_output_type(0, np_dtype_to_trt(ndarray.dtype))
+    if not default_net()._strongly_typed:
+        layer.set_output_type(0, np_dtype_to_trt(ndarray.dtype))
     return _create_tensor(layer.get_output(0), layer)
 
 
@@ -1024,32 +1049,24 @@ def arange(start: Union[Tensor, int], end: Union[Tensor, int],
         `end-start` elements of type `dtype`.
     '''
     if isinstance(start, int):
-        step = 1
         assert isinstance(end, int)
-        assert isinstance(step, int)
-
-        num = len(range(start, end, step))
-
-        layer = default_trtnet().add_fill([num], trt.FillOperation.LINSPACE)
-        layer.set_output_type(0, str_dtype_to_trt(dtype))
-        layer.set_alpha(start)
-        layer.set_beta(step)
-        return _create_tensor(layer.get_output(0), layer)
+        start = constant(int32_array(start))
+        end = constant(int32_array(end))
     elif isinstance(start, Tensor):
-        step = constant(int32_array([1]))
         assert isinstance(end, Tensor)
-        assert isinstance(step, Tensor)
-
-        num = end - start
-        num = num.view([1])
-
-        layer = default_trtnet().add_fill([0], trt.FillOperation.LINSPACE)
-        layer.set_input(0, num.trt_tensor)  # rank = 1
-        layer.set_input(1, start.trt_tensor)  # rank = 0
-        layer.set_input(2, step.trt_tensor)  # rank = 1
-        return _create_tensor(layer.get_output(0), layer)
     else:
         raise TypeError("%s is not supported" % type(start))
+
+    step = constant(int32_array([1]))
+
+    num = end - start
+    num = num.view([1])
+
+    layer = default_trtnet().add_fill([0], trt.FillOperation.LINSPACE)
+    layer.set_input(0, num.trt_tensor)  # rank = 1
+    layer.set_input(1, start.trt_tensor)  # rank = 0
+    layer.set_input(2, step.trt_tensor)  # rank = 1
+    return _create_tensor(layer.get_output(0), layer)
 
 
 def expand(input: Tensor, expand_shape: Tensor) -> Tensor:
@@ -1388,8 +1405,13 @@ def expand_dims_like(left: Union[Tensor, int, float], right: Tensor) -> Tensor:
     if isinstance(left, int):
         left = constant(int32_array([left]))
     elif isinstance(left, float):
-        left = constant(fp32_array([left]))
-
+        if default_net().strongly_typed:
+            if isinstance(right, Tensor) and right.dtype == trt.DataType.HALF:
+                left = constant(fp16_array([left]))
+            else:
+                left = constant(fp32_array([left]))
+        else:
+            left = constant(fp32_array([left]))
     left_ndim = left.ndim()
     right_ndim = right.ndim()
     if right_ndim > left_ndim:
@@ -1878,11 +1900,17 @@ def embedding(input: Tensor,
     return x
 
 
-def constant_to_tensor_(input: Union[Tensor, int, float]) -> Tensor:
+def constant_to_tensor_(input: Union[Tensor, int, float],
+                        dtype: trt.DataType = trt.float32) -> Tensor:
     if isinstance(input, int):
         return constant(int32_array([input]))
     elif isinstance(input, float):
-        return constant(fp32_array([input]))
+        assert dtype == trt.float32 or dtype == trt.float16
+        if dtype == trt.float32:
+            return constant(fp32_array([input]))
+        else:
+            return constant(fp16_array([input]))
+
     return input
 
 
@@ -1907,8 +1935,13 @@ def broadcast_helper(left: Union[Tensor, int, float],
     Returns:
         A pair of tensors of same rank.
     '''
-    left = constant_to_tensor_(left)
-    right = constant_to_tensor_(right)
+    if not default_net().strongly_typed:
+        left = constant_to_tensor_(left)
+        right = constant_to_tensor_(right)
+    else:
+        left = constant_to_tensor_(
+            left, right.dtype if isinstance(right, Tensor) else trt.float32)
+        right = constant_to_tensor_(right, left.dtype)
 
     if left.rank() == right.rank():
         return (left, right)
@@ -2232,8 +2265,26 @@ def gelu(x: Tensor) -> Tensor:
     Returns:
         The tensor produced by the activation layer.
     '''
-    return 0.5 * x * (
-        tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * pow(x, 3.0))) + 1.0)
+    if default_net().strongly_typed:
+        if x.dtype == trt.float16:
+            v1 = constant(fp16_array([0.5]))
+            v2 = constant(fp16_array([math.sqrt(2.0 / math.pi)]))
+            v3 = constant(fp16_array([0.044715]))
+            v4 = constant(fp16_array([3.0]))
+            v5 = constant(fp16_array([1.0]))
+        elif x.dtype == trt.float32:
+            v1 = constant(fp32_array([0.5]))
+            v2 = constant(fp32_array([math.sqrt(2.0 / math.pi)]))
+            v3 = constant(fp32_array([0.044715]))
+            v4 = constant(fp32_array([3.0]))
+            v5 = constant(fp32_array([1.0]))
+        else:
+            assert False, f"gelu on datatype of {x.dtype} is not supported"
+
+        return v1 * x * (tanh(v2 * (x + v3 * pow(x, v4))) + v5)
+    else:
+        return 0.5 * x * (
+            tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * pow(x, 3.0))) + 1.0)
 
 
 def geglu(x: Tensor) -> Tensor:
@@ -2885,12 +2936,17 @@ def gpt_attention(
         num_kv_heads: int,
         q_scaling: float,
         rotary_embedding_dim: int,
-        position_embedding_type: PositionEmbeddingType,
-        multi_block_mode: bool,
-        kv_orig_quant_scale: Tensor,
-        kv_quant_orig_scale: Tensor,
-        kv_cache_quant_mode: QuantMode,
-        max_context_length: int,
+        rotary_embedding_base: float = 10000.0,
+        rotary_embedding_scale_type: RotaryScalingType = RotaryScalingType.none,
+        rotary_embedding_scale: float = 1.0,
+        rotary_embedding_max_positions: int = 1024,
+        position_embedding_type: PositionEmbeddingType = PositionEmbeddingType.
+    learned_absolute,
+        multi_block_mode: bool = False,
+        kv_orig_quant_scale: Tensor = None,
+        kv_quant_orig_scale: Tensor = None,
+        kv_cache_quant_mode: QuantMode = None,
+        max_context_length: int = None,
         mask_type: AttentionMaskType = AttentionMaskType.causal,
         alibi_slopes: Tensor = None,
         tp_size: int = 1,
@@ -2957,6 +3013,24 @@ def gpt_attention(
 
         rotary_embedding_dim: int
             The dimension to compute RoPE. Use 0 when position_embedding_type is not RoPE.
+
+        rotary_embedding_base: float
+            The theta value to use for RoPE. Ignored when position_embedding_type is not RoPE.
+
+        rotary_embedding_scale_type: RotaryScalingType
+            The scaling type of RoPE. Ignored when position_embedding_type is not RoPE.
+            Possible rotary scaling type:
+                * RotaryScalingType.none
+                * RotaryScalingType.linear
+                * RotaryScalingType.dynamic
+
+        rotary_embedding_scale: float
+            The scale value to use for linear/dynamic scaling in RoPE.
+            Ignored when position_embedding_type is not RoPE.
+            Must be set to 1 (default) if rotary_embedding_scale_type is `none`.
+
+        rotary_embedding_max_positions: int
+            Needed only for `dynamic` RoPE scaling. Ignored otherwise.
 
         position_embedding_type: PositionEmbeddingType
             The position embedding type:
@@ -3030,6 +3104,22 @@ def gpt_attention(
     rotary_embedding_dim = trt.PluginField(
         "rotary_embedding_dim", np.array(rotary_embedding_dim, dtype=np.int32),
         trt.PluginFieldType.INT32)
+    rotary_embedding_base = trt.PluginField(
+        "rotary_embedding_base",
+        np.array(rotary_embedding_base, dtype=np.float32),
+        trt.PluginFieldType.FLOAT32)
+    rotary_embedding_scale_type = trt.PluginField(
+        "rotary_embedding_scale_type",
+        np.array(rotary_embedding_scale_type, dtype=np.int8),
+        trt.PluginFieldType.INT8)
+    rotary_embedding_scale = trt.PluginField(
+        "rotary_embedding_scale",
+        np.array(rotary_embedding_scale, dtype=np.float32),
+        trt.PluginFieldType.FLOAT32)
+    rotary_embedding_max_positions = trt.PluginField(
+        "rotary_embedding_max_positions",
+        np.array(rotary_embedding_max_positions, dtype=np.int32),
+        trt.PluginFieldType.INT32)
     position_embedding_type = trt.PluginField(
         "position_embedding_type",
         np.array(int(position_embedding_type), dtype=np.int8),
@@ -3064,10 +3154,6 @@ def gpt_attention(
         "paged_kv_cache",
         np.array(default_net().plugin_config.paged_kv_cache, dtype=np.int32),
         trt.PluginFieldType.INT32)
-    in_flight_batching = trt.PluginField(
-        "in_flight_batching",
-        np.array(default_net().plugin_config.in_flight_batching,
-                 dtype=np.int32), trt.PluginFieldType.INT32)
     max_context_length = trt.PluginField("max_context_length",
                                          np.array(max_context_length, np.int32),
                                          trt.PluginFieldType.INT32)
@@ -3082,10 +3168,11 @@ def gpt_attention(
 
     pfc = trt.PluginFieldCollection([
         nheads, num_kv_heads, unidirectional, q_scaling,
-        position_embedding_type, rotary_embedding_dim, tp_size, tp_rank,
-        context_fmha_type, multi_block_mode, kv_cache_quant_mode_field,
-        remove_input_padding, mask_type, paged_kv_cache, pf_type,
-        in_flight_batching, max_context_length, qkv_bias_enabled
+        position_embedding_type, rotary_embedding_dim, rotary_embedding_base,
+        rotary_embedding_scale_type, rotary_embedding_scale,
+        rotary_embedding_max_positions, tp_size, tp_rank, context_fmha_type,
+        multi_block_mode, kv_cache_quant_mode_field, remove_input_padding,
+        mask_type, paged_kv_cache, pf_type, max_context_length, qkv_bias_enabled
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
@@ -3269,12 +3356,23 @@ def rms_norm(input: Tensor,
 
         dim = tuple([-i - 1 for i in range(len(normalized_shape))])
 
-        with precision("float32"):
-            varx = pow(input, 2.0)
+        if default_net().strongly_typed:
+            input_dtype = input.dtype
+            fp32_input = cast(input, "float32")
+            varx = pow(fp32_input, 2.0)
+
             varx = varx.mean(dim, keepdim=True)
             denom = varx + eps
             denom = denom.sqrt()
-            y = input / denom
+            fp32_y = fp32_input / denom
+            y = cast(fp32_y, input_dtype)
+        else:
+            with precision("float32"):
+                varx = pow(input, 2.0)
+                varx = varx.mean(dim, keepdim=True)
+                denom = varx + eps
+                denom = denom.sqrt()
+                y = input / denom
 
         if weight is not None:
             y = y * weight
@@ -3310,7 +3408,8 @@ def rms_norm(input: Tensor,
 def generate_alibi_slopes(num_heads: int,
                           dtype: trt.DataType = trt.float32,
                           tp_size: int = 1,
-                          tp_rank: int = 0) -> Tensor:
+                          tp_rank: int = 0,
+                          alibi_scale: float = 1.0) -> Tensor:
     '''
     Compute the ALiBi slopes as described in https://arxiv.org/abs/2211.05100.
 
@@ -3356,7 +3455,15 @@ def generate_alibi_slopes(num_heads: int,
         slopes = np.concatenate(
             [slopes, np.power(extra_base, extra_powers)], axis=0)
 
-    slopes = slopes.astype(trt_dtype_to_np(dtype))
+    slopes = alibi_scale * slopes
+    # Note that for bfloat16, we cannot case numpy tensor from float32 to bfloat16
+    # becuases numpy does not support bfloat16. Even if we use custom type to define
+    # the np_bfloat16, the "astype" here would be undefined.
+    # So, we must use torch to cast tensor from float32 to bfloat16, and then use torch_to_numpy
+    # to cast the tensor back.
+    slopes = torch.from_numpy(slopes)
+    slopes = slopes.to(trt_dtype_to_torch(dtype))
+    slopes = torch_to_numpy(slopes)
     slopes = constant(slopes.reshape(1, (end_head_id - start_head_id), 1, 1))
     return slopes
 
@@ -3497,6 +3604,7 @@ ACT2FN = {
     'geglu': geglu,
     'silu': silu,
     'softplus': softplus,
+    'squared-relu': squared_relu,
     'swiglu': swiglu,
     'fast-swiglu': swiglu,
 }

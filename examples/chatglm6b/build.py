@@ -305,6 +305,8 @@ def build_rank_engine(builder: Builder,
             args.max_beam_width)
         tensorrt_llm_ChatGLM6BModel(*inputs)
 
+    tensorrt_llm.graph_rewriting.optimize(network)
+
     engine = None
 
     # Network -> Engine

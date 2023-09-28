@@ -14,16 +14,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TRT_WEIGHT_ONLY_QUANT_MATMUL_PLUGIN_H
-#define TRT_WEIGHT_ONLY_QUANT_MATMUL_PLUGIN_H
+#pragma once
 
-#include "NvInferPlugin.h"
-#include "cutlass/numeric_types.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
-#include "tensorrt_llm/kernels/weightOnlyMatrixVectorMultiplication.h"
+#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/kernelLauncher.h"
+#include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
+
 #include <cassert>
+#include <cutlass/numeric_types.h>
 #include <memory>
 #include <set>
 #include <string>
@@ -33,21 +33,43 @@
 // breaking dependencies
 #include "cutlass/integer_subbyte.h"
 
-namespace nvinfer1
-{
-namespace plugin
+namespace tensorrt_llm::plugins
 {
 
-class WeightOnlyQuantMatmulPlugin : public IPluginV2DynamicExt
+using WeightOnlyGemmRunner = tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunnerInterface;
+using WeightOnlyGemmRunnerPtr = std::shared_ptr<WeightOnlyGemmRunner>;
+
+class WeightOnlyQuantGemmPluginProfiler : public GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
+                                              WeightOnlyGemmRunnerPtr, GemmIdCore, GemmIdCoreHash>
 {
 public:
+    using Config = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
+
+    void setWeightTypeId(int weightId)
+    {
+        mWeightTypeId = weightId;
+    }
+
+protected:
+    void runTactic(int m, int n, int k, const Config& tactic, char* workspace, const cudaStream_t& stream) override;
+
+    void computeTmpSize(int maxM, int n, int k) override;
+
+private:
+    int mWeightTypeId;
+};
+
+class WeightOnlyQuantMatmulPlugin : public BasePlugin
+{
+public:
+    using PluginProfilerPtr = std::shared_ptr<WeightOnlyQuantGemmPluginProfiler>;
     WeightOnlyQuantMatmulPlugin() = delete;
 
     // int8 weight only : weightTypeId = 1;
     // int4 weight only : weightTypeId = 2;
-    WeightOnlyQuantMatmulPlugin(nvinfer1::DataType type, int weightTypeId);
+    WeightOnlyQuantMatmulPlugin(nvinfer1::DataType type, int weightTypeId, const PluginProfilerPtr& profiler);
 
-    WeightOnlyQuantMatmulPlugin(const void* data, size_t length);
+    WeightOnlyQuantMatmulPlugin(const void* data, size_t length, const PluginProfilerPtr& profiler);
 
     ~WeightOnlyQuantMatmulPlugin() override = default;
 
@@ -77,25 +99,34 @@ public:
     size_t getSerializationSize() const noexcept override;
     void serialize(void* buffer) const noexcept override;
     void destroy() noexcept override;
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
-    const char* getPluginNamespace() const noexcept override;
 
 private:
     // int8 weight only : weightTypeId = 1;
     // int4 weight only : weightTypeId = 2;
     void init(nvinfer1::DataType type, int weightTypeId);
 
+    void configGemm();
+
 private:
     const std::string mLayerName;
-    std::string mNamespace;
 
-    std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunnerInterface> m_weightOnlyGemmRunner;
+    WeightOnlyGemmRunnerPtr m_weightOnlyGemmRunner;
     int m_workspaceMaxSize;
     nvinfer1::DataType mType;
     int mWeightTypeId;
+    int mSM = tensorrt_llm::common::getSMVersion();
+
+    // When M is smaller than this value, we trigger a fast path
+    // I.e. a tailored kernel instead of cutlass.
+    static constexpr int SMALL_M_FAST_PATH = 5;
+
+    GemmDims mDims{};
+    GemmIdCore mGemmId{};
+
+    PluginProfilerPtr mPluginProfiler;
 };
 
-class WeightOnlyQuantMatmulPluginCreator : public IPluginCreator
+class WeightOnlyQuantMatmulPluginCreator : public BaseCreator
 {
 public:
     WeightOnlyQuantMatmulPluginCreator();
@@ -111,17 +142,10 @@ public:
     nvinfer1::IPluginV2* deserializePlugin(
         const char* name, const void* serialData, size_t serialLength) noexcept override;
 
-    void setPluginNamespace(const char* pluginNamespace) noexcept override;
-
-    const char* getPluginNamespace() const noexcept override;
-
 private:
-    static PluginFieldCollection mFC;
-    static std::vector<PluginField> mPluginAttributes;
-    std::string mNamespace;
+    GemmPluginProfilerManager<WeightOnlyQuantGemmPluginProfiler> gemmPluginProfileManager;
+    static nvinfer1::PluginFieldCollection mFC;
+    static std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
-} // namespace plugin
-} // namespace nvinfer1
-
-#endif // TRT_WEIGHT_ONLY_QUANT_MATMUL_PLUGIN_H
+} // namespace tensorrt_llm::plugins

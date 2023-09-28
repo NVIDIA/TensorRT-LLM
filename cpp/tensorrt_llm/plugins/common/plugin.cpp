@@ -24,7 +24,11 @@
 #include <functional>
 #include <mutex>
 
-#define CUDA_MEM_ALIGN 128
+#ifdef _MSC_VER
+#define FN_NAME __FUNCTION__
+#else
+#define FN_NAME __func__
+#endif
 
 #if ENABLE_MULTI_DEVICE
 std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap()
@@ -51,10 +55,10 @@ inline CUcontext getCurrentCudaCtx()
     CUresult err = cuCtxGetCurrent(&ctx);
     if (err == CUDA_ERROR_NOT_INITIALIZED || ctx == nullptr)
     {
-        PLUGIN_CUASSERT(cudaFree(nullptr));
+        TLLM_CUDA_CHECK(cudaFree(nullptr));
         err = cuCtxGetCurrent(&ctx);
     }
-    PLUGIN_ASSERT(err == CUDA_SUCCESS);
+    TLLM_CHECK(err == CUDA_SUCCESS);
     return ctx;
 }
 
@@ -131,12 +135,12 @@ std::shared_ptr<cublasHandle_t> getCublasHandle()
         []() -> auto
         {
             auto handle = std::unique_ptr<cublasHandle_t>(new cublasHandle_t);
-            PLUGIN_CUBLASASSERT(cublasCreate(handle.get()));
+            TLLM_CUDA_CHECK(cublasCreate(handle.get()));
             return handle;
         },
         [](cublasHandle_t* handle)
         {
-            PLUGIN_CUBLASASSERT(cublasDestroy(*handle));
+            TLLM_CUDA_CHECK(cublasDestroy(*handle));
             delete handle;
         });
     return creator();
@@ -148,19 +152,19 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
         []() -> auto
         {
             auto handle = std::unique_ptr<cublasLtHandle_t>(new cublasLtHandle_t);
-            PLUGIN_CUBLASASSERT(cublasLtCreate(handle.get()));
+            TLLM_CUDA_CHECK(cublasLtCreate(handle.get()));
             return handle;
         },
         [](cublasLtHandle_t* handle)
         {
-            PLUGIN_CUBLASASSERT(cublasLtDestroy(*handle));
+            TLLM_CUDA_CHECK(cublasLtDestroy(*handle));
             delete handle;
         });
     return creator();
 }
 
 // ALIGNPTR
-int8_t* nvinfer1::plugin::alignPtr(int8_t* ptr, uintptr_t to)
+int8_t* tensorrt_llm::plugins::alignPtr(int8_t* ptr, uintptr_t to)
 {
     uintptr_t addr = (uintptr_t) ptr;
     if (addr % to)
@@ -171,32 +175,45 @@ int8_t* nvinfer1::plugin::alignPtr(int8_t* ptr, uintptr_t to)
 }
 
 // NEXTWORKSPACEPTR
-int8_t* nvinfer1::plugin::nextWorkspacePtr(int8_t* ptr, uintptr_t previousWorkspaceSize)
+int8_t* tensorrt_llm::plugins::nextWorkspacePtrCommon(
+    int8_t* ptr, uintptr_t previousWorkspaceSize, const uintptr_t alignment)
 {
     uintptr_t addr = (uintptr_t) ptr;
     addr += previousWorkspaceSize;
-    return alignPtr((int8_t*) addr, CUDA_MEM_ALIGN);
+    return alignPtr((int8_t*) addr, alignment);
 }
 
-int8_t* nvinfer1::plugin::nextWorkspacePtr(int8_t* const base, uintptr_t& offset, const uintptr_t size)
+int8_t* tensorrt_llm::plugins::nextWorkspacePtr(int8_t* ptr, uintptr_t previousWorkspaceSize)
+{
+    return nextWorkspacePtrCommon(ptr, previousWorkspaceSize, kCudaMemAlign);
+}
+
+int8_t* tensorrt_llm::plugins::nextWorkspacePtr(
+    int8_t* const base, uintptr_t& offset, const uintptr_t size, const uintptr_t alignment)
 {
     uintptr_t curr_offset = offset;
-    uintptr_t next_offset = curr_offset + ((size + CUDA_MEM_ALIGN - 1) / CUDA_MEM_ALIGN) * CUDA_MEM_ALIGN;
+    uintptr_t next_offset = curr_offset + ((size + alignment - 1) / alignment) * alignment;
     int8_t* newptr = size == 0 ? nullptr : base + curr_offset;
     offset = next_offset;
     return newptr;
 }
 
+int8_t* tensorrt_llm::plugins::nextWorkspacePtrWithAlignment(
+    int8_t* ptr, uintptr_t previousWorkspaceSize, const uintptr_t alignment)
+{
+    return nextWorkspacePtrCommon(ptr, previousWorkspaceSize, alignment);
+}
+
 // CALCULATE TOTAL WORKSPACE SIZE
-size_t nvinfer1::plugin::calculateTotalWorkspaceSize(size_t* workspaces, int count)
+size_t tensorrt_llm::plugins::calculateTotalWorkspaceSize(size_t* workspaces, int count, const uintptr_t alignment)
 {
     size_t total = 0;
     for (int i = 0; i < count; i++)
     {
         total += workspaces[i];
-        if (workspaces[i] % CUDA_MEM_ALIGN)
+        if (workspaces[i] % alignment)
         {
-            total += CUDA_MEM_ALIGN - (workspaces[i] % CUDA_MEM_ALIGN);
+            total += alignment - (workspaces[i] % alignment);
         }
     }
     return total;
@@ -219,7 +236,7 @@ PluginFieldParser::~PluginFieldParser()
         {
             std::stringstream ss;
             ss << "unused plugin field with name: " << name;
-            nvinfer1::plugin::logError(ss.str().c_str(), __FILE__, FN_NAME, __LINE__);
+            tensorrt_llm::plugins::logError(ss.str().c_str(), __FILE__, FN_NAME, __LINE__);
         }
     }
 }
@@ -253,7 +270,7 @@ std::optional<T> PluginFieldParser::getScalar(std::string_view const& name)
     }
     auto& record = mMap.at(name);
     auto const& f = mFields[record.index];
-    PLUGIN_ASSERT(toFieldType<T>() == f.type && f.length == 1);
+    TLLM_CHECK(toFieldType<T>() == f.type && f.length == 1);
     record.retrieved = true;
     return std::optional{*static_cast<T const*>(f.data)};
 }

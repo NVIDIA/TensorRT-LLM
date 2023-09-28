@@ -237,7 +237,7 @@ def split_and_save_weight(i, saved_dir, factor, key, val, act_range, config):
         split_dim = 0
         split_vals = np.split(val, factor, axis=split_dim)
         save_split(split_vals, saved_dir, key, i, factor)
-        if save_int8:
+        if act_range is not None and int8_outputs == "all":
             base_key = key.replace(".weight", "")
             vals_i8 = generate_int8(val, act_range)
             write_int8(vals_i8, saved_dir, base_key, split_dim, i, factor)
@@ -246,7 +246,7 @@ def split_and_save_weight(i, saved_dir, factor, key, val, act_range, config):
         split_dim = -1
         split_vals = np.split(val, factor, axis=split_dim)
         save_split(split_vals, saved_dir, key, i, factor)
-        if save_int8:
+        if act_range is not None and int8_outputs == "all":
             base_key = key.replace(".weight", "")
             vals_i8 = generate_int8(val, act_range)
             write_int8(vals_i8, saved_dir, base_key, split_dim, i, factor)

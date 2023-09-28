@@ -44,8 +44,8 @@ TllmException::TllmException(char const* file, std::size_t line, const std::stri
 }
 #else
 TllmException::TllmException(char const* file, std::size_t line, const std::string& msg)
-    : _mNbFrames{}
-    , runtime_error{fmtstr("%s (%s:%zu)", msg.c_str(), file, line)}
+    : mNbFrames{}
+    , std::runtime_error{fmtstr("%s (%s:%zu)", msg.c_str(), file, line)}
 {
 }
 #endif

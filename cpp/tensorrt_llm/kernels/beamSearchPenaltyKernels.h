@@ -26,10 +26,10 @@ namespace kernels
 
 template <typename T>
 void invokeAddBiasApplyPenalties(T* logits, const int** output_ids_ptr, const int** parent_ids_ptr,
-    const int* input_lengths, const int* sequence_lengths, const T* bias, const int ite, const int max_input_length,
-    const int local_batch_size, const int batch_size, const int beam_width, const int vocab_size,
-    const int vocab_size_padded, const int* end_ids, const float temperature, const float repetition_penalty,
-    const RepetitionPenaltyType repetition_penalty_type, const int min_length, int max_seq_len, cudaStream_t stream);
+    const int* input_lengths, const int* sequence_lengths, const T* bias, const int ite, const int local_batch_size,
+    const int batch_size, const int beam_width, const int vocab_size, const int vocab_size_padded, const int* end_ids,
+    const float temperature, const float repetition_penalty, const RepetitionPenaltyType repetition_penalty_type,
+    const int min_length, int max_seq_len, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

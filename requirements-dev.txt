@@ -8,7 +8,7 @@ onnx==1.12.0
 mpi4py
 tensorrt>=8.6.0
 numpy
-cuda-python==12.1.0
+cuda-python==12.2.0
 mypy
 pytest-cov
 pytest-xdist
@@ -17,3 +17,4 @@ pre-commit
 einops
 parameterized
 graphviz
+lark

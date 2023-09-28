@@ -131,15 +131,6 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
                  engine_dir / 'fp16-plugin-packed-paged' / tp_dir, world_size,
                  '--dtype=float16', '--use_gpt_attention_plugin=float16',
                  '--remove_input_padding', '--paged_kv_cache')
-    # build_engine(fp16_weight_dir_x_gpu,
-    #              engine_dir / 'fp16-inflight-batching-plugin' / tp_dir,
-    #              world_size, '--dtype=float16', '--use_inflight_batching',
-    #              '--use_gpt_attention_plugin=float16', '--remove_input_padding')
-    build_engine(fp16_weight_dir_x_gpu,
-                 engine_dir / 'fp16-inflight-batching-plugin-paged' / tp_dir,
-                 world_size, '--dtype=float16', '--use_inflight_batching',
-                 '--use_gpt_attention_plugin=float16', '--remove_input_padding',
-                 '--paged_kv_cache')
 
     print("Done.")
 

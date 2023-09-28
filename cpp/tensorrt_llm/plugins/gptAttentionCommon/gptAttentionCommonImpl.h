@@ -15,12 +15,11 @@
  * limitations under the License.
  */
 
-#ifndef TRT_GPT_ATTENTION_COMMON_IMPL_H
-#define TRT_GPT_ATTENTION_COMMON_IMPL_H
+#pragma once
 
 #include "gptAttentionCommon.h"
 
-namespace nvinfer1::plugin
+namespace tensorrt_llm::plugins
 {
 template <typename T>
 T* GPTAttentionPluginCommon::cloneImpl() const noexcept
@@ -52,6 +51,4 @@ T* GPTAttentionPluginCreatorCommon::deserializePluginImpl(
     }
     return nullptr;
 }
-} // namespace nvinfer1::plugin
-
-#endif // TRT_GPT_ATTENTION_COMMON_IMPL_H
+} // namespace tensorrt_llm::plugins

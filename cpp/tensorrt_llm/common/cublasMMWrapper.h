@@ -23,6 +23,7 @@
 #include <cuda_runtime.h>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 
 namespace tensorrt_llm
@@ -65,6 +66,16 @@ public:
         const void* beta, const void* C, cublasLtMatrixLayout_t Cdesc, void* D, cublasLtMatrixLayout_t Ddesc,
         const cublasLtMatmulAlgo_t* algo, void* workspace, size_t workspaceSizeInBytes, cudaStream_t stream);
 
+    bool checkTactic(cublasOperation_t transa, cublasOperation_t transb, const int m, const int n, const int k,
+        const int lda, const int ldb, const int ldc, const cublasLtMatmulHeuristicResult_t& algo) const;
+
+    std::vector<cublasLtMatmulHeuristicResult_t> getTactics(cublasOperation_t transa, cublasOperation_t transb,
+        const int m, const int n, const int k, const int lda, const int ldb, const int ldc);
+
+    std::vector<cublasLtMatmulHeuristicResult_t> getTactics(cublasLtHandle_t lightHandle,
+        cublasLtMatmulDesc_t computeDesc, cublasLtMatrixLayout_t Adesc, cublasLtMatrixLayout_t Bdesc,
+        cublasLtMatrixLayout_t Cdesc, cublasLtMatrixLayout_t Ddesc);
+
     std::pair<bool, cublasLtMatmulAlgo_t> findBestAlgo(cublasLtHandle_t lightHandle, cublasLtMatmulDesc_t computeDesc,
         const void* alpha, const void* A, cublasLtMatrixLayout_t Adesc, const void* B, cublasLtMatrixLayout_t Bdesc,
         const void* beta, const void* C, cublasLtMatrixLayout_t Cdesc, void* D, cublasLtMatrixLayout_t Ddesc,
@@ -84,7 +95,15 @@ public:
         const int lda, const void* B, const int ldb, void* C, const int ldc);
 
     void Gemm(cublasOperation_t transa, cublasOperation_t transb, const int m, const int n, const int k, const void* A,
+        const int lda, const void* B, const int ldb, void* C, const int ldc,
+        const std::optional<cublasLtMatmulHeuristicResult_t>& algo);
+
+    void Gemm(cublasOperation_t transa, cublasOperation_t transb, const int m, const int n, const int k, const void* A,
         const int lda, const void* B, const int ldb, void* C, const int ldc, float f_alpha, float f_beta);
+
+    void Gemm(cublasOperation_t transa, cublasOperation_t transb, const int m, const int n, const int k, const void* A,
+        const int lda, const void* B, const int ldb, void* C, const int ldc, float f_alpha, float f_beta,
+        const cublasLtMatmulAlgo_t& algo, bool hasAlgo);
 
     void setWorkspace(void* workspace);
 
@@ -99,6 +118,10 @@ public:
 #ifdef ENABLE_BF16
     void setBF16GemmConfig();
 #endif
+#ifdef ENABLE_FP8
+    void setFP8GemmConfig(cudaDataType_t outputType = CUDA_R_16F);
+#endif
+
     void setStream(cudaStream_t stream);
 
     void setGemmConfig(cudaDataType_t aType, cudaDataType_t bType, cudaDataType_t cType, cudaDataType_t computeType);
@@ -131,7 +154,7 @@ public:
         return *(this->cublas_handle_);
     }
 
-    cublasLtHandle_t getCublasLtHandle()
+    cublasLtHandle_t getCublasLtHandle() const
     {
         return *(this->cublaslt_handle_);
     }

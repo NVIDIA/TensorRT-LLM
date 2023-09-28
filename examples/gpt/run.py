@@ -277,7 +277,10 @@ def generate(
                                            model_config.remove_input_padding)
 
     max_input_length = torch.max(input_lengths).item()
-    decoder.setup(input_lengths.size(0), max_input_length, max_output_len)
+    decoder.setup(input_lengths.size(0),
+                  max_input_length,
+                  max_output_len,
+                  beam_width=num_beams)
 
     ptuning_args = [] if not model_config.use_prompt_tuning else ptuning_setup(
         prompt_table, dtype, model_config.hidden_size, tasks, input_ids,

@@ -56,7 +56,7 @@ python build.py --model_dir ./bloom/560M/ \
 # Currently, TensorRT does not support tensors with more than 2^31-1 elements,
 # so we have to shard the embedding table to multi-GPUs.
 
-# sharding embedding table in the vocab dimension
+# sharding embedding table in the vocab dimension (the lookup plugin is optional)
 python build.py --model_dir ./bloom/176B/ \
                 --dtype float16 \
                 --use_gemm_plugin float16 \
@@ -65,7 +65,7 @@ python build.py --model_dir ./bloom/176B/ \
                 --world_size 8 \
                 --use_parallel_embedding \
                 --embedding_sharding_dim 0 \
-                --use_lookup_plugin
+                --use_lookup_plugin  float16
 
 # sharding embedding table in the hidden dimension
 python build.py --model_dir ./bloom/176B/ \
@@ -75,8 +75,20 @@ python build.py --model_dir ./bloom/176B/ \
                 --output_dir ./bloom/176B/trt_engines/fp16/8-gpu/ \
                 --world_size 8 \
                 --use_parallel_embedding \
-                --embedding_sharding_dim 1 \
-                --use_lookup_plugin
+                --embedding_sharding_dim 1
+
+# share embedding table between embedding() and lm_head() layers
+# To reduce the generated engine size, we has to use gemm and lookup plugin (--use_gemm_plugin --use_lookup_plugin) and must shard the embedding table in the vocab dimension.
+python build.py --model_dir ./bloom/176B/ \
+                --dtype float16 \
+                --use_gemm_plugin float16 \
+                --use_gpt_attention_plugin float16 \
+                --output_dir ./bloom/176B/trt_engines/fp16/8-gpu/ \
+                --world_size 8 \
+                --use_parallel_embedding \
+                --embedding_sharding_dim 0 \
+                --use_lookup_plugin float16 \
+                --use_embedding_sharing
 ```
 
 ### 4. Run

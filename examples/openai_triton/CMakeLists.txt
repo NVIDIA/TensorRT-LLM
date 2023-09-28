@@ -58,7 +58,7 @@ if(NOT DEFINED TRT_LIB_DIR)
   set(TRT_LIB_DIR "/usr/local/tensorrt/lib")
   if(NOT EXISTS ${TRT_INCLUDE_DIR})
     # In case of TensorRT installed from a deb package.
-    set(TRT_LIB_DIR "/lib/x86_64-linux-gnu")
+    set(TRT_LIB_DIR "/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu")
   endif()
 endif()
 find_library(
@@ -84,6 +84,11 @@ find_library(TRT_LLM_LIB_PATH nvinfer_plugin_tensorrt_llm
 find_library(TRT_LLM_LIB_PATH nvinfer_plugin_tensorrt_llm REQUIRED)
 message(STATUS "Found nvinfer_plugin_tensorrt_llm library: ${TRT_LLM_LIB_PATH}")
 
+find_library(TRT_LLM_COMMON_LIB_PATH th_common HINTS ${TRT_LLM_LIB_DIR}
+                                                     NO_DEFAULT_PATH)
+find_library(TRT_LLM_COMMON_LIB_PATH th_common REQUIRED)
+message(STATUS "Found th_common library: ${TRT_LLM_COMMON_LIB_PATH}")
+
 # Declare the target library.
 add_library(
   ${TARGET_NAME} SHARED
@@ -94,11 +99,13 @@ add_library(
   aot/fp16/fmha_kernel_d64_fp16.48d785a0_0d1d2d3d4d5d6789.c
   aot/fp32/fmha_kernel_d64_fp32.da74e9ed_0d1d2d3d4d5d6789.c)
 
-set_property(TARGET ${TARGET_NAME} PROPERTY IMPORTED_LOCATION ${TRT_LIB_PATH})
-set_property(TARGET ${TARGET_NAME} PROPERTY IMPORTED_LOCATION
-                                            ${TRT_LLM_LIB_PATH})
-target_link_libraries(${TARGET_NAME} PUBLIC ${CUDA_LIBRARIES})
-target_link_libraries(${TARGET_NAME} PUBLIC cuda)
+target_link_libraries(
+  ${TARGET_NAME} PUBLIC cuda ${CUDA_LIBRARIES} ${TRT_LLM_LIB_PATH}
+                        ${TRT_LLM_COMMON_LIB_PATH} ${TRT_LIB_PATH})
+
+if(NOT MSVC)
+  set_property(TARGET ${TARGET_NAME} PROPERTY LINK_FLAGS "-Wl,--no-undefined")
+endif()
 
 target_include_directories(${TARGET_NAME} PUBLIC /usr/local/cuda/include)
 target_include_directories(${TARGET_NAME} PUBLIC ${TRT_INCLUDE_DIR})

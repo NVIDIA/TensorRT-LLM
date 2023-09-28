@@ -30,8 +30,6 @@ namespace kernels
 
 __global__ void gatherTree(gatherTreeParam param)
 {
-    const int max_input_length = param.input_lengths == nullptr ? 0 : param.max_input_length;
-
     for (int batchbeam_idx = blockIdx.x * blockDim.x + threadIdx.x; batchbeam_idx < param.batch_size * param.beam_width;
          batchbeam_idx += gridDim.x * blockDim.x)
     {
@@ -66,43 +64,36 @@ __global__ void gatherTree(gatherTreeParam param)
             continue;
         }
 
-        const int padding_offset = param.has_padding ? max_input_length - input_len : 0;
-        const int initial_tgt_ix = batch * param.beam_width * param.max_seq_len + beam * param.max_seq_len
-            + max_seq_len_b - 1 - padding_offset;
+        const int initial_tgt_ix
+            = batch * param.beam_width * param.max_seq_len + beam * param.max_seq_len + max_seq_len_b - 1;
         const int initial_parent_ix
             = batch * param.beam_width * param.max_seq_len + beam * param.max_seq_len + max_seq_len_b - 1;
-        param.beams[initial_tgt_ix] = __ldg(step_ids + initial_parent_ix);
+        param.output_ids[initial_tgt_ix] = __ldg(step_ids + initial_parent_ix);
         int parent = parent_ids == nullptr ? 0 : __ldg(parent_ids + initial_parent_ix) % param.beam_width;
         bool found_bad = false;
 
         for (int level = max_seq_len_b - 2; level >= 0; --level)
         {
-            if (param.has_padding && level >= input_len && level < max_input_length)
-            {
-                continue;
-            }
-            const int tgt_level{level >= max_input_length ? level - padding_offset : level};
-            const int level_beam_ix
-                = batch * param.beam_width * param.max_seq_len + beam * param.max_seq_len + tgt_level;
+            const int level_beam_ix = batch * param.beam_width * param.max_seq_len + beam * param.max_seq_len + level;
             const int level_parent_ix
                 = batch * param.beam_width * param.max_seq_len + parent * param.max_seq_len + level;
             if (parent < 0 || parent > param.beam_width)
             {
-                param.beams[level_beam_ix] = param.end_tokens[batch];
+                param.output_ids[level_beam_ix] = param.end_tokens[batch];
                 parent = -1;
                 found_bad = true;
             }
             else
             {
-                param.beams[level_beam_ix] = __ldg(step_ids + level_parent_ix);
+                param.output_ids[level_beam_ix] = __ldg(step_ids + level_parent_ix);
                 parent = parent_ids == nullptr ? 0 : __ldg(parent_ids + level_parent_ix) % param.beam_width;
             }
         }
         // set the padded part as end_token
         // input_len
-        for (int index = max_len - padding_offset; index < param.max_seq_len; ++index)
+        for (int index = max_len; index < param.max_seq_len; ++index)
         {
-            param.beams[batch * param.beam_width * param.max_seq_len + beam * param.max_seq_len + index]
+            param.output_ids[batch * param.beam_width * param.max_seq_len + beam * param.max_seq_len + index]
                 = param.end_tokens[batch];
         }
 
@@ -113,40 +104,21 @@ __global__ void gatherTree(gatherTreeParam param)
         {
             bool finished = false;
             // skip the step 0 because it is often the start token
-            int start_step = max_input_length == 0 ? 1 : max_input_length;
+            int start_step = 1;
             for (int time = start_step; time < max_seq_len_b; ++time)
             {
                 const int level_beam_ix
                     = batch * param.beam_width * param.max_seq_len + beam * param.max_seq_len + time;
                 if (finished)
                 {
-                    param.beams[level_beam_ix] = param.end_tokens[batch];
+                    param.output_ids[level_beam_ix] = param.end_tokens[batch];
                 }
-                else if (param.beams[level_beam_ix] == param.end_tokens[batch])
+                else if (param.output_ids[level_beam_ix] == param.end_tokens[batch])
                 {
                     finished = true;
                 }
             }
         }
-
-        // transpose on output_ids
-        if (param.output_ids != nullptr)
-        {
-            for (int step_idx = 0; step_idx < param.max_seq_len; step_idx++)
-            {
-                param.output_ids[batchbeam_idx * param.max_seq_len + step_idx]
-                    = param.beams[batchbeam_idx * param.max_seq_len + step_idx];
-            }
-        }
-    }
-
-    // remove the pad length from sequence lengths
-    for (int batchbeam_idx = blockIdx.x * blockDim.x + threadIdx.x; batchbeam_idx < param.batch_size * param.beam_width;
-         batchbeam_idx += gridDim.x * blockDim.x)
-    {
-        const int input_len = param.input_lengths == nullptr ? 0 : param.input_lengths[batchbeam_idx];
-        const int pad_len = max_input_length - input_len;
-        param.sequence_lengths[batchbeam_idx] -= pad_len;
     }
 }
 
@@ -319,7 +291,7 @@ void invokeGatherTree(gatherTreeParam param)
 __global__ void finalize(int* output_ids, int* sequence_lengths, float* cum_log_probs, float* output_log_probs,
     const int* topk_output_ids, const int* topk_sequence_lengths, const float* scores, const float* topk_cum_log_probs,
     const float* topk_log_probs, const int* num_beams, const int* input_lengths, const int beam_width,
-    const int max_input_length, const int max_seq_len, bool do_remove_padding)
+    const int max_seq_len)
 {
     // output_ids: [bs, beam_width, max_seq_len]
     // sequence_lengths: [bs, beam_width]
@@ -337,11 +309,9 @@ __global__ void finalize(int* output_ids, int* sequence_lengths, float* cum_log_
     // Note that we remove the start_token (the id at first position) from topk_output_ids
 
     extern __shared__ char array[];
-    int* s_rank = (int*) (array);                                    // [beam_width]
-    float* s_scores = (float*) (s_rank + beam_width);                // [2 * beam_width]
-    int* s_sequence_lengths = (int*) (s_scores + beam_width * 2);    // [beam_width]
-    const int input_length = input_lengths[blockIdx.x * beam_width]; // input_lengths of same batch must be same
-    const int pad_len = do_remove_padding ? max_input_length - input_length : 0;
+    int* s_rank = (int*) (array);                                 // [beam_width]
+    float* s_scores = (float*) (s_rank + beam_width);             // [2 * beam_width]
+    int* s_sequence_lengths = (int*) (s_scores + beam_width * 2); // [beam_width]
     const int num_beam = num_beams[blockIdx.x];
     if (threadIdx.x < num_beam)
     {
@@ -426,8 +396,7 @@ __global__ void finalize(int* output_ids, int* sequence_lengths, float* cum_log_
 
     if (threadIdx.x < beam_width)
     {
-        s_sequence_lengths[threadIdx.x]
-            = topk_sequence_lengths[blockIdx.x * beam_width * 2 + s_rank[threadIdx.x]] - pad_len;
+        s_sequence_lengths[threadIdx.x] = topk_sequence_lengths[blockIdx.x * beam_width * 2 + s_rank[threadIdx.x]];
         sequence_lengths[blockIdx.x * beam_width + threadIdx.x] = s_sequence_lengths[threadIdx.x];
 
         if (cum_log_probs != nullptr)
@@ -443,15 +412,12 @@ __global__ void finalize(int* output_ids, int* sequence_lengths, float* cum_log_
         // start from step 1 to skip the start token
         for (int i = threadIdx.x; i < s_sequence_lengths[beam_idx]; i += blockDim.x)
         {
-            int src_pad_offset = do_remove_padding ? ((i >= input_length) ? pad_len : 0) : 0;
             output_ids[blockIdx.x * beam_width * max_seq_len + beam_idx * max_seq_len + i]
-                = topk_output_ids[blockIdx.x * (beam_width * 2) * max_seq_len + s_rank[beam_idx] * max_seq_len
-                    + (i + src_pad_offset)];
+                = topk_output_ids[blockIdx.x * (beam_width * 2) * max_seq_len + s_rank[beam_idx] * max_seq_len + i];
             if (output_log_probs != nullptr)
             {
                 output_log_probs[blockIdx.x * beam_width * max_seq_len + beam_idx * max_seq_len + i]
-                    = topk_log_probs[blockIdx.x * (beam_width * 2) * max_seq_len + s_rank[beam_idx] * max_seq_len
-                        + (i + src_pad_offset)];
+                    = topk_log_probs[blockIdx.x * (beam_width * 2) * max_seq_len + s_rank[beam_idx] * max_seq_len + i];
             }
         }
     }
@@ -460,8 +426,7 @@ __global__ void finalize(int* output_ids, int* sequence_lengths, float* cum_log_
 void invokeFinalize(int* output_ids, int* sequence_lengths, float* cum_log_probs, float* output_log_probs,
     const int* topk_output_ids, const int* topk_sequence_lengths, const float* scores, const float* topk_cum_log_probs,
     const float* topk_log_probs, const int* num_beams, const int* input_lengths, const int beam_width,
-    const int max_seq_len, const int batch_size, const int max_input_length, cudaStream_t stream,
-    bool do_remove_padding)
+    const int max_seq_len, const int batch_size, cudaStream_t stream)
 {
     TLLM_LOG_DEBUG("%s %s start", __FILE__, __PRETTY_FUNCTION__);
     dim3 block(beam_width * 2);
@@ -469,8 +434,7 @@ void invokeFinalize(int* output_ids, int* sequence_lengths, float* cum_log_probs
     TLLM_CHECK(block.x < 1024);
     finalize<<<batch_size, block, beam_width * sizeof(int) * 2 + (beam_width * 2) * sizeof(float), stream>>>(output_ids,
         sequence_lengths, cum_log_probs, output_log_probs, topk_output_ids, topk_sequence_lengths, scores,
-        topk_cum_log_probs, topk_log_probs, num_beams, input_lengths, beam_width, max_input_length, max_seq_len,
-        do_remove_padding);
+        topk_cum_log_probs, topk_log_probs, num_beams, input_lengths, beam_width, max_seq_len);
 }
 
 __global__ void initializeOutput(int* output_ids, const int* end_ids, const int max_seq_len)

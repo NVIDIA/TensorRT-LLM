@@ -23,8 +23,8 @@ from ..._utils import pad_vocab_size, str_dtype_to_trt
 from ...functional import (PositionEmbeddingType, Tensor, assertion, concat,
                            constant, expand, gather, gpt_attention, shape,
                            split)
-from ...layers import (MLP, AttentionMaskType, ColumnLinear, Embedding,
-                       LayerNorm, RowLinear)
+from ...layers import (MLP, AttentionMaskType, AttentionParams, ColumnLinear,
+                       Embedding, KeyValueCacheParams, LayerNorm, RowLinear)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
 from ...parameter import Parameter
@@ -102,21 +102,12 @@ class ChatGLMAttention(Module):
                                tp_group=tp_group,
                                tp_size=tp_size)
 
-    def forward(
-            self,
-            hidden_states: Tensor,
-            position_embedding,
-            past_key_value,
-            sequence_length,
-            host_past_key_value_lengths,
-            cache_indirection,
-            context_lengths: Tensor = None,
-            host_context_lengths: Tensor = None,
-            host_request_types=None,
-            # max allowed context length. Required to
-            # compute scratch memory size.
-            max_context_length: int = None,
-            use_cache=False):
+    def forward(self,
+                hidden_states: Tensor,
+                position_embedding,
+                use_cache=False,
+                kv_cache_params=None,
+                attention_params=None):
 
         if not default_net().plugin_config.gpt_attention_plugin:
             raise ValueError(
@@ -193,26 +184,27 @@ class ChatGLMAttention(Module):
             concat([shape(qkv, 0),
                     shape(qkv, 1), self.hidden_size * 3]))
         context, past_key_value = gpt_attention(
-            qkv,
-            past_key_value,
-            sequence_length,
+            tensor=qkv,
+            past_key_value=kv_cache_params.get_first_past_key_value(),
+            sequence_length=attention_params.sequence_length,
+            host_past_key_value_lengths=kv_cache_params.
             host_past_key_value_lengths,
-            context_lengths,
-            cache_indirection,
-            host_request_types,
-            self.num_attention_heads,
-            self.num_attention_kv_heads,
-            self.q_scaling,
-            self.rotary_embedding_dim,
-            self.position_embedding_type,
-            self.multi_block_mode,
-            kv_orig_quant_scale,
-            kv_quant_orig_scale,
+            context_lengths=attention_params.context_lengths,
+            cache_indirection=kv_cache_params.cache_indirection,
+            host_request_types=attention_params.host_request_types,
+            num_heads=self.num_attention_heads,
+            num_kv_heads=self.num_attention_kv_heads,
+            q_scaling=self.q_scaling,
+            rotary_embedding_dim=self.rotary_embedding_dim,
+            position_embedding_type=self.position_embedding_type,
+            multi_block_mode=self.multi_block_mode,
+            kv_orig_quant_scale=kv_orig_quant_scale,
+            kv_quant_orig_scale=kv_quant_orig_scale,
             kv_cache_quant_mode=QuantMode.from_description(
                 use_int8_kv_cache=self.use_int8_kv_cache),
-            max_context_length=max_context_length,
+            max_context_length=attention_params.max_context_length,
             mask_type=self.attention_mask_type.value,
-            host_context_lengths=host_context_lengths)
+            host_context_lengths=attention_params.host_context_lengths)
 
         context = self.dense(context)
 
@@ -276,38 +268,21 @@ class ChatGLM6BDecoderLayer(Module):
         self.post_layernorm = LayerNorm(normalized_shape=hidden_size,
                                         dtype=dtype)
 
-    def forward(
-        self,
-        hidden_states: Tensor,
-        position_embedding,
-        past_key_value=None,
-        sequence_length=None,
-        host_past_key_value_lengths=None,
-        use_cache=False,
-        cache_indirection=None,
-        context_lengths: Tensor = None,
-        host_context_lengths: Tensor = None,
-        host_request_types=None,
-        # max allowed context length. Required to
-        # compute scratch memory size.
-        max_context_length: int = None):
+    def forward(self,
+                hidden_states: Tensor,
+                position_embedding,
+                use_cache=False,
+                kv_cache_params=None,
+                attention_params=None):
 
         assert isinstance(hidden_states, Tensor)
         hidden_states = self.input_layernorm(hidden_states)
 
-        attention_output = self.attention(
-            hidden_states,
-            position_embedding=position_embedding,
-            past_key_value=past_key_value,
-            sequence_length=sequence_length,
-            host_past_key_value_lengths=host_past_key_value_lengths,
-            cache_indirection=cache_indirection,
-            context_lengths=context_lengths,
-            host_context_lengths=host_context_lengths,
-            host_request_types=host_request_types,
-            max_context_length=max_context_length,
-            use_cache=use_cache,
-        )
+        attention_output = self.attention(hidden_states,
+                                          position_embedding,
+                                          use_cache=use_cache,
+                                          kv_cache_params=kv_cache_params,
+                                          attention_params=attention_params)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -370,21 +345,12 @@ class ChatGLM6BModel(Module):
 
         self.ln_f = LayerNorm(normalized_shape=hidden_size, dtype=dtype)
 
-    def forward(
-        self,
-        input_ids=None,
-        position_ids=None,
-        past_key_value=None,
-        sequence_length=None,
-        host_past_key_value_lengths=None,
-        use_cache=False,
-        cache_indirection=None,
-        context_lengths: Tensor = None,
-        host_context_lengths: Tensor = None,
-        host_request_types=None,
-        # max allowed context length. Required to
-        # compute scratch memory size.
-        max_context_length: int = None):
+    def forward(self,
+                input_ids=None,
+                position_ids=None,
+                use_cache=False,
+                kv_cache_params=None,
+                attention_params=None):
 
         batch_size = shape(input_ids, 0)
         input_len = shape(input_ids, 1)
@@ -413,25 +379,23 @@ class ChatGLM6BModel(Module):
             position_embedding_sin0, position_embedding_sin1
         ]
 
-        if past_key_value is None:
-            past_key_value = tuple([None] * len(self.layers))
+        if kv_cache_params.past_key_value is None:
+            kv_cache_params.past_key_value = tuple([None] * len(self.layers))
 
         if use_cache:
             presents = []
 
-        for layer, past in zip(self.layers, past_key_value):
+        for layer, past in zip(self.layers, kv_cache_params.past_key_value):
             hidden_states = layer(
                 hidden_states,
                 position_embedding,
-                past_key_value=past,
-                sequence_length=sequence_length,
-                host_past_key_value_lengths=host_past_key_value_lengths,
                 use_cache=use_cache,
-                cache_indirection=cache_indirection,
-                context_lengths=context_lengths,
-                host_context_lengths=host_context_lengths,
-                host_request_types=host_request_types,
-                max_context_length=max_context_length)
+                kv_cache_params=KeyValueCacheParams(
+                    past_key_value=[past],
+                    host_past_key_value_lengths=kv_cache_params.
+                    host_past_key_value_lengths,
+                    cache_indirection=kv_cache_params.cache_indirection),
+                attention_params=attention_params)
 
             if use_cache:
                 presents.append(hidden_states[1])
@@ -488,29 +452,17 @@ class ChatGLM6BHeadModel(ChatGLM6BModel):
                                     tp_size=mapping.tp_size,
                                     gather_output=True)
 
-    def forward(
-        self,
-        input_ids=None,
-        position_ids=None,
-        past_key_value=None,
-        sequence_length=None,
-        host_past_key_value_lengths=None,
-        use_cache=False,
-        last_token_ids=None,
-        cache_indirection=None,
-        context_lengths: Tensor = None,
-        host_context_lengths: Tensor = None,
-        host_request_types=None,
-        # max allowed context length. Required to
-        # compute scratch memory size.
-        max_context_length: int = None):
+    def forward(self,
+                input_ids=None,
+                position_ids=None,
+                use_cache=False,
+                last_token_ids=None,
+                kv_cache_params=None,
+                attention_params=None):
+
         assert last_token_ids is not None, "Expecting last token ids to be not None"
-        hidden_states = super().forward(input_ids, position_ids, past_key_value,
-                                        sequence_length,
-                                        host_past_key_value_lengths, use_cache,
-                                        cache_indirection, context_lengths,
-                                        host_context_lengths,
-                                        host_request_types, max_context_length)
+        hidden_states = super().forward(input_ids, position_ids, use_cache,
+                                        kv_cache_params, attention_params)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -653,7 +605,14 @@ class ChatGLM6BHeadModel(ChatGLM6BModel):
                                        ('max_seq_len', [max_len_range]),
                                    ]))
 
-        return (input_ids, position_ids, past_key_value, sequence_length,
-                host_past_key_value_lengths, True, last_token_ids,
-                cache_indirection, context_lengths, host_context_lengths,
-                host_request_types, max_input_len)
+        return (input_ids, position_ids, True, last_token_ids,
+                KeyValueCacheParams(
+                    past_key_value=past_key_value,
+                    host_past_key_value_lengths=host_past_key_value_lengths,
+                    cache_indirection=cache_indirection,
+                ),
+                AttentionParams(sequence_length=sequence_length,
+                                context_lengths=context_lengths,
+                                host_context_lengths=host_context_lengths,
+                                max_context_length=max_input_len,
+                                host_request_types=host_request_types))

@@ -32,13 +32,13 @@ th::Tensor gatherTree(th::Tensor& sequence_lengths, th::Tensor& output_ids, th::
     th::optional<th::Tensor> beam_hyps_log_probs, th::optional<th::Tensor> beam_hyps_min_normed_scores,
     th::optional<th::Tensor> beam_hyps_num_beams, th::optional<th::Tensor> beam_hyps_is_done,
     th::optional<th::Tensor> finished, th::Tensor& length_penalty, int64_t batch_size, int64_t beam_width,
-    int64_t max_input_length, int64_t max_seq_len, bool use_beam_hyps)
+    int64_t max_seq_len, bool use_beam_hyps)
 {
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    th::Tensor final_output_ids = torch::zeros(
+        {batch_size, beam_width, max_seq_len}, torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
     if (use_beam_hyps && beam_width > 1)
     {
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
-        th::Tensor final_output_ids = torch::zeros({batch_size, beam_width, max_seq_len},
-            torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
         tl::kernels::invokeInitializeOutput(get_ptr<int32_t>(final_output_ids), get_ptr<int32_t>(end_ids),
             batch_size * beam_width, max_seq_len, stream);
 
@@ -69,18 +69,13 @@ th::Tensor gatherTree(th::Tensor& sequence_lengths, th::Tensor& output_ids, th::
             nullptr, // output_logs
             beamHypotheses.output_ids_tgt, beamHypotheses.sequence_lengths_tgt, beamHypotheses.normed_scores,
             beamHypotheses.cum_log_probs, beamHypotheses.log_probs, beamHypotheses.num_beams,
-            get_ptr<int32_t>(tiled_input_lengths), beam_width, max_seq_len, batch_size, max_input_length, stream);
+            get_ptr<int32_t>(tiled_input_lengths), beam_width, max_seq_len, batch_size, stream);
         sync_check_cuda_error();
-
-        return final_output_ids;
     }
-    else
+    else if (!use_beam_hyps && beam_width > 1)
     {
         th::Tensor workspace = torch::zeros(batch_size * beam_width * max_seq_len * sizeof(int32_t),
             torch::dtype(torch::kInt8).device(torch::kCUDA).requires_grad(false));
-
-        th::Tensor final_output_ids = torch::zeros({batch_size, beam_width, max_seq_len},
-            torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
 
         // For sampling, it is equivalent to all parent ids are 0.
         tl::kernels::gatherTreeParam param;
@@ -98,10 +93,9 @@ th::Tensor gatherTree(th::Tensor& sequence_lengths, th::Tensor& output_ids, th::
         param.step_ids = get_ptr<int32_t>(output_ids);
         param.parent_ids = beam_width == 1 ? nullptr : get_ptr<int32_t>(parent_ids);
         param.end_tokens = get_ptr<int32_t>(end_ids);
-        param.max_input_length = max_input_length;
         param.input_lengths = get_ptr<int32_t>(tiled_input_lengths);
 
-        param.stream = at::cuda::getCurrentCUDAStream().stream();
+        param.stream = stream;
         param.output_ids = get_ptr<int32_t>(final_output_ids);
         param.cum_log_probs = cum_log_probs_opt.has_value() ? get_ptr<float>(cum_log_probs_opt.value()) : nullptr;
         param.length_penalty = get_val<float>(length_penalty, 0);
@@ -109,8 +103,14 @@ th::Tensor gatherTree(th::Tensor& sequence_lengths, th::Tensor& output_ids, th::
         // NOTE: need to remove all prompt virtual tokens
         tl::kernels::invokeGatherTree(param);
         sync_check_cuda_error();
-        return final_output_ids;
     }
+    else
+    {
+        cudaMemcpyAsync(get_ptr<int32_t>(final_output_ids), get_ptr<int32_t>(output_ids),
+            sizeof(int) * batch_size * beam_width * max_seq_len, cudaMemcpyDeviceToDevice, stream);
+        sync_check_cuda_error();
+    }
+    return final_output_ids;
 }
 
 } // namespace torch_ext

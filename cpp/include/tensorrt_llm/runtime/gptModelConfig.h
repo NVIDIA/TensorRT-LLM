@@ -35,11 +35,13 @@ public:
         , mHiddenSize(hiddenSize)
         , mDataType(dtype)
         , mUseGptAttentionPlugin(false)
-        , mUseInflightBatching(false)
         , mInputPacked{false}
         , mPagedKvCache{false}
         , mTokensPerBlock{64}
         , mQuantMode{common::QuantMode::none()}
+        , mMaxBatchSize(0)
+        , mMaxInputLen(0)
+        , mMaxOutputLen(0)
     {
     }
 
@@ -53,9 +55,10 @@ public:
         return (mVocabSize + worldSize - 1) / worldSize * worldSize;
     }
 
-    [[nodiscard]] SizeType constexpr getNbLayers() const noexcept
+    [[nodiscard]] SizeType constexpr getNbLayers(SizeType pipelineParallelism = 1) const
     {
-        return mNbLayers;
+        TLLM_CHECK(mNbLayers % pipelineParallelism == 0);
+        return mNbLayers / pipelineParallelism;
     }
 
     [[nodiscard]] SizeType constexpr getNbHeads() const noexcept
@@ -138,14 +141,39 @@ public:
         mQuantMode = QuantMode;
     }
 
-    [[nodiscard]] bool constexpr useInflightBatching() const noexcept
+    [[nodiscard]] bool constexpr supportsInflightBatching() const noexcept
     {
-        return mUseInflightBatching;
+        return mUseGptAttentionPlugin && mInputPacked && mPagedKvCache;
     }
 
-    void constexpr useInflightBatching(bool useInflightBatching) noexcept
+    [[nodiscard]] SizeType constexpr getMaxBatchSize() const noexcept
     {
-        mUseInflightBatching = useInflightBatching;
+        return mMaxBatchSize;
+    }
+
+    void constexpr setMaxBatchSize(SizeType maxBatchSize) noexcept
+    {
+        mMaxBatchSize = maxBatchSize;
+    }
+
+    [[nodiscard]] SizeType constexpr getMaxInputLen() const noexcept
+    {
+        return mMaxInputLen;
+    }
+
+    void constexpr setMaxInputLen(SizeType maxInputLen) noexcept
+    {
+        mMaxInputLen = maxInputLen;
+    }
+
+    [[nodiscard]] SizeType constexpr getMaxOutputLen() const noexcept
+    {
+        return mMaxOutputLen;
+    }
+
+    void constexpr setMaxOutputLen(SizeType maxOutputLen) noexcept
+    {
+        mMaxOutputLen = maxOutputLen;
     }
 
 private:
@@ -156,11 +184,13 @@ private:
     SizeType mHiddenSize;
     nvinfer1::DataType mDataType;
     bool mUseGptAttentionPlugin;
-    bool mUseInflightBatching;
     bool mInputPacked;
     bool mPagedKvCache;
     SizeType mTokensPerBlock;
     common::QuantMode mQuantMode;
+    SizeType mMaxBatchSize;
+    SizeType mMaxInputLen;
+    SizeType mMaxOutputLen;
 };
 
 } // namespace tensorrt_llm::runtime

@@ -57,7 +57,18 @@ python build.py --model_dir ./tmp/llama/7B/ \
                 --use_gpt_attention_plugin float16 \
                 --use_gemm_plugin float16 \
                 --output_dir ./tmp/llama/7B/trt_engines/fp16/2-gpu/ \
-                --world_size 2
+                --world_size 2 \
+                --tp_size 2
+
+# Build LLaMA 7B using 2-way tensor parallelism and 2-way pipeline parallelism.
+python build.py --model_dir ./tmp/llama/7B/ \
+                --dtype float16 \
+                --use_gpt_attention_plugin float16 \
+                --use_gemm_plugin float16 \
+                --output_dir ./tmp/llama/7B/trt_engines/fp16/2-gpu/ \
+                --world_size 4 \
+                --tp_size 2 \
+                --pp_size 2
 
 # Build LLaMA 30B using 2-way tensor parallelism.
 python build.py --model_dir ./tmp/llama/30B/hf/ \
@@ -65,7 +76,8 @@ python build.py --model_dir ./tmp/llama/30B/hf/ \
                 --use_gpt_attention_plugin float16 \
                 --use_gemm_plugin float16 \
                 --output_dir ./tmp/llama/30B/trt_engines/fp16/2-gpu/ \
-                --world_size 2
+                --world_size 2 \
+                --tp_size 2
 ```
 
 #### LLaMA v2 Updates
@@ -88,7 +100,18 @@ python build.py --model_dir ./tmp/llama/70B/hf/ \
                 --use_gpt_attention_plugin float16 \
                 --use_gemm_plugin float16 \
                 --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
-                --world_size 8
+                --world_size 8 \
+                --tp_size 8
+
+# Build LLaMA 70B using 4-way tensor parallelism and 2-way pipeline parallelism.
+python build.py --model_dir ./tmp/llama/70B/hf/ \
+                --dtype float16 \
+                --use_gpt_attention_plugin float16 \
+                --use_gemm_plugin float16 \
+                --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
+                --world_size 8 \
+                --tp_size 4 \
+                --pp_size 2
 
 
 # Build LLaMA 70B TP=8 using Meta checkpoints directly.
@@ -97,10 +120,52 @@ python build.py --meta_ckpt_dir ./tmp/llama/70B \
                 --use_gpt_attention_plugin float16 \
                 --use_gemm_plugin float16 \
                 --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
-                --world_size 8
+                --world_size 8 \
+                --tp_size 8
 ```
 
 Same instructions can be applied to fine-tuned versions of the LLaMA v2 models (e.g. 7Bf or llama-2-7b-chat).
+
+#### INT8 weight only + INT8 KV cache
+For INT8 KV cache, [`hf_llama_convert.py`](./hf_llama_convert.py) features a
+`--calibrate-kv-cache, -kv` option. Setting `-kv` will calibrate the model,
+and then export the scaling factors needed for INT8 KV cache inference.
+
+
+Example:
+
+```bash
+python3 hf_llama_convert.py -i /llama-models/llama-7b-hf -o /llama/smooth_llama_7B/int8_kv_cache/ --calibrate-kv-cache -t float16
+```
+
+[`build.py`](./build.py) add new options for the support of INT8 KV cache.
+
+`--int8_kv_cache` is the command-line option to enable INT8 KV cache.
+
+In addition, it could be combined with INT8 weight-only quantization, as follows:
+
+Examples of INT8 weight-only quantization + INT8 KV cache
+
+```bash
+# Build model with both INT8 weight-only and INT8 KV cache enabled
+python build.py --ft_model_dir=/llama/smooth_llama_7B/int8_kv_cache/1-gpu/ \
+                --dtype float16 \
+                --use_gpt_attention_plugin float16 \
+                --use_gemm_plugin float16 \
+                --output_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_weight_only/1-gpu \
+                --int8_kv_cache \
+                --use_weight_only
+```
+
+Test with `summarize.py`:
+
+```bash
+python summarize.py --test_trt_llm \
+                    --hf_model_location /llama-models/llama-7b-hf \
+                    --data_type fp16 \
+                    --engine_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_weight_only/1-gpu \
+                    --test_hf
+```
 
 #### SmoothQuant
 
@@ -224,4 +289,20 @@ mpirun -n 2 --allow-run-as-root \
                         --hf_model_location ./tmp/llama/30B/ \
                         --data_type fp16 \
                         --engine_dir ./tmp/llama/30B/trt_engines/fp16/2-gpu/
+```
+
+## Running CodeLlama
+Those examples can be used to build and run the CodeLlama models. All 7b, 13b, and 34b sizes and variants are supported.
+
+NOTE: There are a couple of differences in CodeLlama in comparison to LLaMA v1/v2 models: rotary_base (`theta=1000000.0f`) and vocabulary size (`32016`).
+### Build
+Use the following command to build `CodeLlama-7b-Instruct`:
+```
+python build.py --meta_ckpt_dir ./CodeLlama-7b-Instruct/ --dtype float16 --use_gpt_attention_plugin float16 --use_gemm_plugin float16 --use_rmsnorm_plugin float16 --output_dir codellama_7b --rotary_base 1000000 --vocab_size 32016
+```
+
+### Run
+Use the following command to run it:
+```
+python run.py --max_output_len=40 --tokenizer_dir . --engine_dir codellama_7b --input_text "In Bash, how do I list all text files?"
 ```

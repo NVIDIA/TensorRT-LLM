@@ -232,7 +232,6 @@ void TopPSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingPa
     auto const batch_size = outputs.output_ids_ptr.shape[0];
     auto const local_batch_size = params.logits.shape[0];
     auto const ite = params.ite;
-    auto const step = params.step;
 
     // in case of skip any, the logit value is already copied and processed.
     auto* logits = !skip_any_ ? params.logits.template getPtr<T>() : runtime_logits_buf_;

@@ -50,7 +50,7 @@ public:
         return static_cast<SizeType>(mContexts.size());
     }
 
-    nvinfer1::IExecutionContext& getContext(SizeType contextIndex)
+    nvinfer1::IExecutionContext& getContext(SizeType contextIndex) const
     {
         return *mContexts.at(contextIndex);
     }
@@ -68,7 +68,7 @@ public:
 
     void setOutputTensors(SizeType contextIndex, TensorMap& tensorMap);
 
-    bool executeContext(SizeType contextIndex);
+    bool executeContext(SizeType contextIndex) const;
 
     CudaStream const& getStream() const;
 

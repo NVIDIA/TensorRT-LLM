@@ -21,14 +21,13 @@
 
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/tensor.h"
+#include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/gptSession.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
 #include <algorithm>
 #include <filesystem>
-
-#include <NvInferPlugin.h>
 
 using namespace tensorrt_llm::runtime;
 
@@ -43,6 +42,7 @@ auto const DATA_PATH = TEST_RESOURCE_PATH / "data";
 
 auto const GPT_MODEL_DIR = "gpt2";
 auto const GPTJ_MODEL_DIR = "gpt-j-6b";
+auto const LLAMA_MODEL_DIR = "llama-7b-hf";
 
 // Engines need to be generated using cpp/tests/resources/scripts/build_gpt_engines.py.
 auto const FP32_GPT_DIR = "fp32-default";
@@ -51,9 +51,6 @@ auto const FP16_GPT_DIR = "fp16-default";
 auto const FP16_GPT_ATTENTION_DIR = "fp16-plugin";
 auto const FP16_GPT_ATTENTION_PACKED_DIR = FP16_GPT_ATTENTION_DIR + std::string("-packed");
 auto const FP16_GPT_ATTENTION_PACKED_PAGED_DIR = FP16_GPT_ATTENTION_PACKED_DIR + std::string("-paged");
-auto const FP16_GPT_ATTENTION_INFLIGHT_BATCHING_DIR = "fp16-inflight-batching-plugin";
-auto const FP16_GPT_ATTENTION_INFLIGHT_BATCHING_PAGED_DIR
-    = FP16_GPT_ATTENTION_INFLIGHT_BATCHING_DIR + std::string("-paged");
 
 // Expected outputs need to be generated using cpp/tests/resources/scripts/generate_expected_gpt_output.py.
 auto const FP32_RESULT_FILE = "output_tokens_fp32.npy";
@@ -61,6 +58,18 @@ auto const FP32_PLUGIN_RESULT_FILE = "output_tokens_fp32_plugin.npy";
 auto const FP16_RESULT_FILE = "output_tokens_fp16.npy";
 auto const FP16_PLUGIN_RESULT_FILE = "output_tokens_fp16_plugin.npy";
 auto const FP16_PLUGIN_PACKED_RESULT_FILE = "output_tokens_fp16_plugin_packed.npy";
+
+struct ModelIds
+{
+    int endId;
+    int padId;
+};
+
+struct ModelParams
+{
+    char const* baseDir;
+    ModelIds ids;
+};
 
 class ModelSpec
 {
@@ -70,7 +79,6 @@ public:
         , mResultsFile{std::move(resultsFile)}
         , mDataType{dtype}
         , mUseGptAttentionPlugin{false}
-        , mUseInflightBatching{false}
         , mUsePackedInput{false}
         , mUsePagedKvCache{false}
         , mDecoderPerRequest{false}
@@ -80,12 +88,6 @@ public:
     ModelSpec& useGptAttentionPlugin()
     {
         mUseGptAttentionPlugin = true;
-        return *this;
-    }
-
-    ModelSpec& useInflightBatching()
-    {
-        mUseInflightBatching = true;
         return *this;
     }
 
@@ -111,7 +113,6 @@ public:
     std::string mResultsFile;
     nvinfer1::DataType mDataType;
     bool mUseGptAttentionPlugin;
-    bool mUseInflightBatching;
     bool mUsePackedInput;
     bool mUsePagedKvCache;
     bool mDecoderPerRequest;
@@ -130,7 +131,7 @@ protected:
 
         mLogger = std::make_shared<TllmLogger>();
 
-        initLibNvInferPlugins(mLogger.get(), "tensorrt_llm");
+        initTrtLlmPlugins(mLogger.get());
     }
 
     void TearDown() override {}
@@ -149,10 +150,9 @@ void verifyModelConfig(GptModelConfig const& modelConfig, ModelSpec const& model
     ASSERT_EQ(modelSpec.mDataType, modelConfig.getDataType());
 }
 
-template <int endId = 50256, int padId = 50256>
-void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, SizeType beamWidth,
+void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, ModelIds const modelIds, SizeType beamWidth,
     std::initializer_list<int> const& batchSizes, std::string const& resultsFile,
-    std::shared_ptr<nvinfer1::ILogger> const& logger, bool replicateFirstInput = false, bool cudaGraphMode = false)
+    std::shared_ptr<nvinfer1::ILogger> const& logger, bool cudaGraphMode = false)
 {
     ASSERT_TRUE(fs::exists(DATA_PATH));
     auto givenInput = tc::Tensor::loadNpy(DATA_PATH / "input_tokens.npy", tc::MEMORY_CPU);
@@ -172,7 +172,8 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, SizeT
     auto const decoderPerRequest = modelSpec.mDecoderPerRequest;
 
     auto const worldConfig = WorldConfig::mpi(*logger);
-    auto const enginePath = modelPath / json.engineFilename(worldConfig);
+    auto enginePath = modelPath / json.engineFilename(worldConfig);
+    ASSERT_TRUE(fs::exists(enginePath));
 
     auto const maxInputLength = static_cast<SizeType>(givenInput.shape[1]);
     auto const maxSeqLength = static_cast<SizeType>(expectedOutput.shape[1]);
@@ -184,6 +185,9 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, SizeT
     samplingConfig.randomSeed = std::vector{42ull};
     samplingConfig.topK = std::vector{0};
     samplingConfig.topP = std::vector{0.0f};
+
+    auto const padId = modelIds.padId;
+    auto const endId = modelIds.endId;
 
     std::vector<SizeType> givenInputLengths(nbGivenInputs);
     for (SizeType i = 0; i < nbGivenInputs; ++i)
@@ -210,7 +214,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, SizeT
         std::vector<SizeType> inputLenghtsHost(batchSize);
         for (SizeType i = 0; i < batchSize; ++i)
         {
-            const int inputIdx = replicateFirstInput ? 0 : i % nbGivenInputs;
+            const int inputIdx = i % nbGivenInputs;
             inputLenghtsHost[i] = givenInputLengths[inputIdx];
         }
         auto inputLenghts = bufferManager.copyFrom(inputLenghtsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
@@ -226,7 +230,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, SizeT
             std::vector<std::int32_t> inputsHost(totalInputSize);
             for (SizeType i = 0; i < batchSize; ++i)
             {
-                auto const seqBegin = givenInputData + (replicateFirstInput ? 0 : (i % nbGivenInputs) * maxInputLength);
+                auto const seqBegin = givenInputData + (i % nbGivenInputs) * maxInputLength;
                 std::copy(seqBegin, seqBegin + inputLenghtsHost[i], inputsHost.begin() + inputOffsetsHost[i]);
             }
             inputIds = bufferManager.copyFrom(inputsHost, ITensor::makeShape({1, totalInputSize}), MemoryType::kGPU);
@@ -236,7 +240,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, SizeT
             std::vector<std::int32_t> inputsHost(batchSize * maxInputLength, padId);
             for (SizeType i = 0; i < batchSize; ++i)
             {
-                auto const seqBegin = givenInputData + (replicateFirstInput ? 0 : (i % nbGivenInputs) * maxInputLength);
+                auto const seqBegin = givenInputData + (i % nbGivenInputs) * maxInputLength;
                 std::copy(seqBegin, seqBegin + inputLenghtsHost[i], inputsHost.begin() + i * maxInputLength);
             }
             inputIds
@@ -282,9 +286,8 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, SizeT
                     for (auto i = 0; i < maxSeqLength; ++i)
                     {
                         auto const outputIndex = tc::flat_index3(b, beam, i, beamWidth, maxSeqLength);
-                        const int expectedBatch = replicateFirstInput ? 0 : b;
                         auto const expectIndex
-                            = tc::flat_index2((expectedBatch % nbGivenInputs * beamWidth + beam), i, maxSeqLength);
+                            = tc::flat_index2((b % nbGivenInputs * beamWidth + beam), i, maxSeqLength);
                         EXPECT_EQ(output[outputIndex], expectedOutputData[expectIndex])
                             << " b: " << b << " beam: " << beam << " i: " << i;
                         anyMismatch |= (output[outputIndex] != expectedOutputData[expectIndex]);
@@ -304,7 +307,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, SizeT
 
 auto constexpr kBatchSizes = {1, 8};
 
-using ParamType = std::tuple<char const*, ModelSpec, SizeType, bool>;
+using ParamType = std::tuple<ModelParams, ModelSpec, SizeType, bool>;
 
 std::string generateTestName(const testing::TestParamInfo<ParamType>& info)
 {
@@ -314,8 +317,6 @@ std::string generateTestName(const testing::TestParamInfo<ParamType>& info)
     name.append(beamWidth == 1 ? "Sampling" : "BeamWidth" + std::to_string(beamWidth));
     if (modelSpec.mUseGptAttentionPlugin)
         name.append("GptAttentionPlugin");
-    if (modelSpec.mUseInflightBatching)
-        name.append("WithInflightBatching");
     if (modelSpec.mUsePackedInput)
         name.append("Packed");
     if (modelSpec.mUsePagedKvCache)
@@ -334,7 +335,9 @@ class ParamTest : public SessionTest, public ::testing::WithParamInterface<Param
 
 TEST_P(ParamTest, Test)
 {
-    auto const modelDir = std::get<0>(GetParam());
+    auto const modelParams = std::get<0>(GetParam());
+    auto const modelDir = modelParams.baseDir;
+    auto const modelIds = modelParams.ids;
     auto const modelSpec = std::get<1>(GetParam());
     auto const modelPath{ENGINGE_PATH / modelDir / modelSpec.mModelPath / "1-gpu"};
     SizeType const beamWidth{std::get<2>(GetParam())};
@@ -345,15 +348,13 @@ TEST_P(ParamTest, Test)
     if (!modelSpec.mUseGptAttentionPlugin && beamWidth > 1)
         GTEST_SKIP();
 
-    auto const replicateFirstInput = false;
     auto const cudaGraphMode = std::get<3>(GetParam());
 
-    testGptSession(
-        modelPath, modelSpec, beamWidth, kBatchSizes, resultsFile, mLogger, replicateFirstInput, cudaGraphMode);
+    testGptSession(modelPath, modelSpec, modelIds, beamWidth, kBatchSizes, resultsFile, mLogger, cudaGraphMode);
 }
 
 INSTANTIATE_TEST_SUITE_P(GptSessionTest, ParamTest,
-    testing::Combine(testing::Values(GPT_MODEL_DIR),
+    testing::Combine(testing::Values(ModelParams{GPT_MODEL_DIR, {50256, 50256}}),
         testing::Values(
             // single decoder
             ModelSpec{FP32_GPT_DIR, FP32_RESULT_FILE, nvinfer1::DataType::kFLOAT},
@@ -367,17 +368,6 @@ INSTANTIATE_TEST_SUITE_P(GptSessionTest, ParamTest,
                 .usePackedInput(),
             ModelSpec{FP16_GPT_ATTENTION_PACKED_PAGED_DIR, FP16_PLUGIN_PACKED_RESULT_FILE, nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
-                .usePackedInput()
-                .usePagedKvCache(),
-            // ModelSpec{
-            //     FP16_GPT_ATTENTION_INFLIGHT_BATCHING_DIR, FP16_PLUGIN_PACKED_RESULT_FILE, nvinfer1::DataType::kHALF}
-            //     .useGptAttentionPlugin()
-            //     .useInflightBatching()
-            //     .usePackedInput(),
-            ModelSpec{FP16_GPT_ATTENTION_INFLIGHT_BATCHING_PAGED_DIR, FP16_PLUGIN_PACKED_RESULT_FILE,
-                nvinfer1::DataType::kHALF}
-                .useGptAttentionPlugin()
-                .useInflightBatching()
                 .usePackedInput()
                 .usePagedKvCache(),
             // decoderBatch
@@ -397,19 +387,6 @@ INSTANTIATE_TEST_SUITE_P(GptSessionTest, ParamTest,
                 .useGptAttentionPlugin()
                 .usePackedInput()
                 .usePagedKvCache()
-                .useDecoderPerRequest(),
-            // ModelSpec{
-            //     FP16_GPT_ATTENTION_INFLIGHT_BATCHING_DIR, FP16_PLUGIN_PACKED_RESULT_FILE, nvinfer1::DataType::kHALF}
-            //     .useGptAttentionPlugin()
-            //     .useInflightBatching()
-            //     .usePackedInput()
-            //     .useDecoderPerRequest(),
-            ModelSpec{FP16_GPT_ATTENTION_INFLIGHT_BATCHING_PAGED_DIR, FP16_PLUGIN_PACKED_RESULT_FILE,
-                nvinfer1::DataType::kHALF}
-                .useGptAttentionPlugin()
-                .useInflightBatching()
-                .usePackedInput()
-                .usePagedKvCache()
                 .useDecoderPerRequest()
 
                 ),
@@ -417,7 +394,7 @@ INSTANTIATE_TEST_SUITE_P(GptSessionTest, ParamTest,
     generateTestName);
 
 INSTANTIATE_TEST_SUITE_P(GptjSessionTest, ParamTest,
-    testing::Combine(testing::Values(GPTJ_MODEL_DIR),
+    testing::Combine(testing::Values(ModelParams{GPTJ_MODEL_DIR, {50256, 50256}}),
         testing::Values(
             // single decoder
             ModelSpec{FP16_GPT_ATTENTION_DIR, FP16_PLUGIN_RESULT_FILE, nvinfer1::DataType::kHALF}
@@ -425,8 +402,7 @@ INSTANTIATE_TEST_SUITE_P(GptjSessionTest, ParamTest,
             ModelSpec{FP16_GPT_ATTENTION_PACKED_DIR, FP16_PLUGIN_PACKED_RESULT_FILE, nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .usePackedInput(),
-            ModelSpec{FP16_GPT_ATTENTION_INFLIGHT_BATCHING_PAGED_DIR, FP16_PLUGIN_PACKED_RESULT_FILE,
-                nvinfer1::DataType::kHALF}
+            ModelSpec{FP16_GPT_ATTENTION_PACKED_PAGED_DIR, FP16_PLUGIN_PACKED_RESULT_FILE, nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .usePackedInput()
                 .usePagedKvCache(),
@@ -438,8 +414,7 @@ INSTANTIATE_TEST_SUITE_P(GptjSessionTest, ParamTest,
                 .useGptAttentionPlugin()
                 .usePackedInput()
                 .useDecoderPerRequest(),
-            ModelSpec{FP16_GPT_ATTENTION_INFLIGHT_BATCHING_PAGED_DIR, FP16_PLUGIN_PACKED_RESULT_FILE,
-                nvinfer1::DataType::kHALF}
+            ModelSpec{FP16_GPT_ATTENTION_PACKED_PAGED_DIR, FP16_PLUGIN_PACKED_RESULT_FILE, nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .usePackedInput()
                 .usePagedKvCache()
@@ -449,11 +424,26 @@ INSTANTIATE_TEST_SUITE_P(GptjSessionTest, ParamTest,
         testing::Values(1, 2), testing::Values(false)),
     generateTestName);
 
-class LlamaSessionTest : public SessionTest
+INSTANTIATE_TEST_SUITE_P(LlamaSessionTest, ParamTest,
+    testing::Combine(testing::Values(ModelParams{LLAMA_MODEL_DIR, {2, 2}}),
+        testing::Values(
+            // single decoder
+            ModelSpec{FP16_GPT_ATTENTION_DIR, FP16_PLUGIN_RESULT_FILE, nvinfer1::DataType::kHALF}
+                .useGptAttentionPlugin(),
+            // decoderBatch
+            ModelSpec{FP16_GPT_ATTENTION_DIR, FP16_PLUGIN_RESULT_FILE, nvinfer1::DataType::kHALF}
+                .useGptAttentionPlugin()
+                .useDecoderPerRequest()
+
+                ),
+        testing::Values(1, 2), testing::Values(false)),
+    generateTestName);
+
+class LlamaSessionOnDemandTest : public SessionTest
 {
 };
 
-TEST_F(LlamaSessionTest, SamplingFP16WithAttentionPlugin)
+TEST_F(LlamaSessionOnDemandTest, SamplingFP16WithAttentionPlugin)
 {
     GTEST_SKIP() << "Run only on demand";
     auto const modelDir = "llama_7bf";
@@ -465,11 +455,12 @@ TEST_F(LlamaSessionTest, SamplingFP16WithAttentionPlugin)
 
     auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
+    auto const modeIds = ModelIds{2, 2};
 
-    testGptSession<2, 2>(modelPath, modelSpec, beamWidth, batchSizes, resultsFile, mLogger);
+    testGptSession(modelPath, modelSpec, modeIds, beamWidth, batchSizes, resultsFile, mLogger);
 }
 
-TEST_F(LlamaSessionTest, SamplingFP16AttentionPluginDecoderBatch)
+TEST_F(LlamaSessionOnDemandTest, SamplingFP16AttentionPluginDecoderBatch)
 {
     GTEST_SKIP() << "Run only on demand";
     auto const modelDir = "llamav2";
@@ -480,6 +471,7 @@ TEST_F(LlamaSessionTest, SamplingFP16AttentionPluginDecoderBatch)
 
     auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin().usePackedInput().useDecoderPerRequest();
+    auto const modeIds = ModelIds{2, 2};
 
-    testGptSession<2, 2>(modelPath, modelSpec, beamWidth, batchSizes, resultsFile, mLogger);
+    testGptSession(modelPath, modelSpec, modeIds, beamWidth, batchSizes, resultsFile, mLogger);
 }

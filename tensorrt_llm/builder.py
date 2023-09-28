@@ -19,8 +19,9 @@ from pathlib import Path
 from typing import Optional, Union
 
 import tensorrt as trt
+from packaging import version
 
-from ._utils import to_dict, to_json_file
+from ._utils import to_dict, to_json_file, trt_version
 from .logger import logger
 from .network import Network
 
@@ -72,15 +73,24 @@ class Builder():
     def __init__(self):
         super().__init__()
         self._trt_builder = trt.Builder(logger.trt_logger)
+        self.strongly_typed = False
 
     @property
     def trt_builder(self) -> trt.Builder:
         return self._trt_builder
 
     def create_network(self) -> Network:
-        return Network()._init(
-            self.trt_builder.create_network(
-                1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)))
+        if version.parse(trt_version()) >= version.parse(
+                "9.1.0") and self.strongly_typed:
+            return Network()._init(
+                self.trt_builder.create_network(
+                    (1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+                    | (1 << int(
+                        trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED))))
+        else:
+            return Network()._init(
+                self.trt_builder.create_network(
+                    1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)))
 
     def create_builder_config(self,
                               precision: str,
@@ -90,6 +100,7 @@ class Builder():
                               use_refit: bool = False,
                               int8: bool = False,
                               fp8: bool = False,
+                              strongly_typed: bool = False,
                               opt_level: Optional[int] = None,
                               **kwargs) -> BuilderConfig:
         ''' @brief Create a builder config with given precisions and timing cache
@@ -101,8 +112,9 @@ class Builder():
             @param int8: whether to build with int8 enabled or not. Can't be used together with refit option
             @return: A BuilderConfig object, return None if failed
         '''
+        self.strongly_typed = strongly_typed
 
-        if precision not in self._ALLOWED_PRECISIONS:
+        if not strongly_typed and precision not in self._ALLOWED_PRECISIONS:
             logger.error(
                 f"precision should be one of {self._ALLOWED_PRECISIONS}")
 
@@ -112,18 +124,20 @@ class Builder():
             logger.error(f"can't use refit and int8 mode at the same time")
 
         config = self.trt_builder.create_builder_config()
-        if precision == 'float16':
-            config.set_flag(trt.BuilderFlag.FP16)
-            config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
-        elif precision == 'bfloat16':
-            config.set_flag(trt.BuilderFlag.BF16)
-            config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
-        if int8:
-            config.set_flag(trt.BuilderFlag.INT8)
+        if not strongly_typed:
+            if precision == 'float16':
+                config.set_flag(trt.BuilderFlag.FP16)
+                config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+            elif precision == 'bfloat16':
+                config.set_flag(trt.BuilderFlag.BF16)
+                config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+            if int8:
+                config.set_flag(trt.BuilderFlag.INT8)
 
-        if fp8:
-            config.set_flag(trt.BuilderFlag.FP8)
-            config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+            if fp8:
+                config.set_flag(trt.BuilderFlag.FP8)
+                config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+
         config.set_preview_feature(trt.PreviewFeature.PROFILE_SHARING_0806,
                                    True)
 

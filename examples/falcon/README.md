@@ -59,16 +59,41 @@ python build.py --model_dir falcon/40b-instruct \
                 --use_gemm_plugin bfloat16 \
                 --use_gpt_attention_plugin bfloat16 \
                 --output_dir falcon/40b-instruct/trt_engines/bf16/2-gpu/ \
-                --world_size 2
+                --world_size 2 \
+                --tp_size 2
 
-# Use 8-way tensor parallelism on falcon-180B, loading weights shard-by-shard.
-python build.py --model_dir /models/falcon/180b \
+# Use 2-way tensor parallelism and 2-way pipeline parallelism on falcon-40b-instruct
+python build.py --model_dir falcon/40b-instruct \
                 --dtype bfloat16 \
                 --use_gemm_plugin bfloat16 \
                 --use_gpt_attention_plugin bfloat16 \
-                --output_dir /models/falcon/180b/trt_engines/bf16/8-gpu/ \
-                --world_size 8
-                --paralell_build
+                --output_dir falcon/40b-instruct/trt_engines/bf16/2-gpu/ \
+                --world_size 4 \
+                --tp_size 2 \
+                --pp_size 2
+
+# Use 8-way tensor parallelism on falcon-180B, loading weights shard-by-shard.
+python build.py --model_dir falcon/180b \
+                --dtype bfloat16 \
+                --use_gemm_plugin bfloat16 \
+                --use_gpt_attention_plugin bfloat16 \
+                --output_dir falcon/180b/trt_engines/bf16/8-gpu/ \
+                --world_size 8 \
+                --tp_size 8 \
+                --load_by_shard \
+                --parallel_build
+
+# Use 4-way tensor parallelism and 2-way pipeline parallelism on falcon-180B, loading weights shard-by-shard.
+python build.py --model_dir falcon/180b \
+                --dtype bfloat16 \
+                --use_gemm_plugin bfloat16 \
+                --use_gpt_attention_plugin bfloat16 \
+                --output_dir falcon/180b/trt_engines/bf16/8-gpu/ \
+                --world_size 8 \
+                --tp_size 4 \
+                --pp_size 2 \
+                --load_by_shard \
+                --parallel_build
 ```
 
 Note that in order to use N-way tensor parallelism, the number of attention heads must be a multiple of N.

@@ -14,22 +14,22 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/plugins/bertAttentionPlugin/bertAttentionPlugin.h"
+#include "bertAttentionPlugin.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::kernels;
-using namespace tensorrt_llm::common;
-using nvinfer1::plugin::BertAttentionPluginCreator;
-using nvinfer1::plugin::BertAttentionPlugin;
-using nvinfer1::plugin::nextWorkspacePtr;
+namespace tc = tensorrt_llm::common;
+
+using tensorrt_llm::plugins::BertAttentionPluginCreator;
+using tensorrt_llm::plugins::BertAttentionPlugin;
 
 static const char* BERT_ATTENTION_PLUGIN_VERSION{"1"};
 static const char* BERT_ATTENTION_PLUGIN_NAME{"BertAttention"};
 PluginFieldCollection BertAttentionPluginCreator::mFC{};
-std::vector<PluginField> BertAttentionPluginCreator::mPluginAttributes;
+std::vector<nvinfer1::PluginField> BertAttentionPluginCreator::mPluginAttributes;
 
 BertAttentionPlugin::BertAttentionPlugin(int num_heads, int head_size, float q_scaling, bool qk_half_accum,
     ContextFMHAType context_fmha_type, nvinfer1::DataType type)
@@ -56,7 +56,7 @@ BertAttentionPlugin::BertAttentionPlugin(const void* data, size_t length)
     read(d, mEnableContextFMHA);
     read(d, mFMHAForceFP32Acc);
     read(d, mType);
-    PLUGIN_ASSERT(d == a + length);
+    TLLM_CHECK(d == a + length);
 }
 
 // IPluginV2DynamicExt Methods
@@ -71,7 +71,7 @@ nvinfer1::IPluginV2DynamicExt* BertAttentionPlugin::clone() const noexcept
 nvinfer1::DimsExprs BertAttentionPlugin::getOutputDimensions(
     int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
-    PLUGIN_ASSERT(outputIndex == 0);
+    TLLM_CHECK(outputIndex == 0);
     auto ret = inputs[0];
     ret.d[2] = exprBuilder.constant(ret.d[2]->getConstantValue() / 3);
     return ret;
@@ -139,7 +139,7 @@ size_t BertAttentionPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* i
     workspaces[8] = qk_buf_float_size;
     workspaces[9] = padding_offset_size;
 
-    return plugin::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
+    return tensorrt_llm::plugins::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 }
 
 template <typename T>
@@ -168,7 +168,7 @@ int BertAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
     T* context_buf_ = (T*) (outputs[0]);
 
     auto cublasHandle = mCublasWrapper->getCublasHandle();
-    PLUGIN_CUBLASASSERT(cublasSetStream(cublasHandle, stream));
+    TLLM_CUDA_CHECK(cublasSetStream(cublasHandle, stream));
     mCublasWrapper->setStream(stream);
     mCublasWrapper->setWorkspace(workspace);
     if (inputDesc[0].type == DataType::kHALF)
@@ -225,9 +225,9 @@ int BertAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
     // Padding offset = nullptr here (remove padding is not supported).
     invokeAddFusedQKVBiasTranspose(q_buf_2_, k_buf_2_, v_buf_2_, const_cast<T*>(attention_input), input_lengths,
         nullptr, request_batch_size, request_seq_len, batch_size * input_seq_len, mNumHeads, mNumHeads, mHeadSize,
-        mEnableContextFMHA, 0, PositionEmbeddingType::kLEARNED_ABSOLUTE, (float*) nullptr, 0, stream);
+        mEnableContextFMHA, 0, 0.0f, 0.0f, PositionEmbeddingType::kLEARNED_ABSOLUTE, (float*) nullptr, 0, stream);
 
-    const cudaDataType_t gemm_data_type = CudaDataType<T>::value;
+    const auto gemm_data_type = tc::CudaDataType<T>::value;
     const int attention_seq_len_1 = request_seq_len; // q length
     const int attention_seq_len_2 = request_seq_len; // kv length
     const T qk_scale = static_cast<T>(1.0f / (sqrtf(mHeadSize * 1.0f) * q_scaling));
@@ -338,7 +338,7 @@ int BertAttentionPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
 nvinfer1::DataType BertAttentionPlugin::getOutputDataType(
     int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
 {
-    PLUGIN_ASSERT(index == 0);
+    TLLM_CHECK(index == 0);
     return inputTypes[0];
 }
 
@@ -363,10 +363,10 @@ int BertAttentionPlugin::initialize() noexcept
 {
     auto cublasHandle = getCublasHandle();
     auto cublasLtHandle = getCublasLtHandle();
-    mCublasAlgoMap = new cublasAlgoMap(GEMM_CONFIG);
+    mCublasAlgoMap = new tc::cublasAlgoMap(GEMM_CONFIG);
     mCublasWrapperMutex = new std::mutex();
     mCublasWrapper
-        = new cublasMMWrapper(cublasHandle, cublasLtHandle, nullptr, mCublasAlgoMap, mCublasWrapperMutex, nullptr);
+        = new tc::cublasMMWrapper(cublasHandle, cublasLtHandle, nullptr, mCublasAlgoMap, mCublasWrapperMutex, nullptr);
     if (mEnableContextFMHA)
     {
         mFMHARunner = new FusedMHARunnerV2(DATA_TYPE_FP16, mNumHeads, mHeadSize, mQScaling);
@@ -415,16 +415,6 @@ void BertAttentionPlugin::serialize(void* buffer) const noexcept
 
 void BertAttentionPlugin::terminate() noexcept {}
 
-void BertAttentionPlugin::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* BertAttentionPlugin::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
-}
-
 ///////////////
 
 BertAttentionPluginCreator::BertAttentionPluginCreator()
@@ -470,32 +460,32 @@ IPluginV2* BertAttentionPluginCreator::createPlugin(const char* name, const Plug
         const char* attrName = fields[i].name;
         if (!strcmp(attrName, "num_heads"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             num_heads = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "head_size"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             head_size = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "q_scaling"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kFLOAT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kFLOAT32);
             q_scaling = static_cast<float>(*(static_cast<const float*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "enable_qk_half_accum"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT8);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
             qk_half_accum = static_cast<bool>(*(static_cast<const int8_t*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "context_fmha_type"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT8);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
             context_fmha_type = static_cast<ContextFMHAType>(*(static_cast<const int8_t*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "type_id"))
         {
-            PLUGIN_ASSERT(fields[i].type == PluginFieldType::kINT32);
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
         }
     }
@@ -528,14 +518,4 @@ IPluginV2* BertAttentionPluginCreator::deserializePlugin(
         caughtError(e);
     }
     return nullptr;
-}
-
-void BertAttentionPluginCreator::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* BertAttentionPluginCreator::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
 }

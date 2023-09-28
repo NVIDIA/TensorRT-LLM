@@ -31,13 +31,16 @@ from build import get_engine_name  # isort:skip
 
 def TRTLLaMA(args, config):
     dtype = config['builder_config']['precision']
-    world_size = config['builder_config']['tensor_parallel']
+    tp_size = config['builder_config']['tensor_parallel']
+    pp_size = config['builder_config']['pipeline_parallel']
+    world_size = tp_size * pp_size
+
+    assert pp_size == 1, 'Python runtime does not support pipeline parallelism'
     assert world_size == tensorrt_llm.mpi_world_size(), \
         f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
 
-    world_size = config['builder_config']['tensor_parallel']
-    num_heads = config['builder_config']['num_heads'] // world_size
-    hidden_size = config['builder_config']['hidden_size'] // world_size
+    num_heads = config['builder_config']['num_heads'] // tp_size
+    hidden_size = config['builder_config']['hidden_size'] // tp_size
     vocab_size = config['builder_config']['vocab_size']
     num_layers = config['builder_config']['num_layers']
     use_gpt_attention_plugin = bool(
@@ -51,7 +54,7 @@ def TRTLLaMA(args, config):
             "`multi_query_mode` config is deprecated. Please rebuild the engine."
         )
         num_kv_heads = 1
-    num_kv_heads = (num_kv_heads + world_size - 1) // world_size
+    num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
 
     model_config = tensorrt_llm.runtime.ModelConfig(
         vocab_size=vocab_size,
@@ -67,10 +70,12 @@ def TRTLLaMA(args, config):
     runtime_rank = tensorrt_llm.mpi_rank()
     runtime_mapping = tensorrt_llm.Mapping(world_size,
                                            runtime_rank,
-                                           tp_size=world_size)
+                                           tp_size=tp_size,
+                                           pp_size=pp_size)
     torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
 
-    engine_name = get_engine_name('llama', dtype, world_size, runtime_rank)
+    engine_name = get_engine_name('llama', dtype, tp_size, pp_size,
+                                  runtime_rank)
     serialize_path = os.path.join(args.engine_dir, engine_name)
 
     tensorrt_llm.logger.set_level(args.log_level)
@@ -187,7 +192,8 @@ def main(args):
         with torch.no_grad():
             tensorrt_llm_llama.setup(batch_size,
                                      max_context_length=max_length,
-                                     max_new_tokens=output_len)
+                                     max_new_tokens=output_len,
+                                     beam_width=num_beams)
 
             if tensorrt_llm_llama.remove_input_padding:
                 output_ids = tensorrt_llm_llama.decode_batch(

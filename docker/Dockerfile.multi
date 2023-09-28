@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
-ARG BASE_TAG=23.07-py3
+ARG BASE_TAG=23.08-py3
 
 FROM ${BASE_IMAGE}:${BASE_TAG} as base
 
@@ -24,15 +24,26 @@ RUN --mount=type=cache,target=/root/.cache \
     pip uninstall -y tensorrt
 
 # Download & install internal TRT release
-ARG TENSOR_RT_VERSION="9.0.1.4"
+ARG TENSOR_RT_VERSION="9.1.0.1"
 ARG CUDA_VERSION="12.2"
-ARG RELEASE_URL_TRT=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/secure/9.0.1/tars/TensorRT-${TENSOR_RT_VERSION}.Linux.x86_64-gnu.cuda-${CUDA_VERSION}.tar.gz
+ARG RELEASE_URL_TRT
+ARG TARGETARCH
+
 RUN --mount=type=cache,target=/root/.cache \
-    wget --no-verbose ${RELEASE_URL_TRT} -P /workspace && \
-    tar -xf /workspace/TensorRT-${TENSOR_RT_VERSION}.Linux.x86_64-gnu.cuda-${CUDA_VERSION}.tar.gz -C /usr/local/ && \
+    if [ -z "$RELEASE_URL_TRT"];then \
+        ARCH=${TARGETARCH} && \
+        if [ "$ARCH" = "arm64" ];then ARCH="aarch64";fi && \
+        if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi && \
+        if [ "$ARCH" = "x86_64" ];then DIR_NAME="x64-agnostic"; else DIR_NAME=${ARCH};fi &&\
+        if [ "$ARCH" = "aarch64" ];then OS1="Ubuntu22_04" && OS2="Ubuntu-22.04"; else OS1="Linux" && OS2="Linux";fi &&\
+        RELEASE_URL_TRT=http://cuda-repo.nvidia.com/release-candidates/Libraries/TensorRT/v9.1/${TENSOR_RT_VERSION}-b6aa91dc/${CUDA_VERSION}-r535/${OS1}-${DIR_NAME}/tar/TensorRT-${TENSOR_RT_VERSION}.${OS2}.${ARCH}-gnu.cuda-${CUDA_VERSION}.tar.gz;\
+    fi &&\
+    wget --no-verbose ${RELEASE_URL_TRT} -O /workspace/TensorRT.tar && \
+    tar -xf TensorRT.tar -C /usr/local/ && \
     mv /usr/local/TensorRT-${TENSOR_RT_VERSION} /usr/local/tensorrt && \
-    pip install /usr/local/tensorrt/python/tensorrt-9.0.1*cp310-none-linux_x86_64.whl && \
-    rm -rf /workspace/TensorRT-${TENSOR_RT_VERSION}.Linux.x86_64-gnu.cuda-${CUDA_VERSION}.tar.gz
+    pip install /usr/local/tensorrt/python/tensorrt-*-cp310-*.whl && \
+    rm -rf /workspace/TensorRT.tar
+
 ENV LD_LIBRARY_PATH=/usr/local/tensorrt/lib:${LD_LIBRARY_PATH}
 
 # Install latest Polygraphy
@@ -59,6 +70,7 @@ FROM devel as release
 
 WORKDIR /app/tensorrt_llm
 COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl .
+COPY --from=wheel /src/tensorrt_llm/cpp/include/ include/
 RUN pip install tensorrt_llm*.whl && \
     rm tensorrt_llm*.whl
 COPY README.md ./

@@ -20,7 +20,7 @@ import tensorrt as trt
 from .._common import default_net, default_trtnet
 from .._utils import str_dtype_to_np, str_dtype_to_trt
 from ..functional import Tensor, _create_tensor, cast, clip, constant, round
-from ..plugin import _TRT_LLM_PLUGIN_NAMESPACE as TRT_LLM_PLUGIN_NAMESPACE
+from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
 
 
 def smooth_quant_gemm(input: Tensor, weights: Tensor, scales_a: Tensor,
@@ -258,17 +258,27 @@ def quantize(input: Tensor,
 
     output = _create_tensor(layer.get_output(0), layer)
 
-    layer.get_output(0).dtype = str_dtype_to_trt(dtype)
+    if not default_net().strongly_typed:
+        layer.get_output(0).dtype = str_dtype_to_trt(dtype)
 
     return output
 
 
-def dequantize(input: Tensor, scale_factor: Tensor, axis: int = -1) -> Tensor:
+def dequantize(input: Tensor,
+               scale_factor: Tensor,
+               axis: int = -1,
+               output_type: Union[str, trt.DataType] = 'float16') -> Tensor:
+
+    if isinstance(output_type, str):
+        output_type = str_dtype_to_trt(output_type)
+
     layer = default_trtnet().add_dequantize(input.trt_tensor,
-                                            scale_factor.trt_tensor)
+                                            scale_factor.trt_tensor,
+                                            output_type)
     layer.axis = axis
 
-    layer.precision = input.dtype
+    if not default_net().strongly_typed:
+        layer.precision = input.dtype
 
     output = _create_tensor(layer.get_output(0), layer)
 

@@ -132,7 +132,7 @@ def parse_arguments():
         choices=[0, 1],
         help=
         'By default the embedding lookup table is sharded along vocab dimension (embedding_sharding_dim=0). '
-        'To shard it along hiddem dimension, set embedding_sharding_dim=1'
+        'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
     parser.add_argument(
@@ -251,6 +251,8 @@ def build_rank_engine(builder: Builder,
                                                  args.max_output_len, True,
                                                  args.max_beam_width)
         tensorrt_llm_gpt(*inputs)
+
+    tensorrt_llm.graph_rewriting.optimize(network)
 
     engine = None
 
