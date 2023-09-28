@@ -9,3 +9,6 @@
 	path = 3rdparty/cxxopts
 	url = https://github.com/jarro2783/cxxopts
 	branch = v3.1.1
+[submodule "3rdparty/NVTX"]
+	path = 3rdparty/NVTX
+	url = https://github.com/NVIDIA/NVTX.git
