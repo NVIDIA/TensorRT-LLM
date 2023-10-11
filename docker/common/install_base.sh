@@ -25,6 +25,7 @@ init_centos() {
     PY_VERSION=38
     yum -y update
     yum -y install centos-release-scl-rh epel-release
+    # https://gitlab.com/nvidia/container-images/cuda
     CUDA_VERSION=$(nvcc --version | sed -n 's/^.*release \([0-9]\+\.[0-9]\+\).*$/\1/p')
     YUM_CUDA=${CUDA_VERSION/./-}
     # Consistent with manylinux2014 centos-7 based version
