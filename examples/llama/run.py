@@ -22,12 +22,22 @@ import torch
 from transformers import LlamaTokenizer
 
 import tensorrt_llm
+from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 
 from build import get_engine_name  # isort:skip
 
 EOS_TOKEN = 2
 PAD_TOKEN = 2
+
+
+def throttle_generator(generator, stream_interval):
+    for i, out in enumerate(generator):
+        if not i % stream_interval:
+            yield out
+
+    if i % stream_interval:
+        yield out
 
 
 def read_config(config_path: Path):
@@ -47,7 +57,8 @@ def read_config(config_path: Path):
     num_layers = config['builder_config']['num_layers']
     num_kv_heads = config['builder_config'].get('num_kv_heads', num_heads)
     paged_kv_cache = config['plugin_config']['paged_kv_cache']
-    tokens_per_block = config['builder_config']['tokens_per_block']
+    tokens_per_block = config['plugin_config']['tokens_per_block']
+    quant_mode = QuantMode(config['builder_config']['quant_mode'])
     if config['builder_config'].get('multi_query_mode', False):
         tensorrt_llm.logger.warning(
             "`multi_query_mode` config is deprecated. Please rebuild the engine."
@@ -63,7 +74,9 @@ def read_config(config_path: Path):
                                gpt_attention_plugin=use_gpt_attention_plugin,
                                paged_kv_cache=paged_kv_cache,
                                tokens_per_block=tokens_per_block,
-                               remove_input_padding=remove_input_padding)
+                               remove_input_padding=remove_input_padding,
+                               dtype=dtype,
+                               quant_mode=quant_mode)
 
     return model_config, tp_size, pp_size, dtype
 
@@ -168,6 +181,11 @@ def parse_arguments():
                         type=int,
                         help="Use beam search if num_beams >1",
                         default=1)
+    parser.add_argument('--streaming', default=False, action='store_true')
+    parser.add_argument('--streaming_interval',
+                        type=int,
+                        help="How often to return tokens when streaming.",
+                        default=5)
     return parser.parse_args()
 
 
@@ -181,13 +199,14 @@ def generate(
     output_npy: str = None,
     tokenizer_dir: str = None,
     num_beams: int = 1,
+    streaming: bool = False,
+    streaming_interval: int = 5,
 ):
     tensorrt_llm.logger.set_level(log_level)
 
     engine_dir = Path(engine_dir)
     config_path = engine_dir / 'config.json'
     model_config, tp_size, pp_size, dtype = read_config(config_path)
-    assert pp_size == 1, 'Python runtime does not support pipeline parallelism'
     world_size = tp_size * pp_size
 
     runtime_rank = tensorrt_llm.mpi_rank()
@@ -211,7 +230,8 @@ def generate(
     decoder = tensorrt_llm.runtime.GenerationSession(model_config,
                                                      engine_buffer,
                                                      runtime_mapping,
-                                                     debug_mode=False)
+                                                     debug_mode=False,
+                                                     debug_tensors_to_save=None)
     if runtime_rank == 0:
         print(f"Running the {dtype} engine ...")
 
@@ -223,12 +243,22 @@ def generate(
     decoder.setup(input_lengths.size(0), max_input_length, max_output_len,
                   num_beams)
 
-    output_ids = decoder.decode(input_ids, input_lengths, sampling_config)
+    output_gen_ids = decoder.decode(input_ids,
+                                    input_lengths,
+                                    sampling_config,
+                                    streaming=streaming)
     torch.cuda.synchronize()
-
-    if runtime_rank == 0:
-        print_output(output_ids, input_lengths, max_output_len, tokenizer,
-                     output_csv, output_npy)
+    if streaming:
+        for output_ids in throttle_generator(output_gen_ids,
+                                             streaming_interval):
+            if runtime_rank == 0:
+                print_output(output_ids, input_lengths, max_output_len,
+                             tokenizer, output_csv, output_npy)
+    else:
+        output_ids = output_gen_ids
+        if runtime_rank == 0:
+            print_output(output_ids, input_lengths, max_output_len, tokenizer,
+                         output_csv, output_npy)
 
 
 if __name__ == '__main__':

@@ -70,6 +70,9 @@ class Mapping(object):
     def is_first_pp_rank(self):
         return self.pp_rank == 0
 
+    def has_pp(self):
+        return self.pp_size > 1
+
     def prev_pp_rank(self):
         p = self.rank - self.tp_size
         if p < 0:

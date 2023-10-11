@@ -34,19 +34,20 @@ FtDynamicDecode<T>::FtDynamicDecode(
     const size_t vocab_size, const size_t vocab_size_padded, const int tensor_para_size, const int pipeline_para_size)
     : vocab_size_(vocab_size)
     , vocab_size_padded_(vocab_size_padded)
+    , finished_sum_(tr::BufferManager::pinned(tr::ITensor::makeShape({1}), nvinfer1::DataType::kINT32))
 {
     TLLM_CHECK_WITH_INFO(vocab_size_padded_ % tensor_para_size == 0,
         tensorrt_llm::common::fmtstr(
             "vocab_size (%ld) is not multiple of tensor_para_size (%d).", vocab_size_padded_, tensor_para_size));
 
-    allocator_ = new tensorrt_llm::thop::TorchAllocator();
     auto stream = at::cuda::getCurrentCUDAStream().stream();
+    allocator_ = new tensorrt_llm::thop::TorchAllocator(stream);
 
     cudaDeviceProp prop;
     tensorrt_llm::common::check_cuda_error(cudaGetDeviceProperties(&prop, 0));
 
     dynamic_decode_layer_ = new tensorrt_llm::layers::DynamicDecodeLayer<T>(
-        vocab_size_, vocab_size_padded_, stream, nullptr, allocator_, false, &prop_);
+        vocab_size_, vocab_size_padded_, stream, allocator_, false, &prop_);
 }
 
 template <typename T>
@@ -173,13 +174,11 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
     outputParams.newTokens = std::move(convert_tensor<int>(newTokens));
 
     safeUpdate<bool>(finished_opt, outputParams.finished);
-    tr::BufferManager::ITensorPtr finished_sum;
     std::int32_t* finished_sum_host = nullptr;
     if (forwardParams.sequence_limit_length && outputParams.finished.has_value())
     {
-        finished_sum = tr::BufferManager::pinned(tr::ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
-        outputParams.finished_sum = tcc::toTllmTensor(*finished_sum);
-        finished_sum_host = tr::bufferCast<std::int32_t>(*finished_sum);
+        outputParams.finished_sum = tcc::toTllmTensor(*finished_sum_);
+        finished_sum_host = tr::bufferCast<std::int32_t>(*finished_sum_);
         *finished_sum_host = 0;
     }
     safeUpdate<int>(sequence_lengths_opt, outputParams.sequence_length);

@@ -78,6 +78,7 @@ def str_dtype_to_torch(dtype):
 
 _str_to_trt_dtype_dict = dict(float16=trt.float16,
                               float32=trt.float32,
+                              int64=trt.int64,
                               int32=trt.int32,
                               int8=trt.int8,
                               bool=trt.bool,

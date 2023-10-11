@@ -165,7 +165,7 @@ class Encoder:
 
 
 def get_encoder(vocab_file, bpe_file):
-    with open(vocab_file, 'r') as f:
+    with open(vocab_file, 'r', encoding="utf-8") as f:
         encoder = json.load(f)
     with open(bpe_file, 'r', encoding="utf-8") as f:
         bpe_data = f.read()

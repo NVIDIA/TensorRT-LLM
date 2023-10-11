@@ -56,6 +56,15 @@ void initMpi(nvinfer1::ILogger& logger, int threadMode = MPI_THREAD_FUNNELED)
 
 } // namespace
 
+bool WorldConfig::validConfig(nvinfer1::ILogger& logger, SizeType tensorParallelism, SizeType pipelineParallelism)
+{
+    initMpi(logger);
+
+    int mpiSize;
+    TLLM_MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &mpiSize), logger);
+    return mpiSize == tensorParallelism * pipelineParallelism;
+}
+
 WorldConfig WorldConfig::mpi(nvinfer1::ILogger& logger, SizeType gpusPerNode, std::optional<SizeType> tensorParallelism,
     std::optional<SizeType> pipelineParallelism)
 {
@@ -81,11 +90,14 @@ WorldConfig WorldConfig::mpi(
 
 std::vector<SizeType> WorldConfig::getPipelineParallelGroup() const
 {
+    auto const pp = getPipelineParallelism();
+    auto const tp = getTensorParallelism();
+    auto const worldSize = getSize();
     std::vector<SizeType> group;
-    auto const groupIdx = getTensorParallelRank();
-    for (SizeType i = 0; i < getPipelineParallelism(); ++i)
+    group.reserve(pp);
+    for (SizeType idx = getTensorParallelRank(); idx < worldSize; idx += tp)
     {
-        group.push_back(groupIdx + i * getTensorParallelism());
+        group.push_back(idx);
     }
     return group;
 }

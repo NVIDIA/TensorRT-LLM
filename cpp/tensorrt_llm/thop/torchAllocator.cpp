@@ -16,6 +16,7 @@
 #include "torchAllocator.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/thop/thUtils.h"
 
 using namespace tensorrt_llm::thop;
 using namespace tensorrt_llm::common;
@@ -69,5 +70,5 @@ void TorchAllocator::free(void** ptr)
 
 void TorchAllocator::memSet(void* ptr, int const val, size_t const size)
 {
-    check_cuda_error(cudaMemset(ptr, val, size));
+    check_cuda_error(cudaMemsetAsync(ptr, val, size, mStream));
 }

@@ -15,6 +15,7 @@
 import argparse
 import os
 import time
+from pathlib import Path
 
 import tensorrt as trt
 import torch
@@ -26,10 +27,12 @@ from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models import smooth_quantize, weight_only_quantize
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
+from tensorrt_llm.quantization import QuantMode
 
-from weight import load_from_hf_bloom, check_embedding_share  # isort:skip
+from weight import load_from_hf_bloom, load_from_bin, parse_config, check_embedding_share  # isort:skip
 
 MODEL_NAME = "bloom"
 
@@ -114,6 +117,7 @@ def parse_arguments():
                         default=1,
                         help='world size, only support tensor parallelism now')
     parser.add_argument('--model_dir', type=str, default=None)
+    parser.add_argument('--bin_model_dir', type=str, default=None)
     parser.add_argument('--dtype',
                         type=str,
                         default='float16',
@@ -154,6 +158,16 @@ def parse_arguments():
     parser.add_argument('--enable_context_fmha_fp32_acc',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--use_layernorm_plugin',
+        nargs='?',
+        const='float16',
+        type=str,
+        default=False,
+        choices=['float16', 'float32'],
+        help=
+        "Activates layernorm plugin. You can specify the plugin dtype or leave blank to use the model dtype."
+    )
     parser.add_argument('--parallel_build', default=False, action='store_true')
     parser.add_argument('--visualize', default=False, action='store_true')
     parser.add_argument('--enable_debug_output',
@@ -166,6 +180,55 @@ def parse_arguments():
         default='bloom_outputs',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
+    )
+    # Arguments related to the quantization of the model.
+    parser.add_argument(
+        '--use_smooth_quant',
+        default=False,
+        action="store_true",
+        help=
+        'Use the SmoothQuant method to quantize activations and weights for the various GEMMs.'
+        'See --per_channel and --per_token for finer-grained quantization options.'
+    )
+    parser.add_argument(
+        '--use_weight_only',
+        default=False,
+        action="store_true",
+        help='Quantize weights for the various GEMMs to INT4/INT8.'
+        'See --weight_only_precision to set the precision')
+    parser.add_argument(
+        '--weight_only_precision',
+        const='int8',
+        type=str,
+        nargs='?',
+        default='int8',
+        choices=['int8', 'int4'],
+        help=
+        'Define the precision for the weights when using weight-only quantization.'
+        'You must also use --use_weight_only for that argument to have an impact.'
+    )
+    parser.add_argument(
+        '--per_channel',
+        default=False,
+        action="store_true",
+        help=
+        'By default, we use a single static scaling factor for the GEMM\'s result. '
+        'per_channel instead uses a different static scaling factor for each channel. '
+        'The latter is usually more accurate, but a little slower.')
+    parser.add_argument(
+        '--per_token',
+        default=False,
+        action="store_true",
+        help=
+        'By default, we use a single static scaling factor to scale activations in the int8 range. '
+        'per_token chooses at run time, and for each token, a custom scaling factor. '
+        'The latter is usually more accurate, but a little slower.')
+    parser.add_argument(
+        '--int8_kv_cache',
+        default=False,
+        action="store_true",
+        help=
+        'By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV'
     )
     parser.add_argument(
         '--use_parallel_embedding',
@@ -197,11 +260,10 @@ def parse_arguments():
         const=None,
         default=False,
         choices=['float16', 'float32', 'bfloat16'],
-        help=
-        "Activates the lookup plugin which enables embedding sharing. It is also required for language modeling embedding weight sharing."
-    )
+        help="Activates the lookup plugin which enables embedding sharing.")
 
     args = parser.parse_args()
+    logger.set_level(args.log_level)
 
     if args.model_dir is not None:
         hf_config = BloomConfig.from_pretrained(args.model_dir)
@@ -209,6 +271,30 @@ def parse_arguments():
         args.n_head = hf_config.num_attention_heads
         args.n_layer = hf_config.num_hidden_layers
         args.vocab_size = hf_config.vocab_size
+    elif args.bin_model_dir is not None:
+        logger.info(f"Setting model configuration from {args.bin_model_dir}.")
+        n_embd, n_head, n_layer, vocab_size, _, rotary_pct, bias, inter_size, multi_query_mode, dtype, prompt_num_tasks, prompt_max_vocab_size = parse_config(
+            Path(args.bin_model_dir) / "config.ini")
+        args.n_embd = n_embd
+        args.n_head = n_head
+        args.n_layer = n_layer
+        args.vocab_size = vocab_size
+
+    assert not (
+        args.use_smooth_quant and args.use_weight_only
+    ), "You cannot enable both SmoothQuant and INT8 weight-only together."
+
+    if args.use_smooth_quant:
+        args.quant_mode = QuantMode.use_smooth_quant(args.per_token,
+                                                     args.per_channel)
+    elif args.use_weight_only:
+        args.quant_mode = QuantMode.use_weight_only(
+            args.weight_only_precision == 'int4')
+    else:
+        args.quant_mode = QuantMode(0)
+
+    if args.int8_kv_cache:
+        args.quant_mode = args.quant_mode.set_int8_kv_cache()
 
     return args
 
@@ -257,7 +343,14 @@ def build_rank_engine(builder: Builder,
                         tp_size=args.world_size),  # TP only
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
-        share_embedding_table=share_embedding_table)
+        share_embedding_table=share_embedding_table,
+        quant_mode=args.quant_mode)
+    if args.use_smooth_quant:
+        tensorrt_llm_bloom = smooth_quantize(tensorrt_llm_bloom,
+                                             args.quant_mode)
+    elif args.use_weight_only:
+        tensorrt_llm_bloom = weight_only_quantize(tensorrt_llm_bloom,
+                                                  args.quant_mode)
 
     if args.model_dir is not None:
         logger.info(f'Loading HF BLOOM ... from {args.model_dir}')
@@ -276,6 +369,15 @@ def build_rank_engine(builder: Builder,
                            use_parallel_embedding=args.use_parallel_embedding,
                            sharding_dim=args.embedding_sharding_dim,
                            share_embedding_table=share_embedding_table)
+    elif args.bin_model_dir is not None:
+        load_from_bin(tensorrt_llm_bloom,
+                      args.bin_model_dir,
+                      rank,
+                      args.world_size,
+                      args.dtype,
+                      use_parallel_embedding=args.use_parallel_embedding,
+                      sharding_dim=args.embedding_sharding_dim,
+                      share_embedding_table=share_embedding_table)
 
     # Module -> Network
     network = builder.create_network()
@@ -285,6 +387,9 @@ def build_rank_engine(builder: Builder,
             dtype=args.use_gpt_attention_plugin)
     if args.use_gemm_plugin:
         network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
+    if args.use_layernorm_plugin:
+        network.plugin_config.set_layernorm_plugin(
+            dtype=args.use_layernorm_plugin)
     if args.use_lookup_plugin:
         # Use the plugin for the embedding parallelism
         network.plugin_config.set_lookup_plugin(dtype=args.dtype)
@@ -294,6 +399,19 @@ def build_rank_engine(builder: Builder,
     if args.enable_context_fmha_fp32_acc:
         network.plugin_config.set_context_fmha(
             ContextFMHAType.enabled_with_fp32_acc)
+    # Quantization plugins.
+    if args.use_smooth_quant:
+        network.plugin_config.set_smooth_quant_gemm_plugin(dtype=args.dtype)
+        network.plugin_config.set_layernorm_quantization_plugin(
+            dtype=args.dtype)
+        # FIXME(nkorobov)
+        # See https://nvbugs/4164762
+        # See https://nvbugs/4174113
+        network.plugin_config.set_quantize_tensor_plugin()
+        network.plugin_config.set_quantize_per_token_plugin()
+    elif args.use_weight_only:
+        network.plugin_config.set_weight_only_quant_matmul_plugin(
+            dtype=args.dtype)
     if args.world_size > 1:
         network.plugin_config.set_nccl_plugin(args.dtype)
     with net_guard(network):
@@ -343,6 +461,9 @@ def build(rank, args):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
+        # NOTE(nkorobov): when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
+        int8_trt_flag = args.quant_mode.has_act_and_weight_quant(
+        ) or args.quant_mode.has_int8_kv_cache()
         builder_config = builder.create_builder_config(
             name=MODEL_NAME,
             precision=args.dtype,
@@ -356,7 +477,10 @@ def build(rank, args):
             max_position_embeddings=args.n_positions,
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
-            max_output_len=args.max_output_len)
+            max_output_len=args.max_output_len,
+            int8=(args.quant_mode.has_act_and_weight_quant()
+                  or args.quant_mode.has_int8_kv_cache()),
+            quant_mode=args.quant_mode)
         builder_config.trt_builder_config.builder_optimization_level = 1
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.world_size,
                                       cur_rank)

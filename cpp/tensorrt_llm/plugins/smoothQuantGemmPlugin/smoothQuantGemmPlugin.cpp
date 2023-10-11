@@ -64,6 +64,11 @@ void SmoothQuantGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
     setTmpWorkspaceSizeInBytes(bytes);
 }
 
+std::vector<SmoothQuantGemmPluginProfiler::Config> SmoothQuantGemmPluginProfiler::getTactics(int m, int n, int k) const
+{
+    return mRunner->getConfigs();
+}
+
 SmoothQuantGemmPlugin::SmoothQuantGemmPlugin(
     QuantMode quantMode, nvinfer1::DataType type, const SmoothQuantGemmPlugin::PluginProfilerPtr& pluginProfiler)
     : mQuantMode(quantMode)
@@ -302,7 +307,7 @@ void SmoothQuantGemmPlugin::destroy() noexcept
 
 void SmoothQuantGemmPlugin::configGemm()
 {
-    mPluginProfiler->profileTactics(m_sqGemmRunner->getConfigs(), m_sqGemmRunner, mType, mDims, mGemmId);
+    mPluginProfiler->profileTactics(m_sqGemmRunner, mType, mDims, mGemmId);
 }
 
 ///////////////

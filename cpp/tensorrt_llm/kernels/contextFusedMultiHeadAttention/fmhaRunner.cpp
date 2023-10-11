@@ -361,6 +361,8 @@ FusedMHARunnerV2::FusedMHARunnerV2(
 {
 }
 
+FusedMHARunnerV2::~FusedMHARunnerV2() = default;
+
 void FusedMHARunnerV2::setup(
     const int b, const int s, const int total_seqlen, const bool has_alibi, const int tp_size, const int tp_rank)
 {

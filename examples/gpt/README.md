@@ -59,7 +59,8 @@ Examples of build invocations:
 ```bash
 # Build a single-GPU float16 engine using FT weights.
 # Enable the special TensorRT-LLM GPT Attention plugin (--use_gpt_attention_plugin) to increase runtime performance.
-python3 build.py --model_dir=./c-model/gpt2/1-gpu --use_gpt_attention_plugin
+# It is recommend to use --remove_input_padding along with --use_gpt_attention_plugin for better performance
+python3 build.py --model_dir=./c-model/gpt2/1-gpu --use_gpt_attention_plugin --remove_input_padding
 
 # Build 8-GPU GPT-175B float16 engines using dummy weights, useful for performance tests.
 # Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
@@ -70,7 +71,9 @@ python3 build.py --world_size=8 \
                  --n_head=96 \
                  --max_batch_size=256 \
                  --dtype float16 \
+                 --remove_input_padding \
                  --use_gpt_attention_plugin \
+                 --enable_context_fmha \
                  --use_gemm_plugin \
                  --output_dir=gpt_175b 2>&1 | tee build.log
 
@@ -85,63 +88,16 @@ python3 build.py --world_size=16 \
                  --max_input_len=128 \
                  --max_output_len=20 \
                  --dtype float16 \
+                 --remove_input_padding \
                  --use_gpt_attention_plugin \
+                 --enable_context_fmha \
                  --use_gemm_plugin \
-                 --use_layernorm_plugin \
                  --output_dir=gpt_530b 2>&1 | tee build.log
-```
-
-### GPT Variant - SantaCoder
-
-The SantaCoder extends the existing GPT model with multi-query attention mechanism. The following example shows building a 4-GPU engine and running simple prompt to generate the implementation of `hello_world()`.
-
-The main differences in this example are:
-1. In model conversion `hf_gpt_convert.py` where extra option `--model santacoder` is required to allow converting checkpoint correctly
-2. In engine execution `run.py` where `--tokenizer ./santacoder` needs to be specified to decode the output ids correctly.
-
-```bash
-git clone https://huggingface.co/bigcode/santacoder
-
-python3 hf_gpt_convert.py -p 8 --model santacoder -i ./santacoder -o ./c-model/santacoder --tensor-parallelism 4 --storage-type float16
-
-python3 build.py \
-    --model_dir ./c-model/santacoder/4-gpu \
-    --use_gpt_attention_plugin \
-    --enable_context_fmha \
-    --use_layernorm_plugin \
-    --use_gemm_plugin \
-    --parallel_build \
-    --output_dir santacoder_outputs_tp4 \
-    --world_size 4
-
-mpirun -np 4 python3 run.py --engine_dir santacoder_outputs_tp4 --tokenizer ./santacoder --input_text "def print_hello_world():" --max_output_len 20
-```
-
-### GPT Variant - StarCoder
-
-For StarCoder, the steps are similar execpt that `santacoder` is swapped with `starcoder`.
-
-```bash
-git clone https://huggingface.co/bigcode/starcoder
-
-python3 hf_gpt_convert.py -p 8 --model starcoder -i ./starcoder -o ./c-model/starcoder --tensor-parallelism 4 --storage-type float16
-
-python3 build.py \
-    --model_dir ./c-model/starcoder/4-gpu \
-    --use_gpt_attention_plugin \
-    --enable_context_fmha \
-    --use_layernorm_plugin \
-    --use_gemm_plugin \
-    --parallel_build \
-    --output_dir starcoder_outputs_tp4 \
-    --world_size 4
-
-mpirun -np 4 python3 run.py --engine_dir starcoder_outputs_tp4 --tokenizer ./starcoder  --input_text "def print_hello_world():" --max_output_len 20
 ```
 
 #### Fused MultiHead Attention (FMHA)
 
-You can enable the FMHA kernels for GPT by adding `--enable_context_fmha` to the invocation of `build.py`. Note that it is disabled by default because of possible accuracy issues due to the use of Flash Attention.
+You can enable the FMHA kernels for GPT by adding `--enable_context_fmha` to the invocation of `build.py`.
 
 If you find that the default fp16 accumulation (`--enable_context_fmha`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--enable_context_fmha_fp32_acc`. However, it is expected to see performance drop.
 
@@ -213,6 +169,54 @@ sbatch tensorrt_llm_run.sub
 
 You might have to contact your cluster's administrator to help you customize the above script.
 
+## GPT Variant - SantaCoder
+
+The SantaCoder extends the existing GPT model with multi-query attention mechanism. The following example shows building a 4-GPU engine and running simple prompt to generate the implementation of `hello_world()`.
+
+The main differences in this example are:
+1. In model conversion `hf_gpt_convert.py` where extra option `--model santacoder` is required to allow converting checkpoint correctly
+2. In engine execution `run.py` where `--tokenizer ./santacoder` needs to be specified to decode the output ids correctly.
+
+```bash
+git clone https://huggingface.co/bigcode/santacoder
+
+python3 hf_gpt_convert.py -p 8 --model santacoder -i ./santacoder -o ./c-model/santacoder --tensor-parallelism 4 --storage-type float16
+
+python3 build.py \
+    --model_dir ./c-model/santacoder/4-gpu \
+    --remove_input_padding \
+    --use_gpt_attention_plugin \
+    --enable_context_fmha \
+    --use_gemm_plugin \
+    --parallel_build \
+    --output_dir santacoder_outputs_tp4 \
+    --world_size 4
+
+mpirun -np 4 python3 run.py --engine_dir santacoder_outputs_tp4 --tokenizer ./santacoder --input_text "def print_hello_world():" --max_output_len 20
+```
+
+## GPT Variant - StarCoder
+
+For StarCoder, the steps are similar execpt that `santacoder` is swapped with `starcoder`.
+
+```bash
+git clone https://huggingface.co/bigcode/starcoder
+
+python3 hf_gpt_convert.py -p 8 --model starcoder -i ./starcoder -o ./c-model/starcoder --tensor-parallelism 4 --storage-type float16
+
+python3 build.py \
+    --model_dir ./c-model/starcoder/4-gpu \
+    --remove_input_padding \
+    --use_gpt_attention_plugin \
+    --enable_context_fmha \
+    --use_gemm_plugin \
+    --parallel_build \
+    --output_dir starcoder_outputs_tp4 \
+    --world_size 4
+
+mpirun -np 4 python3 run.py --engine_dir starcoder_outputs_tp4 --tokenizer ./starcoder  --input_text "def print_hello_world():" --max_output_len 20
+```
+
 ## Summarization using the GPT model
 
 The following section describes how to run a TensorRT-LLM GPT model to summarize the articles from the
@@ -233,9 +237,10 @@ python3 hf_gpt_convert.py -i gpt2 -o ./c-model/gpt2/fp16 --tensor-parallelism 1 
 
 # Build the model.
 python3 build.py --model_dir=./c-model/gpt2/fp16/1-gpu \
+                 --remove_input_padding \
                  --use_gpt_attention_plugin \
+                 --enable_context_fmha \
                  --use_gemm_plugin \
-                 --use_layernorm_plugin \
                  --max_batch_size 8 \
                  --max_input_len 924 \
                  --max_output_len 100 \
@@ -355,14 +360,17 @@ Examples of build invocations:
 ```bash
 # Build model for SmoothQuant in the _per_tensor_ mode.
 python3 build.py --model_dir=./c-model/gpt2-smooth/1-gpu \
+                 --use_gpt_attention_plugin \
                  --use_smooth_quant
 
 # Build model for SmoothQuant in the _per_token_ + _per_channel_ mode
 python3 build.py --model_dir=./c-model/gpt2-smooth/1-gpu \
+                 --use_gpt_attention_plugin \
                  --use_smooth_quant \
                  --per_token \
                  --per_channel
 ```
+Note that GPT attention plugin is required to be enabled for SmoothQuant for now.
 
 ### INT8 KV Cache, export weights & scales for TensorRT-LLM
 
@@ -386,7 +394,7 @@ Examples of build invocations:
 ```bash
 # Build model for GPT with int8 kv cache.
 python3 build.py --model_dir=./c-model/gpt2/1-gpu \
-                 --int8_kv_cache --use_gpt_attention_plugin float16
+                 --int8_kv_cache --remove_input_padding --use_gpt_attention_plugin float16
 ```
 
 Example of build  invocations without gpt attention plugin
@@ -405,7 +413,7 @@ This architecture is also supported by TensorRT-LLM
 wget https://huggingface.co/nvidia/GPT-2B-001/resolve/main/GPT-2B-001_bf16_tp1.nemo
 ```
 
-### 2. Convert weights from HF Tranformers to FT format
+### 2. Convert weights from NeMo Checkpoint to FT format
 
 TensorRT-LLM can convert `.nemo` to generic binary files with [`nemo_ckpt_convert.py`](./nemo_ckpt_convert.py) script. For example:
 
@@ -420,6 +428,7 @@ python3 nemo_ckpt_convert.py -i GPT-2B-001_bf16_tp1.nemo -o ./c-model/gpt-next-2
 # --use_gpt_attention_plugin must be set for GPT-Next since Rotary positional embeddings (RoPE) is only supported by the gpt attention plugin at this time.
 python3 build.py --model_dir=./c-model/gpt-next-2B/1-gpu \
                  --dtype bfloat16 \
+                 --remove_input_padding \
                  --use_gpt_attention_plugin
 
 # Build GPT-Next architecture engines using dummy weights, useful for performance tests.
@@ -433,6 +442,7 @@ python3 build.py --vocab_size=256000 \
                  --no_bias \
                  --hidden_act swiglu \
                  --rotary_pct 0.5 \
+                 --remove_input_padding \
                  --use_gpt_attention_plugin \
                  --use_gemm_plugin \
                  --output_dir=gpt-next-2B
@@ -454,7 +464,7 @@ TensorRT-LLM supports inference with those virtual tokens. To enable it, pass th
 `--max_prompt_embedding_table_size N`. For example:
 ```bash
 # Build a GPT-Next model with prompt-tuning enabled
-python3 build.py --model_dir=./c-model/gpt-next-8B/1-gpu --use_gpt_attention_plugin --max_prompt_embedding_table_size 100
+python3 build.py --model_dir=./c-model/gpt-next-8B/1-gpu --remove_input_padding --use_gpt_attention_plugin --max_prompt_embedding_table_size 100
 ```
 
 You can now export the learned embedding table with:
@@ -480,7 +490,7 @@ Assume the size of embedding lookup table is (vocab\_size \* hidden\_size), we c
 
 2.1 To shard the embedding lookup table along the hidden\_size dimension, set the flag `--use_parallel_embedding --embedding_sharding_dim 1`. Here is an example:
 ```Bash
-python3 build.py --model_dir=./c-model/gpt2/2-gpu --dtype float16 --world_size=2 --use_gpt_attention_plugin float16 --parallel_build --max_input_len 1000 \
+python3 build.py --model_dir=./c-model/gpt2/2-gpu --dtype float16 --world_size=2 --remove_input_padding --use_gpt_attention_plugin float16 --parallel_build --max_input_len 1000 \
                   --use_parallel_embedding --embedding_sharding_dim 1 \
                   --output_dir=trt_engine/gpt2/float16/2-gpu
 ```
@@ -491,13 +501,13 @@ Meanwhile, we provide a lookup plugin to support tensor parallelism on vocab\_si
 - An example of sharing along vocab\_size dimension with lookup plugin:
 
 ```Bash
-python3 build.py --model_dir=./c-model/gpt2/2-gpu --dtype float16 --world_size=2 --use_gpt_attention_plugin float16 --parallel_build --max_input_len 1000 \
+python3 build.py --model_dir=./c-model/gpt2/2-gpu --dtype float16 --world_size=2 --remove_input_padding --use_gpt_attention_plugin float16 --parallel_build --max_input_len 1000 \
                   --use_parallel_embedding --embedding_sharding_dim 0 --use_lookup_plugin float16 \
                   --output_dir=trt_engine/gpt2/float16/2-gpu
 ```
 - An example of sharing along vocab\_size dimension without lookup plugin:
 ```Bash
-python3 build.py --model_dir=./c-model/gpt2/2-gpu --dtype float16 --world_size=2 --use_gpt_attention_plugin float16 --parallel_build --max_input_len 1000 \
+python3 build.py --model_dir=./c-model/gpt2/2-gpu --dtype float16 --world_size=2 --remove_input_padding --use_gpt_attention_plugin float16 --parallel_build --max_input_len 1000 \
                   --use_parallel_embedding --embedding_sharding_dim 0 \
                   --output_dir=trt_engine/gpt2/float16/2-gpu
 ```
@@ -513,7 +523,7 @@ Here is an example for using embedding parallelism and sharing feature:
 ```Bash
 python3 hf_gpt_convert.py -i gpt2 -o ./c-model/gpt2 --tensor-parallelism 2 --storage-type bfloat16
 
-python3 build.py --model_dir=./c-model/gpt2/2-gpu --dtype bfloat16 --world_size=2 --use_gpt_attention_plugin --use_gemm_plugin --parallel_build --max_input_len 1000 --use_parallel_embedding --embedding_sharding_dim 0 --use_lookup_plugin --use_embedding_sharing --output_dir=trt_engine/gpt2/bfloat16/2-gpu
+python3 build.py --model_dir=./c-model/gpt2/2-gpu --dtype bfloat16 --world_size=2 --remove_input_padding --use_gpt_attention_plugin --use_gemm_plugin --parallel_build --max_input_len 1000 --use_parallel_embedding --embedding_sharding_dim 0 --use_lookup_plugin --use_embedding_sharing --output_dir=trt_engine/gpt2/bfloat16/2-gpu
 
 mpirun -np 2 python3 summarize.py --engine_dir trt_engine/gpt2/bfloat16/2-gpu --batch_size 10 --test_trt_llm --check_accuracy --tensorrt_llm_rouge1_threshold=14 --dataset_path ./dataset
 ```

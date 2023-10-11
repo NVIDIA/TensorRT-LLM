@@ -77,7 +77,8 @@ if __name__ == '__main__':
                                vocab_size=vocab_size,
                                num_layers=num_layers,
                                gpt_attention_plugin=use_gpt_attention_plugin,
-                               remove_input_padding=remove_input_padding)
+                               remove_input_padding=remove_input_padding,
+                               dtype=dtype)
 
     tokenizer.pad_token = tokenizer.eos_token
     end_id = tokenizer.encode(tokenizer.eos_token, add_special_tokens=False)[0]

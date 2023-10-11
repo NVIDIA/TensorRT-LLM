@@ -30,11 +30,10 @@ namespace tensorrt_llm::common
 class Logger
 {
 
-#if _WIN32
 // On Windows, the file wingdi.h is included which has
 // #define ERROR 0
 // This breaks everywhere ERROR is used in the Level enum
-// Alternative, untested solution to #undef: compile with NOGDI flag defined
+#if _WIN32
 #undef ERROR
 #endif // _WIN32
 

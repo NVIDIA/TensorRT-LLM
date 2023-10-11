@@ -33,7 +33,12 @@ def plugin_lib_path():
 
 
 def _load_plugin_lib():
-    handle = ctypes.CDLL(plugin_lib_path(), mode=ctypes.RTLD_GLOBAL)
+    if platform.system() != "Windows":
+        handle = ctypes.CDLL(plugin_lib_path(), mode=ctypes.RTLD_GLOBAL)
+    else:  # Windows
+        handle = ctypes.CDLL(plugin_lib_path(),
+                             mode=ctypes.RTLD_GLOBAL,
+                             winmode=0)
     if handle is None:
         raise ImportError('TensorRT-LLM Plugin is unavailable')
 
@@ -72,9 +77,11 @@ class PluginConfig(object):
         self.weight_only_groupwise_quant_matmul_plugin = False
         self.weight_only_quant_matmul_plugin = False
         self.nccl_plugin = False
+        self.use_custom_all_reduce = False
         self.quantize_per_token_plugin = False
         self.quantize_tensor_plugin = False
         self.paged_kv_cache = False
+        self.tokens_per_block = 0
         self.lookup_plugin = False
 
     def enable_qk_half_accum(self):
@@ -99,8 +106,9 @@ class PluginConfig(object):
         logger.info(f"Remove Padding Enabled")
         return self
 
-    def enable_paged_kv_cache(self):
+    def enable_paged_kv_cache(self, tokens_per_block=64):
         self.paged_kv_cache = True
+        self.tokens_per_block = tokens_per_block
         logger.info(f"Paged KV Cache Enabled")
         return self
 
@@ -148,7 +156,10 @@ class PluginConfig(object):
         self.weight_only_groupwise_quant_matmul_plugin = dtype
         return self
 
-    def set_nccl_plugin(self, dtype='float16'):
+    def set_nccl_plugin(self,
+                        dtype='float16',
+                        use_custom_all_reduce: bool = False):
+        self.use_custom_all_reduce = use_custom_all_reduce
         self.nccl_plugin = dtype
         return self
 

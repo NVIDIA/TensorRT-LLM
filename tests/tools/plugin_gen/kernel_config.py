@@ -4,7 +4,7 @@ from tensorrt_llm.tools.plugin_gen.core import *
 
 openai_triton_example_root = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "examples",
-    "openai_triton")
+    "openai_triton", "manual_plugin")
 
 
 def get_fmha_kernel_meta_data():

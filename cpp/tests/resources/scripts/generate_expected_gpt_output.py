@@ -23,11 +23,13 @@ def generate_output(engine: str,
                     num_beams: int,
                     output_name: str,
                     max_output_len: int = 8):
-
+    tp_size = 1
+    pp_size = 1
     model = 'gpt2'
     resources_dir = Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
-    engine_dir = models_dir / 'rt_engine' / model / engine / '1-gpu/'
+    tp_pp_dir = 'tp' + str(tp_size) + '-pp' + str(pp_size) + '-gpu/'
+    engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_dir
 
     data_dir = resources_dir / 'data'
     input_file = data_dir / 'input_tokens.npy'
@@ -36,6 +38,8 @@ def generate_output(engine: str,
         output_dir = model_data_dir / 'sampling'
     else:
         output_dir = model_data_dir / ('beam_search_' + str(num_beams))
+
+    output_name += '_tp' + str(tp_size) + '_pp' + str(pp_size)
 
     run.generate(engine_dir=str(engine_dir),
                  input_file=str(input_file),

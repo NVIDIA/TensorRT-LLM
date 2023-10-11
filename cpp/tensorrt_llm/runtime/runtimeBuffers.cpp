@@ -29,27 +29,29 @@
 
 using namespace tensorrt_llm::runtime;
 
-RuntimeBuffers::GenerationConfig RuntimeBuffers::GenerationConfig::fromInput(ITensor::SharedPtr const& inputIds,
-    ITensor::SharedPtr const& inputLengthsHost, bool const inputPacked, SizeType const beamWidth,
-    SizeType const maxSequenceLength, std::optional<SizeType> const& maxNewTokensOpt, BufferManager& manager)
+RuntimeBuffers::GenerationConfig RuntimeBuffers::GenerationConfig::fromInput(ITensor const& inputIds,
+    ITensor const& inputLengthsHost, bool const inputPacked, SizeType const beamWidth, SizeType const maxSequenceLength,
+    std::optional<SizeType> const& maxNewTokensOpt, BufferManager& manager)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
-    auto const batchSize = static_cast<SizeType>(inputLengthsHost->getSize());
+    auto const batchSize = static_cast<SizeType>(inputLengthsHost.getSize());
 
-    auto const* inputLengthsPtr = bufferCast<SizeType>(*inputLengthsHost);
-    SizeType const maxInputLength = *std::max_element(inputLengthsPtr, inputLengthsPtr + batchSize);
+    auto const* inputLengthsPtr = bufferCast<SizeType>(inputLengthsHost);
+    SizeType maxInputLength = *std::max_element(inputLengthsPtr, inputLengthsPtr + batchSize);
 
-    auto const& inputShape = inputIds->getShape();
+    auto const& inputShape = inputIds.getShape();
+    SizeType inputLengthSum{0};
     if (inputPacked)
     {
-        auto const inputLengthSum = std::reduce(inputLengthsPtr, inputLengthsPtr + batchSize);
+        inputLengthSum = std::reduce(inputLengthsPtr, inputLengthsPtr + batchSize);
         TLLM_CHECK_WITH_INFO(inputShape.d[0] == 1 && inputShape.d[1] == inputLengthSum,
             "Packed input must have shape [1, <sum of input lengths>].");
     }
     else
     {
-        TLLM_CHECK_WITH_INFO(inputShape.d[0] == batchSize && inputShape.d[1] == maxInputLength,
+        TLLM_CHECK_WITH_INFO(inputShape.d[0] == batchSize && inputShape.d[1] >= maxInputLength,
             "Padded input must have shape [batch size, max input length]");
+        maxInputLength = inputShape.d[1];
     }
 
     auto const maxNewTokens = maxNewTokensOpt.value_or(maxSequenceLength - maxInputLength);
@@ -58,7 +60,7 @@ RuntimeBuffers::GenerationConfig RuntimeBuffers::GenerationConfig::fromInput(ITe
         "generated.");
 
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
-    return GenerationConfig{batchSize, beamWidth, maxInputLength, maxNewTokens, maxSequenceLength};
+    return GenerationConfig{batchSize, beamWidth, maxInputLength, maxNewTokens, maxSequenceLength, inputLengthSum};
 }
 
 void RuntimeBuffers::clear()
@@ -77,7 +79,8 @@ void RuntimeBuffers::clear()
 
     presentKeysVals.clear();
     presentKeysValsAlt.clear();
-    kvCacheBlockPointers = nullptr;
+    kvCacheBlockPointersHost = nullptr;
+    kvCacheBlockPointersDevice = nullptr;
 
     cacheIndirectionDecoderInput = nullptr;
     cacheIndirectionDecoderOutput = nullptr;
@@ -107,8 +110,40 @@ void RuntimeBuffers::create(TllmRuntime& runtime, GptModelConfig const& modelCon
     auto const localNbLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
     auto const firstLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
 
-    presentKeysVals
-        = utils::createBufferVector(runtime, firstLayerId, localNbLayers, "present_key_value_", MemoryType::kGPU);
+    nvinfer1::DataType kvDtype;
+    if (modelConfig.usePagedKvCache())
+    {
+        if (modelConfig.getQuantMode().hasFp8KvCache())
+        {
+            kvDtype = nvinfer1::DataType::kFP8;
+        }
+        else if (modelConfig.getQuantMode().hasInt8KvCache())
+        {
+            kvDtype = nvinfer1::DataType::kINT8;
+        }
+        else
+        {
+            kvDtype = modelConfig.getDataType();
+        }
+    }
+    else
+    {
+        kvDtype = modelConfig.getQuantMode().hasFp8KvCache()
+            ? nvinfer1::DataType::kFP8
+            : engine.getTensorDataType(("present_key_value_" + std::to_string(firstLayerId)).c_str());
+    }
+
+    if (modelConfig.usePagedKvCache())
+    {
+        auto const kvCacheBlockPointersType
+            = engine.getTensorDataType(("kv_cache_block_pointers_" + std::to_string(firstLayerId)).c_str());
+        kvCacheBlockPointersHost = manager.emptyTensor(MemoryType::kCPU, kvCacheBlockPointersType);
+        kvCacheBlockPointersDevice = manager.emptyTensor(MemoryType::kGPU, kvCacheBlockPointersType);
+    }
+    else
+    {
+        presentKeysVals = utils::createBufferVector(runtime, localNbLayers, MemoryType::kGPU, kvDtype);
+    }
 
     if (modelConfig.useGptAttentionPlugin())
     {
@@ -116,15 +151,7 @@ void RuntimeBuffers::create(TllmRuntime& runtime, GptModelConfig const& modelCon
     }
     else
     {
-        presentKeysValsAlt
-            = utils::createBufferVector(runtime, firstLayerId, localNbLayers, "present_key_value_", MemoryType::kGPU);
-    }
-
-    if (modelConfig.usePagedKvCache())
-    {
-        auto const kvCacheBlockPointersType
-            = engine.getTensorDataType(("kv_cache_block_pointers_" + std::to_string(firstLayerId)).c_str());
-        kvCacheBlockPointers = manager.emptyTensor(MemoryType::kGPU, kvCacheBlockPointersType);
+        presentKeysValsAlt = utils::createBufferVector(runtime, localNbLayers, MemoryType::kGPU, kvDtype);
     }
 
     if (modelConfig.useGptAttentionPlugin())
@@ -135,7 +162,7 @@ void RuntimeBuffers::create(TllmRuntime& runtime, GptModelConfig const& modelCon
     cacheIndirectionDecoderInput = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
     cacheIndirectionDecoderOutput = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
 
-    shouldStop = BufferManager::pinned(ITensor::makeShape({1}), nvinfer1::DataType::kUINT8);
+    nbFinished = BufferManager::pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 
     if (worldConfig.isPipelineParallel())
     {
@@ -143,6 +170,14 @@ void RuntimeBuffers::create(TllmRuntime& runtime, GptModelConfig const& modelCon
     }
 
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+}
+
+void RuntimeBuffers::initContextLengths(TensorPtr const& inputLengths, BufferManager& manager)
+{
+    contextLengthsDevice = inputLengths;
+    contextLengthsHost->reshape(inputLengths->getShape());
+    manager.copy(*contextLengthsDevice, *contextLengthsHost);
+    manager.getStream().synchronize(); // wait for context lengths to be copied to host
 }
 
 void RuntimeBuffers::reshape(
@@ -155,10 +190,9 @@ void RuntimeBuffers::reshape(
     auto const maxInputLength = generationConfig.maxInputLength;
     auto const maxSeqLength = generationConfig.maxSeqLength;
 
-    if (worldConfig.isLastPipelineParallelRank())
+    if (worldConfig.isLastPipelineParallelRank() && !modelConfig.computeContextLogits())
     {
         auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
-        // logits are tiled to {batchSize, beamWidth, vocabSizePadded} after context step of engine
         logits->reshape(ITensor::makeShape({batchSize, 1, vocabSizePadded}));
     }
 
@@ -174,11 +208,12 @@ void RuntimeBuffers::reshape(
         auto const maxBlocksPerSeq = (maxSeqLength + tokensPerBlock - 1) / tokensPerBlock;
 
         // reserve batchSize * beamWidth and resize to batchSize
-        auto cacheBlockPointersShape
-            = ITensor::makeShape({localNbLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2});
-        kvCacheBlockPointers->reshape(cacheBlockPointersShape);
+        auto cacheBlockPointersShape = ITensor::makeShape({localNbLayers, batchSize * beamWidth, 2, maxBlocksPerSeq});
+        kvCacheBlockPointersHost->reshape(cacheBlockPointersShape);
+        kvCacheBlockPointersDevice->reshape(cacheBlockPointersShape);
         cacheBlockPointersShape.d[1] = batchSize;
-        kvCacheBlockPointers->reshape(cacheBlockPointersShape);
+        kvCacheBlockPointersHost->reshape(cacheBlockPointersShape);
+        kvCacheBlockPointersDevice->reshape(cacheBlockPointersShape);
     }
     else
     {
@@ -212,6 +247,30 @@ void RuntimeBuffers::reshape(
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
+void RuntimeBuffers::gatherLastTokenLogits(BufferManager& manager, GenerationConfig const& generationConfig,
+    GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
+{
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_CHECK_WITH_INFO(modelConfig.computeContextLogits(),
+        "Gather last token logits is only necessary when context logits are computed");
+
+    if (worldConfig.isLastPipelineParallelRank())
+    {
+        auto const batchSize = generationConfig.batchSize;
+        auto const beamWidth = generationConfig.beamWidth;
+        auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
+
+        auto const tiledTensorShape = ITensor::makeShape({batchSize, beamWidth, vocabSizePadded});
+        auto tiledTensor = std::shared_ptr(manager.gpu(tiledTensorShape, logits->getDataType()));
+        kernels::gatherLastTokenLogits(*tiledTensor, *logits, *lastTokenIds, manager.getStream());
+        manager.getStream().synchronize();
+
+        std::swap(logits, tiledTensor);
+    }
+
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+}
+
 void RuntimeBuffers::tile(BufferManager& manager, GenerationConfig const& generationConfig,
     GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
@@ -219,7 +278,8 @@ void RuntimeBuffers::tile(BufferManager& manager, GenerationConfig const& genera
     auto const beamWidth = generationConfig.beamWidth;
     TLLM_CHECK_WITH_INFO(beamWidth > 1, "Tiling is only necessary for beam search.");
 
-    if (worldConfig.isLastPipelineParallelRank())
+    // Note: If computeContextLogits is true, the copy/expansion is performed in gatherLastTokenLogits.
+    if (worldConfig.isLastPipelineParallelRank() && !modelConfig.computeContextLogits())
     {
         // logits needs beamWidth in second dimension
         auto logitsShape = logits->getShape();
@@ -265,6 +325,11 @@ void RuntimeBuffers::postContextStep(BufferManager& manager, GenerationConfig co
         std::fill_n(hostRequestTypes, requestTypes->getSize(), 1);
     }
 
+    if (modelConfig.computeContextLogits())
+    {
+        gatherLastTokenLogits(manager, generationConfig, modelConfig, worldConfig);
+    }
+
     if (beamWidth > 1)
     {
         tile(manager, generationConfig, modelConfig, worldConfig);
@@ -275,15 +340,16 @@ void RuntimeBuffers::postContextStep(BufferManager& manager, GenerationConfig co
 
     if (modelConfig.useGptAttentionPlugin() && modelConfig.usePagedKvCache())
     {
-        auto cacheBlockPointersShape = kvCacheBlockPointers->getShape();
+        auto cacheBlockPointersShape = kvCacheBlockPointersHost->getShape();
         cacheBlockPointersShape.d[1] = batchSize * beamWidth;
-        kvCacheBlockPointers->reshape(cacheBlockPointersShape);
+        kvCacheBlockPointersHost->reshape(cacheBlockPointersShape);
+        kvCacheBlockPointersDevice->reshape(cacheBlockPointersShape);
     }
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
 void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType const padId, BufferManager& manager,
-    KvCacheManager& kvCacheManager, GenerationConfig const& generationConfig, GptModelConfig const& modelConfig,
+    KvCacheManager const* kvCacheManager, GenerationConfig const& generationConfig, GptModelConfig const& modelConfig,
     WorldConfig const& worldConfig)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
@@ -348,14 +414,8 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
     if (modelConfig.useGptAttentionPlugin() && modelConfig.usePagedKvCache())
     {
         auto constexpr contextBeamWidth = 1;
-        auto const& pointersShape = kvCacheBlockPointers->getShape();
-        auto const maxBlocksPerSeq = pointersShape.d[pointersShape.nbDims - 1] / 2;
-        auto const& blockPointersBatch
-            = kvCacheManager.getBlockPointersOfBatch(batchSize, contextBeamWidth, maxBlocksPerSeq);
-        TLLM_CHECK(blockPointersBatch->getSizeInBytes() == kvCacheBlockPointers->getSizeInBytes());
-        auto pointersPtr = bufferCast<int64_t>(*blockPointersBatch);
-        auto pointersPtr32 = reinterpret_cast<int32_t*>(pointersPtr);
-        manager.copy(pointersPtr32, *kvCacheBlockPointers);
+        kvCacheManager->getBlockPointersOfBatch(kvCacheBlockPointersHost, batchSize, contextBeamWidth);
+        manager.copy(*kvCacheBlockPointersHost, *kvCacheBlockPointersDevice);
     }
 
     if (modelConfig.usePackedInput())
@@ -373,7 +433,7 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
 };
 
 RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, TensorPtr const& outputIds,
-    BufferManager& manager, KvCacheManager& kvCacheManager, GenerationConfig const& generationConfig,
+    BufferManager& manager, KvCacheManager* kvCacheManager, GenerationConfig const& generationConfig,
     GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
@@ -392,8 +452,7 @@ RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, T
         // batch in first dim
         inputShape = ITensor::makeShape({batchSize * beamWidth, 1});
     }
-
-    auto nextInputIds = ITensor::view(outputIds, inputShape);
+    auto nextInputIds = outputIds ? ITensor::view(outputIds, inputShape) : TensorPtr{};
 
     if (modelConfig.useGptAttentionPlugin())
     {
@@ -454,15 +513,10 @@ RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, T
     {
         for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
         {
-            kvCacheManager.addToken(batchIdx);
+            kvCacheManager->addToken(batchIdx);
         }
-        auto const& pointersShape = kvCacheBlockPointers->getShape();
-        auto const maxBlocksPerSeq = pointersShape.d[pointersShape.nbDims - 1] / 2;
-        auto const& blockPointersBatch = kvCacheManager.getBlockPointersOfBatch(batchSize, beamWidth, maxBlocksPerSeq);
-        TLLM_CHECK(blockPointersBatch->getSizeInBytes() == kvCacheBlockPointers->getSizeInBytes());
-        auto pointersPtr = bufferCast<int64_t>(*blockPointersBatch);
-        auto pointersPtr32 = reinterpret_cast<int32_t*>(pointersPtr);
-        manager.copy(pointersPtr32, *kvCacheBlockPointers);
+        kvCacheManager->getBlockPointersOfBatch(kvCacheBlockPointersHost, batchSize, beamWidth);
+        manager.copy(*kvCacheBlockPointersHost, *kvCacheBlockPointersDevice);
     }
 
     kernels::invokeFill(*lastTokenIds, 1, stream);
@@ -476,8 +530,7 @@ RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, T
 };
 
 void RuntimeBuffers::getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outputBuffers, SizeType const step,
-    TensorPtr const& inputIds, KvCacheManager& kvCacheManager, GptModelConfig const& modelConfig,
-    WorldConfig const& worldConfig) const
+    TensorPtr const& inputIds, GptModelConfig const& modelConfig, WorldConfig const& worldConfig) const
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     inputBuffers.clear();
@@ -503,7 +556,10 @@ void RuntimeBuffers::getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outpu
     }
 
     inputBuffers.insert_or_assign("context_lengths", contextLengthsDevice);
-    inputBuffers.insert_or_assign("last_token_ids", lastTokenIds);
+    if (!modelConfig.computeContextLogits())
+    {
+        inputBuffers.insert_or_assign("last_token_ids", lastTokenIds);
+    }
     inputBuffers.insert_or_assign("position_ids", positionIds);
 
     auto const localNbLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
@@ -522,10 +578,8 @@ void RuntimeBuffers::getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outpu
         }
         if (modelConfig.usePagedKvCache())
         {
-            utils::insertTensorVector(inputBuffers, "past_key_value_", kvCacheManager.getMemoryPools(), firstLayerId);
-            utils::insertTensorVector(
-                outputBuffers, "present_key_value_", kvCacheManager.getMemoryPools(), firstLayerId);
-            utils::insertTensorSlices(inputBuffers, "kv_cache_block_pointers_", kvCacheBlockPointers, firstLayerId);
+            utils::insertTensorSlices(
+                inputBuffers, "kv_cache_block_pointers_", kvCacheBlockPointersDevice, firstLayerId);
         }
         else
         {

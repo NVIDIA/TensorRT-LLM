@@ -25,6 +25,7 @@ from transformers import AutoModelForCausalLM, LlamaTokenizer
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization import QuantMode
 
 from build import get_engine_name  # isort:skip
 
@@ -48,7 +49,8 @@ def TRTLLaMA(args, config):
     remove_input_padding = config['plugin_config']['remove_input_padding']
     num_kv_heads = config['builder_config'].get('num_kv_heads', num_heads)
     paged_kv_cache = config['plugin_config']['paged_kv_cache']
-    tokens_per_block = config['builder_config']['tokens_per_block']
+    tokens_per_block = config['plugin_config']['tokens_per_block']
+    quant_mode = QuantMode(config['builder_config']['quant_mode'])
     if config['builder_config'].get('multi_query_mode', False):
         tensorrt_llm.logger.warning(
             "`multi_query_mode` config is deprecated. Please rebuild the engine."
@@ -65,7 +67,9 @@ def TRTLLaMA(args, config):
         paged_kv_cache=paged_kv_cache,
         tokens_per_block=tokens_per_block,
         gpt_attention_plugin=use_gpt_attention_plugin,
-        remove_input_padding=remove_input_padding)
+        remove_input_padding=remove_input_padding,
+        dtype=dtype,
+        quant_mode=quant_mode)
 
     runtime_rank = tensorrt_llm.mpi_rank()
     runtime_mapping = tensorrt_llm.Mapping(world_size,

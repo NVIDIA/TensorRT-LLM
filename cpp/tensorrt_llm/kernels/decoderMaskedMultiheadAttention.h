@@ -116,7 +116,9 @@ struct Multihead_attention_params_base
     // The per-head latent space reserved for rotary embeddings.
     int rotary_embedding_dim = 0;
     float rotary_embedding_base = 0.0f;
+    RotaryScalingType rotary_embedding_scale_type = RotaryScalingType::kNONE;
     float rotary_embedding_scale = 0.0f;
+    int rotary_embedding_max_positions = 0;
     // The current timestep. TODO(bhsueh) Check that do we only this param in cross attention?
     int timestep = 0;
     // The current timestep of each sentences (support different timestep for different sentences)

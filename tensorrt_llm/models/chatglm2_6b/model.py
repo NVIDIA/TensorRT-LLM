@@ -19,8 +19,9 @@ import torch
 from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
 from ...functional import (PositionEmbeddingType, Tensor, concat, constant,
-                           expand, expand_dims, gather, gpt_attention,
-                           index_select, select, shape, slice, split)
+                           expand, expand_dims, gather_last_token_logits,
+                           gpt_attention, index_select, select, shape, slice,
+                           split)
 from ...layers import (MLP, AttentionMaskType, AttentionParams, ColumnLinear,
                        Embedding, KeyValueCacheParams, RmsNorm, RowLinear)
 from ...mapping import Mapping
@@ -267,6 +268,7 @@ class ChatGLM2Attention(Module):
             num_heads=self.num_attention_heads,
             num_kv_heads=self.
             num_attention_heads,  # since self.multi_query_mode is set to False
+            hidden_size_per_head=self.attention_head_size,
             q_scaling=self.q_scaling,
             rotary_embedding_dim=self.rotary_embedding_dim,
             position_embedding_type=self.position_embedding_type,
@@ -574,6 +576,8 @@ class ChatGLM2HeadModel(ChatGLM2Model, GenerationMixin):
         self._dtype = self._kv_dtype
         if quant_mode.has_int8_kv_cache():
             self._kv_dtype = str_dtype_to_trt('int8')
+        elif quant_mode.has_fp8_kv_cache():
+            self._kv_dtype = str_dtype_to_trt('fp8')
         self.use_cache = use_cache
         self.kv_cache_block_pointers = kv_cache_block_pointers
         self.quant_mode = quant_mode
@@ -604,34 +608,24 @@ class ChatGLM2HeadModel(ChatGLM2Model, GenerationMixin):
                 kv_cache_params=None,
                 attention_params=None):
 
-        assert last_token_ids is not None, "Expecting last token ids to be not None"
-
         hidden_states = super().forward(input_ids, position_ids, self.use_cache,
                                         kv_cache_params, attention_params)
 
         if self.use_cache:
             hidden_states, presents = hidden_states
 
-        # only calculate logits for the last token
-        # [batch_size, seqlen, hidden_size] -> [batch_size, hidden_size]
-        last_token_ids = last_token_ids.view(
-            concat([shape(last_token_ids, 0), 1, 1]))
-        last_token_ids = expand(
-            last_token_ids,
-            concat([shape(last_token_ids, 0), 1,
-                    shape(hidden_states, 2)]))
-        last_token_ids = last_token_ids - 1
-        hidden_states = gather(
-            hidden_states, dim=1, indices=last_token_ids).view(
-                concat([shape(hidden_states, 0),
-                        shape(hidden_states, 2)]))
+        hidden_states = gather_last_token_logits(
+            hidden_states, last_token_ids,
+            default_net().plugin_config.remove_input_padding)
 
         lm_logits = self.lm_head(hidden_states)
         lm_logits.mark_output('logits', self._dtype)
 
-        for i, present in enumerate(presents):
-            present.mark_output(f'present_key_value_{i}', self._kv_dtype)
-        return (lm_logits, presents)
+        if default_net().plugin_config.paged_kv_cache == False:
+            for i, present in enumerate(presents):
+                present.mark_output(f'present_key_value_{i}', self._kv_dtype)
+            return (lm_logits, presents)
+        return lm_logits
 
     def prepare_inputs(self,
                        max_batch_size,

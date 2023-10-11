@@ -50,11 +50,11 @@ def TRTFalcon(args, config):
     num_layers = builder_config['num_layers']
     num_kv_heads = builder_config.get('num_kv_heads', num_heads)
     num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
-    tokens_per_block = config['builder_config']['tokens_per_block']
     quant_mode = QuantMode(builder_config['quant_mode'])
 
     use_gpt_attention_plugin = bool(plugin_config['gpt_attention_plugin'])
     paged_kv_cache = plugin_config['paged_kv_cache']
+    tokens_per_block = plugin_config['tokens_per_block']
     remove_input_padding = plugin_config['remove_input_padding']
 
     model_config = tensorrt_llm.runtime.ModelConfig(
@@ -67,7 +67,8 @@ def TRTFalcon(args, config):
         paged_kv_cache=paged_kv_cache,
         tokens_per_block=tokens_per_block,
         remove_input_padding=remove_input_padding,
-        quant_mode=quant_mode)
+        quant_mode=quant_mode,
+        dtype=dtype)
 
     runtime_rank = tensorrt_llm.mpi_rank()
     runtime_mapping = tensorrt_llm.Mapping(world_size,

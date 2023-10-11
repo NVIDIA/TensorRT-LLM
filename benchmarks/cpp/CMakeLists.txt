@@ -25,9 +25,17 @@ add_subdirectory(${CXXOPTS_SRC_DIR} ${CMAKE_CURRENT_BINARY_DIR}/cxxopts)
 function(add_benchmark test_name test_src)
   add_executable(${test_name} ${test_src})
 
-  target_link_libraries(
-    ${test_name} PUBLIC ${SHARED_TARGET} nvinfer_plugin_tensorrt_llm
-                        cxxopts::cxxopts)
+  if(NOT WIN32) # Linux
+    target_link_libraries(
+      ${test_name} PUBLIC ${SHARED_TARGET} nvinfer_plugin_tensorrt_llm
+                          cxxopts::cxxopts)
+  else()
+    # Use STATIC_TARGET on Windows because MSVC is picky about duplicate symbols
+    # if the shared and static libs both get linked
+    target_link_libraries(
+      ${test_name} PUBLIC ${STATIC_TARGET} nvinfer_plugin_tensorrt_llm
+                          cxxopts::cxxopts)
+  endif()
 
   target_compile_features(${test_name} PRIVATE cxx_std_17)
   target_compile_definitions(${test_name}
@@ -37,3 +45,4 @@ endfunction()
 
 add_benchmark(gptSessionBenchmark gptSessionBenchmark.cpp)
 add_benchmark(bertBenchmark bertBenchmark.cpp)
+add_benchmark(gptManagerBenchmark gptManagerBenchmark.cpp)

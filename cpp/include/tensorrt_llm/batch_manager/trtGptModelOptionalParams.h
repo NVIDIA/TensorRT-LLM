@@ -33,14 +33,16 @@ public:
         : mMaxNumSequences(std::nullopt)
         , mMaxTokensInPagedKvCache(std::nullopt)
         , mKvCacheFreeGpuMemFraction(std::nullopt)
+        , mEnableTrtOverlap(std::nullopt)
     {
     }
 
     TrtGptModelOptionalParams(std::optional<SizeType> maxNumSequences, std::optional<SizeType> maxTokensInPagedKvCache,
-        std::optional<float> kvCacheFreeGpuMemFraction)
+        std::optional<float> kvCacheFreeGpuMemFraction, std::optional<bool> enableTrtOverlap)
         : mMaxNumSequences(maxNumSequences)
         , mMaxTokensInPagedKvCache(maxTokensInPagedKvCache)
         , mKvCacheFreeGpuMemFraction(kvCacheFreeGpuMemFraction)
+        , mEnableTrtOverlap(enableTrtOverlap)
     {
     }
 
@@ -59,10 +61,16 @@ public:
         return mMaxNumSequences;
     }
 
+    [[nodiscard]] std::optional<bool> getEnableTrtOverlap() const
+    {
+        return mEnableTrtOverlap;
+    }
+
 private:
     std::optional<SizeType> mMaxNumSequences;
     std::optional<SizeType> mMaxTokensInPagedKvCache;
     std::optional<float> mKvCacheFreeGpuMemFraction;
+    std::optional<bool> mEnableTrtOverlap;
 };
 
 } // namespace tensorrt_llm::batch_manager

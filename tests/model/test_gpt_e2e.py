@@ -132,6 +132,7 @@ def check_accuracy(engine_dir, input_tokens, max_output_len):
     config_path = os.path.join(engine_dir, 'config.json')
     with open(config_path, 'r') as f:
         config = json.load(f)
+    dtype = config['builder_config']['precision']
     use_gpt_attention_plugin = config['plugin_config']['gpt_attention_plugin']
     remove_input_padding = config['plugin_config']['remove_input_padding']
     dtype = config['builder_config']['precision']
@@ -157,7 +158,8 @@ def check_accuracy(engine_dir, input_tokens, max_output_len):
                                vocab_size=vocab_size,
                                num_layers=num_layers,
                                gpt_attention_plugin=use_gpt_attention_plugin,
-                               remove_input_padding=remove_input_padding)
+                               remove_input_padding=remove_input_padding,
+                               dtype=dtype)
     sampling_config = SamplingConfig(end_id=END_ID, pad_id=END_ID)
 
     engine_name = get_engine_name('gpt', dtype, world_size, runtime_rank)

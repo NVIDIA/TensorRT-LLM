@@ -16,8 +16,11 @@
  */
 #pragma once
 
+#include "FTCustomAR.h"
+#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include <cassert>
+#include <memory>
 #include <mpi.h>
 #include <nccl.h>
 #include <set>
@@ -30,7 +33,15 @@ namespace tensorrt_llm::plugins
 class AllreducePlugin : public BasePlugin
 {
 public:
-    AllreducePlugin(std::set<int> group, nvinfer1::DataType type);
+    enum class AllReduceStrategyType : int8_t
+    {
+        NCCL = 0,
+        CUSTOM = 1,
+        AUTO = 2,
+    };
+
+    AllreducePlugin(
+        std::set<int> group, nvinfer1::DataType type, AllReduceStrategyType strategy = AllReduceStrategyType::NCCL);
 
     AllreducePlugin(const void* data, size_t length);
 
@@ -63,10 +74,16 @@ public:
     void serialize(void* buffer) const noexcept override;
     void destroy() noexcept override;
 
+    bool isCustomAllReduceSuported(int ranks_per_node) const noexcept;
+
 private:
+    size_t ncclEstimatedThreshold(int worldSize) const noexcept;
     const std::string mLayerName;
     std::set<int> mGroup;
     nvinfer1::DataType mType;
+    AllReduceStrategyType mStrategy;
+    std::shared_ptr<tensorrt_llm::CustomAllReduceComm> mCustomAllReduceContext;
+    size_t mCustomARBufferSize;
 };
 
 class AllreducePluginCreator : public BaseCreator

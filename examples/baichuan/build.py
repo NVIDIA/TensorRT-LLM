@@ -366,21 +366,17 @@ def build_rank_engine(builder: Builder,
     if args.remove_input_padding:
         network.plugin_config.enable_remove_input_padding()
     if args.paged_kv_cache:
-        network.plugin_config.enable_paged_kv_cache()
+        network.plugin_config.enable_paged_kv_cache(args.tokens_per_block)
 
     with net_guard(network):
         # Prepare
         network.set_named_parameters(tensorrt_llm_baichuan.named_parameters())
 
         # Forward
-        inputs = tensorrt_llm_baichuan.prepare_inputs(
-            args.max_batch_size,
-            args.max_input_len,
-            args.max_output_len,
-            True,
-            args.max_beam_width,
-            paged_kv_cache=args.paged_kv_cache,
-            tokens_per_block=args.tokens_per_block)
+        inputs = tensorrt_llm_baichuan.prepare_inputs(args.max_batch_size,
+                                                      args.max_input_len,
+                                                      args.max_output_len, True,
+                                                      args.max_beam_width)
         tensorrt_llm_baichuan(*inputs)
         if args.enable_debug_output:
             # mark intermediate nodes' outputs
@@ -435,9 +431,7 @@ def build(rank, args):
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
-            int8=args.quant_mode.has_act_and_weight_quant(),
-            paged_kv_cache=args.paged_kv_cache,
-            tokens_per_block=args.tokens_per_block)
+            int8=args.quant_mode.has_act_and_weight_quant())
         engine_name = get_engine_name(model_name, args.dtype, args.world_size,
                                       cur_rank)
         engine = build_rank_engine(builder, builder_config, engine_name,

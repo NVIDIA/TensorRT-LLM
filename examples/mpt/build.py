@@ -1,7 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import argparse
-import os
 import time
 from pathlib import Path
+from typing import List
 
 import torch
 import torch.multiprocessing as mp
@@ -19,11 +33,20 @@ from tensorrt_llm.quantization import QuantMode
 
 from weight import load_from_ft, parse_ft_config, check_embedding_share  # isort:skip
 
-MODEL_NAME = "mpt"
+MODEL_NAME = "gpt"
 
 
 def get_engine_name(model, dtype, tp_size, rank):
     return '{}_{}_tp{}_rank{}.engine'.format(model, dtype, tp_size, rank)
+
+
+def find_engines(dir: Path,
+                 model_name: str = "*",
+                 dtype: str = "*",
+                 tp_size: str = "*",
+                 rank: str = "*") -> List[Path]:
+    template = f"{model_name}_{dtype}_tp{tp_size}_rank{rank}.engine"
+    return list(dir.glob(template))
 
 
 def serialize_engine(engine, path):
@@ -47,6 +70,10 @@ def parse_arguments(args):
                         type=str,
                         default='float16',
                         choices=['float16', 'float32', 'bfloat16'])
+    parser.add_argument('--logits_dtype',
+                        type=str,
+                        default='float32',
+                        choices=['float16', 'float32'])
     parser.add_argument(
         '--timing_cache',
         type=str,
@@ -61,7 +88,6 @@ def parse_arguments(args):
     parser.add_argument('--n_embd', type=int, default=1024)
     parser.add_argument('--n_head', type=int, default=16)
     parser.add_argument('--hidden_act', type=str, default='gelu')
-    parser.add_argument('--position_embedding_type', type=str, default="alibi")
     parser.add_argument(
         '--rotary_pct',
         type=float,
@@ -114,8 +140,8 @@ def parse_arguments(args):
     parser.add_argument('--builder_opt', type=int, default=None)
     parser.add_argument(
         '--output_dir',
-        type=str,
-        default='trt_engines',
+        type=Path,
+        default='gpt_outputs',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
     )
@@ -204,39 +230,65 @@ def parse_arguments(args):
         help='Setting to a value > 0 enables support for prompt tuning.')
     parser.add_argument(
         '--use_inflight_batching',
-        nargs='?',
-        const=None,
+        action="store_true",
         default=False,
-        choices=['float16', 'float32'],
+        help="Activates inflight batching mode of gptAttentionPlugin.")
+    parser.add_argument(
+        '--use_parallel_embedding',
+        action="store_true",
+        default=False,
         help=
-        "Activates attention plugin for inflight batching. You can specify the plugin dtype or leave blank to use the model dtype."
+        'By default embedding parallelism is disabled. By setting this flag, embedding parallelism is enabled'
     )
+    parser.add_argument(
+        '--embedding_sharding_dim',
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=
+        'By default the embedding lookup table is sharded along vocab dimension (embedding_sharding_dim=0). '
+        'To shard it along hidden dimension, set embedding_sharding_dim=1'
+        'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
+    )
+    parser.add_argument(
+        '--use_embedding_sharing',
+        action="store_true",
+        default=False,
+        help=
+        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
+        'Note: the flag might not take effect when the criteria are not met.')
     parser.add_argument(
         '--use_lookup_plugin',
         nargs='?',
         const=None,
         default=False,
-        choices=['float16', 'float32'],
+        choices=['float16', 'float32', 'bfloat16'],
+        help="Activates the lookup plugin which enables embedding sharing.")
+
+    parser.add_argument('--enable_fp8', default=False, action='store_true')
+    parser.add_argument(
+        '--fp8_kv_cache',
+        default=False,
+        action="store_true",
         help=
-        "Activates the lookup plugin which enables tensor-parallel embedding. It is also required for embedding table and language modeling weight sharing."
+        'By default, we use dtype for KV cache. fp8_kv_cache chooses fp8 quantization for KV'
     )
 
+    parser.add_argument(
+        '--strongly_typed',
+        default=False,
+        action="store_true",
+        help=
+        'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
+    )
+    parser.add_argument(
+        '--position_embedding_type',
+        default='alibi',
+        choices=PositionEmbeddingType.choices(),
+        help='Set the postion embedding type.',
+    )
     args = parser.parse_args(args)
     logger.set_level(args.log_level)
-
-    if args.use_inflight_batching:
-        if not args.use_gpt_attention_plugin:
-            args.use_gpt_attention_plugin = 'float16'
-            logger.info(
-                f"Using GPT attention plugin for inflight batching mode. Setting to default '{args.use_gpt_attention_plugin}'"
-            )
-        if not args.remove_input_padding:
-            args.remove_input_padding = True
-            logger.info(
-                "Using remove input padding for inflight batching mode.")
-        if not args.paged_kv_cache:
-            args.paged_kv_cache = True
-            logger.info("Using paged KV cache for inflight batching mode.")
 
     args.bias = not args.no_bias
     if args.inter_size is None:
@@ -260,18 +312,32 @@ def parse_arguments(args):
         args.position_embedding_type = position_embedding_type
     plugins_args = [
         'use_gpt_attention_plugin', 'use_gemm_plugin', 'use_layernorm_plugin',
-        'use_inflight_batching', 'use_lookup_plugin'
+        'use_lookup_plugin'
     ]
     for plugin_arg in plugins_args:
         if getattr(args, plugin_arg) is None:
             logger.info(
-                f"plugin_arg is None, setting it as {args.dtype} automatically."
+                f"{plugin_arg} set, without specifying a value. Using {args.dtype} automatically."
             )
             setattr(args, plugin_arg, args.dtype)
 
     assert not (
         args.use_smooth_quant and args.use_weight_only
     ), "You cannot enable both SmoothQuant and INT8 weight-only together."
+
+    if args.use_inflight_batching:
+        if not args.use_gpt_attention_plugin:
+            args.use_gpt_attention_plugin = 'float16'
+            logger.info(
+                f"Using GPT attention plugin for inflight batching mode. Setting to default '{args.use_gpt_attention_plugin}'"
+            )
+        if not args.remove_input_padding:
+            args.remove_input_padding = True
+            logger.info(
+                "Using remove input padding for inflight batching mode.")
+        if not args.paged_kv_cache:
+            args.paged_kv_cache = True
+            logger.info("Using paged KV cache for inflight batching mode.")
 
     if args.use_smooth_quant:
         args.quant_mode = QuantMode.use_smooth_quant(args.per_token,
@@ -284,6 +350,17 @@ def parse_arguments(args):
 
     if args.int8_kv_cache:
         args.quant_mode = args.quant_mode.set_int8_kv_cache()
+    if args.fp8_kv_cache:
+        assert (
+            args.use_gpt_attention_plugin or args.use_inflight_batching
+        ), "You have to use GPT attention plugin when fp8 KV cache is set"
+        args.quant_mode = args.quant_mode.set_fp8_kv_cache()
+
+    if args.enable_fp8:
+        args.quant_mode = args.quant_mode.set_fp8_qdq()
+
+    args.position_embedding_type = PositionEmbeddingType[
+        args.position_embedding_type]
 
     return args
 
@@ -299,16 +376,25 @@ def build_rank_engine(builder: Builder,
     '''
     kv_dtype = str_dtype_to_trt(args.dtype)
 
-    # Decide if we can share the embedding table between
-    # the lookup OP and the logits calculation OP
+    # Share_embedding_table can be set True only when:
+    # 1) the weight for lm_head() does not exist while other weights exist
+    # 2) For multiple-processes, use_parallel_embedding=True and embedding_sharding_dim == 0.
+    # Besides, for TensorRT 9.0, we can observe the engine size reduction when the lookup and gemm plugin are enabled.
     share_embedding_table = False
-    if args.use_lookup_plugin and args.model_dir is not None:
-        share_embedding_table = check_embedding_share(args.model_dir)
+    if args.use_embedding_sharing:
+        if args.world_size > 1:
+            if args.model_dir is not None and args.embedding_sharding_dim == 0 and args.use_parallel_embedding:
+                share_embedding_table = check_embedding_share(args.model_dir)
+        else:
+            if args.model_dir is not None:
+                share_embedding_table = check_embedding_share(args.model_dir)
 
-    if share_embedding_table and (not args.use_gemm_plugin):
-        logger.warning(
-            f'Sharing embedding tables between OPs requires using GEMM plugin. Otherwise, you might fail to see the engine size reduction.'
-        )
+        if not share_embedding_table:
+            logger.warning(f'Cannot share the embedding lookup table.')
+
+    if share_embedding_table:
+        logger.info(
+            'Engine will share embedding and language modeling weights.')
 
     # Initialize Module
     tensorrt_llm_gpt = tensorrt_llm.models.GPTLMHeadModel(
@@ -319,9 +405,10 @@ def build_rank_engine(builder: Builder,
         vocab_size=args.vocab_size,
         hidden_act=args.hidden_act,
         max_position_embeddings=args.n_positions,
-        position_embedding_type=PositionEmbeddingType.alibi,
+        position_embedding_type=args.position_embedding_type,
         rotary_embedding_percentage=args.rotary_pct,
         dtype=kv_dtype,
+        logits_dtype=args.logits_dtype,
         mapping=Mapping(world_size=args.world_size,
                         rank=rank,
                         tp_size=args.world_size),  # TP only
@@ -331,6 +418,8 @@ def build_rank_engine(builder: Builder,
         bias=args.bias,
         multi_query_mode=args.multi_query_mode,
         use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
+        use_parallel_embedding=args.use_parallel_embedding,
+        embedding_sharding_dim=args.embedding_sharding_dim,
         share_embedding_table=share_embedding_table)
     if args.use_smooth_quant:
         tensorrt_llm_gpt = smooth_quantize(tensorrt_llm_gpt, args.quant_mode)
@@ -339,9 +428,28 @@ def build_rank_engine(builder: Builder,
                                                 args.quant_mode)
 
     if args.model_dir is not None:
-        # print('DEBUG: ', args.dtype)
-        load_from_ft(tensorrt_llm_gpt, args.model_dir, rank, args.world_size,
-                     args.dtype, share_embedding_table, args.use_lookup_plugin)
+        gpt_dummy_fp8_scaling_factors = {
+            'fc_act': [0.5 for _ in range(args.n_layer)],
+            'fc_weights': [0.5 for _ in range(args.n_layer)],
+            'proj_act': [0.5 for _ in range(args.n_layer)],
+            'proj_weights': [0.5 for _ in range(args.n_layer)],
+            'qkv_act': [0.5 for _ in range(args.n_layer)],
+            'qkv_weights': [0.5 for _ in range(args.n_layer)],
+            'qkv_output': [0.5 for _ in range(args.n_layer)],
+            'dense_act': [0.5 for _ in range(args.n_layer)],
+            'dense_weights': [0.5 for _ in range(args.n_layer)],
+        }
+
+        load_from_ft(tensorrt_llm_gpt,
+                     args.model_dir,
+                     rank,
+                     args.world_size,
+                     args.dtype,
+                     args.use_parallel_embedding,
+                     args.embedding_sharding_dim,
+                     share_embedding_table,
+                     scaling_factors=gpt_dummy_fp8_scaling_factors
+                     if args.enable_fp8 else None)
 
     # Module -> Network
     network = builder.create_network()
@@ -363,10 +471,7 @@ def build_rank_engine(builder: Builder,
     if args.remove_input_padding:
         network.plugin_config.enable_remove_input_padding()
     if args.paged_kv_cache:
-        network.plugin_config.enable_paged_kv_cache()
-    if args.use_inflight_batching:
-        network.plugin_config.set_inflight_batching_gpt_attention_plugin(
-            dtype=args.use_inflight_batching)
+        network.plugin_config.enable_paged_kv_cache(args.tokens_per_block)
 
     # Quantization plugins.
     if args.use_smooth_quant:
@@ -388,9 +493,6 @@ def build_rank_engine(builder: Builder,
     if args.use_lookup_plugin:
         # Use the plugin for the embedding parallelism and sharing
         network.plugin_config.set_lookup_plugin(dtype=args.dtype)
-    assert not (args.use_lookup_plugin
-                and args.max_prompt_embedding_table_size > 0
-                ), "Lookup plugin isn't compatible with prompt tuning right now"
 
     with net_guard(network):
         # Prepare
@@ -403,8 +505,6 @@ def build_rank_engine(builder: Builder,
             args.max_output_len,
             True,
             args.max_beam_width,
-            paged_kv_cache=args.paged_kv_cache,
-            tokens_per_block=args.tokens_per_block,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size)
         tensorrt_llm_gpt(*inputs)
 
@@ -415,7 +515,7 @@ def build_rank_engine(builder: Builder,
     # Network -> Engine
     engine = builder.build_engine(network, builder_config)
     if rank == 0:
-        config_path = os.path.join(args.output_dir, 'config.json')
+        config_path = args.output_dir / 'config.json'
         builder.save_config(builder_config, config_path)
     return engine
 
@@ -423,20 +523,23 @@ def build_rank_engine(builder: Builder,
 def build(rank, args):
     torch.cuda.set_device(rank % args.gpus_per_node)
     tensorrt_llm.logger.set_level(args.log_level)
-    if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    timing_cache_file = args.timing_cache if args.timing_cache else args.output_dir / "model.cache"
+    timing_cache = timing_cache_file
 
     builder = Builder()
-    cache = None
     apply_query_key_layer_scaling = False
     for cur_rank in range(args.world_size):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
+        # NOTE(nkorobov): when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
+        int8_trt_flag = args.quant_mode.has_act_and_weight_quant() or (
+            not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
         builder_config = builder.create_builder_config(
             name=MODEL_NAME,
             precision=args.dtype,
-            timing_cache=args.timing_cache if cache is None else cache,
+            timing_cache=timing_cache,
             tensor_parallel=args.world_size,  # TP only
             parallel_build=args.parallel_build,
             num_layers=args.n_layer,
@@ -449,14 +552,13 @@ def build(rank, args):
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
-            int8=(args.quant_mode.has_act_and_weight_quant()
-                  or args.quant_mode.has_int8_kv_cache()),
+            int8=int8_trt_flag,
             opt_level=args.builder_opt,
             multi_query_mode=args.multi_query_mode,
-            paged_kv_cache=args.paged_kv_cache,
-            tokens_per_block=args.tokens_per_block,
+            strongly_typed=args.strongly_typed,
             use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
-            use_parallel_embedding=bool(args.use_lookup_plugin))
+            fp8=args.enable_fp8,
+            use_parallel_embedding=args.use_parallel_embedding)
 
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.world_size,
                                       cur_rank)
@@ -467,13 +569,13 @@ def build(rank, args):
         if cur_rank == 0:
             # Use in-memory timing cache for multiple builder passes.
             if not args.parallel_build:
-                cache = builder_config.trt_builder_config.get_timing_cache()
+                timing_cache = builder_config.trt_builder_config.get_timing_cache(
+                )
 
-        serialize_engine(engine, os.path.join(args.output_dir, engine_name))
+        serialize_engine(engine, args.output_dir / engine_name)
 
     if rank == 0:
-        ok = builder.save_timing_cache(
-            builder_config, os.path.join(args.output_dir, "model.cache"))
+        ok = builder.save_timing_cache(builder_config, timing_cache_file)
         assert ok, "Failed to save timing cache."
 
 

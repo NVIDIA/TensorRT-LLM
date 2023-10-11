@@ -21,6 +21,7 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <NvInferRuntime.h>
 #include <cstdint>
@@ -41,19 +42,29 @@ public:
 
     explicit KVCacheBlock(SizeType blockIdx);
 
+    void startScheduling();
+
     [[nodiscard]] SizeType getBlockIdx() const;
 
     void incRefCount();
 
     void decRefCount();
 
+    void decSchedulingRefCount();
+
     [[nodiscard]] bool hasRefs() const;
+
+    [[nodiscard]] bool hasSchedulingRefs() const;
 
 private:
     // Linear index of block in pool
     SizeType mBlockIdx;
+
     // Number of references to the block
     SizeType mRefCount;
+
+    // Number of references to the block
+    SizeType mSchedulingRefCount;
 };
 
 class GenerationRequest
@@ -144,11 +155,18 @@ private:
 class BlockManager
 {
 public:
+    using SizeType = tensorrt_llm::runtime::SizeType;
+
     explicit BlockManager(std::size_t blocksInPool);
+
+    void startScheduling();
 
     void allocateBlock(GenerationRequest& sequence, bool shareAmongBeams = false);
 
     void freeAllBlocks(GenerationRequest& sequence);
+
+    // Simulate freeing all blocks for that sequence to check impact on number of free blocks
+    void schedulingFreeAllBlocks(GenerationRequest& sequence);
 
     [[nodiscard]] std::size_t getNumFreeBlocks() const
     {
@@ -160,11 +178,18 @@ public:
         return getNumFreeBlocks() >= numRequired;
     }
 
+    [[nodiscard]] bool schedulingHasFreeBlocks(std::size_t numRequired = 1) const
+    {
+        return mSchedulingNumFreeBlocks >= numRequired;
+    }
+
 private:
     // List of free blocks
     std::list<KVCacheBlock> mFreeBlocks;
     // List of allocated blocks for each sequences
     std::vector<std::vector<KVCacheBlock>> mAllocatedBlocks;
+    // Used to keep track of number of free blocks during scheduling
+    SizeType mSchedulingNumFreeBlocks;
 };
 
 class KVCacheManager
@@ -175,8 +200,10 @@ public:
     using CudaStreamPtr = std::shared_ptr<runtime::CudaStream>;
 
     KVCacheManager(SizeType numLayers, SizeType numHeads, SizeType numKvHeads, SizeType hiddenSize,
-        SizeType tokensPerBlock, SizeType maxNumBlocks, SizeType maxBatchSize, nvinfer1::DataType dtype,
-        CudaStreamPtr stream);
+        SizeType tokensPerBlock, SizeType maxNumBlocks, SizeType maxBatchSize, SizeType maxBeamWidth,
+        SizeType maxBlocksPerSeq, nvinfer1::DataType dtype, CudaStreamPtr stream);
+
+    void startScheduling();
 
     [[nodiscard]] SizeType getTokensPerBlock() const
     {
@@ -199,10 +226,11 @@ public:
         return mBlockManager;
     }
 
-    /// @brief  Function that computes the number of KV cache blocks needed to advance a request by one iteration
+    /// @brief  Function that computes the number of KV cache blocks needed to advance a request by one or two
+    /// iterations
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
     /// @return  The number of blocks
-    SizeType getNeededBlocksOneStep(const LlmRequest& req) const;
+    SizeType getNeededBlocksOneStep(const LlmRequest& req, bool twoStepsLookAhead) const;
 
     /// @brief  Function that computes the number of KV cache blocks needed to advance a request to completion (i.e. for
     /// maxNewTokens)
@@ -221,11 +249,12 @@ public:
 
     void removeSequence(SizeType batchSlotIdx);
 
-    [[nodiscard]] std::vector<runtime::ITensor::UniquePtr> getBlockPointersOfSlot(
-        SizeType batchSlotIdx, SizeType beamWidth, SizeType maxBlocksPerSeq) const;
+    void schedulingRemoveSequence(SizeType batchSlotIdx);
 
-    [[nodiscard]] runtime::ITensor::UniquePtr getBlockPointersOfBatch(
-        SizeType batchSize, SizeType beamWidth, SizeType maxBlocksPerSeq) const;
+    void getBlockPointersOfBatch(runtime::ITensor::SharedPtr dstPointers, SizeType batchSize, SizeType beamWidth) const;
+
+    void copyBlockPointers(runtime::ITensor::SharedPtr dstPointers, SizeType dstSlotOffset, SizeType batchSlotIdx,
+        SizeType beamWidth) const;
 
     // Volume of [2, numKvHeads, tokensPerBlock, sizePerHead]
     [[nodiscard]] static SizeType constexpr calculatePageSize(tensorrt_llm::runtime::GptModelConfig const& modelConfig)
@@ -235,10 +264,14 @@ public:
 
     // numLayers * 2 * numKvHeads * sizePerHead
     [[nodiscard]] static SizeType constexpr calculateCacheSizePerToken(
-        tensorrt_llm::runtime::GptModelConfig const& modelConfig)
+        tensorrt_llm::runtime::GptModelConfig const& modelConfig, tensorrt_llm::runtime::WorldConfig const& worldConfig)
     {
-        return modelConfig.getNbLayers() * 2 * modelConfig.getNbKvHeads() * modelConfig.getSizePerHead();
+        return modelConfig.getNbLayers(worldConfig.getPipelineParallelism()) * 2 * modelConfig.getNbKvHeads()
+            * modelConfig.getSizePerHead();
     }
+
+private:
+    void cacheNewBlockPointer(const GenerationRequest& seq, SizeType batchSlotIdx);
 
 private:
     // Number of elements per one blocks
@@ -247,14 +280,20 @@ private:
     SizeType mTokensPerBlock;
     // Total maximum number of blocks
     SizeType mMaxNumBlocks;
+    // Maximum size of batch
+    SizeType mMaxBatchSize;
+    // Maximum beam width
+    SizeType mMaxBeamWidth;
+    // Maximum number of blocks per sequence
+    SizeType mMaxBlocksPerSeq;
     // Pools
     std::vector<runtime::ITensor::SharedPtr> mPools;
     // Block manager
     BlockManager mBlockManager;
     // List of all sequences
     std::vector<SequencesPtr> mSequences;
-    // buffer for block pointers for all batch slots
-    std::vector<runtime::ITensor::UniquePtr> mAllBlockPointers;
+    // buffer for block pointers for all managed sequences
+    runtime::ITensor::SharedPtr mSequenceBlockPointers;
 
     runtime::BufferManager mManager;
 };

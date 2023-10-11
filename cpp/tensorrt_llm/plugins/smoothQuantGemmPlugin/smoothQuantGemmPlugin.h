@@ -48,6 +48,8 @@ protected:
 
     void computeTmpSize(int maxM, int n, int k) override;
 
+    std::vector<Config> getTactics(int m, int n, int k) const override;
+
 private:
     tensorrt_llm::common::QuantMode mQuantMode;
 };
@@ -103,7 +105,7 @@ private:
 
     SqGemmRunnerPtr m_sqGemmRunner;
     tensorrt_llm::common::QuantMode mQuantMode;
-    int m_workspaceMaxSize;
+    size_t m_workspaceMaxSize;
 
     GemmDims mDims{};
     GemmIdCore mGemmId{};

@@ -35,7 +35,7 @@ from transformers.models.llama.modeling_llama import (LlamaAttention,
 import tensorrt_llm
 from tensorrt_llm import Tensor
 from tensorrt_llm._utils import str_dtype_to_np, torch_to_numpy
-from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import GenerationSequence, KVCacheManager
@@ -68,7 +68,8 @@ class TestFunctional(unittest.TestCase):
         return trt_builder.build_engine(trt_network, config)
 
     def load_test_cases():
-        test_cases = list(
+        test_cases = []
+        test_cases += list(
             product(['gpt2_attention', 'llama_attention', 'gptj_attention'],
                     [ContextFMHAType.disabled], ['float16'], [2], [128], [4],
                     [64], [0], [False], [False], [1], [True, False]))
@@ -112,6 +113,21 @@ class TestFunctional(unittest.TestCase):
             product(['llama_attention'], [ContextFMHAType.disabled],
                     ['float16'], [2], [128], [8], [32], [2, 4], [False],
                     [False], [1], [False]))
+
+        # test cases for rotary scaling
+        test_cases += list(
+            product(['llama_attention'], [ContextFMHAType.disabled],
+                    ['float32'], [2], [128], [8], [32], [2, 8], [False],
+                    [False], [1], [False], [10000.0, 1000000.0], [
+                        {
+                            "type": "linear",
+                            "factor": 3.0
+                        },
+                        {
+                            "type": "dynamic",
+                            "factor": 2.0
+                        },
+                    ]))
         return test_cases
 
     def custom_name_func(testcase_func, param_num, param):
@@ -121,10 +137,21 @@ class TestFunctional(unittest.TestCase):
         )
 
     @parameterized.expand(load_test_cases, name_func=custom_name_func)
-    def test_gpt_attention_IFB(self, attention_type, context_fmha_type, dtype,
-                               batch_size, in_len, num_heads, head_size,
-                               num_kv_heads, enable_multi_block_mmha,
-                               use_int8_kv_cache, beam_width, fuse_bias):
+    def test_gpt_attention_IFB(self,
+                               attention_type,
+                               context_fmha_type,
+                               dtype,
+                               batch_size,
+                               in_len,
+                               num_heads,
+                               head_size,
+                               num_kv_heads,
+                               enable_multi_block_mmha,
+                               use_int8_kv_cache,
+                               beam_width,
+                               fuse_bias,
+                               rope_base=10000.0,
+                               rope_scaling=None):
         if num_kv_heads == 0:
             num_kv_heads = num_heads
 
@@ -159,7 +186,7 @@ class TestFunctional(unittest.TestCase):
         remove_input_padding = True
 
         def _construct_execution(session, input_tensor, weight, bias,
-                                 past_key_value, pointer_array, sequence_length,
+                                 pointer_array, sequence_length,
                                  host_past_key_value_lengths, context_lengths,
                                  max_context_length, cache_indirection,
                                  num_heads, hidden_size, num_kv_heads, output,
@@ -173,16 +200,12 @@ class TestFunctional(unittest.TestCase):
             net.plugin_config.set_gpt_attention_plugin(dtype)
             net.plugin_config.set_context_fmha(context_fmha_type)
             net.plugin_config.enable_remove_input_padding()
-            net.plugin_config.enable_paged_kv_cache()
+            net.plugin_config.enable_paged_kv_cache(tokens_per_block)
 
             with tensorrt_llm.net_guard(net):
                 x_tensor = Tensor(name='input',
                                   shape=tuple(input_tensor.shape),
                                   dtype=tensorrt_llm.str_dtype_to_trt(dtype))
-                past_key_value_tensor = Tensor(
-                    name='past_key_value',
-                    shape=tuple(past_key_value.shape),
-                    dtype=tensorrt_llm.str_dtype_to_trt(kv_cache_dtype))
                 sequence_length_tensor = Tensor(
                     name='sequence_length',
                     shape=tuple(sequence_length.shape),
@@ -199,6 +222,14 @@ class TestFunctional(unittest.TestCase):
                     name='cache_indirection',
                     shape=tuple(cache_indirection.shape),
                     dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+                host_request_types_tensor = Tensor(
+                    name='host_request_types',
+                    shape=tuple(host_request_types.shape),
+                    dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+                pointer_array_tensor = Tensor(
+                    name='kv_cache_block_pointers',
+                    shape=tuple(pointer_array.shape),
+                    dtype=tensorrt_llm.str_dtype_to_trt('int64'))
                 kv_int8_quant_scale_tensor = None
                 kv_int8_dequant_scale_tensor = None
                 if use_int8_kv_cache:
@@ -210,10 +241,6 @@ class TestFunctional(unittest.TestCase):
                         name='kv_int8_dequant_scale',
                         shape=(1, ),
                         dtype=tensorrt_llm.str_dtype_to_trt('float32'))
-                pointer_array_tensor = Tensor(
-                    name='kv_cache_block_pointers',
-                    shape=tuple(pointer_array.shape),
-                    dtype=tensorrt_llm.str_dtype_to_trt('int32'))
 
                 host_context_lengths_tensor = None
                 if remove_input_padding:
@@ -221,10 +248,6 @@ class TestFunctional(unittest.TestCase):
                         name='host_context_lengths',
                         shape=tuple(host_context_lengths.shape),
                         dtype=tensorrt_llm.str_dtype_to_trt('int32'))
-                host_request_types_tensor = Tensor(
-                    name='host_request_types',
-                    shape=tuple(host_request_types.shape),
-                    dtype=tensorrt_llm.str_dtype_to_trt('int32'))
 
                 linear = tensorrt_llm.layers.Linear(hidden_size,
                                                     weight.size()[-1],
@@ -261,9 +284,21 @@ class TestFunctional(unittest.TestCase):
                     position_embedding_type = PositionEmbeddingType.rope_gptj
                 else:
                     position_embedding_type = PositionEmbeddingType.learned_absolute
+
+                rope_base = 10000.0
+                rope_scale_type = RotaryScalingType.none
+                rope_scale = 1.0
+                if attention_type == "llama_attention":
+                    rope_base = configuration.rope_theta
+                    if configuration.rope_scaling is not None:
+                        rope_scale_type = {
+                            "linear": RotaryScalingType.linear,
+                            "dynamic": RotaryScalingType.dynamic
+                        }[configuration.rope_scaling["type"]]
+                        rope_scale = configuration.rope_scaling["factor"]
                 outputs = tensorrt_llm.functional.gpt_attention(
                     tensor=qkv,
-                    past_key_value=past_key_value_tensor,
+                    past_key_value=None,
                     sequence_length=sequence_length_tensor,
                     host_past_key_value_lengths=
                     host_past_key_value_lengths_tensor,
@@ -272,8 +307,14 @@ class TestFunctional(unittest.TestCase):
                     host_request_types=host_request_types_tensor,
                     num_heads=num_heads,
                     num_kv_heads=num_kv_heads,
+                    hidden_size_per_head=head_size,
                     q_scaling=1.0,
                     rotary_embedding_dim=rotary_embedding_dim,
+                    rotary_embedding_base=rope_base,
+                    rotary_embedding_scale_type=rope_scale_type,
+                    rotary_embedding_scale=rope_scale,
+                    rotary_embedding_max_positions=configuration.
+                    max_position_embeddings,
                     position_embedding_type=position_embedding_type,
                     multi_block_mode=enable_multi_block_mmha,
                     kv_orig_quant_scale=kv_int8_quant_scale_tensor,
@@ -288,14 +329,9 @@ class TestFunctional(unittest.TestCase):
                 net._mark_output(outputs[0],
                                  'output',
                                  dtype=tensorrt_llm.str_dtype_to_trt(dtype))
-                net._mark_output(
-                    outputs[1],
-                    'present_key_value',
-                    dtype=tensorrt_llm.str_dtype_to_trt(kv_cache_dtype))
 
             inputs = {
                 'input': input_tensor,
-                'past_key_value': past_key_value,
                 'sequence_length': sequence_length,
                 'host_past_key_value_lengths': host_past_key_value_lengths,
                 'context_lengths': context_lengths,
@@ -312,12 +348,14 @@ class TestFunctional(unittest.TestCase):
 
             outputs = {
                 'output': output,
-                'present_key_value': past_key_value,
             }
 
             stream = torch.cuda.current_stream()
-            builder_config = builder.create_builder_config(
-                name=attention_type, precision=dtype, int8=use_int8_kv_cache)
+            # NOTE(nkorobov): since we use int8 only for paged_kv_cache no int8 tensors are visible to TRT
+            int8_trt_flag = False
+            builder_config = builder.create_builder_config(name=attention_type,
+                                                           precision=dtype,
+                                                           int8=int8_trt_flag)
             if session is None:
                 engine = builder.build_engine(net, builder_config)
                 session = tensorrt_llm.runtime.Session.from_serialized_engine(
@@ -328,7 +366,7 @@ class TestFunctional(unittest.TestCase):
 
             torch.cuda.synchronize()
 
-            return session, outputs['output'], outputs['present_key_value']
+            return session, outputs['output']
 
         hidden_size = num_heads * head_size  # embed dimension
         # If MQA/GQA and that GPTBigCodeAttention/LlamaAttention is tested, use compacted IO shape.
@@ -415,6 +453,16 @@ class TestFunctional(unittest.TestCase):
         )
         if attention_type == 'llama_attention':
             configuration.num_key_value_heads = num_kv_heads
+            configuration.rope_theta = rope_base
+            configuration.rope_scaling = rope_scaling
+            if rope_scaling is not None:
+                # scaling is typically used for supporting longer seq lens than max_position_embeddings
+                # so we set the max_position_embeddings to be smaller than total seq len
+                # the following will use default path (no scaling) when generating half of the outputs
+                # the other half will use activate the scaling
+                # NOTE: in_len is also halved because in case the other half is treated as padding.
+                configuration.max_position_embeddings = (
+                    in_len // 2) + out_len - (out_len // 2)
         attention = AttentionCls(configuration).cuda().eval()
         if attention_type == 'gpt2_attention':
             attention.c_attn.weight = torch.nn.parameter.Parameter(
@@ -734,17 +782,13 @@ class TestFunctional(unittest.TestCase):
                 dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
                 device='cuda')
 
-            present_key_value = ordered_key_value[sequence_selection]
-
-            session, output, present_key_value = _construct_execution(
+            session, output = _construct_execution(
                 session, input_tensor, weight_plugin, bias_plugin,
-                present_key_value, dense_pointer_arrays, sequence_lengths,
+                dense_pointer_arrays, sequence_lengths,
                 host_past_key_value_lengths, context_lengths,
                 max_context_length, cache_indirection, num_heads, hidden_size,
                 num_kv_heads, output, dtype, kv_int8_quant_scale,
                 kv_int8_dequant_scale, host_context_lengths, host_request_types)
-
-            ordered_key_value[sequence_selection] = present_key_value
 
             del session
             session = None

@@ -17,6 +17,7 @@
 import argparse as _arg
 import os as _os
 import pathlib as _pl
+import platform as _pf
 import subprocess as _sp
 import sys as _sys
 import typing as _tp
@@ -57,10 +58,17 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
         assert hf_dir.is_dir()
         run_command(["git", "pull"], cwd=hf_dir)
     else:
-        model_url = "file://" + str(
+        if _pf.system() == "Windows":
+            url_prefix = ""
+        else:
+            url_prefix = "file://"
+        model_url = url_prefix + str(
             _pl.Path(model_cache) / model_name
         ) if model_cache else "https://huggingface.co/EleutherAI/gpt-j-6b"
-        run_command(["git", "clone", model_url, "--single-branch", model_name],
+        run_command([
+            "git", "clone", model_url, "--single-branch", "--no-local",
+            model_name
+        ],
                     cwd=hf_dir.parent,
                     env={
                         **_os.environ, "GIT_LFS_SKIP_SMUDGE": "1"
@@ -71,11 +79,18 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
     # Download the model file
     model_file_name = "pytorch_model.bin"
     if model_cache:
-        run_command([
-            "rsync", "-av",
-            str(_pl.Path(model_cache) / model_name / model_file_name), "."
-        ],
-                    cwd=hf_dir)
+        if _pf.system() == "Windows":
+            run_command([
+                "cmd", "/c", "copy",
+                str(_pl.Path(model_cache) / model_name / model_file_name), "."
+            ],
+                        cwd=hf_dir)
+        else:
+            run_command([
+                "rsync", "-av",
+                str(_pl.Path(model_cache) / model_name / model_file_name), "."
+            ],
+                        cwd=hf_dir)
     else:
         run_command(["git", "lfs", "pull", "--include", model_file_name],
                     cwd=hf_dir)
@@ -84,30 +99,36 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
 
     engine_dir = models_dir / 'rt_engine' / model_name
 
+    # TODO(nkorobov) add Tensor and Pipeline parallelism to GPT-J
+    tp_size = 1
+    pp_size = 1
+    tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu"
+
     if only_fp8:
         # with ifb, new plugin
         print(
             "\nBuilding fp8-plugin engine using gpt_attention_plugin with inflight-batching, packed"
         )
-        build_engine(
-            hf_dir, engine_dir / 'fp8-plugin/1-gpu',
-            '--use_gpt_attention_plugin=float16', '--enable_fp8',
-            '--fp8_kv_cache', '--use_inflight_batching', '--paged_kv_cache',
-            '--remove_input_padding', '--quantized_fp8_model_path=' + str(
-                _pl.Path(model_cache) / 'fp8-quantized-ammo' /
-                'GPTJ-07142023.pth'))
+        # TODO: use dummy scales atm; to re-enable when data is uploaded to the model cache
+        # quantized_fp8_model_arg = '--quantized_fp8_model_path=' + \
+        #     str(_pl.Path(model_cache) / 'fp8-quantized-ammo' / 'gptj_tp1_rank0.npz')
+        build_engine(hf_dir, engine_dir / 'fp8-plugin' / tp_pp_dir,
+                     '--use_gpt_attention_plugin=float16', '--enable_fp8',
+                     '--fp8_kv_cache', '--use_inflight_batching',
+                     '--paged_kv_cache', '--remove_input_padding')
     else:
         print("\nBuilding fp16-plugin engine")
-        build_engine(hf_dir, engine_dir / 'fp16-plugin/1-gpu',
+        build_engine(hf_dir, engine_dir / 'fp16-plugin' / tp_pp_dir,
                      '--use_gpt_attention_plugin=float16')
 
         print("\nBuilding fp16-plugin-packed engine")
-        build_engine(hf_dir, engine_dir / 'fp16-plugin-packed/1-gpu',
+        build_engine(hf_dir, engine_dir / 'fp16-plugin-packed' / tp_pp_dir,
                      '--use_gpt_attention_plugin=float16',
                      '--remove_input_padding')
 
         print("\nBuilding fp16-plugin-packed-paged engine")
-        build_engine(hf_dir, engine_dir / 'fp16-plugin-packed-paged/1-gpu',
+        build_engine(hf_dir,
+                     engine_dir / 'fp16-plugin-packed-paged' / tp_pp_dir,
                      '--use_gpt_attention_plugin=float16',
                      '--use_inflight_batching')
         print("Done.")

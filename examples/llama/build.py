@@ -22,8 +22,9 @@ import tensorrt as trt
 import torch
 import torch.multiprocessing as mp
 from transformers import LlamaConfig, LlamaForCausalLM
-from weight import (load_from_binary, load_from_groupwise_safetensors_llama,
-                    load_from_hf_llama, load_from_meta_llama)
+from weight import (get_scaling_factors, load_from_awq_llama, load_from_binary,
+                    load_from_gptq_llama, load_from_hf_llama,
+                    load_from_meta_llama)
 
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_trt
@@ -130,7 +131,7 @@ def parse_arguments():
     parser.add_argument('--model_dir', type=str, default=None)
     parser.add_argument('--ft_model_dir', type=str, default=None)
     parser.add_argument('--meta_ckpt_dir', type=str, default=None)
-    parser.add_argument('--quant_safetensors_path', type=str, default=None)
+    parser.add_argument('--quant_ckpt_path', type=str, default=None)
     parser.add_argument('--dtype',
                         type=str,
                         default='float16',
@@ -235,6 +236,10 @@ def parse_arguments():
         'By default, we use a single static scaling factor to scale weights in the int4 range. '
         'per_group chooses at run time, and for each group, a custom scaling factor. '
         'The flag is built for GPTQ/AWQ quantization.')
+    parser.add_argument('--group_size',
+                        type=int,
+                        default=128,
+                        help='Group size used in GPTQ/AWQ quantization.')
     parser.add_argument(
         '--int8_kv_cache',
         default=False,
@@ -272,19 +277,23 @@ def parse_arguments():
         'By default, we use dtype for KV cache. fp8_kv_cache chooses int8 quantization for KV'
     )
     parser.add_argument(
+        '--quantized_fp8_model_path',
+        type=str,
+        default=None,
+        help='Path of a quantized model checkpoint that in .pyz format')
+    parser.add_argument(
         '--use_weight_only',
         default=False,
         action="store_true",
         help='Quantize weights for the various GEMMs to INT4/INT8.'
         'See --weight_only_precision to set the precision')
-
     parser.add_argument(
         '--weight_only_precision',
         const='int8',
         type=str,
         nargs='?',
         default='int8',
-        choices=['int8', 'int4'],
+        choices=['int8', 'int4', 'int4_awq', 'int4_gptq'],
         help=
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
@@ -305,6 +314,23 @@ def parse_arguments():
                         type=int,
                         default=64,
                         help='Number of tokens per block in paged KV cache')
+    parser.add_argument(
+        '--max_num_tokens',
+        type=int,
+        default=None,
+        help='Define the max number of tokens supported by the engine')
+    parser.add_argument(
+        '--strongly_typed',
+        default=False,
+        action="store_true",
+        help=
+        'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
+    )
+    parser.add_argument(
+        '--use_custom_all_reduce',
+        action='store_true',
+        help=
+        'Activates latency-optimized algorithm for all-reduce instead of NCCL.')
 
     args = parser.parse_args()
     tensorrt_llm.logger.set_level(args.log_level)
@@ -312,6 +338,12 @@ def parse_arguments():
     assert not (
         args.use_smooth_quant and args.use_weight_only
     ), "You cannot enable both SmoothQuant and INT8 weight-only together."
+
+    if not args.remove_input_padding:
+        if args.use_gpt_attention_plugin:
+            logger.warning(
+                f"It is recommended to specify --remove_input_padding when using GPT attention plugin"
+            )
 
     if args.use_inflight_batching:
         if not args.use_gpt_attention_plugin:
@@ -362,15 +394,6 @@ def parse_arguments():
         args.rotary_scaling = rotary_scaling
         if rotary_scaling["type"] == "dynamic":
             assert not args.remove_input_padding, "TODO: Not supported yet"
-
-    if args.inter_size is None:
-        # this should not be need when loading a real model
-        # but it is helpful when creating a dummy model without loading any real weights
-        n_embd = int(4 * args.n_embd * 2 / 3)
-        args.inter_size = args.multiple_of * (
-            (int(n_embd * args.ffn_dim_multiplier) + args.multiple_of - 1) //
-            args.multiple_of)
-        logger.info(f"Setting inter_size to {args.inter_size}.")
 
     # Since gpt_attenttion_plugin is the only way to apply RoPE now,
     # force use the plugin for now with the correct data type.
@@ -428,6 +451,18 @@ def parse_arguments():
 
     assert args.pp_size * args.tp_size == args.world_size
 
+    if args.max_num_tokens is not None:
+        assert args.use_inflight_batching and args.enable_context_fmha
+
+    if args.inter_size is None:
+        # this should not be need when loading a real model
+        # but it is helpful when creating a dummy model without loading any real weights
+        n_embd = int(4 * args.n_embd * 2 / 3)
+        args.inter_size = args.multiple_of * (
+            (int(n_embd * args.ffn_dim_multiplier) + args.multiple_of - 1) //
+            args.multiple_of)
+        logger.info(f"Setting inter_size to {args.inter_size}.")
+
     return args
 
 
@@ -445,6 +480,9 @@ def build_rank_engine(builder: Builder,
                       rank=rank,
                       tp_size=args.tp_size,
                       pp_size=args.pp_size)
+
+    assert args.n_layer % args.pp_size == 0, \
+        f"num_layers {args.n_layer} must be a multiple of pipeline parallelism size {args.pp_size}"
 
     # Initialize Module
     tensorrt_llm_llama = tensorrt_llm.models.LLaMAForCausalLM(
@@ -468,35 +506,43 @@ def build_rank_engine(builder: Builder,
     if args.use_smooth_quant:
         tensorrt_llm_llama = smooth_quantize(tensorrt_llm_llama,
                                              args.quant_mode)
-    elif args.use_weight_only and args.weight_only_precision == 'int8':
-        tensorrt_llm_llama = weight_only_quantize(tensorrt_llm_llama,
-                                                  args.quant_mode)
-    elif args.use_weight_only and args.weight_only_precision == 'int4':
-        if args.per_group:
-            tensorrt_llm_llama = weight_only_groupwise_quantize(
-                model=tensorrt_llm_llama,
-                quant_mode=QuantMode.from_description(
-                    quantize_weights=True,
-                    quantize_activations=False,
-                    per_token=False,
-                    per_channel=False,
-                    per_group=True,
-                    use_int4_weights=True),
-                group_size=128,
-                zero=True)
-        else:
+    elif args.use_weight_only:
+        if args.weight_only_precision == 'int8':
             tensorrt_llm_llama = weight_only_quantize(tensorrt_llm_llama,
                                                       args.quant_mode)
+        elif args.weight_only_precision == 'int4':
+            tensorrt_llm_llama = weight_only_quantize(tensorrt_llm_llama,
+                                                      args.quant_mode)
+        elif args.weight_only_precision == 'int4_awq':
+            tensorrt_llm_llama = weight_only_groupwise_quantize(
+                model=tensorrt_llm_llama,
+                quant_mode=args.quant_mode,
+                group_size=args.group_size,
+                zero=False,
+                pre_quant_scale=True,
+                exclude_modules=[])
+        elif args.weight_only_precision == 'int4_gptq':
+            tensorrt_llm_llama = weight_only_groupwise_quantize(
+                model=tensorrt_llm_llama,
+                quant_mode=args.quant_mode,
+                group_size=args.group_size,
+                zero=True,
+                pre_quant_scale=False)
     elif args.enable_fp8 or args.fp8_kv_cache:
-        # Dummy scales only
-        tensorrt_llm_llama = fp8_quantize(tensorrt_llm_llama, args.quant_mode)
-
+        logger.info(f'Loading scaling factors from '
+                    f'{args.quantized_fp8_model_path}')
+        quant_scales = get_scaling_factors(args.quantized_fp8_model_path,
+                                           num_layers=args.n_layer,
+                                           quant_mode=args.quant_mode)
+        tensorrt_llm_llama = fp8_quantize(tensorrt_llm_llama,
+                                          quant_mode=args.quant_mode,
+                                          quant_scales=quant_scales)
     if args.per_group:
-        load_from_groupwise_safetensors_llama(
-            tensorrt_llm_llama=tensorrt_llm_llama,
-            quant_safetensors_path=args.quant_safetensors_path,
-            mapping=mapping,
-            dtype="float16")
+        load_func = load_from_awq_llama if args.weight_only_precision == 'int4_awq' else load_from_gptq_llama
+        load_func(tensorrt_llm_llama=tensorrt_llm_llama,
+                  quant_ckpt_path=args.quant_ckpt_path,
+                  mapping=mapping,
+                  dtype=args.dtype)
     elif args.meta_ckpt_dir is not None:
         load_from_meta_llama(tensorrt_llm_llama, args.meta_ckpt_dir, mapping,
                              args.dtype)
@@ -557,25 +603,23 @@ def build_rank_engine(builder: Builder,
             network.plugin_config.set_weight_only_quant_matmul_plugin(
                 dtype='float16')
     if args.world_size > 1:
-        network.plugin_config.set_nccl_plugin(args.dtype)
+        network.plugin_config.set_nccl_plugin(args.dtype,
+                                              args.use_custom_all_reduce)
     if args.remove_input_padding:
         network.plugin_config.enable_remove_input_padding()
     if args.paged_kv_cache:
-        network.plugin_config.enable_paged_kv_cache()
+        network.plugin_config.enable_paged_kv_cache(args.tokens_per_block)
 
     with net_guard(network):
         # Prepare
         network.set_named_parameters(tensorrt_llm_llama.named_parameters())
 
         # Forward
-        inputs = tensorrt_llm_llama.prepare_inputs(
-            args.max_batch_size,
-            args.max_input_len,
-            args.max_output_len,
-            True,
-            args.max_beam_width,
-            paged_kv_cache=args.paged_kv_cache,
-            tokens_per_block=args.tokens_per_block)
+        inputs = tensorrt_llm_llama.prepare_inputs(args.max_batch_size,
+                                                   args.max_input_len,
+                                                   args.max_output_len, True,
+                                                   args.max_beam_width,
+                                                   args.max_num_tokens)
         tensorrt_llm_llama(*inputs)
         if args.enable_debug_output:
             # mark intermediate nodes' outputs
@@ -614,6 +658,9 @@ def build(rank, args):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
+        # NOTE(nkorobov): when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
+        int8_trt_flag = args.quant_mode.has_act_and_weight_quant() or (
+            not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
         builder_config = builder.create_builder_config(
             name=MODEL_NAME,
             precision=args.dtype,
@@ -631,12 +678,12 @@ def build(rank, args):
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
-            int8=(args.quant_mode.has_act_and_weight_quant()
-                  or args.quant_mode.has_int8_kv_cache()),
+            max_num_tokens=args.max_num_tokens,
+            int8=int8_trt_flag,
             fp8=args.quant_mode.has_fp8_qdq(),
-            opt_level=args.builder_opt,
-            paged_kv_cache=args.paged_kv_cache,
-            tokens_per_block=args.tokens_per_block)
+            quant_mode=args.quant_mode,
+            strongly_typed=args.strongly_typed,
+            opt_level=args.builder_opt)
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.tp_size,
                                       args.pp_size, cur_rank)
         engine = build_rank_engine(builder, builder_config, engine_name,

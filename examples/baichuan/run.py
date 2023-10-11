@@ -86,7 +86,8 @@ def generate(
         config = json.load(f)
     use_gpt_attention_plugin = config['plugin_config']['gpt_attention_plugin']
     remove_input_padding = config['plugin_config']['remove_input_padding']
-    paged_kv_cache = config['builder_config']['paged_kv_cache']
+    paged_kv_cache = config['plugin_config']['paged_kv_cache']
+    tokens_per_block = config['plugin_config']['tokens_per_block']
     dtype = config['builder_config']['precision']
     world_size = config['builder_config']['tensor_parallel']
     assert world_size == tensorrt_llm.mpi_world_size(), \
@@ -113,7 +114,9 @@ def generate(
                                num_layers=num_layers,
                                gpt_attention_plugin=use_gpt_attention_plugin,
                                paged_kv_cache=paged_kv_cache,
-                               remove_input_padding=remove_input_padding)
+                               tokens_per_block=tokens_per_block,
+                               remove_input_padding=remove_input_padding,
+                               dtype=dtype)
 
     repetition_penalty = 1.1
     temperature = 0.3

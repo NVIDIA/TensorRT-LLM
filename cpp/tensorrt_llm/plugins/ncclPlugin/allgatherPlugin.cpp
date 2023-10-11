@@ -161,7 +161,7 @@ int AllgatherPlugin::initialize() noexcept
         MPI_Status status;
         MPICHECK(MPI_Recv(&id, sizeof(id), MPI_BYTE, *mGroup.begin(), 0, MPI_COMM_WORLD, &status));
     }
-    (*commMap)[mGroup] == nullptr;
+    (*commMap)[mGroup] = nullptr;
     NCCLCHECK(ncclCommInitRank(&((*commMap)[mGroup]), mGroup.size(), id, groupRank));
     return 0;
 }

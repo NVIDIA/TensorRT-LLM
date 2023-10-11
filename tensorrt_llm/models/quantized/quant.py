@@ -17,9 +17,10 @@ from typing import Union
 import numpy as np
 
 from ...layers import ColumnLinear, RowLinear
-from ...models import (FalconForCausalLM, GPTJForCausalLM, GPTLMHeadModel,
-                       LLaMAForCausalLM)
+from ...models import (BloomForCausalLM, FalconForCausalLM, GPTJForCausalLM,
+                       GPTLMHeadModel, LLaMAForCausalLM)
 from ...quantization import QuantMode
+from ...quantization.layers import FP8Linear, FP8RowLinear
 
 # isort: off
 from ...quantization.layers import (
@@ -116,13 +117,59 @@ def _smooth_quantize_llama(model, quant_mode):
     return model
 
 
+def _smooth_quantize_bloom(model, quant_mode):
+    assert quant_mode.has_act_and_weight_quant()
+    for layer in model.layers:
+        assert hasattr(layer,
+                       "input_layernorm"), "The layer has no input_layernorm"
+        layer.input_layernorm = SmoothQuantLayerNorm(
+            normalized_shape=layer.hidden_size,
+            dtype=layer.dtype,
+            quant_mode=quant_mode)
+        assert hasattr(layer, "attention"), "The layer has no attention"
+        layer.attention = SmoothQuantAttention(
+            layer.hidden_size,
+            num_attention_heads=layer.num_attention_heads,
+            max_position_embeddings=layer.max_position_embeddings,
+            num_layers=layer.num_layers,
+            dtype=layer.dtype,
+            attention_mask_type=layer.attention_mask_type,
+            position_embedding_type=layer.position_embedding_type,
+            tp_group=layer.tp_group,
+            tp_size=layer.tp_size,
+            tp_rank=layer.tp_rank,
+            quant_mode=quant_mode)
+
+        assert hasattr(layer, "mlp"), "The layer has no mlp"
+        layer.mlp = SmoothQuantMLP(hidden_size=layer.hidden_size,
+                                   ffn_hidden_size=layer.hidden_size * 4,
+                                   hidden_act=layer.hidden_act,
+                                   dtype=layer.dtype,
+                                   tp_group=layer.tp_group,
+                                   tp_size=layer.tp_size,
+                                   quant_mode=quant_mode)
+        assert hasattr(
+            layer,
+            "post_layernorm"), "The layer has no post_rmspost_layernormnorm"
+        layer.post_layernorm = SmoothQuantLayerNorm(
+            normalized_shape=layer.hidden_size,
+            dtype=layer.dtype,
+            quant_mode=quant_mode)
+
+    setattr(model, 'quant_mode', quant_mode)
+    return model
+
+
 def smooth_quantize(model, quant_mode):
-    assert isinstance(model, GPTLMHeadModel) or isinstance(model, LLaMAForCausalLM),\
-            "Only GPTLMHeadModel and LLaMAForCausalLM are well tested now"
+    assert isinstance(model, GPTLMHeadModel) or isinstance(model, LLaMAForCausalLM) \
+            or isinstance(model, BloomForCausalLM),\
+            "Only GPTLMHeadModel, LLaMAForCausalLM and BloomForCausalLM are well tested now"
     if isinstance(model, GPTLMHeadModel):
         return _smooth_quantize_gpt(model, quant_mode)
     elif isinstance(model, LLaMAForCausalLM):
         return _smooth_quantize_llama(model, quant_mode)
+    elif isinstance(model, BloomForCausalLM):
+        return _smooth_quantize_bloom(model, quant_mode)
     else:
         assert False, f"Model {type(model).__name__} is not supported by SmoothQuant yet"
 
@@ -251,36 +298,41 @@ def get_dummy_quant_scales(num_layers):
 
 def _quantize_layer(layer, layer_idx, quant_mode, quant_scales):
     assert hasattr(layer, "mlp"), "The layer has no mlp"
+    fake_fp8_sf_dt = np.float32
 
+    assert isinstance(layer.mlp.fc, (FP8Linear, FP8RowLinear))
+    assert isinstance(layer.mlp.proj, (FP8Linear, FP8RowLinear))
     layer.mlp.fc.activation_scaling_factor.value = np.array(
-        [quant_scales['fc_act'][layer_idx]], dtype=np.float32)
+        [quant_scales['fc_act'][layer_idx]], dtype=fake_fp8_sf_dt)
     layer.mlp.fc.weights_scaling_factor.value = np.array(
-        [quant_scales['fc_weights'][layer_idx]], dtype=np.float32)
+        [quant_scales['fc_weights'][layer_idx]], dtype=fake_fp8_sf_dt)
     layer.mlp.proj.activation_scaling_factor.value = np.array(
-        [quant_scales['proj_act'][layer_idx]], dtype=np.float32)
+        [quant_scales['proj_act'][layer_idx]], dtype=fake_fp8_sf_dt)
     layer.mlp.proj.weights_scaling_factor.value = np.array(
-        [quant_scales['proj_weights'][layer_idx]], dtype=np.float32)
+        [quant_scales['proj_weights'][layer_idx]], dtype=fake_fp8_sf_dt)
     if hasattr(layer.mlp, 'gate'):
+        assert isinstance(layer.mlp.gate, (FP8Linear, FP8RowLinear))
         layer.mlp.gate.activation_scaling_factor.value = np.array(
-            [quant_scales['gate_act'][layer_idx]], dtype=np.float32)
+            [quant_scales['gate_act'][layer_idx]], dtype=fake_fp8_sf_dt)
         layer.mlp.gate.weights_scaling_factor.value = np.array(
-            [quant_scales['gate_weights'][layer_idx]], dtype=np.float32)
+            [quant_scales['gate_weights'][layer_idx]], dtype=fake_fp8_sf_dt)
 
     assert hasattr(layer, "attention"), "The layer has no attention"
-
+    assert isinstance(layer.attention.qkv, (FP8Linear, FP8RowLinear))
+    assert isinstance(layer.attention.dense, (FP8Linear, FP8RowLinear))
     layer.attention.qkv.activation_scaling_factor.value = np.array(
-        [quant_scales['qkv_act'][layer_idx]], dtype=np.float32)
+        [quant_scales['qkv_act'][layer_idx]], dtype=fake_fp8_sf_dt)
     layer.attention.qkv.weights_scaling_factor.value = np.array(
-        [quant_scales['qkv_weights'][layer_idx]], dtype=np.float32)
+        [quant_scales['qkv_weights'][layer_idx]], dtype=fake_fp8_sf_dt)
     if quant_mode.has_fp8_kv_cache():
         layer.attention.kv_orig_quant_scale.value = np.array(
-            [quant_scales['qkv_output'][layer_idx]], dtype=np.float32)
+            [quant_scales['qkv_output'][layer_idx]], dtype=fake_fp8_sf_dt)
         layer.attention.kv_quant_orig_scale.value = np.array(
-            [1.0 / quant_scales['qkv_output'][layer_idx]], dtype=np.float32)
+            [1.0 / quant_scales['qkv_output'][layer_idx]], dtype=fake_fp8_sf_dt)
     layer.attention.dense.activation_scaling_factor.value = np.array(
-        [quant_scales['dense_act'][layer_idx]], dtype=np.float32)
+        [quant_scales['dense_act'][layer_idx]], dtype=fake_fp8_sf_dt)
     layer.attention.dense.weights_scaling_factor.value = np.array(
-        [quant_scales['dense_weights'][layer_idx]], dtype=np.float32)
+        [quant_scales['dense_weights'][layer_idx]], dtype=fake_fp8_sf_dt)
 
     return layer
 
@@ -306,6 +358,8 @@ def _default_fp8_quantize(model: Union[GPTLMHeadModel, LLaMAForCausalLM,
 
     for layer_idx, layer in enumerate(model.layers):
         layer = _quantize_layer(layer, layer_idx, quant_mode, quant_scales)
+
+    # TODO: add lm_head
 
     return model
 

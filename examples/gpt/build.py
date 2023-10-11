@@ -264,6 +264,9 @@ def parse_arguments(args):
         default=False,
         choices=['float16', 'float32', 'bfloat16'],
         help="Activates the lookup plugin which enables embedding sharing.")
+    parser.add_argument('--gather_all_token_logits',
+                        action='store_true',
+                        default=False)
 
     parser.add_argument('--enable_fp8', default=False, action='store_true')
     parser.add_argument(
@@ -281,8 +284,19 @@ def parse_arguments(args):
         help=
         'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
     )
+    parser.add_argument(
+        '--use_custom_all_reduce',
+        action='store_true',
+        help=
+        'Activates latency-optimized algorithm for all-reduce instead of NCCL.')
     args = parser.parse_args(args)
     logger.set_level(args.log_level)
+
+    if not args.remove_input_padding:
+        if args.use_gpt_attention_plugin:
+            logger.warning(
+                f"It is recommended to specify --remove_input_padding when using GPT attention plugin"
+            )
 
     args.bias = not args.no_bias
     if args.inter_size is None:
@@ -462,7 +476,7 @@ def build_rank_engine(builder: Builder,
     if args.remove_input_padding:
         network.plugin_config.enable_remove_input_padding()
     if args.paged_kv_cache:
-        network.plugin_config.enable_paged_kv_cache()
+        network.plugin_config.enable_paged_kv_cache(args.tokens_per_block)
 
     # Quantization plugins.
     if args.use_smooth_quant:
@@ -479,7 +493,8 @@ def build_rank_engine(builder: Builder,
             dtype=args.dtype)
 
     if args.world_size > 1:
-        network.plugin_config.set_nccl_plugin(args.dtype)
+        network.plugin_config.set_nccl_plugin(args.dtype,
+                                              args.use_custom_all_reduce)
 
     if args.use_lookup_plugin:
         # Use the plugin for the embedding parallelism and sharing
@@ -496,9 +511,8 @@ def build_rank_engine(builder: Builder,
             args.max_output_len,
             True,
             args.max_beam_width,
-            paged_kv_cache=args.paged_kv_cache,
-            tokens_per_block=args.tokens_per_block,
-            prompt_embedding_table_size=args.max_prompt_embedding_table_size)
+            prompt_embedding_table_size=args.max_prompt_embedding_table_size,
+            gather_all_token_logits=args.gather_all_token_logits)
         tensorrt_llm_gpt(*inputs)
 
     tensorrt_llm.graph_rewriting.optimize(network)
@@ -526,6 +540,10 @@ def build(rank, args):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
+        # NOTE(nkorobov): when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
+        int8_trt_flag = args.quant_mode.has_act_and_weight_quant() or (
+            args.paged_kv_cache == False
+            and args.quant_mode.has_int8_kv_cache())
         builder_config = builder.create_builder_config(
             name=MODEL_NAME,
             precision=args.dtype,
@@ -534,6 +552,7 @@ def build(rank, args):
             parallel_build=args.parallel_build,
             num_layers=args.n_layer,
             num_heads=args.n_head,
+            num_kv_heads=1 if args.multi_query_mode else args.n_head,
             hidden_size=args.n_embd,
             vocab_size=args.vocab_size,
             hidden_act=args.hidden_act,
@@ -542,14 +561,12 @@ def build(rank, args):
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
-            int8=(args.quant_mode.has_act_and_weight_quant()
-                  or args.quant_mode.has_int8_kv_cache()),
+            int8=int8_trt_flag,
             opt_level=args.builder_opt,
             multi_query_mode=args.multi_query_mode,
-            paged_kv_cache=args.paged_kv_cache,
-            tokens_per_block=args.tokens_per_block,
             strongly_typed=args.strongly_typed,
             use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
+            gather_all_token_logits=args.gather_all_token_logits,
             fp8=args.enable_fp8,
             use_parallel_embedding=args.use_parallel_embedding)
 

@@ -419,7 +419,8 @@ class TestBloom(unittest.TestCase):
             num_kv_heads=bloom_config.n_head,
             hidden_size=bloom_config.hidden_size,
             gpt_attention_plugin=use_gpt_attention_plugin,
-            remove_input_padding=enable_remove_input_padding)
+            remove_input_padding=enable_remove_input_padding,
+            dtype=dtype)
 
         mapping = tensorrt_llm.Mapping(world_size, rank, tp_size=world_size)
         decoder = tensorrt_llm.runtime.GenerationSession(

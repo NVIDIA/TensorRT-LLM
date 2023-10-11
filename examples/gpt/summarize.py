@@ -46,7 +46,7 @@ def TRTGPT(args, config):
     multi_query_mode = config['builder_config']['multi_query_mode']
     num_kv_heads = 1 if multi_query_mode else num_heads
     paged_kv_cache = config['plugin_config']['paged_kv_cache']
-    tokens_per_block = config['builder_config']['tokens_per_block']
+    tokens_per_block = config['plugin_config']['tokens_per_block']
 
     model_config = tensorrt_llm.runtime.ModelConfig(
         vocab_size=vocab_size,
@@ -57,7 +57,8 @@ def TRTGPT(args, config):
         gpt_attention_plugin=use_gpt_attention_plugin,
         remove_input_padding=remove_input_padding,
         tokens_per_block=tokens_per_block,
-        paged_kv_cache=paged_kv_cache)
+        paged_kv_cache=paged_kv_cache,
+        dtype=dtype)
 
     runtime_rank = tensorrt_llm.mpi_rank()
     runtime_mapping = tensorrt_llm.Mapping(world_size,
@@ -216,23 +217,38 @@ def main(args):
         append_str = ' TL;DR: ' if eval_type == 'summarize' else ''
         if batch_size > 1:
             logger.warning(
-                f"HF does not support batch_size > 1 to verify correctness due to padding. Current batch size is {batch_size}"
+                f"HF does not support batch_size > 1 to verify correctness due to padding and attention mask. Current batch size is {batch_size}"
             )
 
         line = copy.copy(datapoint)
+        line_encoded = []
+        input_lengths = []
         for i in range(batch_size):
             line[i] = line[i] + append_str
 
             line[i] = line[i].strip()
             line[i] = line[i].replace(" n't", "n't")
 
-        line_encoded = tokenizer(line,
-                                 return_tensors='pt',
-                                 padding=True,
-                                 truncation=True)["input_ids"].type(torch.int64)
+            input_id = tokenizer.encode(line[i],
+                                        return_tensors='pt',
+                                        add_special_tokens=False).type(
+                                            torch.int64)
+            input_id = input_id[:, -test_token_num:]
 
-        line_encoded = line_encoded[:, -test_token_num:]
-        line_encoded = line_encoded.cuda()
+            line_encoded.append(input_id)
+            input_lengths.append(input_id.shape[-1])
+
+        max_length = max(input_lengths)
+
+        for i in range(batch_size):
+            pad_size = max_length - input_lengths[i]
+
+            pad = torch.ones([1, pad_size]).type(torch.int64) * pad_id
+            line_encoded[i] = torch.cat(
+                [pad, torch.tensor(line_encoded[i], dtype=torch.int64)],
+                axis=-1)
+
+        line_encoded = torch.cat(line_encoded, axis=0).cuda()
 
         with torch.no_grad():
             output = model.generate(line_encoded,

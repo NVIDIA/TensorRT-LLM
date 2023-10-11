@@ -582,6 +582,10 @@ class PositionEmbeddingType(IntEnum):
     def is_rope(self) -> bool:
         return self in [self.rope_gptj, self.rope_gpt_neox]
 
+    @staticmethod
+    def choices() -> List[str]:
+        return [embedding.name for embedding in PositionEmbeddingType]
+
 
 class AttentionMaskType(IntEnum):
     padding = 0
@@ -2650,6 +2654,16 @@ def chunk(tensor: Tensor, chunks: int, dim: int = 0) -> Tensor:
     return split(tensor, dim_value // chunks, dim)
 
 
+class AllReduceStrategy(IntEnum):
+    """
+    Warning: actual definition is in tensorrt_llm/plugins/ncclPlugin/allreducePlugin.h
+             they must be kept in sync
+    """
+    NCCL = 0
+    CUSTOM = 1
+    AUTO = 2
+
+
 def allreduce(tensor: Tensor, group: List[int]) -> Tensor:
     '''
     Add an operation that performs a collective all-reduce.
@@ -2682,17 +2696,29 @@ def allreduce(tensor: Tensor, group: List[int]) -> Tensor:
     '''
     allreduce_plg_creator = trt.get_plugin_registry().get_plugin_creator(
         'AllReduce', '1', TRT_LLM_PLUGIN_NAMESPACE)
+
+    if default_net().plugin_config.use_custom_all_reduce:
+        strategy = AllReduceStrategy.AUTO
+    else:
+        strategy = AllReduceStrategy.NCCL
+
     assert allreduce_plg_creator is not None
 
     group = trt.PluginField("group", np.array(group, dtype=np.int32),
                             trt.PluginFieldType.INT32)
 
     p_dtype = default_net().plugin_config.nccl_plugin
-    pf_type = trt.PluginField(
+    pf_dtype = trt.PluginField(
         "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
         trt.PluginFieldType.INT32)
+    pfc = [group, pf_dtype]
+    if strategy is not None:
+        p_strategy = trt.PluginField("strategy",
+                                     np.array([int(strategy)], np.int8),
+                                     trt.PluginFieldType.INT8)
+        pfc.append(p_strategy)
 
-    pfc = trt.PluginFieldCollection([group, pf_type])
+    pfc = trt.PluginFieldCollection(pfc)
     ar_plug = allreduce_plg_creator.create_plugin("allreduce", pfc)
     plug_inputs = [tensor.trt_tensor]
 
@@ -2934,6 +2960,7 @@ def gpt_attention(
         host_request_types: Tensor,
         num_heads: int,
         num_kv_heads: int,
+        hidden_size_per_head: int,
         q_scaling: float,
         rotary_embedding_dim: int,
         rotary_embedding_base: float = 10000.0,
@@ -3090,11 +3117,16 @@ def gpt_attention(
     ).plugin_config.remove_input_padding
     assert isinstance(max_context_length, int)
 
+    paged_kv_cache_flag = default_net().plugin_config.paged_kv_cache
+
     nheads = trt.PluginField("num_heads", np.array(num_heads, dtype=np.int32),
                              trt.PluginFieldType.INT32)
     num_kv_heads = trt.PluginField("num_kv_heads",
                                    np.array(num_kv_heads, dtype=np.int32),
                                    trt.PluginFieldType.INT32)
+    head_size = trt.PluginField("head_size",
+                                np.array(hidden_size_per_head, dtype=np.int32),
+                                trt.PluginFieldType.INT32)
     unidirectional = trt.PluginField("unidirectional",
                                      np.array(1, dtype=np.int32),
                                      trt.PluginFieldType.INT32)
@@ -3151,8 +3183,11 @@ def gpt_attention(
         np.array(np.int8(kv_cache_quant_mode), dtype=np.int32),
         trt.PluginFieldType.INT32)
     paged_kv_cache = trt.PluginField(
-        "paged_kv_cache",
-        np.array(default_net().plugin_config.paged_kv_cache, dtype=np.int32),
+        "paged_kv_cache", np.array(paged_kv_cache_flag, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+    tokens_per_block = trt.PluginField(
+        "tokens_per_block",
+        np.array(default_net().plugin_config.tokens_per_block, dtype=np.int32),
         trt.PluginFieldType.INT32)
     max_context_length = trt.PluginField("max_context_length",
                                          np.array(max_context_length, np.int32),
@@ -3167,29 +3202,32 @@ def gpt_attention(
                                            trt.PluginFieldType.INT8)
 
     pfc = trt.PluginFieldCollection([
-        nheads, num_kv_heads, unidirectional, q_scaling,
+        nheads, num_kv_heads, head_size, unidirectional, q_scaling,
         position_embedding_type, rotary_embedding_dim, rotary_embedding_base,
         rotary_embedding_scale_type, rotary_embedding_scale,
         rotary_embedding_max_positions, tp_size, tp_rank, context_fmha_type,
         multi_block_mode, kv_cache_quant_mode_field, remove_input_padding,
-        mask_type, paged_kv_cache, pf_type, max_context_length, qkv_bias_enabled
+        mask_type, paged_kv_cache, tokens_per_block, pf_type,
+        max_context_length, qkv_bias_enabled
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
     plug_inputs = [
         tensor,
-        past_key_value,
         sequence_length,
         host_past_key_value_lengths,
         context_lengths,
         cache_indirection,
         host_request_types,
     ]
+
+    if paged_kv_cache_flag:
+        plug_inputs += [kv_cache_block_pointers]
+    else:
+        plug_inputs += [past_key_value]
+
     if kv_cache_quant_mode.has_kv_cache_quant():
         plug_inputs += [kv_orig_quant_scale, kv_quant_orig_scale]
-
-    if default_net().plugin_config.paged_kv_cache:
-        plug_inputs += [kv_cache_block_pointers]
 
     if alibi_slopes is not None:
         plug_inputs += [alibi_slopes]
@@ -3202,18 +3240,25 @@ def gpt_attention(
 
     plug_inputs = [i.trt_tensor for i in plug_inputs]
     layer = default_trtnet().add_plugin_v2(plug_inputs, attn_plug)
-    assert layer.num_outputs == 2, \
-        f"Plugin outputs number mismatch with expected, got {layer.num_outputs}, expected 2"
     output = _create_tensor(layer.get_output(0), layer)
-    present_key_value = _create_tensor(layer.get_output(1), layer)
-    if kv_cache_quant_mode.has_int8_kv_cache():
+    present_key_value = None
+    if not paged_kv_cache_flag:
+        present_key_value = _create_tensor(layer.get_output(1), layer)
+        assert present_key_value is not None
+        expected_outputs = 2
+    else:
+        expected_outputs = 1
+
+    assert layer.num_outputs == expected_outputs, \
+        f"Plugin outputs number mismatch with expected, got {layer.num_outputs}, expected {expected_outputs}"
+
+    if kv_cache_quant_mode.has_int8_kv_cache() and not paged_kv_cache_flag:
         # past key value
-        layer.get_input(1).set_dynamic_range(-127, 127)
+        layer.get_input(6).set_dynamic_range(-127, 127)
         # present key value
         layer.get_output(1).set_dynamic_range(-127, 127)
 
     assert output is not None
-    assert present_key_value is not None
     return output, present_key_value
 
 
@@ -3435,25 +3480,19 @@ def generate_alibi_slopes(num_heads: int,
         end_head_id = start_head_id + rank_heads
 
     closest_power_of_2 = 2**np.floor(np.log2(num_heads))
-    base = np.array(2**(-(2**-(np.log2(closest_power_of_2) - 3))),
-                    dtype=np.float32)
-    powers = np.arange(start_head_id + 1,
-                       np.min([closest_power_of_2, end_head_id]) + 1,
-                       dtype=np.int32)
-    slopes = np.power(base, powers)
-
-    if closest_power_of_2 != num_heads and end_head_id > closest_power_of_2:
-        extra_base = np.array(2**(-(2**-(np.log2(2 * closest_power_of_2) - 3))),
-                              dtype=np.float32)
-        adj_start_id = np.max([closest_power_of_2, start_head_id
-                               ]) - closest_power_of_2
-        adj_end_id = end_head_id - closest_power_of_2
-        extra_powers = np.arange(1 + adj_start_id,
-                                 1 + 2 * adj_end_id,
-                                 2,
-                                 dtype=np.int32)
-        slopes = np.concatenate(
-            [slopes, np.power(extra_base, extra_powers)], axis=0)
+    # FT's implementation
+    # https://github.com/NVIDIA/FasterTransformer/blob/main/src/fastertransformer/kernels/gen_relative_pos_bias.cu#L248
+    slopes_ft = []
+    for h_id in range(start_head_id, end_head_id):
+        if h_id < closest_power_of_2:
+            slopes_ft.append(
+                np.power(2**(-(2**-(np.log2(closest_power_of_2) - 3))),
+                         h_id + 1))
+        else:
+            slopes_ft.append(
+                np.power(2**(-(2**-(np.log2(closest_power_of_2 * 2) - 3))),
+                         (h_id - closest_power_of_2) * 2 + 1))
+    slopes = np.asarray(slopes_ft, dtype=np.float32)
 
     slopes = alibi_scale * slopes
     # Note that for bfloat16, we cannot case numpy tensor from float32 to bfloat16
@@ -3571,6 +3610,9 @@ def gather_last_token_logits(hidden_states: Tensor, last_token_ids: Tensor,
     Returns:
         The tensor created by that sequence of operations.
     '''
+    if last_token_ids is None:
+        return hidden_states
+
     if remove_input_padding:
         hidden_states = index_select(hidden_states, 1,
                                      last_token_ids - 1)  # [1, seq_len, hidden]

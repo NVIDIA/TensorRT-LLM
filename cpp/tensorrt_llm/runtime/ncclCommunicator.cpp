@@ -20,6 +20,7 @@
 
 #include <NvInferRuntime.h>
 #include <mpi.h>
+#include <type_traits>
 
 #if ENABLE_MULTI_DEVICE
 #include <nccl.h>
@@ -67,7 +68,7 @@ void NcclCommunicator::send(
     T* sendbuff, size_t count, int peer, CudaStream const& stream, nvinfer1::ILogger& logger) const
 {
 #if ENABLE_MULTI_DEVICE
-    auto datatype = NcclDataType<T>::value;
+    auto datatype = NcclDataType<std::remove_cv_t<T>>::value;
     TLLM_NCCL_CHECK(ncclSend(sendbuff, count, datatype, peer, mComm, stream.get()), logger);
 #else
     TLLM_THROW("Multi device support is disabled.");
@@ -76,13 +77,15 @@ void NcclCommunicator::send(
 
 template void NcclCommunicator::send(std::uint8_t*, size_t, int, CudaStream const&, nvinfer1::ILogger&) const;
 template void NcclCommunicator::send(std::int32_t*, size_t, int, CudaStream const&, nvinfer1::ILogger&) const;
+template void NcclCommunicator::send(std::uint8_t const*, size_t, int, CudaStream const&, nvinfer1::ILogger&) const;
+template void NcclCommunicator::send(std::int32_t const*, size_t, int, CudaStream const&, nvinfer1::ILogger&) const;
 
 template <typename T>
 void NcclCommunicator::receive(
     T* sendbuff, size_t count, int peer, CudaStream const& stream, nvinfer1::ILogger& logger) const
 {
 #if ENABLE_MULTI_DEVICE
-    auto datatype = NcclDataType<T>::value;
+    auto datatype = NcclDataType<std::remove_cv_t<T>>::value;
     TLLM_NCCL_CHECK(ncclRecv(sendbuff, count, datatype, peer, mComm, stream.get()), logger);
 #else
     TLLM_THROW("Multi device support is disabled.");
@@ -96,40 +99,32 @@ std::shared_ptr<NcclCommunicator> NcclCommunicator::createPipelineComm(
     WorldConfig const& worldConfig, nvinfer1::ILogger& logger)
 {
 #if ENABLE_MULTI_DEVICE
-    auto ppGroup = worldConfig.getPipelineParallelGroup();
-
-    int myRank = worldConfig.getRank();
-    int groupRank = 0;
-    for (auto it = ppGroup.begin(); it != ppGroup.end(); ++it)
-    {
-        if (*it == myRank)
-        {
-            break;
-        }
-        ++groupRank;
-    }
+    int const myRank = worldConfig.getRank();
+    int const worldSize = worldConfig.getSize();
 
     ncclUniqueId id;
-    if (myRank == ppGroup.front())
+    if (myRank == 0)
     {
         ncclGetUniqueId(&id);
-        for (auto it = std::next(std::begin(ppGroup), 1); it != ppGroup.end(); ++it)
+        for (auto peer = 1; peer < worldSize; ++peer)
         {
-            TLLM_MPI_CHECK(MPI_Send(&id, sizeof(id), MPI_BYTE, *it, 0, MPI_COMM_WORLD), logger);
+            TLLM_MPI_CHECK(MPI_Send(&id, sizeof(id), MPI_BYTE, peer, 0, MPI_COMM_WORLD), logger);
         }
     }
     else
     {
+        auto constexpr peer = 0;
         MPI_Status status;
-        TLLM_MPI_CHECK(MPI_Recv(&id, sizeof(id), MPI_BYTE, ppGroup.front(), 0, MPI_COMM_WORLD, &status), logger);
+        TLLM_MPI_CHECK(MPI_Recv(&id, sizeof(id), MPI_BYTE, peer, 0, MPI_COMM_WORLD, &status), logger);
     }
 
     auto pipelineComm = std::make_shared<NcclCommunicator>();
-    TLLM_NCCL_CHECK(ncclCommInitRank(&pipelineComm->mComm, ppGroup.size(), id, groupRank), logger);
+    TLLM_NCCL_CHECK(ncclCommInitRank(&pipelineComm->mComm, worldSize, id, myRank), logger);
 
     return pipelineComm;
 #else
-    TLLM_THROW("Multi device support is disabled.");
+    // Python runtime requires instantiation of a communicator even though it may never be used to enable
+    // pipeline parallel code-path. To enable this, have an empty communicator with uninitialized state.
     return nullptr;
 #endif // ENABLE_MULTI_DEVICE
 }

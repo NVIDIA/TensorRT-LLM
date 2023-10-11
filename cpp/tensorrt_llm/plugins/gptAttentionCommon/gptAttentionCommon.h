@@ -35,14 +35,14 @@ class GPTAttentionPluginCommon : public BasePlugin
 public:
     GPTAttentionPluginCommon() = delete;
 
-    GPTAttentionPluginCommon(int num_heads, int num_kv_heads, int unidirectional, float q_scaling,
+    GPTAttentionPluginCommon(int num_heads, int num_kv_heads, int head_size, int unidirectional, float q_scaling,
         tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
         tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
         bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
-        nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled);
+        int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled);
 
     GPTAttentionPluginCommon(const void* data, size_t length);
 
@@ -93,7 +93,6 @@ protected:
         void* block_pointers;
         int32_t batch_size;
         int32_t num_tokens;
-        int32_t tokens_per_block;
         int32_t max_blocks_per_sequence;
         void* workspace;
     };
@@ -118,7 +117,6 @@ protected:
         void* block_pointers;
         int32_t max_seq_lengths; // cache capacity
         int32_t num_requests;
-        int32_t tokens_per_block;
         int32_t max_blocks_per_sequence;
         int32_t const* cache_indir;
         void* workspace;
@@ -138,24 +136,6 @@ protected:
             || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPT_NEOX;
     }
 
-    inline void update_rotary_params(int32_t kv_seq_len, float& base, float& scale)
-    {
-        base = mRotaryEmbeddingBase;
-        scale = 1.0f / mRotaryEmbeddingScale; // do the division here so that we can avoid it in the kernel
-        if (mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPT_NEOX
-            && mRotaryEmbeddingScaleType == tensorrt_llm::kernels::RotaryScalingType::kDYNAMIC)
-        {
-            if (kv_seq_len > mRotaryEmbeddingMaxPositions)
-            {
-                const float b
-                    = (mRotaryEmbeddingScale * kv_seq_len / mRotaryEmbeddingMaxPositions) - (mRotaryEmbeddingScale - 1);
-                const float p = static_cast<float>(mRotaryEmbeddingDim) / (mRotaryEmbeddingDim - 2);
-                base = mRotaryEmbeddingBase * pow(b, p);
-            }
-            scale = 1.0f; // scale factor is already used in updated base
-        }
-    }
-
 protected:
     const std::string mLayerName;
 
@@ -173,6 +153,7 @@ protected:
     bool mRemovePadding = false;
     tensorrt_llm::kernels::AttentionMaskType mMaskType;
     bool mPagedKVCache = false;
+    int mTokensPerBlock;
     tensorrt_llm::common::QuantMode mKVCacheQuantMode;
     int mTpSize = 1;
     int mTpRank = 0;
@@ -186,13 +167,13 @@ protected:
     bool mFMHAForceFP32Acc = false;
     int mSM = tensorrt_llm::common::getSMVersion();
     int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
-    tensorrt_llm::kernels::MHARunner* mFMHARunner;
+    // The default copy constructor will leave it as nullptr. clone() shall initialize it.
+    UniqPtrWNullCopy<tensorrt_llm::kernels::MHARunner> mFMHARunner;
 
     bool mMultiBlockMode;
     int mDeviceId = -1;
-    tensorrt_llm::common::cublasAlgoMap* mCublasAlgoMap;
-    std::mutex* mCublasWrapperMutex;
-    tensorrt_llm::common::cublasMMWrapper* mCublasWrapper;
+    // The default copy constructor will leave it as nullptr. clone() shall initialize it.
+    UniqPtrWNullCopy<tensorrt_llm::common::CublasMMWrapper> mCublasWrapper;
 };
 
 class GPTAttentionPluginCreatorCommon : public BaseCreator

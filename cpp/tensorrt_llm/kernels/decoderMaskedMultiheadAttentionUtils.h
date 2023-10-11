@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
+#include "tensorrt_llm/kernels/gptKernels.h"
 #include <stdint.h>
 
 #ifdef ENABLE_BF16
@@ -123,6 +124,12 @@ struct num_elems<Float8_>
 };
 
 template <>
+struct num_elems<half>
+{
+    static constexpr int value = 1;
+};
+
+template <>
 struct num_elems<uint32_t>
 {
     static constexpr int value = 2;
@@ -141,6 +148,12 @@ struct num_elems<uint4>
 };
 
 #ifdef ENABLE_BF16
+template <>
+struct num_elems<__nv_bfloat16>
+{
+    static constexpr int value = 1;
+};
+
 template <>
 struct num_elems<__nv_bfloat162>
 {
@@ -198,6 +211,12 @@ struct packed_type<T, 1>
 };
 
 template <>
+struct packed_type<int8_t, 1>
+{
+    using type = int8_t;
+};
+
+template <>
 struct packed_type<int8_t, 2>
 {
     using type = int16_t;
@@ -216,6 +235,13 @@ struct packed_type<int8_t, 8>
 };
 
 #ifdef ENABLE_FP8
+
+template <>
+struct packed_type<__nv_fp8_e4m3, 1>
+{
+    using type = __nv_fp8_e4m3;
+};
+
 template <>
 struct packed_type<__nv_fp8_e4m3, 2>
 {
@@ -1508,6 +1534,32 @@ inline __device__ void zero(T& dst)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+inline __device__ float update_rotary_base(
+    const int kv_seq_len, const int max_positions, const int embed_dim, const float base, const float scale)
+{
+    const float b = (scale * kv_seq_len / max_positions) - (scale - 1);
+    const float p = static_cast<float>(embed_dim) / (embed_dim - 2);
+    return base * pow(b, p);
+}
+
+inline __device__ void update_rotary_base_n_scale(float& base, float& scale, RotaryScalingType const scale_type,
+    const int rot_embed_dim, const int max_positions, const int seq_len)
+{
+    // only update the base and/or scale if needed based on scale_type
+    if (scale_type == RotaryScalingType::kDYNAMIC)
+    {
+        if (seq_len > max_positions)
+        {
+            base = update_rotary_base(seq_len, max_positions, rot_embed_dim, base, scale);
+        }
+        scale = 1.0f; // scale is only used in base for dynamic scaling
+    }
+    else if (scale_type == RotaryScalingType::kLINEAR)
+    {
+        scale = 1.0f / scale;
+    }
+}
+
 inline __device__ float2 rotary_embedding_coefficient(
     const int zid, const int rot_embed_dim, const float base, const float scale, const float t_step)
 {
@@ -2006,6 +2058,14 @@ inline __device__ float2 convert_to_float(uint32_t u)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <>
+inline __device__ float convert_to_float(half u)
+{
+    return static_cast<float>(u);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 #ifdef ENABLE_FP8
 inline __device__ void convert_from_fp8(uint16_t* v, const __nv_fp8_e4m3 u)
 {
@@ -2205,6 +2265,13 @@ inline __device__ void convert_to_fp8(fp8_8_t* v, const bf16_8_t u)
     v[0].y = fp8_2_t(u.y);
     v[0].z = fp8_2_t(u.z);
     v[0].w = fp8_2_t(u.w);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ void convert_to_fp8(__nv_fp8_e4m3* v, const half u)
+{
+    v[0] = __nv_fp8_e4m3(u);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

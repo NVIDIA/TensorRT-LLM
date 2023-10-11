@@ -39,8 +39,8 @@ namespace tensorrt_llm::batch_manager
 class InferenceRequest;
 class TrtGptModel;
 
-/* Responsible for shepherding Triton requests through to completion
-   using TRT Backend. Each Triton backend should have just one of these. */
+/* Responsible for shepherding requests through to completion
+   using TRT Backend. */
 class GptManager
 {
 public:
@@ -50,6 +50,7 @@ public:
     GptManager(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, int32_t maxBeamWidth,
         batch_scheduler::SchedulerPolicy schedulerPolicy, GetInferenceRequestsCallback getInferenceRequestsCb,
         SendResponseCallback sendResponseCb, PollStopSignalCallback pollStopSignalCb = nullptr,
+        ReturnBatchManagerStatsCallback returnBatchManagerStatsCb = nullptr,
         const TrtGptModelOptionalParams& optionalParams = TrtGptModelOptionalParams());
 
     /* Wraps the user-provided callback for requests.
@@ -57,20 +58,21 @@ public:
        Invoked every generation loop iteration. */
     BatchManagerErrorCode_t fetchNewRequests();
 
-    /* Does the following:
-       1. Returns completed requests to Triton
-       2. Deletes entry from activeRequests */
+    /* Returns completed requests.
+       Deletes entry from activeRequests */
     BatchManagerErrorCode_t returnCompletedRequests();
 
     BatchManagerErrorCode_t pollStopSignals();
 
+    BatchManagerErrorCode_t returnBatchManagerStats();
+
+    BatchManagerErrorCode_t waitUntilTerminate();
+
     virtual ~GptManager();
 
 protected:
-    /* Does the following:
-       1. Maps batch manager requests to backend request
-       2. Invokes one step of backend
-       3. Updates state of all requests */
+    /* Invokes one step of backend
+       Updates state of all requests */
     virtual BatchManagerErrorCode_t step(RequestList& activeRequests, std::set<uint64_t>& activeRequestsIds);
 
 private:
@@ -84,6 +86,8 @@ private:
     SizeType mMaxOutputLen;
     SizeType mMaxNumSequences;
 
+    // Iteration counter - incremented every iteration of the generation loop
+    int64_t mIterationCounter;
     // List of live requests
     RequestList mActiveRequests;
     // IDs of live requests
@@ -92,6 +96,7 @@ private:
     GetInferenceRequestsCallback mGetInferenceRequestsCb;
     SendResponseCallback mSendResponseCb;
     PollStopSignalCallback mPollStopSignalCb;
+    ReturnBatchManagerStatsCallback mReturnBatchManagerStatsCb;
 
     std::atomic<bool> destructor_called_;
     void decoupled_execution_loop();

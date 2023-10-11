@@ -88,7 +88,7 @@ public:
 
     bool operator==(const GemmIdCore& id) const
     {
-        return n == id.n && k == id.k && dtype == id.dtype;
+        return isEqual(id);
     }
 
     friend std::ostream& operator<<(std::ostream& out, const GemmIdCore& id)
@@ -96,6 +96,12 @@ public:
         out << "(N;K)=(" << id.n << ";" << id.k << "),";
         out << " type=" << static_cast<int>(id.dtype);
         return out;
+    }
+
+protected:
+    bool isEqual(const GemmIdCore& id) const
+    {
+        return n == id.n && k == id.k && dtype == id.dtype;
     }
 };
 
@@ -108,6 +114,50 @@ struct GemmIdCoreHash
         auto h2 = std::hash<int>{}(id.k);
         auto h3 = std::hash<int>{}(static_cast<int>(id.dtype));
         return h1 ^ h2 ^ h3;
+    }
+};
+
+class GemmIdCublas : public GemmIdCore
+{
+public:
+    bool transA{};
+    bool transB{};
+
+    GemmIdCublas(int n_, int k_, const nvinfer1::DataType& dtype_, bool transA_, bool transB_)
+        : GemmIdCore(n_, k_, dtype_)
+        , transA(transA_)
+        , transB(transB_)
+    {
+    }
+
+    GemmIdCublas() {}
+
+    bool operator==(const GemmIdCublas& id) const
+    {
+        return isEqual(id) && transA == id.transA && transB == id.transB;
+    }
+
+    friend std::ostream& operator<<(std::ostream& out, const GemmIdCublas& id)
+    {
+        out << "(N;K)=(" << id.n << ";" << id.k << "),";
+        out << " type=" << static_cast<int>(id.dtype);
+        out << " transA=" << id.transA;
+        out << " transB=" << id.transB;
+        return out;
+    }
+};
+
+// Hash of GemmIdCublas
+struct GemmIdCublasHash
+{
+    std::size_t operator()(const GemmIdCublas& id) const
+    {
+        auto h1 = std::hash<int>{}(id.n);
+        auto h2 = std::hash<int>{}(id.k);
+        auto h3 = std::hash<int>{}(static_cast<int>(id.dtype));
+        auto h4 = std::hash<bool>{}(id.transA);
+        auto h5 = std::hash<bool>{}(id.transB);
+        return h1 ^ h2 ^ h3 ^ h4 ^ h5;
     }
 };
 
@@ -160,118 +210,15 @@ public:
 
     using MNKProfileMapPtr = std::shared_ptr<MNKProfileMap>;
 
-    GemmPluginProfiler()
-    {
-        mMNKProfileMap = std::make_shared<MNKProfileMap>();
+    GemmPluginProfiler();
 
-        // set SKIP_GEMM_PLUGIN_PROFILINGS=1 to avoid tactics profilings
-        const auto skip = std::getenv("SKIP_GEMM_PLUGIN_PROFILINGS");
-        mSkip = (skip != NULL && std::stoi(skip));
-        if (mSkip)
-        {
-            TLLM_LOG_DEBUG(
-                "SKIP_GEMM_PLUGIN_PROFILINGS is set. Skipping GEMM plugin profilings. It could result in runtime error "
-                "if default tactic is not defined.");
-        }
-    }
+    void serialize(char*& buffer, const GemmIdType& gemmId) const;
 
-    void serialize(char* buffer, const GemmIdType& gemmId) const
-    {
-        auto mProfileMap = mMNKProfileMap->getMProfileMap(gemmId);
+    void deserialize(const char*& data, GemmDims& dims, const GemmIdType& gemmId);
+    size_t getSerializationSize(const GemmIdType& gemmId) const;
 
-        // Save number of profiles for given GEMM ID
-        write(buffer, static_cast<int>(mProfileMap->size()));
-        for (const auto& pair : *mProfileMap)
-        {
-            // Save pair of M to the best GEMM config
-            write(buffer, pair);
-        }
-    }
-
-    void deserialize(const char*& data, GemmDims& dims, const GemmIdType& gemmId)
-    {
-        // NOTE(nkorobov): this mutex is not needed since each thread owns its own map, but will put here for
-        // consistency
-        writer_lock lock(mMNKProfileMap->mutex);
-
-        mDims = dims;
-
-        // GemmId gemmId(dims.n, dims.k);
-        if (!mMNKProfileMap->existsMProfileMap(gemmId))
-        {
-            // Create GEMM with GEMM ID if it does not exist
-            mMNKProfileMap->createMProfileMap(gemmId);
-        }
-        // Populate map with profiles of GEMM ID
-        auto profileMap = mMNKProfileMap->getMProfileMap(gemmId);
-        int selectedMapSize;
-        read(data, selectedMapSize);
-        for (int ii = 0; ii < selectedMapSize; ++ii)
-        {
-            std::pair<int, std::optional<Config>> config;
-            read(data, config);
-            profileMap->insert(config);
-        }
-    }
-
-    size_t getSerializationSize(const GemmIdType& gemmId) const
-    {
-        reader_lock lock(mMNKProfileMap->mutex);
-        return sizeof(int) +                                 // size of the tactics map
-            mMNKProfileMap->getMProfileMap(gemmId)->size()
-            * sizeof(std::pair<int, std::optional<Config>>); // size of the tactics map
-    }
-
-    void profileTactics(const std::vector<Config>& tactics, const RunnerPtr& runner, const nvinfer1::DataType& type,
-        const GemmDims& dims, const GemmIdType& gemmId)
-    {
-        writer_lock lock(mMNKProfileMap->mutex);
-
-        if (!dims.isInitialized())
-        {
-            return;
-        }
-
-        mRunner = runner;
-        mType = type;
-
-        const int maxM = std::min(nextPowerOfTwo(dims.maxM), MAX_PROFILE_M);
-        computeTmpSize(maxM, dims.n, dims.k);
-
-        if (!mMNKProfileMap->existsMProfileMap(gemmId))
-        {
-            // Create map for GEMM ID
-            mMNKProfileMap->createMProfileMap(gemmId);
-        }
-
-        if (mSkip)
-        {
-            return;
-        }
-
-        auto mProfileMap = mMNKProfileMap->getMProfileMap(gemmId);
-
-        auto profileTactics = [&tactics, &mProfileMap, this](int m, int n, int k)
-        {
-            if (mProfileMap->count(m) == 0)
-            {
-                // Profile different tactics for particular m and insert best config to the map
-                mProfileMap->insert({m, this->profileTacticsForProblem(m, n, k, tactics)});
-            }
-        };
-
-        // Allocate tmp data to run GEMMs
-        allocateTmpData();
-        const int startMinMRounded = nextPowerOfTwo(dims.minM);
-        for (int m = startMinMRounded; m < maxM; m *= 2)
-        {
-            profileTactics(m, dims.n, dims.k);
-        }
-
-        profileTactics(maxM, dims.n, dims.k);
-        // Free tmp data
-        freeTmpData();
-    }
+    void profileTactics(
+        const RunnerPtr& runner, const nvinfer1::DataType& type, const GemmDims& dims, const GemmIdType& gemmId);
 
     void setSelectionTactics(const MNKProfileMapPtr& map)
     {
@@ -283,18 +230,12 @@ public:
         mTmpWorkspaceSizeInBytes = bytes;
     }
 
-    std::optional<Config> getBestConfig(int m, const GemmIdType& gemmId) const
+    void setSkip(bool skip)
     {
-        reader_lock lock(mMNKProfileMap->mutex);
-
-        if (mSkip)
-        {
-            return std::nullopt;
-        }
-
-        const int mRounded = std::min(nextPowerOfTwo(m), MAX_PROFILE_M);
-        return mMNKProfileMap->getMProfileMap(gemmId)->at(mRounded);
+        mSkip = mSkip || skip;
     }
+
+    std::optional<Config> getBestConfig(int m, const GemmIdType& gemmId) const;
 
 protected:
     virtual void runTactic(int m, int n, int k, const Config& tactic, char* workspace, const cudaStream_t& stream) = 0;
@@ -306,108 +247,16 @@ protected:
         return true;
     }
 
+    virtual std::vector<Config> getTactics(int m, int n, int k) const = 0;
+
 private:
-    void allocateTmpData()
-    {
-        TLLM_CHECK_WITH_INFO(mTmpWorkspaceSizeInBytes > 0, "tmpWorkspaceSizeInBytes must be larger than 0");
-        const auto status = cudaMalloc(&mWorkspaceTmp, mTmpWorkspaceSizeInBytes);
-        TLLM_CHECK_WITH_INFO(status == cudaSuccess, "Can't allocate tmp workspace for GEMM tactics profiling.");
-    }
+    void allocateTmpData();
 
-    void freeTmpData()
-    {
-        const auto status = cudaFree(mWorkspaceTmp);
-        TLLM_CHECK_WITH_INFO(status == cudaSuccess, "Can't free tmp workspace for GEMM tactics profiling.");
-    }
+    void freeTmpData();
 
-    std::optional<Config> profileTacticsForProblem(int m, int n, int k, const std::vector<Config>& tactics)
-    {
-        TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    std::optional<Config> profileTacticsForProblem(int m, int n, int k, const std::vector<Config>& tactics);
 
-        float bestTime = std::numeric_limits<float>::max();
-        Config bestConfig;
-        bool foundOne = false;
-
-        // Iterate over all tactics for given M, N and K
-        for (int ii = 0; ii < tactics.size(); ++ii)
-        {
-            const Config& candidateConfig = tactics[ii];
-            float time = std::numeric_limits<float>::max();
-            try
-            {
-                if (!checkTactic(m, n, k, candidateConfig))
-                {
-                    continue;
-                }
-                // Profile particualar tactic for given M, N and K
-                time = profileTacticForProblem(m, n, k, candidateConfig);
-                foundOne = true;
-            }
-            catch (const std::exception& e)
-            {
-                std::ostringstream msg;
-                msg << "Cannot profile configuration " << ii << " (for"
-                    << " m=" << m << ", n=" << n << ", k=" << k << "). Skipped";
-                TLLM_LOG_WARNING(msg.str());
-                continue;
-            }
-
-            // Choose the fastest tactic
-            if (time < bestTime)
-            {
-                bestConfig = candidateConfig;
-                bestTime = time;
-            }
-        }
-
-        if (!foundOne)
-        {
-            std::ostringstream msg;
-            msg << "Have not found any valid GEMM config for shape ("
-                << "m=" << m << ", n=" << n << ", k=" << k << "). Will try to use default or fail at runtime";
-            TLLM_LOG_WARNING(msg.str());
-            return std::nullopt;
-        }
-        return {bestConfig};
-    }
-
-    float profileTacticForProblem(int m, int n, int k, const Config& tactic)
-    {
-        constexpr int warmup = 5;
-        constexpr int runs = 10;
-
-        cudaStream_t stream = cudaStreamDefault;
-        // Warmup the execution
-        for (int i = 0; i < warmup; ++i)
-        {
-            runTactic(m, n, k, tactic, mWorkspaceTmp, stream);
-        }
-
-        cudaEvent_t start;
-        cudaEvent_t stop;
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
-        cudaDeviceSynchronize();
-        cudaEventRecord(start, 0);
-
-        // Profile GEMM
-        for (int i = 0; i < runs; ++i)
-        {
-            runTactic(m, n, k, tactic, mWorkspaceTmp, stream);
-        }
-
-        cudaEventRecord(stop, 0);
-
-        cudaEventSynchronize(stop);
-
-        float elapsed;
-        cudaEventElapsedTime(&elapsed, start, stop);
-
-        cudaEventDestroy(start);
-        cudaEventDestroy(stop);
-
-        return elapsed / runs;
-    }
+    float profileTacticForProblem(int m, int n, int k, const Config& tactic);
 
     int nextPowerOfTwo(int v) const
     {
@@ -450,9 +299,10 @@ public:
         mMNKProfileMap = std::make_shared<MNKProfileMap>();
     }
 
-    GemmPluginProfilerPtr createGemmPluginProfiler(bool inference)
+    GemmPluginProfilerPtr createGemmPluginProfiler(bool inference, bool skip = false)
     {
         auto profiler = std::make_shared<GemmPluginProfilerType>();
+        profiler->setSkip(skip);
         // If the profiler is created during the engine build,
         // mMNKProfileMap is shared between different profilers to minimize the time spent on the profiling
         // and do not repeat profiling for the GEMMs of the same shape.

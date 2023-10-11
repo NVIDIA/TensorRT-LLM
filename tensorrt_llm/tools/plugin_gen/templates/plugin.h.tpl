@@ -18,7 +18,6 @@
 #ifndef TRT_[[ plugin_name ]]_PLUGIN_H
 #define TRT_[[ plugin_name ]]_PLUGIN_H
 #include "NvInferPlugin.h"
-#include "tensorrt_llm/plugins/common/plugin.h"
 
 extern "C"
 {
@@ -32,6 +31,9 @@ extern "C"
 #include <set>
 #include <string>
 #include <vector>
+
+[[ plugin_common_header ]]
+
 
 namespace nvinfer1
 {

@@ -42,8 +42,8 @@ class BaseBeamSearchLayer : public BaseLayer
 public:
     using SetupParams = DecodingSetupParams;
 
-    BaseBeamSearchLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-        tc::cublasMMWrapper* cublas_wrapper, tc::IAllocator* allocator, bool is_free_buffer_after_forward);
+    BaseBeamSearchLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream, tc::IAllocator* allocator,
+        bool is_free_buffer_after_forward);
 
     BaseBeamSearchLayer(BaseBeamSearchLayer<T> const& beam_search_layer);
 

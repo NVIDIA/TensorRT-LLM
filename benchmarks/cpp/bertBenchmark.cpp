@@ -78,7 +78,7 @@ void benchmarkBert(std::string const& modelName, std::filesystem::path const& da
 {
     auto const worldConfig = WorldConfig::mpi(*logger);
     auto const enginePath = dataPath / engineFilename(dataPath, worldConfig, modelName);
-    auto engineBlob = loadEngine(enginePath);
+    auto engineBlob = loadEngine(enginePath.string());
 
     auto rt = std::make_shared<TllmRuntime>(engineBlob.data(), engineBlob.size(), *logger);
     rt->addContext(0);
@@ -180,7 +180,8 @@ int main(int argc, char* argv[])
     if (!result.count("engine_dir"))
     {
         std::cout << options.help() << std::endl;
-        throw std::invalid_argument("Please specify engine directory.");
+        TLLM_LOG_ERROR("Please specify engine directory.");
+        return 1;
     }
 
     // Argument: Batch sizes
@@ -226,11 +227,20 @@ int main(int argc, char* argv[])
     }
     else
     {
-        throw std::invalid_argument("Unexpected log level: " + logLevel);
+        TLLM_LOG_ERROR("Unexpected log level: " + logLevel);
+        return 1;
     }
     initTrtLlmPlugins(logger.get());
 
-    benchmarkBert(result["model"].as<std::string>(), result["engine_dir"].as<std::string>(), batchSizes, inLens, logger,
-        result["warm_up"].as<int>(), result["num_runs"].as<int>(), result["duration"].as<int>());
+    try
+    {
+        benchmarkBert(result["model"].as<std::string>(), result["engine_dir"].as<std::string>(), batchSizes, inLens,
+            logger, result["warm_up"].as<int>(), result["num_runs"].as<int>(), result["duration"].as<int>());
+    }
+    catch (const std::exception& e)
+    {
+        TLLM_LOG_ERROR(e.what());
+        return 1;
+    }
     return 0;
 }

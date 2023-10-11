@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tensorrt_llm/runtime/iGptDecoderBatch.h"
@@ -26,6 +27,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -51,19 +53,27 @@ public:
 
     void newBatch(GenerationInput const& inputs, SamplingConfig const& samplingConfig) override;
 
-    //! @brief Run one step for all requests.
-    //! Note that this method will synchronize with the stream associated with the decoder.
-    void forward(decoder_batch::Output& output, decoder_batch::Input const& input) override;
+    TokenPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) override;
 
-    bool forward(decoder::Output& output, decoder::Input const& input) override;
+    void forwardSync(decoder_batch::Token const& e) override;
 
-    //! @brief Gather final results for request `batchIdx`.
-    void postProcessRequest(SizeType batchIdx) const override;
+    void forwardAsync(decoder::Output& output, decoder::Input const& input) override;
+
+    bool isFinishedSync() override;
 
     //! @return [batchSize], indicators of finished requests
     [[nodiscard]] std::vector<bool> getFinished() const override
     {
-        return std::vector<bool>(mFinished.begin(), mFinished.begin() + mActualBatchSize);
+        return {mFinished.begin(), mFinished.begin() + mActualBatchSize};
+    }
+
+    //! @returns [maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token ids without
+    //! padding for request `batchIdx`, on gpu
+    [[nodiscard]] TensorPtr getOutputIds(SizeType batchIdx) const override
+    {
+        auto tensor = ITensor::slice(mJointDecodingOutput->ids, batchIdx, 1);
+        tensor->squeeze(0);
+        return tensor;
     }
 
     //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token
@@ -73,6 +83,15 @@ public:
         return ITensor::slice(mJointDecodingOutput->ids, 0, mActualBatchSize);
     }
 
+    //! Execute postProcessRequest  and returns OutputIds for request `batchIdx`.
+    //! Result will only be available after event returned
+    //! @returns [maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token ids without
+    //! padding for request `batchIdx`, on gpu
+    [[nodiscard]] std::tuple<CudaEvent, TensorPtr> getFinalOutputIds(SizeType batchIdx) const override;
+
+    //! Execute postProcessRequest and returns OutputIds.
+    //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token
+    //! ids without padding, on gpu
     [[nodiscard]] TensorPtr getFinalOutputIds() const override;
 
     //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], contains parent ids collected during beam
@@ -112,15 +131,25 @@ public:
         return std::vector<SizeType>(mNbSteps.begin(), mNbSteps.begin() + mActualBatchSize);
     }
 
+    //! @returns [1], number of finished sequences, in pinned host memory
+    [[nodiscard]] TensorPtr getNbFinished() const override
+    {
+        return mFinishedSum;
+    }
+
+private:
+    //! @brief Gather final results for request `batchIdx`
+    CudaEvent postProcessRequest(SizeType batchIdx) const;
+
 private:
     std::size_t const mVocabSize;
     std::size_t const mVocabSizePadded;
     CudaStreamPtr mStream;
     BufferManager mBufferManager;
-    tensorrt_llm::common::EventPtr mEventStart, mEventStop;
+    TokenPtr mForwardToken;
+    CudaEvent mForwardEvent;
 
     std::vector<CudaStreamPtr> mStreams;
-    std::vector<tensorrt_llm::common::EventPtr> mEvents;
     using GptDecoderPtr = std::unique_ptr<IGptDecoder>;
     std::vector<GptDecoderPtr> mDecoders;
     using DecodingInputPtr = std::unique_ptr<DecodingInput>;
@@ -133,6 +162,7 @@ private:
 
     std::vector<SizeType> mNbSteps;
     std::vector<bool> mFinished;
+    TensorPtr mFinishedSum;
     std::vector<SizeType> mMaxNewTokens;
     std::vector<SizeType> mBeamWidths;
     SizeType mMaxSequenceLength{};

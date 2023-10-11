@@ -154,9 +154,8 @@ void OnlineBeamSearchLayer<T>::allocateBuffer(size_t batch_size, size_t beam_wid
 
 template <typename T>
 OnlineBeamSearchLayer<T>::OnlineBeamSearchLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-    cublasMMWrapper* cublas_wrapper, IAllocator* allocator, bool is_free_buffer_after_forward)
-    : BaseBeamSearchLayer<T>(
-        vocab_size, vocab_size_padded, stream, cublas_wrapper, allocator, is_free_buffer_after_forward)
+    IAllocator* allocator, bool is_free_buffer_after_forward)
+    : BaseBeamSearchLayer<T>(vocab_size, vocab_size_padded, stream, allocator, is_free_buffer_after_forward)
 {
 }
 

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 struct ncclComm;
@@ -32,7 +33,19 @@ public:
     void send(T* sendbuff, size_t count, int peer, CudaStream const& stream, nvinfer1::ILogger& logger) const;
 
     template <typename T>
+    void send(IBuffer const& buf, int peer, CudaStream const& stream, nvinfer1::ILogger& logger) const
+    {
+        send(bufferCast<T>(buf), buf.getSize(), peer, stream, logger);
+    }
+
+    template <typename T>
     void receive(T* sendbuff, size_t count, int peer, CudaStream const& stream, nvinfer1::ILogger& logger) const;
+
+    template <typename T>
+    void receive(IBuffer& buf, int peer, CudaStream const& stream, nvinfer1::ILogger& logger) const
+    {
+        receive(bufferCast<T>(buf), buf.getSize(), peer, stream, logger);
+    }
 
     static std::shared_ptr<NcclCommunicator> createPipelineComm(
         WorldConfig const& worldConfig, nvinfer1::ILogger& logger);

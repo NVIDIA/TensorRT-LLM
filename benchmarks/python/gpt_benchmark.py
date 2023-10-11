@@ -49,6 +49,7 @@ class GPTBenchmark(BaseBenchmark):
                  max_input_len=None,
                  max_output_len=None,
                  max_batch_size=None,
+                 enable_custom_all_reduce=None,
                  **kwargs):
         super().__init__(engine_dir, model_name, dtype, output_dir)
         self.batch_sizes = batch_sizes
@@ -60,6 +61,7 @@ class GPTBenchmark(BaseBenchmark):
         self.fuse_bias = True
 
         self.cuda_graph_mode = kwargs.get('enable_cuda_graph', False)
+        self.enable_custom_all_reduce = enable_custom_all_reduce
 
         if engine_dir is not None:
             # Get build configs from engine directory is done in base class
@@ -85,12 +87,9 @@ class GPTBenchmark(BaseBenchmark):
             plg_dtype = dtype if is_plugin_mode else False
             self.use_gpt_attention_plugin = plg_dtype
             self.use_gemm_plugin = plg_dtype
-            self.use_layernorm_plugin = plg_dtype
-            # Enable RMS Norm plugin for the LLaMA family.
-            if is_plugin_mode and 'llama' in model_name:
-                self.use_rmsnorm_plugin = dtype
-            else:
-                self.use_rmsnorm_plugin = False
+            # Starting TRT9.1 OOTB norm layer sees improvement over plugin norm layer
+            self.use_layernorm_plugin = False
+            self.use_rmsnorm_plugin = False
             self.use_lookup_plugin = plg_dtype
             self.enable_context_fmha = True
             self.quant_mode = QuantMode(0)
@@ -408,7 +407,8 @@ class GPTBenchmark(BaseBenchmark):
             network.plugin_config.set_rmsnorm_quantization_plugin()
 
         if self.world_size > 1:
-            network.plugin_config.set_nccl_plugin(self.dtype)
+            network.plugin_config.set_nccl_plugin(self.dtype,
+                                                  self.enable_custom_all_reduce)
 
         # Use the plugin for the embedding parallism and sharing
         network.plugin_config.set_lookup_plugin(dtype=self.use_lookup_plugin)
@@ -434,8 +434,7 @@ class GPTBenchmark(BaseBenchmark):
         self.build_time = round(end - start, 2)
 
         if self.output_dir is not None:
-            if not os.path.exists(self.output_dir):
-                os.makedirs(self.output_dir)
+            os.makedirs(self.output_dir, exist_ok=True)
             self.serialize_path = os.path.join(self.output_dir,
                                                self.engine_name)
             serialize_engine(engine, self.serialize_path)

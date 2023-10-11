@@ -27,7 +27,7 @@ namespace tensorrt_llm::batch_manager::batch_scheduler
 enum class SchedulerPolicy
 {
     MAX_UTILIZATION,
-    GUARANTEED_COMPLETION,
+    GUARANTEED_NO_EVICT,
 };
 
 class BatchScheduler
@@ -37,43 +37,43 @@ public:
     using SizeType = tensorrt_llm::runtime::SizeType;
     using RequestList = std::list<std::shared_ptr<LlmRequest>>;
 
-    BatchScheduler(int32_t maxNumRequests, int32_t maxInputLen,
-        std::shared_ptr<kv_cache_manager::KVCacheManager> kvCacheManager, SchedulerPolicy schedulerPolicy)
-        : mMaxNumRequests(maxNumRequests)
-        , mMaxInputLen(maxInputLen)
+    BatchScheduler(SizeType targetBatchSize, std::shared_ptr<kv_cache_manager::KVCacheManager> kvCacheManager,
+        SchedulerPolicy schedulerPolicy, bool manyMicroBatches = false)
+        : mTargetBatchSize(targetBatchSize)
         , mKvCacheManager(kvCacheManager)
         , mSchedulerPolicy(schedulerPolicy)
+        , mManyMicroBatches(manyMicroBatches)
     {
     }
 
     /// @brief Takes as input a sorted list of requets and outputs a map of requests
-    ///        to update for this current iteration
-    RequestTable scheduleRequests(const RequestList& requestList);
+    ///        to update for this current iteration, and a map of requests to terminate
+    std::tuple<RequestTable, RequestTable> scheduleRequests(const RequestList& requestList);
 
 private:
     /// @brief Schedule request using the MAX_UTILIZATION policy
-    RequestTable scheduleRequestsMaxUtilization(const RequestList& requestList);
+    std::tuple<RequestTable, RequestTable> scheduleRequestsMaxUtilization(const RequestList& requestList);
 
     /// @brief Try reserving resources to advance this req by one step, using MAX_UTILIZATION policy
     bool trySchedulingRequestMaxUtilization(
         const LlmRequest& req, SizeType& numScheduledRequests, SizeType& numScheduledBlocks);
 
-    /// @brief Schedule request using the GUARANTEED_COMPLETION policy
-    RequestTable scheduleRequestsGuaranteedCompletion(const RequestList& requestList);
+    /// @brief Schedule request using the GUARANTEED_NO_EVICT policy
+    std::tuple<RequestTable, RequestTable> scheduleRequestsGuaranteedNoEvict(const RequestList& requestList);
 
     /// @brief Schedule up to mMaxNumReuests requests
-    RequestTable scheduleMaxNumRequests(const RequestList& requestList);
+    std::tuple<RequestTable, RequestTable> scheduleTargetBatchSize(const RequestList& requestList);
 
-    /// The maximum number of requests to schedule
-    int32_t mMaxNumRequests;
-
-    /// The maximum prompt length
-    int32_t mMaxInputLen;
+    /// The target number of requests to include in a batch
+    SizeType mTargetBatchSize;
 
     std::shared_ptr<kv_cache_manager::KVCacheManager> mKvCacheManager;
 
     /// The scheduling policy to use
     SchedulerPolicy mSchedulerPolicy;
+
+    /// @brief Boolean that indicates if multiple micro batches might be in flight
+    bool mManyMicroBatches;
 };
 
 } // namespace tensorrt_llm::batch_manager::batch_scheduler

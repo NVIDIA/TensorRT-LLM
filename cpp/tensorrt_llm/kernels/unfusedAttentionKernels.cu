@@ -1252,8 +1252,9 @@ struct Vec_t<__nv_bfloat16>
 template <typename T, bool ADD_BIAS, bool USING_CONTEXT_FMHA>
 __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf, T* QKV, const T* __restrict qkv_bias,
     const int* seq_lens, const int* padding_offset, const int batch_size, const int seq_len, const int head_num,
-    const int kv_head_num, const int size_per_head, const int rotary_embedding_dim, const float rotary_embedding_base,
-    const float rotary_embedding_scale, PositionEmbeddingType const position_embedding_type)
+    const int kv_head_num, const int size_per_head, const int rotary_embedding_dim, float rotary_embedding_base,
+    RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, const int rotary_embedding_max_positions,
+    PositionEmbeddingType const position_embedding_type)
 {
     // This kernel add bias to QKV, which has shape [batch_size, seq_len, 3, head_num, size_per_head], and
     // QKV split to 3 split buffer q, k, v and transpose them to [batch_size, head_num, seq_len, size_per_head].
@@ -1323,6 +1324,11 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
 
     Vec_t q, k, v, zero;
     Vec_t q_bias, k_bias, v_bias;
+    if (valid_seq)
+    {
+        mmha::update_rotary_base_n_scale(rotary_embedding_base, rotary_embedding_scale, rotary_scale_type,
+            rotary_embedding_dim, rotary_embedding_max_positions, actual_seq_len);
+    }
 
 #pragma unroll
     for (int i = 0; i < sizeof(Vec_t) / sizeof(uint32_t); i++)
@@ -1456,14 +1462,16 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
 #define FUSED_QKV_BIAS_ROTARY_TRANSPOSE_LAUNCH(T, ADD_BIAS, USING_CONTEXT_FMHA)                                        \
     add_fusedQKV_bias_transpose_kernel<T, ADD_BIAS, USING_CONTEXT_FMHA><<<grid, block, smem_size, stream>>>(q_buf,     \
         k_buf, v_buf, QKV, qkv_bias, seq_lens, padding_offset, batch_size, seq_len, head_num, kv_head_num,             \
-        size_per_head, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, position_embedding_type);
+        size_per_head, rotary_embedding_dim, rotary_embedding_base, rotary_scale_type, rotary_embedding_scale,         \
+        rotary_embedding_max_positions, position_embedding_type);
 
 template <typename T>
 void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, const T* qkv_bias, const int* seq_lens,
     const int* padding_offset, const int batch_size, const int seq_len, const int token_num, const int head_num,
     const int kv_head_num, const int size_per_head, const bool using_context_fmha, const int rotary_embedding_dim,
-    const float rotary_embedding_base, const float rotary_embedding_scale,
-    const PositionEmbeddingType position_embedding_type, const float* scale, const int int8_mode, cudaStream_t stream)
+    const float rotary_embedding_base, const RotaryScalingType rotary_scale_type, const float rotary_embedding_scale,
+    const int rotary_embedding_max_positions, const PositionEmbeddingType position_embedding_type, const float* scale,
+    const int int8_mode, cudaStream_t stream)
 {
     // [bs, seq_len, 3, head, Dh]
     if (rotary_embedding_dim == 0)
@@ -1535,7 +1543,8 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, const 
     template void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, const T* qkv_bias,              \
         const int* seq_lens, const int* padding_offset, const int batch_size, const int seq_len, const int token_num,  \
         const int head_num, const int kv_head_num, const int size_per_head, const bool using_context_fmha,             \
-        const int rotary_embedding_dim, const float rotary_embedding_base, const float rotary_embedding_scale,         \
+        const int rotary_embedding_dim, const float rotary_embedding_base, const RotaryScalingType rotary_scale_type,  \
+        const float rotary_embedding_scale, const int rotary_embedding_max_poisitions,                                 \
         const PositionEmbeddingType position_embedding_type, const float* scale, const int int8_mode,                  \
         cudaStream_t stream)
 INSTANTIATE_ADDFUSEDQKVBIAS_TRANSPOSE(float);

@@ -231,12 +231,11 @@ class Stage:
         # create build directory and compile
         _run_command(['mkdir', '-p', 'build'], cwd=self.config.sub_workspace)
         _run_command(['rm', '-rf', 'build/*'], cwd=self.config.sub_workspace)
+
         _run_command([
             'cmake',
             '..',
-            '-DTRT_LLM_INCLUDE_DIR=' + os.path.join(trt_llm_path, 'cpp'),
-            '-DTRT_LLM_LIB_DIR=' +
-            os.path.join(trt_llm_path, 'tensorrt_llm', 'libs'),
+            '-DTRT_LLM_LIB_DIR=' + os.path.join(trt_llm_path, 'cpp'),
         ],
                      cwd=os.path.join(self.config.sub_workspace, "build"))
         _run_command(['make', '-j'],

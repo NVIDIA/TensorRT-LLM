@@ -55,6 +55,8 @@ protected:
 
     void computeTmpSize(int maxM, int n, int k) override;
 
+    std::vector<Config> getTactics(int m, int n, int k) const override;
+
 private:
     int mWeightTypeId;
 };
@@ -111,7 +113,7 @@ private:
     const std::string mLayerName;
 
     WeightOnlyGemmRunnerPtr m_weightOnlyGemmRunner;
-    int m_workspaceMaxSize;
+    size_t m_workspaceMaxSize;
     nvinfer1::DataType mType;
     int mWeightTypeId;
     int mSM = tensorrt_llm::common::getSMVersion();

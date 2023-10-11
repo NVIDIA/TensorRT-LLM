@@ -170,22 +170,28 @@ class BlocksManager(object):
         to the allocated blocks in memory pool
         """
         assert (beam_width <= self.beam_width)
-        self.pointer_array = torch.zeros(len(self.allocated_blocks),
-                                         beam_width,
-                                         2,
-                                         self.max_blocks_per_seq,
-                                         dtype=torch.int64)
+
+        def create_nested_list(dims):
+            """Recursive function to generate nested list."""
+            if len(dims) == 1:
+                return [0 for _ in range(dims[0])]
+            return [create_nested_list(dims[1:]) for _ in range(dims[0])]
+
+        pointer_array = create_nested_list(
+            (len(self.allocated_blocks), beam_width, 2,
+             self.max_blocks_per_seq))
 
         for owner, beams_blocks in self.allocated_blocks.items():
             for bi in range(beam_width):
                 for block_linear_idx, block in enumerate(beams_blocks[bi]):
                     # K cache pointers
-                    self.pointer_array[owner.get_batch_idx(
+                    pointer_array[owner.get_batch_idx(
                     )][bi][0][block_linear_idx] = block.get_k_ptr(pool_idx)
                     # V cache pointers
-                    self.pointer_array[owner.get_batch_idx(
+                    pointer_array[owner.get_batch_idx(
                     )][bi][1][block_linear_idx] = block.get_v_ptr(pool_idx)
 
+        self.pointer_array = torch.tensor(pointer_array, dtype=torch.int64)
         return self.pointer_array
 
     def get_continous_caches(self, pool_idx: int) -> torch.Tensor:
@@ -300,8 +306,7 @@ class KVCacheManager(object):
         """
         pointer_arrays = []
         for pool in range(self.num_pools):
-            # View to int32 is hack to overcome absence of int64 dtype in TRT
             pointer_arrays.append(
                 self.blocks_manager.get_pointer_array(
-                    pool, beam_width).to('cuda').view(dtype=torch.int32))
+                    pool, beam_width).to('cuda').view(dtype=torch.int64))
         return pointer_arrays

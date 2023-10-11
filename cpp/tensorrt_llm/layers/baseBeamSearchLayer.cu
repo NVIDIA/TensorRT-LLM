@@ -65,8 +65,8 @@ void update_indir_cache_kernelLauncher(int* tgt_indir_cache, const int* src_indi
 
 template <typename T>
 BaseBeamSearchLayer<T>::BaseBeamSearchLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-    cublasMMWrapper* cublas_wrapper, IAllocator* allocator, bool is_free_buffer_after_forward)
-    : BaseLayer(stream, cublas_wrapper, allocator, is_free_buffer_after_forward, nullptr)
+    IAllocator* allocator, bool is_free_buffer_after_forward)
+    : BaseLayer(stream, allocator, is_free_buffer_after_forward, nullptr)
     , vocab_size_(vocab_size)
     , vocab_size_padded_(vocab_size_padded)
 {

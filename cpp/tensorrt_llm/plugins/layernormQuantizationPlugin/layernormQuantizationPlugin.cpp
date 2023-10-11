@@ -169,7 +169,7 @@ int LayernormQuantizationPlugin::enqueue(const nvinfer1::PluginTensorDesc* input
 nvinfer1::DataType LayernormQuantizationPlugin::getOutputDataType(
     int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
 {
-    assert((mDynActScaling && index < 2) || (~mDynActScaling && index == 0));
+    assert((mDynActScaling && index < 2) || (!mDynActScaling && index == 0));
     if (index == 0)
     {
         // Output 0 quantized output of layer norm

@@ -89,14 +89,12 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
     install_wheel = [python_exe, "-m", "pip", "install", "--upgrade", *wheels]
     run_command(install_wheel)
 
-    scripts_dir = _pl.Path("cpp") / "tests" / "resources" / "scripts"
+    resources_dir = _pl.Path("cpp") / "tests" / "resources"
+    scripts_dir = resources_dir / "scripts"
     model_cache = ["--model_cache", model_cache] if model_cache else []
     only_fp8_arg = ["--only_fp8"] if only_fp8 else []
 
-    gpt_env = {
-        **_os.environ, "PYTHONPATH": "examples/gpt",
-        "SKIP_GEMM_PLUGIN_PROFILINGS": "1"
-    }
+    gpt_env = {**_os.environ, "PYTHONPATH": "examples/gpt"}
     build_gpt_engines = [python_exe,
                          str(scripts_dir / "build_gpt_engines.py")
                          ] + model_cache
@@ -114,10 +112,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
         ] + model_cache + only_fp8_arg
         run_command(build_gptj_engines)
 
-        gptj_env = {
-            **_os.environ, "PYTHONPATH": "examples/gptj",
-            "SKIP_GEMM_PLUGIN_PROFILINGS": "1"
-        }
+        gptj_env = {**_os.environ, "PYTHONPATH": "examples/gptj"}
         generate_expected_gptj_output = [
             python_exe,
             str(scripts_dir / "generate_expected_gptj_output.py")
@@ -132,10 +127,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
         ] + model_cache
         run_command(build_llama_engines)
 
-        llama_env = {
-            **_os.environ, "PYTHONPATH": "examples/llama",
-            "SKIP_GEMM_PLUGIN_PROFILINGS": "1"
-        }
+        llama_env = {**_os.environ, "PYTHONPATH": "examples/llama"}
         generate_expected_llama_output = [
             python_exe,
             str(scripts_dir / "generate_expected_llama_output.py")
@@ -146,10 +138,13 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
 
     build_dir = build_dir if build_dir.is_absolute() else root_dir / build_dir
 
-    make_google_tests = ["make", "-j", "google-tests"]
+    make_google_tests = [
+        "cmake", "--build", ".", "--config", "Release", "-j", "--target",
+        "google-tests"
+    ]
     run_command(make_google_tests, cwd=build_dir)
 
-    cpp_env = {**_os.environ, "SKIP_GEMM_PLUGIN_PROFILINGS": "1"}
+    cpp_env = {**_os.environ}
     ctest = ["ctest", "--output-on-failure", "--output-junit", "report.xml"]
     excluded_tests = []
     if skip_gptj:
@@ -164,16 +159,56 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
         ctest.extend(["-E", "|".join(excluded_tests)])
     run_command(ctest, cwd=build_dir, env=cpp_env)
 
-    make_benchmarks = ["make", "-j", "benchmarks"]
-    run_command(make_benchmarks, cwd=build_dir, env=cpp_env)
+    make_benchmarks = [
+        "cmake", "--build", ".", "--config", "Release", "-j", "--target",
+        "benchmarks"
+    ]
+    run_command(make_benchmarks, cwd=build_dir)
+
+    benchmark_exe_dir = build_dir / "benchmarks"
+    gpt_engine_dir = resources_dir / "models" / "rt_engine" / "gpt2"
+    benchmark = [
+        str(benchmark_exe_dir / "gptSessionBenchmark"), "--model", "gpt",
+        "--engine_dir",
+        str(gpt_engine_dir / "fp16-plugin" / "tp1-pp1-gpu"), "--batch_size",
+        "8", "--input_output_len", "10,20", "--duration", "10"
+    ]
+    run_command(benchmark)
+
+    generate_batch_manager_data = [
+        python_exe,
+        str(scripts_dir / "generate_batch_manager_data.py")
+    ]
+    run_command(generate_batch_manager_data)
+
+    benchmark_src_dir = _pl.Path("benchmarks") / "cpp"
+    data_dir = resources_dir / "data"
+    prepare_dataset = [
+        python_exe,
+        str(benchmark_src_dir / "prepare_dataset.py"), "--dataset",
+        str(data_dir / "dummy_cnn.json"), "--max_input_len", "20",
+        "--tokenizer_dir",
+        str(resources_dir / "models" / "gpt2"), "--output",
+        str(data_dir / "prepared_dummy_cnn.json")
+    ]
+    run_command(prepare_dataset)
 
     benchmark = [
-        str(build_dir / "benchmarks" / "gptSessionBenchmark"), "--model", "gpt",
+        str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
         "--engine_dir",
-        "../tests/resources/models/rt_engine/gpt2/fp16-plugin/1-gpu",
-        "--batch_size", "8", "--input_output_len", "10,20", "--duration", "10"
+        str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
+        "--type", "IFB", "--dataset",
+        str(data_dir / "prepared_dummy_cnn.json")
     ]
-    run_command(benchmark, cwd=build_dir, env=cpp_env)
+    run_command(benchmark)
+    benchmark = [
+        str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
+        "--engine_dir",
+        str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
+        "--type", "V1", "--dataset",
+        str(data_dir / "prepared_dummy_cnn.json")
+    ]
+    run_command(benchmark)
 
 
 if __name__ == "__main__":

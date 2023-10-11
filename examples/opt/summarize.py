@@ -51,7 +51,8 @@ def TRTOPT(args, config):
         num_kv_heads=num_heads,
         hidden_size=hidden_size,
         gpt_attention_plugin=use_gpt_attention_plugin,
-        remove_input_padding=remove_input_padding)
+        remove_input_padding=remove_input_padding,
+        dtype=dtype)
 
     runtime_rank = tensorrt_llm.mpi_rank()
     runtime_mapping = tensorrt_llm.Mapping(world_size,
@@ -130,7 +131,9 @@ def main(args):
             line[i] = line[i].replace(" n't", "n't")
 
             input_id = tokenizer.encode(line[i],
-                                        return_tensors='pt').type(torch.int32)
+                                        return_tensors='pt',
+                                        add_special_tokens=False).type(
+                                            torch.int32)
             input_id = input_id[:, -test_token_num:]
 
             line_encoded.append(input_id)

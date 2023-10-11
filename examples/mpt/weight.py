@@ -69,10 +69,10 @@ def parse_ft_config(ini_file):
     prompt_max_vocab_size = gpt_config.getint('gpt',
                                               'prompt_max_vocab_size',
                                               fallback=0)
-    position_embedding_type = gpt_config.get('gpt',
-                                             'position_embedding_type',
-                                             fallback="alibi")
-    return n_embd, n_head, n_layer, n_positions, vocab_size, do_layer_norm_before, hidden_act, rotary_pct, bias, inter_size, multi_query_mode, dtype, prompt_num_tasks, prompt_max_vocab_size, position_embedding_type
+    pos_embedding_type = gpt_config.get('gpt',
+                                        'position_embedding_type',
+                                        fallback='alibi')
+    return n_embd, n_head, n_layer, n_positions, vocab_size, do_layer_norm_before, hidden_act, rotary_pct, bias, inter_size, multi_query_mode, dtype, prompt_num_tasks, prompt_max_vocab_size, pos_embedding_type
 
 
 def check_embedding_share(dir_path):
@@ -88,8 +88,10 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
                  rank=0,
                  tensor_parallel=1,
                  dtype='float32',
+                 use_parallel_embedding=False,
+                 sharding_dim=0,
                  share_embedding_table=False,
-                 parallel_embedding_table=False):
+                 scaling_factors=None):
     tensorrt_llm.logger.info('Loading weights from FT...')
     tik = time.time()
 
@@ -160,6 +162,9 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
     # Int8 KV cache
     use_int8_kv_cache = quant_mode.has_int8_kv_cache()
 
+    #Enable FP8 Gemm
+    enable_fp8_qdq = quant_mode.has_fp8_qdq()
+
     def sq_trick(x):
         return x.view(np.float32) if use_smooth_quant else x
 
@@ -174,21 +179,25 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
 
     vocab_embedding_weight = fromfile(dir_path, 'model.wte.bin',
                                       [vocab_size, n_embd])
-    if not parallel_embedding_table:
+    if not use_parallel_embedding:
         tensorrt_llm_gpt.embedding.vocab_embedding.weight.value = vocab_embedding_weight
     else:
-        if vocab_size % tensor_parallel != 0:
-            # padding
-            vocab_size_padded = pad_vocab_size(
-                tensorrt_llm_gpt.embedding.vocab_embedding.num_embeddings,
-                tensor_parallel)
-            pad_width = vocab_size_padded - vocab_size
-            vocab_embedding_weight = np.pad(vocab_embedding_weight,
-                                            ((0, pad_width), (0, 0)),
-                                            'constant',
-                                            constant_values=0)
+        if sharding_dim == 0:
+            if vocab_size % tensor_parallel != 0:
+                # padding
+                vocab_size_padded = pad_vocab_size(
+                    tensorrt_llm_gpt.embedding.vocab_embedding.num_embeddings,
+                    tensor_parallel)
+                pad_width = vocab_size_padded - vocab_size
+                vocab_embedding_weight = np.pad(vocab_embedding_weight,
+                                                ((0, pad_width), (0, 0)),
+                                                'constant',
+                                                constant_values=0)
         tensorrt_llm_gpt.embedding.vocab_embedding.weight.value = np.ascontiguousarray(
-            split(vocab_embedding_weight, tensor_parallel, rank))
+            split(vocab_embedding_weight,
+                  tensor_parallel,
+                  rank,
+                  dim=sharding_dim))
 
     if do_layer_norm_before:
         tensorrt_llm_gpt.ln_f.bias.value = (fromfile(
@@ -212,7 +221,7 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
                                     constant_values=0)
         tensorrt_llm_gpt.lm_head.weight.value = np.ascontiguousarray(
             split(lm_head_weight, tensor_parallel, rank))
-
+    fake_fp8_sf_dt = np.float32
     for i in range(n_layer):
         c_attn_out_dim = (3 * n_embd //
                           tensor_parallel) if not multi_query_mode else (
@@ -222,8 +231,6 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
             dir_path, 'model.layers.' + str(i) + '.input_layernorm.weight.bin'))
         tensorrt_llm_gpt.layers[i].input_layernorm.bias.value = (fromfile(
             dir_path, 'model.layers.' + str(i) + '.input_layernorm.bias.bin'))
-        # print('DEBUG:', dir_path, 'model.layers.' + str(i) +
-        #     '.attention.query_key_value.weight.' + suffix)
         t = fromfile(
             dir_path, 'model.layers.' + str(i) +
             '.attention.query_key_value.weight.' + suffix,
@@ -261,6 +268,19 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
             if t is not None:
                 dst = tensorrt_llm_gpt.layers[i].attention.qkv.bias
                 dst.value = np.ascontiguousarray(t)
+        if enable_fp8_qdq:
+            tensorrt_llm_gpt.layers[
+                i].attention.qkv.activation_scaling_factor.value = np.array(
+                    [scaling_factors['qkv_act'][i]], dtype=fake_fp8_sf_dt)
+            tensorrt_llm_gpt.layers[
+                i].attention.qkv.weights_scaling_factor.value = np.array(
+                    [scaling_factors['qkv_weights'][i]], dtype=fake_fp8_sf_dt)
+            tensorrt_llm_gpt.layers[
+                i].attention.kv_orig_quant_scale.value = np.array(
+                    [scaling_factors['qkv_output'][i]], dtype=np.float32)
+            tensorrt_llm_gpt.layers[
+                i].attention.kv_quant_orig_scale.value = np.array(
+                    [1.0 / scaling_factors['qkv_output'][i]], dtype=np.float32)
 
         dst = tensorrt_llm_gpt.layers[i].attention.dense.weight
         t = fromfile(
@@ -275,6 +295,9 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
                 tensorrt_llm_gpt.layers[i].attention.dense, dense_scale,
                 dir_path, 'model.layers.' + str(i) + '.attention.dense.',
                 [1, n_embd], quant_per_token_dyn, quant_per_channel)
+            # change it to the real smoother if dense layer is applied smooth quant
+            tensorrt_llm_gpt.layers[i].attention.dense.smoother.value = np.ones(
+                [1, n_embd // tensor_parallel], dtype=np.float32)
         elif use_weight_only:
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
@@ -292,6 +315,13 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
             dst.value = fromfile(
                 dir_path,
                 'model.layers.' + str(i) + '.attention.dense.bias.bin')
+        if enable_fp8_qdq:
+            tensorrt_llm_gpt.layers[
+                i].attention.dense.activation_scaling_factor.value = np.array(
+                    [scaling_factors['dense_act'][i]], dtype=fake_fp8_sf_dt)
+            tensorrt_llm_gpt.layers[
+                i].attention.dense.weights_scaling_factor.value = np.array(
+                    [scaling_factors['dense_weights'][i]], dtype=fake_fp8_sf_dt)
 
         dst = tensorrt_llm_gpt.layers[i].post_layernorm.weight
         dst.value = fromfile(
@@ -343,6 +373,13 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
             tensorrt_llm_gpt.layers[
                 i].mlp.gate.weight.value = np.ascontiguousarray(
                     np.transpose(t, [1, 0]))
+        if enable_fp8_qdq:
+            tensorrt_llm_gpt.layers[
+                i].mlp.fc.activation_scaling_factor.value = np.array(
+                    [scaling_factors['fc_act'][i]], dtype=fake_fp8_sf_dt)
+            tensorrt_llm_gpt.layers[
+                i].mlp.fc.weights_scaling_factor.value = np.array(
+                    [scaling_factors['fc_weights'][i]], dtype=fake_fp8_sf_dt)
 
         t = fromfile(
             dir_path,
@@ -357,6 +394,9 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
                 tensorrt_llm_gpt.layers[i].mlp.proj, proj_scale, dir_path,
                 'model.layers.' + str(i) + '.mlp.dense_4h_to_h.', [1, n_embd],
                 quant_per_token_dyn, quant_per_channel)
+            # change it to the real smoother if proj layer is applied smooth quant
+            tensorrt_llm_gpt.layers[i].mlp.proj.smoother.value = np.ones(
+                [1, inter_size // tensor_parallel], dtype=np.float32)
         elif use_weight_only:
             dst = tensorrt_llm_gpt.layers[i].mlp.proj.weight
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
@@ -382,6 +422,14 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
             tensorrt_llm_gpt.layers[
                 i].attention.kv_orig_quant_scale.value = 1.0 / t
             tensorrt_llm_gpt.layers[i].attention.kv_quant_orig_scale.value = t
+
+        if enable_fp8_qdq:
+            tensorrt_llm_gpt.layers[
+                i].mlp.proj.activation_scaling_factor.value = np.array(
+                    [scaling_factors['proj_act'][i]], dtype=fake_fp8_sf_dt)
+            tensorrt_llm_gpt.layers[
+                i].mlp.proj.weights_scaling_factor.value = np.array(
+                    [scaling_factors['proj_weights'][i]], dtype=fake_fp8_sf_dt)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

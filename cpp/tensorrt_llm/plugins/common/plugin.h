@@ -119,6 +119,29 @@ int8_t* nextWorkspacePtrWithAlignment(int8_t* ptr, uintptr_t previousWorkspaceSi
 
 size_t calculateTotalWorkspaceSize(size_t* workspaces, int count, const uintptr_t alignment = kCudaMemAlign);
 
+// Like std::unique_ptr, but does not prevent generation of default copy constructor when used as class members.
+// The copy constructor produces nullptr. So the plugin default copy constructor will not really copy this, and
+// your clone() implementation is responsible for initializing such data members.
+// With this we can simplify clone() implementation when there are many data menbers including at least one unique_ptr.
+template <typename T, typename Del = std::default_delete<T>>
+class UniqPtrWNullCopy : public std::unique_ptr<T, Del>
+{
+public:
+    using std::unique_ptr<T, Del>::unique_ptr;
+
+    // for compatibility with std::make_unique
+    explicit UniqPtrWNullCopy(std::unique_ptr<T, Del>&& src)
+        : std::unique_ptr<T, Del>::unique_ptr{std::move(src)}
+    {
+    }
+
+    // copy constructor produces nullptr
+    UniqPtrWNullCopy(UniqPtrWNullCopy const&)
+        : std::unique_ptr<T, Del>::unique_ptr{}
+    {
+    }
+};
+
 } // namespace tensorrt_llm::plugins
 
 inline bool isBuilding()
@@ -127,17 +150,6 @@ inline bool isBuilding()
     auto const val = getenv(key);
     return val != nullptr && std::string(val) == "1";
 }
-
-#define MPICHECK(cmd)                                                                                                  \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        int e = cmd;                                                                                                   \
-        if (e != MPI_SUCCESS)                                                                                          \
-        {                                                                                                              \
-            printf("Failed: MPI error %s:%d '%d'\n", __FILE__, __LINE__, e);                                           \
-            exit(EXIT_FAILURE);                                                                                        \
-        }                                                                                                              \
-    } while (0)
 
 #if ENABLE_MULTI_DEVICE
 #define NCCLCHECK(cmd)                                                                                                 \

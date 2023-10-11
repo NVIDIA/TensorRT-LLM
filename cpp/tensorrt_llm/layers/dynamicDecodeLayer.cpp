@@ -37,20 +37,18 @@ void DynamicDecodeLayer<T>::initialize()
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     mOnlineBeamsearchDecode = std::make_unique<OnlineBeamSearchLayer<T>>(
-        vocab_size_, vocab_size_padded_, stream_, cublas_wrapper_, allocator_, is_free_buffer_after_forward_);
+        vocab_size_, vocab_size_padded_, stream_, allocator_, is_free_buffer_after_forward_);
 
-    mTopKDecode = std::make_unique<TopKSamplingLayer<T>>(
-        vocab_size_, vocab_size_padded_, stream_, cublas_wrapper_, allocator_, false);
+    mTopKDecode = std::make_unique<TopKSamplingLayer<T>>(vocab_size_, vocab_size_padded_, stream_, allocator_, false);
 
     mTopPDecode = std::make_unique<TopPSamplingLayer<T>>(
-        vocab_size_, vocab_size_padded_, stream_, cublas_wrapper_, allocator_, false, cuda_device_prop_);
+        vocab_size_, vocab_size_padded_, stream_, allocator_, false, cuda_device_prop_);
 }
 
 template <typename T>
 DynamicDecodeLayer<T>::DynamicDecodeLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-    cublasMMWrapper* cublas_wrapper, IAllocator* allocator, bool is_free_buffer_after_forward,
-    cudaDeviceProp* cuda_device_prop)
-    : BaseLayer(stream, cublas_wrapper, allocator, is_free_buffer_after_forward)
+    IAllocator* allocator, bool is_free_buffer_after_forward, cudaDeviceProp* cuda_device_prop)
+    : BaseLayer(stream, allocator, is_free_buffer_after_forward)
     , vocab_size_(vocab_size)
     , vocab_size_padded_(vocab_size_padded)
     , cuda_device_prop_(cuda_device_prop)

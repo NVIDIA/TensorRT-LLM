@@ -101,9 +101,6 @@ if(CMAKE_CUDA_COMPILER)
     else()
       message(FATAL_ERROR "Failed to determine CUDA version")
     endif()
-
-    # Export shared libs as both `.lib` and `.dll` to avoid linking errors.
-    set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
   endif()
 else()
   message(FATAL_ERROR "No CUDA compiler found")
@@ -166,7 +163,8 @@ get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_SOURCE_DIR} PATH)
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
 include_directories(
   ${CUDA_INCLUDE_DIRS} ${CUDNN_ROOT_DIR}/include ${NCCL_INCLUDE_DIR}
-  ${3RDPARTY_DIR}/cutlass/include ${3RDPARTY_DIR}/NVTX/include)
+  ${3RDPARTY_DIR}/cutlass/include ${3RDPARTY_DIR}/NVTX/include
+  ${3RDPARTY_DIR}/json/include)
 
 # TRT dependencies
 set_ifndef(TRT_LIB_DIR ${CMAKE_BINARY_DIR})
@@ -195,6 +193,7 @@ endif()
 # it's not called before "CMAKE_CXX_FLAGS" is set, it breaks on Windows for some
 # reason, so we just call it here as a workaround.
 find_package(MPI REQUIRED)
+add_definitions("-DOMPI_SKIP_MPICXX")
 
 # C++17
 set(CMAKE_CXX_STANDARD 17)
@@ -214,6 +213,12 @@ else()
   set(CMAKE_CXX_FLAGS "/wd4996 ${CMAKE_CXX_FLAGS}")
 endif()
 
+# A Windows header file defines max() and min() macros, which break our macro
+# declarations.
+if(WIN32)
+  set(CMAKE_CXX_FLAGS "/DNOMINMAX ${CMAKE_CXX_FLAGS}")
+endif()
+
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
 
@@ -226,10 +231,12 @@ if(BUILD_PYT)
   foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
     if(CUDA_ARCH MATCHES "^([0-9])([0-9])(-real)*$")
       set(TORCH_ARCH "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}")
+    elseif(CUDA_ARCH STREQUAL "native")
+      set(TORCH_ARCH "Auto")
     else()
       message(FATAL_ERROR "${CUDA_ARCH} is not supported")
     endif()
-    if(NOT CUDA_ARCH MATCHES "-real$")
+    if(NOT CUDA_ARCH MATCHES "-real$" AND NOT CUDA_ARCH STREQUAL "native")
       string(APPEND TORCH_ARCH "+PTX")
     endif()
     list(APPEND TORCH_CUDA_ARCH_LIST ${TORCH_ARCH})
@@ -303,8 +310,9 @@ message(
     "Building for TensorRT version: ${TRT_VERSION}, library version: ${TRT_SOVERSION}"
 )
 
-list(APPEND COMMON_HEADER_DIRS ${TORCH_INCLUDE_DIRS} ${TRT_INCLUDE_DIR})
+list(APPEND COMMON_HEADER_DIRS)
 include_directories(${COMMON_HEADER_DIRS})
+include_directories(SYSTEM ${TORCH_INCLUDE_DIRS} ${TRT_INCLUDE_DIR})
 
 add_subdirectory(tensorrt_llm)
 

@@ -82,11 +82,11 @@ void BufferManager::setZero(IBuffer& buffer) const
     }
 }
 
-void BufferManager::copy(void const* src, IBuffer& dst) const
+void BufferManager::copy(void const* src, IBuffer& dst, MemoryType srcType) const
 {
     if (dst.getSizeInBytes() > 0)
     {
-        if (IBuffer::memoryType(src) != MemoryType::kGPU && dst.getMemoryType() != MemoryType::kGPU)
+        if (srcType != MemoryType::kGPU && dst.getMemoryType() != MemoryType::kGPU)
         {
             std::memcpy(dst.data(), src, dst.getSizeInBytes());
         }
@@ -97,11 +97,11 @@ void BufferManager::copy(void const* src, IBuffer& dst) const
     }
 }
 
-void BufferManager::copy(IBuffer const& src, void* dst) const
+void BufferManager::copy(IBuffer const& src, void* dst, MemoryType dstType) const
 {
     if (src.getSizeInBytes() > 0)
     {
-        if (IBuffer::memoryType(dst) != MemoryType::kGPU && src.getMemoryType() != MemoryType::kGPU)
+        if (src.getMemoryType() != MemoryType::kGPU && dstType != MemoryType::kGPU)
         {
             std::memcpy(dst, src.data(), src.getSizeInBytes());
         }
@@ -117,7 +117,7 @@ void BufferManager::copy(IBuffer const& src, IBuffer& dst) const
     TLLM_CHECK_WITH_INFO(src.getDataType() == dst.getDataType(), "Incompatible data types");
     TLLM_CHECK_WITH_INFO(src.getSizeInBytes() == dst.getSizeInBytes(),
         tc::fmtstr("Incompatible buffer sizes: %lu != %lu", src.getSizeInBytes(), dst.getSizeInBytes()));
-    copy(src, dst.data());
+    copy(src, dst.data(), dst.getMemoryType());
 }
 
 BufferManager::IBufferPtr BufferManager::allocate(

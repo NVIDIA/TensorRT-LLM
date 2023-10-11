@@ -41,7 +41,8 @@ public:
     // general
     TensorPtr contextLengthsHost;
     TensorPtr contextLengthsDevice;
-    TensorPtr inputOffsets; // helper for packed input
+    TensorPtr inputOffsets;             // helper for packed input
+    TensorPtr kvCacheBlockPointersHost; // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
 
     // engine
     TensorPtr logits;
@@ -54,14 +55,14 @@ public:
 
     std::vector<TensorPtr> presentKeysVals;
     std::vector<TensorPtr> presentKeysValsAlt; // without attention plugin
-    TensorPtr kvCacheBlockPointers;            // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
+    TensorPtr kvCacheBlockPointersDevice;      // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
 
     // beam search (shared between engine and decoder)
     TensorPtr cacheIndirectionDecoderInput;
     TensorPtr cacheIndirectionDecoderOutput;
 
     // decoder
-    TensorPtr shouldStop;
+    TensorPtr nbFinished;
 
     // pipeline parallelism
     TensorPtr hiddenStates;
@@ -75,12 +76,13 @@ public:
         GenerationConfig() = default;
 
         GenerationConfig(SizeType batchSize, SizeType beamWidth, SizeType maxInputLength, SizeType maxNewTokens,
-            SizeType maxSeqLength)
+            SizeType maxSeqLength, SizeType inputLengthSum = SizeType(0))
             : batchSize{batchSize}
             , beamWidth{beamWidth}
             , maxInputLength{maxInputLength}
             , maxNewTokens{maxNewTokens}
             , maxSeqLength{maxSeqLength}
+            , inputLengthSum{inputLengthSum}
         {
         }
 
@@ -89,16 +91,19 @@ public:
         SizeType maxInputLength{};
         SizeType maxNewTokens{};
         SizeType maxSeqLength{};
+        SizeType inputLengthSum{}; // Initialized only if inputPacked is set to true in fromInput.
 
-        static GenerationConfig fromInput(ITensor::SharedPtr const& inputIds, ITensor::SharedPtr const& inputLengths,
-            bool inputPacked, SizeType beamWidth, SizeType maxSequenceLength,
-            std::optional<SizeType> const& maxNewTokensOpt, BufferManager& manager);
+        static GenerationConfig fromInput(ITensor const& inputIds, ITensor const& inputLengths, bool inputPacked,
+            SizeType beamWidth, SizeType maxSequenceLength, std::optional<SizeType> const& maxNewTokensOpt,
+            BufferManager& manager);
     };
 
 public:
     void clear();
 
     void create(TllmRuntime& runtime, GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
+
+    void initContextLengths(TensorPtr const& inputLengths, BufferManager& manager);
 
     void reshape(
         GenerationConfig const& generationConfig, GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
@@ -107,16 +112,19 @@ public:
         GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void prepareContextStep(TensorPtr const& inputIds, TokenIdType padId, BufferManager& manager,
-        KvCacheManager& kvCacheManager, GenerationConfig const& generationConfig, GptModelConfig const& modelConfig,
-        WorldConfig const& worldConfig);
+        KvCacheManager const* kvCacheManager, GenerationConfig const& generationConfig,
+        GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
     TensorPtr prepareNextStep(SizeType step, TensorPtr const& outputIds, BufferManager& manager,
-        KvCacheManager& kvCacheManager, GenerationConfig const& generationConfig, GptModelConfig const& modelConfig,
+        KvCacheManager* kvCacheManager, GenerationConfig const& generationConfig, GptModelConfig const& modelConfig,
         WorldConfig const& worldConfig);
 
     void getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outputBuffers, SizeType step, TensorPtr const& inputIds,
-        KvCacheManager& kvCacheManager, GptModelConfig const& modelConfig, WorldConfig const& worldConfig) const;
+        GptModelConfig const& modelConfig, WorldConfig const& worldConfig) const;
 
 private:
+    void gatherLastTokenLogits(BufferManager& manager, GenerationConfig const& generationConfig,
+        GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
+
     // Some tensors are properly tiled, some are just reshaped.
     void tile(BufferManager& manager, GenerationConfig const& generationConfig, GptModelConfig const& modelConfig,
         WorldConfig const& worldConfig);

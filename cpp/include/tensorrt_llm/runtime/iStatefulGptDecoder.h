@@ -80,20 +80,30 @@ public:
     //! @brief Initialize the decoder with new batch of inputs.
     virtual void newBatch(GenerationInput const& inputs, SamplingConfig const& samplingConfig) = 0;
 
+    //! @brief Run one step for all requests without blocking the host thread.
+    virtual void forwardAsync(decoder::Output& output, decoder::Input const& input) = 0;
+
+    //! @brief Wait for the last call to `forwardAsync` to complete and return whether all sequences have finished.
+    virtual bool isFinishedSync() = 0;
+
     //! @brief Run one step for all requests.
-    virtual bool forward(decoder::Output& output, decoder::Input const& input) = 0;
+    virtual bool forward(decoder::Output& output, decoder::Input const& input)
+    {
+        forwardAsync(output, input);
+        return isFinishedSync();
+    }
 
     //! @brief Gather final results for all requests.
     virtual TensorPtr getFinalOutputIds() const = 0;
-
-    // TODO: do we need that?
-    virtual std::vector<bool> getFinished() const = 0;
 
     //! @returns [batchSize, beamWidth, maxSequenceLength], all token ids, on gpu
     virtual TensorPtr getOutputIds() const = 0;
 
     //! @returns [batchSize, beamWidth], latests generated tokens (per beam), on gpu
     virtual TensorPtr getNewTokens() const = 0;
+
+    //! @returns [1], number of finished sequences, in pinned host memory
+    virtual TensorPtr getNbFinished() const = 0;
 
 protected:
     IStatefulGptDecoder() = default;

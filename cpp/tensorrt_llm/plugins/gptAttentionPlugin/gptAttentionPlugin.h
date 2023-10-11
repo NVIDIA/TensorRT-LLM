@@ -38,40 +38,40 @@ namespace tensorrt_llm::plugins
 // Context sequences have to appear first, generation sequences after
 
 // inputs
-//     input_tensor [batch_size, seq_len, local_hidden_size + 2 * local_num_kv_heads * head_size]
-//                  [1, num_tokens, local_hidden_size + 2 * local_num_kv_heads * head_size] when
-//                  enable_remove_input_padding
-//     past_key_value_pool [blocks, 2, local_num_kv_heads, tokens_per_block, head_size] if paged_kv_attention
-//                      or [batch_size, 2, local_num_kv_heads, max_seq_len, head_size]
-//     sequence_length [batch_size]
-//     host_past_key_value_lengths [batch_size] (int32)
-//     context_lengths [batch_size]
-//     cache_indir [num_gen_requests, beam_width, memory_max_len] (required in beamsearch)
-//     host_request_types [batch_size] int32. 0: context; 1: generation: 2: none. When not in inflight-batching mode,
-//                  all elements must be identical.
-//     kv_cache_quantization_scale [1] (optional)
-//     kv_cache_dequantization_scale [1] (optional)
-//     block_pointers [batch_size, 2, max_blocks_per_seq] (optional if paged kv cache)
-//     alibi_slopes [num_heads] (optional for ALiBi position embedding)
-//     host_context_lengths [batch_size] int32. (optional, required when remove_input_padding is true)
-//     qkv_bias (optional) [local_hidden_size * 3]
+//     0.  input_tensor [batch_size, seq_len, local_hidden_size + 2 * local_num_kv_heads * head_size] or
+//                      [1, num_tokens, local_hidden_size + 2 * local_num_kv_heads * head_size] when
+//                      enable_remove_input_padding
+//     1.  sequence_length [batch_size]
+//     2.  host_past_key_value_lengths [batch_size] (int32)
+//     3.  context_lengths [batch_size]
+//     4.  cache_indir [num_gen_requests, beam_width, memory_max_len] (required in beamsearch)
+//     5.  host_request_types [batch_size] int32. 0: context; 1: generation: 2: none. When not in inflight-batching
+//     mode,
+//                      all elements must be identical.
+//     6.  past_key_value_pool [batch_size, 2, local_num_kv_heads, max_seq_len, head_size] or
+//         block_pointers [batch_size, 2, max_blocks_per_seq] if paged kv cache
+//     7.  kv_cache_quantization_scale [1] (optional)
+//     8.  kv_cache_dequantization_scale [1] (optional)
+//     9.  alibi_slopes [num_heads] (optional for ALiBi position embedding)
+//     10. host_context_lengths [batch_size] int32. (optional, required when remove_input_padding is true)
+//     11. qkv_bias (optional) [local_hidden_size * 3]
 //
 // outputs
 //     output_tensor [batch_size, seq_len, local_hidden_size]
-//     present_key_value_pool [blocks, 2, local_num_kv_heads, tokens_per_block, head_size] if paged_kv_attention
-//                         or [batch_size, 2, local_num_kv_heads, max_seq_len, head_size]
+//     present_key_value_pool (optional if not paged kv cache) [batch_size, 2, local_num_kv_heads, max_seq_len,
+//     head_size]
 
 class GPTAttentionPlugin : public GPTAttentionPluginCommon
 {
 public:
-    GPTAttentionPlugin(int num_heads, int num_kv_heads, int unidirectional, float q_scaling,
+    GPTAttentionPlugin(int num_heads, int num_kv_heads, int head_size, int unidirectional, float q_scaling,
         tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
         tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
         bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
-        nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled);
+        int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled);
 
     GPTAttentionPlugin(const void* data, size_t length);
 
@@ -134,33 +134,40 @@ private:
         return 0;
     }
 
-    IndexType getPastKeyValueIdx() const
+    IndexType getSequenceLengthIdx() const
     {
         return 1;
     }
 
-    IndexType getSequenceLengthIdx() const
+    IndexType getHostPastKeyValueLengthsIdx() const
     {
         return 2;
     }
 
-    IndexType getHostPastKeyValueLengthsIdx() const
+    IndexType getContextLengthsIdx() const
     {
         return 3;
     }
 
-    IndexType getContextLengthsIdx() const
+    IndexType getCacheIndirIdx() const
     {
         return 4;
     }
 
-    IndexType getCacheIndirIdx() const
+    IndexType getRequestTypesIdx() const
     {
         return 5;
     }
 
-    IndexType getRequestTypesIdx() const
+    IndexType getKVCacheBlockPointersIdx() const
     {
+        // NOTE We either provide this tensor when mPagedKVCache is true or PastKeyValue otherwise
+        return 6;
+    }
+
+    IndexType getPastKeyValueIdx() const
+    {
+        // NOTE We either provide this tensor when mPagedKVCache is false or KVCacheBlockPointers otherwise
         return 6;
     }
 
@@ -174,27 +181,21 @@ private:
         return 8;
     }
 
-    IndexType getKVCacheBlockPointersIdx() const
-    {
-        return mKVCacheQuantMode.hasKvCacheQuant() ? 9 : 7;
-    }
-
     IndexType getAlibiSlopesIdx() const
     {
-        return (mKVCacheQuantMode.hasKvCacheQuant() ? 9 : 7) + (mPagedKVCache ? 1 : 0);
+        return (mKVCacheQuantMode.hasKvCacheQuant() ? 9 : 7);
     }
 
     IndexType getHostContextLengthsIdx() const
     {
         TLLM_CHECK(mRemovePadding);
-        return (mKVCacheQuantMode.hasKvCacheQuant() ? 9 : 7) + (mPagedKVCache ? 1 : 0) + (isALiBi() ? 1 : 0);
+        return (mKVCacheQuantMode.hasKvCacheQuant() ? 9 : 7) + (isALiBi() ? 1 : 0);
     }
 
     IndexType getQKVBiasTensorIdx() const
     {
         TLLM_CHECK(mQKVBiasEnabled);
-        return (mKVCacheQuantMode.hasInt8KvCache() ? 9 : 7) + (mPagedKVCache ? 1 : 0) + (isALiBi() ? 1 : 0)
-            + (mRemovePadding ? 1 : 0);
+        return (mKVCacheQuantMode.hasKvCacheQuant() ? 9 : 7) + (isALiBi() ? 1 : 0) + (mRemovePadding ? 1 : 0);
     }
 };
 

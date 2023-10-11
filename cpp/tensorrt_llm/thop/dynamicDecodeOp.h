@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 namespace th = torch;
@@ -101,6 +102,7 @@ private:
     cudaDeviceProp prop_;
 
     tensorrt_llm::layers::DynamicDecodeLayer<T>* dynamic_decode_layer_;
+    tensorrt_llm::runtime::ITensor::SharedPtr finished_sum_;
 };
 
 class DynamicDecodeOp : public th::jit::CustomClassHolder
