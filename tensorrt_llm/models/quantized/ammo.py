@@ -28,10 +28,10 @@ from ...logger import logger
 
 
 def _quantize_model(model: torch.nn.Module,
-                    qformat: Literal['fp8', 'int8_sq'],
+                    qformat: Literal['fp8', 'int8_sq', 'int4_awq'],
                     calib_dataloader: DataLoader,
                     quant_cfg_dict: Optional[Dict] = None) -> torch.nn.Module:
-    assert qformat in ['fp8', 'int8_sq'], \
+    assert qformat in ['fp8', 'int8_sq', 'int4_awq'], \
         f'Got unsupported AMMO quantization format, {qformat} '
     if qformat == "fp8":
         quant_cfg = atq.FP8_DEFAULT_CFG
@@ -40,6 +40,8 @@ def _quantize_model(model: torch.nn.Module,
                 quant_cfg['quant_cfg'][name] = cfg
     elif qformat == "int8_sq":
         quant_cfg = atq.INT8_SMOOTHQUANT_CFG
+    elif qformat == "int4_awq":
+        quant_cfg = atq.INT4_AWQ_CFG
     else:
         raise ValueError(f"Unsupported quantization format: {qformat}")
 
@@ -56,7 +58,7 @@ def _quantize_model(model: torch.nn.Module,
 
 
 def quantize_and_export(model: torch.nn.Module,
-                        qformat: Literal['fp8', 'int8_sq'],
+                        qformat: Literal['fp8', 'int8_sq', 'int4_awq'],
                         calib_dataloader: DataLoader,
                         export_path: Optional[Union[str, Path]] = None,
                         tensor_parallel_size: int = 1) -> torch.nn.Module:
@@ -80,13 +82,16 @@ def quantize_and_export(model: torch.nn.Module,
 
     if export_path:
         with torch.inference_mode():
-            export_model_config(
-                model,
-                model_type,
-                torch.float16,
-                quantization=qformat,
-                export_dir=export_path,
-                inference_tensor_parallel=tensor_parallel_size,
-            )
+            if qformat == "int4_awq":
+                torch.save(model.state_dict(), export_path)
+            else:
+                export_model_config(
+                    model,
+                    model_type,
+                    torch.float16,
+                    quantization=qformat,
+                    export_dir=export_path,
+                    inference_tensor_parallel=tensor_parallel_size,
+                )
         logger.info(f"Quantized model exported to :{export_path}")
     return model

@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -83,9 +84,10 @@ public:
     }
 
     //! Execute postProcessRequest  and returns OutputIds for request `batchIdx`.
+    //! Result will only be available after event returned
     //! @returns [maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token ids without
     //! padding for request `batchIdx`, on gpu
-    [[nodiscard]] TensorPtr getFinalOutputIds(SizeType batchIdx) const override;
+    [[nodiscard]] std::tuple<CudaEvent, TensorPtr> getFinalOutputIds(SizeType batchIdx) const override;
 
     //! Execute postProcessRequest and returns OutputIds.
     //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token
@@ -136,8 +138,8 @@ public:
     }
 
 private:
-    //! @brief Gather final results for request `batchIdx`.
-    void postProcessRequest(SizeType batchIdx) const;
+    //! @brief Gather final results for request `batchIdx`
+    CudaEvent postProcessRequest(SizeType batchIdx) const;
 
 private:
     std::size_t const mVocabSize;

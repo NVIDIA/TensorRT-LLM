@@ -126,9 +126,10 @@ public:
     virtual TensorPtr getOutputIds(SizeType batchIdx) const = 0;
 
     //! Execute postProcessRequest  and returns OutputIds for request `batchIdx`.
+    //! Result will only be available after event returned
     //! @returns [maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token ids without
     //! padding for request `batchIdx`, on gpu
-    virtual TensorPtr getFinalOutputIds(SizeType batchIdx) const = 0;
+    virtual std::tuple<CudaEvent, TensorPtr> getFinalOutputIds(SizeType batchIdx) const = 0;
 
     //! @returns [batchSize, beamWidth], marks finished requests (per beam), on gpu
     virtual TensorPtr getFinishedBeams() const = 0;

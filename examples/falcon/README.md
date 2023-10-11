@@ -119,21 +119,18 @@ The examples below uses the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit
 First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
 Now quantize HF Falcon weights as follows.
-After successfully running the script, the output should be in .npz format, e.g. `quantized_fp8/falcon_tp_1_rank0.npz`.
-At the moment, TensorRT-LLM only needs the quantization scaling factors from the .npz archive for FP8 quantization,
-while the .npz archive contains the whole weights with the quantization scaling factors.
-The tensor parallel size of the quantized model is not necesary to be matched with the value that TensorRT-LLM engine will use.
-This is subject to change for a smoother user experience.
+After successfully running the script, the output should be in .npz format, e.g. `quantized_fp8/falcon_tp_1_rank0.npz`,
+where FP8 scaling factors are stored.
 
 ```bash
-# Quantize HF Falcon 180B checkpoint into FP8 format
+# Quantize HF Falcon 180B checkpoint into FP8 and export a single-rank checkpoint
 python quantize.py --model_dir falcon/180b \
                    --dtype float16 \
                    --qformat fp8 \
                    --export_path quantized_fp8 \
                    --calib_size 16
 
-# Build Falcon 180B TP=8 using HF checkpoint + PTQ scaling factors
+# Build Falcon 180B TP=8 using HF checkpoint + PTQ scaling factors from the single-rank checkpoint
 python build.py --model_dir falcon/180b \
                 --quantized_fp8_model_path ./quantized_fp8/falcon_tp1_rank0.npz \
                 --dtype float16 \

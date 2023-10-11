@@ -92,11 +92,8 @@ The examples below uses the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit
 First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
 Now quantize HF GPT-J weights as follows.
-After successfully running the script, the output should be in .npz format, e.g. `quantized_fp8/gptj_tp1_rank0.npz`.
-At the moment, TensorRT-LLM only needs the quantization scaling factors from the .npz archive for FP8 quantization,
-while the .npz archive contains the whole weights with the quantization scaling factors.
-The tensor parallel size of the quantized model is not necesary to be matched with the value that TensorRT-LLM engine will use.
-This is subject to change for a smoother user experience.
+After successfully running the script, the output should be in .npz format, e.g. `quantized_fp8/gptj_tp1_rank0.npz`,
+where FP8 scaling factors are stored.
 
 ```bash
 # Quantize HF GPT-J 6B checkpoint into FP8 format

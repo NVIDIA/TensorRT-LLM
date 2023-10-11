@@ -381,7 +381,7 @@ void GptDecoderBatch::forwardSync(decoder_batch::Token const& token)
 }
 
 // TODO (rkobus) call this at the end of forward if mFinished[i] changes from false to true?
-void GptDecoderBatch::postProcessRequest(SizeType batchIdx) const
+CudaEvent GptDecoderBatch::postProcessRequest(SizeType batchIdx) const
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto& stream = mStreams[batchIdx];
@@ -400,6 +400,7 @@ void GptDecoderBatch::postProcessRequest(SizeType batchIdx) const
     stream->record(event);
     mStream->wait(event);
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    return event;
 }
 
 void GptDecoderBatch::newBatch(GenerationInput const& inputs, SamplingConfig const& samplingConfig)
@@ -486,10 +487,10 @@ IStatefulGptDecoder::TensorPtr GptDecoderBatch::getFinalOutputIds() const
     return getOutputIds();
 }
 
-IStatefulGptDecoder::TensorPtr GptDecoderBatch::getFinalOutputIds(SizeType batchIdx) const
+std::tuple<CudaEvent, IStatefulGptDecoder::TensorPtr> GptDecoderBatch::getFinalOutputIds(SizeType batchIdx) const
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
-    postProcessRequest(batchIdx);
+    auto event = postProcessRequest(batchIdx);
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
-    return getOutputIds(batchIdx);
+    return {std::move(event), getOutputIds(batchIdx)};
 }

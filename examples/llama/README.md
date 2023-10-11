@@ -215,40 +215,67 @@ python3 build.py --ft_model_dir=/llama/smooth_llama_7B/sq0.8/1-gpu/ \
 
 Note we use `--ft_model_dir` instead of `--model_dir` and `--meta_ckpt_dir` since SmoothQuant model needs INT8 weights and various scales from the binary files.
 
+#### FP8 Post-Training Quantization
+
+The examples below uses the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
+
+First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+
+After successfully running the script, the output should be in .npz format, e.g. `quantized_fp8/llama_tp_1_rank0.npz`,
+where FP8 scaling factors are stored.
+
+```bash
+# Quantize HF LLaMA 70B into FP8 and export a single-rank checkpoint
+python quantize.py --model_dir ./tmp/llama/70B \
+                   --dtype float16 \
+                   --qformat fp8 \
+                   --export_path ./quantized_fp8 \
+                   --calib_size 512 \
+
+# Build LLaMA 70B TP=2 using original HF checkpoint + PTQ scaling factors from the single-rank checkpoint
+python build.py --model_dir ./tmp/llama/70B \
+                --quantized_fp8_model_path ./quantized_fp8/llama_tp1_rank0.npz \
+                --dtype float16 \
+                --use_gpt_attention_plugin float16 \
+                --use_gemm_plugin float16 \
+                --output_dir ./tmp/llama/70B/trt_engines/fp8/2-gpu/ \
+                --remove_input_padding \
+                --enable_fp8 \
+                --fp8_kv_cache \
+                --world_size 2 \
+                --tp_size 2
+```
+
 #### Groupwise quantization (AWQ/GPTQ)
 One can enable AWQ/GPTQ INT4 weight only quantization with these options when building engine with `build.py`:
 
 - `--use_weight_only` enables weight only GEMMs in the network.
 - `--per_group` enable groupwise weight only quantization, for GPT-J example, we support AWQ with the group size default as 128.
-- `--weight_only_precision=int4` the precision of weight only quantization. Only int4 is supported for groupwise weight only quantization.
-- `--quant_ckpt_path` passes the quantized checkpoint to build the engine, with *.pt and *.safetensors pointing to AWQ/GPTQ respectively.
+- `--weight_only_precision` should specify the weight only quantization format. Supported formats are `int4_awq` or `int4_gptq`.
+- `--quant_ckpt_path` passes the quantized checkpoint to build the engine.
 
-To run the AWQ/GPTQ LLaMa example, the following steps are required:
+AWQ/GPTQ examples below involves 2 steps:
+1. Weight quantization
+2. Build TRT-LLM engine
 
+##### AWQ
 1. Weight quantization:
 
-    For AWQ quantization, the quantized checkpoints are generated using [AMMO](../quantization/README.md), with each layer in the AWQ int4 weight only quantized weights should have 3 parameters:
-    1. FP16 smoothed_weights (=weights/pre_quant_scale) with shape [n, k] ;
-    2. FP16 amax (the max abs values of the smoothed_weights) with shape [n, k/group_size];
-    3. FP16 pre_quant_scale (the smooth scales used to multiply by activation) with shape [k];
-
-    For GPTQ quantization, quantized weights are generated using [GPTQ-for-LLaMa](https://github.com/qwopqwop200/GPTQ-for-LLaMa.git) as follow:
+    NVIDIA AMMO toolkit is used for AWQ weight quantization. Please see [examples/quantization/README.md](/examples/quantization/README.md#preparation) for AMMO installation instructions.
 
     ```bash
-    git clone https://github.com/qwopqwop200/GPTQ-for-LLaMa.git
-    cd GPTQ-for-LLaMa
-    pip install -r requirements.txt
-
-    # Quantize weights into INT4 and save as safetensors
-    # Quantized weight with parameter "--act-order" is not supported in TRT-LLM
-    python llama.py ./tmp/llama/7B/ c4 --wbits 4 --true-sequential --groupsize 128 --save_safetensors ./llama-7b-4bit-gs128.safetensors
+    # Quantize HF LLaMA 7B checkpoint into INT4 AWQ format
+    python quantize.py --model_dir ./tmp/llama/7B \
+                    --dtype float16 \
+                    --qformat int4_awq \
+                    --export_path ./llama-7b-4bit-gs128-awq.pt \
+                    --calib_size 32
     ```
+    The quantized model checkpoint is saved to path `./llama-7b-4bit-gs128-awq.pt` for future TRT-LLM engine build.
 
 2. Build TRT-LLM engine:
 
     ```bash
-    # Build the LLaMA 7B model using a single GPU and apply INT4 AWQ quantization.
-    # Compressed checkpoint is generated seperately from AWQ.
     python build.py --model_dir ./tmp/llama/7B/ \
                     --quant_ckpt_path ./llama-7b-4bit-gs128-awq.pt \
                     --dtype float16 \
@@ -260,7 +287,30 @@ To run the AWQ/GPTQ LLaMa example, the following steps are required:
                     --weight_only_precision int4_awq \
                     --per_group \
                     --output_dir ./tmp/llama/7B/trt_engines/int4_AWQ/1-gpu/
+    ```
 
+##### GPTQ
+To run the GPTQ LLaMa example, the following steps are required:
+
+1. Weight quantization:
+
+    Quantized weights for GPTQ are generated using [GPTQ-for-LLaMa](https://github.com/qwopqwop200/GPTQ-for-LLaMa.git) as follow:
+
+    ```bash
+    git clone https://github.com/qwopqwop200/GPTQ-for-LLaMa.git
+    cd GPTQ-for-LLaMa
+    pip install -r requirements.txt
+
+    # Quantize weights into INT4 and save as safetensors
+    # Quantized weight with parameter "--act-order" is not supported in TRT-LLM
+    python llama.py ./tmp/llama/7B/ c4 --wbits 4 --true-sequential --groupsize 128 --save_safetensors ./llama-7b-4bit-gs128.safetensors
+    ```
+
+    Let us build the TRT-LLM engine with the saved `./llama-7b-4bit-gs128.safetensors`.
+
+2. Build TRT-LLM engine:
+
+    ```bash
     # Build the LLaMA 7B model using 2-way tensor parallelism and apply INT4 GPTQ quantization.
     # Compressed checkpoint safetensors are generated seperately from GPTQ.
     python build.py --model_dir ./tmp/llama/7B/ \
@@ -277,44 +327,6 @@ To run the AWQ/GPTQ LLaMa example, the following steps are required:
                     --tp_size 2 \
                     --output_dir ./tmp/llama/7B/trt_engines/int4_GPTQ/2-gpu/
     ```
-
-#### FP8 Post-Training Quantization
-
-The examples below uses the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
-
-First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
-
-Now quantize HF LLaMA weights as follows.
-After successfully running the script, the output should be in .npz format, e.g. `quantized_fp8/llama_tp_1_rank0.npz`.
-At the moment, TensorRT-LLM only needs the quantization scaling factors from the .npz archive for FP8 quantization,
-while the .npz archive contains the whole weights with the quantization scaling factors.
-The tensor parallel size of the quantized model is not necesary to be matched with the value that TensorRT-LLM engine will use.
-This is subject to change for a smoother user experience.
-
-```bash
-# Quantize HF LLaMA 70B checkpoint into FP8 format
-python quantize.py --model_dir ./tmp/llama/70B \
-                   --dtype float16 \
-                   --qformat fp8 \
-                   --export_path ./quantized_fp8 \
-                   --calib_size 512
-
-# Build LLaMA 70B TP=2 using original HF checkpoint + PTQ scaling factors
-python build.py --model_dir ./tmp/llama/70B \
-                --quantized_fp8_model_path ./quantized_fp8/llama_tp1_rank0.npz \
-                --dtype float16 \
-                --use_gpt_attention_plugin float16 \
-                --output_dir ./tmp/llama/70B/trt_engines/fp8/2-gpu/ \
-                --remove_input_padding \
-                --enable_context_fmha \
-                --enable_fp8 \
-                --fp8_kv_cache \
-                --strongly_typed \
-                --world_size 2 \
-                --tp_size 2 \
-                --parallel_build
-```
-
 
 ### Run
 

@@ -42,19 +42,29 @@ public:
 
     explicit KVCacheBlock(SizeType blockIdx);
 
+    void startScheduling();
+
     [[nodiscard]] SizeType getBlockIdx() const;
 
     void incRefCount();
 
     void decRefCount();
 
+    void decSchedulingRefCount();
+
     [[nodiscard]] bool hasRefs() const;
+
+    [[nodiscard]] bool hasSchedulingRefs() const;
 
 private:
     // Linear index of block in pool
     SizeType mBlockIdx;
+
     // Number of references to the block
     SizeType mRefCount;
+
+    // Number of references to the block
+    SizeType mSchedulingRefCount;
 };
 
 class GenerationRequest
@@ -145,11 +155,18 @@ private:
 class BlockManager
 {
 public:
+    using SizeType = tensorrt_llm::runtime::SizeType;
+
     explicit BlockManager(std::size_t blocksInPool);
+
+    void startScheduling();
 
     void allocateBlock(GenerationRequest& sequence, bool shareAmongBeams = false);
 
     void freeAllBlocks(GenerationRequest& sequence);
+
+    // Simulate freeing all blocks for that sequence to check impact on number of free blocks
+    void schedulingFreeAllBlocks(GenerationRequest& sequence);
 
     [[nodiscard]] std::size_t getNumFreeBlocks() const
     {
@@ -161,11 +178,18 @@ public:
         return getNumFreeBlocks() >= numRequired;
     }
 
+    [[nodiscard]] bool schedulingHasFreeBlocks(std::size_t numRequired = 1) const
+    {
+        return mSchedulingNumFreeBlocks >= numRequired;
+    }
+
 private:
     // List of free blocks
     std::list<KVCacheBlock> mFreeBlocks;
     // List of allocated blocks for each sequences
     std::vector<std::vector<KVCacheBlock>> mAllocatedBlocks;
+    // Used to keep track of number of free blocks during scheduling
+    SizeType mSchedulingNumFreeBlocks;
 };
 
 class KVCacheManager
@@ -178,6 +202,8 @@ public:
     KVCacheManager(SizeType numLayers, SizeType numHeads, SizeType numKvHeads, SizeType hiddenSize,
         SizeType tokensPerBlock, SizeType maxNumBlocks, SizeType maxBatchSize, SizeType maxBeamWidth,
         SizeType maxBlocksPerSeq, nvinfer1::DataType dtype, CudaStreamPtr stream);
+
+    void startScheduling();
 
     [[nodiscard]] SizeType getTokensPerBlock() const
     {
@@ -200,10 +226,11 @@ public:
         return mBlockManager;
     }
 
-    /// @brief  Function that computes the number of KV cache blocks needed to advance a request by one iteration
+    /// @brief  Function that computes the number of KV cache blocks needed to advance a request by one or two
+    /// iterations
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
     /// @return  The number of blocks
-    SizeType getNeededBlocksOneStep(const LlmRequest& req) const;
+    SizeType getNeededBlocksOneStep(const LlmRequest& req, bool twoStepsLookAhead) const;
 
     /// @brief  Function that computes the number of KV cache blocks needed to advance a request to completion (i.e. for
     /// maxNewTokens)
@@ -221,6 +248,8 @@ public:
     void addSequence(SizeType batchSlotIdx, SizeType inputLength, SizeType beamWidth);
 
     void removeSequence(SizeType batchSlotIdx);
+
+    void schedulingRemoveSequence(SizeType batchSlotIdx);
 
     void getBlockPointersOfBatch(runtime::ITensor::SharedPtr dstPointers, SizeType batchSize, SizeType beamWidth) const;
 

@@ -275,10 +275,10 @@ public:
     GptServer(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, int32_t maxBeamWidth,
         batch_scheduler::SchedulerPolicy schedulerPolicy, std::optional<int32_t> maxNumSequences,
         std::optional<int32_t> maxTokensInPagedKvCache, std::optional<float> kvCacheFreeGpuMemFraction,
-        std::shared_ptr<Recorder> recorder)
+        std::optional<bool> enableTrtOverlap, std::shared_ptr<Recorder> recorder)
     {
-        const TrtGptModelOptionalParams& optionalParams
-            = TrtGptModelOptionalParams(maxNumSequences, maxTokensInPagedKvCache, kvCacheFreeGpuMemFraction);
+        const TrtGptModelOptionalParams& optionalParams = TrtGptModelOptionalParams(
+            maxNumSequences, maxTokensInPagedKvCache, kvCacheFreeGpuMemFraction, enableTrtOverlap);
         mBatchManager = std::make_shared<GptManager>(
             trtEnginePath, modelType, maxBeamWidth, schedulerPolicy,
             [this](int max_num_requests) { return getInferenceRequests(max_num_requests); },
@@ -459,7 +459,8 @@ std::pair<std::vector<std::vector<int32_t>>, std::vector<int32_t>> parseDataset(
 void benchmarkGptManager(std::string const& modelName, std::filesystem::path const& engineDir, std::string const& type,
     std::string const& datasetPath, std::shared_ptr<nvinfer1::ILogger> const& logger,
     std::optional<int32_t> maxNumSequences, std::optional<int32_t> maxTokensInPagedKvCache,
-    std::optional<float> kvCacheFreeGpuMemFraction, batch_scheduler::SchedulerPolicy schedulerPolicy)
+    std::optional<float> kvCacheFreeGpuMemFraction, std::optional<bool> enableTrtOverlap,
+    batch_scheduler::SchedulerPolicy schedulerPolicy)
 {
     auto const worldConfig = WorldConfig::mpi(*logger);
 
@@ -481,7 +482,7 @@ void benchmarkGptManager(std::string const& modelName, std::filesystem::path con
     const int maxBeamWidth = 1;
     auto recorder = std::make_shared<Recorder>();
     auto gptServer = std::make_shared<GptServer>(engineDir, modelType, maxBeamWidth, schedulerPolicy, maxNumSequences,
-        maxTokensInPagedKvCache, kvCacheFreeGpuMemFraction, recorder);
+        maxTokensInPagedKvCache, kvCacheFreeGpuMemFraction, enableTrtOverlap, recorder);
 
     auto dataset = parseDataset(datasetPath);
     std::vector<std::vector<NamedTensor>> tensors_list;
@@ -534,8 +535,10 @@ int main(int argc, char* argv[])
         "max_tokens_in_paged_kvcache", "Max tokens in paged K-V Cache.", cxxopts::value<int>()->default_value("-1"));
     options.add_options()("kv_cache_free_gpu_mem_fraction", "K-V Cache Free Gpu Mem Fraction.",
         cxxopts::value<float>()->default_value("-1"));
-    options.add_options()("scheduler_policy", "Choose scheduler policy between max_utilization/guaranteed_completion.",
-        cxxopts::value<std::string>()->default_value("guaranteed_completion"));
+    options.add_options()("scheduler_policy", "Choose scheduler policy between max_utilization/guaranteed_no_evict.",
+        cxxopts::value<std::string>()->default_value("guaranteed_no_evict"));
+    options.add_options()("enable_trt_overlap", "Overlap TRT context preparation and execution",
+        cxxopts::value<bool>()->default_value("false"));
 
     options.add_options()("log_level", "Choose log level between verbose/info/warning/error/internal_error.",
         cxxopts::value<std::string>()->default_value("error"));
@@ -583,6 +586,13 @@ int main(int argc, char* argv[])
         kvCacheFreeGpuMemFraction = result["kv_cache_free_gpu_mem_fraction"].as<float>();
     }
 
+    // Argument: Enable TRT overlap
+    std::optional<bool> enableTrtOverlap = std::nullopt;
+    if (result["enable_trt_overlap"].as<bool>() != -1)
+    {
+        enableTrtOverlap = result["enable_trt_overlap"].as<bool>();
+    }
+
     // Argument: Scheduler policy
     batch_scheduler::SchedulerPolicy schedulerPolicy;
     auto const schedulerPolicyArg = result["scheduler_policy"].as<std::string>();
@@ -590,9 +600,9 @@ int main(int argc, char* argv[])
     {
         schedulerPolicy = batch_scheduler::SchedulerPolicy::MAX_UTILIZATION;
     }
-    else if (schedulerPolicyArg == "guaranteed_completion")
+    else if (schedulerPolicyArg == "guaranteed_no_evict")
     {
-        schedulerPolicy = batch_scheduler::SchedulerPolicy::GUARANTEED_COMPLETION;
+        schedulerPolicy = batch_scheduler::SchedulerPolicy::GUARANTEED_NO_EVICT;
     }
     else
     {
@@ -634,7 +644,8 @@ int main(int argc, char* argv[])
     try
     {
         benchmarkGptManager(result["model"].as<std::string>(), result["engine_dir"].as<std::string>(), type,
-            datasetPath, logger, maxNumSequences, maxTokensInPagedKvCache, kvCacheFreeGpuMemFraction, schedulerPolicy);
+            datasetPath, logger, maxNumSequences, maxTokensInPagedKvCache, kvCacheFreeGpuMemFraction, enableTrtOverlap,
+            schedulerPolicy);
     }
     catch (const std::exception& e)
     {

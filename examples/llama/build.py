@@ -678,6 +678,7 @@ def build(rank, args):
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
+            max_num_tokens=args.max_num_tokens,
             int8=int8_trt_flag,
             fp8=args.quant_mode.has_fp8_qdq(),
             quant_mode=args.quant_mode,

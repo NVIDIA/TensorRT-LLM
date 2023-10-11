@@ -1,12 +1,10 @@
-# AMMO Installation Guide
+# TensorRT-LLM Quantization Toolkit Installation Guide
 
-## What's AMMO?
-
-NVIDIA AMMO (AlgorithMic Model Optimization) is a model optimization toolkit used in TensorRT-LLM for quantization.
+## Introduction
 
 This document introduces:
 
-- The steps to install AMMO.
+- The steps to install the TensorRT-LLM quantization toolkit.
 - The Python APIs to quantize the models.
 
 The detailed LLM quantization recipe is distributed to the README.md of the corresponding model examples.
@@ -19,7 +17,7 @@ The detailed LLM quantization recipe is distributed to the README.md of the corr
 docker run --gpus all --ipc=host --ulimit memlock=-1 --shm-size=20g -it <the docker image with TensorRT-LLM installed> bash
 ```
 
-2. Install the quantization library `ammo` and the related dependencies on top of the TensorRT-LLM installation or docker file.
+2. Install the quantization toolkit `ammo` and the related dependencies on top of the TensorRT-LLM installation or docker file.
 
 ```bash
 # Obtain the cuda version from the system. Assuming nvcc is available in path.
@@ -37,7 +35,7 @@ pip install -r requirements.txt
 
 ## APIs
 
-[`ammo.py`](../../tensorrt_llm/models/quantized/ammo.py) uses AMMO to calibrate the PyTorch models, and generate a model config, saved as a json (for the model structure) and npz files (for the model weights) that TensorRT-LLM could parse. The model config includes everything needed by TensorRT-LLM to build the TensorRT inference engine, as explained below.
+[`ammo.py`](../../tensorrt_llm/models/quantized/ammo.py) uses the quantization toolkit to calibrate the PyTorch models, and generate a model config, saved as a json (for the model structure) and npz files (for the model weights) that TensorRT-LLM could parse. The model config includes everything needed by TensorRT-LLM to build the TensorRT inference engine, as explained below.
 
 > *This quantization step may take a long time to finish and requires large GPU memory. Please use a server grade GPU if a GPU out-of-memory error occurs*
 

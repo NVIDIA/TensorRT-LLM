@@ -24,10 +24,9 @@ import torch
 
 from . import graph_rewriting as gw
 from ._common import default_net, default_trtnet, precision
-from ._utils import (bf16_array, dim_resolve_negative, dim_to_trt_axes,
-                     fp16_array, fp32_array, int32_array, np_dtype_to_trt,
-                     str_dtype_to_np, str_dtype_to_trt, torch_to_numpy,
-                     trt_dtype_to_torch)
+from ._utils import (dim_resolve_negative, dim_to_trt_axes, fp16_array,
+                     fp32_array, int32_array, np_dtype_to_trt, str_dtype_to_np,
+                     str_dtype_to_trt, torch_to_numpy, trt_dtype_to_torch)
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE
 from .quantization import QuantMode
 
@@ -2271,22 +2270,21 @@ def gelu(x: Tensor) -> Tensor:
         The tensor produced by the activation layer.
     '''
     if default_net().strongly_typed:
-        array_fns = {
-            trt.float32: fp32_array,
-            trt.float16: fp16_array,
-            trt.bfloat16: bf16_array,
-        }
-        if x.dtype not in array_fns:
-            raise NotImplementedError(
-                f"stronly_typed gelu on datatype of {x.dtype} is not supported. "
-                f"Please disable stronly_typed.")
-        array_fn = array_fns[x.dtype]
+        if x.dtype == trt.float16:
+            v1 = constant(fp16_array([0.5]))
+            v2 = constant(fp16_array([math.sqrt(2.0 / math.pi)]))
+            v3 = constant(fp16_array([0.044715]))
+            v4 = constant(fp16_array([3.0]))
+            v5 = constant(fp16_array([1.0]))
+        elif x.dtype == trt.float32:
+            v1 = constant(fp32_array([0.5]))
+            v2 = constant(fp32_array([math.sqrt(2.0 / math.pi)]))
+            v3 = constant(fp32_array([0.044715]))
+            v4 = constant(fp32_array([3.0]))
+            v5 = constant(fp32_array([1.0]))
+        else:
+            assert False, f"gelu on datatype of {x.dtype} is not supported"
 
-        v1 = constant(array_fn([0.5]))
-        v2 = constant(array_fn([math.sqrt(2.0 / math.pi)]))
-        v3 = constant(array_fn([0.044715]))
-        v4 = constant(array_fn([3.0]))
-        v5 = constant(array_fn([1.0]))
         return v1 * x * (tanh(v2 * (x + v3 * pow(x, v4))) + v5)
     else:
         return 0.5 * x * (
