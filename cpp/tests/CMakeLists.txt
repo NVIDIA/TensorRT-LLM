@@ -35,15 +35,26 @@ add_custom_target(google-tests)
 function(add_gtest test_name test_src)
   add_executable(${test_name} ${test_src})
 
-  target_link_libraries(
-    ${test_name} PUBLIC ${SHARED_TARGET} gtest_main gmock_main stdc++fs
-                        nvonnxparser nvinfer_plugin_tensorrt_llm)
+  if(NOT WIN32) # Linux
+    target_link_libraries(
+      ${test_name} PUBLIC ${SHARED_TARGET} gtest_main gmock_main nvonnxparser
+                          nvinfer_plugin_tensorrt_llm)
+  else()
+    # Use STATIC_TARGET on Windows because MSVC is picky about duplicate symbols
+    # if the shared and static libs both get linked
+    target_link_libraries(
+      ${test_name} PUBLIC ${STATIC_TARGET} gtest_main gmock_main nvonnxparser
+                          nvinfer_plugin_tensorrt_llm)
+  endif()
 
   target_compile_features(${test_name} PRIVATE cxx_std_17)
   target_compile_definitions(${test_name}
                              PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
-  gtest_discover_tests(${test_name} PROPERTIES ENVIRONMENT
-                                               "CUDA_MODULE_LOADING=LAZY")
+  gtest_discover_tests(
+    ${test_name} PROPERTIES ENVIRONMENT "CUDA_MODULE_LOADING=LAZY"
+                            DISCOVERY_TIMEOUT 30) # Longer timeout needed
+                                                  # because discovery can be
+                                                  # slow on Windows
   add_dependencies(google-tests ${test_name})
 endfunction()
 

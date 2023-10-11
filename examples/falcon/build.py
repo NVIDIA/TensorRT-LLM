@@ -35,6 +35,7 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 
+from weight import get_scaling_factors  # isort:skip
 from weight import load_from_hf_falcon  # isort:skip
 from weight import load_from_hf_checkpoint  # isort:skip
 
@@ -236,13 +237,24 @@ def parse_arguments():
     parser.add_argument('--remove_input_padding',
                         default=False,
                         action='store_true')
-
+    parser.add_argument(
+        '--strongly_typed',
+        default=False,
+        action="store_true",
+        help=
+        'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
+    )
     # Arguments related to the quantization of the model.
     parser.add_argument(
         '--enable_fp8',
         default=False,
         action='store_true',
         help='Use FP8 Linear layer for Attention QKV/Dense and MLP.')
+    parser.add_argument(
+        '--quantized_fp8_model_path',
+        type=str,
+        default=None,
+        help='Path of a quantized model checkpoint in .pyz format')
     parser.add_argument(
         '--fp8_kv_cache',
         default=False,
@@ -265,10 +277,15 @@ def parse_arguments():
                         type=int,
                         default=64,
                         help='Number of tokens per block in paged KV cache')
-
     args = parser.parse_args()
 
     logger.set_level(args.log_level)
+
+    if not args.remove_input_padding:
+        if args.use_gpt_attention_plugin:
+            logger.warning(
+                f"It is recommended to specify --remove_input_padding when using GPT attention plugin"
+            )
 
     if args.use_inflight_batching:
         if not args.use_gpt_attention_plugin:
@@ -318,20 +335,23 @@ def parse_arguments():
     assert args.n_kv_head % args.tp_size == 0 \
         or args.tp_size % args.n_kv_head == 0, \
         "MQA/GQA requires either the number of K/V heads to be divisible by "\
-        "the tensor parallelism size OR the tensor parallelism size to be divisible by the "\
-        "number of K/V heads."
+        "the tensor parallelism size OR the tensor parallelism size to be "\
+        "divisible by the number of K/V heads."
     assert args.pp_size * args.tp_size == args.world_size
 
-    # TODO: Allow gpt plugin once attention module allows alibi with the plugin
     if not args.use_gpt_attention_plugin and not args.alibi:
         args.use_gpt_attention_plugin = args.dtype
         logger.warning(
             f"RoPE does not support without GPT attention plugin. Set by "
             f"use_gpt_attention_plugin={args.dtype}.")
-    elif args.use_gpt_attention_plugin and args.alibi:
-        args.use_gpt_attention_plugin = False
-        logger.warning("GPT attention plugin does not support ALiBi. "
-                       "use_gpt_attention_plugin is disabled.")
+    elif args.alibi:
+        msg = 'Falcon cannot use the context FMHA with ALiBi. Disable {opt}'
+        if args.enable_context_fmha:
+            args.enable_context_fmha = False
+            logger.warning(msg.format(opt='enable_context_fmha'))
+        if args.enable_context_fmha_fp32_acc:
+            args.enable_context_fmha_fp32_acc = False
+            logger.warning(msg.format(opt='enable_context_fmha_fp32_acc'))
 
     logger.info(' Build Arguments '.center(100, '='))
     for k, v in vars(args).items():
@@ -377,8 +397,14 @@ def build_rank_engine(builder: Builder,
         new_decoder_architecture=args.new_decoder_architecture)
 
     if args.enable_fp8 or args.fp8_kv_cache:
-        # Dummy scales only
-        tensorrt_llm_falcon = fp8_quantize(tensorrt_llm_falcon, args.quant_mode)
+        logger.info(f'Loading scaling factors from '
+                    f'{args.quantized_fp8_model_path}')
+        quant_scales = get_scaling_factors(args.quantized_fp8_model_path,
+                                           num_layers=args.n_layer,
+                                           quant_mode=args.quant_mode)
+        tensorrt_llm_falcon = fp8_quantize(tensorrt_llm_falcon,
+                                           quant_mode=args.quant_mode,
+                                           quant_scales=quant_scales)
     if args.model_dir is not None:
         logger.info(f'Loading HF Falcon ... from {args.model_dir}')
         tik = time.time()
@@ -424,7 +450,7 @@ def build_rank_engine(builder: Builder,
     if args.remove_input_padding:
         network.plugin_config.enable_remove_input_padding()
     if args.paged_kv_cache:
-        network.plugin_config.enable_paged_kv_cache()
+        network.plugin_config.enable_paged_kv_cache(args.tokens_per_block)
     with net_guard(network):
         # Prepare
         network.set_named_parameters(tensorrt_llm_falcon.named_parameters())
@@ -433,9 +459,7 @@ def build_rank_engine(builder: Builder,
             max_input_len=args.max_input_len,
             max_new_tokens=args.max_output_len,
             use_cache=True,
-            max_beam_width=args.max_beam_width,
-            paged_kv_cache=args.paged_kv_cache,
-            tokens_per_block=args.tokens_per_block)
+            max_beam_width=args.max_beam_width)
         tensorrt_llm_falcon(*inputs)
         if args.enable_debug_output:
             # mark intermediate nodes' outputs
@@ -493,10 +517,8 @@ def build(rank, args):
             max_output_len=args.max_output_len,
             fp8=args.quant_mode.has_fp8_qdq(),
             quant_mode=args.quant_mode,
-            opt_level=args.builder_opt,
-            paged_kv_cache=args.paged_kv_cache,
-            tokens_per_block=args.tokens_per_block,
-        )
+            strongly_typed=args.strongly_typed,
+            opt_level=args.builder_opt)
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.tp_size,
                                       args.pp_size, cur_rank)
         engine = build_rank_engine(builder, builder_config, engine_name,

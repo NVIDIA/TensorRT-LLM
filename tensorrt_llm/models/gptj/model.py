@@ -200,8 +200,8 @@ class GPTJForCausalLM(GPTJModel):
         self.quant_mode = quant_mode
         if quant_mode.has_int8_kv_cache():
             self._kv_dtype = str_dtype_to_trt('int8')
-        # elif quant_mode.has_fp8_kv_cache():
-        #     self._kv_dtype = str_dtype_to_trt('fp8')
+        elif quant_mode.has_fp8_kv_cache():
+            self._kv_dtype = str_dtype_to_trt('fp8')
 
         if isinstance(logits_dtype, str):
             self._logits_dtype = str_dtype_to_trt(logits_dtype)
@@ -247,7 +247,7 @@ class GPTJForCausalLM(GPTJModel):
         lm_logits = self.lm_head(hidden_states)
         lm_logits.mark_output('logits', self._logits_dtype)
 
-        if use_cache:
+        if use_cache and default_net().plugin_config.paged_kv_cache == False:
             for i, present in enumerate(presents):
                 present.mark_output(f'present_key_value_{i}', self._kv_dtype)
             return (lm_logits, presents)
@@ -260,9 +260,7 @@ class GPTJForCausalLM(GPTJModel):
                        max_new_tokens,
                        use_cache,
                        max_beam_width,
-                       enable_two_optimization_profiles: bool = False,
-                       paged_kv_cache: bool = False,
-                       tokens_per_block: int = 64):
+                       enable_two_optimization_profiles: bool = False):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -305,6 +303,8 @@ class GPTJForCausalLM(GPTJModel):
         use_gpt_attention_plugin = default_net(
         ).plugin_config.gpt_attention_plugin
         remove_input_padding = default_net().plugin_config.remove_input_padding
+        paged_kv_cache = default_net().plugin_config.paged_kv_cache
+        tokens_per_block = default_net().plugin_config.tokens_per_block
 
         if remove_input_padding:
             input_ids = Tensor(name='input_ids',
@@ -365,34 +365,15 @@ class GPTJForCausalLM(GPTJModel):
                 math.ceil(max_len_range[0][1] / tokens_per_block),
                 math.ceil(max_len_range[0][2] / tokens_per_block)
             ]
-            blocks_range = [
-                bb_range[0][0] * max_blocks_per_seq_range[0],
-                bb_range[0][1] * max_blocks_per_seq_range[1],
-                bb_range[0][2] * max_blocks_per_seq_range[2]
-            ]
-            # NOTE(nkorobov): we multiply max_blocks_per_seq by 2 because plugin expects pointers as int64,
-            # but TRT does not support int64. Thus, we emulate int64 with doubled int32.
-            max_blocks_per_seq_range = [2 * x for x in max_blocks_per_seq_range]
 
-            kv_dim_range = OrderedDict([
-                ('blocks', [blocks_range]),
-                ('kv', [2]),
-                ('num_heads', [num_heads]),
-                ('tokens_per_block', [tokens_per_block]),
-                ('head_size', [head_size]),
-            ])
+            max_blocks_per_seq_range = [x for x in max_blocks_per_seq_range]
+
             for i in range(self._num_layers):
                 # (blocks, 2, kv_num_heads, tokens_per_block, head_size)
-                kv = Tensor(
-                    name=f'past_key_value_{i}',
-                    dtype=self._kv_dtype,
-                    shape=[-1, 2, num_heads, tokens_per_block, head_size],
-                    dim_range=kv_dim_range)
-                past_key_value.append(kv)
 
                 kv_cache_block_pointers = Tensor(
                     name=f'kv_cache_block_pointers_{i}',
-                    dtype=trt.int32,
+                    dtype=trt.int64,
                     shape=[-1, 2, -1],
                     dim_range=OrderedDict([
                         ('batch_size', bb_range),
@@ -400,6 +381,7 @@ class GPTJForCausalLM(GPTJModel):
                         ('max_blocks_per_seq', [max_blocks_per_seq_range]),
                     ]))
                 kv_cache_block_pointers_list.append(kv_cache_block_pointers)
+                past_key_value.append(None)
 
         if use_gpt_attention_plugin:
             dim_range = bb_range

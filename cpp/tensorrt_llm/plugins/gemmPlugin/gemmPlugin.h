@@ -27,50 +27,8 @@
 namespace tensorrt_llm::plugins
 {
 
-using CublasGemmWrapper = tensorrt_llm::common::cublasMMWrapper;
+using CublasGemmWrapper = tensorrt_llm::common::CublasMMWrapper;
 using CublasGemmWrapperPtr = std::shared_ptr<CublasGemmWrapper>;
-
-class GemmIdCublas
-{
-public:
-    GemmIdCore gemmIdCore{};
-    bool transA{};
-    bool transB{};
-
-    GemmIdCublas(const GemmIdCore& gemmIdCore_, bool transA_, bool transB_)
-        : gemmIdCore(gemmIdCore_)
-        , transA(transA_)
-        , transB(transB_)
-    {
-    }
-
-    GemmIdCublas() {}
-
-    bool operator==(const GemmIdCublas& id) const
-    {
-        return gemmIdCore == id.gemmIdCore && transA == id.transA && transB == id.transB;
-    }
-
-    friend std::ostream& operator<<(std::ostream& out, const GemmIdCublas& id)
-    {
-        out << "Core ID = {" << id.gemmIdCore << "}";
-        out << " transA=" << id.transA;
-        out << " transB=" << id.transB;
-        return out;
-    }
-};
-
-// Hash of GemmIdCublas
-struct GemmIdCublasHash
-{
-    std::size_t operator()(const GemmIdCublas& id) const
-    {
-        auto h1 = GemmIdCoreHash()(id.gemmIdCore);
-        auto h2 = std::hash<bool>{}(id.transA);
-        auto h3 = std::hash<bool>{}(id.transB);
-        return h1 ^ h2 ^ h3;
-    }
-};
 
 class CublasLtGemmPluginProfiler
     : public GemmPluginProfiler<cublasLtMatmulHeuristicResult_t, CublasGemmWrapperPtr, GemmIdCublas, GemmIdCublasHash>
@@ -90,6 +48,8 @@ protected:
     void computeTmpSize(int maxM, int n, int k) override;
 
     bool checkTactic(int m, int n, int k, const Config& tactic) const override;
+
+    std::vector<Config> getTactics(int m, int n, int k) const override;
 
 private:
     bool mTransA;
@@ -150,8 +110,8 @@ private:
     int mTransB;
     nvinfer1::DataType mType;
 
-    std::shared_ptr<tensorrt_llm::common::cublasAlgoMap> mCublasAlgoMap;
-    std::shared_ptr<std::mutex> mCublasWrapperMutex;
+    // @fixme: seems this is shared across multiple clones.
+    // If we deep copy the wrapper inside clone(), then we may avoid the mutex inside the wrapper?
     CublasGemmWrapperPtr mCublasWrapper;
 
     GemmDims mDims{};

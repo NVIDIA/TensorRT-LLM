@@ -6,8 +6,15 @@ from .kernel_config import get_fmha_kernel_meta_data
 
 KERNEL_META_DATA = get_fmha_kernel_meta_data()
 
-from tensorrt_llm.tools.plugin_gen.plugin_gen import (TRITON_COMPILE_BIN,
-                                                      gen_trt_plugins)
+try:
+    from tensorrt_llm.tools.plugin_gen.plugin_gen import (TRITON_COMPILE_BIN,
+                                                          gen_trt_plugins)
+except ImportError:
+    TRITON_COMPILE_BIN = "does_not_exist"
+
+    def gen_trt_plugins(*args, **kwargs):
+        pass
+
 
 WORKSPACE = './tmp/'
 

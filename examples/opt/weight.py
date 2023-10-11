@@ -17,9 +17,11 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
 
 import tensorrt_llm
 from tensorrt_llm.models import OPTLMHeadModel
+from tensorrt_llm.quantization import QuantMode
 
 
 def extract_layer_idx(name):
@@ -74,6 +76,17 @@ def load_from_ft(tensorrt_llm_gpt: OPTLMHeadModel,
                  share_embedding_table=False):
     tensorrt_llm.logger.info('Loading weights from FT...')
     tik = time.time()
+
+    quant_mode = getattr(tensorrt_llm_gpt, 'quant_mode', QuantMode(0))
+    if quant_mode.is_int8_weight_only():
+        tensorrt_llm.logger.info(
+            'Quantizing weights from FT into INT8 weight-only format...')
+        plugin_weight_only_quant_type = torch.int8
+    elif quant_mode.is_int4_weight_only():
+        tensorrt_llm.logger.info(
+            'Quantizing weights from FT into INT4 weight-only format...')
+        plugin_weight_only_quant_type = torch.quint4x2
+    use_weight_only = quant_mode.is_weight_only()
 
     n_embd, n_head, n_layer, n_positions, vocab_size, do_layer_norm_before = parse_ft_config(
         Path(dir_path) / 'config.ini')
@@ -142,25 +155,43 @@ def load_from_ft(tensorrt_llm_gpt: OPTLMHeadModel,
             dir_path, 'model.layers.' + str(i) + '.input_layernorm.weight.bin'))
         tensorrt_llm_gpt.layers[i].input_layernorm.bias.value = (fromfile(
             dir_path, 'model.layers.' + str(i) + '.input_layernorm.bias.bin'))
+
+        dst = tensorrt_llm_gpt.layers[i].attention.qkv.weight
         t = fromfile(
             dir_path, 'model.layers.' + str(i) +
             '.attention.query_key_value.weight.' + str(rank) + '.bin',
             [n_embd, 3 * n_embd // tensor_parallel])
-        if t is not None:
-            dst = tensorrt_llm_gpt.layers[i].attention.qkv.weight
+        if use_weight_only:
+            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                torch.tensor(t), plugin_weight_only_quant_type)
+            # workaround for trt not supporting int8 inputs in plugins currently
+            dst.value = processed_torch_weights.view(
+                dtype=torch.float32).numpy()
+            scales = tensorrt_llm_gpt.layers[i].attention.qkv.per_channel_scale
+            scales.value = torch_weight_scales.numpy()
+        else:
             dst.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
-        t = fromfile(
+
+        dst = tensorrt_llm_gpt.layers[i].attention.qkv.bias
+        dst.value = fromfile(
             dir_path, 'model.layers.' + str(i) +
             '.attention.query_key_value.bias.' + str(rank) + '.bin')
-        if t is not None:
-            dst = tensorrt_llm_gpt.layers[i].attention.qkv.bias
-            dst.value = np.ascontiguousarray(t)
 
         dst = tensorrt_llm_gpt.layers[i].attention.dense.weight
         t = fromfile(
             dir_path, 'model.layers.' + str(i) + '.attention.dense.weight.' +
             str(rank) + '.bin', [n_embd // tensor_parallel, n_embd])
-        dst.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
+        if use_weight_only:
+            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                torch.tensor(t), plugin_weight_only_quant_type)
+            # workaround for trt not supporting int8 inputs in plugins currently
+            dst.value = processed_torch_weights.view(
+                dtype=torch.float32).numpy()
+            scales = tensorrt_llm_gpt.layers[
+                i].attention.dense.per_channel_scale
+            scales.value = torch_weight_scales.numpy()
+        else:
+            dst.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
 
         dst = tensorrt_llm_gpt.layers[i].attention.dense.bias
         dst.value = fromfile(
@@ -175,20 +206,44 @@ def load_from_ft(tensorrt_llm_gpt: OPTLMHeadModel,
         dst.value = fromfile(
             dir_path,
             'model.layers.' + str(i) + '.post_attention_layernorm.bias.bin')
+
+        dst = tensorrt_llm_gpt.layers[i].mlp.fc.weight
         t = fromfile(
             dir_path, 'model.layers.' + str(i) + '.mlp.dense_h_to_4h.weight.' +
             str(rank) + '.bin', [n_embd, 4 * n_embd // tensor_parallel])
-        tensorrt_llm_gpt.layers[i].mlp.fc.weight.value = np.ascontiguousarray(
-            np.transpose(t, [1, 0]))
-        tensorrt_llm_gpt.layers[i].mlp.fc.bias.value = fromfile(
+        if use_weight_only:
+            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                torch.tensor(t), plugin_weight_only_quant_type)
+            # workaround for trt not supporting int8 inputs in plugins currently
+            dst.value = processed_torch_weights.view(
+                dtype=torch.float32).numpy()
+            scales = tensorrt_llm_gpt.layers[i].mlp.fc.per_channel_scale
+            scales.value = torch_weight_scales.numpy()
+        else:
+            dst.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
+
+        dst = tensorrt_llm_gpt.layers[i].mlp.fc.bias
+        dst.value = fromfile(
             dir_path, 'model.layers.' + str(i) + '.mlp.dense_h_to_4h.bias.' +
             str(rank) + '.bin')
+
+        dst = tensorrt_llm_gpt.layers[i].mlp.proj.weight
         t = fromfile(
             dir_path, 'model.layers.' + str(i) + '.mlp.dense_4h_to_h.weight.' +
             str(rank) + '.bin', [4 * n_embd // tensor_parallel, n_embd])
-        tensorrt_llm_gpt.layers[i].mlp.proj.weight.value = (
-            np.ascontiguousarray(np.transpose(t, [1, 0])))
-        tensorrt_llm_gpt.layers[i].mlp.proj.bias.value = fromfile(
+        if use_weight_only:
+            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                torch.tensor(t), plugin_weight_only_quant_type)
+            # workaround for trt not supporting int8 inputs in plugins currently
+            dst.value = processed_torch_weights.view(
+                dtype=torch.float32).numpy()
+            scales = tensorrt_llm_gpt.layers[i].mlp.proj.per_channel_scale
+            scales.value = torch_weight_scales.numpy()
+        else:
+            dst.value = (np.ascontiguousarray(np.transpose(t, [1, 0])))
+
+        dst = tensorrt_llm_gpt.layers[i].mlp.proj.bias
+        dst.value = fromfile(
             dir_path, 'model.layers.' + str(i) + '.mlp.dense_4h_to_h.bias.bin')
 
     tok = time.time()

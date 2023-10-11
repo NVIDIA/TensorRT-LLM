@@ -42,6 +42,7 @@ public:
         , mMaxBatchSize(0)
         , mMaxInputLen(0)
         , mMaxOutputLen(0)
+        , mComputeContextLogits(false)
     {
     }
 
@@ -176,6 +177,16 @@ public:
         mMaxOutputLen = maxOutputLen;
     }
 
+    [[nodiscard]] bool constexpr computeContextLogits() const noexcept
+    {
+        return mComputeContextLogits;
+    }
+
+    void constexpr computeContextLogits(bool computeContextLogits) noexcept
+    {
+        mComputeContextLogits = computeContextLogits;
+    }
+
 private:
     SizeType mVocabSize;
     SizeType mNbLayers;
@@ -191,6 +202,7 @@ private:
     SizeType mMaxBatchSize;
     SizeType mMaxInputLen;
     SizeType mMaxOutputLen;
+    bool mComputeContextLogits;
 };
 
 } // namespace tensorrt_llm::runtime

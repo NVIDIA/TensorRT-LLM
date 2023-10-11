@@ -35,18 +35,18 @@ using tensorrt_llm::plugins::GPTAttentionPlugin;
 static const char* GPT_ATTENTION_PLUGIN_VERSION{"1"};
 static const char* GPT_ATTENTION_PLUGIN_NAME{"GPTAttention"};
 
-GPTAttentionPlugin::GPTAttentionPlugin(int num_heads, int num_kv_heads, int unidirectional, float q_scaling,
-    tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+GPTAttentionPlugin::GPTAttentionPlugin(int num_heads, int num_kv_heads, int head_size, int unidirectional,
+    float q_scaling, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
     int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
     float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
     float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
     tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
     bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
-    nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled)
-    : GPTAttentionPluginCommon(num_heads, num_kv_heads, unidirectional, q_scaling, position_embedding_type,
+    int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled)
+    : GPTAttentionPluginCommon(num_heads, num_kv_heads, head_size, unidirectional, q_scaling, position_embedding_type,
         rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale,
         rotary_embedding_max_positions, tp_size, tp_rank, context_fmha_type, multi_block_mode, kv_cache_quant_mode,
-        remove_input_padding, mask_type, paged_kv_cache, type, max_context_length, qkv_bias_enabled)
+        remove_input_padding, mask_type, paged_kv_cache, tokens_per_block, type, max_context_length, qkv_bias_enabled)
 {
 }
 
@@ -63,17 +63,17 @@ GPTAttentionPlugin* GPTAttentionPlugin::clone() const noexcept
 
 // outputs
 //     output_tensor [batch_size, seq_len, local_hidden_size]
-//     present_key_value_pool [blocks, 2, local_num_kv_heads, tokens_per_block, head_size] if paged_kv_attention
-//                         or [batch_size, 2, local_num_kv_heads, max_seq_len, head_size]
+//     present_key_value_pool (optional if mPagedKVCache is false) [batch_size, 2, local_num_kv_heads, max_seq_len,
+//     head_size]
 nvinfer1::DimsExprs GPTAttentionPlugin::getOutputDimensions(
     int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
-    TLLM_CHECK(outputIndex == 0 || outputIndex == 1);
+    TLLM_CHECK(outputIndex == 0 || (!mPagedKVCache && outputIndex == 1));
     if (outputIndex == 0)
     {
         auto ret = inputs[getInputTensorIdx()];
         ret.d[2] = exprBuilder.operation(
-            DimensionOperation::kPROD, *inputs[getPastKeyValueIdx()].d[4], *exprBuilder.constant(mNumHeads));
+            DimensionOperation::kPROD, *exprBuilder.constant(mHeadSize), *exprBuilder.constant(mNumHeads));
         return ret;
     }
     return inputs[getPastKeyValueIdx()];
@@ -96,12 +96,19 @@ bool GPTAttentionPlugin::supportsFormatCombination(
     else if (mPagedKVCache && pos == getKVCacheBlockPointersIdx())
     {
         // pointers to kv cache blocks
-        return inOut[pos].type == nvinfer1::DataType::kINT32 && inOut[pos].format == TensorFormat::kLINEAR;
+        return inOut[pos].type == nvinfer1::DataType::kINT64 && inOut[pos].format == TensorFormat::kLINEAR;
     }
-    else if (mKVCacheQuantMode.hasInt8KvCache() && (pos == getPastKeyValueIdx() || pos == nbInputs + 1))
+    else if (mKVCacheQuantMode.hasInt8KvCache()
+        && (!mPagedKVCache && (pos == getPastKeyValueIdx() || pos == nbInputs + 1)))
     {
         // If use Int8 K/V cache we require I/O KV values to int8
         return (inOut[pos].type == nvinfer1::DataType::kINT8) && (inOut[pos].format == TensorFormat::kLINEAR);
+    }
+    else if (mKVCacheQuantMode.hasFp8KvCache()
+        && (!mPagedKVCache && (pos == getPastKeyValueIdx() || pos == nbInputs + 1)))
+    {
+        // If use FP8 K/V cache we require I/O KV values to FP8
+        return (inOut[pos].type == nvinfer1::DataType::kFP8) && (inOut[pos].format == TensorFormat::kLINEAR);
     }
     else if (mRemovePadding && (pos == getHostContextLengthsIdx()))
     {
@@ -117,7 +124,6 @@ bool GPTAttentionPlugin::supportsFormatCombination(
 void GPTAttentionPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
     const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
 {
-    mHeadSize = in[getPastKeyValueIdx()].desc.dims.d[4];
     TLLM_CHECK(mHeadSize > 0);
 
     // pre-check whether FMHA is supported in order to save memory allocation
@@ -242,17 +248,13 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     }
 
     int max_blocks_per_sequence = 0;
-    int tokens_per_block = 0;
     void* block_pointers = nullptr;
     if (mPagedKVCache)
     {
         auto& kvCacheBlockPointers = inputDesc[getKVCacheBlockPointersIdx()];
         auto& kvCacheBlockPointersShape = inputDesc[getKVCacheBlockPointersIdx()].dims;
-        // Div by 2 because we reinterpret int32 input as int64
-        max_blocks_per_sequence = kvCacheBlockPointersShape.d[kvCacheBlockPointersShape.nbDims - 1] / 2;
-        tokens_per_block = inputDesc[getPastKeyValueIdx()].dims.d[3];
-        // Div by 2 because we reinterpret int32 input as int64
-        auto offset = getStride(kvCacheBlockPointersShape, 0) / 2 * seqIdxBeg;
+        max_blocks_per_sequence = kvCacheBlockPointersShape.d[kvCacheBlockPointersShape.nbDims - 1];
+        auto offset = getStride(kvCacheBlockPointersShape, 0) * seqIdxBeg;
         auto const typed_block_pointers = static_cast<void* const*>(inputs[getKVCacheBlockPointersIdx()]) + offset;
         block_pointers = const_cast<void*>(static_cast<void const*>(typed_block_pointers));
     }
@@ -273,7 +275,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         enqueueContext<T, KVCacheBuffer>(
             EnqueueContextParams<T, KVCacheBuffer>{attention_input, qkv_bias, max_context_len, maxSeqLen,
                 context_lengths, kv_scale_orig_quant, kv_scale_quant_orig, alibi_slopes, context_buf_, key_value_cache,
-                block_pointers, batch_size, localNbTokens, tokens_per_block, max_blocks_per_sequence, workspace},
+                block_pointers, batch_size, localNbTokens, max_blocks_per_sequence, workspace},
             stream);
     }
     else // generation stage; input_seq_len == 1
@@ -290,8 +292,8 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         enqueueGeneration<T, KVCacheBuffer>(
             EnqueueGenerationParams<T, KVCacheBuffer>{attention_input, qkv_bias, sequence_length, past_kv_len,
                 beamWidth, context_lengths, kv_scale_orig_quant, kv_scale_quant_orig, alibi_slopes, context_buf_,
-                key_value_cache, block_pointers, maxSeqLen, num_requests, tokens_per_block, max_blocks_per_sequence,
-                cache_indir, workspace},
+                key_value_cache, block_pointers, maxSeqLen, num_requests, max_blocks_per_sequence, cache_indir,
+                workspace},
             stream);
     }
 
@@ -339,8 +341,15 @@ int GPTAttentionPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
 nvinfer1::DataType GPTAttentionPlugin::getOutputDataType(
     int index, const nvinfer1::DataType* inputTypes, int nbInputs) const noexcept
 {
-    TLLM_CHECK(index == 0 || index == 1);
-    return inputTypes[index];
+    TLLM_CHECK(index == 0 || (!mPagedKVCache && index == 1));
+    if (index == 0)
+    {
+        return inputTypes[getInputTensorIdx()];
+    }
+    else
+    {
+        return inputTypes[getPastKeyValueIdx()];
+    }
 }
 
 // IPluginV2 Methods
@@ -357,7 +366,7 @@ const char* GPTAttentionPlugin::getPluginVersion() const noexcept
 
 int GPTAttentionPlugin::getNbOutputs() const noexcept
 {
-    return 2;
+    return mPagedKVCache ? 1 : 2;
 }
 
 size_t GPTAttentionPlugin::getSerializationSize() const noexcept
@@ -403,8 +412,8 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(const char* name, const Plugi
     try
     {
         auto* obj = new GPTAttentionPlugin(p.getScalar<int32_t>("num_heads").value(),
-            p.getScalar<int32_t>("num_kv_heads").value(), p.getScalar<int32_t>("unidirectional").value(),
-            p.getScalar<float>("q_scaling").value(),
+            p.getScalar<int32_t>("num_kv_heads").value(), p.getScalar<int32_t>("head_size").value(),
+            p.getScalar<int32_t>("unidirectional").value(), p.getScalar<float>("q_scaling").value(),
             static_cast<PositionEmbeddingType>(p.getScalar<int8_t>("position_embedding_type").value()),
             p.getScalar<int32_t>("rotary_embedding_dim").value(), p.getScalar<float>("rotary_embedding_base").value(),
             static_cast<RotaryScalingType>(p.getScalar<int8_t>("rotary_embedding_scale_type").value()),
@@ -418,6 +427,7 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(const char* name, const Plugi
             static_cast<bool>(p.getScalar<int8_t>("remove_input_padding").value()),
             static_cast<AttentionMaskType>(p.getScalar<int32_t>("mask_type").value()),
             static_cast<bool>(p.getScalar<int32_t>("paged_kv_cache").value()),
+            p.getScalar<int32_t>("tokens_per_block").value(),
             static_cast<nvinfer1::DataType>(p.getScalar<int32_t>("type_id").value()),
             p.getScalar<int32_t>("max_context_length").value(),
             static_cast<bool>(p.getScalar<int8_t>("qkv_bias_enabled").value()));

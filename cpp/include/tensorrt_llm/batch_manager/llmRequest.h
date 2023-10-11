@@ -37,22 +37,24 @@ enum LlmRequestState_t
 class LlmRequest
 {
 public:
-    using BeamTokens = std::vector<std::vector<int32_t>>;
     using SizeType = runtime::SizeType;
+    using TokenIdType = runtime::TokenIdType;
+    using RequestIdType = std::uint64_t;
+    using BeamTokens = std::vector<std::vector<TokenIdType>>;
 
-    LlmRequest(uint64_t requestId, int32_t maxNewTokens, std::shared_ptr<std::vector<int32_t>> input_tokens,
+    LlmRequest(RequestIdType requestId, SizeType maxNewTokens, std::shared_ptr<std::vector<TokenIdType>> input_tokens,
         runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType> endId = std::nullopt,
         std::optional<SizeType> padId = std::nullopt)
         : mRequestId(requestId)
+        , mPromptLen(input_tokens->size())
         , mMaxNewTokens(maxNewTokens)
         , mSamplingConfig(samplingConfig)
-        , mPromptLen(input_tokens->size())
-        , mNumGeneratedTokens(0)
         , mState(REQUEST_STATE_CONTEXT_INIT)
         , mIsStreaming(isStreaming)
         , mEndId(endId)
         , mPadId(padId)
         , mBatchSlot(-1)
+        , mNumGeneratedTokens(0)
     {
         mMaxSentTokenPos = mPromptLen - 1;
         // Scatter the input tokens to other beam
@@ -62,7 +64,7 @@ public:
     /// @brief Get total number of tokens for this req (prompt + generated)
     /// @param beam The beam index
     /// @return  The number of tokens
-    int32_t getNumTokens(int beam) const
+    SizeType getNumTokens(SizeType beam) const
     {
         return mTokens->at(beam).size();
     }
@@ -71,7 +73,7 @@ public:
     /// @param beam  The beam index
     /// @param pos The position of the token relative to beginning of the prompt
     /// @return  The token index
-    int32_t getToken(int beam, int pos) const
+    TokenIdType getToken(SizeType beam, SizeType pos) const
     {
         return mTokens->at(beam).at(pos);
     }
@@ -79,14 +81,14 @@ public:
     /// @brief Get the tokens at a given beam index
     /// @param beam  The beam index
     /// @return  A vector of tokens for this beam index, includes the prompt
-    std::vector<int32_t> getTokens(int beam) const
+    std::vector<TokenIdType> getTokens(SizeType beam) const
     {
         return mTokens->at(beam);
     }
 
     /// @brief Get the number of generated tokens
     /// @return  The number of generated tokens (doesn't include the prompt tokens)
-    int32_t getNumGeneratedTokens() const
+    SizeType getNumGeneratedTokens() const
     {
         return mNumGeneratedTokens;
     }
@@ -94,10 +96,10 @@ public:
     /// @brief Add new generated tokens to the vector of tokens
     /// @param beamTokens A vector containing the tokens to add for each beam index
     ///                   beamTokens is expected to be of size beamWidth
-    void addNewTokens(const std::vector<int32_t>& beamTokens)
+    void addNewTokens(const std::vector<TokenIdType>& beamTokens)
     {
         assert(mSamplingConfig.beamWidth == beamTokens.size());
-        for (int beam = 0; beam < beamTokens.size(); ++beam)
+        for (std::size_t beam = 0; beam < beamTokens.size(); ++beam)
         {
             mTokens->at(beam).push_back(beamTokens[beam]);
         }
@@ -109,7 +111,7 @@ public:
     void setGeneratedTokens(const BeamTokens& generatedBeamTokens)
     {
         assert(generatedBeamTokens.size() == mSamplingConfig.beamWidth);
-        for (int beam = 0; beam < generatedBeamTokens.size(); ++beam)
+        for (std::size_t beam = 0; beam < generatedBeamTokens.size(); ++beam)
         {
             auto& beamTokens = (*mTokens)[beam];
             beamTokens.resize(mPromptLen);
@@ -151,7 +153,7 @@ public:
     /// @brief Get the maximum position of the tokens returned to the client. Use to ensure we don't return to client
     /// duplicated token positions.
     /// @return The maximum position of the tokens sent to the client
-    int32_t getMaxSentTokenPos() const
+    SizeType getMaxSentTokenPos() const
     {
         return mMaxSentTokenPos;
     }
@@ -159,28 +161,26 @@ public:
     /// @brief Sets the maximum position of the tokens returned to the client. Use to ensure we don't return to client
     /// duplicated token positions.
     /// @param pos The maximum position
-    void setMaxSentTokenPos(int32_t pos)
+    void setMaxSentTokenPos(SizeType pos)
     {
         mMaxSentTokenPos = pos;
     }
 
-    uint64_t mRequestId;
-    int32_t mMaxNewTokens;
+    RequestIdType mRequestId;
+    SizeType mPromptLen;
+    SizeType mMaxNewTokens;
     // Tokens [beam_size, mPromptLen + mNumGeneratedTokens]
     runtime::SamplingConfig mSamplingConfig;
-    int32_t mPromptLen;
     LlmRequestState_t mState;
     bool mIsStreaming;
     std::optional<SizeType> mEndId;
     std::optional<SizeType> mPadId;
-    int32_t mBatchSlot;
-
-    ~LlmRequest() {}
+    SizeType mBatchSlot;
 
 private:
     std::shared_ptr<BeamTokens> mTokens;
-    int32_t mNumGeneratedTokens;
-    int32_t mMaxSentTokenPos;
+    SizeType mNumGeneratedTokens;
+    SizeType mMaxSentTokenPos;
 };
 
 } // namespace tensorrt_llm::batch_manager

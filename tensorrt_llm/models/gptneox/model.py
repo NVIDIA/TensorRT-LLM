@@ -100,6 +100,7 @@ class GPTNeoXAttention(Module):
             host_request_types=attention_params.host_request_types,
             num_heads=self.num_attention_heads,
             num_kv_heads=self.num_attention_heads,
+            hidden_size_per_head=self.attention_head_size,
             q_scaling=1.0,
             rotary_embedding_dim=self.rotary_dim,
             position_embedding_type=self.position_embedding_type,
@@ -328,7 +329,7 @@ class GPTNeoXForCausalLM(GPTNeoXModel, GenerationMixin):
         lm_logits = self.lm_head(hidden_states)
         lm_logits.mark_output('logits', self._kv_dtype)
 
-        if use_cache:
+        if use_cache and default_net().plugin_config.paged_kv_cache == False:
             for i, present in enumerate(presents):
                 present.mark_output(f'present_key_value_{i}', self._kv_dtype)
             return (lm_logits, presents)

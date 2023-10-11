@@ -60,7 +60,6 @@ typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferMan
 {
     constexpr int endId = 1;
     constexpr bool isFreeBufferAfterForward{false};
-    tc::cublasMMWrapper* cublasWrapper = nullptr;
     cudaDeviceProp prop;
     tc::check_cuda_error(cudaGetDeviceProperties(&prop, 0));
 
@@ -97,8 +96,8 @@ typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferMan
     tc::Tensor newTokens{tc::MEMORY_GPU, tc::TYPE_INT32, {batchSize}, gpuNewTokens};
     tc::Tensor noRepeatNgramSize{tc::MEMORY_GPU, tc::TYPE_INT32, {batchSize}, gpuNoRepeatNgramSize};
 
-    auto ddLayer = tl::DynamicDecodeLayer<float>(vocabSize, vocabSizePadded, manager.getStream().get(), cublasWrapper,
-        &allocator, isFreeBufferAfterForward, &prop);
+    auto ddLayer = tl::DynamicDecodeLayer<float>(
+        vocabSize, vocabSizePadded, manager.getStream().get(), &allocator, isFreeBufferAfterForward, &prop);
 
     typename tl::DynamicDecodeLayer<float>::SetupParams setupParams;
 

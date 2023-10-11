@@ -44,7 +44,7 @@ def build_engine(weigth_dir: _pl.Path, engine_dir: _pl.Path, *args):
     run_command(build_args)
 
 
-def build_engines(model_cache: str):
+def build_engines(model_cache: str, only_multi_gpu: bool):
     resources_dir = _pl.Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
     model_name = 'llama-7b-hf'
@@ -61,18 +61,16 @@ def build_engines(model_cache: str):
 
     engine_dir = models_dir / 'rt_engine' / model_name
 
-    tp_size = 1
-    pp_size = 1
-    print(f"\nBuilding fp16 tp{tp_size} pp{pp_size} engine")
-    build_engine(hf_dir, engine_dir / 'fp16-plugin/1-gpu')
-
-    tp_size = 2
-    pp_size = 2
-    world_size = tp_size * pp_size
-    print(f"\nBuilding fp16 tp{tp_size} pp{pp_size} engine")
-    build_engine(hf_dir, engine_dir / f'fp16-plugin/{world_size}-gpu',
-                 f'--world_size={world_size}', f'--tp_size={tp_size}',
-                 f'--pp_size={pp_size}')
+    tp_pp_sizes = [(1, 1)]
+    if only_multi_gpu:
+        tp_pp_sizes = [(1, 4), (4, 1), (2, 2)]
+    for tp_size, pp_size in tp_pp_sizes:
+        tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu"
+        world_size = tp_size * pp_size
+        print(f"\nBuilding fp16 tp{tp_size} pp{pp_size} engine")
+        build_engine(hf_dir, engine_dir / f'fp16-plugin/{tp_pp_dir}',
+                     f'--world_size={world_size}', f'--tp_size={tp_size}',
+                     f'--pp_size={pp_size}')
 
     print("Done.")
 
@@ -82,5 +80,9 @@ if __name__ == "__main__":
     parser.add_argument("--model_cache",
                         type=str,
                         help="Directory where models are stored")
+    parser.add_argument(
+        "--only_multi_gpu",
+        action="store_true",
+        help="Flag to build only for Tensor and Pipeline parallelism")
 
     build_engines(**vars(parser.parse_args()))

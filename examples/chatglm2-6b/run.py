@@ -117,7 +117,8 @@ if __name__ == '__main__':
                                hidden_size=hidden_size,
                                vocab_size=vocab_size,
                                num_layers=num_layers,
-                               gpt_attention_plugin=use_gpt_attention_plugin)
+                               gpt_attention_plugin=use_gpt_attention_plugin,
+                               dtype=dtype)
     sampling_config = SamplingConfig(end_id=2,
                                      pad_id=0,
                                      temperature=args.temperature,

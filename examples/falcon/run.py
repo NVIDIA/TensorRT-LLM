@@ -83,12 +83,12 @@ def read_config(config_path: Path):
 
     vocab_size = builder_config['vocab_size']
     num_layers = builder_config['num_layers']
-    tokens_per_block = builder_config['tokens_per_block']
     quant_mode = QuantMode(builder_config['quant_mode'])
 
     plugin_config = config['plugin_config']
     use_gpt_attention_plugin = plugin_config['gpt_attention_plugin']
     paged_kv_cache = plugin_config['paged_kv_cache']
+    tokens_per_block = plugin_config['tokens_per_block']
     remove_input_padding = plugin_config['remove_input_padding']
 
     model_config = ModelConfig(num_heads=num_heads,
@@ -100,7 +100,8 @@ def read_config(config_path: Path):
                                paged_kv_cache=paged_kv_cache,
                                tokens_per_block=tokens_per_block,
                                remove_input_padding=remove_input_padding,
-                               quant_mode=quant_mode)
+                               quant_mode=quant_mode,
+                               dtype=dtype)
 
     return model_config, tp_size, pp_size, world_size, dtype
 

@@ -481,6 +481,8 @@ class PluginCppCodegen:
             f.write(self.meta_data.to_yaml())
 
     def _render(self, tpl_path: str):
+        env = setup_jinja_env()
+
         tpl_data = dict(
             kernel_name=self.meta_data.kernel_name,
             plugin_name=f"{self.meta_data.kernel_name}Plugin",
@@ -501,11 +503,14 @@ class PluginCppCodegen:
             enqueue_body_arg_list=self.enqueue_body_arg_list,
             getNbOutputs_body=self.getNbOutputs_body,
             creator_constructor_body=self.creator_constructor_body,
+            plugin_common_header=open(
+                env.get_template('plugin_common.h').filename).read(),
+            plugin_common_source=open(
+                env.get_template('plugin_common.cpp').filename).read(),
             plugin_version='0',  # TODO[chunweiy]: update it
             **_render_common_parameters(),
         )
 
-        env = setup_jinja_env()
         return env.get_template(tpl_path).render(tpl_data)
 
     def get_io_count(self) -> int:
@@ -676,7 +681,7 @@ class PluginCmakeCodegen:
             f.write(content)
 
 
-def setup_jinja_env():
+def setup_jinja_env() -> jinja2.Environment:
     env = jinja2.Environment(
         loader=jinja2.PackageLoader(
             package_name="tensorrt_llm.tools.plugin_gen",

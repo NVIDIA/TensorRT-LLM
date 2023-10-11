@@ -78,7 +78,8 @@ if __name__ == '__main__':
                                hidden_size=hidden_size,
                                vocab_size=vocab_size,
                                num_layers=num_layers,
-                               gpt_attention_plugin=use_gpt_attention_plugin)
+                               gpt_attention_plugin=use_gpt_attention_plugin,
+                               dtype=dtype)
     sampling_config = SamplingConfig(end_id=EOS_TOKEN, pad_id=PAD_TOKEN)
     input_lengths = torch.tensor(
         [input_ids.size(1) for _ in range(input_ids.size(0))]).int().cuda()

@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/generationInput.h"
 #include "tensorrt_llm/runtime/generationOutput.h"
 #include "tensorrt_llm/runtime/gptModelConfig.h"
@@ -99,19 +100,52 @@ public:
         mCudaGraphMode = value;
     }
 
-    void setup(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength, bool decoderPerRequest,
-        std::optional<SizeType> maxTokensInPagedKvCache = std::nullopt);
+    //! @brief   Initialize buffers for the given sizes.
+    //!          `generate` may be called with batch size and beam width smaller than the setup parameters.
+    //! @details `maxBatchSize` will be devided by the number of micro batches to initialize each batch buffer.
+    void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxSequenceLength, bool decoderPerRequest,
+        std::optional<SizeType> maxTokensInPagedKvCache = std::nullopt,
+        std::optional<SizeType> numMicroBatches = std::nullopt);
 
-    void generate(GenerationOutput& outputs, GenerationInput const& inputs, SamplingConfig const& samplingConfig);
+    void generate(GenerationOutput& outputs, GenerationInput const& inputs, SamplingConfig const& samplingConfig)
+    {
+        if (mNumMicroBatches == 1)
+            generateSingleBatch(outputs, inputs, samplingConfig);
+        else
+            generateMultiBatch(outputs, inputs, samplingConfig);
+    }
 
 private:
+    void generateSingleBatch(
+        GenerationOutput& outputs, GenerationInput const& inputs, SamplingConfig const& samplingConfig);
+
+    void generateMultiBatch(
+        GenerationOutput& outputs, GenerationInput const& inputs, SamplingConfig const& samplingConfig);
+
     using KvCacheManager = batch_manager::kv_cache_manager::KVCacheManager;
 
-    void createContexts();
-    void createDecoder(bool decoderPerRequest);
+    void createContexts(SizeType numMicroBatches);
+    void createBuffers(SizeType numMicroBatches);
+    void createDecoders(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength,
+        nvinfer1::DataType logitsType, bool decoderPerRequest, SizeType numMicroBatches);
+    void createKvCacheManagers(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength,
+        SizeType numMicroBatches, std::optional<SizeType> maxTokensInPagedKvCache);
 
-    bool executeDecoderStep(ITensor::SharedPtr& outputIds, ITensor::SharedPtr& newTokens, SizeType decoderStep);
-    void finalizeOutputIds(ITensor& outputIds);
+    //! @brief Execute decoder on last PP rank, receive decoder output on other PP ranks.
+    void decoderStepAsync(
+        ITensor::SharedPtr& outputIds, ITensor::SharedPtr& newTokens, SizeType decoderStep, SizeType microBatchId);
+
+    //! @brief Synchronize with the decoder and return the `shouldStop` flag.
+    bool shouldStopSync(SizeType batchSize, SizeType beamWidth, SizeType microBatchId);
+
+    //! @brief Collect final output ids on last PP rank and send them to first PP rank.
+    //! @details Receives are asynchronous on host, so synchronization is required before access.
+    void finalizeOutputIds(ITensor& outputIds, SizeType microBatchId);
+
+    void kvCacheAddSequences(SizeType beamWidth, SizeType microBatchId);
+
+    ITensor::SharedPtr initNewTokens(
+        GenerationInput const& inputs, SamplingConfig const& samplingConfig, SizeType microBatchId);
 
     class CudaGraphExecutor
     {
@@ -153,15 +187,20 @@ private:
     WorldConfig const mWorldConfig;
     int mDevice{-1};
     std::shared_ptr<NcclCommunicator> mPipelineComm;
+    std::shared_ptr<CudaStream> mCommStream;
+    CudaEvent mCommEvent{};
 
     SizeType mDecoderMaxSequenceLength{};
 
     LoggerPtr mLogger;
     std::shared_ptr<TllmRuntime> mRuntime;
-    std::shared_ptr<IStatefulGptDecoder> mDecoder;
 
-    std::shared_ptr<RuntimeBuffers> mBuffers;
-    std::shared_ptr<KvCacheManager> mKvCacheManager;
+    SizeType mNumMicroBatches;
+    // for each micro batch
+    std::vector<std::shared_ptr<IStatefulGptDecoder>> mDecoders;
+    std::vector<std::shared_ptr<RuntimeBuffers>> mBuffers;
+    std::vector<std::shared_ptr<KvCacheManager>> mKvCacheManagers;
+    std::vector<CudaEvent> mReceivedEvents;
 
     bool mCudaGraphMode{false};
     // ping-pong instances

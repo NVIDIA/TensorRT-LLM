@@ -17,7 +17,6 @@
 #include "tensorrt_llm/runtime/statefulGptDecoder.h"
 
 #include <algorithm>
-#include <iostream>
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
@@ -58,6 +57,7 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
     dOutput->lengths = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     dOutput->cumLogProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     dOutput->beamHypotheses.empty(mBufferManager);
+
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -116,8 +116,6 @@ void StatefulGptDecoder::reshapeBuffers(SizeType batchSize, SizeType beamWidth, 
 
     mMaxNewTokens = 0;
     mNbSteps = 0;
-    mFinished.clear();
-    mFinished.resize(batchSize, true);
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -234,12 +232,10 @@ void StatefulGptDecoder::newBatch(GenerationInput const& inputs, SamplingConfig 
 
     // remaining
     mNbSteps = 0;
-    mFinished.clear();
-    mFinished.resize(batchSize, false);
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-bool StatefulGptDecoder::forward(decoder::Output& output, decoder::Input const& input)
+void StatefulGptDecoder::forwardAsync(decoder::Output& output, decoder::Input const& input)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto& logits = input.logits;
@@ -258,9 +254,7 @@ bool StatefulGptDecoder::forward(decoder::Output& output, decoder::Input const& 
         "Specify both srcCacheIndirection and tgtCacheIndirection or neither.");
     TLLM_CHECK(!srcCacheIndirection || srcCacheIndirection->getDataType() == TRTDataType<SizeType>::value);
     TLLM_CHECK(!tgtCacheIndirection || tgtCacheIndirection->getDataType() == TRTDataType<SizeType>::value);
-    auto& sequenceLengths = output.sequenceLengths;
 
-    auto& stream = mStream;
     auto& dInput = *mDecodingInput;
     auto& dOutput = *mDecodingOutput;
     dInput.logits = logits;
@@ -269,21 +263,26 @@ bool StatefulGptDecoder::forward(decoder::Output& output, decoder::Input const& 
         dInput.cacheIndirection = srcCacheIndirection;
         dOutput.cacheIndirection = tgtCacheIndirection;
     }
-    dOutput.lengths = sequenceLengths;
+    dOutput.lengths = output.sequenceLengths;
 
-    auto& decoder = *mDecoder;
-    decoder.forwardAsync(dOutput, dInput);
+    mDecoder->forwardAsync(dOutput, dInput);
+    mStream->record(mDecodedEvent.get());
 
     dInput.step += 1;
     mNbSteps += 1;
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+}
 
-    TLLM_CUDA_CHECK(::cudaStreamSynchronize(stream->get()));
+bool StatefulGptDecoder::isFinishedSync()
+{
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    mDecodedEvent.synchronize();
 
+    auto& dOutput = *mDecodingOutput;
     auto finished = mNbSteps >= mMaxNewTokens
         // This condition requires the synchronization above
         || *bufferCast<SizeType>(*dOutput.finishedSum) == static_cast<SizeType>(dOutput.finished->getSize());
 
-    std::fill(mFinished.begin(), mFinished.end(), finished);
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
     return finished;
 }

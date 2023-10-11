@@ -225,7 +225,8 @@ int BertAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
     // Padding offset = nullptr here (remove padding is not supported).
     invokeAddFusedQKVBiasTranspose(q_buf_2_, k_buf_2_, v_buf_2_, const_cast<T*>(attention_input), input_lengths,
         nullptr, request_batch_size, request_seq_len, batch_size * input_seq_len, mNumHeads, mNumHeads, mHeadSize,
-        mEnableContextFMHA, 0, 0.0f, 0.0f, PositionEmbeddingType::kLEARNED_ABSOLUTE, (float*) nullptr, 0, stream);
+        mEnableContextFMHA, 0, 0.0f, RotaryScalingType::kNONE, 0.0f, 0, PositionEmbeddingType::kLEARNED_ABSOLUTE,
+        (float*) nullptr, 0, stream);
 
     const auto gemm_data_type = tc::CudaDataType<T>::value;
     const int attention_seq_len_1 = request_seq_len; // q length
@@ -363,13 +364,10 @@ int BertAttentionPlugin::initialize() noexcept
 {
     auto cublasHandle = getCublasHandle();
     auto cublasLtHandle = getCublasLtHandle();
-    mCublasAlgoMap = new tc::cublasAlgoMap(GEMM_CONFIG);
-    mCublasWrapperMutex = new std::mutex();
-    mCublasWrapper
-        = new tc::cublasMMWrapper(cublasHandle, cublasLtHandle, nullptr, mCublasAlgoMap, mCublasWrapperMutex, nullptr);
+    mCublasWrapper.reset(new tc::CublasMMWrapper(cublasHandle, cublasLtHandle, nullptr, nullptr));
     if (mEnableContextFMHA)
     {
-        mFMHARunner = new FusedMHARunnerV2(DATA_TYPE_FP16, mNumHeads, mHeadSize, mQScaling);
+        mFMHARunner.reset(new FusedMHARunnerV2(DATA_TYPE_FP16, mNumHeads, mHeadSize, mQScaling));
         // set flags: force_fp32_acc, is_s_padded, causal_mask, num_kv_heads = num_heads
         mFMHARunner->setup_flags(mFMHAForceFP32Acc, true, false, mNumHeads);
     }
@@ -379,18 +377,6 @@ int BertAttentionPlugin::initialize() noexcept
 
 void BertAttentionPlugin::destroy() noexcept
 {
-    delete mCublasAlgoMap;
-    delete mCublasWrapperMutex;
-    delete mCublasWrapper;
-    if (mEnableContextFMHA)
-    {
-        delete mFMHARunner;
-    }
-
-    mCublasAlgoMap = nullptr;
-    mCublasWrapperMutex = nullptr;
-    mCublasWrapper = nullptr;
-    mFMHARunner = nullptr;
     delete this;
 }
 

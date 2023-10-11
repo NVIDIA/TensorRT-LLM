@@ -71,6 +71,12 @@ void WeightOnlyQuantGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
     setTmpWorkspaceSizeInBytes(bytes);
 }
 
+std::vector<WeightOnlyQuantGemmPluginProfiler::Config> WeightOnlyQuantGemmPluginProfiler::getTactics(
+    int m, int n, int k) const
+{
+    return mRunner->getConfigs();
+}
+
 WeightOnlyQuantMatmulPlugin::WeightOnlyQuantMatmulPlugin(
     nvinfer1::DataType type, int weightTypeId, const WeightOnlyQuantMatmulPlugin::PluginProfilerPtr& pluginProfiler)
     : mPluginProfiler(pluginProfiler)
@@ -130,8 +136,7 @@ nvinfer1::IPluginV2DynamicExt* WeightOnlyQuantMatmulPlugin::clone() const noexce
 
 void WeightOnlyQuantMatmulPlugin::configGemm()
 {
-    mPluginProfiler->profileTactics(
-        m_weightOnlyGemmRunner->getConfigs(), m_weightOnlyGemmRunner, mType, mDims, mGemmId);
+    mPluginProfiler->profileTactics(m_weightOnlyGemmRunner, mType, mDims, mGemmId);
 }
 
 nvinfer1::DimsExprs WeightOnlyQuantMatmulPlugin::getOutputDimensions(

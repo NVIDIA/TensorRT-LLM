@@ -47,15 +47,17 @@ void runGemm(const int M, const int N, const int K, const bool transA, const boo
     const CublasGemmWrapperPtr& cublasWrapperPtr, const void* act, const void* weight, void* output,
     const std::optional<cublasLtMatmulHeuristicResult_t>& heuristic, void* workspace, cudaStream_t stream)
 {
-    auto cublasHandle = cublasWrapperPtr->getCublasHandle();
-    TLLM_CUDA_CHECK(cublasSetStream(cublasHandle, stream));
     cublasWrapperPtr->setStream(stream);
     cublasWrapperPtr->setWorkspace(workspace);
+
     cublasOperation_t transa, transb;
     int m, n, k;
     int lda, ldb, ldc;
     getProblemParams(transa, transb, m, n, k, lda, ldb, ldc, transA, transB, M, N, K);
+
+    cublasWrapperPtr->createDescriptors(transa, transb, m, n, k, lda, ldb, ldc);
     cublasWrapperPtr->Gemm(transa, transb, m, n, k, weight, lda, act, ldb, output, ldc, heuristic);
+    cublasWrapperPtr->destroyDescriptors();
 }
 
 void CublasLtGemmPluginProfiler::runTactic(
@@ -80,11 +82,17 @@ void CublasLtGemmPluginProfiler::runTactic(
 bool CublasLtGemmPluginProfiler::checkTactic(int m, int n, int k, const Config& tactic) const
 {
     cublasOperation_t transa, transb;
-    int M, N, K;
+    int M = m, N = n, K = k;
     int lda, ldb, ldc;
-    getProblemParams(transa, transb, m, n, k, lda, ldb, ldc, mTransA, mTransB, n, m, k);
+    getProblemParams(transa, transb, m, n, k, lda, ldb, ldc, mTransA, mTransB, M, N, K);
 
-    return mRunner->checkTactic(transa, transb, m, n, k, lda, ldb, ldc, tactic);
+    mRunner->createDescriptors(transa, transb, m, n, k, lda, ldb, ldc);
+
+    const auto checkResult = mRunner->checkTactic(transa, transb, m, n, k, lda, ldb, ldc, tactic.algo);
+
+    mRunner->destroyDescriptors();
+
+    return checkResult;
 }
 
 void CublasLtGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
@@ -103,6 +111,20 @@ void CublasLtGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
     };
     size_t bytes = calculateTotalWorkspaceSize(workspaces.data(), workspaces.size(), ALIGNMENT);
     setTmpWorkspaceSizeInBytes(bytes);
+}
+
+std::vector<CublasLtGemmPluginProfiler::Config> CublasLtGemmPluginProfiler::getTactics(int M, int N, int K) const
+{
+    cublasOperation_t transa, transb;
+    int m, n, k;
+    int lda, ldb, ldc;
+    getProblemParams(transa, transb, m, n, k, lda, ldb, ldc, mTransA, mTransB, M, N, K);
+
+    mRunner->createDescriptors(transa, transb, m, n, k, lda, ldb, ldc);
+    const auto heruistics = mRunner->getTactics(transa, transb, m, n, k, lda, ldb, ldc);
+    mRunner->destroyDescriptors();
+
+    return heruistics;
 }
 
 GemmPlugin::GemmPlugin(
@@ -138,14 +160,11 @@ void GemmPlugin::init()
 {
     auto cublasHandle = getCublasHandle();
     auto cublasLtHandle = getCublasLtHandle();
-    mCublasAlgoMap = std::make_shared<cublasAlgoMap>(GEMM_CONFIG);
-    mCublasWrapperMutex = std::make_shared<std::mutex>();
-    mCublasWrapper = std::make_shared<cublasMMWrapper>(
-        cublasHandle, cublasLtHandle, nullptr, mCublasAlgoMap.get(), mCublasWrapperMutex.get(), nullptr);
+    mCublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
 
     mPluginProfiler->setTranspose(mTransA, mTransB);
 
-    mGemmId = GemmIdCublas(GemmIdCore(mDims.n, mDims.k, mType), mTransA, mTransB);
+    mGemmId = GemmIdCublas(mDims.n, mDims.k, mType, mTransA, mTransB);
 }
 
 void GemmPlugin::setGemmConfig()
@@ -182,18 +201,7 @@ void GemmPlugin::configGemm()
 
     setGemmConfig();
 
-    std::vector<cublasLtMatmulHeuristicResult_t> totalHeruistics;
-    for (int mCur = mDims.minM; mCur < mDims.maxM; mCur *= 2)
-    {
-        cublasOperation_t transa, transb;
-        int m, n, k;
-        int lda, ldb, ldc;
-        getProblemParams(transa, transb, m, n, k, lda, ldb, ldc, mTransA, mTransB, mCur, mDims.n, mDims.k);
-        const auto heruistics = mCublasWrapper->getTactics(transa, transb, m, n, k, lda, ldb, ldc);
-
-        totalHeruistics.insert(totalHeruistics.end(), heruistics.begin(), heruistics.end());
-    }
-    mPluginProfiler->profileTactics(totalHeruistics, mCublasWrapper, mType, mDims, mGemmId);
+    mPluginProfiler->profileTactics(mCublasWrapper, mType, mDims, mGemmId);
 }
 
 // IPluginV2DynamicExt Methods
@@ -313,7 +321,8 @@ void GemmPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, in
     {
         mDims = {minM, maxM, N, K};
     }
-    mGemmId.gemmIdCore = {N, K, mType};
+    mGemmId.n = N;
+    mGemmId.k = K;
 }
 
 size_t GemmPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
@@ -339,9 +348,7 @@ int GemmPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinf
     const auto N = computeNDimension(mTransB, nbDimsB, inputDesc[1].dims.d);
     const int K = mTransA ? inputDesc[0].dims.d[0] : inputDesc[0].dims.d[nbDimsA - 1];
 
-    // FIXME(nkorobov): enable best config selection
-    // const auto& bestTactic = mPluginProfiler->getBestConfig(M, mGemmId);
-    const std::optional<CublasLtGemmPluginProfiler::Config> bestTactic = {};
+    auto bestTactic = mPluginProfiler->getBestConfig(M, mGemmId);
     runGemm(M, N, K, mTransA, mTransB, mType, mCublasWrapper, inputs[0], inputs[1], outputs[0], bestTactic, workspace,
         stream);
     return 0;
@@ -465,7 +472,8 @@ IPluginV2* GemmPluginCreator::createPlugin(const char* name, const PluginFieldCo
     {
         // GemmPluginCreator is unique and shared for an engine generation
         // Create plugin profiler with shared tactics map
-        auto pluginProfiler = gemmPluginProfileManager.createGemmPluginProfiler(/* inference */ false);
+        // FIXME(nkorobov) enable tactic profiler
+        auto pluginProfiler = gemmPluginProfileManager.createGemmPluginProfiler(/* inference */ false, /* skip */ true);
         auto* obj = new GemmPlugin(transA, transB, type, useFp8, pluginProfiler);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
@@ -485,7 +493,8 @@ IPluginV2* GemmPluginCreator::deserializePlugin(const char* name, const void* se
     {
         // GemmPluginCreator is unique and shared for an engine generation
         // Create plugin profiler with shared tactics map
-        auto pluginProfiler = gemmPluginProfileManager.createGemmPluginProfiler(/* inference */ true);
+        // FIXME(nkorobov) enable tactic profiler
+        auto pluginProfiler = gemmPluginProfileManager.createGemmPluginProfiler(/* inference */ true, /* skip */ true);
         auto* obj = new GemmPlugin(serialData, serialLength, pluginProfiler);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;

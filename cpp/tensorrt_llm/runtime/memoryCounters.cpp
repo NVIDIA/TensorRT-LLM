@@ -30,7 +30,7 @@ auto constexpr kByteUnits = std::array{"B", "KB", "MB", "GB", "TB", "PB", "EB"};
 
 std::string doubleBytesToString(double bytes, int precision)
 {
-    int unitIdx{0};
+    std::uint32_t unitIdx{0};
 
     while (std::abs(bytes) >= 1024.0 && unitIdx < kByteUnits.size() - 1)
     {
@@ -52,7 +52,7 @@ std::string MemoryCounters::bytesToString(SizeType bytes, int precision)
     return doubleBytesToString(static_cast<double>(bytes), precision);
 }
 
-std::string MemoryCounters::bytesToString(MemoryCounters::DiffType bytes, int precision)
+std::string MemoryCounters::bytesToString(DiffType bytes, int precision)
 {
     return doubleBytesToString(static_cast<double>(bytes), precision);
 }
@@ -70,7 +70,6 @@ void MemoryCounters::allocate(MemoryType memoryType, MemoryCounters::SizeType si
 
 void MemoryCounters::deallocate(MemoryType memoryType, MemoryCounters::SizeType size)
 {
-    auto const sizeDiff = -static_cast<DiffType>(size);
     switch (memoryType)
     {
     case MemoryType::kGPU: deallocate<MemoryType::kGPU>(size); break;

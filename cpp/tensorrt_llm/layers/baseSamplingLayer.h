@@ -36,8 +36,8 @@ class BaseSamplingLayer : public BaseLayer
 {
 public:
     BaseSamplingLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-        tensorrt_llm::common::cublasMMWrapper* cublas_wrapper, tensorrt_llm::common::IAllocator* allocator,
-        bool is_free_buffer_after_forward, cudaDeviceProp* cuda_device_prop);
+        tensorrt_llm::common::IAllocator* allocator, bool is_free_buffer_after_forward,
+        cudaDeviceProp* cuda_device_prop);
 
     BaseSamplingLayer(BaseSamplingLayer const& sampling_layer);
 

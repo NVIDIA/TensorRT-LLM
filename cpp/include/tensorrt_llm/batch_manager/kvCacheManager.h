@@ -21,6 +21,7 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <NvInferRuntime.h>
 #include <cstdint>
@@ -175,8 +176,8 @@ public:
     using CudaStreamPtr = std::shared_ptr<runtime::CudaStream>;
 
     KVCacheManager(SizeType numLayers, SizeType numHeads, SizeType numKvHeads, SizeType hiddenSize,
-        SizeType tokensPerBlock, SizeType maxNumBlocks, SizeType maxBatchSize, nvinfer1::DataType dtype,
-        CudaStreamPtr stream);
+        SizeType tokensPerBlock, SizeType maxNumBlocks, SizeType maxBatchSize, SizeType maxBeamWidth,
+        SizeType maxBlocksPerSeq, nvinfer1::DataType dtype, CudaStreamPtr stream);
 
     [[nodiscard]] SizeType getTokensPerBlock() const
     {
@@ -221,11 +222,10 @@ public:
 
     void removeSequence(SizeType batchSlotIdx);
 
-    [[nodiscard]] std::vector<runtime::ITensor::UniquePtr> getBlockPointersOfSlot(
-        SizeType batchSlotIdx, SizeType beamWidth, SizeType maxBlocksPerSeq) const;
+    void getBlockPointersOfBatch(runtime::ITensor::SharedPtr dstPointers, SizeType batchSize, SizeType beamWidth) const;
 
-    [[nodiscard]] runtime::ITensor::UniquePtr getBlockPointersOfBatch(
-        SizeType batchSize, SizeType beamWidth, SizeType maxBlocksPerSeq) const;
+    void copyBlockPointers(runtime::ITensor::SharedPtr dstPointers, SizeType dstSlotOffset, SizeType batchSlotIdx,
+        SizeType beamWidth) const;
 
     // Volume of [2, numKvHeads, tokensPerBlock, sizePerHead]
     [[nodiscard]] static SizeType constexpr calculatePageSize(tensorrt_llm::runtime::GptModelConfig const& modelConfig)
@@ -235,10 +235,14 @@ public:
 
     // numLayers * 2 * numKvHeads * sizePerHead
     [[nodiscard]] static SizeType constexpr calculateCacheSizePerToken(
-        tensorrt_llm::runtime::GptModelConfig const& modelConfig)
+        tensorrt_llm::runtime::GptModelConfig const& modelConfig, tensorrt_llm::runtime::WorldConfig const& worldConfig)
     {
-        return modelConfig.getNbLayers() * 2 * modelConfig.getNbKvHeads() * modelConfig.getSizePerHead();
+        return modelConfig.getNbLayers(worldConfig.getPipelineParallelism()) * 2 * modelConfig.getNbKvHeads()
+            * modelConfig.getSizePerHead();
     }
+
+private:
+    void cacheNewBlockPointer(const GenerationRequest& seq, SizeType batchSlotIdx);
 
 private:
     // Number of elements per one blocks
@@ -247,14 +251,20 @@ private:
     SizeType mTokensPerBlock;
     // Total maximum number of blocks
     SizeType mMaxNumBlocks;
+    // Maximum size of batch
+    SizeType mMaxBatchSize;
+    // Maximum beam width
+    SizeType mMaxBeamWidth;
+    // Maximum number of blocks per sequence
+    SizeType mMaxBlocksPerSeq;
     // Pools
     std::vector<runtime::ITensor::SharedPtr> mPools;
     // Block manager
     BlockManager mBlockManager;
     // List of all sequences
     std::vector<SequencesPtr> mSequences;
-    // buffer for block pointers for all batch slots
-    std::vector<runtime::ITensor::UniquePtr> mAllBlockPointers;
+    // buffer for block pointers for all managed sequences
+    runtime::ITensor::SharedPtr mSequenceBlockPointers;
 
     runtime::BufferManager mManager;
 };

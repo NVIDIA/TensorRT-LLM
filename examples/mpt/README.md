@@ -12,8 +12,9 @@ Support for float16, float32 and bfloat16 conversion. Just change `data_type` fl
 
 The [`hf_gpt_convert.py`](./convert_hf_mpt_to_ft.py) script allows you to convert weights from HF Tranformers format to FT format.
 
-
 ```bash
+python convert_hf_mpt_to_ft.py -i mosaicml/mpt-7b -o ./ft_ckpts/mpt-7b/fp16/ -t float16
+
 python convert_hf_mpt_to_ft.py -i mosaicml/mpt-7b -o ./ft_ckpts/mpt-7b/fp32/ --tensor_parallelism 4 -t float32
 ```
 
@@ -26,39 +27,32 @@ Examples of build invocations:
 
 ```bash
 # Build a single-GPU float16 engine using FT weights.
-# ALiBi is not supported with GPT attention plugin so we can't use that plugin to increase runtime performance
 python3 build.py --model_dir=./ft_ckpts/mpt-7b/fp16/1-gpu \
-                 --dtype float16 \
-                 --use_gemm_plugin float16 \
-                 --world_size 1 \
-                 --output_dir ./trt_engines/mpt-7b/fp32/1-gpu
+                 --max_batch_size 64 \
+                 --use_gpt_attention_plugin \
+                 --use_gemm_plugin \
+                 --output_dir ./trt_engines/mpt-7b/fp16/1-gpu
 
 # Build 4-GPU MPT-7B float32 engines
 # Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
 python3 build.py --world_size=4 \
-                 --log_level=verbose \
+                 --parallel_build \
                  --max_batch_size 64 \
                  --max_input_len 512 \
                  --max_output_len 64 \
-                 --dtype float32 \
-                 --use_gemm_plugin float32 \
+                 --use_gpt_attention_plugin \
+                 --use_gemm_plugin \
                  --model_dir ./ft_ckpts/mpt-7b/fp32/4-gpu \
-                 --output_dir=./trt_engines/mpt-7b/fp32/4-gpu 2>&1 | tee build.log
-
+                 --output_dir=./trt_engines/mpt-7b/fp32/4-gpu
 ```
 
 ### 3. Run TRT engine to check if the build was correct
 
 ```bash
+python run.py --engine_dir ./trt_engines/mpt-7b/fp16/1-gpu/ --max_output_len 10
+
 # Run 4-GPU MPT7B TRT engine on a sample input prompt
 mpirun -n 4 --allow-run-as-root python run.py --engine_dir ./trt_engines/mpt-7b/fp32/4-gpu/ --max_output_len 10
-```
-
-#### 4. Run HF model to compare outputs for same input
-```bash
-# Run MPT-7b fp32 model on the same input prompt to compare inputs
-# Try different prompts by setting --input_text
-python run_hf.py --data_type fp32 --max_output_len 10 --model_dir mosaicml/mpt-7b
 ```
 
 #### MPT 30B
@@ -71,9 +65,7 @@ The [`convert_hf_mpt_to_ft.py`](./convert_hf_mpt_to_ft.py) script allows you to 
 
 
 ```bash
-python convert_hf_mpt_to_ft.py -i mosaicml/mpt-30b \
-                               -o ./ft_ckpts/mpt-7b/fp16/ \
-                               --tensor_parallelism 4 -t float16
+python convert_hf_mpt_to_ft.py -i mosaicml/mpt-30b -o ./ft_ckpts/mpt-7b/fp16/ --tensor_parallelism 4 -t float16
 ```
 
 `--infer_gpu_num 4` is used to convert to FT format with 4-way tensor parallelism
@@ -87,14 +79,14 @@ Examples of build invocations:
 # Build 4-GPU MPT-30B float16 engines
 # ALiBi is not supported with GPT attention plugin so we can't use that plugin to increase runtime performance
 python3 build.py --world_size=4 \
+                 --parallel_build \
                  --max_batch_size 64 \
                  --max_input_len 512 \
                  --max_output_len 64 \
-                 --dtype float16 \
-                 --use_gemm_plugin float16 \
+                 --use_gpt_attention_plugin \
+                 --use_gemm_plugin \
                  --model_dir ./ft_ckpts/mpt-30b/fp16/4-gpu \
                  --output_dir=./trt_engines/mpt-30b/fp16/4-gpu
-
 ```
 
 ### 3. Run TRT engine to check if the build was correct
@@ -102,11 +94,4 @@ python3 build.py --world_size=4 \
 ```bash
 # Run 4-GPU MPT7B TRT engine on a sample input prompt
 mpirun -n 4 --allow-run-as-root python run.py --engine_dir ./trt_engines/mpt-30b/fp16/4-gpu/ --max_output_len 10
-```
-
-#### 4. Run HF model to compare outputs for same input
-```bash
-# Run MPT-7b fp32 model on the same input prompt to compare inputs
-# Try different prompts by setting --input_text
-python run_hf.py --data_type fp16 --max_output_len 10 --model_dir mosaicml/mpt-30b
 ```

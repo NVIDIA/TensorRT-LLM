@@ -22,6 +22,7 @@
 #include "torch/extension.h"
 #endif
 
+#include <cuda_runtime.h>
 #include <string>
 #include <unordered_map>
 
@@ -35,7 +36,10 @@ namespace thop
 class TorchAllocator : public tc::IAllocator
 {
 public:
-    TorchAllocator() = default;
+    explicit TorchAllocator(cudaStream_t stream)
+        : mStream(stream)
+    {
+    }
 
     ~TorchAllocator() override = default;
 
@@ -55,6 +59,8 @@ protected:
 
 private:
     std::unordered_map<void const*, torch::Tensor> mPointerMapping{};
+
+    cudaStream_t mStream{};
 };
 
 } // namespace thop

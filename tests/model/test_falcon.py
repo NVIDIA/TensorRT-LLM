@@ -528,7 +528,8 @@ class TestFalcon(unittest.TestCase):
             num_heads=hf_config.num_attention_heads,
             num_kv_heads=hf_config.num_kv_heads,
             hidden_size=hf_config.hidden_size,
-            gpt_attention_plugin=use_gpt_attengion_plugin)
+            gpt_attention_plugin=use_gpt_attengion_plugin,
+            dtype=dtype)
 
         sampling_config = SamplingConfig(end_id=hf_config.eos_token_id,
                                          pad_id=hf_config.pad_token_id,

@@ -32,18 +32,25 @@ def read_config(config_path: Path):
         config = json.load(f)
     use_gpt_attention_plugin = config['plugin_config']['gpt_attention_plugin']
     remove_input_padding = config['plugin_config']['remove_input_padding']
-    world_size = config['builder_config']['tensor_parallel']
-    assert world_size == tensorrt_llm.mpi_world_size(), \
-        f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
-    num_heads = config['builder_config']['num_heads'] // world_size
-    hidden_size = config['builder_config']['hidden_size'] // world_size
+    tp_size = config['builder_config']['tensor_parallel']
+    pp_size = config['builder_config'].get('pipeline_parallel', 1)
+    world_size = tp_size * pp_size
+    assert tp_size * pp_size == tensorrt_llm.mpi_world_size(), \
+        f'Engine world size ({tp_size} * {pp_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
+    assert (config['builder_config']['num_heads'] %
+            tp_size) == 0, f"The number of heads must be a multiple of tp_size"
+    num_heads = config['builder_config']['num_heads'] // tp_size
+    num_kv_heads = (config['builder_config']['num_kv_heads'] + tp_size -
+                    1) // tp_size
+    hidden_size = config['builder_config']['hidden_size'] // tp_size
     vocab_size = config['builder_config']['vocab_size']
     num_layers = config['builder_config']['num_layers']
-    multi_query_mode = config['builder_config']['multi_query_mode']
     paged_kv_cache = config['plugin_config']['paged_kv_cache']
-    tokens_per_block = config['builder_config']['tokens_per_block']
+    tokens_per_block = config['plugin_config']['tokens_per_block']
     use_prompt_tuning = config['builder_config']['use_prompt_tuning']
-    num_kv_heads = 1 if multi_query_mode else num_heads
+    dtype = config['builder_config']['precision']
+    gather_all_token_logits = config['builder_config'][
+        'gather_all_token_logits']
 
     model_config = ModelConfig(num_heads=num_heads,
                                num_kv_heads=num_kv_heads,
@@ -54,7 +61,9 @@ def read_config(config_path: Path):
                                remove_input_padding=remove_input_padding,
                                paged_kv_cache=paged_kv_cache,
                                tokens_per_block=tokens_per_block,
-                               use_prompt_tuning=use_prompt_tuning)
+                               use_prompt_tuning=use_prompt_tuning,
+                               dtype=dtype,
+                               gather_all_token_logits=gather_all_token_logits)
 
     dtype = config['builder_config']['precision']
     max_input_len = config['builder_config']['max_input_len']
@@ -115,23 +124,17 @@ def ptuning_setup(prompt_table, dtype, hidden_size, tasks, input_ids,
         prompt_table = torch.empty([1, hidden_size]).cuda()
         task_vocab_size = torch.zeros([1]).cuda()
 
+    num_sequences = input_lengths.size(
+        0) if remove_input_padding else input_ids.size(0)
+
     if tasks is not None:
         tasks = torch.tensor([int(t) for t in tasks.split(',')],
                              dtype=torch.int32,
                              device="cuda")
-        assert tasks.shape[0] == input_ids.shape[
-            0], "Number of supplied tasks must match input batch size"
+        assert tasks.shape[
+            0] == num_sequences, "Number of supplied tasks must match input batch size"
     else:
-        tasks = torch.zeros([input_ids.size(0)]).cuda()
-
-    if remove_input_padding:
-        tasks = torch.concat([
-            torch.full([input_lengths[b].item()],
-                       tasks[b].item(),
-                       dtype=torch.int32) for b in range(len(input_lengths))
-        ]).unsqueeze(0).cuda()
-    else:
-        tasks = tasks.unsqueeze(-1).expand(*input_ids.shape)
+        tasks = torch.zeros([num_sequences]).cuda()
 
     return [prompt_table, tasks, task_vocab_size]
 
@@ -286,18 +289,22 @@ def generate(
         prompt_table, dtype, model_config.hidden_size, tasks, input_ids,
         input_lengths, model_config.remove_input_padding)
 
-    output_ids, sequence_lengths = decoder.decode(
-        input_ids,
-        input_lengths,
-        sampling_config,
-        do_return_sequence_length=True,
-        stop_words_list=stop_words_list,
-        bad_words_list=bad_words_list,
-        *ptuning_args)
+    outputs = decoder.decode(input_ids,
+                             input_lengths,
+                             sampling_config,
+                             *ptuning_args,
+                             output_sequence_lengths=True,
+                             return_dict=True,
+                             stop_words_list=stop_words_list,
+                             bad_words_list=bad_words_list)
+    output_ids = outputs['output_ids']
+    sequence_lengths = outputs['sequence_lengths']
     torch.cuda.synchronize()
     if runtime_rank == 0:
         print_output(output_ids, input_lengths, sequence_lengths, tokenizer,
                      output_csv, output_npy)
+        if model_config.gather_all_token_logits:
+            print(outputs['context_logits'])
 
 
 if __name__ == '__main__':

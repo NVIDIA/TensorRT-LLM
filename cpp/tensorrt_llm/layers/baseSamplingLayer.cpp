@@ -69,9 +69,8 @@ void BaseSamplingLayer<T>::freeBuffer()
 
 template <typename T>
 BaseSamplingLayer<T>::BaseSamplingLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-    cublasMMWrapper* cublas_wrapper, IAllocator* allocator, bool is_free_buffer_after_forward,
-    cudaDeviceProp* cuda_device_prop)
-    : BaseLayer(stream, cublas_wrapper, allocator, is_free_buffer_after_forward, cuda_device_prop)
+    IAllocator* allocator, bool is_free_buffer_after_forward, cudaDeviceProp* cuda_device_prop)
+    : BaseLayer(stream, allocator, is_free_buffer_after_forward, cuda_device_prop)
     , vocab_size_(vocab_size)
     , vocab_size_padded_(vocab_size_padded)
 {

@@ -51,7 +51,8 @@ def read_config(config_path: Path):
     num_layers = config['builder_config']['num_layers']
     quant_mode = QuantMode(config['builder_config']['quant_mode'])
     paged_kv_cache = config['plugin_config']['paged_kv_cache']
-    tokens_per_block = config['builder_config']['tokens_per_block']
+    tokens_per_block = config['plugin_config']['tokens_per_block']
+    dtype = config['builder_config']['precision']
 
     model_config = ModelConfig(num_heads=num_heads,
                                num_kv_heads=num_heads,
@@ -62,9 +63,9 @@ def read_config(config_path: Path):
                                remove_input_padding=remove_input_padding,
                                paged_kv_cache=paged_kv_cache,
                                tokens_per_block=tokens_per_block,
-                               quant_mode=quant_mode)
+                               quant_mode=quant_mode,
+                               dtype=dtype)
 
-    dtype = config['builder_config']['precision']
     max_input_len = config['builder_config']['max_input_len']
 
     return model_config, world_size, dtype, max_input_len
@@ -233,11 +234,13 @@ def generate(
                   max_output_len,
                   beam_width=num_beams)
 
-    output_ids, sequence_lengths = decoder.decode(
-        input_ids,
-        input_lengths,
-        sampling_config,
-        do_return_sequence_length=True)
+    outputs = decoder.decode(input_ids,
+                             input_lengths,
+                             sampling_config,
+                             output_sequence_lengths=True,
+                             return_dict=True)
+    output_ids = outputs['output_ids']
+    sequence_lengths = outputs['sequence_lengths']
     torch.cuda.synchronize()
 
     cum_log_probs = decoder.cum_log_probs if num_beams > 1 else None

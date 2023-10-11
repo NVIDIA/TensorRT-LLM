@@ -30,7 +30,7 @@
         auto e = cmd;                                                                                                  \
         if (e != MPI_SUCCESS)                                                                                          \
         {                                                                                                              \
-            logger.log(nvinfer1::ILogger::Severity::kERROR,                                                            \
+            (logger).log(nvinfer1::ILogger::Severity::kERROR,                                                          \
                 tensorrt_llm::common::fmtstr("Failed: MPI error %s:%d '%d'", __FILE__, __LINE__, e).c_str());          \
             exit(EXIT_FAILURE);                                                                                        \
         }                                                                                                              \
@@ -43,7 +43,7 @@
         ncclResult_t r = cmd;                                                                                          \
         if (r != ncclSuccess)                                                                                          \
         {                                                                                                              \
-            logger.log(nvinfer1::ILogger::Severity::kERROR,                                                            \
+            (logger).log(nvinfer1::ILogger::Severity::kERROR,                                                          \
                 tensorrt_llm::common::fmtstr(                                                                          \
                     "Failed, NCCL error %s:%d '%s'\n", __FILE__, __LINE__, ncclGetErrorString(r))                      \
                     .c_str());                                                                                         \

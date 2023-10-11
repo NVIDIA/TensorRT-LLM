@@ -78,7 +78,7 @@ class FusedMHARunnerV2 : public MHARunner
 public:
     FusedMHARunnerV2(const Data_type dataType, const int numHeads, const int headSize, const float qScaling);
 
-    ~FusedMHARunnerV2() = default; // for pimpl
+    ~FusedMHARunnerV2(); // for pimpl
 
     void setup(const int b, const int s, const int total_seqlen, const bool has_alibi = false, const int tp_size = 1,
         const int tp_rank = 0) override;

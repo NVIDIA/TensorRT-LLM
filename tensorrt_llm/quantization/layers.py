@@ -20,8 +20,8 @@ import tensorrt as trt
 from .._common import default_net, precision
 from .._utils import int32_array
 from ..functional import (ACT2FN, Tensor, allgather, allreduce, cast, concat,
-                          constant, gpt_attention, matmul, mul, shape, slice,
-                          softmax, split, where)
+                          constant, generate_alibi_slopes, gpt_attention,
+                          matmul, mul, shape, slice, softmax, split, where)
 from ..layers.attention import AttentionMaskType, PositionEmbeddingType
 from ..layers.linear import Linear, RowLinear
 from ..module import Module
@@ -958,7 +958,9 @@ class SmoothQuantAttention(Module):
                  position_embedding_type=PositionEmbeddingType.learned_absolute,
                  tp_group=None,
                  tp_size=1,
+                 tp_rank=0,
                  multi_block_mode=False,
+                 scale_alibi_bias=False,
                  paged_kv_cache=False,
                  quant_mode=QuantMode(0)):
         super().__init__()
@@ -970,6 +972,8 @@ class SmoothQuantAttention(Module):
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
         self.hidden_size = hidden_size // tp_size
         self.max_position_embeddings = max_position_embeddings
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
 
         self.num_layers = num_layers
         self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
@@ -978,6 +982,11 @@ class SmoothQuantAttention(Module):
         if self.apply_query_key_layer_scaling:
             self.norm_factor *= self.num_layers
             self.q_scaling *= self.num_layers
+        # Whether to scale ALiBi bias. Mathematically, it's equivalent to
+        # normalizing QK after adding bias.
+        #   - False, inv_sqrt_Dh * Q*K^T + alibi_bias
+        #   - True,  inv_sqrt_Dh * Q*K^T + inv_sqrt_Dh * alibi_bias
+        self.scale_alibi_bias = scale_alibi_bias
 
         self.position_embedding_type = position_embedding_type
         self.multi_block_mode = multi_block_mode
@@ -1042,6 +1051,22 @@ class SmoothQuantAttention(Module):
         if not default_net().plugin_config.gpt_attention_plugin:
             raise ValueError("gpt_attention_plugin is not set")
 
+        alibi_slopes = None
+        if self.position_embedding_type == PositionEmbeddingType.alibi:
+            dtype = trt.float32
+            if default_net().plugin_config.gpt_attention_plugin or default_net(
+            ).plugin_config.inflight_batching_gpt_attention_plugin:
+                dtype = hidden_states.dtype if self.quant_mode.has_act_static_scaling(
+                ) else hidden_states[0].dtype
+                if dtype == trt.int8:
+                    dtype = trt.float16
+            alibi_scale = 1. / self.norm_factor if self.scale_alibi_bias else 1.
+            alibi_slopes = alibi_scale * generate_alibi_slopes(
+                self.num_attention_heads * self.tp_size,
+                dtype=dtype,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank)
+
         if default_net().plugin_config.gpt_attention_plugin:
 
             assert attention_params.is_valid(
@@ -1066,6 +1091,7 @@ class SmoothQuantAttention(Module):
                 host_request_types=attention_params.host_request_types,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=self.num_kv_heads,
+                hidden_size_per_head=self.attention_head_size,
                 q_scaling=self.q_scaling,
                 rotary_embedding_dim=self.rotary_embedding_dim,
                 position_embedding_type=self.position_embedding_type,
@@ -1074,6 +1100,9 @@ class SmoothQuantAttention(Module):
                 kv_quant_orig_scale=kv_dequant_scale,
                 kv_cache_quant_mode=self.quant_mode,
                 max_context_length=attention_params.max_context_length,
+                alibi_slopes=alibi_slopes,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
                 kv_cache_block_pointers=kv_cache_params.
                 get_first_kv_cache_block_pointers(),
                 host_context_lengths=attention_params.host_context_lengths)

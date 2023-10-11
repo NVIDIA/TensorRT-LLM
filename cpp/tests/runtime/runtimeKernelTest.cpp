@@ -24,6 +24,7 @@
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include <NvInferRuntime.h>
 
+#include <algorithm>
 #include <memory>
 #include <numeric>
 #include <vector>
@@ -134,6 +135,34 @@ TEST_F(RuntimeKernelTest, AddTensorInt32)
         auto tensor = mManager->gpu(ITensor::makeShape({size, size}), nvinfer1::DataType::kINT32);
         testAdd(*tensor, *mManager, *mStream);
         tensor.release();
+    }
+}
+
+namespace
+{
+void testReduce(IBuffer& buffer, BufferManager& manager, CudaStream& stream)
+{
+    auto output = manager.gpu(1, nvinfer1::DataType::kINT32);
+    manager.setZero(*output);
+
+    SizeType constexpr value{3};
+    kernels::invokeFill(buffer, value, stream);
+    kernels::reduce(*output, buffer, stream);
+    auto outputHost = manager.copyFrom(*output, MemoryType::kCPU);
+    auto outputPtr = bufferCast<SizeType>(*outputHost);
+    auto const expected = buffer.getSize() * value;
+
+    EXPECT_EQ(*outputPtr, expected);
+}
+} // namespace
+
+TEST_F(RuntimeKernelTest, ReduceBufferInt32)
+{
+    for (auto size : {123, 1025})
+    {
+        auto buffer = mManager->gpu(size, nvinfer1::DataType::kINT32);
+        testReduce(*buffer, *mManager, *mStream);
+        buffer.release();
     }
 }
 

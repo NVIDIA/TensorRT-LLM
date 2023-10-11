@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from collections import OrderedDict
+
 import tensorrt as trt
 
 from ..._common import default_net
@@ -117,6 +119,7 @@ class OPTModel(Module):
                  mapping=Mapping(),
                  pre_norm=True,
                  do_layer_norm_before=True,
+                 use_prompt_tuning=False,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0):
         super().__init__()
@@ -128,11 +131,12 @@ class OPTModel(Module):
             max_position_embeddings,
             position_embedding_type=PositionEmbeddingType.learned_absolute,
             dtype=dtype,
+            use_prompt_tuning=use_prompt_tuning,
             tensor_parallel=mapping.tp_size if use_parallel_embedding else 1,
             tensor_parallel_group=mapping.tp_group
             if use_parallel_embedding else None,
             sharding_dim=embedding_sharding_dim,
-            tensor_parallel_rank=mapping.tp_rank)
+            tp_rank=mapping.tp_rank)
 
         self.layers = ModuleList([
             OPTDecoderLayer(hidden_size=hidden_size,
@@ -154,9 +158,14 @@ class OPTModel(Module):
                 use_cache=False,
                 attention_mask=None,
                 kv_cache_params=None,
-                attention_params=None):
+                attention_params=None,
+                prompt_embedding_table=None,
+                prompt_tasks=None,
+                prompt_vocab_size=None):
 
-        hidden_states = self.embedding(input_ids, position_ids)
+        hidden_states = self.embedding(input_ids, position_ids,
+                                       prompt_embedding_table, prompt_tasks,
+                                       prompt_vocab_size)
 
         if kv_cache_params.past_key_value is None:
             kv_cache_params.past_key_value = tuple([None] * len(self.layers))
@@ -200,6 +209,7 @@ class OPTLMHeadModel(OPTModel, GenerationMixin):
                  mapping=Mapping(),
                  pre_norm=True,
                  do_layer_norm_before=True,
+                 use_prompt_tuning=False,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
                  share_embedding_table=False):
@@ -212,19 +222,21 @@ class OPTLMHeadModel(OPTModel, GenerationMixin):
 
         super().__init__(num_layers, num_heads, hidden_size, vocab_size,
                          hidden_act, max_position_embeddings, dtype, mapping,
-                         pre_norm, do_layer_norm_before, use_parallel_embedding,
-                         embedding_sharding_dim)
+                         pre_norm, do_layer_norm_before, use_prompt_tuning,
+                         use_parallel_embedding, embedding_sharding_dim)
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
         if isinstance(dtype, str):
             self._kv_dtype = str_dtype_to_trt(dtype)
         else:
             assert isinstance(dtype, trt.DataType)
             self._kv_dtype = dtype
+        self._dtype = self._kv_dtype
         self._num_layers = num_layers
         self._num_heads = num_heads
         self._hidden_size = hidden_size
         self._vocab_size = vocab_size
         self._tp_size = mapping.tp_size
+        self._use_prompt_tuning = use_prompt_tuning
 
         share_weight = None
         if share_embedding_table:
@@ -246,10 +258,16 @@ class OPTLMHeadModel(OPTModel, GenerationMixin):
                 last_token_ids=None,
                 attention_mask=None,
                 kv_cache_params=None,
-                attention_params=None):
+                attention_params=None,
+                prompt_embedding_table=None,
+                prompt_tasks=None,
+                prompt_vocab_size=None):
         hidden_states = super().forward(input_ids, position_ids, use_cache,
                                         attention_mask, kv_cache_params,
-                                        attention_params)
+                                        attention_params,
+                                        prompt_embedding_table, prompt_tasks,
+                                        prompt_vocab_size)
+
         if use_cache:
             hidden_states, presents = hidden_states
 
@@ -261,15 +279,20 @@ class OPTLMHeadModel(OPTModel, GenerationMixin):
         lm_logits = self.lm_head(hidden_states)
         lm_logits.mark_output('logits', self._kv_dtype)
 
-        if use_cache:
+        if use_cache and default_net().plugin_config.paged_kv_cache == False:
             for i, present in enumerate(presents):
                 present.mark_output(f'present_key_value_{i}', self._kv_dtype)
             return (lm_logits, presents)
 
         return lm_logits
 
-    def prepare_inputs(self, max_batch_size, max_input_len, max_new_tokens,
-                       use_cache, max_beam_width):
+    def prepare_inputs(self,
+                       max_batch_size,
+                       max_input_len,
+                       max_new_tokens,
+                       use_cache,
+                       max_beam_width,
+                       prompt_embedding_table_size=32):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -297,6 +320,53 @@ class OPTLMHeadModel(OPTModel, GenerationMixin):
             use_gpt_attention_plugin,
             use_gemm_plugin=use_gemm_plugin)
 
+        bb_range = [
+            1, (max_batch_size * max_beam_width + 1) // 2,
+            max_batch_size * max_beam_width
+        ]
+        p_embedding_range = [
+            1, prompt_embedding_table_size // 2, prompt_embedding_table_size
+        ]
+        num_tokens_range = [
+            1, max_batch_size * max_beam_width,
+            max(max_input_len * max_batch_size, max_beam_width * max_batch_size)
+        ]
+        [1, 1, max_input_len]
+
+        prompt_embedding_table = None
+        tasks = None
+        prompt_vocab_size = None
+        if self._use_prompt_tuning:
+            prompt_embedding_table = Tensor(name='prompt_embedding_table',
+                                            dtype=self._dtype,
+                                            shape=[-1, self._hidden_size],
+                                            dim_range=OrderedDict([
+                                                ('prompt_embedding_table_size',
+                                                 [p_embedding_range]),
+                                                ('hidden_size',
+                                                 [self._hidden_size]),
+                                            ]))
+            if remove_input_padding:
+                tasks = Tensor(name='tasks',
+                               dtype=trt.int32,
+                               shape=[1, -1],
+                               dim_range=OrderedDict([
+                                   ('batch_size', [1]),
+                                   ('input_len', [num_tokens_range]),
+                               ]))
+            else:
+                tasks = Tensor(name='tasks',
+                               dtype=trt.int32,
+                               shape=[-1, 1],
+                               dim_range=OrderedDict([
+                                   ('batch_size', [bb_range]),
+                                   ('input_len_for_task', [1]),
+                               ]))
+            prompt_vocab_size = Tensor(name='prompt_vocab_size',
+                                       dtype=trt.int32,
+                                       shape=[1],
+                                       dim_range=OrderedDict([('size', [1])]))
+
         return (model_inputs['input_ids'], model_inputs['position_ids'], True,
                 model_inputs['last_token_ids'], model_inputs['attention_mask'],
                 KeyValueCacheParams(
@@ -310,4 +380,5 @@ class OPTLMHeadModel(OPTModel, GenerationMixin):
                     context_lengths=model_inputs['context_lengths'],
                     host_context_lengths=model_inputs['host_context_lengths'],
                     max_context_length=max_input_len,
-                    host_request_types=model_inputs['host_request_types']))
+                    host_request_types=model_inputs['host_request_types']),
+                prompt_embedding_table, tasks, prompt_vocab_size)

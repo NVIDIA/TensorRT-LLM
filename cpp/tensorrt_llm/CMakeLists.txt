@@ -35,10 +35,11 @@ add_subdirectory(kernels)
 add_subdirectory(layers)
 add_subdirectory(runtime)
 
+set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
 if(BUILD_BATCH_MANAGER)
   add_subdirectory(batch_manager)
 else()
-  add_library(tensorrt_llm_batch_manager_static STATIC IMPORTED)
+  add_library(${BATCH_MANAGER_TARGET} STATIC IMPORTED)
   execute_process(
     COMMAND ${Python3_EXECUTABLE} "-c"
             "import torch; print(torch.compiled_with_cxx11_abi(),end='');"
@@ -48,14 +49,14 @@ else()
   message(STATUS "USE_CXX11_ABI: ${USE_CXX11_ABI}")
   if(USE_CXX11_ABI)
     set_property(
-      TARGET tensorrt_llm_batch_manager_static
+      TARGET ${BATCH_MANAGER_TARGET}
       PROPERTY
         IMPORTED_LOCATION
         "${CMAKE_CURRENT_SOURCE_DIR}/batch_manager/libtensorrt_llm_batch_manager_static.a"
     )
   else()
     set_property(
-      TARGET tensorrt_llm_batch_manager_static
+      TARGET ${BATCH_MANAGER_TARGET}
       PROPERTY
         IMPORTED_LOCATION
         "${CMAKE_CURRENT_SOURCE_DIR}/batch_manager/libtensorrt_llm_batch_manager_static.pre_cxx11.a"
@@ -69,15 +70,18 @@ set(TRTLLM_LINK_LIBS
     ${CUDNN_LIB}
     ${CMAKE_DL_LIBS}
     ${MPI_CXX_LIBRARIES}
+    ${NCCL_LIB}
     ${TRT_LIB}
     common_src
     kernels_src
     layers_src
     runtime_src
-    tensorrt_llm_batch_manager_static)
+    ${BATCH_MANAGER_TARGET})
 
 # ################################# SHARED LIBRARY
 # ##############################################################################
+
+set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 add_library(${SHARED_TARGET} SHARED)
 
@@ -104,6 +108,9 @@ set_target_properties(
                               CXX_EXTENSIONS "NO" POSITION_INDEPENDENT_CODE ON)
 
 target_link_libraries(${STATIC_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
+
+# Cyclic dependency of batch manager on TRT-LLM
+target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${STATIC_TARGET})
 
 if(BUILD_PYT)
   add_subdirectory(thop)

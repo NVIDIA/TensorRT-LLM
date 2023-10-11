@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/cudaEvent.h"
 
 #include <cuda_runtime_api.h>
 
@@ -78,15 +79,27 @@ public:
     }
 
     //! \brief Record an event on the stream.
-    void record(tensorrt_llm::common::EventPtr::pointer event)
+    void record(CudaEvent::pointer event) const
     {
         TLLM_CUDA_CHECK(::cudaEventRecord(event, get()));
     }
 
+    //! \brief Record an event on the stream.
+    void record(CudaEvent const& event) const
+    {
+        record(event.get());
+    }
+
     //! \brief Wait for an event.
-    void wait(tensorrt_llm::common::EventPtr::pointer event)
+    void wait(CudaEvent::pointer event) const
     {
         TLLM_CUDA_CHECK(::cudaStreamWaitEvent(get(), event));
+    }
+
+    //! \brief Wait for an event.
+    void wait(CudaEvent const& event) const
+    {
+        wait(event.get());
     }
 
 private:

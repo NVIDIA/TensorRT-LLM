@@ -88,11 +88,10 @@ private:
     bool mEnableContextFMHA = false;
     bool mFMHAForceFP32Acc = false;
     bool mSM = tensorrt_llm::common::getSMVersion();
-    tensorrt_llm::kernels::MHARunner* mFMHARunner;
 
-    tensorrt_llm::common::cublasAlgoMap* mCublasAlgoMap;
-    std::mutex* mCublasWrapperMutex;
-    tensorrt_llm::common::cublasMMWrapper* mCublasWrapper;
+    // The default copy constructor will leave them as nullptr. clone() shall initialize it.
+    UniqPtrWNullCopy<tensorrt_llm::kernels::FusedMHARunnerV2> mFMHARunner;
+    UniqPtrWNullCopy<tensorrt_llm::common::CublasMMWrapper> mCublasWrapper;
 };
 
 class BertAttentionPluginCreator : public BaseCreator

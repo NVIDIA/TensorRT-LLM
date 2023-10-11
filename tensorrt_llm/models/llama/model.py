@@ -100,6 +100,8 @@ class LLaMADecoderLayer(Module):
                 attention_params=None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        if self._layer_id == 0:
+            self.register_network_output(f"norm0", hidden_states)
 
         attention_output = self.attention(hidden_states,
                                           attention_mask=attention_mask,
@@ -109,13 +111,19 @@ class LLaMADecoderLayer(Module):
 
         if use_cache:
             attention_output, presents = attention_output
+        if self._layer_id == 0:
+            self.register_network_output(f"attn", attention_output)
 
         hidden_states = residual + attention_output
 
         residual = hidden_states
         hidden_states = self.post_layernorm(hidden_states)
+        if self._layer_id == 0:
+            self.register_network_output(f"norm1", hidden_states)
 
         hidden_states = self.mlp(hidden_states)
+        if self._layer_id == 0:
+            self.register_network_output(f"mlp", hidden_states)
 
         hidden_states = residual + hidden_states
         if use_cache:
@@ -199,6 +207,7 @@ class LLaMAModel(Module):
             hidden_states = self.vocab_embedding(input_ids)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
+        self.register_network_output(f"embd", hidden_states)
 
         for layer, past, pointer in zip(
                 self.layers, kv_cache_params.past_key_value,
@@ -275,6 +284,8 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
         self.kv_dtype = self.dtype
         if quant_mode.has_int8_kv_cache():
             self.kv_dtype = str_dtype_to_trt('int8')
+        elif quant_mode.has_fp8_kv_cache():
+            self.kv_dtype = str_dtype_to_trt('fp8')
 
         self.quant_mode = quant_mode
         self.use_parallel_embedding = use_parallel_embedding
@@ -324,7 +335,7 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
         else:
             hidden_states.mark_output('hidden_states_output', self.dtype)
 
-        if use_cache:
+        if use_cache and default_net().plugin_config.paged_kv_cache == False:
             for i, present in zip(
                     self.get_transformer_layers(self.mapping, self.num_layers),
                     presents):
@@ -343,8 +354,7 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                        max_new_tokens,
                        use_cache,
                        max_beam_width,
-                       paged_kv_cache: bool = False,
-                       tokens_per_block: int = 64):
+                       max_num_tokens: int = None):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -357,6 +367,8 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
         use_gpt_attention_plugin = default_net(
         ).plugin_config.gpt_attention_plugin
         use_gemm_plugin = default_net().plugin_config.gemm_plugin
+        paged_kv_cache = default_net().plugin_config.paged_kv_cache
+        tokens_per_block = default_net().plugin_config.tokens_per_block
 
         model_inputs = self.prepare_basic_inputs(
             max_batch_size,
@@ -374,7 +386,8 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
             tokens_per_block=tokens_per_block,
             dtype=self.dtype,
             num_heads=self.num_heads,
-            mapping=self.mapping)
+            mapping=self.mapping,
+            max_num_tokens=max_num_tokens)
 
         return (model_inputs['input_ids'], model_inputs['position_ids'], True,
                 model_inputs['last_token_ids'], model_inputs['attention_mask'],

@@ -16,6 +16,7 @@ import logging
 import os
 
 import tensorrt as trt
+from mpi4py import MPI
 
 try:
     from polygraphy.logger import G_LOGGER
@@ -65,6 +66,8 @@ class Logger(metaclass=Singleton):
             self.warning(
                 f"Requested log level {environ_severity} is invalid. Using 'warning' instead"
             )
+        self.mpi_rank = MPI.COMM_WORLD.Get_rank()
+        self.mpi_size = MPI.COMM_WORLD.Get_size()
 
     def _func_wrapper(self, severity):
         if severity == self.INTERNAL_ERROR:
@@ -85,7 +88,10 @@ class Logger(metaclass=Singleton):
         return self._trt_logger
 
     def log(self, severity, msg):
-        msg = f'[TRT-LLM] {severity} ' + msg
+        if self.mpi_size > 1:
+            msg = f'[TRT-LLM] [MPI_Rank {self.mpi_rank}] {severity} ' + msg
+        else:
+            msg = f'[TRT-LLM] {severity} ' + msg
         self._func_wrapper(severity)(msg)
 
     def critical(self, msg):

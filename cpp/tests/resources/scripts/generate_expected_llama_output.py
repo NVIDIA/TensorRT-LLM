@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse as _arg
 from pathlib import Path
 
 import run
@@ -22,13 +23,16 @@ import run
 def generate_output(engine: str,
                     num_beams: int,
                     output_name: str,
+                    tp_size: int = 1,
+                    pp_size: int = 1,
                     max_output_len: int = 8):
 
     model = 'llama-7b-hf'
     resources_dir = Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
     hf_dir = models_dir / model
-    engine_dir = models_dir / 'rt_engine' / model / engine / '1-gpu/'
+    tp_pp_dir = 'tp' + str(tp_size) + '-pp' + str(pp_size) + '-gpu/'
+    engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_dir
 
     data_dir = resources_dir / 'data'
     input_file = data_dir / 'input_tokens.npy'
@@ -37,6 +41,8 @@ def generate_output(engine: str,
         output_dir = model_data_dir / 'sampling'
     else:
         output_dir = model_data_dir / ('beam_search_' + str(num_beams))
+
+    output_name += '_tp' + str(tp_size) + '_pp' + str(pp_size)
 
     run.generate(engine_dir=str(engine_dir),
                  tokenizer_dir=str(hf_dir),
@@ -47,13 +53,28 @@ def generate_output(engine: str,
                  num_beams=num_beams)
 
 
-def generate_outputs(num_beams):
-    print('Generating Llama FP16 outputs')
-    generate_output(engine='fp16-plugin',
-                    num_beams=num_beams,
-                    output_name='output_tokens_fp16_plugin')
+def generate_outputs(num_beams, only_multi_gpu=False):
+    tp_pp_sizes = [(1, 1)] if not only_multi_gpu else [(4, 1), (2, 2), (1, 4)]
+    for tp_size, pp_size in tp_pp_sizes:
+        print(
+            f'Generating outputs for Llama FP16 with TP={tp_size} and PP={pp_size}'
+        )
+        generate_output(engine='fp16-plugin',
+                        num_beams=num_beams,
+                        tp_size=tp_size,
+                        pp_size=pp_size,
+                        output_name='output_tokens_fp16_plugin')
 
 
 if __name__ == '__main__':
-    generate_outputs(num_beams=1)
-    generate_outputs(num_beams=2)
+    parser = _arg.ArgumentParser()
+    parser.add_argument(
+        "--only_multi_gpu",
+        action="store_true",
+        help="Generate data with Pipeline and Tensor Parallelism")
+
+    args = parser.parse_args()
+
+    generate_outputs(num_beams=1, only_multi_gpu=args.only_multi_gpu)
+    generate_outputs(num_beams=2, only_multi_gpu=args.only_multi_gpu)
+    print("Done")

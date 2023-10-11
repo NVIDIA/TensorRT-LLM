@@ -1,4 +1,0 @@
-sphinx-autosummary
-sphinx-rtd-theme
-myst_parser
-breathe

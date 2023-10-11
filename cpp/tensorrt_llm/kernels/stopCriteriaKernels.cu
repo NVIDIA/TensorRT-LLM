@@ -111,8 +111,7 @@ __global__ void length_criterion(bool* finished, int* finished_sum, const uint32
     {
         const int batch_idx = index / beam_width;
 
-        // sequence_lengths is updated, so need to minus 1
-        finished[index] |= sequence_lengths[index] - 1 >= sequence_limit_length[batch_idx];
+        finished[index] |= sequence_lengths[index] >= sequence_limit_length[batch_idx];
         thread_finished_count += finished[index] ? 1 : 0;
     }
 

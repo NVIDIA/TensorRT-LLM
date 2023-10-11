@@ -17,7 +17,6 @@
 #pragma once
 
 #include "tensorrt_llm/common/allocator.h"
-#include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/tensor.h"
 
 namespace tensorrt_llm
@@ -28,11 +27,9 @@ namespace layers
 class BaseLayer
 {
 public:
-    BaseLayer(cudaStream_t stream, tensorrt_llm::common::cublasMMWrapper* cublas_wrapper,
-        tensorrt_llm::common::IAllocator* allocator, bool is_free_buffer_after_forward,
+    BaseLayer(cudaStream_t stream, tensorrt_llm::common::IAllocator* allocator, bool is_free_buffer_after_forward,
         cudaDeviceProp* cuda_device_prop = nullptr)
         : stream_(stream)
-        , cublas_wrapper_(cublas_wrapper)
         , allocator_(allocator)
         , cuda_device_prop_(cuda_device_prop)
         , is_free_buffer_after_forward_(is_free_buffer_after_forward){};
@@ -51,7 +48,6 @@ public:
 protected:
     // device environments
     cudaStream_t stream_;
-    tensorrt_llm::common::cublasMMWrapper* cublas_wrapper_;
     tensorrt_llm::common::IAllocator* allocator_;
     cudaDeviceProp* cuda_device_prop_ = nullptr;
 

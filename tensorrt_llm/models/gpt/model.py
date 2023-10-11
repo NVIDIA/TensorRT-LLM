@@ -55,7 +55,7 @@ class GPTEmbedding(Module):
                  tensor_parallel=1,
                  tensor_parallel_group=None,
                  sharding_dim=0,
-                 tensor_parallel_rank=None):
+                 tp_rank=None):
         super().__init__()
         self.max_position_embeddings = max_position_embeddings
         self.position_embedding_type = position_embedding_type
@@ -68,7 +68,7 @@ class GPTEmbedding(Module):
                                             tp_size=tensor_parallel,
                                             tp_group=tensor_parallel_group,
                                             sharding_dim=sharding_dim,
-                                            tp_rank=tensor_parallel_rank)
+                                            tp_rank=tp_rank)
 
         if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
             self.position_embedding = Embedding(max_position_embeddings,
@@ -109,7 +109,8 @@ class GPTDecoderLayer(Module):
                  bias=True,
                  multi_query_mode=False,
                  tp_group=None,
-                 tp_size=1):
+                 tp_size=1,
+                 tp_rank=0):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
@@ -139,6 +140,7 @@ class GPTDecoderLayer(Module):
             bias=bias,
             tp_group=tp_group,
             tp_size=tp_size,
+            tp_rank=tp_rank,
             use_int8_kv_cache=quant_mode.has_int8_kv_cache(),
             quant_mode=quant_mode)
 
@@ -226,7 +228,7 @@ class GPTModel(Module):
             tensor_parallel_group=mapping.tp_group
             if use_parallel_embedding else None,
             sharding_dim=embedding_sharding_dim,
-            tensor_parallel_rank=mapping.tp_rank)
+            tp_rank=mapping.tp_rank)
 
         self.layers = ModuleList([
             GPTDecoderLayer(
@@ -243,6 +245,7 @@ class GPTModel(Module):
                 multi_query_mode=multi_query_mode,
                 tp_group=mapping.tp_group,
                 tp_size=mapping.tp_size,
+                tp_rank=mapping.tp_rank,
                 inter_size=inter_size,
                 bias=bias,
                 quant_mode=quant_mode) for _ in range(num_layers)
@@ -338,6 +341,8 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
         self.quant_mode = quant_mode
         if quant_mode.has_int8_kv_cache():
             self._kv_dtype = str_dtype_to_trt('int8')
+        elif quant_mode.has_fp8_kv_cache():
+            self._kv_dtype = str_dtype_to_trt('fp8')
 
         if isinstance(logits_dtype, str):
             self._logits_dtype = str_dtype_to_trt(logits_dtype)
@@ -385,7 +390,6 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                 prompt_tasks=None,
                 prompt_vocab_size=None):
 
-        assert last_token_ids is not None, "Expecting last token ids to be not None"
         hidden_states = super().forward(input_ids, position_ids, use_cache,
                                         attention_mask, kv_cache_params,
                                         attention_params,
@@ -404,8 +408,10 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
         lm_logits.mark_output('logits', self._logits_dtype)
 
         if use_cache:
-            for i, present in enumerate(presents):
-                present.mark_output(f'present_key_value_{i}', self._kv_dtype)
+            if default_net().plugin_config.paged_kv_cache == False:
+                for i, present in enumerate(presents):
+                    present.mark_output(f'present_key_value_{i}',
+                                        self._kv_dtype)
             return (lm_logits, presents)
 
         return lm_logits
@@ -416,9 +422,8 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                        max_new_tokens,
                        use_cache,
                        max_beam_width: int = 1,
-                       paged_kv_cache: bool = False,
-                       tokens_per_block: int = 64,
-                       prompt_embedding_table_size: int = 128):
+                       prompt_embedding_table_size: int = 128,
+                       gather_all_token_logits: bool = False):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -433,6 +438,8 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
         use_gpt_attention_plugin = default_net(
         ).plugin_config.gpt_attention_plugin
         use_gemm_plugin = default_net().plugin_config.gemm_plugin
+        paged_kv_cache = default_net().plugin_config.paged_kv_cache
+        tokens_per_block = default_net().plugin_config.tokens_per_block
 
         model_inputs = self.prepare_basic_inputs(
             max_batch_size,
@@ -447,7 +454,8 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             use_gpt_attention_plugin=use_gpt_attention_plugin,
             use_gemm_plugin=use_gemm_plugin,
             paged_kv_cache=paged_kv_cache,
-            tokens_per_block=tokens_per_block)
+            tokens_per_block=tokens_per_block,
+            gather_all_token_logits=gather_all_token_logits)
 
         bb_range_cxt = [1, (max_batch_size + 1) // 2, max_batch_size]
         bb_range_gen = [
@@ -457,7 +465,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
         _p_embedding_range = [
             1, prompt_embedding_table_size // 2, prompt_embedding_table_size
         ]
-        inlen_range_cxt = [1, (max_input_len + 1) // 2, max_input_len]
+        [1, (max_input_len + 1) // 2, max_input_len]
         _num_tokens_range = [
             1, max_batch_size * max_beam_width,
             max(max_input_len * max_batch_size, max_beam_width * max_batch_size)
@@ -471,12 +479,10 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             bb_range = [bb_range_cxt, bb_range_gen]
             p_embedding_range = [_p_embedding_range, _p_embedding_range]
             num_tokens_range = [_num_tokens_range, _num_tokens_range]
-            input_len_task_range = [inlen_range_cxt, inlen_range_cxt]
         else:
             bb_range = [bb_range_gen]
             p_embedding_range = [_p_embedding_range]
             num_tokens_range = [_num_tokens_range]
-            input_len_task_range = [inlen_range_cxt]
 
         prompt_embedding_table = None
         tasks = None
@@ -502,13 +508,15 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                         ('input_len_task', num_tokens_range),
                     ]))
             else:
-                tasks = Tensor(name='tasks',
-                               dtype=trt.int32,
-                               shape=[-1, -1],
-                               dim_range=OrderedDict([
-                                   ('batch_size_beam_width', bb_range),
-                                   ('input_len_task', input_len_task_range),
-                               ]))
+                tasks = Tensor(
+                    name='tasks',
+                    dtype=trt.int32,
+                    shape=[-1, 1],
+                    dim_range=OrderedDict([
+                        ('batch_size_beam_width', bb_range),
+                        ('broadcast_dim',
+                         [1, 1] if enable_two_optimization_profiles else [1]),
+                    ]))
             prompt_vocab_size = Tensor(
                 name='prompt_vocab_size',
                 dtype=trt.int32,

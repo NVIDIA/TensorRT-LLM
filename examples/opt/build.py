@@ -25,8 +25,10 @@ from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models import weight_only_quantize
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
+from tensorrt_llm.quantization import QuantMode
 
 from weight import load_from_ft, parse_ft_config, check_embedding_share  # isort:skip
 
@@ -119,6 +121,37 @@ def parse_arguments():
                         action='store_true')
 
     parser.add_argument(
+        '--int8_kv_cache',
+        default=False,
+        action="store_true",
+        help=
+        'By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV'
+    )
+    parser.add_argument(
+        '--use_weight_only',
+        default=False,
+        action="store_true",
+        help='Quantize weights for the various GEMMs to INT4/INT8.'
+        'See --weight_only_precision to set the precision')
+
+    parser.add_argument(
+        '--weight_only_precision',
+        const='int8',
+        type=str,
+        nargs='?',
+        default='int8',
+        choices=['int8', 'int4'],
+        help=
+        'Define the precision for the weights when using weight-only quantization.'
+        'You must also use --use_weight_only for that argument to have an impact.'
+    )
+    parser.add_argument(
+        '--max_prompt_embedding_table_size',
+        type=int,
+        default=0,
+        help='Setting to a value > 0 enables support for prompt tuning.')
+
+    parser.add_argument(
         '--use_parallel_embedding',
         action="store_true",
         default=False,
@@ -152,6 +185,14 @@ def parse_arguments():
         "Activates the lookup plugin which enables embedding sharing. It is also required for language modeling embedding weight sharing."
     )
     args = parser.parse_args()
+    if args.use_weight_only:
+        args.quant_mode = QuantMode.use_weight_only(
+            args.weight_only_precision == 'int4')
+    else:
+        args.quant_mode = QuantMode(0)
+
+    if args.int8_kv_cache:
+        args.quant_mode = args.quant_mode.set_int8_kv_cache()
     if args.model_dir is not None:
         n_embd, n_head, n_layer, n_positions, vocab_size, do_layer_norm_before = parse_ft_config(
             Path(args.model_dir) / "config.ini")
@@ -205,9 +246,13 @@ def build_rank_engine(builder: Builder,
                         tp_size=args.world_size),  # TP only
         pre_norm=args.pre_norm,
         do_layer_norm_before=args.do_layer_norm_before,
+        use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
         share_embedding_table=share_embedding_table)
+    if args.use_weight_only:
+        tensorrt_llm_gpt = weight_only_quantize(tensorrt_llm_gpt,
+                                                args.quant_mode)
     if args.model_dir is not None:
         load_from_ft(tensorrt_llm_gpt,
                      args.model_dir,
@@ -237,6 +282,10 @@ def build_rank_engine(builder: Builder,
     if args.enable_context_fmha_fp32_acc:
         network.plugin_config.set_context_fmha(
             ContextFMHAType.enabled_with_fp32_acc)
+    if args.use_weight_only:
+        assert (args.dtype == 'float16')
+        network.plugin_config.set_weight_only_quant_matmul_plugin(
+            dtype=args.dtype)
     if args.world_size > 1:
         network.plugin_config.set_nccl_plugin(args.dtype)
     if args.remove_input_padding:
@@ -246,10 +295,13 @@ def build_rank_engine(builder: Builder,
         network.set_named_parameters(tensorrt_llm_gpt.named_parameters())
 
         # Forward
-        inputs = tensorrt_llm_gpt.prepare_inputs(args.max_batch_size,
-                                                 args.max_input_len,
-                                                 args.max_output_len, True,
-                                                 args.max_beam_width)
+        inputs = tensorrt_llm_gpt.prepare_inputs(
+            args.max_batch_size,
+            args.max_input_len,
+            args.max_output_len,
+            True,
+            args.max_beam_width,
+            prompt_embedding_table_size=args.max_prompt_embedding_table_size)
         tensorrt_llm_gpt(*inputs)
 
     tensorrt_llm.graph_rewriting.optimize(network)
@@ -290,7 +342,10 @@ def build(rank, args):
             max_position_embeddings=args.n_positions,
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
-            max_output_len=args.max_output_len)
+            max_output_len=args.max_output_len,
+            use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
+            int8=(args.quant_mode.has_act_and_weight_quant()
+                  or args.quant_mode.has_int8_kv_cache()))
 
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.world_size,
                                       cur_rank)

@@ -47,7 +47,7 @@ def TRTGPTJ(args, config):
     remove_input_padding = config['plugin_config']['remove_input_padding']
     quant_mode = QuantMode(config['builder_config'].get('quant_mode', 0))
     paged_kv_cache = config['plugin_config']['paged_kv_cache']
-    tokens_per_block = config['builder_config']['tokens_per_block']
+    tokens_per_block = config['plugin_config']['tokens_per_block']
 
     model_config = tensorrt_llm.runtime.ModelConfig(
         vocab_size=vocab_size,
@@ -59,7 +59,8 @@ def TRTGPTJ(args, config):
         remove_input_padding=remove_input_padding,
         paged_kv_cache=paged_kv_cache,
         tokens_per_block=tokens_per_block,
-        quant_mode=quant_mode)
+        quant_mode=quant_mode,
+        dtype=dtype)
 
     runtime_rank = tensorrt_llm.mpi_rank()
     runtime_mapping = tensorrt_llm.Mapping(world_size,

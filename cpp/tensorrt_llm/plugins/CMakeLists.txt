@@ -19,7 +19,8 @@ set(PLUGIN_TARGET_NAME nvinfer_plugin_tensorrt_llm)
 set(PLUGIN_SHARED_TARGET ${PLUGIN_TARGET_NAME})
 
 set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
-set(PLUGIN_EXPORT_MAP ${TARGET_DIR}/exports.map)
+set(PLUGIN_EXPORT_MAP ${TARGET_DIR}/exports.map) # Linux
+set(PLUGIN_EXPORT_DEF ${TARGET_DIR}/exports.def) # Windows
 
 if(${CMAKE_BUILD_TYPE} MATCHES "Debug")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
@@ -89,7 +90,11 @@ set_target_properties(
              LIBRARY_OUTPUT_DIRECTORY "${TRT_OUT_DIR}"
              RUNTIME_OUTPUT_DIRECTORY "${TRT_OUT_DIR}")
 
-if(NOT MSVC)
+if(MSVC)
+  set_target_properties(
+    ${PLUGIN_SHARED_TARGET}
+    PROPERTIES LINK_FLAGS "/DEF:${PLUGIN_EXPORT_DEF} ${UNDEFINED_FLAG}")
+else()
   set_target_properties(
     ${PLUGIN_SHARED_TARGET}
     PROPERTIES

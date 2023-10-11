@@ -27,13 +27,12 @@
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 
 #include <algorithm>
-#include <experimental/array>
-#include <experimental/filesystem>
+#include <array>
+#include <filesystem>
 #include <memory>
 #include <vector>
 
-namespace stdEx = std::experimental;
-namespace fs = stdEx::filesystem;
+namespace fs = std::filesystem;
 namespace trt = nvinfer1;
 namespace onnx = nvonnxparser;
 
@@ -56,8 +55,8 @@ std::unique_ptr<trt::IHostMemory> buildMnistEngine(trt::ILogger& logger)
     const auto explicitBatch = 1U << static_cast<uint32_t>(trt::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
     auto network = makeUnique(builder->createNetworkV2(explicitBatch));
     auto parser = makeUnique(nvonnxparser::createParser(*network, logger));
-    auto const parsingSuccess
-        = parser->parseFromFile(MNIST_MODEL_PATH.c_str(), static_cast<int32_t>(trt::ILogger::Severity::kWARNING));
+    auto const parsingSuccess = parser->parseFromFile(
+        MNIST_MODEL_PATH.string().c_str(), static_cast<int32_t>(trt::ILogger::Severity::kWARNING));
     EXPECT_TRUE(parsingSuccess);
     auto config = makeUnique(builder->createBuilderConfig());
     return makeUnique(builder->buildSerializedNetwork(*network, *config));
@@ -107,7 +106,7 @@ TEST_F(TllmRuntimeTest, SinglePass)
     auto const inputName = engine.getIOTensorName(0);
     EXPECT_EQ(engine.getTensorIOMode(inputName), trt::TensorIOMode::kINPUT);
     auto const inputDims = engine.getTensorShape(inputName);
-    auto constexpr inputDimsExpected = stdEx::make_array(1, 1, 28, 28);
+    std::array constexpr inputDimsExpected = {1, 1, 28, 28};
     EXPECT_EQ(inputDims.nbDims, inputDimsExpected.size());
     for (int i = 0; i < inputDims.nbDims; ++i)
     {
@@ -118,7 +117,7 @@ TEST_F(TllmRuntimeTest, SinglePass)
     auto const outputName = engine.getIOTensorName(1);
     EXPECT_EQ(engine.getTensorIOMode(outputName), trt::TensorIOMode::kOUTPUT);
     auto const outputDims = engine.getTensorShape(outputName);
-    auto constexpr outputDimsExpected = stdEx::make_array(1, 10);
+    std::array constexpr outputDimsExpected = {1, 10};
     EXPECT_EQ(outputDims.nbDims, outputDimsExpected.size());
     for (int i = 0; i < outputDims.nbDims; ++i)
     {

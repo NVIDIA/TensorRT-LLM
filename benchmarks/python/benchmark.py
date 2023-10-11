@@ -190,6 +190,13 @@ def parse_arguments():
                         default=False,
                         action='store_true',
                         help='Execute GPT session with CUDA graph.')
+    parser.add_argument(
+        '--enable_custom_all_reduce',
+        default=False,
+        action='store_true',
+        help=
+        'Use latency-optimized all-reduce for tensor parallelism. Gives better performance with NVLink.'
+    )
 
     return parser.parse_args()
 
@@ -209,25 +216,27 @@ def main(args):
                           for io in in_out_len_options]
 
     if args.model in get_allowed_models(benchmark_type="gpt"):
-        benchmarker = GPTBenchmark(args.engine_dir,
-                                   args.model,
-                                   args.mode,
-                                   batch_size_options,
-                                   in_out_len_options,
-                                   args.dtype,
-                                   args.refit,
-                                   args.num_beams,
-                                   args.top_k,
-                                   args.top_p,
-                                   args.output_dir,
-                                   args.n_positions,
-                                   args.max_input_len,
-                                   args.max_output_len,
-                                   args.max_batch_size,
-                                   force_num_layer_1=args.force_num_layer_1,
-                                   enable_fp8=args.enable_fp8,
-                                   fp8_kv_cache=args.fp8_kv_cache,
-                                   enable_cuda_graph=args.enable_cuda_graph)
+        benchmarker = GPTBenchmark(
+            args.engine_dir,
+            args.model,
+            args.mode,
+            batch_size_options,
+            in_out_len_options,
+            args.dtype,
+            args.refit,
+            args.num_beams,
+            args.top_k,
+            args.top_p,
+            args.output_dir,
+            args.n_positions,
+            args.max_input_len,
+            args.max_output_len,
+            args.max_batch_size,
+            force_num_layer_1=args.force_num_layer_1,
+            enable_fp8=args.enable_fp8,
+            fp8_kv_cache=args.fp8_kv_cache,
+            enable_cuda_graph=args.enable_cuda_graph,
+            enable_custom_all_reduce=args.enable_custom_all_reduce)
     elif args.model in get_allowed_models(benchmark_type="bert"):
         benchmarker = BERTBenchmark(args.engine_dir,
                                     args.model,

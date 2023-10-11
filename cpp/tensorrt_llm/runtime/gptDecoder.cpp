@@ -35,13 +35,12 @@ GptDecoder<T>::GptDecoder(size_t vocabSize, size_t vocabSizePadded, CudaStreamPt
     : mManager{stream}
     , mAllocator{mManager}
 {
-    tc::cublasMMWrapper* cublasWrapper = nullptr;
     bool isFreeBufferAfterForward{false};
     cudaDeviceProp prop;
     tc::check_cuda_error(cudaGetDeviceProperties(&prop, 0));
 
     mDynamicDecodeLayer = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(
-        vocabSize, vocabSizePadded, stream->get(), cublasWrapper, &mAllocator, isFreeBufferAfterForward, &prop);
+        vocabSize, vocabSizePadded, stream->get(), &mAllocator, isFreeBufferAfterForward, &prop);
 }
 
 template <typename T>

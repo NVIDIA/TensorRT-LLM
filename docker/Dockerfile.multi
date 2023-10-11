@@ -4,59 +4,42 @@ ARG BASE_TAG=23.08-py3
 
 FROM ${BASE_IMAGE}:${BASE_TAG} as base
 
+# `BASH_ENV` is only used for non-interactive bash.
+ENV BASH_ENV="/tmp/bash_env"
+ENV BUILD_TORCH_FROM_SOURCE=${BUILD_TORCH_FROM_SOURCE}
+SHELL ["/bin/bash", "-c"]
+
 FROM base as devel
+ARG BUILD_TORCH_FROM_SOURCE=0
 
-# Install addtional packages for development
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends git-lfs gdb && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+COPY docker/common/install_base.sh install_base.sh
+RUN bash ./install_base.sh && rm install_base.sh
 
-# Python packages
-COPY requirements-dev.txt /tmp/
-RUN --mount=type=cache,target=/root/.cache \
-    pip install -r /tmp/requirements-dev.txt  --extra-index-url https://pypi.ngc.nvidia.com && \
-    rm /tmp/requirements-dev.txt
-
-# Remove previous TRT installation
-RUN --mount=type=cache,target=/root/.cache \
-    apt-get remove --purge -y libnvinfer* tensorrt* && \
-    pip uninstall -y tensorrt
+COPY docker/common/install_cmake.sh install_cmake.sh
+RUN bash ./install_cmake.sh && rm install_cmake.sh
 
 # Download & install internal TRT release
-ARG TENSOR_RT_VERSION="9.1.0.1"
-ARG CUDA_VERSION="12.2"
 ARG RELEASE_URL_TRT
 ARG TARGETARCH
-
-RUN --mount=type=cache,target=/root/.cache \
-    if [ -z "$RELEASE_URL_TRT"];then \
-        ARCH=${TARGETARCH} && \
-        if [ "$ARCH" = "arm64" ];then ARCH="aarch64";fi && \
-        if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi && \
-        if [ "$ARCH" = "x86_64" ];then DIR_NAME="x64-agnostic"; else DIR_NAME=${ARCH};fi &&\
-        if [ "$ARCH" = "aarch64" ];then OS1="Ubuntu22_04" && OS2="Ubuntu-22.04"; else OS1="Linux" && OS2="Linux";fi &&\
-        RELEASE_URL_TRT=http://cuda-repo.nvidia.com/release-candidates/Libraries/TensorRT/v9.1/${TENSOR_RT_VERSION}-b6aa91dc/${CUDA_VERSION}-r535/${OS1}-${DIR_NAME}/tar/TensorRT-${TENSOR_RT_VERSION}.${OS2}.${ARCH}-gnu.cuda-${CUDA_VERSION}.tar.gz;\
-    fi &&\
-    wget --no-verbose ${RELEASE_URL_TRT} -O /workspace/TensorRT.tar && \
-    tar -xf TensorRT.tar -C /usr/local/ && \
-    mv /usr/local/TensorRT-${TENSOR_RT_VERSION} /usr/local/tensorrt && \
-    pip install /usr/local/tensorrt/python/tensorrt-*-cp310-*.whl && \
-    rm -rf /workspace/TensorRT.tar
-
+ENV RELEASE_URL_TRT=$RELEASE_URL_TRT
+ENV TRT_TARGETARCH=$TARGETARCH
+COPY docker/common/install_tensorrt.sh install_tensorrt.sh
+RUN bash ./install_tensorrt.sh && rm install_tensorrt.sh
 ENV LD_LIBRARY_PATH=/usr/local/tensorrt/lib:${LD_LIBRARY_PATH}
 
 # Install latest Polygraphy
-ARG RELEASE_URL_PG=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/secure/9.0.1/tars/polygraphy-0.48.1-py2.py3-none-any.whl
-RUN --mount=type=cache,target=/root/.cache \
-    pip uninstall -y polygraphy && \
-    pip install ${RELEASE_URL_PG}
+COPY docker/common/install_polygraphy.sh install_polygraphy.sh
+RUN bash ./install_polygraphy.sh && rm install_polygraphy.sh
 
+# Install PyTorch from source (optional)
+COPY docker/common/install_pytorch.sh install_pytorch.sh
+RUN bash ./install_pytorch.sh $BUILD_TORCH_FROM_SOURCE && rm install_pytorch.sh
 
 FROM devel as wheel
-
 WORKDIR /src/tensorrt_llm
+COPY benchmarks benchmarks
 COPY cpp cpp
+COPY benchmarks benchmarks
 COPY scripts scripts
 COPY tensorrt_llm tensorrt_llm
 COPY 3rdparty 3rdparty
@@ -64,7 +47,6 @@ COPY setup.py requirements.txt ./
 
 ARG BUILD_WHEEL_ARGS="--clean --trt_root /usr/local/tensorrt"
 RUN python3 scripts/build_wheel.py ${BUILD_WHEEL_ARGS}
-
 
 FROM devel as release
 

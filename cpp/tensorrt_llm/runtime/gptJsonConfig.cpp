@@ -72,8 +72,6 @@ GptJsonConfig parseJson(InputType&& i)
     else
         TLLM_CHECK_WITH_INFO(false, tc::fmtstr("Model data type '%s' not supported", precision.c_str()));
 
-    auto const pagedKvCache = parseJsonFieldOr(builderConfig, "paged_kv_cache", false);
-    auto const tokensPerBlock = parseJsonFieldOr(builderConfig, "tokens_per_block", 0);
     auto const quantMode = tc::QuantMode(parseJsonFieldOr(builderConfig, "quant_mode", tc::QuantMode::none().value()));
     auto const numKvHeads
         = parseJsonFieldOr(builderConfig, "num_kv_heads", numHeads * tensorParallelism) / tensorParallelism;
@@ -81,7 +79,11 @@ GptJsonConfig parseJson(InputType&& i)
     auto const maxInputLen = parseJsonFieldOr(builderConfig, "max_input_len", 0);
     auto const maxOutputLen = parseJsonFieldOr(builderConfig, "max_output_len", 0);
 
+    auto const computeContextLogits = parseJsonFieldOr(builderConfig, "gather_all_token_logits", false);
+
     auto const& pluginConfig = json.at("plugin_config");
+    auto const pagedKvCache = pluginConfig.at("paged_kv_cache");
+    auto const tokensPerBlock = pluginConfig.at("tokens_per_block");
     auto const& gptAttentionPlugin = pluginConfig.at("gpt_attention_plugin");
     auto const useGptAttentionPlugin = !gptAttentionPlugin.is_boolean() || gptAttentionPlugin.template get<bool>();
     auto const removeInputPadding = pluginConfig.at("remove_input_padding").template get<bool>();
@@ -93,6 +95,7 @@ GptJsonConfig parseJson(InputType&& i)
     modelConfig.setTokensPerBlock(tokensPerBlock);
     modelConfig.setQuantMode(quantMode);
     modelConfig.setNbKvHeads(numKvHeads);
+    modelConfig.computeContextLogits(computeContextLogits);
 
     modelConfig.setMaxBatchSize(maxBatchSize);
     modelConfig.setMaxInputLen(maxInputLen);

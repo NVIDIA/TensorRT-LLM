@@ -86,6 +86,12 @@ void WeightOnlyGroupwiseQuantGemmPluginProfiler::computeTmpSize(int maxM, int n,
     setTmpWorkspaceSizeInBytes(bytes);
 }
 
+std::vector<WeightOnlyGroupwiseQuantGemmPluginProfiler::Config> WeightOnlyGroupwiseQuantGemmPluginProfiler::getTactics(
+    int m, int n, int k) const
+{
+    return mRunner->getConfigs();
+}
+
 WeightOnlyGroupwiseQuantMatmulPlugin::WeightOnlyGroupwiseQuantMatmulPlugin(nvinfer1::DataType type, int quant_algo,
     int group_size, const WeightOnlyGroupwiseQuantMatmulPlugin::PluginProfilerPtr& pluginProfiler)
     : mPluginProfiler(pluginProfiler)
@@ -164,8 +170,7 @@ nvinfer1::IPluginV2DynamicExt* WeightOnlyGroupwiseQuantMatmulPlugin::clone() con
 
 void WeightOnlyGroupwiseQuantMatmulPlugin::configGemm()
 {
-    mPluginProfiler->profileTactics(
-        m_weightOnlyGroupwiseGemmRunner->getConfigs(), m_weightOnlyGroupwiseGemmRunner, mType, mDims, mGemmId);
+    mPluginProfiler->profileTactics(m_weightOnlyGroupwiseGemmRunner, mType, mDims, mGemmId);
 }
 
 nvinfer1::DimsExprs WeightOnlyGroupwiseQuantMatmulPlugin::getOutputDimensions(
@@ -250,7 +255,8 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::configurePlugin(const nvinfer1::Dynam
     }
     mGemmId = {N, K, mType};
 
-    int smoothedActSize = maxM * maxK * (in[0].desc.type == nvinfer1::DataType::kFLOAT ? 4 : 2);
+    size_t smoothedActSize = static_cast<size_t>(maxM) * static_cast<size_t>(maxK)
+        * (in[0].desc.type == nvinfer1::DataType::kFLOAT ? 4 : 2);
     m_workspaceMaxSize = smoothedActSize + m_weightOnlyGroupwiseGemmRunner->getWorkspaceSize(maxM, maxN, maxK);
 }
 

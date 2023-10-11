@@ -25,12 +25,13 @@ import torch
 
 from .logger import logger
 
-fp32_array = partial(np.array, dtype=np.float32)
-fp16_array = partial(np.array, dtype=np.float16)
-int32_array = partial(np.array, dtype=np.int32)
-
 # numpy doesn't know bfloat16, define abstract binary type instead
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
+
+fp32_array = partial(np.array, dtype=np.float32)
+fp16_array = partial(np.array, dtype=np.float16)
+bf16_array = partial(np.array, dtype=np_bfloat16)
+int32_array = partial(np.array, dtype=np.int32)
 
 
 def torch_to_numpy(x):
@@ -78,6 +79,7 @@ def str_dtype_to_torch(dtype):
 
 _str_to_trt_dtype_dict = dict(float16=trt.float16,
                               float32=trt.float32,
+                              int64=trt.int64,
                               int32=trt.int32,
                               int8=trt.int8,
                               bool=trt.bool,

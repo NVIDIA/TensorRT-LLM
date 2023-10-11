@@ -1165,8 +1165,13 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
     zero(k);
     zero(q_bias);
     zero(k_bias);
+    float rotary_embedding_base = params.rotary_embedding_base;
+    float rotary_embedding_scale = params.rotary_embedding_scale;
     if (is_valid_qk_vec)
     {
+        mmha::update_rotary_base_n_scale(rotary_embedding_base, rotary_embedding_scale,
+            params.rotary_embedding_scale_type, params.rotary_embedding_dim, params.rotary_embedding_max_positions,
+            tlength);
         // Query
         // The stride between tokens. We may be able to always use params.stride.
         uint32_t q_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_heads * Dh);
@@ -1280,7 +1285,7 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
             mmha::vec_from_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
 
             mmha::apply_rotary_embedding(q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim,
-                params.rotary_embedding_base, params.rotary_embedding_scale, tlength);
+                rotary_embedding_base, rotary_embedding_scale, tlength);
 
             mmha::write_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
             mmha::write_smem_transpose(q, q_smem_, transpose_idx, smem_pitch);

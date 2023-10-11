@@ -40,6 +40,9 @@ std::vector<uint8_t> loadEngine(std::string const& enginePath);
 std::vector<ITensor::SharedPtr> createBufferVector(TllmRuntime const& runtime, SizeType indexOffset,
     SizeType numBuffers, std::string const& prefix, MemoryType memType);
 
+std::vector<ITensor::SharedPtr> createBufferVector(
+    TllmRuntime const& runtime, SizeType numBuffers, MemoryType memType, nvinfer1::DataType dtype);
+
 void reshapeBufferVector(std::vector<ITensor::SharedPtr>& vector, nvinfer1::Dims const& shape);
 
 void insertTensorVector(StringPtrMap<ITensor>& map, std::string const& key, std::vector<ITensor::SharedPtr> const& vec,

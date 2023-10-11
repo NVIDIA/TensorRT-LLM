@@ -76,8 +76,9 @@ template <typename T>
 void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, const T* qkv_bias, const int* seq_lens,
     const int* padding_offset, const int batch_size, const int seq_len, const int token_num, const int head_num,
     const int kv_head_num, const int size_per_head, const bool using_context_fmha, const int rotary_embedding_dim,
-    const float rotary_embedding_base, const float rotary_embedding_scale,
-    PositionEmbeddingType const position_embedding_type, const float* scale, const int int8_mode, cudaStream_t stream);
+    float rotary_embedding_base, const RotaryScalingType rotary_scale_type, float rotary_embedding_scale,
+    const int rotary_embedding_max_positions, PositionEmbeddingType const position_embedding_type, const float* scale,
+    const int int8_mode, cudaStream_t stream);
 
 template <typename T>
 void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, const T* qkv_bias, const int* seq_lens,
@@ -92,18 +93,28 @@ template <typename T>
 void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, const int* seq_lens,
     const int* padding_offset, const int batch_size, const int seq_len, const int token_num, const int head_num,
     const int kv_head_num, const int size_per_head, const bool using_context_fmha, const int rotary_embedding_dim,
-    const float rotary_embedding_base, const float rotary_embedding_scale,
-    PositionEmbeddingType const position_embedding_type, const float* scale, const int int8_mode, cudaStream_t stream)
+    float rotary_embedding_base, const RotaryScalingType rotary_scale_type, float rotary_embedding_scale,
+    const int rotary_embedding_max_positions, PositionEmbeddingType const position_embedding_type, const float* scale,
+    const int int8_mode, cudaStream_t stream)
 {
     invokeAddFusedQKVBiasTranspose(q_buf, k_buf, v_buf, QKV, (const T*) nullptr, seq_lens, padding_offset, batch_size,
         seq_len, token_num, head_num, kv_head_num, size_per_head, using_context_fmha, rotary_embedding_dim,
-        rotary_embedding_base, rotary_embedding_scale, position_embedding_type, scale, int8_mode, stream);
+        rotary_embedding_base, rotary_scale_type, rotary_embedding_scale, rotary_embedding_max_positions,
+        position_embedding_type, scale, int8_mode, stream);
 }
 
 template <typename T, typename KVCacheBuffer>
 void invokeTranspose4dBatchMajor(const T* k_src, const T* v_src, KVCacheBuffer& kvTable, const int local_batch_size,
     const int seq_len, const int max_seq_len, const int size_per_head, const int local_head_num,
     const KvCacheDataType cache_type, const float* kvScaleOrigQuant, const int* sequence_lengths, cudaStream_t stream);
+
+template <typename T, typename KVCacheBuffer>
+void invokeApplyBiasRopeUpdateKVCache(T* QKV, KVCacheBuffer& kvTable, const T* qkv_bias, const int* seq_lens,
+    const int* padding_offset, const int batch_size, const int seq_len, const int token_num, const int head_num,
+    const int kv_head_num, const int size_per_head, const int rotary_embedding_dim, const float rotary_embedding_base,
+    const RotaryScalingType rotary_scale_type, const float rotary_embedding_scale,
+    const int rotary_embedding_max_positions, const PositionEmbeddingType position_embedding_type, const float* scale,
+    const int int8_mode, const KvCacheDataType cache_type, const float* kvScaleOrigQuant, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

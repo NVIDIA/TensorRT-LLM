@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tensorrt_llm/runtime/iStatefulGptDecoder.h"
@@ -44,17 +45,12 @@ public:
     //! @brief Initialize the decoder with new batch of inputs.
     void newBatch(GenerationInput const& input, SamplingConfig const& samplingConfig) override;
 
-    //! @brief Run one step for all requests.
-    bool forward(decoder::Output& output, decoder::Input const& input) override;
+    void forwardAsync(decoder::Output& output, decoder::Input const& input) override;
+
+    bool isFinishedSync() override;
 
     //! @brief Gather final results for all requests.
     [[nodiscard]] TensorPtr getFinalOutputIds() const override;
-
-    //! @return [batchSize], indicators of finished requests
-    [[nodiscard]] std::vector<bool> getFinished() const override
-    {
-        return mFinished;
-    }
 
     //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token
     //! ids without padding, on gpu
@@ -67,6 +63,12 @@ public:
     [[nodiscard]] TensorPtr getNewTokens() const override
     {
         return mDecodingOutput->newTokens;
+    }
+
+    //! @returns [1], number of finished sequences, in pinned host memory
+    [[nodiscard]] TensorPtr getNbFinished() const override
+    {
+        return mDecodingOutput->finishedSum;
     }
 
 private:
@@ -84,8 +86,8 @@ private:
     DecodingInputPtr mDecodingInput;
     using DecodingOutputPtr = std::unique_ptr<DecodingOutput>;
     DecodingOutputPtr mDecodingOutput;
+    CudaEvent mDecodedEvent{};
 
-    std::vector<bool> mFinished;
     SizeType mNbSteps;
     SizeType mMaxSequenceLength{};
     SizeType mMaxNewTokens;

@@ -40,16 +40,22 @@ Please note that currently `parallel_build` feature only supports single node.
 Here're some examples:
 ```bash
 # Build a single-GPU float16 engine from HF weights.
+# It is recommend to use --remove_input_padding along with --use_gpt_attention_plugin for better performance
 python build.py --model_dir falcon/rw-1b \
                 --dtype float16 \
+                --remove_input_padding \
+                --use_gpt_attention_plugin float16 \
                 --use_gemm_plugin float16 \
                 --output_dir falcon/rw-1b/trt_engines/fp16/1-gpu/
 
 # Single GPU on falcon-7b-instruct
+# --use_gpt_attention_plugin is necessary for rotary positional embedding (RoPE)
 python build.py --model_dir falcon/7b-instruct \
                 --dtype bfloat16 \
                 --use_gemm_plugin bfloat16 \
+                --remove_input_padding \
                 --use_gpt_attention_plugin bfloat16 \
+                --enable_context_fmha \
                 --output_dir falcon/7b-instruct/trt_engines/bf16/1-gpu/ \
                 --world_size 1
 
@@ -57,7 +63,9 @@ python build.py --model_dir falcon/7b-instruct \
 python build.py --model_dir falcon/40b-instruct \
                 --dtype bfloat16 \
                 --use_gemm_plugin bfloat16 \
+                --remove_input_padding \
                 --use_gpt_attention_plugin bfloat16 \
+                --enable_context_fmha \
                 --output_dir falcon/40b-instruct/trt_engines/bf16/2-gpu/ \
                 --world_size 2 \
                 --tp_size 2
@@ -67,6 +75,7 @@ python build.py --model_dir falcon/40b-instruct \
                 --dtype bfloat16 \
                 --use_gemm_plugin bfloat16 \
                 --use_gpt_attention_plugin bfloat16 \
+                --enable_context_fmha \
                 --output_dir falcon/40b-instruct/trt_engines/bf16/2-gpu/ \
                 --world_size 4 \
                 --tp_size 2 \
@@ -76,7 +85,9 @@ python build.py --model_dir falcon/40b-instruct \
 python build.py --model_dir falcon/180b \
                 --dtype bfloat16 \
                 --use_gemm_plugin bfloat16 \
+                --remove_input_padding \
                 --use_gpt_attention_plugin bfloat16 \
+                --enable_context_fmha \
                 --output_dir falcon/180b/trt_engines/bf16/8-gpu/ \
                 --world_size 8 \
                 --tp_size 8 \
@@ -88,6 +99,7 @@ python build.py --model_dir falcon/180b \
                 --dtype bfloat16 \
                 --use_gemm_plugin bfloat16 \
                 --use_gpt_attention_plugin bfloat16 \
+                --enable_context_fmha \
                 --output_dir falcon/180b/trt_engines/bf16/8-gpu/ \
                 --world_size 8 \
                 --tp_size 4 \
@@ -99,6 +111,44 @@ python build.py --model_dir falcon/180b \
 Note that in order to use N-way tensor parallelism, the number of attention heads must be a multiple of N.
 For example, you can't configure 2-way tensor parallism for [falcon-7b](https://huggingface.co/tiiuae/falcon-7b) or [falcon-7b-instruct](https://huggingface.co/tiiuae/falcon-7b-instruct), because the number of attention heads is 71 (not divisible by 2).
 
+
+#### FP8 Post-Training Quantization
+
+The examples below uses the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
+
+First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+
+Now quantize HF Falcon weights as follows.
+After successfully running the script, the output should be in .npz format, e.g. `quantized_fp8/falcon_tp_1_rank0.npz`.
+At the moment, TensorRT-LLM only needs the quantization scaling factors from the .npz archive for FP8 quantization,
+while the .npz archive contains the whole weights with the quantization scaling factors.
+The tensor parallel size of the quantized model is not necesary to be matched with the value that TensorRT-LLM engine will use.
+This is subject to change for a smoother user experience.
+
+```bash
+# Quantize HF Falcon 180B checkpoint into FP8 format
+python quantize.py --model_dir falcon/180b \
+                   --dtype float16 \
+                   --qformat fp8 \
+                   --export_path quantized_fp8 \
+                   --calib_size 16
+
+# Build Falcon 180B TP=8 using HF checkpoint + PTQ scaling factors
+python build.py --model_dir falcon/180b \
+                --quantized_fp8_model_path ./quantized_fp8/falcon_tp1_rank0.npz \
+                --dtype float16 \
+                --enable_context_fmha \
+                --use_gpt_attention_plugin float16 \
+                --output_dir falcon/180b/trt_engines/fp8/8-gpu/ \
+                --remove_input_padding \
+                --enable_fp8 \
+                --fp8_kv_cache \
+                --strongly_typed \
+                --world_size 8 \
+                --tp_size 8 \
+                --load_by_shard \
+                --parallel_build
+```
 
 ### 4. Run
 

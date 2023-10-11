@@ -36,6 +36,7 @@ class BloomDecoderLayer(Module):
                  dtype=None,
                  attention_mask_type=AttentionMaskType.causal,
                  hidden_act='gelu',
+                 position_embedding_type=PositionEmbeddingType.alibi,
                  quant_mode=QuantMode(0),
                  mlp_hidden_size=None,
                  bias=True,
@@ -51,6 +52,7 @@ class BloomDecoderLayer(Module):
         self.dtype = dtype
         self.attention_mask_type = attention_mask_type
         self.hidden_act = hidden_act
+        self.position_embedding_type = position_embedding_type
         self.tp_group = tp_group
         self.tp_size = tp_size
         self.tp_rank = tp_rank
@@ -65,12 +67,13 @@ class BloomDecoderLayer(Module):
             num_layers,
             dtype=dtype,
             attention_mask_type=AttentionMaskType.causal,
-            position_embedding_type=PositionEmbeddingType.alibi,
+            position_embedding_type=position_embedding_type,
             bias=bias,
             tp_group=tp_group,
             tp_size=tp_size,
             tp_rank=tp_rank,
-            use_int8_kv_cache=quant_mode.has_int8_kv_cache())
+            use_int8_kv_cache=quant_mode.has_int8_kv_cache(),
+            quant_mode=quant_mode)
 
         if mlp_hidden_size is None:
             mlp_hidden_size = hidden_size * 4
@@ -81,7 +84,8 @@ class BloomDecoderLayer(Module):
                        dtype=dtype,
                        bias=bias,
                        tp_group=tp_group,
-                       tp_size=tp_size)
+                       tp_size=tp_size,
+                       quant_mode=quant_mode)
         self.post_layernorm = LayerNorm(normalized_shape=hidden_size,
                                         dtype=dtype)
 
@@ -244,6 +248,8 @@ class BloomForCausalLM(BloomModel, GenerationMixin):
         self._dtype = self._kv_dtype
         if quant_mode.has_int8_kv_cache():
             self._kv_dtype = str_dtype_to_trt('int8')
+        elif quant_mode.has_fp8_kv_cache():
+            self._kv_dtype = str_dtype_to_trt('fp8')
 
         self.quant_mode = quant_mode
 
@@ -295,7 +301,7 @@ class BloomForCausalLM(BloomModel, GenerationMixin):
         lm_logits = self.lm_head(hidden_states)
         lm_logits.mark_output('logits', self._dtype)
 
-        if use_cache:
+        if use_cache and default_net().plugin_config.paged_kv_cache == False:
             for i, present in enumerate(presents):
                 present.mark_output(f'present_key_value_{i}', self._kv_dtype)
             return (lm_logits, presents)

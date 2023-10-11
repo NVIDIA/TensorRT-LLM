@@ -90,10 +90,22 @@ public:
     void setZero(IBuffer& buffer) const;
 
     //! \brief Copy `src` to `dst`.
-    void copy(void const* src, IBuffer& dst) const;
+    void copy(void const* src, IBuffer& dst, MemoryType srcType) const;
 
     //! \brief Copy `src` to `dst`.
-    void copy(IBuffer const& src, void* dst) const;
+    void copy(IBuffer const& src, void* dst, MemoryType dstType) const;
+
+    //! \brief Copy `src` to `dst`.
+    void copy(void const* src, IBuffer& dst) const
+    {
+        return copy(src, dst, IBuffer::memoryType(src));
+    }
+
+    //! \brief Copy `src` to `dst`.
+    void copy(IBuffer const& src, void* dst) const
+    {
+        return copy(src, dst, IBuffer::memoryType(dst));
+    }
 
     //! \brief Copy `src` to `dst`.
     void copy(IBuffer const& src, IBuffer& dst) const;

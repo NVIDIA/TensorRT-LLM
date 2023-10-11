@@ -42,8 +42,8 @@ public:
         std::optional<float> length_penalty;
     };
 
-    OnlineBeamSearchLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-        tc::cublasMMWrapper* cublas_wrapper, tc::IAllocator* allocator, bool is_free_buffer_after_forward);
+    OnlineBeamSearchLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream, tc::IAllocator* allocator,
+        bool is_free_buffer_after_forward);
 
     OnlineBeamSearchLayer(OnlineBeamSearchLayer<T> const& beam_search_layer);
 

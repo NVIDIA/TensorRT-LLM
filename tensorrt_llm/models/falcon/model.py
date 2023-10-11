@@ -196,6 +196,8 @@ class FalconModel(Module):
             self.dtype = dtype
         if self.quant_mode.has_int8_kv_cache():
             self.kv_dtype = str_dtype_to_trt('int8')
+        elif quant_mode.has_fp8_kv_cache():
+            self.kv_dtype = str_dtype_to_trt('fp8')
         else:
             self.kv_dtype = self.dtype
 
@@ -363,8 +365,10 @@ class FalconForCausalLM(FalconModel, GenerationMixin):
         else:
             hidden_states.mark_output('hidden_states_output', self.dtype)
 
-        if use_cache:
-            for i, present in enumerate(presents):
+        if use_cache and default_net().plugin_config.paged_kv_cache == False:
+            for i, present in zip(
+                    self.get_transformer_layers(self.mapping, self.num_layers),
+                    presents):
                 present.mark_output(f'present_key_value_{i}', self.kv_dtype)
             if self.mapping.is_last_pp_rank():
                 return lm_logits, presents
@@ -381,9 +385,7 @@ class FalconForCausalLM(FalconModel, GenerationMixin):
                        max_input_len: int,
                        max_new_tokens: int,
                        use_cache: bool,
-                       max_beam_width: int = 1,
-                       paged_kv_cache: bool = False,
-                       tokens_per_block: int = 64):
+                       max_beam_width: int = 1):
         '''
 
         @brief: Prepare inputs Tensors for the model, the given sizes are used
@@ -398,6 +400,9 @@ class FalconForCausalLM(FalconModel, GenerationMixin):
         plugin_config = default_net().plugin_config
         use_gpt_attention_plugin = plugin_config.gpt_attention_plugin
         remove_input_padding = plugin_config.remove_input_padding
+        use_gemm_plugin = plugin_config.gemm_plugin
+        paged_kv_cache = plugin_config.paged_kv_cache
+        tokens_per_block = plugin_config.tokens_per_block
 
         model_inputs = self.prepare_basic_inputs(
             max_batch_size=max_batch_size,
@@ -408,8 +413,9 @@ class FalconForCausalLM(FalconModel, GenerationMixin):
             head_size=head_size,
             num_layers=self.num_layers,
             kv_dtype=self.kv_dtype,
-            use_gpt_attention_plugin=use_gpt_attention_plugin,
             remove_input_padding=remove_input_padding,
+            use_gpt_attention_plugin=use_gpt_attention_plugin,
+            use_gemm_plugin=use_gemm_plugin,
             paged_kv_cache=paged_kv_cache,
             tokens_per_block=tokens_per_block,
             dtype=self.dtype,

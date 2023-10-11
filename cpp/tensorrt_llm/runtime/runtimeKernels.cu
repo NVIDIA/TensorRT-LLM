@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
 #include <cub/cub.cuh>
@@ -66,6 +67,97 @@ template void invokeFill(IBuffer&, float, CudaStream const&);
 namespace
 {
 template <typename T>
+__global__ void fillBatch(T* data, std::int32_t const* indices, std::size_t size, T const* values)
+{
+    auto const batchIdx = indices[blockIdx.y];
+    const T value = values[blockIdx.y];
+    auto const tidx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    auto const stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    auto const startIdx = batchIdx * size;
+    auto const endIdx = startIdx + size;
+
+    for (auto idx = startIdx + tidx; idx < endIdx; idx += stride)
+    {
+        data[idx] = value;
+    }
+}
+} // namespace
+
+template <typename T>
+void invokeFillBatch(IBuffer& buffer, IBuffer const& slotIndices, std::size_t slotStride, IBuffer const& values,
+    CudaStream const& stream)
+{
+    auto data = bufferCast<T>(buffer);
+    auto indices = bufferCast<std::int32_t>(slotIndices);
+    auto fillValues = bufferCast<T>(values);
+    auto numSlots = slotIndices.getSize();
+    auto const size = slotStride;
+    dim3 const blockSize{256};
+    std::size_t const gridx{tc::ceilDiv(size, blockSize.x)};
+    std::size_t const gridMax{std::numeric_limits<std::uint32_t>::max()};
+    dim3 const gridSize{static_cast<std::uint32_t>(std::min(gridx, gridMax)), static_cast<std::uint32_t>(numSlots)};
+
+    fillBatch<<<gridSize, blockSize, 0, stream.get()>>>(data, indices, size, fillValues);
+}
+
+// template instantiation
+template void invokeFillBatch<float>(IBuffer&, IBuffer const&, std::size_t, IBuffer const&, CudaStream const&);
+template void invokeFillBatch<std::int8_t>(IBuffer&, IBuffer const&, std::size_t, IBuffer const&, CudaStream const&);
+template void invokeFillBatch<std::int32_t>(IBuffer&, IBuffer const&, std::size_t, IBuffer const&, CudaStream const&);
+
+namespace
+{
+template <typename T>
+__global__ void copyBatch(
+    const T* srcData, T* dstData, std::int32_t const* srcIndices, std::int32_t const* dstIndices, std::size_t size)
+{
+    auto const srcBatchIdx = srcIndices[blockIdx.y];
+    auto const dstBatchIdx = dstIndices[blockIdx.y];
+    auto const tidx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    auto const stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    auto const srcStartIdx = srcBatchIdx * size;
+    auto const dstStartIdx = dstBatchIdx * size;
+    auto const srcEndIdx = srcStartIdx + size;
+
+    auto srcIdx = srcStartIdx + tidx;
+    auto dstIdx = dstStartIdx + tidx;
+
+    for (; srcIdx < srcEndIdx; srcIdx += stride, dstIdx += stride)
+    {
+        dstData[dstIdx] = srcData[srcIdx];
+    }
+}
+} // namespace
+
+template <typename T>
+void invokeCopyBatch(IBuffer const& srcBuffer, IBuffer& dstBuffer, IBuffer const& srcIndices, IBuffer const& dstIndices,
+    std::size_t slotStride, CudaStream const& stream)
+{
+    auto srcDataPtr = bufferCast<T>(srcBuffer);
+    auto dstDataPtr = bufferCast<T>(dstBuffer);
+    auto srcIndicesPtr = bufferCast<std::int32_t>(srcIndices);
+    auto dstIndicesPtr = bufferCast<std::int32_t>(dstIndices);
+    auto numSlots = srcIndices.getSize();
+    auto const size = slotStride;
+    dim3 const blockSize{256};
+    std::size_t const gridx{tc::ceilDiv(size, blockSize.x)};
+    std::size_t const gridMax{std::numeric_limits<std::uint32_t>::max()};
+    dim3 const gridSize{static_cast<std::uint32_t>(std::min(gridx, gridMax)), static_cast<std::uint32_t>(numSlots)};
+
+    copyBatch<<<gridSize, blockSize, 0, stream.get()>>>(srcDataPtr, dstDataPtr, srcIndicesPtr, dstIndicesPtr, size);
+}
+
+// template instantiation
+template void invokeCopyBatch<float>(
+    IBuffer const&, IBuffer&, IBuffer const&, IBuffer const&, std::size_t, CudaStream const&);
+template void invokeCopyBatch<std::int8_t>(
+    IBuffer const&, IBuffer&, IBuffer const&, IBuffer const&, std::size_t, CudaStream const&);
+template void invokeCopyBatch<std::int32_t>(
+    IBuffer const&, IBuffer&, IBuffer const&, IBuffer const&, std::size_t, CudaStream const&);
+
+namespace
+{
+template <typename T>
 __global__ void add(T* data, std::size_t size, T const value)
 {
     auto const tidx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -94,6 +186,63 @@ void invokeAdd(IBuffer& buffer, T const value, CudaStream const& stream)
 template void invokeAdd(IBuffer&, std::int32_t, CudaStream const&);
 template void invokeAdd(IBuffer&, std::int8_t, CudaStream const&);
 template void invokeAdd(IBuffer&, float, CudaStream const&);
+
+namespace
+{
+template <typename T>
+__global__ void reduceSum(T* output, T const* input, std::size_t size)
+{
+    T threadSum = 0;
+    for (auto index = threadIdx.x; index < size; index += blockDim.x)
+    {
+        threadSum += input[index];
+    }
+
+    T blockSum = 0;
+    if (blockDim.x <= 32)
+    {
+        blockSum = tc::warpReduceSum(threadSum);
+    }
+    else
+    {
+        blockSum = tc::blockReduceSum(threadSum);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+        *output = blockSum;
+    }
+}
+} // namespace
+
+template <typename T>
+void invokeReduce(IBuffer& output, IBuffer const& input, CudaStream const& stream)
+{
+    TLLM_CHECK_WITH_INFO(input.getDataType() == output.getDataType(), "Input and output have different data types");
+    TLLM_CHECK_WITH_INFO(output.getSize() == 1, common::fmtstr("Output size (%ld) has to be 1", output.getSize()));
+
+    auto outputPtr = bufferCast<T>(output);
+    auto inputPtr = bufferCast<T>(input);
+    auto const size = input.getSize();
+
+    dim3 blockSize{std::min(512u, static_cast<std::uint32_t>(size))};
+    dim3 gridSize{1};
+
+    reduceSum<<<gridSize, blockSize, 0, stream.get()>>>(outputPtr, inputPtr, size);
+}
+
+void reduce(IBuffer& output, IBuffer const& input, CudaStream const& stream)
+{
+    switch (input.getDataType())
+    {
+    case nvinfer1::DataType::kINT32: invokeReduce<SizeType>(output, input, stream); break;
+    case nvinfer1::DataType::kFLOAT: invokeReduce<float>(output, input, stream); break;
+    case nvinfer1::DataType::kHALF: invokeReduce<half>(output, input, stream); break;
+    case nvinfer1::DataType::kINT8: invokeReduce<int8_t>(output, input, stream); break;
+    default: TLLM_CHECK_WITH_INFO(false, "data type not supported");
+    }
+}
 
 namespace
 {
@@ -751,6 +900,77 @@ void tileTensorInplace(ITensor& tensor, SizeType beamWidth, CudaStream const& st
     case nvinfer1::DataType::kHALF: invokeTileTensorInPlace<half>(tensor, beamWidth, stream); break;
     case nvinfer1::DataType::kINT8: invokeTileTensorInPlace<int8_t>(tensor, beamWidth, stream); break;
     case nvinfer1::DataType::kFP8: invokeTileTensorInPlace<__nv_fp8_e4m3>(tensor, beamWidth, stream); break;
+    default: TLLM_CHECK_WITH_INFO(false, "data type not supported");
+    }
+}
+
+// In the following kernel, we launch a grid with batchSize blocks of threads. Each thread block
+// copies the logits from the "logits" tensor to the "lastTokenLogits" tensor for the last token
+// of each sequence.
+//
+// TODO: Enable vector copies for higher BW utilization.
+
+template <typename T>
+__global__ void gatherLastTokenLogitsKernel(T* lastTokenLogits, T const* logits, int const* lastTokenIds,
+    int maxInputLength, int beamWidth, int vocabSizePadded)
+{
+    // This sequence.
+    int seqIdx = blockIdx.x;
+    // Find the index of the last token in that sequence.
+    // Since lastTokenIds is the accumulated length instead of real ids, so we need to minus 1.
+    // For length [11, 23], we hope to get the results of id 10 and 22, in fact.
+    int lastTokenIdx = lastTokenIds[seqIdx] - 1;
+
+    // The output pointer.
+    T* lastTokenLogitsPtr = &lastTokenLogits[seqIdx * beamWidth * vocabSizePadded];
+    // The input pointer.
+    T const* logitsPtr = &logits[lastTokenIdx * vocabSizePadded];
+
+    // The threads in the block collaborate to copy the logits.
+    for (int idx = threadIdx.x; idx < vocabSizePadded; idx += blockDim.x)
+    {
+        T value = logitsPtr[idx];
+        for (int beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+        {
+            lastTokenLogitsPtr[beamIdx * vocabSizePadded + idx] = value;
+        }
+    }
+}
+
+template <typename T>
+void invokeGatherLastTokenLogits(
+    ITensor& output, ITensor const& input, ITensor const& lastTokenIds, CudaStream const& stream)
+{
+    auto const& outputShape = output.getShape();
+    auto const batchSize = static_cast<std::uint32_t>(outputShape.d[0]);
+    auto const beamWidth = static_cast<std::uint32_t>(outputShape.d[1]);
+    auto const vocabSizePadded = static_cast<std::uint32_t>(outputShape.d[2]);
+
+    auto const& inputShape = input.getShape();
+    auto const maxInputLength = static_cast<std::uint32_t>(inputShape.d[1]);
+
+    TLLM_CHECK_WITH_INFO(inputShape.d[0] == batchSize, "Invalid input shape: dim[0]");
+    TLLM_CHECK_WITH_INFO(inputShape.d[2] == vocabSizePadded, "Invalid input shape: dim[2]");
+
+    dim3 const blockSize{256, 1};
+    dim3 const gridSize{static_cast<std::uint32_t>(batchSize), 1};
+    gatherLastTokenLogitsKernel<<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<T>(output), bufferCast<T>(input),
+        bufferCast<int32_t>(lastTokenIds), static_cast<std::uint32_t>(maxInputLength),
+        static_cast<std::uint32_t>(beamWidth), vocabSizePadded);
+}
+
+void gatherLastTokenLogits(ITensor& output, ITensor const& input, ITensor const& lastTokenIds, CudaStream const& stream)
+{
+    switch (input.getDataType())
+    {
+    case nvinfer1::DataType::kFLOAT: invokeGatherLastTokenLogits<float>(output, input, lastTokenIds, stream); break;
+    case nvinfer1::DataType::kHALF: invokeGatherLastTokenLogits<half>(output, input, lastTokenIds, stream); break;
+    case nvinfer1::DataType::kBF16:
+        invokeGatherLastTokenLogits<__nv_bfloat16>(output, input, lastTokenIds, stream);
+        break;
+    case nvinfer1::DataType::kFP8:
+        invokeGatherLastTokenLogits<__nv_fp8_e4m3>(output, input, lastTokenIds, stream);
+        break;
     default: TLLM_CHECK_WITH_INFO(false, "data type not supported");
     }
 }

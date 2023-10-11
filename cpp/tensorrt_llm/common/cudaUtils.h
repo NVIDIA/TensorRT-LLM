@@ -287,25 +287,6 @@ inline int getMultiProcessorCount()
     return multi_processor_count;
 }
 
-class CudaEventDeleter
-{
-public:
-    constexpr void operator()(cudaEvent_t stream) const
-    {
-        if (stream != nullptr)
-            check_cuda_error(::cudaEventDestroy(stream));
-    }
-};
-
-using EventPtr = std::unique_ptr<std::remove_pointer_t<cudaEvent_t>, CudaEventDeleter>;
-
-inline EventPtr CreateEvent(unsigned int flags = cudaEventDisableTiming)
-{
-    cudaEvent_t event;
-    check_cuda_error(::cudaEventCreate(&event, flags));
-    return EventPtr{event};
-}
-
 inline int divUp(int a, int n)
 {
     return (a + n - 1) / n;

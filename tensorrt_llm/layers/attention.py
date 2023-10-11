@@ -31,7 +31,7 @@ from ..quantization.layers import FP8Linear, FP8RowLinear
 from .linear import ColumnLinear, RowLinear
 
 
-class AttentionParams(object):
+class AttentionParams:
 
     def __init__(self,
                  sequence_length: Tensor = None,
@@ -61,11 +61,13 @@ class AttentionParams(object):
         if remove_input_padding:
             if self.host_context_lengths is None:
                 return False
+            if not gpt_attention_plugin:
+                return False
 
         return True
 
 
-class KeyValueCacheParams(object):
+class KeyValueCacheParams:
 
     def __init__(self,
                  past_key_value: List[Tensor] = None,
@@ -247,12 +249,15 @@ class Attention(Module):
 
         qkv = self.qkv(hidden_states)
 
+        paged_kv_cache = default_net().plugin_config.paged_kv_cache
+
+        assert attention_params is None or attention_params.is_valid(
+            default_net().plugin_config.gpt_attention_plugin,
+            default_net().plugin_config.remove_input_padding)
+        assert kv_cache_params is None or kv_cache_params.is_valid(
+            default_net().plugin_config.gpt_attention_plugin)
+
         if default_net().plugin_config.gpt_attention_plugin:
-            assert attention_params.is_valid(
-                default_net().plugin_config.gpt_attention_plugin,
-                default_net().plugin_config.remove_input_padding)
-            assert kv_cache_params.is_valid(
-                default_net().plugin_config.gpt_attention_plugin)
             assert self.attention_mask_type in [
                 AttentionMaskType.causal, AttentionMaskType.bidirectional
             ], 'Plugin only support masked MHA.'
@@ -271,6 +276,7 @@ class Attention(Module):
                 host_request_types=attention_params.host_request_types,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=self.num_attention_kv_heads,
+                hidden_size_per_head=self.attention_head_size,
                 q_scaling=self.q_scaling,
                 rotary_embedding_dim=self.rotary_embedding_dim,
                 rotary_embedding_base=self.rotary_embedding_base,
@@ -292,7 +298,7 @@ class Attention(Module):
                 host_context_lengths=attention_params.host_context_lengths)
 
         else:
-            assert default_net().plugin_config.paged_kv_cache == False
+            assert paged_kv_cache == False
 
             def transpose_for_scores(x, is_kv: bool = False):
                 _num_attention_heads = self.num_attention_kv_heads if is_kv else self.num_attention_heads

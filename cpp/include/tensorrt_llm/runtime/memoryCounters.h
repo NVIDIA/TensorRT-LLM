@@ -30,7 +30,7 @@ class MemoryCounters
 {
 public:
     using SizeType = std::size_t;
-    using DiffType = std::int64_t;
+    using DiffType = std::ptrdiff_t;
 
     MemoryCounters() = default;
 

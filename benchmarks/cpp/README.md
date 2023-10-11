@@ -15,7 +15,7 @@ cd cpp/build
 make -j benchmarks
 ```
 
-### 2. Launch C++ benchmarking
+### 2. Launch C++ benchmarking (Fixed BatchSize/InputLen/OutputLen)
 
 Before you launch C++ benchmarking, please make sure that you have already built engine(s) using TensorRT-LLM API, C++ benchmarking code cannot generate engine(s) for you.
 
@@ -55,3 +55,49 @@ mpirun -n 8 ./benchmarks/gptSessionBenchmark \
 ```
 
 *Please note that the expected outputs in that document are only for reference, specific performance numbers depend on the GPU you're using.*
+
+### 3. Launch Batch Manager benchmarking (Inflight/V1 batching)
+
+#### Prepare dataset
+
+Run a preprocessing script to prepare dataset. This script converts the prompts(string) in the dataset to input_ids.
+```
+python3 prepare_dataset.py \
+    --dataset <path/to/dataset> \
+    --max_input_len 300 \
+    --tokenizer_dir <path/to/tokenizer> \
+    --tokenizer_type auto \
+    --output preprocessed_dataset.json
+```
+For `tokenizer_dir`, specifying the path to the local tokenizer that have already been downloaded, or simply the name of the tokenizer from HuggingFace like `gpt2` will both work. The tokenizer will be downloaded automatically for the latter case.
+
+#### Prepare TensorRT-LLM engines
+Please make sure that the engines are built with argument `--use_inflight_batching` and `--remove_input_padding` if you'd like to benchmark inflight batching, for more details, please see the document in TensorRT-LLM examples.
+
+#### Launch benchmarking
+
+For detailed usage, you can do the following
+```
+cd cpp/build
+
+# You can directly execute the binary for help information
+./benchmarks/gptManagerBenchmark --help
+```
+
+Take GPT-350M as an example for single GPU V1 batching
+```
+./benchmarks/gptManagerBenchmark \
+    --model gpt \
+    --engine_dir ../../examples/gpt/trt_engine/gpt2/fp16/1-gpu/ \
+    --type V1 \
+    --dataset ../../benchmarks/cpp/preprocessed_dataset.json
+```
+
+Take GPT-350M as an example for 2-GPU inflight batching
+```
+mpirun -n 2 ./benchmarks/gptManagerBenchmark \
+    --model gpt \
+    --engine_dir ../../examples/gpt/trt_engine/gpt2-ib/fp16/2-gpu/ \
+    --type IFB \
+    --dataset ../../benchmarks/cpp/preprocessed_dataset.json
+```

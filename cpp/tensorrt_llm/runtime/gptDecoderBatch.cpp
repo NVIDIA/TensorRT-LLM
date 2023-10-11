@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
 #include <algorithm>
@@ -73,8 +74,6 @@ GptDecoderBatch::GptDecoderBatch(
     , mVocabSizePadded{vocabSizePadded}
     , mStream{std::move(stream)}
     , mBufferManager{mStream}
-    , mEventStart(tc::CreateEvent())
-    , mEventStop(tc::CreateEvent())
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto constexpr nvTokenIdType = TRTDataType<TokenIdType>::value;
@@ -98,6 +97,7 @@ GptDecoderBatch::GptDecoderBatch(
     dOutput->finished = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<bool>::value);
     // use batchSize many entries instead of the usual 1
     dOutput->finishedSum = mBufferManager.emptyTensor(MemoryType::kPINNED, nvSizeType);
+    mFinishedSum = mBufferManager.pinned(ITensor::makeShape({1}), nvSizeType);
     dOutput->lengths = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     dOutput->cumLogProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     dOutput->beamHypotheses.empty(mBufferManager);
@@ -155,7 +155,6 @@ void GptDecoderBatch::setup(
     }
 
     mStreams.resize(maxBatchSize);
-    mEvents.resize(maxBatchSize);
     mDecoders.resize(maxBatchSize);
     mDecodingInputs.resize(maxBatchSize);
     mDecodingOutputs.resize(maxBatchSize);
@@ -168,7 +167,6 @@ void GptDecoderBatch::setup(
     {
         mStreams[i] = std::make_shared<CudaStream>();
         TLLM_CHECK(mStreams[i]->getDevice() == device);
-        mEvents[i] = tc::CreateEvent();
         mDecoders[i] = IGptDecoder::create(dtype, mVocabSize, mVocabSizePadded, mStreams[i]);
         mDecodingInputs[i].reset();
         mDecodingOutputs[i].reset();
@@ -201,7 +199,6 @@ void GptDecoderBatch::newRequest(
             maxNewTokens, mMaxSequenceLength));
     TLLM_CHECK(requestIds->getDataType() == TRTDataType<TokenIdType>::value);
     auto const endId = request.endId.value_or(mVocabSize - 1);
-    auto const padId = request.padId.value_or(mVocabSize - 1);
 
     auto constexpr localBatchSize = 1;
 
@@ -273,7 +270,8 @@ void GptDecoderBatch::newRequest(
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatch::forward(decoder_batch::Output& output, decoder_batch::Input const& input)
+GptDecoderBatch::TokenPtr GptDecoderBatch::forwardAsync(
+    decoder_batch::Output& output, decoder_batch::Input const& input)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto& logits = input.logits;
@@ -298,14 +296,15 @@ void GptDecoderBatch::forward(decoder_batch::Output& output, decoder_batch::Inpu
     TLLM_CHECK(sequenceLengths);
     auto constexpr singleRequest = 1;
 
-    mStream->record(mEventStart.get());
+    CudaEvent eventStart{};
+    mStream->record(eventStart);
     for (std::int32_t i = 0; i < mActualBatchSize; ++i)
     {
         if (mFinished[i] || !input.active.at(i))
             continue;
 
         auto& stream = mStreams[i];
-        stream->wait(mEventStart.get());
+        stream->wait(eventStart.get());
         auto& dInput = *mDecodingInputs[i];
         auto& dOutput = *mDecodingOutputs[i];
         auto logitsView = std::shared_ptr(ITensor::slice(logits, i, singleRequest));
@@ -349,21 +348,34 @@ void GptDecoderBatch::forward(decoder_batch::Output& output, decoder_batch::Inpu
             manager.copy(*dOutput.parentIds, *jointOutputParentIdsView);
         }
 
-        auto& event = mEvents[i];
-        stream->record(event.get());
-        mStream->wait(event.get());
+        CudaEvent event{};
+        stream->record(event);
+        mStream->wait(event);
         dInput.step += 1;
         mNbSteps[i] += 1;
+        mFinished[i] = mNbSteps[i] >= mMaxNewTokens[i];
     }
-    mStream->record(mEventStop.get());
-    TLLM_CUDA_CHECK(::cudaEventSynchronize(mEventStop.get()));
+
+    CudaEvent eventStop{};
+    mStream->record(eventStop);
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    return std::make_unique<decoder_batch::Token>(std::move(eventStop), input.active);
+}
+
+void GptDecoderBatch::forwardSync(decoder_batch::Token const& token)
+{
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    token.event.synchronize();
 
     for (std::int32_t i = 0; i < mActualBatchSize; ++i)
     {
-        auto& dOutput = *mDecodingOutputs[i];
-        mFinished[i] = mNbSteps[i] >= mMaxNewTokens[i]
-            // This condition requires the synchronization above
-            || *bufferCast<SizeType>(*dOutput.finishedSum) == static_cast<SizeType>(dOutput.finished->getSize());
+        if (token.active[i] && !mFinished[i])
+        {
+            auto& dOutput = *mDecodingOutputs[i];
+            mFinished[i] = mFinished[i]
+                // This condition requires the synchronization above
+                || *bufferCast<SizeType>(*dOutput.finishedSum) == static_cast<SizeType>(dOutput.finished->getSize());
+        }
     }
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
@@ -375,7 +387,6 @@ void GptDecoderBatch::postProcessRequest(SizeType batchIdx) const
     auto& stream = mStreams[batchIdx];
     auto manager = BufferManager{stream};
 
-    stream->wait(mEventStart.get());
     auto& dInput = *mDecodingInputs[batchIdx];
     auto& dOutput = *mDecodingOutputs[batchIdx];
 
@@ -385,9 +396,9 @@ void GptDecoderBatch::postProcessRequest(SizeType batchIdx) const
     IGptDecoder::gatherTree(*finalOutputIds, dOutput, dInput, manager);
     manager.copy(*finalOutputIds, *outputIds);
 
-    auto& event = mEvents[batchIdx];
-    stream->record(event.get());
-    mStream->wait(event.get());
+    CudaEvent event{};
+    stream->record(event);
+    mStream->wait(event);
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -434,7 +445,7 @@ void GptDecoderBatch::newBatch(GenerationInput const& inputs, SamplingConfig con
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-bool GptDecoderBatch::forward(decoder::Output& output, decoder::Input const& input)
+void GptDecoderBatch::forwardAsync(decoder::Output& output, decoder::Input const& input)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     decoder_batch::Input batchInput{input.logits};
@@ -444,12 +455,24 @@ bool GptDecoderBatch::forward(decoder::Output& output, decoder::Input const& inp
     batchOutput.cacheIndirection = output.cacheIndirection;
     batchOutput.sequenceLengths = output.sequenceLengths;
 
-    forward(batchOutput, batchInput);
-
-    auto finished = getFinished();
+    mForwardToken = forwardAsync(batchOutput, batchInput);
+    mBufferManager.setZero(*mFinishedSum);
+    kernels::reduce(*mFinishedSum, *ITensor::slice(mJointDecodingOutput->finishedSum, 0, mActualBatchSize), *mStream);
+    mStream->record(mForwardEvent);
 
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
-    return std::all_of(finished.begin(), finished.end(), [](bool x) { return x; });
+}
+
+bool GptDecoderBatch::isFinishedSync()
+{
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    forwardSync(*mForwardToken);
+    auto const finished
+        = std::all_of(mFinished.begin(), mFinished.begin() + mActualBatchSize, [](bool x) { return x; });
+    // wait for mFinishedSum to be updated
+    mStream->wait(mForwardEvent);
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    return finished;
 }
 
 IStatefulGptDecoder::TensorPtr GptDecoderBatch::getFinalOutputIds() const
@@ -460,5 +483,13 @@ IStatefulGptDecoder::TensorPtr GptDecoderBatch::getFinalOutputIds() const
         postProcessRequest(batchIdx);
     }
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
-    return ITensor::slice(getOutputIds(), 0, mActualBatchSize);
+    return getOutputIds();
+}
+
+IStatefulGptDecoder::TensorPtr GptDecoderBatch::getFinalOutputIds(SizeType batchIdx) const
+{
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    postProcessRequest(batchIdx);
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    return getOutputIds(batchIdx);
 }

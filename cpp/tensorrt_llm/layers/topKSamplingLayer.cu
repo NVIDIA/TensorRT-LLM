@@ -203,9 +203,8 @@ void TopKSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingPa
 
 template <typename T>
 TopKSamplingLayer<T>::TopKSamplingLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-    cublasMMWrapper* cublas_wrapper, IAllocator* allocator, bool is_free_buffer_after_forward)
-    : BaseSamplingLayer<T>(
-        vocab_size, vocab_size_padded, stream, cublas_wrapper, allocator, is_free_buffer_after_forward, nullptr)
+    IAllocator* allocator, bool is_free_buffer_after_forward)
+    : BaseSamplingLayer<T>(vocab_size, vocab_size_padded, stream, allocator, is_free_buffer_after_forward, nullptr)
 {
 }
 

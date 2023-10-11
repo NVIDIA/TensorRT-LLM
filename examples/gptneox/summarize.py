@@ -51,7 +51,8 @@ def TRTGPTNeoX(args, config):
         num_kv_heads=num_heads,
         hidden_size=hidden_size,
         gpt_attention_plugin=use_gpt_attention_plugin,
-        remove_input_padding=remove_input_padding)
+        remove_input_padding=remove_input_padding,
+        dtype=dtype)
 
     runtime_rank = tensorrt_llm.mpi_rank()
     runtime_mapping = tensorrt_llm.Mapping(world_size,

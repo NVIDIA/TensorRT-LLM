@@ -1,7 +1,15 @@
+import os
+
 from tensorrt_llm.tools.plugin_gen.core import *
-from tensorrt_llm.tools.plugin_gen.plugin_gen import _mkdir
 
 from .kernel_config import get_fmha_kernel_meta_data
+
+
+def _mkdir(path: str):
+    '''
+    mkdir if not exists
+    '''
+    os.makedirs(path, exist_ok=True)
 
 
 def test_Type():

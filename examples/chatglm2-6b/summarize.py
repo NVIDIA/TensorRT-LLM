@@ -46,7 +46,8 @@ def TRTGLM2(args, config):
         hidden_size=hidden_size,
         vocab_size=vocab_size,
         num_layers=num_layers,
-        gpt_attention_plugin=use_gpt_attention_plugin)
+        gpt_attention_plugin=use_gpt_attention_plugin,
+        dtype=dtype)
 
     runtime_rank = tensorrt_llm.mpi_rank()
     runtime_mapping = tensorrt_llm.Mapping(world_size,

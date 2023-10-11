@@ -32,7 +32,8 @@ enum class BatchManagerErrorCode_t
 {
     STATUS_SUCCESS = 0,
     STATUS_FAILED = 1,
-    STATUS_NO_WORK = 2
+    STATUS_NO_WORK = 2,
+    STATUS_TERMINATE = 3
 };
 
 enum class TrtGptModelType

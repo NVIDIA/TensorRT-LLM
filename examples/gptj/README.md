@@ -40,13 +40,14 @@ Examples of build invocations:
 # Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
 
 python3 build.py --dtype=float16 \
-                 --log_level=verbose  \
+                 --log_level=verbose \
+                 --enable_context_fmha \
                  --use_gpt_attention_plugin float16 \
                  --use_gemm_plugin float16 \
-                 --use_layernorm_plugin float16 \
                  --max_batch_size=32 \
                  --max_input_len=1919 \
-                 --max_output_len=128  \
+                 --max_output_len=128 \
+                 --remove_input_padding \
                  --output_dir=gptj_engine \
                  --model_dir=gptj_model 2>&1 | tee build.log
 
@@ -54,26 +55,28 @@ python3 build.py --dtype=float16 \
 # Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
 
 python3 build.py --dtype=float16 \
-                 --log_level=verbose  \
+                 --log_level=verbose \
+                 --enable_context_fmha \
                  --use_gpt_attention_plugin float16 \
                  --use_gemm_plugin float16 \
-                 --use_layernorm_plugin float16 \
                  --max_batch_size=32 \
                  --max_input_len=1919 \
-                 --max_output_len=128  \
+                 --max_output_len=128 \
+                 --remove_input_padding \
                  --output_dir=gptj_engine_dummy_weights 2>&1 | tee build.log
 
 # Build an int4 weight only quantization engine using awq int4 weight only quantized weights.
 # Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
 
 python3 build.py --dtype=float16 \
-                 --log_level=verbose  \
+                 --log_level=verbose \
+                 --enable_context_fmha \
                  --use_gpt_attention_plugin float16 \
                  --use_gemm_plugin float16 \
-                 --use_layernorm_plugin float16 \
                  --max_batch_size=32 \
                  --max_input_len=1919 \
-                 --max_output_len=128  \
+                 --max_output_len=128 \
+                 --remove_input_padding \
                  --output_dir=gptj_engine \
                  --use_weight_only \
                  --per_group \
@@ -81,6 +84,41 @@ python3 build.py --dtype=float16 \
                  --model_dir=awq_int4_weight_only_quantized_models 2>&1 | tee build.log
 
 ```
+
+#### FP8 Post-Training Quantization
+
+The examples below uses the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
+
+First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+
+Now quantize HF GPT-J weights as follows.
+After successfully running the script, the output should be in .npz format, e.g. `quantized_fp8/gptj_tp1_rank0.npz`.
+At the moment, TensorRT-LLM only needs the quantization scaling factors from the .npz archive for FP8 quantization,
+while the .npz archive contains the whole weights with the quantization scaling factors.
+The tensor parallel size of the quantized model is not necesary to be matched with the value that TensorRT-LLM engine will use.
+This is subject to change for a smoother user experience.
+
+```bash
+# Quantize HF GPT-J 6B checkpoint into FP8 format
+python quantize.py --model_dir gptj_model \
+                   --dtype float16 \
+                   --qformat fp8 \
+                   --export_path ./quantized_fp8 \
+                   --calib_size 512
+
+# Build GPT-J 6B using original HF checkpoint + PTQ scaling factors
+python build.py --model_dir gptj_model \
+                --quantized_fp8_model_path ./quantized_fp8/gptj_tp1_rank0.npz \
+                --dtype float16 \
+                --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
+                --enable_two_optimization_profiles \
+                --output_dir gptj_engine_fp8_quantized \
+                --enable_fp8 \
+                --fp8_kv_cache \
+                --strongly_typed
+```
+
 #### Fused MultiHead Attention (FMHA)
 
 You can enable the FMHA kernels for GPT by adding `--enable_context_fmha` to the invocation of `build.py`. Note that it is disabled by default because of possible accuracy issues due to the use of Flash Attention.

@@ -29,7 +29,8 @@ BUILD_WHEEL_ARGS  ?= $(shell grep 'ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | gre
 
 define add_local_user
 	docker build \
-		--progress plain \
+		--progress $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
+		--progress $(DOCKER_PROGRESS) \
 		--build-arg BASE_IMAGE_WITH_TAG=$(1) \
 		--build-arg USER_ID=$(USER_ID) \
 		--build-arg USER_NAME=$(USER_NAME) \

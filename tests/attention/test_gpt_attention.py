@@ -94,7 +94,7 @@ class TestFunctional(unittest.TestCase):
                     ['float16', 'float32'], [2], [128], [4], [64], [0], [False],
                     [True], [False], [1, 4], [False], [False]))
 
-        # test cases for multi-query attention
+        #test cases for multi-query attention
         test_cases += list(
             product(['gpt_bigcode_attention'], [
                 ContextFMHAType.disabled, ContextFMHAType.enabled,
@@ -117,7 +117,7 @@ class TestFunctional(unittest.TestCase):
             product(
                 ['llama_attention'],
                 [ContextFMHAType.disabled],
-                ['bfloat16', 'float16'],
+                ['bfloat16', 'float32'],
                 [2],
                 [4],
                 [8],
@@ -248,16 +248,12 @@ class TestFunctional(unittest.TestCase):
             if enable_remove_input_padding:
                 net.plugin_config.enable_remove_input_padding()
             if paged_kv_cache:
-                net.plugin_config.enable_paged_kv_cache()
+                net.plugin_config.enable_paged_kv_cache(tokens_per_block)
 
             with tensorrt_llm.net_guard(net):
                 x_tensor = Tensor(name='input',
                                   shape=tuple(input_tensor.shape),
                                   dtype=tensorrt_llm.str_dtype_to_trt(dtype))
-                past_key_value_tensor = Tensor(
-                    name='past_key_value',
-                    shape=tuple(past_key_value.shape),
-                    dtype=tensorrt_llm.str_dtype_to_trt(kv_cache_dtype))
                 sequence_length_tensor = Tensor(
                     name='sequence_length',
                     shape=tuple(sequence_length.shape),
@@ -283,6 +279,20 @@ class TestFunctional(unittest.TestCase):
                     name='host_request_types',
                     shape=tuple(host_request_types.shape),
                     dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+
+                past_key_value_tensor = None
+                pointer_array_tensor = None
+                if paged_kv_cache:
+                    pointer_array_tensor = Tensor(
+                        name='kv_cache_block_pointers',
+                        shape=tuple(pointer_array.shape),
+                        dtype=tensorrt_llm.str_dtype_to_trt('int64'))
+                else:
+                    past_key_value_tensor = Tensor(
+                        name='past_key_value',
+                        shape=tuple(past_key_value.shape),
+                        dtype=tensorrt_llm.str_dtype_to_trt(kv_cache_dtype))
+
                 kv_int8_quant_scale_tensor = None
                 kv_int8_dequant_scale_tensor = None
                 if use_int8_kv_cache:
@@ -294,12 +304,6 @@ class TestFunctional(unittest.TestCase):
                         name='kv_int8_dequant_scale',
                         shape=(1, ),
                         dtype=tensorrt_llm.str_dtype_to_trt('float32'))
-                pointer_array_tensor = None
-                if paged_kv_cache:
-                    pointer_array_tensor = Tensor(
-                        name='kv_cache_block_pointers',
-                        shape=tuple(pointer_array.shape),
-                        dtype=tensorrt_llm.str_dtype_to_trt('int32'))
 
                 linear = tensorrt_llm.layers.Linear(hidden_size,
                                                     weight.size()[-1],
@@ -360,6 +364,7 @@ class TestFunctional(unittest.TestCase):
                     host_request_types=host_request_types_tensor,
                     num_heads=num_heads,
                     num_kv_heads=num_kv_heads,
+                    hidden_size_per_head=head_size,
                     q_scaling=1.0,
                     rotary_embedding_dim=rotary_embedding_dim,
                     rotary_embedding_base=rope_base,
@@ -381,38 +386,42 @@ class TestFunctional(unittest.TestCase):
                 net._mark_output(outputs[0],
                                  'output',
                                  dtype=tensorrt_llm.str_dtype_to_trt(dtype))
-                net._mark_output(
-                    outputs[1],
-                    'present_key_value',
-                    dtype=tensorrt_llm.str_dtype_to_trt(kv_cache_dtype))
+                if not paged_kv_cache:
+                    net._mark_output(
+                        outputs[1],
+                        'present_key_value',
+                        dtype=tensorrt_llm.str_dtype_to_trt(kv_cache_dtype))
 
             inputs = {
                 'input': input_tensor,
-                'past_key_value': past_key_value,
                 'sequence_length': sequence_length,
                 'host_past_key_value_lengths': host_past_key_value_lengths,
                 'context_lengths': context_lengths,
                 'cache_indirection': cache_indirection,
                 'host_request_types': host_request_types
             }
+            if paged_kv_cache:
+                inputs['kv_cache_block_pointers'] = pointer_array
+            else:
+                inputs['past_key_value'] = past_key_value
+
             if use_int8_kv_cache:
                 inputs['kv_int8_quant_scale'] = kv_int8_quant_scale
                 inputs['kv_int8_dequant_scale'] = kv_int8_dequant_scale
 
-            if paged_kv_cache:
-                inputs['kv_cache_block_pointers'] = pointer_array
-
             if enable_remove_input_padding:
                 inputs['host_context_lengths'] = host_context_lengths
 
-            outputs = {
-                'output': output,
-                'present_key_value': past_key_value,
-            }
+            outputs = {'output': output}
+            if not paged_kv_cache:
+                outputs['present_key_value'] = past_key_value
 
             stream = torch.cuda.current_stream()
-            builder_config = builder.create_builder_config(
-                name=attention_type, precision=dtype, int8=use_int8_kv_cache)
+            # NOTE(nkorobov): when int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
+            int8_trt_flag = use_int8_kv_cache and not paged_kv_cache
+            builder_config = builder.create_builder_config(name=attention_type,
+                                                           precision=dtype,
+                                                           int8=int8_trt_flag)
             if session is None:
                 engine = builder.build_engine(net, builder_config)
                 session = tensorrt_llm.runtime.Session.from_serialized_engine(
@@ -422,7 +431,7 @@ class TestFunctional(unittest.TestCase):
                         stream=stream.cuda_stream)
 
             torch.cuda.synchronize()
-            return session, outputs['output'], outputs['present_key_value']
+            return session, outputs['output'], past_key_value
 
         hidden_size = num_heads * head_size  # embed dimension
         # If MQA/GQA and that GPTBigCodeAttention/LlamaAttention is tested, use compacted IO shape.
@@ -773,7 +782,7 @@ class TestFunctional(unittest.TestCase):
                     # Reassemble pointer array to have KV cache for bs context invokations instead of batch_beam
                     pointer_array = pointer_array[:, 0, :, :]
                     pointer_array = pointer_array.reshape(
-                        batch_size, 1, 2, max_blocks_per_seq * 2)
+                        batch_size, 1, 2, max_blocks_per_seq)
 
                 # Context stage
                 shape_dict['input'] = (batch_size, in_len, hidden_size)
@@ -1014,6 +1023,7 @@ class TestFunctional(unittest.TestCase):
                 # Iterate to the next step. Increase number of tokens for all unfinished sequences
                 # And allocate new blocks if needed
                 manager.step([False] * batch_size)
+        # assert False, "Force fail"
         return
 
 

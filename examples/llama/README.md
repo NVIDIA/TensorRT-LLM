@@ -28,25 +28,32 @@ Here're some examples:
 # Build a single-GPU float16 engine from HF weights.
 # use_gpt_attention_plugin is necessary in LLaMA.
 # Try use_gemm_plugin to prevent accuracy issue.
+# It is recommend to use --remove_input_padding along with --use_gpt_attention_plugin for better performance
 
 # Build the LLaMA 7B model using a single GPU and FP16.
 python build.py --model_dir ./tmp/llama/7B/ \
                 --dtype float16 \
+                --remove_input_padding \
                 --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
                 --use_gemm_plugin float16 \
                 --output_dir ./tmp/llama/7B/trt_engines/fp16/1-gpu/
 
 # Build the LLaMA 7B model using a single GPU and BF16.
 python build.py --model_dir ./tmp/llama/7B/ \
                 --dtype bfloat16 \
+                --remove_input_padding \
                 --use_gpt_attention_plugin bfloat16 \
+                --enable_context_fmha \
                 --use_gemm_plugin bfloat16 \
                 --output_dir ./tmp/llama/7B/trt_engines/bf16/1-gpu/
 
 # Build the LLaMA 7B model using a single GPU and apply INT8 weight-only quantization.
 python build.py --model_dir ./tmp/llama/7B/ \
                 --dtype float16 \
+                --remove_input_padding \
                 --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
                 --use_gemm_plugin float16 \
                 --use_weight_only \
                 --output_dir ./tmp/llama/7B/trt_engines/weight_only/1-gpu/
@@ -54,7 +61,9 @@ python build.py --model_dir ./tmp/llama/7B/ \
 # Build LLaMA 7B using 2-way tensor parallelism.
 python build.py --model_dir ./tmp/llama/7B/ \
                 --dtype float16 \
+                --remove_input_padding \
                 --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
                 --use_gemm_plugin float16 \
                 --output_dir ./tmp/llama/7B/trt_engines/fp16/2-gpu/ \
                 --world_size 2 \
@@ -63,7 +72,9 @@ python build.py --model_dir ./tmp/llama/7B/ \
 # Build LLaMA 7B using 2-way tensor parallelism and 2-way pipeline parallelism.
 python build.py --model_dir ./tmp/llama/7B/ \
                 --dtype float16 \
+                --remove_input_padding \
                 --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
                 --use_gemm_plugin float16 \
                 --output_dir ./tmp/llama/7B/trt_engines/fp16/2-gpu/ \
                 --world_size 4 \
@@ -73,7 +84,9 @@ python build.py --model_dir ./tmp/llama/7B/ \
 # Build LLaMA 30B using 2-way tensor parallelism.
 python build.py --model_dir ./tmp/llama/30B/hf/ \
                 --dtype float16 \
+                --remove_input_padding \
                 --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
                 --use_gemm_plugin float16 \
                 --output_dir ./tmp/llama/30B/trt_engines/fp16/2-gpu/ \
                 --world_size 2 \
@@ -84,20 +97,19 @@ python build.py --model_dir ./tmp/llama/30B/hf/ \
 The LLaMA v2 models with 7B and 13B are compatible with the LLaMA v1 implementation. The above
 commands still work.
 
-~~For LLaMA v2 70B, the current implementation in TensorRT-LLM requires the number of KV heads to
-match the number of GPUs. It means that LLaMA v2 70B requires 8 GPUs (8-way Tensor Parallelism)
-to work. That limitation will be removed in a future version of TensorRT-LLM.~~
 
-UPDATE: LLaMA v2 70B now works with less than 8 GPUs. Current restriction is that the number of KV heads
+For LLaMA v2 70B, there is a restriction on tensor parallelism that the number of KV heads
 must be **divisible by the number of GPUs**. For example, since the 70B model has 8 KV heads, you can run it with
-2, 4 or 8 GPUs (even 1 GPU once FP8 is supported).
+2, 4 or 8 GPUs (1 GPU as well for FP8).
 
 
 ```bash
 # Build LLaMA 70B using 8-way tensor parallelism.
 python build.py --model_dir ./tmp/llama/70B/hf/ \
                 --dtype float16 \
+                --remove_input_padding \
                 --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
                 --use_gemm_plugin float16 \
                 --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
                 --world_size 8 \
@@ -106,7 +118,9 @@ python build.py --model_dir ./tmp/llama/70B/hf/ \
 # Build LLaMA 70B using 4-way tensor parallelism and 2-way pipeline parallelism.
 python build.py --model_dir ./tmp/llama/70B/hf/ \
                 --dtype float16 \
+                --remove_input_padding \
                 --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
                 --use_gemm_plugin float16 \
                 --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
                 --world_size 8 \
@@ -117,7 +131,9 @@ python build.py --model_dir ./tmp/llama/70B/hf/ \
 # Build LLaMA 70B TP=8 using Meta checkpoints directly.
 python build.py --meta_ckpt_dir ./tmp/llama/70B \
                 --dtype float16 \
+                --remove_input_padding \
                 --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
                 --use_gemm_plugin float16 \
                 --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
                 --world_size 8 \
@@ -200,50 +216,105 @@ python3 build.py --ft_model_dir=/llama/smooth_llama_7B/sq0.8/1-gpu/ \
 Note we use `--ft_model_dir` instead of `--model_dir` and `--meta_ckpt_dir` since SmoothQuant model needs INT8 weights and various scales from the binary files.
 
 #### Groupwise quantization (AWQ/GPTQ)
+One can enable AWQ/GPTQ INT4 weight only quantization with these options when building engine with `build.py`:
 
-To run the GPTQ LLaMa example, the following steps are required:
+- `--use_weight_only` enables weight only GEMMs in the network.
+- `--per_group` enable groupwise weight only quantization, for GPT-J example, we support AWQ with the group size default as 128.
+- `--weight_only_precision=int4` the precision of weight only quantization. Only int4 is supported for groupwise weight only quantization.
+- `--quant_ckpt_path` passes the quantized checkpoint to build the engine, with *.pt and *.safetensors pointing to AWQ/GPTQ respectively.
 
-1. Generating quantized weights using [GPTQ-for-LLaMa](https://github.com/qwopqwop200/GPTQ-for-LLaMa.git):
+To run the AWQ/GPTQ LLaMa example, the following steps are required:
 
-```bash
-git clone https://github.com/qwopqwop200/GPTQ-for-LLaMa.git
-cd GPTQ-for-LLaMa
+1. Weight quantization:
 
-# Quantize weights into INT4 and save as safetensors
-# Quantized weight with parameter "--act-order" is not supported in TRT-LLM
-python llama.py ./tmp/llama/7B/ c4 --wbits 4 --true-sequential --groupsize 128 --save_safetensors ./llama-7b-4bit-gs128.safetensors
-```
+    For AWQ quantization, the quantized checkpoints are generated using [AMMO](../quantization/README.md), with each layer in the AWQ int4 weight only quantized weights should have 3 parameters:
+    1. FP16 smoothed_weights (=weights/pre_quant_scale) with shape [n, k] ;
+    2. FP16 amax (the max abs values of the smoothed_weights) with shape [n, k/group_size];
+    3. FP16 pre_quant_scale (the smooth scales used to multiply by activation) with shape [k];
+
+    For GPTQ quantization, quantized weights are generated using [GPTQ-for-LLaMa](https://github.com/qwopqwop200/GPTQ-for-LLaMa.git) as follow:
+
+    ```bash
+    git clone https://github.com/qwopqwop200/GPTQ-for-LLaMa.git
+    cd GPTQ-for-LLaMa
+    pip install -r requirements.txt
+
+    # Quantize weights into INT4 and save as safetensors
+    # Quantized weight with parameter "--act-order" is not supported in TRT-LLM
+    python llama.py ./tmp/llama/7B/ c4 --wbits 4 --true-sequential --groupsize 128 --save_safetensors ./llama-7b-4bit-gs128.safetensors
+    ```
+
 2. Build TRT-LLM engine:
 
-    [`build.py`](./build.py) add "--per_group" for the support of INT4 per-group quantization and "--quant_safetensors_path" for linking generated safetensors.
+    ```bash
+    # Build the LLaMA 7B model using a single GPU and apply INT4 AWQ quantization.
+    # Compressed checkpoint is generated seperately from AWQ.
+    python build.py --model_dir ./tmp/llama/7B/ \
+                    --quant_ckpt_path ./llama-7b-4bit-gs128-awq.pt \
+                    --dtype float16 \
+                    --remove_input_padding \
+                    --use_gpt_attention_plugin float16 \
+                    --enable_context_fmha \
+                    --use_gemm_plugin float16 \
+                    --use_weight_only \
+                    --weight_only_precision int4_awq \
+                    --per_group \
+                    --output_dir ./tmp/llama/7B/trt_engines/int4_AWQ/1-gpu/
 
+    # Build the LLaMA 7B model using 2-way tensor parallelism and apply INT4 GPTQ quantization.
+    # Compressed checkpoint safetensors are generated seperately from GPTQ.
+    python build.py --model_dir ./tmp/llama/7B/ \
+                    --quant_ckpt_path ./llama-7b-4bit-gs128.safetensors \
+                    --dtype float16 \
+                    --remove_input_padding \
+                    --use_gpt_attention_plugin float16 \
+                    --enable_context_fmha \
+                    --use_gemm_plugin float16 \
+                    --use_weight_only \
+                    --weight_only_precision int4_gptq \
+                    --per_group \
+                    --world_size 2 \
+                    --tp_size 2 \
+                    --output_dir ./tmp/llama/7B/trt_engines/int4_GPTQ/2-gpu/
+    ```
 
-```python
-# Build the LLaMA 7B model using a single GPU and apply INT4 GPTQ quantization.
-# Compressed checkpoint safetensors are generated seperately from GPTQ.
-python build.py --model_dir ./tmp/llama/7B/ \
-                --quant_safetensors_path ./llama-7b-4bit-gs128.safetensors \
+#### FP8 Post-Training Quantization
+
+The examples below uses the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
+
+First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+
+Now quantize HF LLaMA weights as follows.
+After successfully running the script, the output should be in .npz format, e.g. `quantized_fp8/llama_tp_1_rank0.npz`.
+At the moment, TensorRT-LLM only needs the quantization scaling factors from the .npz archive for FP8 quantization,
+while the .npz archive contains the whole weights with the quantization scaling factors.
+The tensor parallel size of the quantized model is not necesary to be matched with the value that TensorRT-LLM engine will use.
+This is subject to change for a smoother user experience.
+
+```bash
+# Quantize HF LLaMA 70B checkpoint into FP8 format
+python quantize.py --model_dir ./tmp/llama/70B \
+                   --dtype float16 \
+                   --qformat fp8 \
+                   --export_path ./quantized_fp8 \
+                   --calib_size 512
+
+# Build LLaMA 70B TP=2 using original HF checkpoint + PTQ scaling factors
+python build.py --model_dir ./tmp/llama/70B \
+                --quantized_fp8_model_path ./quantized_fp8/llama_tp1_rank0.npz \
                 --dtype float16 \
                 --use_gpt_attention_plugin float16 \
-                --use_gemm_plugin float16 \
-                --use_weight_only \
-                --weight_only_precision int4 \
-                --per_group \
-                --output_dir ./tmp/llama/7B/trt_engines/int4_GPTQ/1-gpu/
-
-# Build the LLaMA 7B model using 2-way tensor parallelism and apply INT4 GPTQ quantization.
-# Compressed checkpoint safetensors are generated seperately from GPTQ.
-python build.py --model_dir ./tmp/llama/7B/ \
-                --quant_safetensors_path ./llama-7b-4bit-gs128.safetensors \
-                --dtype float16 \
-                --use_gpt_attention_plugin float16 \
-                --use_gemm_plugin float16 \
-                --use_weight_only \
-                --weight_only_precision int4 \
-                --per_group \
+                --output_dir ./tmp/llama/70B/trt_engines/fp8/2-gpu/ \
+                --remove_input_padding \
+                --enable_context_fmha \
+                --enable_fp8 \
+                --fp8_kv_cache \
+                --strongly_typed \
                 --world_size 2 \
-                --output_dir ./tmp/llama/7B/trt_engines/int4_GPTQ/2-gpu/
+                --tp_size 2 \
+                --parallel_build
 ```
+
 
 ### Run
 
@@ -294,15 +365,43 @@ mpirun -n 2 --allow-run-as-root \
 ## Running CodeLlama
 Those examples can be used to build and run the CodeLlama models. All 7b, 13b, and 34b sizes and variants are supported.
 
-NOTE: There are a couple of differences in CodeLlama in comparison to LLaMA v1/v2 models: rotary_base (`theta=1000000.0f`) and vocabulary size (`32016`).
+There are a couple of differences in CodeLlama in comparison to LLaMA v1/v2 models: rotary_base (`theta=1000000.0f`) and vocabulary size (`32016` (1)).
+
+_(1): Only applicable to 7b and 13b model sizes_. 34b model variants use `32000`.
+
 ### Build
 Use the following command to build `CodeLlama-7b-Instruct`:
 ```
-python build.py --meta_ckpt_dir ./CodeLlama-7b-Instruct/ --dtype float16 --use_gpt_attention_plugin float16 --use_gemm_plugin float16 --use_rmsnorm_plugin float16 --output_dir codellama_7b --rotary_base 1000000 --vocab_size 32016
+python build.py --meta_ckpt_dir ./CodeLlama-7b-Instruct/ --dtype float16 \
+    --remove_input_padding --use_gpt_attention_plugin float16 --use_gemm_plugin float16 \
+    --enable_context_fmha --output_dir codellama_7b --rotary_base 1000000 --vocab_size 32016
+```
+Use the following command to build `CodeLlama-34b-Instruct` for 4 GPUs (TP=4):
+```
+python build.py --meta_ckpt_dir ./CodeLlama-34b-Instruct/ --dtype float16 \
+    --remove_input_padding --use_gpt_attention_plugin float16 --use_gemm_plugin float16 --use_rmsnorm_plugin float16 \
+    --enable_context_fmha --output_dir codellama_34b --rotary_base 1000000 --vocab_size 32000 --world_size 4 --tp_size 4
+```
+
+NOTE: CodeLlama uses the `max_position_embeddings` of 16K.
+To build the engine for running similarly long input/output, you need to specify that during build.
+
+Use `--max_input_len` and `--max_output_len` (which defaults to `2048` and `512`, respectively) according to your use case, e.g.:
+```
+python build.py --meta_ckpt_dir ./CodeLlama-34b-Instruct/ --dtype float16 \
+    --remove_input_padding --use_gpt_attention_plugin float16 --use_gemm_plugin float16 --use_rmsnorm_plugin float16 \
+    --output_dir codellama_34b --rotary_base 1000000 --vocab_size 32000 --world_size 8 --tp_size 8 --parallel_build \
+    --enable_context_fmha --use_parallel_embedding --max_input_len 15360 --max_output_len 1024 --max_batch_size 4
 ```
 
 ### Run
-Use the following command to run it:
+Use the following command to run the 7b engine from above:
 ```
 python run.py --max_output_len=40 --tokenizer_dir . --engine_dir codellama_7b --input_text "In Bash, how do I list all text files?"
+```
+Use the following command to run the 34b engine with long input/output from above:
+```
+mpirun -n 8 --allow-run-as-root \
+    python run.py --max_output_len=160 --tokenizer_dir ./CodeLlama-34b-Instruct \
+    --engine_dir codellama_34b --input_text "In python, write a function for binary searching an element in an integer array."
 ```

@@ -67,6 +67,20 @@ std::vector<ITensor::SharedPtr> createBufferVector(TllmRuntime const& runtime, S
     return vector;
 }
 
+std::vector<ITensor::SharedPtr> createBufferVector(
+    TllmRuntime const& runtime, SizeType const numBuffers, MemoryType const memType, nvinfer1::DataType const dtype)
+{
+    auto const& manager = runtime.getBufferManager();
+
+    std::vector<ITensor::SharedPtr> vector;
+
+    for (SizeType i = 0; i < numBuffers; ++i)
+    {
+        vector.emplace_back(manager.emptyTensor(memType, dtype));
+    }
+    return vector;
+}
+
 void reshapeBufferVector(std::vector<ITensor::SharedPtr>& vector, nvinfer1::Dims const& shape)
 {
     for (auto& buffer : vector)

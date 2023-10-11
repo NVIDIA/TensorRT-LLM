@@ -6,7 +6,6 @@ colored
 polygraphy
 onnx==1.12.0
 mpi4py
-tensorrt>=8.6.0
 numpy
 cuda-python==12.2.0
 mypy
@@ -17,4 +16,3 @@ pre-commit
 einops
 parameterized
 graphviz
-lark

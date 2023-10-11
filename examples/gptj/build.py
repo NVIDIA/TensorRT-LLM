@@ -21,7 +21,7 @@ import tensorrt as trt
 import torch
 import torch.multiprocessing as mp
 from transformers import AutoModelForCausalLM
-from weight import load_from_awq_gpt_j, load_from_hf_gpt_j
+from weight import get_scaling_factors, load_from_awq_gpt_j, load_from_hf_gpt_j
 
 import tensorrt_llm
 from tensorrt_llm.builder import Builder
@@ -133,7 +133,11 @@ def parse_arguments(args):
                         default=False,
                         action='store_true')
     parser.add_argument('--enable_fp8', default=False, action='store_true')
-    parser.add_argument('--quantized_fp8_model_path', type=str, default=None)
+    parser.add_argument(
+        '--quantized_fp8_model_path',
+        type=str,
+        default=None,
+        help='Path of a quantized model checkpoint that in .npz format')
     parser.add_argument(
         '--fp8_kv_cache',
         default=False,
@@ -190,9 +194,22 @@ def parse_arguments(args):
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
     )
+    parser.add_argument(
+        '--strongly_typed',
+        default=False,
+        action="store_true",
+        help=
+        'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
+    )
     args = parser.parse_args(args)
 
     logger.set_level(args.log_level)
+
+    if not args.remove_input_padding:
+        if args.use_gpt_attention_plugin:
+            logger.warning(
+                f"It is recommended to specify --remove_input_padding when using GPT attention plugin"
+            )
 
     if args.model_dir is not None:
         global hf_gpt
@@ -267,171 +284,6 @@ def parse_arguments(args):
     return args
 
 
-def get_scaling_factors(model_path, layers=None, n_layers=28):
-    """Get the scaling factors for GPT-J model
-
-    Returns a dictionary of scaling factors for the selected layers of the GPT-J model.
-
-    Args:
-        model_path (str): Path to the GPT-J model
-        layers (list): List of layers to get the scaling factors for. If None, all layers are selected.
-
-    Returns:
-        dict: Dictionary of scaling factors for the selected layers of the GPT-J model.
-        example:
-
-        {
-            'qkv_act': qkv_act_scale,
-            'qkv_weights': qkv_weights_scale,
-            'qkv_out' : qkv_outputs_scale,
-            'dense_act': dense_act_scale,
-            'dense_weights': dense_weights_scale,
-            'fc_act': fc_act_scale,
-            'fc_weights': fc_weights_scale,
-            'proj_act': proj_act_scale,
-            'proj_weights': proj_weights_scale,
-        }
-    """
-    if not os.path.exists(model_path):
-        # raise RuntimeError(
-        #     f"Cannot access {model_path}. Please download the model or mount the scratch path."
-        # )
-        logger.warning(
-            f"Cannot find {model_path} to load scales of gptj. Initilize them automatically."
-        )
-        return {
-            'fc_act': [0.99 for _ in range(n_layers)],
-            'fc_weights': [0.99 for _ in range(n_layers)],
-            'proj_act': [0.99 for _ in range(n_layers)],
-            'proj_weights': [0.99 for _ in range(n_layers)],
-            'qkv_act': [0.99 for _ in range(n_layers)],
-            'qkv_weights': [0.99 for _ in range(n_layers)],
-            'qkv_output':
-            [5.0 for _ in range(n_layers)
-             ],  # An experience valued observed from summarize example
-            'dense_act': [0.99 for _ in range(n_layers)],
-            'dense_weights': [0.99 for _ in range(n_layers)],
-        }
-
-    model = torch.load(model_path)
-    n_layers = 28
-    if layers is not None:
-        for layer in layers:
-            assert 0 >= layer and layer < n_layers, f"Layer {layer} does not exist in GPTJ model.\
-                  Please enter a number between 0 and 27"
-
-    fc_act = []
-    fc_weights = []
-    proj_act = []
-    proj_weights = []
-    qkv_act = []
-    qkv_weights = []
-    qkv_out = []
-    dense_act = []
-    dense_weights = []
-
-    def get_qkv_out(layer):
-        q_out = model[
-            f"transformer.h.{layer}.attn.q_proj.output_quantizer._amax"].item()
-        k_out = model[
-            f"transformer.h.{layer}.attn.k_proj.output_quantizer._amax"].item()
-        v_out = model[
-            f"transformer.h.{layer}.attn.v_proj.output_quantizer._amax"].item()
-        return max(q_out, k_out, v_out)
-
-    def get_qkv_act(layer):
-        q_act = model[
-            f"transformer.h.{layer}.attn.q_proj.input_quantizer._amax"].item()
-        k_act = model[
-            f"transformer.h.{layer}.attn.k_proj.input_quantizer._amax"].item()
-        v_act = model[
-            f"transformer.h.{layer}.attn.v_proj.input_quantizer._amax"].item()
-        return max(q_act, k_act, v_act)
-
-    def get_qkv_weights(layer):
-        q_weights = model[
-            f"transformer.h.{layer}.attn.q_proj.weight_quantizer._amax"].item()
-        k_weights = model[
-            f"transformer.h.{layer}.attn.k_proj.weight_quantizer._amax"].item()
-        v_weights = model[
-            f"transformer.h.{layer}.attn.v_proj.weight_quantizer._amax"].item()
-        return max(q_weights, k_weights, v_weights)
-
-    if layers is None:
-        layers = [x for x in range(n_layers)]
-    for layer in layers:
-        qkv_act.append(get_qkv_act(layer))
-        qkv_weights.append(get_qkv_weights(layer))
-        qkv_out.append(get_qkv_out(layer))
-        dense_act.append(
-            model[f"transformer.h.{layer}.attn.out_proj.input_quantizer._amax"].
-            item())
-        dense_weights.append(
-            model[f"transformer.h.{layer}.attn.out_proj.weight_quantizer._amax"]
-            .item())
-        fc_act.append(
-            model[f"transformer.h.{layer}.mlp.fc_in.input_quantizer._amax"].
-            item())
-        fc_weights.append(
-            model[f"transformer.h.{layer}.mlp.fc_in.weight_quantizer._amax"].
-            item())
-        proj_act.append(
-            model[f"transformer.h.{layer}.mlp.fc_out.input_quantizer._amax"].
-            item())
-        proj_weights.append(
-            model[f"transformer.h.{layer}.mlp.fc_out.weight_quantizer._amax"].
-            item())
-    return convert_amax_to_scale(qkv_act, qkv_weights, qkv_out, dense_act,
-                                 dense_weights, fc_act, fc_weights, proj_act,
-                                 proj_weights)
-
-
-def convert_amax_to_scale(qkv_act, qkv_weights, qkv_out, dense_act,
-                          dense_weights, fc_act, fc_weights, proj_act,
-                          proj_weights):
-    """Convert the amax values to scaling factors for GPT-J model
-
-    Returns a dictionary of scaling factors for the selected layers of the GPT-J model.
-
-    Args:
-        qkv_act (List[float]): List of layers' attention qkv gemm activation amax values.
-        qkv_weights (List[float]): List of layers' attention qkv gemm weights amax values..
-        qkv_out (List[float]): List of layers' attention qkv gemm output amax values.
-        dense_act (List[float]): List of layers' attention dense gemm activation amax values.
-        dense_weights (List[float]): List of layers' attention dense gemm weights amax values.
-        fc_act (List[float]): List of layers' mlp fc gemm activation amax values.
-        fc_weights (List[float]): List of layers' mlp fc gemm weights amax values.
-        proj_act (List[float]): List of layers' mlp proj gemm activation amax values.
-        proj_weights (List[float]): List of layers' mlp proj gemm weights amax values.
-
-    Returns:
-        dict: Dictionary of scaling factors for the selected layers of the GPT-J model.
-    """
-    scaling_factor = 448
-    qkv_act_scale = [x / scaling_factor for x in qkv_act]
-    qkv_weights_scale = [x / scaling_factor for x in qkv_weights]
-    qkv_out_scale = [x / scaling_factor for x in qkv_out]
-    dense_act_scale = [x / scaling_factor for x in dense_act]
-    dense_weights_scale = [x / scaling_factor for x in dense_weights]
-    fc_act_scale = [x / scaling_factor for x in fc_act]
-    fc_weights_scale = [x / scaling_factor for x in fc_weights]
-    proj_act_scale = [x / scaling_factor for x in proj_act]
-    proj_weights_scale = [x / scaling_factor for x in proj_weights]
-    gptj_scaling_factors = {
-        'qkv_act': qkv_act_scale,
-        'qkv_weights': qkv_weights_scale,
-        'qkv_output': qkv_out_scale,
-        'dense_act': dense_act_scale,
-        'dense_weights': dense_weights_scale,
-        'fc_act': fc_act_scale,
-        'fc_weights': fc_weights_scale,
-        'proj_act': proj_act_scale,
-        'proj_weights': proj_weights_scale,
-    }
-
-    return gptj_scaling_factors
-
-
 def build_rank_engine(builder: Builder,
                       builder_config: tensorrt_llm.builder.BuilderConfig,
                       engine_name, rank, args):
@@ -480,7 +332,7 @@ def build_rank_engine(builder: Builder,
         assert hf_gpt is not None, f'Could not load weights from hf_gpt model as it is not loaded yet.'
         if args.enable_fp8:
             gptj_scaling_factors = get_scaling_factors(
-                args.quantized_fp8_model_path, n_layers=args.n_layer)
+                args.quantized_fp8_model_path, args.n_layer, args.quant_mode)
         else:
             gptj_scaling_factors = None
         if args.use_weight_only and args.weight_only_precision == 'int4' and args.per_group:
@@ -523,7 +375,7 @@ def build_rank_engine(builder: Builder,
     if args.remove_input_padding:
         network.plugin_config.enable_remove_input_padding()
     if args.paged_kv_cache:
-        network.plugin_config.enable_paged_kv_cache()
+        network.plugin_config.enable_paged_kv_cache(args.tokens_per_block)
 
     with net_guard(network):
         # Prepare
@@ -537,9 +389,7 @@ def build_rank_engine(builder: Builder,
             True,
             args.max_beam_width,
             enable_two_optimization_profiles=args.
-            enable_two_optimization_profiles,
-            paged_kv_cache=args.paged_kv_cache,
-            tokens_per_block=args.tokens_per_block)
+            enable_two_optimization_profiles)
         tensorrt_llm_gpt(*inputs)
 
     tensorrt_llm.graph_rewriting.optimize(network)
@@ -586,8 +436,7 @@ def build(rank, args):
             max_output_len=args.max_output_len,
             fp8=args.enable_fp8,
             quant_mode=args.quant_mode,
-            paged_kv_cache=args.paged_kv_cache,
-            tokens_per_block=args.tokens_per_block)
+            strongly_typed=args.strongly_typed)
 
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.world_size,
                                       cur_rank)

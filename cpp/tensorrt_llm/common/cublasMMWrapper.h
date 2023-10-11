@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/cublasAlgoMap.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include <cublasLt.h>
 #include <cublas_v2.h>
@@ -31,66 +30,44 @@ namespace tensorrt_llm
 namespace common
 {
 
-class cublasMMWrapper
+class CublasMMWrapper
 {
 protected:
-    std::shared_ptr<cublasHandle_t> cublas_handle_;
-    std::shared_ptr<cublasLtHandle_t> cublaslt_handle_;
+    std::shared_ptr<cublasHandle_t> mCublasHandle;
+    std::shared_ptr<cublasLtHandle_t> mCublasLtHandle;
 
-    cudaDataType_t Atype_;
-    cudaDataType_t Btype_;
-    cudaDataType_t Ctype_;
-    cudaDataType_t computeType_;
+    cudaDataType_t mAType{};
+    cudaDataType_t mBType{};
+    cudaDataType_t mCType{};
+    cublasComputeType_t mComputeType{};
+    cudaDataType_t mScaleType{};
 
-    cudaStream_t stream_;
-    cublasAlgoMap* cublas_algo_map_;
-    std::mutex* mu_;
+    cublasLtMatmulDesc_t mOperationDesc{NULL};
+    cublasLtMatrixLayout_t mADesc{NULL};
+    cublasLtMatrixLayout_t mBDesc{NULL};
+    cublasLtMatrixLayout_t mCDesc{NULL};
 
-    void* cublas_workspace_ = nullptr;
+    cudaStream_t mStream;
+    //@fixme: we may not need the mutex if we copy the wrapper instead of sharing in GemmPlugin::clone()
+    std::shared_ptr<std::mutex> mMutex{std::make_shared<std::mutex>()};
 
-    friend class cublasINT8MMWrapper;
+    void* mCublasWorkspace = nullptr;
 
-    void _Int8Gemm(const int m, const int n, const int k, const int8_t* A, const int lda, const int8_t* B,
-        const int ldb, void* C, const int ldc, const void* alpha, const int mode, const bool per_column_scaling);
+private:
+    bool descriptorsCreated() const
+    {
+        return mOperationDesc != NULL && mADesc != NULL && mBDesc != NULL && mCDesc != NULL;
+    }
 
 public:
-    cublasMMWrapper(std::shared_ptr<cublasHandle_t> cublasHandle, std::shared_ptr<cublasLtHandle_t> cublasLtHandle,
-        cudaStream_t stream, cublasAlgoMap* map, std::mutex* mu, void* workspace);
+    CublasMMWrapper(std::shared_ptr<cublasHandle_t> cublasHandle, std::shared_ptr<cublasLtHandle_t> cublasLtHandle,
+        cudaStream_t stream, void* workspace);
 
-    ~cublasMMWrapper();
+    ~CublasMMWrapper();
 
-    cublasMMWrapper(const cublasMMWrapper& wrapper);
+    CublasMMWrapper(const CublasMMWrapper& wrapper);
 
-    cublasStatus_t cublasLtMatmulWrapper(cublasLtHandle_t lightHandle, cublasLtMatmulDesc_t computeDesc,
-        const void* alpha, const void* A, cublasLtMatrixLayout_t Adesc, const void* B, cublasLtMatrixLayout_t Bdesc,
-        const void* beta, const void* C, cublasLtMatrixLayout_t Cdesc, void* D, cublasLtMatrixLayout_t Ddesc,
-        const cublasLtMatmulAlgo_t* algo, void* workspace, size_t workspaceSizeInBytes, cudaStream_t stream);
-
-    bool checkTactic(cublasOperation_t transa, cublasOperation_t transb, const int m, const int n, const int k,
-        const int lda, const int ldb, const int ldc, const cublasLtMatmulHeuristicResult_t& algo) const;
-
-    std::vector<cublasLtMatmulHeuristicResult_t> getTactics(cublasOperation_t transa, cublasOperation_t transb,
-        const int m, const int n, const int k, const int lda, const int ldb, const int ldc);
-
-    std::vector<cublasLtMatmulHeuristicResult_t> getTactics(cublasLtHandle_t lightHandle,
-        cublasLtMatmulDesc_t computeDesc, cublasLtMatrixLayout_t Adesc, cublasLtMatrixLayout_t Bdesc,
-        cublasLtMatrixLayout_t Cdesc, cublasLtMatrixLayout_t Ddesc);
-
-    std::pair<bool, cublasLtMatmulAlgo_t> findBestAlgo(cublasLtHandle_t lightHandle, cublasLtMatmulDesc_t computeDesc,
-        const void* alpha, const void* A, cublasLtMatrixLayout_t Adesc, const void* B, cublasLtMatrixLayout_t Bdesc,
-        const void* beta, const void* C, cublasLtMatrixLayout_t Cdesc, void* D, cublasLtMatrixLayout_t Ddesc,
-        cudaStream_t stream);
-
-    using MatrixLayout = std::tuple<cudaDataType_t, cublasLtOrder_t, uint64_t, uint64_t>;
-    using cache_idx_t = std::tuple<cublasLtMatmulDesc_t, std::array<MatrixLayout, 4>>;
-    std::map<cache_idx_t, cublasLtMatmulAlgo_t> algo_cache;
-
-    MatrixLayout createMatrixLayout(cublasLtMatrixLayout_t Mdesc);
-
-    void Gemm(cublasOperation_t transa, cublasOperation_t transb, const int m, const int n, const int k,
-        const void* alpha, const void* A, cudaDataType_t Atype, int lda, const void* B, cudaDataType_t Btype, int ldb,
-        const void* beta, void* C, cudaDataType_t Ctype, int ldc, cudaDataType_t computeType, cublasGemmAlgo_t algo);
-
+    /********************** GEMMs **********************/
     void Gemm(cublasOperation_t transa, cublasOperation_t transb, const int m, const int n, const int k, const void* A,
         const int lda, const void* B, const int ldb, void* C, const int ldc);
 
@@ -103,15 +80,36 @@ public:
 
     void Gemm(cublasOperation_t transa, cublasOperation_t transb, const int m, const int n, const int k, const void* A,
         const int lda, const void* B, const int ldb, void* C, const int ldc, float f_alpha, float f_beta,
-        const cublasLtMatmulAlgo_t& algo, bool hasAlgo);
+        const cublasLtMatmulAlgo_t& algo, bool hasAlgo, bool usingCublasLt);
 
+    void stridedBatchedGemm(cublasOperation_t transa, cublasOperation_t transb, const int m, const int n, const int k,
+        const void* A, const int lda, const int64_t strideA, const void* B, const int ldb, const int64_t strideB,
+        void* C, const int ldc, const int64_t strideC, const int batchCount, const float f_alpha = 1.0f,
+        const float f_beta = 0.0f);
+
+    void stridedBatchedGemm(cublasOperation_t transa, cublasOperation_t transb, const int m, const int n, const int k,
+        const float f_alpha, const void* A, cudaDataType_t AType, const int lda, const int64_t strideA, const void* B,
+        cudaDataType_t BType, const int ldb, const int64_t strideB, const float f_beta, void* C, cudaDataType_t CType,
+        const int ldc, const int64_t strideC, const int batchCount, cudaDataType_t computeType);
+
+    /********************** Tactic selection helpers **********************/
+    bool checkTactic(cublasOperation_t transa, cublasOperation_t transb, const int m, const int n, const int k,
+        const int lda, const int ldb, const int ldc, const cublasLtMatmulAlgo_t& algo);
+
+    std::vector<cublasLtMatmulHeuristicResult_t> getTactics(cublasOperation_t transa, cublasOperation_t transb,
+        const int m, const int n, const int k, const int lda, const int ldb, const int ldc);
+
+    std::vector<cublasLtMatmulHeuristicResult_t> getTactics(cublasLtHandle_t lightHandle,
+        cublasLtMatmulDesc_t computeDesc, cublasLtMatrixLayout_t Adesc, cublasLtMatrixLayout_t Bdesc,
+        cublasLtMatrixLayout_t Cdesc, cublasLtMatrixLayout_t Ddesc);
+
+    using MatrixLayout = std::tuple<cudaDataType_t, cublasLtOrder_t, uint64_t, uint64_t>;
+    using cache_idx_t = std::tuple<cublasLtMatmulDesc_t, std::array<MatrixLayout, 4>>;
+
+    MatrixLayout createMatrixLayout(cublasLtMatrixLayout_t Mdesc);
+
+    /********************** Utils **********************/
     void setWorkspace(void* workspace);
-
-    void Int8Gemm(const int m, const int n, const int k, const int8_t* A, const int lda, const int8_t* B, const int ldb,
-        int8_t* C, const int ldc, const float* alpha, const bool per_column_scaling = false);
-
-    void Int8Gemm(const int m, const int n, const int k, const int8_t* A, const int lda, const int8_t* B, const int ldb,
-        int32_t* C, const int ldc);
 
     void setFP32GemmConfig();
     void setFP16GemmConfig();
@@ -128,35 +126,18 @@ public:
 
     CublasDataType getCublasDataType(cudaDataType_t data_type);
 
-#if (CUDART_VERSION >= 11000)
-    void Gemm(cublasOperation_t transa, cublasOperation_t transb, const int m, const int n, const int k, const void* A,
-        const int lda, const void* B, const int ldb, const void* bias, void* C, const int ldc);
-#endif
-
-    void stridedBatchedGemm(cublasOperation_t transa, cublasOperation_t transb, const int m, const int n, const int k,
-        const void* A, const int lda, const int64_t strideA, const void* B, const int ldb, const int64_t strideB,
-        void* C, const int ldc, const int64_t strideC, const int batchCount, const float f_alpha = 1.0f,
-        const float f_beta = 0.0f);
-
-    void stridedBatchedGemm(cublasOperation_t transa, cublasOperation_t transb, const int m, const int n, const int k,
-        const float f_alpha, const void* A, cudaDataType_t AType, const int lda, const int64_t strideA, const void* B,
-        cudaDataType_t BType, const int ldb, const int64_t strideB, const float f_beta, void* C, cudaDataType_t CType,
-        const int ldc, const int64_t strideC, const int batch_count, cudaDataType_t computeType);
-
-    void batchedGemm(cublasOperation_t transa, cublasOperation_t transb, const int m, const int n, const int k,
-        const void* const* A, const int lda, const void* const* B, const int ldb, void* const* C, const int ldc,
-        const int batch_count);
-
-    bool isFuseBatchGemm(const int batch_count, const int m, const int k, const int n);
+    void createDescriptors(cublasOperation_t transa, cublasOperation_t transb, const int m, const int n, const int k,
+        const int lda, const int ldb, const int ldc);
+    void destroyDescriptors();
 
     cublasHandle_t getCublasHandle()
     {
-        return *(this->cublas_handle_);
+        return *(this->mCublasHandle);
     }
 
     cublasLtHandle_t getCublasLtHandle() const
     {
-        return *(this->cublaslt_handle_);
+        return *(this->mCublasLtHandle);
     }
 };
 

@@ -34,8 +34,7 @@ public:
     using SetupParams = typename Base::SetupParams;
 
     TopKSamplingLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-        tensorrt_llm::common::cublasMMWrapper* cublas_wrapper, tensorrt_llm::common::IAllocator* allocator,
-        bool is_free_buffer_after_forward);
+        tensorrt_llm::common::IAllocator* allocator, bool is_free_buffer_after_forward);
     TopKSamplingLayer(TopKSamplingLayer<T> const& top_k_sampling_layer);
     ~TopKSamplingLayer();
 

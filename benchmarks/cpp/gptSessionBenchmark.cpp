@@ -58,7 +58,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
     samplingConfig.topK = std::vector{1};
     samplingConfig.topP = std::vector{0.0f};
 
-    GptSession session{modelConfig, worldConfig, enginePath, logger};
+    GptSession session{modelConfig, worldConfig, enginePath.string(), logger};
     // Use bufferManager for copying data to and from the GPU
     auto& bufferManager = session.getBufferManager();
     session.setCudaGraphMode(cudaGraphMode);
@@ -178,7 +178,8 @@ int main(int argc, char* argv[])
     if (!result.count("engine_dir"))
     {
         std::cout << options.help() << std::endl;
-        throw std::invalid_argument("Please specify engine directory.");
+        TLLM_LOG_ERROR("Please specify engine directory.");
+        return 1;
     }
 
     // Argument: Batch sizes
@@ -230,7 +231,8 @@ int main(int argc, char* argv[])
     }
     else
     {
-        throw std::invalid_argument("Unexpected log level: " + logLevel);
+        TLLM_LOG_ERROR("Unexpected log level: " + logLevel);
+        return 1;
     }
 
     // Argument: Enable CUDA graph
@@ -238,8 +240,16 @@ int main(int argc, char* argv[])
 
     initTrtLlmPlugins(logger.get());
 
-    benchmarkGptSession(result["model"].as<std::string>(), result["engine_dir"].as<std::string>(), batchSizes, inOutLen,
-        logger, result["warm_up"].as<int>(), result["num_runs"].as<int>(), result["duration"].as<int>(),
-        enableCudaGraph);
+    try
+    {
+        benchmarkGptSession(result["model"].as<std::string>(), result["engine_dir"].as<std::string>(), batchSizes,
+            inOutLen, logger, result["warm_up"].as<int>(), result["num_runs"].as<int>(), result["duration"].as<int>(),
+            enableCudaGraph);
+    }
+    catch (const std::exception& e)
+    {
+        TLLM_LOG_ERROR(e.what());
+        return 1;
+    }
     return 0;
 }

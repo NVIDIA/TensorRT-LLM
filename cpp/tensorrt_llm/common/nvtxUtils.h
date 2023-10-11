@@ -30,7 +30,7 @@ inline nvtx3::color nextColor()
         nvtx3::color{0xffff00ff}, nvtx3::color{0xff00ffff}, nvtx3::color{0xffff0000}, nvtx3::color{0xffffffff}};
     constexpr auto numColors = kColors.size();
 
-    static thread_local int colorId = 0;
+    static thread_local std::size_t colorId = 0;
     auto const color = kColors[colorId];
     colorId = colorId + 1 >= numColors ? 0 : colorId + 1;
     return color;
