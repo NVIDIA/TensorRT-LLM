@@ -260,6 +260,7 @@ class GPTJForCausalLM(GPTJModel):
                        max_new_tokens,
                        use_cache,
                        max_beam_width,
+                       max_num_tokens: int = None,
                        enable_two_optimization_profiles: bool = False):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
@@ -292,10 +293,14 @@ class GPTJForCausalLM(GPTJModel):
             beam_width_range = [_beam_width_range]
             inlen_range = [inlen_range_cxt]
             max_len_range = [_max_len_range]
-        num_tokens_range = [
-            1, max_batch_size * max_beam_width,
-            max(max_input_len * max_batch_size, max_beam_width * max_batch_size)
-        ]
+        if max_num_tokens is None:
+            num_tokens_range = [
+                1, max_batch_size * max_beam_width,
+                max(max_input_len * max_batch_size,
+                    max_beam_width * max_batch_size)
+            ]
+        else:
+            num_tokens_range = [1, (max_num_tokens + 1) // 2, max_num_tokens]
 
         past_key_value = []
         sequence_length = None

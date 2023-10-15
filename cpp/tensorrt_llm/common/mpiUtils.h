@@ -101,5 +101,6 @@ void bcast(void* buffer, size_t size, MpiType dtype, int root, MpiComm comm);
 void bcast(std::vector<int64_t>& packed, int root, MpiComm comm);
 void comm_split(MpiComm comm, int color, int key, MpiComm* newcomm);
 void allreduce(const void* sendbuf, void* recvbuf, int count, MpiType dtype, MpiOp op, MpiComm comm);
+void allgather(const void* sendbuf, void* recvbuf, int count, MpiType dtype, MpiComm comm);
 
 } // namespace tensorrt_llm::mpi

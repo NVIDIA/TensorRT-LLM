@@ -42,7 +42,8 @@ public:
         float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
         tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
         bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
-        int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled);
+        int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled,
+        bool cross_attention = false, int max_distance = 0);
 
     GPTAttentionPluginCommon(const void* data, size_t length);
 
@@ -73,7 +74,8 @@ public:
 
 protected:
     int getMaxSeqLenTile(int elemSize) const;
-    size_t getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t nbReq, int32_t max_input_length) const noexcept;
+    size_t getWorkspaceSizeForContext(
+        nvinfer1::DataType type, int32_t nbReq, int32_t max_input_length, int32_t cross_qkv_length = 0) const noexcept;
     // total_num_seq is the sum of beam_width for multiple requests
     size_t getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t total_num_seq) const noexcept;
 
@@ -95,6 +97,14 @@ protected:
         int32_t num_tokens;
         int32_t max_blocks_per_sequence;
         void* workspace;
+        // optional when relative position
+        const T* relative_attention_bias = nullptr;
+        int relative_attention_bias_stride = 0;
+        // optional when cross attention
+        T const* cross_qkv = nullptr;
+        int32_t cross_qkv_length = 0;
+        int32_t const* encoder_input_lengths = nullptr;
+        int32_t num_encoder_tokens = 0;
     };
 
     template <typename T, typename KVCacheBuffer>
@@ -115,25 +125,46 @@ protected:
         T* context_buf;
         void* key_value_cache;
         void* block_pointers;
-        int32_t max_seq_lengths; // cache capacity
+        int32_t max_seq_length; // cache capacity
         int32_t num_requests;
         int32_t max_blocks_per_sequence;
         int32_t const* cache_indir;
         void* workspace;
+        // optional when relative position
+        const T* relative_attention_bias = nullptr;
+        int relative_attention_bias_stride = 0;
+        // optional when cross attention
+        int32_t const* encoder_input_lengths = nullptr;
     };
 
     template <typename T, typename KVCacheBuffer>
     int enqueueGeneration(const EnqueueGenerationParams<T, KVCacheBuffer>& params, cudaStream_t stream);
 
+    bool isRelativePosition() const
+    {
+        return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kRELATIVE;
+    }
+
     bool isALiBi() const
     {
-        return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kALIBI;
+        return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kALIBI
+            || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kALIBI_WITH_SCALE;
+    }
+
+    bool isAliBiWithScale() const
+    {
+        return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kALIBI_WITH_SCALE;
     }
 
     bool isRoPE() const
     {
         return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPTJ
             || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPT_NEOX;
+    }
+
+    bool isCrossAttention() const
+    {
+        return mCrossAttention;
     }
 
 protected:
@@ -160,6 +191,8 @@ protected:
     nvinfer1::DataType mType;
     int32_t mMaxContextLength;
     bool mQKVBiasEnabled;
+    bool mCrossAttention = false;
+    int mMaxDistance = 0;
 
     // fmha runner (disable by default)
     // flag: disabled = 0, enabled = 1, enabled with fp32 accumulation = 2

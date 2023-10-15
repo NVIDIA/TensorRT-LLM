@@ -151,7 +151,9 @@ class GPTBenchmark(BaseBenchmark):
             num_layers=self.num_layers,
             gpt_attention_plugin=self.use_gpt_attention_plugin,
             remove_input_padding=self.remove_input_padding,
-            quant_mode=self.quant_mode)
+            quant_mode=self.quant_mode,
+            use_custom_all_reduce=self.enable_custom_all_reduce,
+        )
         if model_name == 'chatglm_6b':
             self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
                 end_id=130005,

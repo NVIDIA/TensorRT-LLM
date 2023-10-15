@@ -174,7 +174,8 @@ public:
     //!
     static UniquePtr view(SharedPtr tensor)
     {
-        return ITensor::view(std::move(tensor), tensor->getShape());
+        auto shapes = tensor->getShape();
+        return ITensor::view(std::move(tensor), shapes);
     }
 
     //!

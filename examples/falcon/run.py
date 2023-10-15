@@ -75,7 +75,7 @@ def read_config(config_path: Path):
     assert world_size == tensorrt_llm.mpi_world_size(), \
         f'Engine world size ({world_size}) != Runtime world size '\
         f'({tensorrt_llm.mpi_world_size()})'
-    assert pp_size == 1, 'Python runtime does not support pipeline parallelism'
+
     num_heads = builder_config['num_heads'] // tp_size
     num_kv_heads = builder_config.get('num_kv_heads', num_heads)
     num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
@@ -90,6 +90,7 @@ def read_config(config_path: Path):
     paged_kv_cache = plugin_config['paged_kv_cache']
     tokens_per_block = plugin_config['tokens_per_block']
     remove_input_padding = plugin_config['remove_input_padding']
+    use_custom_all_reduce = plugin_config.get('use_custom_all_reduce', False)
 
     model_config = ModelConfig(num_heads=num_heads,
                                num_kv_heads=num_kv_heads,
@@ -101,7 +102,8 @@ def read_config(config_path: Path):
                                tokens_per_block=tokens_per_block,
                                remove_input_padding=remove_input_padding,
                                quant_mode=quant_mode,
-                               dtype=dtype)
+                               dtype=dtype,
+                               use_custom_all_reduce=use_custom_all_reduce)
 
     return model_config, tp_size, pp_size, world_size, dtype
 

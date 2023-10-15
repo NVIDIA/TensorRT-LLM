@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "weightOnlyQuantMatmulPlugin.h"
+#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/enabled.h"
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::common;
@@ -111,11 +112,15 @@ void WeightOnlyQuantMatmulPlugin::init(nvinfer1::DataType type, int weightTypeId
     {
         m_weightOnlyGemmRunner = std::make_shared<
             CutlassFpAIntBGemmRunner<half, uint8_t, cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY>>();
+        mCudaKernelEnabled
+            = tensorrt_llm::kernels::isWeightOnlyBatchedGemvEnabled(tensorrt_llm::kernels::WeightOnlyQuantType::Int8b);
     }
     else if (mType == nvinfer1::DataType::kHALF && mWeightTypeId == 2)
     {
         m_weightOnlyGemmRunner = std::make_shared<
             CutlassFpAIntBGemmRunner<half, cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY>>();
+        mCudaKernelEnabled
+            = tensorrt_llm::kernels::isWeightOnlyBatchedGemvEnabled(tensorrt_llm::kernels::WeightOnlyQuantType::Int4b);
     }
     else
     {
@@ -261,7 +266,7 @@ int WeightOnlyQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDesc* input
     TLLM_CHECK_WITH_INFO(bestTactic, "No valid SQ GEMM tactic");
     if (mType == nvinfer1::DataType::kHALF && mWeightTypeId == 1)
     {
-        if (m < SMALL_M_FAST_PATH && mSM >= 75)
+        if (m < SMALL_M_FAST_PATH && mCudaKernelEnabled)
         {
             // Use CUDA kernels for small batch size
             // The CUDA kernel is designed for ColumnMajorTileInterleave weight layout used in fpAIntB cutlass kernel
@@ -283,7 +288,7 @@ int WeightOnlyQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDesc* input
     }
     else if (mType == nvinfer1::DataType::kHALF && mWeightTypeId == 2)
     {
-        if (m < SMALL_M_FAST_PATH && mSM >= 75)
+        if (m < SMALL_M_FAST_PATH && mCudaKernelEnabled)
         {
             // Use CUDA kernels for small batch size
             // The CUDA kernel is designed for ColumnMajorTileInterleave weight layout used in fpAIntB cutlass kernel

@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/mpiUtils.h"
+#include "mpi.h"
 
 namespace tensorrt_llm
 {
@@ -136,6 +137,11 @@ void comm_split(MpiComm comm, int color, int key, MpiComm* newcomm)
 void allreduce(const void* sendbuf, void* recvbuf, int count, MpiType dtype, MpiOp op, MpiComm comm)
 {
     MPICHECK(MPI_Allreduce(sendbuf, recvbuf, count, getMpiDtype(dtype), getMpiOp(op), comm.group));
+}
+
+void allgather(const void* sendbuf, void* recvbuf, int count, MpiType dtype, MpiComm comm)
+{
+    MPICHECK(MPI_Allgather(sendbuf, count, getMpiDtype(dtype), recvbuf, count, getMpiDtype(dtype), comm.group));
 }
 
 } // namespace mpi

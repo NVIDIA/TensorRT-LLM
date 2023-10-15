@@ -280,7 +280,7 @@ def parse_arguments():
         '--quantized_fp8_model_path',
         type=str,
         default=None,
-        help='Path of a quantized model checkpoint that in .pyz format')
+        help='Path of a quantized model checkpoint in .npz format')
     parser.add_argument(
         '--use_weight_only',
         default=False,
@@ -425,9 +425,10 @@ def parse_arguments():
             args.multiple_of)
         args.rms_norm_eps = meta_config["norm_eps"]
     elif args.ft_model_dir is not None:
-        n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size = parse_ft_config(
+        n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, n_kv_head = parse_ft_config(
             Path(args.ft_model_dir) / "config.ini")
         args.inter_size = inter_size  # override the inter_size for LLaMA
+        args.n_kv_head = n_kv_head
         args.n_embd = n_embd
         args.n_head = n_head
         args.n_layer = n_layer
@@ -452,7 +453,7 @@ def parse_arguments():
     assert args.pp_size * args.tp_size == args.world_size
 
     if args.max_num_tokens is not None:
-        assert args.use_inflight_batching and args.enable_context_fmha
+        assert args.enable_context_fmha
 
     if args.inter_size is None:
         # this should not be need when loading a real model
@@ -565,7 +566,6 @@ def build_rank_engine(builder: Builder,
                            dtype=args.dtype)
         del hf_llama
     elif args.ft_model_dir is not None:
-        # TODO add multi_query_mode
         load_from_binary(tensorrt_llm_llama,
                          args.ft_model_dir,
                          mapping,

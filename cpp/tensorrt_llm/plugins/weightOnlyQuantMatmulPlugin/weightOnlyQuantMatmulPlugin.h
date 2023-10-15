@@ -116,7 +116,7 @@ private:
     size_t m_workspaceMaxSize;
     nvinfer1::DataType mType;
     int mWeightTypeId;
-    int mSM = tensorrt_llm::common::getSMVersion();
+    bool mCudaKernelEnabled;
 
     // When M is smaller than this value, we trigger a fast path
     // I.e. a tailored kernel instead of cutlass.

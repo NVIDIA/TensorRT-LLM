@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/stlUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -431,7 +432,7 @@ TEST_F(RuntimeKernelTest, CopyPackedInputToOutput)
     auto inputLengths = mManager->copyFrom(inputLengthsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
 
     std::vector<SizeType> inputOffsetsHost(batchSize + 1);
-    std::inclusive_scan(inputLengthsHost.begin(), inputLengthsHost.end(), inputOffsetsHost.begin() + 1);
+    tc::stl_utils::inclusiveScan(inputLengthsHost.begin(), inputLengthsHost.end(), inputOffsetsHost.begin() + 1);
     auto const totalInputSize = inputOffsetsHost.back();
 
     std::vector<std::int32_t> inputsHost(totalInputSize);
@@ -543,7 +544,7 @@ TEST_F(RuntimeKernelTest, CopyPackedInputToOutputTransposed)
     auto inputLengths = mManager->copyFrom(inputLengthsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
 
     std::vector<SizeType> inputOffsetsHost(batchSize + 1);
-    std::inclusive_scan(inputLengthsHost.begin(), inputLengthsHost.end(), inputOffsetsHost.begin() + 1);
+    tc::stl_utils::inclusiveScan(inputLengthsHost.begin(), inputLengthsHost.end(), inputOffsetsHost.begin() + 1);
     auto const totalInputSize = inputOffsetsHost.back();
 
     std::vector<std::int32_t> inputsHost(totalInputSize);

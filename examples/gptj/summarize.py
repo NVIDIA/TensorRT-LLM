@@ -189,16 +189,18 @@ def main(args):
             torch.cuda.synchronize()
 
         # Extract a list of tensors of shape beam_width x output_ids.
-        output_beams_list = [
-            tokenizer.batch_decode(output_ids[batch_idx, :,
-                                              input_lengths[batch_idx]:],
-                                   skip_special_tokens=True)
-            for batch_idx in range(batch_size)
-        ]
-        output_ids_list = [
-            output_ids[batch_idx, :, input_lengths[batch_idx]:]
-            for batch_idx in range(batch_size)
-        ]
+        output_beams_list, output_ids_list = [], []
+        if tensorrt_llm_gpt.mapping.is_first_pp_rank():
+            output_beams_list = [
+                tokenizer.batch_decode(output_ids[batch_idx, :,
+                                                  input_lengths[batch_idx]:],
+                                       skip_special_tokens=True)
+                for batch_idx in range(batch_size)
+            ]
+            output_ids_list = [
+                output_ids[batch_idx, :, input_lengths[batch_idx]:]
+                for batch_idx in range(batch_size)
+            ]
         return output_beams_list, output_ids_list
 
     def summarize_hf(datapoint):

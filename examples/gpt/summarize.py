@@ -47,6 +47,7 @@ def TRTGPT(args, config):
     num_kv_heads = 1 if multi_query_mode else num_heads
     paged_kv_cache = config['plugin_config']['paged_kv_cache']
     tokens_per_block = config['plugin_config']['tokens_per_block']
+    use_custom_all_reduce = config['plugin_config']['use_custom_all_reduce']
 
     model_config = tensorrt_llm.runtime.ModelConfig(
         vocab_size=vocab_size,
@@ -58,7 +59,9 @@ def TRTGPT(args, config):
         remove_input_padding=remove_input_padding,
         tokens_per_block=tokens_per_block,
         paged_kv_cache=paged_kv_cache,
-        dtype=dtype)
+        dtype=dtype,
+        use_custom_all_reduce=use_custom_all_reduce,
+    )
 
     runtime_rank = tensorrt_llm.mpi_rank()
     runtime_mapping = tensorrt_llm.Mapping(world_size,
@@ -204,13 +207,15 @@ def main(args):
             torch.cuda.synchronize()
 
         # Extract a list of tensors of shape beam_width x output_ids.
-        output_beams_list = [
-            tokenizer.batch_decode(output_ids[batch_idx, :,
-                                              input_lengths[batch_idx]:],
-                                   skip_special_tokens=True)
-            for batch_idx in range(batch_size)
-        ]
-        return output_beams_list, output_ids[:, :, max_length:].tolist()
+        if tensorrt_llm_gpt.mapping.is_first_pp_rank():
+            output_beams_list = [
+                tokenizer.batch_decode(output_ids[batch_idx, :,
+                                                  input_lengths[batch_idx]:],
+                                       skip_special_tokens=True)
+                for batch_idx in range(batch_size)
+            ]
+            return output_beams_list, output_ids[:, :, max_length:].tolist()
+        return [], []
 
     def eval_hf(datapoint, eval_type='summarize'):
         batch_size = len(datapoint)

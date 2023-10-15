@@ -13,15 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import tensorrt as trt
 
 from .._common import default_net, precision
 from ..functional import (AttentionMaskType, PositionEmbeddingType,
-                          RotaryScalingType, Tensor, cast, clip, concat,
-                          constant, expand_mask, generate_alibi_biases,
+                          RotaryScalingType, Tensor, bert_attention, cast, clip,
+                          concat, constant, expand_mask, generate_alibi_biases,
                           generate_alibi_slopes, gpt_attention, matmul, round,
                           shape, slice, softmax, split)
 from ..module import Module
@@ -38,7 +38,9 @@ class AttentionParams:
                  context_lengths: Tensor = None,
                  host_context_lengths: Tensor = None,
                  max_context_length: int = None,
-                 host_request_types: Tensor = None):
+                 host_request_types: Tensor = None,
+                 encoder_input_lengths: Tensor = None,
+                 encoder_max_input_length: Tensor = None):
         self.sequence_length = sequence_length
         self.context_lengths = context_lengths
         self.host_context_lengths = host_context_lengths
@@ -46,6 +48,16 @@ class AttentionParams:
         # compute scratch memory size.
         self.max_context_length = max_context_length
         self.host_request_types = host_request_types
+
+        self.encoder_input_lengths = encoder_input_lengths
+        self.encoder_max_input_length = encoder_max_input_length
+
+    def is_valid_cross_attn(self, do_cross_attention):
+        if do_cross_attention:
+            if self.encoder_input_lengths is None:
+                return False
+            if self.encoder_max_input_length is None:
+                return False
 
     def is_valid(self, gpt_attention_plugin, remove_input_padding):
         if gpt_attention_plugin:
@@ -73,11 +85,13 @@ class KeyValueCacheParams:
                  past_key_value: List[Tensor] = None,
                  host_past_key_value_lengths: Tensor = None,
                  kv_cache_block_pointers: List[Tensor] = None,
-                 cache_indirection: Tensor = None):
+                 cache_indirection: Tensor = None,
+                 past_key_value_length: Tensor = None):
         self.past_key_value = past_key_value
         self.host_past_key_value_lengths = host_past_key_value_lengths
         self.kv_cache_block_pointers = kv_cache_block_pointers
         self.cache_indirection = cache_indirection
+        # self.past_key_value_length = past_key_value_length
 
     def get_first_past_key_value(self):
         if self.past_key_value is None:
@@ -120,12 +134,20 @@ class Attention(Module):
                  tp_size=1,
                  tp_rank=0,
                  multi_block_mode=False,
-                 scale_alibi_bias=False,
-                 quant_mode: QuantMode = QuantMode(0)):
+                 quant_mode: QuantMode = QuantMode(0),
+                 q_scaling=1.0,
+                 cross_attention=False,
+                 relative_attention=False,
+                 max_distance=0,
+                 num_buckets=0,
+                 instance_id: int = 0):
         super().__init__()
 
+        self.cross_attention = cross_attention
         self.attention_mask_type = attention_mask_type
         self.attention_head_size = hidden_size // num_attention_heads
+        assert num_attention_heads % tp_size == 0, \
+        "num_attention_heads must be divisible by tp_size"
         self.num_attention_heads = num_attention_heads // tp_size
         self.num_attention_kv_heads = (
             num_kv_heads + tp_size - 1
@@ -138,7 +160,7 @@ class Attention(Module):
         self.num_layers = num_layers
         self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
         self.norm_factor = math.sqrt(self.attention_head_size)
-        self.q_scaling = 1
+        self.q_scaling = q_scaling
         if self.apply_query_key_layer_scaling:
             self.norm_factor *= self.num_layers
             self.q_scaling *= self.num_layers
@@ -146,10 +168,13 @@ class Attention(Module):
         # normalizing QK after adding bias.
         #   - False, inv_sqrt_Dh * Q*K^T + alibi_bias
         #   - True,  inv_sqrt_Dh * Q*K^T + inv_sqrt_Dh * alibi_bias
-        self.scale_alibi_bias = scale_alibi_bias
+        self.scale_alibi_bias = position_embedding_type == PositionEmbeddingType.alibi_with_scale
 
         self.position_embedding_type = position_embedding_type
         self.multi_block_mode = multi_block_mode
+
+        self.relative_attention = relative_attention
+        self.max_distance = max_distance
 
         self.rotary_embedding_base = rotary_embedding_base
         self.rotary_embedding_scale_type = RotaryScalingType.none
@@ -201,7 +226,8 @@ class Attention(Module):
                                       bias=bias,
                                       dtype=dtype,
                                       tp_group=tp_group,
-                                      tp_size=tp_size)
+                                      tp_size=tp_size,
+                                      instance_id=instance_id)
         else:
             self.qkv = ColumnLinear(hidden_size,
                                     hidden_size +
@@ -217,7 +243,14 @@ class Attention(Module):
                                    bias=bias,
                                    dtype=dtype,
                                    tp_group=tp_group,
-                                   tp_size=tp_size)
+                                   tp_size=tp_size,
+                                   instance_id=instance_id)
+
+        # per-layer relative attention table
+        if relative_attention:
+            self.rel_attn_table = Parameter(shape=(num_attention_heads //
+                                                   tp_size, num_buckets),
+                                            dtype=dtype)
 
     def forward(
         self,
@@ -226,6 +259,8 @@ class Attention(Module):
         use_cache=False,
         kv_cache_params=None,
         attention_params=None,
+        encoder_output: Optional[Tensor] = None,
+        workspace=None,
     ):
 
         assert isinstance(hidden_states, Tensor)
@@ -235,7 +270,7 @@ class Attention(Module):
             if not default_net().plugin_config.gpt_attention_plugin:
                 raise ValueError(
                     'RoPE is only supported with GPTAttention plugin')
-        elif self.position_embedding_type == PositionEmbeddingType.alibi:
+        elif self.position_embedding_type.is_alibi():
             dtype = trt.float32
             if default_net().plugin_config.gpt_attention_plugin:
                 dtype = hidden_states.dtype
@@ -257,6 +292,25 @@ class Attention(Module):
         assert kv_cache_params is None or kv_cache_params.is_valid(
             default_net().plugin_config.gpt_attention_plugin)
 
+        past_key_value = None if kv_cache_params is None else kv_cache_params.get_first_past_key_value(
+        )
+        if self.cross_attention and (past_key_value is not None):
+            past_key_value = kv_cache_params.past_key_value[1]
+
+        # if cross attention, cross QKV only needs to be calculated once in the
+        # 1st decoding step --> write to cross KV cache --> remains constant
+        # during the entire decoding. 1st and >1 steps are distinguished by
+        # whether past_key_value exists or not
+        # also, cross KV cache max length is set from encoder output seqlen,
+        # this maps to the max context length concept in decoder-only models
+        cross_qkv = None
+        # get length data in every run
+        if encoder_output:
+            assert isinstance(encoder_output, Tensor)
+        # but only do projection once at 1st decoding step
+        if self.cross_attention and encoder_output:
+            cross_qkv = self.qkv(encoder_output)
+
         if default_net().plugin_config.gpt_attention_plugin:
             assert self.attention_mask_type in [
                 AttentionMaskType.causal, AttentionMaskType.bidirectional
@@ -267,7 +321,7 @@ class Attention(Module):
             ) else None
             context, past_key_value = gpt_attention(
                 tensor=qkv,
-                past_key_value=kv_cache_params.get_first_past_key_value(),
+                past_key_value=past_key_value,
                 sequence_length=attention_params.sequence_length,
                 host_past_key_value_lengths=kv_cache_params.
                 host_past_key_value_lengths,
@@ -295,9 +349,18 @@ class Attention(Module):
                 tp_rank=self.tp_rank,
                 kv_cache_block_pointers=kv_cache_params.
                 get_first_kv_cache_block_pointers(),
-                host_context_lengths=attention_params.host_context_lengths)
+                do_cross_attention=self.cross_attention,
+                cross_qkv=cross_qkv,
+                cross_qkv_length=attention_params.encoder_max_input_length,
+                encoder_input_lengths=attention_params.encoder_input_lengths,
+                relative_attention_bias=self.rel_attn_table.value
+                if self.relative_attention else None,
+                max_distance=self.max_distance,
+                host_context_lengths=attention_params.host_context_lengths,
+            )
 
         else:
+            # plain TensorRT mode
             assert paged_kv_cache == False
 
             def transpose_for_scores(x, is_kv: bool = False):
@@ -317,12 +380,18 @@ class Attention(Module):
             kv_size = self.attention_head_size * self.num_attention_kv_heads
             query, key, value = split(qkv, [self.hidden_size, kv_size, kv_size],
                                       dim=2)
+
+            # in cross attention mode, replace kv by encoder_output
+            if self.cross_attention and encoder_output is not None:
+                encoder_qkv = self.qkv(encoder_output)
+                _, key, value = split(encoder_qkv,
+                                      [self.hidden_size, kv_size, kv_size],
+                                      dim=2)
+
             query = transpose_for_scores(query)
             key = transpose_for_scores(key, is_kv=True)
             value = transpose_for_scores(value, is_kv=True)
 
-            past_key_value = None if kv_cache_params is None else kv_cache_params.get_first_past_key_value(
-            )
             if past_key_value is not None:
 
                 def dequantize_tensor(x, scale):
@@ -403,7 +472,7 @@ class Attention(Module):
             if attention_mask is not None:
                 attention_mask = expand_mask(attention_mask, shape(query, 2))
             bias = attention_mask
-            if self.position_embedding_type == PositionEmbeddingType.alibi:
+            if self.position_embedding_type.is_alibi():
                 alibi_biases = generate_alibi_biases(alibi_slopes, key_length)
                 bias = alibi_biases if bias is None else bias + alibi_biases
 
@@ -417,8 +486,132 @@ class Attention(Module):
                 if self.attention_mask_type == AttentionMaskType.causal:
                     bias = causal_mask if bias is None else bias + causal_mask
 
-                if bias is not None:
+                if bias is not None and not self.cross_attention:
                     attention_scores = attention_scores + bias
+
+            attention_probs = softmax(attention_scores, dim=-1)
+
+            context = matmul(attention_probs, value).permute([0, 2, 1, 3])
+            context = context.view(
+                concat([shape(context, 0),
+                        shape(context, 1), self.hidden_size]))
+
+        context = self.dense(context, workspace)
+
+        if use_cache:
+            return (context, past_key_value)
+        else:
+            return context
+
+
+class BertAttention(Module):
+
+    def __init__(self,
+                 hidden_size,
+                 num_attention_heads,
+                 num_kv_heads=None,
+                 max_position_embeddings=1024,
+                 num_layers=1,
+                 q_scaling=1.0,
+                 apply_query_key_layer_scaling=False,
+                 bias=True,
+                 dtype=None,
+                 tp_group=None,
+                 tp_size=1,
+                 tp_rank=0,
+                 relative_attention=False,
+                 max_distance=0,
+                 num_buckets=0):
+        super().__init__()
+
+        self.attention_head_size = hidden_size // num_attention_heads
+        self.num_attention_heads = num_attention_heads // tp_size
+        self.num_attention_kv_heads = (
+            num_kv_heads + tp_size - 1
+        ) // tp_size if num_kv_heads is not None else self.num_attention_heads
+        self.hidden_size = hidden_size // tp_size
+        self.max_position_embeddings = max_position_embeddings
+        self.norm_factor = math.sqrt(self.attention_head_size)
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
+
+        self.num_layers = num_layers
+        self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
+        self.norm_factor = math.sqrt(self.attention_head_size)
+        self.q_scaling = q_scaling
+        if self.apply_query_key_layer_scaling:
+            self.norm_factor *= self.num_layers
+            self.q_scaling *= self.num_layers
+
+        self.dtype = dtype
+
+        self.relative_attention = relative_attention
+        self.max_distance = max_distance
+
+        self.qkv = ColumnLinear(hidden_size,
+                                hidden_size +
+                                (2 * tp_size * self.num_attention_kv_heads *
+                                 self.attention_head_size),
+                                bias=bias,
+                                dtype=dtype,
+                                tp_group=tp_group,
+                                tp_size=tp_size,
+                                gather_output=False)
+        self.dense = RowLinear(hidden_size,
+                               hidden_size,
+                               bias=bias,
+                               dtype=dtype,
+                               tp_group=tp_group,
+                               tp_size=tp_size)
+
+        # per-layer relative attention table
+        if relative_attention:
+            self.rel_attn_table = Parameter(shape=(num_attention_heads //
+                                                   tp_size, num_buckets),
+                                            dtype=dtype)
+
+    def forward(self,
+                hidden_states: Tensor,
+                attention_mask=None,
+                input_lengths=None):
+        assert isinstance(hidden_states, Tensor)
+
+        qkv = self.qkv(hidden_states)
+
+        if default_net().plugin_config.bert_attention_plugin:
+            # TRT plugin mode
+            assert input_lengths is not None
+            context = bert_attention(
+                qkv,
+                input_lengths,
+                self.num_attention_heads,
+                self.attention_head_size,
+                q_scaling=self.q_scaling,
+                relative_attention=self.relative_attention,
+                max_distance=self.max_distance,
+                relative_attention_bias=self.rel_attn_table.value
+                if self.relative_attention else None)
+        else:
+            # plain TRT mode
+            def transpose_for_scores(x):
+                new_x_shape = concat([
+                    shape(x, 0),
+                    shape(x, 1), self.num_attention_heads,
+                    self.attention_head_size
+                ])
+                return x.view(new_x_shape).permute([0, 2, 1, 3])
+
+            query, key, value = split(qkv, self.hidden_size, dim=2)
+            query = transpose_for_scores(query)
+            key = transpose_for_scores(key)
+            value = transpose_for_scores(value)
+
+            key = key.permute([0, 1, 3, 2])
+            attention_scores = matmul(query, key)
+            attention_scores = attention_scores / self.norm_factor
+
+            if attention_mask is not None:
+                attention_scores = attention_scores + attention_mask
 
             attention_probs = softmax(attention_scores, dim=-1)
 
@@ -429,7 +622,4 @@ class Attention(Module):
 
         context = self.dense(context)
 
-        if use_cache:
-            return (context, past_key_value)
-        else:
-            return context
+        return context

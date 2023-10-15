@@ -237,7 +237,8 @@ def hf_gpt_converter(args):
         elif ft_name.split('.')[-2] == 'query_key_value':
             # Is there other ways to get local_dim? local_dim = hidden_size in llama2
             local_dim = model.config.hidden_size if args.multi_query_mode else None
-            merge_qkv_scales(name, model, act_range, llama_qkv_para)
+            if args.smoothquant is None:
+                merge_qkv_scales(name, model, act_range, llama_qkv_para)
             qkv = (0, saved_dir, infer_tp, ft_name,
                    llama_qkv_para.get(
                        name.replace(".weight", "").replace(
@@ -327,5 +328,8 @@ if __name__ == "__main__":
     for key in vars(args):
         print("{}: {}".format(key, vars(args)[key]))
     print("========================================")
+
+    assert (args.calibrate_kv_cache or args.smoothquant), \
+        "Either INT8 kv cache or SmoothQuant must be enabled for this script. Otherwise you can directly build engines from HuggingFace checkpoints, no need to do this FT-format conversion. "
 
     hf_gpt_converter(args)

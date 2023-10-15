@@ -29,7 +29,8 @@ class MLP(Module):
                  dtype=None,
                  tp_group=None,
                  tp_size=1,
-                 quant_mode=QuantMode(0)):
+                 quant_mode=QuantMode(0),
+                 instance_id: int = 0):
         super().__init__()
         if hidden_act not in ACT2FN:
             raise ValueError(
@@ -50,7 +51,8 @@ class MLP(Module):
                                      bias=bias,
                                      dtype=dtype,
                                      tp_group=tp_group,
-                                     tp_size=tp_size)
+                                     tp_size=tp_size,
+                                     instance_id=instance_id)
         else:
             self.fc = ColumnLinear(hidden_size,
                                    fc_output_size,
@@ -64,14 +66,15 @@ class MLP(Module):
                                   bias=bias,
                                   dtype=dtype,
                                   tp_group=tp_group,
-                                  tp_size=tp_size)
+                                  tp_size=tp_size,
+                                  instance_id=instance_id)
         self.hidden_act = hidden_act
         self.dtype = dtype
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, workspace=None):
         inter = self.fc(hidden_states)
         inter = ACT2FN[self.hidden_act](inter)
-        output = self.proj(inter)
+        output = self.proj(inter, workspace)
         return output
 
 
@@ -85,7 +88,8 @@ class GatedMLP(MLP):
                  dtype=None,
                  tp_group=None,
                  tp_size=1,
-                 quant_mode=QuantMode(0)):
+                 quant_mode=QuantMode(0),
+                 instance_id: int = 0):
         self.use_fp8_qdq = quant_mode.has_fp8_qdq()
         super().__init__(hidden_size,
                          ffn_hidden_size,
@@ -94,7 +98,8 @@ class GatedMLP(MLP):
                          dtype=dtype,
                          tp_group=tp_group,
                          tp_size=tp_size,
-                         quant_mode=quant_mode)
+                         quant_mode=quant_mode,
+                         instance_id=instance_id)
 
         if self.use_fp8_qdq:
             self.gate = FP8Linear(hidden_size,
@@ -113,9 +118,9 @@ class GatedMLP(MLP):
                                      tp_size=tp_size,
                                      gather_output=False)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, workspace=None):
         inter = self.fc(hidden_states)
         inter = ACT2FN[self.hidden_act](inter)
         gate = self.gate(hidden_states)
-        output = self.proj(inter * gate)
+        output = self.proj(inter * gate, workspace)
         return output

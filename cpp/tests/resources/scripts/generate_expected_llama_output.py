@@ -59,11 +59,11 @@ def generate_outputs(num_beams, only_multi_gpu=False):
         print(
             f'Generating outputs for Llama FP16 with TP={tp_size} and PP={pp_size}'
         )
-        generate_output(engine='fp16-plugin',
+        generate_output(engine='fp16-plugin-packed-paged',
                         num_beams=num_beams,
                         tp_size=tp_size,
                         pp_size=pp_size,
-                        output_name='output_tokens_fp16_plugin')
+                        output_name='output_tokens_fp16_plugin_packed_paged')
 
 
 if __name__ == '__main__':

@@ -168,7 +168,11 @@ def parse_arguments(args):
                         type=int,
                         default=64,
                         help='Number of tokens per block in paged KV cache')
-
+    parser.add_argument(
+        '--max_num_tokens',
+        type=int,
+        default=None,
+        help='Define the max number of tokens supported by the engine')
     parser.add_argument(
         '--per_group',
         default=False,
@@ -275,6 +279,9 @@ def parse_arguments(args):
         if not args.paged_kv_cache:
             args.paged_kv_cache = True
             logger.info("Using paged KV cache for inflight batching mode.")
+
+    if args.max_num_tokens is not None:
+        assert args.enable_context_fmha
 
     if args.remove_input_padding or args.use_inflight_batching or args.paged_kv_cache:
         assert (
@@ -388,6 +395,7 @@ def build_rank_engine(builder: Builder,
             args.max_output_len,
             True,
             args.max_beam_width,
+            max_num_tokens=args.max_num_tokens,
             enable_two_optimization_profiles=args.
             enable_two_optimization_profiles)
         tensorrt_llm_gpt(*inputs)
@@ -434,6 +442,7 @@ def build(rank, args):
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
+            max_num_tokens=args.max_num_tokens,
             fp8=args.enable_fp8,
             quant_mode=args.quant_mode,
             strongly_typed=args.strongly_typed)

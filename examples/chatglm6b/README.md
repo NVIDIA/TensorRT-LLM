@@ -59,7 +59,7 @@ cp modeling_chatglm.py pyTorchModel
 # export weight of LM
 python3 exportLM.py
 # restore the original file for the later use (for example, summarize.py)
-cp pyTorchModel/modeling_chatglm.py-backup pyTorchModel/modeling_chatglm.py
+mv pyTorchModel/modeling_chatglm.py-backup pyTorchModel/modeling_chatglm.py
 
 python3 hf_chatglm6b_convert.py -i pyTorchModel -o ftModel --tensor-parallelism 1 --storage-type fp16
 ```
@@ -85,7 +85,8 @@ Examples of build invocations:
 # Enable the special TensorRT-LLM ChatGLM-6B Attention plugin (--use_gpt_attention_plugin) to increase runtime performance.
 python3 build.py --model_dir=./ftModel/1-gpu \
                  --dtype float16 \
-                 --use_gpt_attention_plugin float16
+                 --use_gpt_attention_plugin float16 \
+                 --use_gemm_plugin float16
 ```
 
 #### Fused MultiHead Attention (FMHA)

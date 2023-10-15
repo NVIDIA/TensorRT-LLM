@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 import tensorrt_llm
+from tensorrt_llm._utils import pad_vocab_size
 from tensorrt_llm.models import OPTLMHeadModel
 from tensorrt_llm.quantization import QuantMode
 

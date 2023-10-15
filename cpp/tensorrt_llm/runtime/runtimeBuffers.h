@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "ipcUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -32,6 +33,7 @@ class TllmRuntime;
 
 class RuntimeBuffers
 {
+protected:
     using TensorPtr = ITensor::SharedPtr;
     using KvCacheManager = batch_manager::kv_cache_manager::KVCacheManager;
 
@@ -67,7 +69,12 @@ public:
     // pipeline parallelism
     TensorPtr hiddenStates;
 
+    // tensor parallelism
+    TensorPtr commPtrs;
+
     bool allocated{false};
+
+    std::vector<std::shared_ptr<IpcMemory>> mIpcMemoryHandles;
 
 public:
     class GenerationConfig
@@ -93,9 +100,9 @@ public:
         SizeType maxSeqLength{};
         SizeType inputLengthSum{}; // Initialized only if inputPacked is set to true in fromInput.
 
-        static GenerationConfig fromInput(ITensor const& inputIds, ITensor const& inputLengths, bool inputPacked,
-            SizeType beamWidth, SizeType maxSequenceLength, std::optional<SizeType> const& maxNewTokensOpt,
-            BufferManager& manager);
+        static RuntimeBuffers::GenerationConfig fromInput(ITensor const& inputIds, ITensor const& inputLengths,
+            bool const inputPacked, SizeType const beamWidth, SizeType const maxSequenceLength,
+            std::optional<SizeType> const& maxNewTokensOpt);
     };
 
 public:
@@ -121,6 +128,9 @@ public:
     void getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outputBuffers, SizeType step, TensorPtr const& inputIds,
         GptModelConfig const& modelConfig, WorldConfig const& worldConfig) const;
 
+    void createCustomAllReduceWorkspace(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxSequenceLength,
+        SizeType hiddenSize, WorldConfig const& worldConfig, BufferManager& manager);
+
 private:
     void gatherLastTokenLogits(BufferManager& manager, GenerationConfig const& generationConfig,
         GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
@@ -128,6 +138,12 @@ private:
     // Some tensors are properly tiled, some are just reshaped.
     void tile(BufferManager& manager, GenerationConfig const& generationConfig, GptModelConfig const& modelConfig,
         WorldConfig const& worldConfig);
+
+    static std::vector<SizeType> getPositionIdsContextPhaseGlm(
+        SizeType batchSize, SizeType maxInputLength, SizeType const* pInputLengths, bool useGptAttentionPlugin);
+
+    static std::vector<SizeType> getPositionIdsGenerationPhaseGlm(SizeType batchSize, SizeType beamSize, SizeType step,
+        SizeType const* pInputLengths, bool useGptAttentionPlugin);
 };
 
 } // namespace tensorrt_llm::runtime

@@ -7,6 +7,7 @@ openai_triton_example_root = os.path.join(
 
 
 def get_fmha_kernel_meta_data():
+    block_size = 128
     return KernelMetaData(
         kernel_name='fused_attention_kernel',
         ios=[
@@ -23,9 +24,9 @@ def get_fmha_kernel_meta_data():
             ParamArg('num_heads', Type('i32')),
             DimSizeArg('seq_len', hints=['', '16']),
             # constexprs
-            Constexpr(128),
+            Constexpr(block_size),
             Constexpr(64),
-            Constexpr(128),
+            Constexpr(block_size),
         ],
         shape_infer_rules=[
             # The following rules helps to deduce the shapes of the output tensors
@@ -39,8 +40,10 @@ def get_fmha_kernel_meta_data():
         ],
         version=0,
         kernel_file=f'{openai_triton_example_root}/fmha_triton.py',
-        num_warps=1,
-        grid_dims=("(seq_len + 127) / 128", "batch_size * num_heads", "1"))
+        num_warps=4,
+        num_stages=2,
+        grid_dims=(f"(seq_len + {block_size-1}) / {block_size}",
+                   "batch_size * num_heads", "1"))
 
 
 KERNELS = [

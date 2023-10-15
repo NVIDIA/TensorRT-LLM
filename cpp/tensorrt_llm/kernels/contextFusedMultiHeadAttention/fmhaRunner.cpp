@@ -14,11 +14,6 @@
  * limitations under the License.
  */
 
-#define _USE_MATH_DEFINES
-// Include cmath with M_LOG2E defined
-#include <cmath>
-#undef _USE_MATH_DEFINES
-
 #include "fmhaRunner.h"
 #include "fused_multihead_attention_v2.h"
 
@@ -104,17 +99,19 @@ public:
 
     ~mhaImpl() {}
 
-    void setup(
-        const int b, const int s, const int total_seqlen, const bool has_alibi, const int tp_size, const int tp_rank)
+    void setup(const int b, const int s, const int total_seqlen, const bool has_alibi, const bool scale_alibi,
+        const int tp_size, const int tp_rank)
     {
-        // Multiple by LOG2E for the exp2f optimization (reduced number of FMULs).
-        const float scale_bmm1 = (1.f / (sqrtf(mHeadSize) * mQScaling)) * float(M_LOG2E);
+        const float inv_sqrt_scale = (1.f / (sqrtf(mHeadSize) * mQScaling));
+        // Note that we apply scales and bias in the order of
+        // (bmm1_output * scale_bmm1 + alibi) * scale_after_alibi
+        const float scale_after_alibi = scale_alibi ? inv_sqrt_scale : 1.0f;
+        const float scale_bmm1 = scale_alibi ? 1.0f : inv_sqrt_scale;
         const float scale_softmax = 1.f; // Seems to be only required for int8
         const float scale_bmm2 = 1.f;
 
         Data_type scale_type = launch_params.force_fp32_acc ? DATA_TYPE_FP32 : mDataType;
-        // Always use float scale since we move scale to softmax.
-        set_alpha(params.scale_bmm1, scale_bmm1, DATA_TYPE_FP32);
+        set_alpha(params.scale_bmm1, scale_bmm1, scale_type);
         set_alpha(params.scale_softmax, scale_softmax, scale_type);
         set_alpha(params.scale_bmm2, scale_bmm2, scale_type);
 
@@ -176,7 +173,7 @@ public:
         if (has_alibi)
         {
             params.has_alibi = true;
-            params.alibi_params = AlibiParams(mNumHeads, s, tp_size, tp_rank);
+            params.alibi_params = AlibiParams(mNumHeads, s, tp_size, tp_rank, scale_after_alibi);
         }
     }
 
@@ -274,8 +271,8 @@ public:
     {
         // BF16 FMHA only accumulates on FP32
         launch_params.force_fp32_acc = mDataType == DATA_TYPE_BF16 || force_fp32_acc;
-        // Limited_length_causal is disabled temporally.
-        // TODO (perkzz): It will be enabled when the limited_length feature is fully supported.
+        // sliding_window_causal is disabled temporally.
+        // TODO (perkzz): It will be enabled when the sliding window attention is fully supported.
         launch_params.attention_mask_type
             = causal_mask ? ContextAttentionMaskType::CAUSAL : ContextAttentionMaskType::PADDING;
         params.h_kv = num_kv_heads;
@@ -363,10 +360,10 @@ FusedMHARunnerV2::FusedMHARunnerV2(
 
 FusedMHARunnerV2::~FusedMHARunnerV2() = default;
 
-void FusedMHARunnerV2::setup(
-    const int b, const int s, const int total_seqlen, const bool has_alibi, const int tp_size, const int tp_rank)
+void FusedMHARunnerV2::setup(const int b, const int s, const int total_seqlen, const bool has_alibi,
+    const bool scale_alibi, const int tp_size, const int tp_rank)
 {
-    pimpl->setup(b, s, total_seqlen, has_alibi, tp_size, tp_rank);
+    pimpl->setup(b, s, total_seqlen, has_alibi, scale_alibi, tp_size, tp_rank);
 }
 
 bool FusedMHARunnerV2::fmha_supported()

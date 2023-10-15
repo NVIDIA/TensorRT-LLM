@@ -32,7 +32,7 @@ PluginFieldCollection BertAttentionPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> BertAttentionPluginCreator::mPluginAttributes;
 
 BertAttentionPlugin::BertAttentionPlugin(int num_heads, int head_size, float q_scaling, bool qk_half_accum,
-    ContextFMHAType context_fmha_type, nvinfer1::DataType type)
+    ContextFMHAType context_fmha_type, nvinfer1::DataType type, bool do_relative_attention, int max_distance)
     : mNumHeads(num_heads)
     , mHeadSize(head_size)
     , mQScaling(q_scaling)
@@ -40,6 +40,8 @@ BertAttentionPlugin::BertAttentionPlugin(int num_heads, int head_size, float q_s
     , mEnableContextFMHA(context_fmha_type != ContextFMHAType::DISABLED)
     , mFMHAForceFP32Acc(context_fmha_type == ContextFMHAType::ENABLED_WITH_FP32_ACC)
     , mType(type)
+    , mRelativeAttention(do_relative_attention)
+    , mMaxDistance(max_distance)
 {
     // pre-check whether FMHA is supported in order to save memory allocation
     mEnableContextFMHA = mEnableContextFMHA && (mType == DataType::kHALF) && MHARunner::fmha_supported(mHeadSize, mSM);
@@ -56,6 +58,8 @@ BertAttentionPlugin::BertAttentionPlugin(const void* data, size_t length)
     read(d, mEnableContextFMHA);
     read(d, mFMHAForceFP32Acc);
     read(d, mType);
+    read(d, mRelativeAttention);
+    read(d, mMaxDistance);
     TLLM_CHECK(d == a + length);
 }
 
@@ -80,7 +84,7 @@ nvinfer1::DimsExprs BertAttentionPlugin::getOutputDimensions(
 bool BertAttentionPlugin::supportsFormatCombination(
     int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
 {
-    if (pos == nbInputs - 1)
+    if (pos == 1)
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32;
     }
@@ -151,6 +155,7 @@ int BertAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
     // inputs
     //     input_tensor [batch_size, seq_len, local_hidden_size * 3]
     //     input_lengths [batch_size]
+    //     relative_attention_bias [num_heads, num_buckets] (optional)
     // outputs
     //     output_tensor [batch_size, seq_len, local_hidden_size]
 
@@ -163,7 +168,9 @@ int BertAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
     const float q_scaling = mQScaling;
 
     const T* attention_input = reinterpret_cast<const T*>(inputs[0]);
+
     const int* input_lengths = reinterpret_cast<const int*>(inputs[1]);
+    const T* relative_attn_table = mRelativeAttention ? reinterpret_cast<const T*>(inputs[2]) : nullptr;
 
     T* context_buf_ = (T*) (outputs[0]);
 
@@ -231,10 +238,18 @@ int BertAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
     const auto gemm_data_type = tc::CudaDataType<T>::value;
     const int attention_seq_len_1 = request_seq_len; // q length
     const int attention_seq_len_2 = request_seq_len; // kv length
-    const T qk_scale = static_cast<T>(1.0f / (sqrtf(mHeadSize * 1.0f) * q_scaling));
+
+    // If the model has relative attentiona bias, q scaling should be applied in QK gemm stage and use 1 in
+    // softamax stage (because to get softmax[scale(Q*K) + rel pos bias] here, q_scaling can't be applied during
+    // softmax phase by qk_scale); otherwise, use 1 in gemm stage and apply scaling in softmax stage
+    const float qk_scale
+        = 1.0f / (sqrtf(mHeadSize * 1.0f) * q_scaling); // q_scaling in denominator. by default q_scaling =1.0f
+    const float qk_scale_gemm = mRelativeAttention ? qk_scale : 1.0f;
+    const T qk_scale_softmax = static_cast<T>(mRelativeAttention ? 1.0f : qk_scale);
+
     T* linear_bias_slopes = nullptr;
 
-    if (mEnableContextFMHA)
+    if (mEnableContextFMHA && !mRelativeAttention)
     {
         // b, max_seqlen, actual_total_seqlen
         mFMHARunner->setup(request_batch_size, request_seq_len, request_batch_size * request_seq_len);
@@ -248,7 +263,7 @@ int BertAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
                 attention_seq_len_2,             // n
                 attention_seq_len_1,             // m
                 mHeadSize,                       // k
-                1.0f, k_buf_2_, gemm_data_type,
+                qk_scale_gemm, k_buf_2_, gemm_data_type,
                 mHeadSize,                       // k
                 attention_seq_len_2 * mHeadSize, // n * k
                 q_buf_2_, gemm_data_type,
@@ -260,6 +275,19 @@ int BertAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
                 request_batch_size * mNumHeads,  // global batch size
                 CUDA_R_32F);
 
+            // add relative position bias
+            if (mRelativeAttention)
+            {
+                // add rel pos bias
+                // QK is (batch_size, local_head_num, q_length, k_length), rel pos bias is (1, local_head_num,
+                // max_output_len + 1, max_output_len + 1). broadcast along 1st dim. max_seq_len is already
+                // max_output_len + 1. In implicit mode, relative_attention_bias is rel attn table
+                // [num_heads, num_buckets], with necessary params (max_distance, num_buckets) passed at the end
+                invokeAddRelativeAttentionBiasUnaligned(qk_buf_float_, relative_attn_table, request_batch_size,
+                    mNumHeads, attention_seq_len_1, attention_seq_len_2, stream, mMaxDistance > 0,
+                    inputDesc[2].dims.d[1], mMaxDistance, true /* bidirectional */);
+            }
+
             MaskedSoftmaxParam<T, float> param;
             param.attention_score = qk_buf_;       // (batch_size, head_num, q_length, k_length)
             param.qk = qk_buf_float_;              // (batch_size, head_num, q_length, k_length)
@@ -268,7 +296,7 @@ int BertAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
             param.q_length = attention_seq_len_1;
             param.k_length = attention_seq_len_2;
             param.num_heads = mNumHeads;
-            param.qk_scale = qk_scale;
+            param.qk_scale = qk_scale_softmax;
             param.linear_bias_slopes = const_cast<T*>(linear_bias_slopes); // (head_num,), optional
             invokeMaskedSoftmax(param, stream);
         }
@@ -277,7 +305,21 @@ int BertAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
             mCublasWrapper->stridedBatchedGemm(CUBLAS_OP_T, CUBLAS_OP_N, attention_seq_len_2, attention_seq_len_1,
                 mHeadSize, k_buf_2_, mHeadSize, attention_seq_len_2 * mHeadSize, q_buf_2_, mHeadSize,
                 attention_seq_len_1 * mHeadSize, qk_buf_, attention_seq_len_2,
-                attention_seq_len_2 * attention_seq_len_1, request_batch_size * mNumHeads);
+                attention_seq_len_2 * attention_seq_len_1, request_batch_size * mNumHeads, qk_scale_gemm,
+                0.0f); // alpha, beta
+
+            // add relative position bias
+            if (mRelativeAttention)
+            {
+                // add rel pos bias
+                // QK is (batch_size, local_head_num, q_length, k_length), rel pos bias is (1, local_head_num,
+                // max_output_len + 1, max_output_len + 1). broadcast along 1st dim. max_seq_len is already
+                // max_output_len + 1. In implicit mode, relative_attention_bias is rel attn table
+                // [num_heads, num_buckets], with necessary params (max_distance, num_buckets) passed at the end
+                invokeAddRelativeAttentionBiasUnaligned(qk_buf_, relative_attn_table, request_batch_size, mNumHeads,
+                    attention_seq_len_1, attention_seq_len_2, stream, mMaxDistance > 0, inputDesc[2].dims.d[1],
+                    mMaxDistance, true /* bidirectional */);
+            }
 
             MaskedSoftmaxParam<T, T> param;
             param.attention_score = qk_buf_;       // (batch_size, head_num, q_length, k_length)
@@ -287,7 +329,7 @@ int BertAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
             param.q_length = attention_seq_len_1;
             param.k_length = attention_seq_len_2;
             param.num_heads = mNumHeads;
-            param.qk_scale = qk_scale;
+            param.qk_scale = qk_scale_softmax;
             param.linear_bias_slopes = const_cast<T*>(linear_bias_slopes); // (head_num,), optional
             invokeMaskedSoftmax(param, stream);
         }
@@ -383,7 +425,7 @@ void BertAttentionPlugin::destroy() noexcept
 size_t BertAttentionPlugin::getSerializationSize() const noexcept
 {
     return sizeof(mNumHeads) + sizeof(mHeadSize) + sizeof(mQScaling) + sizeof(mQKHalfAccum) + sizeof(mEnableContextFMHA)
-        + sizeof(mFMHAForceFP32Acc) + sizeof(mType);
+        + sizeof(mFMHAForceFP32Acc) + sizeof(mType) + sizeof(mRelativeAttention) + sizeof(mMaxDistance);
 }
 
 void BertAttentionPlugin::serialize(void* buffer) const noexcept
@@ -396,6 +438,8 @@ void BertAttentionPlugin::serialize(void* buffer) const noexcept
     write(d, mEnableContextFMHA);
     write(d, mFMHAForceFP32Acc);
     write(d, mType);
+    write(d, mRelativeAttention);
+    write(d, mMaxDistance);
     assert(d == a + getSerializationSize());
 }
 
@@ -413,6 +457,8 @@ BertAttentionPluginCreator::BertAttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("enable_qk_half_accum", nullptr, PluginFieldType::kINT8, 0));
     mPluginAttributes.emplace_back(PluginField("context_fmha_type", nullptr, PluginFieldType::kINT8, 0));
     mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("do_relative_attention", nullptr, PluginFieldType::kINT8, 0));
+    mPluginAttributes.emplace_back(PluginField("max_distance", nullptr, PluginFieldType::kINT32, 0));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -440,6 +486,8 @@ IPluginV2* BertAttentionPluginCreator::createPlugin(const char* name, const Plug
     bool qk_half_accum;
     float q_scaling;
     nvinfer1::DataType type;
+    bool do_relative_attention;
+    int max_distance;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
@@ -474,10 +522,21 @@ IPluginV2* BertAttentionPluginCreator::createPlugin(const char* name, const Plug
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             type = static_cast<nvinfer1::DataType>(*(static_cast<const nvinfer1::DataType*>(fields[i].data)));
         }
+        else if (!strcmp(attrName, "do_relative_attention"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
+            do_relative_attention = static_cast<bool>(*(static_cast<const int8_t*>(fields[i].data)));
+        }
+        else if (!strcmp(attrName, "max_distance"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            max_distance = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
+        }
     }
     try
     {
-        auto* obj = new BertAttentionPlugin(num_heads, head_size, q_scaling, qk_half_accum, context_fmha_type, type);
+        auto* obj = new BertAttentionPlugin(num_heads, head_size, q_scaling, qk_half_accum, context_fmha_type, type,
+            do_relative_attention, max_distance);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

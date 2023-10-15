@@ -6,11 +6,9 @@ FROM ${BASE_IMAGE}:${BASE_TAG} as base
 
 # `BASH_ENV` is only used for non-interactive bash.
 ENV BASH_ENV="/tmp/bash_env"
-ENV BUILD_TORCH_FROM_SOURCE=${BUILD_TORCH_FROM_SOURCE}
 SHELL ["/bin/bash", "-c"]
 
 FROM base as devel
-ARG BUILD_TORCH_FROM_SOURCE=0
 
 COPY docker/common/install_base.sh install_base.sh
 RUN bash ./install_base.sh && rm install_base.sh
@@ -31,9 +29,10 @@ ENV LD_LIBRARY_PATH=/usr/local/tensorrt/lib:${LD_LIBRARY_PATH}
 COPY docker/common/install_polygraphy.sh install_polygraphy.sh
 RUN bash ./install_polygraphy.sh && rm install_polygraphy.sh
 
-# Install PyTorch from source (optional)
+# Install PyTorch
+ARG TORCH_INSTALL_TYPE="skip"
 COPY docker/common/install_pytorch.sh install_pytorch.sh
-RUN bash ./install_pytorch.sh $BUILD_TORCH_FROM_SOURCE && rm install_pytorch.sh
+RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh
 
 FROM devel as wheel
 WORKDIR /src/tensorrt_llm

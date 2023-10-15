@@ -126,8 +126,11 @@ struct Multihead_attention_params_base
     // The 1.f / sqrt(Dh). Computed on the host.
     float inv_sqrt_dh = 0.0f;
 
+    // If relative position embedding is used
     const T* relative_attention_bias = nullptr;
     int relative_attention_bias_stride = 0;
+    int max_distance = 0;
+
     // The slope per head of linear position bias to attention score (H).
     const T* linear_bias_slopes = nullptr;
 
@@ -164,11 +167,19 @@ struct Multihead_attention_params_base
     float* partial_max = nullptr;
     // threadblock counter to identify the complete of partial attention computations
     int* block_counter = nullptr;
+
+    const int* memory_length_per_sample = nullptr;
 };
 
+template <typename T, bool USE_CROSS_ATTENTION = false>
+struct Multihead_attention_params;
+
+// self-attention params
 template <typename T>
-struct Multihead_attention_params : public Multihead_attention_params_base<T>
+struct Multihead_attention_params<T, false> : public Multihead_attention_params_base<T>
 {
+    static constexpr bool DO_CROSS_ATTENTION = false;
+
     int max_decoder_seq_len = 0;
 
     // allows to exit attention early
@@ -181,27 +192,45 @@ struct Multihead_attention_params : public Multihead_attention_params_base<T>
     const int* input_lengths = nullptr;
 };
 template <class T>
-using Masked_multihead_attention_params = Multihead_attention_params<T>;
+using Masked_multihead_attention_params = Multihead_attention_params<T, false>;
+
+// cross-attention params
+template <typename T>
+struct Multihead_attention_params<T, true> : public Multihead_attention_params_base<T>
+{
+    static constexpr bool DO_CROSS_ATTENTION = true;
+
+    int max_decoder_seq_len = 0;
+
+    // allows to exit attention early
+    bool* finished = nullptr;
+
+    // required in case of masked attention with different length
+    const int* length_per_sample = nullptr;
+
+    // input lengths to identify the paddings (i.e. input seq < padding < new generated seq).
+    const int* input_lengths = nullptr;
+};
+template <class T>
+using Cross_multihead_attention_params = Multihead_attention_params<T, true>;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void masked_multihead_attention(const Masked_multihead_attention_params<float>& params, const KVBlockArray& block_array,
-    const cudaStream_t& stream);
-void masked_multihead_attention(const Masked_multihead_attention_params<uint16_t>& params,
-    const KVBlockArray& block_array, const cudaStream_t& stream);
+#define DECLARE_MMHA_NORMAL_AND_PAGED(T)                                                                               \
+    void masked_multihead_attention(const Masked_multihead_attention_params<T>& params,                                \
+        const KVBlockArray& block_array, const cudaStream_t& stream);                                                  \
+    void masked_multihead_attention(const Masked_multihead_attention_params<T>& params,                                \
+        const KVLinearBuffer& kv_cache_buffer, const cudaStream_t& stream);                                            \
+    void masked_multihead_attention(const Cross_multihead_attention_params<T>& params,                                 \
+        const KVBlockArray& block_array, const cudaStream_t& stream);                                                  \
+    void masked_multihead_attention(const Cross_multihead_attention_params<T>& params,                                 \
+        const KVLinearBuffer& kv_cache_buffer, const cudaStream_t& stream);
+DECLARE_MMHA_NORMAL_AND_PAGED(float);
+DECLARE_MMHA_NORMAL_AND_PAGED(uint16_t);
 #ifdef ENABLE_BF16
-void masked_multihead_attention(const Masked_multihead_attention_params<__nv_bfloat16>& params,
-    const KVBlockArray& block_array, const cudaStream_t& stream);
+DECLARE_MMHA_NORMAL_AND_PAGED(__nv_bfloat16);
 #endif
-
-void masked_multihead_attention(const Masked_multihead_attention_params<float>& params,
-    const KVLinearBuffer& block_array, const cudaStream_t& stream);
-void masked_multihead_attention(const Masked_multihead_attention_params<uint16_t>& params,
-    const KVLinearBuffer& block_array, const cudaStream_t& stream);
-#ifdef ENABLE_BF16
-void masked_multihead_attention(const Masked_multihead_attention_params<__nv_bfloat16>& params,
-    const KVLinearBuffer& block_array, const cudaStream_t& stream);
-#endif
+#undef DECLARE_MMHA_NORMAL_AND_PAGED
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

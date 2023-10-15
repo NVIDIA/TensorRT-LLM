@@ -132,7 +132,8 @@ class RowLinear(Module):
                  bias=True,
                  dtype=None,
                  tp_group=None,
-                 tp_size=1):
+                 tp_size=1,
+                 instance_id: int = 0):
         super().__init__()
         self.in_features = in_features // tp_size
         self.out_features = out_features
@@ -148,15 +149,21 @@ class RowLinear(Module):
 
         self.tp_group = tp_group
         self.tp_size = tp_size
+        self.instance_id = instance_id
 
-    def multiply_reduce(self, x, weight, gemm_plugin, use_fp8=False):
+    def multiply_reduce(self,
+                        x,
+                        weight,
+                        gemm_plugin,
+                        use_fp8=False,
+                        workspace=None):
         if gemm_plugin:
             x = _gemm_plugin(x, weight, transb=True, use_fp8=use_fp8)
         else:
             x = matmul(x, weight, transb=True)
 
         if self.tp_size > 1 and self.tp_group is not None:
-            x = allreduce(x, self.tp_group)
+            x = allreduce(x, self.tp_group, workspace, self.instance_id)
 
         if self.bias is not None:
             if x.dtype != self.bias.value.dtype:
@@ -166,6 +173,8 @@ class RowLinear(Module):
 
         return x
 
-    def forward(self, x):
-        return self.multiply_reduce(x, self.weight.value,
-                                    default_net().plugin_config.gemm_plugin)
+    def forward(self, x, workspace=None):
+        return self.multiply_reduce(x,
+                                    self.weight.value,
+                                    default_net().plugin_config.gemm_plugin,
+                                    workspace=workspace)

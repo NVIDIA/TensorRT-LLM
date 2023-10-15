@@ -23,6 +23,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/runtime/gptDecoderBatch.h"
+#include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/ncclCommunicator.h"
 #include "tensorrt_llm/runtime/runtimeBuffers.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
@@ -34,6 +35,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
+#include <memory>
 
 using namespace tensorrt_llm::runtime;
 
@@ -168,6 +170,19 @@ void GptSession::createKvCacheManagers(SizeType batchSize, SizeType beamWidth, S
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
+void GptSession::createCustomAllReduceWorkspace(
+    SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxSequenceLength)
+{
+    setPeerAccess(mWorldConfig, true);
+
+    auto& manager = mRuntime->getBufferManager();
+    for (const auto& buffer : mBuffers)
+    {
+        buffer->createCustomAllReduceWorkspace(
+            maxBatchSize, maxBeamWidth, maxSequenceLength, mModelConfig.getHiddenSize(), mWorldConfig, manager);
+    }
+}
+
 void GptSession::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxSequenceLength, bool decoderPerRequest,
     std::optional<SizeType> maxTokensInPagedKvCache, std::optional<SizeType> numMicroBatches)
 {
@@ -205,6 +220,11 @@ void GptSession::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType ma
             mReceivedEvents.emplace_back();
     }
 
+    if (mWorldConfig.isTensorParallel() && mModelConfig.useCustomAllReduce())
+    {
+        createCustomAllReduceWorkspace(microBatchSize, maxBeamWidth, maxSequenceLength);
+    }
+
     // we don't know maxInputLength and maxNewTokens yet and ignore those for pre-allocation
     auto const generationConfig
         = RuntimeBuffers::GenerationConfig{microBatchSize, maxBeamWidth, 0, 0, maxSequenceLength};
@@ -232,7 +252,7 @@ void GptSession::generateSingleBatch(
     TLLM_CHECK_WITH_INFO(buffers.allocated, "Buffers not allocated, please call setup first!");
     buffers.initContextLengths(inputLengths, manager);
     auto const generationConfig = RuntimeBuffers::GenerationConfig::fromInput(*inputs.ids, *buffers.contextLengthsHost,
-        inputs.packed, samplingConfig.beamWidth, mDecoderMaxSequenceLength, inputs.maxNewTokens, manager);
+        inputs.packed, samplingConfig.beamWidth, mDecoderMaxSequenceLength, inputs.maxNewTokens);
 
     auto const batchSize = generationConfig.batchSize;
     auto const beamWidth = generationConfig.beamWidth;
@@ -507,7 +527,7 @@ void GptSession::generateMultiBatch(
         buffers.initContextLengths(microBatchInputs.lengths, manager);
         generationConfigs.emplace_back(RuntimeBuffers::GenerationConfig::fromInput(*microBatchInputs.ids,
             *buffers.contextLengthsHost, microBatchInputs.packed, samplingConfig.beamWidth, mDecoderMaxSequenceLength,
-            microBatchInputs.maxNewTokens, manager));
+            microBatchInputs.maxNewTokens));
         auto const& generationConfig = generationConfigs.back();
 
         auto const beamWidth = generationConfig.beamWidth;

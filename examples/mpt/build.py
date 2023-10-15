@@ -224,6 +224,11 @@ def parse_arguments(args):
                         default=64,
                         help='Number of tokens per block in paged KV cache')
     parser.add_argument(
+        '--max_num_tokens',
+        type=int,
+        default=None,
+        help='Define the max number of tokens supported by the engine')
+    parser.add_argument(
         '--max_prompt_embedding_table_size',
         type=int,
         default=0,
@@ -361,6 +366,9 @@ def parse_arguments(args):
 
     args.position_embedding_type = PositionEmbeddingType[
         args.position_embedding_type]
+
+    if args.max_num_tokens is not None:
+        assert args.enable_context_fmha
 
     return args
 
@@ -505,6 +513,7 @@ def build_rank_engine(builder: Builder,
             args.max_output_len,
             True,
             args.max_beam_width,
+            max_num_tokens=args.max_num_tokens,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size)
         tensorrt_llm_gpt(*inputs)
 
@@ -552,6 +561,7 @@ def build(rank, args):
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
+            max_num_tokens=args.max_num_tokens,
             int8=int8_trt_flag,
             opt_level=args.builder_opt,
             multi_query_mode=args.multi_query_mode,

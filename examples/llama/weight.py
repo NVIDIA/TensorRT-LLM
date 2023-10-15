@@ -89,12 +89,12 @@ def get_scaling_factors(
     }
 
     for layer in range(num_layers):
-        scaling_factor['qkv_act'].append(min(
+        scaling_factor['qkv_act'].append(max(
             weight_dict[f'_np:layers:{layer}:attention:qkv:q:activation_scaling_factor'].item(),
             weight_dict[f'_np:layers:{layer}:attention:qkv:k:activation_scaling_factor'].item(),
             weight_dict[f'_np:layers:{layer}:attention:qkv:v:activation_scaling_factor'].item()
             ))
-        scaling_factor['qkv_weights'].append(min(
+        scaling_factor['qkv_weights'].append(max(
             weight_dict[f'_np:layers:{layer}:attention:qkv:q:weights_scaling_factor'].item(),
             weight_dict[f'_np:layers:{layer}:attention:qkv:k:weights_scaling_factor'].item(),
             weight_dict[f'_np:layers:{layer}:attention:qkv:v:weights_scaling_factor'].item()
@@ -106,13 +106,14 @@ def get_scaling_factors(
         scaling_factor['dense_weights'].append(weight_dict[f'_np:layers:{layer}:attention:dense:weights_scaling_factor'].item())
         scaling_factor['fc_act'].append(weight_dict[f'_np:layers:{layer}:mlp:fc:activation_scaling_factor'].item())
         scaling_factor['fc_weights'].append(weight_dict[f'_np:layers:{layer}:mlp:fc:weights_scaling_factor'].item())
-        scaling_factor['fc_act'].append(weight_dict[f'_np:layers:{layer}:mlp:fc:activation_scaling_factor'].item())
-        scaling_factor['fc_weights'].append(weight_dict[f'_np:layers:{layer}:mlp:fc:weights_scaling_factor'].item())
         scaling_factor['gate_act'].append(weight_dict[f'_np:layers:{layer}:mlp:gate:activation_scaling_factor'].item())
         scaling_factor['gate_weights'].append(weight_dict[f'_np:layers:{layer}:mlp:gate:weights_scaling_factor'].item())
         scaling_factor['proj_act'].append(weight_dict[f'_np:layers:{layer}:mlp:proj:activation_scaling_factor'].item())
         scaling_factor['proj_weights'].append(weight_dict[f'_np:layers:{layer}:mlp:proj:weights_scaling_factor'].item())
     # yapf: enable
+    for k, v in scaling_factor.items():
+        assert len(v) == num_layers, \
+        f'Expect scaling factor {k} of length {num_layers}, got {len(v)}'
 
     return scaling_factor
 
@@ -165,11 +166,12 @@ def parse_ft_config(ini_file):
     vocab_size = gpt_config.getint('llama', 'vocab_size')
     hidden_act = gpt_config.get('llama', 'hidden_act')
     inter_size = gpt_config.getint('llama', 'intermediate_size', fallback=None)
+    n_kv_head = gpt_config.getint('llama', 'num_key_value_heads', fallback=None)
 
     if inter_size is None:
         inter_size = 4 * n_embd
 
-    return n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size
+    return n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, n_kv_head
 
 
 def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
@@ -541,7 +543,7 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
 
     quant_mode = getattr(tensorrt_llm_llama, 'quant_mode', QuantMode(0))
 
-    n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size = parse_ft_config(
+    n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, n_kv_head = parse_ft_config(
         Path(dir_path) / 'config.ini')
     np_dtype = np.float16 if fp16 else np.float32
 
@@ -575,15 +577,26 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
         if per_tok_dyn:
             if pre_scale_weight is not None:
                 pre_scale_weight.value = np.array([1.0], dtype=np.float32)
-            t = fromfile(dir_path, f"{basename}scale_w_quant_orig.{suffix}",
-                         col_shape, np.float32)
+            if is_qkv and not per_channel:
+                t = fromfile(dir_path,
+                             f"{basename}scale_w_quant_orig.{rank}.{suffix}",
+                             col_shape, np.float32)
+            else:
+                t = fromfile(dir_path, f"{basename}scale_w_quant_orig.{suffix}",
+                             col_shape, np.float32)
             module.per_channel_scale.value = t
         else:
             t = fromfile(dir_path, f"{basename}scale_x_orig_quant.bin", [1],
                          np.float32)
             pre_scale_weight.value = t
-            t = fromfile(dir_path, f"{basename}scale_y_accum_quant.{suffix}",
-                         col_shape, np.float32)
+            if is_qkv:
+                t = fromfile(dir_path,
+                             f"{basename}scale_y_accum_quant.{rank}.{suffix}",
+                             col_shape, np.float32)
+            else:
+                t = fromfile(dir_path,
+                             f"{basename}scale_y_accum_quant.{suffix}",
+                             col_shape, np.float32)
             module.per_channel_scale.value = t
             t = fromfile(dir_path, f"{basename}scale_y_quant_orig.bin", [1, 1],
                          np.float32)
@@ -649,10 +662,11 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
               (mapping.pp_rank + 1) * tensorrt_llm_llama.num_layers, 1))
 
     for i in layers_range:
-        c_attn_out_dim = (3 * n_embd //
-                          mapping.tp_size) if not multi_query_mode else (
-                              n_embd // mapping.tp_size +
-                              (n_embd // n_head) * 2)
+        n_groups = n_head // n_kv_head
+        c_attn_out_dim = (
+            3 * n_embd // mapping.tp_size) if not multi_query_mode else (
+                n_embd // mapping.tp_size +
+                (n_embd // n_head * n_groups) // mapping.tp_size * 2)
         idx = i - mapping.pp_rank * tensorrt_llm_llama.num_layers
         tensorrt_llm_llama.layers[idx].input_layernorm.weight.value = (fromfile(
             dir_path, 'model.layers.' + str(i) + '.input_layernorm.weight.bin'))
@@ -807,7 +821,6 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
             tensorrt_llm_llama.layers[idx].mlp.proj.weight.value = (
                 np.ascontiguousarray(np.transpose(t, [1, 0])))
 
-        assert use_int8_kv_cache
         if use_int8_kv_cache:
             t = fromfile(
                 dir_path, 'model.layers.' + str(i) +

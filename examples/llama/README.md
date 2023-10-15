@@ -151,7 +151,7 @@ and then export the scaling factors needed for INT8 KV cache inference.
 Example:
 
 ```bash
-python3 hf_llama_convert.py -i /llama-models/llama-7b-hf -o /llama/smooth_llama_7B/int8_kv_cache/ --calibrate-kv-cache -t float16
+python3 hf_llama_convert.py -i /llama-models/llama-7b-hf -o /llama/smooth_llama_7B/int8_kv_cache/ --calibrate-kv-cache -t fp16
 ```
 
 [`build.py`](./build.py) add new options for the support of INT8 KV cache.

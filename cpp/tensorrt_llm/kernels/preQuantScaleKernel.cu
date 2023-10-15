@@ -60,19 +60,23 @@ void apply_per_channel_scale_kernel_launcher(
     int elems = rows * cols;
     if (elems < 2048 * 2048)
     {
-        apply_per_channel_scale_kernel_launcher_<T, 1, float4>(smoothed_act, act, per_channel_scale, rows, cols);
+        apply_per_channel_scale_kernel_launcher_<T, 1, float4>(
+            smoothed_act, act, per_channel_scale, rows, cols, stream);
     }
     else if (elems < 4096 * 4096)
     {
-        apply_per_channel_scale_kernel_launcher_<T, 4, float4>(smoothed_act, act, per_channel_scale, rows, cols);
+        apply_per_channel_scale_kernel_launcher_<T, 4, float4>(
+            smoothed_act, act, per_channel_scale, rows, cols, stream);
     }
     else if (elems < 8192 * 8192)
     {
-        apply_per_channel_scale_kernel_launcher_<T, 8, float4>(smoothed_act, act, per_channel_scale, rows, cols);
+        apply_per_channel_scale_kernel_launcher_<T, 8, float4>(
+            smoothed_act, act, per_channel_scale, rows, cols, stream);
     }
     else
     {
-        apply_per_channel_scale_kernel_launcher_<T, 16, float4>(smoothed_act, act, per_channel_scale, rows, cols);
+        apply_per_channel_scale_kernel_launcher_<T, 16, float4>(
+            smoothed_act, act, per_channel_scale, rows, cols, stream);
     }
 }
 

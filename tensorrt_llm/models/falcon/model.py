@@ -47,6 +47,7 @@ class FalconDecoderLayer(Module):
         layernorm_epsilon=1e-5,
         tp_group=None,
         tp_size=1,
+        tp_rank=0,
         layer_id=None,
     ):
         super().__init__()
@@ -63,7 +64,8 @@ class FalconDecoderLayer(Module):
                                          eps=layernorm_epsilon,
                                          dtype=dtype)
         if use_alibi:
-            position_embedding_type = PositionEmbeddingType.alibi
+            # Note falcon models will also scale alibi with inv_sqrt_Dh
+            position_embedding_type = PositionEmbeddingType.alibi_with_scale
         else:
             position_embedding_type = PositionEmbeddingType.rope_gpt_neox
 
@@ -78,9 +80,10 @@ class FalconDecoderLayer(Module):
             position_embedding_type=position_embedding_type,
             tp_group=tp_group,
             tp_size=tp_size,
+            tp_rank=tp_rank,
             use_int8_kv_cache=quant_mode.has_int8_kv_cache(),
-            scale_alibi_bias=True,
             quant_mode=quant_mode,
+            instance_id=2 * layer_id,
         )
 
         if mlp_hidden_size is None:
@@ -105,6 +108,7 @@ class FalconDecoderLayer(Module):
             tp_group=tp_group,
             tp_size=tp_size,
             quant_mode=quant_mode,
+            instance_id=2 * layer_id + 1,
         )
         if self.new_decoder_architecture or self.parallel_attn:
             self.post_layernorm = None
@@ -117,7 +121,8 @@ class FalconDecoderLayer(Module):
                 attention_mask=None,
                 use_cache=False,
                 kv_cache_params=None,
-                attention_params=None):
+                attention_params=None,
+                all_reduce_workspace=None):
         assert isinstance(hidden_states, Tensor)
 
         residual = hidden_states
@@ -130,7 +135,8 @@ class FalconDecoderLayer(Module):
                                           attention_mask=attention_mask,
                                           use_cache=use_cache,
                                           kv_cache_params=kv_cache_params,
-                                          attention_params=attention_params)
+                                          attention_params=attention_params,
+                                          workspace=all_reduce_workspace)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -145,7 +151,7 @@ class FalconDecoderLayer(Module):
         else:
             hidden_states = mlp_ln_output
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, all_reduce_workspace)
 
         if self.new_decoder_architecture or self.parallel_attn:
             hidden_states = hidden_states + attention_output
@@ -220,6 +226,7 @@ class FalconModel(Module):
                 new_decoder_architecture=new_decoder_architecture,
                 tp_group=mapping.tp_group,
                 tp_size=mapping.tp_size,
+                tp_rank=mapping.tp_rank,
                 layer_id=i,
             ) for i in self.get_transformer_layers(self.mapping, num_layers)
         ])
@@ -234,7 +241,8 @@ class FalconModel(Module):
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
-                hidden_states=None):
+                hidden_states=None,
+                all_reduce_workspace=None):
 
         if kv_cache_params.past_key_value is None:
             kv_cache_params.past_key_value = tuple([None] * len(self.layers))
@@ -260,7 +268,8 @@ class FalconModel(Module):
                     host_past_key_value_lengths,
                     kv_cache_block_pointers=[pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
-                attention_params=attention_params)
+                attention_params=attention_params,
+                all_reduce_workspace=all_reduce_workspace)
 
             if use_cache:
                 presents.append(hidden_states[1])
@@ -339,15 +348,18 @@ class FalconForCausalLM(FalconModel, GenerationMixin):
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
-                hidden_states=None):
+                hidden_states=None,
+                all_reduce_workspace=None):
 
-        hidden_states = super().forward(input_ids=input_ids,
-                                        position_ids=position_ids,
-                                        use_cache=use_cache,
-                                        attention_mask=attention_mask,
-                                        kv_cache_params=kv_cache_params,
-                                        attention_params=attention_params,
-                                        hidden_states=hidden_states)
+        hidden_states = super().forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            use_cache=use_cache,
+            attention_mask=attention_mask,
+            kv_cache_params=kv_cache_params,
+            attention_params=attention_params,
+            hidden_states=hidden_states,
+            all_reduce_workspace=all_reduce_workspace)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -385,7 +397,8 @@ class FalconForCausalLM(FalconModel, GenerationMixin):
                        max_input_len: int,
                        max_new_tokens: int,
                        use_cache: bool,
-                       max_beam_width: int = 1):
+                       max_beam_width: int = 1,
+                       max_num_tokens: int = None):
         '''
 
         @brief: Prepare inputs Tensors for the model, the given sizes are used
@@ -403,6 +416,7 @@ class FalconForCausalLM(FalconModel, GenerationMixin):
         use_gemm_plugin = plugin_config.gemm_plugin
         paged_kv_cache = plugin_config.paged_kv_cache
         tokens_per_block = plugin_config.tokens_per_block
+        use_custom_all_reduce = plugin_config.use_custom_all_reduce
 
         model_inputs = self.prepare_basic_inputs(
             max_batch_size=max_batch_size,
@@ -416,12 +430,13 @@ class FalconForCausalLM(FalconModel, GenerationMixin):
             remove_input_padding=remove_input_padding,
             use_gpt_attention_plugin=use_gpt_attention_plugin,
             use_gemm_plugin=use_gemm_plugin,
+            use_custom_all_reduce=use_custom_all_reduce,
             paged_kv_cache=paged_kv_cache,
             tokens_per_block=tokens_per_block,
             dtype=self.dtype,
             num_heads=self.num_heads,
             mapping=self.mapping,
-        )
+            max_num_tokens=max_num_tokens)
 
         return (
             model_inputs['input_ids'],
@@ -443,4 +458,5 @@ class FalconForCausalLM(FalconModel, GenerationMixin):
                 max_context_length=max_input_len,
                 host_request_types=model_inputs['host_request_types']),
             model_inputs['hidden_states_input'],
+            model_inputs['all_reduce_workspace'],
         )

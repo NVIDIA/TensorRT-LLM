@@ -22,4 +22,4 @@ pre-commit
 einops
 parameterized
 graphviz
-pypiwin32
+pywin32

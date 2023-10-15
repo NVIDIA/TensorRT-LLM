@@ -238,8 +238,13 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
 
         return lm_logits
 
-    def prepare_inputs(self, max_batch_size, max_input_len, max_new_tokens,
-                       use_cache, max_beam_width):
+    def prepare_inputs(self,
+                       max_batch_size,
+                       max_input_len,
+                       max_new_tokens,
+                       use_cache,
+                       max_beam_width,
+                       max_num_tokens: int = None):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -270,7 +275,8 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
             use_gpt_attention_plugin=use_gpt_attention_plugin,
             use_gemm_plugin=use_gemm_plugin,
             paged_kv_cache=paged_kv_cache,
-            tokens_per_block=tokens_per_block)
+            tokens_per_block=tokens_per_block,
+            max_num_tokens=max_num_tokens)
 
         return (model_inputs['input_ids'], model_inputs['position_ids'], True,
                 model_inputs['last_token_ids'], model_inputs['attention_mask'],

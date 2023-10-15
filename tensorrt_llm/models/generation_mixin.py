@@ -42,6 +42,7 @@ class GenerationMixin:
                              remove_input_padding=False,
                              use_gpt_attention_plugin=False,
                              use_gemm_plugin=False,
+                             use_custom_all_reduce=False,
                              paged_kv_cache=False,
                              tokens_per_block=64,
                              gather_all_token_logits=False,
@@ -356,6 +357,19 @@ class GenerationMixin:
             ]),
         )
 
+        all_reduce_workspace = None
+        if use_custom_all_reduce and mapping.tp_size > 1:
+            # 3 (= buffer + signals_in + signals_out)
+            workspace_size = 3 * mapping.tp_size
+            all_reduce_workspace = Tensor(
+                name='all_reduce_workspace',
+                dtype=trt.int64,
+                shape=[workspace_size],
+                dim_range=OrderedDict([
+                    ('all_reduce_size', [workspace_size, workspace_size]
+                     if enable_two_optimization_profiles else [workspace_size])
+                ]))
+
         return {
             'input_ids': input_ids,
             'hidden_states_input': hidden_states,
@@ -369,5 +383,6 @@ class GenerationMixin:
             'kv_cache_block_pointers_list': kv_cache_block_pointers_list,
             'context_lengths': context_lengths,
             'host_context_lengths': host_context_lengths,
-            'host_request_types': host_request_types
+            'host_request_types': host_request_types,
+            'all_reduce_workspace': all_reduce_workspace,
         }
