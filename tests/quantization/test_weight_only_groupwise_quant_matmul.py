@@ -138,10 +138,10 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
 
         # Flags for indicating whether the corresponding inputs are applied in quant_algo
         BIAS = 1
-        ZER0 = 2
-        PRE_SCALE_QUANT = 4
+        ZERO = 2
+        PRE_QUANT_SCALE = 4
 
-        quant_algo = has_pre_quant * PRE_SCALE_QUANT + has_zero * ZER0 + has_bias * BIAS
+        quant_algo = has_pre_quant * PRE_QUANT_SCALE + has_zero * ZERO + has_bias * BIAS
 
         packer = torch.ops.fastertransformer.pack_int8_tensor_to_packed_int4
         preprocessor = torch.ops.fastertransformer.preprocess_weights_for_mixed_gemm

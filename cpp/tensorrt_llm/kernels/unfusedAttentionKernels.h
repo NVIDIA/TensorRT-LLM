@@ -116,5 +116,10 @@ void invokeApplyBiasRopeUpdateKVCache(T* QKV, KVCacheBuffer& kvTable, const T* q
     const int rotary_embedding_max_positions, const PositionEmbeddingType position_embedding_type, const float* scale,
     const int int8_mode, const KvCacheDataType cache_type, const float* kvScaleOrigQuant, cudaStream_t stream);
 
+template <typename T, typename BT>
+void invokeAddRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_attention_bias, const int batch_size,
+    const int head_num, const int seq_len, const int max_seq_len, cudaStream_t stream, bool implicit = false,
+    int num_buckets = 0, int max_distance = 0, bool bidirectional = true);
+
 } // namespace kernels
 } // namespace tensorrt_llm

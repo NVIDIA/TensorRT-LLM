@@ -18,20 +18,20 @@ import argparse as _arg
 import os as _os
 import pathlib as _pl
 import platform as _pf
-import subprocess as _sp
 import typing as _tp
 
 import hf_gpt_convert as _egc
 import torch.multiprocessing as _mp
+from build_engines_utils import run_command, wincopy
 
 import build as _egb  # isort:skip
 
 
-def build_engine(weigth_dir: _pl.Path, engine_dir: _pl.Path, world_size, *args):
+def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, world_size, *args):
     args = [
         '--log_level=error',
         '--model_dir',
-        str(weigth_dir),
+        str(weight_dir),
         '--output_dir',
         str(engine_dir),
         '--max_batch_size=256',
@@ -45,14 +45,8 @@ def build_engine(weigth_dir: _pl.Path, engine_dir: _pl.Path, world_size, *args):
     _egb.run_build(args)
 
 
-def run_command(command: _tp.Sequence[str], *, cwd=None, **kwargs) -> None:
-    print(f"Running: cd %s && %s" %
-          (str(cwd or _pl.Path.cwd()), " ".join(command)))
-    _sp.check_call(command, cwd=cwd, **kwargs)
-
-
 def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
-    # TODO(nkorobov) add support of Pipeline parallelism to GPT
+    # TODO add support of Pipeline parallelism to GPT
     tp_size = world_size
     pp_size = 1
 
@@ -89,11 +83,11 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
     model_file_name = "pytorch_model.bin"
     if model_cache:
         if _pf.system() == "Windows":
-            run_command([
-                "cmd", "/c", "copy",
-                str(_pl.Path(model_cache) / model_name / model_file_name), "."
-            ],
-                        cwd=hf_dir)
+            wincopy(source=str(
+                _pl.Path(model_cache) / model_name / model_file_name),
+                    dest=model_file_name,
+                    isdir=False,
+                    cwd=hf_dir)
         else:
             run_command([
                 "rsync", "-av",
@@ -152,7 +146,8 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
     build_engine(fp16_weight_dir_x_gpu,
                  engine_dir / 'fp16-plugin-packed-paged' / tp_pp_dir, tp_size,
                  '--dtype=float16', '--use_gpt_attention_plugin=float16',
-                 '--remove_input_padding', '--paged_kv_cache')
+                 '--remove_input_padding', '--paged_kv_cache',
+                 '--enable_context_fmha', '--max_num_tokens=10000')
 
     print("Done.")
 

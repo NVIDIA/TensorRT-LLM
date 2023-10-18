@@ -288,7 +288,7 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(T* QKV, KVCacheBuffer& kvTable, co
     const int rotary_embedding_max_positions, const PositionEmbeddingType position_embedding_type, const float* scale,
     const float* kvScaleOrigQuant, const int int8_mode, cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(int8_mode != 2, "w8a8 not yet implemented with RoPE"); // TODO(mseznec)
+    TLLM_CHECK_WITH_INFO(int8_mode != 2, "w8a8 not yet implemented with RoPE"); // TODO
     // To implement rotary embeddings, each thread processes two QKV elems:
     dim3 block((size_per_head / Vec_t<T>::size + 31) / 32 * 32);
     dim3 grid(token_num, head_num);

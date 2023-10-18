@@ -19,7 +19,7 @@ install_centos_requirements() {
 }
 
 install_tensorrt() {
-    TENSOR_RT_VERSION="9.1.0.3"
+    TENSOR_RT_VERSION="9.1.0.4"
     CUDA_VERSION="12.2"
 
     PY_VERSION=$(python -c 'import sys; print(".".join(map(str, sys.version_info[0:2])))')
@@ -31,8 +31,8 @@ install_tensorrt() {
         if [ "$ARCH" = "arm64" ];then ARCH="aarch64";fi
         if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
         if [ "$ARCH" = "x86_64" ];then DIR_NAME="x64-agnostic"; else DIR_NAME=${ARCH};fi
-        if [ "$ARCH" = "aarch64" ];then OS1="Ubuntu22_04" && OS2="Ubuntu-22.04"; else OS1="Linux" && OS2="Linux";fi
-        RELEASE_URL_TRT=http://cuda-repo.nvidia.com/release-candidates/Libraries/TensorRT/v9.1/${TENSOR_RT_VERSION}-04908a66/${CUDA_VERSION}-r535/${OS1}-${DIR_NAME}/tar/TensorRT-${TENSOR_RT_VERSION}.${OS2}.${ARCH}-gnu.cuda-${CUDA_VERSION}.tar.gz;
+        if [ "$ARCH" = "aarch64" ];then OS="ubuntu-22.04"; else OS="linux";fi
+        RELEASE_URL_TRT=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/secure/9.1.0/tars/tensorrt-${TENSOR_RT_VERSION}.${OS}.${ARCH}-gnu.cuda-${CUDA_VERSION}.tar.gz;
     fi
     wget --no-verbose ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
     tar -xf /tmp/TensorRT.tar -C /usr/local/

@@ -51,7 +51,8 @@ public:
         batch_scheduler::SchedulerPolicy schedulerPolicy, GetInferenceRequestsCallback getInferenceRequestsCb,
         SendResponseCallback sendResponseCb, PollStopSignalCallback pollStopSignalCb = nullptr,
         ReturnBatchManagerStatsCallback returnBatchManagerStatsCb = nullptr,
-        const TrtGptModelOptionalParams& optionalParams = TrtGptModelOptionalParams());
+        const TrtGptModelOptionalParams& optionalParams = TrtGptModelOptionalParams(),
+        std::optional<uint64_t> terminateReqId = std::nullopt);
 
     /* Wraps the user-provided callback for requests.
        Adds requests to request table.
@@ -85,6 +86,7 @@ private:
     SizeType mMaxInputLen;
     SizeType mMaxOutputLen;
     SizeType mMaxNumSequences;
+    std::optional<uint64_t> mTerminateReqId;
 
     // Iteration counter - incremented every iteration of the generation loop
     int64_t mIterationCounter;

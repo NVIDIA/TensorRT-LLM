@@ -124,7 +124,8 @@ def fused_attention(q, k, v, sm_scale, o_buf=None, l_buf=None, m_buf=None):
         BLOCK_M=BLOCK,
         BLOCK_N=BLOCK,
         BLOCK_DMODEL=Lk,
-        num_warps=num_warps
+        num_warps=num_warps,
+        num_stages=2,
     )
 
     return o

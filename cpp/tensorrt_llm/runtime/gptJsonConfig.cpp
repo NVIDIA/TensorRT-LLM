@@ -45,6 +45,27 @@ FieldType parseJsonFieldOr(Json const& json, std::string_view name, FieldType de
     return value;
 }
 
+template <typename FieldType>
+std::optional<FieldType> parseJsonFieldOptional(Json const& json, std::string_view name)
+{
+    std::optional<FieldType> value = std::nullopt;
+    try
+    {
+        value = json.at(name).template get<FieldType>();
+    }
+    catch (const nlohmann::json::out_of_range& e)
+    {
+        TLLM_LOG_WARNING(e.what());
+        TLLM_LOG_WARNING("Optional value for parameter %s will not be set.", std::string(name).c_str());
+    }
+    catch (const nlohmann::json::type_error& e)
+    {
+        TLLM_LOG_WARNING(e.what());
+        TLLM_LOG_WARNING("Optional value for parameter %s will not be set.", std::string(name).c_str());
+    }
+    return value;
+}
+
 template <typename InputType>
 GptJsonConfig parseJson(InputType&& i)
 {
@@ -73,11 +94,14 @@ GptJsonConfig parseJson(InputType&& i)
         TLLM_CHECK_WITH_INFO(false, tc::fmtstr("Model data type '%s' not supported", precision.c_str()));
 
     auto const quantMode = tc::QuantMode(parseJsonFieldOr(builderConfig, "quant_mode", tc::QuantMode::none().value()));
-    auto const numKvHeads
-        = parseJsonFieldOr(builderConfig, "num_kv_heads", numHeads * tensorParallelism) / tensorParallelism;
+    // TODO:
+    // Code crashes when numKvHeads <= 0. Clamping downwards to 1 prevents that, make sure this is best fix.
+    auto const numKvHeads = std::max(
+        parseJsonFieldOr(builderConfig, "num_kv_heads", numHeads * tensorParallelism) / tensorParallelism, 1);
     auto const maxBatchSize = parseJsonFieldOr(builderConfig, "max_batch_size", 0);
     auto const maxInputLen = parseJsonFieldOr(builderConfig, "max_input_len", 0);
     auto const maxOutputLen = parseJsonFieldOr(builderConfig, "max_output_len", 0);
+    auto const maxNumTokens = parseJsonFieldOptional<SizeType>(builderConfig, "max_num_tokens");
 
     auto const computeContextLogits = parseJsonFieldOr(builderConfig, "gather_all_token_logits", false);
 
@@ -87,11 +111,13 @@ GptJsonConfig parseJson(InputType&& i)
     auto const& gptAttentionPlugin = pluginConfig.at("gpt_attention_plugin");
     auto const useGptAttentionPlugin = !gptAttentionPlugin.is_boolean() || gptAttentionPlugin.template get<bool>();
     auto const removeInputPadding = pluginConfig.at("remove_input_padding").template get<bool>();
+    auto const useCustomAllReduce = pluginConfig.at("use_custom_all_reduce").template get<bool>();
 
     auto modelConfig = GptModelConfig{vocabSize, numLayers, numHeads, hiddenSize, dataType};
     modelConfig.useGptAttentionPlugin(useGptAttentionPlugin);
     modelConfig.usePackedInput(removeInputPadding);
     modelConfig.usePagedKvCache(pagedKvCache);
+    modelConfig.useCustomAllReduce(useCustomAllReduce);
     modelConfig.setTokensPerBlock(tokensPerBlock);
     modelConfig.setQuantMode(quantMode);
     modelConfig.setNbKvHeads(numKvHeads);
@@ -100,6 +126,12 @@ GptJsonConfig parseJson(InputType&& i)
     modelConfig.setMaxBatchSize(maxBatchSize);
     modelConfig.setMaxInputLen(maxInputLen);
     modelConfig.setMaxOutputLen(maxOutputLen);
+    modelConfig.setMaxNumTokens(maxNumTokens);
+
+    if (tc::strStartsWith(name, "chatglm"))
+    {
+        modelConfig.setModelVariant(GptModelConfig::ModelVariant::kGlm);
+    }
 
     return GptJsonConfig{name, precision, tensorParallelism, pipelineParallelism, modelConfig};
 }

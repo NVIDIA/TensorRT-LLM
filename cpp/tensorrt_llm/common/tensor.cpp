@@ -57,7 +57,7 @@ Tensor::Tensor(MemoryType _where, DataType _type, std::vector<size_t> const& _sh
 {
 }
 
-void Tensor::parseNpyIntro(FILE*& f_ptr, uint32_t& header_len, uint32_t& start_data)
+void ManagedTensor::parseNpyIntro(FILE*& f_ptr, uint32_t& header_len, uint32_t& start_data)
 {
     const char magic[]
         = "\x93"
@@ -95,7 +95,7 @@ void Tensor::parseNpyIntro(FILE*& f_ptr, uint32_t& header_len, uint32_t& start_d
     start_data = 8 + 2 * npy_major + header_len;
 }
 
-int Tensor::parseNpyHeader(FILE*& f_ptr, uint32_t header_len, DataType& type, std::vector<size_t>& shape)
+int ManagedTensor::parseNpyHeader(FILE*& f_ptr, uint32_t header_len, DataType& type, std::vector<size_t>& shape)
 {
     char* header_c = (char*) malloc(header_len * sizeof(char));
     size_t n_elems = fread((void*) header_c, sizeof(char), header_len, f_ptr);
@@ -111,7 +111,7 @@ int Tensor::parseNpyHeader(FILE*& f_ptr, uint32_t header_len, DataType& type, st
     start = header.find("'descr'") + 7;
     start = header.find("'", start);
     end = header.find("'", start + 1);
-    type = typeFromNumpyDesc(header.substr(start + 2, end - start - 2));
+    type = Tensor::typeFromNumpyDesc(header.substr(start + 2, end - start - 2));
 
     start = header.find("'fortran_order'") + 15;
     start = header.find(":", start);
@@ -141,7 +141,7 @@ int Tensor::parseNpyHeader(FILE*& f_ptr, uint32_t header_len, DataType& type, st
     return 0;
 }
 
-Tensor Tensor::loadNpy(const std::string& npy_file, const MemoryType where)
+ManagedTensor ManagedTensor::loadNpy(const std::string& npy_file, const MemoryType where)
 {
     DataType type;
     std::vector<size_t> shape;
@@ -156,20 +156,22 @@ Tensor Tensor::loadNpy(const std::string& npy_file, const MemoryType where)
     parseNpyHeader(f_ptr, header_len, type, shape);
 
     const size_t size = std::accumulate(shape.begin(), shape.end(), size_t{1}, std::multiplies<size_t>());
-    void* data_cpu = malloc(size * Tensor::getTypeSize(type));
-    void* data = data_cpu;
+    std::unique_ptr<void, std::function<void(void*)>> data_cpu{
+        malloc(size * Tensor::getTypeSize(type)), [](void* p) { free(p); }};
+    void* data = data_cpu.get();
 
-    size_t n_elems = fread(data_cpu, Tensor::getTypeSize(type), size, f_ptr);
+    size_t n_elems = fread(data_cpu.get(), Tensor::getTypeSize(type), size, f_ptr);
+    fclose(f_ptr);
     TLLM_CHECK_WITH_INFO(n_elems == size, "reading tensor failed");
     if (where == MEMORY_GPU)
     {
         cudaMalloc(&data, size * Tensor::getTypeSize(type));
-        cudaMemcpy(data, data_cpu, size * Tensor::getTypeSize(type), cudaMemcpyHostToDevice);
-        free(data_cpu);
+        std::unique_ptr<void, std::function<void(void*)>> data_gpu{data, [](void* p) { cudaFree(p); }};
+        cudaMemcpy(data, data_cpu.get(), size * Tensor::getTypeSize(type), cudaMemcpyHostToDevice);
+        return ManagedTensor(Tensor(where, type, shape, data), std::move(data_gpu));
     }
 
-    fclose(f_ptr);
-    return Tensor(where, type, shape, data);
+    return ManagedTensor(Tensor(where, type, shape, data), std::move(data_cpu));
 }
 
 size_t Tensor::size() const
@@ -419,57 +421,6 @@ std::string TensorMap::toString()
     return ss.str();
 }
 
-TensorMap TensorMap::fromNpyFolder(const std::string& base_folder)
-{
-#if !defined(_WIN32)
-    DIR* dir_p = opendir(base_folder.c_str());
-    TLLM_CHECK_WITH_INFO(dir_p != nullptr, fmtstr("Could not open folder %s. ", base_folder.c_str()));
-    struct dirent* dp;
-
-    TensorMap ret_tensor;
-    while ((dp = readdir(dir_p)) != nullptr)
-    {
-        std::string filename(dp->d_name);
-        size_t len = filename.length();
-        if (len < 4 || filename.compare(len - 4, 4, ".npy"))
-        {
-            continue;
-        }
-
-        size_t pos = filename.find('-');
-        TLLM_CHECK_WITH_INFO(pos != std::string::npos, fmtstr("Invalid filename: %s\n", filename.c_str()));
-
-        MemoryType where;
-        if (filename.compare(0, pos, "GPU") == 0)
-        {
-            where = MEMORY_GPU;
-        }
-        else if (filename.compare(0, pos, "CPU") == 0)
-        {
-            where = MEMORY_CPU;
-        }
-        else if (filename.compare(0, pos, "CPU_PINNED") == 0)
-        {
-            where = MEMORY_CPU_PINNED;
-        }
-        else
-        {
-            TLLM_CHECK_WITH_INFO(false, fmtstr("Invalid filename: %s\n", filename.c_str()));
-        }
-        std::string key = filename.substr(pos + 1, len - pos - 5);
-
-        ret_tensor.tensor_map_.insert({key, Tensor::loadNpy(base_folder + "/" + filename, where)});
-    }
-
-    closedir(dir_p);
-
-    return ret_tensor;
-#else
-    throw std::runtime_error("TensorMap::fromNpyFolder is not implemented on Windows.");
-    return {};
-#endif // !defined(_WIN32)
-}
-
 void TensorMap::saveNpy(const std::string& base_folder)
 {
 #if !defined(_WIN32)
@@ -485,6 +436,9 @@ void TensorMap::saveNpy(const std::string& base_folder)
     throw std::runtime_error("TensorMap::saveNpy is not implemented on Windows.");
 #endif // !defined(_WIN32)
 }
+
+ManagedTensor::~ManagedTensor() = default;
+ManagedTensor::ManagedTensor(ManagedTensor&&) = default;
 
 } // namespace common
 } // namespace tensorrt_llm

@@ -50,6 +50,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
               model_cache: _tp.Optional[str] = None,
               skip_gptj=False,
               skip_llama=False,
+              skip_chatglm6b=False,
               only_fp8=False,
               trt_root: _tp.Optional[str] = None) -> None:
     root_dir = find_root_dir()
@@ -136,6 +137,22 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
     else:
         _log.info("Skipping Lllama tests")
 
+    if not skip_chatglm6b:
+        build_chatglm6b_engines = [
+            python_exe,
+            str(scripts_dir / "build_chatglm6b_engines.py")
+        ]
+        run_command(build_chatglm6b_engines)
+
+        chatglm6b_env = {**_os.environ, "PYTHONPATH": "examples/chatglm6b"}
+        generate_expected_chatglm6b_output = [
+            python_exe,
+            str(scripts_dir / "generate_expected_chatglm6b_output.py")
+        ]  # only_fp8 is not supported by ChatGLM-6B now
+        run_command(generate_expected_chatglm6b_output, env=chatglm6b_env)
+    else:
+        _log.info("Skipping ChatGLM6B tests")
+
     build_dir = build_dir if build_dir.is_absolute() else root_dir / build_dir
 
     make_google_tests = [
@@ -151,6 +168,8 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
         excluded_tests.append(".*Gptj.*")
     if skip_llama:
         excluded_tests.append(".*Llama.*")
+    if skip_chatglm6b:
+        excluded_tests.append(".*Glm6.*")
     if only_fp8:
         ctest.extend(["-R", ".*FP8.*"])
     else:
@@ -234,6 +253,10 @@ if __name__ == "__main__":
     parser.add_argument("--skip_llama",
                         action="store_true",
                         help="Skip the tests for Llama")
+    parser.add_argument("--skip_chatglm6b",
+                        action="store_true",
+                        help="Skip the tests for ChatGLM6B")
+
     parser.add_argument(
         "--only_fp8",
         action="store_true",

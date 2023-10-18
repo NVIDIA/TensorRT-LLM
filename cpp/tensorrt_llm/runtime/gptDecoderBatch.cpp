@@ -290,7 +290,7 @@ GptDecoderBatch::TokenPtr GptDecoderBatch::forwardAsync(
     TLLM_CHECK(!srcCacheIndirection || srcCacheIndirection->getDataType() == TRTDataType<SizeType>::value);
     TLLM_CHECK(!tgtCacheIndirection || tgtCacheIndirection->getDataType() == TRTDataType<SizeType>::value);
 
-    // TODO(bhsueh) should remove this reshape and set shape to [batch_size, beam_width] outside
+    // TODO should remove this reshape and set shape to [batch_size, beam_width] outside
     TensorPtr sequenceLengths = ITensor::view(output.sequenceLengths);
     sequenceLengths->reshape(ITensor::makeShape({mActualBatchSize, maxBeamWidth}));
     TLLM_CHECK(sequenceLengths);
@@ -380,7 +380,7 @@ void GptDecoderBatch::forwardSync(decoder_batch::Token const& token)
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-// TODO (rkobus) call this at the end of forward if mFinished[i] changes from false to true?
+// TODO call this at the end of forward if mFinished[i] changes from false to true?
 CudaEvent GptDecoderBatch::postProcessRequest(SizeType batchIdx) const
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
@@ -390,7 +390,7 @@ CudaEvent GptDecoderBatch::postProcessRequest(SizeType batchIdx) const
     auto& dInput = *mDecodingInputs[batchIdx];
     auto& dOutput = *mDecodingOutputs[batchIdx];
 
-    // TODO (rkobus) can we do this inplace?
+    // TODO can we do this inplace?
     auto& outputIds = dOutput.ids;
     auto finalOutputIds = manager.gpu(outputIds->getShape(), outputIds->getDataType());
     IGptDecoder::gatherTree(*finalOutputIds, dOutput, dInput, manager);

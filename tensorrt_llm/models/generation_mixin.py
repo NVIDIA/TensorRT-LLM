@@ -22,6 +22,7 @@ from ..mapping import Mapping
 
 
 class GenerationMixin:
+    _use_prompt_tuning = False
 
     def get_transformer_layers(self, mapping, num_layers):
         layers_per_pipeline_stage = num_layers // mapping.pp_size
@@ -42,13 +43,15 @@ class GenerationMixin:
                              remove_input_padding=False,
                              use_gpt_attention_plugin=False,
                              use_gemm_plugin=False,
+                             use_custom_all_reduce=False,
                              paged_kv_cache=False,
                              tokens_per_block=64,
                              gather_all_token_logits=False,
                              dtype=None,
                              num_heads=None,
                              mapping=Mapping(),
-                             max_num_tokens=None):
+                             max_num_tokens=None,
+                             prompt_embedding_table_size=None):
 
         max_len = max_input_len + max_new_tokens
 
@@ -356,6 +359,71 @@ class GenerationMixin:
             ]),
         )
 
+        all_reduce_workspace = None
+        if use_custom_all_reduce and mapping.tp_size > 1:
+            # 3 (= buffer + signals_in + signals_out)
+            workspace_size = 3 * mapping.tp_size
+            all_reduce_workspace = Tensor(
+                name='all_reduce_workspace',
+                dtype=trt.int64,
+                shape=[workspace_size],
+                dim_range=OrderedDict([
+                    ('all_reduce_size', [workspace_size, workspace_size]
+                     if enable_two_optimization_profiles else [workspace_size])
+                ]))
+
+        prompt_embedding_table = None
+        tasks = None
+        prompt_vocab_size = None
+        if self._use_prompt_tuning:
+            hidden_size = num_heads * head_size
+            assert prompt_embedding_table_size is not None, "prompt_embedding_table_size cannot be None when self._use_prompt_tuning is True"
+            _p_embedding_range = [
+                1, prompt_embedding_table_size // 2, prompt_embedding_table_size
+            ]
+            if enable_two_optimization_profiles:
+                p_embedding_range = [_p_embedding_range, _p_embedding_range]
+            else:
+                p_embedding_range = [_p_embedding_range]
+
+            prompt_embedding_table = Tensor(
+                name='prompt_embedding_table',
+                dtype=dtype,
+                shape=[-1, hidden_size],
+                dim_range=OrderedDict([
+                    ('prompt_embedding_table_size', p_embedding_range),
+                    ('hidden_size', [hidden_size, hidden_size]
+                     if enable_two_optimization_profiles else [hidden_size]),
+                ]))
+            if remove_input_padding:
+                tasks = Tensor(
+                    name='tasks',
+                    dtype=trt.int32,
+                    shape=[1, -1],
+                    dim_range=OrderedDict([
+                        ('batch_size_fake',
+                         [1, 1] if enable_two_optimization_profiles else [1]),
+                        ('input_len_task', num_tokens_range),
+                    ]))
+            else:
+                tasks = Tensor(
+                    name='tasks',
+                    dtype=trt.int32,
+                    shape=[-1, 1],
+                    dim_range=OrderedDict([
+                        ('batch_size_beam_width', bb_range),
+                        ('broadcast_dim',
+                         [1, 1] if enable_two_optimization_profiles else [1]),
+                    ]))
+            prompt_vocab_size = Tensor(
+                name='prompt_vocab_size',
+                dtype=trt.int32,
+                shape=[1],
+                dim_range=OrderedDict([
+                    ('size',
+                     [1, 1] if enable_two_optimization_profiles else [1])
+                ]))
+
         return {
             'input_ids': input_ids,
             'hidden_states_input': hidden_states,
@@ -369,5 +437,9 @@ class GenerationMixin:
             'kv_cache_block_pointers_list': kv_cache_block_pointers_list,
             'context_lengths': context_lengths,
             'host_context_lengths': host_context_lengths,
-            'host_request_types': host_request_types
+            'host_request_types': host_request_types,
+            'prompt_embedding_table': prompt_embedding_table,
+            'tasks': tasks,
+            'prompt_vocab_size': prompt_vocab_size,
+            'all_reduce_workspace': all_reduce_workspace,
         }

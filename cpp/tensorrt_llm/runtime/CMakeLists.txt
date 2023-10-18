@@ -24,6 +24,7 @@ set(SRCS
     gptSession.cpp
     iBuffer.cpp
     iTensor.cpp
+    ipcUtils.cpp
     memoryCounters.cpp
     ncclCommunicator.cpp
     runtimeBuffers.cpp

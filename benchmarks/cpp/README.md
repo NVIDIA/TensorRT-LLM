@@ -9,6 +9,11 @@ multiple GPUs or multiple nodes with multiple GPUs.
 
 Please follow the [`installation document`](../../../README.md) to build TensorRT-LLM.
 
+Windows users: Follow the
+[`Windows installation document`](../../../windows/README.md)
+instead, and be sure to set DLL paths as specified in
+[Extra Steps for C++ Runtime Usage](../../../windows/README.md#extra-steps-for-c-runtime-usage).
+
 After that, you can build benchmarking source code for C++ runtime
 ```
 cd cpp/build

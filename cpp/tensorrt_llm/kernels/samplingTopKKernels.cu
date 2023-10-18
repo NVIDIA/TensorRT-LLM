@@ -304,10 +304,9 @@ __global__ void topk_stage2_sampling(const int* __restrict topk_tmp_id_buf, T* t
         {
             int seqlen = sequence_lengths[batch_id];
             finished[batch_id] = ids[batch_id][seqlen] == end_ids[batch_id];
-            if (!finished[batch_id])
-            {
-                sequence_lengths[batch_id] = seqlen + 1;
-            }
+            // Increase the seq_len even if the sample has finished.
+            // On the following iteration we check if the seqeunce has already finished and exit early
+            sequence_lengths[batch_id] = seqlen + 1;
         }
     }
 }

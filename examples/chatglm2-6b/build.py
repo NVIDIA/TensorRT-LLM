@@ -288,9 +288,7 @@ def build_rank_engine(builder: Builder,
         network.plugin_config.set_smooth_quant_gemm_plugin(dtype=args.dtype)
         network.plugin_config.set_layernorm_quantization_plugin(
             dtype=args.dtype)
-        # FIXME(nkorobov)
-        # See https://nvbugs/4164762
-        # See https://nvbugs/4174113
+        # FIXME
         network.plugin_config.set_quantize_tensor_plugin()
         network.plugin_config.set_quantize_per_token_plugin()
     elif args.use_weight_only:

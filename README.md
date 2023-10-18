@@ -1,28 +1,57 @@
-# TensorRT-LLM: A TensorRT toolbox for Large Language Models
+<div align="center">
+
+TensorRT-LLM
+===========================
+<h4> A TensorRT Toolbox for Large Language Models </h4>
+
+[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)]()
+[![python](https://img.shields.io/badge/python-3.10.12-green)](https://www.python.org/downloads/release/python-31012/)
+[![cuda](https://img.shields.io/badge/cuda-12.2-green)](https://developer.nvidia.com/cuda-downloads)
+[![trt](https://img.shields.io/badge/TRT-9.1-green)](https://developer.nvidia.com/tensorrt)
+[![version](https://img.shields.io/badge/release-0.5.0-green)](./setup.py)
+[![license](https://img.shields.io/badge/license-Apache%202-blue)](./LICENSE)
+
+[Architecture](./docs/source/architecture.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Results](./docs/source/performance.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](./examples/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentations](./docs/source/)
+
+---
+<div align="left">
+
 
 ## Table of Contents
 
-- [The TensorRT-LLM Overview](#the-tensorrt-llm-overview)
+- [TensorRT-LLM Overview](#tensorrt-llm-overview)
 - [Installation](#installation)
-- [Supported Models and Examples](#supported-models-and-examples)
+- [Quick Start](#quick-start)
+- [Support Matrix](#support-matrix)
+- [Performance](#performance)
+- [Advanced Topics](#advanced-topics)
+  - [Quantization](#quantization)
+  - [In-flight Batching](#in-flight-batching)
+  - [Attention](#attention)
+  - [Graph Rewriting](#graph-rewriting)
+  - [Benchmarking](#benchmarking)
 - [Troubleshooting](#troubleshooting)
-- [Release notes](#release-notes)
+- [Release Notes](#release-notes)
   - [Changelog](#changelog)
   - [Known issues](#known-issues)
 
-## The TensorRT-LLM Overview
+## TensorRT-LLM Overview
 
 TensorRT-LLM provides users with an easy-to-use Python API to define Large
 Language Models (LLMs) and build
 [TensorRT](https://developer.nvidia.com/tensorrt) engines that contain
 state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.
 TensorRT-LLM also contains components to create Python and C++ runtimes that
-execute those TensorRT engines. It also includes a backend for integration with
-the [NVIDIA Triton Inference
-Server](https://developer.nvidia.com/nvidia-triton-inference-server).  Models
-built with TensorRT-LLM can be executed on a wide range of configurations going
-from a single GPU to multiple nodes with multiple GPUs (using [Tensor
-Parallelism](https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/nlp/nemo_megatron/parallelisms.html#tensor-parallelism)).
+execute those TensorRT engines. It also includes a
+[backend](https://github.com/triton-inference-server/tensorrtllm_backend)
+for integration with the
+[NVIDIA Triton Inference Server](https://developer.nvidia.com/nvidia-triton-inference-server);
+a production-quality system to serve LLMs.  Models built with TensorRT-LLM can
+be executed on a wide range of configurations going from a single GPU to
+multiple nodes with multiple GPUs (using
+[Tensor Parallelism](https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/nlp/nemo_megatron/parallelisms.html#tensor-parallelism)
+and/or
+[Pipeline Parallelism](https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/nlp/nemo_megatron/parallelisms.html#pipeline-parallelism)).
 
 The Python API of TensorRT-LLM is architectured to look similar to the
 [PyTorch](https://pytorch.org) API. It provides users with a
@@ -33,17 +62,10 @@ block, a `MLP` or the entire `Transformer` layer. Model-specific components,
 like `GPTAttention` or `BertAttention`, can be found in the
 [model](./tensorrt_llm/model) module.
 
-TensorRT-LLM provides users with predefined models that can easily be modified
-and extended. The current version of TensorRT-LLM supports
-[BERT](https://huggingface.co/docs/transformers/model_doc/bert),
-[GPT](https://huggingface.co/docs/transformers/model_doc/openai-gpt),
-[NVIDIA GPT-2B](https://huggingface.co/nvidia/GPT-2B-001),
-[GPT-J](https://huggingface.co/docs/transformers/model_doc/gptj),
-[LLaMA](https://huggingface.co/docs/transformers/model_doc/llama),
-[OPT](https://huggingface.co/docs/transformers/model_doc/opt),
-[SantaCoder](https://huggingface.co/bigcode/santacoder)
-and
-[StarCoder](https://huggingface.co/bigcode/starcoder).
+TensorRT-LLM comes with several popular models pre-defined. They can easily be
+modified and extended to fit custom needs. See below for a list of supported
+[models](#Models).
+
 To maximize performance and reduce memory footprint, TensorRT-LLM allows the
 models to be executed using different quantization modes (see
 [`examples/gpt`](./examples/gpt) for concrete examples).  TensorRT-LLM supports
@@ -57,273 +79,229 @@ concepts used in TensorRT-LLM, we recommend you to read the following
 
 ## Installation
 
-TensorRT-LLM contains Python and C++ components, and must be compiled from
-source to be used.  TensorRT-LLM is dependent on the latest versions of
-TensorRT and [Polygraphy](https://github.com/NVIDIA/TensorRT/tree/main/tools/Polygraphy) which are distributed separately, and should be copied
-into this repository.
+*For Windows installation, see [`Windows/`](Windows/).*
 
-We recommend that you use a [Docker](https://www.docker.com) container to build
-and run TensorRT-LLM. Instructions to install an environment to run Docker
-containers for the NVIDIA platform can be found
-[here](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
+TensorRT-LLM must be built from source, instructions can be found
+[here](./docs/source/installation.md). An image of a Docker container with
+TensorRT-LLM and its Triton Inference Server Backend will be made available
+soon.
 
+The remaining commands in that document must be executed from the TensorRT-LLM
+container.
 
-Make sure you have fetched all the dependencies before compiling TensorRT-LLM:
+## Quick Start
 
-```bash
-git submodule update --init --recursive
-```
+To create a TensorRT engine for an existing model, there are 3 steps:
 
-### Docker Container
+1. Download pre-trained weights,
+2. Build a fully-optimized engine of the model,
+3. Deploy the engine.
 
-Use the following command to create a Docker image for development:
+The following sections show how to use TensorRT-LLM to run the
+[BLOOM-560m](https://huggingface.co/bigscience/bloom-560m) model.
 
-```bash
-make -C docker build
-```
+***0. In the BLOOM folder***
 
-This will create a docker image for development of TensorRT-LLM and tag it locally with `tensorrt_llm/devel:latest`.
-To run the container, use the following command:
+Inside the Docker container, you have to install the requirements:
 
 ```bash
-make -C docker run
+cd  examples/bloom
+pip install -r examples/bloom/requirements.txt
+git lfs install
 ```
 
-If you prefer to work with your own user account in that container instead of `root`, include the option `LOCAL_USER=1`
-in the command above like so:
+***1. Download the model weights from HuggingFace***
+
+From the BLOOM example folder, you must download the weights of the model.
 
 ```bash
-make -C docker run LOCAL_USER=1
+rm -rf ./bloom/560M
+mkdir -p ./bloom/560M && git clone https://huggingface.co/bigscience/bloom-560m ./bloom/560M
+
+```
+***2. Build the engine***
+
+```python
+# Single GPU on BLOOM 560M
+python build.py --model_dir ./bloom/560M/ \
+                --dtype float16 \
+                --use_gemm_plugin float16 \
+                --use_gpt_attention_plugin float16 \
+                --output_dir ./bloom/560M/trt_engines/fp16/1-gpu/
 ```
 
-#### Systems without GNU `make`
+See the BLOOM [example](examples/bloom) for more details and options regarding the `build.py` script.
 
-On systems without GNU `make` or shell support, you can build the Docker image for development as follows:
+***3. Run***
 
-```bash
-docker build --pull  \
-    --target devel \
-    --file docker/Dockerfile.multi \
-    --tag tensorrt_llm/devel:latest \
-    .
+The `summarize.py` script can be used to perform the summarization of articles
+from the CNN Daily dataset:
+
+```python
+python summarize.py --test_trt_llm \
+                    --hf_model_location ./bloom/560M/ \
+                    --data_type fp16 \
+                    --engine_dir ./bloom/560M/trt_engines/fp16/1-gpu/
 ```
 
-Then run the container by issuing the following command:
+More details about the script and how to run the BLOOM model can be found in
+the example [folder](examples/bloom). Many more [models](#models) than BLOOM
+are implemented in TensorRT-LLM. They can be found in the
+[examples](./examples/) directory.
 
-```bash
-docker run --rm -it \
-    --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 --gpus=all \
-    --volume ${PWD}:/code/tensorrt_llm \
-    --workdir /code/tensorrt_llm \
-    tensorrt_llm/devel:latest
-```
+## Support Matrix
 
-### Build From Source
+TensorRT-LLM optimizes the performance of a range of well-known models on
+NVIDIA GPUs. The following sections provide a list of supported GPU
+architectures as well as important features implemented in TensorRT-LLM.
 
-```bash
-# To build the TensorRT-LLM code.
-python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt
+### Devices
 
-# Deploy TensorRT-LLM in your environment.
-pip install ./build/tensorrt_llm*.whl
-```
+TensorRT-LLM is rigorously tested on the following GPUs:
 
-By default, `build_wheel.py` enables incremental builds. To clean the build
-directory, add the `--clean` option:
+* [H100](https://www.nvidia.com/en-us/data-center/h100/)
+* [L40S](https://www.nvidia.com/en-us/data-center/l40s/)
+* [A100](https://www.nvidia.com/en-us/data-center/a100/)/[A30](https://www.nvidia.com/en-us/data-center/products/a30-gpu/)
+* [V100](https://www.nvidia.com/en-us/data-center/v100/) (experimental)
 
-```bash
-python3 ./scripts/build_wheel.py --clean  --trt_root /usr/local/tensorrt
-```
+If a GPU is not listed above, it is important to note that TensorRT-LLM is
+expected to work on GPUs based on the Volta, Turing, Ampere, Hopper and Ada
+Lovelace architectures. Certain limitations may, however, apply.
 
-#### Fully automated release builds in Docker
+### Precision
 
-The steps of creating a Docker image for development, building the wheel and installing it inside the container can be
-executed in a single command:
+Various numerical precisions are supported in TensorRT-LLM. The support for
+some of those numerical features require specific architectures:
 
-```bash
-make -C docker release_build
-```
+|                              | FP32  | FP16  | BF16  | FP8  | INT8 | INT4 |
+| :--------------------------- | :---- | :---- | :---- | :--- | :--- | :--- |
+| Volta (SM70)                 | Y     | Y     | N     | N    | Y    | Y    |
+| Turing (SM75)                | Y     | Y     | N     | N    | Y    | Y    |
+| Ampere (SM80, SM86)          | Y     | Y     | Y     | N    | Y    | Y    |
+| Ada-Lovelace (SM89)          | Y     | Y     | Y     | Y    | Y    | Y    |
+| Hopper (SM90)                | Y     | Y     | Y     | Y    | Y    | Y    |
 
-You can optionally append `CUDA_ARCHS="<list of architectures in CMake format>"` to specify which architectures should
-be supported by the wheel. Once the image is built, run it in a Docker container with:
+In this release of TensorRT-LLM, the support for FP8 and quantized data types
+(INT8 or INT4) is not implemented for all the models. See the
+[precision](./docs/source/precision.md) document and the
+[examples](./examples/.) folder for additional details.
 
-```bash
-make -C docker release_run
-```
+### Key Features
 
-Append `LOCAL_USER=1` to this command for switching to your local user account instead of `root` inside the container.
-The examples of TensorRT-LLM are installed in directory `/app/tensorrt_llm/examples`.
+TensorRT-LLM contains examples that implement the following features.
 
-### Building for Specific CUDA Architectures
+* Multi-head Attention([MHA](https://arxiv.org/abs/1706.03762))
+* Multi-query Attention ([MQA](https://arxiv.org/abs/1911.02150))
+* Group-query Attention([GQA](https://arxiv.org/abs/2307.09288))
+* In-flight Batching
+* Paged KV Cache for the Attention
+* Tensor Parallelism
+* Pipeline Parallelism
+* INT4/INT8 Weight-Only Quantization (W4A16 & W8A16)
+* [SmoothQuant](https://arxiv.org/abs/2211.10438)
+* [GPTQ](https://arxiv.org/abs/2210.17323)
+* [AWQ](https://arxiv.org/abs/2306.00978)
+* [FP8](https://arxiv.org/abs/2209.05433)
+* Greedy-search
+* Beam-search
+* RoPE
 
-Specific CUDA architectures may be passed as an argument to
-[`build_wheel.py`](scripts/build_wheel.py). The script accepts a single
-argument taking a semicolon separated list of CUDA architecture specifications
-compatible with [CUDA_ARCHITECTURES in CMake].  For instance, to build for
-compute capabilities 8.0 and 8.6, call `build_wheel.py` like so:
+In this release of TensorRT-LLM, some of the features are not enabled for all
+the models listed in the [examples](examples/.) folder.
 
-```bash
-python3 ./scripts/build_wheel.py --cuda_architectures "80-real;86-real"
-```
+### Models
 
-### Building and Linking Against the C++ Runtime of TensorRT-LLM
+The list of supported models is:
 
-Running `build_wheel.py` will also compile the library containing the C++
-runtime of TensorRT-LLM. If Python support and `torch` modules are not
-required, the script provides the option `--cpp_only` which restricts the build
-to the C++ runtime only:
+* [Baichuan](examples/baichuan)
+* [Bert](examples/bert)
+* [Blip2](examples/blip2)
+* [BLOOM](examples/bloom)
+* [ChatGLM-6B](examples/chatglm6b)
+* [ChatGLM2-6B](examples/chatglm2-6b/)
+* [Falcon](examples/falcon)
+* [GPT](examples/gpt)
+* [GPT-J](examples/gptj)
+* [GPT-Nemo](examples/gpt)
+* [GPT-NeoX](examples/gptneox)
+* [LLaMA](examples/llama)
+* [LLaMA-v2](examples/llama)
+* [MPT](examples/mpt)
+* [OPT](examples/opt)
+* [SantaCoder](examples/gpt)
+* [StarCoder](examples/gpt)
 
-```bash
-python3 ./scripts/build_wheel.py --cuda_architectures "80-real;86-real" --cpp_only --clean
-```
 
-This is particularly useful to avoid linking problems which may be introduced
-by particular versions of `torch` related to the [dual ABI support of
-GCC](https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html). The
-option `--clean` will remove the build directory before building. The default
-build directory is `cpp/build`, which may be overridden using the option
-`--build_dir`. Run `build_wheel.py --help` for an overview of all supported
-options.
+## Performance
 
-Clients may choose to link against the shared or the static version of the
-library. These libraries can be found in the following locations:
+Please refer to the [performance](./docs/source/performance.md) page for
+performance numbers. That page contains measured numbers for four variants of
+popular models (GPT-J, LLAMA-7B, LLAMA-70B, Falcon-180B), measured on the H100,
+L40S and A100 GPU(s).
 
-```bash
-cpp/build/tensorrt_llm/libtensorrt_llm.so
-cpp/build/tensorrt_llm/libtensorrt_llm_static.a
-```
+## Advanced Topics
 
-In addition, one needs to link against the library containing the LLM plugins
-for TensorRT available here:
+### Quantization
 
-```bash
-cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so
-```
+This [document](./docs/source/precision.md) describes the different
+quantization methods implemented in TensorRT-LLM and contains a support matrix
+for the different models.
 
-Add the following directories to your project include paths
+### In-flight Batching
 
-```bash
-cpp
-cpp/include
-```
+TensorRT-LLM supports in-flight batching of requests (also known as continuous
+batching or iteration-level batching). It's a
+[technique](./docs/source/batch_manager.md) that aims at reducing wait
+times in queues, eliminating the need for padding requests and allowing for
+higher GPU utilization.
 
-Only header files contained in `cpp/include` are part of the supported API and
-may be directly included. Other headers contained under `cpp` should not be
-included directly since they might change in future versions.
+### Attention
 
-For examples of how to use the C++ runtime, see the unit tests in
-[gptSessionTest.cpp](cpp/tests/runtime/gptSessionTest.cpp) and the related
-[CMakeLists.txt](cpp/tests/CMakeLists.txt) file.
+TensorRT-LLM implements several variants of the Attention mechanism that
+appears in most the Large Language Models.  This
+[document](./docs/source/gpt_attention.md) summarizes those implementations and
+how they are optimized in TensorRT-LLM.
 
-## Supported Models and Examples
+### Graph Rewriting
 
-- [Bert](examples/bert)
-- [BLOOM](examples/bloom)
-- [ChatGLM-6B](examples/chatglm6b)
-- [ChatGLM2-6B](examples/chatglm2-6b/)
-- [Falcon](examples/falcon)
-- [GPT](examples/gpt)
-- [GPT-J](examples/gptj)
-- [GPT-NeoX](examples/gptneox)
-- [LLaMA](examples/llama)
-- [OpenAI Triton](examples/openai_triton)
-- [OPT](examples/opt)
-- [SantaCoder](examples/gpt)
-- [StarCoder](examples/gpt)
+TensorRT-LLM uses a declarative approach to define neural networks and contains
+techniques to optimize the underlying graph. For more details, please refer to
+[doc](./docs/source/graph-rewriting.md)
+
+### Benchmark
+
+TensorRT-LLM provides [C++](./benchmarks/cpp/README.md) and
+[Python](./benchmarks/python/README.md) tools to perform benchmarking. Note,
+however, that it is recommended to use the C++ version.
 
 ## Troubleshooting
 
-- It's recommended to add options `–shm-size=1g –ulimit memlock=-1` to the
+
+* It's recommended to add options `–shm-size=1g –ulimit memlock=-1` to the
   docker or nvidia-docker run command.  Otherwise you may see NCCL errors when
   running multiple GPU inferences. See
   https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting.html#errors
   for details.
 
-- If you encounter
-```text
-NVIDIA H100 PCIe with CUDA capability sm_90 is not compatible with the current PyTorch installation. The current PyTorch install supports CUDA capabilities sm_37 sm_50 sm_60 sm_70 sm_75 sm_80 sm_86.
-```
-
-when building engines, you need to install the preview version of PyTorch that
-corresponds to your CUDA version.  As an example, for CUDA 12.1, use:
-
-```bash
-pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu121
-```
-
-- When building models, you might encounter memory-related issues. Such as:
+* When building models, memory-related issues such as
 ```
 [09/23/2023-03:13:00] [TRT] [E] 9: GPTLMHeadModel/layers/0/attention/qkv/PLUGIN_V2_Gemm_0: could not find any supported formats consistent with input/output data types
 [09/23/2023-03:13:00] [TRT] [E] 9: [pluginV2Builder.cpp::reportPluginError::24] Error Code 9: Internal Error (GPTLMHeadModel/layers/0/attention/qkv/PLUGIN_V2_Gemm_0: could not find any supported formats consistent with input/output data types)
 ```
-You can reduce the memory pressure by lowering the maximum batch size, input and output lengths. Another option is to enable plugins, for example: `--use_gpt_attention_plugin`.
-
-- [CUDA_ARCHITECTURES in CMake]: https://cmake.org/cmake/help/latest/prop_tgt/CUDA_ARCHITECTURES.html#prop_tgt:CUDA_ARCHITECTURES
+may happen. One possible solution is to reduce the amount of memory needed by
+reducing the maximum batch size, input and output lengths. Another option is to
+enable plugins, for example: `--use_gpt_attention_plugin`.
 
 ## Release notes
 
-### Changelog
+  * TensorRT-LLM requires TensorRT 9.0.1.4 and 23.08 containers.
 
-**August 2023**
+### Change Log
 
-  - TensorRT-LLM requires TensorRT 9.0.1.4 and 23.07 containers,
-  - Support for Baichuan-13B, ChatGLM2, Falcon-40B,
-  - Support for GPTQ for GPT-NeoX and LLaMA (experimental),
-  - Support for AWQ for GPT-J (experimental),
-  - Revised GPT Attention plugin,
-    - The GPT Attention now supports in-flight batching,
-    - The In-flight Batching Attention plugin will be removed in the next release (kept for debugging purposes in that release),
-  - Support for Group-Query Attention (GQA)
-    - LLama 70B can now be run with 4 GPUs,
-  - ALiBi support in Multi-head Attention (context and generation),
-  - Optimization of the MHA/MQA/GQA CUDA kernel (generation),
-  - Enhancements and bug fixes for the beam-search implementation,
-  - Support for "no_repeat_ngram_size" parameters,
-  - Bug fixes for the "bad/stop words" features,
-  - Embeddings can now be splitted along the hidden dimension,
-  - Improvements to the in-flight batching feature and paged K/V cache manager (C++),
-    - Included in the C++ Triton backend,
-  - Multi-GPU support in the Triton backend,
-  - Early-stopping support in the Triton backend,
-  - First implementation of a graph rewriting feature (to be updated in the next release).
+  * TensorRT-LLM v0.5.0 is the first public release.
 
-**July 2023**
+### Known Issues
 
-  - TensorRT-LLM requires TensorRT 9.0,
-  - Support for BLOOM, ChatGLM 6B, GPT-NeoX, LLaMA v2,
-  - Support for BF16 and FP8 models,
-  - Support for in-flight batching,
-  - Support for a new C++ Triton Backend,
-  - Refactoring of the KV cache to support paging,
-    - The KV cache is now decomposed into blocks,
-    - The layout of the K cache has changed to `[batch_size, num_heads, seq_length, dim_per_head]`,
-  - Support for multi-GPU embeddings,
-  - Support for embedding sharing (input embedding and LM head),
-  - New example that shows how to integrate an OpenAI Triton kernel into TensorRT-LLM,
-  - Improved documentation (Docstrings in `functional.py` and documentation in `docs`)
+### Report Issues
 
-**June 2023**
-
-  - Support Nemo-GPT Next, SantaCoder, StarCoder in FP16,
-  - Support for a new C++ Runtime (with streaming support),
-  - Support for beam-search,
-  - Support for Multiquery Attention (MQA),
-  - Support for RoPE,
-  - Support for INT8 KV Cache,
-  - Support INT4 weight-only (with GPT example), but the weight-only kernels will not be optimal on hopper
-
-**May 2023**
-
-  - **The initial release of TensorRT-LLM**
-  - Support GPT, BERT, OPT, LLaMA in FP16,
-  - Support single-node multi-GPU GPT, OPT, BERT, LLaMA FP16 using Tensor parallelism,
-  - Support Triton Inference Server with a Python backend,
-  - Support sampling features, including top-k, top-p, temperature, and sampling penalty,
-  - Attention support
-   - Optimized Flash-Attention-based Multihead Attention for Ampere, Ada and Hopper architectures,
-   - Multi-Query Attention (MQA),
-   - ALiBi in Multihead-Attention,
-  - Support SmoothQuant INT8 (with GPT example),
-  - Support INT8 weight-only (with GPT example), but the weight-only kernels will not be optimal on hopper
-
-### Known issues
+You can use GitHub issues to report issues with TensorRT-LLM.

@@ -20,7 +20,6 @@ import sys
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-import nvtx
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -328,14 +327,10 @@ def attention_fn(
         attention_probs = self.scale_mask_softmax(attention_scores,
                                                   attention_mask.contiguous())
     else:
-        # wili, edit the mask part to export ONNX with both context and generation phase
-        attention_scores.masked_fill_(attention_mask, -10000.0)
-        # original code, useless
-        '''
         if not (attention_mask == 0).all():
             # if auto-regressive, skip
             attention_scores.masked_fill_(attention_mask, -10000.0)
-        '''
+
         dtype = attention_scores.dtype
         attention_scores = attention_scores.float()
         attention_scores = attention_scores * query_key_layer_scaling_coeff
@@ -1257,64 +1252,28 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        with nvtx.annotate("TRAN", color="green"):  # for NSight-Systems
-
-            if attention_mask is None:
-                attention_mask = torch.zeros(
-                    1, 1, 1, past_key_values[0][0].shape[0] + 1).bool().cuda()
-
-            transformer_outputs = self.transformer(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
+        transformer_outputs = self.transformer(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
 
         hidden_states = transformer_outputs[0]
 
-        with nvtx.annotate("LM", color="blue"):  # for NSight-Systems
-            lm_logits = self.lm_head(hidden_states).permute(1, 0,
-                                                            2).contiguous()
+        lm_logits = self.lm_head(hidden_states).permute(1, 0, 2).contiguous()
 
-            if not os.path.exists("lm.onnx"):
-                print("Export LM")
-
-                if os.getenv('EXPORT_FP16_ONNX') == '1':
-                    print("Export FP16 ONNX")
-                else:
-                    self.lm_head.float()
-                    hidden_states = hidden_states.float()
-                torch.onnx.export( \
-                    self.lm_head,
-                    hidden_states,
-                    "lm.onnx",
-                    export_params=True,
-                    opset_version=17,
-                    do_constant_folding=True,
-                    input_names=["inputX"],
-                    dynamic_axes={'inputX':{0:'L', 1:'B'}}
-                    )
-
-                from copy import deepcopy
-
-                import numpy as np
-                import onnx
-                import onnx_graphsurgeon as gs
-                onnxModel = onnx.load("lm.onnx", load_external_data=False)
-                onnx.load_external_data_for_model(onnxModel, ".")
-                graphLM = gs.import_onnx(onnxModel)
-                weight = deepcopy(graphLM.nodes[0].inputs[1].values.astype(
-                    np.float32).reshape(4096, 130528).transpose(1, 0))
-
-                np.save("lm.npy", weight)
-                os.system("rm -rv lm.onnx")
-                print("Finish exporting weight of LM!")
-                exit()
+        print("Export LM")
+        import numpy as np
+        weight = self.lm_head.weight.detach().cpu().numpy()
+        np.save("lm.npy", weight)
+        print("Finish exporting weight of LM")
+        exit()
 
         loss = None
         if labels is not None:
@@ -1412,12 +1371,6 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                     i, old_query, response)
             prompt += "[Round {}]\n问：{}\n答：".format(len(history), query)
         inputs = tokenizer([prompt], return_tensors="pt")
-        # wili, for BatchSzie > 1
-        if False:
-            inputs['input_ids'] = torch.tile(inputs['input_ids'], [2, 1])
-            inputs['input_ids'][1, 1] = 74874
-            inputs['input_ids'][1, 2] = 130001
-            inputs['input_ids'][1, 3:] = 130004
 
         inputs = inputs.to(self.device)
         outputs = self.generate(**inputs, **gen_kwargs)

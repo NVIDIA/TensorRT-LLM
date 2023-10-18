@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/mpiUtils.h"
+#include "mpi.h"
 
 namespace tensorrt_llm
 {
@@ -108,6 +109,13 @@ void barrier()
     MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
 }
 
+std::shared_ptr<MpiRequest> bcast_async(void* buffer, size_t size, MpiType dtype, int root, MpiComm comm)
+{
+    std::shared_ptr<MpiRequest> r = std::make_shared<MpiRequest>();
+    MPICHECK(MPI_Ibcast(buffer, size, getMpiDtype(dtype), root, comm.group, &r->mRequest));
+    return r;
+}
+
 void bcast(void* buffer, size_t size, MpiType dtype, int root, MpiComm comm)
 {
     MPICHECK(MPI_Bcast(buffer, size, getMpiDtype(dtype), root, comm.group));
@@ -136,6 +144,11 @@ void comm_split(MpiComm comm, int color, int key, MpiComm* newcomm)
 void allreduce(const void* sendbuf, void* recvbuf, int count, MpiType dtype, MpiOp op, MpiComm comm)
 {
     MPICHECK(MPI_Allreduce(sendbuf, recvbuf, count, getMpiDtype(dtype), getMpiOp(op), comm.group));
+}
+
+void allgather(const void* sendbuf, void* recvbuf, int count, MpiType dtype, MpiComm comm)
+{
+    MPICHECK(MPI_Allgather(sendbuf, count, getMpiDtype(dtype), recvbuf, count, getMpiDtype(dtype), comm.group));
 }
 
 } // namespace mpi

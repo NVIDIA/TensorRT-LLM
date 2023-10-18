@@ -58,9 +58,6 @@ class Embedding(Module):
                 self.num_embeddings / self.tp_size), self.embedding_dim),
                                     dtype=dtype)
 
-        self.tp_size = tp_size
-        self.tp_group = tp_group
-
     def forward(self, x):
         return embedding(x,
                          self.weight.value,

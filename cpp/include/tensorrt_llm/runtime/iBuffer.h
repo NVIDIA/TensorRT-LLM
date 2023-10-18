@@ -66,7 +66,7 @@ struct MemoryTypeString<MemoryType::kPINNED>
     static auto constexpr value = "PINNED";
 };
 
-//! \brief For converting a C++ data type to a TensorRT data type.
+//! \brief For converting a TensorRT data type to a C++ data type.
 template <nvinfer1::DataType kDataType, bool kIsUnsigned = false, bool kIsPointer = false>
 struct CppDataType
 {

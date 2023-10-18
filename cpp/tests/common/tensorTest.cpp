@@ -63,6 +63,9 @@ TEST(TensorMapTest, InsertCorrectness)
     EXPECT_TRUE(map.contains("t1"));
     EXPECT_EQUAL_TENSORS(map.at("t1"), t1);
     EXPECT_FALSE(map.contains("t2"));
+
+    delete[] v1;
+    delete[] v2;
 }
 
 TEST(TensorMapTest, InsertDoesNotAllowNoneTensor)

@@ -52,7 +52,7 @@ protected:
     cudaDeviceProp* cuda_device_prop_ = nullptr;
 
     bool is_free_buffer_after_forward_;
-    bool is_allocate_buffer_ = false; // TODO (bhsueh) to be deprecated
+    bool is_allocate_buffer_ = false; // TODO to be deprecated
 };
 
 } // namespace layers

@@ -79,8 +79,8 @@ def parse_arguments():
     parser.add_argument('--n_head', type=int, default=32)
     parser.add_argument('--hidden_act', type=str, default='gelu')
     parser.add_argument('--inter_size', type=int, default=None)
-    parser.add_argument('--no_bias', action="store_false")
-    parser.add_argument('--max_batch_size', type=int, default=1)
+    parser.add_argument('--no_bias', action="store_false", default=False)
+    parser.add_argument('--max_batch_size', type=int, default=8)
     parser.add_argument('--max_input_len', type=int, default=1024)
     parser.add_argument('--max_output_len', type=int, default=1024)
     parser.add_argument('--max_beam_width', type=int, default=1)
@@ -283,9 +283,7 @@ def build_rank_engine(builder: Builder,
         network.plugin_config.set_smooth_quant_gemm_plugin(dtype=args.dtype)
         network.plugin_config.set_layernorm_quantization_plugin(
             dtype=args.dtype)
-        # FIXME(nkorobov)
-        # See https://nvbugs/4164762
-        # See https://nvbugs/4174113
+
         network.plugin_config.set_quantize_tensor_plugin()
         network.plugin_config.set_quantize_per_token_plugin()
     elif args.use_weight_only:

@@ -2,6 +2,8 @@
 
 This document explains how to build and run the C++ tests, and the included [resources](resources).
 
+Windows users: Be sure to set DLL paths as specified in [Extra Steps for C++ Runtime Usage](../../windows/README.md#extra-steps-for-c-runtime-usage).
+
 ## Compile
 
 From the top-level directory call:
@@ -50,6 +52,7 @@ End-to-end tests read inputs and expected outputs from Numpy files located at [c
 PYTHONPATH=examples/gpt:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_gpt_output.py
 PYTHONPATH=examples/gptj:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_gptj_output.py
 PYTHONPATH=examples/llama:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_llama_output.py
+PYTHONPATH=examples/CHATGLM6B:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_CHATGLM6B_output.py
 ```
 
 ### Generate data with tensor and pipeline parallelism

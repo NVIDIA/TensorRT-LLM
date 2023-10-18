@@ -36,7 +36,6 @@ def TRTLLaMA(args, config):
     pp_size = config['builder_config']['pipeline_parallel']
     world_size = tp_size * pp_size
 
-    assert pp_size == 1, 'Python runtime does not support pipeline parallelism'
     assert world_size == tensorrt_llm.mpi_world_size(), \
         f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
 
@@ -50,6 +49,9 @@ def TRTLLaMA(args, config):
     num_kv_heads = config['builder_config'].get('num_kv_heads', num_heads)
     paged_kv_cache = config['plugin_config']['paged_kv_cache']
     tokens_per_block = config['plugin_config']['tokens_per_block']
+    use_custom_all_reduce = config['plugin_config'].get('use_custom_all_reduce',
+                                                        False)
+
     quant_mode = QuantMode(config['builder_config']['quant_mode'])
     if config['builder_config'].get('multi_query_mode', False):
         tensorrt_llm.logger.warning(
@@ -68,6 +70,7 @@ def TRTLLaMA(args, config):
         tokens_per_block=tokens_per_block,
         gpt_attention_plugin=use_gpt_attention_plugin,
         remove_input_padding=remove_input_padding,
+        use_custom_all_reduce=use_custom_all_reduce,
         dtype=dtype,
         quant_mode=quant_mode)
 
@@ -212,13 +215,15 @@ def main(args):
             torch.cuda.synchronize()
 
         # Extract a list of tensors of shape beam_width x output_ids.
-        output_beams_list = [
-            tokenizer.batch_decode(output_ids[batch_idx, :,
-                                              input_lengths[batch_idx]:],
-                                   skip_special_tokens=True)
-            for batch_idx in range(batch_size)
-        ]
-        return output_beams_list, output_ids[:, :, max_length:].tolist()
+        if tensorrt_llm_llama.mapping.is_first_pp_rank():
+            output_beams_list = [
+                tokenizer.batch_decode(output_ids[batch_idx, :,
+                                                  input_lengths[batch_idx]:],
+                                       skip_special_tokens=True)
+                for batch_idx in range(batch_size)
+            ]
+            return output_beams_list, output_ids[:, :, max_length:].tolist()
+        return [], []
 
     def summarize_hf(datapoint):
         batch_size = len(datapoint['article'])

@@ -55,16 +55,16 @@ IBuffer::UniquePtr IBuffer::wrap(void* data, nvinfer1::DataType type, std::size_
     switch (memoryType)
     {
     case MemoryType::kPINNED:
-        result.reset(new GenericBuffer( // NOLINT(modernize-make-unique)
+        result.reset(new GenericBuffer<PinnedBorrowingAllocator>( // NOLINT(modernize-make-unique)
             capacity, type, PinnedBorrowingAllocator(data, capacityInBytes)));
         break;
     case MemoryType::kCPU:
         result.reset( // NOLINT(modernize-make-unique)
-            new GenericBuffer(capacity, type, CpuBorrowingAllocator(data, capacityInBytes)));
+            new GenericBuffer<CpuBorrowingAllocator>(capacity, type, CpuBorrowingAllocator(data, capacityInBytes)));
         break;
     case MemoryType::kGPU:
         result.reset( // NOLINT(modernize-make-unique)
-            new GenericBuffer(capacity, type, GpuBorrowingAllocator(data, capacityInBytes)));
+            new GenericBuffer<GpuBorrowingAllocator>(capacity, type, GpuBorrowingAllocator(data, capacityInBytes)));
         break;
     default: TLLM_THROW("Unknown memory type");
     }

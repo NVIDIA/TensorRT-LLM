@@ -1,0 +1,5 @@
+sphinx>=7.0
+sphinx-rtd-theme
+myst_parser
+breathe
+pygit2

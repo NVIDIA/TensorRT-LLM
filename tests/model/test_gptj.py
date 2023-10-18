@@ -415,7 +415,7 @@ class TestGPTJ(unittest.TestCase):
         compare_context()
         compare_generation()
 
-    def test_gptj_noplugin_unsupported(self):
+    def test_gptj_noplugin_supported(self):
 
         use_refit = False
 
@@ -433,13 +433,11 @@ class TestGPTJ(unittest.TestCase):
 
         gpt_config, hf_gpt = self._gen_hf_gpt_j(hidden_act, n_layer,
                                                 seq_len + max_length, dtype)
-        with self.assertRaisesRegex(
-                ValueError,
-                ".*RoPE is only supported with GPTAttention plugin.*"):
-            runtime, _ = self._gen_tensorrt_llm_runtime(
-                dtype, world_size, rank, gpt_config, hf_gpt,
-                use_attention_plugin, batch_size, beam_width, seq_len,
-                max_length, use_refit, use_ln_gemm_plugin)
+
+        runtime, _ = self._gen_tensorrt_llm_runtime(
+            dtype, world_size, rank, gpt_config, hf_gpt, use_attention_plugin,
+            batch_size, beam_width, seq_len, max_length, use_refit,
+            use_ln_gemm_plugin)
 
         use_ln_gemm_plugin = False
         if trt.__version__[:3] == '8.6':

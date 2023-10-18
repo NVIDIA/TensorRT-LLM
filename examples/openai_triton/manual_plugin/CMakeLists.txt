@@ -96,8 +96,8 @@ add_library(
   TritonFlashAttentionPlugin.cpp
   aot/fmha_kernel_fp16.c
   aot/fmha_kernel_fp32.c
-  aot/fp16/fmha_kernel_d64_fp16.48d785a0_0d1d2d3d4d5d6789.c
-  aot/fp32/fmha_kernel_d64_fp32.da74e9ed_0d1d2d3d4d5d6789.c)
+  aot/fp16/fmha_kernel_d64_fp16.fbf0f274_0d1d2d3d4d5d6789.c
+  aot/fp32/fmha_kernel_d64_fp32.f30323ef_0d1d2d3d4d5d6789.c)
 
 target_link_libraries(
   ${TARGET_NAME} PUBLIC cuda ${CUDA_LIBRARIES} ${TRT_LLM_LIB_PATH}

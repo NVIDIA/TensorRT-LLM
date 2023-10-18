@@ -23,6 +23,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/runtime/gptDecoderBatch.h"
+#include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/ncclCommunicator.h"
 #include "tensorrt_llm/runtime/runtimeBuffers.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
@@ -34,6 +35,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
+#include <memory>
 
 using namespace tensorrt_llm::runtime;
 
@@ -168,6 +170,19 @@ void GptSession::createKvCacheManagers(SizeType batchSize, SizeType beamWidth, S
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
+void GptSession::createCustomAllReduceWorkspace(
+    SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxSequenceLength)
+{
+    setPeerAccess(mWorldConfig, true);
+
+    auto& manager = mRuntime->getBufferManager();
+    for (const auto& buffer : mBuffers)
+    {
+        buffer->createCustomAllReduceWorkspace(
+            maxBatchSize, maxBeamWidth, maxSequenceLength, mModelConfig.getHiddenSize(), mWorldConfig, manager);
+    }
+}
+
 void GptSession::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxSequenceLength, bool decoderPerRequest,
     std::optional<SizeType> maxTokensInPagedKvCache, std::optional<SizeType> numMicroBatches)
 {
@@ -182,7 +197,7 @@ void GptSession::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType ma
     // Store this param related to deocder buffer size and kv cache manager to check against
     // the input shape with the params given in generate().
     // gptDecoderBatch does not resize buffers, but allows smaller batchSize and beamWidth.
-    // TODO (rkobus) refactor batch manager to remove dependency on maxSequenceLength.
+    // TODO refactor batch manager to remove dependency on maxSequenceLength.
     mDecoderMaxSequenceLength = maxSequenceLength;
 
     if (mModelConfig.usePagedKvCache())
@@ -203,6 +218,11 @@ void GptSession::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType ma
         mReceivedEvents.clear();
         for (SizeType i = 0; i < mNumMicroBatches; ++i)
             mReceivedEvents.emplace_back();
+    }
+
+    if (mWorldConfig.isTensorParallel() && mModelConfig.useCustomAllReduce())
+    {
+        createCustomAllReduceWorkspace(microBatchSize, maxBeamWidth, maxSequenceLength);
     }
 
     // we don't know maxInputLength and maxNewTokens yet and ignore those for pre-allocation
@@ -232,7 +252,7 @@ void GptSession::generateSingleBatch(
     TLLM_CHECK_WITH_INFO(buffers.allocated, "Buffers not allocated, please call setup first!");
     buffers.initContextLengths(inputLengths, manager);
     auto const generationConfig = RuntimeBuffers::GenerationConfig::fromInput(*inputs.ids, *buffers.contextLengthsHost,
-        inputs.packed, samplingConfig.beamWidth, mDecoderMaxSequenceLength, inputs.maxNewTokens, manager);
+        inputs.packed, samplingConfig.beamWidth, mDecoderMaxSequenceLength, inputs.maxNewTokens);
 
     auto const batchSize = generationConfig.batchSize;
     auto const beamWidth = generationConfig.beamWidth;
@@ -329,7 +349,7 @@ void GptSession::generateSingleBatch(
 
         sync_check_cuda_error();
 
-        // FIXME(nkorobov): this synchronize is important to get logits right
+        // FIXME: this synchronize is important to get logits right
         // manager.getStream().synchronize();
 
         decoderStepAsync(outputs.ids, newTokens, maxInputLength + step, microBatchId);
@@ -339,7 +359,7 @@ void GptSession::generateSingleBatch(
         {
             if (onTokenGenerated)
             {
-                // TODO(rkobus) use getNewTokens(), remove step from Callback?
+                // TODO use getNewTokens(), remove step from Callback?
                 ITensor::SharedPtr outputIds
                     = mWorldConfig.isPipelineParallel() ? outputs.ids : mDecoders.at(microBatchId)->getOutputIds();
                 onTokenGenerated(outputIds, step, shouldStop || step == maxNewTokens - 1);
@@ -507,7 +527,7 @@ void GptSession::generateMultiBatch(
         buffers.initContextLengths(microBatchInputs.lengths, manager);
         generationConfigs.emplace_back(RuntimeBuffers::GenerationConfig::fromInput(*microBatchInputs.ids,
             *buffers.contextLengthsHost, microBatchInputs.packed, samplingConfig.beamWidth, mDecoderMaxSequenceLength,
-            microBatchInputs.maxNewTokens, manager));
+            microBatchInputs.maxNewTokens));
         auto const& generationConfig = generationConfigs.back();
 
         auto const beamWidth = generationConfig.beamWidth;

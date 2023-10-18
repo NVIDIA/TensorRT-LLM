@@ -51,6 +51,7 @@ def read_config(config_path: Path):
     dtype = config['builder_config']['precision']
     gather_all_token_logits = config['builder_config'][
         'gather_all_token_logits']
+    use_custom_all_reduce = config['plugin_config']['use_custom_all_reduce']
 
     model_config = ModelConfig(num_heads=num_heads,
                                num_kv_heads=num_kv_heads,
@@ -63,7 +64,8 @@ def read_config(config_path: Path):
                                tokens_per_block=tokens_per_block,
                                use_prompt_tuning=use_prompt_tuning,
                                dtype=dtype,
-                               gather_all_token_logits=gather_all_token_logits)
+                               gather_all_token_logits=gather_all_token_logits,
+                               use_custom_all_reduce=use_custom_all_reduce)
 
     dtype = config['builder_config']['precision']
     max_input_len = config['builder_config']['max_input_len']

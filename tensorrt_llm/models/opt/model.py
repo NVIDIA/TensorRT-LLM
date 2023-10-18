@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections import OrderedDict
 
 import tensorrt as trt
 
@@ -306,6 +305,8 @@ class OPTLMHeadModel(OPTModel, GenerationMixin):
         use_gpt_attention_plugin = default_net(
         ).plugin_config.gpt_attention_plugin
         use_gemm_plugin = default_net().plugin_config.gemm_plugin
+        paged_kv_cache = default_net().plugin_config.paged_kv_cache
+        tokens_per_block = default_net().plugin_config.tokens_per_block
 
         model_inputs = self.prepare_basic_inputs(
             max_batch_size,
@@ -318,54 +319,12 @@ class OPTLMHeadModel(OPTModel, GenerationMixin):
             self._kv_dtype,
             remove_input_padding,
             use_gpt_attention_plugin,
-            use_gemm_plugin=use_gemm_plugin)
-
-        bb_range = [
-            1, (max_batch_size * max_beam_width + 1) // 2,
-            max_batch_size * max_beam_width
-        ]
-        p_embedding_range = [
-            1, prompt_embedding_table_size // 2, prompt_embedding_table_size
-        ]
-        num_tokens_range = [
-            1, max_batch_size * max_beam_width,
-            max(max_input_len * max_batch_size, max_beam_width * max_batch_size)
-        ]
-        [1, 1, max_input_len]
-
-        prompt_embedding_table = None
-        tasks = None
-        prompt_vocab_size = None
-        if self._use_prompt_tuning:
-            prompt_embedding_table = Tensor(name='prompt_embedding_table',
-                                            dtype=self._dtype,
-                                            shape=[-1, self._hidden_size],
-                                            dim_range=OrderedDict([
-                                                ('prompt_embedding_table_size',
-                                                 [p_embedding_range]),
-                                                ('hidden_size',
-                                                 [self._hidden_size]),
-                                            ]))
-            if remove_input_padding:
-                tasks = Tensor(name='tasks',
-                               dtype=trt.int32,
-                               shape=[1, -1],
-                               dim_range=OrderedDict([
-                                   ('batch_size', [1]),
-                                   ('input_len', [num_tokens_range]),
-                               ]))
-            else:
-                tasks = Tensor(name='tasks',
-                               dtype=trt.int32,
-                               shape=[-1, 1],
-                               dim_range=OrderedDict([
-                                   ('batch_size', [bb_range]),
-                                   ('input_len_for_task', [1]),
-                               ]))
-            prompt_vocab_size = Tensor(name='prompt_vocab_size',
-                                       dtype=trt.int32,
-                                       shape=[1],
-                                       dim_range=OrderedDict([('size', [1])]))
+            num_heads=num_heads,
+            dtype=self._dtype,
+            use_gemm_plugin=use_gemm_plugin,
+            paged_kv_cache=paged_kv_cache,
+            tokens_per_block=tokens_per_block,
+            prompt_embedding_table_size=prompt_embedding_table_size)
 
         return (model_inputs['input_ids'], model_inputs['position_ids'], True,
                 model_inputs['last_token_ids'], model_inputs['attention_mask'],
@@ -381,4 +340,5 @@ class OPTLMHeadModel(OPTModel, GenerationMixin):
                     host_context_lengths=model_inputs['host_context_lengths'],
                     max_context_length=max_input_len,
                     host_request_types=model_inputs['host_request_types']),
-                prompt_embedding_table, tasks, prompt_vocab_size)
+                model_inputs['prompt_embedding_table'], model_inputs['tasks'],
+                model_inputs['prompt_vocab_size'])

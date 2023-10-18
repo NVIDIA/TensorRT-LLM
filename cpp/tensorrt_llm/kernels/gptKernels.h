@@ -39,7 +39,11 @@ enum class PositionEmbeddingType : int8_t
     kLEARNED_ABSOLUTE = 0,
     kROPE_GPTJ = 1,
     kROPE_GPT_NEOX = 2,
-    kALIBI = 3
+    // Workflow: (bmm1_output * scale_bmm1 + alibi).
+    kALIBI = 3,
+    // Workflow: (bmm1_output + alibi) * scale_bmm1.
+    kALIBI_WITH_SCALE = 4,
+    kRELATIVE = 5
 };
 
 enum class RotaryScalingType : int8_t

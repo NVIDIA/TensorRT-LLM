@@ -31,8 +31,8 @@ template <typename T>
 void invokeFillBatch(
     IBuffer& buffer, IBuffer const& indices, std::size_t stride, IBuffer const& values, CudaStream const& stream);
 
-template <typename T>
-void invokeCopyBatch(IBuffer const&, IBuffer&, IBuffer const&, IBuffer const&, std::size_t, CudaStream const&);
+void invokeCopyBatch(IBuffer const& srcBuffer, IBuffer& dstBuffer, IBuffer const& srcOffsets, IBuffer const& dstOffsets,
+    IBuffer const& sizes, std::size_t maxStride, CudaStream const& stream);
 
 template <typename T>
 void invokeAdd(IBuffer& buffer, T value, CudaStream const& stream);

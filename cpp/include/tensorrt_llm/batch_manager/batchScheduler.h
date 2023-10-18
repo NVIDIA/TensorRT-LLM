@@ -46,23 +46,23 @@ public:
     {
     }
 
-    /// @brief Takes as input a sorted list of requets and outputs a map of requests
+    /// @brief Takes as input a sorted list of requets and outputs a sorted lists of requests
     ///        to update for this current iteration, and a map of requests to terminate
-    std::tuple<RequestTable, RequestTable> scheduleRequests(const RequestList& requestList);
+    std::tuple<RequestList, RequestTable> scheduleRequests(const RequestList& requestList);
 
 private:
     /// @brief Schedule request using the MAX_UTILIZATION policy
-    std::tuple<RequestTable, RequestTable> scheduleRequestsMaxUtilization(const RequestList& requestList);
+    std::tuple<RequestList, RequestTable> scheduleRequestsMaxUtilization(const RequestList& requestList);
 
     /// @brief Try reserving resources to advance this req by one step, using MAX_UTILIZATION policy
     bool trySchedulingRequestMaxUtilization(
         const LlmRequest& req, SizeType& numScheduledRequests, SizeType& numScheduledBlocks);
 
     /// @brief Schedule request using the GUARANTEED_NO_EVICT policy
-    std::tuple<RequestTable, RequestTable> scheduleRequestsGuaranteedNoEvict(const RequestList& requestList);
+    std::tuple<RequestList, RequestTable> scheduleRequestsGuaranteedNoEvict(const RequestList& requestList);
 
     /// @brief Schedule up to mMaxNumReuests requests
-    std::tuple<RequestTable, RequestTable> scheduleTargetBatchSize(const RequestList& requestList);
+    std::tuple<RequestList, RequestTable> scheduleTargetBatchSize(const RequestList& requestList);
 
     /// The target number of requests to include in a batch
     SizeType mTargetBatchSize;

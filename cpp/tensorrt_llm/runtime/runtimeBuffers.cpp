@@ -22,16 +22,19 @@
 #include <algorithm>
 #include <iostream>
 
+#include "ipcUtils.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/stlUtils.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/utils/sessionUtils.h"
 
 using namespace tensorrt_llm::runtime;
+namespace tc = tensorrt_llm::common;
 
 RuntimeBuffers::GenerationConfig RuntimeBuffers::GenerationConfig::fromInput(ITensor const& inputIds,
     ITensor const& inputLengthsHost, bool const inputPacked, SizeType const beamWidth, SizeType const maxSequenceLength,
-    std::optional<SizeType> const& maxNewTokensOpt, BufferManager& manager)
+    std::optional<SizeType> const& maxNewTokensOpt)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto const batchSize = static_cast<SizeType>(inputLengthsHost.getSize());
@@ -43,7 +46,7 @@ RuntimeBuffers::GenerationConfig RuntimeBuffers::GenerationConfig::fromInput(ITe
     SizeType inputLengthSum{0};
     if (inputPacked)
     {
-        inputLengthSum = std::reduce(inputLengthsPtr, inputLengthsPtr + batchSize);
+        inputLengthSum = std::accumulate(inputLengthsPtr, inputLengthsPtr + batchSize, 0);
         TLLM_CHECK_WITH_INFO(inputShape.d[0] == 1 && inputShape.d[1] == inputLengthSum,
             "Packed input must have shape [1, <sum of input lengths>].");
     }
@@ -178,6 +181,31 @@ void RuntimeBuffers::initContextLengths(TensorPtr const& inputLengths, BufferMan
     contextLengthsHost->reshape(inputLengths->getShape());
     manager.copy(*contextLengthsDevice, *contextLengthsHost);
     manager.getStream().synchronize(); // wait for context lengths to be copied to host
+}
+
+void RuntimeBuffers::createCustomAllReduceWorkspace(SizeType maxBatchSize, SizeType maxBeamWidth,
+    SizeType maxSequenceLength, SizeType hiddenSize, WorldConfig const& worldConfig, BufferManager& manager)
+{
+    mIpcMemoryHandles.clear();
+    const std::size_t bufferSize = static_cast<std::size_t>(maxBatchSize) * maxBeamWidth * maxSequenceLength
+        * hiddenSize * worldConfig.getTensorParallelism() * sizeof(float);
+    mIpcMemoryHandles.emplace_back(std::make_shared<IpcMemory>(worldConfig, bufferSize));
+    mIpcMemoryHandles.emplace_back(std::make_shared<IpcMemory>(worldConfig, IpcMemory::FLAGS_SIZE * sizeof(int32_t)));
+    mIpcMemoryHandles.emplace_back(std::make_shared<IpcMemory>(worldConfig, IpcMemory::FLAGS_SIZE * sizeof(int32_t)));
+
+    commPtrs = manager.cpu(
+        ITensor::makeShape({static_cast<SizeType>(mIpcMemoryHandles.size()) * worldConfig.getTensorParallelism()}),
+        nvinfer1::DataType::kINT64);
+    const auto commPtrsData = bufferCast<void*>(*commPtrs);
+
+    for (size_t memIdx = 0; memIdx < mIpcMemoryHandles.size(); memIdx++)
+    {
+        const auto& memCommPtrs = mIpcMemoryHandles[memIdx]->getCommPtrsTensor();
+        for (SizeType tpIdx = 0; tpIdx < worldConfig.getTensorParallelism(); tpIdx++)
+        {
+            commPtrsData[memIdx * worldConfig.getTensorParallelism() + tpIdx] = memCommPtrs[tpIdx];
+        }
+    }
 }
 
 void RuntimeBuffers::reshape(
@@ -371,19 +399,34 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
             std::fill_n(RequestTypesPtr, batchSize, 0);
         }
 
-        auto const inputSize = inputIds->getSize();
         auto const& inputShape = inputIds->getShape();
-
         auto const contextLengthsHostPtr = bufferCast<SizeType const>(*contextLengthsHost);
-        std::vector<SizeType> positionIdsVec(inputSize);
-        auto begin = std::begin(positionIdsVec);
-        for (SizeType i = 0; i < batchSize; ++i)
+        auto const modelVariant = modelConfig.getModelVariant();
+
+        if (modelVariant == GptModelConfig::ModelVariant::kGpt)
         {
-            auto end = begin + (modelConfig.usePackedInput() ? contextLengthsHostPtr[i] : maxInputLength);
-            std::iota(begin, end, 0);
-            begin = end;
+            auto const inputSize = inputIds->getSize();
+            std::vector<SizeType> positionIdsVec(inputSize);
+            auto begin = std::begin(positionIdsVec);
+            for (SizeType i = 0; i < batchSize; ++i)
+            {
+                auto end = begin + (modelConfig.usePackedInput() ? contextLengthsHostPtr[i] : maxInputLength);
+                std::iota(begin, end, 0);
+                begin = end;
+            }
+            positionIds = manager.copyFrom(positionIdsVec, inputShape, MemoryType::kGPU);
         }
-        positionIds = manager.copyFrom(positionIdsVec, inputShape, MemoryType::kGPU);
+        else if (modelVariant == GptModelConfig::ModelVariant::kGlm)
+        {
+            auto const positionIdsVec = getPositionIdsContextPhaseGlm(
+                batchSize, maxInputLength, contextLengthsHostPtr, modelConfig.useGptAttentionPlugin());
+            auto const positionIdsShape = ITensor::makeShape({batchSize, 2, maxInputLength});
+            positionIds = manager.copyFrom(positionIdsVec, positionIdsShape, MemoryType::kGPU);
+        }
+        else
+        {
+            TLLM_THROW("Unsupported model variant");
+        }
 
         if (worldConfig.isPipelineParallel())
         {
@@ -402,8 +445,8 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
         std::vector<SizeType> positionIdsVec(attentionMask->getSize());
         for (SizeType i = 0; i < batchSize; ++i)
         {
-            std::exclusive_scan(attentionMaskData + i * maxInputLength, attentionMaskData + (i + 1) * maxInputLength,
-                std::begin(positionIdsVec) + i * maxInputLength, 0);
+            tc::stl_utils::exclusiveScan(attentionMaskData + i * maxInputLength,
+                attentionMaskData + (i + 1) * maxInputLength, std::begin(positionIdsVec) + i * maxInputLength, 0);
         }
         for (std::size_t i = 0; i < positionIdsVec.size(); ++i)
             if (attentionMaskData[i] == 0)
@@ -430,7 +473,7 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
     manager.setZero(*cacheIndirectionDecoderInput);
     manager.setZero(*cacheIndirectionDecoderOutput);
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
-};
+}
 
 RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, TensorPtr const& outputIds,
     BufferManager& manager, KvCacheManager* kvCacheManager, GenerationConfig const& generationConfig,
@@ -458,17 +501,33 @@ RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, T
     {
         auto const contextLengthsHostPtr = bufferCast<SizeType const>(*contextLengthsHost);
         auto const pastKeyValueLengthsPtr = bufferCast<SizeType>(*pastKeyValueLengths);
-        SizeType const tensorBatchSize = pastKeyValueLengths->getSize();
-        SizeType const srcStride = (modelConfig.useGptAttentionPlugin() ? 1 : beamWidth);
+        auto const tensorBatchSize = static_cast<SizeType>(pastKeyValueLengths->getSize());
+        SizeType const srcStride{modelConfig.useGptAttentionPlugin() ? 1 : beamWidth};
         TLLM_CHECK(static_cast<std::size_t>(tensorBatchSize * srcStride) == contextLengthsDevice->getSize());
         for (SizeType i = 0; i < tensorBatchSize; ++i)
         {
             pastKeyValueLengthsPtr[i] = contextLengthsHostPtr[i * srcStride] + step;
         }
 
-        positionIds->reshape(inputShape);
-        manager.copy(*contextLengthsDevice, *positionIds);
-        kernels::invokeAdd(*positionIds, step, stream);
+        auto const modelVariant = modelConfig.getModelVariant();
+
+        if (modelVariant == GptModelConfig::ModelVariant::kGpt)
+        {
+            positionIds->reshape(inputShape);
+            manager.copy(*contextLengthsDevice, *positionIds);
+            kernels::invokeAdd(*positionIds, step, stream);
+        }
+        else if (modelVariant == GptModelConfig::ModelVariant::kGlm)
+        {
+            auto const positionIdsVec = getPositionIdsGenerationPhaseGlm(
+                batchSize, beamWidth, step, contextLengthsHostPtr, modelConfig.useGptAttentionPlugin());
+            auto const positionIdsShape = ITensor::makeShape({batchSize * beamWidth, 2, 1});
+            positionIds = manager.copyFrom(positionIdsVec, positionIdsShape, MemoryType::kGPU);
+        }
+        else
+        {
+            TLLM_THROW("Unsupported model variant");
+        }
 
         if (worldConfig.isPipelineParallel())
         {
@@ -496,7 +555,7 @@ RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, T
         std::vector<SizeType> positionIdsVec(attentionMask->getSize());
         for (SizeType i = 0; i < nbInputs; ++i)
         {
-            std::exclusive_scan(attentionMaskPtr + i * newLength, attentionMaskPtr + (i + 1) * newLength,
+            tc::stl_utils::exclusiveScan(attentionMaskPtr + i * newLength, attentionMaskPtr + (i + 1) * newLength,
                 std::begin(positionIdsVec) + i * newLength, 0);
         }
         for (std::size_t i = 0; i < positionIdsVec.size(); ++i)
@@ -527,7 +586,7 @@ RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, T
 
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
     return nextInputIds;
-};
+}
 
 void RuntimeBuffers::getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outputBuffers, SizeType const step,
     TensorPtr const& inputIds, GptModelConfig const& modelConfig, WorldConfig const& worldConfig) const
@@ -612,5 +671,56 @@ void RuntimeBuffers::getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outpu
                 inputBuffers, "past_key_value_", (step % 2) ? presentKeysVals : presentKeysValsAlt, firstLayerId);
         }
     }
+
+    if (modelConfig.useCustomAllReduce() && worldConfig.getTensorParallelism())
+    {
+        inputBuffers.insert_or_assign("all_reduce_workspace", commPtrs);
+    }
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+}
+
+std::vector<SizeType> RuntimeBuffers::getPositionIdsContextPhaseGlm(
+    SizeType batchSize, SizeType maxInputLength, SizeType const* pInputLengths, bool useGptAttentionPlugin)
+{
+    TLLM_CHECK(pInputLengths != nullptr);
+    TLLM_CHECK_WITH_INFO(useGptAttentionPlugin, "GptAttentionPlugin must be used");
+
+    auto const size = batchSize * 2 * maxInputLength;
+    std::vector<SizeType> positionIdsVec(size, 0);
+
+    for (SizeType b = 0; b < batchSize; ++b)
+    {
+        auto* pIdB = positionIdsVec.data() + b * 2 * maxInputLength;
+        auto const length = pInputLengths[b];
+        std::iota(pIdB, pIdB + length, 0);
+
+        pIdB[length - 1] = length - 2;
+        pIdB[length - 1 + maxInputLength] = 1;
+    }
+
+    return positionIdsVec;
+}
+
+std::vector<SizeType> RuntimeBuffers::getPositionIdsGenerationPhaseGlm(
+    SizeType batchSize, SizeType beamSize, SizeType step, SizeType const* pInputLengths, bool useGptAttentionPlugin)
+{
+    TLLM_CHECK(pInputLengths != nullptr);
+    TLLM_CHECK_WITH_INFO(useGptAttentionPlugin, "GptAttentionPlugin must be used");
+
+    auto const size = batchSize * beamSize * 2;
+    std::vector<SizeType> positionIdsVec(size, 0);
+
+    for (SizeType b = 0; b < batchSize; ++b)
+    {
+        auto* pIdB = positionIdsVec.data() + b * beamSize * 2;
+        auto const length = pInputLengths[b * beamSize];
+
+        for (SizeType bm = 0; bm < beamSize; ++bm)
+        {
+            pIdB[bm * 2 + 0] = length - 2;
+            pIdB[bm * 2 + 1] = step + 2;
+        }
+    }
+
+    return positionIdsVec;
 }

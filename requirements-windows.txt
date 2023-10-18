@@ -17,4 +17,4 @@ numpy
 cuda-python==12.2.0
 sentencepiece>=0.1.99
 wheel
-pypiwin32
+pywin32

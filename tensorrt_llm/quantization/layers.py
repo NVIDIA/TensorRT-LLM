@@ -219,7 +219,7 @@ class SmoothQuantRowLinear(Module):
         self.tp_size = tp_size
         self.quant_mode = quant_mode
 
-    def forward(self, x):
+    def forward(self, x, workspace=None):
         if self.quant_mode.has_act_static_scaling():
             per_token_scale = self.act_scale.value
         else:
@@ -230,7 +230,7 @@ class SmoothQuantRowLinear(Module):
                               self.quant_mode.has_per_channel_scaling())
 
         if self.tp_size > 1 and self.tp_group is not None:
-            x = allreduce(x, self.tp_group)
+            x = allreduce(x, self.tp_group, workspace)
 
         if self.bias is not None:
             x = x + self.bias.value
@@ -435,13 +435,13 @@ class WeightOnlyQuantRowLinear(Module):
         self.tp_group = tp_group
         self.tp_size = tp_size
 
-    def forward(self, x):
+    def forward(self, x, workspace=None):
         x = weight_only_quant_matmul(x, self.weight.value,
                                      self.per_channel_scale.value,
                                      self.weight_only_quant_mode)
 
         if self.tp_size > 1 and self.tp_group is not None:
-            x = allreduce(x, self.tp_group)
+            x = allreduce(x, self.tp_group, workspace)
 
         if self.bias is not None:
             x = x + self.bias.value
@@ -467,10 +467,10 @@ class WeightOnlyGroupwiseQuantLinear(Module):
 
         # Flags for indicating whether the corresponding inputs are applied in quant_algo
         BIAS = 1
-        ZER0 = 2
-        PRE_SCALE_QUANT = 4
+        ZERO = 2
+        PRE_QUANT_SCALE = 4
 
-        self.quant_algo = pre_quant_scale * PRE_SCALE_QUANT + zero * ZER0 + bias * BIAS
+        self.quant_algo = pre_quant_scale * PRE_QUANT_SCALE + zero * ZERO + bias * BIAS
         self.group_size = group_size
         self.in_features = in_features
         self.out_features = out_features // tp_size
@@ -551,10 +551,10 @@ class WeightOnlyGroupwiseQuantRowLinear(Module):
 
         # Flags for indicating whether the corresponding inputs are applied in quant_algo
         BIAS = 1
-        ZER0 = 2
-        PRE_SCALE_QUANT = 4
+        ZERO = 2
+        PRE_QUANT_SCALE = 4
 
-        self.quant_algo = pre_quant_scale * PRE_SCALE_QUANT + zero * ZER0 + bias * BIAS
+        self.quant_algo = pre_quant_scale * PRE_QUANT_SCALE + zero * ZERO + bias * BIAS
         self.group_size = group_size
         self.in_features = in_features // tp_size
         self.out_features = out_features
@@ -584,7 +584,7 @@ class WeightOnlyGroupwiseQuantRowLinear(Module):
         self.tp_size = tp_size
         self.tp_group = tp_group
 
-    def forward(self, x):
+    def forward(self, x, workspace=None):
         pre_quant_scale = self.pre_quant_scale.value if self.pre_quant_scale else None
         zero = self.zero.value if self.zero else None
         bias = self.bias.value if self.bias else None
@@ -594,7 +594,7 @@ class WeightOnlyGroupwiseQuantRowLinear(Module):
                                                self.scale.value, zero, bias,
                                                self.quant_algo, self.group_size)
         if self.tp_size > 1 and self.tp_group is not None:
-            x = allreduce(x, self.tp_group)
+            x = allreduce(x, self.tp_group, workspace)
 
         return x
 
@@ -640,7 +640,7 @@ class SmoothQuantMLP(Module):
         else:
             self.register_parameter('quantization_scaling_factor', None)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, workspace=None):
         inter = self.fc(hidden_states)
         inter = ACT2FN[self.hidden_act](inter)
         inter = inter / self.proj.smoother.value
@@ -653,7 +653,7 @@ class SmoothQuantMLP(Module):
                 # Quantize per token outputs tuple:
                 # quantized tensor and scaling factors per token
                 inter = quantize_per_token(inter)
-        output = self.proj(inter)
+        output = self.proj(inter, workspace)
         return output
 
 
@@ -679,30 +679,52 @@ class Int8SmoothQuantRowLinear(RowLinear):
         self.prequant_scaling_factor = Parameter(shape=(self.in_features, ),
                                                  dtype=dtype)
 
-    def forward(self, x):
+    def forward(self, x, workspace=None):
 
-        act_cast_out = cast(x, 'float32')
+        if default_net().strongly_typed:
+            assert x.dtype == self.dtype
+            assert x.dtype == self.weight.value.dtype
+        x = mul(x, self.prequant_scaling_factor.value)
 
-        scaled_act_cast_out = mul(act_cast_out,
-                                  self.prequant_scaling_factor.value)
+        if default_net(
+        ).strongly_typed and self.activation_scaling_factor.value.dtype != self.dtype:
+            x = cast(x, self.activation_scaling_factor.value.dtype)
 
-        quantized_out = quantize(scaled_act_cast_out,
-                                 self.activation_scaling_factor.value, 'int8')
+        quantized_out = quantize(x, self.activation_scaling_factor.value,
+                                 'int8')
 
         dequantized_out = dequantize(quantized_out,
-                                     self.activation_scaling_factor.value)
+                                     self.activation_scaling_factor.value, -1,
+                                     self.activation_scaling_factor.value.dtype)
 
-        w_cast_out = cast(self.weight.value, 'float32')
+        if default_net(
+        ).strongly_typed and self.activation_scaling_factor.value.dtype != self.dtype:
+            dequantized_out = cast(dequantized_out, self.dtype)
 
-        w_quant_out = quantize(w_cast_out,
-                               self.weights_scaling_factor.value,
-                               'int8',
-                               axis=0)
-        w_deq_out = dequantize(w_quant_out,
-                               self.weights_scaling_factor.value,
-                               axis=0)
+        if default_net(
+        ).strongly_typed and self.weights_scaling_factor.value.dtype != self.dtype:
+            cast_weight = cast(self.weight.value,
+                               self.weights_scaling_factor.value.dtype)
 
-        return super().multiply_reduce(dequantized_out, w_deq_out, False)
+            w_quant_out = quantize(cast_weight,
+                                   self.weights_scaling_factor.value,
+                                   'int8',
+                                   axis=0)
+        else:
+
+            w_quant_out = quantize(self.weight.value,
+                                   self.weights_scaling_factor.value, 'int8')
+
+        w_deq_out = dequantize(w_quant_out, self.weights_scaling_factor.value,
+                               0, self.weights_scaling_factor.value.dtype)
+
+        if default_net(
+        ).strongly_typed and self.weights_scaling_factor.value.dtype != self.dtype:
+            w_deq_out = cast(w_deq_out, self.dtype)
+        return super().multiply_reduce(dequantized_out,
+                                       w_deq_out,
+                                       False,
+                                       workspace=workspace)
 
 
 class Int8SmoothQuantLinear(Linear):
@@ -731,23 +753,45 @@ class Int8SmoothQuantLinear(Linear):
                                                  dtype=dtype)
 
     def forward(self, x):
-        act_cast_out = cast(x, 'float32')
-        scaled_act_cast_out = mul(act_cast_out,
-                                  self.prequant_scaling_factor.value)
+        if default_net().strongly_typed:
+            assert x.dtype == self.dtype
+            assert x.dtype == self.weight.value.dtype
+        x = mul(x, self.prequant_scaling_factor.value)
 
-        quantized_out = quantize(scaled_act_cast_out,
-                                 self.activation_scaling_factor.value, 'int8')
+        if default_net(
+        ).strongly_typed and self.activation_scaling_factor.value.dtype != self.dtype:
+            x = cast(x, self.activation_scaling_factor.value.dtype)
+
+        quantized_out = quantize(x, self.activation_scaling_factor.value,
+                                 'int8')
+
         dequantized_out = dequantize(quantized_out,
-                                     self.activation_scaling_factor.value)
+                                     self.activation_scaling_factor.value, -1,
+                                     self.activation_scaling_factor.value.dtype)
 
-        w_cast_out = cast(self.weight.value, 'float32')
-        w_quant_out = quantize(w_cast_out,
-                               self.weights_scaling_factor.value,
-                               'int8',
-                               axis=0)
-        w_deq_out = dequantize(w_quant_out,
-                               self.weights_scaling_factor.value,
-                               axis=0)
+        if default_net(
+        ).strongly_typed and self.activation_scaling_factor.value.dtype != self.dtype:
+            dequantized_out = cast(dequantized_out, self.dtype)
+
+        if default_net(
+        ).strongly_typed and self.weights_scaling_factor.value.dtype != self.dtype:
+            cast_weight = cast(self.weight.value,
+                               self.weights_scaling_factor.value.dtype)
+
+            w_quant_out = quantize(cast_weight,
+                                   self.weights_scaling_factor.value,
+                                   'int8',
+                                   axis=0)
+        else:
+            w_quant_out = quantize(self.weight.value,
+                                   self.weights_scaling_factor.value, 'int8')
+
+        w_deq_out = dequantize(w_quant_out, self.weights_scaling_factor.value,
+                               0, self.weights_scaling_factor.value.dtype)
+
+        if default_net(
+        ).strongly_typed and self.weights_scaling_factor.value.dtype != self.dtype:
+            w_deq_out = cast(w_deq_out, self.dtype)
 
         return super().multiply_gather(dequantized_out, w_deq_out, False)
 
@@ -813,7 +857,7 @@ class FP8Linear(Linear):
         ).strongly_typed and self.weights_scaling_factor.value.dtype != self.dtype:
             w_deq_out = cast(w_deq_out, self.dtype)
 
-        # TODO(nkorobov): allow gemm plugin default_net().plugin_config.gemm_plugin
+        # TODO: allow gemm plugin default_net().plugin_config.gemm_plugin
         return self.multiply_gather(dequantized_out,
                                     w_deq_out,
                                     False,
@@ -828,18 +872,20 @@ class FP8RowLinear(RowLinear):
                  bias=True,
                  dtype=None,
                  tp_group=None,
-                 tp_size=1):
+                 tp_size=1,
+                 instance_id: int = 0):
         super().__init__(in_features,
                          out_features,
                          bias=bias,
                          dtype=dtype,
                          tp_group=tp_group,
-                         tp_size=tp_size)
+                         tp_size=tp_size,
+                         instance_id=instance_id)
         self.activation_scaling_factor = Parameter(shape=(1, ),
                                                    dtype=trt.float32)
         self.weights_scaling_factor = Parameter(shape=(1, ), dtype=trt.float32)
 
-    def forward(self, x):
+    def forward(self, x, workspace=None):
         if default_net().strongly_typed:
             assert x.dtype == self.dtype
             assert x.dtype == self.weight.value.dtype
@@ -879,11 +925,12 @@ class FP8RowLinear(RowLinear):
         ).strongly_typed and self.weights_scaling_factor.value.dtype != self.dtype:
             w_deq_out = cast(w_deq_out, self.dtype)
 
-        # TODO(nkorobov): allow gemm plugin default_net().plugin_config.gemm_plugin
+        # TODO: allow gemm plugin default_net().plugin_config.gemm_plugin
         return self.multiply_reduce(dequantized_out,
                                     w_deq_out,
                                     False,
-                                    use_fp8=True)
+                                    use_fp8=True,
+                                    workspace=workspace)
 
 
 class SmoothQuantGatedMLP(SmoothQuantMLP):
@@ -923,7 +970,7 @@ class SmoothQuantGatedMLP(SmoothQuantMLP):
         else:
             self.register_parameter('quantization_scaling_factor', None)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, workspace=None):
         inter = self.fc(hidden_states)
         inter = ACT2FN[self.hidden_act](inter)
         gate = self.gate(hidden_states)
@@ -939,7 +986,7 @@ class SmoothQuantGatedMLP(SmoothQuantMLP):
                 # quantized tensor and scaling factors per token
                 inter_x_gate = quantize_per_token(inter_x_gate)
 
-        output = self.proj(inter_x_gate)
+        output = self.proj(inter_x_gate, workspace)
         return output
 
 
@@ -1042,8 +1089,9 @@ class SmoothQuantAttention(Module):
                 attention_mask=None,
                 use_cache=False,
                 kv_cache_params=None,
-                attention_params=None):
-        # TODO(nkorobov) add in-flight batching to SmoothQuant
+                attention_params=None,
+                workspace=None):
+        # TODO add in-flight batching to SmoothQuant
         if default_net().plugin_config.smooth_quant_gemm_plugin:
             qkv = self.qkv(hidden_states)
         else:
@@ -1211,7 +1259,7 @@ class SmoothQuantAttention(Module):
                 # quantized tensor and scaling factors per token
                 context = quantize_per_token(context)
 
-        context = self.dense(context)
+        context = self.dense(context, workspace)
 
         if use_cache:
             return (context, past_key_value)

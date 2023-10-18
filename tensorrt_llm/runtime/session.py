@@ -53,13 +53,14 @@ class Session(object):
         # use Session.from_serialized_engine to create a session
         pass
 
-    def _init(self, engine_buffer):
+    def _init(self, engine_buffer=None):
         '''
         @brief: Setup TensorRT engines and context from a serialized engine file
         @param engine_buffer: a buffer holds the serialized TRT engine
         '''
         self._runtime = trt.Runtime(logger.trt_logger)
-        self._engine = self.runtime.deserialize_cuda_engine(engine_buffer)
+        if engine_buffer is not None:
+            self._engine = self.runtime.deserialize_cuda_engine(engine_buffer)
         self._context = self.engine.create_execution_context()
         with _scoped_stream() as stream:
             self._context.set_optimization_profile_async(0, stream)
@@ -75,6 +76,17 @@ class Session(object):
         session = Session()
         return session._init(engine)
 
+    @staticmethod
+    def from_engine(engine) -> Session:
+        '''
+        @brief: Create a session from an existing ICudaEngine engine
+        @param engine: an ICudaEngine
+        @return: a Session object
+        '''
+        session = Session()
+        session.engine = engine
+        return session._init()
+
     @property
     def runtime(self) -> trt.Runtime:
         return self._runtime
@@ -82,6 +94,10 @@ class Session(object):
     @property
     def engine(self) -> trt.ICudaEngine:
         return self._engine
+
+    @engine.setter
+    def engine(self, engine: trt.ICudaEngine):
+        self._engine = engine
 
     @property
     def context(self) -> trt.IExecutionContext:

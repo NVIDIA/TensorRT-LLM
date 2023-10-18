@@ -64,7 +64,7 @@ public:
     void destroy() noexcept override;
 
 private:
-    ncclComm_t mComm; // TODO: (kaiyu) Remove this
+    ncclComm_t mComm; // TODO: Remove this
     int mSrcRank;
     nvinfer1::DataType mType;
 };

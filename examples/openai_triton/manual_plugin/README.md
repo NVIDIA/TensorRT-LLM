@@ -37,6 +37,7 @@ python triton/python/triton/tools/compile.py \
     -o aot/fp16/fmha_kernel_d64_fp16 \
     --out-name fmha_d64_fp16 \
     -w 4 \
+    -ns 2 \
     -s "*fp16:16, *fp32:16, *fp32:16, *fp16:16, *fp16:16, *fp16:16, fp32, i32, i32, i32, 128, 64, 128" \
     -g "(seq_len + 127) / 128, batch_size * num_heads, 1"
 # Kernel for data type=float32, BLOCK_M=64, BLOCK_DMODEL=64, BLOCK_N=64
@@ -47,6 +48,7 @@ python triton/python/triton/tools/compile.py \
     -o aot/fp32/fmha_kernel_d64_fp32 \
     --out-name fmha_d64_fp32 \
     -w 4 \
+    -ns 2 \
     -s "*fp32:16, *fp32:16, *fp32:16, *fp32:16, *fp32:16, *fp32:16, fp32, i32, i32, i32, 64, 64, 64" \
     -g "(seq_len + 63) / 64, batch_size * num_heads, 1"
 

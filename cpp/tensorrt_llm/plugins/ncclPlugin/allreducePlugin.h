@@ -16,8 +16,9 @@
  */
 #pragma once
 
-#include "FTCustomAR.h"
 #include "tensorrt_llm/common/mpiUtils.h"
+#include "tensorrt_llm/common/tensor.h"
+#include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include <cassert>
 #include <memory>
@@ -33,15 +34,8 @@ namespace tensorrt_llm::plugins
 class AllreducePlugin : public BasePlugin
 {
 public:
-    enum class AllReduceStrategyType : int8_t
-    {
-        NCCL = 0,
-        CUSTOM = 1,
-        AUTO = 2,
-    };
-
     AllreducePlugin(
-        std::set<int> group, nvinfer1::DataType type, AllReduceStrategyType strategy = AllReduceStrategyType::NCCL);
+        std::set<int> group, nvinfer1::DataType type, kernels::AllReduceStrategyType strategy, int32_t counter);
 
     AllreducePlugin(const void* data, size_t length);
 
@@ -77,13 +71,12 @@ public:
     bool isCustomAllReduceSuported(int ranks_per_node) const noexcept;
 
 private:
-    size_t ncclEstimatedThreshold(int worldSize) const noexcept;
+    kernels::AllReduceStrategyType selectImplementation(size_t messageSize, int worldSize) const noexcept;
     const std::string mLayerName;
     std::set<int> mGroup;
     nvinfer1::DataType mType;
-    AllReduceStrategyType mStrategy;
-    std::shared_ptr<tensorrt_llm::CustomAllReduceComm> mCustomAllReduceContext;
-    size_t mCustomARBufferSize;
+    kernels::AllReduceStrategyType mStrategy;
+    int32_t mCounter;
 };
 
 class AllreducePluginCreator : public BaseCreator

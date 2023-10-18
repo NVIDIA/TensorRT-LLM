@@ -91,7 +91,6 @@ int LayernormPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const 
     //     bias [N, ]
     // outputs
     //     output [M(*), N]
-
     int m = 1;
     for (int i = 0; i < inputDesc[0].dims.nbDims - 1; ++i)
     {

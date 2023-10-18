@@ -36,7 +36,8 @@ namespace
 {
 void benchmarkGptSession(std::string const& modelName, std::filesystem::path const& dataPath,
     std::vector<int> const& batchSizes, std::vector<std::vector<int>> const& inOutLen,
-    std::shared_ptr<nvinfer1::ILogger> const& logger, int warmUp, int numRuns, int duration, bool cudaGraphMode)
+    std::shared_ptr<nvinfer1::ILogger> const& logger, int warmUp, int numRuns, int duration,
+    std::optional<SizeType> numMicroBatches, bool cudaGraphMode)
 {
     auto const json = GptJsonConfig::parse(dataPath / "config.json");
     auto const modelConfig = json.getModelConfig();
@@ -73,7 +74,8 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
 
         for (auto const batchSize : batchSizes)
         {
-            session.setup(batchSize, beamWidth, maxInputLength + maxNewTokens, decoderPerRequest);
+            session.setup(
+                batchSize, beamWidth, maxInputLength + maxNewTokens, decoderPerRequest, std::nullopt, numMicroBatches);
 
             std::vector<SizeType> inputLenghtsHost(batchSize, maxInputLength);
             auto inputLenghts
@@ -163,6 +165,8 @@ int main(int argc, char* argv[])
         cxxopts::value<int>()->default_value("10"));
     options.add_options()("duration", "Minimal duration of iterations to measure in seconds.",
         cxxopts::value<int>()->default_value("60"));
+    options.add_options()(
+        "num_micro_batches", "Number of micro batches if enabling pipeline parallelism.", cxxopts::value<int>());
 
     options.add_options()("enable_cuda_graph", "Execute GPT session with CUDA graph.");
 
@@ -235,6 +239,13 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    // Argument: Number of micro batches
+    std::optional<SizeType> numMicroBatches{std::nullopt};
+    if (result.count("num_micro_batches"))
+    {
+        numMicroBatches = result["num_micro_batches"].as<int>();
+    }
+
     // Argument: Enable CUDA graph
     auto enableCudaGraph = result.count("enable_cuda_graph") > 0;
 
@@ -244,7 +255,7 @@ int main(int argc, char* argv[])
     {
         benchmarkGptSession(result["model"].as<std::string>(), result["engine_dir"].as<std::string>(), batchSizes,
             inOutLen, logger, result["warm_up"].as<int>(), result["num_runs"].as<int>(), result["duration"].as<int>(),
-            enableCudaGraph);
+            numMicroBatches, enableCudaGraph);
     }
     catch (const std::exception& e)
     {

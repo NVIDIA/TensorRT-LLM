@@ -31,8 +31,9 @@ def split(weight: np.ndarray, tp_size: int, rank: int = 0, dim: int = 0):
     if tp_size == 1:
         return weight
     elif weight.ndim == 1:
-        return np.ascontiguousarray(np.split(weight, tp_size)[rank])
-    return np.ascontiguousarray(np.split(weight, tp_size, axis=dim)[rank])
+        return np.ascontiguousarray(np.split(weight, tp_size)[rank].copy())
+    return np.ascontiguousarray(
+        np.split(weight, tp_size, axis=dim)[rank].copy())
 
 
 def reorder_qkv_weight_or_bias(weight: np.ndarray,
@@ -494,12 +495,12 @@ def get_scaling_factors(
     }
 
     for layer in range(num_layers):
-        scaling_factor['qkv_act'].append(min(
+        scaling_factor['qkv_act'].append(max(
             weight_dict[f'_np:layers:{layer}:attention:qkv:q:activation_scaling_factor'].item(),
             weight_dict[f'_np:layers:{layer}:attention:qkv:k:activation_scaling_factor'].item(),
             weight_dict[f'_np:layers:{layer}:attention:qkv:v:activation_scaling_factor'].item()
             ))
-        scaling_factor['qkv_weights'].append(min(
+        scaling_factor['qkv_weights'].append(max(
             weight_dict[f'_np:layers:{layer}:attention:qkv:q:weights_scaling_factor'].item(),
             weight_dict[f'_np:layers:{layer}:attention:qkv:k:weights_scaling_factor'].item(),
             weight_dict[f'_np:layers:{layer}:attention:qkv:v:weights_scaling_factor'].item()
@@ -511,10 +512,11 @@ def get_scaling_factors(
         scaling_factor['dense_weights'].append(weight_dict[f'_np:layers:{layer}:attention:dense:weights_scaling_factor'].item())
         scaling_factor['fc_act'].append(weight_dict[f'_np:layers:{layer}:mlp:fc:activation_scaling_factor'].item())
         scaling_factor['fc_weights'].append(weight_dict[f'_np:layers:{layer}:mlp:fc:weights_scaling_factor'].item())
-        scaling_factor['fc_act'].append(weight_dict[f'_np:layers:{layer}:mlp:fc:activation_scaling_factor'].item())
-        scaling_factor['fc_weights'].append(weight_dict[f'_np:layers:{layer}:mlp:fc:weights_scaling_factor'].item())
         scaling_factor['proj_act'].append(weight_dict[f'_np:layers:{layer}:mlp:proj:activation_scaling_factor'].item())
         scaling_factor['proj_weights'].append(weight_dict[f'_np:layers:{layer}:mlp:proj:weights_scaling_factor'].item())
     # yapf: enable
+    for k, v in scaling_factor.items():
+        assert len(v) == num_layers, \
+        f'Expect scaling factor {k} of length {num_layers}, got {len(v)}'
 
     return scaling_factor

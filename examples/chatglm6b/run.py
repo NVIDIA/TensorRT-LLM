@@ -25,8 +25,8 @@ from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 
 from build import get_engine_name  # isort:skip
 
-START_ID = 50256
-END_ID = 50256
+END_ID = 130005
+PAD_ID = 3
 
 
 def parse_arguments():
@@ -34,11 +34,12 @@ def parse_arguments():
     parser.add_argument('--max_output_len', type=int, default=1024)
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument('--engine_dir', type=str, default='trtModel')
+    parser.add_argument('--beam_width', type=int, default=1)
     parser.add_argument(
         '--input_text',
         type=str,
-        default=
-        'Continuation: Nvidia was founded on April 5, 1993, by Jensen Huang，')
+        nargs='*',
+        default=["Hello", "Could you introduce NVIDIA Corporation for me?"])
     parser.add_argument(
         '--input_tokens',
         type=str,
@@ -103,9 +104,12 @@ if __name__ == '__main__':
     input_text = None
     if args.input_tokens is None:
         input_text = args.input_text
-        input_ids = tokenizer(
-            [input_text], return_tensors="pt",
-            padding=True)['input_ids'].int().contiguous().cuda()
+        tokenized = tokenizer(input_text,
+                              return_tensors="pt",
+                              padding=True,
+                              return_length=True)
+        input_ids = tokenized['input_ids'].int().contiguous().cuda()
+        input_lengths = tokenized['length'].int().contiguous().cuda()
     else:
         input_ids = []
         with open(args.input_tokens) as f_in:
@@ -115,8 +119,28 @@ if __name__ == '__main__':
         input_text = "<ids from file>"
         input_ids = torch.tensor(input_ids,
                                  dtype=torch.int32).cuda().unsqueeze(0)
-    input_lengths = torch.tensor(
-        [input_ids.size(1) for _ in range(input_ids.size(0))]).int().cuda()
+
+    input_ids_padding_right = torch.zeros_like(input_ids) + END_ID
+    for i, sample in enumerate(input_ids):
+        nPadding = 0
+        for token in sample:
+            if token == PAD_ID:
+                nPadding += 1
+            else:
+                break
+        input_ids_padding_right[i, :len(sample[nPadding:])] = sample[nPadding:]
+    input_ids = input_ids_padding_right
+
+    input_ids_padding_right = torch.zeros_like(input_ids) + END_ID
+    for i, sample in enumerate(input_ids):
+        nPadding = 0
+        for token in sample:
+            if token == PAD_ID:
+                nPadding += 1
+            else:
+                break
+        input_ids_padding_right[i, :len(sample[nPadding:])] = sample[nPadding:]
+    input_ids = input_ids_padding_right
 
     model_config = ModelConfig(model_name="chatglm6b",
                                num_heads=num_heads,
@@ -126,13 +150,21 @@ if __name__ == '__main__':
                                num_layers=num_layers,
                                gpt_attention_plugin=use_gpt_attention_plugin,
                                dtype=dtype)
-    sampling_config = SamplingConfig(end_id=130005, pad_id=3)
+    sampling_config = SamplingConfig(
+        end_id=END_ID,
+        pad_id=PAD_ID,
+        top_k=1,
+        top_p=1.0,
+        num_beams=args.beam_width,
+    )
+    sampling_config.random_seed = 1
 
     with open(serialize_path, 'rb') as f:
         engine_buffer = f.read()
     decoder = tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession(
         model_config, engine_buffer, runtime_mapping)
-    decoder.setup(input_ids.size(0), input_ids.size(1), args.max_output_len)
+    decoder.setup(input_ids.size(0), input_ids.size(1), args.max_output_len,
+                  args.beam_width)
     output_ids = decoder.decode(input_ids, input_lengths, sampling_config)
     torch.cuda.synchronize()
 
@@ -143,8 +175,10 @@ if __name__ == '__main__':
                                    skip_special_tokens=True)
             for batch_idx in range(input_lengths.size(0))
         ]
-        output_text = process_response(output_beams_list[0])
-        print(f'Input --->\n {input_text}')
-        print(f'Output --->\n {" ".join(output_text)}')
+        output_text = process_response(output_beams_list[i])
+        print("Input  --->\n%s" % input_text[i])
+        print("Output --->")
+        for j, simple_output in enumerate(output_text):
+            print("Beam %2d--->\n%s" % (j, simple_output))
 
     print("Finished!")
