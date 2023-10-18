@@ -31,8 +31,9 @@ def split(weight: np.ndarray, tp_size: int, rank: int = 0, dim: int = 0):
     if tp_size == 1:
         return weight
     elif weight.ndim == 1:
-        return np.ascontiguousarray(np.split(weight, tp_size)[rank])
-    return np.ascontiguousarray(np.split(weight, tp_size, axis=dim)[rank])
+        return np.ascontiguousarray(np.split(weight, tp_size)[rank].copy())
+    return np.ascontiguousarray(
+        np.split(weight, tp_size, axis=dim)[rank].copy())
 
 
 def reorder_qkv_weight_or_bias(weight: np.ndarray,
