@@ -10,6 +10,13 @@ The TensorRT-LLM BLOOM implementation can be found in [tensorrt_llm/models/bloom
  * [`run.py`](./run.py) to run the inference on an input text,
  * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
 
+## Support Matrix
+  * FP16
+  * INT8 & INT4 Weight-Only
+  * INT8 KV CACHE
+  * Smooth Quant
+  * Tensor Parallel
+
 ## Usage
 
 The TensorRT-LLM BLOOM example code locates at [examples/bloom](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.

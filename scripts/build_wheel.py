@@ -87,6 +87,10 @@ def main(build_type: str = "Release",
 
     hardware_arch = platform.machine()
 
+    if platform.system() == "Windows":
+        # Windows does not support multi-device currently.
+        extra_cmake_vars.extend(["ENABLE_MULTI_DEVICE=0"])
+
     if job_count is None:
         job_count = cpu_count()
 
@@ -98,7 +102,8 @@ def main(build_type: str = "Release",
             expanded_args += var.split(";")
 
         extra_cmake_vars = ["\"-D{}\"".format(var) for var in expanded_args]
-        cmake_def_args.extend(extra_cmake_vars)
+        # Don't include duplicate conditions
+        cmake_def_args.extend(set(extra_cmake_vars))
 
     if trt_root is not None:
         trt_root = trt_root.replace("\\", "/")

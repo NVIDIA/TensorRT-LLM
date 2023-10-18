@@ -9,11 +9,14 @@ import os
 import subprocess
 import sys
 
+import pygit2
+
 sys.path.insert(0, os.path.abspath('../..'))
 
 project = 'tensorrt_llm'
 copyright = '2023, NVidia'
 author = 'NVidia'
+branch_name = pygit2.Repository('.').head.shorthand
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -31,6 +34,15 @@ extensions = [
     "breathe",
     'sphinx.ext.todo',
 ]
+
+myst_url_schemes = {
+    "http":
+    None,
+    "https":
+    None,
+    "source":
+    "https://github.com/NVIDIA/TensorRT-LLM/tree/" + branch_name + "/{{path}}",
+}
 
 autosummary_generate = True
 

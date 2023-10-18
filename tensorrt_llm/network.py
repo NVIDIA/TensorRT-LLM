@@ -51,7 +51,7 @@ class Network(object):
 
         # Holds the removed layers and disable them in graph rewritings and other phases.
         # This is a hacky way since INetwork python API doesn't provide a way to remove a layer.
-        # TODO[chunweiy]: remove this when TensorRT provides a better way to remove a layer
+        # TODO: remove this when TensorRT provides a better way to remove a layer
         self._removed_layers: Set[str] = set()
 
         self.is_graph_altered = False
@@ -276,9 +276,9 @@ class Network(object):
 
         NOTE, the graph might be redundancy since TRT's INetwork wont clean the unused inputs and layers
         automatically.
-        TODO[chunweiy]: add an flag to hide all the removed layers and their output tensors
-        TODO[chunweiy]: replace this when TensorRT provides a better way to get the graph of INetworkDefinition
-        TODO[chunweiy]: a little feature, add blocks in the figure to highlight the subgraphes of Modules
+        TODO: add an flag to hide all the removed layers and their output tensors
+        TODO: replace this when TensorRT provides a better way to get the graph of INetworkDefinition
+        TODO: a little feature, add blocks in the figure to highlight the subgraphes of Modules
 
         Parameters:
             path: the path to save the graphviz file, if not provided, will return the graphviz source code
@@ -405,7 +405,7 @@ class Network(object):
                         self.tensor_to_producer[output_tensor] = layer
 
     def _get_network_hash(self, lightweight=True) -> bytes:
-        # TODO[chunweiy]: Ask TensorRT team to add a hash function for INetworkDefinition instead of using this hacky way
+        # TODO: Ask TensorRT team to add a hash function for INetworkDefinition instead of using this hacky way
         num_layers = self.trt_network.num_layers
 
         # Some special layers, such as slice, may be associated with tensors that do not have the `trt_tensor` member.

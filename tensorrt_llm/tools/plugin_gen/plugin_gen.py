@@ -224,7 +224,7 @@ class Stage:
                             add_header=i == 0,
                             plugin_lib_path=plugin_lib_path).generate()
 
-        # TODO[chunweiy]: make it customizable
+        # TODO: make it customizable
         trt_llm_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                     '../../..')
 

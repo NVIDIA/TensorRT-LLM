@@ -14,6 +14,15 @@ code is located in [`examples/gpt`](./). There are four main files in that folde
  * [`run.py`](./run.py) to run the inference on an input text,
  * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
 
+## Support Matrix
+  * FP16
+  * FP8
+  * Inflight Batching
+  * PAGED_KV_CACHE
+  * FP8 KV CACHE
+  * Tensor Parallel
+  * STRONGLY TYPED
+
 ## Usage
 
 The next two sections describe how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers)

@@ -870,7 +870,7 @@ def interpolate(input: Tensor,
             layer.coordinate_transformation = trt.ResizeCoordinateTransformation.ALIGN_CORNERS
         else:
             layer.coordinate_transformation = trt.ResizeCoordinateTransformation.HALF_PIXEL
-        # TODO(guomingz), need to confirm the align_corners effect on bilinear mode.
+        # TODO, need to confirm the align_corners effect on bilinear mode.
         if mode == 'bilinear':
             layer.coordinate_transformation = trt.ResizeCoordinateTransformation.HALF_PIXEL
 
@@ -952,7 +952,7 @@ def constant(ndarray: np.ndarray) -> Tensor:
     return _create_tensor(layer.get_output(0), layer)
 
 
-# TODO(qijun): TensorRT uses sizes of the output dimensions.
+# TODO: TensorRT uses sizes of the output dimensions.
 # DL framework uses ends usually. Will change it to ends.
 def slice(input: Tensor, starts: Union[Tensor, Sequence[int]],
           sizes: Union[Tensor, Sequence[int]]) -> Tensor:
@@ -1034,7 +1034,7 @@ def slice(input: Tensor, starts: Union[Tensor, Sequence[int]],
     return _create_tensor(layer.get_output(0), layer)
 
 
-# TODO(qijun): support step.
+# TODO: support step.
 def arange(start: Union[Tensor, int], end: Union[Tensor, int],
            dtype: str) -> Tensor:
     '''
@@ -2606,7 +2606,7 @@ def split(tensor: Tensor,
     sizes = [shape(tensor, i) for i in range(ndim)]
 
     if isinstance(split_size_or_sections, int):
-        # TODO(kaiyu): support non-divisible cases
+        # TODO: support non-divisible cases
         assert dim_value % split_size_or_sections == 0
         num_sections = dim_value // split_size_or_sections
         sizes[dim] = constant(int32_array([split_size_or_sections]))
@@ -3439,7 +3439,7 @@ def layer_norm(input: Tensor,
     if not default_net().plugin_config.layernorm_plugin:
         input, weight = broadcast_helper(input, weight)
         input, bias = broadcast_helper(input, bias)
-        if isinstance(normalized_shape, int):  # FIXME(kaiyu): better way?
+        if isinstance(normalized_shape, int):  # FIXME: better way?
             axis = input.ndim() - 1
         else:
             axis = input.ndim() - len(normalized_shape)

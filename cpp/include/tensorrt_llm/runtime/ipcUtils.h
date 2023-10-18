@@ -34,7 +34,7 @@ public:
 
     size_t static constexpr FLAGS_SIZE = kernels::MAX_ALL_REDUCE_BLOCKS * sizeof(uint32_t);
 
-    IpcMemory(WorldConfig worldConfig, SizeType bufferSize);
+    IpcMemory(WorldConfig worldConfig, std::size_t bufferSize);
     ~IpcMemory();
 
     [[nodiscard]] const std::vector<void*>& getCommPtrsTensor() const
@@ -48,7 +48,7 @@ private:
 
     WorldConfig mWorldConfig;
     std::vector<void*> mCommPtrs;
-    SizeType mBufferSize;
+    std::size_t mBufferSize;
     void* mBufferPtr;
 };
 

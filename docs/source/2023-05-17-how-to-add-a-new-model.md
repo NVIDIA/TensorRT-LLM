@@ -2,8 +2,6 @@
 
 This document describes how to add a new model in TensorRT-LLM.
 
-- Author(s):     Freddy Qi
-- Last updated:  2023-05-17
 
 ## Steps
 

@@ -94,7 +94,7 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
 
     engine_dir = models_dir / 'rt_engine' / model_name
 
-    # TODO(nkorobov) add Tensor and Pipeline parallelism to GPT-J
+    # TODO add Tensor and Pipeline parallelism to GPT-J
     tp_size = 1
     pp_size = 1
     tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu"

@@ -359,7 +359,7 @@ class GPTJForCausalLM(GPTJModel):
                             shape=[-1, 2, num_heads, -1, head_size],
                             dim_range=kv_dim_range)
                 past_key_value.append(kv)
-                # TODO(kaiyu): Remove this when TRT fix the named dimension
+                # TODO: Remove this when TRT fix the named dimension
                 if not remove_input_padding:
                     assertion(shape(input_ids, 0) == shape(kv, 0), 'batch size')
 

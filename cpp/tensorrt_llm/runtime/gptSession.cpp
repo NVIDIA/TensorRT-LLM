@@ -197,7 +197,7 @@ void GptSession::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType ma
     // Store this param related to deocder buffer size and kv cache manager to check against
     // the input shape with the params given in generate().
     // gptDecoderBatch does not resize buffers, but allows smaller batchSize and beamWidth.
-    // TODO (rkobus) refactor batch manager to remove dependency on maxSequenceLength.
+    // TODO refactor batch manager to remove dependency on maxSequenceLength.
     mDecoderMaxSequenceLength = maxSequenceLength;
 
     if (mModelConfig.usePagedKvCache())
@@ -349,7 +349,7 @@ void GptSession::generateSingleBatch(
 
         sync_check_cuda_error();
 
-        // FIXME(nkorobov): this synchronize is important to get logits right
+        // FIXME: this synchronize is important to get logits right
         // manager.getStream().synchronize();
 
         decoderStepAsync(outputs.ids, newTokens, maxInputLength + step, microBatchId);
@@ -359,7 +359,7 @@ void GptSession::generateSingleBatch(
         {
             if (onTokenGenerated)
             {
-                // TODO(rkobus) use getNewTokens(), remove step from Callback?
+                // TODO use getNewTokens(), remove step from Callback?
                 ITensor::SharedPtr outputIds
                     = mWorldConfig.isPipelineParallel() ? outputs.ids : mDecoders.at(microBatchId)->getOutputIds();
                 onTokenGenerated(outputIds, step, shouldStop || step == maxNewTokens - 1);

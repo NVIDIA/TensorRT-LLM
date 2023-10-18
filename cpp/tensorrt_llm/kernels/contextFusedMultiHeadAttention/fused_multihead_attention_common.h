@@ -27,8 +27,6 @@ namespace kernels
 enum Data_type
 {
     DATA_TYPE_BOOL,
-    DATA_TYPE_E8M10,
-    DATA_TYPE_E8M7,
     DATA_TYPE_FP16,
     DATA_TYPE_FP32,
     DATA_TYPE_INT4,

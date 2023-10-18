@@ -857,7 +857,7 @@ class FP8Linear(Linear):
         ).strongly_typed and self.weights_scaling_factor.value.dtype != self.dtype:
             w_deq_out = cast(w_deq_out, self.dtype)
 
-        # TODO(nkorobov): allow gemm plugin default_net().plugin_config.gemm_plugin
+        # TODO: allow gemm plugin default_net().plugin_config.gemm_plugin
         return self.multiply_gather(dequantized_out,
                                     w_deq_out,
                                     False,
@@ -925,7 +925,7 @@ class FP8RowLinear(RowLinear):
         ).strongly_typed and self.weights_scaling_factor.value.dtype != self.dtype:
             w_deq_out = cast(w_deq_out, self.dtype)
 
-        # TODO(nkorobov): allow gemm plugin default_net().plugin_config.gemm_plugin
+        # TODO: allow gemm plugin default_net().plugin_config.gemm_plugin
         return self.multiply_reduce(dequantized_out,
                                     w_deq_out,
                                     False,
@@ -1091,7 +1091,7 @@ class SmoothQuantAttention(Module):
                 kv_cache_params=None,
                 attention_params=None,
                 workspace=None):
-        # TODO(nkorobov) add in-flight batching to SmoothQuant
+        # TODO add in-flight batching to SmoothQuant
         if default_net().plugin_config.smooth_quant_gemm_plugin:
             qkv = self.qkv(hidden_states)
         else:

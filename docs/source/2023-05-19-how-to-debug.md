@@ -2,9 +2,6 @@
 
 This document describes how to debug in TensorRT-LLM.
 
-- Author(s):     Freddy Qi
-- Last updated:  2023-07-14
-
 ## Overview
 
 Usually, we want to print the intermediate tensor values when debugging a TensorRT-LLM model.
@@ -61,7 +58,7 @@ print(outputs.keys())
 print(outputs['inter'])
 ```
 
-Here is the [full example](../tests/test_debugging_api.py).
+Here is the [full example](../../tests/test_debugging_api.py).
 
 
 ## Debug on E2E models

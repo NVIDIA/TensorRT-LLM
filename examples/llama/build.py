@@ -658,7 +658,7 @@ def build(rank, args):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
-        # NOTE(nkorobov): when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
+        # NOTE: when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
         int8_trt_flag = args.quant_mode.has_act_and_weight_quant() or (
             not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
         builder_config = builder.create_builder_config(

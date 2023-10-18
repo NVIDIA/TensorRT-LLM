@@ -103,7 +103,7 @@ struct Multihead_attention_params_base
     // The beam width
     int beam_width = 0;
     // The sequence length.
-    // TODO (martinma): change name max_seq_len
+    // TODO: change name max_seq_len
     int memory_max_len = 0;
     // The number of heads (H).
     int num_heads = 0;
@@ -119,7 +119,7 @@ struct Multihead_attention_params_base
     RotaryScalingType rotary_embedding_scale_type = RotaryScalingType::kNONE;
     float rotary_embedding_scale = 0.0f;
     int rotary_embedding_max_positions = 0;
-    // The current timestep. TODO(bhsueh) Check that do we only this param in cross attention?
+    // The current timestep. TODO Check that do we only this param in cross attention?
     int timestep = 0;
     // The current timestep of each sentences (support different timestep for different sentences)
 

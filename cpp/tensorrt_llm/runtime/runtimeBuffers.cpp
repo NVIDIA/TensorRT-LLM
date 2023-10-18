@@ -187,9 +187,9 @@ void RuntimeBuffers::createCustomAllReduceWorkspace(SizeType maxBatchSize, SizeT
     SizeType maxSequenceLength, SizeType hiddenSize, WorldConfig const& worldConfig, BufferManager& manager)
 {
     mIpcMemoryHandles.clear();
-    mIpcMemoryHandles.emplace_back(std::make_shared<IpcMemory>(worldConfig,
-        maxBatchSize * maxBeamWidth * maxSequenceLength * hiddenSize * worldConfig.getTensorParallelism()
-            * sizeof(float)));
+    const std::size_t bufferSize = static_cast<std::size_t>(maxBatchSize) * maxBeamWidth * maxSequenceLength
+        * hiddenSize * worldConfig.getTensorParallelism() * sizeof(float);
+    mIpcMemoryHandles.emplace_back(std::make_shared<IpcMemory>(worldConfig, bufferSize));
     mIpcMemoryHandles.emplace_back(std::make_shared<IpcMemory>(worldConfig, IpcMemory::FLAGS_SIZE * sizeof(int32_t)));
     mIpcMemoryHandles.emplace_back(std::make_shared<IpcMemory>(worldConfig, IpcMemory::FLAGS_SIZE * sizeof(int32_t)));
 

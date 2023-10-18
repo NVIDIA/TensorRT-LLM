@@ -46,7 +46,7 @@ def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, world_size, *args):
 
 
 def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
-    # TODO(nkorobov) add support of Pipeline parallelism to GPT
+    # TODO add support of Pipeline parallelism to GPT
     tp_size = world_size
     pp_size = 1
 

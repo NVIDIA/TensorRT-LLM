@@ -7,7 +7,7 @@ This directory contains the stuff for building static html documentations based 
 Firstly, install the sphinx:
 
 ```sh
-apt-get install python3-sphinx doxygen
+apt-get install python3-sphinx doxygen python3-pip graphviz
 ```
 
 Secondly, install the packages:
@@ -19,7 +19,7 @@ python3 -m pip install -r ./requirements.txt
 And then, make the docs:
 
 ```sh
-doxygen Doxyfile # build C++ docs
+doxygen Doxygen # build C++ docs
 
 make html
 ```

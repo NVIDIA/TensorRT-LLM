@@ -394,9 +394,6 @@ class GPTBenchmark(BaseBenchmark):
             network.plugin_config.set_smooth_quant_gemm_plugin(dtype=self.dtype)
             network.plugin_config.set_layernorm_quantization_plugin(
                 dtype=self.dtype)
-            # FIXME(nkorobov)
-            # See https://nvbugs/4164762
-            # See https://nvbugs/4174113
             network.plugin_config.set_quantize_tensor_plugin()
             network.plugin_config.set_quantize_per_token_plugin()
         elif self.use_weight_only:

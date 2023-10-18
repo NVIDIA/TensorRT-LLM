@@ -72,7 +72,7 @@ weights of the model. TensorRT-LLM includes scripts to prepare the model to
 run using the SmoothQuant method.
 
 Examples of how to enable SmoothQuant for GPT, GPT-J and LLaMA can be found in
-the [examples/quantization](../examples/quantization) folder of that release.
+the [examples/quantization](source:examples/quantization) folder of that release.
 
 ## INT4 and INT8 Weight-Only (W4A16 and W8A16)
 
@@ -83,8 +83,8 @@ The activations are encoded using floating-point values (FP16 or BF16).
 To use INT4/INT8 Weight-Only methods, the user must determine the scaling
 factors to use to quantize and dequantize the weights of the model.
 
-This release includes examples for [GPT](../examples/gpt) and
-[LLaMA](../examples/llama).
+This release includes examples for [GPT](source:examples/gpt) and
+[LLaMA](source:examples/llama).
 
 ## GPTQ and AWQ (W4A16)
 
@@ -94,21 +94,21 @@ and
 [https://arxiv.org/abs/2306.00978](https://arxiv.org/abs/2306.00978),
 respectively. TensorRT-LLM supports per-group scaling factors and
 zero-offsetting in linear layers to implement GPTQ and AWQ methods. See the
-[WeightOnlyGroupwiseQuantMatmulPlugin](../cpp/tensorrt_llm/plugins/weightOnlyGroupwiseQuantMatmulPlugin)
+[WeightOnlyGroupwiseQuantMatmulPlugin](source:cpp/tensorrt_llm/plugins/weightOnlyGroupwiseQuantMatmulPlugin)
 plugin and the corresponding
-[`weight_only_groupwise_quant_matmul`](../tensorrt_llm/quantization/functional.py)
+[`weight_only_groupwise_quant_matmul`](source:tensorrt_llm/quantization/functional.py)
 Python function, for details.
 
-This release includes examples of applying GPTQ to [GPT-NeoX](../examples/gpt)
-and [LLaMA-v2](../examples/llama), as well as an example of using AWQ with
-[GPT-J](../examples/gptj). Those examples are experimental implementations and
+This release includes examples of applying GPTQ to [GPT-NeoX](source:examples/gpt)
+and [LLaMA-v2](source:examples/llama), as well as an example of using AWQ with
+[GPT-J](source:examples/gptj). Those examples are experimental implementations and
 are likely to evolve in a future release.
 
 ## FP8 (Hopper)
 
 This release of TensorRT-LLM contains implementations of FP8 for GPT-NeMo,
 GPT-J and LLaMA. Those examples can be found in
-[examples/quantization](../examples/quantization).
+[examples/quantization](source:examples/quantization).
 
 ## Support matrix
 
@@ -135,7 +135,7 @@ This release of TensorRT-LLM contains the following examples:
 ## Technical Detail: The `QuantMode` Flags
 
 The quantization method is controlled by the
-[`QuantMode`](../tensorrt_llm/quantization/mode.py) flags. The different fields
+[`QuantMode`](source:tensorrt_llm/quantization/mode.py) flags. The different fields
 are:
 
  * `INT4_WEIGHTS`, the weights are quantized to 4 bits (W4A\*),

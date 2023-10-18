@@ -5,11 +5,11 @@ the Python API as described in the [Architecture](architecture.md) document.
 That component is called the C++ runtime.
 
 The API of the C++ runtime is composed of the classes declared in
-[`cpp/include/tensorrt_llm/runtime`](../cpp/include/tensorrt_llm/runtime) and
+[`cpp/include/tensorrt_llm/runtime`](source:cpp/include/tensorrt_llm/runtime) and
 implemented in
-[`cpp/tensorrt_llm/runtime`](../cpp/tensorrt_llm/runtime). An example of
+[`cpp/tensorrt_llm/runtime`](source:cpp/tensorrt_llm/runtime). An example of
 how to use the C++ runtime for a GPT-like auto-regressive model can be found in
-[`cpp/tests/runtime/gptSessionTest.cpp`](../cpp/tests/runtime/gptSessionTest.cpp).
+[`cpp/tests/runtime/gptSessionTest.cpp`](source:cpp/tests/runtime/gptSessionTest.cpp).
 
 Even if the different components described in that document mention GPT in
 their name, they are not restricted to this specific model. Those classes can
@@ -18,22 +18,22 @@ LLaMA, for example.
 
 Complete support of encoder-decoder models, like T5, will be added to
 TensorRT-LLM in a future release. An experimental version, only in Python for
-now, can be found in the [`examples/enc_dec`](../examples/enc_dec) folder.
+now, can be found in the [`examples/enc_dec`](source:examples/enc_dec) folder.
 
 ## The Session
 
 The main component of the C++ runtime is the session. For GPT-like
 auto-regressive models, it is the
-[`GptSession`](../cpp/include/tensorrt_llm/runtime/gptSession.h) class.
+[`GptSession`](source:cpp/include/tensorrt_llm/runtime/gptSession.h) class.
 
 ### Creation
 
 The constructors of that class allow users to specify the model and the
 environment to execute it. The model is described by an instance of the
-[`GptModelConfig`](../cpp/include/tensorrt_llm/runtime/gptModelConfig.h)
+[`GptModelConfig`](source:cpp/include/tensorrt_llm/runtime/gptModelConfig.h)
 class and a pointer to the TensorRT engine that must be
 executed to perform the inference. The environment is configured through the
-[`WorldConfig`](../cpp/include/tensorrt_llm/runtime/worldConfig.h)
+[`WorldConfig`](source:cpp/include/tensorrt_llm/runtime/worldConfig.h)
 (that name comes from
 [MPI](https://en.wikipedia.org/wiki/Message_Passing_Interface) and its "famous"
 `MPI_COMM_WORLD` default communicator). The constructor also accepts an
@@ -59,7 +59,7 @@ encapsulate the engine.
 #### Model Configuration
 
 The model configuration is an instance of the
-[`GptModelConfig`](../cpp/include/tensorrt_llm/runtime/gptModelConfig.h) class.
+[`GptModelConfig`](source:cpp/include/tensorrt_llm/runtime/gptModelConfig.h) class.
 That class encapsulates the following parameters (they are declared as private
 member variables and exposed through getters and setters):
 
@@ -76,7 +76,7 @@ member variables and exposed through getters and setters):
    must be used to run the model during inference,
  * `useGptAttentionPlugin`, indicates if the [GPT Attention](gpt_attention.md)
    operator was compiled using the
-   [GPT Attention plugin](../cpp/tensorrt_llm/plugins/gptAttentionPlugin),
+   [GPT Attention plugin](source:cpp/tensorrt_llm/plugins/gptAttentionPlugin),
  * `inputPacked`, indicates that the input must be packed (or padded when set
    to `false`). For performance reasons, it is recommended to always use packed,
    even if its default is set to `false` (will be changed in a future release).
@@ -106,7 +106,7 @@ node as well as on different nodes in a cluster. Each process is called a
 TensorRT-LLM C++ Runtime calls that group the *world*.
 
 The world configuration is an instance of the
-[`WorldConfig`](../cpp/include/tensorrt_llm/runtime/worldConfig.h)
+[`WorldConfig`](source:cpp/include/tensorrt_llm/runtime/worldConfig.h)
 class. In this release, that class encapsulates the following parameters:
 
 * `tensorParallelism`, is the number of ranks that collaborate together to
@@ -216,9 +216,9 @@ for (int step = 0; !allFinished && step < maxNewTokens; ++step) {
 #### Inputs and Outputs
 
 The `generate` member function takes an instance of the
-[`GenerationInput`](../cpp/include/tensorrt_llm/runtime/generationInput.h) class and
+[`GenerationInput`](source:cpp/include/tensorrt_llm/runtime/generationInput.h) class and
 populates an instance of the
-[`GenerationOutput`](../cpp/include/tensorrt_llm/runtime/generationOutput.h) class.
+[`GenerationOutput`](source:cpp/include/tensorrt_llm/runtime/generationOutput.h) class.
 
 ***Mandatory inputs***
 
@@ -316,7 +316,7 @@ batchSize, beamWidth]`_.
 
 #### Sampling Parameters
 
-The [`SamplingConfig`](../cpp/include/tensorrt_llm/runtime/samplingConfig.h)
+The [`SamplingConfig`](source:cpp/include/tensorrt_llm/runtime/samplingConfig.h)
 class encapsulates parameters that control the
 [generation](https://huggingface.co/blog/how-to-generate) of new tokens.
 Except for the `beamWidth` parameter, all the fields are optional and the
@@ -388,9 +388,9 @@ sequence. This limitation is likely to be removed in a future release.
 ## Internal Components
 
 The `GptSession` class encapsulates two main components. The
-[`TllmRuntime`](../cpp/tensorrt_llm/runtime/tllmRuntime.h) is in charge of the
+[`TllmRuntime`](source:cpp/tensorrt_llm/runtime/tllmRuntime.h) is in charge of the
 execution of the TensorRT engine. The
-[`GptDecoder`](../cpp/include/tensorrt_llm/runtime/gptDecoder.h)
+[`GptDecoder`](source:cpp/include/tensorrt_llm/runtime/gptDecoder.h)
 does the generation of the tokens from the logits.  The `TllmRuntime` class is
 an internal component and users are not expected to use that class directly.
 The `GptDecoder` can be used directly to implement very custom generation loop

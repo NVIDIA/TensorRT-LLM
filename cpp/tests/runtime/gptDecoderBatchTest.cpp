@@ -53,7 +53,7 @@ void verifyResults(BufferManager& manager, GptDecoderBatch const& decoder,
     }
 
     auto outputsIds = decoder.getOutputIds();
-    // TODO(nkorobov): test parentIds
+    // TODO: test parentIds
     // parentIds = decoder.getParentIds();
     ASSERT_TRUE(outputsIds);
     auto outputShape = outputsIds->getShape();

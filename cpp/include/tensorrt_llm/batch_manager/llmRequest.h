@@ -126,7 +126,6 @@ public:
     {
         // TODO: For beamWidth > 1, we would need to support swapping to avoid
         // recomputing from the start
-        // See https://jirasw.nvidia.com/browse/TRT-21715
         // As a temporary solution, we currently reset the tokens to the prompt
         if (mSamplingConfig.beamWidth > 1)
         {

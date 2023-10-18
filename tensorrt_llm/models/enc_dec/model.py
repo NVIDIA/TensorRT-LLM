@@ -998,7 +998,7 @@ class DecoderModel(Module):
                 dim_range=cross_kv_dim_range)
             past_key_value.append((kv, cross_kv))
 
-            # TODO(kaiyu): Remove this when TRT fix the named dimension
+            # TODO: Remove this when TRT fix the named dimension
             if not remove_input_padding:
                 assertion(shape(input_ids, 0) == shape(kv, 0), 'batch size')
 

@@ -215,7 +215,7 @@ public:
     MemoryType where;
     DataType type;
     std::vector<size_t> shape;
-    void const* data; // TODO(bhseuh) modify from const void* to void* const
+    void const* data; // TODO modify from const void* to void* const
 
     Tensor();
     Tensor(MemoryType _where, DataType _type, std::vector<size_t> const& _shape, void const* _data);

@@ -17,7 +17,7 @@ how it returns completed requests to the user.
 
 A software component (called the client in the text that follows) can interact
 with the batch manager using two main callbacks. Their signatures are defined
-in the [`callbacks.h`](../cpp/include/tensorrt_llm/batch_manager/callbacks.h) file.
+in the [`callbacks.h`](source:cpp/include/tensorrt_llm/batch_manager/callbacks.h) file.
 
 ### Get and Send Callbacks
 
@@ -39,7 +39,7 @@ the request. That identifier is called the *request ID* in the text that
 follows (and in the code of the batch manager). The input tensors are collected
 in a map (`std::map<std::string, Tensor>`) that associates input names to
 tensor. See
-[`InferenceRequest.h`](../cpp/include/tensorrt_llm/batch_manager/InferenceRequest.h)
+[`InferenceRequest.h`](source:cpp/include/tensorrt_llm/batch_manager/InferenceRequest.h)
 for more details.
 
 The responses are delivered to the client through a callback of type

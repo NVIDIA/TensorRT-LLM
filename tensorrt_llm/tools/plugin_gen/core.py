@@ -286,7 +286,7 @@ class KernelMetaData:
         version = yaml_data.get("version", 1)
         grid_dims = yaml_data["grid_dims"]
 
-        # TODO[chunweiy]: add other metadata for launching a Triton kernel
+        # TODO: add other metadata for launching a Triton kernel
 
         return KernelMetaData(kernel_name=kernel_name,
                               ios=ios,
@@ -507,7 +507,7 @@ class PluginCppCodegen:
                 env.get_template('plugin_common.h').filename).read(),
             plugin_common_source=open(
                 env.get_template('plugin_common.cpp').filename).read(),
-            plugin_version='0',  # TODO[chunweiy]: update it
+            plugin_version='0',
             **_render_common_parameters(),
         )
 

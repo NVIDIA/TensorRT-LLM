@@ -50,7 +50,7 @@ void setPeerAccess(WorldConfig worldConfig, bool enable)
     }
 }
 
-IpcMemory::IpcMemory(WorldConfig worldConfig, SizeType bufferSize)
+IpcMemory::IpcMemory(WorldConfig worldConfig, std::size_t bufferSize)
     : mWorldConfig(worldConfig)
     , mCommPtrs(worldConfig.getTensorParallelism())
     , mBufferSize(bufferSize)

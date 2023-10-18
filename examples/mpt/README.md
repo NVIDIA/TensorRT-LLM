@@ -6,6 +6,14 @@ This document explains how to build the [MPT](https://huggingface.co/mosaicml/mp
 Currently we use `tensorrt_llm.models.GPTLMHeadModel` to build TRT engine for MPT models.
 Support for float16, float32 and bfloat16 conversion. Just change `data_type` flags to any.
 
+## Support Matrix
+  * FP16
+  * FP8
+  * INT8 & INT4 Weight-Only
+  * FP8 KV CACHE
+  * Tensor Parallel
+  * STRONGLY TYPED
+
 #### MPT 7B
 
 ### 1. Convert weights from HF Tranformers to FT format

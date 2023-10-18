@@ -191,7 +191,7 @@ int AllreducePlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const 
         int myRank;
         int nRanks = inputDesc[1].dims.d[0] / 3;
         MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &myRank));
-        // FIXME(nkorobov): pass world config here
+        // FIXME: pass world config here
         myRank = myRank % nRanks;
 
         auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(

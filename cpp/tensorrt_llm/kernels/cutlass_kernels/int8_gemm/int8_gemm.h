@@ -34,7 +34,7 @@ namespace cutlass_kernels
   This runner supports:
   int8_t inputs (A and B)
   float alpha scalings (either per-col, or per-col x per-row)
-  T output (D) where T = {float, half, __nv_bfloat16} // TODO(mseznec)
+  T output (D) where T = {float, half, __nv_bfloat16} // TODO
 
   Activations, biases, scales and outputs are all assumed to be row-major.
   Weights are assumed to be column-major.

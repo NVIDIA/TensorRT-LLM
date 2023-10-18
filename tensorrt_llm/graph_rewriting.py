@@ -245,7 +245,7 @@ class RewritePatternManager(_PatternManager):
 
     def rewrite(self, net: Network, args=None):
         modified = True
-        # TODO[chunweiy]: we can optimize this by asking TRT to expose a graph iterator consistent even after the graph is modified
+        # TODO: we can optimize this by asking TRT to expose a graph iterator consistent even after the graph is modified
         while modified:
             modified = False
             # Since the graph iterator is hold by the underlying INetwork, we can only rebuild the graph cache and match the nodes again.

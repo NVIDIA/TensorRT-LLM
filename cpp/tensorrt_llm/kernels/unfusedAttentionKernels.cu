@@ -1187,7 +1187,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
             {
                 if (int8_mode == 2)
                 {
-                    // TODO(mseznec): add support for int8 BMM with FusedAtt
+                    // TODO: add support for int8 BMM with FusedAtt
                 }
                 else
                 {
@@ -1517,7 +1517,7 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, const 
     }
     else
     {
-        TLLM_CHECK_WITH_INFO(int8_mode != 2, "w8a8 not yet implemented with RoPE"); // TODO(mseznec)
+        TLLM_CHECK_WITH_INFO(int8_mode != 2, "w8a8 not yet implemented with RoPE"); // TODO
         // To implement rotary embeddings, each thread processes two QKV elems:
         dim3 block((size_per_head / Vec_t<T>::size + 31) / 32 * 32);
         dim3 grid(token_num, head_num);
@@ -1680,7 +1680,7 @@ __global__ void transpose4dBatchMajorKVCache(const T* kSrc, const T* vSrc, KVCac
         // If T is fp32, T_src is float4 and mmha::num_elems<T_src>::value returns 4
         // If T is fp16/bf16, T_src is uint4 and mmha::num_elems<T_src>::value returns 8
         // mmha::packed_type<int8_t ...>::type becomes uint32_t or uint64_t respectively
-        // FIXME(nkorobov) mmha::num_elems semantic is confusing
+        // FIXME mmha::num_elems semantic is confusing
         inBlockIdx = inBlockIdx * sizeof(mmha::packed_type<T_dst, mmha::num_elems<T_src>::value>::type);
         // Cast float scale to dst data type.
         using T_scale = typename mmha::kv_cache_scale_type_t<T, T_cache>::Type;

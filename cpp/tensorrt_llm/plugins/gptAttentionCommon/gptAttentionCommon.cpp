@@ -573,7 +573,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
     }
     else
     {
-        // FIXME(qijun): a temporary solution to make sure the padding part of key/value buffer is 0
+        // FIXME: a temporary solution to make sure the padding part of key/value buffer is 0
         // NOTE: pointer subtraction is used below since there could be some extra gap due to alignment.
         //  Otherwise, we could do cudaMemsetAsync(k_buf_2_, 0, k_buf_2_size + v_buf_2_size, stream);
         cudaMemsetAsync(k_buf_2_, 0,

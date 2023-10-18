@@ -12,6 +12,11 @@ The TensorRT-LLM Baichuan implementation can be found in [tensorrt_llm/models/ba
 
 These scripts accept an argument named model_version, whose value should be `v1_7b`/`v1_13b`/`v2_7b`/`v2_13b` and the default value is `v1_13b`.
 
+## Support Matrix
+  * FP16
+  * BF16
+  * INT4 & INT8 Weight-Only
+
 ## Usage
 
 The TensorRT-LLM Baichuan example code locates at [examples/baichuan](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
@@ -139,3 +144,9 @@ mpirun -n 2 --allow-run-as-root \
                         --data_type fp16 \
                         --engine_dir ./tmp/baichuan_v1_13b/trt_engines/fp16/2-gpu/
 ```
+
+### Known Issues
+
+ * The implementation of the Baichuan-7B model with INT8 Weight-Only and Tensor
+   Parallelism greater than 2 might have accuracy issues. It is under
+   investigation.

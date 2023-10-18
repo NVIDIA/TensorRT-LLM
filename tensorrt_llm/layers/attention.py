@@ -415,7 +415,7 @@ class Attention(Module):
                 past_key = past_key.view(key_shape, zero_is_placeholder=False)
                 past_value = past_value.view(key_shape,
                                              zero_is_placeholder=False)
-                # FIXME(kaiyu): Remove cast after https://nvbugs/4211574 is fixed
+
                 key = concat([past_key, key], dim=2).cast(self.dtype)
                 value = concat([past_value, value], dim=2).cast(self.dtype)
 

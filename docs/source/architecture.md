@@ -46,7 +46,7 @@ familiar with the core concepts of the TensorRT API, refer to the
 [Core Concepts](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/coreConcepts.html)
 section of the TensorRT documentation before proceeding further.
 
-In TensorRT-LLM, the [`tensorrt_llm.Builder`](../tensorrt_llm/builder.py) class
+In TensorRT-LLM, the [`tensorrt_llm.Builder`](source:tensorrt_llm/builder.py) class
 contains a
 [`tensorrt.Builder`](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Core/Builder.html#tensorrt.Builder)
 object. That instance is used in the `tensorrt_llm.Builder.create_network`
@@ -54,7 +54,7 @@ method to create an instance of the
 [`tensorrt.INetworkDefinition`](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Network.html#tensorrt.INetworkDefinition)
 class. The `INetworkDefinition` object can then be populated using the free
 functions defined in the
-[`tensorrt_llm.functional`](../tensorrt_llm/functional.py).
+[`tensorrt_llm.functional`](source:tensorrt_llm/functional.py).
 
 A simple example of such a free function is `tensorrt_llm.activation` that inserts a
 [`tensorrt.IActivationLayer`](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Layers.html#tensorrt.IActivationLayer)
@@ -194,7 +194,7 @@ limitation, TensorRT offers a powerful mechanism known as
 
 The plugins are nodes inserted in the network graph definition that map to user-defined
 GPU kernels. TensorRT-LLM uses a number of such plugins. They can be found in
-the [`cpp/tensorrt_llm/plugins`](../cpp/tensorrt_llm/plugins) directory.
+the [`cpp/tensorrt_llm/plugins`](source:/cpp/tensorrt_llm/plugins) directory.
 
 Plugins are written in C++ and follow a well-defined interface described in the
 [Extending TensorRT with Custom Layers](https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#extending)
@@ -202,7 +202,7 @@ section of the TensorRT
 [Developer Guide](https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html).
 When executed within a TensorRT engine, plugins trigger the execution of
 their encapsulated GPU kernels. A fairly simple example of plugins is the
-[`QuantizeTensorPlugin`](../cpp/tensorrt_llm/plugins/quantizeTensorPlugin) that
+[`QuantizeTensorPlugin`](source:/cpp/tensorrt_llm/plugins/quantizeTensorPlugin) that
 triggers a CUDA kernel in the `QuantizeTensorPlugin::enqueue` member function:
 
 ```cpp
@@ -248,7 +248,7 @@ plugin that optimize the All-Reduce primitive in the presence of All-to-all
 connections between GPUs (through NVSwitch in DGX systems).
 
 The communication plugins can be found in
-[cpp/tensorrt_llm/plugins/ncclPlugin](../cpp/tensorrt_llm/plugins/ncclPlugin)
+[cpp/tensorrt_llm/plugins/ncclPlugin](source:cpp/tensorrt_llm/plugins/ncclPlugin)
 and the multi-GPU functions are exposed in the TensorRT-LLM Python API
 as:
 

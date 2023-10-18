@@ -10,7 +10,7 @@ Multi-query Attention (MQA) [[https://arxiv.org/abs/1911.02150](https://arxiv.or
 Group-query Attention (GQA) [[https://arxiv.org/abs/2307.09288](https://arxiv.org/abs/2307.09288)]
 are variants of MHA that use fewer, so-called, K/V head than the number of
 query heads.  TensorRT-LLM, MHA, MQA and GQA are implemented by the operator
-[`tensorrt_llm.functional.gpt_attention`](../tensorrt_llm/functional.py).
+[`tensorrt_llm.functional.gpt_attention`](source:tensorrt_llm/functional.py).
 
 ## Important Note
 
@@ -24,7 +24,7 @@ future***.
 In TensorRT-LLM, the GPT attention operator supports two different types
 of QKV inputs: Padded and packed (i.e. non padded) inputs. The mode is
 determined by the global configuration parameter `remove_input_padding` defined
-in [`tensorrt_llm.plugin`](../tensorrt_llm/plugin/plugin.py).
+in [`tensorrt_llm.plugin`](source:tensorrt_llm/plugin/plugin.py).
 
 When padding is enabled (i.e. `remove_input_padding` is `False`), the sequences
 that are shorter than the `max_sequence_length` are padded to that maximum
@@ -46,7 +46,7 @@ context and generation phases in auto-regressive models like GPT.
 ### Context Phase
 
 If the `context_fmha_type` is set to `disabled` (see
-[`tensorrt_llm.plugin`](../tensorrt_llm/plugin/plugin.py)),
+[`tensorrt_llm.plugin`](source:tensorrt_llm/plugin/plugin.py)),
 the implementation maps to a sequence of GPU kernels that will store the
 intermediate `Q*K^T` tensor in memory before calling the softmax operator. It
 is the slowest method and the memory footprint is significant (quadratically
@@ -141,9 +141,9 @@ The paged KV cache decomposes the KV cache into blocks that are distributed to
 the different requests by a cache manager during processing. That cache manager
 keeps track of the sequences, allocate new blocks from a pool and recycle those
 blocks when required. See the simplified implementation of
-[`tensorrt_llm.runtime.KVCacheManager`](../tensorrt_llm/runtime/kv_cache_manager.py).
+[`tensorrt_llm.runtime.KVCacheManager`](source:tensorrt_llm/runtime/kv_cache_manager.py).
 A more efficient C++ implementation is included in the
-[Batch Manager](../cpp/include/tensorrt_llm/batch_manager).
+[Batch Manager](source:cpp/include/tensorrt_llm/batch_manager).
 
 ## INT8/FP8 KV Caches
 

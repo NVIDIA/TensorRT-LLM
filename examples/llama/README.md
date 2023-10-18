@@ -10,6 +10,14 @@ The TensorRT-LLM LLaMA implementation can be found in [tensorrt_llm/models/llama
  * [`run.py`](./run.py) to run the inference on an input text,
  * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
 
+## Support Matrix
+  * FP16
+  * FP8
+  * INT8 & INT4 Weight-Only
+  * FP8 KV CACHE
+  * Tensor Parallel
+  * STRONGLY TYPED
+
 ## Usage
 
 The TensorRT-LLM LLaMA example code locates at [examples/llama](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.

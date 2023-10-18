@@ -10,6 +10,14 @@ The TensorRT-LLM Falcon implementation can be found in [tensorrt_llm/models/falc
  * [`run.py`](./run.py) to run the inference on an input text,
  * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
 
+## Support Matrix
+  * FP16
+  * BF16
+  * FP8
+  * STRONGLY TYPED
+  * FP8 KV CACHE
+  * Tensor Parallel
+
 ## Usage
 
 The TensorRT-LLM Falcon example code is located at [examples/falcon](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.

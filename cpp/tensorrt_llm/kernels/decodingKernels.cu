@@ -40,7 +40,7 @@ __global__ void gatherTree(gatherTreeParam param)
         const int* parent_ids = param.parent_ids;
         const int* step_ids = param.step_ids;
 
-        // TODO(bhsueh) optimize the reduce_max operation for large beam_width
+        // TODO optimize the reduce_max operation for large beam_width
         int max_len = -1;
         bool update_response_input_length = param.response_input_lengths != nullptr;
         // int selected_beam_index = 0;

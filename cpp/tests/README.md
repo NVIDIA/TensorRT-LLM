@@ -2,6 +2,8 @@
 
 This document explains how to build and run the C++ tests, and the included [resources](resources).
 
+Windows users: Be sure to set DLL paths as specified in [Extra Steps for C++ Runtime Usage](../../windows/README.md#extra-steps-for-c-runtime-usage).
+
 ## Compile
 
 From the top-level directory call:

@@ -13,6 +13,11 @@ code is located in [`examples/opt`](./). There are four main files in that folde
  * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the OPT model,
  * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
 
+## Support Matrix
+  * FP16
+  * INT8 & INT4 Weight-Only
+  * Tensor Parallel
+
 ## Usage
 
 The next two sections describe how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers)

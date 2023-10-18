@@ -94,8 +94,10 @@ GptJsonConfig parseJson(InputType&& i)
         TLLM_CHECK_WITH_INFO(false, tc::fmtstr("Model data type '%s' not supported", precision.c_str()));
 
     auto const quantMode = tc::QuantMode(parseJsonFieldOr(builderConfig, "quant_mode", tc::QuantMode::none().value()));
-    auto const numKvHeads
-        = parseJsonFieldOr(builderConfig, "num_kv_heads", numHeads * tensorParallelism) / tensorParallelism;
+    // TODO:
+    // Code crashes when numKvHeads <= 0. Clamping downwards to 1 prevents that, make sure this is best fix.
+    auto const numKvHeads = std::max(
+        parseJsonFieldOr(builderConfig, "num_kv_heads", numHeads * tensorParallelism) / tensorParallelism, 1);
     auto const maxBatchSize = parseJsonFieldOr(builderConfig, "max_batch_size", 0);
     auto const maxInputLen = parseJsonFieldOr(builderConfig, "max_input_len", 0);
     auto const maxOutputLen = parseJsonFieldOr(builderConfig, "max_output_len", 0);

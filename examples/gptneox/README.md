@@ -10,6 +10,10 @@ The TensorRT-LLM GPT-NeoX implementation can be found in [`tensorrt_llm/models/g
  * [`run.py`](./run.py) to run the inference on an input text,
  * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
 
+## Support Matrix
+  * FP16
+  * Tensor Parallel
+
 ## Usage
 
 ### 1. Download weights from HuggingFace (HF) Transformers
