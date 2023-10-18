@@ -48,6 +48,11 @@ public:
         return mTensorParallelism;
     }
 
+    [[nodiscard]] bool constexpr isTensorParallel() const noexcept
+    {
+        return mTensorParallelism > 1;
+    }
+
     [[nodiscard]] SizeType constexpr getPipelineParallelism() const noexcept
     {
         return mPipelineParallelism;

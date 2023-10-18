@@ -106,16 +106,20 @@ struct FusedQKVMaskedAttentionDispatchParams
     tc::QuantMode kv_cache_quant_mode;
     int multi_processor_count;
     KVCacheBuffer kv_block_array;
+    bool cross_attention = false;
+    const int* memory_length_per_sample = nullptr;
+    int max_distance = 0;
 };
 
-template <typename T, typename KVCacheBuffer>
-void fusedQKV_masked_attention_dispatch(
+template <typename T_MMHA, typename T, typename KVCacheBuffer, bool CROSS_ATTENTION>
+void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS_ATTENTION>& params,
     const FusedQKVMaskedAttentionDispatchParams<T, KVCacheBuffer>& input_params, cudaStream_t stream)
 {
     using DataType = typename SATypeConverter<T>::Type;
+
     // Prepare the parameters.
-    Masked_multihead_attention_params<DataType> params;
     memset(&params, 0, sizeof(params));
+
     int hidden_units = input_params.head_num * input_params.size_per_head;
     int hidden_units_kv = input_params.kv_head_num * input_params.size_per_head;
     if (input_params.qkv_bias != nullptr)
@@ -169,12 +173,9 @@ void fusedQKV_masked_attention_dispatch(
     // Note: keep norm factor (sqrt(K_dim)) when adopting megatron T5 structure (may adjust)
     params.inv_sqrt_dh = 1.F / (sqrtf((float) params.hidden_size_per_head) * input_params.q_scaling);
 
-    // TODO(bhsueh) Need better implementation
-    if (input_params.relative_attention_bias != nullptr)
-    {
-        params.relative_attention_bias = reinterpret_cast<const DataType*>(input_params.relative_attention_bias);
-    }
+    params.relative_attention_bias = reinterpret_cast<const DataType*>(input_params.relative_attention_bias);
     params.relative_attention_bias_stride = input_params.relative_attention_bias_stride;
+    params.max_distance = input_params.max_distance;
 
     // The slope of linear position bias per head, e.g., ALiBi.
     if (input_params.linear_bias_slopes != nullptr)
@@ -207,17 +208,28 @@ void fusedQKV_masked_attention_dispatch(
 
     params.multi_processor_count = input_params.multi_processor_count;
 
+    // cross attn
+    params.memory_length_per_sample = input_params.memory_length_per_sample;
+    sync_check_cuda_error();
+
     masked_multihead_attention(params, input_params.kv_block_array, stream);
 }
 
-template void fusedQKV_masked_attention_dispatch(
-    const FusedQKVMaskedAttentionDispatchParams<float, KVLinearBuffer>&, cudaStream_t stream);
-template void fusedQKV_masked_attention_dispatch(
-    const FusedQKVMaskedAttentionDispatchParams<half, KVLinearBuffer>&, cudaStream_t stream);
-template void fusedQKV_masked_attention_dispatch(
-    const FusedQKVMaskedAttentionDispatchParams<float, KVBlockArray>&, cudaStream_t stream);
-template void fusedQKV_masked_attention_dispatch(
-    const FusedQKVMaskedAttentionDispatchParams<half, KVBlockArray>&, cudaStream_t stream);
+#define INSTANTIATE_MMHA_DISPATH(T_MMHA, T)                                                                            \
+    template void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, false>&,                       \
+        const FusedQKVMaskedAttentionDispatchParams<T, KVLinearBuffer>&, cudaStream_t stream);                         \
+    template void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, true>&,                        \
+        const FusedQKVMaskedAttentionDispatchParams<T, KVLinearBuffer>&, cudaStream_t stream);                         \
+    template void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, false>&,                       \
+        const FusedQKVMaskedAttentionDispatchParams<T, KVBlockArray>&, cudaStream_t stream);                           \
+    template void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, true>&,                        \
+        const FusedQKVMaskedAttentionDispatchParams<T, KVBlockArray>&, cudaStream_t stream);
+INSTANTIATE_MMHA_DISPATH(float, float)
+INSTANTIATE_MMHA_DISPATH(uint16_t, half)
+#ifdef ENABLE_BF16
+INSTANTIATE_MMHA_DISPATH(__nv_bfloat16, __nv_bfloat16)
+#endif
+#undef INSTANTIATE_MMHA_DISPATH
 
 GPTAttentionPluginCommon::GPTAttentionPluginCommon(int num_heads, int num_kv_heads, int head_size, int unidirectional,
     float q_scaling, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
@@ -226,7 +238,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int num_heads, int num_kv_hea
     float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
     tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
     bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
-    int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled)
+    int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled,
+    bool cross_attention, int max_distance)
     : mNumHeads(num_heads)
     , mNumKVHeads(num_kv_heads)
     , mHeadSize(head_size)
@@ -251,6 +264,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int num_heads, int num_kv_hea
     , mTpRank(tp_rank)
     , mMaxContextLength(max_context_length)
     , mQKVBiasEnabled(qkv_bias_enabled)
+    , mCrossAttention(cross_attention)
+    , mMaxDistance(max_distance)
 {
     mEnableContextFMHA = mEnableContextFMHA && (mType == DataType::kHALF || mType == DataType::kBF16);
     TLLM_CHECK(isRoPE() == (rotary_embedding_dim != 0));
@@ -297,6 +312,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(const void* data, size_t leng
     read(d, mType);
     read(d, mMaxContextLength);
     read(d, mQKVBiasEnabled);
+    read(d, mCrossAttention);
+    read(d, mMaxDistance);
 
     mKVCacheQuantMode = tc::QuantMode(kvCacheQuantMode);
 
@@ -306,9 +323,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(const void* data, size_t leng
 }
 
 size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(
-    DataType type, int32_t nbReq, int32_t max_input_length) const noexcept
+    DataType type, int32_t nbReq, int32_t input_seq_length, int32_t cross_qkv_length) const noexcept
 {
-    int32_t const input_seq_length = max_input_length;
     const int local_hidden_units_qo = mNumHeads * getHeadSize();
     const int local_hidden_units_kv = mNumKVHeads * getHeadSize();
 
@@ -317,16 +333,24 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(
     size_t context_workspace_size = 0;
 
     const int batch_size = nbReq;
-    const size_t attention_mask_size = mEnableContextFMHA ? 0 : size * batch_size * max_input_length * max_input_length;
+    const size_t attention_mask_size = mEnableContextFMHA
+        ? 0
+        : size * batch_size * input_seq_length * (isCrossAttention() ? cross_qkv_length : input_seq_length);
     const size_t cu_seqlens_size = sizeof(int) * (batch_size + 1);
     const size_t q_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_length * local_hidden_units_qo;
-    const size_t k_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_length * local_hidden_units_kv;
-    const size_t v_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_length * local_hidden_units_kv;
-    const size_t qk_buf_size
-        = mEnableContextFMHA ? 0 : size * batch_size * mNumHeads * input_seq_length * input_seq_length;
+    const size_t k_buf_2_size = mEnableContextFMHA
+        ? 0
+        : size * batch_size * (isCrossAttention() ? cross_qkv_length : input_seq_length) * local_hidden_units_kv;
+    const size_t v_buf_2_size = mEnableContextFMHA
+        ? 0
+        : size * batch_size * (isCrossAttention() ? cross_qkv_length : input_seq_length) * local_hidden_units_kv;
+    const size_t qk_buf_size = mEnableContextFMHA
+        ? 0
+        : size * batch_size * mNumHeads * input_seq_length * (isCrossAttention() ? cross_qkv_length : input_seq_length);
     const size_t qkv_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_length * local_hidden_units_qo;
-    const size_t qk_buf_float_size
-        = mEnableContextFMHA ? 0 : sizeof(float) * batch_size * mNumHeads * input_seq_length * input_seq_length;
+    const size_t qk_buf_float_size = mEnableContextFMHA ? 0
+                                                        : sizeof(float) * batch_size * mNumHeads * input_seq_length
+            * (isCrossAttention() ? cross_qkv_length : input_seq_length);
     const size_t padding_offset_size = sizeof(int) * batch_size * input_seq_length;
 
     const int NUM_BUFFERS = 10;
@@ -399,8 +423,6 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
     const int local_hidden_units_kv = num_kv_heads * head_size;
     const PositionEmbeddingType position_embedding_type = mPositionEmbeddingType;
     const float q_scaling = mQScaling;
-    const int relative_attention_bias_stride = 0;
-    const T* relative_attention_bias = nullptr;
     const bool* finished = nullptr;
     const bool has_ia3 = false;
 
@@ -416,8 +438,8 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
     else
     {
         using BufferDataType = typename KVCacheBufferDataType<KVCacheBuffer>::Type;
-        kv_cache_buffer
-            = KVCacheBuffer(params.batch_size, 1, params.max_seq_length, num_kv_heads * head_size * elem_size);
+        kv_cache_buffer = KVCacheBuffer(params.batch_size, 1,
+            isCrossAttention() ? params.cross_qkv_length : params.max_seq_length, num_kv_heads * head_size * elem_size);
         kv_cache_buffer.data = reinterpret_cast<BufferDataType*>(params.key_value_cache);
     }
 
@@ -435,9 +457,6 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
     float* partial_sum = nullptr;
     float* partial_max = nullptr;
     int* block_counter = nullptr;
-
-    const int request_batch_size = params.batch_size;
-    const int request_seq_length = params.input_seq_length;
 
     auto cublasHandle = mCublasWrapper->getCublasHandle();
     TLLM_CUDA_CHECK(cublasSetStream(cublasHandle, stream));
@@ -458,23 +477,26 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
     }
 #endif
 
-    const size_t attention_mask_size
-        = mEnableContextFMHA ? 0 : sizeof(T) * params.batch_size * params.input_seq_length * params.input_seq_length;
+    const size_t attention_mask_size = mEnableContextFMHA ? 0
+                                                          : sizeof(T) * params.batch_size * params.input_seq_length
+            * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
     const size_t cu_seqlens_size = sizeof(int) * (params.batch_size + 1);
     const size_t q_buf_2_size
         = mEnableContextFMHA ? 0 : sizeof(T) * params.batch_size * params.input_seq_length * local_hidden_units_qo;
-    const size_t k_buf_2_size
-        = mEnableContextFMHA ? 0 : sizeof(T) * params.batch_size * params.input_seq_length * local_hidden_units_kv;
-    const size_t v_buf_2_size
-        = mEnableContextFMHA ? 0 : sizeof(T) * params.batch_size * params.input_seq_length * local_hidden_units_kv;
-    const size_t qk_buf_size = mEnableContextFMHA
-        ? 0
-        : sizeof(T) * params.batch_size * mNumHeads * params.input_seq_length * params.input_seq_length;
+    const size_t k_buf_2_size = mEnableContextFMHA ? 0
+                                                   : sizeof(T) * params.batch_size
+            * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length) * local_hidden_units_kv;
+    const size_t v_buf_2_size = mEnableContextFMHA ? 0
+                                                   : sizeof(T) * params.batch_size
+            * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length) * local_hidden_units_kv;
+    const size_t qk_buf_size = mEnableContextFMHA ? 0
+                                                  : sizeof(T) * params.batch_size * mNumHeads * params.input_seq_length
+            * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
     const size_t qkv_buf_2_size
         = mEnableContextFMHA ? 0 : sizeof(T) * params.batch_size * params.input_seq_length * local_hidden_units_qo;
-    const size_t qk_buf_float_size = mEnableContextFMHA
-        ? 0
-        : sizeof(float) * params.batch_size * mNumHeads * params.input_seq_length * params.input_seq_length;
+    const size_t qk_buf_float_size = mEnableContextFMHA ? 0
+                                                        : sizeof(float) * params.batch_size * mNumHeads
+            * params.input_seq_length * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
     const size_t padding_offset_size = sizeof(int) * params.batch_size * params.input_seq_length;
 
     const bool is_qk_buf_float_ = true;
@@ -507,46 +529,97 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
     invokeBuildDecoderInfo(decoder_params, stream);
     sync_check_cuda_error();
 
+    // In cross attention context phase, the attention mask should be a matrix of all ones.
+    // We reassign attention_mask to override what previous invokeBuildDecoderInfo() does
+    if (isCrossAttention())
+    {
+        std::vector<T> h_attention_mask(params.batch_size * params.cross_qkv_length * params.input_seq_length, 1.);
+        cudaMemcpyAsync(attention_mask, h_attention_mask.data(),
+            sizeof(T) * params.batch_size * params.cross_qkv_length * params.input_seq_length, cudaMemcpyHostToDevice,
+            stream);
+    }
+
+    // write KV to cache
     const KvCacheDataType cache_type = mKVCacheQuantMode.hasInt8KvCache()
         ? KvCacheDataType::INT8
         : (mKVCacheQuantMode.hasFp8KvCache() ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
 
     const cudaDataType_t gemm_data_type = tc::CudaDataType<T>::value;
-    const int attention_seq_len_1 = request_seq_length; // q length
-    const int attention_seq_len_2 = request_seq_length; // kv length
-    const T qk_scale = static_cast<T>(1.0f / (sqrtf(getHeadSize() * 1.0f) * q_scaling));
+    const int attention_seq_len_1 = params.input_seq_length;                                                // q length
+    const int attention_seq_len_2 = isCrossAttention() ? params.cross_qkv_length : params.input_seq_length; // kv length
 
-    if (mEnableContextFMHA)
+    // If the model has relative attentiona bias, q scaling should be applied in QK gemm stage and use 1 in
+    // softamax stage (because to get softmax[scale(Q*K) + rel pos bias] here, q_scaling can't be applied during
+    // softmax phase by qk_scale); otherwise, use 1 in gemm stage and apply scaling in softmax stage
+    const float qk_scale
+        = 1.0f / (sqrtf(getHeadSize() * 1.0f) * q_scaling); // q_scaling in denominator. by default q_scaling =1.0f
+    const float qk_scale_gemm = isRelativePosition() ? qk_scale : 1.0f;
+    const T qk_scale_softmax = static_cast<T>(isRelativePosition() ? 1.0f : qk_scale);
+
+    // in context phase, currently FMHA runner has two restrictions:
+    // 1. only apply to self attention. If want fused multi-head cross attention, FMHCA kernels and runner is needed
+    // 2. doesn't apply to MHA with relative attention bias, i.e. softmax(QK + bias) * V
+    if (mEnableContextFMHA && !isCrossAttention() && !isRelativePosition())
     {
         invokeApplyBiasRopeUpdateKVCache(const_cast<T*>(params.attention_input), kv_cache_buffer,
             const_cast<T*>(params.qkv_bias), params.context_lengths, mRemovePadding ? padding_offset : nullptr,
-            request_batch_size, request_seq_length, params.num_tokens, mNumHeads, mNumKVHeads, getHeadSize(),
+            params.batch_size, params.input_seq_length, params.num_tokens, mNumHeads, mNumKVHeads, getHeadSize(),
             mRotaryEmbeddingDim, mRotaryEmbeddingBase, mRotaryEmbeddingScaleType, mRotaryEmbeddingScale,
             mRotaryEmbeddingMaxPositions, position_embedding_type, (float*) nullptr, 0, cache_type,
             params.kv_scale_orig_quant, stream);
-        mFMHARunner->setup(request_batch_size, request_seq_length, params.num_tokens, isALiBi(), mTpSize, mTpRank);
+        mFMHARunner->setup(params.batch_size, params.input_seq_length, params.num_tokens, isALiBi(), isAliBiWithScale(),
+            mTpSize, mTpRank);
         mFMHARunner->run(const_cast<T*>(params.attention_input), cu_seqlens, params.context_buf, stream);
     }
     else
     {
-        // FIXME(qijun): a temporary solution to make sure the padding part of key/value buffer is 0
+        // FIXME: a temporary solution to make sure the padding part of key/value buffer is 0
         // NOTE: pointer subtraction is used below since there could be some extra gap due to alignment.
         //  Otherwise, we could do cudaMemsetAsync(k_buf_2_, 0, k_buf_2_size + v_buf_2_size, stream);
         cudaMemsetAsync(k_buf_2_, 0,
             reinterpret_cast<int8_t*>(v_buf_2_) - reinterpret_cast<int8_t*>(k_buf_2_) + v_buf_2_size, stream);
-        invokeAddFusedQKVBiasTranspose(q_buf_2_, k_buf_2_, v_buf_2_, const_cast<T*>(params.attention_input),
-            const_cast<T*>(params.qkv_bias), params.context_lengths, mRemovePadding ? padding_offset : nullptr,
-            request_batch_size, request_seq_length, params.num_tokens, mNumHeads, mNumKVHeads, getHeadSize(),
-            mEnableContextFMHA, mRotaryEmbeddingDim, mRotaryEmbeddingBase, mRotaryEmbeddingScaleType,
-            mRotaryEmbeddingScale, mRotaryEmbeddingMaxPositions, position_embedding_type, (float*) nullptr, 0, stream);
+
+        if (!isCrossAttention())
+        {
+            // self attention, write to Q/K/V
+            invokeAddFusedQKVBiasTranspose(q_buf_2_, k_buf_2_, v_buf_2_, const_cast<T*>(params.attention_input),
+                const_cast<T*>(params.qkv_bias), params.context_lengths, mRemovePadding ? padding_offset : nullptr,
+                params.batch_size, params.input_seq_length, params.num_tokens, mNumHeads, mNumKVHeads, getHeadSize(),
+                mEnableContextFMHA, mRotaryEmbeddingDim, mRotaryEmbeddingBase, mRotaryEmbeddingScaleType,
+                mRotaryEmbeddingScale, mRotaryEmbeddingMaxPositions, position_embedding_type, (float*) nullptr, 0,
+                stream);
+        }
+        else
+        {
+            // cross attention, write Q from self QKV, write KV from cross QKV
+            // kernel modifed accordingly to handle nullptr buffer
+            invokeAddFusedQKVBiasTranspose(q_buf_2_, (T*) nullptr, (T*) nullptr, const_cast<T*>(params.attention_input),
+                const_cast<T*>(params.qkv_bias), params.context_lengths, mRemovePadding ? padding_offset : nullptr,
+                params.batch_size, params.input_seq_length, params.num_tokens, mNumHeads, mNumKVHeads, getHeadSize(),
+                mEnableContextFMHA, mRotaryEmbeddingDim, mRotaryEmbeddingBase, mRotaryEmbeddingScaleType,
+                mRotaryEmbeddingScale, mRotaryEmbeddingMaxPositions, position_embedding_type, (float*) nullptr, 0,
+                stream);
+            invokeAddFusedQKVBiasTranspose((T*) nullptr, k_buf_2_, v_buf_2_, const_cast<T*>(params.cross_qkv),
+                const_cast<T*>(params.qkv_bias), params.encoder_input_lengths,
+                mRemovePadding ? padding_offset : nullptr, params.batch_size, params.cross_qkv_length,
+                params.num_encoder_tokens, mNumHeads, mNumKVHeads, getHeadSize(), mEnableContextFMHA,
+                mRotaryEmbeddingDim, mRotaryEmbeddingBase, mRotaryEmbeddingScaleType, mRotaryEmbeddingScale,
+                mRotaryEmbeddingMaxPositions, position_embedding_type, (float*) nullptr, 0, stream);
+        }
         sync_check_cuda_error();
 
-        invokeTranspose4dBatchMajor(k_buf_2_, v_buf_2_, kv_cache_buffer, request_batch_size, request_seq_length,
-            params.max_seq_length, getHeadSize(), mNumKVHeads, cache_type, params.kv_scale_orig_quant,
-            params.context_lengths, stream);
+        // write KV to cach
+        invokeTranspose4dBatchMajor(k_buf_2_, v_buf_2_, kv_cache_buffer, params.batch_size,
+            isCrossAttention() ? params.cross_qkv_length : params.input_seq_length,
+            isCrossAttention() ? params.cross_qkv_length : params.max_seq_length, getHeadSize(), mNumKVHeads,
+            cache_type, params.kv_scale_orig_quant,
+            isCrossAttention() ? params.encoder_input_lengths : params.context_lengths, stream);
         sync_check_cuda_error();
 
         const T* linear_bias_slopes = isALiBi() ? params.alibi_slopes : nullptr;
+        const T* relative_attention_bias = isRelativePosition() ? params.relative_attention_bias : nullptr;
+        const int relative_attention_bias_stride = isRelativePosition() ? params.relative_attention_bias_stride : 0;
+        const int max_distance = mMaxDistance;
         cudaDataType_t gemm_out_data_type = is_qk_buf_float_ ? CUDA_R_32F : gemm_data_type;
         void* gemm_out_buf_ = is_qk_buf_float_ ? static_cast<void*>(qk_buf_float_) : static_cast<void*>(qk_buf_);
         if (mNumKVHeads == 1) // MQA
@@ -557,7 +630,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
                 attention_seq_len_2,                                   // n
                 attention_seq_len_1 * mNumHeads,                       // m
                 getHeadSize(),                                         // k
-                1.0f, k_buf_2_, gemm_data_type,
+                qk_scale_gemm, k_buf_2_, gemm_data_type,
                 getHeadSize(),                                         // k
                 attention_seq_len_2 * getHeadSize(),                   // n * k
                 q_buf_2_, gemm_data_type,
@@ -566,7 +639,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
                 0.0f, gemm_out_buf_, gemm_out_data_type,
                 attention_seq_len_2,                                   // n
                 attention_seq_len_1 * mNumHeads * attention_seq_len_2, // m * n
-                request_batch_size,                                    // global batch size
+                params.batch_size,                                     // global batch size
                 CUDA_R_32F);
         }
         else if (mNumKVHeads == mNumHeads) // MHA
@@ -577,7 +650,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
                 attention_seq_len_2,                 // n
                 attention_seq_len_1,                 // m
                 getHeadSize(),                       // k
-                1.0f, k_buf_2_, gemm_data_type,
+                qk_scale_gemm, k_buf_2_, gemm_data_type,
                 getHeadSize(),                       // k
                 attention_seq_len_2 * getHeadSize(), // n * k
                 q_buf_2_, gemm_data_type,
@@ -586,7 +659,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
                 0.0f, gemm_out_buf_, gemm_out_data_type,
                 attention_seq_len_2,                 // n
                 attention_seq_len_2 * attention_seq_len_1,
-                request_batch_size * mNumHeads,      // global batch size
+                params.batch_size * mNumHeads,       // global batch size
                 CUDA_R_32F);
         }
         else // GQA
@@ -607,7 +680,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
                     attention_seq_len_2,                                   // n
                     attention_seq_len_1 * num_qheads_per_kv_head,          // m
                     getHeadSize(),                                         // k
-                    1.0f, kptr, gemm_data_type,
+                    qk_scale_gemm, kptr, gemm_data_type,
                     getHeadSize(),                                         // k
                     mNumKVHeads * attention_seq_len_2 * getHeadSize(),     // n * k
                     qptr, gemm_data_type,
@@ -616,21 +689,36 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
                     0.0f, qkptr, gemm_out_data_type,
                     attention_seq_len_2,                                   // n
                     attention_seq_len_1 * mNumHeads * attention_seq_len_2, // m * n
-                    request_batch_size,                                    // global batch size
+                    params.batch_size,                                     // global batch size
                     CUDA_R_32F);
             }
         }
+
+        // add relative position bias
+        if (isRelativePosition())
+        {
+            // Add relative_attention_bias
+            // QK is (batch_size, local_head_num, q_length, k_length), relative_attention_bias is (1, local_head_num,
+            // max_output_len + 1, max_output_len + 1).
+            // broadcast along 1st dim. max_seq_len is already max_output_len + 1.
+            // In implicit mode, relative_attention_bias is relative_attention_table [num_heads, num_buckets], with
+            // necessary params (max_distance, num_buckets) passed at the end
+            invokeAddRelativeAttentionBiasUnaligned(qk_buf_float_, relative_attention_bias, params.batch_size,
+                mNumHeads, attention_seq_len_1, isCrossAttention() ? params.cross_qkv_length : params.max_seq_length,
+                stream, max_distance > 0, relative_attention_bias_stride, max_distance, true /* bidirectional */);
+        }
+
         if (is_qk_buf_float_ == true)
         {
             MaskedSoftmaxParam<T, float> param;
             param.attention_score = qk_buf_;       // (batch_size, head_num, q_length, k_length)
             param.qk = qk_buf_float_;              // (batch_size, head_num, q_length, k_length)
             param.attention_mask = attention_mask; // (batch_size, q_length, k_length)
-            param.batch_size = request_batch_size;
+            param.batch_size = params.batch_size;
             param.q_length = attention_seq_len_1;
             param.k_length = attention_seq_len_2;
             param.num_heads = mNumHeads;
-            param.qk_scale = qk_scale;
+            param.qk_scale = qk_scale_softmax;
             param.linear_bias_slopes = const_cast<T*>(linear_bias_slopes); // (head_num,), optional
             invokeMaskedSoftmax(param, stream);
         }
@@ -640,14 +728,15 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
             param.attention_score = qk_buf_;       // (batch_size, head_num, q_length, k_length)
             param.qk = qk_buf_;                    // (batch_size, head_num, q_length, k_length)
             param.attention_mask = attention_mask; // (batch_size, q_length, k_length)
-            param.batch_size = request_batch_size;
+            param.batch_size = params.batch_size;
             param.q_length = attention_seq_len_1;
             param.k_length = attention_seq_len_2;
             param.num_heads = mNumHeads;
-            param.qk_scale = qk_scale;
+            param.qk_scale = qk_scale_softmax;
             param.linear_bias_slopes = const_cast<T*>(linear_bias_slopes); // (head_num,), optional
             invokeMaskedSoftmax(param, stream);
         }
+
         if (mNumKVHeads == 1)
         {
             // Attn_weight[b, h*s_q, s_k]
@@ -666,7 +755,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
                 qkv_buf_2_,
                 getHeadSize(),                                         // n
                 getHeadSize() * mNumHeads * attention_seq_len_1,       // n * m
-                request_batch_size                                     // global batch size
+                params.batch_size                                      // global batch size
             );
         }
         else if (mNumKVHeads == mNumHeads) // MHA
@@ -676,7 +765,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
             mCublasWrapper->stridedBatchedGemm(CUBLAS_OP_N, CUBLAS_OP_N, getHeadSize(), attention_seq_len_1,
                 attention_seq_len_2, v_buf_2_, getHeadSize(), attention_seq_len_2 * getHeadSize(), qk_buf_,
                 attention_seq_len_2, attention_seq_len_1 * attention_seq_len_2, qkv_buf_2_, getHeadSize(),
-                attention_seq_len_1 * getHeadSize(), request_batch_size * mNumHeads);
+                attention_seq_len_1 * getHeadSize(), params.batch_size * mNumHeads);
         }
         else // GQA
         {
@@ -702,20 +791,20 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
                     qkvptr,
                     getHeadSize(),                                         // n
                     getHeadSize() * mNumHeads * attention_seq_len_1,       // n * m
-                    request_batch_size                                     // global batch size
+                    params.batch_size                                      // global batch size
                 );
             }
         }
 
         if (!mRemovePadding)
         {
-            invokeTransposeQKV(params.context_buf, qkv_buf_2_, request_batch_size, attention_seq_len_1, mNumHeads,
+            invokeTransposeQKV(params.context_buf, qkv_buf_2_, params.batch_size, attention_seq_len_1, mNumHeads,
                 getHeadSize(), (float*) nullptr, 0, stream);
         }
         else
         {
             invokeTransposeAttentionOutRemovePadding(qkv_buf_2_, params.context_buf, params.num_tokens,
-                request_batch_size, attention_seq_len_1, mNumHeads, getHeadSize(), padding_offset, (float*) nullptr, 0,
+                params.batch_size, attention_seq_len_1, mNumHeads, getHeadSize(), padding_offset, (float*) nullptr, 0,
                 stream);
         }
     }
@@ -757,8 +846,9 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     const int local_hidden_units_kv = num_kv_heads * head_size;
     const PositionEmbeddingType position_embedding_type = mPositionEmbeddingType;
     const float q_scaling = mQScaling;
-    const int relative_attention_bias_stride = 0;
-    const T* relative_attention_bias = nullptr;
+    const T* relative_attention_bias = isRelativePosition() ? params.relative_attention_bias : nullptr;
+    const int relative_attention_bias_stride = isRelativePosition() ? params.relative_attention_bias_stride : 0;
+    const int max_distance = mMaxDistance;
     const bool* finished = nullptr;
     const bool has_ia3 = false;
 
@@ -804,10 +894,9 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     else
     {
         using BufferDataType = typename KVCacheBufferDataType<KVCacheBuffer>::Type;
-        kv_cache_buffer = KVCacheBuffer(batch_beam, 1, params.max_seq_lengths, num_kv_heads * head_size * elem_size);
+        kv_cache_buffer = KVCacheBuffer(batch_beam, 1, params.max_seq_length, num_kv_heads * head_size * elem_size);
         kv_cache_buffer.data = reinterpret_cast<BufferDataType*>(params.key_value_cache);
     }
-
     sync_check_cuda_error();
 
     FusedQKVMaskedAttentionDispatchParams<T, KVCacheBuffer> dispatch_params;
@@ -815,6 +904,8 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     dispatch_params.qkv_buf = params.attention_input;
     dispatch_params.qkv_bias = params.qkv_bias;
     dispatch_params.relative_attention_bias = relative_attention_bias;
+    dispatch_params.relative_attention_bias_stride = relative_attention_bias_stride;
+    dispatch_params.max_distance = max_distance;
     dispatch_params.cache_indir = params.cache_indir;
     dispatch_params.context_buf = params.context_buf;
     dispatch_params.finished = finished;
@@ -828,13 +919,12 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     dispatch_params.size_per_head = getHeadSize();
     dispatch_params.rotary_embedding_dim = mRotaryEmbeddingDim;
     dispatch_params.position_embedding_type = mPositionEmbeddingType;
-    dispatch_params.max_seq_len = params.max_seq_lengths;
+    dispatch_params.max_seq_len = params.max_seq_length; // difference between max_seq_lengths and max_seq_length?
     dispatch_params.input_lengths = params.context_lengths;
     dispatch_params.step = step;
     dispatch_params.q_scaling = q_scaling;
     dispatch_params.relative_attention_bias_stride = relative_attention_bias_stride;
-    dispatch_params.linear_bias_slopes
-        = (mPositionEmbeddingType == PositionEmbeddingType::kALIBI ? params.alibi_slopes : nullptr);
+    dispatch_params.linear_bias_slopes = isALiBi() ? params.alibi_slopes : nullptr;
     dispatch_params.ia3_tasks = ia3_tasks;
     dispatch_params.ia3_key_weights = ia3_key_weights;
     dispatch_params.ia3_value_weights = ia3_value_weights;
@@ -856,8 +946,22 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     dispatch_params.rotary_embedding_scale_type = mRotaryEmbeddingScaleType;
     dispatch_params.rotary_embedding_scale = mRotaryEmbeddingScale;
     dispatch_params.rotary_embedding_max_positions = mRotaryEmbeddingMaxPositions;
-    fusedQKV_masked_attention_dispatch(dispatch_params, stream);
-    sync_check_cuda_error();
+    dispatch_params.cross_attention = mCrossAttention;
+    dispatch_params.memory_length_per_sample = params.encoder_input_lengths;
+
+    using DataType = typename SATypeConverter<T>::Type;
+    if (!mCrossAttention)
+    {
+        // self attn
+        Masked_multihead_attention_params<DataType> mmha_params;
+        fusedQKV_masked_attention_dispatch(mmha_params, dispatch_params, stream);
+    }
+    else
+    {
+        // cross attn
+        Cross_multihead_attention_params<DataType> mmhca_params;
+        fusedQKV_masked_attention_dispatch(mmhca_params, dispatch_params, stream);
+    }
     return 0;
 }
 
@@ -927,7 +1031,7 @@ size_t GPTAttentionPluginCommon::getCommonSerializationSize() noexcept
         + sizeof(mTpSize) + sizeof(mTpRank) + sizeof(mEnableContextFMHA) + sizeof(mFMHAForceFP32Acc)
         + sizeof(mMultiBlockMode) + sizeof(unsigned int) // mKVCacheQuantMode
         + sizeof(mRemovePadding) + sizeof(mMaskType) + sizeof(mPagedKVCache) + sizeof(mTokensPerBlock) + sizeof(mType)
-        + sizeof(mMaxContextLength) + sizeof(mQKVBiasEnabled);
+        + sizeof(mMaxContextLength) + sizeof(mQKVBiasEnabled) + sizeof(mCrossAttention) + sizeof(mMaxDistance);
 }
 
 void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
@@ -957,6 +1061,8 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mType);
     write(d, mMaxContextLength);
     write(d, mQKVBiasEnabled);
+    write(d, mCrossAttention);
+    write(d, mMaxDistance);
     assert(d == a + getCommonSerializationSize());
 }
 
@@ -994,6 +1100,8 @@ GPTAttentionPluginCreatorCommon::GPTAttentionPluginCreatorCommon()
     mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("max_context_length", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("qkv_bias_enabled", nullptr, PluginFieldType::kINT8, 0));
+    mPluginAttributes.emplace_back(PluginField("do_cross_attention", nullptr, PluginFieldType::kINT8, 0));
+    mPluginAttributes.emplace_back(PluginField("max_distance", nullptr, PluginFieldType::kINT32, 0));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }

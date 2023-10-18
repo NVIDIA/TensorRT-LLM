@@ -11,6 +11,12 @@ code is located in [`examples/gptj`](./). There are three main files in that fol
  * [`run.py`](./run.py) to run the inference on an input text,
  * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
 
+## Support Matrix
+  * FP16
+  * FP8
+  * INT4 Weight-Only
+  * FP8 KV CACHE
+
 ## Usage
 
 ### 1. Download weights from HuggingFace (HF) Transformers

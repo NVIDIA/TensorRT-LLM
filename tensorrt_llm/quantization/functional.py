@@ -123,18 +123,18 @@ def weight_only_groupwise_quant_matmul(input: Tensor, pre_quant_scale: Tensor,
         plug_inputs = [input.trt_tensor]
 
         # Flags for indicating whether the corresponding inputs are applied in quant_algo
-        # quant_algo = pre_quant_scale * PRE_SCALE_QUANT + zero * ZER0 + bias * BIAS
+        # quant_algo = pre_quant_scale * PRE_QUANT_SCALE + zero * ZERO + bias * BIAS
         # Here pre_quant_scale, zero and bias are boolean type
         BIAS = 1
-        ZER0 = 2
-        PRE_SCALE_QUANT = 4
+        ZERO = 2
+        PRE_QUANT_SCALE = 4
 
-        if quant_algo & PRE_SCALE_QUANT:
+        if quant_algo & PRE_QUANT_SCALE:
             plug_inputs += [pre_quant_scale.trt_tensor]
 
         plug_inputs += [weights.trt_tensor, scales.trt_tensor]
 
-        if quant_algo & ZER0:
+        if quant_algo & ZERO:
             plug_inputs += [zeros.trt_tensor]
         if quant_algo & BIAS:
             plug_inputs += [biases.trt_tensor]

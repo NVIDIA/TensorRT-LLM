@@ -351,7 +351,7 @@ class TestFunctional(unittest.TestCase):
             }
 
             stream = torch.cuda.current_stream()
-            # NOTE(nkorobov): since we use int8 only for paged_kv_cache no int8 tensors are visible to TRT
+            # NOTE: since we use int8 only for paged_kv_cache no int8 tensors are visible to TRT
             int8_trt_flag = False
             builder_config = builder.create_builder_config(name=attention_type,
                                                            precision=dtype,
@@ -402,7 +402,7 @@ class TestFunctional(unittest.TestCase):
             shape_dict['weight'],
             dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
             device='cuda') * 1e-3
-        # FIXME(qijun): test_gpt_attention_llama_attention_False_float16_2_90_4_64_False_False_False_True
+        # FIXME: test_gpt_attention_llama_attention_False_float16_2_90_4_64_False_False_False_True
         # fails with xavier_uniform_ initialization
         # torch.nn.init.xavier_uniform_(weight)
 

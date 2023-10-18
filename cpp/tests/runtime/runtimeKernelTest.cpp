@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/stlUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -431,7 +432,7 @@ TEST_F(RuntimeKernelTest, CopyPackedInputToOutput)
     auto inputLengths = mManager->copyFrom(inputLengthsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
 
     std::vector<SizeType> inputOffsetsHost(batchSize + 1);
-    std::inclusive_scan(inputLengthsHost.begin(), inputLengthsHost.end(), inputOffsetsHost.begin() + 1);
+    tc::stl_utils::inclusiveScan(inputLengthsHost.begin(), inputLengthsHost.end(), inputOffsetsHost.begin() + 1);
     auto const totalInputSize = inputOffsetsHost.back();
 
     std::vector<std::int32_t> inputsHost(totalInputSize);
@@ -543,7 +544,7 @@ TEST_F(RuntimeKernelTest, CopyPackedInputToOutputTransposed)
     auto inputLengths = mManager->copyFrom(inputLengthsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
 
     std::vector<SizeType> inputOffsetsHost(batchSize + 1);
-    std::inclusive_scan(inputLengthsHost.begin(), inputLengthsHost.end(), inputOffsetsHost.begin() + 1);
+    tc::stl_utils::inclusiveScan(inputLengthsHost.begin(), inputLengthsHost.end(), inputOffsetsHost.begin() + 1);
     auto const totalInputSize = inputOffsetsHost.back();
 
     std::vector<std::int32_t> inputsHost(totalInputSize);
@@ -821,4 +822,85 @@ TEST_F(RuntimeKernelTest, TileInplaceInt8Large)
     {
         EXPECT_EQ(bufferPtr[i], expected) << "Error at index " << i;
     }
+}
+
+namespace
+{
+void testCopyBatch(SizeType stride, BufferManager& manager, CudaStream& stream)
+{
+    SizeType constexpr rows{8};
+    SizeType constexpr numIndices{rows / 2};
+
+    auto const bufferShape = ITensor::makeShape({rows, stride});
+    auto const indicesShape = ITensor::makeShape({numIndices});
+    auto srcBufferHost = manager.cpu(bufferShape, nvinfer1::DataType::kINT32);
+    auto dstBufferDevice = manager.gpu(bufferShape, nvinfer1::DataType::kINT32);
+    auto srcOffsets = manager.pinned(indicesShape, nvinfer1::DataType::kINT32);
+    auto dstOffsets = manager.pinned(indicesShape, nvinfer1::DataType::kINT32);
+    auto sizes = manager.pinned(indicesShape, nvinfer1::DataType::kINT32);
+    kernels::invokeFill(*dstBufferDevice, 0, stream);
+
+    auto srcBufferHostPtr = bufferCast<std::int32_t>(*srcBufferHost);
+    for (SizeType row = 0; row < rows; ++row)
+    {
+        for (SizeType ci = 0; ci < stride; ++ci)
+        {
+            const auto idx = row * stride + ci;
+            srcBufferHostPtr[idx] = idx;
+        }
+    }
+
+    auto srcOffsetsPtr = bufferCast<std::int32_t>(*srcOffsets);
+    auto dstOffsetsPtr = bufferCast<std::int32_t>(*dstOffsets);
+    auto sizesPtr = bufferCast<std::int32_t>(*sizes);
+    for (SizeType idx = 0; idx < numIndices; ++idx)
+    {
+        // Copy rows 0, 2, 4, etc to 0, 1, 2, 3...
+        srcOffsetsPtr[idx] = 2 * idx * stride;
+        dstOffsetsPtr[idx] = idx * stride;
+        sizesPtr[idx] = stride;
+    }
+
+    auto srcBufferDevice = manager.copyFrom(*srcBufferHost, MemoryType::kGPU);
+
+    // TODO(nkorobov): test different dataSizes copy
+    kernels::invokeCopyBatch(*srcBufferDevice, *dstBufferDevice, *srcOffsets, *dstOffsets, *sizes, stride, stream);
+
+    auto dstBufferHost = manager.copyFrom(*dstBufferDevice, MemoryType::kCPU);
+
+    auto dstBufferHostPtr = bufferCast<std::int32_t>(*dstBufferHost);
+    for (SizeType idx = 0; idx < rows; ++idx)
+    {
+        for (SizeType ci = 0; ci < stride; ++ci)
+        {
+            if (idx < numIndices && ci < sizesPtr[idx])
+            {
+                const auto refIdx = srcOffsetsPtr[idx] + ci;
+                const auto ref = srcBufferHostPtr[refIdx];
+
+                const auto outIdx = dstOffsetsPtr[idx] + ci;
+                const auto out = dstBufferHostPtr[outIdx];
+
+                EXPECT_EQ(ref, out) << "Error at index row: " << idx << " column: " << ci << " for stride " << stride;
+            }
+            else
+            {
+                const auto outIdx = idx * stride + ci;
+                const auto out = dstBufferHostPtr[outIdx];
+
+                EXPECT_EQ(0, out) << "Error at index row: " << idx << " column: " << ci << " for stride " << stride;
+            }
+        }
+    }
+}
+} // namespace
+
+TEST_F(RuntimeKernelTest, CopyBatchStride64)
+{
+    testCopyBatch(64, *mManager, *mStream);
+}
+
+TEST_F(RuntimeKernelTest, CopyBatchStride5)
+{
+    testCopyBatch(5, *mManager, *mStream);
 }

@@ -125,7 +125,7 @@ int [[ plugin_name ]]::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, cons
   [[arg.dtype.dtype.to("c")]] [[arg.name]] = [[arg.code]];
   {%- endfor %}
 
-  // TODO[chunweiy]: Check result code
+  // TODO: Check result code
   [[kernel_name]]([[enqueue_body_arg_list]]);
 
   return 0;

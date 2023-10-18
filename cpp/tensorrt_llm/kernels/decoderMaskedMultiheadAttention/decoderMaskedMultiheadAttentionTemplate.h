@@ -996,6 +996,8 @@ template <
     unsigned Dh,
     // The number of threads in a threadblock.
     unsigned THREADS_PER_BLOCK,
+    // Whether cross attention is enabled
+    bool DO_CROSS_ATTENTION,
     // Whether has beams.
     bool HAS_BEAMS,
     // Whether enable multi-block mode for long-sequence-length.
@@ -1009,7 +1011,8 @@ template <
     // The unroll factor for loading from V cache.
     // Set it default to 4 for higher occupancy (by reducing registers usage).
     unsigned V_LOOP_UNROLL = 4>
-__global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> params, KVCacheBuffer kvCacheBuffer)
+__global__ void masked_multihead_attention_kernel(
+    Multihead_attention_params<T, DO_CROSS_ATTENTION> params, KVCacheBuffer kvCacheBuffer)
 {
 
     using Tk = typename kernel_type_t<T>::Type;
@@ -1055,7 +1058,7 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
     if (sizeof(Tk) != 4)
     {
         // TODO - change to tlength
-        const auto max_timesteps = min(timestep, max_seq_len);
+        const auto max_timesteps = DO_CROSS_ATTENTION ? max_seq_len : min(timestep, max_seq_len);
         logits_smem_ += divUp(max_timesteps + 1, 4u) * 16;
     }
     Tk* logits_smem = reinterpret_cast<Tk*>(logits_smem_);
@@ -1103,6 +1106,11 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
     using V_vec_m = typename packed_type<Tcache, num_elems<V_vec_k>::value>::type;
     static_assert(V_VEC_SIZE == sizeof(V_vec_k) / sizeof(T));
 
+    // This could be one of the reasons to have a separate kernel for cross attention
+    constexpr auto bias_smem_size = DO_CROSS_ATTENTION ? Dh_MAX : 1u;
+    __shared__ __align__(mmha::const_max(mmha::const_max(sizeof(Qk_vec_k), sizeof(K_vec_k)), sizeof(V_vec_k)))
+        Tk bias_smem[bias_smem_size];
+
     // The number of elements per vector.
     constexpr unsigned QK_VEC_SIZE{sizeof(Qk_vec_m) / sizeof(T)};
     // Make sure the hidden size per head is a multiple of the vector size.
@@ -1134,14 +1142,30 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
     // The column tile along L dimension on K^T -- noted as T_c in flash-attention paper
     const unsigned c_tile{MULTI_BLOCK_FLAG ? blockIdx.z : 0};
 
+    // Indicate if we need to compute the K/V cache element (add KV bias, IA3, RoPE, etc.) and update the cache.
+    // For Self-Attention, it's always required.
+    // For Cross-Attention, as everything is pre-computed,
+    // in the context phase of the encoder, it's not needed in that kernel.
+    // Therefore, handle_kv is !DO_CROSS_ATTENTION and irrelevant of timestep.
+    const bool handle_kv{!DO_CROSS_ATTENTION};
+
     // While doing the product Q*K^T for the different keys we track the max.
     float qk_max = -FLT_MAX;
 
     float qk = 0.0F;
 
+    // Compute relative attention bias on the fly, with relative attention table [head_num/TP, num_buckets] passed in.
+    // num_buckets passed as params.relative_attention_bias_stride, max_distance passed as params.max_distance
+    bool implicit_rel_attn_bias = params.max_distance != 0;
+    int relative_attention_bias_stride
+        = params.relative_attention_bias_stride; // num_buckets might be modified below, save it beforehand
+    int max_distance = params.max_distance;
+
     // The actual sequence length excluding the paddings.
     // minus 1 because it includes the current timestep while tlength denotes the kv cache length.
-    const int tlength = params.length_per_sample ? (params.length_per_sample[bi] - 1) : static_cast<int>(timestep);
+    const int tlength = DO_CROSS_ATTENTION
+        ? params.memory_length_per_sample[bi] - 1
+        : (params.length_per_sample ? (params.length_per_sample[bi] - 1) : static_cast<int>(timestep));
     // The context length for beam searching optimization (all points to beam 0).
     const int input_length = params.input_lengths[bi];
 
@@ -1192,25 +1216,36 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
             q = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<const Qk_vec_m*>(&params.q[q_offset]));
         }
 
-        // Key
-        // The stride between tokens. We may be able to always use params.stride.
-        uint32_t k_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_heads_kv * Dh);
-        // The offset.
-        const auto k_offset = tensorrt_llm::common::flat_index_strided3(bi, hi_kv, qk_vec_idx, k_stride, Dh);
-
-        if (load_qkv_quant)
+        if constexpr (DO_CROSS_ATTENTION)
         {
-            using Packed_Int8_t = typename packed_type<int8_t, num_elems<Qk_vec_m>::value>::type;
-            using Packed_Float_t = typename packed_type<float, num_elems<Qk_vec_m>::value>::type;
-            const auto k_scaling = params.qkv_scale_quant_orig[1];
-            const auto k_quant
-                = *reinterpret_cast<const Packed_Int8_t*>(&reinterpret_cast<const int8_t*>(params.k)[k_offset]);
+            const auto k_idx = QK_VEC_SIZE * tidx;
+            const int inBlockIdx = kvCacheBuffer.getKVLocalIdx(tlength, hi, Dh, k_idx);
+            Tcache* k_cache = reinterpret_cast<Tcache*>(kvCacheBuffer.getKBlockPtr(bi, tlength));
 
-            convert_from_float(&k, mul<Packed_Float_t, float>(k_scaling, float_from_int8(k_quant)));
+            k = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<const Qk_vec_m*>(&k_cache[inBlockIdx]));
         }
         else
         {
-            k = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<const Qk_vec_m*>(&params.k[k_offset]));
+            // Key
+            // The stride between tokens. We may be able to always use params.stride.
+            uint32_t k_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_heads_kv * Dh);
+            // The offset.
+            const auto k_offset = tensorrt_llm::common::flat_index_strided3(bi, hi_kv, qk_vec_idx, k_stride, Dh);
+
+            if (load_qkv_quant)
+            {
+                using Packed_Int8_t = typename packed_type<int8_t, num_elems<Qk_vec_m>::value>::type;
+                using Packed_Float_t = typename packed_type<float, num_elems<Qk_vec_m>::value>::type;
+                const auto k_scaling = params.qkv_scale_quant_orig[1];
+                const auto k_quant
+                    = *reinterpret_cast<const Packed_Int8_t*>(&reinterpret_cast<const int8_t*>(params.k)[k_offset]);
+
+                convert_from_float(&k, mul<Packed_Float_t, float>(k_scaling, float_from_int8(k_quant)));
+            }
+            else
+            {
+                k = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<const Qk_vec_m*>(&params.k[k_offset]));
+            }
         }
 
         if (params.q_bias != nullptr)
@@ -1219,7 +1254,7 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
             q_bias
                 = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<const Qk_vec_m*>(&params.q_bias[q_bias_offset]));
         }
-        if (params.k_bias != nullptr)
+        if (handle_kv && params.k_bias != nullptr)
         {
             const auto k_bias_offset = tensorrt_llm::common::flat_index2(hi_kv, qk_vec_idx, Dh);
             k_bias
@@ -1229,9 +1264,12 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
 
     // Computes the Q/K values with bias.
     q = add(q, q_bias);
-    k = add(k, k_bias);
+    if (handle_kv)
+    {
+        k = add(k, k_bias);
+    }
 
-    const bool do_ia3 = params.ia3_tasks != nullptr;
+    const bool do_ia3 = handle_kv && params.ia3_tasks != nullptr;
     const auto beam_width = static_cast<unsigned>(params.beam_width);
     const auto ia3_ti_hi = do_ia3
         ? tensorrt_llm::common::flat_index2(static_cast<unsigned>(params.ia3_tasks[bi / beam_width]), hi, num_heads)
@@ -1248,11 +1286,21 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
     switch (params.position_embedding_type)
     {
     case PositionEmbeddingType::kLEARNED_ABSOLUTE:
-    case PositionEmbeddingType::kALIBI: break;
+    case PositionEmbeddingType::kRELATIVE:
+    case PositionEmbeddingType::kALIBI:
+    case PositionEmbeddingType::kALIBI_WITH_SCALE: break;
     case PositionEmbeddingType::kROPE_GPTJ:
     {
-        apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, params.rotary_embedding_base,
-            params.rotary_embedding_scale, tlength);
+        if (handle_kv)
+        {
+            apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, params.rotary_embedding_base,
+                params.rotary_embedding_scale, tlength);
+        }
+        else
+        {
+            apply_rotary_embedding(q, tidx, params.rotary_embedding_dim, params.rotary_embedding_base,
+                params.rotary_embedding_scale, tlength);
+        }
         break;
     }
     case PositionEmbeddingType::kROPE_GPT_NEOX:
@@ -1272,7 +1320,10 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
         if (do_rotary)
         {
             *reinterpret_cast<Qk_vec_k*>(q_smem_ + half_idx * smem_pitch + intra_half_idx) = q;
-            *reinterpret_cast<Qk_vec_k*>(k_smem + half_idx * smem_pitch + intra_half_idx) = k;
+            if (handle_kv)
+            {
+                *reinterpret_cast<Qk_vec_k*>(k_smem + half_idx * smem_pitch + intra_half_idx) = k;
+            }
         }
 
         __syncthreads();
@@ -1282,12 +1333,20 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
         if (do_rotary)
         {
             mmha::vec_from_smem_transpose(q, q_smem_, transpose_idx, smem_pitch);
-            mmha::vec_from_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
+            if (handle_kv)
+            {
+                mmha::vec_from_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
 
-            mmha::apply_rotary_embedding(q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim,
-                rotary_embedding_base, rotary_embedding_scale, tlength);
+                mmha::apply_rotary_embedding(q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim,
+                    rotary_embedding_base, rotary_embedding_scale, tlength);
 
-            mmha::write_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
+                mmha::write_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
+            }
+            else
+            {
+                mmha::apply_rotary_embedding(q, transpose_idx / tidx_factor, params.rotary_embedding_dim,
+                    rotary_embedding_base, rotary_embedding_scale, tlength);
+            }
             mmha::write_smem_transpose(q, q_smem_, transpose_idx, smem_pitch);
         }
 
@@ -1296,13 +1355,18 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
         if (do_rotary)
         {
             q = *reinterpret_cast<Qk_vec_k*>(q_smem_ + half_idx * smem_pitch + intra_half_idx);
-            k = *reinterpret_cast<Qk_vec_k*>(k_smem + half_idx * smem_pitch + intra_half_idx);
+            if (handle_kv)
+            {
+                k = *reinterpret_cast<Qk_vec_k*>(k_smem + half_idx * smem_pitch + intra_half_idx);
+            }
         }
 
         __syncthreads();
         break;
     }
     }
+
+    // For the same reason as handle_kv, no compute needed in Cross-Attention's 1st step
 
     if (qk_vec_idx < Dh_MAX)
     {
@@ -1313,6 +1377,7 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
         zero(zero_q);
 
         *reinterpret_cast<Qk_vec_k*>(&q_smem[qk_vec_idx]) = is_valid_qk_vec ? q : zero_q;
+
         // Write the K values to the global memory cache.
         //
         // NOTE: The stores are uncoalesced as we have multiple chunks of 16B spread across the memory
@@ -1321,7 +1386,7 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
         // the end of the kernel. There's plenty of time for the transactions to complete.
 
         // For MQA/GQA mode, write only with the first Q head of each group per KV head.
-        if (hi == (hi_kv * qhead_per_kv) && (IS_Dh_MAX || is_valid_qk_vec))
+        if (handle_kv && hi == (hi_kv * qhead_per_kv) && (IS_Dh_MAX || is_valid_qk_vec))
         {
             // Trigger the stores to global memory.
             const auto k_idx = QK_VEC_SIZE * tidx;
@@ -1369,10 +1434,19 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
         qk *= params.inv_sqrt_dh;
         if (params.relative_attention_bias != nullptr)
         {
-            qk = add(qk,
-                params.relative_attention_bias[hi * params.relative_attention_bias_stride
-                        * params.relative_attention_bias_stride
-                    + tlength * params.relative_attention_bias_stride + tlength]);
+            if (implicit_rel_attn_bias)
+            {
+                // Here i == j == tlength, so relative_position = 0 --> relative_buckets = 0.
+                T rel_attn_bias = params.relative_attention_bias[hi * relative_attention_bias_stride + 0];
+                qk = add(qk, rel_attn_bias);
+            }
+            else
+            {
+                qk = add(qk,
+                    params.relative_attention_bias[hi * params.relative_attention_bias_stride
+                            * params.relative_attention_bias_stride
+                        + tlength * params.relative_attention_bias_stride + tlength]);
+            }
         }
         // We don't need to apply the linear position bias here since qi - ki = 0 yields the position bias 0.
 
@@ -1428,7 +1502,6 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
     // Take all previous cache as context when we have no beam searching in order to batch as many LDGs as possible.
     const int context_length = HAS_BEAMS ? input_length : tlength;
     const auto context_ti_end = MULTI_BLOCK_FLAG
-
         ? divUp(timesteps_per_block, UNROLLED_K_PER_WARP) * UNROLLED_K_PER_WARP
         : divUp(static_cast<unsigned>(context_length), UNROLLED_K_PER_WARP) * UNROLLED_K_PER_WARP;
 
@@ -1480,9 +1553,7 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
         {
             const int local_time_now = time_now + k_loop * K_PER_ITER;
             const int local_ti = ti + k_loop * K_PER_ITER;
-            // Perform the dot product and normalize qk.
-            //
-            // WARNING: ALL THE THREADS OF A WARP MUST ENTER!!!
+
             K_vec_k k_vec[K_VECS_PER_THREAD];
 #pragma unroll
             for (int k_vec_i = 0; k_vec_i < K_VECS_PER_THREAD; ++k_vec_i)
@@ -1500,6 +1571,9 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
                 }
             }
 
+            // Perform the dot product and normalize qk.
+            //
+            // WARNING: ALL THE THREADS OF A WARP MUST ENTER!!!
             float qk_{Qk_dot<T, THREADS_PER_KEY>::dot(q_vec, k_vec) * params.inv_sqrt_dh};
 
             // For multi-block mode, we still need to make sure it will not be OOB.
@@ -1513,10 +1587,35 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
             {
                 if (params.relative_attention_bias != nullptr)
                 {
-                    qk_ = add(qk_,
-                        params.relative_attention_bias[hi * params.relative_attention_bias_stride
-                                * params.relative_attention_bias_stride
-                            + tlength * params.relative_attention_bias_stride + local_time_now]);
+                    if (implicit_rel_attn_bias)
+                    {
+                        // Compute bias value on the fly (See bert_preprocess_kernels.cu::buildRelativeAttentionBias)
+                        int relative_buckets = 0;
+                        int relative_position = local_time_now - tlength;
+                        int num_buckets = relative_attention_bias_stride;
+                        // Special logic in T5 relative attention, both encoder & decoder use this, because
+                        // relative_attention_bias is pre-computed once and passed around.
+                        num_buckets /= 2;
+                        relative_buckets += relative_position > 0 ? num_buckets : 0;
+                        relative_position = abs(relative_position);
+                        int max_exact = num_buckets / 2;
+                        bool is_small = relative_position < max_exact;
+                        int relative_position_if_large = max_exact
+                            + (int) (logf(relative_position * 1.0f / max_exact) / logf((float) max_distance / max_exact)
+                                * (num_buckets - max_exact));
+                        relative_position_if_large = min(relative_position_if_large, num_buckets - 1);
+                        relative_buckets += is_small ? relative_position : relative_position_if_large;
+                        T rel_attn_bias
+                            = params.relative_attention_bias[hi * relative_attention_bias_stride + relative_buckets];
+                        qk_ = add(qk_, rel_attn_bias);
+                    }
+                    else
+                    {
+                        qk_ = add(qk_,
+                            params.relative_attention_bias[hi * params.relative_attention_bias_stride
+                                    * params.relative_attention_bias_stride
+                                + tlength * params.relative_attention_bias_stride + local_time_now]);
+                    }
                 }
                 if (params.linear_bias_slopes != nullptr)
                 {
@@ -1587,10 +1686,37 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
                 {
                     if (params.relative_attention_bias != nullptr)
                     {
-                        qk_ = add(qk_,
-                            params.relative_attention_bias[hi * params.relative_attention_bias_stride
-                                    * params.relative_attention_bias_stride
-                                + tlength * params.relative_attention_bias_stride + time_now]);
+                        if (implicit_rel_attn_bias)
+                        {
+                            // Compute bias value on the fly (See
+                            // bert_preprocess_kernels.cu::buildRelativeAttentionBias)
+                            int relative_buckets = 0;
+                            int relative_position = time_now - tlength;
+                            int num_buckets = relative_attention_bias_stride;
+                            // Special logic in T5 relative attention, both encoder & decoder use this, because
+                            // relative_attention_bias is pre-computed once and passed around.
+                            num_buckets /= 2;
+                            relative_buckets += relative_position > 0 ? num_buckets : 0;
+                            relative_position = abs(relative_position);
+                            int max_exact = num_buckets / 2;
+                            bool is_small = relative_position < max_exact;
+                            int relative_position_if_large = max_exact
+                                + (int) (logf(relative_position * 1.0f / max_exact)
+                                    / logf((float) max_distance / max_exact) * (num_buckets - max_exact));
+                            relative_position_if_large = min(relative_position_if_large, num_buckets - 1);
+                            relative_buckets += is_small ? relative_position : relative_position_if_large;
+                            T rel_attn_bias
+                                = params
+                                      .relative_attention_bias[hi * relative_attention_bias_stride + relative_buckets];
+                            qk_ = add(qk_, rel_attn_bias);
+                        }
+                        else
+                        {
+                            qk_ = add(qk_,
+                                params.relative_attention_bias[hi * params.relative_attention_bias_stride
+                                        * params.relative_attention_bias_stride
+                                    + tlength * params.relative_attention_bias_stride + time_now]);
+                        }
                     }
                     if (params.linear_bias_slopes != nullptr)
                     {
@@ -1741,13 +1867,18 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
     V_vec_k v_bias;
     zero(v_bias);
     // if( vo == params.timestep % V_PER_ITER ) {
-    if (is_valid_vi && vo == tlength % V_PER_ITER)
+    if (is_valid_vi && handle_kv && vo == tlength % V_PER_ITER)
     {
         // Trigger the loads from the V bias buffer.
         if (params.v_bias != nullptr)
         {
             const auto v_bias_offset = tensorrt_llm::common::flat_index2(hi_kv, vi, Dh);
             v_bias = *reinterpret_cast<const V_vec_k*>(&params.v_bias[v_bias_offset]);
+        }
+
+        if (DO_CROSS_ATTENTION)
+        {
+            *reinterpret_cast<V_vec_k*>(&bias_smem[vi]) = v_bias;
         }
     }
 
@@ -1813,6 +1944,7 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
 
                 int local_time_idx = ti + v_loop * V_PER_ITER;
                 int time_idx = local_time_idx + (MULTI_BLOCK_FLAG ? c_tile_times_timesteps_per_block : 0);
+
                 const bool is_mask
                     = (MULTI_BLOCK_FLAG && local_time_idx >= timesteps_per_block) || (time_idx >= context_length);
                 // Load the logits from shared memory.
@@ -1883,35 +2015,53 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T> 
         Tcache* v_cache_base = reinterpret_cast<Tcache*>(kvCacheBuffer.getBlockPtr(v_cache_base_row_ptr, tokenIdx));
 
         V_vec_k v;
-        // Trigger the loads from the V buffer.
-        // The stride between tokens. We may be able to always use params.stride.
-        uint32_t v_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_heads_kv * Dh);
-        // The offset.
-        const auto v_offset = tensorrt_llm::common::flat_index_strided3(bi, hi_kv, vi, v_stride, Dh);
-
-        if (load_qkv_quant)
+        if (DO_CROSS_ATTENTION)
         {
-            using Packed_Int8_t = typename packed_type<int8_t, num_elems<V_vec_k>::value>::type;
-            using Packed_Float_t = typename packed_type<float, num_elems<V_vec_k>::value>::type;
-            const auto v_scaling = params.qkv_scale_quant_orig[2];
-            const auto v_quant
-                = *reinterpret_cast<const Packed_Int8_t*>(&reinterpret_cast<const int8_t*>(params.v)[v_offset]);
-
-            convert_from_float(&v, mul<Packed_Float_t, float>(v_scaling, float_from_int8(v_quant)));
+            if constexpr (ENABLE_8BITS_CACHE)
+            {
+                // To verify
+                load_8bits_kv_cache_vec(&v, v_cache_base, inBlockIdx, kv_scale_quant_orig);
+            }
+            else
+            {
+                v = vec_conversion<V_vec_k, V_vec_m>(*reinterpret_cast<const V_vec_m*>(&v_cache_base[inBlockIdx]));
+            }
         }
         else
         {
-            v = *reinterpret_cast<const V_vec_k*>(&params.v[v_offset]);
+            // Trigger the loads from the V buffer.
+            // The stride between tokens. We may be able to always use params.stride.
+            uint32_t v_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_heads_kv * Dh);
+            // The offset.
+            const auto v_offset = tensorrt_llm::common::flat_index_strided3(bi, hi_kv, vi, v_stride, Dh);
+
+            if (load_qkv_quant)
+            {
+                using Packed_Int8_t = typename packed_type<int8_t, num_elems<V_vec_k>::value>::type;
+                using Packed_Float_t = typename packed_type<float, num_elems<V_vec_k>::value>::type;
+                const auto v_scaling = params.qkv_scale_quant_orig[2];
+                const auto v_quant
+                    = *reinterpret_cast<const Packed_Int8_t*>(&reinterpret_cast<const int8_t*>(params.v)[v_offset]);
+
+                convert_from_float(&v, mul<Packed_Float_t, float>(v_scaling, float_from_int8(v_quant)));
+            }
+            else
+            {
+                v = *reinterpret_cast<const V_vec_k*>(&params.v[v_offset]);
+            }
         }
 
-        // Compute the V values with bias.
-        v = add(v, v_bias);
-
-        if (do_ia3)
+        if (handle_kv)
         {
-            v = mul<V_vec_k, V_vec_k, V_vec_k>(v,
-                *reinterpret_cast<const V_vec_k*>(
-                    &params.ia3_value_weights[tensorrt_llm::common::flat_index2(ia3_ti_hi, vi, Dh)]));
+            // Compute the V values with bias.
+            v = add(v, v_bias);
+
+            if (do_ia3)
+            {
+                v = mul<V_vec_k, V_vec_k, V_vec_k>(v,
+                    *reinterpret_cast<const V_vec_k*>(
+                        &params.ia3_value_weights[tensorrt_llm::common::flat_index2(ia3_ti_hi, vi, Dh)]));
+            }
         }
 
         // Store the values with bias back to global memory in the cache for V.

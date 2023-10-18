@@ -18,20 +18,15 @@ import argparse as _arg
 import os as _os
 import pathlib as _pl
 import platform as _pf
-import subprocess as _sp
 import sys as _sys
 import typing as _tp
 
-
-def run_command(command: _tp.Sequence[str], *, cwd=None, **kwargs) -> None:
-    print(f"Running: cd %s && %s" %
-          (str(cwd or _pl.Path.cwd()), " ".join(command)))
-    _sp.check_call(command, cwd=cwd, **kwargs)
+from build_engines_utils import run_command, wincopy
 
 
-def build_engine(weigth_dir: _pl.Path, engine_dir: _pl.Path, *args):
+def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, *args):
     build_args = [_sys.executable, "examples/gptj/build.py"] + (
-        ['--model_dir', str(weigth_dir)] if weigth_dir else []) + [
+        ['--model_dir', str(weight_dir)] if weight_dir else []) + [
             '--output_dir',
             str(engine_dir),
             '--dtype=float16',
@@ -80,11 +75,11 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
     model_file_name = "pytorch_model.bin"
     if model_cache:
         if _pf.system() == "Windows":
-            run_command([
-                "cmd", "/c", "copy",
-                str(_pl.Path(model_cache) / model_name / model_file_name), "."
-            ],
-                        cwd=hf_dir)
+            wincopy(source=str(
+                _pl.Path(model_cache) / model_name / model_file_name),
+                    dest=model_file_name,
+                    isdir=False,
+                    cwd=hf_dir)
         else:
             run_command([
                 "rsync", "-av",
@@ -99,7 +94,7 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
 
     engine_dir = models_dir / 'rt_engine' / model_name
 
-    # TODO(nkorobov) add Tensor and Pipeline parallelism to GPT-J
+    # TODO add Tensor and Pipeline parallelism to GPT-J
     tp_size = 1
     pp_size = 1
     tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu"

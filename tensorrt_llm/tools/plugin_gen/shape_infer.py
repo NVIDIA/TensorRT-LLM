@@ -266,7 +266,7 @@ class CppCodeTranspiler:
         ret = []
         # process right, and generate the code for each dimensions
 
-        # TODO[chunweiy]: support more wildcard cases, currently only A[*] -> B[*], C[*] is supported
+        # TODO: support more wildcard cases, currently only A[*] -> B[*], C[*] is supported
         is_right_identical_dims = False
         for off, item in enumerate(rule.right):
             is_cur_identical_dims = self.is_cur_identical_dims(item)

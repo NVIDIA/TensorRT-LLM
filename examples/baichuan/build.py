@@ -214,6 +214,11 @@ def parse_arguments():
                         type=int,
                         default=64,
                         help='Number of tokens per block in paged KV cache')
+    parser.add_argument(
+        '--max_num_tokens',
+        type=int,
+        default=None,
+        help='Define the max number of tokens supported by the engine')
 
     args = parser.parse_args()
 
@@ -236,6 +241,9 @@ def parse_arguments():
         if not args.paged_kv_cache:
             args.paged_kv_cache = True
             logger.info("Using paged KV cache for inflight batching mode.")
+
+    if args.max_num_tokens is not None:
+        assert args.enable_context_fmha
 
     if args.model_dir is not None:
         hf_config = AutoConfig.from_pretrained(args.model_dir,
@@ -376,7 +384,8 @@ def build_rank_engine(builder: Builder,
         inputs = tensorrt_llm_baichuan.prepare_inputs(args.max_batch_size,
                                                       args.max_input_len,
                                                       args.max_output_len, True,
-                                                      args.max_beam_width)
+                                                      args.max_beam_width,
+                                                      args.max_num_tokens)
         tensorrt_llm_baichuan(*inputs)
         if args.enable_debug_output:
             # mark intermediate nodes' outputs
@@ -431,6 +440,7 @@ def build(rank, args):
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
+            max_num_tokens=args.max_num_tokens,
             int8=args.quant_mode.has_act_and_weight_quant())
         engine_name = get_engine_name(model_name, args.dtype, args.world_size,
                                       cur_rank)

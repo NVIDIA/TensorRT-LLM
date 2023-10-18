@@ -10,6 +10,10 @@ The TensorRT-LLM GPT-NeoX implementation can be found in [`tensorrt_llm/models/g
  * [`run.py`](./run.py) to run the inference on an input text,
  * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
 
+## Support Matrix
+  * FP16
+  * Tensor Parallel
+
 ## Usage
 
 ### 1. Download weights from HuggingFace (HF) Transformers
@@ -149,28 +153,48 @@ sh gptq_convert.sh
 ### 3. Build TensorRT engine(s)
 
 ```bash
-# Build a float16 engine using generated quantized weights.
+# Build a engine applying INT4 GPTQ quantization using a single GPU and the generated quantized weights.
 # Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
 # Set --use_weight_only_groupwise_quant_matmul_plugin to enable GPTQ
-
-python3 build.py --dtype=float16 \
-                 --log_level=verbose  \
-                 --use_gpt_attention_plugin float16 \
-                 --use_gemm_plugin float16 \
-                 --use_layernorm_plugin float16 \
-                 --use_weight_only_groupwise_quant_matmul_plugin float16 \
+python3 build.py --dtype=float16                                                                     \
+                 --log_level=verbose                                                                 \
+                 --use_gpt_attention_plugin float16                                                  \
+                 --use_gemm_plugin float16                                                           \
+                 --use_layernorm_plugin float16                                                      \
+                 --use_weight_only_groupwise_quant_matmul_plugin float16                             \
                  --groupwise_quant_safetensors_path=gptneox_model/gptneox-20b-4bit-gs128.safetensors \
-                 --max_batch_size=16 \
-                 --max_input_len=1024 \
-                 --max_output_len=1024 \
-                 --output_dir=gptneox_engine_gptq \
+                 --max_batch_size=16                                                                 \
+                 --max_input_len=1024                                                                \
+                 --max_output_len=1024                                                               \
+                 --output_dir=gptneox_engine_gptq                                                    \
                  --model_dir=gptneox_model 2>&1 | tee build_gptq.log
+
+# Build a engine applying INT4 GPTQ quantization using 2-way tensor parallelism and the generated quantized weights.
+# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
+# Set --use_weight_only_groupwise_quant_matmul_plugin to enable GPTQ
+python3 build.py --dtype=float16                                                                     \
+                 --log_level=verbose                                                                 \
+                 --use_gpt_attention_plugin float16                                                  \
+                 --use_gemm_plugin float16                                                           \
+                 --use_layernorm_plugin float16                                                      \
+                 --use_weight_only_groupwise_quant_matmul_plugin float16                             \
+                 --groupwise_quant_safetensors_path=gptneox_model/gptneox-20b-4bit-gs128.safetensors \
+                 --max_batch_size=16                                                                 \
+                 --max_input_len=1024                                                                \
+                 --max_output_len=1024                                                               \
+                 --world_size=2                                                                      \
+                 --output_dir=gptneox_engine_gptq_tp2                                                \
+                 --model_dir=gptneox_model 2>&1 | tee build_gptq_tp2.log
 ```
 
 ### 4. Run the GPTQ quantized GPT-NeoX model
 
 ```bash
+# For a single GPU
 python3 run.py --max_output_len=50 --engine_dir=gptneox_engine_gptq
+
+# For 2-way tensor parallelism
+mpirun -n 2 --allow-run-as-root python3 run.py --max_output_len=50 --engine_dir=gptneox_engine_gptq_tp2
 ```
 
 ### 5. Summarize with the GPTQ quantized GPT-NeoX model
@@ -184,11 +208,22 @@ pip install -r requirements.txt
 Then use the [`summarize.py`](./summarize.py) script to summarize.
 
 ```bash
-python3 summarize.py --engine_dir gptneox_engine_gptq \
-                     --model_dir gptneox_model \
-                     --batch_size 1 \
-                     --test_trt_llm \
-                     --tensorrt_llm_rouge1_threshold 14 \
-                     --data_type fp16 \
+# Run the summarization task using a TensorRT-LLM model and a single GPU.
+python3 summarize.py --engine_dir gptneox_engine_gptq     \
+                     --model_dir gptneox_model            \
+                     --batch_size 1                       \
+                     --test_trt_llm                       \
+                     --tensorrt_llm_rouge1_threshold 14   \
+                     --data_type fp16                     \
                      --check_accuracy 2>&1 | tee summary_trt_llm_gptq.log
+
+# Run the summarization task using a TensorRT-LLM model and 2-way tensor parallelism.
+mpirun -n 2 --allow-run-as-root                           \
+python3 summarize.py --engine_dir gptneox_engine_gptq_tp2 \
+                     --model_dir gptneox_model            \
+                     --batch_size 1                       \
+                     --test_trt_llm                       \
+                     --tensorrt_llm_rouge1_threshold 14   \
+                     --data_type fp16                     \
+                     --check_accuracy 2>&1 | tee summary_trt_llm_gptq_tp2.log
 ```

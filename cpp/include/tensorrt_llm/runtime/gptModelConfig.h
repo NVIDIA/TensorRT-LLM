@@ -26,6 +26,12 @@ namespace tensorrt_llm::runtime
 class GptModelConfig
 {
 public:
+    enum class ModelVariant : std::int32_t
+    {
+        kGpt = 0,
+        kGlm = 1, // https://github.com/THUDM/GLM
+    };
+
     constexpr explicit GptModelConfig(
         SizeType vocabSize, SizeType nbLayers, SizeType nbHeads, SizeType hiddenSize, nvinfer1::DataType dtype)
         : mVocabSize(vocabSize)
@@ -42,7 +48,10 @@ public:
         , mMaxBatchSize(0)
         , mMaxInputLen(0)
         , mMaxOutputLen(0)
+        , mMaxNumTokens(std::nullopt)
         , mComputeContextLogits(false)
+        , mModelVariant(ModelVariant::kGpt)
+        , mUseCustomAllReduce(false)
     {
     }
 
@@ -177,6 +186,16 @@ public:
         mMaxOutputLen = maxOutputLen;
     }
 
+    [[nodiscard]] std::optional<SizeType> constexpr getMaxNumTokens() const noexcept
+    {
+        return mMaxNumTokens;
+    }
+
+    void constexpr setMaxNumTokens(std::optional<SizeType> maxNumTokens) noexcept
+    {
+        mMaxNumTokens = maxNumTokens;
+    }
+
     [[nodiscard]] bool constexpr computeContextLogits() const noexcept
     {
         return mComputeContextLogits;
@@ -185,6 +204,26 @@ public:
     void constexpr computeContextLogits(bool computeContextLogits) noexcept
     {
         mComputeContextLogits = computeContextLogits;
+    }
+
+    [[nodiscard]] ModelVariant getModelVariant() const
+    {
+        return mModelVariant;
+    }
+
+    void setModelVariant(ModelVariant modelVariant)
+    {
+        mModelVariant = modelVariant;
+    }
+
+    [[nodiscard]] bool constexpr useCustomAllReduce() const noexcept
+    {
+        return mUseCustomAllReduce;
+    }
+
+    void constexpr useCustomAllReduce(bool customAllReduce) noexcept
+    {
+        mUseCustomAllReduce = customAllReduce;
     }
 
 private:
@@ -202,7 +241,11 @@ private:
     SizeType mMaxBatchSize;
     SizeType mMaxInputLen;
     SizeType mMaxOutputLen;
+    std::optional<SizeType> mMaxNumTokens;
+
     bool mComputeContextLogits;
+    ModelVariant mModelVariant;
+    bool mUseCustomAllReduce;
 };
 
 } // namespace tensorrt_llm::runtime

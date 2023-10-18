@@ -254,7 +254,7 @@ def parse_arguments():
         '--quantized_fp8_model_path',
         type=str,
         default=None,
-        help='Path of a quantized model checkpoint in .pyz format')
+        help='Path of a quantized model checkpoint in .npz format')
     parser.add_argument(
         '--fp8_kv_cache',
         default=False,
@@ -277,6 +277,18 @@ def parse_arguments():
                         type=int,
                         default=64,
                         help='Number of tokens per block in paged KV cache')
+    parser.add_argument(
+        '--max_num_tokens',
+        type=int,
+        default=None,
+        help='Define the max number of tokens supported by the engine')
+
+    parser.add_argument(
+        '--use_custom_all_reduce',
+        action='store_true',
+        help=
+        'Activates latency-optimized algorithm for all-reduce instead of NCCL.')
+
     args = parser.parse_args()
 
     logger.set_level(args.log_level)
@@ -300,6 +312,9 @@ def parse_arguments():
         if not args.paged_kv_cache:
             args.paged_kv_cache = True
             logger.info('Using paged KV cache for inflight batching mode.')
+
+    if args.max_num_tokens is not None:
+        assert args.enable_context_fmha
 
     args.quant_mode = QuantMode(0)
     if args.fp8_kv_cache:
@@ -328,7 +343,6 @@ def parse_arguments():
             args.n_kv_head = 1
     else:
         args.n_kv_head = args.n_kv_head or args.n_head
-
     assert (args.n_head % args.n_kv_head) == 0, \
         "MQA/GQA requires the number of heads to be divisible by the number "\
         "of K/V heads."
@@ -344,14 +358,6 @@ def parse_arguments():
         logger.warning(
             f"RoPE does not support without GPT attention plugin. Set by "
             f"use_gpt_attention_plugin={args.dtype}.")
-    elif args.alibi:
-        msg = 'Falcon cannot use the context FMHA with ALiBi. Disable {opt}'
-        if args.enable_context_fmha:
-            args.enable_context_fmha = False
-            logger.warning(msg.format(opt='enable_context_fmha'))
-        if args.enable_context_fmha_fp32_acc:
-            args.enable_context_fmha_fp32_acc = False
-            logger.warning(msg.format(opt='enable_context_fmha_fp32_acc'))
 
     logger.info(' Build Arguments '.center(100, '='))
     for k, v in vars(args).items():
@@ -380,6 +386,10 @@ def build_rank_engine(builder: Builder,
         tp_size=args.tp_size,
         pp_size=args.pp_size,
     )
+    assert args.n_layer % args.pp_size == 0, \
+        f"num_layers {args.n_layer} must be a multiple of pipeline "\
+        f"parallelism size {args.pp_size}"
+
     tensorrt_llm_falcon = tensorrt_llm.models.FalconForCausalLM(
         num_layers=args.n_layer,
         num_heads=args.n_head,
@@ -446,7 +456,8 @@ def build_rank_engine(builder: Builder,
             ContextFMHAType.enabled_with_fp32_acc)
 
     if args.world_size > 1:
-        network.plugin_config.set_nccl_plugin(args.dtype)
+        network.plugin_config.set_nccl_plugin(args.dtype,
+                                              args.use_custom_all_reduce)
     if args.remove_input_padding:
         network.plugin_config.enable_remove_input_padding()
     if args.paged_kv_cache:
@@ -459,7 +470,8 @@ def build_rank_engine(builder: Builder,
             max_input_len=args.max_input_len,
             max_new_tokens=args.max_output_len,
             use_cache=True,
-            max_beam_width=args.max_beam_width)
+            max_beam_width=args.max_beam_width,
+            max_num_tokens=args.max_num_tokens)
         tensorrt_llm_falcon(*inputs)
         if args.enable_debug_output:
             # mark intermediate nodes' outputs
@@ -515,6 +527,7 @@ def build(rank, args):
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
+            max_num_tokens=args.max_num_tokens,
             fp8=args.quant_mode.has_fp8_qdq(),
             quant_mode=args.quant_mode,
             strongly_typed=args.strongly_typed,

@@ -65,6 +65,8 @@ def read_config(config_path: Path):
         )
         num_kv_heads = 1
     num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
+    use_custom_all_reduce = config['plugin_config'].get('use_custom_all_reduce',
+                                                        False)
 
     model_config = ModelConfig(num_heads=num_heads,
                                num_kv_heads=num_kv_heads,
@@ -76,7 +78,8 @@ def read_config(config_path: Path):
                                tokens_per_block=tokens_per_block,
                                remove_input_padding=remove_input_padding,
                                dtype=dtype,
-                               quant_mode=quant_mode)
+                               quant_mode=quant_mode,
+                               use_custom_all_reduce=use_custom_all_reduce)
 
     return model_config, tp_size, pp_size, dtype
 

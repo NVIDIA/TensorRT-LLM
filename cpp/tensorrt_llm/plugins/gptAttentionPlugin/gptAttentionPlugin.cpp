@@ -42,11 +42,13 @@ GPTAttentionPlugin::GPTAttentionPlugin(int num_heads, int num_kv_heads, int head
     float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
     tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
     bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
-    int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled)
+    int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled,
+    bool cross_attention, int max_distance)
     : GPTAttentionPluginCommon(num_heads, num_kv_heads, head_size, unidirectional, q_scaling, position_embedding_type,
         rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale,
         rotary_embedding_max_positions, tp_size, tp_rank, context_fmha_type, multi_block_mode, kv_cache_quant_mode,
-        remove_input_padding, mask_type, paged_kv_cache, tokens_per_block, type, max_context_length, qkv_bias_enabled)
+        remove_input_padding, mask_type, paged_kv_cache, tokens_per_block, type, max_context_length, qkv_bias_enabled,
+        cross_attention, max_distance)
 {
 }
 
@@ -114,6 +116,10 @@ bool GPTAttentionPlugin::supportsFormatCombination(
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32 && inOut[pos].format == TensorFormat::kLINEAR;
     }
+    else if (mCrossAttention && (pos == getCrossQKVLengthIdx() || pos == getEncoderInputLengthsIdx()))
+    {
+        return inOut[pos].type == nvinfer1::DataType::kINT32;
+    }
     else
     {
         return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
@@ -134,9 +140,10 @@ size_t GPTAttentionPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* in
     const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept
 {
     const int max_context_length = mMaxContextLength;
+    const int cross_qkv_length = isCrossAttention() ? inputs[getCrossQKVLengthIdx()].dims.d[0] : 0;
     const int nbReq = inputs[getSequenceLengthIdx()].dims.d[0];
     auto const type = inputs[getInputTensorIdx()].type;
-    size_t const context_workspace_size = getWorkspaceSizeForContext(type, nbReq, max_context_length);
+    size_t const context_workspace_size = getWorkspaceSizeForContext(type, nbReq, max_context_length, cross_qkv_length);
 
     const int total_num_seq = inputs[getSequenceLengthIdx()].dims.d[0];
     size_t const generation_workspace_size = getWorkspaceSizeForGeneration(type, total_num_seq);
@@ -209,8 +216,12 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
     const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream)
 {
-    const int beamWidth = inputDesc[getCacheIndirIdx()].dims.d[1];
-    const int maxSeqLen = inputDesc[getCacheIndirIdx()].dims.d[2];
+    //     relative_attention_bias [head_num, max_seq_len, max_seq_len] (optional in relative position)
+    //                          or [head_num, num_buckets] (optional in implicit relative attention)
+    //     cross_qkv [batch_size, seq_len, 3 * local_hidden_size] or [1, num_tokens, 3 * local_hidden_size]
+    //               when enable remove_input_padding (optional in cross attention mode)
+    //     cross_qkv_length [int] max encoder input context length (optional in cross attention mode)
+    //     encoder_input_lengths [batch_size] raw sequence lengths (optional in cross attention mode)
 
     const T* attention_input
         = static_cast<const T*>(inputs[getInputTensorIdx()]) + inputDesc[getInputTensorIdx()].dims.d[2] * tokenIdxBeg;
@@ -225,7 +236,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     bool const is_context = (reqTypeInBatchPtr[0] == RequestType::kCONTEXT);
 
     const int* context_lengths = reinterpret_cast<const int*>(inputs[getContextLengthsIdx()]) + seqIdxBeg;
-    // Note we still need context length during generation for MMHA optimziation.
+    // Note we still need context length during generation for MMHA optimization.
     int32_t const max_context_len = [&]()
     {
         if (!mRemovePadding)
@@ -236,6 +247,18 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         return *std::max_element(host_context_lengths, host_context_lengths + localNbSeq);
     }();
     TLLM_CHECK(max_context_len <= mMaxContextLength);
+
+    int max_encoder_context_len = isCrossAttention() ? inputDesc[getCrossQKVLengthIdx()].dims.d[0] : 0;
+    // for enc-dec model, since decoder_input_ids could be longer than 1,
+    // such model has an encoder context (for cross attn) and an decoder context (for self attn)
+    // clarify 3 lens:
+    // -- max_context_len: len of decoder input. No "max" concept, it's what it is given.
+    //                     Also called (decoder_)input_seq_length
+    // -- max_seq_len: max allowed len of decoder output, i.e. final results
+    // -- max_encoder_context_len: len of encoder input (in cross attn). Also called encoder_input_seq_length
+
+    const int beamWidth = inputDesc[getCacheIndirIdx()].dims.d[1];
+    const int maxSeqLen = isCrossAttention() ? max_encoder_context_len : inputDesc[getCacheIndirIdx()].dims.d[2];
 
     const float* kv_scale_orig_quant = nullptr;
     const float* kv_scale_quant_orig = nullptr;
@@ -269,19 +292,45 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     }
 
     const T* alibi_slopes = isALiBi() ? static_cast<const T*>(inputs[getAlibiSlopesIdx()]) : nullptr;
+
     if (is_context) // context stage
     {
         const int batch_size = localNbSeq;
-        enqueueContext<T, KVCacheBuffer>(
-            EnqueueContextParams<T, KVCacheBuffer>{attention_input, qkv_bias, max_context_len, maxSeqLen,
-                context_lengths, kv_scale_orig_quant, kv_scale_quant_orig, alibi_slopes, context_buf_, key_value_cache,
-                block_pointers, batch_size, localNbTokens, max_blocks_per_sequence, workspace},
-            stream);
+        const int request_batch_size = batch_size;
+        // num of total tokens (without paddings when remove paddings).
+        int num_encoder_tokens = 0;
+        if (!mRemovePadding)
+        {
+            num_encoder_tokens = request_batch_size * max_encoder_context_len;
+        }
+        else
+        {
+            num_encoder_tokens = inputDesc[getCrossQKVIdx()].dims.d[1];
+        }
+
+        EnqueueContextParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, max_context_len, maxSeqLen,
+            context_lengths, kv_scale_orig_quant, kv_scale_quant_orig, alibi_slopes, context_buf_, key_value_cache,
+            block_pointers, batch_size, localNbTokens, max_blocks_per_sequence, workspace};
+        if (isRelativePosition())
+        {
+            enqueue_params.relative_attention_bias = static_cast<const T*>(inputs[getRelativeAttentionBiasIdx()]);
+            enqueue_params.relative_attention_bias_stride
+                = inputDesc[getRelativeAttentionBiasIdx()].dims.d[1]; // max_seq_len or num_buckets
+        }
+        if (isCrossAttention())
+        {
+            enqueue_params.cross_qkv = static_cast<const T*>(inputs[getCrossQKVIdx()]);
+            enqueue_params.cross_qkv_length = max_encoder_context_len;
+            enqueue_params.encoder_input_lengths
+                = reinterpret_cast<const int*>(inputs[getEncoderInputLengthsIdx()]) + seqIdxBeg;
+            enqueue_params.num_encoder_tokens = num_encoder_tokens;
+        }
+
+        enqueueContext<T, KVCacheBuffer>(enqueue_params, stream);
     }
-    else // generation stage; input_seq_len == 1
+    else // generation stage; max_context_len == input_seq_len == 1
     {
         int batch_beam = localNbSeq;
-
         TLLM_CHECK(batch_beam % beamWidth == 0);
         int32_t const num_requests = batch_beam / beamWidth;
 
@@ -289,12 +338,23 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
         int32_t const* past_kv_len_list = static_cast<const int*>(inputs[getHostPastKeyValueLengthsIdx()]) + seqIdxBeg;
         int32_t const past_kv_len = *std::max_element(past_kv_len_list, past_kv_len_list + localNbSeq);
-        enqueueGeneration<T, KVCacheBuffer>(
-            EnqueueGenerationParams<T, KVCacheBuffer>{attention_input, qkv_bias, sequence_length, past_kv_len,
-                beamWidth, context_lengths, kv_scale_orig_quant, kv_scale_quant_orig, alibi_slopes, context_buf_,
-                key_value_cache, block_pointers, maxSeqLen, num_requests, max_blocks_per_sequence, cache_indir,
-                workspace},
-            stream);
+        EnqueueGenerationParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, sequence_length,
+            past_kv_len, beamWidth, context_lengths, kv_scale_orig_quant, kv_scale_quant_orig, alibi_slopes,
+            context_buf_, key_value_cache, block_pointers, maxSeqLen, num_requests, max_blocks_per_sequence,
+            cache_indir, workspace};
+        if (isRelativePosition())
+        {
+            enqueue_params.relative_attention_bias = static_cast<const T*>(inputs[getRelativeAttentionBiasIdx()]);
+            enqueue_params.relative_attention_bias_stride
+                = inputDesc[getRelativeAttentionBiasIdx()].dims.d[1]; // max_seq_len or num_buckets
+        }
+        if (isCrossAttention())
+        {
+            enqueue_params.encoder_input_lengths
+                = reinterpret_cast<const int*>(inputs[getEncoderInputLengthsIdx()]) + seqIdxBeg;
+        }
+
+        enqueueGeneration<T, KVCacheBuffer>(enqueue_params, stream);
     }
 
     return 0;
@@ -385,7 +445,7 @@ GPTAttentionPluginCreator::GPTAttentionPluginCreator()
     : GPTAttentionPluginCreatorCommon()
 {
 
-    mPluginAttributes.emplace_back(PluginField("remove_input_padding", nullptr, PluginFieldType::kINT8, 0));
+    mPluginAttributes.emplace_back(PluginField("in_flight_batching", nullptr, PluginFieldType::kINT8, 0));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -430,7 +490,9 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(const char* name, const Plugi
             p.getScalar<int32_t>("tokens_per_block").value(),
             static_cast<nvinfer1::DataType>(p.getScalar<int32_t>("type_id").value()),
             p.getScalar<int32_t>("max_context_length").value(),
-            static_cast<bool>(p.getScalar<int8_t>("qkv_bias_enabled").value()));
+            static_cast<bool>(p.getScalar<int8_t>("qkv_bias_enabled").value()),
+            static_cast<bool>(p.getScalar<int8_t>("do_cross_attention").value()),
+            static_cast<int32_t>(p.getScalar<int32_t>("max_distance").value()));
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

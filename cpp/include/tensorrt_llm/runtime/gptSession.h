@@ -23,6 +23,7 @@
 #include "tensorrt_llm/runtime/generationOutput.h"
 #include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
@@ -130,6 +131,7 @@ private:
         nvinfer1::DataType logitsType, bool decoderPerRequest, SizeType numMicroBatches);
     void createKvCacheManagers(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength,
         SizeType numMicroBatches, std::optional<SizeType> maxTokensInPagedKvCache);
+    void createCustomAllReduceWorkspace(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength);
 
     //! @brief Execute decoder on last PP rank, receive decoder output on other PP ranks.
     void decoderStepAsync(

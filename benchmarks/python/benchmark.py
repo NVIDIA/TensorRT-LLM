@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import multiprocessing as mp
 from multiprocessing import Process, Queue
 from time import time
 
@@ -38,11 +39,12 @@ def parse_arguments():
         '--mode',
         type=str,
         default="plugin",
-        choices=['ootb', 'plugin'],
+        choices=['ootb', 'plugin', 'ootb-except-mha'],
         help=
         ('Choose mode between ootb/plugin. '
          '\"ootb\" means the engines will be built without any plugins, '
-         'while \"plugin\" means the engines will be built with tuned recipe of using plugins.'
+         '\"plugin\" means the engines will be built with tuned recipe of using plugins.'
+         '\"ootb-except-mha\" means the engines will be built with only attention plugins.'
          ))
 
     parser.add_argument('--batch_size',
@@ -298,12 +300,16 @@ def main(args):
             )
 
         except Exception as e:
+            print("Found exception during benchmarking", e.with_traceback())
             p.kill()
             raise e
-
+        logger.debug("Sending signal to mem monitor process, start")
         q1.put(1)
+        logger.debug("Sending signal to mem monitor process, done")
         peak_gpu_used = q2.get()
+        logger.debug("Get peak gpu memory usage from mem monitor process, done")
         p.join()
+        logger.debug("Memory monitor process joined")
 
         latency = round(sum(latencies) / iter_idx, 3)
         latencies.sort()
@@ -318,5 +324,6 @@ def main(args):
 
 
 if __name__ == '__main__':
+    mp.set_start_method('spawn')
     args = parse_arguments()
     main(args)

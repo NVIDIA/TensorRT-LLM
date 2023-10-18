@@ -58,7 +58,7 @@ template <typename Config, typename RunnerPtr, typename GemmIdType, typename Gem
 void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::deserialize(
     const char*& data, GemmDims& dims, const GemmIdType& gemmId)
 {
-    // NOTE(nkorobov): this mutex is not needed since each thread owns its private map, but will put here for
+    // NOTE: this mutex is not needed since each thread owns its private map, but will put here for
     // consistency
     writer_lock lock(mMNKProfileMap->mutex);
 

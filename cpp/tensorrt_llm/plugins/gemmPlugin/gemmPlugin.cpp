@@ -385,7 +385,10 @@ int GemmPlugin::initialize() noexcept
     return 0;
 }
 
-void GemmPlugin::destroy() noexcept {}
+void GemmPlugin::destroy() noexcept
+{
+    delete this;
+}
 
 size_t GemmPlugin::getSerializationSize() const noexcept
 {
@@ -472,7 +475,7 @@ IPluginV2* GemmPluginCreator::createPlugin(const char* name, const PluginFieldCo
     {
         // GemmPluginCreator is unique and shared for an engine generation
         // Create plugin profiler with shared tactics map
-        // FIXME(nkorobov) enable tactic profiler
+        // FIXME enable tactic profiler
         auto pluginProfiler = gemmPluginProfileManager.createGemmPluginProfiler(/* inference */ false, /* skip */ true);
         auto* obj = new GemmPlugin(transA, transB, type, useFp8, pluginProfiler);
         obj->setPluginNamespace(mNamespace.c_str());
@@ -493,7 +496,7 @@ IPluginV2* GemmPluginCreator::deserializePlugin(const char* name, const void* se
     {
         // GemmPluginCreator is unique and shared for an engine generation
         // Create plugin profiler with shared tactics map
-        // FIXME(nkorobov) enable tactic profiler
+        // FIXME enable tactic profiler
         auto pluginProfiler = gemmPluginProfileManager.createGemmPluginProfiler(/* inference */ true, /* skip */ true);
         auto* obj = new GemmPlugin(serialData, serialLength, pluginProfiler);
         obj->setPluginNamespace(mNamespace.c_str());

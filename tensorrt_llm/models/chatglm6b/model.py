@@ -509,7 +509,7 @@ class ChatGLM6BHeadModel(ChatGLM6BModel):
         bs_range = [1, (max_batch_size + 1) // 2, max_batch_size]
         beam_width_range = [1, (max_beam_width + 1) // 2, max_beam_width]
         inlen_range = [1, 1, max_input_len]
-        max_len_range = [0, (max_len + 1) // 2, max_len]
+        max_len_range = [1, (max_len + 1) // 2 + 1, max_len + 1]
 
         past_key_value = []
         sequence_length = None
@@ -519,7 +519,7 @@ class ChatGLM6BHeadModel(ChatGLM6BModel):
                            dtype=trt.int32,
                            shape=[-1, -1],
                            dim_range=OrderedDict([
-                               ('batch_size', [bb_range]),
+                               ('batch_beam_size', [bb_range]),
                                ('input_len', [inlen_range]),
                            ]))
 
@@ -527,14 +527,14 @@ class ChatGLM6BHeadModel(ChatGLM6BModel):
                               dtype=trt.int32,
                               shape=[-1, 2, -1],
                               dim_range=OrderedDict([
-                                  ('batch_size', [bb_range]),
+                                  ('batch_beam_size', [bb_range]),
                                   ('2', [2]),
                                   ('input_len', [inlen_range]),
                               ]))
 
         for i in range(self._num_layers):
             kv_dim_range = OrderedDict([
-                ('batch_size', [bb_range]),
+                ('batch_beam_size', [bb_range]),
                 ('kv', [2]),
                 ('num_heads', [num_heads_kv]),
                 ('past_key_len', [max_len_range]),
@@ -553,18 +553,18 @@ class ChatGLM6BHeadModel(ChatGLM6BModel):
             name='sequence_length',
             dtype=trt.int32,
             shape=[-1],
-            dim_range=OrderedDict([('batch_size', [bb_range])]),
+            dim_range=OrderedDict([('batch_beam_size', [bb_range])]),
         )
         host_past_key_value_lengths = Tensor(
             name='host_past_key_value_lengths',
             dtype=trt.int32,
             shape=[-1],
-            dim_range=OrderedDict([('batch_size', [bb_range])]),
+            dim_range=OrderedDict([('batch_beam_size', [bb_range])]),
         )
         context_lengths = Tensor(name='context_lengths',
                                  dtype=trt.int32,
                                  shape=[-1],
-                                 dim_range=OrderedDict([('batch_size',
+                                 dim_range=OrderedDict([('batch_beam_size',
                                                          [bb_range])]))
 
         host_context_lengths = None
@@ -572,20 +572,21 @@ class ChatGLM6BHeadModel(ChatGLM6BModel):
             host_context_lengths = Tensor(name='host_context_lengths',
                                           dtype=trt.int32,
                                           shape=[-1],
-                                          dim_range=OrderedDict([('batch_size',
-                                                                  [bb_range])]))
+                                          dim_range=OrderedDict([
+                                              ('batch_beam_size', [bb_range])
+                                          ]))
 
         host_request_types = Tensor(name='host_request_types',
                                     dtype=trt.int32,
                                     shape=[-1],
-                                    dim_range=OrderedDict([('batch_size',
+                                    dim_range=OrderedDict([('batch_beam_size',
                                                             [bb_range])]))
 
         last_token_ids = Tensor(name='last_token_ids',
                                 dtype=trt.int32,
                                 shape=[-1],
                                 dim_range=OrderedDict([
-                                    ('batch_size', [bb_range]),
+                                    ('batch_beam_size', [bb_range]),
                                 ]))
 
         cache_indirection = Tensor(name='cache_indirection',

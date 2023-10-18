@@ -187,6 +187,23 @@ def parse_arguments():
     parser.add_argument('--remove_input_padding',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--use_parallel_embedding',
+        action="store_true",
+        default=False,
+        help=
+        'By default embedding parallelism is disabled. By setting this flag, embedding parallelism is enabled'
+    )
+    parser.add_argument(
+        '--embedding_sharding_dim',
+        type=int,
+        default=1,  # Meta does TP on hidden dim
+        choices=[0, 1],
+        help=
+        'By default the embedding lookup table is sharded along vocab dimension (--embedding_sharding_dim=0). '
+        'To shard it along hidden dimension, set --embedding_sharding_dim=1'
+        'Note: embedding sharing is only enabled when --embedding_sharding_dim=0'
+    )
 
     args = parser.parse_args()
 
@@ -248,7 +265,10 @@ def build_rank_engine(builder: Builder,
                         rank=rank,
                         tp_size=args.world_size),  # TP only
         apply_query_key_layer_scaling=builder_config.
-        apply_query_key_layer_scaling)
+        apply_query_key_layer_scaling,
+        use_parallel_embedding=args.use_parallel_embedding,
+        embedding_sharding_dim=args.embedding_sharding_dim)
+
     if args.use_weight_only_quant_matmul_plugin:
         tensorrt_llm_gpt = weight_only_quantize(tensorrt_llm_gpt)
 

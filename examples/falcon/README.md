@@ -1,6 +1,6 @@
 # Falcon
 
-This document shows how to build and run a Falcon model in TensorRT-LLM on both single GPU, single node multi-GPU and multi-node multi-GPU.
+This document shows how to build and run a Falcon model in TensorRT-LLM on single GPU, single node multi-GPU, and multi-node multi-GPU.
 
 ## Overview
 
@@ -9,6 +9,14 @@ The TensorRT-LLM Falcon implementation can be found in [tensorrt_llm/models/falc
  * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Falcon model,
  * [`run.py`](./run.py) to run the inference on an input text,
  * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
+
+## Support Matrix
+  * FP16
+  * BF16
+  * FP8
+  * STRONGLY TYPED
+  * FP8 KV CACHE
+  * Tensor Parallel
 
 ## Usage
 
@@ -34,10 +42,10 @@ git clone https://huggingface.co/tiiuae/falcon-180B falcon/180b
 TensorRT-LLM Falcon builds TensorRT engine(s) from HF checkpoint.
 If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
 
-Normally `build.py` only requires a single GPU, but if you've already got all the GPUs needed while inferencing, you could enable parallelly building to make the engine building process faster by adding `--parallel_build` argument.
+Normally `build.py` only requires a single GPU, but if you've already got all the GPUs needed while inferencing, you could enable parallel building to make the engine building process faster by adding `--parallel_build` argument.
 Please note that currently `parallel_build` feature only supports single node.
 
-Here're some examples:
+Here are some examples:
 ```bash
 # Build a single-GPU float16 engine from HF weights.
 # It is recommend to use --remove_input_padding along with --use_gpt_attention_plugin for better performance

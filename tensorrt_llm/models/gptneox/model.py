@@ -204,9 +204,18 @@ class GPTNeoXModel(Module):
                  dtype=None,
                  position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
                  mapping=Mapping(),
-                 apply_query_key_layer_scaling=False):
+                 apply_query_key_layer_scaling=False,
+                 use_parallel_embedding=False,
+                 embedding_sharding_dim=0):
         super().__init__()
-        self.embedding = Embedding(vocab_size, hidden_size, dtype=dtype)
+        self.embedding = Embedding(
+            num_embeddings=vocab_size,
+            embedding_dim=hidden_size,
+            dtype=dtype,
+            tp_size=mapping.tp_size if use_parallel_embedding else 1,
+            tp_group=mapping.tp_group if use_parallel_embedding else None,
+            sharding_dim=embedding_sharding_dim,
+            tp_rank=mapping.rank)
 
         self.layers = ModuleList([
             GPTNeoXDecoderLayer(
@@ -275,7 +284,9 @@ class GPTNeoXForCausalLM(GPTNeoXModel, GenerationMixin):
                  dtype,
                  position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
                  mapping=Mapping(),
-                 apply_query_key_layer_scaling=False):
+                 apply_query_key_layer_scaling=False,
+                 use_parallel_embedding=False,
+                 embedding_sharding_dim=0):
         if isinstance(dtype, str):
             self._kv_dtype = str_dtype_to_trt(dtype)
         else:
@@ -286,6 +297,9 @@ class GPTNeoXForCausalLM(GPTNeoXModel, GenerationMixin):
         self._hidden_size = hidden_size
         self._vocab_size = vocab_size
         self._tp_size = mapping.tp_size
+        self._use_parallel_embedding = use_parallel_embedding
+        self._embedding_sharding_dim = embedding_sharding_dim
+
         super().__init__(
             num_layers=num_layers,
             num_heads=num_heads,
@@ -297,7 +311,9 @@ class GPTNeoXForCausalLM(GPTNeoXModel, GenerationMixin):
             dtype=dtype,
             position_embedding_type=position_embedding_type,
             mapping=mapping,
-            apply_query_key_layer_scaling=apply_query_key_layer_scaling)
+            apply_query_key_layer_scaling=apply_query_key_layer_scaling,
+            use_parallel_embedding=use_parallel_embedding,
+            embedding_sharding_dim=embedding_sharding_dim)
 
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
         self.lm_head = ColumnLinear(hidden_size,

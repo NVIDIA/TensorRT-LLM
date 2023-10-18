@@ -17,21 +17,26 @@
 #include "allreducePlugin.h"
 #include "mpi.h"
 #include "plugin.h"
+#include "tensorrt_llm/common/mpiUtils.h"
+#include "tensorrt_llm/kernels/customAllReduceKernels.h"
+#include <unistd.h>
 
 using namespace nvinfer1;
 using tensorrt_llm::plugins::AllreducePluginCreator;
 using tensorrt_llm::plugins::AllreducePlugin;
+using tensorrt_llm::kernels::AllReduceStrategyType;
 
 static const char* ALLREDUCE_PLUGIN_VERSION{"1"};
 static const char* ALLREDUCE_PLUGIN_NAME{"AllReduce"};
 PluginFieldCollection AllreducePluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> AllreducePluginCreator::mPluginAttributes;
 
-AllreducePlugin::AllreducePlugin(std::set<int> group, nvinfer1::DataType type, AllReduceStrategyType strategy)
+AllreducePlugin::AllreducePlugin(
+    std::set<int> group, nvinfer1::DataType type, AllReduceStrategyType strategy, int32_t counter)
     : mGroup(group)
     , mType(type)
     , mStrategy(strategy)
-    , mCustomARBufferSize(0)
+    , mCounter(counter)
 {
 }
 
@@ -41,7 +46,7 @@ AllreducePlugin::AllreducePlugin(const void* data, size_t length)
     const char *d = reinterpret_cast<const char*>(data), *a = d;
     read(d, mType);
     read(d, mStrategy);
-    read(d, mCustomARBufferSize);
+    read(d, mCounter);
     mGroup.clear();
     int groupItem = 0;
     while (d != a + length)
@@ -69,38 +74,28 @@ nvinfer1::DimsExprs AllreducePlugin::getOutputDimensions(
 bool AllreducePlugin::supportsFormatCombination(
     int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
 {
-    return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
+    if (mStrategy == AllReduceStrategyType::RING)
+    {
+        TLLM_CHECK_WITH_INFO(nbInputs == 1, "RING (aka. NCCL) strategy only accepts one input.");
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(nbInputs == 2, "Non-RING (aka. NCCL) strategies require a workspace tensor.");
+    }
+
+    if (nbInputs == 2 && pos == 1)
+    {
+        return (inOut[pos].type == nvinfer1::DataType::kINT64) && (inOut[pos].format == TensorFormat::kLINEAR);
+    }
+    else
+    {
+        return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
+    }
 }
 
 void AllreducePlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
     const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
 {
-    if (mStrategy == AllReduceStrategyType::NCCL)
-    {
-        return;
-    }
-
-    size_t sizePerElem = 0;
-    switch (mType)
-    {
-    case DataType::kFLOAT: sizePerElem = sizeof(float); break;
-    case DataType::kHALF: sizePerElem = sizeof(half); break;
-#ifdef ENABLE_BF16
-    case DataType::kBF16: sizePerElem = sizeof(__nv_bfloat16); break;
-#endif
-    default: break;
-    }
-
-    size_t inputSize = 1;
-    for (int i = 0; i < in[0].max.nbDims; i++)
-    {
-        inputSize *= in[0].max.d[i];
-    }
-
-    if (isBuilding())
-    {
-        mCustomARBufferSize = std::max(mCustomARBufferSize, inputSize * sizePerElem);
-    }
 }
 
 size_t AllreducePlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
@@ -109,11 +104,41 @@ size_t AllreducePlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* input
     return 0;
 }
 
-size_t AllreducePlugin::ncclEstimatedThreshold(int worldSize) const noexcept
+AllReduceStrategyType AllreducePlugin::selectImplementation(size_t messageSize, int worldSize) const noexcept
 {
-    // returns the message size over which it's more interesting to use NCCL
-    // 0.60 * TP_SIZE * 10MB
-    return 0.60 * (10 * 1000 * 1000 * worldSize);
+    if (worldSize <= 2)
+    {
+        if (messageSize < 16 * 1000 * 1000)
+        {
+            return AllReduceStrategyType::ONESHOT;
+        }
+    }
+
+    if (worldSize > 2 && worldSize <= 4)
+    {
+        if (messageSize < 1 * 1000 * 1000)
+        {
+            return AllReduceStrategyType::ONESHOT;
+        }
+        if (messageSize < 8 * 1000 * 1000)
+        {
+            return AllReduceStrategyType::TWOSHOT;
+        }
+    }
+
+    if (worldSize > 4)
+    {
+        if (messageSize < 500 * 1000)
+        {
+            return AllReduceStrategyType::ONESHOT;
+        }
+        if (messageSize < 8 * 1000 * 1000)
+        {
+            return AllReduceStrategyType::TWOSHOT;
+        }
+    }
+
+    return AllReduceStrategyType::RING;
 }
 
 int AllreducePlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
@@ -129,12 +154,23 @@ int AllreducePlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const 
         size *= inputDesc[0].dims.d[i];
     }
     size_t sizePerElem = 0;
+    using tensorrt_llm::common::datatype_enum;
+    datatype_enum type;
     switch (mType)
     {
-    case DataType::kFLOAT: sizePerElem = sizeof(float); break;
-    case DataType::kHALF: sizePerElem = sizeof(half); break;
+    case DataType::kFLOAT:
+        sizePerElem = sizeof(float);
+        type = datatype_enum::TYPE_FP32;
+        break;
+    case DataType::kHALF:
+        sizePerElem = sizeof(half);
+        type = datatype_enum::TYPE_FP16;
+        break;
 #ifdef ENABLE_BF16
-    case DataType::kBF16: sizePerElem = sizeof(__nv_bfloat16); break;
+    case DataType::kBF16:
+        sizePerElem = sizeof(__nv_bfloat16);
+        type = datatype_enum::TYPE_BF16;
+        break;
 #endif
     default: break;
     }
@@ -142,21 +178,31 @@ int AllreducePlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const 
     auto runtimeStrategy = mStrategy;
     if (runtimeStrategy == AllReduceStrategyType::AUTO)
     {
-        runtimeStrategy = size * sizePerElem > ncclEstimatedThreshold(mGroup.size()) ? AllReduceStrategyType::NCCL
-                                                                                     : AllReduceStrategyType::CUSTOM;
+        runtimeStrategy = selectImplementation(size * sizePerElem, mGroup.size());
     }
 
-    if (runtimeStrategy == AllReduceStrategyType::NCCL)
+    if (runtimeStrategy == AllReduceStrategyType::RING)
     {
         NCCLCHECK(ncclAllReduce(inputs[0], outputs[0], size, (*getDtypeMap())[inputDesc[0].type], ncclSum,
             (*getCommMap())[mGroup], stream));
     }
-    else if (runtimeStrategy == AllReduceStrategyType::CUSTOM)
+    else
     {
-        auto shareBuffer = mCustomAllReduceContext->getShareBuffer();
-        cudaMemcpyAsync(shareBuffer, inputs[0], size * sizePerElem, cudaMemcpyDeviceToDevice, stream);
+        int myRank;
+        int nRanks = inputDesc[1].dims.d[0] / 3;
+        MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &myRank));
+        // FIXME: pass world config here
+        myRank = myRank % nRanks;
 
-        mCustomAllReduceContext->customAllReduce(outputs[0], size, sizePerElem, mType, stream);
+        auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(
+            reinterpret_cast<const int32_t*>(inputs[1]), nRanks, myRank, mCounter);
+
+        // Make sure all GPUs have finished using their peer_comm_buffer_ptrs in previous invocations
+        tensorrt_llm::kernels::invokeMultiGpuBarrier(params, stream);
+        cudaMemcpyAsync(
+            params.peer_comm_buffer_ptrs[myRank], inputs[0], size * sizePerElem, cudaMemcpyDeviceToDevice, stream);
+
+        tensorrt_llm::kernels::customAllReduce(params, outputs[0], size, sizePerElem, type, runtimeStrategy, stream);
     }
 
     return 0;
@@ -196,13 +242,13 @@ bool AllreducePlugin::isCustomAllReduceSuported(int ranks_per_node) const noexce
         false;
 #endif
 
-    return isCudaVersionSupported && (ranks_per_node % 2 == 0) && (ranks_per_node <= MAX_RANKS_PER_NODE)
+    return isCudaVersionSupported && (ranks_per_node % 2 == 0) && (ranks_per_node <= kernels::MAX_RANKS_PER_NODE)
         && (ranks_per_node > 0);
 }
 
 int AllreducePlugin::initialize() noexcept
 {
-    if (isBuilding())
+    if (isBuilding() || mStrategy == AllReduceStrategyType::ONESHOT || mStrategy == AllReduceStrategyType::TWOSHOT)
     {
         return 0;
     }
@@ -213,56 +259,47 @@ int AllreducePlugin::initialize() noexcept
 
     int deviceId;
     cudaGetDevice(&deviceId);
-    TLLM_CHECK_WITH_INFO(myRank == deviceId, "MPI rank != cudaDeviceId, check if cudaSetDevice has been called");
 
-    if (mStrategy == AllReduceStrategyType::NCCL || mStrategy == AllReduceStrategyType::AUTO)
+    auto* commMap = getCommMap();
+    // [] operator inserts T() if it does not exist
+    if ((*commMap)[mGroup] != nullptr)
     {
-        auto* commMap = getCommMap();
-        // [] operator inserts T() if it does not exist
-        if ((*commMap)[mGroup] == nullptr)
-        {
-            int groupRank = 0;
-            for (auto it = mGroup.begin(); it != mGroup.end(); ++it)
-            {
-                if (*it == myRank)
-                {
-                    break;
-                }
-                ++groupRank;
-            }
+        return 0;
+    }
 
-            ncclUniqueId id;
-            if (myRank == *mGroup.begin())
-            {
-                ncclGetUniqueId(&id);
-                for (auto it = std::next(std::begin(mGroup), 1); it != mGroup.end(); ++it)
-                {
-                    MPICHECK(MPI_Send(&id, sizeof(id), MPI_BYTE, *it, 0, MPI_COMM_WORLD));
-                }
-            }
-            else
-            {
-                MPI_Status status;
-                MPICHECK(MPI_Recv(&id, sizeof(id), MPI_BYTE, *mGroup.begin(), 0, MPI_COMM_WORLD, &status));
-            }
-            (*commMap)[mGroup] = nullptr;
-            NCCLCHECK(ncclCommInitRank(&((*commMap)[mGroup]), mGroup.size(), id, groupRank));
+    int groupRank = 0;
+    for (auto it = mGroup.begin(); it != mGroup.end(); ++it)
+    {
+        if (*it == myRank)
+        {
+            break;
+        }
+        ++groupRank;
+    }
+
+    ncclUniqueId id;
+    if (myRank == *mGroup.begin())
+    {
+        ncclGetUniqueId(&id);
+        for (auto it = std::next(std::begin(mGroup), 1); it != mGroup.end(); ++it)
+        {
+            MPICHECK(MPI_Send(&id, sizeof(id), MPI_BYTE, *it, 0, MPI_COMM_WORLD));
         }
     }
-
-    if (mStrategy == AllReduceStrategyType::CUSTOM || mStrategy == AllReduceStrategyType::AUTO)
+    else
     {
-        TLLM_CHECK_WITH_INFO(tensorrt_llm::CustomAllReduceComm::isAvailable(), "Custom all reduce isn't available.");
-        auto allocSize = mCustomARBufferSize > 0 ? mCustomARBufferSize : CUSTOM_AR_SIZE_THRESHOLD;
-        mCustomAllReduceContext = std::make_shared<tensorrt_llm::CustomAllReduceComm>(nRanks, 0, myRank, allocSize);
+        MPI_Status status;
+        MPICHECK(MPI_Recv(&id, sizeof(id), MPI_BYTE, *mGroup.begin(), 0, MPI_COMM_WORLD, &status));
     }
+    (*commMap)[mGroup] = nullptr;
+    NCCLCHECK(ncclCommInitRank(&((*commMap)[mGroup]), mGroup.size(), id, groupRank));
 
     return 0;
 }
 
 void AllreducePlugin::terminate() noexcept
 {
-    if (mStrategy == AllReduceStrategyType::NCCL || mStrategy == AllReduceStrategyType::AUTO)
+    if (mStrategy == AllReduceStrategyType::RING || mStrategy == AllReduceStrategyType::AUTO)
     {
         auto* commMap = getCommMap();
         // [] operator inserts T() if it does not exist
@@ -277,7 +314,7 @@ void AllreducePlugin::terminate() noexcept
 
 size_t AllreducePlugin::getSerializationSize() const noexcept
 {
-    return sizeof(int) * mGroup.size() + sizeof(mType) + sizeof(mStrategy) + sizeof(mCustomARBufferSize);
+    return sizeof(int) * mGroup.size() + sizeof(mType) + sizeof(mStrategy) + sizeof(mCounter);
 }
 
 void AllreducePlugin::serialize(void* buffer) const noexcept
@@ -285,7 +322,7 @@ void AllreducePlugin::serialize(void* buffer) const noexcept
     char *d = static_cast<char*>(buffer), *a = d;
     write(d, mType);
     write(d, mStrategy);
-    write(d, mCustomARBufferSize);
+    write(d, mCounter);
     for (auto it = mGroup.begin(); it != mGroup.end(); ++it)
     {
         write(d, *it);
@@ -308,6 +345,7 @@ AllreducePluginCreator::AllreducePluginCreator()
     mPluginAttributes.emplace_back(PluginField("group", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("strategy", nullptr, PluginFieldType::kINT8, 1));
+    mPluginAttributes.emplace_back(PluginField("counter", nullptr, PluginFieldType::kINT32, 1));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -332,7 +370,8 @@ IPluginV2* AllreducePluginCreator::createPlugin(const char* name, const PluginFi
     const PluginField* fields = fc->fields;
     std::set<int> group;
     nvinfer1::DataType type;
-    AllreducePlugin::AllReduceStrategyType strategy;
+    AllReduceStrategyType strategy;
+    int32_t counter;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
@@ -355,13 +394,18 @@ IPluginV2* AllreducePluginCreator::createPlugin(const char* name, const PluginFi
         else if (!strcmp(attrName, "strategy"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
-            strategy = static_cast<AllreducePlugin::AllReduceStrategyType>(*static_cast<const int8_t*>(fields[i].data));
+            strategy = static_cast<AllReduceStrategyType>(*static_cast<const int8_t*>(fields[i].data));
+        }
+        else if (!strcmp(attrName, "counter"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            counter = *static_cast<const int32_t*>(fields[i].data);
         }
     }
 
     try
     {
-        auto* obj = new AllreducePlugin(group, type, strategy);
+        auto* obj = new AllreducePlugin(group, type, strategy, counter);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

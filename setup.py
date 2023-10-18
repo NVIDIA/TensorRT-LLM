@@ -51,7 +51,7 @@ setup_kwargs = {}
 
 setup(
     name='tensorrt_llm',
-    version='0.1.3',
+    version='0.5.0',
     description='TensorRT-LLM: A TensorRT Toolbox for Large Language Models',
     install_requires=required_deps,
     dependency_links=extra_URLs,

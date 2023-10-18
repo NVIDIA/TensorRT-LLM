@@ -10,6 +10,14 @@ The TensorRT-LLM LLaMA implementation can be found in [tensorrt_llm/models/llama
  * [`run.py`](./run.py) to run the inference on an input text,
  * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
 
+## Support Matrix
+  * FP16
+  * FP8
+  * INT8 & INT4 Weight-Only
+  * FP8 KV CACHE
+  * Tensor Parallel
+  * STRONGLY TYPED
+
 ## Usage
 
 The TensorRT-LLM LLaMA example code locates at [examples/llama](./). It takes HF weights as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
@@ -151,7 +159,7 @@ and then export the scaling factors needed for INT8 KV cache inference.
 Example:
 
 ```bash
-python3 hf_llama_convert.py -i /llama-models/llama-7b-hf -o /llama/smooth_llama_7B/int8_kv_cache/ --calibrate-kv-cache -t float16
+python3 hf_llama_convert.py -i /llama-models/llama-7b-hf -o /llama/smooth_llama_7B/int8_kv_cache/ --calibrate-kv-cache -t fp16
 ```
 
 [`build.py`](./build.py) add new options for the support of INT8 KV cache.

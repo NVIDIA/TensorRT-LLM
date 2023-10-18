@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <memory>
 #include <mpi.h>
 #include <stdio.h>
 #include <unordered_map>
@@ -85,6 +86,22 @@ struct MpiComm
         : group(g){};
 };
 
+class MpiRequest
+{
+public:
+    MpiRequest() {}
+
+    ~MpiRequest() {}
+
+    void wait()
+    {
+        // TODO: Don't ignore return status
+        MPI_Wait(&mRequest, MPI_STATUS_IGNORE);
+    }
+
+    MPI_Request mRequest;
+};
+
 MPI_Datatype getMpiDtype(MpiType dtype);
 
 void initialize(int* argc, char*** argv);
@@ -97,9 +114,11 @@ void barrier();
 int getCommWorldRank();
 int getCommWorldSize();
 
+std::shared_ptr<MpiRequest> bcast_async(void* buffer, size_t size, MpiType dtype, int root, MpiComm comm);
 void bcast(void* buffer, size_t size, MpiType dtype, int root, MpiComm comm);
 void bcast(std::vector<int64_t>& packed, int root, MpiComm comm);
 void comm_split(MpiComm comm, int color, int key, MpiComm* newcomm);
 void allreduce(const void* sendbuf, void* recvbuf, int count, MpiType dtype, MpiOp op, MpiComm comm);
+void allgather(const void* sendbuf, void* recvbuf, int count, MpiType dtype, MpiComm comm);
 
 } // namespace tensorrt_llm::mpi

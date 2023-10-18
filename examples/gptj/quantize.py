@@ -99,7 +99,7 @@ def get_args():
     parser.add_argument("--dtype", help="Model data type.", default="float16")
     parser.add_argument("--qformat",
                         type=str,
-                        choices=['fp8', 'int8_sq'],
+                        choices=['fp8'],
                         default='fp8',
                         help='Quantization format.')
     parser.add_argument("--calib_size",
@@ -107,10 +107,6 @@ def get_args():
                         default=512,
                         help="Number of samples for calibration.")
     parser.add_argument("--export_path", default="exported_model")
-    parser.add_argument("--tp_size",
-                        type=int,
-                        default=1,
-                        help='Tensor parallel size.')
     parser.add_argument('--seed', type=int, default=None, help='Random seed')
     args = parser.parse_args()
     return args
@@ -134,8 +130,7 @@ def main():
     model = quantize_and_export(model,
                                 qformat=args.qformat,
                                 calib_dataloader=calib_dataloader,
-                                export_path=args.export_path,
-                                tensor_parallel_size=args.tp_size)
+                                export_path=args.export_path)
 
 
 if __name__ == "__main__":

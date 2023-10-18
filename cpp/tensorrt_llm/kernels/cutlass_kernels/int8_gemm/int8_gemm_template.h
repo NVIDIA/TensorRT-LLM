@@ -125,7 +125,7 @@ void genericInt8GemmKernelLauncher(const int8_t* A, const int8_t* B, tk::QuantMo
 
     using Gemm = cutlass::gemm::device::GemmUniversalBase<GemmKernel>;
 
-    typename EpilogueOp::Params linearScalingParams; // TODO(mseznec): right now it's unused (scaling is done in
+    typename EpilogueOp::Params linearScalingParams; // TODO: right now it's unused (scaling is done in
                                                      // visitor, no activation needed)
     typename Gemm::Arguments args{cutlass::gemm::GemmUniversalMode::kBatched, {m, n, k}, 1,
         {reinterpret_cast<ElementInput*>(const_cast<ElementInput*>(A)), k},
@@ -136,7 +136,7 @@ void genericInt8GemmKernelLauncher(const int8_t* A, const int8_t* B, tk::QuantMo
         typename EpilogueVisitor::Arguments(linearScalingParams, 0, 0, 0)};
 
     Gemm gemm;
-    // TODO(mseznec): handle that
+    // TODO: handle that
     if (gemm.get_workspace_size(args) > workspaceBytes)
     {
         TLLM_LOG_WARNING(

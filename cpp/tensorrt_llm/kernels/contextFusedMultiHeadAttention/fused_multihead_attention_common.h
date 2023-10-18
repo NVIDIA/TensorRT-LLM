@@ -27,8 +27,6 @@ namespace kernels
 enum Data_type
 {
     DATA_TYPE_BOOL,
-    DATA_TYPE_E8M10,
-    DATA_TYPE_E8M7,
     DATA_TYPE_FP16,
     DATA_TYPE_FP32,
     DATA_TYPE_INT4,
@@ -77,14 +75,15 @@ struct AlibiParams
 
     AlibiParams() = default;
 
-    AlibiParams(int h)
+    AlibiParams(int h, float scale_after_alibi)
+        : scale_after_alibi(scale_after_alibi)
     {
         h_pow_2 = round_down_to_power_two(h);
         alibi_neg4_div_h = -4.0f / h_pow_2;
     }
 
-    AlibiParams(int h, int s, int tp_size, int rank)
-        : AlibiParams(h * tp_size)
+    AlibiParams(int h, int s, int tp_size, int rank, float scale_after_alibi)
+        : AlibiParams(h * tp_size, scale_after_alibi)
     {
         head_idx_offset = h * rank;
         sequence_pos_offset = s * rank;
@@ -92,6 +91,7 @@ struct AlibiParams
 
     int h_pow_2{};
     float alibi_neg4_div_h{};
+    float scale_after_alibi{};
     // Could be simplified to `int rank` derive the others as `num_heads * rank, s * rank` at
     // runtime, but this makes assumptions about the layout downstream
     // (e.g. downstream may only split across the head dimension, so s would be the full sequence)
@@ -146,9 +146,9 @@ struct Fused_multihead_attention_params_v2
     // In multi-query or grouped-query attention (MQA/GQA), several Q heads are associated with one KV head
     int h_kv;
 
-    // Max_past_length for attention.
-    // Only pay attention to [max(0, seq_length - max_past_length), seq_length).
-    int max_past_s = INT_MAX;
+    // Sliding Window Attention
+    // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
+    int sliding_window_size = INT_MAX;
 
     // is input/output padded
     bool is_s_padded = false;
@@ -215,7 +215,7 @@ struct Launch_params
     bool warp_specialization = false;
     // granular tiling flash attention kernels
     bool granular_tiling = false;
-    // mask type: padding, causal, limited_length_causal
+    // mask type: padding, causal, sliding_window_causal
     ContextAttentionMaskType attention_mask_type = ContextAttentionMaskType::PADDING;
     // harward properties to determine how to launch blocks
     int multi_processor_count = 0;

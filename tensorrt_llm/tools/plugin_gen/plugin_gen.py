@@ -3,13 +3,12 @@ This file is a script tool for generating TensorRT plugin library for Triton.
 '''
 import argparse
 import glob
-#import pkg_resources
 import logging
 import os
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import ClassVar, Iterable, List, Tuple, Union
+from typing import ClassVar, Iterable, List, Optional, Tuple, Union
 
 try:
     import triton
@@ -71,6 +70,9 @@ class _TrtPluginGenArgs(StageArgs):
 @dataclass
 class _TrtPluginCompileArgs:
     workspace: str
+    trt_lib_dir: Optional[str] = None
+    trt_include_dir: Optional[str] = None
+    trt_llm_include_dir: Optional[str] = None
 
     stage_name: ClassVar[str] = 'compile_trt_plugin'
 
@@ -224,19 +226,22 @@ class Stage:
                             add_header=i == 0,
                             plugin_lib_path=plugin_lib_path).generate()
 
-        # TODO[chunweiy]: make it customizable
-        trt_llm_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    '../../..')
-
         # create build directory and compile
         _run_command(['mkdir', '-p', 'build'], cwd=self.config.sub_workspace)
         _run_command(['rm', '-rf', 'build/*'], cwd=self.config.sub_workspace)
 
-        _run_command([
-            'cmake',
-            '..',
-            '-DTRT_LLM_LIB_DIR=' + os.path.join(trt_llm_path, 'cpp'),
-        ],
+        cmake_cmds = ['cmake', '..']
+        if self.config.trt_lib_dir is not None:
+            cmake_cmds.append(f'-DTRT_LIB_DIR={self.config.trt_lib_dir}')
+        if self.config.trt_include_dir:
+            cmake_cmds.append(
+                f'-DTRT_INCLUDE_DIR={self.config.trt_include_dir}')
+        if self.config.trt_llm_include_dir is None:
+            self.config.trt_llm_include_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), '../../../cpp')
+        cmake_cmds.append(
+            f'-DTRT_LLM_INCLUDE_DIR={self.config.trt_llm_include_dir}')
+        _run_command(cmake_cmds,
                      cwd=os.path.join(self.config.sub_workspace, "build"))
         _run_command(['make', '-j'],
                      cwd=os.path.join(self.config.sub_workspace, "build"))
@@ -255,7 +260,11 @@ class Stage:
             ['cp', self.config.functional_py_path, self.config.output_dir])
 
 
-def gen_trt_plugins(workspace: str, metas: List[KernelMetaData]):
+def gen_trt_plugins(workspace: str,
+                    metas: List[KernelMetaData],
+                    trt_lib_dir: Optional[str] = None,
+                    trt_include_dir: Optional[str] = None,
+                    trt_llm_inlcude_dir: Optional[str] = None):
     '''
     Generate TRT plugins end-to-end.
     '''
@@ -265,7 +274,13 @@ def gen_trt_plugins(workspace: str, metas: List[KernelMetaData]):
         Stage(meta.to_TrtPluginGenArgs(workspace)).run()
 
     # collect all the plugins
-    Stage(metas[0].to_TrtPluginCompileArgs(workspace)).run()
+    compile_args = _TrtPluginCompileArgs(
+        workspace=workspace,
+        trt_lib_dir=trt_lib_dir,
+        trt_include_dir=trt_include_dir,
+        trt_llm_include_dir=trt_llm_inlcude_dir,
+    )
+    Stage(compile_args).run()
     Stage(metas[0].to_CopyOutputArgs(workspace)).run()
 
 
@@ -296,21 +311,41 @@ def _run_command(args, cwd=None):
     subprocess.run(args, check=True, cwd=cwd)
 
 
-def parse_arguments(args):
+def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--workspace',
         type=str,
         required=True,
-        help="the root path to store all the intermediate files")
+        help="The root path to store all the intermediate files")
     parser.add_argument(
         '--kernel_config',
         type=str,
         required=True,
         help=
-        'the path to the kernel config file, which should be a python module containing KernelMetaData instances'
-    )
-    args = parser.parse_args(args)
+        'The path to the kernel config file, which should be a python module '
+        'containing KernelMetaData instances')
+    parser.add_argument(
+        '--trt_lib_dir',
+        type=str,
+        default=None,
+        help='Directory to find TensorRT library. If None, find the library '
+        'from the system path or /usr/local/tensorrt.')
+    parser.add_argument(
+        '--trt_include_dir',
+        type=str,
+        default=None,
+        help='Directory to find TensorRT headers. If None, find the headers '
+        'from the system path or /usr/local/tensorrt.')
+    parser.add_argument('--trt_llm_include_dir',
+                        type=str,
+                        default=None,
+                        help='Directory to find TensorRT LLM C++ headers.')
+    args = parser.parse_args()
+
+    assert args.kernel_config.endswith('.py'), \
+        f"Kernel config {args.kernel_config} should be a python module"
+
     return args
 
 
@@ -325,14 +360,14 @@ def import_from_file(module_name, file_path):
 
 
 if __name__ == '__main__':
-    args = parse_arguments(None)
+    args = parse_arguments()
 
-    assert args.kernel_config.endswith(
-        '.py'), f"Kernel config {args.kernel_config} should be a python module"
     module_name = os.path.basename(args.kernel_config).replace('.py', '')
-
     config_module = import_from_file(module_name, args.kernel_config)
-
     kernel_configs: List[KernelMetaData] = config_module.KERNELS
 
-    gen_trt_plugins(args.workspace, kernel_configs)
+    gen_trt_plugins(workspace=args.workspace,
+                    trt_lib_dir=args.trt_lib_dir,
+                    trt_include_dir=args.trt_include_dir,
+                    trt_llm_inlcude_dir=args.trt_llm_include_dir,
+                    metas=kernel_configs)

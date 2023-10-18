@@ -77,7 +77,9 @@ class LLaMADecoderLayer(Module):
             tp_group=tp_group,
             tp_size=tp_size,
             use_int8_kv_cache=quant_mode.has_int8_kv_cache(),
-            quant_mode=quant_mode)
+            quant_mode=quant_mode,
+            instance_id=2 * layer_id,
+        )
         if not mlp_hidden_size:
             self.mlp_hidden_size = hidden_size * 4
         self.mlp = GatedMLP(hidden_size=hidden_size,
@@ -87,7 +89,8 @@ class LLaMADecoderLayer(Module):
                             bias=False,
                             tp_group=tp_group,
                             tp_size=tp_size,
-                            quant_mode=quant_mode)
+                            quant_mode=quant_mode,
+                            instance_id=2 * layer_id + 1)
         self.post_layernorm = RmsNorm(normalized_shape=hidden_size,
                                       eps=rms_norm_eps,
                                       dtype=dtype)
@@ -97,7 +100,8 @@ class LLaMADecoderLayer(Module):
                 attention_mask=None,
                 use_cache=False,
                 kv_cache_params=None,
-                attention_params=None):
+                attention_params=None,
+                all_reduce_workspace=None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         if self._layer_id == 0:
@@ -107,7 +111,8 @@ class LLaMADecoderLayer(Module):
                                           attention_mask=attention_mask,
                                           use_cache=use_cache,
                                           kv_cache_params=kv_cache_params,
-                                          attention_params=attention_params)
+                                          attention_params=attention_params,
+                                          workspace=all_reduce_workspace)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -121,7 +126,7 @@ class LLaMADecoderLayer(Module):
         if self._layer_id == 0:
             self.register_network_output(f"norm1", hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, all_reduce_workspace)
         if self._layer_id == 0:
             self.register_network_output(f"mlp", hidden_states)
 
@@ -195,7 +200,8 @@ class LLaMAModel(Module):
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
-                hidden_states=None):
+                hidden_states=None,
+                all_reduce_workspace=None):
 
         if kv_cache_params.past_key_value is None:
             tuple([None] * len(self.layers))
@@ -222,7 +228,8 @@ class LLaMAModel(Module):
                     host_past_key_value_lengths,
                     kv_cache_block_pointers=[pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
-                attention_params=attention_params)
+                attention_params=attention_params,
+                all_reduce_workspace=all_reduce_workspace)
 
             if use_cache:
                 presents.append(hidden_states[1])
@@ -316,10 +323,12 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
-                hidden_states=None):
+                hidden_states=None,
+                all_reduce_workspace=None):
         hidden_states = super().forward(input_ids, position_ids, use_cache,
                                         attention_mask, kv_cache_params,
-                                        attention_params, hidden_states)
+                                        attention_params, hidden_states,
+                                        all_reduce_workspace)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -369,6 +378,8 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
         use_gemm_plugin = default_net().plugin_config.gemm_plugin
         paged_kv_cache = default_net().plugin_config.paged_kv_cache
         tokens_per_block = default_net().plugin_config.tokens_per_block
+        use_custom_all_reduce = default_net(
+        ).plugin_config.use_custom_all_reduce
 
         model_inputs = self.prepare_basic_inputs(
             max_batch_size,
@@ -382,6 +393,7 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
             remove_input_padding=remove_input_padding,
             use_gpt_attention_plugin=use_gpt_attention_plugin,
             use_gemm_plugin=use_gemm_plugin,
+            use_custom_all_reduce=use_custom_all_reduce,
             paged_kv_cache=paged_kv_cache,
             tokens_per_block=tokens_per_block,
             dtype=self.dtype,
@@ -405,4 +417,5 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                     host_context_lengths=model_inputs['host_context_lengths'],
                     max_context_length=max_input_len,
                     host_request_types=model_inputs['host_request_types']),
-                model_inputs['hidden_states_input'])
+                model_inputs['hidden_states_input'],
+                model_inputs['all_reduce_workspace'])

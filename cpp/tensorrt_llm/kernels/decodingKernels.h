@@ -28,7 +28,7 @@ namespace kernels
 
 struct gatherTreeParam
 {
-    // TODO (bhsueh) rename the parameters
+    // TODO rename the parameters
     int* beams = nullptr;            // [batch_size, beam_width, max_seq_len], workspace to put intermediate output_ids
     int* sequence_lengths = nullptr; // [batch_size, beam_width], total lengths of each query
     int max_sequence_length_final_step = 0;

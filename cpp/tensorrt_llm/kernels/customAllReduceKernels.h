@@ -22,18 +22,28 @@
 
 #include <iostream>
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-
-#define CUSTOM_AR_SIZE_THRESHOLD 50331648
-#define MAX_ALL_REDUCE_BLOCKS 24
-#define FLAG(a) ((uint32_t) ((a) % 0x146))
-#define MAX_RANKS_PER_NODE 8
-#define WARP_SIZE 32
-#define DEFAULT_BLOCK_SIZE 1024
-#define DEFAULT_ALGO_AR_SIZE_THRESHOLD 393216
+#include "tensorrt_llm/common/tensor.h"
 
 namespace tensorrt_llm::kernels
 {
+
+constexpr size_t WARP_SIZE = 32;
+constexpr size_t CUSTOM_AR_SIZE_THRESHOLD = 50331648;
+constexpr size_t MAX_ALL_REDUCE_BLOCKS = 24;
+constexpr size_t MAX_RANKS_PER_NODE = 8;
+constexpr size_t DEFAULT_BLOCK_SIZE = 1024;
+
+// Warning: python definition is in tensorrt_llm/functional.py
+// they must be kept in sync
+enum class AllReduceStrategyType : int8_t
+{
+    RING = 0,
+    ONESHOT = 1,
+    TWOSHOT = 2,
+    AUTO = 3,
+};
 
 #ifdef ENABLE_BF16
 typedef struct bf168
@@ -45,29 +55,48 @@ typedef struct bf168
 } bf168;
 #endif
 
-struct AllReduceIpcMemHandles
-{
-    cudaIpcMemHandle_t peer_barrier_ipc_handles[MAX_RANKS_PER_NODE];
-    cudaIpcMemHandle_t peer_comm_buffer_ipc_handles[MAX_RANKS_PER_NODE];
-};
-
 struct AllReduceParams
 {
     size_t elts_total;
     size_t elts_per_rank;
     size_t elts_per_block;
     size_t rank_offset;
-    size_t ranks_per_node, rank, local_rank, node_id;
+    size_t ranks_per_node, rank, local_rank;
     uint32_t barrier_flag;
-    uint32_t* peer_barrier_ptrs[MAX_RANKS_PER_NODE];
+    uint32_t* peer_barrier_ptrs_in[MAX_RANKS_PER_NODE];
+    uint32_t* peer_barrier_ptrs_out[MAX_RANKS_PER_NODE];
     void* peer_comm_buffer_ptrs[MAX_RANKS_PER_NODE];
     void* local_output_buffer_ptr;
-    AllReduceIpcMemHandles ipc_mem_handles;
+
+    static AllReduceParams deserialize(const int32_t* buffer, size_t tpSize, size_t tpRank, uint32_t flag_value);
 };
 
 template <typename T>
-void invokeOneOrTwoShotAllReduceKernel(AllReduceParams& param, cudaStream_t stream);
+void invokeOneOrTwoShotAllReduceKernel(AllReduceParams& param, AllReduceStrategyType strat, cudaStream_t stream);
 
-void kernelLaunchConfig(int& blocks_per_grid, int& threads_per_block, size_t elts, int kernel_algo);
+void invokeMultiGpuBarrier(AllReduceParams& param, cudaStream_t stream);
+
+template <typename T>
+struct CustomARCommTypeConverter
+{
+    using Type = uint32_t;
+};
+
+template <>
+struct CustomARCommTypeConverter<half>
+{
+    using Type = uint16_t;
+};
+
+#ifdef ENABLE_BF16
+template <>
+struct CustomARCommTypeConverter<__nv_bfloat16>
+{
+    using Type = __nv_bfloat16;
+};
+#endif
+
+void customAllReduce(kernels::AllReduceParams& params, void* data, size_t elts, size_t size_per_elem,
+    common::datatype_enum dataType, AllReduceStrategyType strat, cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels

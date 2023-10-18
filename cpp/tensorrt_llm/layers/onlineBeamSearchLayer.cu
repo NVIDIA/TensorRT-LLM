@@ -46,10 +46,9 @@ __global__ void update_kernel(bool* finished, int** parent_ids_ptr, int* sequenc
     {
         const int current_step{s_sequence_lengths[beam_idx]};
 
-        if (!finished[blockIdx.x * beam_width + beam_idx])
-        {
-            s_sequence_lengths[beam_idx]++;
-        }
+        // Increase the seq_len even if the request has finished.
+        // On the following iteration we check if the sequence has finished before
+        s_sequence_lengths[beam_idx]++;
 
         int new_word_id{output_ids_ptr[blockIdx.x][beam_idx * max_seq_len + current_step]};
         int new_beam_id{(new_word_id / vocab_size) % beam_width};

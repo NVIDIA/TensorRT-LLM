@@ -88,4 +88,10 @@ inline std::string vec2str(std::vector<T> vec)
 {
     return arr2str(vec.data(), vec.size());
 }
+
+inline bool strStartsWith(std::string const& str, std::string const& prefix)
+{
+    return str.rfind(prefix, 0) == 0;
+}
+
 } // namespace tensorrt_llm::common

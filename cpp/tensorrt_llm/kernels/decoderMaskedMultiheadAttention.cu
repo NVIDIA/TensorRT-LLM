@@ -27,7 +27,7 @@ namespace mmha
 {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Forward declaration of the kernel launcher to avoid including decoder_masked_multihead_attention_template.hpp
+// Forward declaration of the kernel launcher to avoid including decoderMaskedMultiheadAttentionLaunch.h
 template <typename T, typename KVCacheBuffer, typename T_PARAMS, int Dh>
 void mmha_launch_kernel(const T_PARAMS& params, const KVCacheBuffer& kv_cache_buffer, const cudaStream_t& stream);
 
@@ -35,6 +35,10 @@ void mmha_launch_kernel(const T_PARAMS& params, const KVCacheBuffer& kv_cache_bu
 
 namespace
 {
+
+#define MMHA_LAUNCH_KERNEL(Dh)                                                                                         \
+    mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh>(params, kv_cache_buffer, stream);               \
+    break;
 
 template <typename T, typename KVCacheBuffer, typename KERNEL_PARAMS_TYPE>
 void multihead_attention_(
@@ -47,6 +51,9 @@ void multihead_attention_(
     case 64: mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, 64>(params, kv_cache_buffer, stream); break;
     case 80: mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, 80>(params, kv_cache_buffer, stream); break;
     case 96: mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, 96>(params, kv_cache_buffer, stream); break;
+    case 112:
+        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, 112>(params, kv_cache_buffer, stream);
+        break;
     case 128:
         mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, 128>(params, kv_cache_buffer, stream);
         break;
@@ -69,65 +76,34 @@ void multihead_attention_(
     }
 }
 
+#undef MMHA_LAUNCH_KERNEL
+
 } // namespace
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void masked_multihead_attention(const Masked_multihead_attention_params<float>& params,
-    const KVBlockArray& kv_cache_buffer, const cudaStream_t& stream)
-{
-    multihead_attention_<float, KVBlockArray, Masked_multihead_attention_params<float>>(
-        params, kv_cache_buffer, stream);
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-void masked_multihead_attention(const Masked_multihead_attention_params<uint16_t>& params,
-    const KVBlockArray& kv_cache_buffer, const cudaStream_t& stream)
-{
-    multihead_attention_<uint16_t, KVBlockArray, Masked_multihead_attention_params<uint16_t>>(
-        params, kv_cache_buffer, stream);
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
+#define INSTANTIATE_MMHA_NORMAL_AND_PAGED(T, CROSS_ATTENTION)                                                          \
+    void masked_multihead_attention(const Multihead_attention_params<T, CROSS_ATTENTION>& params,                      \
+        const KVBlockArray& kv_cache_buffer, const cudaStream_t& stream)                                               \
+    {                                                                                                                  \
+        multihead_attention_<T, KVBlockArray, Multihead_attention_params<T, CROSS_ATTENTION>>(                         \
+            params, kv_cache_buffer, stream);                                                                          \
+    }                                                                                                                  \
+    void masked_multihead_attention(const Multihead_attention_params<T, CROSS_ATTENTION>& params,                      \
+        const KVLinearBuffer& kv_cache_buffer, const cudaStream_t& stream)                                             \
+    {                                                                                                                  \
+        multihead_attention_<T, KVLinearBuffer, Multihead_attention_params<T, CROSS_ATTENTION>>(                       \
+            params, kv_cache_buffer, stream);                                                                          \
+    }
+INSTANTIATE_MMHA_NORMAL_AND_PAGED(float, true)
+INSTANTIATE_MMHA_NORMAL_AND_PAGED(float, false)
+INSTANTIATE_MMHA_NORMAL_AND_PAGED(uint16_t, true)
+INSTANTIATE_MMHA_NORMAL_AND_PAGED(uint16_t, false)
 #ifdef ENABLE_BF16
-void masked_multihead_attention(const Masked_multihead_attention_params<__nv_bfloat16>& params,
-    const KVBlockArray& kv_cache_buffer, const cudaStream_t& stream)
-{
-    multihead_attention_<__nv_bfloat16, KVBlockArray, Masked_multihead_attention_params<__nv_bfloat16>>(
-        params, kv_cache_buffer, stream);
-}
+INSTANTIATE_MMHA_NORMAL_AND_PAGED(__nv_bfloat16, true)
+INSTANTIATE_MMHA_NORMAL_AND_PAGED(__nv_bfloat16, false)
 #endif
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-void masked_multihead_attention(const Masked_multihead_attention_params<float>& params,
-    const KVLinearBuffer& kv_cache_buffer, const cudaStream_t& stream)
-{
-    multihead_attention_<float, KVLinearBuffer, Masked_multihead_attention_params<float>>(
-        params, kv_cache_buffer, stream);
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-void masked_multihead_attention(const Masked_multihead_attention_params<uint16_t>& params,
-    const KVLinearBuffer& kv_cache_buffer, const cudaStream_t& stream)
-{
-    multihead_attention_<uint16_t, KVLinearBuffer, Masked_multihead_attention_params<uint16_t>>(
-        params, kv_cache_buffer, stream);
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-#ifdef ENABLE_BF16
-void masked_multihead_attention(const Masked_multihead_attention_params<__nv_bfloat16>& params,
-    const KVLinearBuffer& kv_cache_buffer, const cudaStream_t& stream)
-{
-    multihead_attention_<__nv_bfloat16, KVLinearBuffer, Masked_multihead_attention_params<__nv_bfloat16>>(
-        params, kv_cache_buffer, stream);
-}
-#endif
+#undef INSTANTIATE_MMHA_NORMAL_AND_PAGED
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

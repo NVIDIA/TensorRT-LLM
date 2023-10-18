@@ -260,6 +260,7 @@ class GPTJForCausalLM(GPTJModel):
                        max_new_tokens,
                        use_cache,
                        max_beam_width,
+                       max_num_tokens: int = None,
                        enable_two_optimization_profiles: bool = False):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
@@ -280,22 +281,30 @@ class GPTJForCausalLM(GPTJModel):
         inlen_range_cxt = [1, (max_input_len + 1) // 2, max_input_len]
         inlen_range_gen = [1, 1, 1]
         _max_len_range = [0, (max_len + 1) // 2, max_len]
+        _mask_len_range = [1, (max_len + 1) // 2 + 1, max_len + 1]
         if enable_two_optimization_profiles:
             bb_range = [bb_range_cxt, bb_range_gen]
             bs_range = [_bs_range, _bs_range]
             beam_width_range = [_beam_width_range, _beam_width_range]
             inlen_range = [inlen_range_cxt, inlen_range_gen]
             max_len_range = [_max_len_range, _max_len_range]
+            mask_len_range = [_mask_len_range, _mask_len_range]
         else:
             bb_range = [bb_range_gen]
             bs_range = [_bs_range]
             beam_width_range = [_beam_width_range]
             inlen_range = [inlen_range_cxt]
             max_len_range = [_max_len_range]
-        num_tokens_range = [
-            1, max_batch_size * max_beam_width,
-            max(max_input_len * max_batch_size, max_beam_width * max_batch_size)
-        ]
+            mask_len_range = [_mask_len_range]
+
+        if max_num_tokens is None:
+            num_tokens_range = [
+                1, max_batch_size * max_beam_width,
+                max(max_input_len * max_batch_size,
+                    max_beam_width * max_batch_size)
+            ]
+        else:
+            num_tokens_range = [1, (max_num_tokens + 1) // 2, max_num_tokens]
 
         past_key_value = []
         sequence_length = None
@@ -354,7 +363,7 @@ class GPTJForCausalLM(GPTJModel):
                             shape=[-1, 2, num_heads, -1, head_size],
                             dim_range=kv_dim_range)
                 past_key_value.append(kv)
-                # TODO(kaiyu): Remove this when TRT fix the named dimension
+                # TODO: Remove this when TRT fix the named dimension
                 if not remove_input_padding:
                     assertion(shape(input_ids, 0) == shape(kv, 0), 'batch size')
 
@@ -418,6 +427,14 @@ class GPTJForCausalLM(GPTJModel):
                                         shape=[-1],
                                         dim_range=OrderedDict([('batch_size',
                                                                 bb_range)]))
+        else:
+            attention_mask = Tensor(name='attention_mask',
+                                    dtype=trt.int32,
+                                    shape=[-1, -1],
+                                    dim_range=OrderedDict([
+                                        ('batch_size', bb_range),
+                                        ('mask_len', mask_len_range),
+                                    ]))
 
         last_token_ids = Tensor(name='last_token_ids',
                                 dtype=trt.int32,

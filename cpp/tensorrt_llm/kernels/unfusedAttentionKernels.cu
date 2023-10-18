@@ -1112,6 +1112,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     //   qkv_bias: [hidden + 2 * kv_head_num * size_per_head]
     //   q_buf: [batch, head_num, seq_len, size_per_head]
     //   k_buf, v_buf: [batch, kv_head_num, seq_len, size_per_head]
+    // For cross attention where q/k/v buffer could be nullptr, writing to split buffer is suppressed when null
     T* qkv_ptr[3] = {q_buf, k_buf, v_buf};
     const bool has_padding = padding_offset == nullptr;
     const int hidden = head_num * size_per_head; // hidden dim Q
@@ -1186,7 +1187,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
             {
                 if (int8_mode == 2)
                 {
-                    // TODO(mseznec): add support for int8 BMM with FusedAtt
+                    // TODO: add support for int8 BMM with FusedAtt
                 }
                 else
                 {
@@ -1203,9 +1204,10 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
                 const int target_batch_stride = head_num * seq_len * size_per_head;
                 const int target_head_stride = seq_len * size_per_head;
                 const int target_seq_stride = size_per_head;
-                qkv_ptr[qkv_id][target_batch_id * target_batch_stride + head_id * target_head_stride
-                    + seq_id * target_seq_stride + size_id]
-                    = val;
+                if (qkv_ptr[qkv_id])
+                    qkv_ptr[qkv_id][target_batch_id * target_batch_stride + head_id * target_head_stride
+                        + seq_id * target_seq_stride + size_id]
+                        = val;
             }
         }
         else if (head_num != kv_head_num && qkv_id > 0) // KV when MQA/GQA
@@ -1213,9 +1215,10 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
             const int target_batch_stride = kv_head_num * seq_len * size_per_head;
             const int target_head_stride = seq_len * size_per_head;
             const int target_seq_stride = size_per_head;
-            qkv_ptr[qkv_id][target_batch_id * target_batch_stride + head_id * target_head_stride
-                + seq_id * target_seq_stride + size_id]
-                = val;
+            if (qkv_ptr[qkv_id])
+                qkv_ptr[qkv_id][target_batch_id * target_batch_stride + head_id * target_head_stride
+                    + seq_id * target_seq_stride + size_id]
+                    = val;
         }
     }
 }
@@ -1259,6 +1262,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     // This kernel add bias to QKV, which has shape [batch_size, seq_len, 3, head_num, size_per_head], and
     // QKV split to 3 split buffer q, k, v and transpose them to [batch_size, head_num, seq_len, size_per_head].
     // For q and k, also apply the rotary embedding.
+    // For cross attention where q/k/v buffer could be nullptr, writing to split buffer is suppressed when null
 
     // NOTE:
     // head_num == kv_head_num
@@ -1357,6 +1361,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
 
     switch (position_embedding_type)
     {
+    case PositionEmbeddingType::kRELATIVE:
     case PositionEmbeddingType::kROPE_GPTJ:
     {
         mmha::apply_rotary_embedding(
@@ -1415,7 +1420,8 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
         }
         else
         {
-            *reinterpret_cast<Vec_t*>(&q_buf[dest_q_idx]) = q;
+            if (q_buf)
+                *reinterpret_cast<Vec_t*>(&q_buf[dest_q_idx]) = q;
         }
         if ((head_num == kv_head_num) || (head_idx == (kv_head_idx * qheads_per_kv_head)))
         {
@@ -1425,8 +1431,10 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
                 *reinterpret_cast<Vec_t*>(&QKV[src_v_idx]) = v;
             }
             // we always need the following writes for KV cache
-            *reinterpret_cast<Vec_t*>(&k_buf[dest_kv_idx]) = k;
-            *reinterpret_cast<Vec_t*>(&v_buf[dest_kv_idx]) = v;
+            if (k_buf)
+                *reinterpret_cast<Vec_t*>(&k_buf[dest_kv_idx]) = k;
+            if (v_buf)
+                *reinterpret_cast<Vec_t*>(&v_buf[dest_kv_idx]) = v;
         }
     }
     else if (is_seq_masked && !is_head_size_masked)
@@ -1438,7 +1446,8 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
         }
         else
         {
-            *reinterpret_cast<Vec_t*>(&q_buf[dest_q_idx]) = zero;
+            if (q_buf)
+                *reinterpret_cast<Vec_t*>(&q_buf[dest_q_idx]) = zero;
         }
         if ((head_num == kv_head_num) || (head_idx == (kv_head_idx * qheads_per_kv_head)))
         {
@@ -1448,8 +1457,10 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
                 *reinterpret_cast<Vec_t*>(&QKV[src_v_idx]) = zero;
             }
             // we always need the following writes for KV cache
-            *reinterpret_cast<Vec_t*>(&k_buf[dest_kv_idx]) = zero;
-            *reinterpret_cast<Vec_t*>(&v_buf[dest_kv_idx]) = zero;
+            if (k_buf)
+                *reinterpret_cast<Vec_t*>(&k_buf[dest_kv_idx]) = zero;
+            if (v_buf)
+                *reinterpret_cast<Vec_t*>(&v_buf[dest_kv_idx]) = zero;
         }
     }
 }
@@ -1506,7 +1517,7 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, const 
     }
     else
     {
-        TLLM_CHECK_WITH_INFO(int8_mode != 2, "w8a8 not yet implemented with RoPE"); // TODO(mseznec)
+        TLLM_CHECK_WITH_INFO(int8_mode != 2, "w8a8 not yet implemented with RoPE"); // TODO
         // To implement rotary embeddings, each thread processes two QKV elems:
         dim3 block((size_per_head / Vec_t<T>::size + 31) / 32 * 32);
         dim3 grid(token_num, head_num);
@@ -1669,7 +1680,7 @@ __global__ void transpose4dBatchMajorKVCache(const T* kSrc, const T* vSrc, KVCac
         // If T is fp32, T_src is float4 and mmha::num_elems<T_src>::value returns 4
         // If T is fp16/bf16, T_src is uint4 and mmha::num_elems<T_src>::value returns 8
         // mmha::packed_type<int8_t ...>::type becomes uint32_t or uint64_t respectively
-        // FIXME(nkorobov) mmha::num_elems semantic is confusing
+        // FIXME mmha::num_elems semantic is confusing
         inBlockIdx = inBlockIdx * sizeof(mmha::packed_type<T_dst, mmha::num_elems<T_src>::value>::type);
         // Cast float scale to dst data type.
         using T_scale = typename mmha::kv_cache_scale_type_t<T, T_cache>::Type;
@@ -1733,6 +1744,80 @@ INSTANTIATE_TRANSPOSE_4D_BATCH_MAJOR(__nv_bfloat16);
 
 #undef INSTANTIATE_TRANSPOSE_4D_BATCH_MAJOR_KV_CACHE_TYPE
 #undef INSTANTIATE_TRANSPOSE_4D_BATCH_MAJOR
+
+template <typename T, typename BT>
+__global__ void addRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_attention_bias, const int batch_size,
+    const int head_num, const int seq_len, int max_seq_len, bool implicit, int num_buckets, int max_distance,
+    bool bidirectional)
+{
+    const int seq_i = blockIdx.x;
+    const int batch_id = blockIdx.y / head_num;
+    const int head_id = blockIdx.y % head_num;
+    const int rel_attn_table_stride = num_buckets; // num_buckets could be modified below, save it beforehand
+
+    for (int seq_j = threadIdx.x; seq_j < seq_len; seq_j += blockDim.x)
+    {
+
+        const int qk_index
+            = batch_id * head_num * seq_len * seq_len + head_id * seq_len * seq_len + seq_i * seq_len + seq_j;
+
+        if (implicit)
+        {
+            // compute bias value on the fly (see bert_preprocess_kernels.cu::buildRelativeAttentionBias)
+            int relative_buckets = 0;
+            int relative_position = seq_j - seq_i;
+            if (bidirectional)
+            { // special logic in T5 relative attention, both encoder & decoder use this, because rel pos bias is
+                // pre-computed once and passed around
+                num_buckets /= 2;
+                relative_buckets += relative_position > 0 ? num_buckets : 0;
+            }
+            relative_position = abs(relative_position);
+
+            int max_exact = num_buckets / 2;
+            bool is_small = relative_position < max_exact;
+            int relative_position_if_large = max_exact
+                + (int) (logf(relative_position * 1.0f / max_exact) / logf((float) max_distance / max_exact)
+                    * (num_buckets - max_exact));
+            relative_position_if_large = min(relative_position_if_large, num_buckets - 1);
+            relative_buckets += is_small ? relative_position : relative_position_if_large;
+            BT rel_attn_bias = relative_attention_bias[head_id * rel_attn_table_stride + relative_buckets];
+            qk_buf[qk_index] = (T) add((T) rel_attn_bias, qk_buf[qk_index]);
+        }
+        else
+        {
+            const int bias_index = head_id * max_seq_len * max_seq_len + seq_i * max_seq_len + seq_j;
+            qk_buf[qk_index] = (T) add((T) relative_attention_bias[bias_index], qk_buf[qk_index]);
+        }
+    }
+}
+
+template <typename T, typename BT>
+void invokeAddRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_attention_bias, const int batch_size,
+    const int head_num, const int seq_len, const int max_seq_len, cudaStream_t stream, bool implicit, int num_buckets,
+    int max_distance, bool bidirectional)
+{
+    // qk_buf: [batch_size, head_num, seq_len, seq_len]
+    // relative_attention_bias: [1, head_num, max_seq_len, max_seq_len]
+    dim3 grid(seq_len, batch_size * head_num); // increase block parallelism for long sequence scenario
+    dim3 block(1024);
+
+    addRelativeAttentionBiasUnaligned<<<grid, block, 0, stream>>>(qk_buf, relative_attention_bias, batch_size, head_num,
+        seq_len, max_seq_len, implicit, num_buckets, max_distance, bidirectional);
+}
+
+#define INSTANTIATE_ADD_RELATIVE_ATTENTION_BIAS_UNALIGNED(T, BT)                                                       \
+    template void invokeAddRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_attention_bias,                \
+        const int batch_size, const int head_num, const int seq_len, const int max_seq_len, cudaStream_t stream,       \
+        bool implicit, int num_buckets, int max_distance, bool bidirectional)
+INSTANTIATE_ADD_RELATIVE_ATTENTION_BIAS_UNALIGNED(float, float);
+INSTANTIATE_ADD_RELATIVE_ATTENTION_BIAS_UNALIGNED(half, half);
+INSTANTIATE_ADD_RELATIVE_ATTENTION_BIAS_UNALIGNED(float, half);
+#ifdef ENABLE_BF16
+INSTANTIATE_ADD_RELATIVE_ATTENTION_BIAS_UNALIGNED(__nv_bfloat16, __nv_bfloat16);
+INSTANTIATE_ADD_RELATIVE_ATTENTION_BIAS_UNALIGNED(float, __nv_bfloat16);
+#endif
+#undef INSTANTIATE_ADD_RELATIVE_ATTENTION_BIAS_UNALIGNED
 
 } // namespace kernels
 } // namespace tensorrt_llm

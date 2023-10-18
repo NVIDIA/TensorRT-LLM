@@ -27,13 +27,19 @@ GPTQ_FLAG = 1
 GROUP_SIZE = 128
 
 
-def split(v, tp_size, idx, dim=0):
+def numpy_split(v, tp_size, idx, dim=0):
     if tp_size == 1:
         return v
-    if len(v.shape) == 1:
-        return np.ascontiguousarray(np.split(v, tp_size)[idx])
     else:
         return np.ascontiguousarray(np.split(v, tp_size, axis=dim)[idx])
+
+
+def torch_split(v, tp_size, idx, dim=0):
+    if tp_size == 1:
+        return v
+    else:
+        return (torch.split(v, v.shape[dim] // tp_size,
+                            dim=dim)[idx]).contiguous()
 
 
 def unpack_int32_into_int8(w_packed):
@@ -61,8 +67,8 @@ def preprocess_groupwise_weight_params(qweight_unpacked_int8, scales_fp16,
     zeros_x_scales_fp16 = zeros_x_scales_fp16.half()
 
     # return processed interleaved weight, original scales and zeros * scales
-    return qweight_interleaved.contiguous(), scales_fp16.contiguous(
-    ), zeros_x_scales_fp16.contiguous()
+    return qweight_interleaved.contiguous().numpy(), scales_fp16.contiguous(
+    ).numpy(), zeros_x_scales_fp16.contiguous().numpy()
 
 
 def load_from_hf_gpt_neox(tensorrt_llm_gpt_neox: GPTNeoXForCausalLM,
@@ -116,9 +122,12 @@ def load_from_hf_gpt_neox(tensorrt_llm_gpt_neox: GPTNeoXForCausalLM,
     hf_gpt_neox_state_dict = hf_gpt_neox.state_dict()
 
     # [vocab_size, hidden_size]
-    v = hf_gpt_neox_state_dict.get('gpt_neox.embed_in.weight')
-    tensorrt_llm_gpt_neox.embedding.weight.value = v.to(
+    v = hf_gpt_neox_state_dict.get('gpt_neox.embed_in.weight').to(
         torch_dtype).cpu().numpy()
+    if tensorrt_llm_gpt_neox._use_parallel_embedding:
+        v = numpy_split(v, tp_size, rank,
+                        tensorrt_llm_gpt_neox._embedding_sharding_dim)
+    tensorrt_llm_gpt_neox.embedding.weight.value = v
 
     n_layer = hf_gpt_neox.config.num_hidden_layers
 
@@ -133,20 +142,20 @@ def load_from_hf_gpt_neox(tensorrt_llm_gpt_neox: GPTNeoXForCausalLM,
 
             if tp_size > 1:
                 if 'dense.weight' in hf_attr:
-                    # [k=hidden_size, n=hidden_size] ->
-                    # [k=hidden_size, n=hidden_size // tp_size]
-                    split_v = split(v, tp_size, rank, dim=1)
+                    # [n=hidden_size, k=hidden_size] ->
+                    # [n=hidden_size, k=hidden_size // tp_size]
+                    split_v = numpy_split(v, tp_size, rank, dim=1)
                 elif 'dense_h_to_4h.weight' in hf_attr:
                     # [hidden_size * 4, hidden_size] ->
                     # [hidden_size * 4 // tp_size, hidden_size]
-                    split_v = split(v, tp_size, rank, dim=0)
+                    split_v = numpy_split(v, tp_size, rank, dim=0)
                 elif 'dense_h_to_4h.bias' in hf_attr:
                     # [hidden_size * 4] -> [hidden_size * 4 // tp_size]
-                    split_v = split(v, tp_size, rank, dim=0)
+                    split_v = numpy_split(v, tp_size, rank, dim=0)
                 elif 'dense_4h_to_h.weight' in hf_attr:
                     # [hidden_size, hidden_size * 4] ->
                     # [hidden_size, hidden_size * 4 // tp_size]
-                    split_v = split(v, tp_size, rank, dim=1)
+                    split_v = numpy_split(v, tp_size, rank, dim=1)
                 else:
                     split_v = v
                 setattr(layer, 'value', split_v)
@@ -178,17 +187,17 @@ def load_from_hf_gpt_neox(tensorrt_llm_gpt_neox: GPTNeoXForCausalLM,
             if tp_size > 1:
                 qkv_weights = qkv_weights.reshape(
                     3, hidden_size, hidden_size).to(torch_dtype).cpu().numpy()
-                split_qkv_weights = split(qkv_weights, tp_size, rank,
-                                          dim=1).reshape(
-                                              3 * (hidden_size // tp_size),
-                                              hidden_size)
+                split_qkv_weights = numpy_split(
+                    qkv_weights, tp_size, rank,
+                    dim=1).reshape(3 * (hidden_size // tp_size), hidden_size)
                 tensorrt_llm_gpt_neox.layers[layer_idx].attention.qkv.weight.value = \
                     np.ascontiguousarray(split_qkv_weights)
 
                 qkv_bias = qkv_bias.reshape(
                     3, hidden_size).to(torch_dtype).cpu().numpy()
-                split_qkv_bias = split(qkv_bias, tp_size, rank, dim=1).reshape(
-                    3 * (hidden_size // tp_size))
+                split_qkv_bias = numpy_split(qkv_bias, tp_size, rank,
+                                             dim=1).reshape(
+                                                 3 * (hidden_size // tp_size))
                 tensorrt_llm_gpt_neox.layers[layer_idx].attention.qkv.bias.value = \
                     np.ascontiguousarray(split_qkv_bias)
             else:
@@ -197,6 +206,8 @@ def load_from_hf_gpt_neox(tensorrt_llm_gpt_neox: GPTNeoXForCausalLM,
                 tensorrt_llm_gpt_neox.layers[layer_idx].attention.qkv.bias.value = \
                     qkv_bias.to(torch_dtype).cpu().numpy()
         else:
+            # use_weight_only_groupwise_quant_matmul_plugin
+
             qweight_int32 = hf_gpt_neox_state_dict.get(
                 prefix + "attention.query_key_value.qweight")
             scales_fp16 = hf_gpt_neox_state_dict.get(
@@ -214,45 +225,73 @@ def load_from_hf_gpt_neox(tensorrt_llm_gpt_neox: GPTNeoXForCausalLM,
             qzeros_unpacked_int8 = unpack_int32_into_int8(qzeros_int32)
 
             # qkv_weights [num_heads x (q|k|v), hidden_size] ->
-            # [hidden_size, (num_heads x q)|(num_heads x k)|(num_heads x v)]
+            # [(num_heads x q)|(num_heads x k)|(num_heads x v), hidden_size]
             new_qkv_weight_shape = torch.Size(
                 [num_heads, 3, head_size * qweight_unpacked_int8.size()[-1]])
-            # [hidden_size, hidden_size * 3]
+            # [hidden_size * 3, hidden_size]
             qweight_unpacked_int8 = qweight_unpacked_int8.view(
                 new_qkv_weight_shape).permute(1, 0, 2).reshape(
-                    [hidden_size * 3, hidden_size]).T.contiguous()
+                    [hidden_size * 3, hidden_size]).contiguous()
 
             new_qkv_scale_shape = torch.Size(
                 [num_heads, 3, head_size * (hidden_size // GROUP_SIZE)])
-            # [hidden_size // GROUP_SIZE, hidden_size * 3]
+            # [hidden_size * 3, hidden_size // GROUP_SIZE]
             scales_fp16 = scales_fp16.T.contiguous().view(
                 new_qkv_scale_shape).permute(1, 0, 2).reshape(
-                    [hidden_size * 3,
-                     hidden_size // GROUP_SIZE]).T.contiguous()
+                    [hidden_size * 3, hidden_size // GROUP_SIZE]).contiguous()
 
             new_qkv_zero_shape = torch.Size(
                 [num_heads, 3, head_size * (hidden_size // GROUP_SIZE)])
-            # [hidden_size // GROUP_SIZE, hidden_size * 3]
+            # [hidden_size * 3, hidden_size // GROUP_SIZE]
             qzeros_unpacked_int8 = qzeros_unpacked_int8.T.contiguous().view(
                 new_qkv_zero_shape).permute(1, 0, 2).reshape(
-                    [hidden_size * 3,
-                     hidden_size // GROUP_SIZE]).T.contiguous()
-
-            qweight_fp32, scales_fp16, zeros_fp16 = preprocess_groupwise_weight_params(
-                qweight_unpacked_int8, scales_fp16, qzeros_unpacked_int8)
+                    [hidden_size * 3, hidden_size // GROUP_SIZE]).contiguous()
 
             new_qkv_bias_shape = torch.Size([num_heads, 3, head_size])
             biases_fp16 = biases_fp16.view(new_qkv_bias_shape).permute(
-                1, 0, 2).reshape([hidden_size * 3])
+                1, 0, 2).reshape([hidden_size * 3]).numpy()
+
+            if tp_size > 1:
+                qweight_unpacked_int8 = qweight_unpacked_int8.reshape(
+                    [3, hidden_size, hidden_size])
+                qweight_unpacked_int8 = torch_split(qweight_unpacked_int8,
+                                                    tp_size,
+                                                    rank,
+                                                    dim=1)
+                qweight_unpacked_int8 = qweight_unpacked_int8.reshape(
+                    [3 * hidden_size // tp_size, hidden_size])
+
+                scales_fp16 = scales_fp16.reshape(
+                    [3, hidden_size, hidden_size // GROUP_SIZE])
+                scales_fp16 = torch_split(scales_fp16, tp_size, rank, dim=1)
+                scales_fp16 = scales_fp16.reshape(
+                    [3 * hidden_size // tp_size, hidden_size // GROUP_SIZE])
+
+                qzeros_unpacked_int8 = qzeros_unpacked_int8.reshape(
+                    [3, hidden_size, hidden_size // GROUP_SIZE])
+                qzeros_unpacked_int8 = torch_split(qzeros_unpacked_int8,
+                                                   tp_size,
+                                                   rank,
+                                                   dim=1)
+                qzeros_unpacked_int8 = qzeros_unpacked_int8.reshape(
+                    [3 * hidden_size // tp_size, hidden_size // GROUP_SIZE])
+
+                biases_fp16 = biases_fp16.reshape([3, hidden_size])
+                biases_fp16 = numpy_split(biases_fp16, tp_size, rank, dim=1)
+                biases_fp16 = biases_fp16.reshape([3 * hidden_size // tp_size])
+
+            qweight_fp32, scales_fp16, zeros_fp16 = preprocess_groupwise_weight_params(
+                qweight_unpacked_int8.T.contiguous(),
+                scales_fp16.T.contiguous(), qzeros_unpacked_int8.T.contiguous())
 
             tensorrt_llm_gpt_neox.layers[layer_idx].attention.qkv.qweight.value = \
-                qweight_fp32.numpy()
+                qweight_fp32
             tensorrt_llm_gpt_neox.layers[layer_idx].attention.qkv.scale.value = \
-                scales_fp16.numpy()
+                scales_fp16
             tensorrt_llm_gpt_neox.layers[layer_idx].attention.qkv.zero.value = \
-                zeros_fp16.numpy()
+                zeros_fp16
             tensorrt_llm_gpt_neox.layers[layer_idx].attention.qkv.bias.value = \
-                biases_fp16.numpy()
+                biases_fp16
 
             qweight_int32 = hf_gpt_neox_state_dict.get(
                 prefix + "attention.dense.qweight")
@@ -260,28 +299,42 @@ def load_from_hf_gpt_neox(tensorrt_llm_gpt_neox: GPTNeoXForCausalLM,
                                                      "attention.dense.scales")
             qzeros_int32 = hf_gpt_neox_state_dict.get(prefix +
                                                       "attention.dense.qzeros")
-            biases_fp16 = hf_gpt_neox_state_dict.get(prefix +
-                                                     "attention.dense.bias")
+            biases_fp16 = hf_gpt_neox_state_dict.get(
+                prefix + "attention.dense.bias").numpy()
 
-            # [hidden_size // 8, hidden_size] -> [hidden_size, hidden_size]
+            # [k=hidden_size // 8, n=hidden_size] -> [n=hidden_size, k=hidden_size]
             qweight_unpacked_int8 = unpack_int32_into_int8(
                 qweight_int32.T).contiguous() - 8
+            # [n=hidden_size, k=hidden_size] -> [k=hidden_size, n=hidden_size]
             qweight_unpacked_int8 = qweight_unpacked_int8.T.contiguous()
-            # [hidden_size // GROUP_SIZE, hidden_size // 8] ->
-            # [hidden_size // GROUP_SIZE, hidden_size]
+            # [k=hidden_size // GROUP_SIZE, n=hidden_size // 8] ->
+            # [k=hidden_size // GROUP_SIZE, n=hidden_size]
             qzeros_unpacked_int8 = unpack_int32_into_int8(qzeros_int32)
+
+            if tp_size > 1:
+                qweight_unpacked_int8 = torch_split(qweight_unpacked_int8,
+                                                    tp_size,
+                                                    rank,
+                                                    dim=0)
+                scales_fp16 = torch_split(scales_fp16, tp_size, rank, dim=0)
+                qzeros_unpacked_int8 = torch_split(qzeros_unpacked_int8,
+                                                   tp_size,
+                                                   rank,
+                                                   dim=0)
+                if rank > 0:
+                    biases_fp16 = np.zeros_like(biases_fp16)
 
             qweight_fp32, scales_fp16, zeros_fp16 = preprocess_groupwise_weight_params(
                 qweight_unpacked_int8, scales_fp16, qzeros_unpacked_int8)
 
             tensorrt_llm_gpt_neox.layers[layer_idx].attention.dense.qweight.value = \
-                qweight_fp32.numpy()
+                qweight_fp32
             tensorrt_llm_gpt_neox.layers[layer_idx].attention.dense.scale.value = \
-                scales_fp16.numpy()
+                scales_fp16
             tensorrt_llm_gpt_neox.layers[layer_idx].attention.dense.zero.value = \
-                zeros_fp16.numpy()
+                zeros_fp16
             tensorrt_llm_gpt_neox.layers[layer_idx].attention.dense.bias.value = \
-                biases_fp16.numpy()
+                biases_fp16
 
             qweight_int32 = hf_gpt_neox_state_dict.get(
                 prefix + "mlp.dense_h_to_4h.qweight")
@@ -289,28 +342,48 @@ def load_from_hf_gpt_neox(tensorrt_llm_gpt_neox: GPTNeoXForCausalLM,
                                                      "mlp.dense_h_to_4h.scales")
             qzeros_int32 = hf_gpt_neox_state_dict.get(
                 prefix + "mlp.dense_h_to_4h.qzeros")
-            biases_fp16 = hf_gpt_neox_state_dict.get(prefix +
-                                                     "mlp.dense_h_to_4h.bias")
+            biases_fp16 = hf_gpt_neox_state_dict.get(
+                prefix + "mlp.dense_h_to_4h.bias").numpy()
 
             # [hidden_size // 8, hidden_size * 4] -> [hidden_size, hidden_size * 4]
             qweight_unpacked_int8 = unpack_int32_into_int8(
                 qweight_int32.T).contiguous() - 8
             qweight_unpacked_int8 = qweight_unpacked_int8.T.contiguous()
+
             # [hidden_size // GROUP_SIZE, hidden_size * 4 // 8] ->
             # [hidden_size // GROUP_SIZE, hidden_size * 4]
             qzeros_unpacked_int8 = unpack_int32_into_int8(qzeros_int32)
+
+            if tp_size > 1:
+                # [hidden_size, hidden_size * 4] ->
+                # [hidden_size, hidden_size * 4 // tp_size]
+                qweight_unpacked_int8 = torch_split(qweight_unpacked_int8,
+                                                    tp_size,
+                                                    rank,
+                                                    dim=1)
+                # [hidden_size // GROUP_SIZE, hidden_size * 4] ->
+                # [hidden_size // GROUP_SIZE, hidden_size * 4 // tp_size]
+                scales_fp16 = torch_split(scales_fp16, tp_size, rank, dim=1)
+                # [hidden_size // GROUP_SIZE, hidden_size * 4] ->
+                # [hidden_size // GROUP_SIZE, hidden_size * 4 // tp_size]
+                qzeros_unpacked_int8 = torch_split(qzeros_unpacked_int8,
+                                                   tp_size,
+                                                   rank,
+                                                   dim=1)
+                # [hidden_size * 4] -> [hidden_size * 4 // tp_size]
+                biases_fp16 = numpy_split(biases_fp16, tp_size, rank, dim=0)
 
             qweight_fp32, scales_fp16, zeros_fp16 = preprocess_groupwise_weight_params(
                 qweight_unpacked_int8, scales_fp16, qzeros_unpacked_int8)
 
             tensorrt_llm_gpt_neox.layers[layer_idx].mlp.fc.qweight.value = \
-                qweight_fp32.numpy()
+                qweight_fp32
             tensorrt_llm_gpt_neox.layers[layer_idx].mlp.fc.scale.value = \
-                scales_fp16.numpy()
+                scales_fp16
             tensorrt_llm_gpt_neox.layers[layer_idx].mlp.fc.zero.value = \
-                zeros_fp16.numpy()
+                zeros_fp16
             tensorrt_llm_gpt_neox.layers[layer_idx].mlp.fc.bias.value = \
-                biases_fp16.numpy()
+                biases_fp16
 
             qweight_int32 = hf_gpt_neox_state_dict.get(
                 prefix + "mlp.dense_4h_to_h.qweight")
@@ -318,28 +391,48 @@ def load_from_hf_gpt_neox(tensorrt_llm_gpt_neox: GPTNeoXForCausalLM,
                                                      "mlp.dense_4h_to_h.scales")
             qzeros_int32 = hf_gpt_neox_state_dict.get(
                 prefix + "mlp.dense_4h_to_h.qzeros")
-            biases_fp16 = hf_gpt_neox_state_dict.get(prefix +
-                                                     "mlp.dense_4h_to_h.bias")
+            biases_fp16 = hf_gpt_neox_state_dict.get(
+                prefix + "mlp.dense_4h_to_h.bias").numpy()
 
             # [hidden_size * 4 // 8, hidden_size] -> [hidden_size * 4, hidden_size]
             qweight_unpacked_int8 = unpack_int32_into_int8(
                 qweight_int32.T).contiguous() - 8
             qweight_unpacked_int8 = qweight_unpacked_int8.T.contiguous()
+
             # [hidden_size * 4 // GROUP_SIZE, hidden_size // 8] ->
             # [hidden_size * 4 // GROUP_SIZE, hidden_size]
             qzeros_unpacked_int8 = unpack_int32_into_int8(qzeros_int32)
+
+            if tp_size > 1:
+                # [hidden_size * 4, hidden_size] ->
+                # [hidden_size * 4 // tp_size, hidden_size]
+                qweight_unpacked_int8 = torch_split(qweight_unpacked_int8,
+                                                    tp_size,
+                                                    rank,
+                                                    dim=0)
+                # [hidden_size * 4 // GROUP_SIZE, hidden_size] ->
+                # [hidden_size * 4 // GROUP_SIZE // tp_size, hidden_size] ->
+                scales_fp16 = torch_split(scales_fp16, tp_size, rank, dim=0)
+                # [hidden_size * 4 // GROUP_SIZE, hidden_size] ->
+                # [hidden_size * 4 // GROUP_SIZE // tp_size, hidden_size]
+                qzeros_unpacked_int8 = torch_split(qzeros_unpacked_int8,
+                                                   tp_size,
+                                                   rank,
+                                                   dim=0)
+                if rank > 0:
+                    biases_fp16 = np.zeros_like(biases_fp16)
 
             qweight_fp32, scales_fp16, zeros_fp16 = preprocess_groupwise_weight_params(
                 qweight_unpacked_int8, scales_fp16, qzeros_unpacked_int8)
 
             tensorrt_llm_gpt_neox.layers[layer_idx].mlp.proj.qweight.value = \
-                qweight_fp32.numpy()
+                qweight_fp32
             tensorrt_llm_gpt_neox.layers[layer_idx].mlp.proj.scale.value = \
-                scales_fp16.numpy()
+                scales_fp16
             tensorrt_llm_gpt_neox.layers[layer_idx].mlp.proj.zero.value = \
-                zeros_fp16.numpy()
+                zeros_fp16
             tensorrt_llm_gpt_neox.layers[layer_idx].mlp.proj.bias.value = \
-                biases_fp16.numpy()
+                biases_fp16
 
     v = hf_gpt_neox_state_dict.get('gpt_neox.final_layer_norm.weight')
     tensorrt_llm_gpt_neox.ln_f.weight.value = v.to(torch_dtype).cpu().numpy()
@@ -360,7 +453,7 @@ def load_from_hf_gpt_neox(tensorrt_llm_gpt_neox: GPTNeoXForCausalLM,
                        'constant',
                        constant_values=0)
 
-        split_v = split(v, tp_size, rank, dim=0)
+        split_v = numpy_split(v, tp_size, rank, dim=0)
         tensorrt_llm_gpt_neox.lm_head.weight.value = split_v
     else:
         tensorrt_llm_gpt_neox.lm_head.weight.value = v

@@ -28,7 +28,7 @@ namespace tensorrt_llm
 namespace layers
 {
 
-// TODO (martinma) - merge this class with BaseBeamSearchLayer
+// TODO  - merge this class with BaseBeamSearchLayer
 template <typename T>
 class OnlineBeamSearchLayer : public BaseBeamSearchLayer<T>
 {

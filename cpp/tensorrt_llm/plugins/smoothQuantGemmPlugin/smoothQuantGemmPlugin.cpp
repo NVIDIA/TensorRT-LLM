@@ -116,7 +116,7 @@ void SmoothQuantGemmPlugin::init(nvinfer1::DataType type)
     }
     else
     {
-        // TODO (nkorobov): add bf16 support
+        // TODO: add bf16 support
         TLLM_THROW("Support for bf16 is missing");
     }
 

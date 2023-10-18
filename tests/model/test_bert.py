@@ -205,7 +205,7 @@ class TestBert(unittest.TestCase):
             network.plugin_config.set_context_fmha(context_fmha_type)
             with net_guard(network):
                 # Prepare inputs
-                # TODO(kaiyu): could class be better than dict for profiles?
+                # TODO: could class be better than dict for profiles?
                 input_ids = tensorrt_llm.Tensor(name='input_ids',
                                                 dtype=trt.int32,
                                                 shape=[-1, -1],

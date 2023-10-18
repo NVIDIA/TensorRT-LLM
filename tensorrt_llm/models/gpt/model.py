@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections import OrderedDict
 
 import tensorrt as trt
 
@@ -36,11 +35,12 @@ def MLPFactory(hidden_size,
                dtype=None,
                tp_group=None,
                tp_size=1,
-               quant_mode=QuantMode(0)):
+               quant_mode=QuantMode(0),
+               instance_id: int = 0):
     MLPClass = GatedMLP if is_gated_activation(hidden_act) else MLP
     hidden_act = non_gated_version(hidden_act)
     return MLPClass(hidden_size, ffn_hidden_size, hidden_act, bias, dtype,
-                    tp_group, tp_size, quant_mode)
+                    tp_group, tp_size, quant_mode, instance_id)
 
 
 class GPTEmbedding(Module):
@@ -110,7 +110,8 @@ class GPTDecoderLayer(Module):
                  multi_query_mode=False,
                  tp_group=None,
                  tp_size=1,
-                 tp_rank=0):
+                 tp_rank=0,
+                 instance_id: int = 0):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
@@ -142,7 +143,8 @@ class GPTDecoderLayer(Module):
             tp_size=tp_size,
             tp_rank=tp_rank,
             use_int8_kv_cache=quant_mode.has_int8_kv_cache(),
-            quant_mode=quant_mode)
+            quant_mode=quant_mode,
+            instance_id=2 * instance_id)
 
         if inter_size is None:
             inter_size = hidden_size * 4
@@ -154,7 +156,8 @@ class GPTDecoderLayer(Module):
                               bias=bias,
                               tp_group=tp_group,
                               tp_size=tp_size,
-                              quant_mode=quant_mode)
+                              quant_mode=quant_mode,
+                              instance_id=2 * instance_id + 1)
         self.post_layernorm = LayerNorm(normalized_shape=hidden_size,
                                         dtype=dtype)
 
@@ -163,7 +166,8 @@ class GPTDecoderLayer(Module):
                 attention_mask=None,
                 use_cache=False,
                 kv_cache_params=None,
-                attention_params=None):
+                attention_params=None,
+                workspace=None):
 
         assert isinstance(hidden_states, Tensor)
 
@@ -175,7 +179,8 @@ class GPTDecoderLayer(Module):
                                           attention_mask=attention_mask,
                                           use_cache=use_cache,
                                           kv_cache_params=kv_cache_params,
-                                          attention_params=attention_params)
+                                          attention_params=attention_params,
+                                          workspace=workspace)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -185,7 +190,7 @@ class GPTDecoderLayer(Module):
         residual = hidden_states
         hidden_states = self.post_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, workspace=workspace)
 
         hidden_states = residual + hidden_states
 
@@ -216,6 +221,7 @@ class GPTModel(Module):
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0):
         super().__init__()
+        self.mapping = mapping
 
         self.embedding = GPTEmbedding(
             vocab_size,
@@ -248,7 +254,9 @@ class GPTModel(Module):
                 tp_rank=mapping.tp_rank,
                 inter_size=inter_size,
                 bias=bias,
-                quant_mode=quant_mode) for _ in range(num_layers)
+                quant_mode=quant_mode,
+                instance_id=i,
+            ) for i in range(num_layers)
         ])
 
         self.ln_f = LayerNorm(normalized_shape=hidden_size, dtype=dtype)
@@ -262,7 +270,8 @@ class GPTModel(Module):
                 attention_params=None,
                 prompt_embedding_table=None,
                 prompt_tasks=None,
-                prompt_vocab_size=None):
+                prompt_vocab_size=None,
+                workspace=None):
 
         hidden_states = self.embedding(input_ids, position_ids,
                                        prompt_embedding_table, prompt_tasks,
@@ -287,7 +296,8 @@ class GPTModel(Module):
                     host_past_key_value_lengths,
                     kv_cache_block_pointers=[pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
-                attention_params=attention_params)
+                attention_params=attention_params,
+                workspace=workspace)
 
             if use_cache:
                 presents.append(hidden_states[1])
@@ -388,13 +398,14 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                 attention_params=None,
                 prompt_embedding_table=None,
                 prompt_tasks=None,
-                prompt_vocab_size=None):
+                prompt_vocab_size=None,
+                workspace=None):
 
         hidden_states = super().forward(input_ids, position_ids, use_cache,
                                         attention_mask, kv_cache_params,
                                         attention_params,
                                         prompt_embedding_table, prompt_tasks,
-                                        prompt_vocab_size)
+                                        prompt_vocab_size, workspace)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -422,6 +433,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                        max_new_tokens,
                        use_cache,
                        max_beam_width: int = 1,
+                       max_num_tokens: int = None,
                        prompt_embedding_table_size: int = 128,
                        gather_all_token_logits: bool = False):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
@@ -432,99 +444,37 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
 
         # Prepare inputs
         head_size = self._hidden_size // self._num_heads
-        num_heads = self._num_heads // self._tp_size
-        num_heads_kv = 1 if self._multi_query_mode else num_heads
+        num_heads_kv = 1 if self._multi_query_mode else self._num_heads
         remove_input_padding = default_net().plugin_config.remove_input_padding
         use_gpt_attention_plugin = default_net(
         ).plugin_config.gpt_attention_plugin
         use_gemm_plugin = default_net().plugin_config.gemm_plugin
         paged_kv_cache = default_net().plugin_config.paged_kv_cache
         tokens_per_block = default_net().plugin_config.tokens_per_block
+        use_custom_all_reduce = default_net(
+        ).plugin_config.use_custom_all_reduce
 
         model_inputs = self.prepare_basic_inputs(
-            max_batch_size,
-            max_beam_width,
-            max_input_len,
-            max_new_tokens,
-            num_heads_kv,
-            head_size,
-            self._num_layers,
-            self._kv_dtype,
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_input_len=max_input_len,
+            max_new_tokens=max_new_tokens,
+            num_kv_heads=num_heads_kv,
+            head_size=head_size,
+            num_layers=self._num_layers,
+            kv_dtype=self._kv_dtype,
+            num_heads=self._num_heads,
+            dtype=self._dtype,
             remove_input_padding=remove_input_padding,
             use_gpt_attention_plugin=use_gpt_attention_plugin,
             use_gemm_plugin=use_gemm_plugin,
+            use_custom_all_reduce=use_custom_all_reduce,
             paged_kv_cache=paged_kv_cache,
             tokens_per_block=tokens_per_block,
-            gather_all_token_logits=gather_all_token_logits)
-
-        bb_range_cxt = [1, (max_batch_size + 1) // 2, max_batch_size]
-        bb_range_gen = [
-            1, (max_batch_size * max_beam_width + 1) // 2,
-            max_batch_size * max_beam_width
-        ]
-        _p_embedding_range = [
-            1, prompt_embedding_table_size // 2, prompt_embedding_table_size
-        ]
-        [1, (max_input_len + 1) // 2, max_input_len]
-        _num_tokens_range = [
-            1, max_batch_size * max_beam_width,
-            max(max_input_len * max_batch_size, max_beam_width * max_batch_size)
-        ]
-
-        enable_two_optimization_profiles = False
-        if use_gpt_attention_plugin == False or use_gemm_plugin == False:
-            use_in_flight_batching = use_gpt_attention_plugin and remove_input_padding and paged_kv_cache
-            enable_two_optimization_profiles = not use_in_flight_batching
-        if enable_two_optimization_profiles:
-            bb_range = [bb_range_cxt, bb_range_gen]
-            p_embedding_range = [_p_embedding_range, _p_embedding_range]
-            num_tokens_range = [_num_tokens_range, _num_tokens_range]
-        else:
-            bb_range = [bb_range_gen]
-            p_embedding_range = [_p_embedding_range]
-            num_tokens_range = [_num_tokens_range]
-
-        prompt_embedding_table = None
-        tasks = None
-        prompt_vocab_size = None
-        if self._use_prompt_tuning:
-            prompt_embedding_table = Tensor(
-                name='prompt_embedding_table',
-                dtype=self._dtype,
-                shape=[-1, self._hidden_size],
-                dim_range=OrderedDict([
-                    ('prompt_embedding_table_size', p_embedding_range),
-                    ('hidden_size', [self._hidden_size, self._hidden_size] if
-                     enable_two_optimization_profiles else [self._hidden_size]),
-                ]))
-            if remove_input_padding:
-                tasks = Tensor(
-                    name='tasks',
-                    dtype=trt.int32,
-                    shape=[1, -1],
-                    dim_range=OrderedDict([
-                        ('batch_size_fake',
-                         [1, 1] if enable_two_optimization_profiles else [1]),
-                        ('input_len_task', num_tokens_range),
-                    ]))
-            else:
-                tasks = Tensor(
-                    name='tasks',
-                    dtype=trt.int32,
-                    shape=[-1, 1],
-                    dim_range=OrderedDict([
-                        ('batch_size_beam_width', bb_range),
-                        ('broadcast_dim',
-                         [1, 1] if enable_two_optimization_profiles else [1]),
-                    ]))
-            prompt_vocab_size = Tensor(
-                name='prompt_vocab_size',
-                dtype=trt.int32,
-                shape=[1],
-                dim_range=OrderedDict([
-                    ('size',
-                     [1, 1] if enable_two_optimization_profiles else [1])
-                ]))
+            gather_all_token_logits=gather_all_token_logits,
+            mapping=self.mapping,
+            max_num_tokens=max_num_tokens,
+            prompt_embedding_table_size=prompt_embedding_table_size)
 
         return (model_inputs['input_ids'], model_inputs['position_ids'], True,
                 model_inputs['last_token_ids'], model_inputs['attention_mask'],
@@ -542,4 +492,6 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                     host_context_lengths=model_inputs['host_context_lengths'],
                     max_context_length=max_input_len,
                     host_request_types=model_inputs['host_request_types']),
-                prompt_embedding_table, tasks, prompt_vocab_size)
+                model_inputs['prompt_embedding_table'], model_inputs['tasks'],
+                model_inputs['prompt_vocab_size'],
+                model_inputs['all_reduce_workspace'])

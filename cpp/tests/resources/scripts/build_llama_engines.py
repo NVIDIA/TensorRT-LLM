@@ -16,30 +16,22 @@
 
 import argparse as _arg
 import pathlib as _pl
-import subprocess as _sp
+import platform as _pf
 import sys as _sys
-import typing as _tp
+
+from build_engines_utils import run_command, wincopy
 
 
-def run_command(command: _tp.Sequence[str], *, cwd=None, **kwargs) -> None:
-    print(f"Running: cd %s && %s" %
-          (str(cwd or _pl.Path.cwd()), " ".join(command)))
-    _sp.check_call(command, cwd=cwd, **kwargs)
-
-
-def build_engine(weigth_dir: _pl.Path, engine_dir: _pl.Path, *args):
+def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, *args):
     build_args = [_sys.executable, "examples/llama/build.py"] + (
-        ['--model_dir', str(weigth_dir)] if weigth_dir else []) + [
+        ['--model_dir', str(weight_dir)] if weight_dir else []) + [
             '--output_dir',
-            str(engine_dir),
-            '--dtype=float16',
-            '--use_gpt_attention_plugin=float16',
-            '--use_gemm_plugin=float16',
-            '--max_batch_size=32',
-            '--max_input_len=40',
-            '--max_output_len=20',
-            '--max_beam_width=2',
-            '--log_level=error',
+            str(engine_dir), '--dtype=float16',
+            '--use_gpt_attention_plugin=float16', '--use_custom_all_reduce',
+            '--use_gemm_plugin=float16', '--max_batch_size=32',
+            '--max_input_len=40', '--max_output_len=20', '--max_beam_width=2',
+            '--log_level=error', '--use_inflight_batching', '--paged_kv_cache',
+            '--remove_input_padding'
         ] + list(args)
     run_command(build_args)
 
@@ -54,7 +46,14 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
         model_cache_dir = _pl.Path(model_cache) / 'llama-models' / model_name
         assert (model_cache_dir.is_dir())
 
-        run_command(["rsync", "-av", str(model_cache_dir), "."], cwd=models_dir)
+        if _pf.system() == "Windows":
+            wincopy(source=str(model_cache_dir),
+                    dest=model_name,
+                    isdir=True,
+                    cwd=models_dir)
+        else:
+            run_command(
+                ["rsync", "-av", str(model_cache_dir), "."], cwd=models_dir)
 
     hf_dir = models_dir / model_name
     assert hf_dir.is_dir()
@@ -68,7 +67,8 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
         tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu"
         world_size = tp_size * pp_size
         print(f"\nBuilding fp16 tp{tp_size} pp{pp_size} engine")
-        build_engine(hf_dir, engine_dir / f'fp16-plugin/{tp_pp_dir}',
+        build_engine(hf_dir,
+                     engine_dir / f'fp16-plugin-packed-paged/{tp_pp_dir}',
                      f'--world_size={world_size}', f'--tp_size={tp_size}',
                      f'--pp_size={pp_size}')
 

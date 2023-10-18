@@ -71,7 +71,8 @@ public:
         float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
         tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
         bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
-        int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled);
+        int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled,
+        bool cross_attention = false, int max_distance = 0);
 
     GPTAttentionPlugin(const void* data, size_t length);
 
@@ -186,10 +187,30 @@ private:
         return (mKVCacheQuantMode.hasKvCacheQuant() ? 9 : 7);
     }
 
+    IndexType getRelativeAttentionBiasIdx() const
+    {
+        return getAlibiSlopesIdx() + (isALiBi() ? 1 : 0);
+    }
+
+    IndexType getCrossQKVIdx() const
+    {
+        return getRelativeAttentionBiasIdx() + (isRelativePosition() ? 1 : 0);
+    }
+
+    IndexType getCrossQKVLengthIdx() const
+    {
+        return getCrossQKVIdx() + 1;
+    }
+
+    IndexType getEncoderInputLengthsIdx() const
+    {
+        return getCrossQKVLengthIdx() + 1;
+    }
+
     IndexType getHostContextLengthsIdx() const
     {
         TLLM_CHECK(mRemovePadding);
-        return (mKVCacheQuantMode.hasKvCacheQuant() ? 9 : 7) + (isALiBi() ? 1 : 0);
+        return getCrossQKVIdx() + (isCrossAttention() ? 3 : 0);
     }
 
     IndexType getQKVBiasTensorIdx() const

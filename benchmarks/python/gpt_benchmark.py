@@ -57,7 +57,7 @@ class GPTBenchmark(BaseBenchmark):
         self.refit = refit
         self.num_beams = num_beams
         self.build_time = 0
-        self.mode = mode  # plugin or ootb
+        self.mode = mode  # plugin or ootb or ootb-except-mha
         self.fuse_bias = True
 
         self.cuda_graph_mode = kwargs.get('enable_cuda_graph', False)
@@ -83,17 +83,20 @@ class GPTBenchmark(BaseBenchmark):
             self.per_token = False
             self.per_channel = False
 
-            is_plugin_mode = mode == 'plugin'
-            plg_dtype = dtype if is_plugin_mode else False
-            self.use_gpt_attention_plugin = plg_dtype
-            self.use_gemm_plugin = plg_dtype
+            use_mha_plugin = mode == 'plugin' or mode == 'ootb-except-mha'
+            mha_plg_dtype = dtype if use_mha_plugin else False
+            use_non_mha_plugin = mode == 'plugin'
+            non_mha_plg_dtype = dtype if use_mha_plugin else False
+
+            self.use_gpt_attention_plugin = mha_plg_dtype
+            self.use_gemm_plugin = non_mha_plg_dtype
             # Starting TRT9.1 OOTB norm layer sees improvement over plugin norm layer
             self.use_layernorm_plugin = False
             self.use_rmsnorm_plugin = False
-            self.use_lookup_plugin = plg_dtype
-            self.enable_context_fmha = True
+            self.use_lookup_plugin = non_mha_plg_dtype
+            self.enable_context_fmha = use_mha_plugin
             self.quant_mode = QuantMode(0)
-            self.remove_input_padding = is_plugin_mode
+            self.remove_input_padding = use_non_mha_plugin
 
             for key, value in get_build_config(model_name).items():
                 setattr(self, key, value)
@@ -135,8 +138,6 @@ class GPTBenchmark(BaseBenchmark):
                 self.quant_mode = self.quant_mode.set_fp8_qdq()
 
             if self.fp8_kv_cache:
-                # Watch out, enable_fp8 and fp8_kv_cache are not exclusive
-                assert self.use_gpt_attention_plugin, "GPT attention plugin needed"
                 self.quant_mode = self.quant_mode.set_fp8_kv_cache()
 
             engine_buffer = self.build()
@@ -151,7 +152,9 @@ class GPTBenchmark(BaseBenchmark):
             num_layers=self.num_layers,
             gpt_attention_plugin=self.use_gpt_attention_plugin,
             remove_input_padding=self.remove_input_padding,
-            quant_mode=self.quant_mode)
+            quant_mode=self.quant_mode,
+            use_custom_all_reduce=self.enable_custom_all_reduce,
+        )
         if model_name == 'chatglm_6b':
             self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
                 end_id=130005,
@@ -392,9 +395,6 @@ class GPTBenchmark(BaseBenchmark):
             network.plugin_config.set_smooth_quant_gemm_plugin(dtype=self.dtype)
             network.plugin_config.set_layernorm_quantization_plugin(
                 dtype=self.dtype)
-            # FIXME(nkorobov)
-            # See https://nvbugs/4164762
-            # See https://nvbugs/4174113
             network.plugin_config.set_quantize_tensor_plugin()
             network.plugin_config.set_quantize_per_token_plugin()
         elif self.use_weight_only:

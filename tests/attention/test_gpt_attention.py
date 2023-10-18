@@ -69,9 +69,9 @@ class TestFunctional(unittest.TestCase):
         test_cases += list(
             product(['llama_attention'], [
                 ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
-            ], ['float16', 'bfloat16'], [2], [90, 1024], [4], [32, 64, 80, 128],
-                    [0], [False], [False], [False, True], [1], [False],
-                    [False]))
+            ], ['float16', 'bfloat16'], [2], [90, 1024], [4],
+                    [32, 64, 80, 112, 128], [0], [False], [False],
+                    [False, True], [1], [False], [False]))
 
         # Test cases of float32 d=256 case (for testing MMHA key loops).
         test_cases += list(
@@ -417,7 +417,7 @@ class TestFunctional(unittest.TestCase):
                 outputs['present_key_value'] = past_key_value
 
             stream = torch.cuda.current_stream()
-            # NOTE(nkorobov): when int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
+            # NOTE: when int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
             int8_trt_flag = use_int8_kv_cache and not paged_kv_cache
             builder_config = builder.create_builder_config(name=attention_type,
                                                            precision=dtype,
@@ -487,7 +487,7 @@ class TestFunctional(unittest.TestCase):
         weight = torch.randn(shape_dict['weight'],
                              dtype=str_dtype_to_torch(dtype),
                              device='cuda') * 1e-3
-        # FIXME(qijun): test_gpt_attention_llama_attention_False_float16_2_90_4_64_False_False_False_True
+        # FIXME: test_gpt_attention_llama_attention_False_float16_2_90_4_64_False_False_False_True
         # fails with xavier_uniform_ initialization
         # torch.nn.init.xavier_uniform_(weight)
 

@@ -42,7 +42,6 @@ def TRTFalcon(args, config):
     assert world_size == tensorrt_llm.mpi_world_size(), \
         f'Engine world size ({world_size}) != Runtime world size '\
         f'({tensorrt_llm.mpi_world_size()})'
-    assert pp_size == 1, 'Python runtime does not support pipeline parallelism'
 
     num_heads = builder_config['num_heads'] // tp_size
     hidden_size = builder_config['hidden_size'] // tp_size
@@ -56,6 +55,7 @@ def TRTFalcon(args, config):
     paged_kv_cache = plugin_config['paged_kv_cache']
     tokens_per_block = plugin_config['tokens_per_block']
     remove_input_padding = plugin_config['remove_input_padding']
+    use_custom_all_reduce = plugin_config.get('use_custom_all_reduce', False)
 
     model_config = tensorrt_llm.runtime.ModelConfig(
         vocab_size=vocab_size,
@@ -68,7 +68,8 @@ def TRTFalcon(args, config):
         tokens_per_block=tokens_per_block,
         remove_input_padding=remove_input_padding,
         quant_mode=quant_mode,
-        dtype=dtype)
+        dtype=dtype,
+        use_custom_all_reduce=use_custom_all_reduce)
 
     runtime_rank = tensorrt_llm.mpi_rank()
     runtime_mapping = tensorrt_llm.Mapping(world_size,
@@ -219,13 +220,16 @@ def main(args):
                     sampling_config,
                 )
             torch.cuda.synchronize()
+
+        output_lines_list, tokens_list = [], []
         # output_ids = [batch_size, num_beams, output_len]
-        tokens_list = output_ids[:, :, max_length:].tolist()
-        output_lines_list = [
-            tokenizer.batch_decode(output_ids[:, i, max_length:],
-                                   skip_special_tokens=True)
-            for i in range(num_beams)
-        ]
+        if tensorrt_llm_falcon.mapping.is_first_pp_rank():
+            tokens_list = output_ids[:, :, max_length:].tolist()
+            output_lines_list = [
+                tokenizer.batch_decode(output_ids[:, i, max_length:],
+                                       skip_special_tokens=True)
+                for i in range(num_beams)
+            ]
         return output_lines_list, tokens_list
 
     def summarize_hf(datapoint):

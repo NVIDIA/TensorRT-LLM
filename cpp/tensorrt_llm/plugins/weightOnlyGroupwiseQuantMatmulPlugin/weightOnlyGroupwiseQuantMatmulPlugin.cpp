@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "weightOnlyGroupwiseQuantMatmulPlugin.h"
+#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/enabled.h"
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::common;
@@ -24,11 +25,11 @@ using tensorrt_llm::plugins::WeightOnlyGroupwiseQuantMatmulPlugin;
 using tensorrt_llm::plugins::WeightOnlyGroupwiseQuantGemmPluginProfiler;
 
 // Flags for indicating whether the corresponding inputs are applied in mQuantAlgo
-// mQuantAlgo = pre_quant_scale * PRE_SCALE_QUANT + zero * ZER0 + bias * BIAS
+// mQuantAlgo = pre_quant_scale * PRE_QUANT_SCALE + zero * ZERO + bias * BIAS
 // Here pre_quant_scale, zero and bias are boolean type
 static constexpr int BIAS = int(1) << 0;
-static constexpr int ZER0 = int(1) << 1;
-static constexpr int PRE_SCALE_QUANT = int(1) << 2;
+static constexpr int ZERO = int(1) << 1;
+static constexpr int PRE_QUANT_SCALE = int(1) << 2;
 using tensorrt_llm::plugins::read;
 using tensorrt_llm::plugins::write;
 
@@ -54,7 +55,7 @@ void WeightOnlyGroupwiseQuantGemmPluginProfiler::runTactic(int m, int n, int k,
     char* workspacePtr
         = reinterpret_cast<char*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(outputPtr), m * originalN * sizeof(half)));
 
-    if ((mQuantAlgo & ZER0) == 0)
+    if ((mQuantAlgo & ZERO) == 0)
     {
         zerosPtr = nullptr;
     }
@@ -127,15 +128,15 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
     mGroupSize = group_size;
 
     // quant_algo = pre_quant_scale * 4 + zero * 2 + bias
-    mPreQuantScaleInputIdx = (quant_algo & PRE_SCALE_QUANT) ? 1 : 0;
+    mPreQuantScaleInputIdx = (quant_algo & PRE_QUANT_SCALE) ? 1 : 0;
     mWeightInputIdx = mPreQuantScaleInputIdx + 1;
     mScalesInputIdx = mWeightInputIdx + 1;
-    mZerosInputIdx = (quant_algo & ZER0) ? mScalesInputIdx + 1 : mScalesInputIdx;
+    mZerosInputIdx = (quant_algo & ZERO) ? mScalesInputIdx + 1 : mScalesInputIdx;
     mBiasesInputIdx = (quant_algo & BIAS) ? mZerosInputIdx + 1 : mZerosInputIdx;
 
     if (mType == nvinfer1::DataType::kHALF)
     {
-        if (quant_algo & ZER0)
+        if (quant_algo & ZERO)
         {
             // has zeros
             m_weightOnlyGroupwiseGemmRunner
@@ -149,6 +150,8 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
                 = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<half,
                     cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>>();
         }
+        mCudaKernelEnabled
+            = tensorrt_llm::kernels::isWeightOnlyBatchedGemvEnabled(tensorrt_llm::kernels::WeightOnlyQuantType::Int4b);
     }
     else
     {
@@ -289,21 +292,21 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
     const int k = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
 
     // mQuantAlgo = pre_quant_scale * 4 + zero * 2 + bias
-    if (mQuantAlgo & PRE_SCALE_QUANT)
+    if (mQuantAlgo & PRE_QUANT_SCALE)
     {
         // Apply pre-quant per channel scale on activations
         tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<half>(reinterpret_cast<half*>(workspace),
             reinterpret_cast<const half*>(inputs[0]), reinterpret_cast<const half*>(inputs[mPreQuantScaleInputIdx]), m,
-            k);
+            k, stream);
     }
 
-    const half* zeros_ptr = (mQuantAlgo & ZER0) ? reinterpret_cast<const half*>(inputs[mZerosInputIdx]) : nullptr;
+    const half* zeros_ptr = (mQuantAlgo & ZERO) ? reinterpret_cast<const half*>(inputs[mZerosInputIdx]) : nullptr;
     const half* biases_ptr = (mQuantAlgo & BIAS) ? reinterpret_cast<const half*>(inputs[mBiasesInputIdx]) : nullptr;
-    const half* act_ptr = reinterpret_cast<const half*>((mQuantAlgo & PRE_SCALE_QUANT) ? workspace : inputs[0]);
+    const half* act_ptr = reinterpret_cast<const half*>((mQuantAlgo & PRE_QUANT_SCALE) ? workspace : inputs[0]);
 
     if (mType == nvinfer1::DataType::kHALF)
     {
-        if (m < SMALL_M_FAST_PATH && mSM >= 75)
+        if (m < SMALL_M_FAST_PATH && mCudaKernelEnabled)
         {
             // Use CUDA kernels for small batch size
             // The CUDA kernel is designed for ColumnMajorTileInterleave weight layout used in fpAIntB cutlass kernel

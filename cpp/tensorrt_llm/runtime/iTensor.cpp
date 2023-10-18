@@ -79,16 +79,18 @@ ITensor::UniquePtr ITensor::wrap(void* data, nvinfer1::DataType type, nvinfer1::
     switch (memoryType)
     {
     case MemoryType::kPINNED:
-        result.reset(new GenericTensor( // NOLINT(modernize-make-unique)
+        result.reset(new GenericTensor<PinnedBorrowingAllocator>( // NOLINT(modernize-make-unique)
             shape, capacity, type, PinnedBorrowingAllocator(data, capacityInBytes)));
         break;
     case MemoryType::kCPU:
         result.reset( // NOLINT(modernize-make-unique)
-            new GenericTensor(shape, capacity, type, CpuBorrowingAllocator(data, capacityInBytes)));
+            new GenericTensor<CpuBorrowingAllocator>(
+                shape, capacity, type, CpuBorrowingAllocator(data, capacityInBytes)));
         break;
     case MemoryType::kGPU:
         result.reset( // NOLINT(modernize-make-unique)
-            new GenericTensor(shape, capacity, type, GpuBorrowingAllocator(data, capacityInBytes)));
+            new GenericTensor<GpuBorrowingAllocator>(
+                shape, capacity, type, GpuBorrowingAllocator(data, capacityInBytes)));
         break;
     default: TLLM_THROW("Unknown memory type");
     }

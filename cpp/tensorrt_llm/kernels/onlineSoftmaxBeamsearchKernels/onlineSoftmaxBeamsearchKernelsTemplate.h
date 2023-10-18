@@ -234,7 +234,8 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
                         = ((vector_id + beam_hyps.ite * beam_hyps.local_batch_size) * (K * 2) + beam_idx)
                         * (beam_hyps.max_seq_len);
 
-                    const int current_step{sequence_lengths[vector_id * beam_idx]};
+                    int prev_id = (x[total.p[i]] / vocab_size) % K;
+                    const int current_step{sequence_lengths[vector_id * K + prev_id]};
                     beam_hyps.output_ids_tgt[tgt_id_offset + current_step] = beam_hyps.end_ids[vector_id];
 
                     if (beam_hyps.log_probs != nullptr)
@@ -243,7 +244,6 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
                             = (float) y[total.p[i]] - old_cum_log_probs[(x[total.p[i]] / vocab_size) % K];
                     }
 
-                    int prev_id = (x[total.p[i]] / vocab_size) % K;
                     for (int j = current_step - 1; j >= 0; j--)
                     {
                         const int src_idx = j * beam_hyps.batch_size * K

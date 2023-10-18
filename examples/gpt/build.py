@@ -276,7 +276,11 @@ def parse_arguments(args):
         help=
         'By default, we use dtype for KV cache. fp8_kv_cache chooses fp8 quantization for KV'
     )
-
+    parser.add_argument(
+        '--max_num_tokens',
+        type=int,
+        default=None,
+        help='Define the max number of tokens supported by the engine')
     parser.add_argument(
         '--strongly_typed',
         default=False,
@@ -365,6 +369,9 @@ def parse_arguments(args):
 
     if args.enable_fp8:
         args.quant_mode = args.quant_mode.set_fp8_qdq()
+
+    if args.max_num_tokens is not None:
+        assert args.enable_context_fmha
 
     return args
 
@@ -483,9 +490,7 @@ def build_rank_engine(builder: Builder,
         network.plugin_config.set_smooth_quant_gemm_plugin(dtype=args.dtype)
         network.plugin_config.set_layernorm_quantization_plugin(
             dtype=args.dtype)
-        # FIXME(nkorobov)
-        # See https://nvbugs/4164762
-        # See https://nvbugs/4174113
+
         network.plugin_config.set_quantize_tensor_plugin()
         network.plugin_config.set_quantize_per_token_plugin()
     elif args.use_weight_only:
@@ -511,6 +516,7 @@ def build_rank_engine(builder: Builder,
             args.max_output_len,
             True,
             args.max_beam_width,
+            args.max_num_tokens,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size,
             gather_all_token_logits=args.gather_all_token_logits)
         tensorrt_llm_gpt(*inputs)
@@ -540,7 +546,7 @@ def build(rank, args):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
-        # NOTE(nkorobov): when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
+        # NOTE: when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
         int8_trt_flag = args.quant_mode.has_act_and_weight_quant() or (
             args.paged_kv_cache == False
             and args.quant_mode.has_int8_kv_cache())
@@ -561,6 +567,7 @@ def build(rank, args):
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
+            max_num_tokens=args.max_num_tokens,
             int8=int8_trt_flag,
             opt_level=args.builder_opt,
             multi_query_mode=args.multi_query_mode,

@@ -275,7 +275,8 @@ public:
     GptServer(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, int32_t maxBeamWidth,
         batch_scheduler::SchedulerPolicy schedulerPolicy, std::optional<int32_t> maxNumSequences,
         std::optional<int32_t> maxTokensInPagedKvCache, std::optional<float> kvCacheFreeGpuMemFraction,
-        std::optional<bool> enableTrtOverlap, std::shared_ptr<Recorder> recorder)
+        std::optional<bool> enableTrtOverlap, std::shared_ptr<Recorder> recorder,
+        std::optional<uint64_t> terminateReqId)
     {
         const TrtGptModelOptionalParams& optionalParams = TrtGptModelOptionalParams(
             maxNumSequences, maxTokensInPagedKvCache, kvCacheFreeGpuMemFraction, enableTrtOverlap);
@@ -285,8 +286,9 @@ public:
             [this](uint64_t requestId, std::list<NamedTensor> response_tensors, bool final_response,
                 const std::string& errMsg)
             { return sendResponse(requestId, response_tensors, final_response, errMsg); },
-            nullptr, nullptr, optionalParams);
+            nullptr, nullptr, optionalParams, terminateReqId);
         mRecorder = recorder;
+        mTerminateReqId = terminateReqId;
     }
 
     ~GptServer()
@@ -298,7 +300,7 @@ public:
     {
         // Create InferenceRequest from a set of tensors
         auto request = std::make_shared<InferenceRequest>(requestId);
-        if (requestId == -1)
+        if (requestId == mTerminateReqId)
         {
             mWorkItemsQueue.push(request, requestId);
             return;
@@ -430,6 +432,7 @@ private:
     std::shared_ptr<GptManager> mBatchManager;
     std::shared_ptr<Recorder> mRecorder;
     WorkItemsQueue mWorkItemsQueue;
+    std::optional<uint64_t> mTerminateReqId;
 
 }; // class GptServer
 
@@ -479,11 +482,7 @@ void benchmarkGptManager(std::string const& modelName, std::filesystem::path con
         TLLM_LOG_ERROR(errStr);
     }
 
-    const int maxBeamWidth = 1;
-    auto recorder = std::make_shared<Recorder>();
-    auto gptServer = std::make_shared<GptServer>(engineDir, modelType, maxBeamWidth, schedulerPolicy, maxNumSequences,
-        maxTokensInPagedKvCache, kvCacheFreeGpuMemFraction, enableTrtOverlap, recorder);
-
+    // Load dataset
     auto dataset = parseDataset(datasetPath);
     std::vector<std::vector<NamedTensor>> tensors_list;
     const auto num_samples = dataset.first.size();
@@ -499,6 +498,12 @@ void benchmarkGptManager(std::string const& modelName, std::filesystem::path con
         tensors_list.push_back(tensors);
     }
 
+    const int maxBeamWidth = 1;
+    auto recorder = std::make_shared<Recorder>();
+    uint64_t terminateReqId = num_samples + 1;
+    auto gptServer = std::make_shared<GptServer>(engineDir, modelType, maxBeamWidth, schedulerPolicy, maxNumSequences,
+        maxTokensInPagedKvCache, kvCacheFreeGpuMemFraction, enableTrtOverlap, recorder, terminateReqId);
+
     if (worldConfig.getRank() == 0)
     {
         recorder->initialize();
@@ -510,8 +515,11 @@ void benchmarkGptManager(std::string const& modelName, std::filesystem::path con
         recorder->finalize();
         recorder->calculateMetrics();
         recorder->report();
-        gptServer->enqueue({}, -1, false);
+        // Send terminateReqId to terminate servers on all ranks
+        // Sever on rank 0 will broadcast the terminate signal to other servers on multi-GPU cases
+        gptServer->enqueue({}, terminateReqId, false);
     }
+    // Wait until benchmarking is done and batch manager is terminated
     gptServer->waitBatchManager();
 }
 

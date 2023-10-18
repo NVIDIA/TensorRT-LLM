@@ -22,6 +22,7 @@
 #include "tensorrt_llm/layers/onlineBeamSearchLayer.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
 #include "tensorrt_llm/layers/topPSamplingLayer.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 
 #include <optional>
 #include <string>
@@ -149,9 +150,8 @@ private:
     size_t vocab_size_;
     size_t vocab_size_padded_;
     cudaDeviceProp* cuda_device_prop_;
-    int** output_ids_ptr = nullptr;
-    int** parent_ids_ptr = nullptr;
     int* zero_parent_ids = nullptr;
+    runtime::IBuffer::SharedPtr mIdsPtrHost;
 
     bool has_diff_runtime_args_ = false;
     int* h_pinned_finished_sum_ = nullptr;
