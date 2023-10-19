@@ -1,0 +1,819 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Runtime &mdash; tensorrt_llm  documentation</title>
+      <link rel="stylesheet" href="../_static/pygments.css" type="text/css" />
+      <link rel="stylesheet" href="../_static/css/theme.css" type="text/css" />
+  <!--[if lt IE 9]>
+    <script src="../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script src="../_static/jquery.js?v=5d32c60e"></script>
+        <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+        <script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js?v=b3ba4146"></script>
+        <script src="../_static/doctools.js?v=888ff710"></script>
+        <script src="../_static/sphinx_highlight.js?v=4825356b"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Runtime" href="../_cpp_gen/runtime.html" />
+    <link rel="prev" title="Qunatization" href="tensorrt_llm.quantization.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            tensorrt_llm
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../architecture.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpt_runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance.html">Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation.html">Build From Sources</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../2023-05-19-how-to-debug.html">How to debug</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../graph-rewriting.html">Graph Rewriting Module</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Python API</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.quantization.html">Qunatization</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Runtime</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession"><code class="docutils literal notranslate"><span class="pre">ChatGLM6BHeadModelGenerationSession</span></code></a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.batch_size"><code class="docutils literal notranslate"><span class="pre">ChatGLM6BHeadModelGenerationSession.batch_size</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.buffer_allocated"><code class="docutils literal notranslate"><span class="pre">ChatGLM6BHeadModelGenerationSession.buffer_allocated</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.cuda_graph_mode"><code class="docutils literal notranslate"><span class="pre">ChatGLM6BHeadModelGenerationSession.cuda_graph_mode</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.debug_mode"><code class="docutils literal notranslate"><span class="pre">ChatGLM6BHeadModelGenerationSession.debug_mode</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.debug_tensors_to_save"><code class="docutils literal notranslate"><span class="pre">ChatGLM6BHeadModelGenerationSession.debug_tensors_to_save</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.device"><code class="docutils literal notranslate"><span class="pre">ChatGLM6BHeadModelGenerationSession.device</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.mapping"><code class="docutils literal notranslate"><span class="pre">ChatGLM6BHeadModelGenerationSession.mapping</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.runtime"><code class="docutils literal notranslate"><span class="pre">ChatGLM6BHeadModelGenerationSession.runtime</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSequence"><code class="docutils literal notranslate"><span class="pre">GenerationSequence</span></code></a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSequence.get_batch_idx"><code class="docutils literal notranslate"><span class="pre">GenerationSequence.get_batch_idx()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSequence.get_seq_idx"><code class="docutils literal notranslate"><span class="pre">GenerationSequence.get_seq_idx()</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession"><code class="docutils literal notranslate"><span class="pre">GenerationSession</span></code></a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.batch_size"><code class="docutils literal notranslate"><span class="pre">GenerationSession.batch_size</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.buffer_allocated"><code class="docutils literal notranslate"><span class="pre">GenerationSession.buffer_allocated</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.cross_attention"><code class="docutils literal notranslate"><span class="pre">GenerationSession.cross_attention</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.cuda_graph_mode"><code class="docutils literal notranslate"><span class="pre">GenerationSession.cuda_graph_mode</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.cuda_stream_guard"><code class="docutils literal notranslate"><span class="pre">GenerationSession.cuda_stream_guard()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.debug_mode"><code class="docutils literal notranslate"><span class="pre">GenerationSession.debug_mode</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.debug_tensors_to_save"><code class="docutils literal notranslate"><span class="pre">GenerationSession.debug_tensors_to_save</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.decode"><code class="docutils literal notranslate"><span class="pre">GenerationSession.decode()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.decode_batch"><code class="docutils literal notranslate"><span class="pre">GenerationSession.decode_batch()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.decode_regular"><code class="docutils literal notranslate"><span class="pre">GenerationSession.decode_regular()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.decode_stream"><code class="docutils literal notranslate"><span class="pre">GenerationSession.decode_stream()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.device"><code class="docutils literal notranslate"><span class="pre">GenerationSession.device</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.dtype"><code class="docutils literal notranslate"><span class="pre">GenerationSession.dtype</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.finalize_decoder"><code class="docutils literal notranslate"><span class="pre">GenerationSession.finalize_decoder()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.first_layer"><code class="docutils literal notranslate"><span class="pre">GenerationSession.first_layer</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.gather_all_token_logits"><code class="docutils literal notranslate"><span class="pre">GenerationSession.gather_all_token_logits</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.handle_per_step"><code class="docutils literal notranslate"><span class="pre">GenerationSession.handle_per_step()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.has_position_embedding"><code class="docutils literal notranslate"><span class="pre">GenerationSession.has_position_embedding</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.has_token_type_embedding"><code class="docutils literal notranslate"><span class="pre">GenerationSession.has_token_type_embedding</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.head_size"><code class="docutils literal notranslate"><span class="pre">GenerationSession.head_size</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.hidden_size"><code class="docutils literal notranslate"><span class="pre">GenerationSession.hidden_size</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.last_layer"><code class="docutils literal notranslate"><span class="pre">GenerationSession.last_layer</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.mapping"><code class="docutils literal notranslate"><span class="pre">GenerationSession.mapping</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.num_heads"><code class="docutils literal notranslate"><span class="pre">GenerationSession.num_heads</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.num_heads_kv"><code class="docutils literal notranslate"><span class="pre">GenerationSession.num_heads_kv</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.num_layers"><code class="docutils literal notranslate"><span class="pre">GenerationSession.num_layers</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.paged_kv_cache"><code class="docutils literal notranslate"><span class="pre">GenerationSession.paged_kv_cache</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.pp_communicate_final_output_ids"><code class="docutils literal notranslate"><span class="pre">GenerationSession.pp_communicate_final_output_ids()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.pp_communicate_new_tokens"><code class="docutils literal notranslate"><span class="pre">GenerationSession.pp_communicate_new_tokens()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.quant_mode"><code class="docutils literal notranslate"><span class="pre">GenerationSession.quant_mode</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.remove_input_padding"><code class="docutils literal notranslate"><span class="pre">GenerationSession.remove_input_padding</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.runtime"><code class="docutils literal notranslate"><span class="pre">GenerationSession.runtime</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.setup"><code class="docutils literal notranslate"><span class="pre">GenerationSession.setup()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.tokens_per_block"><code class="docutils literal notranslate"><span class="pre">GenerationSession.tokens_per_block</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.use_custom_all_reduce"><code class="docutils literal notranslate"><span class="pre">GenerationSession.use_custom_all_reduce</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.use_gpt_attention_plugin"><code class="docutils literal notranslate"><span class="pre">GenerationSession.use_gpt_attention_plugin</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession.vocab_size"><code class="docutils literal notranslate"><span class="pre">GenerationSession.vocab_size</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#tensorrt_llm.runtime.KVCacheManager"><code class="docutils literal notranslate"><span class="pre">KVCacheManager</span></code></a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.KVCacheManager.add_sequence"><code class="docutils literal notranslate"><span class="pre">KVCacheManager.add_sequence()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.KVCacheManager.get_pointer_arrays"><code class="docutils literal notranslate"><span class="pre">KVCacheManager.get_pointer_arrays()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.KVCacheManager.step"><code class="docutils literal notranslate"><span class="pre">KVCacheManager.step()</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig"><code class="docutils literal notranslate"><span class="pre">ModelConfig</span></code></a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig.cross_attention"><code class="docutils literal notranslate"><span class="pre">ModelConfig.cross_attention</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig.dtype"><code class="docutils literal notranslate"><span class="pre">ModelConfig.dtype</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig.gather_all_token_logits"><code class="docutils literal notranslate"><span class="pre">ModelConfig.gather_all_token_logits</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig.gpt_attention_plugin"><code class="docutils literal notranslate"><span class="pre">ModelConfig.gpt_attention_plugin</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig.has_position_embedding"><code class="docutils literal notranslate"><span class="pre">ModelConfig.has_position_embedding</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig.has_token_type_embedding"><code class="docutils literal notranslate"><span class="pre">ModelConfig.has_token_type_embedding</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig.hidden_size"><code class="docutils literal notranslate"><span class="pre">ModelConfig.hidden_size</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig.model_name"><code class="docutils literal notranslate"><span class="pre">ModelConfig.model_name</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig.num_heads"><code class="docutils literal notranslate"><span class="pre">ModelConfig.num_heads</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig.num_kv_heads"><code class="docutils literal notranslate"><span class="pre">ModelConfig.num_kv_heads</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig.num_layers"><code class="docutils literal notranslate"><span class="pre">ModelConfig.num_layers</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig.paged_kv_cache"><code class="docutils literal notranslate"><span class="pre">ModelConfig.paged_kv_cache</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig.quant_mode"><code class="docutils literal notranslate"><span class="pre">ModelConfig.quant_mode</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig.remove_input_padding"><code class="docutils literal notranslate"><span class="pre">ModelConfig.remove_input_padding</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig.tokens_per_block"><code class="docutils literal notranslate"><span class="pre">ModelConfig.tokens_per_block</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig.use_custom_all_reduce"><code class="docutils literal notranslate"><span class="pre">ModelConfig.use_custom_all_reduce</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig.use_prompt_tuning"><code class="docutils literal notranslate"><span class="pre">ModelConfig.use_prompt_tuning</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig.vocab_size"><code class="docutils literal notranslate"><span class="pre">ModelConfig.vocab_size</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig"><code class="docutils literal notranslate"><span class="pre">SamplingConfig</span></code></a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig.beam_search_diversity_rate"><code class="docutils literal notranslate"><span class="pre">SamplingConfig.beam_search_diversity_rate</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig.end_id"><code class="docutils literal notranslate"><span class="pre">SamplingConfig.end_id</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig.length_penalty"><code class="docutils literal notranslate"><span class="pre">SamplingConfig.length_penalty</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig.min_length"><code class="docutils literal notranslate"><span class="pre">SamplingConfig.min_length</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig.num_beams"><code class="docutils literal notranslate"><span class="pre">SamplingConfig.num_beams</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig.output_cum_log_probs"><code class="docutils literal notranslate"><span class="pre">SamplingConfig.output_cum_log_probs</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig.output_log_probs"><code class="docutils literal notranslate"><span class="pre">SamplingConfig.output_log_probs</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig.pad_id"><code class="docutils literal notranslate"><span class="pre">SamplingConfig.pad_id</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig.presence_penalty"><code class="docutils literal notranslate"><span class="pre">SamplingConfig.presence_penalty</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig.random_seed"><code class="docutils literal notranslate"><span class="pre">SamplingConfig.random_seed</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig.repetition_penalty"><code class="docutils literal notranslate"><span class="pre">SamplingConfig.repetition_penalty</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig.temperature"><code class="docutils literal notranslate"><span class="pre">SamplingConfig.temperature</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig.top_k"><code class="docutils literal notranslate"><span class="pre">SamplingConfig.top_k</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig.top_p"><code class="docutils literal notranslate"><span class="pre">SamplingConfig.top_p</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig.use_beam_hyps"><code class="docutils literal notranslate"><span class="pre">SamplingConfig.use_beam_hyps</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#tensorrt_llm.runtime.Session"><code class="docutils literal notranslate"><span class="pre">Session</span></code></a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.Session.context"><code class="docutils literal notranslate"><span class="pre">Session.context</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.Session.engine"><code class="docutils literal notranslate"><span class="pre">Session.engine</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.Session.from_engine"><code class="docutils literal notranslate"><span class="pre">Session.from_engine()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.Session.from_serialized_engine"><code class="docutils literal notranslate"><span class="pre">Session.from_serialized_engine()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.Session.infer_shapes"><code class="docutils literal notranslate"><span class="pre">Session.infer_shapes()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.Session.run"><code class="docutils literal notranslate"><span class="pre">Session.run()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.Session.runtime"><code class="docutils literal notranslate"><span class="pre">Session.runtime</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#tensorrt_llm.runtime.TensorInfo"><code class="docutils literal notranslate"><span class="pre">TensorInfo</span></code></a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.TensorInfo.dtype"><code class="docutils literal notranslate"><span class="pre">TensorInfo.dtype</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.TensorInfo.name"><code class="docutils literal notranslate"><span class="pre">TensorInfo.name</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.TensorInfo.shape"><code class="docutils literal notranslate"><span class="pre">TensorInfo.shape</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#tensorrt_llm.runtime.to_word_list_format"><code class="docutils literal notranslate"><span class="pre">to_word_list_format()</span></code></a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">tensorrt_llm</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Runtime</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../_sources/python-api/tensorrt_llm.runtime.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="module-tensorrt_llm">
+<span id="runtime"></span><h1>Runtime<a class="headerlink" href="#module-tensorrt_llm" title="Permalink to this heading"></a></h1>
+<span class="target" id="module-tensorrt_llm.runtime"></span><dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.runtime.</span></span><span class="sig-name descname"><span class="pre">ChatGLM6BHeadModelGenerationSession</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model_config</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig" title="tensorrt_llm.runtime.generation.ModelConfig"><span class="pre">ModelConfig</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_buffer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mapping</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Mapping</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">debug_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">debug_tensors_to_save</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cuda_graph_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stream</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Stream</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/generation.html#ChatGLM6BHeadModelGenerationSession"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession" title="Permalink to this definition"></a></dt>
+<dd><p>Bases: <a class="reference internal" href="#tensorrt_llm.runtime.GenerationSession" title="tensorrt_llm.runtime.generation.GenerationSession"><code class="xref py py-class docutils literal notranslate"><span class="pre">GenerationSession</span></code></a></p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.batch_size">
+<span class="sig-name descname"><span class="pre">batch_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.batch_size" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.buffer_allocated">
+<span class="sig-name descname"><span class="pre">buffer_allocated</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.buffer_allocated" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.cuda_graph_mode">
+<span class="sig-name descname"><span class="pre">cuda_graph_mode</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.cuda_graph_mode" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.debug_mode">
+<span class="sig-name descname"><span class="pre">debug_mode</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.debug_mode" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.debug_tensors_to_save">
+<span class="sig-name descname"><span class="pre">debug_tensors_to_save</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.debug_tensors_to_save" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.device">
+<span class="sig-name descname"><span class="pre">device</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">device</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.device" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.mapping">
+<span class="sig-name descname"><span class="pre">mapping</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Mapping</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.mapping" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.runtime">
+<span class="sig-name descname"><span class="pre">runtime</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">_Runtime</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession.runtime" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSequence">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.runtime.</span></span><span class="sig-name descname"><span class="pre">GenerationSequence</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">seq_idx</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">batch_idx</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/kv_cache_manager.html#GenerationSequence"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSequence" title="Permalink to this definition"></a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSequence.get_batch_idx">
+<span class="sig-name descname"><span class="pre">get_batch_idx</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">int</span></span></span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/kv_cache_manager.html#GenerationSequence.get_batch_idx"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSequence.get_batch_idx" title="Permalink to this definition"></a></dt>
+<dd><p>Returns idx of sequence in batch</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSequence.get_seq_idx">
+<span class="sig-name descname"><span class="pre">get_seq_idx</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">int</span></span></span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/kv_cache_manager.html#GenerationSequence.get_seq_idx"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSequence.get_seq_idx" title="Permalink to this definition"></a></dt>
+<dd><p>Returns sequence idx</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.runtime.</span></span><span class="sig-name descname"><span class="pre">GenerationSession</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model_config</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.runtime.ModelConfig" title="tensorrt_llm.runtime.generation.ModelConfig"><span class="pre">ModelConfig</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_buffer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mapping</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Mapping</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">debug_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">debug_tensors_to_save</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cuda_graph_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stream</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Stream</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/generation.html#GenerationSession"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession" title="Permalink to this definition"></a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.batch_size">
+<span class="sig-name descname"><span class="pre">batch_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.batch_size" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.buffer_allocated">
+<span class="sig-name descname"><span class="pre">buffer_allocated</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.buffer_allocated" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.cross_attention">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">cross_attention</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.cross_attention" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.cuda_graph_mode">
+<span class="sig-name descname"><span class="pre">cuda_graph_mode</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.cuda_graph_mode" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.cuda_stream_guard">
+<span class="sig-name descname"><span class="pre">cuda_stream_guard</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/generation.html#GenerationSession.cuda_stream_guard"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.cuda_stream_guard" title="Permalink to this definition"></a></dt>
+<dd><p>Sync external stream and set current stream to the one bound to the session. Reset on exit.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.debug_mode">
+<span class="sig-name descname"><span class="pre">debug_mode</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.debug_mode" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.debug_tensors_to_save">
+<span class="sig-name descname"><span class="pre">debug_tensors_to_save</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.debug_tensors_to_save" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.decode">
+<span class="sig-name descname"><span class="pre">decode</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input_ids</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">context_lengths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sampling_config</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig" title="tensorrt_llm.runtime.generation.SamplingConfig"><span class="pre">SamplingConfig</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">prompt_embedding_table</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tasks</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prompt_vocab_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stop_words_list</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bad_words_list</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">no_repeat_ngram_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">streaming</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">output_sequence_lengths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">return_dict</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">encoder_output</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">encoder_input_lengths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/generation.html#GenerationSession.decode"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.decode" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.decode_batch">
+<span class="sig-name descname"><span class="pre">decode_batch</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input_ids</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><span class="pre">Tensor</span><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sampling_config</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig" title="tensorrt_llm.runtime.generation.SamplingConfig"><span class="pre">SamplingConfig</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">streaming</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/generation.html#GenerationSession.decode_batch"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.decode_batch" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.decode_regular">
+<span class="sig-name descname"><span class="pre">decode_regular</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">batch_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scfg</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig" title="tensorrt_llm.runtime.generation.SamplingConfig"><span class="pre">SamplingConfig</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">sequence_lengths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">context_lengths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">host_context_lengths</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_context_length</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">beam_width</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cache_indirections</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">list</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_ids</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hidden_states</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prompt_embedding_table</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tasks</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prompt_vocab_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ite</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sequence_limit_lengths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stop_words_list</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bad_words_list</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">no_repeat_ngram_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">output_sequence_lengths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">return_dict</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">encoder_output</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">encoder_input_lengths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/generation.html#GenerationSession.decode_regular"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.decode_regular" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.decode_stream">
+<span class="sig-name descname"><span class="pre">decode_stream</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">batch_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scfg</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig" title="tensorrt_llm.runtime.generation.SamplingConfig"><span class="pre">SamplingConfig</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">sequence_lengths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">context_lengths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">host_context_lengths</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_context_length</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">beam_width</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cache_indirections</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">list</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_ids</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hidden_states</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prompt_embedding_table</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tasks</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prompt_vocab_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ite</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sequence_limit_lengths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stop_words_list</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bad_words_list</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">no_repeat_ngram_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">output_sequence_lengths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">return_dict</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">encoder_output</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">encoder_input_lengths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/generation.html#GenerationSession.decode_stream"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.decode_stream" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.device">
+<span class="sig-name descname"><span class="pre">device</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">device</span></em><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.device" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.dtype">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">dtype</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.dtype" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.finalize_decoder">
+<span class="sig-name descname"><span class="pre">finalize_decoder</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">context_lengths</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">batch_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">beam_width</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scfg</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/generation.html#GenerationSession.finalize_decoder"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.finalize_decoder" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.first_layer">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">first_layer</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.first_layer" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.gather_all_token_logits">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">gather_all_token_logits</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.gather_all_token_logits" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.handle_per_step">
+<span class="sig-name descname"><span class="pre">handle_per_step</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">cache_indirections</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">list</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">step</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">batch_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_context_length</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">beam_width</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_ids</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hidden_states</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scfg</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.runtime.SamplingConfig" title="tensorrt_llm.runtime.generation.SamplingConfig"><span class="pre">SamplingConfig</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_cache_block_pointers</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">list</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prompt_embedding_table</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tasks</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">context_lengths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">host_context_lengths</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">attention_mask</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prompt_vocab_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ite</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sequence_limit_lengths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sequence_lengths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">next_step_buffer</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dict</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stop_words_list</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bad_words_list</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">no_repeat_ngram_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">encoder_output</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">encoder_input_lengths</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/generation.html#GenerationSession.handle_per_step"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.handle_per_step" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.has_position_embedding">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">has_position_embedding</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.has_position_embedding" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.has_token_type_embedding">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">has_token_type_embedding</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.has_token_type_embedding" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.head_size">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">head_size</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.head_size" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.hidden_size">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">hidden_size</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.hidden_size" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.last_layer">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">last_layer</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.last_layer" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.mapping">
+<span class="sig-name descname"><span class="pre">mapping</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Mapping</span></em><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.mapping" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.num_heads">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">num_heads</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.num_heads" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.num_heads_kv">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">num_heads_kv</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.num_heads_kv" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.num_layers">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">num_layers</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.num_layers" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.paged_kv_cache">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">paged_kv_cache</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.paged_kv_cache" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.pp_communicate_final_output_ids">
+<span class="sig-name descname"><span class="pre">pp_communicate_final_output_ids</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">final_output_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">batch_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">beam_width</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/generation.html#GenerationSession.pp_communicate_final_output_ids"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.pp_communicate_final_output_ids" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.pp_communicate_new_tokens">
+<span class="sig-name descname"><span class="pre">pp_communicate_new_tokens</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">should_stop</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cache_indir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sequence_length</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/generation.html#GenerationSession.pp_communicate_new_tokens"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.pp_communicate_new_tokens" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.quant_mode">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">quant_mode</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.quant_mode" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.remove_input_padding">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">remove_input_padding</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.remove_input_padding" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.runtime">
+<span class="sig-name descname"><span class="pre">runtime</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">_Runtime</span></em><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.runtime" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.setup">
+<span class="sig-name descname"><span class="pre">setup</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">batch_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_context_length</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_new_tokens</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">beam_width</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">encoder_max_input_length</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/generation.html#GenerationSession.setup"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.setup" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.tokens_per_block">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">tokens_per_block</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.tokens_per_block" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.use_custom_all_reduce">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">use_custom_all_reduce</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.use_custom_all_reduce" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.use_gpt_attention_plugin">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">use_gpt_attention_plugin</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.use_gpt_attention_plugin" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.GenerationSession.vocab_size">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">vocab_size</span></span><a class="headerlink" href="#tensorrt_llm.runtime.GenerationSession.vocab_size" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.KVCacheManager">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.runtime.</span></span><span class="sig-name descname"><span class="pre">KVCacheManager</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">memory_pools</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">Tensor</span><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">blocks</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tokens_per_block</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_blocks_per_seq</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">beam_width</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/kv_cache_manager.html#KVCacheManager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.KVCacheManager" title="Permalink to this definition"></a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.KVCacheManager.add_sequence">
+<span class="sig-name descname"><span class="pre">add_sequence</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">sequence</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.runtime.GenerationSequence" title="tensorrt_llm.runtime.kv_cache_manager.GenerationSequence"><span class="pre">GenerationSequence</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">context_len</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/kv_cache_manager.html#KVCacheManager.add_sequence"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.KVCacheManager.add_sequence" title="Permalink to this definition"></a></dt>
+<dd><p>Add sequence to the manager and allocate minimum amount of blocks for context</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.KVCacheManager.get_pointer_arrays">
+<span class="sig-name descname"><span class="pre">get_pointer_arrays</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">beam_width</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">Tensor</span><span class="p"><span class="pre">]</span></span></span></span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/kv_cache_manager.html#KVCacheManager.get_pointer_arrays"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.KVCacheManager.get_pointer_arrays" title="Permalink to this definition"></a></dt>
+<dd><p>Returns arrays of pointers for all memory pools copied to GPU</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.KVCacheManager.step">
+<span class="sig-name descname"><span class="pre">step</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">finished</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">bool</span><span class="p"><span class="pre">]</span></span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/kv_cache_manager.html#KVCacheManager.step"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.KVCacheManager.step" title="Permalink to this definition"></a></dt>
+<dd><p>Iterate to the next generation step.
+Add new blocks where needed and clear finished sequences.</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.runtime.</span></span><span class="sig-name descname"><span class="pre">ModelConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">vocab_size:</span> <span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_layers:</span> <span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_heads:</span> <span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads:</span> <span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hidden_size:</span> <span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gpt_attention_plugin:</span> <span class="pre">bool</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">remove_input_padding:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">model_name:</span> <span class="pre">str</span> <span class="pre">=</span> <span class="pre">''</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">paged_kv_cache:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cross_attention:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">has_position_embedding:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">has_token_type_embedding:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tokens_per_block:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">64</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_prompt_tuning:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">quant_mode:</span> <span class="pre">tensorrt_llm.quantization.mode.QuantMode</span> <span class="pre">=</span> <span class="pre">&lt;QuantMode.0:</span> <span class="pre">0&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gather_all_token_logits:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype:</span> <span class="pre">str</span> <span class="pre">=</span> <span class="pre">''</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_custom_all_reduce:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/generation.html#ModelConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig" title="Permalink to this definition"></a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig.cross_attention">
+<span class="sig-name descname"><span class="pre">cross_attention</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig.cross_attention" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig.dtype">
+<span class="sig-name descname"><span class="pre">dtype</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">''</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig.dtype" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig.gather_all_token_logits">
+<span class="sig-name descname"><span class="pre">gather_all_token_logits</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig.gather_all_token_logits" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig.gpt_attention_plugin">
+<span class="sig-name descname"><span class="pre">gpt_attention_plugin</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig.gpt_attention_plugin" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig.has_position_embedding">
+<span class="sig-name descname"><span class="pre">has_position_embedding</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig.has_position_embedding" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig.has_token_type_embedding">
+<span class="sig-name descname"><span class="pre">has_token_type_embedding</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig.has_token_type_embedding" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig.hidden_size">
+<span class="sig-name descname"><span class="pre">hidden_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig.hidden_size" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig.model_name">
+<span class="sig-name descname"><span class="pre">model_name</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">''</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig.model_name" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig.num_heads">
+<span class="sig-name descname"><span class="pre">num_heads</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig.num_heads" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig.num_kv_heads">
+<span class="sig-name descname"><span class="pre">num_kv_heads</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig.num_kv_heads" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig.num_layers">
+<span class="sig-name descname"><span class="pre">num_layers</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig.num_layers" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig.paged_kv_cache">
+<span class="sig-name descname"><span class="pre">paged_kv_cache</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig.paged_kv_cache" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig.quant_mode">
+<span class="sig-name descname"><span class="pre">quant_mode</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="tensorrt_llm.quantization.html#tensorrt_llm.quantization.QuantMode" title="tensorrt_llm.quantization.mode.QuantMode"><span class="pre">QuantMode</span></a></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig.quant_mode" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig.remove_input_padding">
+<span class="sig-name descname"><span class="pre">remove_input_padding</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig.remove_input_padding" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig.tokens_per_block">
+<span class="sig-name descname"><span class="pre">tokens_per_block</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">64</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig.tokens_per_block" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig.use_custom_all_reduce">
+<span class="sig-name descname"><span class="pre">use_custom_all_reduce</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig.use_custom_all_reduce" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig.use_prompt_tuning">
+<span class="sig-name descname"><span class="pre">use_prompt_tuning</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig.use_prompt_tuning" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.ModelConfig.vocab_size">
+<span class="sig-name descname"><span class="pre">vocab_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#tensorrt_llm.runtime.ModelConfig.vocab_size" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.SamplingConfig">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.runtime.</span></span><span class="sig-name descname"><span class="pre">SamplingConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">end_id</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pad_id</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_beams</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">temperature</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">torch.Tensor</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">top_k</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">torch.Tensor</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">top_p</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">torch.Tensor</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">length_penalty</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">torch.Tensor</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">repetition_penalty</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">torch.Tensor</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">min_length</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">torch.Tensor</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">presence_penalty</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">torch.Tensor</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_beam_hyps</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/generation.html#SamplingConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.SamplingConfig" title="Permalink to this definition"></a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.SamplingConfig.beam_search_diversity_rate">
+<span class="sig-name descname"><span class="pre">beam_search_diversity_rate</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Tensor</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.runtime.SamplingConfig.beam_search_diversity_rate" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.SamplingConfig.end_id">
+<span class="sig-name descname"><span class="pre">end_id</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#tensorrt_llm.runtime.SamplingConfig.end_id" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.SamplingConfig.length_penalty">
+<span class="sig-name descname"><span class="pre">length_penalty</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Tensor</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1.0</span></em><a class="headerlink" href="#tensorrt_llm.runtime.SamplingConfig.length_penalty" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.SamplingConfig.min_length">
+<span class="sig-name descname"><span class="pre">min_length</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Tensor</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1</span></em><a class="headerlink" href="#tensorrt_llm.runtime.SamplingConfig.min_length" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.SamplingConfig.num_beams">
+<span class="sig-name descname"><span class="pre">num_beams</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1</span></em><a class="headerlink" href="#tensorrt_llm.runtime.SamplingConfig.num_beams" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.SamplingConfig.output_cum_log_probs">
+<span class="sig-name descname"><span class="pre">output_cum_log_probs</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.runtime.SamplingConfig.output_cum_log_probs" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.SamplingConfig.output_log_probs">
+<span class="sig-name descname"><span class="pre">output_log_probs</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.runtime.SamplingConfig.output_log_probs" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.SamplingConfig.pad_id">
+<span class="sig-name descname"><span class="pre">pad_id</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#tensorrt_llm.runtime.SamplingConfig.pad_id" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.SamplingConfig.presence_penalty">
+<span class="sig-name descname"><span class="pre">presence_penalty</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Tensor</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0.0</span></em><a class="headerlink" href="#tensorrt_llm.runtime.SamplingConfig.presence_penalty" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.SamplingConfig.random_seed">
+<span class="sig-name descname"><span class="pre">random_seed</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Tensor</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.runtime.SamplingConfig.random_seed" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.SamplingConfig.repetition_penalty">
+<span class="sig-name descname"><span class="pre">repetition_penalty</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Tensor</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1.0</span></em><a class="headerlink" href="#tensorrt_llm.runtime.SamplingConfig.repetition_penalty" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.SamplingConfig.temperature">
+<span class="sig-name descname"><span class="pre">temperature</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Tensor</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1.0</span></em><a class="headerlink" href="#tensorrt_llm.runtime.SamplingConfig.temperature" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.SamplingConfig.top_k">
+<span class="sig-name descname"><span class="pre">top_k</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Tensor</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1</span></em><a class="headerlink" href="#tensorrt_llm.runtime.SamplingConfig.top_k" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.SamplingConfig.top_p">
+<span class="sig-name descname"><span class="pre">top_p</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Tensor</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0.0</span></em><a class="headerlink" href="#tensorrt_llm.runtime.SamplingConfig.top_p" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.SamplingConfig.use_beam_hyps">
+<span class="sig-name descname"><span class="pre">use_beam_hyps</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.runtime.SamplingConfig.use_beam_hyps" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.Session">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.runtime.</span></span><span class="sig-name descname"><span class="pre">Session</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/session.html#Session"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.Session" title="Permalink to this definition"></a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
+<p>Session is a managed TensorRT runtime.</p>
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.Session.context">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">context</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">IExecutionContext</span></em><a class="headerlink" href="#tensorrt_llm.runtime.Session.context" title="Permalink to this definition"></a></dt>
+<dd><dl class="simple">
+<dt>Get the default TensorRT execution context,</dt><dd><p>use self.engine.create_execution_context() to create a new context if needed</p>
+</dd>
+</dl>
+<p>&#64;return: one TensorRT execution context object</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>&#64;brief</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.Session.engine">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">engine</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ICudaEngine</span></em><a class="headerlink" href="#tensorrt_llm.runtime.Session.engine" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.Session.from_engine">
+<em class="property"><span class="pre">static</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">from_engine</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">engine</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#tensorrt_llm.runtime.Session" title="tensorrt_llm.runtime.session.Session"><span class="pre">Session</span></a></span></span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/session.html#Session.from_engine"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.Session.from_engine" title="Permalink to this definition"></a></dt>
+<dd><p>&#64;brief: Create a session from an existing ICudaEngine engine
+&#64;param engine: an ICudaEngine
+&#64;return: a Session object</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.Session.from_serialized_engine">
+<em class="property"><span class="pre">static</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">from_serialized_engine</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">engine</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#tensorrt_llm.runtime.Session" title="tensorrt_llm.runtime.session.Session"><span class="pre">Session</span></a></span></span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/session.html#Session.from_serialized_engine"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.Session.from_serialized_engine" title="Permalink to this definition"></a></dt>
+<dd><p>&#64;brief: Create a session from a serialized engine
+&#64;param engine: a serialized engine
+&#64;return: a Session object</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.Session.infer_shapes">
+<span class="sig-name descname"><span class="pre">infer_shapes</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">inputs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">List</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#tensorrt_llm.runtime.TensorInfo" title="tensorrt_llm.runtime.session.TensorInfo"><span class="pre">TensorInfo</span></a><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">context</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">List</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#tensorrt_llm.runtime.TensorInfo" title="tensorrt_llm.runtime.session.TensorInfo"><span class="pre">TensorInfo</span></a><span class="p"><span class="pre">]</span></span></span></span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/session.html#Session.infer_shapes"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.Session.infer_shapes" title="Permalink to this definition"></a></dt>
+<dd><dl class="simple">
+<dt>&#64;brief: Set input shapes to given context, and infer the output shapes from the given input shapes.</dt><dd><p>This function should be called every time when the input shapes are changed before calling run().
+Or call the context.set_input_shape on all dynamic shaped input tensors manually.</p>
+</dd>
+</dl>
+<p>&#64;param inputs: list of TensorInfo object, each item represents an input tensor
+&#64;param context: TensorRT execution context, if None, use the default context
+&#64;return: list of TensorInfo object, each item represents an output tensor, returns None if failed</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.Session.run">
+<span class="sig-name descname"><span class="pre">run</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">inputs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Any</span><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">outputs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Any</span><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stream</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">context</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">bool</span></span></span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/session.html#Session.run"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.Session.run" title="Permalink to this definition"></a></dt>
+<dd><p>&#64;brief: Run the TensorRT engine with the given inputs and outputs
+&#64;param inputs: dict of input tensors, key is tensor name, value is tensor pointer or torch tensor
+&#64;param outputs: dict of output tensors, key is tensor name, value is tensor pointer or torch tensor
+&#64;param stream: cuda stream to enqueue the TensorRT engine on
+&#64;param context: TensorRT execution context, if None, use the default context
+&#64;return: True if enqueue succeeded, note the enqueue is an async call,</p>
+<blockquote>
+<div><p>returning True does not mean the execution is finished</p>
+</div></blockquote>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.Session.runtime">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">runtime</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Runtime</span></em><a class="headerlink" href="#tensorrt_llm.runtime.Session.runtime" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.TensorInfo">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.runtime.</span></span><span class="sig-name descname"><span class="pre">TensorInfo</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'str'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'trt.DataType'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shape</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'tuple'</span></span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/session.html#TensorInfo"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.TensorInfo" title="Permalink to this definition"></a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.TensorInfo.dtype">
+<span class="sig-name descname"><span class="pre">dtype</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">DataType</span></em><a class="headerlink" href="#tensorrt_llm.runtime.TensorInfo.dtype" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.TensorInfo.name">
+<span class="sig-name descname"><span class="pre">name</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></em><a class="headerlink" href="#tensorrt_llm.runtime.TensorInfo.name" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.TensorInfo.shape">
+<span class="sig-name descname"><span class="pre">shape</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">tuple</span></em><a class="headerlink" href="#tensorrt_llm.runtime.TensorInfo.shape" title="Permalink to this definition"></a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.to_word_list_format">
+<span class="sig-prename descclassname"><span class="pre">tensorrt_llm.runtime.</span></span><span class="sig-name descname"><span class="pre">to_word_list_format</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">word_dict</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tokenizer</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/generation.html#to_word_list_format"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.to_word_list_format" title="Permalink to this definition"></a></dt>
+<dd><dl class="simple">
+<dt>format of word_dict</dt><dd><p>len(word_dict) should be same to batch_size
+word_dict[i] means the words for batch i
+len(word_dict[i]) must be 1, which means it only contains 1 string
+This string can contains several sentences and split by “,”.
+For example, if word_dict[2] = ” I am happy, I am sad”, then this function will return
+the ids for two short sentences ” I am happy” and ” I am sad”.</p>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="tensorrt_llm.quantization.html" class="btn btn-neutral float-left" title="Qunatization" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="../_cpp_gen/runtime.html" class="btn btn-neutral float-right" title="Runtime" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2023, NVidia.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

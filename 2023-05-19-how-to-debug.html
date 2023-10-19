@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>How to debug &mdash; tensorrt_llm  documentation</title>
+      <link rel="stylesheet" href="_static/pygments.css" type="text/css" />
+      <link rel="stylesheet" href="_static/css/theme.css" type="text/css" />
+  <!--[if lt IE 9]>
+    <script src="_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script src="_static/jquery.js?v=5d32c60e"></script>
+        <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+        <script data-url_root="./" id="documentation_options" src="_static/documentation_options.js?v=b3ba4146"></script>
+        <script src="_static/doctools.js?v=888ff710"></script>
+        <script src="_static/sphinx_highlight.js?v=4825356b"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="How to add a new model" href="2023-05-17-how-to-add-a-new-model.html" />
+    <link rel="prev" title="Build From Sources" href="installation.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            tensorrt_llm
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="architecture.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gpt_runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="performance.html">Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Build From Sources</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">How to debug</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#debug-on-unit-tests">Debug on unit tests</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#debug-on-e2e-models">Debug on E2E models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#debug-execution-errors">Debug execution errors</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
+<li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Python API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.quantization.html">Qunatization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">tensorrt_llm</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">How to debug</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/2023-05-19-how-to-debug.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="how-to-debug">
+<h1>How to debug<a class="headerlink" href="#how-to-debug" title="Permalink to this heading"></a></h1>
+<p>This document describes how to debug in TensorRT-LLM.</p>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Permalink to this heading"></a></h2>
+<p>Usually, we want to print the intermediate tensor values when debugging a TensorRT-LLM model.
+TensorRT-LLM obeys define-and-run paradigm, we should mark the interested intermediate tensors as the network outputs.
+Then, we print the values at runtime.</p>
+</section>
+<section id="debug-on-unit-tests">
+<h2>Debug on unit tests<a class="headerlink" href="#debug-on-unit-tests" title="Permalink to this heading"></a></h2>
+<ol class="arabic simple">
+<li><p>Register the intermediate tensors as the network outputs with <code class="docutils literal notranslate"><span class="pre">register_network_output</span></code> API.</p></li>
+</ol>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span> <span class="nc">MLP</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                 <span class="n">hidden_size</span><span class="p">,</span>
+                 <span class="n">ffn_hidden_size</span><span class="p">,</span>
+                 <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                 <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">fc</span> <span class="o">=</span> <span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">layers</span><span class="o">.</span><span class="n">ColumnLinear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span>
+                                                   <span class="n">ffn_hidden_size</span><span class="p">,</span>
+                                                   <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
+                                                   <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
+                                                   <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+                                                   <span class="n">gather_output</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">proj</span> <span class="o">=</span> <span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">layers</span><span class="o">.</span><span class="n">RowLinear</span><span class="p">(</span><span class="n">ffn_hidden_size</span><span class="p">,</span>
+                                                  <span class="n">hidden_size</span><span class="p">,</span>
+                                                  <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
+                                                  <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
+                                                  <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">)</span>
+
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">):</span>
+        <span class="n">inter</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="n">inter</span> <span class="o">=</span> <span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">relu</span><span class="p">(</span><span class="n">inter</span><span class="p">)</span>
+        <span class="c1"># Here, we want to print the tensor value after relu</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;inter&#39;</span><span class="p">,</span> <span class="n">inter</span><span class="p">)</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">inter</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">output</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="2">
+<li><p>Mark the intermediate tensors as network outputs.</p></li>
+</ol>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">gm</span><span class="o">.</span><span class="n">named_network_outputs</span><span class="p">():</span>
+    <span class="n">net</span><span class="o">.</span><span class="n">_mark_output</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">dtype</span><span class="p">)</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="3">
+<li><p>Print the tensors at runtime.</p></li>
+</ol>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nb">print</span><span class="p">(</span><span class="n">outputs</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;inter&#39;</span><span class="p">])</span>
+</pre></div>
+</div>
+<p>Here is the <a class="reference download internal" download="" href="_downloads/29c17f8c7171976309d720e2b031e77e/test_debugging_api.py"><span class="xref download myst">full example</span></a>.</p>
+</section>
+<section id="debug-on-e2e-models">
+<h2>Debug on E2E models<a class="headerlink" href="#debug-on-e2e-models" title="Permalink to this heading"></a></h2>
+<p>Here is an example to print the values of the MLP output tensor in the GPT model.</p>
+<ol class="arabic simple">
+<li><p>In <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/models/gpt/model.py</span></code>, we register the MLP output tensor:</p></li>
+</ol>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span>        <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">attention_output</span><span class="o">.</span><span class="n">data</span>
+
+        <span class="n">residual</span> <span class="o">=</span> <span class="n">hidden_states</span>
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">post_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="c1"># register as model output</span>
+        <span class="c1"># ------------------------------------------------------</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;mlp_output&#39;</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
+        <span class="c1"># ------------------------------------------------------</span>
+
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">hidden_states</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="2">
+<li><p>In <code class="docutils literal notranslate"><span class="pre">examples/gpt/build.py</span></code>, we mark it as a TensorRT network output:</p></li>
+</ol>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span>    <span class="k">with</span> <span class="n">net_guard</span><span class="p">(</span><span class="n">network</span><span class="p">):</span>
+        <span class="n">network</span><span class="o">.</span><span class="n">set_named_parameters</span><span class="p">(</span><span class="n">tensorrt_llm_gpt</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">())</span>
+
+        <span class="n">inputs</span> <span class="o">=</span> <span class="n">tensorrt_llm_gpt</span><span class="o">.</span><span class="n">prepare_inputs</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">max_batch_size</span><span class="p">,</span>
+                                                 <span class="n">args</span><span class="o">.</span><span class="n">max_input_len</span><span class="p">,</span>
+                                                 <span class="n">args</span><span class="o">.</span><span class="n">max_output_len</span><span class="p">,</span> <span class="kc">True</span><span class="p">,</span>
+                                                 <span class="n">args</span><span class="o">.</span><span class="n">max_beam_width</span><span class="p">)</span>
+        <span class="n">tensorrt_llm_gpt</span><span class="p">(</span><span class="o">*</span><span class="n">inputs</span><span class="p">)</span>
+
+        <span class="c1"># mark as TRT network output</span>
+        <span class="c1"># ----------------------------------------------------------------</span>
+        <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">tensorrt_llm_gpt</span><span class="o">.</span><span class="n">named_network_outputs</span><span class="p">():</span>
+            <span class="n">network</span><span class="o">.</span><span class="n">_mark_output</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span>
+                                 <span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">dtype</span><span class="p">))</span>
+        <span class="c1"># ----------------------------------------------------------------</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="3">
+<li><p>Build the TensorRT engine of the model:</p></li>
+</ol>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rm<span class="w"> </span>-rf<span class="w"> </span>gpt2<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>git<span class="w"> </span>clone<span class="w"> </span>https://huggingface.co/gpt2-medium<span class="w"> </span>gpt2
+<span class="nb">pushd</span><span class="w"> </span>gpt2<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>rm<span class="w"> </span>pytorch_model.bin<span class="w"> </span>model.safetensors<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>wget<span class="w"> </span>-q<span class="w"> </span>https://huggingface.co/gpt2-medium/resolve/main/pytorch_model.bin<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">popd</span>
+python3<span class="w"> </span>hf_gpt_convert.py<span class="w"> </span>-i<span class="w"> </span>gpt2<span class="w"> </span>-o<span class="w"> </span>./c-model/gpt2<span class="w"> </span>--tensor-parallelism<span class="w"> </span><span class="m">1</span><span class="w"> </span>--storage-type<span class="w"> </span>float16
+
+python3<span class="w"> </span>build.py<span class="w"> </span>--model_dir<span class="o">=</span>./c-model/gpt2/1-gpu<span class="w"> </span>--use_gpt_attention_plugin
+</pre></div>
+</div>
+<ol class="arabic simple" start="4">
+<li><p>Print the intermediate output tensors:</p></li>
+</ol>
+<p>In <code class="docutils literal notranslate"><span class="pre">examples/gpt/run.py</span></code>, we open the debug mode:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span>    <span class="n">decoder</span> <span class="o">=</span> <span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">GenerationSession</span><span class="p">(</span><span class="n">model_config</span><span class="p">,</span>
+                                                     <span class="n">engine_buffer</span><span class="p">,</span>
+                                                     <span class="n">runtime_mapping</span><span class="p">,</span>
+                                                     <span class="n">debug_mode</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>In <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/runtime/generation.py</span></code>, we print the debug info:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span>        <span class="k">if</span> <span class="n">step</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="o">...</span>
+            <span class="n">ctx_shape</span><span class="p">,</span> <span class="n">ctx_buffer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_context_shape_buffer</span><span class="p">(</span>
+                    <span class="n">input_ids</span><span class="p">,</span> <span class="n">max_input_length</span><span class="p">,</span> <span class="n">step</span><span class="p">,</span>
+                    <span class="n">input_lengths</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">,</span> <span class="n">last_token_ids</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">,</span>
+                    <span class="n">this_src_cache_indirection</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">_set_shape</span><span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="n">ctx_shape</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">_set_buffer</span><span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="n">ctx_buffer</span><span class="p">)</span>
+            <span class="c1"># -------------------------------------------</span>
+            <span class="n">debug_buffer</span> <span class="o">=</span> <span class="n">ctx_buffer</span>
+            <span class="c1"># -------------------------------------------</span>
+
+        <span class="n">stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span><span class="o">.</span><span class="n">cuda_stream</span>
+        <span class="n">ok</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">_run</span><span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="n">stream</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">ok</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s1">&#39;Executing TRT engine failed!&#39;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">debug_mode</span><span class="p">:</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+            <span class="c1"># -------------------------------------------</span>
+            <span class="k">if</span> <span class="n">step</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="nb">print</span><span class="p">(</span><span class="n">debug_buffer</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+            <span class="nb">print</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">debug_buffer</span><span class="p">[</span><span class="s1">&#39;layers.6.mlp_output&#39;</span><span class="p">])</span>
+            <span class="c1"># -------------------------------------------</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">step</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_new_tokens</span> <span class="o">-</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="o">...</span>
+            <span class="n">next_step_shape</span><span class="p">,</span> <span class="n">next_step_buffer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_next_step_shape_buffer</span><span class="p">(</span>
+                    <span class="n">batch_size</span><span class="p">,</span> <span class="n">scfg</span><span class="o">.</span><span class="n">num_beams</span><span class="p">,</span> <span class="n">max_input_length</span><span class="p">,</span> <span class="n">step</span><span class="p">,</span>
+                    <span class="n">input_lengths</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">,</span> <span class="n">last_token_ids</span><span class="p">,</span>
+                    <span class="n">attention_mask</span><span class="p">,</span> <span class="n">next_src_cache_indirection</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">_set_shape</span><span class="p">(</span><span class="n">next_context</span><span class="p">,</span> <span class="n">next_step_shape</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">_set_buffer</span><span class="p">(</span><span class="n">next_context</span><span class="p">,</span> <span class="n">next_step_buffer</span><span class="p">)</span>
+            <span class="c1"># -------------------------------------------</span>
+            <span class="n">debug_buffer</span> <span class="o">=</span> <span class="n">next_step_buffer</span>
+            <span class="c1"># -------------------------------------------</span>
+
+</pre></div>
+</div>
+<p>Then, we will see the tensor values:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>run.py<span class="w"> </span>--max_output_len<span class="o">=</span><span class="m">8</span>
+dict_keys<span class="o">([</span><span class="s1">&#39;input_ids&#39;</span>,<span class="w"> </span><span class="s1">&#39;logits&#39;</span>,<span class="w"> </span><span class="s1">&#39;input_lengths&#39;</span>,<span class="w"> </span><span class="s1">&#39;position_ids&#39;</span>,<span class="w"> </span><span class="s1">&#39;last_token_ids&#39;</span>,<span class="w"> </span><span class="s1">&#39;max_input_length&#39;</span>,<span class="w"> </span><span class="s1">&#39;cache_indirection&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_0&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_0&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_0&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_0&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_1&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_1&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_1&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_1&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_2&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_2&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_2&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_2&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_3&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_3&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_3&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_3&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_4&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_4&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_4&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_4&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_5&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_5&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_5&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_5&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_6&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_6&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_6&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_6&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_7&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_7&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_7&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_7&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_8&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_8&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_8&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_8&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_9&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_9&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_9&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_9&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_10&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_10&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_10&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_10&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_11&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_11&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_11&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_11&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_12&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_12&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_12&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_12&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_13&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_13&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_13&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_13&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_14&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_14&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_14&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_14&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_15&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_15&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_15&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_15&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_16&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_16&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_16&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_16&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_17&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_17&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_17&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_17&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_18&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_18&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_18&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_18&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_19&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_19&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_19&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_19&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_20&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_20&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_20&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_20&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_21&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_21&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_21&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_21&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_22&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_22&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_22&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_22&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_23&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_value_23&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_key_23&#39;</span>,<span class="w"> </span><span class="s1">&#39;present_value_23&#39;</span>,<span class="w"> </span><span class="s1">&#39;sequence_length&#39;</span>,<span class="w"> </span><span class="s1">&#39;past_key_value_length&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.0.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.1.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.2.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.3.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.4.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.5.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.6.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.7.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.8.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.9.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.10.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.11.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.12.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.13.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.14.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.15.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.16.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.17.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.18.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.19.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.20.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.21.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.22.mlp_output&#39;</span>,<span class="w"> </span><span class="s1">&#39;layers.23.mlp_output&#39;</span><span class="o">])</span>
+<span class="m">0</span><span class="w"> </span>tensor<span class="o">([[[</span><span class="w"> </span><span class="m">0</span>.0295,<span class="w"> </span>-0.0256,<span class="w"> </span>-0.0780,<span class="w">  </span>...,<span class="w"> </span>-0.0562,<span class="w"> </span>-0.0241,<span class="w">  </span><span class="m">0</span>.0273<span class="o">]</span>,
+<span class="w">         </span><span class="o">[</span>-0.0089,<span class="w">  </span><span class="m">0</span>.5882,<span class="w">  </span><span class="m">0</span>.1989,<span class="w">  </span>...,<span class="w"> </span>-1.0464,<span class="w"> </span>-0.6305,<span class="w">  </span><span class="m">0</span>.5967<span class="o">]</span>,
+<span class="w">         </span><span class="o">[</span>-0.8793,<span class="w">  </span><span class="m">0</span>.1056,<span class="w">  </span><span class="m">0</span>.7083,<span class="w">  </span>...,<span class="w">  </span><span class="m">0</span>.0889,<span class="w">  </span><span class="m">1</span>.0714,<span class="w"> </span>-0.2931<span class="o">]</span>,
+<span class="w">         </span>...,
+<span class="w">         </span><span class="o">[</span><span class="w"> </span><span class="m">0</span>.1209,<span class="w"> </span>-0.0886,<span class="w"> </span>-0.5927,<span class="w">  </span>...,<span class="w"> </span>-0.1048,<span class="w"> </span>-0.3437,<span class="w">  </span><span class="m">0</span>.1085<span class="o">]</span>,
+<span class="w">         </span><span class="o">[</span>-1.0752,<span class="w"> </span>-0.0739,<span class="w">  </span><span class="m">0</span>.6156,<span class="w">  </span>...,<span class="w">  </span><span class="m">0</span>.3454,<span class="w">  </span><span class="m">0</span>.3014,<span class="w">  </span><span class="m">0</span>.2653<span class="o">]</span>,
+<span class="w">         </span><span class="o">[</span>-0.7126,<span class="w">  </span><span class="m">0</span>.9685,<span class="w"> </span>-0.1145,<span class="w">  </span>...,<span class="w"> </span>-0.0084,<span class="w">  </span><span class="m">0</span>.9521,<span class="w">  </span><span class="m">0</span>.1425<span class="o">]]]</span>,
+<span class="w">       </span><span class="nv">device</span><span class="o">=</span><span class="s1">&#39;cuda:0&#39;</span><span class="o">)</span>
+<span class="m">1</span><span class="w"> </span>tensor<span class="o">([[[</span>-0.2129,<span class="w">  </span><span class="m">0</span>.5879,<span class="w">  </span><span class="m">0</span>.8172,<span class="w">  </span>...,<span class="w">  </span><span class="m">0</span>.7892,<span class="w"> </span>-0.6887,<span class="w">  </span><span class="m">0</span>.6063<span class="o">]]]</span>,
+<span class="w">       </span><span class="nv">device</span><span class="o">=</span><span class="s1">&#39;cuda:0&#39;</span><span class="o">)</span>
+<span class="m">2</span><span class="w"> </span>tensor<span class="o">([[[</span><span class="w"> </span><span class="m">0</span>.4184,<span class="w"> </span>-0.0066,<span class="w">  </span><span class="m">1</span>.3895,<span class="w">  </span>...,<span class="w"> </span>-0.9023,<span class="w"> </span>-0.0686,<span class="w"> </span>-0.2831<span class="o">]]]</span>,
+<span class="w">       </span><span class="nv">device</span><span class="o">=</span><span class="s1">&#39;cuda:0&#39;</span><span class="o">)</span>
+<span class="m">3</span><span class="w"> </span>tensor<span class="o">([[[</span>-0.7935,<span class="w"> </span>-0.5085,<span class="w"> </span>-0.1696,<span class="w">  </span>...,<span class="w"> </span>-0.5839,<span class="w"> </span>-0.1375,<span class="w"> </span>-0.0078<span class="o">]]]</span>,
+<span class="w">       </span><span class="nv">device</span><span class="o">=</span><span class="s1">&#39;cuda:0&#39;</span><span class="o">)</span>
+<span class="m">4</span><span class="w"> </span>tensor<span class="o">([[[</span>-0.0810,<span class="w">  </span><span class="m">0</span>.1262,<span class="w"> </span>-0.6260,<span class="w">  </span>...,<span class="w"> </span>-0.1065,<span class="w"> </span>-0.0529,<span class="w">  </span><span class="m">0</span>.7143<span class="o">]]]</span>,
+<span class="w">       </span><span class="nv">device</span><span class="o">=</span><span class="s1">&#39;cuda:0&#39;</span><span class="o">)</span>
+<span class="m">5</span><span class="w"> </span>tensor<span class="o">([[[</span>-0.3322,<span class="w"> </span>-0.8835,<span class="w">  </span><span class="m">0</span>.3427,<span class="w">  </span>...,<span class="w">  </span><span class="m">0</span>.8159,<span class="w"> </span>-0.0622,<span class="w">  </span><span class="m">1</span>.2327<span class="o">]]]</span>,
+<span class="w">       </span><span class="nv">device</span><span class="o">=</span><span class="s1">&#39;cuda:0&#39;</span><span class="o">)</span>
+<span class="m">6</span><span class="w"> </span>tensor<span class="o">([[[</span>-0.2217,<span class="w"> </span>-0.2057,<span class="w"> </span>-0.1475,<span class="w">  </span>...,<span class="w"> </span>-0.3545,<span class="w"> </span>-0.1673,<span class="w">  </span><span class="m">0</span>.1131<span class="o">]]]</span>,
+<span class="w">       </span><span class="nv">device</span><span class="o">=</span><span class="s1">&#39;cuda:0&#39;</span><span class="o">)</span>
+<span class="m">7</span><span class="w"> </span>tensor<span class="o">([[[</span><span class="w"> </span><span class="m">0</span>.1268,<span class="w"> </span>-0.1570,<span class="w">  </span><span class="m">0</span>.3972,<span class="w">  </span>...,<span class="w"> </span>-0.8213,<span class="w"> </span>-0.3282,<span class="w"> </span>-0.8672<span class="o">]]]</span>,
+<span class="w">       </span><span class="nv">device</span><span class="o">=</span><span class="s1">&#39;cuda:0&#39;</span><span class="o">)</span>
+Input:<span class="w"> </span>Born<span class="w"> </span><span class="k">in</span><span class="w"> </span>north-east<span class="w"> </span>France,<span class="w"> </span>Soyer<span class="w"> </span>trained<span class="w"> </span>as<span class="w"> </span>a
+Output:<span class="w">  </span>chef<span class="w"> </span>before<span class="w"> </span>moving<span class="w"> </span>to<span class="w"> </span>London<span class="w"> </span><span class="k">in</span><span class="w"> </span>the<span class="w"> </span>early
+</pre></div>
+</div>
+</section>
+<section id="debug-execution-errors">
+<h2>Debug execution errors<a class="headerlink" href="#debug-execution-errors" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>If you use plugins, use can set the environment variable <code class="docutils literal notranslate"><span class="pre">CUDA_LAUNCH_BLOCKING=1</span></code> so that kernels are launch synchronously, with their return status checked immediately.</p></li>
+<li><p>If you see memory errors, make sure that the engine inputs respect the build-time shapes and that they reside <strong>on the correct device</strong> (CPU/GPU).</p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="installation.html" class="btn btn-neutral float-left" title="Build From Sources" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="2023-05-17-how-to-add-a-new-model.html" class="btn btn-neutral float-right" title="How to add a new model" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2023, NVidia.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
