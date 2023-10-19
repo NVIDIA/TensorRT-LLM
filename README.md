@@ -4,7 +4,7 @@ TensorRT-LLM
 ===========================
 <h4> A TensorRT Toolbox for Large Language Models </h4>
 
-[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)]()
+[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://nvidia.github.io/TensorRT-LLM/)
 [![python](https://img.shields.io/badge/python-3.10.12-green)](https://www.python.org/downloads/release/python-31012/)
 [![cuda](https://img.shields.io/badge/cuda-12.2-green)](https://developer.nvidia.com/cuda-downloads)
 [![trt](https://img.shields.io/badge/TRT-9.1-green)](https://developer.nvidia.com/tensorrt)
