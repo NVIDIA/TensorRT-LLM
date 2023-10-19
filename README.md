@@ -105,7 +105,6 @@ The following sections show how to use TensorRT-LLM to run the
 Inside the Docker container, you have to install the requirements:
 
 ```bash
-cd  examples/bloom
 pip install -r examples/bloom/requirements.txt
 git lfs install
 ```
@@ -115,6 +114,7 @@ git lfs install
 From the BLOOM example folder, you must download the weights of the model.
 
 ```bash
+cd examples/bloom
 rm -rf ./bloom/560M
 mkdir -p ./bloom/560M && git clone https://huggingface.co/bigscience/bloom-560m ./bloom/560M
 
