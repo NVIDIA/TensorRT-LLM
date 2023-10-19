@@ -28,9 +28,14 @@ for the NVIDIA platform can be found
 The first step to build TensorRT-LLM is to fetch the sources:
 
 ```bash
+# TensorRT-LLM uses git-lfs, which needs to be installed in advance.
+apt-get update && apt-get -y install git git-lfs
+
 git clone https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
 git submodule update --init --recursive
+git lfs install
+git lfs pull
 ```
 
 ## Build TensorRT-LLM in One Step
