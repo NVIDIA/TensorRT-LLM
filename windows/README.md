@@ -147,7 +147,7 @@ Building from source will produce the following library files:
     - `th_common.exp`
     - `th_common.lib`
 
-The locations of the DLLs, in addition to some `torch` DLLs, must be added to the Windows `Path` in order to us the TensorRT-LLM C++ runtime. As in [Setup](#setup), append the locations of these libraries to your `Path`. When complete, your `Path` should include lines similar to these:
+The locations of the DLLs, in addition to some `torch` DLLs, must be added to the Windows `Path` in order to us the TensorRT-LLM C++ runtime. As in [Detailed Setup](#detailed-setup), append the locations of these libraries to your `Path`. When complete, your `Path` should include lines similar to these:
 
 ```
 C:\Users\<username>\inference\TensorRT-LLM\cpp\build\tensorrt_llm\Release
@@ -156,8 +156,8 @@ C:\Users\<username>\AppData\Local\Programs\Python\Python39\Lib\site-packages\tor
 ```
 
 For examples of how to use the C++ runtime, see the unit tests in
-[gptSessionTest.cpp](cpp/tests/runtime/gptSessionTest.cpp) and the related
-[CMakeLists.txt](cpp/tests/CMakeLists.txt) file.
+[gptSessionTest.cpp](../cpp/tests/runtime/gptSessionTest.cpp) and the related
+[CMakeLists.txt](../cpp/tests/CMakeLists.txt) file.
 
 ## Next Steps
 
