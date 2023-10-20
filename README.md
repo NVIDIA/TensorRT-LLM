@@ -11,7 +11,7 @@ TensorRT-LLM
 [![version](https://img.shields.io/badge/release-0.5.0-green)](./setup.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](./LICENSE)
 
-[Architecture](./docs/source/architecture.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Results](./docs/source/performance.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](./examples/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentations](./docs/source/)
+[Architecture](./docs/source/architecture.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Results](./docs/source/performance.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](./examples/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](./docs/source/)
 
 ---
 <div align="left">
@@ -75,7 +75,7 @@ well as a complete implementation of the
 
 For a more detailed presentation of the software architecture and the key
 concepts used in TensorRT-LLM, we recommend you to read the following
-[document](./docs/architecture.md).
+[document](./docs/source/architecture.md).
 
 ## Installation
 
@@ -231,7 +231,6 @@ The list of supported models is:
 * [SantaCoder](examples/gpt)
 * [StarCoder](examples/gpt)
 
-
 ## Performance
 
 Please refer to the [performance](./docs/source/performance.md) page for
@@ -294,7 +293,7 @@ enable plugins, for example: `--use_gpt_attention_plugin`.
 
 ## Release notes
 
-  * TensorRT-LLM requires TensorRT 9.0.1.4 and 23.08 containers.
+  * TensorRT-LLM requires TensorRT 9.1.0.4 and 23.08 containers.
 
 ### Change Log
 
