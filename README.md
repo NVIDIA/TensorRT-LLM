@@ -56,11 +56,11 @@ and/or
 The Python API of TensorRT-LLM is architectured to look similar to the
 [PyTorch](https://pytorch.org) API. It provides users with a
 [functional](./tensorrt_llm/functional.py) module containing functions like
-`einsum`, `softmax`, `matmul` or `view`. The [layer](./tensorrt_llm/layer)
+`einsum`, `softmax`, `matmul` or `view`. The [layers](./tensorrt_llm/layers)
 module bundles useful building blocks to assemble LLMs; like an `Attention`
 block, a `MLP` or the entire `Transformer` layer. Model-specific components,
 like `GPTAttention` or `BertAttention`, can be found in the
-[model](./tensorrt_llm/model) module.
+[models](./tensorrt_llm/models) module.
 
 TensorRT-LLM comes with several popular models pre-defined. They can easily be
 modified and extended to fit custom needs. See below for a list of supported
