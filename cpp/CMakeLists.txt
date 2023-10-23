@@ -257,6 +257,8 @@ if(BUILD_PYT)
   message(STATUS "Found Python libraries at ${Python3_LIBRARY_DIRS}")
   link_directories("${Python3_LIBRARY_DIRS}")
   list(APPEND COMMON_HEADER_DIRS ${Python3_INCLUDE_DIRS})
+  list(APPEND CMAKE_PREFIX_PATH /usr/local/lib/python3.10/dist-packages/pybind11)
+  find_package(pybind11 REQUIRED)
 
   execute_process(
     COMMAND
@@ -325,3 +327,7 @@ if(BUILD_BENCHMARKS)
   add_subdirectory(${TRT_LLM_ROOT_DIR}/benchmarks/cpp
                    ${CMAKE_BINARY_DIR}/benchmarks)
 endif()
+
+pybind11_add_module(pygptmanager include/tensorrt_llm/batch_manager/pygptmanager.cpp)
+include_directories(${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(pygptmanager PRIVATE pybind11:headers tensorrt_llm)
