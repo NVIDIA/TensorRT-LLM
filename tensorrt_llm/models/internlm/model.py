@@ -26,7 +26,7 @@ from ...quantization import QuantMode
 from ..generation_mixin import GenerationMixin
 
 
-class LLaMADecoderLayer(Module):
+class InternLMDecoderLayer(Module):
 
     def __init__(self,
                  layer_id,
@@ -136,7 +136,7 @@ class LLaMADecoderLayer(Module):
         return hidden_states
 
 
-class LLaMAModel(Module):
+class InternLMModel(Module):
 
     def __init__(self,
                  num_layers,
@@ -170,7 +170,7 @@ class LLaMAModel(Module):
                 tp_rank=mapping.tp_rank)
 
         self.layers = ModuleList([
-            LLaMADecoderLayer(layer_id=i,
+            InternLMDecoderLayer(layer_id=i,
                               hidden_size=hidden_size,
                               num_attention_heads=num_heads,
                               num_kv_heads=num_kv_heads,
@@ -245,7 +245,7 @@ class LLaMAModel(Module):
         return hidden_states
 
 
-class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
+class InternLMForCausalLM(InternLMModel, GenerationMixin):
 
     def __init__(self,
                  num_layers,

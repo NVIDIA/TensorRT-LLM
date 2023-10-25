@@ -157,7 +157,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--max_output_len', type=int, required=True)
     parser.add_argument('--log_level', type=str, default='error')
-    parser.add_argument('--engine_dir', type=str, default='llama_outputs')
+    parser.add_argument('--engine_dir', type=str, default='internlm_outputs')
     parser.add_argument('--tokenizer_dir',
                         type=str,
                         default=".",
@@ -195,7 +195,7 @@ def parse_arguments():
 def generate(
     max_output_len: int,
     log_level: str = 'error',
-    engine_dir: str = 'llama_outputs',
+    engine_dir: str = 'internlm_outputs',
     input_text: str = 'Born in north-east France, Soyer trained as a',
     input_file: str = None,
     output_csv: str = None,
@@ -225,7 +225,7 @@ def generate(
                                      pad_id=PAD_TOKEN,
                                      num_beams=num_beams)
 
-    engine_name = get_engine_name('llama', dtype, tp_size, pp_size,
+    engine_name = get_engine_name('internlm', dtype, tp_size, pp_size,
                                   runtime_rank)
     serialize_path = engine_dir / engine_name
     with open(serialize_path, 'rb') as f:

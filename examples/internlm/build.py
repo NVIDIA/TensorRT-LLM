@@ -22,9 +22,9 @@ import tensorrt as trt
 import torch
 import torch.multiprocessing as mp
 from transformers import LlamaConfig, LlamaForCausalLM
-from weight import (get_scaling_factors, load_from_awq_llama, load_from_binary,
-                    load_from_gptq_llama, load_from_hf_llama,
-                    load_from_meta_llama)
+from weight import (get_scaling_factors, load_from_awq_internlm, load_from_binary,
+                    load_from_gptq_internlm, load_from_hf_internlm,
+                    load_from_meta_internlm)
 
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_trt
@@ -41,7 +41,7 @@ from tensorrt_llm.quantization import QuantMode
 
 from weight import parse_ft_config  # isort:skip
 
-MODEL_NAME = "llama"
+MODEL_NAME = "internlm"
 
 # 2 routines: get_engine_name, serialize_engine
 # are direct copy from gpt example, TODO: put in utils?
@@ -195,7 +195,7 @@ def parse_arguments():
     parser.add_argument(
         '--output_dir',
         type=str,
-        default='llama_outputs',
+        default='internlm_outputs',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
     )
@@ -400,7 +400,7 @@ def parse_arguments():
     args.use_gpt_attention_plugin = args.dtype
     if args.model_dir is not None:
         hf_config = LlamaConfig.from_pretrained(args.model_dir)
-        args.inter_size = hf_config.intermediate_size  # override the inter_size for LLaMA
+        args.inter_size = hf_config.intermediate_size  # override the inter_size for InternLM
         args.n_embd = hf_config.hidden_size
         args.n_head = hf_config.num_attention_heads
         if hasattr(hf_config, "num_key_value_heads"):
@@ -427,7 +427,7 @@ def parse_arguments():
     elif args.ft_model_dir is not None:
         n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, n_kv_head = parse_ft_config(
             Path(args.ft_model_dir) / "config.ini")
-        args.inter_size = inter_size  # override the inter_size for LLaMA
+        args.inter_size = inter_size  # override the inter_size for InternLM
         args.n_kv_head = n_kv_head
         args.n_embd = n_embd
         args.n_head = n_head
@@ -437,7 +437,7 @@ def parse_arguments():
         args.hidden_act = hidden_act
         args.rms_norm_eps = 1e-06
         logger.warning("Set rms_norm_eps to 1e-06 directly.")
-    assert args.use_gpt_attention_plugin, "LLaMa must use gpt attention plugin"
+    assert args.use_gpt_attention_plugin, "InternLM must use gpt attention plugin"
     if args.n_kv_head is None:
         args.n_kv_head = args.n_head
     elif args.n_kv_head != args.n_head:
@@ -486,7 +486,7 @@ def build_rank_engine(builder: Builder,
         f"num_layers {args.n_layer} must be a multiple of pipeline parallelism size {args.pp_size}"
 
     # Initialize Module
-    tensorrt_llm_llama = tensorrt_llm.models.LLaMAForCausalLM(
+    tensorrt_llm_internlm = tensorrt_llm.models.InternLMForCausalLM(
         num_layers=args.n_layer,
         num_heads=args.n_head,
         num_kv_heads=args.n_kv_head,
@@ -505,26 +505,26 @@ def build_rank_engine(builder: Builder,
         quant_mode=args.quant_mode,
         rms_norm_eps=args.rms_norm_eps)
     if args.use_smooth_quant:
-        tensorrt_llm_llama = smooth_quantize(tensorrt_llm_llama,
+        tensorrt_llm_internlm = smooth_quantize(tensorrt_llm_internlm,
                                              args.quant_mode)
     elif args.use_weight_only:
         if args.weight_only_precision == 'int8':
-            tensorrt_llm_llama = weight_only_quantize(tensorrt_llm_llama,
+            tensorrt_llm_internlm = weight_only_quantize(tensorrt_llm_internlm,
                                                       args.quant_mode)
         elif args.weight_only_precision == 'int4':
-            tensorrt_llm_llama = weight_only_quantize(tensorrt_llm_llama,
+            tensorrt_llm_internlm = weight_only_quantize(tensorrt_llm_internlm,
                                                       args.quant_mode)
         elif args.weight_only_precision == 'int4_awq':
-            tensorrt_llm_llama = weight_only_groupwise_quantize(
-                model=tensorrt_llm_llama,
+            tensorrt_llm_internlm = weight_only_groupwise_quantize(
+                model=tensorrt_llm_internlm,
                 quant_mode=args.quant_mode,
                 group_size=args.group_size,
                 zero=False,
                 pre_quant_scale=True,
                 exclude_modules=[])
         elif args.weight_only_precision == 'int4_gptq':
-            tensorrt_llm_llama = weight_only_groupwise_quantize(
-                model=tensorrt_llm_llama,
+            tensorrt_llm_internlm = weight_only_groupwise_quantize(
+                model=tensorrt_llm_internlm,
                 quant_mode=args.quant_mode,
                 group_size=args.group_size,
                 zero=True,
@@ -535,20 +535,20 @@ def build_rank_engine(builder: Builder,
         quant_scales = get_scaling_factors(args.quantized_fp8_model_path,
                                            num_layers=args.n_layer,
                                            quant_mode=args.quant_mode)
-        tensorrt_llm_llama = fp8_quantize(tensorrt_llm_llama,
+        tensorrt_llm_internlm = fp8_quantize(tensorrt_llm_internlm,
                                           quant_mode=args.quant_mode,
                                           quant_scales=quant_scales)
     if args.per_group:
-        load_func = load_from_awq_llama if args.weight_only_precision == 'int4_awq' else load_from_gptq_llama
-        load_func(tensorrt_llm_llama=tensorrt_llm_llama,
+        load_func = load_from_awq_internlm if args.weight_only_precision == 'int4_awq' else load_from_gptq_internlm
+        load_func(tensorrt_llm_internlm=tensorrt_llm_internlm,
                   quant_ckpt_path=args.quant_ckpt_path,
                   mapping=mapping,
                   dtype=args.dtype)
     elif args.meta_ckpt_dir is not None:
-        load_from_meta_llama(tensorrt_llm_llama, args.meta_ckpt_dir, mapping,
+        load_from_meta_internlm(tensorrt_llm_internlm, args.meta_ckpt_dir, mapping,
                              args.dtype)
     elif args.model_dir is not None:
-        logger.info(f'Loading HF LLaMA ... from {args.model_dir}')
+        logger.info(f'Loading HF InternLM ... from {args.model_dir}')
         tik = time.time()
         hf_llama = LlamaForCausalLM.from_pretrained(
             args.model_dir,
@@ -559,14 +559,14 @@ def build_rank_engine(builder: Builder,
             torch_dtype="auto")
         tok = time.time()
         t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-        logger.info(f'HF LLaMA loaded. Total time: {t}')
-        load_from_hf_llama(tensorrt_llm_llama,
-                           hf_llama,
+        logger.info(f'HF InternLM loaded. Total time: {t}')
+        load_from_hf_internlm(tensorrt_llm_internlm,
+                           hf_internlm,
                            mapping=mapping,
                            dtype=args.dtype)
-        del hf_llama
+        del hf_internlm
     elif args.ft_model_dir is not None:
-        load_from_binary(tensorrt_llm_llama,
+        load_from_binary(tensorrt_llm_internlm,
                          args.ft_model_dir,
                          mapping,
                          fp16=(args.dtype == 'float16'),
@@ -612,18 +612,18 @@ def build_rank_engine(builder: Builder,
 
     with net_guard(network):
         # Prepare
-        network.set_named_parameters(tensorrt_llm_llama.named_parameters())
+        network.set_named_parameters(tensorrt_llm_internlm.named_parameters())
 
         # Forward
-        inputs = tensorrt_llm_llama.prepare_inputs(args.max_batch_size,
+        inputs = tensorrt_llm_internlm.prepare_inputs(args.max_batch_size,
                                                    args.max_input_len,
                                                    args.max_output_len, True,
                                                    args.max_beam_width,
                                                    args.max_num_tokens)
-        tensorrt_llm_llama(*inputs)
+        tensorrt_llm_internlm(*inputs)
         if args.enable_debug_output:
             # mark intermediate nodes' outputs
-            for k, v in tensorrt_llm_llama.named_network_outputs():
+            for k, v in tensorrt_llm_internlm.named_network_outputs():
                 v = v.trt_tensor
                 v.name = k
                 network.trt_network.mark_output(v)
