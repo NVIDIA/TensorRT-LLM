@@ -170,12 +170,12 @@ class TestQuantMode(unittest.TestCase):
         self.assertTrue(qm.is_int8_weight_only())
 
     def test_failure_quant(self):
-        # Expect failure if weights are not qunatized, but activations are.
+        # Expect failure if weights are not quantized, but activations are.
         self.assertRaises(
             ValueError,
             lambda: QuantMode.from_description(False, True, False, False))
 
-        # Expect failure if per token and per channel quantization, but weights and activations are not qunatized.
+        # Expect failure if per token and per channel quantization, but weights and activations are not quantized.
         self.assertRaises(
             ValueError,
             lambda: QuantMode.from_description(False, False, True, True))
