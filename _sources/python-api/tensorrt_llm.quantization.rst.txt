@@ -1,4 +1,4 @@
-Qunatization
+Quantization
 ===========================
 
 .. automodule:: tensorrt_llm
