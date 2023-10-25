@@ -21,7 +21,7 @@ from pathlib import Path
 import tensorrt as trt
 import torch
 import torch.multiprocessing as mp
-from transformers import LlamaConfig, LlamaForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 from weight import (get_scaling_factors, load_from_awq_internlm, load_from_binary,
                     load_from_gptq_internlm, load_from_hf_internlm,
                     load_from_meta_internlm)
@@ -144,7 +144,7 @@ def parse_arguments():
         'The path of to read timing cache from, will be ignored if the file does not exist'
     )
     parser.add_argument('--log_level', type=str, default='info')
-    parser.add_argument('--vocab_size', type=int, default=32000)
+    parser.add_argument('--vocab_size', type=int, default=103168)
     parser.add_argument('--n_layer', type=int, default=32)
     parser.add_argument('--n_positions', type=int, default=2048)
     parser.add_argument('--n_embd', type=int, default=4096)
@@ -399,7 +399,7 @@ def parse_arguments():
     # force use the plugin for now with the correct data type.
     args.use_gpt_attention_plugin = args.dtype
     if args.model_dir is not None:
-        hf_config = LlamaConfig.from_pretrained(args.model_dir)
+        hf_config = AutoConfig.from_pretrained(args.model_dir, trust_remote_code=True)
         args.inter_size = hf_config.intermediate_size  # override the inter_size for InternLM
         args.n_embd = hf_config.hidden_size
         args.n_head = hf_config.num_attention_heads
@@ -550,13 +550,14 @@ def build_rank_engine(builder: Builder,
     elif args.model_dir is not None:
         logger.info(f'Loading HF InternLM ... from {args.model_dir}')
         tik = time.time()
-        hf_llama = LlamaForCausalLM.from_pretrained(
+        hf_internlm = AutoModelForCausalLM.from_pretrained(
             args.model_dir,
             device_map={
                 "model": "cpu",
                 "lm_head": "cpu"
             },  # Load to CPU memory
-            torch_dtype="auto")
+            torch_dtype="auto",
+            trust_remote_code=True)
         tok = time.time()
         t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
         logger.info(f'HF InternLM loaded. Total time: {t}')

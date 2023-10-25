@@ -189,6 +189,7 @@ def load_from_hf_internlm(tensorrt_llm_internlm: tensorrt_llm.models.InternLMFor
     use_weight_only = quant_mode.is_weight_only()
     num_kv_heads = tensorrt_llm_internlm.num_kv_heads
     mha_mode = (num_kv_heads == tensorrt_llm_internlm.num_heads)
+    print(f"mha_mode = {mha_mode}")
 
     model_params = dict(hf_internlm.named_parameters())
     for l in range(hf_internlm.config.num_hidden_layers):
@@ -196,6 +197,9 @@ def load_from_hf_internlm(tensorrt_llm_internlm: tensorrt_llm.models.InternLMFor
         q_weight = model_params[prefix + 'q_proj.weight']
         k_weight = model_params[prefix + 'k_proj.weight']
         v_weight = model_params[prefix + 'v_proj.weight']
+        q_bias = model_params[prefix + 'q_proj.bias']
+        k_bias = model_params[prefix + 'k_proj.bias']
+        v_bias = model_params[prefix + 'v_proj.bias']
         if not mha_mode:
             head_size = tensorrt_llm_internlm.hidden_size // tensorrt_llm_internlm.num_heads
             if num_kv_heads < mapping.tp_size:
@@ -209,8 +213,10 @@ def load_from_hf_internlm(tensorrt_llm_internlm: tensorrt_llm.models.InternLMFor
             qkv_weight = [q_weight, k_weight, v_weight]
         else:
             qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+            qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
 
         model_params[prefix + 'qkv_proj.weight'] = qkv_weight
+        model_params[prefix + 'qkv_proj.bias'] = qkv_bias
 
     torch_dtype = str_dtype_to_torch(dtype)
     layers_per_pipeline_stage = hf_internlm.config.num_hidden_layers // mapping.pp_size
@@ -275,6 +281,32 @@ def load_from_hf_internlm(tensorrt_llm_internlm: tensorrt_llm.models.InternLMFor
                     scales.value = torch_weight_scales.numpy()
                 else:
                     dst.value = np.ascontiguousarray(split_v)
+            elif 'self_attn.qkv_proj.bias' in k:
+                dst = tensorrt_llm_internlm.layers[idx].attention.qkv.bias
+                if not mha_mode:
+                    assert isinstance(v, list) and len(v) == 3
+                    bq = split(v[0], mapping.tp_size, mapping.tp_rank)
+                    bk = split(v[1], mapping.tp_size, mapping.tp_rank)
+                    bv = split(v[2], mapping.tp_size, mapping.tp_rank)
+                    split_v = np.concatenate((bq, bk, bv))
+                else:
+                    q_emb = v.shape[0] // 3
+                    v = v.reshape(3, q_emb)
+                    split_v = split(v, mapping.tp_size, mapping.tp_rank, dim=0)
+                    split_v = split_v.reshape(3 * (q_emb // mapping.tp_size))
+                # if use_weight_only:
+                #     v = np.ascontiguousarray(split_v.transpose())
+                #     processed_torch_weights, torch_weight_scales = \
+                #         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                #         torch.tensor(v), plugin_weight_only_quant_type)
+                #     # workaround for trt not supporting int8 inputs in plugins currently
+                #     dst.value = processed_torch_weights.view(
+                #         dtype=torch.float32).numpy()
+                #     scales = tensorrt_llm_internlm.layers[
+                #         idx].attention.qkv.per_channel_scale
+                #     scales.value = torch_weight_scales.numpy()
+                # else:
+                dst.value = np.ascontiguousarray(split_v)
             elif 'self_attn.o_proj.weight' in k:
                 dst = tensorrt_llm_internlm.layers[idx].attention.dense.weight
                 split_v = split(v, mapping.tp_size, mapping.tp_rank, dim=1)
@@ -291,6 +323,27 @@ def load_from_hf_internlm(tensorrt_llm_internlm: tensorrt_llm.models.InternLMFor
                     scales.value = torch_weight_scales.numpy()
                 else:
                     dst.value = np.ascontiguousarray(split_v)
+            elif 'self_attn.o_proj.bias' in k:
+                dst = tensorrt_llm_internlm.layers[idx].attention.dense.bias
+                if mapping.tp_rank == 0:
+                    split_v = v
+                else:
+                    print(v)
+                    split_v = np.zeros_like(v)
+                    print(split_v)
+                # if use_weight_only:
+                #     v = np.ascontiguousarray(split_v.transpose())
+                #     processed_torch_weights, torch_weight_scales = \
+                #         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                #         torch.tensor(v), plugin_weight_only_quant_type)
+                #     # workaround for trt not supporting int8 inputs in plugins currently
+                #     dst.value = processed_torch_weights.view(
+                #         dtype=torch.float32).numpy()
+                #     scales = tensorrt_llm_internlm.layers[
+                #         idx].attention.dense.per_channel_scale
+                #     scales.value = torch_weight_scales.numpy()
+                # else:
+                dst.value = np.ascontiguousarray(split_v)
             elif 'mlp.up_proj.weight' in k:
                 dst = tensorrt_llm_internlm.layers[idx].mlp.gate.weight
                 split_v = split(v, mapping.tp_size, mapping.tp_rank, dim=0)
