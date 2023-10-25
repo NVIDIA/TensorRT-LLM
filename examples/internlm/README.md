@@ -8,15 +8,15 @@ The TensorRT-LLM InternLM implementation can be found in [tensorrt_llm/models/in
 
  * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the InternLM model,
  * [`run.py`](./run.py) to run the inference on an input text,
- * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
+ <!-- * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model. -->
 
 ## Support Matrix
   * FP16
-  * FP8
+  <!-- * FP8
   * INT8 & INT4 Weight-Only
   * FP8 KV CACHE
   * Tensor Parallel
-  * STRONGLY TYPED
+  * STRONGLY TYPED -->
 
 ## Usage
 
@@ -24,11 +24,11 @@ The TensorRT-LLM InternLM example code locates at [examples/internlm](./). It ta
 
 ### Build TensorRT engine(s)
 
-Need to prepare the HF LLaMA checkpoint first by following the guides here https://huggingface.co/docs/transformers/main/en/model_doc/llama.
+Need to prepare the HF InternLM checkpoint first by following the guides here https://huggingface.co/internlm/internlm-chat-7b (or one of the other repos under https://huggingface.co/internlm).
 
 TensorRT-LLM InternLM builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
 
-Normally `build.py` only requires single GPU, but if you've already got all the GPUs needed while inferencing, you could enable parallelly building to make the engine building process faster by adding `--parallel_build` argument. Please note that currently `parallel_build` feature only supports single node.
+<!-- Normally `build.py` only requires single GPU, but if you've already got all the GPUs needed while inferencing, you could enable parallelly building to make the engine building process faster by adding `--parallel_build` argument. Please note that currently `parallel_build` feature only supports single node. -->
 
 Here're some examples:
 
@@ -57,48 +57,48 @@ python build.py --model_dir ./internlm-chat-7b/ \
                 --output_dir ./internlm-chat-7b/trt_engines/bf16/1-gpu/
 
 # Build the InternLM 7B model using a single GPU and apply INT8 weight-only quantization.
-python build.py --model_dir ./internlm-chat-7b/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --use_weight_only \
-                --output_dir ./internlm-chat-7b/trt_engines/weight_only/1-gpu/
+# python build.py --model_dir ./internlm-chat-7b/ \
+#                 --dtype float16 \
+#                 --remove_input_padding \
+#                 --use_gpt_attention_plugin float16 \
+#                 --enable_context_fmha \
+#                 --use_gemm_plugin float16 \
+#                 --use_weight_only \
+#                 --output_dir ./internlm-chat-7b/trt_engines/weight_only/1-gpu/
 
 # Build InternLM 7B using 2-way tensor parallelism.
-python build.py --model_dir ./internlm-chat-7b/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir ./internlm-chat-7b/trt_engines/fp16/2-gpu/ \
-                --world_size 2 \
-                --tp_size 2
+# python build.py --model_dir ./internlm-chat-7b/ \
+#                 --dtype float16 \
+#                 --remove_input_padding \
+#                 --use_gpt_attention_plugin float16 \
+#                 --enable_context_fmha \
+#                 --use_gemm_plugin float16 \
+#                 --output_dir ./internlm-chat-7b/trt_engines/fp16/2-gpu/ \
+#                 --world_size 2 \
+#                 --tp_size 2
 
 # Build InternLM 7B using 2-way tensor parallelism and 2-way pipeline parallelism.
-python build.py --model_dir ./internlm-chat-7b/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir ./internlm-chat-7b/trt_engines/fp16/2-gpu/ \
-                --world_size 4 \
-                --tp_size 2 \
-                --pp_size 2
+# python build.py --model_dir ./internlm-chat-7b/ \
+#                 --dtype float16 \
+#                 --remove_input_padding \
+#                 --use_gpt_attention_plugin float16 \
+#                 --enable_context_fmha \
+#                 --use_gemm_plugin float16 \
+#                 --output_dir ./internlm-chat-7b/trt_engines/fp16/2-gpu/ \
+#                 --world_size 4 \
+#                 --tp_size 2 \
+#                 --pp_size 2
 
 # Build InternLM 30B using 2-way tensor parallelism.
-python build.py --model_dir ./internlm/30B/hf/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir ./internlm/30B/trt_engines/fp16/2-gpu/ \
-                --world_size 2 \
-                --tp_size 2
+# python build.py --model_dir ./internlm/30B/hf/ \
+#                 --dtype float16 \
+#                 --remove_input_padding \
+#                 --use_gpt_attention_plugin float16 \
+#                 --enable_context_fmha \
+#                 --use_gemm_plugin float16 \
+#                 --output_dir ./internlm/30B/trt_engines/fp16/2-gpu/ \
+#                 --world_size 2 \
+#                 --tp_size 2
 ```
 <!--
 #### InternLM v2 Updates
@@ -150,7 +150,7 @@ python build.py --meta_ckpt_dir ./tmp/internlm/70B \
 
 Same instructions can be applied to fine-tuned versions of the InternLM v2 models (e.g. 7Bf or internlm-2-7b-chat). -->
 
-#### INT8 weight only + INT8 KV cache
+<!-- #### INT8 weight only + INT8 KV cache
 For INT8 KV cache, [`hf_internlm_convert.py`](./hf_internlm_convert.py) features a
 `--calibrate-kv-cache, -kv` option. Setting `-kv` will calibrate the model,
 and then export the scaling factors needed for INT8 KV cache inference.
@@ -334,7 +334,7 @@ To run the GPTQ LLaMa example, the following steps are required:
                     --world_size 2 \
                     --tp_size 2 \
                     --output_dir ./tmp/internlm-chat-7b/trt_engines/int4_GPTQ/2-gpu/
-    ```
+    ``` -->
 
 ### Run
 
@@ -342,16 +342,18 @@ To run a TensorRT-LLM InternLM model using the engines generated by build.py
 
 ```bash
 # With fp16 inference
-python3 run.py --max_output_len=50 \
+python3 run.py --max_output_len=99 \
+               --input_text 'Tell me about yourself.' \
                --tokenizer_dir ./internlm-chat-7b/ \
                --engine_dir=./internlm-chat-7b/trt_engines/fp16/1-gpu/
 
 # With bf16 inference
-python3 run.py --max_output_len=50 \
+python3 run.py --max_output_len=99 \
+               --input_text 'Tell me about yourself.' \
                --tokenizer_dir ./internlm-chat-7b/ \
                --engine_dir=./internlm-chat-7b/trt_engines/bf16/1-gpu/
 ```
-
+<!--
 ### Summarization using the InternLM model
 
 ```bash
@@ -380,9 +382,9 @@ mpirun -n 2 --allow-run-as-root \
                         --hf_model_location ./tmp/internlm/30B/ \
                         --data_type fp16 \
                         --engine_dir ./tmp/internlm/30B/trt_engines/fp16/2-gpu/
-```
+``` -->
 
-## Running CodeLlama
+<!-- ## Running CodeLlama
 Those examples can be used to build and run the CodeLlama models. All 7b, 13b, and 34b sizes and variants are supported.
 
 There are a couple of differences in CodeLlama in comparison to InternLM v1/v2 models: rotary_base (`theta=1000000.0f`) and vocabulary size (`32016` (1)).
@@ -424,4 +426,4 @@ Use the following command to run the 34b engine with long input/output from abov
 mpirun -n 8 --allow-run-as-root \
     python run.py --max_output_len=160 --tokenizer_dir ./CodeLlama-34b-Instruct \
     --engine_dir codeinternlm_34b --input_text "In python, write a function for binary searching an element in an integer array."
-```
+``` -->

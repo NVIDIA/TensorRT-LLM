@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from transformers import LlamaTokenizer
+from transformers import AutoTokenizer
 
 import tensorrt_llm
 from tensorrt_llm.quantization import QuantMode
@@ -88,8 +88,11 @@ def parse_input(input_text: str, input_file: str, tokenizer, end_id: int,
                 remove_input_padding: bool):
     input_tokens = []
     if input_file is None:
+        input_text = f'<s><|User|>:{input_text}<eoh>'
         input_tokens.append(
             tokenizer.encode(input_text, add_special_tokens=False))
+        print(f'Input: \"{input_text}\"')
+        print(f'Input: {input_tokens[0]}')
     else:
         if input_file.endswith('.csv'):
             with open(input_file, 'r') as csv_file:
@@ -134,6 +137,7 @@ def print_output(output_ids, input_lengths, max_output_len, tokenizer,
                 output_end = input_lengths[b] + max_output_len
                 outputs = output_ids[b][beam][output_begin:output_end].tolist()
                 output_text = tokenizer.decode(outputs)
+                print(f'Output ids: {outputs}')
                 print(f'Output: \"{output_text}\"')
 
     output_ids = output_ids.reshape((-1, output_ids.size(2)))
@@ -164,7 +168,7 @@ def parse_arguments():
                         help="Directory containing the tokenizer.model.")
     parser.add_argument('--input_text',
                         type=str,
-                        default='Born in north-east France, Soyer trained as a')
+                        default='Tell me about yourself.')
     parser.add_argument(
         '--input_tokens',
         dest='input_file',
@@ -196,7 +200,7 @@ def generate(
     max_output_len: int,
     log_level: str = 'error',
     engine_dir: str = 'internlm_outputs',
-    input_text: str = 'Born in north-east France, Soyer trained as a',
+    input_text: str = 'Tell me about yourself.',
     input_file: str = None,
     output_csv: str = None,
     output_npy: str = None,
@@ -219,7 +223,7 @@ def generate(
                                            pp_size=pp_size)
     torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
 
-    tokenizer = LlamaTokenizer.from_pretrained(tokenizer_dir, legacy=False)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, legacy=False, trust_remote_code=True)
 
     sampling_config = SamplingConfig(end_id=EOS_TOKEN,
                                      pad_id=PAD_TOKEN,

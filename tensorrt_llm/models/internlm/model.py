@@ -70,7 +70,7 @@ class InternLMDecoderLayer(Module):
             max_position_embeddings,
             dtype=dtype,
             attention_mask_type=AttentionMaskType.causal,
-            bias=False,
+            bias=True,
             position_embedding_type=position_embedding_type,
             rotary_embedding_base=rotary_base,
             rotary_embedding_scaling=rotary_scaling,

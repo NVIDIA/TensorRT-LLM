@@ -22,6 +22,7 @@ from .gpt.model import GPTLMHeadModel, GPTModel
 from .gptj.model import GPTJForCausalLM, GPTJModel
 from .gptneox.model import GPTNeoXForCausalLM, GPTNeoXModel
 from .llama.model import LLaMAForCausalLM, LLaMAModel
+from .internlm.model import InternLMForCausalLM, InternLMModel
 from .opt.model import OPTLMHeadModel, OPTModel
 from .quantized.quant import (fp8_quantize, smooth_quantize,
                               weight_only_groupwise_quantize,
@@ -53,4 +54,6 @@ __all__ = [
     'ChatGLM2_6BHeadModel',
     'ChatGLM2_6BModel',
     'BaichuanForCausalLM',
+    'InternLMForCausalLM',
+    'InternLMModel'
 ]
