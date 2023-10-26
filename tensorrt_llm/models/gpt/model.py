@@ -112,7 +112,7 @@ class GPTDecoderLayer(Module):
                  rotary_embedding_percentage=1.0,
                  inter_size=None,
                  bias=True,
-                 multi_query_mode=False,
+                 num_kv_heads=None,
                  tp_group=None,
                  tp_size=1,
                  tp_rank=0,
@@ -135,7 +135,7 @@ class GPTDecoderLayer(Module):
         self.attention = Attention(
             hidden_size,
             num_attention_heads,
-            1 if multi_query_mode else num_attention_heads,
+            num_kv_heads,
             max_position_embeddings,
             num_layers,
             apply_query_key_layer_scaling,
@@ -221,7 +221,7 @@ class GPTModel(Module):
                  inter_size=None,
                  bias=True,
                  quant_mode=QuantMode(0),
-                 multi_query_mode=False,
+                 num_kv_heads=None,
                  use_prompt_tuning=False,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0):
@@ -255,7 +255,7 @@ class GPTModel(Module):
                 hidden_act=hidden_act,
                 position_embedding_type=position_embedding_type,
                 rotary_embedding_percentage=rotary_embedding_percentage,
-                multi_query_mode=multi_query_mode,
+                num_kv_heads=num_kv_heads,
                 tp_group=mapping.tp_group,
                 tp_size=mapping.tp_size,
                 tp_rank=mapping.tp_rank,
@@ -339,7 +339,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                  inter_size=None,
                  bias=True,
                  quant_mode=QuantMode(0),
-                 multi_query_mode=False,
+                 num_kv_heads=None,
                  use_prompt_tuning=False,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
@@ -376,13 +376,13 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
         self._hidden_size = hidden_size
         self._vocab_size = vocab_size
         self._tp_size = mapping.tp_size
-        self._multi_query_mode = multi_query_mode
+        self._num_kv_heads = num_kv_heads if num_kv_heads else num_heads
 
         super().__init__(num_layers, num_heads, hidden_size, vocab_size,
                          hidden_act, max_position_embeddings, dtype, mapping,
                          apply_query_key_layer_scaling, position_embedding_type,
                          rotary_embedding_percentage, inter_size, bias,
-                         quant_mode, multi_query_mode, use_prompt_tuning,
+                         quant_mode, num_kv_heads, use_prompt_tuning,
                          use_parallel_embedding, embedding_sharding_dim)
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
 
@@ -454,7 +454,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
 
         # Prepare inputs
         head_size = self._hidden_size // self._num_heads
-        num_heads_kv = 1 if self._multi_query_mode else self._num_heads
+        num_heads_kv = self._num_kv_heads
         remove_input_padding = default_net().plugin_config.remove_input_padding
         use_gpt_attention_plugin = default_net(
         ).plugin_config.gpt_attention_plugin

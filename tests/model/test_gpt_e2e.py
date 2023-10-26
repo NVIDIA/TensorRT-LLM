@@ -143,8 +143,7 @@ def check_accuracy(engine_dir, input_tokens, max_output_len):
     hidden_size = config['builder_config']['hidden_size'] // world_size
     vocab_size = config['builder_config']['vocab_size']
     num_layers = config['builder_config']['num_layers']
-    multi_query_mode = config['builder_config']['multi_query_mode']
-    num_kv_heads = 1 if multi_query_mode else num_heads
+    num_kv_heads = config['builder_config']['num_kv_heads']
 
     runtime_rank = tensorrt_llm.mpi_rank()
     runtime_mapping = tensorrt_llm.Mapping(world_size,

@@ -62,9 +62,14 @@ def parse_ft_config(ini_file):
     if inter_size is None:
         inter_size = 4 * n_embd
 
+    n_kv_head = gpt_config.getint('gpt', 'n_kv_head', fallback=None)
     multi_query_mode = gpt_config.getboolean('gpt',
                                              'multi_query_mode',
                                              fallback=False)
+    assert not (multi_query_mode and n_kv_head and n_kv_head != 1), \
+        "if multi_query_mode is enabled, n_kv_head must be 1 or unset"
+    if multi_query_mode:
+        n_kv_head = 1
     prompt_num_tasks = gpt_config.getint('gpt', 'prompt_num_tasks', fallback=0)
     prompt_max_vocab_size = gpt_config.getint('gpt',
                                               'prompt_max_vocab_size',
@@ -72,7 +77,7 @@ def parse_ft_config(ini_file):
     pos_embedding_type = gpt_config.get('gpt',
                                         'position_embedding_type',
                                         fallback='alibi')
-    return n_embd, n_head, n_layer, n_positions, vocab_size, do_layer_norm_before, hidden_act, rotary_pct, bias, inter_size, multi_query_mode, dtype, prompt_num_tasks, prompt_max_vocab_size, pos_embedding_type
+    return n_embd, n_head, n_layer, n_positions, vocab_size, do_layer_norm_before, hidden_act, rotary_pct, bias, inter_size, n_kv_head, dtype, prompt_num_tasks, prompt_max_vocab_size, pos_embedding_type
 
 
 def check_embedding_share(dir_path):
@@ -100,7 +105,7 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
         plugin_weight_only_quant_type = torch.int8
     elif quant_mode.is_int4_weight_only():
         plugin_weight_only_quant_type = torch.quint4x2
-    n_embd, n_head, n_layer, n_positions, vocab_size, do_layer_norm_before, hidden_act, rotary_pct, bias, inter_size, multi_query_mode, *_ = parse_ft_config(
+    n_embd, n_head, n_layer, n_positions, vocab_size, do_layer_norm_before, hidden_act, rotary_pct, bias, inter_size, n_kv_head, *_ = parse_ft_config(
         Path(dir_path) / 'config.ini')
     np_dtype = str_dtype_to_np(dtype)
 
@@ -220,10 +225,17 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
             split(lm_head_weight, tensor_parallel, rank))
     fake_fp8_sf_dt = np.float32
     for i in range(n_layer):
-        c_attn_out_dim = (3 * n_embd //
-                          tensor_parallel) if not multi_query_mode else (
-                              n_embd // tensor_parallel +
-                              (n_embd // n_head) * 2)
+        head_dim = n_embd // n_head
+        if n_kv_head == 1:
+            # multi-query attention.
+            c_attn_out_dim = (n_embd // tensor_parallel) + (head_dim * 2)
+        elif n_kv_head:
+            # grouped-query attention.
+            c_attn_out_dim = (n_embd // tensor_parallel +
+                (head_dim * n_kv_head * 2) // tensor_parallel)
+        else:
+            # multi-head attention.
+            c_attn_out_dim = 3 * n_embd // tensor_parallel
         tensorrt_llm_gpt.layers[i].input_layernorm.weight.value = (fromfile(
             dir_path, 'model.layers.' + str(i) + '.input_layernorm.weight.bin'))
         tensorrt_llm_gpt.layers[i].input_layernorm.bias.value = (fromfile(
@@ -420,139 +432,6 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
             tensorrt_llm_gpt.layers[
                 i].mlp.proj.weights_scaling_factor.value = np.array(
                     [scaling_factors['proj_weights'][i]], dtype=fake_fp8_sf_dt)
-
-    tok = time.time()
-    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-    tensorrt_llm.logger.info(f'Weights loaded. Total time: {t}')
-
-
-def load_from_hf_gpt(tensorrt_llm_gpt: GPTLMHeadModel,
-                     hf_gpt,
-                     rank=0,
-                     tensor_parallel=1,
-                     dtype='float32',
-                     multi_query_mode=False):
-    tensorrt_llm.logger.info('Loading weights from HF GPT...')
-    tik = time.time()
-
-    valid_lm_head_weight = False
-    hidden_size = tensorrt_llm_gpt._hidden_size
-    head_size = tensorrt_llm_gpt._num_heads // hidden_size
-    for k, v in hf_gpt.state_dict().items():
-        torch_dtype = str_dtype_to_torch(dtype)
-        v = v.to(torch_dtype).cpu().numpy()
-        if 'wte.weight' in k:
-            tensorrt_llm_gpt.embedding.vocab_embedding.weight.value = v
-        elif 'wpe.weight' in k:
-            tensorrt_llm_gpt.embedding.position_embedding.weight.value = v
-        elif 'ln_f.weight' in k:
-            tensorrt_llm_gpt.ln_f.weight.value = v
-        elif 'ln_f.bias' in k:
-            tensorrt_llm_gpt.ln_f.bias.value = v
-        elif 'lm_head.weight' in k:
-            tensorrt_llm_gpt.lm_head.weight.value = np.ascontiguousarray(
-                split(v, tensor_parallel, rank))
-            valid_lm_head_weight = True
-        else:
-            layer_idx = extract_layer_idx(k)
-            if layer_idx is None:
-                continue
-            idx = int(layer_idx)
-            if 'ln_1.weight' in k:
-                tensorrt_llm_gpt.layers[idx].input_layernorm.weight.value = v
-            elif 'ln_1.bias' in k:
-                tensorrt_llm_gpt.layers[idx].input_layernorm.bias.value = v
-            elif 'attn.c_attn.weight' in k:
-                if multi_query_mode:
-                    # HF-StarCoder uses torch.nn.Linear
-                    w_qkv = v.reshape(hidden_size + 2 * head_size, 3,
-                                      hidden_size)
-                    w_q, w_kv = np.split(w_qkv, [hidden_size, 2 * head_size])
-                    w_q = split(w_q, tensor_parallel, rank)
-                    dst = tensorrt_llm_gpt.layers[idx].attention.qkv.weight
-                    dst.value = np.ascontiguousarray(np.concatenate(w_q, w_kv))
-                else:
-                    # HF-GPT uses Conv1D instead of Linear
-                    v = v.transpose()
-                    dst = tensorrt_llm_gpt.layers[idx].attention.qkv.weight
-                    dst.value = np.ascontiguousarray(
-                        split(v, tensor_parallel, rank))
-            elif 'attn.c_attn.bias' in k:
-                if multi_query_mode:
-                    v.reshape(hidden_size + 2 * head_size, 3)
-                    bias_q, bias_kv = np.split(w_qkv,
-                                               [hidden_size, 2 * head_size])
-                    bias_q = split(bias_q, tensor_parallel, rank)
-                    dst = tensorrt_llm_gpt.layers[idx].attention.qkv.bias
-                    dst.value = np.ascontiguousarray(
-                        np.concatenate(bias_q, bias_kv))
-                else:
-                    dst = tensorrt_llm_gpt.layers[idx].attention.qkv.bias
-                    dst.value = np.ascontiguousarray(
-                        split(v, tensor_parallel, rank))
-            elif 'attn.q_attn.weight' in k:
-                # Get the corresponding kv_atten.weight:
-                # ex: transformer.h.23.attn.kv_attn.weight
-                u = hf_gpt.state_dict()[k.replace('q_attn', 'kv_attn')]
-                u = u.to(torch_dtype).cpu().numpy(force=True)
-                # HF-SantaCoder uses transformer.Conv1D so we transpose to match shape
-                # In addition, kv_head must be broadcasted to all ranks so split is not applied
-                v = split(v.transpose(), tensor_parallel, rank)  # W_q
-                u = u.transpose()  # W_kv
-                dst = tensorrt_llm_gpt.layers[idx].attention.qkv.weight
-                dst.value = np.ascontiguousarray(np.concatenate((v, u)))
-            elif 'attn.q_attn.bias' in k:
-                # Get the corresponding kv_atten.bias:
-                # ex: transformer.h.23.attn.kv_attn.bias
-                u = hf_gpt.state_dict()[k.replace('q_attn', 'kv_attn')]
-                u = u.to(torch_dtype).cpu().numpy(force=True)
-                v = split(v, tensor_parallel, rank)
-                dst = tensorrt_llm_gpt.layers[idx].attention.qkv.bias
-                dst.value = np.ascontiguousarray(np.concatenate((v, u)))
-            elif 'attn.c_proj.weight' in k:
-                v = v.transpose()
-                dst = tensorrt_llm_gpt.layers[idx].attention.dense.weight
-                dst.value = np.ascontiguousarray(
-                    split(v, tensor_parallel, rank, dim=1))
-            elif 'attn.c_proj.bias' in k:
-                dst = tensorrt_llm_gpt.layers[idx].attention.dense.bias
-                dst.value = v
-            elif 'ln_2.weight' in k:
-                dst = tensorrt_llm_gpt.layers[idx].post_layernorm.weight
-                dst.value = v
-            elif 'ln_2.bias' in k:
-                dst = tensorrt_llm_gpt.layers[idx].post_layernorm.bias
-                dst.value = v
-            elif 'mlp.c_fc.weight' in k:
-                v = v.transpose()
-                tensorrt_llm_gpt.layers[
-                    idx].mlp.fc.weight.value = np.ascontiguousarray(
-                        split(v, tensor_parallel, rank))
-            elif 'mlp.c_fc.bias' in k:
-                tensorrt_llm_gpt.layers[
-                    idx].mlp.fc.bias.value = np.ascontiguousarray(
-                        split(v, tensor_parallel, rank))
-            elif 'mlp.c_proj.weight' in k:
-                v = v.transpose()
-                tensorrt_llm_gpt.layers[
-                    idx].mlp.proj.weight.value = np.ascontiguousarray(
-                        split(v, tensor_parallel, rank, dim=1))
-            elif 'mlp.c_proj.bias' in k:
-                tensorrt_llm_gpt.layers[idx].mlp.proj.bias.value = v
-
-    if not valid_lm_head_weight:
-        # Use wte as lm_head weight to match the load_from_ft implementation.
-        lm_head_weight = tensorrt_llm_gpt.embedding.vocab_embedding.weight._value
-        vocab_size = hf_gpt.config.vocab_size
-        if vocab_size % tensor_parallel != 0:
-            # padding
-            vocab_size_padded = tensorrt_llm_gpt.lm_head.out_features * tensor_parallel
-            pad_width = vocab_size_padded - vocab_size
-            lm_head_weight = np.pad(lm_head_weight, ((0, pad_width), (0, 0)),
-                                    'constant',
-                                    constant_values=0)
-        tensorrt_llm_gpt.lm_head.weight.value = np.ascontiguousarray(
-            split(lm_head_weight, tensor_parallel, rank))
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
