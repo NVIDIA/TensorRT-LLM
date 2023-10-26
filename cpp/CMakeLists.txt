@@ -335,6 +335,6 @@ set_property(
   TARGET tensorrt_llm_batch_manager
   PROPERTY
     IMPORTED_LOCATION
-    "tensorrt_llm/batch_manager/x86_64-linux-gnu/libtensorrt_llm_bitch_manager_static.a>"
+    "tensorrt_llm/batch_manager/x86_64-linux-gnu/libtensorrt_llm_batch_manager_static.a"
 )
 target_link_libraries(pygptmanager PRIVATE pybind11:headers tensorrt_llm_batch_manager)
