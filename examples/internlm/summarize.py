@@ -20,7 +20,7 @@ import os
 import numpy as np
 import torch
 from datasets import load_dataset, load_metric
-from transformers import AutoModelForCausalLM, LlamaTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
@@ -30,7 +30,7 @@ from tensorrt_llm.quantization import QuantMode
 from build import get_engine_name  # isort:skip
 
 
-def TRTLLaMA(args, config):
+def TRTInternLM(args, config):
     dtype = config['builder_config']['precision']
     tp_size = config['builder_config']['tensor_parallel']
     pp_size = config['builder_config']['pipeline_parallel']
@@ -81,7 +81,7 @@ def TRTLLaMA(args, config):
                                            pp_size=pp_size)
     torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
 
-    engine_name = get_engine_name('llama', dtype, tp_size, pp_size,
+    engine_name = get_engine_name('internlm', dtype, tp_size, pp_size,
                                   runtime_rank)
     serialize_path = os.path.join(args.engine_dir, engine_name)
 
@@ -108,9 +108,10 @@ def main(args):
     test_trt_llm = args.test_trt_llm
     hf_model_location = args.hf_model_location
     profiler.start('load tokenizer')
-    tokenizer = LlamaTokenizer.from_pretrained(hf_model_location,
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_location,
                                                legacy=False,
-                                               padding_side='left')
+                                               padding_side='left',
+                                               trust_remote_code=True)
     profiler.stop('load tokenizer')
     tensorrt_llm.logger.info(
         f'Load tokenizer takes: {profiler.elapsed_time_in_sec("load tokenizer")} sec'
@@ -141,7 +142,7 @@ def main(args):
         with open(config_path, 'r') as f:
             config = json.load(f)
 
-        tensorrt_llm_llama = TRTLLaMA(args, config)
+        tensorrt_llm_internlm = TRTInternLM(args, config)
 
     if test_hf:
         profiler.start('load HF model')
@@ -175,7 +176,7 @@ def main(args):
 
         # do padding, should move outside the profiling to prevent the overhead
         max_length = max(input_lengths)
-        if tensorrt_llm_llama.remove_input_padding:
+        if tensorrt_llm_internlm.remove_input_padding:
             line_encoded = [
                 torch.tensor(t, dtype=torch.int32).cuda() for t in line_encoded
             ]
@@ -197,16 +198,16 @@ def main(args):
             end_id=end_id, pad_id=pad_id, top_k=top_k, num_beams=num_beams)
 
         with torch.no_grad():
-            tensorrt_llm_llama.setup(batch_size,
+            tensorrt_llm_internlm.setup(batch_size,
                                      max_context_length=max_length,
                                      max_new_tokens=output_len,
                                      beam_width=num_beams)
 
-            if tensorrt_llm_llama.remove_input_padding:
-                output_ids = tensorrt_llm_llama.decode_batch(
+            if tensorrt_llm_internlm.remove_input_padding:
+                output_ids = tensorrt_llm_internlm.decode_batch(
                     line_encoded, sampling_config)
             else:
-                output_ids = tensorrt_llm_llama.decode(
+                output_ids = tensorrt_llm_internlm.decode(
                     line_encoded,
                     input_lengths,
                     sampling_config,
@@ -215,7 +216,7 @@ def main(args):
             torch.cuda.synchronize()
 
         # Extract a list of tensors of shape beam_width x output_ids.
-        if tensorrt_llm_llama.mapping.is_first_pp_rank():
+        if tensorrt_llm_internlm.mapping.is_first_pp_rank():
             output_beams_list = [
                 tokenizer.batch_decode(output_ids[batch_idx, :,
                                                   input_lengths[batch_idx]:],
@@ -382,7 +383,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--hf_model_location',
                         type=str,
-                        default='/workspace/models/llama-models/llama-7b-hf')
+                        default='/workspace/models/internlm-models/internlm-7b-hf')
     parser.add_argument('--test_hf', action='store_true')
     parser.add_argument('--test_trt_llm', action='store_true')
     parser.add_argument('--data_type',
@@ -391,7 +392,7 @@ if __name__ == '__main__':
                         default='fp16')
     parser.add_argument('--dataset_path', type=str, default='')
     parser.add_argument('--log_level', type=str, default='info')
-    parser.add_argument('--engine_dir', type=str, default='llama_outputs')
+    parser.add_argument('--engine_dir', type=str, default='internlm_outputs')
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--max_ite', type=int, default=20)
     parser.add_argument('--check_accuracy', action='store_true')
