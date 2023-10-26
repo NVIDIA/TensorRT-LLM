@@ -146,7 +146,7 @@ def main(args):
 
     if test_hf:
         profiler.start('load HF model')
-        model = AutoModelForCausalLM.from_pretrained(hf_model_location)
+        model = AutoModelForCausalLM.from_pretrained(hf_model_location, trust_remote_code=True)
         profiler.stop('load HF model')
         tensorrt_llm.logger.info(
             f'Load HF model takes: {profiler.elapsed_time_in_sec("load HF model")} sec'
@@ -178,7 +178,7 @@ def main(args):
         max_length = max(input_lengths)
         if tensorrt_llm_internlm.remove_input_padding:
             line_encoded = [
-                torch.tensor(t, dtype=torch.int32).cuda() for t in line_encoded
+                torch.as_tensor(t, dtype=torch.int32, device='cuda') for t in line_encoded
             ]
         else:
             # do padding, should move outside the profiling to prevent the overhead
@@ -383,7 +383,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--hf_model_location',
                         type=str,
-                        default='/workspace/models/internlm-models/internlm-7b-hf')
+                        default='internlm-7b-hf')
     parser.add_argument('--test_hf', action='store_true')
     parser.add_argument('--test_trt_llm', action='store_true')
     parser.add_argument('--data_type',
