@@ -292,7 +292,7 @@ def load_from_hf_internlm(tensorrt_llm_internlm: tensorrt_llm.models.InternLMFor
                 else:
                     q_emb = v.shape[0] // 3
                     v = v.reshape(3, q_emb)
-                    split_v = split(v, mapping.tp_size, mapping.tp_rank, dim=0)
+                    split_v = split(v, mapping.tp_size, mapping.tp_rank, dim=1)
                     split_v = split_v.reshape(3 * (q_emb // mapping.tp_size))
                 # if use_weight_only:
                 #     v = np.ascontiguousarray(split_v.transpose())
