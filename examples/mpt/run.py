@@ -39,10 +39,9 @@ def read_config(config_path: Path):
     hidden_size = config['builder_config']['hidden_size'] // world_size
     vocab_size = config['builder_config']['vocab_size']
     num_layers = config['builder_config']['num_layers']
-    multi_query_mode = config['builder_config']['multi_query_mode']
+    num_kv_heads = config['builder_config'].get('num_kv_heads', num_heads)
     paged_kv_cache = config['plugin_config']['paged_kv_cache']
     tokens_per_block = config['plugin_config']['tokens_per_block']
-    num_kv_heads = 1 if multi_query_mode else num_heads
     dtype = config['builder_config']['precision']
 
     model_config = ModelConfig(num_heads=num_heads,

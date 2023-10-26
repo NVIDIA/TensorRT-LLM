@@ -12,13 +12,14 @@ Support for float16, float32 and bfloat16 conversion. Just change `data_type` fl
   * INT8 & INT4 Weight-Only
   * FP8 KV CACHE
   * Tensor Parallel
+  * MHA, MQA & GQA
   * STRONGLY TYPED
 
 #### MPT 7B
 
 ### 1. Convert weights from HF Transformers to FT format
 
-The [`hf_gpt_convert.py`](./convert_hf_mpt_to_ft.py) script allows you to convert weights from HF Transformers format to FT format.
+The [`convert_hf_mpt_to_ft.py`](./convert_hf_mpt_to_ft.py) script allows you to convert weights from HF Transformers format to FT format.
 
 ```bash
 python convert_hf_mpt_to_ft.py -i mosaicml/mpt-7b -o ./ft_ckpts/mpt-7b/fp16/ -t float16
