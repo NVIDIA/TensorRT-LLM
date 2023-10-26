@@ -24,6 +24,7 @@ import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.layers import PositionEmbeddingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models import (fp8_quantize, smooth_quantize,
                                  weight_only_quantize)
 from tensorrt_llm.network import net_guard
@@ -50,6 +51,9 @@ class GPTBenchmark(BaseBenchmark):
                  max_output_len=None,
                  max_batch_size=None,
                  enable_custom_all_reduce=None,
+                 paged_kv_cached=None,
+                 tokens_per_block=None,
+                 use_inflight_batching=None,
                  **kwargs):
         super().__init__(engine_dir, model_name, dtype, output_dir)
         self.batch_sizes = batch_sizes
@@ -94,6 +98,9 @@ class GPTBenchmark(BaseBenchmark):
             self.enable_context_fmha = True
             self.quant_mode = QuantMode(0)
             self.remove_input_padding = is_plugin_mode
+            self.paged_kv_cache = paged_kv_cached
+            self.tokens_per_block = tokens_per_block
+            self.use_inflight_batching = use_inflight_batching
 
             for key, value in get_build_config(model_name).items():
                 setattr(self, key, value)
@@ -124,6 +131,20 @@ class GPTBenchmark(BaseBenchmark):
             if kwargs.get('force_num_layer_1', False):
                 self.num_layers = 1
 
+            if self.use_inflight_batching:
+                if not self.use_gpt_attention_plugin:
+                    self.use_gpt_attention_plugin = 'float16'
+                    logger.info(
+                        f"Using GPT attention plugin for inflight batching mode. Setting to default '{self.use_gpt_attention_plugin}'"
+                    )
+                if not self.remove_input_padding:
+                    self.remove_input_padding = True
+                    logger.info(
+                        "Using remove input padding for inflight batching mode.")
+                if not self.paged_kv_cache:
+                    self.paged_kv_cache = True
+                    logger.info("Using paged KV cache for inflight batching mode.")
+
             if self.use_smooth_quant:
                 self.quant_mode = QuantMode.use_smooth_quant(
                     self.per_token, self.per_channel)
@@ -153,6 +174,9 @@ class GPTBenchmark(BaseBenchmark):
             remove_input_padding=self.remove_input_padding,
             quant_mode=self.quant_mode,
             use_custom_all_reduce=self.enable_custom_all_reduce,
+            paged_kv_cache=self.paged_kv_cache,
+            tokens_per_block=self.tokens_per_block,
+            dtype=self.dtype,
         )
         if model_name == 'chatglm_6b':
             self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
@@ -204,6 +228,8 @@ class GPTBenchmark(BaseBenchmark):
 
     def build(self):
         builder = Builder()
+        int8_trt_flag = self.quant_mode.has_act_and_weight_quant() or (
+            not self.paged_kv_cache and self.quant_mode.has_int8_kv_cache())
         builder_config = builder.create_builder_config(
             name=self.model_name,
             precision=self.dtype,
@@ -221,7 +247,7 @@ class GPTBenchmark(BaseBenchmark):
             max_batch_size=self.max_batch_size,
             max_input_len=self.max_input_len,
             max_output_len=self.max_output_len,
-            int8=self.quant_mode.has_act_and_weight_quant(),
+            int8=int8_trt_flag,
             fp8=self.quant_mode.has_fp8_qdq(),
             quant_mode=self.quant_mode,
             use_refit=self.refit,
@@ -388,6 +414,8 @@ class GPTBenchmark(BaseBenchmark):
             network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
         if self.remove_input_padding:
             network.plugin_config.enable_remove_input_padding()
+        if self.paged_kv_cache:
+            network.plugin_config.enable_paged_kv_cache(self.tokens_per_block)
 
         # Quantization plugins.
         if self.use_smooth_quant:

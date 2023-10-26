@@ -182,6 +182,22 @@ def parse_arguments():
         help=
         'By default, we use dtype for KV cache. fp8_kv_cache chooses fp8 quantization for KV'
     )
+    parser.add_argument(
+        '--use_inflight_batching',
+        action="store_true",
+        default=False,
+        help="Activates inflight batching mode of gptAttentionPlugin.")
+    parser.add_argument(
+        '--paged_kv_cache',
+        action="store_true",
+        default=False,
+        help=
+        'By default we use contiguous KV cache. By setting this flag you enable paged KV cache'
+    )
+    parser.add_argument('--tokens_per_block',
+                        type=int,
+                        default=16,
+                        help='Number of tokens per block in paged KV cache')
     parser.add_argument('--csv',
                         default=False,
                         action="store_true",
@@ -236,7 +252,10 @@ def main(args):
             enable_fp8=args.enable_fp8,
             fp8_kv_cache=args.fp8_kv_cache,
             enable_cuda_graph=args.enable_cuda_graph,
-            enable_custom_all_reduce=args.enable_custom_all_reduce)
+            enable_custom_all_reduce=args.enable_custom_all_reduce,
+            paged_kv_cached=args.paged_kv_cache,
+            tokens_per_block=args.tokens_per_block,
+            use_inflight_batching=args.use_inflight_batching)
     elif args.model in get_allowed_models(benchmark_type="bert"):
         benchmarker = BERTBenchmark(args.engine_dir,
                                     args.model,
