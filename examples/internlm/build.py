@@ -410,7 +410,9 @@ def parse_arguments():
         args.vocab_size = hf_config.vocab_size
         args.hidden_act = hf_config.hidden_act
         args.rms_norm_eps = hf_config.rms_norm_eps
+        args.attn_bias = hf_config.bias
     elif args.meta_ckpt_dir is not None:
+        # Not tested
         with open(Path(args.meta_ckpt_dir, "params.json")) as fp:
             meta_config: dict = json.load(fp)
         args.n_embd = meta_config["dim"]
@@ -425,6 +427,7 @@ def parse_arguments():
             args.multiple_of)
         args.rms_norm_eps = meta_config["norm_eps"]
     elif args.ft_model_dir is not None:
+        # Not tested
         n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, n_kv_head = parse_ft_config(
             Path(args.ft_model_dir) / "config.ini")
         args.inter_size = inter_size  # override the inter_size for InternLM
@@ -493,6 +496,7 @@ def build_rank_engine(builder: Builder,
         hidden_size=args.n_embd,
         vocab_size=args.vocab_size,
         hidden_act=args.hidden_act,
+        attn_bias=args.attn_bias,
         max_position_embeddings=args.n_positions,
         dtype=dtype,
         mlp_hidden_size=args.inter_size,
