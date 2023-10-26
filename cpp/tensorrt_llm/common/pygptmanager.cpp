@@ -8,14 +8,16 @@ PYBIND11_MODULE(pygptmanager, m)
     m.doc() = "Python bindings for GptManager";
 
     py::class_<tensorrt_llm::batch_manager::GptManager>(m, "GptManager")
-        .def(py::init<const std::filesystem::path&, tensorrt_llm::batch_manager::TrtGptModelType, int32_t, int32_t,
-                 int32_t, tensorrt_llm::batch_manager::GetInferenceRequestsCallback,
-                 tensorrt_llm::batch_manager::SendResponseCallback,
-                 tensorrt_llm::batch_manager::PollStopSignalCallback>(),
-            py::arg("trtEnginePath"), py::arg("modelType"), py::arg("maxSeqLen"), py::arg("maxNumRequests"),
-            py::arg("maxBeamWidth"), py::arg("getInferenceRequestsCb"), py::arg("sendResponseCb"),
-            py::arg("pollStopSignalCb") = nullptr)
+        .def(py::init<const std::filesystem::path&, tensorrt_llm::batch_manager::TrtGptModelType, int32_t,
+                 tensorrt_llm::batch_manager::batch_scheduler::SchedulerPolicy,
+                 tensorrt_llm::batch_manager::GetInferenceRequestsCallback,
+                 tensorrt_llm::batch_manager::SendResponseCallback, tensorrt_llm::batch_manager::PollStopSignalCallback,
+                 tensorrt_llm::batch_manager::ReturnBatchManagerStatsCallback>(),
+            py::arg("trtEnginePath"), py::arg("modelType"), py::arg("maxBeamWidth"), py::arg("schedulerPolicy"),
+            py::arg("getInferenceRequestsCb"), py::arg("sendResponseCb"), py::arg("pollStopSignalCb") = nullptr,
+            py::arg("returnBatchManagerStatsCb") = nullptr)
         .def("fetchNewRequests", &tensorrt_llm::batch_manager::GptManager::fetchNewRequests)
-        .def("return_completed_requests", &tensorrt_llm::batch_manager::GptManager::return_completed_requests)
-        .def("pollStopSignals", &tensorrt_llm::batch_manager::GptManager::pollStopSignals);
+        .def("returnCompletedRequests", &tensorrt_llm::batch_manager::GptManager::returnCompletedRequests)
+        .def("pollStopSignals", &tensorrt_llm::batch_manager::GptManager::pollStopSignals)
+        .def("returnBatchManagerStats", &tensorrt_llm::batch_manager::GptManager::returnBatchManagerStats);
 }

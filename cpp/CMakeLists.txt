@@ -327,7 +327,7 @@ if(BUILD_BENCHMARKS)
                    ${CMAKE_BINARY_DIR}/benchmarks)
 endif()
 
-pybind11_add_module(pygptmanager include/tensorrt_llm/batch_manager/pygptmanager.cpp)
+pybind11_add_module(pygptmanager tensorrt_llm/common/pygptmanager.cpp)
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
 add_library(tensorrt_llm_batch_manager STATIC IMPORTED)
