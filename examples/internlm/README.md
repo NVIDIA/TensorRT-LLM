@@ -70,7 +70,7 @@ python build.py --model_dir ./internlm-chat-7b/ \
                 --use_weight_only \
                 --output_dir ./internlm-chat-7b/trt_engines/weight_only/1-gpu/
 
-# Note: setting `--weight_only_precision` to use other quantization precisions
+# Note: setting `--weight_only_precision int4` to use INT4 weight-only quantization
 
 # Build InternLM 7B using 2-way tensor parallelism.
 python build.py --model_dir ./internlm-chat-7b/ \
@@ -82,18 +82,6 @@ python build.py --model_dir ./internlm-chat-7b/ \
                 --output_dir ./internlm-chat-7b/trt_engines/fp16/2-gpu/ \
                 --world_size 2 \
                 --tp_size 2 \
-                --parallel_build
-
-# Build InternLM 20B using 4-way tensor parallelism
-python build.py --model_dir ./internlm-chat-20b/ \
-                --dtype bfloat16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin bfloat16 \
-                --enable_context_fmha \
-                --use_gemm_plugin bfloat16 \
-                --output_dir ./internlm-chat-20b/trt_engines/bf16/2-gpu/ \
-                --world_size 4 \
-                --tp_size 4 \
                 --parallel_build
 
 # Build InternLM 20B using 2-way tensor parallelism and 2-way pipeline parallelism.
@@ -111,8 +99,7 @@ python build.py --model_dir ./internlm-chat-20b/ \
 ```
 
 #### INT8 weight only + INT8 KV cache
-TODO
-<!--
+
 For INT8 KV cache, [`hf_internlm_convert.py`](./hf_internlm_convert.py) features a
 `--calibrate-kv-cache, -kv` option. Setting `-kv` will calibrate the model,
 and then export the scaling factors needed for INT8 KV cache inference.
@@ -121,7 +108,10 @@ and then export the scaling factors needed for INT8 KV cache inference.
 Example:
 
 ```bash
-python3 hf_internlm_convert.py -i /internlm-models/internlm-7b-hf -o /internlm/smooth_internlm_7B/int8_kv_cache/ --calibrate-kv-cache -t fp16
+# For 7B models
+python hf_internlm_convert.py -i ./internlm-chat-7b -o ./internlm-chat-7b/smooth_internlm_7b/int8_kv_cache/ --calibrate-kv-cache -t fp16
+# For 20B models
+python hf_internlm_convert.py -i ./internlm-chat-20b -o ./internlm-chat-20b/smooth_internlm_20b/int8_kv_cache/ --calibrate-kv-cache -t fp16
 ```
 
 [`build.py`](./build.py) add new options for the support of INT8 KV cache.
@@ -133,25 +123,50 @@ In addition, it could be combined with INT8 weight-only quantization, as follows
 Examples of INT8 weight-only quantization + INT8 KV cache
 
 ```bash
-# Build model with both INT8 weight-only and INT8 KV cache enabled
-python build.py --ft_model_dir=/internlm/smooth_internlm_7B/int8_kv_cache/1-gpu/ \
+# Build 7B model with both INT8 weight-only and INT8 KV cache enabled
+python build.py --ft_model_dir=./internlm-chat-7b/smooth_internlm_7b/int8_kv_cache/1-gpu/ \
                 --dtype float16 \
                 --use_gpt_attention_plugin float16 \
                 --use_gemm_plugin float16 \
-                --output_dir ./tmp/internlm-chat-7b/trt_engines/int8_kv_cache_weight_only/1-gpu \
+                --output_dir ./internlm-chat-7b/trt_engines/int8_kv_cache_weight_only/1-gpu \
+                --int8_kv_cache \
+                --use_weight_only
+
+# Build 20B model with both INT8 weight-only and INT8 KV cache enabled
+python build.py --ft_model_dir=./internlm-chat-20b/smooth_internlm_20b/int8_kv_cache/1-gpu/ \
+                --dtype float16 \
+                --use_gpt_attention_plugin float16 \
+                --use_gemm_plugin float16 \
+                --output_dir ./internlm-chat-20b/trt_engines/int8_kv_cache_weight_only/1-gpu \
                 --int8_kv_cache \
                 --use_weight_only
 ```
 
-Test with `summarize.py`:
+Test with `run.py` or `summarize.py`:
 
 ```bash
-python summarize.py --test_trt_llm \
-                    --hf_model_location /internlm-models/internlm-7b-hf \
+python run.py --max_output_len=120 \
+              --input_text 'Tell me about yourself.' \
+              --tokenizer_dir ./internlm-chat-7b/ \
+              --engine_dir ./internlm-chat-7b/trt_engines/int8_kv_cache_weight_only/1-gpu
+
+python run.py --max_output_len=120 \
+              --input_text 'Tell me about yourself.' \
+              --tokenizer_dir ./internlm-chat-20b/ \
+              --engine_dir ./internlm-chat-20b/trt_engines/int8_kv_cache_weight_only/1-gpu
+
+python summarize.py --test_trt_llm --test_hf \
+                    --hf_model_location ./internlm-chat-7b \
                     --data_type fp16 \
-                    --engine_dir ./tmp/internlm-chat-7b/trt_engines/int8_kv_cache_weight_only/1-gpu \
-                    --test_hf
-```-->
+                    --engine_dir ./internlm-chat-7b/trt_engines/int8_kv_cache_weight_only/1-gpu
+
+python summarize.py --test_trt_llm --test_hf \
+                    --hf_model_location ./internlm-chat-20b \
+                    --data_type fp16 \
+                    --engine_dir ./internlm-chat-20b/trt_engines/int8_kv_cache_weight_only/1-gpu
+```
+
+TODO: The result of 7B is not good, probably some error lies at qkv bias part.
 
 #### SmoothQuant
 TODO
