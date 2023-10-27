@@ -109,9 +109,9 @@ def main(args):
     hf_model_location = args.hf_model_location
     profiler.start('load tokenizer')
     tokenizer = AutoTokenizer.from_pretrained(hf_model_location,
-                                               legacy=False,
-                                               padding_side='left',
-                                               trust_remote_code=True)
+                                              legacy=False,
+                                              padding_side='left',
+                                              trust_remote_code=True)
     profiler.stop('load tokenizer')
     tensorrt_llm.logger.info(
         f'Load tokenizer takes: {profiler.elapsed_time_in_sec("load tokenizer")} sec'
@@ -146,13 +146,19 @@ def main(args):
 
     if test_hf:
         profiler.start('load HF model')
-        model = AutoModelForCausalLM.from_pretrained(hf_model_location, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(hf_model_location,
+                                                     trust_remote_code=True)
         profiler.stop('load HF model')
         tensorrt_llm.logger.info(
             f'Load HF model takes: {profiler.elapsed_time_in_sec("load HF model")} sec'
         )
         if args.data_type == 'fp16':
             model.half()
+        elif args.data_type == 'fp32':
+            model = model.float()
+        elif args.data_type == 'bf16':
+            model = model.to(dtype=torch.bfloat16)
+        # else use dtype in hf config, which is by default
         model.cuda()
 
     def summarize_tensorrt_llm(datapoint):
@@ -178,7 +184,8 @@ def main(args):
         max_length = max(input_lengths)
         if tensorrt_llm_internlm.remove_input_padding:
             line_encoded = [
-                torch.as_tensor(t, dtype=torch.int32, device='cuda') for t in line_encoded
+                torch.as_tensor(t, dtype=torch.int32, device='cuda')
+                for t in line_encoded
             ]
         else:
             # do padding, should move outside the profiling to prevent the overhead
@@ -199,9 +206,9 @@ def main(args):
 
         with torch.no_grad():
             tensorrt_llm_internlm.setup(batch_size,
-                                     max_context_length=max_length,
-                                     max_new_tokens=output_len,
-                                     beam_width=num_beams)
+                                        max_context_length=max_length,
+                                        max_new_tokens=output_len,
+                                        beam_width=num_beams)
 
             if tensorrt_llm_internlm.remove_input_padding:
                 output_ids = tensorrt_llm_internlm.decode_batch(
@@ -301,8 +308,8 @@ def main(args):
 
     ite_count = 0
     data_point_idx = 0
-    while (data_point_idx < len(dataset_cnn['test'])) and (ite_count <
-                                                           args.max_ite):
+    while (data_point_idx < len(dataset_cnn['test'])) and (ite_count
+                                                           < args.max_ite):
         if runtime_rank == 0:
             logger.debug(
                 f"run data_point {data_point_idx} ~ {data_point_idx + max_batch_size}"
@@ -388,8 +395,8 @@ if __name__ == '__main__':
     parser.add_argument('--test_trt_llm', action='store_true')
     parser.add_argument('--data_type',
                         type=str,
-                        choices=['fp32', 'fp16'],
-                        default='fp16')
+                        choices=['fp32', 'fp16', 'bf16'],
+                        default='auto')
     parser.add_argument('--dataset_path', type=str, default='')
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument('--engine_dir', type=str, default='internlm_outputs')
