@@ -593,6 +593,7 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
     def fromfile(dir_path, name, shape=None, dtype=None):
         dtype = np_dtype if dtype is None else dtype
         p = dir_path + '/' + name
+        print(p)
         if Path(p).exists():
             t = np.fromfile(p, dtype=dtype)
             if shape is not None:
@@ -719,7 +720,7 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
             dst = tensorrt_llm_internlm.layers[idx].attention.qkv.bias
             t = fromfile(
                 dir_path, 'model.layers.' + str(i) +
-                '.attention.query_key_value.bias.' + suffix)
+                f'.attention.query_key_value.bias.{mapping.tp_rank}.bin')
             dst.value = np.ascontiguousarray(t)
 
         t = fromfile(

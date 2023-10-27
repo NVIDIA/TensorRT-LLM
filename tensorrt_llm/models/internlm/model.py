@@ -289,6 +289,7 @@ class InternLMForCausalLM(InternLMModel, GenerationMixin):
             num_kv_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.hidden_size = hidden_size
+        self.attn_bias = attn_bias
         self.vocab_size = vocab_size
         self.tp_size = mapping.tp_size
 

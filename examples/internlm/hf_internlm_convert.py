@@ -325,8 +325,8 @@ if __name__ == "__main__":
         "--processes",
         "-p",
         type=int,
-        help="How many processes to spawn for conversion (default: 4)",
-        default=4)
+        help="How many processes to spawn for conversion (default: 8)",
+        default=8)
     parser.add_argument(
         "--calibrate-kv-cache",
         "-kv",

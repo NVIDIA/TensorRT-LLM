@@ -18,7 +18,7 @@ import numpy as np
 
 from ...layers import ColumnLinear, RowLinear
 from ...models import (BloomForCausalLM, FalconForCausalLM, GPTJForCausalLM,
-                       GPTLMHeadModel, LLaMAForCausalLM)
+                       GPTLMHeadModel, LLaMAForCausalLM, InternLMForCausalLM)
 from ...quantization import QuantMode
 from ...quantization.layers import FP8Linear, FP8RowLinear
 
@@ -160,9 +160,54 @@ def _smooth_quantize_bloom(model, quant_mode):
     return model
 
 
+def _smooth_quantize_internlm(model, quant_mode):
+    assert quant_mode.has_act_and_weight_quant()
+    for layer in model.layers:
+        assert hasattr(layer,
+                       "input_layernorm"), "The layer has no input_layernorm"
+        layer.input_layernorm = SmoothQuantRmsNorm(
+            normalized_shape=layer.hidden_size,
+            dtype=layer.dtype,
+            quant_mode=quant_mode)
+        assert hasattr(layer, "attention"), "The layer has no attention"
+        layer.attention = SmoothQuantAttention(
+            layer.hidden_size,
+            num_attention_heads=layer.num_attention_heads,
+            num_kv_heads=layer.num_kv_heads,
+            max_position_embeddings=layer.max_position_embeddings,
+            num_layers=model.num_layers,
+            dtype=layer.dtype,
+            attention_mask_type=layer.attention_mask_type,
+            position_embedding_type=layer.position_embedding_type,
+            tp_group=layer.tp_group,
+            tp_size=layer.tp_size,
+            quant_mode=quant_mode,
+            bias=model.attn_bias)
+
+        assert hasattr(layer, "mlp"), "The layer has no mlp"
+        layer.mlp = SmoothQuantGatedMLP(hidden_size=model.hidden_size,
+                                        ffn_hidden_size=layer.mlp_hidden_size,
+                                        hidden_act=layer.hidden_act,
+                                        dtype=layer.dtype,
+                                        tp_group=layer.tp_group,
+                                        tp_size=layer.tp_size,
+                                        quant_mode=quant_mode,
+                                        bias=False)
+        assert hasattr(
+            layer,
+            "post_layernorm"), "The layer has no post_rmspost_layernormnorm"
+        layer.post_layernorm = SmoothQuantRmsNorm(
+            normalized_shape=layer.hidden_size,
+            dtype=layer.dtype,
+            quant_mode=quant_mode)
+
+    setattr(model, 'quant_mode', quant_mode)
+    return model
+
+
 def smooth_quantize(model, quant_mode):
     assert isinstance(model, GPTLMHeadModel) or isinstance(model, LLaMAForCausalLM) \
-            or isinstance(model, BloomForCausalLM),\
+            or isinstance(model, BloomForCausalLM) or isinstance(model, InternLMForCausalLM), \
             "Only GPTLMHeadModel, LLaMAForCausalLM and BloomForCausalLM are well tested now"
     if isinstance(model, GPTLMHeadModel):
         return _smooth_quantize_gpt(model, quant_mode)
@@ -170,6 +215,8 @@ def smooth_quantize(model, quant_mode):
         return _smooth_quantize_llama(model, quant_mode)
     elif isinstance(model, BloomForCausalLM):
         return _smooth_quantize_bloom(model, quant_mode)
+    elif isinstance(model, InternLMForCausalLM):
+        return _smooth_quantize_internlm(model, quant_mode)
     else:
         assert False, f"Model {type(model).__name__} is not supported by SmoothQuant yet"
 
