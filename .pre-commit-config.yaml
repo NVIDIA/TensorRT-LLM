@@ -40,3 +40,10 @@ repos:
     rev: v0.6.10
     hooks:
     -   id: cmake-format
+-   repo: https://github.com/codespell-project/codespell
+    rev: v2.2.4
+    hooks:
+    -   id: codespell
+        args:
+        - --skip=".git,3rdparty"
+        - --ignore-words-list=rouge,inout,atleast,strat

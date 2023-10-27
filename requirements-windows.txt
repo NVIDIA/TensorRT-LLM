@@ -6,7 +6,7 @@ torchvision==0.16.0.dev20230828
 torchdata==0.7.0.dev20230828
 torchtext==0.16.0.dev20230828
 tokenizers==0.13.3
-transformers==4.31.0
+transformers==4.33.1
 diffusers==0.15.0
 accelerate==0.20.3
 colored

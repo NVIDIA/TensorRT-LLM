@@ -36,6 +36,7 @@ To build the engines from the top-level directory:
 PYTHONPATH=examples/gpt:$PYTHONPATH python3 cpp/tests/resources/scripts/build_gpt_engines.py
 PYTHONPATH=examples/gptj:$PYTHONPATH python3 cpp/tests/resources/scripts/build_gptj_engines.py
 PYTHONPATH=examples/llama:$PYTHONPATH python3 cpp/tests/resources/scripts/build_llama_engines.py
+PYTHONPATH=examples/CHATGLM6B:$PYTHONPATH python3 cpp/tests/resources/scripts/build_chatglm6b_engines.py
 ```
 
 It is possible to build engines with tensor and pipeline parallelism for LLaMA using 4 GPUs.
@@ -52,7 +53,8 @@ End-to-end tests read inputs and expected outputs from Numpy files located at [c
 PYTHONPATH=examples/gpt:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_gpt_output.py
 PYTHONPATH=examples/gptj:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_gptj_output.py
 PYTHONPATH=examples/llama:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_llama_output.py
-PYTHONPATH=examples/CHATGLM6B:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_CHATGLM6B_output.py
+PYTHONPATH=examples/chatglm6b:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_chatglm6b_output.py
+PYTHONPATH=examples/chatglm2-6b:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_chatglm2-6b_output.py
 ```
 
 ### Generate data with tensor and pipeline parallelism

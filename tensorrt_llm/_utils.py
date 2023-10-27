@@ -25,10 +25,6 @@ import torch
 
 from .logger import logger
 
-fp32_array = partial(np.array, dtype=np.float32)
-fp16_array = partial(np.array, dtype=np.float16)
-int32_array = partial(np.array, dtype=np.int32)
-
 # numpy doesn't know bfloat16, define abstract binary type instead
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
 
@@ -37,6 +33,17 @@ def torch_to_numpy(x):
     if x.dtype != torch.bfloat16:
         return x.numpy()
     return x.view(torch.int16).numpy().view(np_bfloat16)
+
+
+fp32_array = partial(np.array, dtype=np.float32)
+fp16_array = partial(np.array, dtype=np.float16)
+int32_array = partial(np.array, dtype=np.int32)
+
+
+def bf16_array(x):
+    x = torch.tensor(x, dtype=torch.bfloat16)
+    x = torch_to_numpy(x)
+    return x
 
 
 def trt_version():

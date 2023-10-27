@@ -117,6 +117,7 @@ private:
     inline static const std::string kPresencePenaltyTensorName_ = "presence_penalty";
     inline static const std::string kRandomSeedTensorName_ = "random_seed";
     inline static const std::string kOutputIdsTensorName_ = "output_ids";
+    inline static const std::string kSequenceLengthTensorName_ = "sequence_length";
 
     std::shared_ptr<nvinfer1::ILogger> mLogger{};
 };

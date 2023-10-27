@@ -178,7 +178,7 @@ public:
     }
 
     // NOTE: assume that heads_interleaved = false (b, s, 3, h, d), and sequences are padded/non-padded
-    // TMA descriptors are used as grid_constant parameters (remove MemCpyH2D operaitons)
+    // TMA descriptors are used as grid_constant parameters (remove MemCpyH2D operations)
     void set_tma_descriptors()
     {
         // split D into multiple groups in order to match the TMA swizzle mode (128B)

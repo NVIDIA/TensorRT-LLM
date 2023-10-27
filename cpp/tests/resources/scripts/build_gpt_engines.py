@@ -41,7 +41,7 @@ def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, world_size, *args):
         '--builder_opt=0',
         f'--world_size={world_size}',
     ] + list(args)
-    print("Runnning: " + " ".join(args))
+    print("Running: " + " ".join(args))
     _egb.run_build(args)
 
 

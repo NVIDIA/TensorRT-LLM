@@ -779,7 +779,7 @@ class TestFunctional(unittest.TestCase):
                 host_request_types = torch.tensor([0] * batch_size,
                                                   dtype=torch.int32)
                 if paged_kv_cache:
-                    # Reassemble pointer array to have KV cache for bs context invokations instead of batch_beam
+                    # Reassemble pointer array to have KV cache for bs context invocations instead of batch_beam
                     pointer_array = pointer_array[:, 0, :, :]
                     pointer_array = pointer_array.reshape(
                         batch_size, 1, 2, max_blocks_per_seq)

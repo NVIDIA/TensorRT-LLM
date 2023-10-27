@@ -34,9 +34,9 @@ def split(v, tp_size, idx, dim=0):
     if tp_size == 1:
         return v
     if len(v.shape) == 1:
-        return np.ascontiguousarray(np.split(v, tp_size)[idx])
+        return np.ascontiguousarray(np.split(v, tp_size)[idx].copy())
     else:
-        return np.ascontiguousarray(np.split(v, tp_size, axis=dim)[idx])
+        return np.ascontiguousarray(np.split(v, tp_size, axis=dim)[idx].copy())
 
 
 def load_from_hf_baichuan(tensorrt_llm_baichuan,
@@ -101,9 +101,7 @@ def load_from_hf_baichuan(tensorrt_llm_baichuan,
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    # workaround for trt not supporting int8 inputs in plugins currently
-                    dst.value = processed_torch_weights.view(
-                        dtype=torch.float32).numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_baichuan.layers[
                         idx].attention.qkv.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -116,9 +114,7 @@ def load_from_hf_baichuan(tensorrt_llm_baichuan,
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    # workaround for trt not supporting int8 inputs in plugins currently
-                    dst.value = processed_torch_weights.view(
-                        dtype=torch.float32).numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_baichuan.layers[
                         idx].attention.dense.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -131,9 +127,7 @@ def load_from_hf_baichuan(tensorrt_llm_baichuan,
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    # workaround for trt not supporting int8 inputs in plugins currently
-                    dst.value = processed_torch_weights.view(
-                        dtype=torch.float32).numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_baichuan.layers[
                         idx].mlp.gate.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -146,9 +140,7 @@ def load_from_hf_baichuan(tensorrt_llm_baichuan,
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    # workaround for trt not supporting int8 inputs in plugins currently
-                    dst.value = processed_torch_weights.view(
-                        dtype=torch.float32).numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_baichuan.layers[
                         idx].mlp.proj.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -161,9 +153,7 @@ def load_from_hf_baichuan(tensorrt_llm_baichuan,
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    # workaround for trt not supporting int8 inputs in plugins currently
-                    dst.value = processed_torch_weights.view(
-                        dtype=torch.float32).numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_baichuan.layers[
                         idx].mlp.fc.per_channel_scale
                     scales.value = torch_weight_scales.numpy()

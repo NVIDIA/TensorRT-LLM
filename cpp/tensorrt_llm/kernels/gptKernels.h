@@ -30,7 +30,7 @@ enum class AttentionMaskType
     PADDING = 0,
     // Mask the padded tokens and all the tokens that come after in a sequence.
     CAUSAL = 1,
-    // See ChatGLM mask.
+    // See ChatGLM-6B mask.
     BIDIRECTIONAL = 2
 };
 

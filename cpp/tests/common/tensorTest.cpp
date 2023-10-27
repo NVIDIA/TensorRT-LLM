@@ -137,7 +137,7 @@ TEST(TensorMapTest, GetTensorCorrectness)
 
     delete[] default_val;
     delete[] t2_val;
-    delete[] t1_val;
+    delete t1_val;
 }
 
 TEST(TensorMapTest, GetTensorCorrectnessAtConstTensorMap)
@@ -159,7 +159,7 @@ TEST(TensorMapTest, GetTensorCorrectnessAtConstTensorMap)
 
     delete[] default_val;
     delete[] t2_val;
-    delete[] t1_val;
+    delete t1_val;
 }
 
 TEST(TensorTest, EmptyTensorMinMaxRaiseError)

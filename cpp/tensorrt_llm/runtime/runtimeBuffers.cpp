@@ -683,7 +683,6 @@ std::vector<SizeType> RuntimeBuffers::getPositionIdsContextPhaseGlm(
     SizeType batchSize, SizeType maxInputLength, SizeType const* pInputLengths, bool useGptAttentionPlugin)
 {
     TLLM_CHECK(pInputLengths != nullptr);
-    TLLM_CHECK_WITH_INFO(useGptAttentionPlugin, "GptAttentionPlugin must be used");
 
     auto const size = batchSize * 2 * maxInputLength;
     std::vector<SizeType> positionIdsVec(size, 0);
@@ -705,7 +704,6 @@ std::vector<SizeType> RuntimeBuffers::getPositionIdsGenerationPhaseGlm(
     SizeType batchSize, SizeType beamSize, SizeType step, SizeType const* pInputLengths, bool useGptAttentionPlugin)
 {
     TLLM_CHECK(pInputLengths != nullptr);
-    TLLM_CHECK_WITH_INFO(useGptAttentionPlugin, "GptAttentionPlugin must be used");
 
     auto const size = batchSize * beamSize * 2;
     std::vector<SizeType> positionIdsVec(size, 0);

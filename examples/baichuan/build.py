@@ -441,7 +441,7 @@ def build(rank, args):
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,
-            int8=args.quant_mode.has_act_and_weight_quant())
+            int8=args.quant_mode.has_act_or_weight_quant())
         engine_name = get_engine_name(model_name, args.dtype, args.world_size,
                                       cur_rank)
         engine = build_rank_engine(builder, builder_config, engine_name,

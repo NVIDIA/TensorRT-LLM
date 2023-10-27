@@ -14,7 +14,7 @@ described in the benchmarks [folder](../../benchmarks/).
 
 ## High Throughput
 
-The below tables provide reference data at large batch sizes, representating
+The below tables provide reference data at large batch sizes, representing
 high throughput tasks.
 
 ### H100 GPUs (FP8)
@@ -83,7 +83,7 @@ high throughput tasks.
 ## Low Latency
 
 The below tables provide reference data at batch size 1 for first token
-latency, representating end-user's percieved latency for online streaming
+latency, representing end-user's perceived latency for online streaming
 tasks.
 
 ### H100 GPUs (FP8)

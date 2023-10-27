@@ -140,9 +140,9 @@ def split(v, tp_size, idx, dim=0):
     if tp_size == 1:
         return v
     if len(v.shape) == 1:
-        return np.ascontiguousarray(np.split(v, tp_size)[idx])
+        return np.ascontiguousarray(np.split(v, tp_size)[idx].copy())
     else:
-        return np.ascontiguousarray(np.split(v, tp_size, axis=dim)[idx])
+        return np.ascontiguousarray(np.split(v, tp_size, axis=dim)[idx].copy())
 
 
 def dup_kv_weight(v, num_head, tp_size):
@@ -267,9 +267,7 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    # workaround for trt not supporting int8 inputs in plugins currently
-                    dst.value = processed_torch_weights.view(
-                        dtype=torch.float32).numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_llama.layers[
                         idx].attention.qkv.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -283,9 +281,7 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    # workaround for trt not supporting int8 inputs in plugins currently
-                    dst.value = processed_torch_weights.view(
-                        dtype=torch.float32).numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_llama.layers[
                         idx].attention.dense.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -299,9 +295,7 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    # workaround for trt not supporting int8 inputs in plugins currently
-                    dst.value = processed_torch_weights.view(
-                        dtype=torch.float32).numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_llama.layers[
                         idx].mlp.gate.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -315,9 +309,7 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    # workaround for trt not supporting int8 inputs in plugins currently
-                    dst.value = processed_torch_weights.view(
-                        dtype=torch.float32).numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_llama.layers[
                         idx].mlp.proj.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -331,9 +323,7 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    # workaround for trt not supporting int8 inputs in plugins currently
-                    dst.value = processed_torch_weights.view(
-                        dtype=torch.float32).numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_llama.layers[
                         idx].mlp.fc.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -627,9 +617,6 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
     # Int8 KV cache
     use_int8_kv_cache = quant_mode.has_int8_kv_cache()
 
-    def sq_trick(x):
-        return x.view(np.float32) if use_smooth_quant else x
-
     # Debug
     suffix = gen_suffix(mapping.tp_rank, use_smooth_quant, quant_per_channel)
     # The type of weights.
@@ -677,8 +664,7 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
         if t is not None:
             dst = tensorrt_llm_llama.layers[idx].attention.qkv.weight
             if use_smooth_quant:
-                dst.value = sq_trick(
-                    np.ascontiguousarray(np.transpose(t, [1, 0])))
+                dst.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
                 set_smoothquant_scale_factors(
                     tensorrt_llm_llama.layers[idx].attention.qkv,
                     tensorrt_llm_llama.layers[idx].input_layernorm.scale_to_int,
@@ -692,9 +678,7 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
             elif use_weight_only:
                 processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                     torch.tensor(t), plugin_weight_only_quant_type)
-                # workaround for trt not supporting int8 inputs in plugins currently
-                dst.value = processed_torch_weights.view(
-                    dtype=torch.float32).numpy()
+                dst.value = processed_torch_weights.numpy()
                 scales = tensorrt_llm_llama.layers[
                     i].attention.qkv.per_channel_scale
                 scales.value = torch_weight_scales.numpy()
@@ -707,7 +691,7 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
             'model.layers.' + str(i) + '.attention.dense.weight.' + suffix,
             [n_embd // mapping.tp_size, n_embd], w_type)
         if use_smooth_quant:
-            dst.value = sq_trick(np.ascontiguousarray(np.transpose(t, [1, 0])))
+            dst.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
             dense_scale = getattr(tensorrt_llm_llama.layers[idx].attention,
                                   "quantization_scaling_factor", None)
             set_smoothquant_scale_factors(
@@ -721,9 +705,7 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
         elif use_weight_only:
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            # workaround for trt not supporting int8 inputs in plugins currently
-            dst.value = processed_torch_weights.view(
-                dtype=torch.float32).numpy()
+            dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_llama.layers[
                 i].attention.dense.per_channel_scale
             scales.value = torch_weight_scales.numpy()
@@ -739,8 +721,9 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
                      [n_embd, inter_size // mapping.tp_size], w_type)
 
         if use_smooth_quant:
-            tensorrt_llm_llama.layers[idx].mlp.fc.weight.value = sq_trick(
-                np.ascontiguousarray(np.transpose(t, [1, 0])))
+            tensorrt_llm_llama.layers[
+                idx].mlp.fc.weight.value = np.ascontiguousarray(
+                    np.transpose(t, [1, 0]))
             set_smoothquant_scale_factors(
                 tensorrt_llm_llama.layers[idx].mlp.fc,
                 tensorrt_llm_llama.layers[idx].post_layernorm.scale_to_int,
@@ -754,9 +737,7 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
             dst = tensorrt_llm_llama.layers[i].mlp.fc.weight
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            # workaround for trt not supporting int8 inputs in plugins currently
-            dst.value = processed_torch_weights.view(
-                dtype=torch.float32).numpy()
+            dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_llama.layers[i].mlp.fc.per_channel_scale
             scales.value = torch_weight_scales.numpy()
         else:
@@ -768,8 +749,9 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
                      'model.layers.' + str(i) + '.mlp.gate.weight.' + suffix,
                      [n_embd, inter_size // mapping.tp_size], w_type)
         if use_smooth_quant:
-            tensorrt_llm_llama.layers[idx].mlp.gate.weight.value = sq_trick(
-                np.ascontiguousarray(np.transpose(t, [1, 0])))
+            tensorrt_llm_llama.layers[
+                idx].mlp.gate.weight.value = np.ascontiguousarray(
+                    np.transpose(t, [1, 0]))
             set_smoothquant_scale_factors(
                 tensorrt_llm_llama.layers[idx].mlp.gate,
                 tensorrt_llm_llama.layers[idx].post_layernorm.scale_to_int,
@@ -783,9 +765,7 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
             dst = tensorrt_llm_llama.layers[i].mlp.gate.weight
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            # workaround for trt not supporting int8 inputs in plugins currently
-            dst.value = processed_torch_weights.view(
-                dtype=torch.float32).numpy()
+            dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_llama.layers[i].mlp.gate.per_channel_scale
             scales.value = torch_weight_scales.numpy()
         else:
@@ -797,8 +777,9 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
                      'model.layers.' + str(i) + '.mlp.proj.weight.' + suffix,
                      [inter_size // mapping.tp_size, n_embd], w_type)
         if use_smooth_quant:
-            tensorrt_llm_llama.layers[idx].mlp.proj.weight.value = sq_trick(
-                np.ascontiguousarray(np.transpose(t, [1, 0])))
+            tensorrt_llm_llama.layers[
+                idx].mlp.proj.weight.value = np.ascontiguousarray(
+                    np.transpose(t, [1, 0]))
             proj_scale = getattr(tensorrt_llm_llama.layers[idx].mlp,
                                  "quantization_scaling_factor", None)
             set_smoothquant_scale_factors(
@@ -812,9 +793,7 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
             dst = tensorrt_llm_llama.layers[i].mlp.proj.weight
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            # workaround for trt not supporting int8 inputs in plugins currently
-            dst.value = processed_torch_weights.view(
-                dtype=torch.float32).numpy()
+            dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_llama.layers[i].mlp.proj.per_channel_scale
             scales.value = torch_weight_scales.numpy()
         else:
@@ -885,7 +864,7 @@ def load_from_gptq_llama(tensorrt_llm_llama,
         qweight_unpacked_int8 = unpack_int32_into_int8(
             qweight_int32.T).T.contiguous() - 8
         qweight_interleaved = preprocessor(packer(qweight_unpacked_int8),
-                                           torch.quint4x2).view(torch.float32)
+                                           torch.quint4x2).view(torch.int8)
         # zeros = zeros * scales
         qzeros_unpacked_int32 = unpack_int32_into_int8(qzeros_int32)
         zeros_x_scales_fp16 = (-qzeros_unpacked_int32 + 8 * UINT4_TO_INT4_FLAG -
@@ -920,16 +899,13 @@ def load_from_gptq_llama(tensorrt_llm_llama,
             q_part = model_params[prefix + 'q_proj.' + suf].cpu()
             k_part = model_params[prefix + 'k_proj.' + suf].cpu()
             v_part = model_params[prefix + 'v_proj.' + suf].cpu()
-            qkv_part = torch.cat([q_part, k_part, v_part], dim=0)
-            dim = qkv_part.shape
-            qkv_part = qkv_part.reshape(3, dim[0] // 3, dim[1])
-            split_qkv = qkv_part.split(dim[1] // mapping.tp_size,
-                                       dim=2)[mapping.tp_rank]
-            split_qkv = torch.cat([
-                split_qkv[0, :, :].squeeze(0), split_qkv[1, :, :].squeeze(0),
-                split_qkv[2, :, :].squeeze(0)
-            ],
-                                  dim=1)
+            q_part = q_part.split(q_part.shape[1] // mapping.tp_size,
+                                  dim=1)[mapping.tp_rank]
+            k_part = k_part.split(k_part.shape[1] // mapping.tp_size,
+                                  dim=1)[mapping.tp_rank]
+            v_part = v_part.split(v_part.shape[1] // mapping.tp_size,
+                                  dim=1)[mapping.tp_rank]
+            split_qkv = torch.cat([q_part, k_part, v_part], dim=1)
             split_qkv_suf.append(split_qkv)
 
         th_qweight, th_zero, th_scale = preprocess_groupwise_weight_params(
@@ -1088,7 +1064,7 @@ def load_from_awq_llama(tensorrt_llm_llama: LLaMAForCausalLM,
         qweight_int8 = torch.clamp(torch.round(weight.cuda()).char(), -8, 7)
         int4_weight = packer(qweight_int8.cpu())
         int4_weight = preprocessor(int4_weight, torch.quint4x2)
-        return int4_weight.view(torch.float32).cpu().numpy()
+        return int4_weight.view(torch.int8).cpu().numpy()
 
     def process_and_assign_weight(awq_llama, mPrefix, mOp, tp_dim=0):
         weight = awq_llama[mPrefix + ".weight"].T.contiguous()

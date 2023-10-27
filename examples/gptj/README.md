@@ -135,7 +135,7 @@ Note `--enable_context_fmha` / `--enable_context_fmha_fp32_acc` has to be used t
 One can enable FP8 for KV cache to reduce memory footprint used by KV cache and improve the accuracy over INT8 KV cache. There are 3 options need to be added to the invocation of `build.py` for that:
 
 - `--enable_fp8` enables FP8 GEMMs in the network.
-- `--fp8_kv_cache` to enable FP8 accurancy for KV cache.
+- `--fp8_kv_cache` to enable FP8 accuracy for KV cache.
 - `--quantized_fp8_model_path` to provide path to the quantized model calibrated for FP8. For more details see [quantization docs](../quantization/README.md).
 
 #### AWQ INT4 weight only quantization

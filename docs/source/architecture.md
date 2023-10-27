@@ -271,7 +271,7 @@ entire network and synchronizes with its sibblings when needed. The Pipeline
 Parallelism distributes the different layers to the GPUs. Each GPU runs a
 subset of the entire model and communications happen at the boundary of those
 subsets of layers. Tensor Parallelism usually leads to more balanced executions
-but requires more memory bandwdith between the GPUs. Pipeline Parallelism
+but requires more memory bandwidth between the GPUs. Pipeline Parallelism
 reduces the need for high-bandwidth communication but may incur load-balancing
 issues and may be less efficient in terms of GPU utilization.
 

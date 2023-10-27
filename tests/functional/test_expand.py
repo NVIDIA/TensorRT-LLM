@@ -110,3 +110,40 @@ class TestFunctional(unittest.TestCase):
 
         # compare diff
         np.testing.assert_allclose(ref.cpu().numpy(), outputs['output'])
+
+    def test_expand_3(self):
+        # test data
+        dtype = 'float32'
+        hidden_dim = 10
+        input_shape = (1, hidden_dim)
+        batch_size = 8
+        input_data = torch.rand(
+            input_shape, dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
+
+        # construct trt network
+        builder = tensorrt_llm.Builder()
+        net = builder.create_network()
+        with tensorrt_llm.net_guard(net):
+            network = tensorrt_llm.default_trtnet()
+            input = Tensor(name='input',
+                           shape=input_shape,
+                           dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+            input_length = tensorrt_llm.functional.constant(
+                np.array([0] * batch_size, dtype=np.int32))
+            expand_shape = tensorrt_llm.functional.concat(
+                [tensorrt_llm.functional.shape(input_length, 0), hidden_dim])
+            output = tensorrt_llm.functional.expand(input,
+                                                    expand_shape).trt_tensor
+            output.name = 'output'
+            network.mark_output(output)
+            output.dtype = tensorrt_llm.str_dtype_to_trt(dtype)
+
+        # trt run
+        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
+        with TrtRunner(build_engine) as runner:
+            outputs = runner.infer(feed_dict={'input': input_data.numpy()})
+
+        ref = input_data.expand([batch_size, hidden_dim])
+        np.testing.assert_allclose(ref.cpu().numpy(),
+                                   outputs['output'],
+                                   atol=1e-5)

@@ -81,7 +81,6 @@ protected:
     using Base::stream_;
     using Base::allocator_;
     using Base::is_allocate_buffer_;
-    using Base::cuda_device_prop_;
 
 private:
     void allocateBuffer(std::size_t batch_size, std::vector<float> const& top_k);

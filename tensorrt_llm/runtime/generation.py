@@ -33,7 +33,9 @@ from .kv_cache_manager import GenerationSequence, KVCacheManager
 from .session import _scoped_stream
 
 
-def to_word_list_format(word_dict: List[List[str]], tokenizer=None):
+def to_word_list_format(word_dict: List[List[str]],
+                        tokenizer=None,
+                        add_special_tokens=False):
     '''
     format of word_dict
         len(word_dict) should be same to batch_size
@@ -56,7 +58,7 @@ def to_word_list_format(word_dict: List[List[str]], tokenizer=None):
 
         words = list(csv.reader(word_dict_item))[0]
         for word in words:
-            ids = tokenizer.encode(word)
+            ids = tokenizer.encode(word, add_special_tokens=add_special_tokens)
 
             if len(ids) == 0:
                 continue
@@ -272,7 +274,7 @@ class SamplingConfig:
     ## None here means user didn't set it, and dynamicDecodeOp.cpp take optional value
     ## The real default value is set in dynamicDecodeOp.cpp when it's None
     beam_search_diversity_rate: Union[float, torch.Tensor] = field(init=False,
-                                                                   default=None)
+                                                                   default=0.0)
     random_seed: Union[int, torch.Tensor] = field(init=False, default=None)
     output_cum_log_probs: bool = field(init=False, default=False)
     output_log_probs: bool = field(init=False, default=False)
@@ -328,8 +330,15 @@ class GenerationSession(object):
         self.vocab_size_padded = pad_vocab_size(self.vocab_size,
                                                 self.mapping.tp_size)
 
-        self.nccl_comm = torch.classes.FasterTransformer.NcclCommunicatorOp(
-            self.mapping.tp_size, self.mapping.pp_size, self.mapping.rank)
+        if self.paged_kv_cache:
+            logger.warning(
+                "The paged KV cache in Python runtime is experimental. For performance and correctness, please, use C++ runtime."
+            )
+
+        if self.mapping.has_pp():
+            self.nccl_comm = torch.classes.FasterTransformer.NcclCommunicatorOp(
+                self.mapping.tp_size, self.mapping.pp_size, self.mapping.rank)
+
         if self.mapping.is_last_pp_rank():
             self.decoder_logits_dtype = self._tensor_dtype('logits')
             if self.decoder_logits_dtype not in [torch.float16, torch.float32]:
@@ -578,8 +587,10 @@ class GenerationSession(object):
                                                  scfg.repetition_penalty,
                                                  dtype=torch.float32)
 
-        self.length_penalty = torch.FloatTensor([scfg.length_penalty
-                                                 ])  # only support scalar now
+        self.host_length_penalty = torch.full([batch_size],
+                                              scfg.length_penalty,
+                                              dtype=torch.float32)
+        self.length_penalty = self.host_length_penalty.to(self.device)
 
         if isinstance(scfg.presence_penalty, torch.Tensor):
             assert scfg.presence_penalty.dtype == torch.float32, f"scfg.presence_penalty.dtype ({scfg.presence_penalty.dtype}) must be torch.float32"
@@ -633,12 +644,14 @@ class GenerationSession(object):
             self.random_seed = None
 
         if self.mapping.is_last_pp_rank():
-            self.dynamic_decoder.setup(
-                batch_size, scfg.num_beams, self.top_k, self.top_p,
-                self.temperature, self.repetition_penalty,
-                self.presence_penalty, self.min_length, self.length_penalty,
-                self.beam_search_diversity_rate, self.random_seed,
-                self.top_p_decay, self.top_p_min, self.top_p_reset_ids)
+            self.dynamic_decoder.setup(batch_size, scfg.num_beams, self.top_k,
+                                       self.top_p, self.temperature,
+                                       self.repetition_penalty,
+                                       self.presence_penalty, self.min_length,
+                                       self.host_length_penalty,
+                                       self.beam_search_diversity_rate,
+                                       self.random_seed, self.top_p_decay,
+                                       self.top_p_min, self.top_p_reset_ids)
 
         assert scfg.end_id is not None, "end_id cannot be none"
         assert scfg.pad_id is not None, 'pad_id cannot be none'
@@ -1433,7 +1446,7 @@ class GenerationSession(object):
                 self.debug_buffer = ctx_buffer
             if self.cuda_graph_mode:
                 # context mode, clean cuda graph instances
-                self.cuda_graph_instances = [None for _ in range(2)]
+                self.runtime.cuda_graph_instances = [None for _ in range(2)]
 
         # dynamic_decoder currently use torch's current stream, so must let TRT enqueue use same stream here
         stream = torch.cuda.current_stream().cuda_stream
@@ -1900,7 +1913,6 @@ class ChatGLM6BHeadModelGenerationSession(GenerationSession):
                                 use_gpt_attention_plugin, remove_input_padding,
                                 **kwargs):
 
-        assert use_gpt_attention_plugin
         assert not remove_input_padding
         last_token_ids = context_lengths.detach().clone()
         max_context_length = kwargs.pop('max_context_length')
@@ -1913,12 +1925,18 @@ class ChatGLM6BHeadModelGenerationSession(GenerationSession):
             position_ids[i, 1, length - 1] = 1
             position_ids[i, :, length:] = 0
         position_ids = position_ids.cuda()
-        return {'position_ids': position_ids, 'last_token_ids': last_token_ids}
+        inputs = {
+            'position_ids': position_ids,
+            'last_token_ids': last_token_ids
+        }
+        if not use_gpt_attention_plugin:
+            attention_mask = torch.zeros((batch_size, 1))
+            inputs['attention_mask'] = attention_mask
+        return inputs
 
     def _prepare_generation_inputs(self, batch_size, context_lengths,
                                    use_gpt_attention_plugin,
                                    remove_input_padding, **kwargs):
-        assert use_gpt_attention_plugin
         assert not remove_input_padding
         last_token_ids = torch.ones_like(context_lengths)
 
@@ -1931,4 +1949,11 @@ class ChatGLM6BHeadModelGenerationSession(GenerationSession):
         position_ids = torch.tensor(data, dtype=torch.int32, device='cuda')
         position_ids = _tile_beam_width(position_ids, num_beams)
 
-        return {'position_ids': position_ids, 'last_token_ids': last_token_ids}
+        inputs = {
+            'position_ids': position_ids,
+            'last_token_ids': last_token_ids
+        }
+        if not use_gpt_attention_plugin:
+            attention_mask = torch.zeros((batch_size, 1))
+            inputs['attention_mask'] = attention_mask
+        return inputs

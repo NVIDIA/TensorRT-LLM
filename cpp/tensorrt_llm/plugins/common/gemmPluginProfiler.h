@@ -176,7 +176,7 @@ public:
     // requires shared ownership to read from other
     using writer_lock = std::shared_lock<std::shared_timed_mutex>;
 
-    // Struct of contining map if GEMMs to the best profiles for different Ms
+    // Struct of continuing map if GEMMs to the best profiles for different Ms
     struct MNKProfileMap
     {
         // Mutex guarding map

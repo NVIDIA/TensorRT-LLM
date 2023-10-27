@@ -16,10 +16,15 @@
 
 #include "tensorrt_llm/common/mpiUtils.h"
 #include "mpi.h"
+#include "tensorrt_llm/runtime/common.h"
+#include <type_traits>
 
-namespace tensorrt_llm
-{
-namespace mpi
+// We rely on SizeType being int32_t in some places with weak type checking,
+// i.e. we're passing void ptr to some function. To prevent mysterious errors
+// in the future, we trigger a compilation error here if SizeType isn't int32_t.
+static_assert(std::is_same<tensorrt_llm::runtime::SizeType, std::int32_t>::value);
+
+namespace tensorrt_llm::mpi
 {
 
 MPI_Datatype getMpiDtype(MpiType dtype)
@@ -28,9 +33,14 @@ MPI_Datatype getMpiDtype(MpiType dtype)
         {MPI_TYPE_BYTE, MPI_BYTE},
         {MPI_TYPE_CHAR, MPI_CHAR},
         {MPI_TYPE_INT, MPI_INT},
+        {MPI_TYPE_FLOAT, MPI_FLOAT},
+        {MPI_TYPE_DOUBLE, MPI_DOUBLE},
         {MPI_TYPE_INT64_T, MPI_INT64_T},
+        {MPI_TYPE_INT32_T, MPI_INT32_T},
+        {MPI_TYPE_UINT64_T, MPI_UINT64_T},
         {MPI_TYPE_UINT32_T, MPI_UINT32_T},
         {MPI_TYPE_UNSIGNED_LONG_LONG, MPI_UNSIGNED_LONG_LONG},
+        {MPI_TYPE_SIZETYPE, MPI_INT32_T},
     };
     return dtype_map.at(dtype);
 }
@@ -88,14 +98,14 @@ void initThread(int* argc, char*** argv, MpiThreadSupport required, int* provide
 int getCommWorldRank()
 {
     int rank = 0;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
     return rank;
 }
 
 int getCommWorldSize()
 {
     int world_size = 1;
-    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    MPICHECK(MPI_Comm_size(MPI_COMM_WORLD, &world_size));
     return world_size;
 }
 
@@ -151,5 +161,4 @@ void allgather(const void* sendbuf, void* recvbuf, int count, MpiType dtype, Mpi
     MPICHECK(MPI_Allgather(sendbuf, count, getMpiDtype(dtype), recvbuf, count, getMpiDtype(dtype), comm.group));
 }
 
-} // namespace mpi
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::mpi

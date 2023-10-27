@@ -29,9 +29,9 @@ def split(v, tp_size, idx, dim=0):
     if tp_size == 1:
         return v
     if len(v.shape) == 1:
-        return np.ascontiguousarray(np.split(v, tp_size)[idx])
+        return np.ascontiguousarray(np.split(v, tp_size)[idx].copy())
     else:
-        return np.ascontiguousarray(np.split(v, tp_size, axis=dim)[idx])
+        return np.ascontiguousarray(np.split(v, tp_size, axis=dim)[idx].copy())
 
 
 def reorder_qkv_weight_or_bias(v, n_head, n_hidden, is_bias=False):
@@ -113,9 +113,7 @@ def set_layer_weight(layer, val, quant_mode):
         v = np.ascontiguousarray(val.transpose())
         processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
             torch.tensor(v), plugin_weight_only_quant_type)
-        # workaround for trt not supporting int8 inputs in plugins currently
-        layer.weight.value = processed_torch_weights.view(
-            dtype=torch.float32).numpy()
+        layer.weight.value = processed_torch_weights.numpy()
         layer.per_channel_scale.value = torch_weight_scales.numpy()
     else:
         layer.weight.value = np.ascontiguousarray(val)
@@ -357,9 +355,6 @@ def load_from_bin(tensorrt_llm_bloom: BloomForCausalLM,
     # Int8 KV cache
     use_int8_kv_cache = quant_mode.has_int8_kv_cache()
 
-    def sq_trick(x):
-        return x.view(np.float32) if use_smooth_quant else x
-
     # Debug
     suffix = gen_suffix(rank, use_smooth_quant, quant_per_channel)
     # The type of weights.
@@ -410,8 +405,8 @@ def load_from_bin(tensorrt_llm_bloom: BloomForCausalLM,
         if t is not None:
             layer = tensorrt_llm_bloom.layers[i].attention.qkv
             if use_smooth_quant:
-                layer.weight.value = sq_trick(
-                    np.ascontiguousarray(np.transpose(t, [1, 0])))
+                layer.weight.value = np.ascontiguousarray(
+                    np.transpose(t, [1, 0]))
                 set_smoothquant_scale_factors(
                     layer,
                     tensorrt_llm_bloom.layers[i].input_layernorm.scale_to_int,
@@ -437,8 +432,7 @@ def load_from_bin(tensorrt_llm_bloom: BloomForCausalLM,
             [n_embd // tensor_parallel, n_embd], w_type)
         layer = tensorrt_llm_bloom.layers[i].attention.dense
         if use_smooth_quant:
-            layer.weight.value = sq_trick(
-                np.ascontiguousarray(np.transpose(t, [1, 0])))
+            layer.weight.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
             dense_scale = getattr(tensorrt_llm_bloom.layers[i].attention,
                                   "quantization_scaling_factor", None)
             set_smoothquant_scale_factors(
@@ -474,8 +468,7 @@ def load_from_bin(tensorrt_llm_bloom: BloomForCausalLM,
             [n_embd, inter_size // tensor_parallel], w_type)
         layer = tensorrt_llm_bloom.layers[i].mlp.fc
         if use_smooth_quant:
-            layer.weight.value = sq_trick(
-                np.ascontiguousarray(np.transpose(t, [1, 0])))
+            layer.weight.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
             set_smoothquant_scale_factors(
                 layer,
                 tensorrt_llm_bloom.layers[i].post_layernorm.scale_to_int,
@@ -498,8 +491,7 @@ def load_from_bin(tensorrt_llm_bloom: BloomForCausalLM,
             [inter_size // tensor_parallel, n_embd], w_type)
         layer = tensorrt_llm_bloom.layers[i].mlp.proj
         if use_smooth_quant:
-            layer.weight.value = sq_trick(
-                np.ascontiguousarray(np.transpose(t, [1, 0])))
+            layer.weight.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
             proj_scale = getattr(tensorrt_llm_bloom.layers[i].mlp,
                                  "quantization_scaling_factor", None)
             set_smoothquant_scale_factors(

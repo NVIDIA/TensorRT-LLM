@@ -40,9 +40,9 @@ rm -rf gpt2 && git clone https://huggingface.co/gpt2-medium gpt2
 pushd gpt2 && rm pytorch_model.bin model.safetensors && wget -q https://huggingface.co/gpt2-medium/resolve/main/pytorch_model.bin && popd
 ```
 
-### 2. Convert weights from HF Tranformers to FT format
+### 2. Convert weights from HF Transformers to FT format
 
-TensorRT-LLM can directly load weights from FT. The [`hf_gpt_convert.py`](./hf_gpt_convert.py) script allows you to convert weights from HF Tranformers
+TensorRT-LLM can directly load weights from FT. The [`hf_gpt_convert.py`](./hf_gpt_convert.py) script allows you to convert weights from HF Transformers
 format to FT format.
 
 ```bash
@@ -206,7 +206,7 @@ mpirun -np 4 python3 run.py --engine_dir santacoder_outputs_tp4 --tokenizer ./sa
 
 ## GPT Variant - StarCoder
 
-For StarCoder, the steps are similar execpt that `santacoder` is swapped with `starcoder`.
+For StarCoder, the steps are similar except that `santacoder` is swapped with `starcoder`.
 
 ```bash
 git clone https://huggingface.co/bigcode/starcoder
@@ -523,9 +523,9 @@ python3 build.py --model_dir=./c-model/gpt2/2-gpu --dtype float16 --world_size=2
 ### 3. Embedding sharing
 In some examples, the embedding lookup table is used both in embedding() and lm_head() layers. Sharing the embedding lookup table can reduce memory consumption.
 
-With flag `--use_embedding_sharing` for  `build.py`, we will try to enable this feature. However it only takes effect when the following criterias are met:
+With flag `--use_embedding_sharing` for  `build.py`, we will try to enable this feature. However it only takes effect when the following criteria are met:
 - The weight is shared between two layers. If we found the weight for lm_head() layer, we cannot enable it.
-- For muliple processes case, `--use_parallel_embedding` must be set. And we only support sharing when the embedding lookup table is sharded along the vocab dimension (`--embedding_sharding_dim 0`, as is the default value), which minimizes the overall communication cost.
+- For multiple processes case, `--use_parallel_embedding` must be set. And we only support sharing when the embedding lookup table is sharded along the vocab dimension (`--embedding_sharding_dim 0`, as is the default value), which minimizes the overall communication cost.
 - For TensorRT 9.0 version, the engine size is expected to be reduced when the lookup and gemm plugin are enabled.
 
 Here is an example for using embedding parallelism and sharing feature:

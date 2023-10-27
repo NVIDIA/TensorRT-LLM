@@ -115,7 +115,7 @@ def serialize_engine(engine, path):
 
 
 def load_falcon_config(model_dir: Union[str, Path]) -> FalconConfig:
-    """ Helper utility to laod FalconConfig.
+    """ Helper utility to load FalconConfig.
 
     A pretrained checkpoint from modeling_RW.py has a different structure
     and is not compatible with `transformers.FalconConfig` and

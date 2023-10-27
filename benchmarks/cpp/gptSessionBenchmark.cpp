@@ -74,65 +74,90 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
 
         for (auto const batchSize : batchSizes)
         {
-            session.setup(
-                batchSize, beamWidth, maxInputLength + maxNewTokens, decoderPerRequest, std::nullopt, numMicroBatches);
-
-            std::vector<SizeType> inputLenghtsHost(batchSize, maxInputLength);
-            auto inputLenghts
-                = bufferManager.copyFrom(inputLenghtsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
-
-            // copy inputs and wrap into shared_ptr
-            GenerationInput::TensorPtr inputIds;
-            std::vector<int32_t> inputsHost(batchSize * maxInputLength, padId);
-            if (inputPacked)
+            try
             {
-                inputIds = bufferManager.copyFrom(
-                    inputsHost, ITensor::makeShape({1, batchSize * maxInputLength}), MemoryType::kGPU);
+                session.setup(batchSize, beamWidth, maxInputLength + maxNewTokens, decoderPerRequest, std::nullopt,
+                    numMicroBatches);
+
+                std::vector<SizeType> inputLenghtsHost(batchSize, maxInputLength);
+                auto inputLenghts
+                    = bufferManager.copyFrom(inputLenghtsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
+
+                // copy inputs and wrap into shared_ptr
+                GenerationInput::TensorPtr inputIds;
+                std::vector<int32_t> inputsHost(batchSize * maxInputLength, padId);
+                if (inputPacked)
+                {
+                    inputIds = bufferManager.copyFrom(
+                        inputsHost, ITensor::makeShape({1, batchSize * maxInputLength}), MemoryType::kGPU);
+                }
+                else
+                {
+                    inputIds = bufferManager.copyFrom(
+                        inputsHost, ITensor::makeShape({batchSize, maxInputLength}), MemoryType::kGPU);
+                }
+                GenerationInput generationInput{
+                    endId, padId, std::move(inputIds), std::move(inputLenghts), inputPacked};
+
+                // runtime will allocate memory for output if this tensor is empty
+                GenerationOutput generationOutput{
+                    bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32),
+                    bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32)};
+
+                for (auto r = 0; r < warmUp; ++r)
+                {
+                    SizeType numSteps = 0;
+                    generationOutput.onTokenGenerated
+                        = [&numSteps, maxNewTokens](GenerationOutput::TensorPtr const& outputIds, SizeType step,
+                              bool finished) { ++numSteps; };
+                    session.generate(generationOutput, generationInput, samplingConfig);
+                    bufferManager.getStream().synchronize();
+                }
+                cudaDeviceSynchronize();
+
+                int iterIdx = 0;
+                float curDuration = 0;
+                while (iterIdx < numRuns || curDuration / 1000 < duration)
+                {
+                    auto const start = std::chrono::steady_clock::now();
+                    SizeType numSteps = 0;
+                    generationOutput.onTokenGenerated
+                        = [&numSteps, maxNewTokens](GenerationOutput::TensorPtr const& outputIds, SizeType step,
+                              bool finished) { ++numSteps; };
+                    session.generate(generationOutput, generationInput, samplingConfig);
+                    bufferManager.getStream().synchronize();
+                    auto const end = std::chrono::steady_clock::now();
+
+                    iterIdx += 1;
+                    curDuration += std::chrono::duration<float, std::milli>(end - start).count();
+                }
+                printf("Benchmarking done. Iteration: %d, duration: %.2f sec.\n", iterIdx, curDuration / 1000);
+
+                auto averageLatency = curDuration / iterIdx;
+                if (worldConfig.getRank() == 0)
+                {
+                    printf("[BENCHMARK] batch_size %d input_length %d output_length %d latency(ms) %.2f\n", batchSize,
+                        maxInputLength, maxNewTokens, averageLatency);
+                }
             }
-            else
+            catch (std::runtime_error& e)
             {
-                inputIds = bufferManager.copyFrom(
-                    inputsHost, ITensor::makeShape({batchSize, maxInputLength}), MemoryType::kGPU);
-            }
-            GenerationInput generationInput{endId, padId, std::move(inputIds), std::move(inputLenghts), inputPacked};
+                std::size_t found = std::string(e.what()).find("out of memory");
 
-            // runtime will allocate memory for output if this tensor is empty
-            GenerationOutput generationOutput{bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32)};
+                // Unexpected error; rethrow
+                if (found == std::string::npos)
+                {
+                    throw;
+                }
 
-            for (auto r = 0; r < warmUp; ++r)
-            {
-                SizeType numSteps = 0;
-                generationOutput.onTokenGenerated
-                    = [&numSteps, maxNewTokens](
-                          GenerationOutput::TensorPtr const& outputIds, SizeType step, bool finished) { ++numSteps; };
-                session.generate(generationOutput, generationInput, samplingConfig);
-                bufferManager.getStream().synchronize();
-            }
-            cudaDeviceSynchronize();
-
-            int iterIdx = 0;
-            float curDuration = 0;
-            while (iterIdx < numRuns || curDuration / 1000 < duration)
-            {
-                auto const start = std::chrono::steady_clock::now();
-                SizeType numSteps = 0;
-                generationOutput.onTokenGenerated
-                    = [&numSteps, maxNewTokens](
-                          GenerationOutput::TensorPtr const& outputIds, SizeType step, bool finished) { ++numSteps; };
-                session.generate(generationOutput, generationInput, samplingConfig);
-                bufferManager.getStream().synchronize();
-                auto const end = std::chrono::steady_clock::now();
-
-                iterIdx += 1;
-                curDuration += std::chrono::duration<float, std::milli>(end - start).count();
-            }
-            printf("Benchmarking done. Iteration: %d, duration: %.2f sec.\n", iterIdx, curDuration / 1000);
-
-            auto averageLatency = curDuration / iterIdx;
-            if (worldConfig.getRank() == 0)
-            {
-                printf("[BENCHMARK] batch_size %d input_length %d output_length %d latency(ms) %.2f\n", batchSize,
-                    maxInputLength, maxNewTokens, averageLatency);
+                // We can ignore the OOM exception and continue the rest of the benchmark
+                if (worldConfig.getRank() == 0)
+                {
+                    printf("%s", e.what());
+                    printf("[BENCHMARK] batch_size %d input_length %d output_length %d latency(ms) N/A\n", batchSize,
+                        maxInputLength, maxNewTokens);
+                }
+                continue;
             }
         }
     }

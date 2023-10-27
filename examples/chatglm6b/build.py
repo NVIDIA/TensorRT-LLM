@@ -13,30 +13,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
-import os
+import json
 import time
 from pathlib import Path
+from typing import List
 
 import torch
 import torch.multiprocessing as mp
+import transformers
+from weight import load_from_hf
 
 import tensorrt_llm
-from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import smooth_quantize, weight_only_quantize
+from tensorrt_llm.models import (ChatGLM6BHeadModel, smooth_quantize,
+                                 weight_only_quantize)
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 
-from weight import load_from_ft, parse_ft_config  # isort:skip
-
-MODEL_NAME = "chatglm6b"
+MODEL_NAME = "chatglm-6b"
 
 
 def get_engine_name(model, dtype, tp_size, rank):
     return '{}_{}_tp{}_rank{}.engine'.format(model, dtype, tp_size, rank)
+
+
+def find_engines(dir: Path,
+                 model_name: str = "*",
+                 dtype: str = "*",
+                 tp_size: str = "*",
+                 rank: str = "*") -> List[Path]:
+    template = f"{model_name}_{dtype}_tp{tp_size}_rank{rank}.engine"
+    return list(dir.glob(template))
 
 
 def serialize_engine(engine, path):
@@ -49,17 +59,17 @@ def serialize_engine(engine, path):
     logger.info(f'Engine serialized. Total time: {t}')
 
 
-def parse_arguments():
+def parse_arguments(args):
     parser = argparse.ArgumentParser()
     parser.add_argument('--world_size',
                         type=int,
                         default=1,
                         help='world size, only support tensor parallelism now')
-    parser.add_argument('--model_dir', type=str, default=None)
+    parser.add_argument('--model_dir', type=str, default="pyTorchModel")
     parser.add_argument('--dtype',
                         type=str,
                         default='float16',
-                        choices=['float16', 'float32'])
+                        choices=['float32', 'float16', 'bfloat16'])
     parser.add_argument(
         '--timing_cache',
         type=str,
@@ -72,35 +82,42 @@ def parse_arguments():
         type=str,
         default='verbose',
         choices=['verbose', 'info', 'warning', 'error', 'internal_error'])
-    parser.add_argument('--vocab_size', type=int, default=130528)
-    parser.add_argument('--n_layer', type=int, default=28)
-    parser.add_argument('--n_positions', type=int, default=2048)
-    parser.add_argument('--n_embd', type=int, default=4096)
-    parser.add_argument('--n_head', type=int, default=32)
-    parser.add_argument('--hidden_act', type=str, default='gelu')
-    parser.add_argument('--inter_size', type=int, default=None)
-    parser.add_argument('--no_bias', action="store_false", default=False)
     parser.add_argument('--max_batch_size', type=int, default=8)
     parser.add_argument('--max_input_len', type=int, default=1024)
     parser.add_argument('--max_output_len', type=int, default=1024)
     parser.add_argument('--max_beam_width', type=int, default=1)
-    parser.add_argument('--use_gpt_attention_plugin',
-                        nargs='?',
-                        const='float16',
-                        default='float16',
-                        choices=['float16', 'float32', False])
-    parser.add_argument('--use_gemm_plugin',
-                        nargs='?',
-                        const='float16',
-                        type=str,
-                        default=False,
-                        choices=['float16', 'float32'])
-    parser.add_argument('--use_layernorm_plugin',
-                        nargs='?',
-                        const='float16',
-                        type=str,
-                        default=False,
-                        choices=['float16', 'float32'])
+    parser.add_argument(
+        '--use_gpt_attention_plugin',
+        nargs='?',
+        const='float16',
+        default='float16',
+        choices=['float32', 'float16', 'bfloat16', False],
+        help=
+        "Activates attention plugin. You can specify the plugin dtype or leave blank to use the model dtype."
+    )
+    parser.add_argument(
+        '--use_gemm_plugin',
+        nargs='?',
+        const='float16',
+        type=str,
+        default='float16',
+        choices=['float32', 'float16', 'bfloat16', False],
+        help=
+        "Activates GEMM plugin. You can specify the plugin dtype or leave blank to use the model dtype."
+    )
+    parser.add_argument(
+        '--use_layernorm_plugin',
+        nargs='?',
+        const='float16',
+        type=str,
+        default='float16',
+        choices=['float32', 'float16', 'bfloat16', False],
+        help=
+        "Activates layernorm plugin. You can specify the plugin dtype or leave blank to use the model dtype.",
+    )
+    parser.add_argument('--gather_all_token_logits',
+                        action='store_true',
+                        default=False)
     parser.add_argument('--parallel_build', default=False, action='store_true')
     parser.add_argument('--enable_context_fmha',
                         default=False,
@@ -112,19 +129,20 @@ def parse_arguments():
     parser.add_argument('--builder_opt', type=int, default=None)
     parser.add_argument(
         '--output_dir',
-        type=str,
+        type=Path,
         default='trtModel',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
     )
+    parser.add_argument('--remove_input_padding',
+                        default=False,
+                        action='store_true')
     parser.add_argument(
-        "--multi_query_mode",
-        "-mq",
+        '--use_inflight_batching',
+        action="store_true",
         default=False,
-        action='store_true',
-        help=
-        "Whether this model uses multi-query attention mechanism (default: False)"
-    )
+        help="Activates inflight batching mode of gptAttentionPlugin.")
+
     # Arguments related to the quantization of the model.
     parser.add_argument(
         '--use_smooth_quant',
@@ -180,8 +198,104 @@ def parse_arguments():
         default=None,
         help=
         'Seed to use when initializing the random number generator for torch.')
+    parser.add_argument(
+        '--paged_kv_cache',
+        action="store_true",
+        default=False,
+        help=
+        'By default we use contiguous KV cache. By setting this flag you enable paged KV cache'
+    )
+    parser.add_argument('--tokens_per_block',
+                        type=int,
+                        default=64,
+                        help='Number of tokens per block in paged KV cache')
 
-    args = parser.parse_args()
+    parser.add_argument(
+        '--enable_fp8',
+        default=False,
+        action='store_true',
+    )
+    parser.add_argument(
+        '--fp8_kv_cache',
+        default=False,
+        action="store_true",
+        help=
+        'By default, we use dtype for KV cache. fp8_kv_cache chooses fp8 quantization for KV'
+    )
+    parser.add_argument(
+        '--max_num_tokens',
+        type=int,
+        default=None,
+        help='Define the max number of tokens supported by the engine')
+    parser.add_argument(
+        '--strongly_typed',
+        default=False,
+        action="store_true",
+        help=
+        'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
+    )
+    parser.add_argument(
+        '--use_custom_all_reduce',
+        action='store_true',
+        help=
+        'Activates latency-optimized algorithm for all-reduce instead of NCCL.')
+    args = parser.parse_args(args)
+    logger.set_level(args.log_level)
+
+    args.apply_query_key_layer_scaling = False  # always False in TRT-LLM
+    args.bias = True
+    args.hidden_act = 'gelu'
+    args.multi_block_mode = False
+    args.multi_query_mode = False  # always False in ChatGLM-6B
+
+    plugins_args = [
+        'use_gpt_attention_plugin',
+        'use_gemm_plugin',
+        'use_layernorm_plugin',
+    ]
+
+    for plugin_arg in plugins_args:
+        if getattr(args, plugin_arg) is None:
+            logger.info(
+                f"{plugin_arg} set, without specifying a value. Using {args.dtype} automatically."
+            )
+            setattr(args, plugin_arg, args.dtype)
+
+    assert args.model_dir is not None
+    with open(Path(args.model_dir) / "config.json", "r") as f:
+        js = json.loads(f.read())
+    assert js["_name_or_path"] == "THUDM/" + MODEL_NAME
+    assert args.max_input_len < js["max_sequence_length"]
+
+    args.eos_token_id = js["eos_token_id"]
+    args.ffn_hidden_size = js["inner_hidden_size"]
+    args.gmask_token_id = js["gmask_token_id"]
+    args.hidden_size = js["hidden_size"]
+    args.layernorm_epsilon = js["layernorm_epsilon"]
+    args.mask_token_id = js["mask_token_id"]
+    args.max_seq_length = min(args.max_input_len + args.max_output_len,
+                              js["max_sequence_length"])
+    args.num_heads = js["num_attention_heads"]
+    args.num_kv_heads = js["num_attention_heads"]
+    args.num_layers = js["num_layers"]
+    args.pad_token_id = js["pad_token_id"]
+    args.use_cache = js["use_cache"]
+    args.vocab_size = js["vocab_size"]
+
+    if args.use_inflight_batching:
+        if not args.use_gpt_attention_plugin:
+            args.use_gpt_attention_plugin = 'float16'
+            logger.info(
+                f"Using GPT attention plugin for inflight batching mode. Setting to default '{args.use_gpt_attention_plugin}'"
+            )
+        if not args.remove_input_padding:
+            args.remove_input_padding = True
+            logger.info(
+                "Using remove input padding for inflight batching mode.")
+        if not args.paged_kv_cache:
+            args.paged_kv_cache = True
+            logger.info("Using paged KV cache for inflight batching mode.")
+
     assert not (
         args.use_smooth_quant and args.use_weight_only
     ), "You cannot enable both SmoothQuant and INT8 weight-only together."
@@ -194,29 +308,22 @@ def parse_arguments():
             args.weight_only_precision == 'int4')
     else:
         args.quant_mode = QuantMode(0)
-    args.bias = not args.no_bias
-
-    if args.inter_size is None:
-        args.inter_size = 4 * args.n_embd
 
     if args.int8_kv_cache:
-        assert (
-            args.use_gpt_attention_plugin
-        ), "You have to use GPT attention plugin when int8 KV cache is set"
         args.quant_mode = args.quant_mode.set_int8_kv_cache()
 
-    if args.model_dir is not None:
-        n_embd, n_head, n_layer, n_positions, vocab_size, _, hidden_act, _, bias, inter_size, multi_query_mode = parse_ft_config(
-            Path(args.model_dir) / "config.ini")
-        args.n_embd = n_embd
-        args.n_head = n_head
-        args.n_layer = n_layer
-        args.n_positions = n_positions
-        args.vocab_size = vocab_size
-        args.hidden_act = hidden_act
-        args.bias = bias
-        args.inter_size = inter_size
-        args.multi_query_mode = multi_query_mode
+    if args.fp8_kv_cache:
+        assert (
+            args.use_gpt_attention_plugin or args.use_inflight_batching
+        ), "You have to use GPT attention plugin when fp8 KV cache is set"
+        args.quant_mode = args.quant_mode.set_fp8_kv_cache()
+
+    if args.enable_fp8:
+        args.quant_mode = args.quant_mode.set_fp8_qdq()
+
+    if args.max_num_tokens is not None:
+        assert args.enable_context_fmha
+
     return args
 
 
@@ -229,36 +336,31 @@ def build_rank_engine(builder: Builder,
        @param args: The cmd line arguments.
        @return: The built engine.
     '''
-    kv_dtype = str_dtype_to_trt(args.dtype)
 
     # Initialize Module
-    tensorrt_llm_ChatGLM6BModel = tensorrt_llm.models.ChatGLM6BHeadModel(
-        num_layers=args.n_layer,
-        num_heads=args.n_head,
-        hidden_size=args.n_embd,
-        inter_size=args.inter_size,
-        vocab_size=args.vocab_size,
-        hidden_act=args.hidden_act,
-        max_position_embeddings=args.n_positions,
-        dtype=kv_dtype,
-        mapping=Mapping(world_size=args.world_size,
-                        rank=rank,
-                        tp_size=args.world_size),  # TP only
-        quant_mode=args.quant_mode,
-        bias=args.bias)
+    args.mapping = Mapping(
+        world_size=args.world_size,
+        rank=rank,
+        tp_size=args.world_size,
+    )
+    trtllm_model = ChatGLM6BHeadModel(args=args)
+
     if args.use_smooth_quant:
-        tensorrt_llm_ChatGLM6BModel = smooth_quantize(
-            tensorrt_llm_ChatGLM6BModel, args.quant_mode)
+        trtllm_model = smooth_quantize(trtllm_model, args.quant_mode)
     elif args.use_weight_only:
-        tensorrt_llm_ChatGLM6BModel = weight_only_quantize(
-            tensorrt_llm_ChatGLM6BModel, args.quant_mode)
+        trtllm_model = weight_only_quantize(trtllm_model, args.quant_mode)
 
     if args.model_dir is not None:
-        load_from_ft(tensorrt_llm_ChatGLM6BModel,
-                     args.model_dir,
-                     rank,
-                     args.world_size,
-                     fp16=(args.dtype == 'float16'))
+        hf_model = transformers.AutoModel.from_pretrained(
+            args.model_dir, trust_remote_code=True).cpu()
+        trtllm_model = load_from_hf(
+            trtllm_model,
+            hf_model,
+            mapping=args.mapping,
+            dtype=args.dtype,
+            max_seq_length=args.max_seq_length,
+        )
+        del hf_model
 
     # Module -> Network
     network = builder.create_network()
@@ -277,6 +379,10 @@ def build_rank_engine(builder: Builder,
     if args.enable_context_fmha_fp32_acc:
         network.plugin_config.set_context_fmha(
             ContextFMHAType.enabled_with_fp32_acc)
+    if args.remove_input_padding:
+        network.plugin_config.enable_remove_input_padding()
+    if args.paged_kv_cache:
+        network.plugin_config.enable_paged_kv_cache(args.tokens_per_block)
 
     # Quantization plugins.
     if args.use_smooth_quant:
@@ -288,20 +394,25 @@ def build_rank_engine(builder: Builder,
         network.plugin_config.set_quantize_per_token_plugin()
     elif args.use_weight_only:
         network.plugin_config.set_weight_only_quant_matmul_plugin(
-            dtype='float16')
+            dtype=args.dtype)
 
     if args.world_size > 1:
-        network.plugin_config.set_nccl_plugin(args.dtype)
+        network.plugin_config.set_nccl_plugin(args.dtype,
+                                              args.use_custom_all_reduce)
+
     with net_guard(network):
         # Prepare
-        network.set_named_parameters(
-            tensorrt_llm_ChatGLM6BModel.named_parameters())
+        network.set_named_parameters(trtllm_model.named_parameters())
 
         # Forward
-        inputs = tensorrt_llm_ChatGLM6BModel.prepare_inputs(
-            args.max_batch_size, args.max_input_len, args.max_output_len, True,
-            args.max_beam_width)
-        tensorrt_llm_ChatGLM6BModel(*inputs)
+        inputs = trtllm_model.prepare_inputs(
+            max_batch_size=args.max_batch_size,
+            max_input_len=args.max_input_len,
+            max_new_tokens=args.max_output_len,
+            use_cache=True,
+            max_beam_width=args.max_beam_width,
+        )
+        trtllm_model(*inputs)
 
     tensorrt_llm.graph_rewriting.optimize(network)
 
@@ -310,7 +421,7 @@ def build_rank_engine(builder: Builder,
     # Network -> Engine
     engine = builder.build_engine(network, builder_config)
     if rank == 0:
-        config_path = os.path.join(args.output_dir, 'config.json')
+        config_path = args.output_dir / 'config.json'
         builder.save_config(builder_config, config_path)
     return engine
 
@@ -318,35 +429,47 @@ def build_rank_engine(builder: Builder,
 def build(rank, args):
     torch.cuda.set_device(rank % args.gpus_per_node)
     tensorrt_llm.logger.set_level(args.log_level)
-    if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    timing_cache_file = args.output_dir / "model.cache"
+    timing_cache = timing_cache_file
 
-    # when doing serializing build, all ranks share one engine
     builder = Builder()
 
-    cache = None
     for cur_rank in range(args.world_size):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
         builder_config = builder.create_builder_config(
-            name=MODEL_NAME,
             precision=args.dtype,
-            timing_cache=args.timing_cache if cache is None else cache,
-            tensor_parallel=args.world_size,  # TP only
-            parallel_build=args.parallel_build,
-            num_layers=args.n_layer,
-            num_heads=args.n_head,
-            hidden_size=args.n_embd,
-            vocab_size=args.vocab_size,
+            timing_cache=timing_cache,
+            tensor_parallel=args.world_size,
+            int8=(args.quant_mode.has_act_or_weight_quant()
+                  or args.quant_mode.has_int8_kv_cache()),
+            fp8=args.enable_fp8,
+            strongly_typed=args.strongly_typed,
+            opt_level=args.builder_opt,
+            apply_query_key_layer_scaling=args.apply_query_key_layer_scaling,
+            eos_token_id=args.eos_token_id,
+            gather_all_token_logits=args.gather_all_token_logits,
             hidden_act=args.hidden_act,
-            max_position_embeddings=args.n_positions,
+            hidden_size=args.hidden_size,
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
+            max_num_tokens=args.max_output_len + args.max_input_len,
             max_output_len=args.max_output_len,
-            int8=(args.quant_mode.has_act_and_weight_quant()
-                  or args.quant_mode.has_int8_kv_cache()),
-            opt_level=args.builder_opt)
+            max_position_embeddings=args.max_seq_length,
+            multi_query_mode=args.multi_query_mode,
+            name=MODEL_NAME,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_heads,
+            num_layers=args.num_layers,
+            pad_token_id=args.pad_token_id,
+            paged_kv_cache=args.paged_kv_cache,
+            parallel_build=args.parallel_build,
+            quant_mode=int(args.quant_mode),
+            remove_input_padding=args.remove_input_padding,
+            vocab_size=args.vocab_size,
+        )
 
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.world_size,
                                       cur_rank)
@@ -357,18 +480,18 @@ def build(rank, args):
         if cur_rank == 0:
             # Use in-memory timing cache for multiple builder passes.
             if not args.parallel_build:
-                cache = builder_config.trt_builder_config.get_timing_cache()
+                timing_cache = builder_config.trt_builder_config.get_timing_cache(
+                )
 
-        serialize_engine(engine, os.path.join(args.output_dir, engine_name))
+        serialize_engine(engine, args.output_dir / engine_name)
 
     if rank == 0:
-        ok = builder.save_timing_cache(
-            builder_config, os.path.join(args.output_dir, "model.cache"))
+        ok = builder.save_timing_cache(builder_config, timing_cache_file)
         assert ok, "Failed to save timing cache."
 
 
-if __name__ == '__main__':
-    args = parse_arguments()
+def run_build(args=None):
+    args = parse_arguments(args)
 
     if args.random_seed is not None:
         torch.manual_seed(args.random_seed)
@@ -389,3 +512,7 @@ if __name__ == '__main__':
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Total time of building all {args.world_size} engines: {t}')
+
+
+if __name__ == '__main__':
+    run_build()

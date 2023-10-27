@@ -51,7 +51,8 @@ class GenerationMixin:
                              num_heads=None,
                              mapping=Mapping(),
                              max_num_tokens=None,
-                             prompt_embedding_table_size=None):
+                             prompt_embedding_table_size=None,
+                             is_chatglm6b=False):
 
         max_len = max_input_len + max_new_tokens
 
@@ -169,13 +170,26 @@ class GenerationMixin:
                                        ('batch_size_beam_width', bb_range),
                                        ('input_len', inlen_range),
                                    ]))
-                position_ids = Tensor(name='position_ids',
-                                      dtype=trt.int32,
-                                      shape=[-1, -1],
-                                      dim_range=OrderedDict([
-                                          ('batch_size_beam_width', bb_range),
-                                          ('input_len', inlen_range),
-                                      ]))
+                if is_chatglm6b:
+                    position_ids = Tensor(
+                        name='position_ids',
+                        dtype=trt.int32,
+                        shape=[-1, 2, -1],
+                        dim_range=OrderedDict([
+                            ('batch_size_beam_width', bb_range),
+                            ('2', [2, 2]
+                             if enable_two_optimization_profiles else [2]),
+                            ('input_len', inlen_range),
+                        ]))
+                else:
+                    position_ids = Tensor(name='position_ids',
+                                          dtype=trt.int32,
+                                          shape=[-1, -1],
+                                          dim_range=OrderedDict([
+                                              ('batch_size_beam_width',
+                                               bb_range),
+                                              ('input_len', inlen_range),
+                                          ]))
             else:
                 assert dtype is not None
                 assert num_heads is not None

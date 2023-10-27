@@ -130,6 +130,7 @@ def main(args):
     # random_seed = 5
     temperature = 1
     num_beams = args.num_beams
+    length_penalty = args.length_penalty
 
     pad_id = tokenizer.encode(tokenizer.pad_token, add_special_tokens=False)[0]
     end_id = tokenizer.encode(tokenizer.eos_token, add_special_tokens=False)[0]
@@ -186,7 +187,11 @@ def main(args):
                                          dtype=torch.int32).cuda()
 
         sampling_config = tensorrt_llm.runtime.SamplingConfig(
-            end_id=end_id, pad_id=pad_id, top_k=top_k, num_beams=num_beams)
+            end_id=end_id,
+            pad_id=pad_id,
+            top_k=top_k,
+            num_beams=num_beams,
+            length_penalty=length_penalty)
 
         with torch.no_grad():
             tensorrt_llm_gpt.setup(batch_size,
@@ -265,7 +270,8 @@ def main(args):
                                     pad_token_id=tokenizer.pad_token_id,
                                     num_beams=num_beams,
                                     num_return_sequences=num_beams,
-                                    early_stopping=True)
+                                    early_stopping=True,
+                                    length_penalty=length_penalty)
 
         tokens_list = output[:, len(line_encoded[0]):].tolist()
         output = output.reshape([batch_size, num_beams, -1])
@@ -423,6 +429,7 @@ if __name__ == '__main__':
                         type=str,
                         default='summarize',
                         choices=['summarize', 'code_completion'])
+    parser.add_argument('--length_penalty', type=float, default=1.0)
 
     args = parser.parse_args()
     if args.tokenizer == None:

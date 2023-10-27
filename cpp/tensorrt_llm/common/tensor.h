@@ -228,9 +228,6 @@ public:
     std::string toString() const;
     std::string getNumpyTypeDesc(DataType type) const;
 
-    void saveNpy(const std::string& filename) const;
-
-    static DataType typeFromNumpyDesc(std::string type);
     static size_t getTypeSize(DataType type);
 
     template <typename T>
@@ -413,38 +410,6 @@ public:
     }
 
     Tensor slice(std::vector<size_t> shape, size_t offset = 0) const;
-};
-
-class ManagedTensor
-{
-public:
-    // We could take std::function<void(void*)> instead of unique_ptr but t.data is `void const*` and we want
-    // to avoid const_cast.
-    ManagedTensor(Tensor t, std::unique_ptr<void, std::function<void(void*)>> holder)
-        : mMemHolder{std::move(holder)}
-        , mTensor(std::move(t))
-    {
-        TLLM_CHECK(t.data == mMemHolder.get());
-    }
-
-    ~ManagedTensor();
-    ManagedTensor(ManagedTensor&&);
-
-    Tensor const& get() const
-    {
-        return mTensor;
-    }
-
-private:
-    std::unique_ptr<void, std::function<void(void*)>> mMemHolder;
-    Tensor mTensor;
-
-public:
-    static ManagedTensor loadNpy(const std::string& npy_file, const MemoryType where);
-
-private:
-    static void parseNpyIntro(FILE*& f_ptr, uint32_t& header_len, uint32_t& start_data);
-    static int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, DataType& type, std::vector<size_t>& shape);
 };
 
 class TensorMap
@@ -666,7 +631,6 @@ public:
     }
 
     std::string toString();
-    void saveNpy(const std::string& base_folder);
 };
 
 } // namespace common

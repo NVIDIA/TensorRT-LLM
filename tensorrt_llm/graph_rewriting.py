@@ -156,7 +156,7 @@ class Layer:
             # bypass TRT's bug of retrieving a specific ILayer type in TensorRT
             self.trt_layer.__class__ = self.TRT_LAYER_TYPE_TO_LAYER[self.type]
             return self.trt_layer
-        raise NotImplementedError(f"Unkown layer type: {self.type}")
+        raise NotImplementedError(f"Unknown layer type: {self.type}")
 
     def __hash__(self):
         return id(self.trt_layer)
@@ -405,8 +405,15 @@ class FLayerInfo:
         def _swap_tensor_info(new, deprecated):
             name = deprecated.trt_tensor.name
             deprecated.trt_tensor.name = name + '_deprecated'
+            from ._common import default_net
+            from .functional import cast
+
+            if default_net().strongly_typed:
+                if new.trt_tensor.dtype != deprecated.trt_tensor.dtype:
+                    new = cast(new, deprecated.trt_tensor.dtype)
+            else:
+                new.trt_tensor.dtype = deprecated.trt_tensor.dtype
             new.trt_tensor.name = name
-            new.trt_tensor.dtype = deprecated.trt_tensor.dtype
 
         def _reset_network_output_tensors(network, out, new_out):
             net_outputs = list()

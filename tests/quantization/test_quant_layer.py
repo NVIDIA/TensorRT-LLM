@@ -239,9 +239,6 @@ class TestSmoothQuant(unittest.TestCase):
                 5, (ffn_h, ),
                 dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype)) * 0.1
 
-        # Temporary hack to overcome TRT int8 plugin limitation
-        fc1_trt_hack = fc1.view(dtype=torch.float32)
-
         m = test_shape[0] * test_shape[1] * test_shape[2]
         test_shape[3]
         c_1 = ffn_h
@@ -281,7 +278,7 @@ class TestSmoothQuant(unittest.TestCase):
                             **args)
 
             # TensorRT-LLM's Linear uses Parameter class which as a 'value' setter
-            gm.weight.value = fc1_trt_hack.cpu().numpy()
+            gm.weight.value = fc1.cpu().numpy()
             gm.per_channel_scale.value = scale_fc1_w.cpu().numpy()
             if bias:
                 gm.bias.value = bias_data.cpu().numpy()
@@ -376,10 +373,7 @@ class TestSmoothQuant(unittest.TestCase):
         # Init operands for multiplication in int8
         x_data = torch.randint(-8, 8, test_shape, dtype=torch.int8)
         fc1 = torch.randint(-16, 16, (ffn_h, d_h), dtype=torch.int8)
-        # Temporary hack to overcome TRT int8 plugin limitation
-        fc1_trt_hack = fc1.view(dtype=torch.float32)
         fc2 = torch.randint(-16, 16, (d_h, ffn_h), dtype=torch.int8)
-        fc2_trt_hack = fc2.view(dtype=torch.float32)
 
         m = test_shape[0] * test_shape[1] * test_shape[2]
         c_1 = ffn_h
@@ -430,11 +424,11 @@ class TestSmoothQuant(unittest.TestCase):
                 return
 
             # TensorRT-LLM's MLP uses Parameter class which as a 'value' setter
-            gm.fc.weight.value = fc1_trt_hack.cpu().numpy()
+            gm.fc.weight.value = fc1.cpu().numpy()
             gm.fc.per_channel_scale.value = scale_fc1_w.cpu().numpy()
-            gm.proj.weight.value = fc2_trt_hack.cpu().numpy()
+            gm.proj.weight.value = fc2.cpu().numpy()
             gm.proj.per_channel_scale.value = scale_fc2_w.cpu().numpy()
-            gm.proj.smoother.value = np.ones([1, fc2_trt_hack.shape[1] * 4],
+            gm.proj.smoother.value = np.ones([1, fc2.shape[1]],
                                              dtype=np.float32)
 
             # Set activation scaling factors if needed
@@ -648,8 +642,7 @@ class TestSmoothQuant(unittest.TestCase):
             gm = linear_cls(k, n, bias=bias, quant_mode=quant_mode, **args)
 
             # TensorRT-LLM's Linear uses Parameter class which as a 'value' setter
-            gm.weight.value = processed_torch_weights.view(
-                dtype=torch.float32).cpu().numpy()
+            gm.weight.value = processed_torch_weights.cpu().numpy()
             gm.per_channel_scale.value = torch_weight_scales.cpu().numpy()
             if bias:
                 gm.bias.value = bias_data.cpu().numpy()
@@ -664,7 +657,7 @@ class TestSmoothQuant(unittest.TestCase):
         build_engine = EngineFromNetwork(
             (builder.trt_builder, net.trt_network),
             config=CreateConfig(
-                int8=False,
+                int8=True,
                 fp16=(dtype == "float16"),
                 memory_pool_limits={trt.MemoryPoolType.WORKSPACE: 33554432}))
 
@@ -751,14 +744,12 @@ class TestSmoothQuant(unittest.TestCase):
 
                 attention = tensorrt_llm_gpt
 
-                attention.qkv.weight.value = weight_qkv.view(
-                    dtype=torch.float32).cpu().numpy()
+                attention.qkv.weight.value = weight_qkv.cpu().numpy()
                 attention.qkv.bias.value = bias_qkv.cpu().numpy()
                 attention.qkv.per_channel_scale.value = scale_attn_w.cpu(
                 ).numpy()
 
-                attention.dense.weight.value = weight_proj.view(
-                    dtype=torch.float32).cpu().numpy()
+                attention.dense.weight.value = weight_proj.cpu().numpy()
                 attention.dense.bias.value = bias_proj.cpu().numpy()
                 attention.dense.per_channel_scale.value = scale_proj_w.cpu(
                 ).numpy()

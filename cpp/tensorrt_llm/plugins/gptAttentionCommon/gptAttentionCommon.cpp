@@ -592,7 +592,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
         else
         {
             // cross attention, write Q from self QKV, write KV from cross QKV
-            // kernel modifed accordingly to handle nullptr buffer
+            // kernel modified accordingly to handle nullptr buffer
             invokeAddFusedQKVBiasTranspose(q_buf_2_, (T*) nullptr, (T*) nullptr, const_cast<T*>(params.attention_input),
                 const_cast<T*>(params.qkv_bias), params.context_lengths, mRemovePadding ? padding_offset : nullptr,
                 params.batch_size, params.input_seq_length, params.num_tokens, mNumHeads, mNumKVHeads, getHeadSize(),
@@ -608,7 +608,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
         }
         sync_check_cuda_error();
 
-        // write KV to cach
+        // write KV to cache
         invokeTranspose4dBatchMajor(k_buf_2_, v_buf_2_, kv_cache_buffer, params.batch_size,
             isCrossAttention() ? params.cross_qkv_length : params.input_seq_length,
             isCrossAttention() ? params.cross_qkv_length : params.max_seq_length, getHeadSize(), mNumKVHeads,

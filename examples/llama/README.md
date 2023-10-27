@@ -30,6 +30,8 @@ TensorRT-LLM LLaMA builds TensorRT engine(s) from HF checkpoint. If no checkpoin
 
 Normally `build.py` only requires single GPU, but if you've already got all the GPUs needed while inferencing, you could enable parallelly building to make the engine building process faster by adding `--parallel_build` argument. Please note that currently `parallel_build` feature only supports single node.
 
+`--use_fused_mlp` enables GEMM horizontal fusion in gated MLP layer, which reduces input traffic and potentially improves performance. For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded (accuracy 0.45734 vs 0.45755 for LLaMA-v2 7B using ammo/examples/hf/instruct_eval/mmlu.py).
+
 Here're some examples:
 
 ```bash
@@ -320,7 +322,7 @@ To run the GPTQ LLaMa example, the following steps are required:
 
     ```bash
     # Build the LLaMA 7B model using 2-way tensor parallelism and apply INT4 GPTQ quantization.
-    # Compressed checkpoint safetensors are generated seperately from GPTQ.
+    # Compressed checkpoint safetensors are generated separately from GPTQ.
     python build.py --model_dir ./tmp/llama/7B/ \
                     --quant_ckpt_path ./llama-7b-4bit-gs128.safetensors \
                     --dtype float16 \

@@ -51,9 +51,9 @@ git-lfs clone https://huggingface.co/facebook/opt-2.7b
 git-lfs clone https://huggingface.co/facebook/opt-66b
 ```
 
-### 2. Convert weights from HF Tranformers to FT format
+### 2. Convert weights from HF Transformers to FT format
 
-TensorRT-LLM can directly load weights from FT. The [`hf_opt_convert.py`](./hf_opt_convert.py) script allows you to convert weights from HF Tranformers
+TensorRT-LLM can directly load weights from FT. The [`hf_opt_convert.py`](./hf_opt_convert.py) script allows you to convert weights from HF Transformers
 format to FT format.
 
 ```bash

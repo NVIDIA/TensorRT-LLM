@@ -104,12 +104,8 @@ class SmoothQuantLinear(Module):
             )
 
         weights_dtype = dtype
-        # Dirty hack to make it work with SmoothQuant int8 weights
-        # reinterpreted as fp32 weights due to the int8 TRT plugin limitation.
         if quant_mode.has_act_and_weight_quant():
-            assert self.in_features % 4 == 0
-            self.in_features = self.in_features // 4
-            weights_dtype = "float32"
+            weights_dtype = "int8"
 
         self.weight = Parameter(shape=(self.out_features, self.in_features),
                                 dtype=weights_dtype)
@@ -190,17 +186,12 @@ class SmoothQuantRowLinear(Module):
                 "SmoothQuant Linear has to have act+weight quantization mode set"
             )
         weights_dtype = dtype
-        # Dirty hack to make it work with SmoothQuant int8 weights
-        # reinterpreted as fp32 weights due to the int8 TRT plugin limitation.
         if quant_mode.has_act_and_weight_quant():
-            assert self.in_features % 4 == 0
-            self.in_features = self.in_features // 4
-            weights_dtype = "float32"
+            weights_dtype = "int8"
 
         self.weight = Parameter(shape=(self.out_features, self.in_features),
                                 dtype=weights_dtype)
-        self.smoother = Parameter(shape=(1, self.in_features * 4),
-                                  dtype="float32")
+        self.smoother = Parameter(shape=(1, self.in_features), dtype="float32")
         if quant_mode.has_act_and_weight_quant():
             scale_shape = (1, self.out_features
                            ) if quant_mode.has_per_channel_scaling() else (1, 1)
@@ -352,11 +343,11 @@ class WeightOnlyQuantLinear(Module):
             quant_type_size_in_bits = 4
         self.in_features = in_features
         self.out_features = out_features // tp_size
-        # we use a fake tensor with data_type = float
+        # we use a fake tensor with data_type = int8
         self.weight = Parameter(shape=(self.in_features,
                                        int(self.out_features *
-                                           quant_type_size_in_bits / 32)),
-                                dtype="float32")
+                                           quant_type_size_in_bits / 8)),
+                                dtype="int8")
 
         scale_shape = (self.out_features, )
         self.per_channel_scale = Parameter(shape=scale_shape, dtype=dtype)
@@ -419,11 +410,11 @@ class WeightOnlyQuantRowLinear(Module):
             self.weight_only_quant_mode = 2
         self.in_features = in_features // tp_size
         self.out_features = out_features
-        #we use a fake tensor with data_type = float
+        #we use a fake tensor with data_type = int8
         self.weight = Parameter(shape=(self.in_features,
-                                       int(self.out_features / 4 /
+                                       int(self.out_features /
                                            self.weight_only_quant_mode)),
-                                dtype="float32")
+                                dtype="int8")
         self.per_channel_scale = Parameter(shape=(self.out_features, ),
                                            dtype=dtype)
 
@@ -475,8 +466,8 @@ class WeightOnlyGroupwiseQuantLinear(Module):
         self.in_features = in_features
         self.out_features = out_features // tp_size
         self.qweight = Parameter(shape=(self.in_features,
-                                        self.out_features // 8),
-                                 dtype="float32")
+                                        self.out_features // 2),
+                                 dtype="int8")
 
         scale_shape = (self.in_features // group_size, self.out_features)
         self.scale = Parameter(shape=scale_shape, dtype=dtype)
@@ -559,8 +550,8 @@ class WeightOnlyGroupwiseQuantRowLinear(Module):
         self.in_features = in_features // tp_size
         self.out_features = out_features
         self.qweight = Parameter(shape=(self.in_features,
-                                        self.out_features // 8),
-                                 dtype="float32")
+                                        self.out_features // 2),
+                                 dtype="int8")
 
         scale_shape = (self.in_features // group_size, self.out_features)
         self.scale = Parameter(shape=scale_shape, dtype=dtype)

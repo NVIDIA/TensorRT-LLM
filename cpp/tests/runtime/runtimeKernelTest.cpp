@@ -83,7 +83,6 @@ TEST_F(RuntimeKernelTest, FillBufferInt8)
     {
         auto buffer = mManager->gpu(size, nvinfer1::DataType::kINT8);
         testFill<std::int8_t>(*buffer, *mManager, *mStream);
-        buffer.release();
     }
 }
 
@@ -93,7 +92,6 @@ TEST_F(RuntimeKernelTest, FillTensorInt8)
     {
         auto tensor = mManager->gpu(ITensor::makeShape({size, 2}), nvinfer1::DataType::kINT8);
         testFill<std::int8_t>(*tensor, *mManager, *mStream);
-        tensor.release();
     }
 }
 
@@ -125,7 +123,6 @@ TEST_F(RuntimeKernelTest, AddBufferInt32)
     {
         auto buffer = mManager->gpu(size, nvinfer1::DataType::kINT32);
         testAdd(*buffer, *mManager, *mStream);
-        buffer.release();
     }
 }
 
@@ -135,7 +132,6 @@ TEST_F(RuntimeKernelTest, AddTensorInt32)
     {
         auto tensor = mManager->gpu(ITensor::makeShape({size, size}), nvinfer1::DataType::kINT32);
         testAdd(*tensor, *mManager, *mStream);
-        tensor.release();
     }
 }
 
@@ -163,7 +159,6 @@ TEST_F(RuntimeKernelTest, ReduceBufferInt32)
     {
         auto buffer = mManager->gpu(size, nvinfer1::DataType::kINT32);
         testReduce(*buffer, *mManager, *mStream);
-        buffer.release();
     }
 }
 

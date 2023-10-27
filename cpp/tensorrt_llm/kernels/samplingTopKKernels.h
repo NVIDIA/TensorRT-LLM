@@ -22,34 +22,87 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-
+// clang-format off
+//! \brief Given logProbs, performs top K **and** top P sampling at the same time. Fills sampled tokens to outputIds.
+//! Computes sequenceLength, finished state, cumLogProbs inplace.
+//! Sampling per request can be controlled using skipDecode, topPs and topKs parameters.
+//! Function sets workspaceSize and exits early if workspace is nullptr.
+//!
+//! \param workspace pointer to the workspace. Has to be pre-allocated by caller. Function does not take ownership of the
+//! buffer.
+//! \param workspaceSize size of the workspace in bytes
+//! \param logProbs input buffer [batchSize x vocabSizePadded].
+//! Log probabilities of each token in the vocab. If cumLogProbs or outputLogProbs are specified,
+//! logProbs must contain **just** probabilities instead of log probabilities.
+//! \param outputIds output buffer [batchSize][maxSeqLen]. Contains pointers to rows with output tokens per request
+//! \param sequenceLength input/output buffer [batchSize]. Current sequence length of the request up to, but excluding endId token
+//! \param finishedBuf input/output buffer [batchSize]. Flag if sequence has finished (if finished || outputId == endId).
+//! If true, request exits early.
+//! \param cumLogProbs input/output buffer [batchSize]. Cumulative log probability of selected tokens. Ignored if nullptr
+//! \param outputLogProbs output buffer [batchSize]. Log probs is the probability induced by the top-k sampling.
+//! We normalize the probability 'expLogit' of the selected token by the probability 's_sum' of a set of top-k
+//! tokens, meaning the logProb is the probability of the selected token, conditioned on the event that it is selected,
+//! i.e., log_prob = log P(i | i is in top-k) = log(expLogit / s_sum). Ignored if nullptr.
+//! \param curandstate input buffer [batchSize]. Curand states properly
+//! initialized using invokeCurandInitialize per request.
+//! \param maxTopK maximum among all topKs K for topK sampling
+//! \param topKs input buffer [batchSize]. K for topK sampling per request.
+//! Supported K is in range [1; 1024]. Where K=1 is greedy search. If nullptr maxTopK is used for all requests.
+//! \param topP probability for topP sampling.
+//! \param topPs input buffer [batchSize]. Probability for topP sampling per request.
+//! Supported P is in range (0.0, 1.0]. If nullptr, topP is used for all requests
+//! \param vocabSizePadded size of padded vocab
+//! \param endIds input buffer [batchSize]. EOS token ids per request
+//! \param stream cuda stream
+//! \param batchSize batch size
+//! \param skipDecode input buffer [batchSize]. Flags whether to skip decoding per request
+// clang-format on
 template <typename T>
-void invokeTopKSampling(void* workspace, size_t& workspace_size, const T* log_probs, int** ids, int* sequence_length,
-    bool* finished_buf, float* cum_log_probs, float* output_log_probs, curandState_t* curandstate, const int top_k,
-    const float top_p, const int vocab_size_padded, const int* end_ids, cudaStream_t stream, const int batch_size,
-    const bool* skip_decode);
+void invokeBatchTopKSampling(void* workspace, size_t& workspaceSize, const T* logProbs, int** ids, int* sequenceLengths,
+    bool* finished, float* cumLogProbs, float* outputLogProbs, curandState_t* curandstate, const int maxTopK,
+    const int* topKs, const float topP, const float* topPs, const int vocabSizePadded, const int* endIds,
+    cudaStream_t stream, const int batchSize, const bool* skipDecode);
 
+//! \brief Specialization of invokeBatchTopKSampling with topPs=nullptr and topKs=nullptr
 template <typename T>
-void invokeBatchTopKSampling(void* workspace, size_t& workspace_size, const T* log_probs, int** ids,
-    int* sequence_lengths, bool* finished, float* cum_log_probs, float* output_log_probs, curandState_t* curandstate,
-    const int max_top_k, const int* top_ks, const float top_p, const float* top_ps, const int vocab_size_padded,
-    const int* end_ids, cudaStream_t stream, const int batch_size, const bool* skip_decode);
+void invokeTopKSampling(void* workspace, size_t& workspaceSize, const T* logProbs, int** outputIds, int* sequenceLength,
+    bool* finishedBuf, float* cumLogProbs, float* outputLogProbs, curandState_t* curandstate, const int topK,
+    const float topP, const int vocabSizePadded, const int* endIds, cudaStream_t stream, const int batchSize,
+    const bool* skipDecode);
 
+//! \brief Initialize batchSize curand states with given seed.
+//!
+//! \param state output buffer [batchSize]. Curand states to be initialized
+//! \param batchSize number of states to initialize
+//! \param randomSeed seed to initialize states
+//! \param stream stream
 void invokeCurandInitialize(
-    curandState_t* state, const size_t batch_size, unsigned long long random_seed, cudaStream_t stream);
+    curandState_t* state, const size_t batchSize, unsigned long long randomSeed, cudaStream_t stream);
 
+//! \brief Initialize batchSize curand states with given seed per request.
+//!
+//! \param state output buffer [batchSize] of curand states to be initialized
+//! \param batchSize number of states to initialize
+//! \param randomSeeds input buffer [batchSize] with seeds
+//! \param stream stream
 void invokeCurandBatchInitialize(
-    curandState_t* states, const size_t batch_size, const unsigned long long* random_seeds, cudaStream_t stream);
+    curandState_t* states, const size_t batchSize, const unsigned long long* randomSeeds, cudaStream_t stream);
 
+//! \brief Applies mask and bias to logits. Sets -MAX_FLT value for tokens in range [vocabSize; vocabSizePadded) to
+//! prevent them being chosen If request finished the generation, sets MAX_FLT to endId token and -MAX_FLT to all other
+//! tokens forcing to choose endId token. Otherwise, adds bias per token if bias pointer is not nullptr.
+//!
+//! \param logits input/output buffer [batchSize, vocabSize]. Logits to be modified.
+//! \param bias input buffer [vocabSize]. Bias to logit per token. Ignored if nullptr
+//! \param endIds input buffer [batchSize]. EOS token ids per request
+//! \param finished input buffer [batchSize] with flags set to true if request has finished the generation
+//! \param batchSize batch size
+//! \param vocabSize unpadded vocab size
+//! \param vocabSizePadded padded vocab size
+//! \param stream stream
 template <typename T>
-void invokeAddBiasEndMask(T* logits, const T* bias, const int* end_ids, const bool* finished, const int batch_size,
-    const int vocab_size, const int vocab_size_padded, cudaStream_t stream);
-
-template <typename T>
-void invokeTopKTopPSampling(void* workspace, size_t& workspace_size, int** output_ids, const T* logits,
-    int* sequence_lengths, bool* finished_buf, float* cum_log_probs, float* output_log_probs,
-    curandState_t* curandstate, const int batch_size, const int top_k, const float top_p, const int vocab_size_padded,
-    const int* end_ids, cudaStream_t stream);
+void invokeAddBiasEndMask(T* logits, const T* bias, const int* endIds, const bool* finished, const int batchSize,
+    const int vocabSize, const int vocabSizePadded, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

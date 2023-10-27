@@ -79,7 +79,7 @@ concepts used in TensorRT-LLM, we recommend you to read the following
 
 ## Installation
 
-*For Windows installation, see [`Windows/`](windows/).*
+*For Windows installation, see [`Windows`](windows/README.md).*
 
 TensorRT-LLM must be built from source, instructions can be found
 [here](./docs/source/installation.md). An image of a Docker container with

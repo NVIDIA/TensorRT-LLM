@@ -62,12 +62,12 @@ class Logger(metaclass=Singleton):
             self._polygraphy_logger.module_severity = severity_map[
                 min_severity][2]
 
+        self.mpi_rank = MPI.COMM_WORLD.Get_rank()
+        self.mpi_size = MPI.COMM_WORLD.Get_size()
         if invalid_severity:
             self.warning(
                 f"Requested log level {environ_severity} is invalid. Using 'warning' instead"
             )
-        self.mpi_rank = MPI.COMM_WORLD.Get_rank()
-        self.mpi_size = MPI.COMM_WORLD.Get_size()
 
     def _func_wrapper(self, severity):
         if severity == self.INTERNAL_ERROR:

@@ -70,8 +70,8 @@ public:
         std::optional<std::vector<std::int32_t>> top_p_reset_ids; // [batch_size]
 
         // omlineBeamSearchLayer
-        std::optional<float> beam_search_diversity_rate;
-        std::optional<float> length_penalty;
+        std::optional<std::vector<float>> beam_search_diversity_rate;
+        std::optional<std::vector<float>> length_penalty;
     };
 
     void setup(size_t batch_size, size_t beam_width, SetupParams const& setupParams);

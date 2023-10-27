@@ -27,6 +27,7 @@ using tensorrt_llm::common::bf1622float2;
 using tensorrt_llm::common::bf16hmul2;
 using tensorrt_llm::common::bf16hmul;
 using tensorrt_llm::common::bf16hadd2;
+using tensorrt_llm::common::float22bf162;
 #endif
 
 namespace tensorrt_llm
@@ -611,6 +612,18 @@ inline __device__ float4 fma(float4 a, float4 b, float4 c)
     return d;
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float4_ fma(float4 a, Float4_ fb, Float4_ fc)
+{
+    Float4_ fa, fd;
+    fa = reinterpret_cast<Float4_&>(a);
+
+    fd.x = fma(fa.x, fb.x, fc.x);
+    fd.y = fma(fa.y, fb.y, fc.y);
+    return fd;
+}
+
 //////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline __device__ Float8_ fma(Float8_ a, Float8_ b, Float8_ c)
@@ -783,6 +796,14 @@ inline __device__ float2 fma(uint32_t a, uint32_t b, float2 fc)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+inline __device__ float2 fma(float2 fa, uint32_t b, float2 fc)
+{
+    float2 fb = half2_to_float2(b);
+    return fma(fa, fb, fc);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 inline __device__ float2 fma(uint16_t a, uint32_t b, float2 fc)
 {
     return fma(h0_h0(a), b, fc);
@@ -823,6 +844,18 @@ inline __device__ Float8_ fma(uint4 a, uint4 b, Float8_ fc)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+inline __device__ Float8_ fma(Float8_ fa, uint4 b, Float8_ fc)
+{
+    Float8_ fd;
+    fd.x = fma(fa.x, b.x, fc.x);
+    fd.y = fma(fa.y, b.y, fc.y);
+    fd.z = fma(fa.z, b.z, fc.z);
+    fd.w = fma(fa.w, b.w, fc.w);
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 inline __device__ Float8_ fma(uint16_t a, uint4 b, Float8_ fc)
 {
     uint32_t s = h0_h0(a);
@@ -831,6 +864,77 @@ inline __device__ Float8_ fma(uint16_t a, uint4 b, Float8_ fc)
     fd.y = fma(s, b.y, fc.y);
     fd.z = fma(s, b.z, fc.z);
     fd.w = fma(s, b.w, fc.w);
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ float fma(uint16_t a, float fb, float fc)
+{
+    float fa = half_to_float(a);
+    return fa * fb + fc;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ float2 fma(uint32_t a, float2 fb, float2 fc)
+{
+    float2 fa = half2_to_float2(a);
+    return fma(fa, fb, fc);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ float2 fma(uint16_t a, float2 fb, float2 fc)
+{
+    float fa = half_to_float(a);
+    float2 fd;
+    fd.x = fma(fa, fb.x, fc.x);
+    fd.y = fma(fa, fb.y, fc.y);
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float4_ fma(uint2 a, Float4_ fb, Float4_ fc)
+{
+    Float4_ fd;
+    fd.x = fma(a.x, fb.x, fc.x);
+    fd.y = fma(a.y, fb.y, fc.y);
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float4_ fma(uint16_t a, Float4_ fb, Float4_ fc)
+{
+    Float4_ fd;
+    fd.x = fma(a, fb.x, fc.x);
+    fd.y = fma(a, fb.y, fc.y);
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float8_ fma(uint4 a, Float8_ fb, Float8_ fc)
+{
+    Float8_ fd;
+    fd.x = fma(a.x, fb.x, fc.x);
+    fd.y = fma(a.y, fb.y, fc.y);
+    fd.z = fma(a.z, fb.z, fc.z);
+    fd.w = fma(a.w, fb.w, fc.w);
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float8_ fma(uint16_t a, Float8_ fb, Float8_ fc)
+{
+    Float8_ fd;
+    fd.x = fma(a, fb.x, fc.x);
+    fd.y = fma(a, fb.y, fc.y);
+    fd.z = fma(a, fb.z, fc.z);
+    fd.w = fma(a, fb.w, fc.w);
     return fd;
 }
 
@@ -912,6 +1016,14 @@ inline __device__ float2 fma(__nv_bfloat162 a, __nv_bfloat162 b, float2 fc)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+inline __device__ float2 fma(float2 fa, __nv_bfloat162 b, float2 fc)
+{
+    float2 fb = bf1622float2(b);
+    return fma(fa, fb, fc);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 inline __device__ float2 fma(__nv_bfloat16 a, __nv_bfloat162 b, float2 fc)
 {
     return fma(bf162bf162(a), b, fc);
@@ -952,6 +1064,18 @@ inline __device__ Float8_ fma(bf16_8_t a, bf16_8_t b, Float8_ fc)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+inline __device__ Float8_ fma(Float8_ fa, bf16_8_t b, Float8_ fc)
+{
+    Float8_ fd;
+    fd.x = fma(fa.x, b.x, fc.x);
+    fd.y = fma(fa.y, b.y, fc.y);
+    fd.z = fma(fa.z, b.z, fc.z);
+    fd.w = fma(fa.w, b.w, fc.w);
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 inline __device__ Float8_ fma(__nv_bfloat16 a, bf16_8_t b, Float8_ fc)
 {
     __nv_bfloat162 s = bf162bf162(a);
@@ -962,7 +1086,396 @@ inline __device__ Float8_ fma(__nv_bfloat16 a, bf16_8_t b, Float8_ fc)
     fd.w = fma(s, b.w, fc.w);
     return fd;
 }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ float fma(__nv_bfloat16 a, float fb, float fc)
+{
+    float fa = __bfloat162float(a);
+    return fa * fb + fc;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ float2 fma(__nv_bfloat162 a, float2 fb, float2 fc)
+{
+    float2 fa = bf1622float2(a);
+    return fma(fa, fb, fc);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ float2 fma(__nv_bfloat16 a, float2 fb, float2 fc)
+{
+    float fa = __bfloat162float(a);
+    return fma(fa, fb, fc);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float4_ fma(bf16_4_t a, Float4_ fb, Float4_ fc)
+{
+    Float4_ fd;
+    fd.x = fma(a.x, fb.x, fc.x);
+    fd.y = fma(a.y, fb.y, fc.y);
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float4_ fma(__nv_bfloat16 a, Float4_ fb, Float4_ fc)
+{
+    Float4_ fd;
+    fd.x = fma(a, fb.x, fc.x);
+    fd.y = fma(a, fb.y, fc.y);
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float8_ fma(bf16_8_t a, Float8_ fb, Float8_ fc)
+{
+    Float8_ fd;
+    fd.x = fma(a.x, fb.x, fc.x);
+    fd.y = fma(a.y, fb.y, fc.y);
+    fd.z = fma(a.z, fb.z, fc.z);
+    fd.w = fma(a.w, fb.w, fc.w);
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float8_ fma(__nv_bfloat16 a, Float8_ fb, Float8_ fc)
+{
+    Float8_ fd;
+    fd.x = fma(a, fb.x, fc.x);
+    fd.y = fma(a, fb.y, fc.y);
+    fd.z = fma(a, fb.z, fc.z);
+    fd.w = fma(a, fb.w, fc.w);
+    return fd;
+}
+
 #endif // ENABLE_BF16
+
+#ifdef ENABLE_FP8
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ float4 fma(float4 a, fp8_4_t b, float4 fc)
+{
+    float4 fd;
+
+    union
+    {
+        fp8_4_t fp8_4;
+        fp8_2_t fp8_2[2];
+    };
+
+    fp8_4 = b;
+    float2 fb0 = float2(fp8_2[0]);
+    float2 fb1 = float2(fp8_2[1]);
+
+    fd.x = fma(a.x, fb0.x, fc.x);
+    fd.y = fma(a.y, fb0.y, fc.y);
+    fd.z = fma(a.z, fb1.x, fc.z);
+    fd.w = fma(a.w, fb1.y, fc.w);
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ float4 fma(float a, fp8_4_t b, float4 fc)
+{
+    float4 fd;
+
+    union
+    {
+        fp8_4_t fp8_4;
+        fp8_2_t fp8_2[2];
+    };
+
+    fp8_4 = b;
+    float2 fb0 = float2(fp8_2[0]);
+    float2 fb1 = float2(fp8_2[1]);
+
+    fd.x = fma(a, fb0.x, fc.x);
+    fd.y = fma(a, fb0.y, fc.y);
+    fd.z = fma(a, fb1.x, fc.z);
+    fd.w = fma(a, fb1.y, fc.w);
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float4_ fma(float4 a, fp8_4_t b, Float4_ fc)
+{
+    float4 fd;
+    fd = fma(a, b, reinterpret_cast<float4&>(fc));
+
+    return reinterpret_cast<Float4_&>(fd);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float8_ fma(uint4 a, fp8_8_t b, Float8_ fc)
+{
+    Float8_ fd;
+
+    union
+    {
+        fp8_8_t fp8_8;
+        fp8_2_t fp8_2[4];
+    };
+
+    fp8_8 = b;
+
+    fd.x = fma(a.x, float2(fp8_2[0]), fc.x);
+    fd.y = fma(a.y, float2(fp8_2[1]), fc.y);
+    fd.z = fma(a.z, float2(fp8_2[2]), fc.z);
+    fd.w = fma(a.w, float2(fp8_2[3]), fc.w);
+
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float8_ fma(Float8_ fa, fp8_8_t b, Float8_ fc)
+{
+    Float8_ fd;
+
+    union
+    {
+        fp8_8_t fp8_8;
+        fp8_2_t fp8_2[4];
+    };
+
+    fp8_8 = b;
+
+    fd.x = fma(fa.x, float2(fp8_2[0]), fc.x);
+    fd.y = fma(fa.y, float2(fp8_2[1]), fc.y);
+    fd.z = fma(fa.z, float2(fp8_2[2]), fc.z);
+    fd.w = fma(fa.w, float2(fp8_2[3]), fc.w);
+
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float8_ fma(float a, fp8_8_t b, Float8_ fc)
+{
+    Float8_ fd;
+
+    union
+    {
+        fp8_8_t fp8_8;
+        fp8_2_t fp8_2[4];
+    };
+
+    fp8_8 = b;
+
+    fd.x = fma(a, float2(fp8_2[0]), fc.x);
+    fd.y = fma(a, float2(fp8_2[1]), fc.y);
+    fd.z = fma(a, float2(fp8_2[2]), fc.z);
+    fd.w = fma(a, float2(fp8_2[3]), fc.w);
+
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float8_ fma(uint16_t a, fp8_8_t b, Float8_ fc)
+{
+    return fma(half_to_float(a), b, fc);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float8_ fma(bf16_8_t a, fp8_8_t b, Float8_ fc)
+{
+    Float8_ fd;
+
+    union
+    {
+        fp8_8_t fp8_8;
+        fp8_2_t fp8_2[4];
+    };
+
+    fp8_8 = b;
+
+    fd.x = fma(a.x, float2(fp8_2[0]), fc.x);
+    fd.y = fma(a.y, float2(fp8_2[1]), fc.y);
+    fd.z = fma(a.z, float2(fp8_2[2]), fc.z);
+    fd.w = fma(a.w, float2(fp8_2[3]), fc.w);
+
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float8_ fma(__nv_bfloat16 a, fp8_8_t b, Float8_ fc)
+{
+    return fma(__bfloat162float(a), b, fc);
+}
+
+#endif // ENABLE_FP8
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ float4 fma(float4 a, int32_t b, float4 fc)
+{
+    float4 fd;
+
+    union
+    {
+        int32_t int32;
+        ;
+        int8_t int8[4];
+    };
+
+    int32 = b;
+
+    fd.x = fma(a.x, int8[0], fc.x);
+    fd.y = fma(a.y, int8[1], fc.y);
+    fd.z = fma(a.z, int8[2], fc.z);
+    fd.w = fma(a.w, int8[3], fc.w);
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float4_ fma(float4 a, int32_t b, Float4_ fc)
+{
+    float4 fd;
+    fd = fma(a, b, reinterpret_cast<float4&>(fc));
+
+    return reinterpret_cast<Float4_&>(fd);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ float4 fma(float a, int32_t b, float4 fc)
+{
+    float4 fd;
+
+    union
+    {
+        int32_t int32;
+        ;
+        int8_t int8[4];
+    };
+
+    int32 = b;
+
+    fd.x = fma(a, int8[0], fc.x);
+    fd.y = fma(a, int8[1], fc.y);
+    fd.z = fma(a, int8[2], fc.z);
+    fd.w = fma(a, int8[3], fc.w);
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float8_ fma(uint4 a, int64_t b, Float8_ fc)
+{
+    Float8_ fd;
+
+    union
+    {
+        int64_t int64;
+        int8_t int8[8];
+    };
+
+    int64 = b;
+
+    fd.x = fma(a.x, make_float2(int8[0], int8[1]), fc.x);
+    fd.y = fma(a.y, make_float2(int8[2], int8[3]), fc.y);
+    fd.z = fma(a.z, make_float2(int8[4], int8[5]), fc.z);
+    fd.w = fma(a.w, make_float2(int8[6], int8[7]), fc.w);
+
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float8_ fma(Float8_ fa, int64_t b, Float8_ fc)
+{
+    Float8_ fd;
+
+    union
+    {
+        int64_t int64;
+        int8_t int8[8];
+    };
+
+    int64 = b;
+
+    fd.x = fma(fa.x, make_float2(int8[0], int8[1]), fc.x);
+    fd.y = fma(fa.y, make_float2(int8[2], int8[3]), fc.y);
+    fd.z = fma(fa.z, make_float2(int8[4], int8[5]), fc.z);
+    fd.w = fma(fa.w, make_float2(int8[6], int8[7]), fc.w);
+
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float8_ fma(float a, int64_t b, Float8_ fc)
+{
+    Float8_ fd;
+    float2 fa = make_float2(a, a);
+
+    union
+    {
+        int64_t int64;
+        int8_t int8[8];
+    };
+
+    int64 = b;
+
+    fd.x = fma(fa, make_float2(int8[0], int8[1]), fc.x);
+    fd.y = fma(fa, make_float2(int8[2], int8[3]), fc.y);
+    fd.z = fma(fa, make_float2(int8[4], int8[5]), fc.z);
+    fd.w = fma(fa, make_float2(int8[6], int8[7]), fc.w);
+
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float8_ fma(uint16_t a, int64_t b, Float8_ fc)
+{
+    return fma(half_to_float(a), b, fc);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float8_ fma(bf16_8_t a, int64_t b, Float8_ fc)
+{
+    Float8_ fd;
+
+    union
+    {
+        int64_t int64;
+        int8_t int8[8];
+    };
+
+    int64 = b;
+
+    fd.x = fma(a.x, make_float2(int8[0], int8[1]), fc.x);
+    fd.y = fma(a.y, make_float2(int8[2], int8[3]), fc.y);
+    fd.z = fma(a.z, make_float2(int8[4], int8[5]), fc.z);
+    fd.w = fma(a.w, make_float2(int8[6], int8[7]), fc.w);
+
+    return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ Float8_ fma(__nv_bfloat16 a, int64_t b, Float8_ fc)
+{
+    return fma(__bfloat162float(a), b, fc);
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename Acc, typename A, typename B>
@@ -1017,6 +1530,16 @@ inline __device__ float4 mul(float4 a, float4 b)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <>
+inline __device__ Float4_ mul(float4 a, Float4_ b)
+{
+    float4 c;
+    c = mul<float4, float4, float4>(a, reinterpret_cast<float4&>(b));
+    return reinterpret_cast<Float4_&>(c);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
 inline __device__ float4 mul(float a, float4 b)
 {
     float4 c;
@@ -1025,6 +1548,15 @@ inline __device__ float4 mul(float a, float4 b)
     c.z = a * b.z;
     c.w = a * b.w;
     return c;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ Float4_ mul(float a, Float4_ b)
+{
+    float4 c = mul<float4, float, float4>(a, reinterpret_cast<float4&>(b));
+    return reinterpret_cast<Float4_&>(c);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1149,6 +1681,24 @@ inline __device__ float2 mul(uint32_t a, uint32_t b)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <>
+inline __device__ float2 mul(uint32_t a, float2 fb)
+{
+    float2 fa = half2_to_float2(a);
+    return mul<float2, float2, float2>(fa, fb);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ float2 mul(float2 fa, uint32_t b)
+{
+    float2 fb = half2_to_float2(b);
+    return mul<float2, float2, float2>(fa, fb);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
 inline __device__ float2 mul(uint16_t a, uint32_t b)
 {
     return mul<float2, uint32_t, uint32_t>(h0_h0(a), b);
@@ -1193,6 +1743,45 @@ inline __device__ Float8_ mul(uint4 a, uint4 b)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <>
+inline __device__ Float8_ mul(Float8_ fa, uint4 b)
+{
+    Float8_ fc;
+    fc.x = mul<float2, float2, uint32_t>(fa.x, b.x);
+    fc.y = mul<float2, float2, uint32_t>(fa.y, b.y);
+    fc.z = mul<float2, float2, uint32_t>(fa.z, b.z);
+    fc.w = mul<float2, float2, uint32_t>(fa.w, b.w);
+    return fc;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ Float8_ mul(Float8_ fa, Float8_ fb)
+{
+    Float8_ fc;
+    fc.x = mul<float2, float2, float2>(fa.x, fb.x);
+    fc.y = mul<float2, float2, float2>(fa.y, fb.y);
+    fc.z = mul<float2, float2, float2>(fa.z, fb.z);
+    fc.w = mul<float2, float2, float2>(fa.w, fb.w);
+    return fc;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ Float8_ mul(uint4 a, Float8_ fb)
+{
+    Float8_ fc;
+    fc.x = mul<float2, uint32_t, float2>(a.x, fb.x);
+    fc.y = mul<float2, uint32_t, float2>(a.y, fb.y);
+    fc.z = mul<float2, uint32_t, float2>(a.z, fb.z);
+    fc.w = mul<float2, uint32_t, float2>(a.w, fb.w);
+    return fc;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
 inline __device__ Float8_ mul(uint16_t a, uint4 b)
 {
     uint32_t s = h0_h0(a);
@@ -1217,6 +1806,16 @@ inline __device__ Float8_ mul(float a, uint4 b)
     fc.z = mul<float2, uint32_t, uint32_t>(s, b.z);
     fc.w = mul<float2, uint32_t, uint32_t>(s, b.w);
     return fc;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ uint4 mul(float a, uint4 b)
+{
+    uint16_t h = float_to_half(a);
+    uint4 c = mul<uint4, uint16_t, uint4>(h, b);
+    return c;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1287,6 +1886,20 @@ inline __device__ bf16_8_t mul(bf16_8_t a, bf16_8_t b)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <>
+inline __device__ bf16_8_t mul(float a, bf16_8_t b)
+{
+    __nv_bfloat162 a_ = float22bf162(make_float2(a, a));
+    bf16_8_t c;
+    c.x = mul<__nv_bfloat162, __nv_bfloat162, __nv_bfloat162>(a_, b.x);
+    c.y = mul<__nv_bfloat162, __nv_bfloat162, __nv_bfloat162>(a_, b.y);
+    c.z = mul<__nv_bfloat162, __nv_bfloat162, __nv_bfloat162>(a_, b.z);
+    c.w = mul<__nv_bfloat162, __nv_bfloat162, __nv_bfloat162>(a_, b.w);
+    return c;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
 inline __device__ bf16_8_t mul(__nv_bfloat16 a, bf16_8_t b)
 {
     __nv_bfloat162 s = bf162bf162(a);
@@ -1322,6 +1935,24 @@ template <>
 inline __device__ float2 mul(__nv_bfloat162 a, __nv_bfloat162 b)
 {
     float2 fa = bf1622float2(a);
+    float2 fb = bf1622float2(b);
+    return mul<float2, float2, float2>(fa, fb);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ float2 mul(__nv_bfloat162 a, float2 fb)
+{
+    float2 fa = bf1622float2(a);
+    return mul<float2, float2, float2>(fa, fb);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ float2 mul(float2 fa, __nv_bfloat162 b)
+{
     float2 fb = bf1622float2(b);
     return mul<float2, float2, float2>(fa, fb);
 }
@@ -1373,6 +2004,32 @@ inline __device__ Float8_ mul(bf16_8_t a, bf16_8_t b)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <>
+inline __device__ Float8_ mul(bf16_8_t a, Float8_ fb)
+{
+    Float8_ fc;
+    fc.x = mul<float2, __nv_bfloat162, float2>(a.x, fb.x);
+    fc.y = mul<float2, __nv_bfloat162, float2>(a.y, fb.y);
+    fc.z = mul<float2, __nv_bfloat162, float2>(a.z, fb.z);
+    fc.w = mul<float2, __nv_bfloat162, float2>(a.w, fb.w);
+    return fc;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ Float8_ mul(Float8_ fa, bf16_8_t b)
+{
+    Float8_ fc;
+    fc.x = mul<float2, float2, __nv_bfloat162>(fa.x, b.x);
+    fc.y = mul<float2, float2, __nv_bfloat162>(fa.y, b.y);
+    fc.z = mul<float2, float2, __nv_bfloat162>(fa.z, b.z);
+    fc.w = mul<float2, float2, __nv_bfloat162>(fa.w, b.w);
+    return fc;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
 inline __device__ Float8_ mul(__nv_bfloat16 a, bf16_8_t b)
 {
     __nv_bfloat162 s = bf162bf162(a);
@@ -1384,6 +2041,304 @@ inline __device__ Float8_ mul(__nv_bfloat16 a, bf16_8_t b)
     return fc;
 }
 #endif // ENABLE_BF16
+
+#ifdef ENABLE_FP8
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ Float8_ mul(uint4 a, fp8_8_t b)
+{
+    Float8_ fc;
+
+    union
+    {
+        fp8_8_t fp8_8;
+        fp8_2_t fp8_2[4];
+    };
+
+    fp8_8 = b;
+
+    fc.x = mul<float2, uint32_t, float2>(a.x, float2(fp8_2[0]));
+    fc.y = mul<float2, uint32_t, float2>(a.y, float2(fp8_2[1]));
+    fc.z = mul<float2, uint32_t, float2>(a.z, float2(fp8_2[2]));
+    fc.w = mul<float2, uint32_t, float2>(a.w, float2(fp8_2[3]));
+
+    return fc;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ Float8_ mul(Float8_ fa, fp8_8_t b)
+{
+    Float8_ fc;
+
+    union
+    {
+        fp8_8_t fp8_8;
+        fp8_2_t fp8_2[4];
+    };
+
+    fp8_8 = b;
+
+    fc.x = mul<float2, float2, float2>(fa.x, float2(fp8_2[0]));
+    fc.y = mul<float2, float2, float2>(fa.y, float2(fp8_2[1]));
+    fc.z = mul<float2, float2, float2>(fa.z, float2(fp8_2[2]));
+    fc.w = mul<float2, float2, float2>(fa.w, float2(fp8_2[3]));
+
+    return fc;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ Float4_ mul(float fa, fp8_4_t b)
+{
+    Float4_ fc;
+
+    union
+    {
+        fp8_4_t fp8_4;
+        fp8_2_t fp8_2[2];
+    };
+
+    fp8_4 = b;
+    float2 fa2 = make_float2(fa, fa);
+
+    fc.x = mul<float2, float2, float2>(fa2, float2(fp8_2[0]));
+    fc.y = mul<float2, float2, float2>(fa2, float2(fp8_2[1]));
+
+    return fc;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ float4 mul(float fa, fp8_4_t b)
+{
+    Float4_ fc = mul<Float4_, float, fp8_4_t>(fa, b);
+    return reinterpret_cast<float4&>(fc);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ Float8_ mul(float fa, fp8_8_t b)
+{
+    Float8_ fc;
+
+    union
+    {
+        fp8_8_t fp8_8;
+        fp8_2_t fp8_2[4];
+    };
+
+    fp8_8 = b;
+    float2 fa2 = make_float2(fa, fa);
+
+    fc.x = mul<float2, float2, float2>(fa2, float2(fp8_2[0]));
+    fc.y = mul<float2, float2, float2>(fa2, float2(fp8_2[1]));
+    fc.z = mul<float2, float2, float2>(fa2, float2(fp8_2[2]));
+    fc.w = mul<float2, float2, float2>(fa2, float2(fp8_2[3]));
+
+    return fc;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ Float8_ mul(bf16_8_t a, fp8_8_t b)
+{
+    Float8_ fc;
+
+    union
+    {
+        fp8_8_t fp8_8;
+        fp8_2_t fp8_2[4];
+    };
+
+    fp8_8 = b;
+
+    fc.x = mul<float2, __nv_bfloat162, float2>(a.x, float2(fp8_2[0]));
+    fc.y = mul<float2, __nv_bfloat162, float2>(a.y, float2(fp8_2[1]));
+    fc.z = mul<float2, __nv_bfloat162, float2>(a.z, float2(fp8_2[2]));
+    fc.w = mul<float2, __nv_bfloat162, float2>(a.w, float2(fp8_2[3]));
+    return fc;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ float4 mul(float4 fa, fp8_4_t b)
+{
+    float4 fc;
+
+    union
+    {
+        fp8_4_t fp8_4;
+        fp8_2_t fp8_2[2];
+    };
+
+    fp8_4 = b;
+
+    float2 fb0 = float2(fp8_2[0]);
+    float2 fb1 = float2(fp8_2[1]);
+
+    fc.x = fa.x * fb0.x;
+    fc.y = fa.y * fb0.y;
+    fc.z = fa.z * fb1.x;
+    fc.w = fa.w * fb1.y;
+
+    return fc;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#endif // ENABLE_FP8
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ Float8_ mul(uint4 a, int64_t b)
+{
+    Float8_ fc;
+
+    union
+    {
+        int64_t int64;
+        int8_t int8[8];
+    };
+
+    int64 = b;
+
+    fc.x = mul<float2, uint32_t, float2>(a.x, make_float2(int8[0], int8[1]));
+    fc.y = mul<float2, uint32_t, float2>(a.y, make_float2(int8[2], int8[3]));
+    fc.z = mul<float2, uint32_t, float2>(a.z, make_float2(int8[4], int8[5]));
+    fc.w = mul<float2, uint32_t, float2>(a.w, make_float2(int8[6], int8[7]));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ Float8_ mul(Float8_ fa, int64_t b)
+{
+    Float8_ fc;
+
+    union
+    {
+        int64_t int64;
+        int8_t int8[8];
+    };
+
+    int64 = b;
+
+    fc.x = mul<float2, float2, float2>(fa.x, make_float2(int8[0], int8[1]));
+    fc.y = mul<float2, float2, float2>(fa.y, make_float2(int8[2], int8[3]));
+    fc.z = mul<float2, float2, float2>(fa.z, make_float2(int8[4], int8[5]));
+    fc.w = mul<float2, float2, float2>(fa.w, make_float2(int8[6], int8[7]));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ Float8_ mul(float fa, int64_t b)
+{
+    Float8_ fc;
+
+    union
+    {
+        int64_t int64;
+        int8_t int8[8];
+    };
+
+    int64 = b;
+    float2 fa2 = make_float2(fa, fa);
+
+    fc.x = mul<float2, float2, float2>(fa2, make_float2(int8[0], int8[1]));
+    fc.y = mul<float2, float2, float2>(fa2, make_float2(int8[2], int8[3]));
+    fc.z = mul<float2, float2, float2>(fa2, make_float2(int8[4], int8[5]));
+    fc.w = mul<float2, float2, float2>(fa2, make_float2(int8[6], int8[7]));
+    return fc;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ Float4_ mul(float fa, int32_t b)
+{
+    Float4_ fc;
+
+    union
+    {
+        int32_t int32;
+        int8_t int8[4];
+    };
+
+    int32 = b;
+    float2 fa2 = make_float2(fa, fa);
+
+    fc.x = mul<float2, float2, float2>(fa2, make_float2(int8[0], int8[1]));
+    fc.y = mul<float2, float2, float2>(fa2, make_float2(int8[2], int8[3]));
+    return fc;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ float4 mul(float fa, int32_t b)
+{
+    Float4_ fc = mul<Float4_, float, int32_t>(fa, b);
+    return reinterpret_cast<float4&>(fc);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#ifdef ENABLE_BF16
+
+template <>
+inline __device__ Float8_ mul(bf16_8_t a, int64_t b)
+{
+    Float8_ fc;
+
+    union
+    {
+        int64_t int64;
+        int8_t int8[8];
+    };
+
+    int64 = b;
+
+    fc.x = mul<float2, __nv_bfloat162, float2>(a.x, make_float2(int8[0], int8[1]));
+    fc.y = mul<float2, __nv_bfloat162, float2>(a.y, make_float2(int8[2], int8[3]));
+    fc.z = mul<float2, __nv_bfloat162, float2>(a.z, make_float2(int8[4], int8[5]));
+    fc.w = mul<float2, __nv_bfloat162, float2>(a.w, make_float2(int8[6], int8[7]));
+}
+
+#endif // ENABLE_BF16
+
+///////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ float4 mul(float4 a, int32_t b)
+{
+    float4 fc;
+
+    union
+    {
+        int32_t int32;
+        int8_t int8[4];
+    };
+
+    int32 = b;
+
+    fc.x = a.x * float(int8[0]);
+    fc.y = a.y * float(int8[1]);
+    fc.z = a.z * float(int8[2]);
+    fc.w = a.w * float(int8[3]);
+    return fc;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline __device__ float sum(float v)
@@ -2426,13 +3381,13 @@ inline __device__ int64_t cast_to_int8(Float8_ val)
 template <typename Vec_k, typename T, typename T_scale>
 inline __device__ void load_8bits_kv_cache_vec(Vec_k* vec, const T* pointer, int idx, T_scale scale)
 {
-    ; // Not used.
+    assert(false); // Not used.
 }
 
 template <typename Vec_k, typename T, typename T_scale>
 inline __device__ void store_8bits_kv_cache_vec(T* pointer, const Vec_k& vec, int idx, T_scale scale)
 {
-    ; // Not used.
+    assert(false); // Not used.
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2450,12 +3405,18 @@ inline __device__ void load_8bits_kv_cache_vec(Vec_k* vec, const int8_t* pointer
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #ifdef ENABLE_FP8
-template <typename Vec_k, typename T_scale>
-inline __device__ void load_8bits_kv_cache_vec(Vec_k* vec, const __nv_fp8_e4m3* pointer, int idx, T_scale scale)
+template <typename Vec_k>
+inline __device__ void load_8bits_kv_cache_vec(Vec_k* vec, const __nv_fp8_e4m3* pointer, int idx)
 {
     using Packed_8bits_t = typename packed_type<__nv_fp8_e4m3, num_elems<Vec_k>::value>::type;
     const auto quant = *reinterpret_cast<const Packed_8bits_t*>(&pointer[idx]);
     convert_from_fp8(vec, quant);
+}
+
+template <typename Vec_k, typename T_scale>
+inline __device__ void load_8bits_kv_cache_vec(Vec_k* vec, const __nv_fp8_e4m3* pointer, int idx, T_scale scale)
+{
+    load_8bits_kv_cache_vec(vec, pointer, idx);
     vec[0] = mul<Vec_k>(scale, vec[0]);
 }
 #endif // ENABLE_FP8
@@ -2501,6 +3462,26 @@ inline __device__ void convert_from_8bit_kv_cache(Vec_out* vec_o, const Vec_in& 
     {
         convert_from_fp8(vec_o, vec_i);
         vec_o[0] = mul<Vec_out>(scale, vec_o[0]);
+    }
+#endif // ENABLE_FP8
+    else
+    {
+        ; // not supported.
+    }
+}
+
+template <typename Vec_in, typename Vec_out, typename T_cache>
+inline __device__ void convert_from_8bit_kv_cache(Vec_out* vec_o, const Vec_in& vec_i)
+{
+    if constexpr (std::is_same<T_cache, int8_t>::value)
+    {
+        using Packed_Float_t = typename packed_type<float, num_elems<Vec_out>::value>::type;
+        convert_from_float(vec_o, float_from_int8(vec_i));
+    }
+#ifdef ENABLE_FP8
+    else if constexpr (std::is_same<T_cache, __nv_fp8_e4m3>::value)
+    {
+        convert_from_fp8(vec_o, vec_i);
     }
 #endif // ENABLE_FP8
     else

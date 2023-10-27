@@ -75,6 +75,13 @@ add_gtest(bufferManagerTest runtime/bufferManagerTest.cpp)
 add_gtest(runtimeKernelTest runtime/runtimeKernelTest.cpp)
 add_gtest(samplingTest runtime/samplingTest.cpp)
 add_gtest(torchTest runtime/torchTest.cpp)
+set(SAMPLING_KERNEL_TEST_SRC
+    kernels/sampling/samplingTest.cpp
+    kernels/sampling/samplingTopKTest.cpp
+    kernels/sampling/samplingTopPTest.cpp
+    kernels/sampling/samplingPenaltyTest.cpp
+    kernels/sampling/samplingUtilsTest.cu)
+add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
 target_link_libraries(torchTest PUBLIC ${TORCH_LIBRARIES})
 
 if(BUILD_BATCH_MANAGER)

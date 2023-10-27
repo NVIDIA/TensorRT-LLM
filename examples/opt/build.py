@@ -344,7 +344,7 @@ def build(rank, args):
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
-            int8=(args.quant_mode.has_act_and_weight_quant()
+            int8=(args.quant_mode.has_act_or_weight_quant()
                   or args.quant_mode.has_int8_kv_cache()))
 
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.world_size,

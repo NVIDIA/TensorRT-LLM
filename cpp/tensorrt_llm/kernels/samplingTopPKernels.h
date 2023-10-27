@@ -22,100 +22,105 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-void invokeTopPInitialize(int* topp_id_val_buf, int* topp_offset_buf, int* begin_topp_offset_buf_,
-    const size_t batch_size, const int n, cudaStream_t stream);
+//! \brief Initialize buffers for topP inference
+//!
+//! \param topPIdValBuf output buffer [batchSize, vocabSize]. Value at {bi,vi} position contains vi token id.
+//! \param topPOffsetBuf output buffer [batchSize+1].
+//! \param beginTopPOffsetBuf output buffer [batchSize+1].
+//! \param batchSize number of requests in batch
+//! \param vocabSize size of the inner dimension
+//! \param stream stream
+void invokeTopPInitialize(int* topPIdValBuf, int* topPOffsetBuf, int* beginTopPOffsetBuf, const size_t batchSize,
+    const int vocabSize, cudaStream_t stream);
 
+//! \brief Applies mask, adds bias to logits and computes softmax values.
+//! Sets -MAX_FLT value for tokens in range [vocabSize; vocabSizePadded) to prevent them from being chosen.
+//! If request finished the generation, sets MAX_FLT to endId token and -MAX_FLT to all other tokens forcing to choose
+//! endId token. Otherwise, adds bias per token if bias pointer is not nullptr.
+//!
+//! \param logits input/output buffer [batchSize, vocabSize]. Logits to be modified by mask, bias and softmax.
+//! \param bias input buffer [vocabSize]. Bias to logit per token. Ignored if nullptr
+//! \param endIds input buffer [batchSize]. EOS token ids per request
+//! \param finished input buffer [batchSize] with flags set to true if request has finished the generation
+//! \param batchSize batch size
+//! \param vocabSize unpadded vocab size
+//! \param vocabSizePadded padded vocab size
+//! \param stream stream
 template <typename T>
-void invokeTopPSampling(void* workspace, size_t& workspace_size, size_t& cub_temp_storage_size, int** output_ids,
-    int* sequence_length, bool* finished_buf, float* cum_log_probs, float* output_log_probs, const T* log_probs,
-    const int* id_vals, int* offset_buf, int* begin_offset_buf, curandState_t* curandstate, const int batch_size,
-    const size_t vocab_size_padded, const int* end_ids, const float top_p, cudaStream_t stream,
-    cudaDeviceProp* cuda_device_prop, const bool* skip_decode);
+void invokeAddBiasSoftMax(T* logits, const T* bias, const int* endIds, const bool* finished, const int batchSize,
+    const int vocabSize, const int vocabSizePadded, cudaStream_t stream);
 
+/**
+//! \brief Given logProbs, performs top P sampling. Fills sampled tokens to outputIds.
+//! Computes sequenceLength, finished state, cumLogProbs inplace.
+//! Sampling per request can be controlled using skipDecode and topPs parameters.
+//! Function sets workspaceSize and cubTempStorageSize and exits early if workspace is nullptr.
+//!
+//! \param workspace pointer to the workspace. Has to be pre-allocated by caller. Function does not take ownership of
+the
+//! buffer.
+//! \param workspaceSize size of the workspace in bytes.
+//! \param cubTempStorageSize workspace size for cub radix sort.
+//! \param outputIds output buffer [batchSize][maxSeqLen]. Contains pointers to rows with output tokens per request.
+//! \param sequenceLength input/output buffer [batchSize]. Current sequence length of the request up to, but excluding
+endId token.
+//! \param finishedBuf input/output buffer [batchSize]. Flag if sequence has finished (if finished || outputId ==
+endId).
+//! If true, request exits early.
+//! \param cumLogProbs input/output buffer [batchSize]. Cumulative log probability of selected tokens. Ignored if
+nullptr.
+//! \param outputLogProbs output buffer [batchSize]. Log probs is the probability
+//! induced by the top-k sampling. We normalize the probability 'expLogit' of the selected token by the probability
+//! 's_sum' of a set of top-k tokens, meaning the logProb is the probability of the selected token, conditioned on the
+//! event that it is selected, i.e., log_prob = log P(i | i is in top-k) = log(expLogit / s_sum). Ignored if nullptr.
+//! \param logProbs input buffer [batchSize x vocabSizePadded]. Log probabilities of each token in the vocab.
+//! If cumLogProbs or outputLogProbs are specified, logProbs must contain **just** probabilities instead of log
+//! probabilities.
+//! \param idVals input buffer [batchSize, vocabSize]. Value at {bi,vi} position contains vi token id.
+//! Initialized using invokeTopPInitialize.
+//! \param offsetBuf input buffer [batchSize+1]. Array of offsets initialized using invokeTopPInitialize.
+//! \param beginOffsetBuf input buffer [batchSize+1]. Array of offsets initialized using invokeTopPInitialize.
+//! \param curandstate input buffer [batchSize]. Curand states properly initialized using
+//! invokeCurandInitialize per request.
+//! \param batchSize batch size
+//! \param vocabSizePadded size of padded vocab
+//! \param endIds input buffer [batchSize]. EOS token ids per request
+//! \param maxTopP maximum among all topPs P for topP sampling
+//! \param topPs input buffer [batchSize]. P for topP sampling per request. Supported P is in range (0.0; 1.0].
+//! If nullptr maxTopP is used for all requests.
+//! \param stream cuda stream
+//! \param cudaDeviceProp
+//! \param skipDecode input buffer [batchSize]. Flags whether to skip decoding per request
+ */
 template <typename T>
-void invokeBatchTopPSampling(void* workspace, size_t& workspace_size, size_t& cub_temp_storage_size, int** output_ids,
-    int* sequence_length, bool* finished_buf, float* cum_log_probs, float* output_log_probs, const T* log_probs,
-    const int* id_vals, int* offset_buf, int* begin_offset_buf, curandState_t* curandstate, const int batch_size,
-    const size_t vocab_size_padded, const int* end_ids, const float max_top_p, const float* top_ps, cudaStream_t stream,
-    cudaDeviceProp* cuda_device_prop, const bool* skip_decode);
+void invokeBatchTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize, int** outputIds,
+    int* sequenceLength, bool* finishedBuf, float* cumLogProbs, float* outputLogProbs, const T* logProbs,
+    const int* idVals, int* offsetBuf, int* beginOffsetBuf, curandState_t* curandstate, const int batchSize,
+    const size_t vocabSizePadded, const int* endIds, const float maxTopP, const float* topPs, cudaStream_t stream,
+    const bool* skipDecode);
 
+//! \brief Specialization of invokeBatchTopPSampling with topPs=nullptr
 template <typename T>
-void invokeAddBiasSoftMax(T* logits, const T* bias, const int* end_ids, const bool* finished, const int m,
-    const int n_padded, const int n, cudaStream_t stream);
+void invokeTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize, int** outputIds,
+    int* sequenceLength, bool* finishedBuf, float* cumLogProbs, float* outputLogProbs, const T* logProbs,
+    const int* idVals, int* offsetBuf, int* beginOffsetBuf, curandState_t* curandstate, const int batchSize,
+    const size_t vocabSizePadded, const int* endIds, const float topPp, cudaStream_t stream, const bool* skipDecode);
 
-namespace segmented_topp_impl
-{
-enum DType_t
-{
-    kFLOAT,
-    kHALF,
-    kINT8
-};
-
-template <typename Key_Data_Type_ = float, typename Value_Data_Type_ = int32_t, int BLOCK_THREADS_ = 256,
-    int KEYS_PER_LDG_ = 1>
-struct Segmented_topk_kernel_params
-{
-    typedef Key_Data_Type_ Key_Data_Type;
-    typedef Value_Data_Type_ Value_Data_Type;
-
-    enum
-    {
-        BLOCK_THREADS = BLOCK_THREADS_
-    };
-
-    enum
-    {
-        ITEMS_INCREMENT = 32
-    };
-
-    // enum { KEYS_PER_LDG = 2 * 4 / sizeof(Key_Data_Type_) };
-    enum
-    {
-        KEYS_PER_LDG = KEYS_PER_LDG_
-    };
-};
-
-struct TopKPerSegmentContext
-{
-    TopKPerSegmentContext()
-        : sm_count(0)
-        , sm_shared_size(0)
-        , sm_version(0){};
-    int sm_count;
-    int sm_shared_size;
-    int sm_version;
-};
-
-struct TopKPerSegmentParams
-{
-    // input/output keys and values
-    void *gmem_src_keys, *gmem_dst_keys, *gmem_dst_vals;
-    // not used in the custom implementation
-    void* gmem_src_vals;
-    // int array of size num_segments
-    int* gmem_active_count_per_segment;
-    int* gmem_active_count_total;
-    int* gmem_begin_offsets;
-    // gmem_end_offsets will be populated
-    int* gmem_end_offsets;
-    void* workspace;
-    // total number of items for all segments
-    int num_items;
-    int num_segments;
-    // top_k per segment
-    int num_top_k;
-    float top_p;
-    float confidence_threshold;
-};
-
-int topPPerSegment(const TopKPerSegmentContext& context, TopKPerSegmentParams& params, const DType_t DT_SCORE,
-    void* temp_storage, size_t& temp_storage_bytes, cudaStream_t stream);
-} // namespace segmented_topp_impl
-
-void invokeComputeToppDecay(float* runtime_top_p, const float* runtime_initial_top_p, const int** output_ids,
-    const float* top_p_decay, const float* top_p_min, const int32_t* top_p_reset_ids, const int* sequence_lengths,
-    const int local_batch_size, cudaStream_t stream);
+//! \brief Compute the topp decay by https://arxiv.org/pdf/2206.04624.pdf
+//!        In short, the formula is
+//!          runtimeTopP = max(runtimeTopP * topPDecay, topPMin)
+//!        If generating the topPResetIds, then reset the runtimeTopP.
+//!
+//! \param runtimeTopP
+//! \param runtimeInitialTopP
+//! \param outputIds
+//! \param topPDecay
+//! \param topPMin
+//! \param topPResetIds
+//! \param localBatchSize
+void invokeComputeToppDecay(float* runtimeTopP, const float* runtimeInitialTopP, const int** outputIds,
+    const float* topPDecay, const float* topPMin, const int32_t* topPResetIds, const int* sequenceLengths,
+    const int localBatchSize, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

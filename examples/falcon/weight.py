@@ -46,7 +46,7 @@ def reorder_qkv_weight_or_bias(weight: np.ndarray,
 
     The shape of the fused QKV weights in HF is different from the shape that
     TRT-LLM requires. In particular, the weight of HF consists of interleaved
-    q, k, v head weights, while that of TRT-LLM is contigous.
+    q, k, v head weights, while that of TRT-LLM is contiguous.
         HF     : [q1, k1, v1, ..., qh, kh, vh]
         TRT-LLM: [q1, ..., qh, k1, ..., kh, v1, vh]
     where qi, vi, ki are weight vectors corresponding to attention head i.

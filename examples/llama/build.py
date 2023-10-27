@@ -202,6 +202,15 @@ def parse_arguments():
     parser.add_argument('--remove_input_padding',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--use_fused_mlp',
+        default=False,
+        action='store_true',
+        help=
+        'Enable horizontal fusion in GatedMLP, reduces layer input traffic and potentially improves performance. '
+        'For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded '
+        '(0.45734 vs 0.45755 for LLaMA-v2 7B using ammo/examples/hf/instruct_eval/mmlu.py).'
+    )
 
     # Arguments related to the quantization of the model.
     parser.add_argument(
@@ -499,7 +508,8 @@ def build_rank_engine(builder: Builder,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
         quant_mode=args.quant_mode,
-        rms_norm_eps=args.rms_norm_eps)
+        rms_norm_eps=args.rms_norm_eps,
+        use_fused_mlp=args.use_fused_mlp)
     if args.use_smooth_quant:
         tensorrt_llm_llama = smooth_quantize(tensorrt_llm_llama,
                                              args.quant_mode)
@@ -655,7 +665,7 @@ def build(rank, args):
         if args.parallel_build and cur_rank != rank:
             continue
         # NOTE: when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
-        int8_trt_flag = args.quant_mode.has_act_and_weight_quant() or (
+        int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
             not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
         builder_config = builder.create_builder_config(
             name=MODEL_NAME,

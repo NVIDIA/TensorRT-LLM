@@ -34,21 +34,20 @@ engine_target_path = _pl.Path(
 import build as _ecb
 
 
-def build_engine(weigth_dir: _pl.Path, engine_dir: _pl.Path, *args):
-    print("Additional parameters: " + " ".join(args[0]))
-    arg = _ecb.parse_arguments()
-    arg.model_dir = str(weigth_dir)
-    arg.output_dir = str(engine_dir)
-    arg.max_batch_size = 2
-    arg.max_beam_width = 2
-    for item in args[0]:
-        key, value = item.split(" ")
-        if key[2:] in dir(arg):
-            arg.__setattr__(key, value)
-        else:
-            print("Error parameter name:", key)
-            return
-    _ecb.build(0, arg)
+def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, world_size, *args):
+    args = [
+        '--log_level=error',
+        '--model_dir',
+        str(weight_dir),
+        '--output_dir',
+        str(engine_dir),
+        '--max_batch_size=2',
+        '--max_beam_width=2',
+        '--builder_opt=0',
+        f'--world_size={world_size}',
+    ] + list(args)
+    print("Running: " + " ".join(args))
+    _ecb.run_build(args)
 
 
 def run_command(command: _tp.Sequence[str], *, cwd=None, **kwargs) -> None:
@@ -63,7 +62,6 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
 
     # Clone the model directory
     hf_dir = resources_dir / "pyTorchModel"
-    ft_dir = resources_dir / "ftModel"
     trt_dir = resources_dir / "trtModel"
 
     run_command(
@@ -76,54 +74,24 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
 
     if len(_glob(str(hf_dir) + "/*")) == 0:
         run_command(
-            ["git", "clone", "https://huggingface.co/THUDM/chatglm-6b", hf_dir],
-            cwd=resources_dir)
+            [
+                "git",
+                "clone",
+                "https://huggingface.co/THUDM/chatglm-6b",
+                hf_dir,
+            ],
+            cwd=resources_dir,
+        )
 
-    if not _os.path.exists(resources_dir / "lm.npy"):
-        print("Exporting weight of LM")
-        run_command([
-            "cp",
-            str(hf_dir) + "/modeling_chatglm.py",
-            str(hf_dir) + "/modeling_chatglm.py-backup"
-        ],
-                    cwd=resources_dir)
-        run_command([
-            "cp",
-            str(resources_dir) + "/modeling_chatglm.py",
-            str(hf_dir) + "/modeling_chatglm.py"
-        ],
-                    cwd=resources_dir)
-        run_command(["python3", str(resources_dir) + "/exportLM.py"],
-                    cwd=resources_dir)
-        assert (_os.path.exists(resources_dir / "lm.npy"))
-        run_command([
-            "mv",
-            str(hf_dir) + "/modeling_chatglm.py-backup",
-            str(hf_dir) + "/modeling_chatglm.py"
-        ],
-                    cwd=resources_dir)
-
-    if len(_glob(str(ft_dir) + "/*")) == 0:
-        print("\nConverting weight")
-        run_command([
-            "python3",
-            str(resources_dir) + "/hf_chatglm6b_convert.py", "-i", hf_dir, "-o",
-            ft_dir, "--storage-type", "fp16"
-        ],
-                    cwd=resources_dir)
-
-    if len(_glob(str(trt_dir) + "/*")) == 0:
-        print("\nBuilding engine")
-        arg_list = [
-            "--dtype float16",
-            "--use_gpt_attention_plugin float16",
-            "--use_gemm_plugin float16",
-        ]
-        build_engine(ft_dir / "1-gpu", trt_dir, arg_list)
+    print("\nBuilding engine")
+    build_engine(hf_dir, trt_dir, world_size, "--dtype", "float16",
+                 "--use_gpt_attention_plugin", "float16", "--use_gemm_plugin",
+                 "float16")
 
     if not _os.path.exists(str(engine_target_path)):
         _os.system(f"mkdir -p {str(engine_target_path)}")
-        _os.system(f"cp -r {str(trt_dir) + '/*'} {engine_target_path}")
+
+    _os.system(f"cp -r {str(trt_dir) + '/*'} {engine_target_path}")
 
     print("Done.")
 
@@ -132,7 +100,6 @@ if __name__ == "__main__":
     parser = _arg.ArgumentParser()
     parser.add_argument("--model_cache",
                         type=str,
-                        default="examples/chatglm6b/pyTorchModel",
                         help="Directory where models are stored")
 
     parser.add_argument('--world_size',

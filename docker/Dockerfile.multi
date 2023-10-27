@@ -4,8 +4,10 @@ ARG BASE_TAG=23.08-py3
 
 FROM ${BASE_IMAGE}:${BASE_TAG} as base
 
-# `BASH_ENV` is only used for non-interactive bash.
-ENV BASH_ENV="/tmp/bash_env"
+# https://www.gnu.org/software/bash/manual/html_node/Bash-Startup-Files.html
+# The default values come from `nvcr.io/nvidia/pytorch`
+ENV BASH_ENV=${BASH_ENV:-/etc/bash.bashrc}
+ENV ENV=${ENV:-/etc/shinit_v2}
 SHELL ["/bin/bash", "-c"]
 
 FROM base as devel
@@ -23,7 +25,6 @@ ENV RELEASE_URL_TRT=$RELEASE_URL_TRT
 ENV TRT_TARGETARCH=$TARGETARCH
 COPY docker/common/install_tensorrt.sh install_tensorrt.sh
 RUN bash ./install_tensorrt.sh && rm install_tensorrt.sh
-ENV LD_LIBRARY_PATH=/usr/local/tensorrt/lib:${LD_LIBRARY_PATH}
 
 # Install latest Polygraphy
 COPY docker/common/install_polygraphy.sh install_polygraphy.sh

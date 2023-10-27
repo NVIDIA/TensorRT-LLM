@@ -427,10 +427,10 @@ class TestLLaMA(unittest.TestCase):
             expand_params(x) if isinstance(x, (list, tuple)) else str(x)
             for x in params
         ])
-        nam = expand_params(param.args)
+        name = expand_params(param.args)
         return "%s_%s" % (
             testcase_func.__name__,
-            parameterized.to_safe_name(nam),
+            parameterized.to_safe_name(name),
         )
 
     @parameterized.expand(get_loader_test_cases, name_func=loader_name_func)
@@ -448,14 +448,14 @@ class TestLLaMA(unittest.TestCase):
         if not meta_path.exists():
             pytest.skip(f"Skipping since the path {meta_path} does not exist.")
 
-        def print_corner(nam, t: np.ndarray):
+        def print_corner(name, t: np.ndarray):
             if len(t.shape) == 1:
                 tl = t[:2]
                 br = t[-2:]
             elif len(t.shape) == 2:
                 tl = t[:2, :2]
                 br = t[-2:, -2:]
-            print(nam, np.concatenate([tl, br]).flatten())
+            print(name, np.concatenate([tl, br]).flatten())
 
         def print_layers(m: tensorrt_llm.models.LLaMAForCausalLM):
             print_corner("vocab", m.vocab_embedding.weight._value)

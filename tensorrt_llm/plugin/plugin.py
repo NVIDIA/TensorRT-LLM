@@ -22,28 +22,23 @@ from tensorrt_llm.logger import logger
 TRT_LLM_PLUGIN_NAMESPACE = 'tensorrt_llm'
 
 
-def plugin_lib_path():
-    project_dir = str(Path(__file__).parent.parent.absolute())
-
-    # load tensorrt_llm plugin
-    if platform.system() != "Windows":
-        return project_dir + '/libs/libnvinfer_plugin_tensorrt_llm.so'
-    else:  # Windows
-        return project_dir + '/libs/nvinfer_plugin_tensorrt_llm.dll'
+def plugin_lib_path() -> str:
+    project_dir = Path(__file__).parent.parent.absolute()
+    dyn_lib = "libnvinfer_plugin_tensorrt_llm.so" if platform.system(
+    ) != "Windows" else "nvinfer_plugin_tensorrt_llm.dll"
+    return str(project_dir.joinpath("libs", dyn_lib))
 
 
 def _load_plugin_lib():
-    if platform.system() != "Windows":
-        handle = ctypes.CDLL(plugin_lib_path(), mode=ctypes.RTLD_GLOBAL)
-    else:  # Windows
-        handle = ctypes.CDLL(plugin_lib_path(),
-                             mode=ctypes.RTLD_GLOBAL,
-                             winmode=0)
-    if handle is None:
-        raise ImportError('TensorRT-LLM Plugin is unavailable')
-
-    handle.initTrtLlmPlugins.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-    handle.initTrtLlmPlugins.restype = ctypes.c_bool
+    winmode = 0 if platform.system() == "Windows" else None
+    handle = ctypes.CDLL(plugin_lib_path(),
+                         mode=ctypes.RTLD_GLOBAL,
+                         winmode=winmode)
+    try:
+        handle.initTrtLlmPlugins.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        handle.initTrtLlmPlugins.restype = ctypes.c_bool
+    except AttributeError as err:
+        raise ImportError('TensorRT-LLM Plugin is unavailable') from err
     assert handle.initTrtLlmPlugins(None,
                                     TRT_LLM_PLUGIN_NAMESPACE.encode('utf-8'))
 

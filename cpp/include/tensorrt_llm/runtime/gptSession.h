@@ -103,7 +103,7 @@ public:
 
     //! @brief   Initialize buffers for the given sizes.
     //!          `generate` may be called with batch size and beam width smaller than the setup parameters.
-    //! @details `maxBatchSize` will be devided by the number of micro batches to initialize each batch buffer.
+    //! @details `maxBatchSize` will be divided by the number of micro batches to initialize each batch buffer.
     void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxSequenceLength, bool decoderPerRequest,
         std::optional<SizeType> maxTokensInPagedKvCache = std::nullopt,
         std::optional<SizeType> numMicroBatches = std::nullopt);

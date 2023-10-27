@@ -21,12 +21,12 @@
 
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/stlUtils.h"
-#include "tensorrt_llm/common/tensor.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/gptSession.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
+#include "tensorrt_llm/runtime/utils/numpyUtils.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -91,6 +91,7 @@ public:
         , mDecoderPerRequest{false}
         , mPPSize(1)
         , mTPSize(1)
+        , mRandomEndId(false)
     {
     }
 
@@ -130,6 +131,12 @@ public:
         return *this;
     }
 
+    ModelSpec& useRandomEndId()
+    {
+        mRandomEndId = true;
+        return *this;
+    }
+
     fs::path mModelPath;
     fs::path mResultsFile;
     nvinfer1::DataType mDataType;
@@ -139,6 +146,7 @@ public:
     bool mDecoderPerRequest;
     int mPPSize;
     int mTPSize;
+    bool mRandomEndId;
 };
 } // namespace
 
@@ -177,19 +185,21 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
     std::initializer_list<int> const& batchSizes, fs::path const& resultsFile,
     std::shared_ptr<nvinfer1::ILogger> const& logger, bool cudaGraphMode, SizeType numMicroBatches)
 {
+    auto manager = BufferManager(std::make_shared<CudaStream>());
+
     ASSERT_TRUE(fs::exists(DATA_PATH));
-    fs::path input_path = DATA_PATH / "input_tokens.npy";
-    auto const managedGivenInput = tc::ManagedTensor::loadNpy(input_path.string(), tc::MEMORY_CPU);
-    auto const& givenInput = managedGivenInput.get();
-    ASSERT_EQ(givenInput.shape.size(), 2);
-    ASSERT_GT(givenInput.shape[0], 0);
-    auto const nbGivenInputs = static_cast<SizeType>(givenInput.shape[0]);
-    auto const managedExpectedOutput = tc::ManagedTensor::loadNpy(resultsFile.string(), tc::MEMORY_CPU);
-    auto const& expectedOutput = managedExpectedOutput.get();
-    ASSERT_EQ(expectedOutput.shape.size(), 2);
-    ASSERT_EQ(givenInput.shape[0] * beamWidth, expectedOutput.shape[0]);
-    auto const givenInputData = givenInput.getPtr<int>();
-    auto const expectedOutputData = expectedOutput.getPtr<int>();
+    fs::path inputPath = DATA_PATH / "input_tokens.npy";
+    auto const& givenInput = utils::loadNpy(manager, inputPath.string(), MemoryType::kCPU);
+    auto const& inputShape = givenInput->getShape();
+    ASSERT_EQ(inputShape.nbDims, 2);
+    ASSERT_GT(inputShape.d[0], 0);
+    auto const nbGivenInputs = static_cast<SizeType>(inputShape.d[0]);
+    auto expectedOutput = utils::loadNpy(manager, resultsFile.string(), MemoryType::kCPU);
+    auto const& outputShape = expectedOutput->getShape();
+    ASSERT_EQ(outputShape.nbDims, 2);
+    ASSERT_EQ(inputShape.d[0] * beamWidth, outputShape.d[0]);
+    auto const givenInputData = bufferCast<TokenIdType const>(*givenInput);
+    auto expectedOutputData = bufferCast<TokenIdType>(*expectedOutput);
 
     ASSERT_TRUE(fs::exists(modelPath));
     auto const json = GptJsonConfig::parse(modelPath / "config.json");
@@ -203,8 +213,8 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
     auto enginePath = modelPath / json.engineFilename(worldConfig);
     ASSERT_TRUE(fs::exists(enginePath));
 
-    auto const maxInputLength = static_cast<SizeType>(givenInput.shape[1]);
-    auto const maxSeqLength = static_cast<SizeType>(expectedOutput.shape[1]);
+    auto const maxInputLength = static_cast<SizeType>(inputShape.d[1]);
+    auto const maxSeqLength = static_cast<SizeType>(outputShape.d[1]);
     ASSERT_LT(maxInputLength, maxSeqLength);
     auto const maxNewTokens = maxSeqLength - maxInputLength;
     SamplingConfig samplingConfig{beamWidth};
@@ -215,7 +225,6 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
     samplingConfig.topP = std::vector{0.0f};
 
     auto const padId = modelIds.padId;
-    auto const endId = modelIds.endId;
 
     std::vector<SizeType> givenInputLengths(nbGivenInputs);
     for (SizeType i = 0; i < nbGivenInputs; ++i)
@@ -223,6 +232,45 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
         auto const seqBegin = givenInputData + i * maxInputLength;
         auto const it = std::find(seqBegin, seqBegin + maxInputLength, padId);
         givenInputLengths[i] = std::distance(seqBegin, it);
+    }
+
+    std::srand(42);
+    auto endId = modelIds.endId;
+    if (modelSpec.mRandomEndId)
+    {
+        const auto endIdRow = std::rand() % nbGivenInputs;
+        const auto endIdBeam = std::rand() % beamWidth;
+        const auto endIdCol = givenInputLengths[endIdRow] + std::rand() % maxNewTokens;
+        auto const endIdIndex = tc::flat_index2((endIdRow * beamWidth + endIdBeam), endIdCol, maxSeqLength);
+        endId = expectedOutputData[endIdIndex];
+    }
+
+    std::vector<SizeType> expectedLengths(nbGivenInputs * beamWidth);
+    for (SizeType bi = 0; bi < nbGivenInputs; ++bi)
+    {
+        for (SizeType beam = 0; beam < beamWidth; ++beam)
+        {
+            SizeType expectedLen = givenInputLengths[bi] + maxNewTokens;
+            if (modelSpec.mRandomEndId)
+            {
+                for (SizeType si = givenInputLengths[bi]; si < maxSeqLength; ++si)
+                {
+                    auto const expectIndex = tc::flat_index2((bi * beamWidth + beam), si, maxSeqLength);
+                    if (expectedOutputData[expectIndex] == endId)
+                    {
+                        expectedLen = si;
+                        break;
+                    }
+                }
+                // Fill new EOS token to the expected data
+                for (SizeType si = expectedLen; si < maxSeqLength; ++si)
+                {
+                    auto const expectIndex = tc::flat_index2((bi * beamWidth + beam), si, maxSeqLength);
+                    expectedOutputData[expectIndex] = endId;
+                }
+            }
+            expectedLengths[bi * beamWidth + beam] = expectedLen;
+        }
     }
 
     GptSession session{modelConfig, worldConfig, enginePath.string(), logger};
@@ -280,7 +328,8 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
             endId, padId, std::move(inputIds), std::move(inputLenghts), modelConfig.usePackedInput()};
 
         // runtime will allocate memory for output if this tensor is empty
-        GenerationOutput generationOutput{bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32)};
+        GenerationOutput generationOutput{bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32),
+            bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32)};
 
         // repeat the same inputs multiple times for testing idempotency of `generate()`
         auto constexpr repetitions = 10;
@@ -288,19 +337,44 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
         {
             SizeType numSteps = 0;
             generationOutput.onTokenGenerated
-                = [&numSteps, maxNewTokens]([[maybe_unused]] GenerationOutput::TensorPtr const& outputIds,
+                = [&numSteps, &modelSpec, maxNewTokens]([[maybe_unused]] GenerationOutput::TensorPtr const& outputIds,
                       [[maybe_unused]] SizeType step, bool finished)
             {
                 ++numSteps;
-                EXPECT_TRUE(!finished || numSteps == maxNewTokens);
+                EXPECT_TRUE(!finished || modelSpec.mRandomEndId || numSteps == maxNewTokens);
             };
 
             session.generate(generationOutput, generationInput, samplingConfig);
+
+            // compare outputs
             if (worldConfig.isFirstPipelineParallelRank())
             {
-                EXPECT_EQ(numSteps, maxNewTokens);
+                if (!modelSpec.mRandomEndId)
+                {
+                    EXPECT_EQ(numSteps, maxNewTokens);
+                }
 
-                // compare outputs
+                auto const& outputLengths = generationOutput.lengths;
+                auto const& outputLengthsDims = outputLengths->getShape();
+                EXPECT_EQ(outputLengthsDims.nbDims, 2);
+                EXPECT_EQ(outputLengthsDims.d[0], batchSize) << "r: " << r;
+                EXPECT_EQ(outputLengthsDims.d[1], beamWidth) << "r: " << r;
+                auto outputLengthsHost = bufferManager.copyFrom(*outputLengths, MemoryType::kCPU);
+                auto lengths = bufferCast<std::int32_t>(*outputLengthsHost);
+                bufferManager.getStream().synchronize();
+                bool anyMismatch = false;
+                for (auto b = 0; b < batchSize; ++b)
+                {
+                    for (auto beam = 0; beam < beamWidth; ++beam)
+                    {
+                        auto const lengthsIndex = tc::flat_index2(b, beam, beamWidth);
+                        auto const expectedLength = expectedLengths[b % nbGivenInputs * beamWidth + beam];
+                        EXPECT_EQ(lengths[lengthsIndex], expectedLength) << " b: " << b << " beam: " << beam;
+                        anyMismatch |= (lengths[lengthsIndex] != expectedLength);
+                    }
+                }
+                ASSERT_FALSE(anyMismatch) << "wrong output lengths";
+
                 auto const& outputIds = generationOutput.ids;
                 auto const& outputDims = outputIds->getShape();
                 EXPECT_EQ(outputDims.nbDims, 3);
@@ -320,6 +394,10 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
                             auto const outputIndex = tc::flat_index3(b, beam, i, beamWidth, maxSeqLength);
                             auto const expectIndex
                                 = tc::flat_index2((b % nbGivenInputs * beamWidth + beam), i, maxSeqLength);
+                            if (expectedOutputData[expectIndex] == endId)
+                            {
+                                break;
+                            }
                             EXPECT_EQ(output[outputIndex], expectedOutputData[expectIndex])
                                 << " b: " << b << " beam: " << beam << " i: " << i;
                             anyMismatch |= (output[outputIndex] != expectedOutputData[expectIndex]);
@@ -362,6 +440,8 @@ std::string generateTestName(const testing::TestParamInfo<ParamType>& info)
         name.append("PP" + std::to_string(modelSpec.mPPSize));
     if (modelSpec.mTPSize > 1)
         name.append("TP" + std::to_string(modelSpec.mTPSize));
+    if (modelSpec.mRandomEndId)
+        name.append("EndId");
     return name;
 }
 } // namespace
@@ -389,6 +469,16 @@ TEST_P(ParamTest, Test)
     {
         GTEST_SKIP() << "Model's world size " << modelSpec.mPPSize * modelSpec.mTPSize
                      << " is not equal to the system world size";
+    }
+
+    if (!modelSpec.mUsePackedInput && modelSpec.mRandomEndId)
+    {
+        GTEST_SKIP() << "Test does not support endId test with padded inputs";
+    }
+
+    if (modelSpec.mRandomEndId && beamWidth > 1)
+    {
+        GTEST_SKIP() << "Test does not support endId test with beam search";
     }
 
     std::ostringstream gpuSizePath;
@@ -436,9 +526,14 @@ INSTANTIATE_TEST_SUITE_P(GptSessionTest, ParamTest,
                 .useGptAttentionPlugin()
                 .usePackedInput()
                 .usePagedKvCache()
+                .useDecoderPerRequest(),
+            ModelSpec{
+                FP16_GPT_ATTENTION_PACKED_PAGED_DIR, FP16_PLUGIN_PACKED_PAGED_RESULT_FILE, nvinfer1::DataType::kHALF}
+                .useGptAttentionPlugin()
+                .usePackedInput()
+                .usePagedKvCache()
                 .useDecoderPerRequest()
-
-                ),
+                .useRandomEndId()),
         testing::Values(1, 2), testing::Values(false, true), testing::Values(1, 3)),
     generateTestName);
 
@@ -559,40 +654,45 @@ class Glm6bSessionTest : public SessionTest
 {
 };
 
+class Glm2_6bSessionTest : public SessionTest
+{
+};
+
 // Engines need to be generated using cpp/tests/resources/scripts/build_gpt_engines.py.
-// Expected outputs need to be generated using cpp/tests/resources/scripts/generate_expected_chatglm6b_output.py.
+// Expected outputs need to be generated using cpp/tests/resources/scripts/generate_expected_gpt_output.py.
 
 namespace
 {
 
 // TODO: consolidate this function with testGptSession
-void testGlm6bSession(fs::path const& modelPath, ModelSpec const& modelSpec, ModelIds const modelIds,
-    SizeType beamWidth, std::initializer_list<int> const& batchSizes, std::shared_ptr<nvinfer1::ILogger> const& logger,
-    bool cudaGraphMode, SizeType numMicroBatches)
+// Notice: both ChatGLM-6B and ChatGLM2-6B use this function, which are different at GptModelConfig::ModelVariant
+void testGlm6bSession(fs::path const& modelPath, std::string const& modelName, ModelSpec const& modelSpec,
+    ModelIds const modelIds, SizeType beamWidth, std::initializer_list<int> const& batchSizes,
+    std::shared_ptr<nvinfer1::ILogger> const& logger, bool cudaGraphMode, SizeType numMicroBatches)
 {
-    ASSERT_TRUE(fs::exists(DATA_PATH / "chatglm6b"));
+    auto manager = BufferManager(std::make_shared<CudaStream>());
+
+    ASSERT_TRUE(fs::exists(DATA_PATH / modelName));
     const int batchSize = *batchSizes.begin();
     std::string fileNameSuffix
         = std::string("-BS") + std::to_string(batchSize) + "-BM" + std::to_string(beamWidth) + std::string(".npy");
-    fs::path givenInputPath = DATA_PATH / "chatglm6b" / (std::string("inputId") + fileNameSuffix);
-    auto const managedGivenInput = tc::ManagedTensor::loadNpy(givenInputPath.string(), tc::MEMORY_CPU);
-    auto const& givenInput = managedGivenInput.get();
-    ASSERT_EQ(givenInput.shape.size(), 2);
-    ASSERT_GT(givenInput.shape[0], 0);
-    auto const nbGivenInputs = static_cast<SizeType>(givenInput.shape[0]);
-    fs::path expectedOutputPath = DATA_PATH / "chatglm6b" / (std::string("outputId") + fileNameSuffix);
-    auto const managedExpectedOutput = tc::ManagedTensor::loadNpy(expectedOutputPath.string(), tc::MEMORY_CPU);
-    auto const& expectedOutput = managedExpectedOutput.get();
-    ASSERT_EQ(expectedOutput.shape.size(), 3);
-    ASSERT_EQ(batchSize, expectedOutput.shape[0]);
-    ASSERT_EQ(beamWidth, expectedOutput.shape[1]);
-    auto const givenInputData = givenInput.getPtr<int>();
-    auto const expectedOutputData = expectedOutput.getPtr<int>();
+    fs::path givenInputPath = DATA_PATH / modelName / (std::string("inputId") + fileNameSuffix);
+    auto const& givenInput = utils::loadNpy(manager, givenInputPath, MemoryType::kCPU);
+    auto const& inputShape = givenInput->getShape();
+    ASSERT_EQ(inputShape.nbDims, 2);
+    ASSERT_GT(inputShape.d[0], 0);
+    auto const nbGivenInputs = static_cast<SizeType>(inputShape.d[0]);
+    fs::path expectedOutputPath = DATA_PATH / modelName / (std::string("outputId") + fileNameSuffix);
+    auto const& expectedOutput = utils::loadNpy(manager, expectedOutputPath.string(), MemoryType::kCPU);
+    auto const& outputShape = expectedOutput->getShape();
+    ASSERT_EQ(outputShape.nbDims, 3);
+    ASSERT_EQ(inputShape.d[0], outputShape.d[0]);
+    auto const givenInputData = bufferCast<TokenIdType const>(*givenInput);
+    auto const expectedOutputData = bufferCast<TokenIdType const>(*expectedOutput);
 
     ASSERT_TRUE(fs::exists(modelPath));
     auto const json = GptJsonConfig::parse(modelPath / "config.json");
     auto const modelConfig = json.getModelConfig();
-    EXPECT_EQ(modelConfig.getModelVariant(), GptModelConfig::ModelVariant::kGlm);
     verifyModelConfig(modelConfig, modelSpec);
     auto const decoderPerRequest = modelSpec.mDecoderPerRequest;
 
@@ -602,9 +702,9 @@ void testGlm6bSession(fs::path const& modelPath, ModelSpec const& modelSpec, Mod
     auto enginePath = modelPath / json.engineFilename(worldConfig);
     ASSERT_TRUE(fs::exists(enginePath));
 
-    auto const maxInputLength = static_cast<SizeType>(givenInput.shape[1]);
+    auto const maxInputLength = static_cast<SizeType>(inputShape.d[1]);
     auto const maxNewTokens = 1024;
-    auto const maxSeqLengthGroundTruth = static_cast<SizeType>(expectedOutput.shape[2]);
+    auto const maxSeqLengthGroundTruth = static_cast<SizeType>(outputShape.d[2]);
     auto const maxSeqLength = maxInputLength + maxNewTokens;
     SamplingConfig samplingConfig{beamWidth};
     samplingConfig.temperature = std::vector{1.0f};
@@ -635,8 +735,6 @@ void testGlm6bSession(fs::path const& modelPath, ModelSpec const& modelSpec, Mod
 
     for (auto const batchSize : batchSizes)
     {
-        std::cout << "=== batchSize:" << batchSize << " ===\n";
-
         std::vector<SizeType> inputLenghtsHost(batchSize);
         for (SizeType i = 0; i < batchSize; ++i)
         {
@@ -678,22 +776,21 @@ void testGlm6bSession(fs::path const& modelPath, ModelSpec const& modelSpec, Mod
             endId, padId, std::move(inputIds), std::move(inputLenghts), modelConfig.usePackedInput()};
 
         // runtime will allocate memory for output if this tensor is empty
-        GenerationOutput generationOutput{bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32)};
+        GenerationOutput generationOutput{bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32),
+            bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32)};
 
         // repeat the same inputs multiple times for testing idempotency of `generate()`
         auto constexpr repetitions = 10;
         for (auto r = 0; r < repetitions; ++r)
         {
             SizeType numSteps = 0;
-            /*
-            generationOutput.onTokenGenerated
-                = [&numSteps, maxNewTokens]([[maybe_unused]] GenerationOutput::TensorPtr const& outputIds,
-                      [[maybe_unused]] SizeType step, bool finished)
-            {
-                ++numSteps;
-                EXPECT_TRUE(!finished || numSteps == maxNewTokens);
-            };
-            */
+            // generationOutput.onTokenGenerated
+            //      = [&numSteps, maxNewTokens]([[maybe_unused]] GenerationOutput::TensorPtr const& outputIds,
+            //            [[maybe_unused]] SizeType step, bool finished)
+            // {
+            //      ++numSteps;
+            //      EXPECT_TRUE(!finished || numSteps == maxNewTokens);
+            // };
             session.generate(generationOutput, generationInput, samplingConfig);
             // EXPECT_EQ(numSteps, maxNewTokens);
 
@@ -716,13 +813,11 @@ void testGlm6bSession(fs::path const& modelPath, ModelSpec const& modelSpec, Mod
                     {
                         int outputIndex = b * beamWidth * maxSeqLength + beam * maxSeqLength + i;
                         int expectIndex = b * beamWidth * maxSeqLengthGroundTruth + beam * maxSeqLengthGroundTruth + i;
-                        /*
-                        printf("[%2d,%2d,%4d]->[%4d,%4d,%s][out=%6d,ref=%6d] %s\n", \
-                            b, beam, i, outputIndex, expectIndex, \
-                            ((output[outputIndex] == expectedOutputData[expectIndex]) ? "Y" : "N"), \
-                            output[outputIndex], expectedOutputData[expectIndex], \
-                            (output[outputIndex] == endId ? "<" : ""));
-                        */
+                        //printf("[%2d,%2d,%4d]->[%4d,%4d,%s][out=%6d,ref=%6d] %s\n", \
+                        //    b, beam, i, outputIndex, expectIndex, \
+                        //    ((output[outputIndex] == expectedOutputData[expectIndex]) ? "Y" : "N"), \
+                        //    output[outputIndex], expectedOutputData[expectIndex], \
+                        //    (output[outputIndex] == endId ? "<" : ""));
                         EXPECT_EQ(output[outputIndex], expectedOutputData[expectIndex])
                             << " b: " << b << " beam: " << beam << " i: " << i;
                         anyMismatch |= (output[outputIndex] != expectedOutputData[expectIndex]);
@@ -741,22 +836,60 @@ void testGlm6bSession(fs::path const& modelPath, ModelSpec const& modelSpec, Mod
 
 TEST_F(Glm6bSessionTest, SamplingFP16WithGptAttentionPluginBS1BM1)
 {
-    auto const modelPath{ENGINGE_PATH / "chatglm6b"};
+    auto const modelName{"chatglm6b"};
+    auto const modelPath{ENGINGE_PATH / modelName};
     auto const batchSizes = {1};
     auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
     auto const modeIds = ModelIds{130005, 130005};
 
-    testGlm6bSession(modelPath, modelSpec, modeIds, 1, batchSizes, mLogger, false, 1);
+    testGlm6bSession(modelPath, modelName, modelSpec, modeIds, 1, batchSizes, mLogger, false, 1);
 }
 
 TEST_F(Glm6bSessionTest, SamplingFP16WithGptAttentionPluginBS2BM1)
 {
-    auto const modelPath{ENGINGE_PATH / "chatglm6b"};
+    auto const modelName{"chatglm6b"};
+    auto const modelPath{ENGINGE_PATH / modelName};
     auto const batchSizes = {2};
     auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
     auto const modeIds = ModelIds{130005, 130005};
 
-    testGlm6bSession(modelPath, modelSpec, modeIds, 1, batchSizes, mLogger, false, 1);
+    testGlm6bSession(modelPath, modelName, modelSpec, modeIds, 1, batchSizes, mLogger, false, 1);
+}
+
+TEST_F(Glm2_6bSessionTest, SamplingFP16WithGptAttentionPluginBS1BM1)
+{
+    auto const modelName{"chatglm2-6b"};
+    auto const modelPath{ENGINGE_PATH / modelName};
+    auto const batchSizes = {1};
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
+    auto const modeIds = ModelIds{2, 2};
+
+    testGlm6bSession(modelPath, modelName, modelSpec, modeIds, 1, batchSizes, mLogger, false, 1);
+}
+
+TEST_F(Glm2_6bSessionTest, SamplingFP16WithGptAttentionPluginBS2BM1)
+{
+    auto const modelName{"chatglm2-6b"};
+    auto const modelPath{ENGINGE_PATH / modelName};
+    auto const batchSizes = {2};
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
+    auto const modeIds = ModelIds{2, 2};
+
+    testGlm6bSession(modelPath, modelName, modelSpec, modeIds, 1, batchSizes, mLogger, false, 1);
+}
+
+TEST_F(Glm2_6bSessionTest, SamplingFP16WithGptAttentionPluginBS1BM2)
+{
+    auto const modelName{"chatglm2-6b"};
+    auto const modelPath{ENGINGE_PATH / modelName};
+    auto const batchSizes = {1};
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
+    auto const modeIds = ModelIds{2, 2};
+
+    testGlm6bSession(modelPath, modelName, modelSpec, modeIds, 2, batchSizes, mLogger, false, 1);
 }

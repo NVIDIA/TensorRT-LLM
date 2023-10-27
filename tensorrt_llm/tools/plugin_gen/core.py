@@ -40,7 +40,7 @@ class DType(Enum):
         if dst == 'trt_plugin_py':
             map = DType.get_map("dtype", 'trt_plugin')
             ret = map[self]
-            return ret[1:]  # skip the preceeding 'k'
+            return ret[1:]  # skip the proceeding 'k'
 
         map = DType.get_map("dtype", dst)
         ret = map[self]
@@ -539,7 +539,7 @@ class PluginCppCodegen:
 
     @property
     def enqueue_body_arg_list(self) -> str:
-        # Here we add two additional arguments: stream and algo_id=0 for lauching the triton kernel
+        # Here we add two additional arguments: stream and algo_id=0 for launching the triton kernel
         return ", ".join(["stream"] +
                          [arg.name for arg in self.meta_data.arguments] + ['0'])
 

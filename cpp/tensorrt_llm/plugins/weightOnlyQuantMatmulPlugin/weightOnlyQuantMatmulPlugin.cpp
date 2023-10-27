@@ -34,7 +34,7 @@ std::vector<nvinfer1::PluginField> WeightOnlyQuantMatmulPluginCreator::mPluginAt
 void WeightOnlyQuantGemmPluginProfiler::runTactic(int m, int n, int k,
     const WeightOnlyQuantGemmPluginProfiler::Config& tactic, char* workspace, const cudaStream_t& stream)
 {
-    const int originalN = n * (mWeightTypeId == 1 ? 4 : 8);
+    const int originalN = n * getWeightTypeMultiplier(mWeightTypeId);
     half* actPtr = reinterpret_cast<half*>(workspace);
     int8_t* weightPtr
         = reinterpret_cast<int8_t*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(actPtr), m * k * sizeof(half)));
@@ -47,7 +47,7 @@ void WeightOnlyQuantGemmPluginProfiler::runTactic(int m, int n, int k,
 
     const int wsSize = mRunner->getWorkspaceSize(m, n, k);
 
-    if (mWeightTypeId == 1)
+    if (mWeightTypeId == WeightTypeId::INT8)
     {
         mRunner->gemm(actPtr, weightPtr, scalesPtr, outputPtr, m, originalN, k, tactic, workspacePtr, wsSize, stream);
     }
@@ -60,7 +60,7 @@ void WeightOnlyQuantGemmPluginProfiler::runTactic(int m, int n, int k,
 
 void WeightOnlyQuantGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
 {
-    const int originalN = n * (mWeightTypeId == 1 ? 4 : 8);
+    const int originalN = n * getWeightTypeMultiplier(mWeightTypeId);
     std::vector<size_t> workspaces = {
         maxM * k * sizeof(half),              // A
         originalN * k * sizeof(int8_t),       // B
@@ -78,8 +78,8 @@ std::vector<WeightOnlyQuantGemmPluginProfiler::Config> WeightOnlyQuantGemmPlugin
     return mRunner->getConfigs();
 }
 
-WeightOnlyQuantMatmulPlugin::WeightOnlyQuantMatmulPlugin(
-    nvinfer1::DataType type, int weightTypeId, const WeightOnlyQuantMatmulPlugin::PluginProfilerPtr& pluginProfiler)
+WeightOnlyQuantMatmulPlugin::WeightOnlyQuantMatmulPlugin(nvinfer1::DataType type, WeightTypeId weightTypeId,
+    const WeightOnlyQuantMatmulPlugin::PluginProfilerPtr& pluginProfiler)
     : mPluginProfiler(pluginProfiler)
 {
     init(type, weightTypeId);
@@ -92,7 +92,7 @@ WeightOnlyQuantMatmulPlugin::WeightOnlyQuantMatmulPlugin(
 {
     const char *d = reinterpret_cast<const char*>(data), *a = d;
     nvinfer1::DataType type;
-    int weightTypeId = 0;
+    WeightTypeId weightTypeId;
     read(d, type);
     read(d, weightTypeId);
     read(d, mDims);
@@ -104,18 +104,18 @@ WeightOnlyQuantMatmulPlugin::WeightOnlyQuantMatmulPlugin(
     TLLM_CHECK(d == a + length);
 }
 
-void WeightOnlyQuantMatmulPlugin::init(nvinfer1::DataType type, int weightTypeId)
+void WeightOnlyQuantMatmulPlugin::init(nvinfer1::DataType type, WeightTypeId weightTypeId)
 {
     mType = type;
     mWeightTypeId = weightTypeId;
-    if (mType == nvinfer1::DataType::kHALF && mWeightTypeId == 1)
+    if (mType == nvinfer1::DataType::kHALF && mWeightTypeId == WeightTypeId::INT8)
     {
         m_weightOnlyGemmRunner = std::make_shared<
             CutlassFpAIntBGemmRunner<half, uint8_t, cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY>>();
         mCudaKernelEnabled
             = tensorrt_llm::kernels::isWeightOnlyBatchedGemvEnabled(tensorrt_llm::kernels::WeightOnlyQuantType::Int8b);
     }
-    else if (mType == nvinfer1::DataType::kHALF && mWeightTypeId == 2)
+    else if (mType == nvinfer1::DataType::kHALF && mWeightTypeId == WeightTypeId::INT4)
     {
         m_weightOnlyGemmRunner = std::make_shared<
             CutlassFpAIntBGemmRunner<half, cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY>>();
@@ -148,7 +148,7 @@ nvinfer1::DimsExprs WeightOnlyQuantMatmulPlugin::getOutputDimensions(
     int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     // input [m1, m2, m3, ... , k]
-    // weight [k, n/4] for int8, [k, n/8] for int4
+    // weight [k, n] for int8, [k, n/2] for int4
 
     try
     {
@@ -164,15 +164,15 @@ nvinfer1::DimsExprs WeightOnlyQuantMatmulPlugin::getOutputDimensions(
         {
             ret.d[ii] = inputs[0].d[ii];
         }
-        if (mWeightTypeId == 1)
+        if (mWeightTypeId == WeightTypeId::INT8)
         {
             // int8 weight only quant
-            ret.d[nbDimsA - 1] = exprBuilder.constant(inputs[1].d[1]->getConstantValue() * 4);
+            ret.d[nbDimsA - 1] = exprBuilder.constant(inputs[1].d[1]->getConstantValue());
         }
         else
         {
             // int4 weight only quant
-            ret.d[nbDimsA - 1] = exprBuilder.constant(inputs[1].d[1]->getConstantValue() * 8);
+            ret.d[nbDimsA - 1] = exprBuilder.constant(inputs[1].d[1]->getConstantValue() * INT8_INT4_RATIO);
         }
         return ret;
     }
@@ -193,14 +193,9 @@ bool WeightOnlyQuantMatmulPlugin::supportsFormatCombination(
         return inOut[0].type == mType && inOut[0].format == TensorFormat::kLINEAR;
     case 1:
         // weights
-        // FIXME
-        // Dirty hack to overcome TRT int8/int4 limitatition with plugins
-        // Weights are required to be float, but will be reinterpreted as int8/int4 in enqueue
+        // Weights are required to be int8, but will be reinterpreted as int4 in enqueue if required
         // Weights stored in checkpoint should have int8/int4 type
-        // Because of the reinterpretation, input weights have shape 4/8 times smaller than required
-        // in_channels has to be divisable by 4/8
-
-        return inOut[1].type == nvinfer1::DataType::kFLOAT && inOut[1].format == TensorFormat::kLINEAR;
+        return inOut[1].type == nvinfer1::DataType::kINT8 && inOut[1].format == TensorFormat::kLINEAR;
     case 2:
         // scales channels
         return inOut[2].type == mType && inOut[2].format == TensorFormat::kLINEAR;
@@ -221,10 +216,10 @@ void WeightOnlyQuantMatmulPlugin::configurePlugin(const nvinfer1::DynamicPluginT
     const auto maxM = std::accumulate(in[0].max.d, in[0].max.d + in[0].max.nbDims - 1, 1, std::multiplies<int>());
 
     const int maxK = in[0].max.d[in[0].max.nbDims - 1];
-    const int maxN = in[1].max.d[1] * (mWeightTypeId == 1 ? 4 : 8);
+    const int maxN = in[1].max.d[1] * getWeightTypeMultiplier(mWeightTypeId);
 
     const auto K = maxK;
-    const auto N = maxN / (mWeightTypeId == 1 ? 4 : 8);
+    const auto N = maxN / getWeightTypeMultiplier(mWeightTypeId);
 
     if (!mDims.isInitialized())
     {
@@ -248,7 +243,7 @@ int WeightOnlyQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDesc* input
 {
     // inputs
     //     mat1           [M1, M2,..., K]
-    //     mat2           [K, N/4] for int8, [K, N/8] for int4
+    //     mat2           [K, N] for int8, [K, N/2] for int4
     //     scale_channels [N]
     // outputs
     //     mat [M, N]
@@ -263,8 +258,9 @@ int WeightOnlyQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDesc* input
 
     const int ws_size = m_weightOnlyGemmRunner->getWorkspaceSize(m, n, k);
     const auto& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
-    TLLM_CHECK_WITH_INFO(bestTactic, "No valid SQ GEMM tactic");
-    if (mType == nvinfer1::DataType::kHALF && mWeightTypeId == 1)
+    TLLM_CHECK_WITH_INFO(bestTactic, "No valid weight only groupwise GEMM tactic");
+    TLLM_CHECK_WITH_INFO(mType == nvinfer1::DataType::kHALF, "No valid weightOnlyQuantMatmul configuration");
+    if (mType == nvinfer1::DataType::kHALF && mWeightTypeId == WeightTypeId::INT8)
     {
         if (m < SMALL_M_FAST_PATH && mCudaKernelEnabled)
         {
@@ -273,7 +269,7 @@ int WeightOnlyQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDesc* input
             // when sm >= 75 and the preprocessing of cutlass on sm70 does not interleave the weights.
             tensorrt_llm::kernels::WeightOnlyParams params{reinterpret_cast<const uint8_t*>(inputs[1]),
                 reinterpret_cast<const half*>(inputs[2]), nullptr, reinterpret_cast<const half*>(inputs[0]), nullptr,
-                reinterpret_cast<half*>(outputs[0]), m, n * 4, k, 0};
+                reinterpret_cast<half*>(outputs[0]), m, n, k, 0};
             tensorrt_llm::kernels::weight_only_batched_gemv_launcher(tensorrt_llm::kernels::WeightOnlyQuantType::Int8b,
                 tensorrt_llm::kernels::WeightOnlyType::PerChannel,
                 tensorrt_llm::kernels::WeightOnlyActivationType::Identity, params, stream);
@@ -282,11 +278,11 @@ int WeightOnlyQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDesc* input
         {
             m_weightOnlyGemmRunner->gemm(reinterpret_cast<const half*>(inputs[0]),
                 reinterpret_cast<const int8_t*>(inputs[1]), reinterpret_cast<const half*>(inputs[2]),
-                reinterpret_cast<half*>(outputs[0]), m, n * 4, k, *bestTactic, reinterpret_cast<char*>(workspace),
-                ws_size, stream);
+                reinterpret_cast<half*>(outputs[0]), m, n, k, *bestTactic, reinterpret_cast<char*>(workspace), ws_size,
+                stream);
         }
     }
-    else if (mType == nvinfer1::DataType::kHALF && mWeightTypeId == 2)
+    else if (mType == nvinfer1::DataType::kHALF && mWeightTypeId == WeightTypeId::INT4)
     {
         if (m < SMALL_M_FAST_PATH && mCudaKernelEnabled)
         {
@@ -295,7 +291,7 @@ int WeightOnlyQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDesc* input
             // when sm >= 75 and the preprocessing of cutlass on sm70 does not interleave the weights.
             tensorrt_llm::kernels::WeightOnlyParams params{reinterpret_cast<const uint8_t*>(inputs[1]),
                 reinterpret_cast<const half*>(inputs[2]), nullptr, reinterpret_cast<const half*>(inputs[0]), nullptr,
-                reinterpret_cast<half*>(outputs[0]), m, n * 8, k, 0};
+                reinterpret_cast<half*>(outputs[0]), m, n * INT8_INT4_RATIO, k, 0};
             tensorrt_llm::kernels::weight_only_batched_gemv_launcher(tensorrt_llm::kernels::WeightOnlyQuantType::Int4b,
                 tensorrt_llm::kernels::WeightOnlyType::PerChannel,
                 tensorrt_llm::kernels::WeightOnlyActivationType::Identity, params, stream);
@@ -304,13 +300,9 @@ int WeightOnlyQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDesc* input
         {
             m_weightOnlyGemmRunner->gemm(reinterpret_cast<const half*>(inputs[0]),
                 reinterpret_cast<const cutlass::uint4b_t*>(inputs[1]), reinterpret_cast<const half*>(inputs[2]),
-                reinterpret_cast<half*>(outputs[0]), m, n * 8, k, *bestTactic, reinterpret_cast<char*>(workspace),
-                ws_size, stream);
+                reinterpret_cast<half*>(outputs[0]), m, n * INT8_INT4_RATIO, k, *bestTactic,
+                reinterpret_cast<char*>(workspace), ws_size, stream);
         }
-    }
-    else
-    {
-        assert(false);
     }
 
     return 0;
@@ -351,7 +343,7 @@ void WeightOnlyQuantMatmulPlugin::terminate() noexcept {}
 
 size_t WeightOnlyQuantMatmulPlugin::getSerializationSize() const noexcept
 {
-    return sizeof(int) +                                // mWeightTypeId
+    return sizeof(mWeightTypeId) +                      // mWeightTypeId
         sizeof(nvinfer1::DataType) +                    // mType
         sizeof(mDims) +                                 // Dimensions
         mPluginProfiler->getSerializationSize(mGemmId); // selected tactics container size
@@ -405,7 +397,7 @@ IPluginV2* WeightOnlyQuantMatmulPluginCreator::createPlugin(const char* name, co
 {
     const PluginField* fields = fc->fields;
     nvinfer1::DataType type;
-    int weightTypeId;
+    WeightTypeId weightTypeId;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
@@ -413,7 +405,7 @@ IPluginV2* WeightOnlyQuantMatmulPluginCreator::createPlugin(const char* name, co
         if (!strcmp(attrName, "weight_type_id"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            weightTypeId = static_cast<int>(*(static_cast<const int*>(fields[i].data)));
+            weightTypeId = static_cast<WeightTypeId>(*(static_cast<const int*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "type_id"))
         {

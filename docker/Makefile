@@ -98,11 +98,10 @@ centos7_%: TORCH_INSTALL_TYPE = src_cxx11_abi
 centos7_%: BASE_IMAGE = nvidia/cuda
 centos7_%: BASE_TAG = 12.2.0-devel-centos7
 
-ubuntu20_%: IMAGE_WITH_TAG = $(shell grep 'LLM_UBUNTU20_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
-ubuntu20_%: STAGE = devel
-ubuntu20_%: TORCH_INSTALL_TYPE = src_cxx11_abi
-ubuntu20_%: BASE_IMAGE = nvidia/cuda
-ubuntu20_%: BASE_TAG = 12.2.0-devel-ubuntu20.04
+ubuntu22_%: STAGE = devel
+ubuntu22_%: TORCH_INSTALL_TYPE = src_cxx11_abi
+ubuntu22_%: BASE_IMAGE = nvidia/cuda
+ubuntu22_%: BASE_TAG = 12.2.0-devel-ubuntu22.04
 
 old-cuda_%: IMAGE_WITH_TAG = $(shell grep 'LLM_OLD_CUDA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 old-cuda_%: BASE_TAG = 23.07-py3

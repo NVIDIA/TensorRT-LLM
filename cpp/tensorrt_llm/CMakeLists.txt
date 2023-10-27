@@ -38,12 +38,31 @@ add_subdirectory(runtime)
 set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
 set(BATCH_MANAGER_TARGET_ARCH "unknown")
 
+execute_process(
+  COMMAND grep -oP "(?<=^ID=).+" /etc/os-release
+  COMMAND tr -d "\""
+  COMMAND tr -d "\n"
+  RESULT_VARIABLE _OS_ID_SUCCESS
+  OUTPUT_VARIABLE OS_ID)
+execute_process(
+  COMMAND grep -oP "(?<=^VERSION_ID=).+" /etc/os-release
+  COMMAND tr -d "\""
+  COMMAND tr -d "\n"
+  RESULT_VARIABLE _OS_VERSION_ID_SUCCESS
+  OUTPUT_VARIABLE OS_VERSION_ID)
+message(STATUS "Operating System: ${OS_ID}, ${OS_VERSION_ID}")
+
 message(STATUS "CMAKE_SYSTEM_PROCESSOR: ${CMAKE_SYSTEM_PROCESSOR}")
 if(NOT WIN32) # Linux
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
     set(BATCH_MANAGER_TARGET_ARCH "x86_64-linux-gnu")
   elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
     set(BATCH_MANAGER_TARGET_ARCH "aarch64-linux-gnu")
+    if(NOT ${OS_ID} MATCHES "ubuntu" OR ${OS_VERSION_ID} VERSION_LESS 22.04)
+      message(
+        FATAL_ERROR
+          "The minimum system requirement for aarch64 is Ubuntu 22.04.")
+    endif()
   else()
     message(
       FATAL_ERROR
@@ -68,18 +87,21 @@ else()
   message(STATUS "USE_CXX11_ABI: ${USE_CXX11_ABI}")
 
   if(USE_CXX11_ABI)
-    set_property(
-      TARGET ${BATCH_MANAGER_TARGET}
-      PROPERTY
-        IMPORTED_LOCATION
+    set(BATCH_MANAGER_LIB_LOC
         "${CMAKE_CURRENT_SOURCE_DIR}/batch_manager/${BATCH_MANAGER_TARGET_ARCH}/libtensorrt_llm_batch_manager_static.a"
     )
   else()
-    set_property(
-      TARGET ${BATCH_MANAGER_TARGET}
-      PROPERTY
-        IMPORTED_LOCATION
+    set(BATCH_MANAGER_LIB_LOC
         "${CMAKE_CURRENT_SOURCE_DIR}/batch_manager/${BATCH_MANAGER_TARGET_ARCH}/libtensorrt_llm_batch_manager_static.pre_cxx11.a"
+    )
+  endif()
+  set_property(TARGET ${BATCH_MANAGER_TARGET} PROPERTY IMPORTED_LOCATION
+                                                       ${BATCH_MANAGER_LIB_LOC})
+  file(SIZE ${BATCH_MANAGER_LIB_LOC} BATCH_MANAGER_LIB_SIZE)
+  if(BATCH_MANAGER_LIB_SIZE LESS 1024)
+    message(
+      FATAL_ERROR
+        "The batch manager library is truncated or incomplete. This is usually caused by using Git LFS (Large File Storage) incorrectly. Please try running command `git lfs install && git lfs pull`."
     )
   endif()
 endif()

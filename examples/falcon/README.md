@@ -117,7 +117,7 @@ python build.py --model_dir falcon/180b \
 ```
 
 Note that in order to use N-way tensor parallelism, the number of attention heads must be a multiple of N.
-For example, you can't configure 2-way tensor parallism for [falcon-7b](https://huggingface.co/tiiuae/falcon-7b) or [falcon-7b-instruct](https://huggingface.co/tiiuae/falcon-7b-instruct), because the number of attention heads is 71 (not divisible by 2).
+For example, you can't configure 2-way tensor parallelism for [falcon-7b](https://huggingface.co/tiiuae/falcon-7b) or [falcon-7b-instruct](https://huggingface.co/tiiuae/falcon-7b-instruct), because the number of attention heads is 71 (not divisible by 2).
 
 
 #### FP8 Post-Training Quantization

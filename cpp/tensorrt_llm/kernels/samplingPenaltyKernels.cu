@@ -17,6 +17,8 @@
 #include <assert.h>
 #include <float.h>
 
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/samplingPenaltyKernels.h"
 
 namespace tensorrt_llm
@@ -26,18 +28,18 @@ namespace kernels
 
 // TODO Add half2 implementation
 template <typename T>
-__global__ void applyTemperaturePenalty(T* logits, const T* bias, const float temperature_inverse, const int m,
-    const int vocab_size, const int vocab_size_padd)
+__global__ void applyTemperaturePenalty(T* logits, const T* bias, const float temperatureInverse, const int m,
+    const int vocabSize, const int vocabSizePadded)
 {
     const bool IS_FP16 = std::is_same<T, half>::value;
     const T MAX_T_VAL = (IS_FP16) ? 65504.F : FLT_MAX;
-    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < m * vocab_size_padd;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < m * vocabSizePadded;
          index += blockDim.x * gridDim.x)
     {
-        T bias_val = bias == nullptr ? (T) (0.0f) : bias[index % vocab_size_padd];
-        if (index % vocab_size_padd < vocab_size)
+        T biasVal = bias == nullptr ? (T) (0.0f) : bias[index % vocabSizePadded];
+        if (index % vocabSizePadded < vocabSize)
         {
-            logits[index] = (logits[index] + bias_val) * (T) temperature_inverse;
+            logits[index] = (logits[index] + biasVal) * (T) temperatureInverse;
         }
         else
         {
@@ -47,236 +49,180 @@ __global__ void applyTemperaturePenalty(T* logits, const T* bias, const float te
 }
 
 template <>
-__global__ void applyTemperaturePenalty(half2* logits, const half2* bias, const float temperature_inverse,
-    const int batch_size, const int vocab_size, const int vocab_size_padded)
+__global__ void applyTemperaturePenalty(half2* logits, const half2* bias, const float temperatureInverse,
+    const int batchSize, const int vocabSize, const int vocabSizePaddeded)
 {
-    assert(vocab_size % 2 == 0);
-    assert(vocab_size_padded % 2 == 0);
-    const half2 mask_val = __float2half2_rn(-65504.0f);
-    const half2 temp_inv = __float2half2_rn(temperature_inverse);
+    assert(vocabSize % 2 == 0);
+    assert(vocabSizePaddeded % 2 == 0);
+    const half2 maskVal = __float2half2_rn(-65504.0f);
+    const half2 tempInv = __float2half2_rn(temperatureInverse);
 
-    const int half_vocab_size = vocab_size / 2;
-    const int half_vocab_size_padded = vocab_size_padded / 2;
-    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < batch_size * half_vocab_size_padded;
+    const int halfVocabSize = vocabSize / 2;
+    const int halfVocabSizePaddeded = vocabSizePaddeded / 2;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < batchSize * halfVocabSizePaddeded;
          index += blockDim.x * gridDim.x)
     {
-        int vocab_idx = index % half_vocab_size_padded;
-        half2 logit = vocab_idx < half_vocab_size ? __ldg(&logits[index]) : mask_val;
-        if (vocab_idx < half_vocab_size)
+        int vocabIdx = index % halfVocabSizePaddeded;
+        half2 logit = vocabIdx < halfVocabSize ? __ldg(&logits[index]) : maskVal;
+        if (vocabIdx < halfVocabSize)
         {
             if (bias != nullptr)
             {
-                logit = __hadd2(logit, bias[vocab_idx]);
+                logit = __hadd2(logit, bias[vocabIdx]);
             }
-            logits[index] = __hmul2(logit, temp_inv);
+            logits[index] = __hmul2(logit, tempInv);
         }
     }
 }
 
 template <typename T>
-void invokeApplyTemperaturePenalty(T* logits, const T* bias, const float temperature, const int batch_size,
-    const int vocab_size, const int vocab_size_padd, cudaStream_t stream)
+void invokeApplyTemperaturePenalty(T* logits, const T* bias, const float temperature, const int batchSize,
+    const int vocabSize, const int vocabSizePadded, cudaStream_t stream)
 {
-    dim3 block(min(vocab_size_padd, 1024));
-    dim3 grid(min(batch_size * vocab_size_padd / block.x, 65536));
-    const T temperature_inverse = (T) (1.f / (temperature + 1e-6f));
-    if (std::is_same<T, half>::value && vocab_size % 2 == 0 && vocab_size_padd % 2 == 0)
+    dim3 block(min(vocabSizePadded, 1024));
+    dim3 grid(min(batchSize * vocabSizePadded / block.x, 65536));
+    const T temperatureInverse = (T) (1.f / (temperature + 1e-6f));
+    if (std::is_same<T, half>::value && vocabSize % 2 == 0 && vocabSizePadded % 2 == 0)
     {
         applyTemperaturePenalty<<<grid, block, 0, stream>>>(reinterpret_cast<half2*>(logits),
-            reinterpret_cast<const half2*>(bias), temperature_inverse, batch_size, vocab_size, vocab_size_padd);
+            reinterpret_cast<const half2*>(bias), temperatureInverse, batchSize, vocabSize, vocabSizePadded);
     }
     else
     {
         applyTemperaturePenalty<T>
-            <<<grid, block, 0, stream>>>(logits, bias, temperature_inverse, batch_size, vocab_size, vocab_size_padd);
+            <<<grid, block, 0, stream>>>(logits, bias, temperatureInverse, batchSize, vocabSize, vocabSizePadded);
     }
 }
 
 template void invokeApplyTemperaturePenalty(float* logits, const float* bias, const float temperature,
-    const int batch_size, const int vocab_size, const int vocab_size_padd, cudaStream_t stream);
+    const int batchSize, const int vocabSize, const int vocabSizePadded, cudaStream_t stream);
 
 template void invokeApplyTemperaturePenalty(half* logits, const half* bias, const float temperature,
-    const int batch_size, const int vocab_size, const int vocab_size_padd, cudaStream_t stream);
+    const int batchSize, const int vocabSize, const int vocabSizePadded, cudaStream_t stream);
 
 template <typename T>
-__global__ void batchApplyTemperaturePenalty(T* logits, const T* bias, const float* temperatures, const int batch_size,
-    const int vocab_size, const int vocab_size_padd)
+__global__ void batchApplyTemperaturePenalty(T* logits, const T* bias, const float* temperatures, const int batchSize,
+    const int vocabSize, const int vocabSizePadded)
 {
     // TODO: Add macro or device function to get MAX_T_VAL.
     const bool IS_FP16 = std::is_same<T, half>::value;
     const T MAX_T_VAL = (IS_FP16) ? 65504.F : FLT_MAX;
-    extern __shared__ float inv_temperatures[];
-    if (threadIdx.x < batch_size)
+    extern __shared__ float invTemperatures[];
+    if (threadIdx.x < batchSize)
     {
-        inv_temperatures[threadIdx.x] = 1.0f / (temperatures[threadIdx.x] + 1e-6f);
+        invTemperatures[threadIdx.x] = 1.0f / (temperatures[threadIdx.x] + 1e-6f);
     }
     __syncthreads();
 
-    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < batch_size * vocab_size_padd;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < batchSize * vocabSizePadded;
          index += blockDim.x * gridDim.x)
     {
-        int batch_idx = index / vocab_size_padd;
-        int vocab_idx = index % vocab_size_padd;
-        T logit = (vocab_idx < vocab_size) ? logits[index] : -MAX_T_VAL;
-        if (vocab_idx < vocab_size)
+        int batchIdx = index / vocabSizePadded;
+        int vocabIdx = index % vocabSizePadded;
+        T logit = (vocabIdx < vocabSize) ? logits[index] : -MAX_T_VAL;
+        if (vocabIdx < vocabSize)
         {
             if (bias != nullptr)
             {
-                logit += bias[vocab_idx];
+                logit += bias[vocabIdx];
             }
-            logit *= inv_temperatures[batch_idx];
+            logit *= invTemperatures[batchIdx];
         }
         logits[index] = logit;
     }
 }
 
 __global__ void batchApplyTemperaturePenalty_h2(half2* logits, const half2* bias, const float* temperatures,
-    const int batch_size, const int vocab_size, const int vocab_size_padded)
+    const int batchSize, const int vocabSize, const int vocabSizePaddeded)
 {
-    assert(vocab_size % 2 == 0);
-    assert(vocab_size_padded % 2 == 0);
-    extern __shared__ half2 h2_inv_temperatures[];
-    if (threadIdx.x < batch_size)
+    assert(vocabSize % 2 == 0);
+    assert(vocabSizePaddeded % 2 == 0);
+    extern __shared__ half2 h2InvTemperatures[];
+    if (threadIdx.x < batchSize)
     {
-        h2_inv_temperatures[threadIdx.x] = __float2half2_rn(1.f / (temperatures[threadIdx.x] + 1e-6f));
+        h2InvTemperatures[threadIdx.x] = __float2half2_rn(1.f / (temperatures[threadIdx.x] + 1e-6f));
     }
     __syncthreads();
 
-    const half2 mask_val = __float2half2_rn(-65504.0f);
-    const int half_vocab_size = vocab_size / 2;
-    const int half_vocab_size_padded = vocab_size_padded / 2;
-    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < batch_size * half_vocab_size_padded;
+    const half2 maskVal = __float2half2_rn(-65504.0f);
+    const int halfVocabSize = vocabSize / 2;
+    const int halfVocabSizePaddeded = vocabSizePaddeded / 2;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < batchSize * halfVocabSizePaddeded;
          index += blockDim.x * gridDim.x)
     {
-        int batch_idx = index / half_vocab_size_padded;
-        int vocab_idx = index % half_vocab_size_padded;
-        half2 logit = vocab_idx < half_vocab_size ? __ldg(&logits[index]) : mask_val;
-        if (vocab_idx < half_vocab_size)
+        int batchIdx = index / halfVocabSizePaddeded;
+        int vocabIdx = index % halfVocabSizePaddeded;
+        half2 logit = vocabIdx < halfVocabSize ? __ldg(&logits[index]) : maskVal;
+        if (vocabIdx < halfVocabSize)
         {
             if (bias != nullptr)
             {
-                logit = __hadd2(logit, bias[vocab_idx]);
+                logit = __hadd2(logit, bias[vocabIdx]);
             }
-            logits[index] = __hmul2(logit, h2_inv_temperatures[batch_idx]);
+            logits[index] = __hmul2(logit, h2InvTemperatures[batchIdx]);
         }
     }
 }
 
 template <typename T>
-void invokeBatchApplyTemperaturePenalty(T* logits, const T* bias, const float* temperatures, const int batch_size,
-    const int vocab_size, const int vocab_size_padd, cudaStream_t stream)
+void invokeBatchApplyTemperaturePenalty(T* logits, const T* bias, const float* temperatures, const int batchSize,
+    const int vocabSize, const int vocabSizePadded, cudaStream_t stream)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
-    dim3 block(min(vocab_size_padd, 1024));
-    dim3 grid(min(batch_size * vocab_size_padd / block.x, 65536));
-    if (std::is_same<T, half>::value && vocab_size % 2 == 0 && vocab_size_padd % 2 == 0)
+    dim3 block(min(vocabSizePadded, 1024));
+    dim3 grid(min(batchSize * vocabSizePadded / block.x, 65536));
+    if (std::is_same<T, half>::value && vocabSize % 2 == 0 && vocabSizePadded % 2 == 0)
     {
-        size_t smem_size = sizeof(half2) * batch_size;
-        batchApplyTemperaturePenalty_h2<<<grid, block, smem_size, stream>>>(reinterpret_cast<half2*>(logits),
-            reinterpret_cast<const half2*>(bias), temperatures, batch_size, vocab_size, vocab_size_padd);
+        size_t smemSize = sizeof(half2) * batchSize;
+        batchApplyTemperaturePenalty_h2<<<grid, block, smemSize, stream>>>(reinterpret_cast<half2*>(logits),
+            reinterpret_cast<const half2*>(bias), temperatures, batchSize, vocabSize, vocabSizePadded);
     }
     else
     {
-        size_t smem_size = sizeof(float) * batch_size;
+        size_t smemSize = sizeof(float) * batchSize;
         batchApplyTemperaturePenalty<T>
-            <<<grid, block, smem_size, stream>>>(logits, bias, temperatures, batch_size, vocab_size, vocab_size_padd);
+            <<<grid, block, smemSize, stream>>>(logits, bias, temperatures, batchSize, vocabSize, vocabSizePadded);
     }
 }
 
 template void invokeBatchApplyTemperaturePenalty(float* logits, const float* bias, const float* temperatures,
-    const int batch_size, const int vocab_size, const int vocab_size_padd, cudaStream_t stream);
+    const int batchSize, const int vocabSize, const int vocabSizePadded, cudaStream_t stream);
 
 template void invokeBatchApplyTemperaturePenalty(half* logits, const half* bias, const float* temperatures,
-    const int batch_size, const int vocab_size, const int vocab_size_padd, cudaStream_t stream);
+    const int batchSize, const int vocabSize, const int vocabSizePadded, cudaStream_t stream);
 
-template <typename T, RepetitionPenaltyType penalty_type>
-__global__ void applyRepetitionPenalty(T* logits, const float penalty, const int* start_ids, int* output_ids,
-    const int batch_size, const int local_batch_size, const int vocab_size, const int vocab_size_padd,
-    const int* input_lengths, const int step)
+template <typename T, RepetitionPenaltyType penaltyType>
+__global__ void batchApplyRepetitionPenalty(T* logits, const float* penalties, const int** outputIds,
+    const int* sequenceLengths, const int batchSize, const int vocabSize, const int maxSeqLen)
 {
-    extern __shared__ float penalty_logits[];
-    int* penalty_indices = (int*) (penalty_logits + step);
+    extern __shared__ float penaltyLogits[];
+    int* penaltyIndices = (int*) (penaltyLogits + maxSeqLen);
+    const int batchIdx = blockIdx.x;
+    const float penalty = penalties[batchIdx];
+    const int currentStep = sequenceLengths[batchIdx];
 
-    logits = logits + blockIdx.x * vocab_size_padd;
-    const int input_length = input_lengths != nullptr ? input_lengths[blockIdx.x] : 0;
-    for (int index = threadIdx.x; index < step; index += blockDim.x)
-    {
-        // output_ids shape: (batch_size, input_len + output_len)
-        int penalty_index = output_ids[index * batch_size + blockIdx.x];
-        if (penalty_index >= vocab_size)
-        {
-            continue;
-        }
-        penalty_indices[index] = penalty_index;
-        float logit = (float) logits[penalty_index];
-        if (penalty_type == RepetitionPenaltyType::Additive)
-        {
-            penalty_logits[index] = logit - penalty;
-        }
-        else if (penalty_type == RepetitionPenaltyType::Multiplicative)
-        {
-            penalty_logits[index] = logit < 0.0f ? logit * penalty : logit / penalty;
-        }
-        else if (penalty_type == RepetitionPenaltyType::None)
-        {
-            penalty_logits[index] = logit;
-        }
-        else
-        {
-            // Unsupported type
-            assert(false);
-        }
-    }
-
-    if (blockDim.x > 32)
-    {
-        __syncthreads();
-    }
-
-    for (int index = threadIdx.x; index < step; index += blockDim.x)
-    {
-        // output_ids shape: (batch_size, input_len + output_len)
-        if (penalty_indices[index] >= vocab_size)
-        {
-            continue;
-        }
-        logits[penalty_indices[index]] = penalty_logits[index];
-    }
-}
-
-template <typename T, RepetitionPenaltyType penalty_type>
-__global__ void batchApplyRepetitionPenalty(T* logits, const float* penalties, const int** output_ids,
-    const int* sequence_lengths, const int batch_size, const int vocab_size, const int* input_lengths,
-    const int max_seq_len)
-{
-    extern __shared__ float penalty_logits[];
-    int* penalty_indices = (int*) (penalty_logits + max_seq_len);
-    const int batch_idx = blockIdx.x;
-    const float penalty = penalties[batch_idx];
-    const int current_step = sequence_lengths[batch_idx];
-
-    logits += batch_idx * vocab_size;
+    logits += batchIdx * vocabSize;
 
     // Phase 1. Find indices to penalize and keep the penalized values.
     // A vocab id can appear multiple times but should be penalized once.
-    for (int index = threadIdx.x; index < current_step; index += blockDim.x)
+    for (int index = threadIdx.x; index < currentStep; index += blockDim.x)
     {
-        // output_ids shape: (batch_size, input_len + output_len)
-        int penalty_index = output_ids[batch_idx][blockIdx.y * max_seq_len + index];
-        assert(penalty_index < vocab_size);
-        penalty_indices[index] = penalty_index;
-        float logit = (float) logits[penalty_index];
-        if (penalty_type == RepetitionPenaltyType::Additive)
+        // outputIds shape: (batchSize, input_len + output_len)
+        int penaltyIndex = outputIds[batchIdx][blockIdx.y * maxSeqLen + index];
+        assert(penaltyIndex < vocabSize);
+        penaltyIndices[index] = penaltyIndex;
+        float logit = (float) logits[penaltyIndex];
+        if (penaltyType == RepetitionPenaltyType::Additive)
         {
-            penalty_logits[index] = logit - penalty;
+            penaltyLogits[index] = logit - penalty;
         }
-        else if (penalty_type == RepetitionPenaltyType::Multiplicative)
+        else if (penaltyType == RepetitionPenaltyType::Multiplicative)
         {
-            penalty_logits[index] = logit < 0.0f ? logit * penalty : logit / penalty;
+            penaltyLogits[index] = logit < 0.0f ? logit * penalty : logit / penalty;
         }
-        else if (penalty_type == RepetitionPenaltyType::None)
+        else if (penaltyType == RepetitionPenaltyType::None)
         {
-            penalty_logits[index] = logit;
+            penaltyLogits[index] = logit;
         }
         else
         {
@@ -291,85 +237,96 @@ __global__ void batchApplyRepetitionPenalty(T* logits, const float* penalties, c
     }
 
     // Phase 2. Replace a logit value by the penalized one.
-    for (int index = threadIdx.x; index < current_step; index += blockDim.x)
+    for (int index = threadIdx.x; index < currentStep; index += blockDim.x)
     {
-        logits[penalty_indices[index]] = penalty_logits[index];
+        logits[penaltyIndices[index]] = penaltyLogits[index];
     }
 }
 
 template <typename T>
-void invokeBatchApplyRepetitionPenalty(T* logits, const float* penalties, const int** output_ids,
-    const int* sequence_lengths, const int batch_size, const int local_batch_size, const int vocab_size,
-    const int* input_lengths, RepetitionPenaltyType penalty_type, int max_seq_len, cudaStream_t stream)
+void invokeBatchApplyRepetitionPenalty(T* logits, const float* penalties, const int** outputIds,
+    const int* sequenceLengths, const int batchSize, const int vocabSize, RepetitionPenaltyType penaltyType,
+    int maxSeqLen, cudaStream_t stream)
 {
-    // Inputs
-    //   logits [local_batch_size, vocab_size] : logit values.
-    //   penalties [local_batch_size] : repetition penalty factors.
-    //   output_ids int**, [bs] array, each array has [1, max_seq_len]
-    //   sequence_lengths int*, [bs]
-    //   input_lengths [local_batch_size], input lengths
-
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
-    dim3 block(min(max_seq_len, 1024));
-    dim3 grid(batch_size);
-    size_t smem_size = max_seq_len * (sizeof(float) + sizeof(int));
-    if (penalty_type == RepetitionPenaltyType::Additive)
+    dim3 block(min(maxSeqLen, 1024));
+    dim3 grid(batchSize);
+    // FIXME(nkorobov): with long sequences we might hit upper smem limit
+    size_t smemSize = maxSeqLen * (sizeof(float) + sizeof(int));
+    if (penaltyType == RepetitionPenaltyType::Additive)
     {
-        batchApplyRepetitionPenalty<T, RepetitionPenaltyType::Additive><<<grid, block, smem_size, stream>>>(
-            logits, penalties, output_ids, sequence_lengths, batch_size, vocab_size, input_lengths, max_seq_len);
+        if (smemSize >= 46 * 1024)
+        {
+            /* Set 46KB threshold here because we have to take static/driver shared memory into consideration. */
+            cudaError_t res = cudaFuncSetAttribute(batchApplyRepetitionPenalty<T, RepetitionPenaltyType::Additive>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize);
+            TLLM_CHECK_WITH_INFO(res == cudaSuccess,
+                "Sequence Length is too long for the batchApplyRepetitionPenalty kernel (not enough shared memory).");
+        }
+        batchApplyRepetitionPenalty<T, RepetitionPenaltyType::Additive><<<grid, block, smemSize, stream>>>(
+            logits, penalties, outputIds, sequenceLengths, batchSize, vocabSize, maxSeqLen);
     }
-    else if (penalty_type == RepetitionPenaltyType::Multiplicative)
+    else if (penaltyType == RepetitionPenaltyType::Multiplicative)
     {
-        batchApplyRepetitionPenalty<T, RepetitionPenaltyType::Multiplicative><<<grid, block, smem_size, stream>>>(
-            logits, penalties, output_ids, sequence_lengths, batch_size, vocab_size, input_lengths, max_seq_len);
+        if (smemSize >= 46 * 1024)
+        {
+            /* Set 46KB threshold here because we have to take static/driver shared memory into consideration. */
+            cudaError_t res
+                = cudaFuncSetAttribute(batchApplyRepetitionPenalty<T, RepetitionPenaltyType::Multiplicative>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize);
+            TLLM_CHECK_WITH_INFO(res == cudaSuccess,
+                "Sequence Length is too long for the batchApplyRepetitionPenalty kernel (not enough shared memory).");
+        }
+        batchApplyRepetitionPenalty<T, RepetitionPenaltyType::Multiplicative><<<grid, block, smemSize, stream>>>(
+            logits, penalties, outputIds, sequenceLengths, batchSize, vocabSize, maxSeqLen);
     }
-    else if (penalty_type == RepetitionPenaltyType::None)
+    else if (penaltyType == RepetitionPenaltyType::None)
     {
         // do nothing
     }
 }
 
-template void invokeBatchApplyRepetitionPenalty(float* logits, const float* penalties, const int** output_ids,
-    const int* sequence_lengths, const int batch_size, const int local_batch_size, const int vocab_size,
-    const int* input_lengths, RepetitionPenaltyType penalty_type, int max_seq_len, cudaStream_t stream);
+template void invokeBatchApplyRepetitionPenalty(float* logits, const float* penalties, const int** outputIds,
+    const int* sequenceLengths, const int batchSize, const int vocabSize, RepetitionPenaltyType penaltyType,
+    int maxSeqLen, cudaStream_t stream);
 
-template void invokeBatchApplyRepetitionPenalty(half* logits, const float* penalties, const int** output_ids,
-    const int* sequence_lengths, const int batch_size, const int local_batch_size, const int vocab_size,
-    const int* input_lengths, RepetitionPenaltyType penalty_type, int max_seq_len, cudaStream_t stream);
+template void invokeBatchApplyRepetitionPenalty(half* logits, const float* penalties, const int** outputIds,
+    const int* sequenceLengths, const int batchSize, const int vocabSize, RepetitionPenaltyType penaltyType,
+    int maxSeqLen, cudaStream_t stream);
 
 template <typename T>
-__global__ void batchApplyMinLengthPenalty(T* logits, const int* min_lengths, const int* end_ids,
-    const int* sequence_lengths, const int* input_lengths, const int vocab_size_padded)
+__global__ void batchApplyMinLengthPenalty(T* logits, const int* minLengths, const int* endIds,
+    const int* sequenceLengths, const int* contextLengths, const int vocabSizePaddeded)
 {
     int bid = threadIdx.x + blockIdx.x * blockDim.x; // batch index
-    auto const input_length{input_lengths == nullptr ? 0 : input_lengths[bid]};
-    // We need +1 because sequence_lengths = num_gen_tokens + input_length - 1, which is equal to the length of k/v
+    auto const contextLength{contextLengths == nullptr ? 0 : contextLengths[bid]};
+    // This kernel is called before sequenceLengths is incrememnted.
+    // We need +1 because sequenceLengths = contextLength + numGenTokens - 1, which is equal to the length of k/v
     // caches.
-    if (sequence_lengths[bid] + 1 - input_length < min_lengths[bid])
+    if (sequenceLengths[bid] + 1 - contextLength < minLengths[bid])
     {
-        T mask_val = (std::is_same<T, half>::value) ? -65504.0f : -FLT_MAX;
-        logits[bid * vocab_size_padded + end_ids[bid]] = mask_val;
+        T maskVal = (std::is_same<T, half>::value) ? -65504.0f : -FLT_MAX;
+        logits[bid * vocabSizePaddeded + endIds[bid]] = maskVal;
     }
 }
 
 template <typename T>
-void invokeMinLengthPenalty(T* logits, const int* min_lengths, const int* end_ids, const int* sequnece_lengths,
-    const int* input_lengths, const int batch_size, const int vocab_size_padded, cudaStream_t stream)
+void invokeMinLengthPenalty(T* logits, const int* minLengths, const int* endIds, const int* sequneceLengths,
+    const int* contextLengths, const int batchSize, const int vocabSizePaddeded, cudaStream_t stream)
 
 {
-    const int block_size = min(batch_size, 1024);
-    const int grid_size = (batch_size + block_size - 1) / block_size;
-    batchApplyMinLengthPenalty<<<grid_size, block_size, 0, stream>>>(
-        logits, min_lengths, end_ids, sequnece_lengths, input_lengths, vocab_size_padded);
+    const int blockSize = min(batchSize, 1024);
+    const int gridSize = (batchSize + blockSize - 1) / blockSize;
+    batchApplyMinLengthPenalty<<<gridSize, blockSize, 0, stream>>>(
+        logits, minLengths, endIds, sequneceLengths, contextLengths, vocabSizePaddeded);
 }
 
-template void invokeMinLengthPenalty(float* logits, const int* min_lengths, const int* end_ids,
-    const int* sequnece_lengths, const int* input_lengths, const int batch_size, const int vocab_size_padded,
+template void invokeMinLengthPenalty(float* logits, const int* minLengths, const int* endIds,
+    const int* sequneceLengths, const int* contextLengths, const int batchSize, const int vocabSizePaddeded,
     cudaStream_t stream);
 
-template void invokeMinLengthPenalty(half* logits, const int* min_lengths, const int* end_ids,
-    const int* sequnece_lengths, const int* input_lengths, const int batch_size, const int vocab_size_padded,
-    cudaStream_t stream);
+template void invokeMinLengthPenalty(half* logits, const int* minLengths, const int* endIds, const int* sequneceLengths,
+    const int* contextLengths, const int batchSize, const int vocabSizePaddeded, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm
