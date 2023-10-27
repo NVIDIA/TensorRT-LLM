@@ -2451,6 +2451,161 @@ def avg_pool2d(input: Tensor,
     return output
 
 
+def conv1d(input: Tensor,
+           weight: Tensor,
+           bias: Optional[Tensor] = None,
+           stride: Tuple[int] = (1,),
+           padding: Tuple[int] = (0,),
+           dilation: Tuple[int] = (1,),
+           groups: int = 1) -> Tensor:
+    """
+    Applies a 1D convolution layer over an input tensor of a given shape.
+
+    Parameters:
+        input : Tensor
+            The input tensor with the following shape, (batch_size, in_channels, width).
+
+        weight : Tensor
+            The filter tensor with the following shape, (out_channels, in_channels/groups, kernel_width).
+
+        bias : Optional[Tensor]
+            The bias tensor with the following shape, (out_channels,). Default is None.
+
+        stride : Tuple[int]
+            The stride of the convolving kernel. Default is (1,).
+
+        padding : Tuple[int]
+            Implicit zero padding to be added on both sides. Default is (0,).
+
+        dilation : Tuple[int]
+            The spacing between kernel elements. Default is (1,).
+
+        groups : int
+            Number of blocked connections from input channels to output channels. Default is 1. Must be non-negative.
+
+    Returns:
+        Tensor: The computed output tensor produced by this layer.
+    """
+
+    assert not input.is_dynamic()
+
+    ndim = input.ndim()
+    if ndim == 2:
+        input = expand_dims(input, 0)
+
+    noutput = weight.size()[0]
+    kernel_size = (weight.size()[-1],)
+
+    is_weight_constant = (weight.producer is not None
+                          and weight.producer.type == trt.LayerType.CONSTANT)
+    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+
+    if bias is not None:
+        is_bias_constant = (bias.producer is not None
+                            and bias.producer.type == trt.LayerType.CONSTANT)
+        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+
+    layer = default_trtnet().add_convolution_nd(input.trt_tensor, noutput,
+                                                kernel_size, weight, bias)
+    layer.stride_nd = stride
+    layer.padding_nd = padding
+    layer.dilation = dilation
+    layer.num_groups = groups
+
+    if not is_weight_constant:
+        layer.set_input(1, weight.trt_tensor)
+    if bias is not None and not is_bias_constant:
+        layer.set_input(2, bias.trt_tensor)
+
+    output = _create_tensor(layer.get_output(0), layer)
+
+    if ndim == 2:
+        return output.view(
+            concat([output.size(1),
+                    output.size(2)]))
+
+    return output
+
+
+def conv_transpose1d(input: Tensor,
+                     weight: Tensor,
+                     bias: Optional[Tensor] = None,
+                     stride: Tuple[int] = (1,),
+                     padding: Tuple[int] = (0,),
+                     output_padding: Tuple[int] = (0,),
+                     dilation: Tuple[int] = (1,),
+                     groups: int = 1) -> Tensor:
+    """
+    Applies a 1D deconvolution layer over an input tensor of a given shape.
+
+    Parameters:
+        input : Tensor
+            The input tensor with the following shape, (batch_size, in_channels, width).
+
+        weight : Tensor
+            The filter tensor with the following shape, (in_channels, out_channels/groups, kernel_width).
+
+        bias : Optional[Tensor]
+            The bias tensor with the following shape, (out_channels,). Default is None.
+
+        stride : Tuple[int]
+            The stride of the convolving kernel. Default is (1,).
+
+        padding : Tuple[int]
+            Implicit zero padding to be added on both sides. Default is (0,).
+
+        output_padding : Tuple[int]
+            Additional size added to one side of each dimension in the output shape. Default is (0,).
+
+        dilation : Tuple[int]
+            The spacing between kernel elements. Default is (1,).
+
+        groups : int
+            Number of blocked connections from input channels to output channels. Default is 1. Must be non-negative.
+
+    Returns:
+        Tensor: The computed output tensor produced by this layer.
+    """
+
+    assert not input.is_dynamic()
+
+    ndim = input.ndim()
+    if ndim == 2:
+        input = expand_dims(input, 0)
+
+    noutput = weight.size()[1]
+    kernel_size = (weight.size()[-1],)
+
+    is_weight_constant = (weight.producer is not None
+                          and weight.producer.type == trt.LayerType.CONSTANT)
+    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+
+    if bias is not None:
+        is_bias_constant = (bias.producer is not None
+                            and bias.producer.type == trt.LayerType.CONSTANT)
+        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+
+    layer = default_trtnet().add_deconvolution_nd(input.trt_tensor, noutput,
+                                                  kernel_size, weight, bias)
+    layer.stride_nd = stride
+    layer.padding_nd = padding
+    layer.num_groups = groups
+
+    if not is_weight_constant:
+        layer.set_input(1, weight.trt_tensor)
+    if bias is not None and not is_bias_constant:
+        layer.set_input(2, bias.trt_tensor)
+
+    output = _create_tensor(layer.get_output(0), layer)
+
+    if ndim == 2:
+        return output.view(
+            concat([output.size(1),
+                    output.size(2)]))
+
+    return output
+
+
 def conv2d(input: Tensor,
            weight: Tensor,
            bias: Optional[Tensor] = None,
@@ -2458,10 +2613,34 @@ def conv2d(input: Tensor,
            padding: Tuple[int, int] = (0, 0),
            dilation: Tuple[int, int] = (1, 1),
            groups: int = 1) -> Tensor:
+    """
+    Applies a 2D convolution layer over an input tensor of a given shape.
 
-    ##
-    ## TODO: Document that function!
-    ##
+    Parameters:
+        input : Tensor) 
+            The input tensor with the following shape, (batch_size, in_channels, height, width).
+
+        weight : Tensor
+            The filter tensor with the following shape, (out_channels, in_channels/groups, kernel_height, kernel_width).
+
+        bias : Optional[Tensor]
+            The bias tensor with the following shape, (out_channels,). Default is None.
+
+        stride : Tuple[int, int] 
+            The stride of the convolving kernel. Default is (1, 1).
+
+        padding : Tuple[int, int] 
+            Implicit zero padding to be added on both sides. Default is (0, 0).
+
+        dilation : Tuple[int, int] 
+            The spacing between kernel elements. Default is (1, 1).
+
+        groups : int
+            Number of blocked connections from input channels to output channels. Default is 1. Must be non-negative.
+
+    Returns:
+        Tensor: The computed output tensor produced by this layer.
+    """
 
     assert not input.is_dynamic()
 
@@ -2512,9 +2691,37 @@ def conv_transpose2d(input: Tensor,
                      output_padding: Tuple[int, int] = (0, 0),
                      dilation: Tuple[int, int] = (1, 1),
                      groups: int = 1) -> Tensor:
-    ##
-    ## TODO: Document that function!
-    ##
+    """
+    Applies a 2D deconvolution layer over an input tensor of a given shape.
+
+    Parameters:
+        input : Tensor
+            The input tensor with the following shape, (batch_size, in_channels, height, width).
+
+        weight : Tensor
+            The filter tensor with the following shape, (in_channels, out_channels/groups, kernel_height, kernel_width).
+
+        bias : Optional[Tensor]
+            The bias tensor with the following shape, (out_channels,). Default is None.
+
+        stride : Tuple[int, int]
+            The stride of the convolving kernel. Default is (1, 1).
+
+        padding : Tuple[int, int]
+            Implicit zero padding to be added on both sides. Default is (0, 0).
+
+        output_padding : Tuple[int, int]
+            Additional size added to one side of each dimension in the output shape. Default is (0, 0).
+
+        dilation : Tuple[int, int]
+            The spacing between kernel elements. Default is (1, 1).
+
+        groups : int
+            Number of blocked connections from input channels to output channels. Default is 1. Must be non-negative.
+
+    Returns:
+        Tensor: The computed output tensor produced by this layer.
+    """
 
     assert not input.is_dynamic()
 
@@ -2552,6 +2759,165 @@ def conv_transpose2d(input: Tensor,
             concat([output.size(1),
                     output.size(2),
                     output.size(3)]))
+
+    return output
+
+
+def conv3d(input: Tensor,
+           weight: Tensor,
+           bias: Optional[Tensor] = None,
+           stride: Tuple[int, int, int] = (1, 1, 1),
+           padding: Tuple[int, int, int] = (0, 0, 0),
+           dilation: Tuple[int, int, int] = (1, 1, 1),
+           groups: int = 1) -> Tensor:
+    """
+    Applies a 3D convolution layer over an input tensor of a given shape.
+
+    Parameters:
+        input : Tensor
+            The input tensor with the following shape, (batch_size, in_channels, depth, height, width).
+
+        weight : Tensor
+            The filter tensor with the following shape, (out_channels, in_channels/groups, kernel_depth, kernel_height, kernel_width).
+
+        bias : Optional[Tensor]
+            The bias tensor with the following shape, (out_channels,). Default is None.
+
+        stride : Tuple[int, int, int]
+            The stride of the convolving kernel. Default is (1, 1, 1).
+
+        padding : Tuple[int, int, int]
+            Implicit zero padding to be added on all sides. Default is (0, 0, 0).
+
+        dilation : Tuple[int, int, int]
+            The spacing between kernel elements. Default is (1, 1, 1).
+
+        groups : int
+            Number of blocked connections from input channels to output channels. Default is 1. Must be non-negative.
+
+    Returns:
+        Tensor: The computed output tensor produced by this layer.
+    """
+
+    assert not input.is_dynamic()
+
+    ndim = input.ndim()
+    if ndim == 4:
+        input = expand_dims(input, 0)
+
+    noutput = weight.size()[0]
+    kernel_size = (weight.size()[-3], weight.size()[-2], weight.size()[-1])
+
+    is_weight_constant = (weight.producer is not None
+                          and weight.producer.type == trt.LayerType.CONSTANT)
+    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+
+    if bias is not None:
+        is_bias_constant = (bias.producer is not None
+                            and bias.producer.type == trt.LayerType.CONSTANT)
+        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+
+    layer = default_trtnet().add_convolution_nd(input.trt_tensor, noutput,
+                                                kernel_size, weight, bias)
+    layer.stride_nd = stride
+    layer.padding_nd = padding
+    layer.dilation = dilation
+    layer.num_groups = groups
+
+    if not is_weight_constant:
+        layer.set_input(1, weight.trt_tensor)
+    if bias is not None and not is_bias_constant:
+        layer.set_input(2, bias.trt_tensor)
+
+    output = _create_tensor(layer.get_output(0), layer)
+
+    if ndim == 4:
+        return output.view(
+            concat([output.size(1),
+                    output.size(2),
+                    output.size(3),
+                    output.size(4)]))
+
+    return output
+
+
+def conv_transpose3d(input: Tensor,
+                     weight: Tensor,
+                     bias: Optional[Tensor] = None,
+                     stride: Tuple[int, int, int] = (1, 1, 1),
+                     padding: Tuple[int, int, int] = (0, 0, 0),
+                     output_padding: Tuple[int, int, int] = (0, 0, 0),
+                     dilation: Tuple[int, int, int] = (1, 1, 1),
+                     groups: int = 1) -> Tensor:
+    """
+    Applies a 3D deconvolution layer over an input tensor of a given shape.
+
+    Parameters:
+        input : Tensor
+            The input tensor with the following shape, (batch_size, in_channels, depth, height, width).
+
+        weight : Tensor
+            The filter tensor with the following shape, (in_channels, out_channels/groups, kernel_depth, kernel_height, kernel_width).
+
+        bias : Optional[Tensor]
+            The bias tensor with the following shape, (out_channels,). Default is None.
+
+        stride : Tuple[int, int, int]
+            The stride of the convolving kernel. Default is (1, 1, 1).
+
+        padding : Tuple[int, int, int]
+            Implicit zero padding to be added on all sides. Default is (0, 0, 0).
+
+        output_padding : Tuple[int, int, int]
+            Additional size added to one side of each dimension in the output shape. Default is (0, 0, 0).
+
+        dilation : Tuple[int, int, int]
+            The spacing between kernel elements. Default is (1, 1, 1).
+
+        groups : int
+            Number of blocked connections from input channels to output channels. Default is 1. Must be non-negative.
+
+    Returns:
+        Tensor: The computed output tensor produced by this layer.
+    """
+
+    assert not input.is_dynamic()
+
+    ndim = input.ndim()
+    if ndim == 4:
+        input = expand_dims(input, 0)
+
+    noutput = weight.size()[1]
+    kernel_size = (weight.size()[-3], weight.size()[-2], weight.size()[-1])
+
+    is_weight_constant = (weight.producer is not None
+                          and weight.producer.type == trt.LayerType.CONSTANT)
+    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+
+    if bias is not None:
+        is_bias_constant = (bias.producer is not None
+                            and bias.producer.type == trt.LayerType.CONSTANT)
+        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+
+    layer = default_trtnet().add_deconvolution_nd(input.trt_tensor, noutput,
+                                                  kernel_size, weight, bias)
+    layer.stride_nd = stride
+    layer.padding_nd = padding
+    layer.num_groups = groups
+
+    if not is_weight_constant:
+        layer.set_input(1, weight.trt_tensor)
+    if bias is not None and not is_bias_constant:
+        layer.set_input(2, bias.trt_tensor)
+
+    output = _create_tensor(layer.get_output(0), layer)
+
+    if ndim == 4:
+        return output.view(
+            concat([output.size(1),
+                    output.size(2),
+                    output.size(3),
+                    output.size(4)]))
 
     return output
 
