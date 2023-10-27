@@ -88,7 +88,7 @@ def parse_input(input_text: str, input_file: str, tokenizer, end_id: int,
                 remove_input_padding: bool):
     input_tokens = []
     if input_file is None:
-        input_text = f'<s><|User|>:{input_text}<eoh>'
+        input_text = f'<s><|User|>:{input_text}<eoh>\n<|Bot|>:'
         input_tokens.append(
             tokenizer.encode(input_text, add_special_tokens=False))
         print(f'Input: \"{input_text}\"')
