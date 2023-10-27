@@ -428,7 +428,7 @@ def parse_arguments():
         args.rms_norm_eps = meta_config["norm_eps"]
     elif args.ft_model_dir is not None:
         # Not tested
-        n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, n_kv_head = parse_ft_config(
+        n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, n_kv_head, attn_bias = parse_ft_config(
             Path(args.ft_model_dir) / "config.ini")
         args.inter_size = inter_size  # override the inter_size for InternLM
         args.n_kv_head = n_kv_head
@@ -440,6 +440,7 @@ def parse_arguments():
         args.hidden_act = hidden_act
         args.rms_norm_eps = 1e-06
         logger.warning("Set rms_norm_eps to 1e-06 directly.")
+        args.attn_bias = attn_bias
     assert args.use_gpt_attention_plugin, "InternLM must use gpt attention plugin"
     if args.n_kv_head is None:
         args.n_kv_head = args.n_head

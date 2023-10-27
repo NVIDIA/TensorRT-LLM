@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import configparser
+import math
 import time
 from operator import attrgetter
 from pathlib import Path
@@ -166,12 +167,13 @@ def parse_ft_config(ini_file):
     vocab_size = gpt_config.getint('internlm', 'vocab_size')
     hidden_act = gpt_config.get('internlm', 'hidden_act')
     inter_size = gpt_config.getint('internlm', 'intermediate_size', fallback=None)
-    n_kv_head = gpt_config.getint('internlm', 'num_key_value_heads', fallback=None)
+    n_kv_head = gpt_config.getint('internlm', 'num_key_value_heads', fallback=n_head)
+    attn_bias = gpt_config.getboolean('internlm', 'bias', fallback=False)
 
     if inter_size is None:
-        inter_size = 4 * n_embd
+        inter_size = math.ceil(8/3 * n_embd / 256) * 256
 
-    return n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, n_kv_head
+    return n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, n_kv_head, attn_bias
 
 
 def load_from_hf_internlm(tensorrt_llm_internlm: tensorrt_llm.models.InternLMForCausalLM,
@@ -330,24 +332,7 @@ def load_from_hf_internlm(tensorrt_llm_internlm: tensorrt_llm.models.InternLMFor
                     dst.value = np.ascontiguousarray(split_v)
             elif 'self_attn.o_proj.bias' in k:
                 dst = tensorrt_llm_internlm.layers[idx].attention.dense.bias
-                # if mapping.tp_rank == 0:
                 split_v = v # no need to divide among ranks?
-                # else:
-                    # print(v)
-                    # split_v = np.zeros_like(v)
-                    # print(split_v)
-                # if use_weight_only:
-                #     v = np.ascontiguousarray(split_v.transpose())
-                #     processed_torch_weights, torch_weight_scales = \
-                #         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
-                #         torch.tensor(v), plugin_weight_only_quant_type)
-                #     # workaround for trt not supporting int8 inputs in plugins currently
-                #     dst.value = processed_torch_weights.view(
-                #         dtype=torch.float32).numpy()
-                #     scales = tensorrt_llm_internlm.layers[
-                #         idx].attention.dense.per_channel_scale
-                #     scales.value = torch_weight_scales.numpy()
-                # else:
                 dst.value = np.ascontiguousarray(split_v)
             elif 'mlp.up_proj.weight' in k:
                 dst = tensorrt_llm_internlm.layers[idx].mlp.gate.weight
@@ -601,7 +586,7 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
 
     quant_mode = getattr(tensorrt_llm_internlm, 'quant_mode', QuantMode(0))
 
-    n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, n_kv_head = parse_ft_config(
+    n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, n_kv_head, attn_bias = parse_ft_config(
         Path(dir_path) / 'config.ini')
     np_dtype = np.float16 if fp16 else np.float32
 
@@ -726,8 +711,17 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
                 n_embd // mapping.tp_size +
                 (n_embd // n_head * n_groups) // mapping.tp_size * 2)
         idx = i - mapping.pp_rank * tensorrt_llm_internlm.num_layers
-        tensorrt_llm_internlm.layers[idx].input_layernorm.weight.value = (fromfile(
-            dir_path, 'model.layers.' + str(i) + '.input_layernorm.weight.bin'))
+        tensorrt_llm_internlm.layers[idx].input_layernorm.weight.value = (
+            fromfile(dir_path,
+                     'model.layers.' + str(i) + '.input_layernorm.weight.bin'))
+
+        if attn_bias:
+            dst = tensorrt_llm_internlm.layers[idx].attention.qkv.bias
+            t = fromfile(
+                dir_path, 'model.layers.' + str(i) +
+                '.attention.query_key_value.bias.' + suffix)
+            dst.value = np.ascontiguousarray(t)
+
         t = fromfile(
             dir_path, 'model.layers.' + str(i) +
             '.attention.query_key_value.weight.' + suffix,
@@ -739,7 +733,8 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
                     np.ascontiguousarray(np.transpose(t, [1, 0])))
                 set_smoothquant_scale_factors(
                     tensorrt_llm_internlm.layers[idx].attention.qkv,
-                    tensorrt_llm_internlm.layers[idx].input_layernorm.scale_to_int,
+                    tensorrt_llm_internlm.layers[idx].input_layernorm.
+                    scale_to_int,
                     dir_path,
                     'model.layers.' + str(i) + '.attention.query_key_value.',
                     [1, c_attn_out_dim],
@@ -860,8 +855,8 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
             proj_scale = getattr(tensorrt_llm_internlm.layers[idx].mlp,
                                  "quantization_scaling_factor", None)
             set_smoothquant_scale_factors(
-                tensorrt_llm_internlm.layers[idx].mlp.proj, proj_scale, dir_path,
-                'model.layers.' + str(i) + '.mlp.proj.', [1, n_embd],
+                tensorrt_llm_internlm.layers[idx].mlp.proj, proj_scale,
+                dir_path, 'model.layers.' + str(i) + '.mlp.proj.', [1, n_embd],
                 quant_per_token_dyn, quant_per_channel)
             set_smoother(tensorrt_llm_internlm.layers[idx].mlp.proj, dir_path,
                          'model.layers.' + str(i) + '.mlp.proj',
