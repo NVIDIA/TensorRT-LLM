@@ -59,7 +59,7 @@ struct BeamHypotheses
     int batch_size;
     int local_batch_size;
     int max_seq_len;
-    float length_penalty;
+    float* length_penalties;
 
     bool early_stopping = true;
     bool is_return_normed_score = true; // return normed_cum_log_probs or cum_log_probs

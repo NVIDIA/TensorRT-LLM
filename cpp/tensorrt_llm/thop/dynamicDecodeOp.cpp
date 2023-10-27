@@ -130,10 +130,8 @@ void FtDynamicDecode<T>::setup(size_t batch_size, size_t beam_width, th::optiona
     safeInsert(top_p_decay_opt, setupParams.top_p_decay);
     safeInsert(top_p_min_opt, setupParams.top_p_min);
     safeInsert(top_p_reset_ids_opt, setupParams.top_p_reset_ids);
-
-    safeUpdateScalar(
-        beam_search_diversity_rate_opt, setupParams.beam_search_diversity_rate, "beam_search_diversity_rate");
-    safeUpdateScalar(length_penalty_opt, setupParams.length_penalty, "length_penalty");
+    safeInsert(beam_search_diversity_rate_opt, setupParams.beam_search_diversity_rate);
+    safeInsert(length_penalty_opt, setupParams.length_penalty);
 
     dynamic_decode_layer_->setup(batch_size, beam_width, setupParams);
 }

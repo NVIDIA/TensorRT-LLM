@@ -33,14 +33,17 @@ public:
 
     using Callback = std::function<void(TensorPtr const& ids, SizeType step, bool finished)>;
 
-    explicit GenerationOutput(TensorPtr ids)
+    explicit GenerationOutput(TensorPtr ids, TensorPtr lengths)
         : ids{std::move(ids)}
+        , lengths{std::move(lengths)}
     {
         TLLM_CHECK_WITH_INFO(static_cast<bool>(this->ids), "Invalid ids tensor");
+        TLLM_CHECK_WITH_INFO(static_cast<bool>(this->lengths), "Invalid lengths tensor");
     }
 
     // mandatory parameters
-    TensorPtr ids; // [batchSize, beamWidth, maxInputLength + maxNewTokens]
+    TensorPtr ids;     // [batchSize, beamWidth, maxInputLength + maxNewTokens]
+    TensorPtr lengths; // [batchSize, beamWidth]
 
     // optional parameters
     TensorPtr logProbs;      // [request_output_length, batch_size * beam_width], must be float*, on gpu

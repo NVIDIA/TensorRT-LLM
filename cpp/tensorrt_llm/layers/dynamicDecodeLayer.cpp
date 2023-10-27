@@ -152,7 +152,7 @@ void DynamicDecodeLayer<T>::setup(size_t batch_size, size_t beam_width, SetupPar
         beamSearchParams.length_penalty = setupParams.length_penalty;
 
         has_diff_runtime_args_ = hasDiffRuntimeArgs(beamSearchParams);
-        mOnlineBeamsearchDecode->setup(beamSearchParams);
+        mOnlineBeamsearchDecode->setup(batch_size, beamSearchParams);
     }
 }
 

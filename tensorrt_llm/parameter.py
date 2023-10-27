@@ -46,8 +46,15 @@ class Parameter(object):
                 v_range = 0.1
 
             # value ~ U[-1, 1]
-            value = torch.rand(
-                (shape), dtype=trt_dtype_to_torch(dtype), device='cuda') * 2 - 1
+            if dtype == trt.DataType.INT8:
+                value = torch.randint(-128,
+                                      128, (shape),
+                                      dtype=trt_dtype_to_torch(dtype),
+                                      device='cuda')
+            else:
+                value = torch.randn(
+                    (shape), dtype=trt_dtype_to_torch(dtype),
+                    device='cuda') * 2 - 1
             # value ~ U[-v_range, v_range]
             value = torch_to_numpy((value * v_range).cpu())
 
@@ -58,6 +65,13 @@ class Parameter(object):
         if isinstance(self._value, np.ndarray):
             self._value = constant(self._value)
 
+        return self._value
+
+    @property
+    def raw_value(self) -> np.ndarray:
+        assert isinstance(
+            self._value, np.ndarray
+        ), "Must be np.ndarray. Proper usage: get parameter.raw_value before getting parameter.value"
         return self._value
 
     @value.setter

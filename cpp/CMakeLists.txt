@@ -21,6 +21,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include(CheckLanguage)
 include(cmake/modules/set_ifndef.cmake)
 include(cmake/modules/find_library_create_target.cmake)
+include(cmake/modules/resolve_dirs.cmake)
 
 project(tensorrt_llm LANGUAGES CXX)
 
@@ -29,6 +30,7 @@ option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
 option(BUILD_TESTS "Build Google tests" ON)
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
 option(NVTX_DISABLE "Disable all NVTX features" ON)
+option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
@@ -129,6 +131,13 @@ enable_language(CUDA)
 
 find_package(CUDAToolkit REQUIRED)
 
+resolve_dirs(CUDAToolkit_INCLUDE_DIRS "${CUDAToolkit_INCLUDE_DIRS}")
+
+message(STATUS "CUDA library status:")
+message(STATUS "    version: ${CUDAToolkit_VERSION}")
+message(STATUS "    libraries: ${CUDAToolkit_LIBRARY_DIR}")
+message(STATUS "    include path: ${CUDAToolkit_INCLUDE_DIRS}")
+
 find_library(
   CUDNN_LIB cudnn
   HINTS ${CUDNN_ROOT_DIR} ${CUDAToolkit_LIBRARY_DIR}
@@ -162,7 +171,7 @@ get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
 include_directories(
-  ${CUDA_INCLUDE_DIRS} ${CUDNN_ROOT_DIR}/include ${NCCL_INCLUDE_DIR}
+  ${CUDAToolkit_INCLUDE_DIRS} ${CUDNN_ROOT_DIR}/include ${NCCL_INCLUDE_DIR}
   ${3RDPARTY_DIR}/cutlass/include ${3RDPARTY_DIR}/NVTX/include
   ${3RDPARTY_DIR}/json/include)
 
@@ -171,7 +180,6 @@ set_ifndef(TRT_LIB_DIR ${CMAKE_BINARY_DIR})
 set_ifndef(TRT_INCLUDE_DIR /usr/include/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
 set(TRT_LIB nvinfer)
 find_library_create_target(${TRT_LIB} nvinfer SHARED ${TRT_LIB_DIR})
-find_library_create_target(nvuffparser nvparsers SHARED ${TRT_LIB_DIR})
 
 if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")

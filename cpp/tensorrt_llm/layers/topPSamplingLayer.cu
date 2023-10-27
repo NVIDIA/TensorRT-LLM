@@ -115,7 +115,7 @@ void TopPSamplingLayer<T>::allocateBuffer(std::size_t batch_size, std::vector<fl
         nullptr,                   // output_log_probs
         nullptr,                   // log_probs
         topp_id_vals_buf_, topp_offset_buf_, begin_topp_offset_buf_, curandstate_buf_, batch_size, vocab_size_padded_,
-        nullptr, max_top_p, stream_, cuda_device_prop_, skip_decode_buf_);
+        nullptr, max_top_p, stream_, skip_decode_buf_);
     sampling_workspace_ = allocator_->reMalloc(sampling_workspace_, sampling_workspace_size_, true);
     runtime_top_k_buf_ = allocator_->reMalloc(runtime_top_k_buf_, sizeof(std::uint32_t) * batch_size, false);
     runtime_top_p_buf_ = allocator_->reMalloc(runtime_top_p_buf_, sizeof(float) * batch_size, false);
@@ -243,7 +243,7 @@ void TopPSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingPa
 
     bool* finished = (outputs.finished) ? outputs.finished->template getPtr<bool>() : nullptr;
     invokeAddBiasSoftMax(
-        logits, (T*) (nullptr), end_ids, finished, local_batch_size, vocab_size_padded_, vocab_size_, stream_);
+        logits, (T*) (nullptr), end_ids, finished, local_batch_size, vocab_size_, vocab_size_padded_, stream_);
     sync_check_cuda_error();
 
     float* cum_log_probs = (outputs.cum_log_probs) ? outputs.cum_log_probs->template getPtr<float>() : nullptr;
@@ -254,7 +254,7 @@ void TopPSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingPa
         outputs.output_ids_ptr.template getPtr<int*>(), sequence_length, finished, cum_log_probs, output_log_probs,
         logits, topp_id_vals_buf_, topp_offset_buf_, begin_topp_offset_buf_, curandstate_buf_ + ite * local_batch_size,
         local_batch_size, vocab_size_padded_, end_ids, runtime_max_top_p_, runtime_top_p_buf_ + ite * local_batch_size,
-        stream_, cuda_device_prop_, skip_decode_buf_ + ite * local_batch_size);
+        stream_, skip_decode_buf_ + ite * local_batch_size);
     sync_check_cuda_error();
 
     invokeComputeToppDecay(runtime_top_p_buf_ + ite * local_batch_size, initial_top_p_buf_ + ite * local_batch_size,

@@ -16,9 +16,9 @@ Support for float16, float32 and bfloat16 conversion. Just change `data_type` fl
 
 #### MPT 7B
 
-### 1. Convert weights from HF Tranformers to FT format
+### 1. Convert weights from HF Transformers to FT format
 
-The [`hf_gpt_convert.py`](./convert_hf_mpt_to_ft.py) script allows you to convert weights from HF Tranformers format to FT format.
+The [`hf_gpt_convert.py`](./convert_hf_mpt_to_ft.py) script allows you to convert weights from HF Transformers format to FT format.
 
 ```bash
 python convert_hf_mpt_to_ft.py -i mosaicml/mpt-7b -o ./ft_ckpts/mpt-7b/fp16/ -t float16
@@ -67,9 +67,9 @@ mpirun -n 4 --allow-run-as-root python run.py --engine_dir ./trt_engines/mpt-7b/
 
 Same commands can be changed to convert MPT 30B to TRT LLM format. Below is an example to build MPT30B fp16 4-way tensor parallelized TRT engine
 
-### 1. Convert weights from HF Tranformers to FT format
+### 1. Convert weights from HF Transformers to FT format
 
-The [`convert_hf_mpt_to_ft.py`](./convert_hf_mpt_to_ft.py) script allows you to convert weights from HF Tranformers format to FT format.
+The [`convert_hf_mpt_to_ft.py`](./convert_hf_mpt_to_ft.py) script allows you to convert weights from HF Transformers format to FT format.
 
 
 ```bash

@@ -12,346 +12,165 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import math
-from collections import OrderedDict
+import argparse
 
 import numpy as np
 import tensorrt as trt
 
 from ..._common import default_net
-from ..._utils import pad_vocab_size, str_dtype_to_trt
-from ...functional import (PositionEmbeddingType, Tensor, assertion, concat,
-                           constant, gather_last_token_logits, gpt_attention,
-                           shape, split)
-from ...layers import (MLP, AttentionMaskType, AttentionParams, ColumnLinear,
-                       Embedding, KeyValueCacheParams, LayerNorm, RowLinear)
-from ...mapping import Mapping
+from ..._utils import (pad_vocab_size, str_dtype_to_np, str_dtype_to_trt,
+                       trt_dtype_to_np)
+from ...functional import (PositionEmbeddingType, Tensor, concat,
+                           gather_last_token_logits, shape)
+from ...layers import (MLP, Attention, AttentionMaskType, AttentionParams,
+                       ColumnLinear, Embedding, KeyValueCacheParams, LayerNorm)
 from ...module import Module, ModuleList
-from ...parameter import Parameter
-from ...quantization import QuantMode
-
-
-class ChatGLMAttention(Module):
-
-    def __init__(self,
-                 hidden_size,
-                 num_attention_heads,
-                 max_position_embeddings,
-                 num_layers=1,
-                 apply_query_key_layer_scaling=False,
-                 bias=True,
-                 dtype=None,
-                 position_embedding_type:
-                 PositionEmbeddingType = PositionEmbeddingType.learned_absolute,
-                 use_int8_kv_cache=False,
-                 tp_group=None,
-                 tp_size=1,
-                 multi_block_mode=False,
-                 multi_query_mode=False):
-        super().__init__()
-
-        self.attention_mask_type = AttentionMaskType.bidirectional
-        self.attention_head_size = hidden_size // num_attention_heads
-        self.num_attention_heads = num_attention_heads // tp_size
-        self.num_attention_kv_heads = 1 if multi_query_mode else self.num_attention_heads
-        self.hidden_size = hidden_size // tp_size
-        self.max_position_embeddings = max_position_embeddings
-
-        self.num_layers = num_layers
-        self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
-        self.norm_factor = math.sqrt(self.attention_head_size)
-        self.q_scaling = 1
-        if self.apply_query_key_layer_scaling:
-            self.norm_factor *= self.num_layers
-            self.q_scaling *= self.num_layers
-
-        self.multi_block_mode = multi_block_mode
-        self.multi_query_mode = multi_query_mode
-
-        self.rotary_embedding_dim = 0
-        self.position_embedding_type = position_embedding_type
-        self.dtype = dtype
-
-        self.use_int8_kv_cache = use_int8_kv_cache
-        if self.use_int8_kv_cache:
-            self.kv_orig_quant_scale = Parameter(shape=(1, ), dtype='float32')
-            self.kv_quant_orig_scale = Parameter(shape=(1, ), dtype='float32')
-        else:
-            self.register_parameter('kv_orig_quant_scale', None)
-            self.register_parameter('kv_quant_orig_scale', None)
-
-        # Note: in multi_query_mode, only query heads are split between multiple GPUs,
-        # while key/value head are not split as there is only one head per key/value.
-        # The output feature size is therefore (h/tp + 2) * d, where h is num_heads,
-        # d is head_size, and tp is tensor_parallel_size.
-        # In ColumnLinear op, the output dim is calculated by (h + 2*tp) * d / tp,
-        # which matches the desired output size (h/tp + 2) * d after splitting
-        self.qkv = ColumnLinear(hidden_size,
-                                hidden_size *
-                                3 if not multi_query_mode else hidden_size +
-                                2 * tp_size * self.attention_head_size,
-                                bias=bias,
-                                dtype=dtype,
-                                tp_group=tp_group,
-                                tp_size=tp_size,
-                                gather_output=False)
-        self.dense = RowLinear(hidden_size,
-                               hidden_size,
-                               bias=bias,
-                               dtype=dtype,
-                               tp_group=tp_group,
-                               tp_size=tp_size)
-
-    def forward(self,
-                hidden_states: Tensor,
-                position_embedding,
-                use_cache=False,
-                kv_cache_params=None,
-                attention_params=None):
-
-        if not default_net().plugin_config.gpt_attention_plugin:
-            raise ValueError(
-                'ChatGLM is only supported with GPTAttention plugin')
-
-        assert isinstance(hidden_states, Tensor)
-        qkv = self.qkv(hidden_states)
-
-        # attention
-
-        qkv = qkv.view(
-            concat([
-                shape(qkv, 0),
-                shape(qkv, 1), self.num_attention_heads, 3,
-                self.attention_head_size
-            ]))
-        query, key, value = split(qkv, 1, dim=3)
-        query = query.view(
-            concat([
-                shape(qkv, 0),
-                shape(qkv, 1), self.num_attention_heads,
-                self.attention_head_size
-            ]))
-        key = key.view(
-            concat([
-                shape(qkv, 0),
-                shape(qkv, 1), self.num_attention_heads,
-                self.attention_head_size
-            ]))
-        value = value.view(
-            concat([
-                shape(qkv, 0),
-                shape(qkv, 1), self.num_attention_heads,
-                self.attention_head_size
-            ]))
-        zero = constant(
-            np.ascontiguousarray(
-                np.zeros([1, 1, 1, 1],
-                         dtype=np.float16
-                         if self.dtype == trt.float16 else np.float32)))
-
-        def rotate(x64):
-            x32_part0, x32_part1 = x64.split(32, dim=-1)
-
-            x32_part1_negtive = zero - x32_part1
-
-            y64 = concat([x32_part1_negtive, x32_part0], dim=3)
-            return y64
-
-        def rotate_embedding(x, position_embedding_value):
-            cos0, cos1, sin0, sin1 = position_embedding_value
-
-            x128 = x
-            x64_part0, x64_part1 = x128.split(64, dim=-1)
-
-            x64_part0_rotate = rotate(x64_part0)
-            y64_part0 = x64_part0 * cos0 + x64_part0_rotate * sin0
-
-            x64_part1_rotate = rotate(x64_part1)
-            y64_part1 = x64_part1 * cos1 + x64_part1_rotate * sin1
-
-            y128 = concat([y64_part0, y64_part1], dim=3)
-            y128 = y128.view(shape(x))
-            return y128
-
-        query = rotate_embedding(query, position_embedding)
-        key = rotate_embedding(key, position_embedding)
-
-        kv_orig_quant_scale = self.kv_orig_quant_scale.value if self.use_int8_kv_cache else None
-        kv_quant_orig_scale = self.kv_quant_orig_scale.value if self.use_int8_kv_cache else None
-
-        qkv = concat([query, key, value], dim=2)
-        qkv = qkv.view(
-            concat([shape(qkv, 0),
-                    shape(qkv, 1), self.hidden_size * 3]))
-        context, past_key_value = gpt_attention(
-            tensor=qkv,
-            past_key_value=kv_cache_params.get_first_past_key_value(),
-            sequence_length=attention_params.sequence_length,
-            host_past_key_value_lengths=kv_cache_params.
-            host_past_key_value_lengths,
-            context_lengths=attention_params.context_lengths,
-            cache_indirection=kv_cache_params.cache_indirection,
-            host_request_types=attention_params.host_request_types,
-            num_heads=self.num_attention_heads,
-            num_kv_heads=self.num_attention_kv_heads,
-            hidden_size_per_head=self.attention_head_size,
-            q_scaling=self.q_scaling,
-            rotary_embedding_dim=self.rotary_embedding_dim,
-            position_embedding_type=self.position_embedding_type,
-            multi_block_mode=self.multi_block_mode,
-            kv_orig_quant_scale=kv_orig_quant_scale,
-            kv_quant_orig_scale=kv_quant_orig_scale,
-            kv_cache_quant_mode=QuantMode.from_description(
-                use_int8_kv_cache=self.use_int8_kv_cache),
-            max_context_length=attention_params.max_context_length,
-            mask_type=self.attention_mask_type.value,
-            host_context_lengths=attention_params.host_context_lengths)
-
-        context = self.dense(context)
-
-        if use_cache:
-            return (context, past_key_value)
-        else:
-            return context
+from ..generation_mixin import GenerationMixin
 
 
 class ChatGLM6BDecoderLayer(Module):
 
-    def __init__(self,
-                 hidden_size,
-                 num_attention_heads,
-                 max_position_embeddings,
-                 num_layers,
-                 dtype=None,
-                 apply_query_key_layer_scaling=False,
-                 hidden_act='relu',
-                 quant_mode=QuantMode(0),
-                 inter_size=None,
-                 bias=True,
-                 tp_group=None,
-                 tp_size=1):
+    def __init__(self, args):
+
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_attention_heads = num_attention_heads
-        self.max_position_embeddings = max_position_embeddings
-        self.num_layers = num_layers
-        self.dtype = dtype
-        self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
-        self.hidden_act = hidden_act
-        self.tp_group = tp_group
-        self.tp_size = tp_size
-        self.input_layernorm = LayerNorm(normalized_shape=hidden_size,
-                                         dtype=dtype)
 
-        self.attention = ChatGLMAttention(
-            hidden_size,
-            num_attention_heads,
-            max_position_embeddings,
-            num_layers,
-            apply_query_key_layer_scaling,
-            dtype=dtype,
-            position_embedding_type=PositionEmbeddingType.learned_absolute,
-            bias=bias,
-            tp_group=tp_group,
-            tp_size=tp_size,
-            use_int8_kv_cache=quant_mode.has_int8_kv_cache())
+        self.use_cache = args.use_cache
 
-        if inter_size is None:
-            inter_size = hidden_size * 4
+        self.input_layernorm = LayerNorm(
+            normalized_shape=args.hidden_size,
+            eps=args.layernorm_epsilon,
+            dtype=args.dtype,
+        )
 
-        self.mlp = MLP(hidden_size=hidden_size,
-                       ffn_hidden_size=inter_size,
-                       hidden_act=hidden_act,
-                       dtype=dtype,
-                       bias=bias,
-                       tp_group=tp_group,
-                       tp_size=tp_size)
-        self.post_layernorm = LayerNorm(normalized_shape=hidden_size,
-                                        dtype=dtype)
+        self.attention = Attention(
+            hidden_size=args.hidden_size,
+            num_attention_heads=args.num_heads,
+            num_kv_heads=args.num_heads,
+            max_position_embeddings=args.max_seq_length,
+            num_layers=args.num_layers,
+            apply_query_key_layer_scaling=args.apply_query_key_layer_scaling,
+            attention_mask_type=AttentionMaskType.bidirectional,
+            bias=args.bias,
+            dtype=args.dtype,
+            position_embedding_type=PositionEmbeddingType.chatglm,
+            use_int8_kv_cache=args.quant_mode.has_int8_kv_cache(),
+            tp_group=args.mapping.tp_group,
+            tp_size=args.mapping.tp_size,
+            multi_block_mode=args.multi_block_mode,
+            quant_mode=args.quant_mode,
+        )
 
-    def forward(self,
-                hidden_states: Tensor,
-                position_embedding,
-                use_cache=False,
-                kv_cache_params=None,
-                attention_params=None):
+        self.mlp = MLP(
+            hidden_size=args.hidden_size,
+            ffn_hidden_size=args.ffn_hidden_size,
+            hidden_act=args.hidden_act,
+            dtype=args.dtype,
+            bias=args.bias,
+            tp_group=args.mapping.tp_group,
+            tp_size=args.mapping.tp_size,
+        )
 
-        assert isinstance(hidden_states, Tensor)
-        hidden_states = self.input_layernorm(hidden_states)
+        self.post_layernorm = LayerNorm(
+            normalized_shape=args.hidden_size,
+            eps=args.layernorm_epsilon,
+            dtype=args.dtype,
+        )
 
-        attention_output = self.attention(hidden_states,
-                                          position_embedding,
-                                          use_cache=use_cache,
-                                          kv_cache_params=kv_cache_params,
-                                          attention_params=attention_params)
+    def forward(
+        self,
+        hidden_states: Tensor,
+        position_embedding: Tensor,
+        kv_cache_params: KeyValueCacheParams = None,
+        attention_params: AttentionParams = None,
+    ):
 
-        if use_cache:
+        layernorm_output = self.input_layernorm(hidden_states)
+
+        attention_output = self.attention(
+            hidden_states=layernorm_output,
+            attention_mask=None,
+            use_cache=self.use_cache,
+            kv_cache_params=kv_cache_params,
+            attention_params=attention_params,
+            encoder_output=None,
+            workspace=None,
+            position_embedding=position_embedding,
+        )
+
+        if self.use_cache:
             attention_output, presents = attention_output
 
-        hidden_states = hidden_states * 7.484375 + attention_output
+        layernorm_input = layernorm_output * 7.484375 + attention_output
 
-        hidden_states = self.post_layernorm(hidden_states)
+        layernorm_output = self.post_layernorm(layernorm_input)
 
-        mlp_output = self.mlp(hidden_states)
+        mlp_output = self.mlp(layernorm_output)
 
-        hidden_states = hidden_states * 7.484375 + mlp_output
+        output = layernorm_output * 7.484375 + mlp_output
 
-        if use_cache:
-            return (hidden_states, presents)
-        return hidden_states
+        return (output, presents) if self.use_cache else output
 
 
 class ChatGLM6BModel(Module):
 
-    def __init__(self,
-                 num_layers,
-                 num_heads,
-                 hidden_size,
-                 vocab_size,
-                 hidden_act,
-                 max_position_embeddings,
-                 dtype=None,
-                 mapping=Mapping(),
-                 apply_query_key_layer_scaling=False,
-                 inter_size=None,
-                 bias=True,
-                 quant_mode=QuantMode(0)):
+    def __init__(self, args):
+
         super().__init__()
 
-        self.half_head_size = hidden_size // num_heads // 2
+        self.use_cache = args.use_cache
+        self.half_head_size = args.hidden_size // args.num_heads // 2
 
-        self.embedding = Embedding(vocab_size, hidden_size, dtype=dtype)
-        self.position_embedding_cos = Embedding(max_position_embeddings,
-                                                self.half_head_size,
-                                                dtype=dtype)
-        self.position_embedding_sin = Embedding(max_position_embeddings,
-                                                self.half_head_size,
-                                                dtype=dtype)
+        self.embedding = Embedding(
+            num_embeddings=args.vocab_size,
+            embedding_dim=args.hidden_size,
+            dtype=args.dtype,
+        )
 
-        self.layers = ModuleList([
-            ChatGLM6BDecoderLayer(
-                hidden_size=hidden_size,
-                num_attention_heads=num_heads,
-                max_position_embeddings=max_position_embeddings,
-                num_layers=num_layers,
-                dtype=dtype,
-                apply_query_key_layer_scaling=apply_query_key_layer_scaling,
-                hidden_act=hidden_act,
-                tp_group=mapping.tp_group,
-                tp_size=mapping.tp_size,
-                inter_size=inter_size,
-                bias=bias,
-                quant_mode=quant_mode) for _ in range(num_layers)
-        ])
+        # pre-compute weight of position embedding manually
+        if isinstance(args.dtype, trt.DataType):
+            np_dtype = trt_dtype_to_np(args.dtype)
+        else:
+            np_dtype = str_dtype_to_np(args.dtype)
 
-        self.ln_f = LayerNorm(normalized_shape=hidden_size, dtype=dtype)
+        inv_freq = 10**(-1 / 16 *
+                        np.arange(0, 64, 2, dtype=np.float32)).reshape(1, 32)
+        valueTable = np.matmul(
+            np.arange(args.max_seq_length, dtype=np.float32).reshape(-1, 1),
+            np.tile(inv_freq, [1, 2]),
+        ).reshape(args.max_seq_length, 64)
 
-    def forward(self,
-                input_ids=None,
-                position_ids=None,
-                use_cache=False,
-                kv_cache_params=None,
-                attention_params=None):
+        self.position_embedding_cos = Embedding(
+            num_embeddings=args.max_seq_length,
+            embedding_dim=self.half_head_size,
+            dtype=args.dtype,
+        )
+        self.position_embedding_sin = Embedding(
+            num_embeddings=args.max_seq_length,
+            embedding_dim=self.half_head_size,
+            dtype=args.dtype,
+        )
+
+        self.position_embedding_cos.weight.value = np.cos(valueTable).astype(
+            np_dtype)
+        self.position_embedding_sin.weight.value = np.sin(valueTable).astype(
+            np_dtype)
+
+        self.layers = ModuleList(
+            ChatGLM6BDecoderLayer(args) for _ in range(args.num_layers))
+
+        self.final_layernorm = LayerNorm(
+            normalized_shape=args.hidden_size,
+            eps=args.layernorm_epsilon,
+            dtype=args.dtype,
+        )
+
+    def forward(
+        self,
+        input_ids: Tensor = None,
+        position_ids: Tensor = None,
+        kv_cache_params: KeyValueCacheParams = None,
+        attention_params: AttentionParams = None,
+    ):
 
         batch_size = shape(input_ids, 0)
         input_len = shape(input_ids, 1)
@@ -383,229 +202,169 @@ class ChatGLM6BModel(Module):
         if kv_cache_params.past_key_value is None:
             kv_cache_params.past_key_value = tuple([None] * len(self.layers))
 
-        if use_cache:
+        if self.use_cache:
             presents = []
 
-        for layer, past in zip(self.layers, kv_cache_params.past_key_value):
-            hidden_states = layer(
+        for layer, past_key_value, kv_cache_block_pointers in zip(
+                self.layers, kv_cache_params.past_key_value,
+                kv_cache_params.kv_cache_block_pointers):
+            layer_output = layer(
                 hidden_states,
                 position_embedding,
-                use_cache=use_cache,
                 kv_cache_params=KeyValueCacheParams(
-                    past_key_value=[past],
+                    past_key_value=[past_key_value],
+                    kv_cache_block_pointers=[kv_cache_block_pointers],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
-                    cache_indirection=kv_cache_params.cache_indirection),
-                attention_params=attention_params)
+                    cache_indirection=kv_cache_params.cache_indirection,
+                ),
+                attention_params=attention_params,
+            )
 
-            if use_cache:
-                presents.append(hidden_states[1])
-                hidden_states = hidden_states[0]
+            if self.use_cache:
+                hidden_states = layer_output[0]
+                presents.append(layer_output[1])
 
-        hidden_states = self.ln_f(hidden_states)
+        hidden_states = self.final_layernorm(hidden_states)
 
-        if use_cache:
-            return (hidden_states, tuple(presents))
-        return hidden_states
+        return (hidden_states,
+                tuple(presents)) if self.use_cache else hidden_states
 
 
-class ChatGLM6BHeadModel(ChatGLM6BModel):
+class ChatGLM6BHeadModel(ChatGLM6BModel, GenerationMixin):
 
-    def __init__(self,
-                 num_layers,
-                 num_heads,
-                 hidden_size,
-                 vocab_size,
-                 hidden_act,
-                 max_position_embeddings,
-                 dtype,
-                 mapping=Mapping(),
-                 apply_query_key_layer_scaling=False,
-                 inter_size=None,
-                 bias=True,
-                 quant_mode=QuantMode(0)):
-        if isinstance(dtype, str):
-            self._kv_dtype = str_dtype_to_trt(dtype)
+    def __init__(self, **args):
+
+        if "args" not in args.keys():
+            argNamespace = argparse.Namespace()
+            for key, value in args.items():
+                argNamespace.__setattr__(key, value)
+            # Other default values
+            argNamespace.bias = True
+            argNamespace.ffn_hidden_size = 16384
+            argNamespace.layernorm_epsilon = 1.0e-5
+            argNamespace.max_seq_length = argNamespace.max_position_embeddings
+            argNamespace.multi_block_mode = False
+            argNamespace.num_kv_heads = 32
+            argNamespace.use_cache = True
+            args = argNamespace
         else:
-            assert isinstance(dtype, trt.DataType)
-            self._kv_dtype = dtype
-        self._dtype = self._kv_dtype
-        if quant_mode.has_int8_kv_cache():
-            self._kv_dtype = str_dtype_to_trt('int8')
-        elif quant_mode.has_fp8_kv_cache():
-            self._kv_dtype = str_dtype_to_trt('fp8')
+            args = args["args"]
 
-        self.quant_mode = quant_mode
+        self.init(args)
 
-        self._num_layers = num_layers
-        self._num_heads = num_heads
-        self._hidden_size = hidden_size
-        self._vocab_size = vocab_size
-        self._tp_size = mapping.tp_size
-        super().__init__(num_layers, num_heads, hidden_size, vocab_size,
-                         hidden_act, max_position_embeddings, dtype, mapping,
-                         apply_query_key_layer_scaling, inter_size, bias,
-                         quant_mode)
-        vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
-        self.lm_head = ColumnLinear(hidden_size,
-                                    vocab_size_padded,
-                                    bias=False,
-                                    dtype=dtype,
-                                    tp_group=mapping.tp_group,
-                                    tp_size=mapping.tp_size,
-                                    gather_output=True)
+    def init(self, args):
 
-    def forward(self,
-                input_ids=None,
-                position_ids=None,
-                use_cache=False,
-                last_token_ids=None,
-                kv_cache_params=None,
-                attention_params=None):
+        super().__init__(args)
 
-        hidden_states = super().forward(input_ids, position_ids, use_cache,
-                                        kv_cache_params, attention_params)
+        if isinstance(args.dtype, str):
+            self.kv_dtype = str_dtype_to_trt(args.dtype)
+        else:
+            assert isinstance(args.dtype, trt.DataType)
+            self.kv_dtype = args.dtype
+        self.dtype = self.kv_dtype
 
-        if use_cache:
+        if args.quant_mode.has_int8_kv_cache():
+            self.kv_dtype = str_dtype_to_trt('int8')
+        elif args.quant_mode.has_fp8_kv_cache():
+            self.kv_dtype = str_dtype_to_trt('fp8')
+
+        self.hidden_size = args.hidden_size
+        self.num_heads = args.num_heads
+        self.num_kv_heads = args.num_kv_heads
+        self.num_layers = args.num_layers
+        self.tp_size = args.mapping.tp_size
+        self.use_cache = args.use_cache
+
+        self.lm_head = ColumnLinear(
+            in_features=self.hidden_size,
+            out_features=pad_vocab_size(args.vocab_size, self.tp_size),
+            bias=False,
+            dtype=self.dtype,
+            tp_group=args.mapping.tp_group,
+            tp_size=self.tp_size,
+            gather_output=True,
+        )
+
+    def forward(
+        self,
+        input_ids: Tensor = None,
+        position_ids: Tensor = None,
+        last_token_ids: Tensor = None,
+        kv_cache_params: KeyValueCacheParams = None,
+        attention_params: AttentionParams = None,
+    ):
+
+        hidden_states = super().forward(
+            input_ids,
+            position_ids,
+            kv_cache_params,
+            attention_params,
+        )
+
+        if self.use_cache:
             hidden_states, presents = hidden_states
 
         hidden_states = gather_last_token_logits(
             hidden_states, last_token_ids,
             default_net().plugin_config.remove_input_padding)
 
-        # [batch_size, hidden_size] -> [batch_size, vocab_size]
         lm_logits = self.lm_head(hidden_states)
-        lm_logits.mark_output('logits', self._dtype)
-        # out_inter.mark_output('inter', str_dtype_to_trt('float32'))
+        lm_logits.mark_output('logits', self.dtype)
 
-        if use_cache and default_net().plugin_config.paged_kv_cache == False:
+        if self.use_cache and default_net(
+        ).plugin_config.paged_kv_cache == False:
             for i, present in enumerate(presents):
-                present.mark_output(f'present_key_value_{i}', self._kv_dtype)
+                present.mark_output(f'present_key_value_{i}', self.kv_dtype)
             return (lm_logits, presents)
 
         return lm_logits
 
-    def prepare_inputs(self,
-                       max_batch_size,
-                       max_input_len,
-                       max_new_tokens,
-                       use_cache,
-                       max_beam_width: int = 1):
+    def prepare_inputs(
+        self,
+        max_batch_size: int = 0,
+        max_input_len: int = 0,
+        max_new_tokens: int = 0,
+        use_cache: bool = True,
+        max_beam_width: int = 1,
+    ):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
             @return: a list contains values which can be fed into the self.forward()
         '''
 
-        # Prepare inputs
-        head_size = self._hidden_size // self._num_heads
-        num_heads = self._num_heads // self._tp_size
-        num_heads_kv = num_heads
-        max_len = max_input_len + max_new_tokens
-        bb_range = [
-            1, (max_batch_size * max_beam_width + 1) // 2,
-            max_batch_size * max_beam_width
-        ]
-        bs_range = [1, (max_batch_size + 1) // 2, max_batch_size]
-        beam_width_range = [1, (max_beam_width + 1) // 2, max_beam_width]
-        inlen_range = [1, 1, max_input_len]
-        max_len_range = [1, (max_len + 1) // 2 + 1, max_len + 1]
-
-        past_key_value = []
-        sequence_length = None
-        host_past_key_value_lengths = None
-
-        input_ids = Tensor(name='input_ids',
-                           dtype=trt.int32,
-                           shape=[-1, -1],
-                           dim_range=OrderedDict([
-                               ('batch_beam_size', [bb_range]),
-                               ('input_len', [inlen_range]),
-                           ]))
-
-        position_ids = Tensor(name='position_ids',
-                              dtype=trt.int32,
-                              shape=[-1, 2, -1],
-                              dim_range=OrderedDict([
-                                  ('batch_beam_size', [bb_range]),
-                                  ('2', [2]),
-                                  ('input_len', [inlen_range]),
-                              ]))
-
-        for i in range(self._num_layers):
-            kv_dim_range = OrderedDict([
-                ('batch_beam_size', [bb_range]),
-                ('kv', [2]),
-                ('num_heads', [num_heads_kv]),
-                ('past_key_len', [max_len_range]),
-                ('head_size', [head_size]),
-            ])
-            kv = Tensor(name=f'past_key_value_{i}',
-                        dtype=self._kv_dtype,
-                        shape=[-1, 2, num_heads_kv, -1, head_size],
-                        dim_range=kv_dim_range)
-            past_key_value.append(kv)
-
-            # TODO(kaiyu): Remove this when TRT fix the named dimension
-            assertion(shape(input_ids, 0) == shape(kv, 0), 'batch size')
-
-        sequence_length = Tensor(
-            name='sequence_length',
-            dtype=trt.int32,
-            shape=[-1],
-            dim_range=OrderedDict([('batch_beam_size', [bb_range])]),
+        model_inputs = self.prepare_basic_inputs(
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_input_len=max_input_len,
+            max_new_tokens=max_new_tokens,
+            num_kv_heads=self.num_kv_heads // self.tp_size,
+            head_size=self.hidden_size // self.num_heads,
+            num_layers=self.num_layers,
+            kv_dtype=self.kv_dtype,
+            remove_input_padding=default_net(
+            ).plugin_config.remove_input_padding,
+            use_gpt_attention_plugin=default_net().plugin_config.
+            gpt_attention_plugin,
+            use_gemm_plugin=default_net().plugin_config.gemm_plugin,
+            is_chatglm6b=True,
         )
-        host_past_key_value_lengths = Tensor(
-            name='host_past_key_value_lengths',
-            dtype=trt.int32,
-            shape=[-1],
-            dim_range=OrderedDict([('batch_beam_size', [bb_range])]),
-        )
-        context_lengths = Tensor(name='context_lengths',
-                                 dtype=trt.int32,
-                                 shape=[-1],
-                                 dim_range=OrderedDict([('batch_beam_size',
-                                                         [bb_range])]))
 
-        host_context_lengths = None
-        if default_net().plugin_config.remove_input_padding:
-            host_context_lengths = Tensor(name='host_context_lengths',
-                                          dtype=trt.int32,
-                                          shape=[-1],
-                                          dim_range=OrderedDict([
-                                              ('batch_beam_size', [bb_range])
-                                          ]))
-
-        host_request_types = Tensor(name='host_request_types',
-                                    dtype=trt.int32,
-                                    shape=[-1],
-                                    dim_range=OrderedDict([('batch_beam_size',
-                                                            [bb_range])]))
-
-        last_token_ids = Tensor(name='last_token_ids',
-                                dtype=trt.int32,
-                                shape=[-1],
-                                dim_range=OrderedDict([
-                                    ('batch_beam_size', [bb_range]),
-                                ]))
-
-        cache_indirection = Tensor(name='cache_indirection',
-                                   dtype=trt.int32,
-                                   shape=[-1, -1, -1],
-                                   dim_range=OrderedDict([
-                                       ('batch_size', [bs_range]),
-                                       ('beam_width', [beam_width_range]),
-                                       ('max_seq_len', [max_len_range]),
-                                   ]))
-
-        return (input_ids, position_ids, True, last_token_ids,
+        return (model_inputs['input_ids'], model_inputs['position_ids'],
+                model_inputs['last_token_ids'],
                 KeyValueCacheParams(
-                    past_key_value=past_key_value,
-                    host_past_key_value_lengths=host_past_key_value_lengths,
-                    cache_indirection=cache_indirection,
+                    past_key_value=model_inputs['past_key_value'],
+                    host_past_key_value_lengths=model_inputs[
+                        'host_past_key_value_lengths'],
+                    kv_cache_block_pointers=model_inputs[
+                        'kv_cache_block_pointers_list'],
+                    cache_indirection=model_inputs['cache_indirection'],
                 ),
-                AttentionParams(sequence_length=sequence_length,
-                                context_lengths=context_lengths,
-                                host_context_lengths=host_context_lengths,
-                                max_context_length=max_input_len,
-                                host_request_types=host_request_types))
+                AttentionParams(
+                    sequence_length=model_inputs['sequence_length'],
+                    context_lengths=model_inputs['context_lengths'],
+                    host_context_lengths=model_inputs['host_context_lengths'],
+                    max_context_length=max_input_len,
+                    host_request_types=model_inputs['host_request_types'],
+                ))

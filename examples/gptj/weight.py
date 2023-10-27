@@ -242,7 +242,7 @@ def AWQ_quantize_pack_preprocess(weight, scale, group_size, packer,
     qweight_int8 = torch.where(weight < -8, -8, weight)
     int4_weight = packer(qweight_int8.cpu())
     int4_weight = preprocessor(int4_weight, torch.quint4x2)
-    return int4_weight.view(torch.float32).cpu().numpy()
+    return int4_weight.view(torch.int8).cpu().numpy()
 
 
 def process_and_assign_weight(awq_gpt_j, mPrefix, mOp, group_size, packer,
@@ -402,7 +402,7 @@ def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
         process_and_assign_weight(awq_gpt_j, mPrefix, mOp, group_size, packer,
                                   preprocessor, torch_dtype)
 
-        # MLP Desne (mlp.proj) Linear
+        # MLP Dense (mlp.proj) Linear
         mPrefix = prefix + "mlp.fc_out"
         mOp = tensorrt_llm_gpt_j.layers[layer_idx].mlp.proj
         process_and_assign_weight(awq_gpt_j, mPrefix, mOp, group_size, packer,

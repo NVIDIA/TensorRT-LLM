@@ -173,6 +173,11 @@ public:
         return mFreeBlocks.size();
     }
 
+    [[nodiscard]] std::size_t getNumAllocatedBlocks() const
+    {
+        return mAllocatedBlocks.size();
+    }
+
     [[nodiscard]] bool hasFreeBlocks(std::size_t numRequired = 1) const
     {
         return getNumFreeBlocks() >= numRequired;
@@ -189,7 +194,7 @@ private:
     // List of allocated blocks for each sequences
     std::vector<std::vector<KVCacheBlock>> mAllocatedBlocks;
     // Used to keep track of number of free blocks during scheduling
-    SizeType mSchedulingNumFreeBlocks;
+    std::size_t mSchedulingNumFreeBlocks;
 };
 
 class KVCacheManager
@@ -213,6 +218,16 @@ public:
     [[nodiscard]] SizeType getMaxNumBlocks() const
     {
         return mMaxNumBlocks;
+    }
+
+    [[nodiscard]] SizeType getUsedNumBlocks() const
+    {
+        return mBlockManager.getNumAllocatedBlocks();
+    }
+
+    [[nodiscard]] SizeType getNumFreeBlocks() const
+    {
+        return mBlockManager.getNumFreeBlocks();
     }
 
     // Volume of [2, numKvHeads, tokensPerBlock, sizePerHead]
@@ -271,6 +286,8 @@ public:
     }
 
 private:
+    void resetBlockPointers(SizeType batchSlotIdx, SizeType beamWidth);
+
     void cacheNewBlockPointer(const GenerationRequest& seq, SizeType batchSlotIdx);
 
 private:

@@ -24,9 +24,11 @@ import torch
 
 from . import graph_rewriting as gw
 from ._common import default_net, default_trtnet, precision
-from ._utils import (dim_resolve_negative, dim_to_trt_axes, fp16_array,
-                     fp32_array, int32_array, np_dtype_to_trt, str_dtype_to_np,
-                     str_dtype_to_trt, torch_to_numpy, trt_dtype_to_torch)
+from ._utils import (bf16_array, dim_resolve_negative, dim_to_trt_axes,
+                     fp16_array, fp32_array, int32_array, np_dtype_to_trt,
+                     str_dtype_to_np, str_dtype_to_trt, torch_to_numpy,
+                     trt_dtype_to_torch)
+from .logger import logger
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE
 from .quantization import QuantMode
 
@@ -69,7 +71,7 @@ class DimRange(object):
         for dim in shape:
             if isinstance(dim, (list, tuple)):
                 assert len(dim) == 3 and 0 <= dim[0] <= dim[1] <= dim[2], \
-                "Each dimension must specify a 3-elements tuple or list in the oder of (min,opt,max), got {dim=}"
+                "Each dimension must specify a 3-elements tuple or list in the order of (min,opt,max), got {dim=}"
                 self.min.append(dim[0])
                 self.opt.append(dim[1])
                 self.max.append(dim[2])
@@ -497,7 +499,7 @@ class Tensor(object):
         '''
         Check if there is a trt.ITensor member inside, which is required for
         graph rewriter. In order to differentiate usages, it may be necessary
-        to have an inheritance hierarachy.
+        to have an inheritance hierarchy.
         '''
         if hasattr(self, 'trt_tensor'):
             return True
@@ -580,6 +582,7 @@ class PositionEmbeddingType(IntEnum):
     alibi = 3
     alibi_with_scale = 4
     relative = 5
+    chatglm = 6
 
     def is_rope(self) -> bool:
         return self in [self.rope_gptj, self.rope_gpt_neox]
@@ -1123,7 +1126,7 @@ def expand(input: Tensor, expand_shape: Tensor) -> Tensor:
 
     This operation is implemented using a tensorrt.ISliceLayer. The current
     implementation does not verify that non singleton dimensions are not
-    shrinked. In other words, for an input of shape [4, 1, 2],
+    shrunk. In other words, for an input of shape [4, 1, 2],
 
         expand(input, [3, 2, 2])
 
@@ -1298,7 +1301,7 @@ def view(input: Tensor,
         zero_is_placeholder : bool
             When that parameter is True, the 0s in 'shape' are replaced by the
             sizes of the corresponding dimensions from the 'input'. Otherwise,
-            the dimensions corresponding to 0s are shrinked.
+            the dimensions corresponding to 0s are shrunk.
 
     Returns:
         The tensor produced by the view/shuffle layer.
@@ -1619,16 +1622,16 @@ def index_select(input: Tensor, dim: int, index: Tensor) -> Tensor:
 
         index_select(input, 0, [0, 1])
 
-    will create a tensor of shape [3, 2] that contains the [[4, 2, 5], [2, 1, 2]].
+    will create a tensor of shape [2, 3] that contains the [[4, 2, 5], [2, 1, 2]].
 
     Regarding the shape of the output tensor, the dimension 'dim' has the same
-    size as the 'index' tensor. It means that for a tensor of shape [4, 2, 6, 3],
+    size as the 'index' tensor. It means that for a input tensor of shape [4, 2, 6, 3],
 
         index_select(input, 2, [1, 4])
 
     will select the 2nd and 5th slices (index == 1 or 4) from the 3rd dimension
     (dim == 2) and return a tensor of shape [4, 2, 2, 3] (i.e. the 3rd
-    dimension is shrinked to 2).
+    dimension is shrunk to 2).
 
     Note that this operation can also be used to expand a tensor in the 'dim'
     dimension, for example, on input [[0, 1], [2, 3]],
@@ -1804,7 +1807,9 @@ def embedding(input: Tensor,
               tp_size=1,
               tp_group=None,
               sharding_dim=0,
-              tp_rank=None) -> Tensor:
+              tp_rank=None,
+              workspace: Optional[Tensor] = None,
+              instance_id: int = 0) -> Tensor:
     '''
     Add an operation to perform embedding lookup.
 
@@ -1855,11 +1860,17 @@ def embedding(input: Tensor,
         tp_rank : int
             The tensor parallelism rank. Used to calculate offset in TP on vocab dim.
 
+        workspace: Optional[Tensor]
+            See allreduce's documentation for workspace.
+
+        instance_id: int
+            See allreduce's documentation for instance_id.
+
     Returns:
         The tensor produced by the embedding lookup layer.
     '''
 
-    # Distribute embedding lookup table accross multiple GPU
+    # Distribute embedding lookup table across multiple GPU
     if tp_size > 1 and tp_group is not None:
         if sharding_dim == 0:  # TP on vocab_size dimension
             if tp_rank == None:
@@ -1868,7 +1879,7 @@ def embedding(input: Tensor,
 
             if default_net().plugin_config.lookup_plugin:
                 x = _lookup_plugin(input, weight, tp_rank)
-                x = allreduce(x, tp_group)
+                x = allreduce(x, tp_group, workspace, instance_id)
             else:
                 shape_weight = shape(weight)
                 vocab_size = slice(shape_weight, starts=[0], sizes=[1])
@@ -1893,7 +1904,7 @@ def embedding(input: Tensor,
                 x = where(is_qualified_expand, tmp_output, placeholder)
 
                 # Use all reduce to collect the results
-                x = allreduce(x, tp_group)
+                x = allreduce(x, tp_group, workspace, instance_id)
 
         elif sharding_dim == 1:  # TP on hidden dimension
             layer = default_trtnet().add_gather(weight.trt_tensor,
@@ -2297,26 +2308,22 @@ def gelu(x: Tensor) -> Tensor:
     Returns:
         The tensor produced by the activation layer.
     '''
-    if default_net().strongly_typed:
-        if x.dtype == trt.float16:
-            v1 = constant(fp16_array([0.5]))
-            v2 = constant(fp16_array([math.sqrt(2.0 / math.pi)]))
-            v3 = constant(fp16_array([0.044715]))
-            v4 = constant(fp16_array([3.0]))
-            v5 = constant(fp16_array([1.0]))
-        elif x.dtype == trt.float32:
-            v1 = constant(fp32_array([0.5]))
-            v2 = constant(fp32_array([math.sqrt(2.0 / math.pi)]))
-            v3 = constant(fp32_array([0.044715]))
-            v4 = constant(fp32_array([3.0]))
-            v5 = constant(fp32_array([1.0]))
-        else:
-            assert False, f"gelu on datatype of {x.dtype} is not supported"
-
-        return v1 * x * (tanh(v2 * (x + v3 * pow(x, v4))) + v5)
-    else:
+    if not default_net().strongly_typed:
         return 0.5 * x * (
             tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * pow(x, 3.0))) + 1.0)
+
+    array_fn = {
+        trt.float32: fp32_array,
+        trt.float16: fp16_array,
+        trt.bfloat16: bf16_array,
+    }[x.dtype]
+
+    v1 = constant(array_fn([0.5]))
+    v2 = constant(array_fn([math.sqrt(2.0 / math.pi)]))
+    v3 = constant(array_fn([0.044715]))
+    v4 = constant(array_fn([3.0]))
+    v5 = constant(array_fn([1.0]))
+    return v1 * x * (tanh(v2 * (x + v3 * pow(x, v4))) + v5)
 
 
 def geglu(x: Tensor) -> Tensor:
@@ -2393,7 +2400,7 @@ def softplus(input: Tensor, beta: float, threshold: float) -> Tensor:
         beta : float
             The parameter for softplus computation.
         threshold : float
-            The threshold for reverting to the linear function when input * beta > threashold
+            The threshold for reverting to the linear function when input * beta > threshold
 
     Returns:
         The output tensor created by that layer.
@@ -2728,12 +2735,12 @@ def allreduce(tensor: Tensor,
             When using CUSTOM or AUTO mode, a tensor containing pointers to memory
             visible to all GPUs. It should be 3 poitners per TP rank -
             ptr to data buffer, ptr to barriers in, ptr to barriers out.
-            It must be initilized using IpcMemory class.
+            It must be initialized using IpcMemory class.
 
         instance_id: int
             Used for synchronization with CUSTOM or AUTO. Corresponding plugins MUST have the same
             instance_id. I.e. GPU#0's allreduce after MLP at layer i must have the same instance_id as
-            GPU#1, GPU#2... Also, instance_id MUST be unique per model. There should be two allreduce instance
+            GPU#1, GPU#2... Also, instance_id MUST be unique per model. There should not be two allreduce instances
             in GPU#0 that have the same id.
 
     Returns:
@@ -2748,6 +2755,16 @@ def allreduce(tensor: Tensor,
             strategy = AllReduceStrategy.AUTO
         else:
             strategy = AllReduceStrategy.RING
+
+    if strategy != AllReduceStrategy.RING:
+        if not hasattr(allreduce, "ids"):
+            allreduce.ids = set()
+
+        if instance_id not in allreduce.ids:
+            allreduce.ids.add(instance_id)
+        else:
+            logger.warning(
+                f"Custom allreduce has already used id {instance_id}")
 
     assert allreduce_plg_creator is not None
 
@@ -3179,7 +3196,7 @@ def gpt_attention(
             The type of mask:
                 * tensorrt_llm.layers.AttentionMaskType.padding for BERT,
                 * tensorrt_llm.layers.AttentionMaskType.causal for GPT,
-                * tensorrt_llm.layers.AttentionMaskType.bidirectional for ChatGLM,
+                * tensorrt_llm.layers.AttentionMaskType.bidirectional for ChatGLM-6B,
 
         alibi_slopes: Tensor
             The ALiBi slopes. The ALiBi bias is computed on-the-fly in the kernel
@@ -3656,7 +3673,7 @@ def generate_alibi_slopes(num_heads: int,
 
     slopes = alibi_scale * slopes
     # Note that for bfloat16, we cannot case numpy tensor from float32 to bfloat16
-    # becuases numpy does not support bfloat16. Even if we use custom type to define
+    # because numpy does not support bfloat16. Even if we use custom type to define
     # the np_bfloat16, the "astype" here would be undefined.
     # So, we must use torch to cast tensor from float32 to bfloat16, and then use torch_to_numpy
     # to cast the tensor back.
@@ -3760,7 +3777,7 @@ def gather_last_token_logits(hidden_states: Tensor, last_token_ids: Tensor,
             The hidden states
 
         last_token_ids : Tensor
-            The inclusive prefix-sum of the lengths or the lenghts of the
+            The inclusive prefix-sum of the lengths or the lengths of the
             sequences in the batch.
 
         remove_input_padding : bool

@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+from typing import Optional
 
-from ..functional import embedding, unsqueeze, where
+from ..functional import Tensor, embedding, unsqueeze, where
 from ..module import Module
 from ..parameter import Parameter
 
@@ -39,7 +40,8 @@ class Embedding(Module):
                  tp_size=1,
                  tp_group=None,
                  sharding_dim=0,
-                 tp_rank=None):
+                 tp_rank=None,
+                 instance_id: int = 0):
         super().__init__()
         # num_embeddings records the total vocab size no matter using TP or not
         self.num_embeddings = num_embeddings
@@ -48,6 +50,7 @@ class Embedding(Module):
         self.tp_group = tp_group
         self.sharding_dim = sharding_dim
         self.tp_rank = tp_rank
+        self.instance_id = instance_id
 
         if sharding_dim == 1:
             self.weight = Parameter(shape=(self.num_embeddings,
@@ -58,13 +61,15 @@ class Embedding(Module):
                 self.num_embeddings / self.tp_size), self.embedding_dim),
                                     dtype=dtype)
 
-    def forward(self, x):
+    def forward(self, x, workspace: Optional[Tensor] = None):
         return embedding(x,
                          self.weight.value,
                          tp_size=self.tp_size,
                          tp_group=self.tp_group,
                          sharding_dim=self.sharding_dim,
-                         tp_rank=self.tp_rank)
+                         tp_rank=self.tp_rank,
+                         workspace=workspace,
+                         instance_id=self.instance_id)
 
 
 class PromptTuningEmbedding(Embedding):
@@ -81,22 +86,32 @@ class PromptTuningEmbedding(Embedding):
                  tp_size=1,
                  tp_group=None,
                  sharding_dim=0,
-                 tp_rank=0):
+                 tp_rank=0,
+                 instance_id: int = 0):
         super().__init__(num_embeddings, embedding_dim, dtype, tp_size,
-                         tp_group, sharding_dim, tp_rank)
+                         tp_group, sharding_dim, tp_rank, instance_id)
         if vocab_size is None:
             vocab_size = num_embeddings
         self.vocab_size = vocab_size
 
-    def forward(self, tokens, prompt_embedding_table, tasks, task_vocab_size):
+    def forward(self,
+                tokens,
+                prompt_embedding_table,
+                tasks,
+                task_vocab_size,
+                workspace: Optional[Tensor] = None):
         # do not use ">=" because internally the layer works with floating points
         prompt_tokens_mask = tokens > (self.vocab_size - 1)
 
         # clip tokens in the [0, vocab_size) range
         normal_tokens = where(prompt_tokens_mask, self.vocab_size - 1, tokens)
-        normal_embeddings = embedding(normal_tokens, self.weight.value,
-                                      self.tp_size, self.tp_group,
-                                      self.sharding_dim, self.tp_rank)
+        normal_embeddings = embedding(normal_tokens,
+                                      self.weight.value,
+                                      self.tp_size,
+                                      self.tp_group,
+                                      self.sharding_dim,
+                                      self.tp_rank,
+                                      workspace=workspace)
 
         # put virtual tokens in the [0, max_prompt_vocab_size) range
         prompt_tokens = where(prompt_tokens_mask, tokens - self.vocab_size, 0)

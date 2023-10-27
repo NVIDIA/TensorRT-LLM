@@ -35,9 +35,11 @@ from .linear import ColumnLinear, RowLinear
 class RopeEmbeddingUtils:
 
     @staticmethod
-    def create_sinusoidal_positions(num_pos: int,
-                                    dim: int,
-                                    theta: float = 10000.0):
+    def create_sinusoidal_positions(
+        num_pos: int,
+        dim: int,
+        theta: float = 10000.0,
+    ):
         inv_freq = 1.0 / (theta**(np.arange(0, dim, 2) / dim)).astype(
             np.float32)
         sinusoid_inp = np.einsum("i , j -> i j",
@@ -61,8 +63,8 @@ class RopeEmbeddingUtils:
         x2 = slice(tensor, [0, 0, 0, 1], shape_tensor, [1, 1, 1, 2])
         x1 = expand_dims(x1, 4)
         x2 = expand_dims(x2, 4)
-        minusOne = constant(-1 * np.ones([1], dtype=np.float32))
-        x2 = x2 * minusOne
+        zero = constant(np.ascontiguousarray(np.zeros([1], dtype=np.float32)))
+        x2 = zero - x2
         x = concat([x2, x1], 4)
         return view(
             x, concat([shape(x, 0),
@@ -72,6 +74,7 @@ class RopeEmbeddingUtils:
 
     @staticmethod
     def rotate_half(tensor: Tensor) -> Tensor:
+        # [bs, num_attention_kv_heads, seqlen, attention_head_size]
         assert tensor.ndim() == 4
         shape_tensor = concat([
             shape(tensor, i) / 2 if i == (tensor.ndim() -
@@ -82,33 +85,60 @@ class RopeEmbeddingUtils:
         x1 = slice(tensor, [0, 0, 0, 0], shape_tensor, [1, 1, 1, 1])
         x2 = slice(tensor, concat([0, 0, 0, last_dim]), shape_tensor,
                    [1, 1, 1, 1])
-        minusOne = constant(-1 * np.ones([1], dtype=np.float32))
-        x2 = x2 * minusOne
+        zero = constant(np.ascontiguousarray(np.zeros([1], dtype=np.float32)))
+        x2 = zero - x2
         x = concat([x2, x1], 3)
         return x
 
     @staticmethod
     def apply_rotary_pos_emb(
         tensor: Tensor,
-        sin: Tensor,
-        cos: Tensor,
+        position_embedding: List[Tensor] = None,
         pos_emb_type: PositionEmbeddingType = PositionEmbeddingType.rope_gptj
     ) -> Tensor:
 
-        sin = expand_dims(sin, 2)
-        cos = expand_dims(cos, 2)
-        rope_func = None
+        rotate_func = None
         if pos_emb_type == PositionEmbeddingType.rope_gpt_neox:
+            assert len(position_embedding) == 2
+            cos, sin = position_embedding
+            sin = expand_dims(sin, 2)
+            cos = expand_dims(cos, 2)
             sin = concat([sin, sin], 3)
             cos = concat([cos, cos], 3)
-            rope_func = RopeEmbeddingUtils.rotate_half
+            rotate_func = RopeEmbeddingUtils.rotate_half
         elif pos_emb_type == PositionEmbeddingType.rope_gptj:
+            assert len(position_embedding) == 2
+            cos, sin = position_embedding
+            sin = expand_dims(sin, 2)
+            cos = expand_dims(cos, 2)
             sin = repeat_interleave(sin, 2, 3)
             cos = repeat_interleave(cos, 2, 3)
-            rope_func = RopeEmbeddingUtils.rotate_every_two
+            rotate_func = RopeEmbeddingUtils.rotate_every_two
+        elif pos_emb_type == PositionEmbeddingType.chatglm:
+            assert len(position_embedding) == 4
+            cos0, cos1, sin0, sin1 = position_embedding
+
+            shape_tensor = concat([
+                shape(tensor, i) / 2 if i == (tensor.ndim() -
+                                              1) else shape(tensor, i)
+                for i in range(tensor.ndim())
+            ])
+            last_dim = shape(tensor, tensor.ndim() - 1) / 2
+            x_part0 = slice(tensor, [0, 0, 0, 0], shape_tensor, [1, 1, 1, 1])
+            x_part1 = slice(tensor, concat([0, 0, 0, last_dim]), shape_tensor,
+                            [1, 1, 1, 1])
+
+            y_part0 = (x_part0 *
+                       cos0) + (RopeEmbeddingUtils.rotate_half(x_part0) * sin0)
+            y_part1 = (x_part1 *
+                       cos1) + (RopeEmbeddingUtils.rotate_half(x_part1) * sin1)
+
+            result = concat([y_part0, y_part1], dim=3)
+            return result.view(shape(tensor))
+
         else:
             raise ValueError('The PositionEmbeddingType is not RoPE')
-        return (tensor * cos) + (rope_func(tensor) * sin)
+        return (tensor * cos) + (rotate_func(tensor) * sin)
 
 
 class AttentionParams(object):
@@ -138,6 +168,7 @@ class AttentionParams(object):
                 return False
             if self.encoder_max_input_length is None:
                 return False
+        return True
 
     def is_valid(self, gpt_attention_plugin, remove_input_padding):
         if gpt_attention_plugin:
@@ -195,32 +226,35 @@ class KeyValueCacheParams:
 
 class Attention(Module):
 
-    def __init__(self,
-                 hidden_size,
-                 num_attention_heads,
-                 num_kv_heads=None,
-                 max_position_embeddings=1024,
-                 num_layers=1,
-                 apply_query_key_layer_scaling=False,
-                 attention_mask_type=AttentionMaskType.padding,
-                 bias=True,
-                 dtype=None,
-                 position_embedding_type=PositionEmbeddingType.learned_absolute,
-                 rotary_embedding_base=10000.0,
-                 rotary_embedding_scaling=None,
-                 use_int8_kv_cache=False,
-                 rotary_embedding_percentage=1.0,
-                 tp_group=None,
-                 tp_size=1,
-                 tp_rank=0,
-                 multi_block_mode=False,
-                 quant_mode: QuantMode = QuantMode(0),
-                 q_scaling=1.0,
-                 cross_attention=False,
-                 relative_attention=False,
-                 max_distance=0,
-                 num_buckets=0,
-                 instance_id: int = 0):
+    def __init__(
+        self,
+        hidden_size,
+        num_attention_heads,
+        num_kv_heads=None,
+        max_position_embeddings=1024,
+        num_layers=1,
+        apply_query_key_layer_scaling=False,
+        attention_mask_type=AttentionMaskType.padding,
+        bias=True,
+        dtype=None,
+        position_embedding_type=PositionEmbeddingType.learned_absolute,
+        rotary_embedding_base=10000.0,
+        rotary_embedding_scaling=None,
+        use_int8_kv_cache=False,
+        rotary_embedding_percentage=1.0,
+        tp_group=None,
+        tp_size=1,
+        tp_rank=0,
+        multi_block_mode=False,
+        quant_mode: QuantMode = QuantMode(0),
+        q_scaling=1.0,
+        cross_attention=False,
+        relative_attention=False,
+        max_distance=0,
+        num_buckets=0,
+        instance_id: int = 0,
+        dense_bias=None,
+    ):
         super().__init__()
 
         self.cross_attention = cross_attention
@@ -236,6 +270,9 @@ class Attention(Module):
         self.max_position_embeddings = max_position_embeddings
         self.tp_size = tp_size
         self.tp_rank = tp_rank
+        self.dtype = dtype
+        if dense_bias is None:
+            dense_bias = bias
 
         self.num_layers = num_layers
         self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
@@ -249,13 +286,10 @@ class Attention(Module):
         #   - False, inv_sqrt_Dh * Q*K^T + alibi_bias
         #   - True,  inv_sqrt_Dh * Q*K^T + inv_sqrt_Dh * alibi_bias
         self.scale_alibi_bias = position_embedding_type == PositionEmbeddingType.alibi_with_scale
-
         self.position_embedding_type = position_embedding_type
         self.multi_block_mode = multi_block_mode
-
         self.relative_attention = relative_attention
         self.max_distance = max_distance
-
         self.rotary_embedding_base = rotary_embedding_base
         self.rotary_embedding_scale_type = RotaryScalingType.none
         self.rotary_embedding_scale = 1.0
@@ -277,7 +311,6 @@ class Attention(Module):
             self.embed_positions = RopeEmbeddingUtils.create_sinusoidal_positions(
                 self.max_position_embeddings, self.rotary_embedding_dim)
 
-        self.dtype = dtype
         self.quant_mode = quant_mode
         if use_int8_kv_cache:
             # TODO: remove use_int8_kv_cache as can be replaced by quant_mode.has_kv_cache_quant()
@@ -295,6 +328,7 @@ class Attention(Module):
         # d is head_size, kvh is the num_kv_heads and tp is tensor_parallel_size.
         # In ColumnLinear op, the output dim is calculated by (h + 2*kvh) * d / tp,
         # which matches the desired output size (h/tp + 2*kvh/tp) * d after splitting
+
         self.use_fp8_qdq = self.quant_mode.has_fp8_qdq()
         if self.use_fp8_qdq:
             self.qkv = FP8Linear(hidden_size,
@@ -308,7 +342,7 @@ class Attention(Module):
                                  gather_output=False)
             self.dense = FP8RowLinear(hidden_size,
                                       hidden_size,
-                                      bias=bias,
+                                      bias=dense_bias,
                                       dtype=dtype,
                                       tp_group=tp_group,
                                       tp_size=tp_size,
@@ -325,7 +359,7 @@ class Attention(Module):
                                     gather_output=False)
             self.dense = RowLinear(hidden_size,
                                    hidden_size,
-                                   bias=bias,
+                                   bias=dense_bias,
                                    dtype=dtype,
                                    tp_group=tp_group,
                                    tp_size=tp_size,
@@ -346,6 +380,7 @@ class Attention(Module):
         attention_params=None,
         encoder_output: Optional[Tensor] = None,
         workspace=None,
+        position_embedding=None,
     ):
 
         assert isinstance(hidden_states, Tensor)
@@ -364,6 +399,36 @@ class Attention(Module):
                                                  alibi_scale=alibi_scale)
 
         qkv = self.qkv(hidden_states)
+        if self.position_embedding_type == PositionEmbeddingType.chatglm:
+            qkv = qkv.view(
+                concat([
+                    shape(qkv, 0),
+                    shape(qkv, 1), self.num_attention_heads, 3,
+                    self.attention_head_size
+                ]))
+            query, key, value = split(qkv, 1, dim=3)
+            q_shape = concat([
+                shape(qkv, 0),
+                shape(qkv, 1), self.num_attention_heads,
+                self.attention_head_size
+            ])
+            query = query.view(q_shape)
+            key = key.view(q_shape)
+            value = value.view(q_shape)
+
+            query = RopeEmbeddingUtils.apply_rotary_pos_emb(
+                query,
+                position_embedding=position_embedding,
+                pos_emb_type=PositionEmbeddingType.chatglm)
+            key = RopeEmbeddingUtils.apply_rotary_pos_emb(
+                key,
+                position_embedding=position_embedding,
+                pos_emb_type=PositionEmbeddingType.chatglm)
+
+            qkv = concat([query, key, value], dim=2)
+            qkv = qkv.view(
+                concat([shape(qkv, 0),
+                        shape(qkv, 1), self.hidden_size * 3]))
 
         paged_kv_cache = default_net().plugin_config.paged_kv_cache
 
@@ -499,37 +564,47 @@ class Attention(Module):
                                      self.rotary_embedding_dim // 2,
                                      dim=-1)
 
-                    rot_size = concat([
+                    key_rot_size = concat([
                         shape(key, 0),
                         shape(key, 1),
                         shape(key, 2), self.rotary_embedding_dim
                     ])
+                    query_rot_size = concat([
+                        shape(query, 0),
+                        shape(query, 1),
+                        shape(query, 2), self.rotary_embedding_dim
+                    ])
                     remaining = shape(key, 3) - self.rotary_embedding_dim
-                    pass_size = concat([
+                    key_pass_size = concat([
                         shape(key, 0),
                         shape(key, 1),
                         shape(key, 2), remaining
                     ])
-                    k_rot = slice(key, [0, 0, 0, 0], rot_size)
+                    query_pass_size = concat([
+                        shape(query, 0),
+                        shape(query, 1),
+                        shape(query, 2), remaining
+                    ])
+                    k_rot = slice(key, [0, 0, 0, 0], key_rot_size)
                     k_pass = slice(key, [0, 0, 0, self.rotary_embedding_dim],
-                                   pass_size)
+                                   key_pass_size)
 
-                    q_rot = slice(query, [0, 0, 0, 0], rot_size)
+                    q_rot = slice(query, [0, 0, 0, 0], query_rot_size)
                     q_pass = slice(query, [0, 0, 0, self.rotary_embedding_dim],
-                                   pass_size)
+                                   query_pass_size)
 
                     k_rot = RopeEmbeddingUtils.apply_rotary_pos_emb(
-                        k_rot, sin, cos, self.position_embedding_type)
+                        k_rot, [cos, sin], self.position_embedding_type)
                     q_rot = RopeEmbeddingUtils.apply_rotary_pos_emb(
-                        q_rot, sin, cos, self.position_embedding_type)
+                        q_rot, [cos, sin], self.position_embedding_type)
 
                     key = concat([k_rot, k_pass], dim=3)
                     query = concat([q_rot, q_pass], dim=3)
                 else:
                     key = RopeEmbeddingUtils.apply_rotary_pos_emb(
-                        key, sin, cos, self.position_embedding_type)
+                        key, [cos, sin], self.position_embedding_type)
                     query = RopeEmbeddingUtils.apply_rotary_pos_emb(
-                        query, sin, cos, self.position_embedding_type)
+                        query, [cos, sin], self.position_embedding_type)
 
                 key = key.permute([0, 2, 1, 3])
                 query = query.permute([0, 2, 1, 3])
@@ -620,7 +695,27 @@ class Attention(Module):
                 mask_buf = np.zeros_like(select_buf, np.float32)
                 mask_buf[select_buf] = float('-inf')
                 buffer = constant(mask_buf)
-                causal_mask = slice(buffer, starts, sizes)
+                generated_mask = slice(buffer, starts, sizes)
+
+            elif self.attention_mask_type == AttentionMaskType.bidirectional:
+                query_length = shape(query, 2)
+                zero_buf = np.expand_dims(
+                    np.zeros((self.max_position_embeddings,
+                              self.max_position_embeddings),
+                             dtype=np.float32), (0, 1))
+
+                zero_buf[:, :, :-1, -1] = 1
+                zero_buf *= -10000
+
+                mask = constant(zero_buf)
+
+                # context phase, query_length
+                mask_size = where(query_length > 1, query_length, 1)
+                mask_start = where(query_length > 1,
+                                   self.max_position_embeddings - mask_size, 1)
+                start = concat([0, 0, mask_start, mask_start])
+                size = concat([1, 1, mask_size, mask_size])
+                generated_mask = slice(mask, start, size)
 
             if attention_mask is not None:
                 attention_mask = expand_mask(attention_mask, shape(query, 2))
@@ -636,8 +731,11 @@ class Attention(Module):
 
                 attention_scores = attention_scores / self.norm_factor
 
-                if self.attention_mask_type == AttentionMaskType.causal:
-                    bias = causal_mask if bias is None else bias + causal_mask
+                if self.attention_mask_type in [
+                        AttentionMaskType.causal,
+                        AttentionMaskType.bidirectional
+                ]:
+                    bias = generated_mask if bias is None else bias + generated_mask
 
                 if bias is not None and not self.cross_attention:
                     attention_scores = attention_scores + bias

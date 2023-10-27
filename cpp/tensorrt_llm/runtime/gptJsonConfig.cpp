@@ -128,9 +128,10 @@ GptJsonConfig parseJson(InputType&& i)
     modelConfig.setMaxOutputLen(maxOutputLen);
     modelConfig.setMaxNumTokens(maxNumTokens);
 
-    if (tc::strStartsWith(name, "chatglm"))
+    if (name == std::string("chatglm-6b"))
     {
         modelConfig.setModelVariant(GptModelConfig::ModelVariant::kGlm);
+        // kGlm is only for ChatGLM-6B, not for ChatGLM2-6B
     }
 
     return GptJsonConfig{name, precision, tensorParallelism, pipelineParallelism, modelConfig};

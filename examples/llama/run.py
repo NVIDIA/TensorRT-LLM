@@ -122,7 +122,7 @@ def parse_input(input_text: str, input_file: str, tokenizer, end_id: int,
 
 
 def print_output(output_ids, input_lengths, max_output_len, tokenizer,
-                 output_csv, output_npy):
+                 output_csv, output_npy, sequence_lengths):
     num_beams = output_ids.size(1)
     if output_csv is None and output_npy is None:
         for b in range(input_lengths.size(0)):
@@ -131,7 +131,8 @@ def print_output(output_ids, input_lengths, max_output_len, tokenizer,
             print(f'Input: \"{input_text}\"')
             for beam in range(num_beams):
                 output_begin = input_lengths[b]
-                output_end = input_lengths[b] + max_output_len
+                output_length = sequence_lengths[b][beam] - input_lengths[b]
+                output_end = input_lengths[b] + output_length
                 outputs = output_ids[b][beam][output_begin:output_end].tolist()
                 output_text = tokenizer.decode(outputs)
                 print(f'Output: \"{output_text}\"')
@@ -246,22 +247,27 @@ def generate(
     decoder.setup(input_lengths.size(0), max_input_length, max_output_len,
                   num_beams)
 
-    output_gen_ids = decoder.decode(input_ids,
-                                    input_lengths,
-                                    sampling_config,
-                                    streaming=streaming)
+    outputs = decoder.decode(input_ids,
+                             input_lengths,
+                             sampling_config,
+                             streaming=streaming,
+                             output_sequence_lengths=True,
+                             return_dict=True)
     torch.cuda.synchronize()
     if streaming:
-        for output_ids in throttle_generator(output_gen_ids,
-                                             streaming_interval):
+        for outputs_dict in throttle_generator(outputs, streaming_interval):
             if runtime_rank == 0:
+                output_ids = outputs_dict['output_ids']
+                sequence_lengths = outputs_dict['sequence_lengths']
                 print_output(output_ids, input_lengths, max_output_len,
-                             tokenizer, output_csv, output_npy)
+                             tokenizer, output_csv, output_npy,
+                             sequence_lengths)
     else:
-        output_ids = output_gen_ids
         if runtime_rank == 0:
+            output_ids = outputs['output_ids']
+            sequence_lengths = outputs['sequence_lengths']
             print_output(output_ids, input_lengths, max_output_len, tokenizer,
-                         output_csv, output_npy)
+                         output_csv, output_npy, sequence_lengths)
 
 
 if __name__ == '__main__':

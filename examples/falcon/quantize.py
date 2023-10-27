@@ -34,16 +34,21 @@ def get_calib_dataloader(data="cnn_dailymail",
                          tokenizer=None,
                          batch_size=1,
                          calib_size=16,
-                         block_size=512):
+                         block_size=512,
+                         cache_dir=None):
     print("Loading calibration dataset")
     if data == "pileval":
         dataset = load_dataset(
             "json",
             data_files="https://the-eye.eu/public/AI/pile/val.jsonl.zst",
-            split="train")
+            split="train",
+            cache_dir=cache_dir)
         dataset = dataset["text"][:calib_size]
     elif data == "cnn_dailymail":
-        dataset = load_dataset("cnn_dailymail", name="3.0.0", split="train")
+        dataset = load_dataset("cnn_dailymail",
+                               name="3.0.0",
+                               split="train",
+                               cache_dir=cache_dir)
         dataset = dataset["article"][:calib_size]
     else:
         raise NotImplementedError
@@ -72,7 +77,7 @@ def get_tokenizer(ckpt_path, **kwargs):
     return tokenizer
 
 
-def get_model(ckpt_path, dtype="float16"):
+def get_model(ckpt_path, dtype="float16", cache_dir=None):
     logger.info(f"Loading model from {ckpt_path}")
     torch_dtype = str_dtype_to_torch(dtype)
     model = AutoModelForCausalLM.from_pretrained(
@@ -103,6 +108,10 @@ def get_args():
                         default=128,
                         help="Number of samples for calibration.")
     parser.add_argument("--export_path", default="exported_model")
+    parser.add_argument("--cache_dir",
+                        type=str,
+                        default=None,
+                        help="Directory of dataset cache.")
     parser.add_argument('--seed', type=int, default=None, help='Random seed')
     args = parser.parse_args()
     return args
@@ -118,11 +127,12 @@ def main():
         random.seed(args.seed)
         np.random.seed(args.seed)
 
-    tokenizer = get_tokenizer(args.model_dir)
-    model = get_model(args.model_dir, args.dtype)
+    tokenizer = get_tokenizer(args.model_dir, cache_dir=args.cache_dir)
+    model = get_model(args.model_dir, args.dtype, cache_dir=args.cache_dir)
 
     calib_dataloader = get_calib_dataloader(tokenizer=tokenizer,
-                                            calib_size=args.calib_size)
+                                            calib_size=args.calib_size,
+                                            cache_dir=args.cache_dir)
     model = quantize_and_export(model,
                                 qformat=args.qformat,
                                 calib_dataloader=calib_dataloader,

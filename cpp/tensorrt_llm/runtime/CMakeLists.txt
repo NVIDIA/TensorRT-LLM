@@ -15,6 +15,7 @@
 include(FetchContent)
 
 set(SRCS
+    utils/numpyUtils.cpp
     utils/sessionUtils.cpp
     bufferManager.cpp
     decodingOutput.cpp
@@ -39,6 +40,10 @@ include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)
 if(NOT MSVC)
   # additional warnings
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
+  if(WARNING_IS_ERROR)
+    message(STATUS "Treating warnings as errors in GCC compilation")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+  endif()
 else() # Windows
   # warning level 4
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")

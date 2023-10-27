@@ -167,13 +167,8 @@ bool SmoothQuantGemmPlugin::supportsFormatCombination(
         return inOut[pos].type == nvinfer1::DataType::kINT8 && inOut[pos].format == TensorFormat::kLINEAR;
     case 1:
         // weights
-        // FIXME
-        // Dirty hack to overcome TRT int8 limitatition with plugins
-        // Weights are required to be fp32, but will be reinterpreted as int8 in enqueue
-        // Weights stored in checkpoint should have int8 type
-        // Because of the reinterpretation, input weights have shape 4 times smaller than required
-        // in_channels has to be divisible by 4
-        return inOut[pos].type == nvinfer1::DataType::kFLOAT && inOut[pos].format == TensorFormat::kLINEAR;
+        // Weights stored in checkpoint must have int8 type
+        return inOut[pos].type == nvinfer1::DataType::kINT8 && inOut[pos].format == TensorFormat::kLINEAR;
     case 2:
         // scales channels
     case 3:

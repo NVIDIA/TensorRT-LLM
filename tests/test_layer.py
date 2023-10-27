@@ -33,6 +33,7 @@ from tensorrt_llm import Tensor
 from tensorrt_llm._utils import str_dtype_to_torch, torch_to_numpy
 from tensorrt_llm.layers import (AttentionParams, KeyValueCacheParams,
                                  PositionEmbeddingType)
+from tensorrt_llm.quantization.mode import QuantMode
 
 
 class TestLayer(unittest.TestCase):
@@ -153,7 +154,19 @@ class TestLayer(unittest.TestCase):
                                    outputs['output'],
                                    atol=1e-6)
 
-    def test_gated_mlp_float32(self):
+    def _gated_mlp_custom_id(testcase_func, param_num, param):
+        return "%s_%s_%s" % (testcase_func.__name__, param.args[0].__name__,
+                             param.args[1])
+
+    @parameterized.expand([[tensorrt_llm.layers.GatedMLP, 'float32'],
+                           [tensorrt_llm.layers.FusedGatedMLP, 'float32'],
+                           [tensorrt_llm.layers.GatedMLP, 'fp8'],
+                           [tensorrt_llm.layers.FusedGatedMLP, 'fp8']],
+                          name_func=_gated_mlp_custom_id)
+    def test_gated_mlp(self, ClsMLP, qformat):
+        if getSMVersion() < 89 and qformat == 'fp8':
+            pytest.skip("fp8 is not supported in pre-ada architecture")
+
         # test data
         d_h = 8
         ffn_h = 20
@@ -183,25 +196,47 @@ class TestLayer(unittest.TestCase):
         net = builder.create_network()
         with tensorrt_llm.net_guard(net):
             network = tensorrt_llm.default_trtnet()
+            quant_mode = QuantMode(0)
+            if qformat == 'fp8':
+                quant_mode = quant_mode.set_fp8_qdq()
+
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
 
-            gm = tensorrt_llm.layers.GatedMLP(d_h,
-                                              ffn_h,
-                                              hidden_act='silu',
-                                              bias=False)
+            gm = ClsMLP(d_h,
+                        ffn_h,
+                        hidden_act='silu',
+                        bias=False,
+                        dtype=tensorrt_llm.str_dtype_to_trt(dtype),
+                        quant_mode=quant_mode)
 
             # TensorRT-LLM's Linear uses Parameter class which as a 'value' setter
             gm.fc.weight.value = fc.cpu().numpy()
             gm.gate.weight.value = gate.cpu().numpy()
             gm.proj.weight.value = proj.cpu().numpy()
+            if quant_mode.has_fp8_qdq():
+                gm.fc.weights_scaling_factor.value = np.array([1.42],
+                                                              dtype=np.float32)
+                gm.gate.weights_scaling_factor.value = np.array(
+                    [1.42], dtype=np.float32)
+                gm.proj.weights_scaling_factor.value = np.array(
+                    [0.42], dtype=np.float32)
+                gm.fc.activation_scaling_factor.value = np.array(
+                    [0.42], dtype=np.float32)
+                gm.gate.activation_scaling_factor.value = np.array(
+                    [0.42], dtype=np.float32)
+                gm.proj.activation_scaling_factor.value = np.array(
+                    [0.42], dtype=np.float32)
+
             output = gm.forward(x).trt_tensor
             output.name = 'output'
             network.mark_output(output)
 
         # trt run
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
+        build_engine = EngineFromNetwork(
+            (builder.trt_builder, net.trt_network),
+            CreateConfig(fp8=(qformat == 'fp8'), precision_constraints="obey"))
         with TrtRunner(build_engine) as runner:
             outputs = runner.infer(feed_dict={'x': x_data.numpy()})
 
@@ -210,9 +245,14 @@ class TestLayer(unittest.TestCase):
             ref = m(x_data)
 
         # compare diff
-        np.testing.assert_allclose(ref.cpu().numpy(),
-                                   outputs['output'],
-                                   atol=1e-5)
+        kwargs = {
+            'atol': 0.2,
+            'rtol': 0.03
+        } if qformat == 'fp8' else {
+            'atol': 1e-5
+        }
+        np.testing.assert_allclose(ref.cpu().numpy(), outputs['output'],
+                                   **kwargs)
 
     @parameterized.expand([["float32", False], ["float32", True],
                            ["bfloat16", False], ["bfloat16", True]])

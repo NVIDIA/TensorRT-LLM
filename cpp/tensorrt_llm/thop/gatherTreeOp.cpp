@@ -48,7 +48,7 @@ th::Tensor gatherTree(th::Tensor& sequence_lengths, th::Tensor& output_ids, th::
         beamHypotheses.output_ids_src = get_ptr<int32_t>(output_ids);
         beamHypotheses.log_probs_src = nullptr;
         beamHypotheses.max_seq_len = max_seq_len;
-        beamHypotheses.length_penalty = get_val<float>(length_penalty, 0);
+        beamHypotheses.length_penalties = get_ptr<float>(length_penalty);
 
         beamHypotheses.output_ids_tgt = get_ptr<int32_t>(beam_hyps_output_ids_tgt.value());
         beamHypotheses.sequence_lengths_tgt = get_ptr<int32_t>(beam_hyps_sequence_lengths_tgt.value());

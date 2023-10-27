@@ -17,7 +17,6 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
-#include "tensorrt_llm/common/tensor.h"
 #include "tllmBuffers.h"
 #include "tllmLogger.h"
 

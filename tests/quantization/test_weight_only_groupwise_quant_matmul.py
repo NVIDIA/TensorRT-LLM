@@ -47,7 +47,6 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                            dtype,
                            quant_algo,
                            group_size=128):
-        th_weight = th_weight.view(dtype=torch.float32)
         # Create builder
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
@@ -65,10 +64,9 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                 shape=th_pre_quant_scale.shape,
                 dtype=tensorrt_llm._utils.str_dtype_to_trt(dtype))
             # Init TensorRT-LLM tensor for weight
-            weight = Tensor(
-                name='weight',
-                shape=th_weight.shape,
-                dtype=tensorrt_llm._utils.str_dtype_to_trt("float32"))
+            weight = Tensor(name='weight',
+                            shape=th_weight.shape,
+                            dtype=tensorrt_llm._utils.str_dtype_to_trt("int8"))
             # Init TensorRT-LLM tensor for scale
             scale = Tensor(name='scale',
                            shape=th_scale.shape,
@@ -96,7 +94,7 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
         build_engine = EngineFromNetwork(
             (builder.trt_builder, net.trt_network),
             config=CreateConfig(
-                int8=False,
+                int8=True,
                 fp16=(dtype == "float16"),
                 memory_pool_limits={trt.MemoryPoolType.WORKSPACE: 33554432}))
 
@@ -106,7 +104,7 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                 feed_dict={
                     'activation': th_activation.numpy(),
                     'pre_quant_scale': th_pre_quant_scale.numpy(),
-                    'weight': th_weight.view(dtype=torch.float32).numpy(),
+                    'weight': th_weight.numpy(),
                     'scale': th_scale.numpy(),
                     'zero': th_zero.numpy(),
                     'bias': th_bias.numpy()

@@ -88,7 +88,7 @@ If you are using the pre-built TensorRT-LLM release wheel (recommended unless yo
 
 *Advanced. Skip this section if you plan to use the pre-built TensorRT-LLM release wheel.*
 
-Install [CMake](https://cmake.org/download/) and select the option to add it to the system path.
+Install [CMake](https://cmake.org/download/) (version 3.27.7 recommended) and select the option to add it to the system path.
 
 Download and install [Visual Studio 2022](https://visualstudio.microsoft.com/). When prompted to select more Workloads, check "Desktop development with C++."
 

@@ -49,10 +49,6 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
 
     def _run_matmul_plugin(self, mat1, processed_torch_weights,
                            torch_weight_scales, dtype, wTypeId):
-        # int8/int4 workaround for the plugin weights
-        processed_torch_weights = processed_torch_weights.view(
-            dtype=torch.float32)
-
         # Create builder
         builder = tensorrt_llm.Builder()
         # Create empty network
@@ -68,7 +64,7 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
             # Init TensorRT-LLM tensor for weight
             y = Tensor(name='y',
                        shape=processed_torch_weights.shape,
-                       dtype=tensorrt_llm._utils.str_dtype_to_trt("float32"))
+                       dtype=tensorrt_llm._utils.str_dtype_to_trt("int8"))
 
             # Init TensorRT-LLM tensor for per channel scaling
             scale = Tensor(name='scale',
@@ -84,7 +80,7 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
         build_engine = EngineFromNetwork(
             (builder.trt_builder, net.trt_network),
             config=CreateConfig(
-                int8=False,
+                int8=True,
                 fp16=(dtype == "float16"),
                 memory_pool_limits={trt.MemoryPoolType.WORKSPACE: 33554432}))
 
@@ -93,9 +89,7 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
             outputs = runner.infer(
                 feed_dict={
                     'x': mat1.numpy(),
-                    # convert to float32 as workaround
-                    'y': processed_torch_weights.view(
-                        dtype=torch.float32).numpy(),
+                    'y': processed_torch_weights.numpy(),
                     'scale': torch_weight_scales.numpy()
                 })
 

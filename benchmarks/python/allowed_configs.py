@@ -370,6 +370,23 @@ _allowed_configs = {
                     builder_opt=None,
                     remove_input_padding=False,
                 )),
+    "chatglm2_6b":
+    ModelConfig(name="chatglm2_6b",
+                family="chatglm2",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=28,
+                    num_heads=32,
+                    hidden_size=4096,
+                    vocab_size=65024,
+                    hidden_act='swiglu',
+                    n_positions=2048,
+                    max_batch_size=256,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                    remove_input_padding=False,
+                )),
     "bloom_560m":
     ModelConfig(name="bloom_560m",
                 family="bloom",

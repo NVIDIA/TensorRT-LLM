@@ -37,7 +37,7 @@ executed to perform the inference. The environment is configured through the
 (that name comes from
 [MPI](https://en.wikipedia.org/wiki/Message_Passing_Interface) and its "famous"
 `MPI_COMM_WORLD` default communicator). The constructor also accepts an
-optional object to log informations, warnings and errors:
+optional object to log information, warnings and errors:
 
 ```cpp
 #include <tensorrt_llm/runtime/gptSession.h>

@@ -57,123 +57,6 @@ Tensor::Tensor(MemoryType _where, DataType _type, std::vector<size_t> const& _sh
 {
 }
 
-void ManagedTensor::parseNpyIntro(FILE*& f_ptr, uint32_t& header_len, uint32_t& start_data)
-{
-    const char magic[]
-        = "\x93"
-          "NUMPY";
-    char magic_test[sizeof(magic)] = "\0";
-
-    size_t n_elems = fread((void*) magic_test, sizeof(char), sizeof(magic) - 1, f_ptr);
-    if (n_elems != sizeof(magic) - 1 || std::string(magic) != std::string(magic_test))
-    {
-        throw std::runtime_error("Could read magic token in NPY file");
-    }
-
-    uint8_t npy_major = 0;
-    uint8_t npy_minor = 0;
-    n_elems = fread((void*) &npy_major, sizeof(uint8_t), 1, f_ptr);
-    n_elems += fread((void*) &npy_minor, sizeof(uint8_t), 1, f_ptr);
-
-    if (npy_major == 1)
-    {
-        uint16_t header_len_u16 = 0;
-        n_elems = fread((void*) &header_len_u16, sizeof(uint16_t), 1, f_ptr);
-        header_len = header_len_u16;
-    }
-    else if (npy_major == 2)
-    {
-        uint32_t header_len_u32 = 0;
-        n_elems = fread((void*) &header_len_u32, sizeof(uint32_t), 1, f_ptr);
-        header_len = header_len_u32;
-    }
-    else
-    {
-        throw std::runtime_error("Unsupported npy version: " + std::to_string(npy_major));
-    }
-
-    start_data = 8 + 2 * npy_major + header_len;
-}
-
-int ManagedTensor::parseNpyHeader(FILE*& f_ptr, uint32_t header_len, DataType& type, std::vector<size_t>& shape)
-{
-    char* header_c = (char*) malloc(header_len * sizeof(char));
-    size_t n_elems = fread((void*) header_c, sizeof(char), header_len, f_ptr);
-    if (n_elems != header_len)
-    {
-        free(header_c);
-        return -1;
-    }
-    std::string header(header_c, header_len);
-    free(header_c);
-
-    size_t start, end;
-    start = header.find("'descr'") + 7;
-    start = header.find("'", start);
-    end = header.find("'", start + 1);
-    type = Tensor::typeFromNumpyDesc(header.substr(start + 2, end - start - 2));
-
-    start = header.find("'fortran_order'") + 15;
-    start = header.find(":", start);
-    end = header.find(",", start + 1);
-    if (header.substr(start + 1, end - start - 1).find("False") == std::string::npos)
-    {
-        throw std::runtime_error("Unsupported value for fortran_order while reading npy file");
-    }
-
-    start = header.find("'shape'") + 7;
-    start = header.find("(", start);
-    end = header.find(")", start + 1);
-
-    std::istringstream shape_stream(header.substr(start + 1, end - start - 1));
-    std::string token;
-
-    shape.clear();
-    while (std::getline(shape_stream, token, ','))
-    {
-        if (token.find_first_not_of(' ') == std::string::npos)
-        {
-            break;
-        }
-        shape.push_back(std::stoul(token));
-    }
-
-    return 0;
-}
-
-ManagedTensor ManagedTensor::loadNpy(const std::string& npy_file, const MemoryType where)
-{
-    DataType type;
-    std::vector<size_t> shape;
-
-    FILE* f_ptr = fopen(npy_file.c_str(), "rb");
-    if (f_ptr == nullptr)
-    {
-        throw std::runtime_error("Could not open file " + npy_file);
-    }
-    uint32_t header_len, start_data;
-    parseNpyIntro(f_ptr, header_len, start_data);
-    parseNpyHeader(f_ptr, header_len, type, shape);
-
-    const size_t size = std::accumulate(shape.begin(), shape.end(), size_t{1}, std::multiplies<size_t>());
-    std::unique_ptr<void, std::function<void(void*)>> data_cpu{
-        malloc(size * Tensor::getTypeSize(type)), [](void* p) { free(p); }};
-    void* data = data_cpu.get();
-
-    size_t n_elems = fread(data_cpu.get(), Tensor::getTypeSize(type), size, f_ptr);
-    fclose(f_ptr);
-    TLLM_CHECK_WITH_INFO(n_elems == size, "reading tensor failed");
-    if (where == MEMORY_GPU)
-    {
-        cudaMalloc(&data, size * Tensor::getTypeSize(type));
-        std::unique_ptr<void, std::function<void(void*)>> data_gpu{data, [](void* p) { cudaFree(p); }};
-        cudaMemcpy(data, data_cpu.get(), size * Tensor::getTypeSize(type), cudaMemcpyHostToDevice);
-        return ManagedTensor(Tensor(where, type, shape, data), std::move(data_gpu));
-    }
-
-    return ManagedTensor(Tensor(where, type, shape, data), std::move(data_cpu));
-}
-
 size_t Tensor::size() const
 {
     if (data == nullptr || shape.size() == 0)
@@ -222,16 +105,6 @@ std::string Tensor::toString() const
         vec2str(shape).c_str(), data);
 }
 
-DataType Tensor::typeFromNumpyDesc(std::string type)
-{
-    static const std::unordered_map<std::string, DataType> type_map{{"?", TYPE_BOOL}, {"b", TYPE_BYTES},
-        {"u1", TYPE_UINT8}, {"u2", TYPE_UINT16}, {"u4", TYPE_UINT32}, {"u8", TYPE_UINT64}, {"i1", TYPE_INT8},
-        {"i2", TYPE_INT16}, {"i4", TYPE_INT32}, {"i8", TYPE_INT64}, {"f2", TYPE_FP16}, {"f4", TYPE_FP32},
-        {"f8", TYPE_FP64}};
-    TLLM_CHECK_WITH_INFO(type_map.count(type) > 0, "numpy data type '" + type + "' not supported");
-    return type_map.at(type);
-}
-
 size_t Tensor::getTypeSize(DataType type)
 {
     static const std::unordered_map<DataType, size_t> type_map{{TYPE_BOOL, sizeof(bool)}, {TYPE_BYTES, sizeof(char)},
@@ -264,78 +137,6 @@ std::string Tensor::getNumpyTypeDesc(DataType type) const
     }
 
     return type_map.count(type) > 0 ? type_map.at(type) : "x";
-}
-
-void Tensor::saveNpy(const std::string& filename) const
-{
-    // Save tensor to NPY 1.0 format (see https://numpy.org/neps/nep-0001-npy-format.html)
-    void* cpu_data = (void*) data;
-    bool is_data_temp = false;
-    size_t tensor_size = size();
-
-#ifdef ENABLE_BF16
-    if (type == TYPE_BF16)
-    {
-        TLLM_CHECK(where == MemoryType::MEMORY_GPU);
-        float* data_fp32 = nullptr;
-        cudaMalloc(&data_fp32, tensor_size * sizeof(float));
-        invokeCudaD2DcpyConvert(data_fp32, static_cast<const __nv_bfloat16*>(data), tensor_size);
-        Tensor{where, TYPE_FP32, shape, data_fp32}.saveNpy(filename);
-        cudaFree(data_fp32);
-        return;
-    }
-#endif
-
-    if (where == MemoryType::MEMORY_GPU)
-    {
-        cpu_data = malloc(tensor_size * Tensor::getTypeSize(type));
-        is_data_temp = true;
-        cudaDeviceSynchronize();
-        cudaMemcpy(cpu_data, data, tensor_size * Tensor::getTypeSize(type), cudaMemcpyDeviceToHost);
-    }
-
-    const char magic[]
-        = "\x93"
-          "NUMPY";
-    const uint8_t npy_major = 1;
-    const uint8_t npy_minor = 0;
-
-    std::stringstream header_stream;
-    header_stream << "{'descr': '" << getNumpyTypeDesc(type) << "', 'fortran_order': False, 'shape': (";
-    for (size_t i = 0; i < shape.size(); ++i)
-    {
-        header_stream << shape[i];
-        if (i + 1 < shape.size() || shape.size() == 1)
-        {
-            header_stream << ", ";
-        }
-    }
-    header_stream << ")}";
-    int base_length = 6 + 4 + header_stream.str().size();
-    int pad_length = 16 * ((base_length + 1 + 15) / 16); // Take ceiling of base_length + 1 (for '\n' ending)
-    for (int i = 0; i < pad_length - base_length; ++i)
-    {
-        header_stream << ((i == pad_length - base_length - 1) ? "\n" : "\x20");
-    }
-    std::string header = header_stream.str();
-    const uint16_t header_len = header.size();
-
-    FILE* f_ptr = fopen(filename.c_str(), "wb");
-    TLLM_CHECK_WITH_INFO(f_ptr != nullptr, fmtstr("Unable to open %s for writing.\n", filename.c_str()));
-
-    fwrite(magic, sizeof(char), sizeof(magic) - 1, f_ptr);
-    fwrite(&npy_major, sizeof(uint8_t), 1, f_ptr);
-    fwrite(&npy_minor, sizeof(uint8_t), 1, f_ptr);
-    fwrite(&header_len, sizeof(uint16_t), 1, f_ptr);
-    fwrite(header.c_str(), sizeof(char), header_len, f_ptr);
-    fwrite(cpu_data, Tensor::getTypeSize(type), tensor_size, f_ptr);
-
-    fclose(f_ptr);
-
-    if (is_data_temp)
-    {
-        free(cpu_data);
-    }
 }
 
 Tensor Tensor::slice(std::vector<size_t> shape, size_t offset) const
@@ -420,25 +221,6 @@ std::string TensorMap::toString()
     ss << "}";
     return ss.str();
 }
-
-void TensorMap::saveNpy(const std::string& base_folder)
-{
-#if !defined(_WIN32)
-    mode_t mode_0755 = S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH;
-    int ret = mkdir(base_folder.c_str(), mode_0755);
-    TLLM_CHECK_WITH_INFO(ret == 0 || errno == EEXIST, fmtstr("Could not create folder %s.\n", base_folder.c_str()));
-
-    for (const auto& item : tensor_map_)
-    {
-        item.second.saveNpy(base_folder + "/" + item.second.whereToString() + "-" + item.first + ".npy");
-    }
-#else
-    throw std::runtime_error("TensorMap::saveNpy is not implemented on Windows.");
-#endif // !defined(_WIN32)
-}
-
-ManagedTensor::~ManagedTensor() = default;
-ManagedTensor::ManagedTensor(ManagedTensor&&) = default;
 
 } // namespace common
 } // namespace tensorrt_llm

@@ -43,8 +43,6 @@ class TestSmoothQuantGemm(unittest.TestCase):
         mat1 = torch.randint(-128, 128, shape1, dtype=torch.int8)
         shape2 = (n, k)
         mat2 = torch.randint(-128, 128, shape2, dtype=torch.int8)
-        # Temporary hack to overcome TRT int8 plugin limitation
-        mat2_trt_hack = mat2.view(dtype=torch.float32)
 
         # Init scales in fp32
         shape_scale_a = (m, 1) if per_token_scaling else (1, 1)
@@ -74,8 +72,8 @@ class TestSmoothQuantGemm(unittest.TestCase):
                        dtype=tensorrt_llm._utils.str_dtype_to_trt("int8"))
             # Init TensorRT-LLM tensor for mat2
             y = Tensor(name='y',
-                       shape=mat2_trt_hack.shape,
-                       dtype=tensorrt_llm._utils.str_dtype_to_trt("float32"))
+                       shape=mat2.shape,
+                       dtype=tensorrt_llm._utils.str_dtype_to_trt("int8"))
             # Init TensorRT-LLM tensor for per token scaling
             scale_a = Tensor(
                 name='scale_a',
@@ -107,7 +105,7 @@ class TestSmoothQuantGemm(unittest.TestCase):
             outputs = runner.infer(
                 feed_dict={
                     'x': mat1.numpy(),
-                    'y': mat2_trt_hack.numpy(),
+                    'y': mat2.numpy(),
                     'scale_a': scale_a_torch.numpy(),
                     'scale_b': scale_b_torch.numpy()
                 })

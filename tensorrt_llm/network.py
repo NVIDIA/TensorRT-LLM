@@ -274,7 +274,7 @@ class Network(object):
         '''
         Get a graphviz representation of the network.
 
-        NOTE, the graph might be redundancy since TRT's INetwork wont clean the unused inputs and layers
+        NOTE, the graph might be redundancy since TRT's INetwork won't clean the unused inputs and layers
         automatically.
         TODO: add an flag to hide all the removed layers and their output tensors
         TODO: replace this when TensorRT provides a better way to get the graph of INetworkDefinition

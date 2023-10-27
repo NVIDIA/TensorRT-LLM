@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/common/tensor.h"
+
 #include <curand_kernel.h>
 #include <sys/stat.h>
 #include <unordered_map>

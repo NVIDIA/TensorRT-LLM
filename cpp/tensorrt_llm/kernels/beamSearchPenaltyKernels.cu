@@ -30,13 +30,14 @@ namespace kernels
 
 template <typename T>
 __global__ void add_bias_temperature(T* logits, const T* bias, const int batch_size, const int beam_width,
-    const int vocab_size, const int vocab_size_padded, const float temperature)
+    const int vocab_size, const int vocab_size_padded, const float* temperatures)
 {
     int tid = threadIdx.x;
     int bid = blockIdx.x;
     int bbid = blockIdx.y;
 
     logits += bbid * vocab_size_padded;
+    const float temperature{temperatures[bbid / beam_width]};
 
     const T MASK_VAL = (std::is_same<T, half>::value) ? -HALF_FLT_MAX : -FLT_MAX;
     const T inv_temp = static_cast<T>(1.0f / (temperature + 1e-6f));
@@ -56,7 +57,7 @@ __global__ void add_bias_temperature(T* logits, const T* bias, const int batch_s
 
 template <>
 __global__ void add_bias_temperature(half2* logits, const half2* bias, const int batch_size, const int beam_width,
-    const int vocab_size, const int vocab_size_padded, const float temperature)
+    const int vocab_size, const int vocab_size_padded, const float* temperatures)
 {
     assert(vocab_size % 2 == 0);
     assert(vocab_size_padded % 2 == 0);
@@ -64,6 +65,7 @@ __global__ void add_bias_temperature(half2* logits, const half2* bias, const int
     const int tid = threadIdx.x;
     const int bid = blockIdx.x;
     const int bbid = blockIdx.y;
+    const float temperature{temperatures[bbid / beam_width]};
 
     const half2 mask_val = __float2half2_rn(-HALF_FLT_MAX);
     const half2 inv_temp = __float2half2_rn(1.0f / (temperature + 1e-6f));
@@ -91,12 +93,13 @@ __global__ void add_bias_temperature(half2* logits, const half2* bias, const int
 template <typename T, bool IS_ADDITIVE>
 __global__ void apply_repetition_penalty(T* logits, const int batch_size, const int beam_width, const int vocab_size,
     const int vocab_size_padded, const int** output_ids_ptr, const int** parent_ids_ptr, const int* input_lengths,
-    const int* sequence_lengths, const float repetition_penalty, int max_seq_len)
+    const int* sequence_lengths, const float* repetition_penalties, int max_seq_len)
 {
     const int tid = threadIdx.x;
     const int bbid = blockIdx.x;
     const int batch_id = bbid / beam_width;
     const int beam_idx{bbid % beam_width};
+    const float repetition_penalty{repetition_penalties[batch_id]};
 
     logits += bbid * vocab_size_padded;
     extern __shared__ char sbuf[];
@@ -148,11 +151,12 @@ __global__ void apply_repetition_penalty(T* logits, const int batch_size, const 
 }
 
 template <typename T>
-__global__ void apply_min_length_penalty(T* logits, const int min_length, const int* end_ids,
+__global__ void apply_min_length_penalty(T* logits, const int* min_lengths, const int* end_ids,
     const int* sequence_lengths, const int* input_lengths, const int beam_width, const int vocab_size_padded)
 {
     int bbid = threadIdx.x + blockIdx.x * blockDim.x; // batch-beam index
     int bid = bbid / beam_width;                      // batch index
+    const int min_length{min_lengths[bid]};
     auto const input_length{input_lengths == nullptr ? 0 : input_lengths[bbid]};
     // We need +1 because sequence_lengths = num_gen_tokens + input_length - 1,
     // which is equal to the length of k/v caches.
@@ -167,10 +171,10 @@ template <typename T>
 void invokeAddBiasApplyPenalties(T* logits, const int** output_ids_ptr, const int** parent_ids_ptr,
     const int* input_lengths, const int* sequence_lengths, const T* bias, const int ite, const int local_batch_size,
     const int batch_size, const int beam_width, const int vocab_size, const int vocab_size_padded, const int* end_ids,
-    const float temperature, const float repetition_penalty, const RepetitionPenaltyType repetition_penalty_type,
-    const int min_length, const int max_seq_len, cudaStream_t stream)
+    const float* temperatures, const float* repetition_penalties, const RepetitionPenaltyType repetition_penalty_type,
+    const int* min_lengths, const int max_seq_len, cudaStream_t stream)
 {
-    if (bias != nullptr || temperature != 1.0f || vocab_size != vocab_size_padded)
+    if (bias != nullptr || temperatures != nullptr || vocab_size != vocab_size_padded)
     {
         dim3 block(512);
         if (std::is_same<T, half>::value && vocab_size % 2 == 0 && vocab_size_padded % 2 == 0)
@@ -178,19 +182,19 @@ void invokeAddBiasApplyPenalties(T* logits, const int** output_ids_ptr, const in
             dim3 grid((vocab_size_padded / 2 + block.x - 1) / block.x, beam_width * local_batch_size);
             add_bias_temperature<<<grid, block, 0, stream>>>(reinterpret_cast<half2*>(logits),
                 reinterpret_cast<const half2*>(bias), batch_size, beam_width, vocab_size, vocab_size_padded,
-                temperature);
+                temperatures);
         }
         else
         {
             dim3 grid((vocab_size_padded + block.x - 1) / block.x, beam_width * local_batch_size);
             add_bias_temperature<<<grid, block, 0, stream>>>(
-                logits, bias, batch_size, beam_width, vocab_size, vocab_size_padded, temperature);
+                logits, bias, batch_size, beam_width, vocab_size, vocab_size_padded, temperatures);
         }
     }
 
     if (repetition_penalty_type != RepetitionPenaltyType::None)
     {
-        if (repetition_penalty != getDefaultPenaltyValue(repetition_penalty_type))
+        if (repetition_penalties != nullptr)
         {
             size_t smem_size = (sizeof(T) * max_seq_len + 31) / 32 * 32 + sizeof(int) * max_seq_len;
             dim3 block(256);
@@ -199,14 +203,14 @@ void invokeAddBiasApplyPenalties(T* logits, const int** output_ids_ptr, const in
             {
                 apply_repetition_penalty<T, false><<<grid, block, smem_size, stream>>>(logits, batch_size, beam_width,
                     vocab_size, vocab_size_padded, output_ids_ptr, parent_ids_ptr, input_lengths, sequence_lengths,
-                    repetition_penalty, max_seq_len);
+                    repetition_penalties, max_seq_len);
                 sync_check_cuda_error();
             }
             else if (repetition_penalty_type == RepetitionPenaltyType::Additive)
             {
                 apply_repetition_penalty<T, true><<<grid, block, smem_size, stream>>>(logits, batch_size, beam_width,
                     vocab_size, vocab_size_padded, output_ids_ptr, parent_ids_ptr, input_lengths, sequence_lengths,
-                    repetition_penalty, max_seq_len);
+                    repetition_penalties, max_seq_len);
                 sync_check_cuda_error();
             }
         }
@@ -218,21 +222,21 @@ void invokeAddBiasApplyPenalties(T* logits, const int** output_ids_ptr, const in
     const int block_size = min(local_batch_size * beam_width, 1024);
     const int grid_size = (local_batch_size * beam_width + block_size - 1) / block_size;
     apply_min_length_penalty<<<grid_size, block_size, 0, stream>>>(
-        logits, min_length, end_ids, sequence_lengths, input_lengths, beam_width, vocab_size_padded);
+        logits, min_lengths, end_ids, sequence_lengths, input_lengths, beam_width, vocab_size_padded);
     sync_check_cuda_error();
 }
 
 template void invokeAddBiasApplyPenalties(float* logits, const int** output_ids_ptr, const int** parent_ids_ptr,
     const int* input_lengths, const int* sequence_lengths, const float* bias, const int ite, const int local_batch_size,
     const int batch_size, const int beam_width, const int vocab_size, const int vocab_size_padded, const int* end_ids,
-    const float temperature, const float repetition_penalty, const RepetitionPenaltyType repetition_penalty_type,
-    const int min_length, int max_seq_len, cudaStream_t stream);
+    const float* temperatures, const float* repetition_penalties, const RepetitionPenaltyType repetition_penalty_type,
+    const int* min_lengths, int max_seq_len, cudaStream_t stream);
 
 template void invokeAddBiasApplyPenalties(half* logits, const int** output_ids_ptr, const int** parent_ids_ptr,
     const int* input_lengths, const int* sequence_lengths, const half* bias, const int ite, const int local_batch_size,
     const int batch_size, const int beam_width, const int vocab_size, const int vocab_size_padded, const int* end_ids,
-    const float temperature, const float repetition_penalty, const RepetitionPenaltyType repetition_penalty_type,
-    const int min_length, int max_seq_len, cudaStream_t stream);
+    const float* temperatures, const float* repetition_penalties, const RepetitionPenaltyType repetition_penalty_type,
+    const int* min_lengths, int max_seq_len, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

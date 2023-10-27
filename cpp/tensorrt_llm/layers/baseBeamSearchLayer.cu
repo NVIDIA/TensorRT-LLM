@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/beamSearchPenaltyKernels.h"
 #include "tensorrt_llm/layers/baseBeamSearchLayer.h"
 
@@ -91,21 +92,59 @@ BaseBeamSearchLayer<T>::~BaseBeamSearchLayer()
 template <typename T>
 void BaseBeamSearchLayer<T>::freeBuffer()
 {
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     if (is_allocate_buffer_)
     {
-        allocator_->free((void**) (&topk_softmax_workspace_));
+        allocator_->free((void**) (&temperature_buf_));
+        allocator_->free((void**) (&min_lengths_buf_));
+        allocator_->free((void**) (&repetition_penalty_buf_));
         is_allocate_buffer_ = false;
     }
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-void BaseBeamSearchLayer<T>::setupBase(SetupParams const& setupParams)
+void BaseBeamSearchLayer<T>::allocateBuffer(size_t batch_size)
 {
-    mTemperature = (setupParams.temperature) ? setupParams.temperature->at(0) : 1.0f;
-    mMinLength = (setupParams.min_length) ? setupParams.min_length->at(0) : 0;
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    temperature_buf_ = allocator_->reMalloc(temperature_buf_, sizeof(float) * batch_size, false);
+    min_lengths_buf_ = allocator_->reMalloc(min_lengths_buf_, sizeof(int) * batch_size, false);
+    repetition_penalty_buf_ = allocator_->reMalloc(repetition_penalty_buf_, sizeof(float) * batch_size, false);
+
+    is_allocate_buffer_ = true;
+    TLLM_LOG_DEBUG("% stop", __PRETTY_FUNCTION__);
+}
+
+template <typename T>
+void BaseBeamSearchLayer<T>::setupBase(size_t batch_size, SetupParams const& setupParams)
+{
+    allocateBuffer(batch_size);
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    // Setup penalties.
+    auto fillBuffers
+        = [this, &batch_size](auto const& optParam, auto const defaultValue, auto& hostBuffer, auto& deviceBuffer)
+    {
+        hostBuffer.resize(batch_size);
+        if (!optParam)
+        {
+            std::fill(std::begin(hostBuffer), std::end(hostBuffer), defaultValue);
+        }
+        else if (optParam->size() == 1)
+        {
+            std::fill(std::begin(hostBuffer), std::end(hostBuffer), optParam->front());
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(optParam->size() == batch_size, "Argument vector size mismatch.");
+            std::copy(optParam->begin(), optParam->end(), std::begin(hostBuffer));
+        }
+        cudaAutoCpy(deviceBuffer, hostBuffer.data(), batch_size, stream_);
+    };
+
+    fillBuffers(setupParams.temperature, 1.0f, mTemperature, temperature_buf_);
+    fillBuffers(setupParams.min_length, 1, mMinLength, min_lengths_buf_);
 
     mRepetitionPenaltyType = RepetitionPenaltyType::None;
-    mRepetitionPenalty = getDefaultPenaltyValue(mRepetitionPenaltyType);
     if (setupParams.repetition_penalty || setupParams.presence_penalty)
     {
         TLLM_CHECK_WITH_INFO(!(setupParams.repetition_penalty && setupParams.presence_penalty),
@@ -114,10 +153,16 @@ void BaseBeamSearchLayer<T>::setupBase(SetupParams const& setupParams)
             "Please provide one of repetition_penalty or presence_penalty.");
         mRepetitionPenaltyType
             = setupParams.repetition_penalty ? RepetitionPenaltyType::Multiplicative : RepetitionPenaltyType::Additive;
-        mRepetitionPenalty = mRepetitionPenaltyType == RepetitionPenaltyType::Multiplicative
-            ? setupParams.repetition_penalty->at(0)
-            : setupParams.presence_penalty->at(0);
+        if (mRepetitionPenaltyType == RepetitionPenaltyType::Multiplicative)
+        {
+            fillBuffers(setupParams.repetition_penalty, 1.0f, mRepetitionPenalty, repetition_penalty_buf_);
+        }
+        else
+        {
+            fillBuffers(setupParams.presence_penalty, 1.0f, mRepetitionPenalty, repetition_penalty_buf_);
+        }
     }
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
@@ -129,7 +174,6 @@ void BaseBeamSearchLayer<T>::forward(BeamSearchOutputParams& outputs, ForwardPar
     const auto batch_size = static_cast<std::int32_t>(output_ids_ptr.shape[0]);
     const auto beam_width = static_cast<std::int32_t>(output_ids_ptr.shape[1]);
     const auto max_seq_len = static_cast<std::int32_t>(output_ids_ptr.shape[2]);
-    allocateBuffer(batch_size, beam_width);
 
     TLLM_CHECK_WITH_INFO(params.ite == 0, "Pipeline Parallelism is not supported yet !");
 
@@ -145,8 +189,8 @@ void BaseBeamSearchLayer<T>::forward(BeamSearchOutputParams& outputs, ForwardPar
 
     invokeAddBiasApplyPenalties(logits.getPtr<T>(), output_ids_ptr.template getPtr<const int*>(),
         outputs.parent_ids_ptr.template getPtr<const int*>(), input_lengths, sequence_length, embedding_bias, ite,
-        local_batch_size, batch_size, beam_width, vocab_size_, vocab_size_padded_, end_ids, mTemperature,
-        mRepetitionPenalty, mRepetitionPenaltyType, mMinLength, max_seq_len, stream_);
+        local_batch_size, batch_size, beam_width, vocab_size_, vocab_size_padded_, end_ids, temperature_buf_,
+        repetition_penalty_buf_, mRepetitionPenaltyType, min_lengths_buf_, max_seq_len, stream_);
     sync_check_cuda_error();
 
     invokeSoftMax(outputs, params);

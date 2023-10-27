@@ -151,13 +151,6 @@ def parse_arguments(args):
         default=False,
         help="Activates inflight batching mode of gptAttentionPlugin.")
     parser.add_argument(
-        '--enable_two_optimization_profiles',
-        default=False,
-        action='store_true',
-        help=
-        "Enables two optimization profiles during engine build, for context and generate phases. By default (and for inflight batching too), only 1 opt profile."
-    )
-    parser.add_argument(
         '--paged_kv_cache',
         action="store_true",
         default=False,
@@ -180,7 +173,7 @@ def parse_arguments(args):
         help=
         'By default, we use a single static scaling factor to scale weights in the int4 range. '
         'per_group chooses at run time, and for each group, a custom scaling factor. '
-        'The falg is built for GPTQ/AWQ quantization.')
+        'The flag is built for GPTQ/AWQ quantization.')
     parser.add_argument(
         '--use_weight_only',
         default=False,
@@ -282,11 +275,6 @@ def parse_arguments(args):
 
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha
-
-    if args.remove_input_padding or args.use_inflight_batching or args.paged_kv_cache:
-        assert (
-            not args.enable_two_optimization_profiles
-        ), "Only 1 opt profile supported for inflight batching and paged kv cache."
 
     return args
 
@@ -395,9 +383,8 @@ def build_rank_engine(builder: Builder,
             args.max_output_len,
             True,
             args.max_beam_width,
-            max_num_tokens=args.max_num_tokens,
-            enable_two_optimization_profiles=args.
-            enable_two_optimization_profiles)
+            max_num_tokens=args.max_num_tokens)
+
         tensorrt_llm_gpt(*inputs)
 
     tensorrt_llm.graph_rewriting.optimize(network)
@@ -444,6 +431,7 @@ def build(rank, args):
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,
             fp8=args.enable_fp8,
+            int8=args.quant_mode.has_act_or_weight_quant(),
             quant_mode=args.quant_mode,
             strongly_typed=args.strongly_typed)
 

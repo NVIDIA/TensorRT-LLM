@@ -44,7 +44,7 @@ Take GPT-350M as an example for single GPU
     --batch_size "1" \
     --input_output_len "60,20"
 
-# Expected ouput:
+# Expected output:
 # [BENCHMARK] batch_size 1 input_length 60 output_length 20 latency(ms) 40.81
 ```
 Take GPT-175B as an example for multiple GPUs
@@ -55,7 +55,7 @@ mpirun -n 8 ./benchmarks/gptSessionBenchmark \
     --batch_size "1" \
     --input_output_len "60,20"
 
-# Expected ouput:
+# Expected output:
 # [BENCHMARK] batch_size 1 input_length 60 output_length 20 latency(ms) 792.14
 ```
 

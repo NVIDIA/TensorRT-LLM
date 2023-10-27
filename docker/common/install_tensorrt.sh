@@ -39,6 +39,7 @@ install_tensorrt() {
     mv /usr/local/TensorRT-${TENSOR_RT_VERSION} /usr/local/tensorrt
     pip install /usr/local/tensorrt/python/tensorrt-*-cp${PARSED_PY_VERSION}-*.whl
     rm -rf /tmp/TensorRT.tar
+    echo 'export LD_LIBRARY_PATH=/usr/local/tensorrt/lib:$LD_LIBRARY_PATH' >> "${ENV}"
 }
 
 # Install base packages depending on the base OS

@@ -16,8 +16,10 @@ how it returns completed requests to the user.
 ## The Batch Manager API
 
 A software component (called the client in the text that follows) can interact
-with the batch manager using two main callbacks. Their signatures are defined
+with the batch manager using two mandatory, and several optional callbacks. Their signatures are defined
 in the [`callbacks.h`](source:cpp/include/tensorrt_llm/batch_manager/callbacks.h) file.
+
+These callbacks are invoked in the generation loop at regular intervals and serve a variety of functions described below.
 
 ### Get and Send Callbacks
 
@@ -42,7 +44,7 @@ tensor. See
 [`InferenceRequest.h`](source:cpp/include/tensorrt_llm/batch_manager/InferenceRequest.h)
 for more details.
 
-The responses are delivered to the client through a callback of type
+Responses are delivered to the client through a callback of type
 `SendResponseCallback`. A conforming callback must accept the 64-bit
 request ID that uniquely identifies the request, the list of output tensors,
 a boolean (identifying the last response for the request when set to
@@ -94,9 +96,10 @@ The statistics are packaged as a JSON string. That string contains three fields:
 
 ### GptManager Design
 
-GptManager is designed to integrate into an inference server that's managing a pool of
+Batch Manager is designed to integrate into an inference server that's executing a pool of
 active work items populated by a stream of requests actively received
-by the server. GptManager spawns a worker thread in its constructor that then
+by the server. GptManager assumes a GPT-style autoregressive model architecture.
+GptManager spawns a worker thread in its constructor that then
 persistently runs the token generation loop. The worker thread invokes `GetInferenceRequestsCallback`
 at the start of each loop iteration, which is intended to read new
 requests. It invokes `SendResponseCallback` at the end of each iteration when one or
@@ -138,16 +141,13 @@ even in the worst case of KV cache consumption. That mode corresponds to a
 `schedulerPolicy` set to `GUARANTEED_NO_EVICT`.
 
 The `GptManager`'s worker thread terminates when the `GptManager` destructor is
-called and there are no more active requests. Alternatively, a special request
-with a `requestID` of `-1` can be sent to the `GptManager`, it will be
-interpreted as a `TERMINATE` signal. It leads to the invocation of
-`waitUntilTerminate` which returns when the worker thread has terminated.
+called and there are no more active requests.
 
 ### Multi-GPU execution
 
 When running on multiple GPUs using either tensor or pipeline parallelism, it
 is assumed that the server launches as many processes as GPU ranks, and each
-process runs its own copy of `GptManager`. The number of GPUs visible on a given
+process runs its own instance of `GptManager`. The number of GPUs visible on a given
 node can be controlled using the `CUDA_VISIBLE_DEVICES` environment variable.
 
 Care must be taken to ensure all ranks see the same inputs at each iteration of

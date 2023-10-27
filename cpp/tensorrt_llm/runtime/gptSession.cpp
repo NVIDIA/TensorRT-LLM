@@ -194,7 +194,7 @@ void GptSession::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType ma
     createBuffers(mNumMicroBatches);
 
     auto const microBatchSize = tc::ceilDiv(maxBatchSize, mNumMicroBatches);
-    // Store this param related to deocder buffer size and kv cache manager to check against
+    // Store this param related to decoder buffer size and kv cache manager to check against
     // the input shape with the params given in generate().
     // gptDecoderBatch does not resize buffers, but allows smaller batchSize and beamWidth.
     // TODO refactor batch manager to remove dependency on maxSequenceLength.
@@ -280,6 +280,7 @@ void GptSession::generateSingleBatch(
 
     auto& onTokenGenerated = outputs.onTokenGenerated;
     outputs.ids->reshape(ITensor::makeShape({batchSize, beamWidth, mDecoderMaxSequenceLength}));
+    outputs.lengths->reshape(ITensor::makeShape({batchSize, beamWidth}));
 
     auto kvCacheManager = mModelConfig.usePagedKvCache() ? mKvCacheManagers.at(microBatchId).get() : nullptr;
     RuntimeBuffers::TensorMap inputBuffers[2];
@@ -382,6 +383,7 @@ void GptSession::generateSingleBatch(
     }
 
     finalizeOutputIds(*outputs.ids, microBatchId);
+    manager.copy(*buffers.sequenceLengths, *outputs.lengths);
     manager.getStream().synchronize();
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
@@ -508,6 +510,7 @@ void GptSession::generateMultiBatch(
     auto const batchSize = static_cast<SizeType>(inputLengths->getSize());
     auto const beamWidth = samplingConfig.beamWidth;
     outputs.ids->reshape(ITensor::makeShape({batchSize, beamWidth, mDecoderMaxSequenceLength}));
+    outputs.lengths->reshape(ITensor::makeShape({batchSize, beamWidth}));
     auto& onTokenGenerated = outputs.onTokenGenerated;
 
     auto const numMicroBatches = std::min(batchSize, mNumMicroBatches);
@@ -633,6 +636,7 @@ void GptSession::generateMultiBatch(
         }
     }
 
+    offset = 0;
     // TODO(micro batching) move into loop above?
     for (auto microBatchId = 0; microBatchId < numMicroBatches; ++microBatchId)
     {
@@ -658,6 +662,11 @@ void GptSession::generateMultiBatch(
 
         // TODO(micro batching) use mCommStream?
         finalizeOutputIds(*outputIds, microBatchId);
+
+        auto& buffers = *mBuffers.at(microBatchId);
+        auto outputLengths = ITensor::slice(outputs.lengths, offset, microBatchSize);
+        manager.copy(*buffers.sequenceLengths, *outputLengths);
+        offset += microBatchSize;
     }
     manager.getStream().synchronize();
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);

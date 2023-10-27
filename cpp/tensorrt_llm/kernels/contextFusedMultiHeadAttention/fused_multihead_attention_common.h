@@ -123,7 +123,7 @@ struct Fused_multihead_attention_params_v2
     // Do we use trick to avoid I2F/F2I in the INT8 kernel.
     bool enable_i2f_trick;
 
-    // array of length b+1 holding prefix sum of actual sequence lenghts
+    // array of length b+1 holding prefix sum of actual sequence lengths
     int* cu_seqlens;
 
     // use C/32 Format.

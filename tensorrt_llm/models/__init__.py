@@ -15,9 +15,8 @@
 from .baichuan.model import BaichuanForCausalLM
 from .bert.model import BertForQuestionAnswering, BertModel
 from .bloom.model import BloomForCausalLM, BloomModel
-from .chatglm2_6b.model import ChatGLM2HeadModel, ChatGLM2Model
+from .chatglm2_6b.model import ChatGLM2_6BHeadModel, ChatGLM2_6BModel
 from .chatglm6b.model import ChatGLM6BHeadModel, ChatGLM6BModel
-from .enc_dec.model import DecoderModel, EncoderModel
 from .falcon.model import FalconForCausalLM, FalconModel
 from .gpt.model import GPTLMHeadModel, GPTModel
 from .gptj.model import GPTJForCausalLM, GPTJModel
@@ -51,9 +50,7 @@ __all__ = [
     'fp8_quantize',
     'ChatGLM6BHeadModel',
     'ChatGLM6BModel',
-    'ChatGLM2HeadModel',
-    'ChatGLM2Model',
+    'ChatGLM2_6BHeadModel',
+    'ChatGLM2_6BModel',
     'BaichuanForCausalLM',
-    'EncoderModel',
-    'DecoderModel',
 ]

@@ -54,7 +54,6 @@ public:
         , mEndId(endId)
         , mPadId(padId)
         , mBatchSlot(-1)
-        , mNumGeneratedTokens(0)
     {
         mMaxSentTokenPos = mPromptLen - 1;
         // Scatter the input tokens to other beam
@@ -67,6 +66,18 @@ public:
     SizeType getNumTokens(SizeType beam) const
     {
         return mTokens->at(beam).size();
+    }
+
+    /// @brief Get max number of tokens across all beams
+    /// @return  The number of tokens
+    SizeType getMaxBeamNumTokens() const
+    {
+        SizeType maxTokens = 0;
+        for (SizeType beam = 0; beam < mSamplingConfig.beamWidth; ++beam)
+        {
+            maxTokens = std::max(maxTokens, static_cast<SizeType>(mTokens->at(beam).size()));
+        }
+        return maxTokens;
     }
 
     /// @brief Get a token at a given position and beam index
@@ -86,11 +97,11 @@ public:
         return mTokens->at(beam);
     }
 
-    /// @brief Get the number of generated tokens
+    /// @brief Get the maximum number of generated tokens among all rays in beam
     /// @return  The number of generated tokens (doesn't include the prompt tokens)
-    SizeType getNumGeneratedTokens() const
+    SizeType getMaxNumGeneratedTokens() const
     {
-        return mNumGeneratedTokens;
+        return getMaxBeamNumTokens() - mPromptLen;
     }
 
     /// @brief Add new generated tokens to the vector of tokens
@@ -101,9 +112,9 @@ public:
         assert(mSamplingConfig.beamWidth == beamTokens.size());
         for (std::size_t beam = 0; beam < beamTokens.size(); ++beam)
         {
-            mTokens->at(beam).push_back(beamTokens[beam]);
+            const auto outputId = beamTokens[beam];
+            mTokens->at(beam).push_back(outputId);
         }
-        mNumGeneratedTokens++;
     }
 
     /// @brief Sets the generated tokens for all beams. Erases all previous generated tokens.
@@ -117,7 +128,6 @@ public:
             beamTokens.resize(mPromptLen);
             beamTokens.insert(beamTokens.end(), generatedBeamTokens[beam].begin(), generatedBeamTokens[beam].end());
         }
-        mNumGeneratedTokens = generatedBeamTokens.at(0).size();
     }
 
     /// @brief Pause a request by moving the generated tokens to the prompt
@@ -136,7 +146,7 @@ public:
         }
         else
         {
-            SizeType newPromptLen = std::min(maxInputLen, mPromptLen + mNumGeneratedTokens);
+            SizeType newPromptLen = std::min(maxInputLen, mPromptLen + getMaxNumGeneratedTokens());
             for (auto& beamTokens : *mTokens)
             {
                 beamTokens.resize(newPromptLen);
@@ -144,7 +154,6 @@ public:
             mMaxNewTokens -= (newPromptLen - mPromptLen);
             mPromptLen = newPromptLen;
         }
-        mNumGeneratedTokens = 0;
         mState = REQUEST_STATE_CONTEXT_INIT;
         mBatchSlot = -1;
     }
@@ -168,7 +177,7 @@ public:
     RequestIdType mRequestId;
     SizeType mPromptLen;
     SizeType mMaxNewTokens;
-    // Tokens [beam_size, mPromptLen + mNumGeneratedTokens]
+    // Tokens [beam_size, mPromptLen + getMaxNumGeneratedTokens()]
     runtime::SamplingConfig mSamplingConfig;
     LlmRequestState_t mState;
     bool mIsStreaming;
@@ -178,7 +187,6 @@ public:
 
 private:
     std::shared_ptr<BeamTokens> mTokens;
-    SizeType mNumGeneratedTokens;
     SizeType mMaxSentTokenPos;
 };
 

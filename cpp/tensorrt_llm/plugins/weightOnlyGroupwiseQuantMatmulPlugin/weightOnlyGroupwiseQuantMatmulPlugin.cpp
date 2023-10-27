@@ -41,7 +41,7 @@ std::vector<nvinfer1::PluginField> WeightOnlyGroupwiseQuantMatmulPluginCreator::
 void WeightOnlyGroupwiseQuantGemmPluginProfiler::runTactic(int m, int n, int k,
     const WeightOnlyGroupwiseQuantGemmPluginProfiler::Config& tactic, char* workspace, const cudaStream_t& stream)
 {
-    const int originalN = n * 8;
+    const int originalN = n * INT8_INT4_RATIO;
     half* actPtr = reinterpret_cast<half*>(workspace);
     cutlass::uint4b_t* weightPtr = reinterpret_cast<cutlass::uint4b_t*>(
         nextWorkspacePtr(reinterpret_cast<int8_t*>(actPtr), m * k * sizeof(half)));
@@ -73,7 +73,7 @@ void WeightOnlyGroupwiseQuantGemmPluginProfiler::runTactic(int m, int n, int k,
 
 void WeightOnlyGroupwiseQuantGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
 {
-    const int originalN = n * 8;
+    const int originalN = n * INT8_INT4_RATIO;
     std::vector<size_t> workspaces = {
         maxM * k * sizeof(half),                   // A
         k * n * sizeof(float),                     // B
@@ -183,7 +183,7 @@ nvinfer1::DimsExprs WeightOnlyGroupwiseQuantMatmulPlugin::getOutputDimensions(
     // inputs
     //   0 activations      [M, K]
     //   1 pre-quant scales [K] (optional)
-    //   2 weights          [K, N/8]
+    //   2 weights          [K, N/2]
     //   3 scales           [K // group_size, N]
     //   4 zeros            [K // group_size, N] (optional)
     //   5 biases           [M] (optional)
@@ -204,7 +204,7 @@ nvinfer1::DimsExprs WeightOnlyGroupwiseQuantMatmulPlugin::getOutputDimensions(
         }
 
         // int4 weight only quant
-        ret.d[nbDimsA - 1] = exprBuilder.constant(inputs[mWeightInputIdx].d[1]->getConstantValue() * 8);
+        ret.d[nbDimsA - 1] = exprBuilder.constant(inputs[mWeightInputIdx].d[1]->getConstantValue() * INT8_INT4_RATIO);
 
         return ret;
     }
@@ -223,7 +223,7 @@ bool WeightOnlyGroupwiseQuantMatmulPlugin::supportsFormatCombination(
         if (pos == mWeightInputIdx)
         {
             // weights
-            return inOut[mWeightInputIdx].type == nvinfer1::DataType::kFLOAT
+            return inOut[mWeightInputIdx].type == nvinfer1::DataType::kINT8
                 && inOut[mWeightInputIdx].format == TensorFormat::kLINEAR;
         }
         else
@@ -246,11 +246,11 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::configurePlugin(const nvinfer1::Dynam
     const auto maxM = std::accumulate(in[0].max.d, in[0].max.d + in[0].max.nbDims - 1, 1, std::multiplies<int>());
 
     const int maxK = in[0].max.d[in[0].max.nbDims - 1];
-    // int32 packed int4 elements
-    const int maxN = in[mWeightInputIdx].max.d[1] * 8;
+    // int8 packed int4 elements
+    const int maxN = in[mWeightInputIdx].max.d[1] * INT8_INT4_RATIO;
 
     const auto K = maxK;
-    const auto N = maxN / 8;
+    const auto N = maxN / INT8_INT4_RATIO;
 
     if (!mDims.isInitialized())
     {
@@ -259,7 +259,7 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::configurePlugin(const nvinfer1::Dynam
     mGemmId = {N, K, mType};
 
     size_t smoothedActSize = static_cast<size_t>(maxM) * static_cast<size_t>(maxK)
-        * (in[0].desc.type == nvinfer1::DataType::kFLOAT ? 4 : 2);
+        * (in[0].desc.type == nvinfer1::DataType::kFLOAT ? sizeof(float) : sizeof(half));
     m_workspaceMaxSize = smoothedActSize + m_weightOnlyGroupwiseGemmRunner->getWorkspaceSize(maxM, maxN, maxK);
 }
 
@@ -276,7 +276,7 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
     // inputs
     //   0 activations      [M, K]
     //   1 pre-quant scales [K]
-    //   2 weights          [K, N/8]
+    //   2 weights          [K, N/2]
     //   3 scales           [K // group_size, N]
     //   4 zeros            [K // group_size, N]
     //   5 biases           [M]
@@ -304,38 +304,32 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
     const half* biases_ptr = (mQuantAlgo & BIAS) ? reinterpret_cast<const half*>(inputs[mBiasesInputIdx]) : nullptr;
     const half* act_ptr = reinterpret_cast<const half*>((mQuantAlgo & PRE_QUANT_SCALE) ? workspace : inputs[0]);
 
-    if (mType == nvinfer1::DataType::kHALF)
+    TLLM_CHECK_WITH_INFO(mType == nvinfer1::DataType::kHALF, "No valid weightOnlyGropwiseQuantMatmul configuration");
+    if (m < SMALL_M_FAST_PATH && mCudaKernelEnabled)
     {
-        if (m < SMALL_M_FAST_PATH && mCudaKernelEnabled)
-        {
-            // Use CUDA kernels for small batch size
-            // The CUDA kernel is designed for ColumnMajorTileInterleave weight layout used in fpAIntB cutlass kernel
-            // when sm >= 75 and the preprocessing of cutlass on sm70 does not interleave the weights.
-            tensorrt_llm::kernels::WeightOnlyParams params{reinterpret_cast<const uint8_t*>(inputs[mWeightInputIdx]),
-                reinterpret_cast<const half*>(inputs[mScalesInputIdx]), zeros_ptr, act_ptr, biases_ptr,
-                reinterpret_cast<half*>(outputs[0]), m, n * 8, k, mGroupSize};
-            tensorrt_llm::kernels::weight_only_batched_gemv_launcher(tensorrt_llm::kernels::WeightOnlyQuantType::Int4b,
-                tensorrt_llm::kernels::WeightOnlyType::GroupWise,
-                tensorrt_llm::kernels::WeightOnlyActivationType::Identity, params, stream);
-        }
-        else
-        {
-            // Use cutlass kernels for large batch size
-            const int ws_bytes = m_weightOnlyGroupwiseGemmRunner->getWorkspaceSize(m, n, k);
-
-            int32_t* weight_ptr = const_cast<int32_t*>(reinterpret_cast<const int32_t*>(inputs[mWeightInputIdx]));
-
-            const auto& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
-            TLLM_CHECK_WITH_INFO(bestTactic, "No valid SQ GEMM tactic");
-            m_weightOnlyGroupwiseGemmRunner->gemm(act_ptr, reinterpret_cast<cutlass::uint4b_t*>(weight_ptr),
-                reinterpret_cast<const half*>(inputs[mScalesInputIdx]), zeros_ptr, biases_ptr,
-                reinterpret_cast<half*>(outputs[0]), m, n * 8, k, mGroupSize, *bestTactic,
-                reinterpret_cast<char*>(workspace) + m * k * sizeof(half), ws_bytes, stream);
-        }
+        // Use CUDA kernels for small batch size
+        // The CUDA kernel is designed for ColumnMajorTileInterleave weight layout used in fpAIntB cutlass kernel
+        // when sm >= 75 and the preprocessing of cutlass on sm70 does not interleave the weights.
+        tensorrt_llm::kernels::WeightOnlyParams params{reinterpret_cast<const uint8_t*>(inputs[mWeightInputIdx]),
+            reinterpret_cast<const half*>(inputs[mScalesInputIdx]), zeros_ptr, act_ptr, biases_ptr,
+            reinterpret_cast<half*>(outputs[0]), m, n * INT8_INT4_RATIO, k, mGroupSize};
+        tensorrt_llm::kernels::weight_only_batched_gemv_launcher(tensorrt_llm::kernels::WeightOnlyQuantType::Int4b,
+            tensorrt_llm::kernels::WeightOnlyType::GroupWise, tensorrt_llm::kernels::WeightOnlyActivationType::Identity,
+            params, stream);
     }
     else
     {
-        assert(false);
+        // Use cutlass kernels for large batch size
+        const int ws_bytes = m_weightOnlyGroupwiseGemmRunner->getWorkspaceSize(m, n, k);
+
+        int32_t* weight_ptr = const_cast<int32_t*>(reinterpret_cast<const int32_t*>(inputs[mWeightInputIdx]));
+
+        const auto& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
+        TLLM_CHECK_WITH_INFO(bestTactic, "No valid weight only groupwise GEMM tactic");
+        m_weightOnlyGroupwiseGemmRunner->gemm(act_ptr, reinterpret_cast<cutlass::uint4b_t*>(weight_ptr),
+            reinterpret_cast<const half*>(inputs[mScalesInputIdx]), zeros_ptr, biases_ptr,
+            reinterpret_cast<half*>(outputs[0]), m, n * INT8_INT4_RATIO, k, mGroupSize, *bestTactic,
+            reinterpret_cast<char*>(workspace) + m * k * sizeof(half), ws_bytes, stream);
     }
 
     return 0;

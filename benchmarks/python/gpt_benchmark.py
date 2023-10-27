@@ -86,7 +86,7 @@ class GPTBenchmark(BaseBenchmark):
             use_mha_plugin = mode == 'plugin' or mode == 'ootb-except-mha'
             mha_plg_dtype = dtype if use_mha_plugin else False
             use_non_mha_plugin = mode == 'plugin'
-            non_mha_plg_dtype = dtype if use_mha_plugin else False
+            non_mha_plg_dtype = dtype if use_non_mha_plugin else False
 
             self.use_gpt_attention_plugin = mha_plg_dtype
             self.use_gemm_plugin = non_mha_plg_dtype
@@ -163,6 +163,15 @@ class GPTBenchmark(BaseBenchmark):
                 top_k=top_k,
                 top_p=top_p)
             self.decoder = tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession(
+                model_config, engine_buffer, self.runtime_mapping)
+        elif model_name == 'chatglm2_6b':
+            self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
+                end_id=2,
+                pad_id=0,
+                num_beams=num_beams,
+                top_k=top_k,
+                top_p=top_p)
+            self.decoder = tensorrt_llm.runtime.GenerationSession(
                 model_config, engine_buffer, self.runtime_mapping)
         else:
             self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
@@ -327,6 +336,21 @@ class GPTBenchmark(BaseBenchmark):
                 apply_query_key_layer_scaling=builder_config.
                 apply_query_key_layer_scaling,
                 quant_mode=self.quant_mode)
+        elif family == "chatglm2":
+            tensorrt_llm_model = tensorrt_llm.models.ChatGLM2_6BHeadModel(
+                num_layers=self.num_layers,
+                num_heads=self.num_heads,
+                hidden_size=self.hidden_size,
+                vocab_size=self.vocab_size,
+                hidden_act=self.hidden_act,
+                max_position_embeddings=self.n_positions,
+                dtype=kv_dtype,
+                mapping=tensorrt_llm.Mapping(
+                    world_size=self.world_size,
+                    tp_size=self.world_size),  # TP only
+                apply_query_key_layer_scaling=builder_config.
+                apply_query_key_layer_scaling,
+                quant_mode=self.quant_mode)
         elif family == "bloom":
             tensorrt_llm_model = tensorrt_llm.models.BloomForCausalLM(
                 num_layers=self.num_layers,
@@ -410,7 +434,7 @@ class GPTBenchmark(BaseBenchmark):
             network.plugin_config.set_nccl_plugin(self.dtype,
                                                   self.enable_custom_all_reduce)
 
-        # Use the plugin for the embedding parallism and sharing
+        # Use the plugin for the embedding parallelism and sharing
         network.plugin_config.set_lookup_plugin(dtype=self.use_lookup_plugin)
 
         with net_guard(network):

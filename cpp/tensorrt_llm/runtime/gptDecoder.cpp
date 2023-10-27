@@ -302,7 +302,9 @@ void IGptDecoder::gatherTree(ITensor& finalOutputIds, DecodingOutput const& deco
         beamHypotheses.output_ids_src = bufferCast<TokenIdType>(*decodingOutput.ids);
         beamHypotheses.log_probs_src = nullptr;
         beamHypotheses.max_seq_len = maxSeqLength;
-        beamHypotheses.length_penalty = 1.0f;
+        beamHypotheses.length_penalties
+            = nullptr; // TODO (bhsueh) should set length penalties, this should be a gpu tensor When it is set as
+                       // nullptr, the kernel will use default value (1.0f) automatically.
 
         beamHypotheses.output_ids_tgt = bufferCast<TokenIdType>(*decodingOutput.beamHypotheses.outputIdsTgt);
         beamHypotheses.sequence_lengths_tgt = bufferCast<SizeType>(*decodingOutput.beamHypotheses.sequenceLengthsTgt);
@@ -331,4 +333,5 @@ void IGptDecoder::gatherTree(ITensor& finalOutputIds, DecodingOutput const& deco
         manager.copy(*decodingOutput.ids, finalOutputIds);
         sync_check_cuda_error();
     }
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }

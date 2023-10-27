@@ -129,7 +129,7 @@ struct DefaultIteratorsTensorOp<cutlass::bfloat16_t, int32_t, 8, ThreadblockShap
 ///
 /// Satisfies: ReadableTileIterator
 ///
-template <typename ThreadMap_ ///< Thread map (conept: OutputTileThreadMap)
+template <typename ThreadMap_ ///< Thread map (concept: OutputTileThreadMap)
     >
 class SharedLoadIteratorMixed<ThreadMap_, int32_t, 32, 16, 8, 8>
 {

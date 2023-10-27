@@ -4,5 +4,5 @@ models/llama-7b-hf
 models/c-model
 models/rt_engine
 /models/v2
-output_*.npy
+data/*/**/*.npy
 data/*.json

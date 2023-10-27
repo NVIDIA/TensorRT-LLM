@@ -58,7 +58,7 @@ __global__ void setup_topk_runtime_args(int batch_size, uint32_t top_k, uint32_t
             // compatibility.
             p = 1.0f;
         }
-        // Clip k value. A topk sampling kernel supports up to TOP_K_MAX=64.
+        // Clip k value. A topk sampling kernel supports up to TOP_K_MAX=1024.
         top_ks[i] = k > TOP_K_MAX ? TOP_K_MAX : k;
         if (k > TOP_K_MAX)
         {
@@ -182,7 +182,7 @@ void TopKSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingPa
     if (cum_log_probs != nullptr || output_log_probs != nullptr)
     {
         invokeAddBiasSoftMax(
-            logits, (T*) (nullptr), end_ids, finished, local_batch_size, vocab_size_padded_, vocab_size_, stream_);
+            logits, (T*) (nullptr), end_ids, finished, local_batch_size, vocab_size_, vocab_size_padded_, stream_);
         sync_check_cuda_error();
     }
 

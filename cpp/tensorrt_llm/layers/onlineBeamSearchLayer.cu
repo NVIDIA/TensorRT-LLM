@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/beamSearchTopkKernels.h"
 #include "tensorrt_llm/layers/onlineBeamSearchLayer.h"
 
@@ -48,7 +49,10 @@ __global__ void update_kernel(bool* finished, int** parent_ids_ptr, int* sequenc
 
         // Increase the seq_len even if the request has finished.
         // On the following iteration we check if the sequence has finished before
-        s_sequence_lengths[beam_idx]++;
+        if (!finished[beam_idx])
+        {
+            s_sequence_lengths[beam_idx]++;
+        }
 
         int new_word_id{output_ids_ptr[blockIdx.x][beam_idx * max_seq_len + current_step]};
         int new_beam_id{(new_word_id / vocab_size) % beam_width};
@@ -83,13 +87,38 @@ void invokeUpdate(bool* finished, int** parent_ids_ptr, int* sequence_lengths, i
 }
 
 template <typename T>
-void OnlineBeamSearchLayer<T>::setup(SetupParams const& setupParams)
+void OnlineBeamSearchLayer<T>::setup(size_t batch_size, SetupParams const& setupParams)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    BaseBeamSearchLayer<T>::setupBase(setupParams);
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    BaseBeamSearchLayer<T>::setupBase(batch_size, setupParams);
+    allocateBuffer(batch_size);
 
-    mDiversityRate = setupParams.beam_search_diversity_rate.value_or(0.0f);
-    mLengthPenalty = setupParams.length_penalty.value_or(0.0f);
+    mDiversityRate = setupParams.beam_search_diversity_rate.value_or(std::vector<float>(0.0f));
+    mLengthPenalty = setupParams.length_penalty.value_or(std::vector<float>(0.0f));
+
+    auto fillBuffers
+        = [this, &batch_size](auto const& optParam, auto const defaultValue, auto& hostBuffer, auto& deviceBuffer)
+    {
+        hostBuffer.resize(batch_size);
+        if (!optParam)
+        {
+            std::fill(std::begin(hostBuffer), std::end(hostBuffer), defaultValue);
+        }
+        else if (optParam->size() == 1)
+        {
+            std::fill(std::begin(hostBuffer), std::end(hostBuffer), optParam->front());
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(optParam->size() == batch_size, "Argument vector size mismatch.");
+            std::copy(optParam->begin(), optParam->end(), std::begin(hostBuffer));
+        }
+        cudaAutoCpy(deviceBuffer, hostBuffer.data(), batch_size, stream_);
+    };
+
+    fillBuffers(setupParams.beam_search_diversity_rate, 0.0f, mDiversityRate, diversity_rates_buf_);
+    fillBuffers(setupParams.length_penalty, 0.0f, mLengthPenalty, length_penalties_buf_);
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
@@ -120,7 +149,7 @@ void OnlineBeamSearchLayer<T>::invokeSoftMax(BeamSearchOutputParams& outputs, So
         beamHypotheses.parent_ids_src_ptr = outputs.parent_ids_ptr.template getPtr<const int*>();
         beamHypotheses.sequence_lengths_src = sequence_lengths;
         beamHypotheses.log_probs_src = output_log_probs;
-        beamHypotheses.length_penalty = mLengthPenalty;
+        beamHypotheses.length_penalties = length_penalties_buf_;
         beamHypotheses.end_ids = end_ids;
     }
 
@@ -128,7 +157,7 @@ void OnlineBeamSearchLayer<T>::invokeSoftMax(BeamSearchOutputParams& outputs, So
     invokeTopkSoftMax(logits.template getPtr<T>(), (const T*) (nullptr), finished, sequence_lengths,
         outputs.cum_log_probs->template getPtr<float>(), output_log_probs, output_ids_ptr.getPtr<int*>(),
         topk_softmax_workspace_, topk_softmax_workspace_size_, &beamHypotheses, local_batch_size, beam_width,
-        vocab_size_padded_, end_ids, mDiversityRate, mLengthPenalty, stream_);
+        vocab_size_padded_, end_ids, diversity_rates_buf_, length_penalties_buf_, stream_);
     sync_check_cuda_error();
 
     invokeUpdate(finished, outputs.parent_ids_ptr.template getPtr<int*>(), sequence_lengths,
@@ -138,9 +167,9 @@ void OnlineBeamSearchLayer<T>::invokeSoftMax(BeamSearchOutputParams& outputs, So
 }
 
 template <typename T>
-void OnlineBeamSearchLayer<T>::allocateBuffer(size_t batch_size, size_t beam_width)
+void OnlineBeamSearchLayer<T>::allocateBuffer(size_t batch_size)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     // we need to check 2 * beam_width candidates each time
     // 64 is the max beam width we support now.
     topk_softmax_workspace_size_ = (size_t) (ceil(batch_size * 64 * (64 * 2) / 4.) * 4 * 2
@@ -148,7 +177,25 @@ void OnlineBeamSearchLayer<T>::allocateBuffer(size_t batch_size, size_t beam_wid
 
     topk_softmax_workspace_ = reinterpret_cast<float*>(
         allocator_->reMalloc(topk_softmax_workspace_, sizeof(float) * topk_softmax_workspace_size_, true));
+    diversity_rates_buf_ = allocator_->reMalloc(diversity_rates_buf_, sizeof(float) * batch_size, false);
+    length_penalties_buf_ = allocator_->reMalloc(length_penalties_buf_, sizeof(float) * batch_size, false);
+
     is_allocate_buffer_ = true;
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+}
+
+template <typename T>
+void OnlineBeamSearchLayer<T>::freeBuffer()
+{
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    if (is_allocate_buffer_)
+    {
+        allocator_->free((void**) (&topk_softmax_workspace_));
+        allocator_->free((void**) (&diversity_rates_buf_));
+        allocator_->free((void**) (&length_penalties_buf_));
+        is_allocate_buffer_ = false;
+    }
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>

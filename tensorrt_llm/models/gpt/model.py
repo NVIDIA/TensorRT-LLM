@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
+
 import tensorrt as trt
 
 from ..._common import default_net
@@ -55,7 +57,8 @@ class GPTEmbedding(Module):
                  tensor_parallel=1,
                  tensor_parallel_group=None,
                  sharding_dim=0,
-                 tp_rank=None):
+                 tp_rank=None,
+                 instance_id: int = 0):
         super().__init__()
         self.max_position_embeddings = max_position_embeddings
         self.position_embedding_type = position_embedding_type
@@ -68,7 +71,8 @@ class GPTEmbedding(Module):
                                             tp_size=tensor_parallel,
                                             tp_group=tensor_parallel_group,
                                             sharding_dim=sharding_dim,
-                                            tp_rank=tp_rank)
+                                            tp_rank=tp_rank,
+                                            instance_id=instance_id)
 
         if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
             self.position_embedding = Embedding(max_position_embeddings,
@@ -80,11 +84,12 @@ class GPTEmbedding(Module):
                 position_ids,
                 prompt_embedding_table=None,
                 prompt_tasks=None,
-                prompt_vocab_size=None):
+                prompt_vocab_size=None,
+                workspace: Optional[Tensor] = None):
         args = []
         if self.use_prompt_tuning:
             args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size]
-        x = self.vocab_embedding(input_ids, *args)
+        x = self.vocab_embedding(input_ids, *args, workspace=workspace)
         if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
             x = x + self.position_embedding(position_ids)
 
@@ -234,7 +239,9 @@ class GPTModel(Module):
             tensor_parallel_group=mapping.tp_group
             if use_parallel_embedding else None,
             sharding_dim=embedding_sharding_dim,
-            tp_rank=mapping.tp_rank)
+            tp_rank=mapping.tp_rank,
+            instance_id=2 * num_layers,
+        )
 
         self.layers = ModuleList([
             GPTDecoderLayer(
@@ -273,9 +280,12 @@ class GPTModel(Module):
                 prompt_vocab_size=None,
                 workspace=None):
 
-        hidden_states = self.embedding(input_ids, position_ids,
-                                       prompt_embedding_table, prompt_tasks,
-                                       prompt_vocab_size)
+        hidden_states = self.embedding(input_ids,
+                                       position_ids,
+                                       prompt_embedding_table,
+                                       prompt_tasks,
+                                       prompt_vocab_size,
+                                       workspace=workspace)
 
         if kv_cache_params.past_key_value is None:
             kv_cache_params.past_key_value = tuple([None] * len(self.layers))

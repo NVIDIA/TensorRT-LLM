@@ -5,6 +5,7 @@ import argparse
 import configparser
 import dataclasses
 import os
+import platform
 from pathlib import Path
 
 import torch
@@ -328,7 +329,7 @@ def hf_bloom_converter(args: ProgArgs):
                 saved_dir / f"{trt_llm_name}.bin")
         else:
             # Needed by QKV projection weight split. With multi_query_mode one does not simply take
-            # out_dim and divide it by 3 to get local_dim becuase out_dim = local_dim + 2 * head_size
+            # out_dim and divide it by 3 to get local_dim because out_dim = local_dim + 2 * head_size
             local_dim = model.transformer.h[
                 0].attn.embed_dim if multi_query_mode else None
             starmap_args.append(
@@ -350,6 +351,12 @@ def hf_bloom_converter(args: ProgArgs):
 
 
 def run_conversion(args: ProgArgs):
+    if args.processes > 1 and platform.system() == "Windows":
+        print(
+            "Resetting processes to 1 because multi-process on Windows is not implemented."
+        )
+        args = dataclasses.replace(args, processes=1)
+
     print("\n=============== Arguments ===============")
     for key, value in vars(args).items():
         print(f"{key}: {value}")
