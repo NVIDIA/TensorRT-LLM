@@ -26,11 +26,9 @@ from convert import split_and_save_weight, str_to_np_dtype
 from smoothquant import (capture_activation_range, smooth_gemm,
                          smooth_gemm_fc1_gate)
 from tqdm import tqdm
-from transformers import LlamaForCausalLM, LlamaTokenizer
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-
-def merge_qkv_scales(q_name, hf_model, scales, llama_qkv_para):
+def merge_qkv_scales(q_name, hf_model, scales, internlm_qkv_para):
     layer_name_q = q_name.replace(".weight", "")
     layer_name_k = layer_name_q.replace("q_proj", "k_proj")
     layer_name_v = layer_name_q.replace("q_proj", "v_proj")
@@ -51,14 +49,14 @@ def merge_qkv_scales(q_name, hf_model, scales, llama_qkv_para):
     ],
                                             dim=0)
 
-    llama_qkv_para[layer_name_qkv] = weight.transpose(0, 1)
+    internlm_qkv_para[layer_name_qkv] = weight.transpose(0, 1)
 
 
 @torch.no_grad()
-def smooth_llama_model(model, scales, alpha, llama_qkv_para, llama_smoother):
+def smooth_internlm_model(model, scales, alpha, internlm_qkv_para, internlm_smoother):
     # Smooth the activation and weights with smoother = $\diag{s}$
     for name, module in model.named_modules():
-        if not isinstance(module, LlamaDecoderLayer):
+        if not module.__class__.__name__ == "InternLMDecoderLayer":
             continue
         # qkv_proj
         layer_name_q = name + ".self_attn.q_proj"
@@ -84,13 +82,13 @@ def smooth_llama_model(model, scales, alpha, llama_qkv_para, llama_smoother):
                                                 dim=0)
 
         # see transpose_weights function
-        llama_qkv_para[layer_name_qkv] = weight.transpose(0, 1)
+        internlm_qkv_para[layer_name_qkv] = weight.transpose(0, 1)
 
         # =================================================================
         layer_name = name + ".self_attn.o_proj"
         smoother = smooth_gemm(module.self_attn.o_proj.weight,
                                scales[layer_name]["x"], None, None, alpha)
-        llama_smoother[layer_name] = smoother.float()
+        internlm_smoother[layer_name] = smoother.float()
 
         scales[layer_name]["x"] = scales[layer_name]["x"] / smoother
         scales[layer_name]["w"] = module.self_attn.o_proj.weight.abs().max(
@@ -118,7 +116,7 @@ def smooth_llama_model(model, scales, alpha, llama_qkv_para, llama_smoother):
         layer_name = name + ".mlp.down_proj"
         smoother = smooth_gemm(module.mlp.down_proj.weight,
                                scales[layer_name]["x"], None, None, alpha)
-        llama_smoother[layer_name] = smoother.float()
+        internlm_smoother[layer_name] = smoother.float()
         scales[layer_name]["x"] = scales[layer_name]["x"] / smoother
         scales[layer_name]["w"] = module.mlp.down_proj.weight.abs().max(
             dim=1)[0]
@@ -171,31 +169,31 @@ def hf_gpt_converter(args):
     saved_dir = Path(args.out_dir) / f"{infer_tp}-gpu"
     saved_dir.mkdir(parents=True, exist_ok=True)
 
-    model = LlamaForCausalLM.from_pretrained(args.in_file, device_map="auto")
+    model = AutoModelForCausalLM.from_pretrained(args.in_file, device_map="auto", trust_remote_code=True)
 
     act_range = {}
-    llama_qkv_para = {}
+    internlm_qkv_para = {}
     # smoother for inputs of self_attn.o_proj and mlp.down_proj
-    llama_smoother = {}
+    internlm_smoother = {}
 
     if args.smoothquant is not None or args.calibrate_kv_cache:
         os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
             "TOKENIZERS_PARALLELISM", "false")
         act_range = capture_activation_range(
             model,
-            LlamaTokenizer.from_pretrained(args.in_file, padding_side='left'))
+            AutoTokenizer.from_pretrained(args.in_file, padding_side='left', trust_remote_code=True))
         if args.smoothquant is not None:
-            smooth_llama_model(model, act_range, args.smoothquant,
-                               llama_qkv_para, llama_smoother)
+            smooth_internlm_model(model, act_range, args.smoothquant,
+                               internlm_qkv_para, internlm_smoother)
 
     config = configparser.ConfigParser()
-    config["llama"] = {}
+    config["internlm"] = {}
     for key in vars(args):
-        config["llama"][key] = f"{vars(args)[key]}"
+        config["internlm"][key] = f"{vars(args)[key]}"
     for k, v in vars(model.config).items():
-        config["llama"][k] = f"{v}"
-    config["llama"]["weight_data_type"] = args.storage_type
-    config["llama"]["multi_query_mode"] = str(args.multi_query_mode)
+        config["internlm"][k] = f"{v}"
+    config["internlm"]["weight_data_type"] = args.storage_type
+    config["internlm"]["multi_query_mode"] = str(args.multi_query_mode)
     with open(saved_dir / "config.ini", 'w') as configfile:
         config.write(configfile)
 
@@ -217,8 +215,8 @@ def hf_gpt_converter(args):
             continue
         ft_name = gpt_to_ft_name(name)
 
-        if name.replace(".weight", "") in llama_smoother.keys():
-            smoother = llama_smoother[name.replace(".weight", "")]
+        if name.replace(".weight", "") in internlm_smoother.keys():
+            smoother = internlm_smoother[name.replace(".weight", "")]
             smoother = smoother.detach().cpu().numpy()
             starmap_args.append(
                 (0, saved_dir, infer_tp,
@@ -235,12 +233,12 @@ def hf_gpt_converter(args):
         if ft_name in global_ft_weights:
             param.tofile(saved_dir / f"{ft_name}.bin")
         elif ft_name.split('.')[-2] == 'query_key_value':
-            # Is there other ways to get local_dim? local_dim = hidden_size in llama2
+            # Is there other ways to get local_dim? local_dim = hidden_size in internlm2
             local_dim = model.config.hidden_size if args.multi_query_mode else None
             if args.smoothquant is None:
-                merge_qkv_scales(name, model, act_range, llama_qkv_para)
+                merge_qkv_scales(name, model, act_range, internlm_qkv_para)
             qkv = (0, saved_dir, infer_tp, ft_name,
-                   llama_qkv_para.get(
+                   internlm_qkv_para.get(
                        name.replace(".weight", "").replace(
                            ".q_proj",
                            ".qkv_proj")).cpu().numpy().astype(storage_type),
