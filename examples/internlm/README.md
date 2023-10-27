@@ -109,9 +109,9 @@ Example:
 
 ```bash
 # For 7B models
-python hf_internlm_convert.py -i ./internlm-chat-7b -o ./internlm-chat-7b/smooth_internlm_7b/int8_kv_cache/ --calibrate-kv-cache -t fp16
+python hf_internlm_convert.py -i ./internlm-chat-7b -o ./internlm-chat-7b/smooth_internlm/int8_kv_cache/ --calibrate-kv-cache -t fp16
 # For 20B models
-python hf_internlm_convert.py -i ./internlm-chat-20b -o ./internlm-chat-20b/smooth_internlm_20b/int8_kv_cache/ --calibrate-kv-cache -t fp16
+python hf_internlm_convert.py -i ./internlm-chat-20b -o ./internlm-chat-20b/smooth_internlm/int8_kv_cache/ --calibrate-kv-cache -t fp16
 ```
 
 [`build.py`](./build.py) add new options for the support of INT8 KV cache.
@@ -124,7 +124,7 @@ Examples of INT8 weight-only quantization + INT8 KV cache
 
 ```bash
 # Build 7B model with both INT8 weight-only and INT8 KV cache enabled
-python build.py --ft_model_dir=./internlm-chat-7b/smooth_internlm_7b/int8_kv_cache/1-gpu/ \
+python build.py --ft_model_dir=./internlm-chat-7b/smooth_internlm/int8_kv_cache/1-gpu/ \
                 --dtype float16 \
                 --use_gpt_attention_plugin float16 \
                 --use_gemm_plugin float16 \
@@ -133,7 +133,7 @@ python build.py --ft_model_dir=./internlm-chat-7b/smooth_internlm_7b/int8_kv_cac
                 --use_weight_only
 
 # Build 20B model with both INT8 weight-only and INT8 KV cache enabled
-python build.py --ft_model_dir=./internlm-chat-20b/smooth_internlm_20b/int8_kv_cache/1-gpu/ \
+python build.py --ft_model_dir=./internlm-chat-20b/smooth_internlm/int8_kv_cache/1-gpu/ \
                 --dtype float16 \
                 --use_gpt_attention_plugin float16 \
                 --use_gemm_plugin float16 \
@@ -169,13 +169,15 @@ python summarize.py --test_trt_llm --test_hf \
 TODO: The result of 7B is not good, probably some error lies at qkv bias part.
 
 #### SmoothQuant
-TODO
-<!--
-The smoothquant supports both InternLM v1 and InternLM v2. Unlike the FP16 build where the HF weights are processed and loaded into the TensorRT-LLM directly, the SmoothQuant needs to load INT8 weights which should be pre-processed before building an engine.
+
+Unlike the FP16 build where the HF weights are processed and loaded into the TensorRT-LLM directly, the SmoothQuant needs to load INT8 weights which should be pre-processed before building an engine.
 
 Example:
 ```bash
-python3 hf_internlm_convert.py -i /internlm-models/internlm-7b-hf -o /internlm/smooth_internlm_7B/sq0.8/ -sq 0.8 --tensor-parallelism 1 --storage-type fp16
+# For 7B models
+python hf_internlm_convert.py -i ./internlm-chat-7b -o ./internlm-chat-7b/smooth_internlm/sq0.8/ -sq 0.8 --tensor-parallelism 1 --storage-type fp16
+# For 20B models
+python hf_internlm_convert.py -i ./internlm-chat-20b -o ./internlm-chat-20b/smooth_internlm/sq0.8/ -sq 0.8 --tensor-parallelism 1 --storage-type fp16
 ```
 
 [`build.py`](./build.py) add new options for the support of INT8 inference of SmoothQuant models.
@@ -189,19 +191,60 @@ Examples of build invocations:
 
 ```bash
 # Build model for SmoothQuant in the _per_tensor_ mode.
-python3 build.py --ft_model_dir=/internlm/smooth_internlm_7B/sq0.8/1-gpu/ \
-                 --use_smooth_quant
+# 7B model
+python build.py --ft_model_dir=./internlm-chat-7b/smooth_internlm/sq0.8/1-gpu/ \
+                --use_smooth_quant \
+                --output_dir ./internlm-chat-7b/trt_engines/smoothquant_0.8/1-gpu
+
+# 20B model
+python build.py --ft_model_dir=./internlm-chat-20b/smooth_internlm/sq0.8/1-gpu/ \
+                --use_smooth_quant
+                --output_dir ./internlm-chat-20b/trt_engines/smoothquant_0.8/1-gpu
 
 # Build model for SmoothQuant in the _per_token_ + _per_channel_ mode
-python3 build.py --ft_model_dir=/internlm/smooth_internlm_7B/sq0.8/1-gpu/ \
-                 --use_smooth_quant \
-                 --per_token \
-                 --per_channel
+# 7B model
+python build.py --ft_model_dir=./internlm-chat-7b/smooth_internlm/sq0.8/1-gpu/ \
+                --use_smooth_quant \
+                --per_token \
+                --per_channel \
+                --output_dir ./internlm-chat-7b/trt_engines/smoothquant/1-gpu
+
+# 20B model
+python build.py --ft_model_dir=./internlm-chat-20b/smooth_internlm/sq0.8/1-gpu/ \
+                --use_smooth_quant \
+                --per_token \
+                --per_channel \
+                --output_dir ./internlm-chat-20b/trt_engines/smoothquant/1-gpu
 ```
 
 Note we use `--ft_model_dir` instead of `--model_dir` and `--meta_ckpt_dir` since SmoothQuant model needs INT8 weights and various scales from the binary files.
 
--->
+Test with `run.py` or `summarize.py`:
+
+```bash
+python run.py --max_output_len=120 \
+              --input_text 'Tell me about yourself.' \
+              --tokenizer_dir ./internlm-chat-7b/ \
+              --engine_dir ./internlm-chat-7b/trt_engines/smoothquant/1-gpu
+
+python run.py --max_output_len=120 \
+              --input_text 'Tell me about yourself.' \
+              --tokenizer_dir ./internlm-chat-20b/ \
+              --engine_dir ./internlm-chat-20b/trt_engines/smoothquant/1-gpu
+
+# python summarize.py --test_trt_llm --test_hf \
+#                     --hf_model_location ./internlm-chat-7b \
+#                     --data_type fp16 \
+#                     --engine_dir ./internlm-chat-7b/trt_engines/smoothquant/1-gpu
+
+python summarize.py --test_trt_llm --test_hf \
+                    --hf_model_location ./internlm-chat-20b \
+                    --data_type fp16 \
+                    --engine_dir ./internlm-chat-20b/trt_engines/smoothquant/1-gpu
+```
+
+TODO: The result of 7B is not good, probably some error lies at qkv bias part.
+
 #### FP8 Post-Training Quantization
 TODO
 <!--
