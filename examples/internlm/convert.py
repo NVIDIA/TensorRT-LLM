@@ -305,6 +305,15 @@ def split_and_save_weight(i, saved_dir, factor, key, val, act_range, config):
                        factor,
                        is_qkv=True,
                        multi_query_mode=multi_query_mode)
+
+    elif "attention.query_key_value.bias" in key:
+        if local_dim is None:
+            local_dim = val.shape[-1] // 3
+
+        val = val.reshape(3, local_dim)
+        split_vals = np.split(val, factor, axis=-1)
+        save_split(split_vals, saved_dir, key, i, factor)
+
     elif "attention.dense.smoother" in key or "mlp.proj.smoother" in key:
         split_vals = np.split(val, factor, axis=0)
         save_split(split_vals, saved_dir, key, i, factor)

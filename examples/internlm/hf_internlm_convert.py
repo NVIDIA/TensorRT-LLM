@@ -28,6 +28,7 @@ from smoothquant import (capture_activation_range, smooth_gemm,
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+
 def merge_qkv_scales(q_name, hf_model, scales, internlm_qkv_para):
     layer_name_q = q_name.replace(".weight", "")
     layer_name_k = layer_name_q.replace("q_proj", "k_proj")
@@ -50,6 +51,21 @@ def merge_qkv_scales(q_name, hf_model, scales, internlm_qkv_para):
                                             dim=0)
 
     internlm_qkv_para[layer_name_qkv] = weight.transpose(0, 1)
+
+
+def merge_qkv_bias(q_name, hf_model, internlm_qkv_para={}):
+    layer_name_q = q_name.replace(".bias", "")
+    layer_name_k = layer_name_q.replace("q_proj", "k_proj")
+    layer_name_v = layer_name_q.replace("q_proj", "v_proj")
+    # layer_name_qkv = layer_name_q.replace("q_proj", "qkv_proj")
+
+    q = hf_model.state_dict()[layer_name_q + ".bias"]
+    k = hf_model.state_dict()[layer_name_k + ".bias"]
+    v = hf_model.state_dict()[layer_name_v + ".bias"]
+
+    bias = torch.cat([q, k, v], dim=0)
+
+    return bias
 
 
 @torch.no_grad()
@@ -141,10 +157,15 @@ def gpt_to_ft_name(orig_name):
         return f"layers.{layer_id}.attention.query_key_value.weight"
     elif weight_name == 'self_attn.k_proj.weight' or weight_name == 'self_attn.v_proj.weight':
         return f"layers.{layer_id}.attention.kv.weight"
+    if weight_name == 'self_attn.q_proj.bias':
+        return f"layers.{layer_id}.attention.query_key_value.bias"
+    elif weight_name == 'self_attn.k_proj.bias' or weight_name == 'self_attn.v_proj.bias':
+        return f"layers.{layer_id}.attention.kv.bias"
 
     per_layer_weights = {
         "input_layernorm.weight": "input_layernorm.weight",
         "self_attn.o_proj.weight": "attention.dense.weight",
+        "self_attn.o_proj.bias": "attention.dense.bias",
         "mlp.gate_proj.weight": "mlp.fc.weight",
         "mlp.down_proj.weight": "mlp.proj.weight",
         "mlp.up_proj.weight": "mlp.gate.weight",
@@ -232,8 +253,17 @@ def hf_gpt_converter(args):
 
         if ft_name in global_ft_weights:
             param.tofile(saved_dir / f"{ft_name}.bin")
-        elif ft_name.split('.')[-2] == 'query_key_value':
-            # Is there other ways to get local_dim? local_dim = hidden_size in internlm2
+        elif ft_name.split('.')[-2:] == ['query_key_value', 'bias']:
+            param = merge_qkv_bias(name, model)
+            param = param.cpu().numpy().astype(storage_type)
+            bias = (0, saved_dir, infer_tp, ft_name, param,
+                   act_range.get(name.replace(".weight", "").replace(".q_proj", ".qkv_proj")),
+                    {"int8_outputs": int8_outputs,
+                    "multi_query_mode": args.multi_query_mode,
+                    "local_dim": None})
+            starmap_args.append(bias)
+        elif ft_name.split('.')[-2:] == ['query_key_value', 'weight']:
+            # Is there other ways to get local_dim? local_dim = hidden_size in internlm
             local_dim = model.config.hidden_size if args.multi_query_mode else None
             if args.smoothquant is None:
                 merge_qkv_scales(name, model, act_range, internlm_qkv_para)
