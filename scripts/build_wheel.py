@@ -150,7 +150,7 @@ def main(build_type: str = "Release",
                 f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" {cmake_cuda_architectures}'
                 f' {cmake_def_args} -S "{source_dir}"')
         build_run(
-            f'cmake --build . --config {build_type} --parallel {job_count} --target tensorrt_llm tensorrt_llm_static nvinfer_plugin_tensorrt_llm {th_common_lib} '
+            f'cmake --build . --config {build_type} --parallel {job_count} --target tensorrt_llm tensorrt_llm_static pygptmanager nvinfer_plugin_tensorrt_llm {th_common_lib} '
             f'{" ".join(extra_make_targets)}')
 
     if cpp_only:
