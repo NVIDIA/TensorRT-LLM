@@ -432,6 +432,7 @@ class Tensor(object):
         '''
         Returns the rank (i.e. the number of dimensions) of the tensor.
         '''
+        print(f'Tensor shape: {self.trt_tensor.shape}')
         return len(self.trt_tensor.shape)
 
     def ndim(self):
@@ -661,21 +662,6 @@ relu = partial(activation, act_type=trt.ActivationType.RELU)
 tanh = partial(activation, act_type=trt.ActivationType.TANH)
 sigmoid = partial(activation, act_type=trt.ActivationType.SIGMOID)
 
-def elu(input: Tensor, alpha: float = 1.0) -> Tensor:
-    '''
-    Add a ELU operation.
-
-    Parameters:
-        input : Tensor
-            The input tensor on which the activation function is applied.
-        
-        alpha : float
-            The value for ELU formulation. Default value is set to 1.0.
-    
-    Returns:
-        The tensor produced by teh activation layer.
-    '''
-    return where(input > 0, input, alpha * (exp(input) - 1))
 
 def silu(input: Tensor) -> Tensor:
     '''
@@ -2341,6 +2327,17 @@ def geglu(x: Tensor) -> Tensor:
     return a * gelu(b)
 
 
+def tanhshrink(x: Tensor) -> Tensor:
+    '''
+    Add a Tanshrink operation.
+
+    Returns:
+        The tensor produced by the activation layer.
+    '''
+
+    return x - tanh(x) # activation(input=x, act_type=trt.ActivationType.TANH)
+
+
 def group_norm(input: Tensor,
                num_groups: int,
                weight: Optional[Tensor] = None,
@@ -3776,7 +3773,6 @@ def gather_last_token_logits(hidden_states: Tensor, last_token_ids: Tensor,
 ACT2FN = {
     'relu': relu,
     'tanh': tanh,
-    'elu': elu,
     'gelu': gelu,
     'gelu_new': gelu,
     'gelu_fast': gelu,
@@ -3786,6 +3782,7 @@ ACT2FN = {
     'squared-relu': squared_relu,
     'swiglu': swiglu,
     'fast-swiglu': swiglu,
+    'tanhshrink': tanhshrink,
 }
 
 GATED_ACT_2_ACT = {
