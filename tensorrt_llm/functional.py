@@ -1745,7 +1745,7 @@ def softmax(input: Tensor, dim: Optional[int] = None) -> Tensor:
     return _create_tensor(layer.get_output(0), layer)
 
 
-def softmin(input: Tensor, dim: Optional[int] = None) -> Tensor: 
+def softmin(x: Tensor, dim: Optional[int] = None) -> Tensor: 
     '''
     Add an operation to compute softmin on a tensor.
 
@@ -1764,7 +1764,12 @@ def softmin(input: Tensor, dim: Optional[int] = None) -> Tensor:
     Returns:
         The output tensor of the softmin layer.
     '''
-    return softmax(input=-input)
+    if dim is None:
+        dim = x.ndim() - 1
+    if dim < 0:
+        dim = x.ndim() + dim
+
+    return softmax(input=neg(x), dim=dim)
 
 
 def logsoftmax(x: Tensor, dim: Optional[int] = None) -> Tensor:
@@ -2167,6 +2172,7 @@ def unary(input: Tensor, op: trt.UnaryOperation) -> Tensor:
         cos     for op=trt.UnaryOperation.COS
         abs     for op=trt.UnaryOperation.ABS
         log     for op=trt.UnaryOperation.LOG
+        neg     for op=trt.UnaryOperation.NEG
 
     It is implemented using the IUnaryLayer from TensorRT.
 
@@ -2191,6 +2197,7 @@ sin = partial(unary, op=trt.UnaryOperation.SIN)
 cos = partial(unary, op=trt.UnaryOperation.COS)
 abs = partial(unary, op=trt.UnaryOperation.ABS)
 log = partial(unary, op=trt.UnaryOperation.LOG)
+neg = partial(unary, op=trt.UnaryOperation.NEG)
 
 
 def mean(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
