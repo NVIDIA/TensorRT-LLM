@@ -1745,6 +1745,28 @@ def softmax(input: Tensor, dim: Optional[int] = None) -> Tensor:
     return _create_tensor(layer.get_output(0), layer)
 
 
+def softmin(input: Tensor, dim: Optional[int] = None) -> Tensor: 
+    '''
+    Add an operation to compute softmin on a tensor.
+
+    That operation computes the softmin on the input tensor in the dimension
+    'dim' if specified. Otherwise, it is applied on the last dimension.
+
+    It inserts a ISoftmaxLayer to the TensorRT graph.
+
+    Parameters:
+        input : Tensor
+            The input tensor on which to apply softmin.
+
+        dim : Optional[int]
+            The dimension used to apply softmin.
+
+    Returns:
+        The output tensor of the softmin layer.
+    '''
+    return softmax(input=-input)
+
+
 def logsoftmax(x: Tensor, dim: Optional[int] = None) -> Tensor:
     '''
     Add an operation to compute logsoftmax on a tensor.
@@ -3811,6 +3833,7 @@ ACT2FN = {
     'geglu': geglu,
     'logsoftmax': logsoftmax,
     'silu': silu,
+    'softmin': softmin,
     'softplus': softplus,
     'squared-relu': squared_relu,
     'swiglu': swiglu,
