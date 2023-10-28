@@ -670,7 +670,10 @@ def elu(input: Tensor, alpha: float) -> Tensor:
             The input tensor on which the activation function is applied.
         
         alpha : float
-            The value for ELU formulation
+            The value for ELU formulation.
+    
+    Returns:
+        The tensor produced by teh activation layer.
     '''
     return where(input > 0, input, alpha * (exp(input) - 1))
 
