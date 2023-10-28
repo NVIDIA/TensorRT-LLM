@@ -2264,6 +2264,40 @@ def max(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
     return _create_tensor(layer.get_output(0), layer)
 
 
+def sum(input: Tensor, dim: int, keep_dims: bool = False) -> Tensor:
+    '''
+    Add an operation to compute the sum along a dimension.
+
+    Computes the sum along the dimension 'dim' of the input tensor.
+
+    It is implemented using the IReduceLayer from TensorRT.
+
+    Parameters:
+        input : Tensor
+            The input tensor.
+
+        dim : int
+            The dimension along which the mean is computed.
+
+        keepdim : bool
+            Is the dimension kept in the reduced tensor? When True the
+            dimension is kept, it is removed from the shape otherwise.
+
+    Returns:
+        The tensor produced by this reduction operation.
+    '''
+    dim_param = dim if dim else -1
+    dim = dim_resolve_negative(dim_param, input.ndim())
+    axes = dim_to_trt_axes(dim)
+
+    sum_layer = default_trtnet().add_reduce(input.trt_tensor,
+                                        trt.ReduceOperation.SUM,
+                                        axes,
+                                        keep_dims=keep_dims)
+
+    return _create_tensor(sum_layer.get_output(0), sum_layer)
+
+
 def identity(input: Tensor) -> Tensor:
     '''
     Add an identity operation.

@@ -27,9 +27,10 @@ class TestFunctional(unittest.TestCase):
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    def test_softmin(self):
+    def test_sum(self):
         dtype = 'float32'
         x_data = torch.randn(2, 3, 4, 5)
+        dim = 1
 
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
@@ -38,7 +39,7 @@ class TestFunctional(unittest.TestCase):
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
-            output = tensorrt_llm.functional.softmin(x).trt_tensor
+            output = tensorrt_llm.functional.sum(input=x, dim=dim).trt_tensor
             output.name = 'output'
             network.mark_output(output)
 
@@ -48,10 +49,7 @@ class TestFunctional(unittest.TestCase):
                 'x': x_data.numpy(),
             })
 
-        ref = torch.nn.functional.softmin(x_data)
+        ref = torch.sum(input=x_data, dim=dim)
         np.testing.assert_allclose(ref.cpu().numpy(),
                                    outputs['output'],
                                    atol=1e-5)
-
-if __name__ == "__main__":
-    unittest.main()
