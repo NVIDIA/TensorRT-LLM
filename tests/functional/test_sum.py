@@ -53,3 +53,6 @@ class TestFunctional(unittest.TestCase):
         np.testing.assert_allclose(ref.cpu().numpy(),
                                    outputs['output'],
                                    atol=1e-5)
+
+if __name__ == "__main__":
+    unittest.main()
