@@ -1760,7 +1760,7 @@ def logsoftmax(input: Tensor, dim: Optional[int] = None) -> Tensor:
     ''' 
     computed_softmax = softmax(input=input, dim=dim)
 
-    return math.log(computed_softmax)
+    return log(computed_softmax)
 
 
 def _lookup_plugin(input: Tensor, weight: Tensor, rank: int) -> Tensor:
@@ -2132,6 +2132,7 @@ def unary(input: Tensor, op: trt.UnaryOperation) -> Tensor:
         sin     for op=trt.UnaryOperation.SIN
         cos     for op=trt.UnaryOperation.COS
         abs     for op=trt.UnaryOperation.ABS
+        log     for op=trt.UnaryOperation.LOG
 
     It is implemented using the IUnaryLayer from TensorRT.
 
@@ -2155,6 +2156,7 @@ exp = partial(unary, op=trt.UnaryOperation.EXP)
 sin = partial(unary, op=trt.UnaryOperation.SIN)
 cos = partial(unary, op=trt.UnaryOperation.COS)
 abs = partial(unary, op=trt.UnaryOperation.ABS)
+log = partial(unary, op=trt.UnaryOperation.LOG)
 
 
 def mean(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
