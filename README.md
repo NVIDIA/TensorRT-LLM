@@ -257,7 +257,7 @@ higher GPU utilization.
 ### Attention
 
 TensorRT-LLM implements several variants of the Attention mechanism that
-appears in most the Large Language Models.  This
+appears in most of the Large Language Models.  This
 [document](./docs/source/gpt_attention.md) summarizes those implementations and
 how they are optimized in TensorRT-LLM.
 
@@ -277,7 +277,7 @@ however, that it is recommended to use the C++ version.
 
 
 * It's recommended to add options `–shm-size=1g –ulimit memlock=-1` to the
-  docker or nvidia-docker run command.  Otherwise you may see NCCL errors when
+  docker or Nvidia-docker run command.  Otherwise, you may see NCCL errors when
   running multiple GPU inferences. See
   https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting.html#errors
   for details.
