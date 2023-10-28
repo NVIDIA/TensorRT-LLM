@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ..functional import softplus, tanh, tanhshrink
+from ..functional import softplus, tanh, tanhshrink, logsoftmax
 from ..module import Module
 
 
@@ -25,3 +25,8 @@ class Tanhshrink(Module):
 
     def forward(self, input):
         return tanhshrink(x=input)
+    
+class LogSoftmax(Module):
+
+    def forward(self, input):
+        return logsoftmax(input=input)

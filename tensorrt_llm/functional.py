@@ -1745,6 +1745,24 @@ def softmax(input: Tensor, dim: Optional[int] = None) -> Tensor:
     return _create_tensor(layer.get_output(0), layer)
 
 
+def logsoftmax(input: Tensor, dim: Optional[int] = None) -> Tensor:
+    '''
+    Add an operation to compute logsoftmax on a tensor.
+
+    Parameters:
+        input : Tensor
+            The input tensor on which to apply logsoftmax.
+
+        dim: Optional[int]
+
+    Returns:
+        The output tensor of the logsoftmax layer.
+    ''' 
+    computed_softmax = softmax(input=input, dim=dim)
+
+    return math.log(computed_softmax)
+
+
 def _lookup_plugin(input: Tensor, weight: Tensor, rank: int) -> Tensor:
     '''
     Add an operation to perform lookup in a tensor.
@@ -2329,7 +2347,7 @@ def geglu(x: Tensor) -> Tensor:
 
 def tanhshrink(x: Tensor) -> Tensor:
     '''
-    Add a Tanshrink operation.
+    Add a Tanhshrink operation.
 
     Returns:
         The tensor produced by the activation layer.
@@ -3777,6 +3795,7 @@ ACT2FN = {
     'gelu_new': gelu,
     'gelu_fast': gelu,
     'geglu': geglu,
+    'logsoftmax': logsoftmax,
     'silu': silu,
     'softplus': softplus,
     'squared-relu': squared_relu,

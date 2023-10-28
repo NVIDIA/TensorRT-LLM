@@ -27,7 +27,7 @@ class TestFunctional(unittest.TestCase):
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    def test_tanshrink(self):
+    def test_logsoftmax(self):
         dtype = 'float32'
         x_data = torch.randn(2, 3, 4, 5)
 
@@ -38,7 +38,7 @@ class TestFunctional(unittest.TestCase):
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
-            output = tensorrt_llm.functional.tanhshrink(x).trt_tensor
+            output = tensorrt_llm.functional.logsoftmax(x).trt_tensor
             output.name = 'output'
             network.mark_output(output)
 
@@ -48,10 +48,7 @@ class TestFunctional(unittest.TestCase):
                 'x': x_data.numpy(),
             })
 
-        ref = torch.nn.functional.tanhshrink(x_data)
+        ref = torch.nn.functional.log_softmax(x_data)
         np.testing.assert_allclose(ref.cpu().numpy(),
                                    outputs['output'],
                                    atol=1e-5)
-
-if __name__ == "__main__":
-    unittest.main()
