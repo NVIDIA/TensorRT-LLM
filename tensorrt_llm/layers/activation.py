@@ -24,4 +24,4 @@ class Mish(Module):
 class Tanhshrink(Module):
 
     def forward(self, input):
-        return tanhshrink
+        return tanhshrink(x=input)
