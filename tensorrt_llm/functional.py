@@ -663,6 +663,28 @@ tanh = partial(activation, act_type=trt.ActivationType.TANH)
 sigmoid = partial(activation, act_type=trt.ActivationType.SIGMOID)
 
 
+def selu(input: Tensor) -> Tensor:
+    '''
+    Add a SeLU operation.
+
+    Parameters:
+        input : Tensor
+            The input tensor on which the activation function is applied.
+
+    Returns:
+        The tensor produced by the activation layer.
+    '''
+
+    alpha = 1.6732632423543772848170429916717
+    scale = 1.0507009873554804934193349852946
+
+    selu_layer = default_trtnet().add_activation(input.trt_tensor,
+                                               trt.ActivationType.SELU)
+    selu_layer.alpha = alpha
+    selu_layer.beta = scale
+
+    return _create_tensor(selu_layer.get_output(0), selu_layer)
+
 def silu(input: Tensor) -> Tensor:
     '''
     Add a SiLU (`x * sigmoid(x)`) operation.
@@ -1755,7 +1777,7 @@ def softmin(x: Tensor, dim: Optional[int] = None) -> Tensor:
     It inserts a ISoftmaxLayer to the TensorRT graph.
 
     Parameters:
-        input : Tensor
+        x : Tensor
             The input tensor on which to apply softmin.
 
         dim : Optional[int]
@@ -2262,40 +2284,6 @@ def max(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
                                         axes,
                                         keep_dims=keepdim)
     return _create_tensor(layer.get_output(0), layer)
-
-
-def sum(input: Tensor, dim: int, keep_dims: bool = False) -> Tensor:
-    '''
-    Add an operation to compute the sum along a dimension.
-
-    Computes the sum along the dimension 'dim' of the input tensor.
-
-    It is implemented using the IReduceLayer from TensorRT.
-
-    Parameters:
-        input : Tensor
-            The input tensor.
-
-        dim : int
-            The dimension along which the mean is computed.
-
-        keepdim : bool
-            Is the dimension kept in the reduced tensor? When True the
-            dimension is kept, it is removed from the shape otherwise.
-
-    Returns:
-        The tensor produced by this reduction operation.
-    '''
-    dim_param = dim if dim else -1
-    dim = dim_resolve_negative(dim_param, input.ndim())
-    axes = dim_to_trt_axes(dim)
-
-    sum_layer = default_trtnet().add_reduce(input.trt_tensor,
-                                        trt.ReduceOperation.SUM,
-                                        axes,
-                                        keep_dims=keep_dims)
-
-    return _create_tensor(sum_layer.get_output(0), sum_layer)
 
 
 def identity(input: Tensor) -> Tensor:
@@ -3873,6 +3861,7 @@ ACT2FN = {
     'gelu_fast': gelu,
     'geglu': geglu,
     'logsoftmax': logsoftmax,
+    'selu': selu,
     'silu': silu,
     'softmin': softmin,
     'softplus': softplus,
