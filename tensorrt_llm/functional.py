@@ -661,7 +661,7 @@ relu = partial(activation, act_type=trt.ActivationType.RELU)
 tanh = partial(activation, act_type=trt.ActivationType.TANH)
 sigmoid = partial(activation, act_type=trt.ActivationType.SIGMOID)
 
-def elu(input: Tensor, alpha: float) -> Tensor:
+def elu(input: Tensor, alpha: float = 1.0) -> Tensor:
     '''
     Add a ELU operation.
 
@@ -670,7 +670,7 @@ def elu(input: Tensor, alpha: float) -> Tensor:
             The input tensor on which the activation function is applied.
         
         alpha : float
-            The value for ELU formulation.
+            The value for ELU formulation. Default value is set to 1.0.
     
     Returns:
         The tensor produced by teh activation layer.
