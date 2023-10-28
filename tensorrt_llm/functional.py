@@ -661,6 +661,18 @@ relu = partial(activation, act_type=trt.ActivationType.RELU)
 tanh = partial(activation, act_type=trt.ActivationType.TANH)
 sigmoid = partial(activation, act_type=trt.ActivationType.SIGMOID)
 
+def elu(input: Tensor, alpha: float) -> Tensor:
+    '''
+    Add a ELU operation.
+
+    Parameters:
+        input : Tensor
+            The input tensor on which the activation function is applied.
+        
+        alpha : float
+            The value for ELU formulation
+    '''
+    return where(input > 0, input, alpha * (exp(input) - 1))
 
 def silu(input: Tensor) -> Tensor:
     '''
@@ -3761,6 +3773,7 @@ def gather_last_token_logits(hidden_states: Tensor, last_token_ids: Tensor,
 ACT2FN = {
     'relu': relu,
     'tanh': tanh,
+    'elu': elu,
     'gelu': gelu,
     'gelu_new': gelu,
     'gelu_fast': gelu,
