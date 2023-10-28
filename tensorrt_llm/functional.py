@@ -1745,12 +1745,12 @@ def softmax(input: Tensor, dim: Optional[int] = None) -> Tensor:
     return _create_tensor(layer.get_output(0), layer)
 
 
-def logsoftmax(input: Tensor, dim: Optional[int] = None) -> Tensor:
+def logsoftmax(x: Tensor, dim: Optional[int] = None) -> Tensor:
     '''
     Add an operation to compute logsoftmax on a tensor.
 
     Parameters:
-        input : Tensor
+        x : Tensor
             The input tensor on which to apply logsoftmax.
 
         dim: Optional[int]
@@ -1758,9 +1758,21 @@ def logsoftmax(input: Tensor, dim: Optional[int] = None) -> Tensor:
     Returns:
         The output tensor of the logsoftmax layer.
     ''' 
-    computed_softmax = softmax(input=input, dim=dim)
 
-    return log(computed_softmax)
+    dim_param = dim if dim else -1
+    dim = dim_resolve_negative(dim_param, x.ndim())
+    axes = dim_to_trt_axes(dim)
+
+    sum_layer = default_trtnet().add_reduce(exp(x).trt_tensor,
+                                        trt.ReduceOperation.SUM,
+                                        axes,
+                                        keep_dims=True)
+
+    summed_tensor = _create_tensor(sum_layer.get_output(0), sum_layer)
+
+    # log-sum-exp trick for numerical stability
+    return x - log(summed_tensor)
+
 
 
 def _lookup_plugin(input: Tensor, weight: Tensor, rank: int) -> Tensor:
