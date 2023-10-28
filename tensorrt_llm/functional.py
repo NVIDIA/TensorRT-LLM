@@ -663,6 +663,21 @@ tanh = partial(activation, act_type=trt.ActivationType.TANH)
 sigmoid = partial(activation, act_type=trt.ActivationType.SIGMOID)
 
 
+def logsigmoid(input: Tensor) -> Tensor:
+    '''
+    Add a LogSigmoid operation.
+
+    Parameters:
+        input : Tensor
+            The input tensor on which the activation function is applied
+
+    Returns:
+        The tensor produced by the activation layer.
+    '''
+
+    return log(sigmoid(input=input))
+
+
 def selu(input: Tensor) -> Tensor:
     '''
     Add a SeLU operation.
@@ -2410,7 +2425,7 @@ def geglu(x: Tensor) -> Tensor:
     return a * gelu(b)
 
 
-def tanhshrink(x: Tensor) -> Tensor:
+def tanhshrink(input: Tensor) -> Tensor:
     '''
     Add a Tanhshrink operation.
 
@@ -2418,7 +2433,7 @@ def tanhshrink(x: Tensor) -> Tensor:
         The tensor produced by the activation layer.
     '''
 
-    return x - tanh(x) # activation(input=x, act_type=trt.ActivationType.TANH)
+    return input - tanh(input)
 
 
 def group_norm(input: Tensor,
@@ -3860,6 +3875,7 @@ ACT2FN = {
     'gelu_new': gelu,
     'gelu_fast': gelu,
     'geglu': geglu,
+    'logsigmoid': logsigmoid,
     'logsoftmax': logsoftmax,
     'selu': selu,
     'silu': silu,

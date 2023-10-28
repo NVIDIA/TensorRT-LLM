@@ -24,7 +24,7 @@ class Mish(Module):
 class Tanhshrink(Module):
 
     def forward(self, input):
-        return tanhshrink(x=input)
+        return tanhshrink(input=input)
     
 class LogSoftmax(Module):
 
@@ -37,6 +37,11 @@ class Softmin(Module):
         return softmin(input=input)
     
 class SELU(Module):
+
+    def forward(self, input):
+        return selu(input=input)
+
+class LogSigmoid(Module):
 
     def forward(self, input):
         return selu(input=input)
