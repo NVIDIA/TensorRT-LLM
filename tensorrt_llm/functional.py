@@ -2373,6 +2373,23 @@ def argmax(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
     return _create_tensor(layer.get_output(0), layer)
 
 
+def relu6(input: Tensor) -> Tensor:
+    '''
+    Add a ReLU6 operation. 
+
+    Applies ReLU with an lower bound of 6
+
+    Parameters:
+        input : Tensor
+            The input tensor on which the activation function is applied.
+
+    Returns:
+        The tensor produced by the activation layer.
+    '''
+
+    return relu(input)
+
+
 def gelu(x: Tensor) -> Tensor:
     '''
     Add a GELU operation.
@@ -3877,6 +3894,7 @@ ACT2FN = {
     'geglu': geglu,
     'logsigmoid': logsigmoid,
     'logsoftmax': logsoftmax,
+    'relu6': relu6,
     'selu': selu,
     'silu': silu,
     'softmin': softmin,
