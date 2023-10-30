@@ -14,6 +14,8 @@ The TensorRT-LLM InternLM implementation can be found in [tensorrt_llm/models/in
   * FP16 / BF16
   <!-- * FP8 -->
   * INT8 & INT4 Weight-Only
+  * Smooth Quant
+  * INT8 KV Cache
   <!-- * FP8 KV CACHE -->
   * Tensor Parallel
   <!-- * STRONGLY TYPED -->
@@ -166,8 +168,6 @@ python summarize.py --test_trt_llm --test_hf \
                     --engine_dir ./internlm-chat-20b/trt_engines/int8_kv_cache_weight_only/1-gpu
 ```
 
-TODO: The result of 7B is not good, probably some error lies at qkv bias part.
-
 #### SmoothQuant
 
 Unlike the FP16 build where the HF weights are processed and loaded into the TensorRT-LLM directly, the SmoothQuant needs to load INT8 weights which should be pre-processed before building an engine.
@@ -194,14 +194,14 @@ Examples of build invocations:
 # 7B model
 python build.py --ft_model_dir=./internlm-chat-7b/smooth_internlm/sq0.8/1-gpu/ \
                 --use_smooth_quant \
-                --output_dir ./internlm-chat-7b/trt_engines/smoothquant_0.8/1-gpu
+                --output_dir ./internlm-chat-7b/trt_engines/smoothquant/1-gpu
 
 # 20B model
 python build.py --ft_model_dir=./internlm-chat-20b/smooth_internlm/sq0.8/1-gpu/ \
                 --use_smooth_quant
-                --output_dir ./internlm-chat-20b/trt_engines/smoothquant_0.8/1-gpu
+                --output_dir ./internlm-chat-20b/trt_engines/smoothquant/1-gpu
 
-# Build model for SmoothQuant in the _per_token_ + _per_channel_ mode
+# OR build model for SmoothQuant in the _per_token_ + _per_channel_ mode
 # 7B model
 python build.py --ft_model_dir=./internlm-chat-7b/smooth_internlm/sq0.8/1-gpu/ \
                 --use_smooth_quant \
@@ -232,18 +232,16 @@ python run.py --max_output_len=120 \
               --tokenizer_dir ./internlm-chat-20b/ \
               --engine_dir ./internlm-chat-20b/trt_engines/smoothquant/1-gpu
 
-# python summarize.py --test_trt_llm --test_hf \
-#                     --hf_model_location ./internlm-chat-7b \
-#                     --data_type fp16 \
-#                     --engine_dir ./internlm-chat-7b/trt_engines/smoothquant/1-gpu
+python summarize.py --test_trt_llm --test_hf \
+                    --hf_model_location ./internlm-chat-7b \
+                    --data_type fp16 \
+                    --engine_dir ./internlm-chat-7b/trt_engines/smoothquant/1-gpu
 
 python summarize.py --test_trt_llm --test_hf \
                     --hf_model_location ./internlm-chat-20b \
                     --data_type fp16 \
                     --engine_dir ./internlm-chat-20b/trt_engines/smoothquant/1-gpu
 ```
-
-TODO: The result of 7B is not good, probably some error lies at qkv bias part.
 
 #### FP8 Post-Training Quantization
 TODO

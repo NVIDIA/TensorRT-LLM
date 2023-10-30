@@ -716,13 +716,6 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
             fromfile(dir_path,
                      'model.layers.' + str(i) + '.input_layernorm.weight.bin'))
 
-        if attn_bias:
-            dst = tensorrt_llm_internlm.layers[idx].attention.qkv.bias
-            t = fromfile(
-                dir_path, 'model.layers.' + str(i) +
-                f'.attention.query_key_value.bias.{mapping.tp_rank}.bin')
-            dst.value = np.ascontiguousarray(t)
-
         t = fromfile(
             dir_path, 'model.layers.' + str(i) +
             '.attention.query_key_value.weight.' + suffix,
@@ -783,6 +776,21 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
             scales.value = torch_weight_scales.numpy()
         else:
             dst.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
+
+        if attn_bias:
+            dst = tensorrt_llm_internlm.layers[idx].attention.qkv.bias
+            t = fromfile(
+                dir_path, 'model.layers.' + str(i) +
+                f'.attention.query_key_value.bias.{mapping.tp_rank}.bin')
+            # print("bias")
+            # print(t.shape)
+            dst.value = np.ascontiguousarray(t)
+
+            dst = tensorrt_llm_internlm.layers[idx].attention.dense.bias
+            t = fromfile(
+                dir_path,
+                'model.layers.' + str(i) + '.attention.dense.bias.bin')
+            dst.value = np.ascontiguousarray(t)
 
         dst = tensorrt_llm_internlm.layers[idx].post_layernorm.weight
         dst.value = fromfile(

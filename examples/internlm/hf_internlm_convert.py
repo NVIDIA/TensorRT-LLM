@@ -47,8 +47,7 @@ def merge_qkv_scales(q_name, hf_model, scales, internlm_qkv_para):
     scales[layer_name_qkv]["y"] = torch.cat([
         scales[layer_name_q]["y"], scales[layer_name_k]["y"],
         scales[layer_name_v]["y"]
-    ],
-                                            dim=0)
+    ], dim=0)
 
     internlm_qkv_para[layer_name_qkv] = weight.transpose(0, 1)
 
@@ -257,7 +256,7 @@ def hf_gpt_converter(args):
             param = merge_qkv_bias(name, model)
             param = param.cpu().numpy().astype(storage_type)
             bias = (0, saved_dir, infer_tp, ft_name, param,
-                   act_range.get(name.replace(".weight", "").replace(".q_proj", ".qkv_proj")),
+                   None,
                     {"int8_outputs": int8_outputs,
                     "multi_query_mode": args.multi_query_mode,
                     "local_dim": None})
