@@ -47,7 +47,8 @@ def merge_qkv_scales(q_name, hf_model, scales, internlm_qkv_para):
     scales[layer_name_qkv]["y"] = torch.cat([
         scales[layer_name_q]["y"], scales[layer_name_k]["y"],
         scales[layer_name_v]["y"]
-    ], dim=0)
+    ],
+                                            dim=0)
 
     internlm_qkv_para[layer_name_qkv] = weight.transpose(0, 1)
 
@@ -68,7 +69,8 @@ def merge_qkv_bias(q_name, hf_model, internlm_qkv_para={}):
 
 
 @torch.no_grad()
-def smooth_internlm_model(model, scales, alpha, internlm_qkv_para, internlm_smoother):
+def smooth_internlm_model(model, scales, alpha, internlm_qkv_para,
+                          internlm_smoother):
     # Smooth the activation and weights with smoother = $\diag{s}$
     for name, module in model.named_modules():
         if not module.__class__.__name__ == "InternLMDecoderLayer":
@@ -189,7 +191,9 @@ def hf_gpt_converter(args):
     saved_dir = Path(args.out_dir) / f"{infer_tp}-gpu"
     saved_dir.mkdir(parents=True, exist_ok=True)
 
-    model = AutoModelForCausalLM.from_pretrained(args.in_file, device_map="auto", trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(args.in_file,
+                                                 device_map="auto",
+                                                 trust_remote_code=True)
 
     act_range = {}
     internlm_qkv_para = {}
@@ -201,10 +205,12 @@ def hf_gpt_converter(args):
             "TOKENIZERS_PARALLELISM", "false")
         act_range = capture_activation_range(
             model,
-            AutoTokenizer.from_pretrained(args.in_file, padding_side='left', trust_remote_code=True))
+            AutoTokenizer.from_pretrained(args.in_file,
+                                          padding_side='left',
+                                          trust_remote_code=True))
         if args.smoothquant is not None:
             smooth_internlm_model(model, act_range, args.smoothquant,
-                               internlm_qkv_para, internlm_smoother)
+                                  internlm_qkv_para, internlm_smoother)
 
     config = configparser.ConfigParser()
     config["internlm"] = {}
@@ -255,11 +261,11 @@ def hf_gpt_converter(args):
         elif ft_name.split('.')[-2:] == ['query_key_value', 'bias']:
             param = merge_qkv_bias(name, model)
             param = param.cpu().numpy().astype(storage_type)
-            bias = (0, saved_dir, infer_tp, ft_name, param,
-                   None,
-                    {"int8_outputs": int8_outputs,
-                    "multi_query_mode": args.multi_query_mode,
-                    "local_dim": None})
+            bias = (0, saved_dir, infer_tp, ft_name, param, None, {
+                "int8_outputs": int8_outputs,
+                "multi_query_mode": args.multi_query_mode,
+                "local_dim": None
+            })
             starmap_args.append(bias)
         elif ft_name.split('.')[-2:] == ['query_key_value', 'weight']:
             # Is there other ways to get local_dim? local_dim = hidden_size in internlm

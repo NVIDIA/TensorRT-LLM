@@ -223,7 +223,9 @@ def generate(
                                            pp_size=pp_size)
     torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, legacy=False, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir,
+                                              legacy=False,
+                                              trust_remote_code=True)
 
     sampling_config = SamplingConfig(end_id=EOS_TOKEN,
                                      pad_id=PAD_TOKEN,

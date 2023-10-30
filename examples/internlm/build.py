@@ -22,9 +22,9 @@ import tensorrt as trt
 import torch
 import torch.multiprocessing as mp
 from transformers import AutoConfig, AutoModelForCausalLM
-from weight import (get_scaling_factors, load_from_awq_internlm, load_from_binary,
-                    load_from_gptq_internlm, load_from_hf_internlm,
-                    load_from_meta_internlm)
+from weight import (get_scaling_factors, load_from_awq_internlm,
+                    load_from_binary, load_from_gptq_internlm,
+                    load_from_hf_internlm, load_from_meta_internlm)
 
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_trt
@@ -399,7 +399,8 @@ def parse_arguments():
     # force use the plugin for now with the correct data type.
     args.use_gpt_attention_plugin = args.dtype
     if args.model_dir is not None:
-        hf_config = AutoConfig.from_pretrained(args.model_dir, trust_remote_code=True)
+        hf_config = AutoConfig.from_pretrained(args.model_dir,
+                                               trust_remote_code=True)
         args.inter_size = hf_config.intermediate_size  # override the inter_size for InternLM
         args.n_embd = hf_config.hidden_size
         args.n_head = hf_config.num_attention_heads
@@ -511,14 +512,14 @@ def build_rank_engine(builder: Builder,
         rms_norm_eps=args.rms_norm_eps)
     if args.use_smooth_quant:
         tensorrt_llm_internlm = smooth_quantize(tensorrt_llm_internlm,
-                                             args.quant_mode)
+                                                args.quant_mode)
     elif args.use_weight_only:
         if args.weight_only_precision == 'int8':
-            tensorrt_llm_internlm = weight_only_quantize(tensorrt_llm_internlm,
-                                                      args.quant_mode)
+            tensorrt_llm_internlm = weight_only_quantize(
+                tensorrt_llm_internlm, args.quant_mode)
         elif args.weight_only_precision == 'int4':
-            tensorrt_llm_internlm = weight_only_quantize(tensorrt_llm_internlm,
-                                                      args.quant_mode)
+            tensorrt_llm_internlm = weight_only_quantize(
+                tensorrt_llm_internlm, args.quant_mode)
         elif args.weight_only_precision == 'int4_awq':
             tensorrt_llm_internlm = weight_only_groupwise_quantize(
                 model=tensorrt_llm_internlm,
@@ -541,8 +542,8 @@ def build_rank_engine(builder: Builder,
                                            num_layers=args.n_layer,
                                            quant_mode=args.quant_mode)
         tensorrt_llm_internlm = fp8_quantize(tensorrt_llm_internlm,
-                                          quant_mode=args.quant_mode,
-                                          quant_scales=quant_scales)
+                                             quant_mode=args.quant_mode,
+                                             quant_scales=quant_scales)
     if args.per_group:
         load_func = load_from_awq_internlm if args.weight_only_precision == 'int4_awq' else load_from_gptq_internlm
         load_func(tensorrt_llm_internlm=tensorrt_llm_internlm,
@@ -550,8 +551,8 @@ def build_rank_engine(builder: Builder,
                   mapping=mapping,
                   dtype=args.dtype)
     elif args.meta_ckpt_dir is not None:
-        load_from_meta_internlm(tensorrt_llm_internlm, args.meta_ckpt_dir, mapping,
-                             args.dtype)
+        load_from_meta_internlm(tensorrt_llm_internlm, args.meta_ckpt_dir,
+                                mapping, args.dtype)
     elif args.model_dir is not None:
         logger.info(f'Loading HF InternLM ... from {args.model_dir}')
         tik = time.time()
@@ -567,9 +568,9 @@ def build_rank_engine(builder: Builder,
         t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
         logger.info(f'HF InternLM loaded. Total time: {t}')
         load_from_hf_internlm(tensorrt_llm_internlm,
-                           hf_internlm,
-                           mapping=mapping,
-                           dtype=args.dtype)
+                              hf_internlm,
+                              mapping=mapping,
+                              dtype=args.dtype)
         del hf_internlm
     elif args.ft_model_dir is not None:
         load_from_binary(tensorrt_llm_internlm,
@@ -622,10 +623,10 @@ def build_rank_engine(builder: Builder,
 
         # Forward
         inputs = tensorrt_llm_internlm.prepare_inputs(args.max_batch_size,
-                                                   args.max_input_len,
-                                                   args.max_output_len, True,
-                                                   args.max_beam_width,
-                                                   args.max_num_tokens)
+                                                      args.max_input_len,
+                                                      args.max_output_len, True,
+                                                      args.max_beam_width,
+                                                      args.max_num_tokens)
         tensorrt_llm_internlm(*inputs)
         if args.enable_debug_output:
             # mark intermediate nodes' outputs

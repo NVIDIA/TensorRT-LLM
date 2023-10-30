@@ -308,8 +308,8 @@ def main(args):
 
     ite_count = 0
     data_point_idx = 0
-    while (data_point_idx < len(dataset_cnn['test'])) and (ite_count
-                                                           < args.max_ite):
+    while (data_point_idx < len(dataset_cnn['test'])) and (ite_count <
+                                                           args.max_ite):
         if runtime_rank == 0:
             logger.debug(
                 f"run data_point {data_point_idx} ~ {data_point_idx + max_batch_size}"
