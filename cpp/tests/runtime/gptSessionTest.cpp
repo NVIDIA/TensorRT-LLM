@@ -205,7 +205,6 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
     auto const json = GptJsonConfig::parse(modelPath / "config.json");
     auto const modelConfig = json.getModelConfig();
     verifyModelConfig(modelConfig, modelSpec);
-    auto const decoderPerRequest = modelSpec.mDecoderPerRequest;
 
     const int worldSize = modelSpec.mTPSize * modelSpec.mPPSize;
     auto const worldConfig = WorldConfig::mpi(*logger, worldSize, modelSpec.mTPSize, modelSpec.mPPSize);
@@ -273,14 +272,16 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
         }
     }
 
-    GptSession session{modelConfig, worldConfig, enginePath.string(), logger};
-    session.setCudaGraphMode(cudaGraphMode);
+    auto const maxBatchSize = *std::max_element(batchSizes.begin(), batchSizes.end());
+    GptSession::Config sessionConfig{maxBatchSize, beamWidth, maxSeqLength};
+    sessionConfig.decoderPerRequest = modelSpec.mDecoderPerRequest;
+    sessionConfig.numMicroBatches = numMicroBatches;
+    sessionConfig.cudaGraphMode = cudaGraphMode;
+
+    GptSession session{sessionConfig, modelConfig, worldConfig, enginePath.string(), logger};
     EXPECT_EQ(session.getDevice(), worldConfig.getDevice());
     // Use bufferManager for copying data to and from the GPU
     auto& bufferManager = session.getBufferManager();
-
-    auto maxBatchSize = *std::max_element(batchSizes.begin(), batchSizes.end());
-    session.setup(maxBatchSize, beamWidth, maxSeqLength, decoderPerRequest, std::nullopt, numMicroBatches);
 
     for (auto const batchSize : batchSizes)
     {
@@ -724,14 +725,16 @@ void testGlm6bSession(fs::path const& modelPath, std::string const& modelName, M
         givenInputLengths[i] = std::distance(seqBegin, it);
     }
 
-    GptSession session{modelConfig, worldConfig, enginePath.string(), logger};
-    session.setCudaGraphMode(cudaGraphMode);
+    auto const maxBatchSize = *std::max_element(batchSizes.begin(), batchSizes.end());
+    GptSession::Config sessionConfig{maxBatchSize, beamWidth, maxSeqLength};
+    sessionConfig.decoderPerRequest = decoderPerRequest;
+    sessionConfig.numMicroBatches = numMicroBatches;
+    sessionConfig.cudaGraphMode = cudaGraphMode;
+
+    GptSession session{sessionConfig, modelConfig, worldConfig, enginePath.string(), logger};
     EXPECT_EQ(session.getDevice(), worldConfig.getDevice());
     // Use bufferManager for copying data to and from the GPU
     auto& bufferManager = session.getBufferManager();
-
-    auto maxBatchSize = *std::max_element(batchSizes.begin(), batchSizes.end());
-    session.setup(maxBatchSize, beamWidth, maxSeqLength, decoderPerRequest, std::nullopt, numMicroBatches);
 
     for (auto const batchSize : batchSizes)
     {

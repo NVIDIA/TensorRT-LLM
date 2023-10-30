@@ -273,18 +273,11 @@ void StatefulGptDecoder::forwardAsync(decoder::Output& output, decoder::Input co
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-bool StatefulGptDecoder::isFinishedSync()
+void StatefulGptDecoder::forwardSync()
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     mDecodedEvent.synchronize();
-
-    auto& dOutput = *mDecodingOutput;
-    auto finished = mNbSteps >= mMaxNewTokens
-        // This condition requires the synchronization above
-        || *bufferCast<SizeType>(*dOutput.finishedSum) == static_cast<SizeType>(dOutput.finished->getSize());
-
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
-    return finished;
 }
 
 IStatefulGptDecoder::TensorPtr StatefulGptDecoder::getFinalOutputIds() const

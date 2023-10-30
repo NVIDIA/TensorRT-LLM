@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "ipcUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -29,6 +28,7 @@ class KVCacheManager;
 
 namespace tensorrt_llm::runtime
 {
+class IpcMemory;
 class TllmRuntime;
 
 class RuntimeBuffers
@@ -59,6 +59,11 @@ public:
     std::vector<TensorPtr> presentKeysValsAlt; // without attention plugin
     TensorPtr kvCacheBlockPointersDevice;      // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
 
+    // References to tmp buffers
+    TensorPtr newTokens;
+    TensorPtr outputIds;
+    TensorPtr outputLengths;
+
     // beam search (shared between engine and decoder)
     TensorPtr cacheIndirectionDecoderInput;
     TensorPtr cacheIndirectionDecoderOutput;
@@ -74,6 +79,7 @@ public:
 
     bool allocated{false};
 
+private:
     std::vector<std::shared_ptr<IpcMemory>> mIpcMemoryHandles;
 
 public:
@@ -119,10 +125,10 @@ public:
         GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void prepareContextStep(TensorPtr const& inputIds, TokenIdType padId, BufferManager& manager,
-        KvCacheManager const* kvCacheManager, GenerationConfig const& generationConfig,
+        KvCacheManager const* kvCacheManager, SizeType firstBatchSlotIdx, GenerationConfig const& generationConfig,
         GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
-    TensorPtr prepareNextStep(SizeType step, TensorPtr const& outputIds, BufferManager& manager,
-        KvCacheManager* kvCacheManager, GenerationConfig const& generationConfig, GptModelConfig const& modelConfig,
+    TensorPtr prepareNextStep(SizeType step, BufferManager& manager, KvCacheManager* kvCacheManager,
+        SizeType firstBatchSlotIdx, GenerationConfig const& generationConfig, GptModelConfig const& modelConfig,
         WorldConfig const& worldConfig);
 
     void getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outputBuffers, SizeType step, TensorPtr const& inputIds,

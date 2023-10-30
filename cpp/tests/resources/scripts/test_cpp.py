@@ -44,35 +44,25 @@ def find_root_dir(start_dir: _tp.Optional[_pl.Path] = None) -> _pl.Path:
     return find_dir_containing(("scripts", "examples", "cpp"), start_dir)
 
 
-def run_tests(cuda_architectures: _tp.Optional[str] = None,
-              build_dir: _tp.Optional[str] = None,
-              dist_dir: _tp.Optional[str] = None,
-              model_cache: _tp.Optional[str] = None,
-              skip_gptj=False,
-              skip_llama=False,
-              skip_chatglm6b=False,
-              skip_chatglm2_6b=False,
-              only_fp8=False,
-              trt_root: _tp.Optional[str] = None) -> None:
-    root_dir = find_root_dir()
-    _log.info("Using root directory: %s", str(root_dir))
+def run_command(command: _tp.Sequence[str],
+                cwd: _pl.Path,
+                *,
+                shell=False,
+                env=None) -> None:
+    _log.info("Running: cd %s && %s", str(cwd), " ".join(command))
+    _sp.check_call(command, cwd=cwd, shell=shell, env=env)
 
-    def run_command(command: _tp.Sequence[str],
-                    *,
-                    cwd=root_dir,
-                    shell=False,
-                    env=None) -> None:
-        _log.info("Running: cd %s && %s", str(cwd), " ".join(command))
-        _sp.check_call(command, cwd=cwd, shell=shell, env=env)
 
-    python_exe = _sys.executable
-
+def build_trt_llm(python_exe: str,
+                  root_dir: _pl.Path,
+                  build_dir: _pl.Path,
+                  cuda_architectures: _tp.Optional[str] = None,
+                  dist_dir: _tp.Optional[str] = None,
+                  trt_root: _tp.Optional[str] = None):
     # Build wheel again to WAR issue that the "google-tests" target needs the cmake generated files
     # which were not packaged when running the build job
     # eventually it should be packaged in build job, and run test only on test node
     cuda_architectures = cuda_architectures if cuda_architectures is not None else "80"
-    build_dir = _pl.Path(
-        build_dir) if build_dir is not None else _pl.Path("cpp") / "build"
     dist_dir = _pl.Path(dist_dir) if dist_dir is not None else _pl.Path("build")
     build_wheel = [
         python_exe, "scripts/build_wheel.py", "--cuda_architectures",
@@ -83,95 +73,171 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
     if trt_root is not None:
         build_wheel += ["--trt_root", str(trt_root)]
 
-    run_command(build_wheel)
+    run_command(build_wheel, cwd=root_dir)
 
     dist_dir = dist_dir if dist_dir.is_absolute() else root_dir / dist_dir
     wheels = _gl.glob(str(dist_dir / "tensorrt_llm-*.whl"))
     assert len(wheels) > 0, "No wheels found"
     install_wheel = [python_exe, "-m", "pip", "install", "--upgrade", *wheels]
-    run_command(install_wheel)
+    run_command(install_wheel, cwd=root_dir)
 
+
+def run_tests(cuda_architectures: _tp.Optional[str] = None,
+              build_dir: _tp.Optional[str] = None,
+              dist_dir: _tp.Optional[str] = None,
+              model_cache: _tp.Optional[str] = None,
+              skip_gptj=False,
+              skip_llama=False,
+              skip_chatglm6b=False,
+              skip_chatglm2_6b=False,
+              only_fp8=False,
+              only_multi_gpu=False,
+              trt_root: _tp.Optional[str] = None) -> None:
+    root_dir = find_root_dir()
+    _log.info("Using root directory: %s", str(root_dir))
+
+    python_exe = _sys.executable
+    build_dir = _pl.Path(
+        build_dir) if build_dir is not None else _pl.Path("cpp") / "build"
+
+    build_trt_llm(python_exe=python_exe,
+                  root_dir=root_dir,
+                  build_dir=build_dir,
+                  cuda_architectures=cuda_architectures,
+                  dist_dir=dist_dir,
+                  trt_root=trt_root)
+
+    build_dir = build_dir if build_dir.is_absolute() else root_dir / build_dir
     resources_dir = _pl.Path("cpp") / "tests" / "resources"
-    scripts_dir = resources_dir / "scripts"
-    model_cache = ["--model_cache", model_cache] if model_cache else []
+
+    if not only_multi_gpu:
+        prepare_all_model_tests(python_exe=python_exe,
+                                root_dir=root_dir,
+                                resources_dir=resources_dir,
+                                model_cache=model_cache,
+                                skip_gptj=skip_gptj,
+                                skip_llama=skip_llama,
+                                skip_chatglm6b=skip_chatglm6b,
+                                skip_chatglm2_6b=skip_chatglm2_6b,
+                                only_fp8=only_fp8)
+
+        run_google_tests(build_dir=build_dir,
+                         skip_gptj=skip_gptj,
+                         skip_llama=skip_llama,
+                         skip_chatglm6b=skip_chatglm6b,
+                         skip_chatglm2_6b=skip_chatglm2_6b,
+                         only_fp8=only_fp8)
+
+        run_benchmarks(python_exe=python_exe,
+                       root_dir=root_dir,
+                       build_dir=build_dir,
+                       resources_dir=resources_dir)
+    else:
+        prepare_multi_gpu_model_tests(python_exe=python_exe,
+                                      root_dir=root_dir,
+                                      resources_dir=resources_dir,
+                                      model_cache=model_cache)
+
+        run_multi_gpu_tests(build_dir=build_dir)
+
+
+def prepare_all_model_tests(python_exe: str,
+                            root_dir: _pl.Path,
+                            resources_dir: _pl.Path,
+                            model_cache: _tp.Optional[str] = None,
+                            skip_gptj=False,
+                            skip_llama=False,
+                            skip_chatglm6b=False,
+                            skip_chatglm2_6b=False,
+                            only_fp8=False):
+    model_cache_arg = ["--model_cache", model_cache] if model_cache else []
     only_fp8_arg = ["--only_fp8"] if only_fp8 else []
 
-    gpt_env = {**_os.environ, "PYTHONPATH": "examples/gpt"}
-    build_gpt_engines = [python_exe,
-                         str(scripts_dir / "build_gpt_engines.py")
-                         ] + model_cache
-    run_command(build_gpt_engines, env=gpt_env)
-
-    generate_expected_gpt_output = [
-        python_exe,
-        str(scripts_dir / "generate_expected_gpt_output.py")
-    ]
-    run_command(generate_expected_gpt_output, env=gpt_env)
+    prepare_model_tests(model_name="gpt",
+                        python_exe=python_exe,
+                        root_dir=root_dir,
+                        resources_dir=resources_dir,
+                        model_cache_arg=model_cache_arg)
 
     if not skip_gptj:
-        build_gptj_engines = [
-            python_exe, str(scripts_dir / "build_gptj_engines.py")
-        ] + model_cache + only_fp8_arg
-        run_command(build_gptj_engines)
-
-        gptj_env = {**_os.environ, "PYTHONPATH": "examples/gptj"}
-        generate_expected_gptj_output = [
-            python_exe,
-            str(scripts_dir / "generate_expected_gptj_output.py")
-        ] + only_fp8_arg
-        run_command(generate_expected_gptj_output, env=gptj_env)
+        prepare_model_tests(model_name="gptj",
+                            python_exe=python_exe,
+                            root_dir=root_dir,
+                            resources_dir=resources_dir,
+                            model_cache_arg=model_cache_arg,
+                            only_fp8_arg=only_fp8_arg)
     else:
         _log.info("Skipping GPT-J tests")
 
     if not skip_llama:
-        build_llama_engines = [
-            python_exe, str(scripts_dir / "build_llama_engines.py")
-        ] + model_cache
-        run_command(build_llama_engines)
-
-        llama_env = {**_os.environ, "PYTHONPATH": "examples/llama"}
-        generate_expected_llama_output = [
-            python_exe,
-            str(scripts_dir / "generate_expected_llama_output.py")
-        ]
-        run_command(generate_expected_llama_output, env=llama_env)
+        prepare_model_tests(model_name="llama",
+                            python_exe=python_exe,
+                            root_dir=root_dir,
+                            resources_dir=resources_dir,
+                            model_cache_arg=model_cache_arg)
     else:
         _log.info("Skipping Lllama tests")
 
     if not skip_chatglm6b:
-        build_chatglm6b_engines = [
-            python_exe,
-            str(scripts_dir / "build_chatglm6b_engines.py")
-        ]
-        run_command(build_chatglm6b_engines)
-
-        chatglm6b_env = {**_os.environ, "PYTHONPATH": "examples/chatglm6b"}
-        generate_expected_chatglm6b_output = [
-            python_exe,
-            str(scripts_dir / "generate_expected_chatglm6b_output.py")
-        ]  # only_fp8 is not supported by ChatGLM-6B now
-        run_command(generate_expected_chatglm6b_output, env=chatglm6b_env)
+        prepare_model_tests(model_name="chatglm6b",
+                            python_exe=python_exe,
+                            root_dir=root_dir,
+                            resources_dir=resources_dir)
     else:
         _log.info("Skipping ChatGLM6B tests")
 
     if not skip_chatglm2_6b:
-        build_chatglm2_6b_engines = [
-            python_exe,
-            str(scripts_dir / "build_chatglm2-6b_engines.py")
-        ]
-        run_command(build_chatglm2_6b_engines)
-
-        chatglm2_6b_env = {**_os.environ, "PYTHONPATH": "examples/chatglm2-6b"}
-        generate_expected_chatglm2_6b_output = [
-            python_exe,
-            str(scripts_dir / "generate_expected_chatglm2-6b_output.py")
-        ]  # only_fp8 is not supported by ChatGLM2-6B now
-        run_command(generate_expected_chatglm2_6b_output, env=chatglm2_6b_env)
+        prepare_model_tests(model_name="chatglm2-6b",
+                            python_exe=python_exe,
+                            root_dir=root_dir,
+                            resources_dir=resources_dir)
     else:
         _log.info("Skipping ChatGLM2-6B tests")
 
-    build_dir = build_dir if build_dir.is_absolute() else root_dir / build_dir
 
+def prepare_multi_gpu_model_tests(python_exe: str,
+                                  root_dir: _pl.Path,
+                                  resources_dir: _pl.Path,
+                                  model_cache: _tp.Optional[str] = None):
+    model_cache_arg = ["--model_cache", model_cache] if model_cache else []
+    only_multi_gpu_arg = ["--only_multi_gpu"]
+
+    prepare_model_tests(model_name="llama",
+                        python_exe=python_exe,
+                        root_dir=root_dir,
+                        resources_dir=resources_dir,
+                        model_cache_arg=model_cache_arg,
+                        only_multi_gpu_arg=only_multi_gpu_arg)
+
+
+def prepare_model_tests(model_name: str,
+                        python_exe: str,
+                        root_dir: _pl.Path,
+                        resources_dir: _pl.Path,
+                        model_cache_arg=[],
+                        only_fp8_arg=[],
+                        only_multi_gpu_arg=[]):
+    scripts_dir = resources_dir / "scripts"
+
+    model_env = {**_os.environ, "PYTHONPATH": f"examples/{model_name}"}
+    build_engines = [
+        python_exe,
+        str(scripts_dir / f"build_{model_name}_engines.py")
+    ] + model_cache_arg + only_fp8_arg + only_multi_gpu_arg
+    run_command(build_engines, cwd=root_dir, env=model_env)
+
+    generate_expected_output = [
+        python_exe,
+        str(scripts_dir / f"generate_expected_{model_name}_output.py")
+    ] + only_fp8_arg + only_multi_gpu_arg
+    if only_multi_gpu_arg:
+        generate_expected_output = ["mpirun", "-n", "4"
+                                    ] + generate_expected_output
+    run_command(generate_expected_output, cwd=root_dir, env=model_env)
+
+
+def run_google_tests(build_dir: _pl.Path, skip_gptj, skip_llama, skip_chatglm6b,
+                     skip_chatglm2_6b, only_fp8):
     make_google_tests = [
         "cmake", "--build", ".", "--config", "Release", "-j", "--target",
         "google-tests"
@@ -197,6 +263,26 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
         ctest.extend(["-E", "|".join(excluded_tests)])
     run_command(ctest, cwd=build_dir, env=cpp_env)
 
+
+def run_multi_gpu_tests(build_dir: _pl.Path):
+    make_google_tests = [
+        "cmake", "--build", ".", "--config", "Release", "-j", "--target",
+        "google-tests"
+    ]
+    run_command(make_google_tests, cwd=build_dir)
+
+    tests_dir = build_dir / "tests"
+    cpp_env = {**_os.environ}
+    session_test = [
+        "mpirun", "-n", "4", "gptSessionTest", "--gtest_filter=*TP*:*PP*"
+    ]
+    run_command(session_test, cwd=tests_dir, env=cpp_env)
+
+
+def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
+                   resources_dir: _pl.Path):
+    scripts_dir = resources_dir / "scripts"
+
     make_benchmarks = [
         "cmake", "--build", ".", "--config", "Release", "-j", "--target",
         "benchmarks"
@@ -211,13 +297,13 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
         str(gpt_engine_dir / "fp16-plugin" / "tp1-pp1-gpu"), "--batch_size",
         "8", "--input_output_len", "10,20", "--duration", "10"
     ]
-    run_command(benchmark)
+    run_command(benchmark, cwd=root_dir)
 
     generate_batch_manager_data = [
         python_exe,
         str(scripts_dir / "generate_batch_manager_data.py")
     ]
-    run_command(generate_batch_manager_data)
+    run_command(generate_batch_manager_data, cwd=root_dir)
 
     benchmark_src_dir = _pl.Path("benchmarks") / "cpp"
     data_dir = resources_dir / "data"
@@ -229,7 +315,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
         str(resources_dir / "models" / "gpt2"), "--output",
         str(data_dir / "prepared_dummy_cnn.json")
     ]
-    run_command(prepare_dataset)
+    run_command(prepare_dataset, cwd=root_dir)
 
     benchmark = [
         str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
@@ -238,7 +324,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
         "--type", "IFB", "--dataset",
         str(data_dir / "prepared_dummy_cnn.json")
     ]
-    run_command(benchmark)
+    run_command(benchmark, cwd=root_dir)
     benchmark = [
         str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
         "--engine_dir",
@@ -246,7 +332,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
         "--type", "V1", "--dataset",
         str(data_dir / "prepared_dummy_cnn.json")
     ]
-    run_command(benchmark)
+    run_command(benchmark, cwd=root_dir)
 
 
 if __name__ == "__main__":
@@ -282,4 +368,9 @@ if __name__ == "__main__":
         "--only_fp8",
         action="store_true",
         help="Run only FP8 tests. Implemented for H100 runners.")
+    parser.add_argument(
+        "--only_multi_gpu",
+        action="store_true",
+        help="Run only mulit-GPU tests. Implemented for 4 GPUs.")
+
     run_tests(**vars(parser.parse_args()))

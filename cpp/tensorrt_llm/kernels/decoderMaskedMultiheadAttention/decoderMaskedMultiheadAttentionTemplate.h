@@ -45,9 +45,10 @@ namespace kernels
 // #define MMHA_USE_HMMA
 
 // Apply the FP8 scaling to Q instead of K.
+// Note: temporarily disabled due to accuracy loss
 #ifdef ENABLE_FP8
-#define MMHA_FP8_SCALE_Q_INSTEAD_OF_K
-#define MMHA_FP8_SCALE_P_INSTEAD_OF_V
+// #define MMHA_FP8_SCALE_Q_INSTEAD_OF_K
+// #define MMHA_FP8_SCALE_P_INSTEAD_OF_V
 #endif // !defined ENABLE_FP8
 
 // Below are knobs to extend FP32 accumulation for higher FP16 accuracy

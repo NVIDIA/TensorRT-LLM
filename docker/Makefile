@@ -67,6 +67,7 @@ DOCKER_RUN_ARGS   ?=
 GPU_OPTS          ?= --gpus=all
 SOURCE_DIR        ?= $(shell readlink -f ..)
 CODE_DIR          ?= /code/tensorrt_llm
+CCACHE_DIR        ?= ${CODE_DIR}/cpp/.ccache
 RUN_CMD           ?=
 CONTAINER_NAME    ?= tensorrt_llm
 
@@ -77,6 +78,8 @@ endif
 	docker run $(DOCKER_RUN_OPTS) $(DOCKER_RUN_ARGS) \
     		$(GPU_OPTS) \
     		--volume $(SOURCE_DIR):$(CODE_DIR) \
+    		--env "CCACHE_DIR=${CCACHE_DIR}" \
+    		--env "CCACHE_BASEDIR=${CODE_DIR}" \
     		--workdir $(CODE_DIR) \
     		--hostname $(shell hostname)-$* \
     		--name $(CONTAINER_NAME)-$*-$(USER_NAME) \

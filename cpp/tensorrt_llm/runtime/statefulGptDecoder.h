@@ -47,7 +47,7 @@ public:
 
     void forwardAsync(decoder::Output& output, decoder::Input const& input) override;
 
-    bool isFinishedSync() override;
+    void forwardSync() override;
 
     //! @brief Gather final results for all requests.
     [[nodiscard]] TensorPtr getFinalOutputIds() const override;
