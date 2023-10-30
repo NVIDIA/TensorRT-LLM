@@ -230,6 +230,7 @@ The list of supported models is:
 * [OPT](examples/opt)
 * [SantaCoder](examples/gpt)
 * [StarCoder](examples/gpt)
+* [InternLM](examples/internlm)
 
 ## Performance
 
