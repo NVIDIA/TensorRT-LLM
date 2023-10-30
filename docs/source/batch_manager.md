@@ -87,12 +87,24 @@ callback:
 using ReturnBatchManagerStatsCallback = std::function<void(const std::string&)>;
 ```
 
-The statistics are packaged as a JSON string. That string contains three fields:
+The statistics are packaged as a JSON string. That string contains the following fields:
   * `Timestamp`, the timestamp of the request (obtained using
     `std::put_time(&tm, "%m-%d-%Y %H:%M:%S")`),
-  * `Iteration Counter`, a counter value that corresponds to the execution of a
-    given request,
-  * `Active Request Count`, the number of active requests.
+  * `Iteration Counter`, a global step counter value that increases monotonically over time
+  * `Active Request Count`, the number of active requests in batch manager
+  * `Max Request Count`, the max number of requests batch manager can support at a time
+
+When using in-flight batching, the following additional statistics are reported:
+  * `Max KV cache blocks`, the maximum number of KV cache blocks per GPU
+  * `Free KV cache blocks`, number of free KV cache blocks per GPU
+  * `Used KV cache blocks`, number of used KV cache blocks per GPU
+  * `Tokens per KV cache block`, number of tokens per KV cache block
+  * `Scheduled Requests`, number of requests scheduled this iteration
+  * `Context Requests`, number of requests in Context phase
+  * `Total Context Tokens`, total number of tokens across requests in context phase
+  * `Generation Requests`, number of requests in Context phase
+  * `Generation Requests`, number of requests in Generation phase
+  * `MicroBatch ID`, number of requests in Generation phase
 
 ### GptManager Design
 

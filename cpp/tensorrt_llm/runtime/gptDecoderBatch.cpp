@@ -464,16 +464,13 @@ void GptDecoderBatch::forwardAsync(decoder::Output& output, decoder::Input const
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-bool GptDecoderBatch::isFinishedSync()
+void GptDecoderBatch::forwardSync()
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     forwardSync(*mForwardToken);
-    auto const finished
-        = std::all_of(mFinished.begin(), mFinished.begin() + mActualBatchSize, [](bool x) { return x; });
     // wait for mFinishedSum to be updated
-    mStream->wait(mForwardEvent);
+    mForwardEvent.synchronize();
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
-    return finished;
 }
 
 IStatefulGptDecoder::TensorPtr GptDecoderBatch::getFinalOutputIds() const

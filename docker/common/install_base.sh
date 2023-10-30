@@ -16,7 +16,15 @@ set_bash_env() {
 
 init_ubuntu() {
     apt-get update
-    apt-get install -y --no-install-recommends wget gdb git-lfs python3-pip python3-dev python-is-python3 libffi-dev
+    apt-get install -y --no-install-recommends \
+      ccache \
+      gdb \
+      git-lfs \
+      libffi-dev \
+      python3-dev \
+      python3-pip \
+      python-is-python3 \
+      wget
     if ! command -v mpirun &> /dev/null; then
       DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
     fi

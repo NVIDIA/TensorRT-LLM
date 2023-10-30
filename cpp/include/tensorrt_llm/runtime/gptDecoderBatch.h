@@ -59,7 +59,7 @@ public:
 
     void forwardAsync(decoder::Output& output, decoder::Input const& input) override;
 
-    bool isFinishedSync() override;
+    void forwardSync() override;
 
     //! @return [batchSize], indicators of finished requests
     [[nodiscard]] std::vector<bool> getFinished() const override
@@ -83,13 +83,13 @@ public:
         return ITensor::slice(mJointDecodingOutput->ids, 0, mActualBatchSize);
     }
 
-    //! Execute postProcessRequest  and returns OutputIds for request `batchIdx`.
-    //! Result will only be available after event returned
+    //! @brief Gather final beam search results for request `batchIdx`.
+    //! Result will only be available after event returned.
     //! @returns [maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token ids without
     //! padding for request `batchIdx`, on gpu
     [[nodiscard]] std::tuple<CudaEvent, TensorPtr> getFinalOutputIds(SizeType batchIdx) const override;
 
-    //! Execute postProcessRequest and returns OutputIds.
+    //! @brief Gather final beam search results for all requests.
     //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token
     //! ids without padding, on gpu
     [[nodiscard]] TensorPtr getFinalOutputIds() const override;
@@ -138,7 +138,7 @@ public:
     }
 
 private:
-    //! @brief Gather final results for request `batchIdx`
+    //! @brief Gather final beam search results for request `batchIdx`.
     CudaEvent postProcessRequest(SizeType batchIdx) const;
 
 private:

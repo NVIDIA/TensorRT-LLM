@@ -17,32 +17,29 @@
 
 #pragma once
 
-#include "tensorrt_llm/batch_manager/kvCacheConfig.h"
 #include "tensorrt_llm/runtime/common.h"
 
 #include <optional>
 
-namespace tensorrt_llm::batch_manager
+namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-class TrtGptModelOptionalParams
+class KvCacheConfig
 {
-    using KvCacheConfig = kv_cache_manager::KvCacheConfig;
-
 public:
     using SizeType = tensorrt_llm::runtime::SizeType;
 
-    explicit TrtGptModelOptionalParams(KvCacheConfig const& kvCacheConfig = KvCacheConfig{},
-        std::optional<SizeType> maxNumSequences = std::nullopt, bool enableTrtOverlap = true)
-        : kvCacheConfig{kvCacheConfig}
-        , maxNumSequences{maxNumSequences}
-        , enableTrtOverlap{enableTrtOverlap}
+    explicit KvCacheConfig(
+        std::optional<SizeType> maxTokens = std::nullopt, std::optional<float> freeGpuMemoryFraction = std::nullopt)
+        : maxTokens{maxTokens}
+        , freeGpuMemoryFraction{freeGpuMemoryFraction}
     {
     }
 
-    KvCacheConfig kvCacheConfig;
-    std::optional<SizeType> maxNumSequences;
-    bool enableTrtOverlap;
+    std::optional<SizeType> maxTokens;
+    std::optional<float> freeGpuMemoryFraction;
+
+    static constexpr auto kDefaultGpuMemFraction = 0.85f;
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager

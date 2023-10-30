@@ -53,8 +53,8 @@ class TestFunctional(unittest.TestCase):
         test_cases = []
         test_cases += list(
             product(['gpt2_attention', 'llama_attention', 'gptj_attention'],
-                    [ContextFMHAType.disabled], ['float16', 'bfloat16'], [2],
-                    [128], [4], [64], [0], [False], [False], [False], [1, 4],
+                    [ContextFMHAType.disabled], ['float16', 'bfloat16'], [None],
+                    [2], [128], [4], [64], [0], [False], [False], [1, 4],
                     [True, False], [True, False]))
 
         # Test cases for input padding
@@ -62,22 +62,22 @@ class TestFunctional(unittest.TestCase):
             product(['llama_attention'], [
                 ContextFMHAType.disabled,
                 ContextFMHAType.enabled,
-            ], ['float16', 'bfloat16'], [2], [128], [4], [64], [False], [False],
+            ], ['float16', 'bfloat16'], [None], [2], [128], [4], [64], [False],
                     [False], [False, True], [1], [False], [False]))
 
         # Test cases for fused context MHAs
         test_cases += list(
             product(['llama_attention'], [
                 ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
-            ], ['float16', 'bfloat16'], [2], [90, 1024], [4],
-                    [32, 64, 80, 112, 128], [0], [False], [False],
-                    [False, True], [1], [False], [False]))
+            ], ['float16', 'bfloat16'], [None], [2], [90, 1024], [4],
+                    [32, 64, 80, 112, 128], [0], [False], [False, True], [1],
+                    [False], [False]))
 
         # Test cases of float32 d=256 case (for testing MMHA key loops).
         test_cases += list(
             product(['gptj_attention'], [
                 ContextFMHAType.enabled,
-            ], ['float32'], [2], [128], [2], [256], [False], [False], [False],
+            ], ['float32'], [None], [2], [128], [2], [256], [False], [False],
                     [True], [1], [False], [True, False]))
 
         # Test cases for the multi-block MMHA.
@@ -85,32 +85,32 @@ class TestFunctional(unittest.TestCase):
         test_cases += list(
             product(['llama_attention'], [
                 ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
-            ], ['float16', 'bfloat16'], [2], [2048], [4], [64], [0], [True],
-                    [False], [False], [1], [False], [False]))
+            ], ['float16', 'bfloat16'], [None], [2], [2048], [4], [64], [0],
+                    [True], [False], [1], [False], [False]))
 
-        # Test cases for the int8 K/V cache.
+        # Test cases for the 8-bit K/V cache.
         test_cases += list(
             product(['gpt2_attention'], [ContextFMHAType.disabled],
-                    ['float16', 'float32'], [2], [128], [4], [64], [0], [False],
-                    [True], [False], [1, 4], [False], [False]))
+                    ['float16', 'float32'], ['int8', 'fp8'], [2], [128], [4],
+                    [64], [0], [False], [False], [1, 4], [False], [False]))
 
-        #test cases for multi-query attention
+        # test cases for multi-query attention
         test_cases += list(
             product(['gpt_bigcode_attention'], [
                 ContextFMHAType.disabled, ContextFMHAType.enabled,
                 ContextFMHAType.enabled_with_fp32_acc
-            ], ['float16', 'bfloat16'], [2], [128], [4], [64], [1], [False],
+            ], ['float16', 'bfloat16'], [None], [2], [128], [4], [64], [1],
                     [False], [False], [1, 4], [False], [False]))
 
         # test cases for grouped-query attention
         test_cases += list(
             product(['llama_attention'], [ContextFMHAType.disabled],
-                    ['bfloat16', 'float16'], [2], [4], [8], [32], [2, 4],
-                    [False], [False], [False], [1], [False], [False]))
+                    ['bfloat16', 'float16'], [None], [2], [4], [8], [32],
+                    [2, 4], [False], [False], [1], [False], [False]))
         test_cases += list(
             product(['llama_attention'], [ContextFMHAType.enabled], ['float32'],
-                    [1], [165], [32], [128], [4], [False], [False], [False],
-                    [1], [False], [False]))
+                    [None], [1], [165], [32], [128], [4], [False], [False], [1],
+                    [False], [False]))
 
         # test cases for RoPE base and scaling
         test_cases += list(
@@ -118,12 +118,12 @@ class TestFunctional(unittest.TestCase):
                 ['llama_attention'],
                 [ContextFMHAType.disabled],
                 ['bfloat16', 'float32'],
+                [None],
                 [2],
                 [4],
                 [8],
                 [32],
                 [2, 4],
-                [False],
                 [False],
                 [False],
                 [1],
@@ -145,12 +145,12 @@ class TestFunctional(unittest.TestCase):
                 ['llama_attention'],
                 [ContextFMHAType.enabled],
                 ['float32'],
+                [None],
                 [1],
                 [165],
                 [32],
                 [128],
                 [4],
-                [False],
                 [False],
                 [False],
                 [1],
@@ -181,13 +181,13 @@ class TestFunctional(unittest.TestCase):
                            attention_type,
                            context_fmha_type,
                            dtype,
+                           kv_cache_dtype,
                            batch_size,
                            in_len,
                            num_heads,
                            head_size,
                            num_kv_heads,
                            enable_multi_block_mmha,
-                           use_int8_kv_cache,
                            enable_remove_input_padding,
                            beam_width,
                            paged_kv_cache,
@@ -197,6 +197,10 @@ class TestFunctional(unittest.TestCase):
         # if attention_type != "gpt_bigcode_attention" and attention_type != "llama_attention":
         #     assert num_kv_heads == 0 # safe guard against bad test case configs
 
+        use_int8_kv_cache = True if kv_cache_dtype == 'int8' else False
+        use_fp8_kv_cache = True if kv_cache_dtype == 'fp8' else False
+        if kv_cache_dtype is None:
+            kv_cache_dtype = dtype
         # Skip tests that are not supported in pre-ampere architecture
         if getSMVersion() < 80:
             if context_fmha_type == ContextFMHAType.enabled:
@@ -211,6 +215,10 @@ class TestFunctional(unittest.TestCase):
                 pytest.skip(
                     "bfloat16 is not supported in pre-ampere architecture")
 
+        if getSMVersion() < 89:
+            if use_fp8_kv_cache:
+                pytest.skip("FP8 is not supported on pre-Ada architectures")
+
         if num_kv_heads == 0:
             num_kv_heads = num_heads
         # Skip duplicated tests.
@@ -220,8 +228,7 @@ class TestFunctional(unittest.TestCase):
                 so it has been tested with ContextFMHAType.enabled")
 
         session = None
-        kv_cache_dtype = 'int8' if use_int8_kv_cache else dtype
-        if use_int8_kv_cache:
+        if use_int8_kv_cache or use_fp8_kv_cache or True:
             # Fixing seed to avoid flakiness in tests with quantization
             torch.manual_seed(42)
 
@@ -293,15 +300,15 @@ class TestFunctional(unittest.TestCase):
                         shape=tuple(past_key_value.shape),
                         dtype=tensorrt_llm.str_dtype_to_trt(kv_cache_dtype))
 
-                kv_int8_quant_scale_tensor = None
-                kv_int8_dequant_scale_tensor = None
-                if use_int8_kv_cache:
-                    kv_int8_quant_scale_tensor = Tensor(
-                        name='kv_int8_quant_scale',
+                kv_quant_scale_tensor = None
+                kv_dequant_scale_tensor = None
+                if use_int8_kv_cache or use_fp8_kv_cache:
+                    kv_quant_scale_tensor = Tensor(
+                        name='kv_quant_scale',
                         shape=(1, ),
                         dtype=tensorrt_llm.str_dtype_to_trt('float32'))
-                    kv_int8_dequant_scale_tensor = Tensor(
-                        name='kv_int8_dequant_scale',
+                    kv_dequant_scale_tensor = Tensor(
+                        name='kv_dequant_scale',
                         shape=(1, ),
                         dtype=tensorrt_llm.str_dtype_to_trt('float32'))
 
@@ -374,11 +381,12 @@ class TestFunctional(unittest.TestCase):
                     max_position_embeddings,
                     position_embedding_type=position_embedding_type,
                     multi_block_mode=enable_multi_block_mmha,
-                    kv_orig_quant_scale=kv_int8_quant_scale_tensor,
-                    kv_quant_orig_scale=kv_int8_dequant_scale_tensor,
+                    kv_orig_quant_scale=kv_quant_scale_tensor,
+                    kv_quant_orig_scale=kv_dequant_scale_tensor,
                     host_context_lengths=host_context_lengths_tensor,
                     kv_cache_quant_mode=QuantMode.from_description(
-                        use_int8_kv_cache=use_int8_kv_cache),
+                        use_int8_kv_cache=use_int8_kv_cache,
+                        use_fp8_kv_cache=use_fp8_kv_cache),
                     kv_cache_block_pointers=pointer_array_tensor,
                     max_context_length=max_context_length,
                     qkv_bias=qkv_bias)
@@ -405,9 +413,9 @@ class TestFunctional(unittest.TestCase):
             else:
                 inputs['past_key_value'] = past_key_value
 
-            if use_int8_kv_cache:
-                inputs['kv_int8_quant_scale'] = kv_int8_quant_scale
-                inputs['kv_int8_dequant_scale'] = kv_int8_dequant_scale
+            if use_int8_kv_cache or use_fp8_kv_cache:
+                inputs['kv_quant_scale'] = kv_quant_scale
+                inputs['kv_dequant_scale'] = kv_dequant_scale
 
             if enable_remove_input_padding:
                 inputs['host_context_lengths'] = host_context_lengths
@@ -417,11 +425,13 @@ class TestFunctional(unittest.TestCase):
                 outputs['present_key_value'] = past_key_value
 
             stream = torch.cuda.current_stream()
-            # NOTE: when int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
+            # NOTE: when 8-bit kv cache is used together with paged kv cache no 8-bit tensors are exposed to TRT
             int8_trt_flag = use_int8_kv_cache and not paged_kv_cache
+            fp8_trt_flag = use_fp8_kv_cache and not paged_kv_cache
             builder_config = builder.create_builder_config(name=attention_type,
                                                            precision=dtype,
-                                                           int8=int8_trt_flag)
+                                                           int8=int8_trt_flag,
+                                                           fp8=fp8_trt_flag)
             if session is None:
                 engine = builder.build_engine(net, builder_config)
                 session = tensorrt_llm.runtime.Session.from_serialized_engine(
@@ -452,8 +462,8 @@ class TestFunctional(unittest.TestCase):
             'host_past_key_value_lengths': (batch_size, ),
             'sequence_length': (batch_size, ),
             'context_lengths': (batch_size, ),
-            'kv_int8_quant_scale': (1, ),
-            'kv_int8_dequant_scale': (1, ),
+            'kv_quant_scale': (1, ),
+            'kv_dequant_scale': (1, ),
             'cache_indirection': (batch_size, 1, max_seq_len),
             'host_request_types': (batch_size)
         }
@@ -467,10 +477,14 @@ class TestFunctional(unittest.TestCase):
         if enable_remove_input_padding:
             shape_dict['host_context_lengths'] = (batch_size, )
 
-        present_key_value = torch.zeros(
-            shape_dict['past_key_value'],
-            dtype=tensorrt_llm._utils.str_dtype_to_torch(kv_cache_dtype),
-            device='cuda')
+        # HACK: pytorch does not have fp8 dtype yet
+        torch_kv_cache_dtype = tensorrt_llm._utils.str_dtype_to_torch(
+            'int8'
+        ) if kv_cache_dtype == 'fp8' else tensorrt_llm._utils.str_dtype_to_torch(
+            kv_cache_dtype)
+        present_key_value = torch.zeros(shape_dict['past_key_value'],
+                                        dtype=torch_kv_cache_dtype,
+                                        device='cuda')
         # Init KV cache block manager
         if paged_kv_cache:
             manager = KVCacheManager([present_key_value],
@@ -496,13 +510,12 @@ class TestFunctional(unittest.TestCase):
                            device='cuda') * 1e-2
         torch_present = None
 
-        kv_int8_dequant_scale = torch.randint(
-            1,
-            10,
-            shape_dict['kv_int8_dequant_scale'],
-            dtype=str_dtype_to_torch(kv_cache_dtype),
-            device='cuda') * 0.0001
-        kv_int8_quant_scale = 1.0 / kv_int8_dequant_scale
+        kv_dequant_scale = torch.randint(1,
+                                         10,
+                                         shape_dict['kv_dequant_scale'],
+                                         dtype=torch.float32,
+                                         device='cuda') * 0.0001
+        kv_quant_scale = 1.0 / kv_dequant_scale
 
         ConfigCls = None
         AttentionCls = None
@@ -709,7 +722,7 @@ class TestFunctional(unittest.TestCase):
                                        device='cuda')
 
         def verify_kv_cache(torch_present):
-            if not use_int8_kv_cache and num_kv_heads == num_heads and beam_width == 1:
+            if not use_int8_kv_cache and not use_fp8_kv_cache and num_kv_heads == num_heads and beam_width == 1:
                 if paged_kv_cache:
                     kv_cache_cont = manager.blocks_manager.get_continous_caches(
                         0)
@@ -862,8 +875,8 @@ class TestFunctional(unittest.TestCase):
                     host_past_key_value_lengths, input_lengths,
                     host_context_lengths, cache_indirection, host_request_types,
                     num_heads, hidden_size, num_kv_heads, output, dtype,
-                    max_context_length, shape_dict, kv_int8_quant_scale,
-                    kv_int8_dequant_scale, configuration)
+                    max_context_length, shape_dict, kv_quant_scale,
+                    kv_dequant_scale, configuration)
                 del session
                 session = None
 
@@ -1007,8 +1020,8 @@ class TestFunctional(unittest.TestCase):
                     tiled_input_lengths, tiled_host_context_lengths,
                     cache_indirection, tiled_host_request_types, num_heads,
                     hidden_size, num_kv_heads, tiled_output, dtype,
-                    max_context_length, shape_dict, kv_int8_quant_scale,
-                    kv_int8_dequant_scale, configuration)
+                    max_context_length, shape_dict, kv_quant_scale,
+                    kv_dequant_scale, configuration)
 
                 del session
                 session = None

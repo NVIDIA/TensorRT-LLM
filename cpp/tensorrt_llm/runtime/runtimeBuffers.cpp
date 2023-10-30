@@ -1,6 +1,3 @@
-//
-// Created by martinma on 5/24/23.
-//
 /*
  * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
  *
@@ -19,15 +16,15 @@
 
 #include "tensorrt_llm/runtime/runtimeBuffers.h"
 
-#include <algorithm>
-#include <iostream>
-
 #include "ipcUtils.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/stlUtils.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/utils/sessionUtils.h"
+
+#include <algorithm>
+#include <iostream>
 
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
@@ -107,7 +104,6 @@ void RuntimeBuffers::create(TllmRuntime& runtime, GptModelConfig const& modelCon
     }
 
     contextLengthsHost = manager.emptyTensor(MemoryType::kPINNED, nvinfer1::DataType::kINT32);
-    sequenceLengths = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
     lastTokenIds = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
 
     auto const localNbLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
@@ -224,7 +220,6 @@ void RuntimeBuffers::reshape(
         logits->reshape(ITensor::makeShape({batchSize, 1, vocabSizePadded}));
     }
 
-    sequenceLengths->reshape(ITensor::makeShape({batchSize}));
     lastTokenIds->reshape(ITensor::makeShape({batchSize}));
 
     auto kvCacheShape
@@ -317,7 +312,6 @@ void RuntimeBuffers::tile(BufferManager& manager, GenerationConfig const& genera
     }
 
     utils::tileBufferReplace(contextLengthsDevice, beamWidth, manager);
-    utils::tileBufferReplace(sequenceLengths, beamWidth, manager);
 
     if (modelConfig.useGptAttentionPlugin())
     {
@@ -363,6 +357,10 @@ void RuntimeBuffers::postContextStep(BufferManager& manager, GenerationConfig co
         tile(manager, generationConfig, modelConfig, worldConfig);
     }
 
+    // use output lengths after context step
+    manager.copy(*contextLengthsDevice, *outputLengths);
+    sequenceLengths = ITensor::view(outputLengths);
+    sequenceLengths->reshape(ITensor::makeShape({batchSize * beamWidth}));
     // no need to copy data in lastTokenIds because it is overwritten in prepareNextStep
     lastTokenIds->reshape(ITensor::makeShape({batchSize * beamWidth}));
 
@@ -377,15 +375,16 @@ void RuntimeBuffers::postContextStep(BufferManager& manager, GenerationConfig co
 }
 
 void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType const padId, BufferManager& manager,
-    KvCacheManager const* kvCacheManager, GenerationConfig const& generationConfig, GptModelConfig const& modelConfig,
-    WorldConfig const& worldConfig)
+    KvCacheManager const* kvCacheManager, SizeType firstBatchSlotIdx, GenerationConfig const& generationConfig,
+    GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto& stream = manager.getStream();
     SizeType const batchSize = generationConfig.batchSize;
     SizeType const maxInputLength = generationConfig.maxInputLength;
 
-    manager.copy(*contextLengthsDevice, *sequenceLengths);
+    // use context lengths only in context step
+    sequenceLengths = contextLengthsDevice;
 
     if (modelConfig.useGptAttentionPlugin())
     {
@@ -457,7 +456,8 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
     if (modelConfig.useGptAttentionPlugin() && modelConfig.usePagedKvCache())
     {
         auto constexpr contextBeamWidth = 1;
-        kvCacheManager->getBlockPointersOfBatch(kvCacheBlockPointersHost, batchSize, contextBeamWidth);
+        kvCacheManager->getBlockPointersOfBatch(
+            *kvCacheBlockPointersHost, firstBatchSlotIdx, batchSize, contextBeamWidth);
         manager.copy(*kvCacheBlockPointersHost, *kvCacheBlockPointersDevice);
     }
 
@@ -475,8 +475,8 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, TensorPtr const& outputIds,
-    BufferManager& manager, KvCacheManager* kvCacheManager, GenerationConfig const& generationConfig,
+RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, BufferManager& manager,
+    KvCacheManager* kvCacheManager, SizeType firstBatchSlotIdx, GenerationConfig const& generationConfig,
     GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
@@ -495,7 +495,7 @@ RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, T
         // batch in first dim
         inputShape = ITensor::makeShape({batchSize * beamWidth, 1});
     }
-    auto nextInputIds = outputIds ? ITensor::view(outputIds, inputShape) : TensorPtr{};
+    auto nextInputIds = newTokens ? ITensor::view(newTokens, inputShape) : TensorPtr{};
 
     if (modelConfig.useGptAttentionPlugin())
     {
@@ -570,11 +570,11 @@ RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, T
 
     if (modelConfig.usePagedKvCache())
     {
-        for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+        for (auto batchIdx = firstBatchSlotIdx; batchIdx < firstBatchSlotIdx + batchSize; ++batchIdx)
         {
             kvCacheManager->addToken(batchIdx);
         }
-        kvCacheManager->getBlockPointersOfBatch(kvCacheBlockPointersHost, batchSize, beamWidth);
+        kvCacheManager->getBlockPointersOfBatch(*kvCacheBlockPointersHost, firstBatchSlotIdx, batchSize, beamWidth);
         manager.copy(*kvCacheBlockPointersHost, *kvCacheBlockPointersDevice);
     }
 

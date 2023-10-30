@@ -83,17 +83,17 @@ public:
     //! @brief Run one step for all requests without blocking the host thread.
     virtual void forwardAsync(decoder::Output& output, decoder::Input const& input) = 0;
 
-    //! @brief Wait for the last call to `forwardAsync` to complete and return whether all sequences have finished.
-    virtual bool isFinishedSync() = 0;
+    //! @brief Wait for the last call to `forwardAsync` to complete.
+    virtual void forwardSync() = 0;
 
     //! @brief Run one step for all requests.
-    virtual bool forward(decoder::Output& output, decoder::Input const& input)
+    virtual void forward(decoder::Output& output, decoder::Input const& input)
     {
         forwardAsync(output, input);
-        return isFinishedSync();
+        return forwardSync();
     }
 
-    //! @brief Gather final results for all requests.
+    //! @brief Gather final beam search results for all requests.
     virtual TensorPtr getFinalOutputIds() const = 0;
 
     //! @returns [batchSize, beamWidth, maxSequenceLength], all token ids, on gpu
@@ -104,6 +104,8 @@ public:
 
     //! @returns [1], number of finished sequences, in pinned host memory
     virtual TensorPtr getNbFinished() const = 0;
+
+    virtual ~IStatefulGptDecoder() = default;
 
 protected:
     IStatefulGptDecoder() = default;

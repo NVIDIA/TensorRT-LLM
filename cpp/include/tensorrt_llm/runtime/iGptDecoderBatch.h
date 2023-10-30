@@ -125,7 +125,7 @@ public:
     //! ids without padding for request `batchIdx`, on gpu
     virtual TensorPtr getOutputIds(SizeType batchIdx) const = 0;
 
-    //! Execute postProcessRequest  and returns OutputIds for request `batchIdx`.
+    //! @brief Gather final beam search results for request `batchIdx`.
     //! Result will only be available after event returned
     //! @returns [maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token ids without
     //! padding for request `batchIdx`, on gpu

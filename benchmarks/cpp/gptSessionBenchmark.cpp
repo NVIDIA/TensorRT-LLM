@@ -35,9 +35,9 @@ namespace trt = nvinfer1;
 namespace
 {
 void benchmarkGptSession(std::string const& modelName, std::filesystem::path const& dataPath,
-    std::vector<int> const& batchSizes, std::vector<std::vector<int>> const& inOutLen,
+    std::vector<int> const& batchSizes, int beamWidth, std::vector<std::vector<int>> const& inOutLen,
     std::shared_ptr<nvinfer1::ILogger> const& logger, int warmUp, int numRuns, int duration,
-    std::optional<SizeType> numMicroBatches, bool cudaGraphMode)
+    GptSession::Config& sessionConfig, bool cudaGraphMode)
 {
     auto const json = GptJsonConfig::parse(dataPath / "config.json");
     auto const modelConfig = json.getModelConfig();
@@ -50,8 +50,6 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
     auto const dtype = modelConfig.getDataType();
     auto const useHalf = (dtype == nvinfer1::DataType::kHALF);
 
-    auto constexpr decoderPerRequest = false;
-    auto constexpr beamWidth = 1;
     SamplingConfig samplingConfig{beamWidth};
     samplingConfig.temperature = std::vector{1.0f};
     samplingConfig.minLength = std::vector{1};
@@ -59,15 +57,23 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
     samplingConfig.topK = std::vector{1};
     samplingConfig.topP = std::vector{0.0f};
 
-    GptSession session{modelConfig, worldConfig, enginePath.string(), logger};
-    // Use bufferManager for copying data to and from the GPU
-    auto& bufferManager = session.getBufferManager();
-    session.setCudaGraphMode(cudaGraphMode);
+    auto const maxBatchSize = *std::max_element(batchSizes.begin(), batchSizes.end());
+    sessionConfig.maxBatchSize = maxBatchSize;
+    sessionConfig.maxBeamWidth = beamWidth;
+    sessionConfig.decoderPerRequest = false;
+    sessionConfig.cudaGraphMode = cudaGraphMode;
 
     for (auto inOut : inOutLen)
     {
         auto const maxInputLength = inOut[0];
         auto const maxNewTokens = inOut[1];
+
+        sessionConfig.maxSequenceLength = maxInputLength + maxNewTokens;
+
+        GptSession session{sessionConfig, modelConfig, worldConfig, enginePath.string(), logger};
+
+        // Use bufferManager for copying data to and from the GPU
+        auto& bufferManager = session.getBufferManager();
 
         auto constexpr endId = 50256;
         auto constexpr padId = 50256;
@@ -76,9 +82,6 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
         {
             try
             {
-                session.setup(batchSize, beamWidth, maxInputLength + maxNewTokens, decoderPerRequest, std::nullopt,
-                    numMicroBatches);
-
                 std::vector<SizeType> inputLenghtsHost(batchSize, maxInputLength);
                 auto inputLenghts
                     = bufferManager.copyFrom(inputLenghtsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
@@ -133,11 +136,14 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                 }
                 printf("Benchmarking done. Iteration: %d, duration: %.2f sec.\n", iterIdx, curDuration / 1000);
 
-                auto averageLatency = curDuration / iterIdx;
                 if (worldConfig.getRank() == 0)
                 {
-                    printf("[BENCHMARK] batch_size %d input_length %d output_length %d latency(ms) %.2f\n", batchSize,
-                        maxInputLength, maxNewTokens, averageLatency);
+                    auto const averageLatency = curDuration / iterIdx;
+                    float const tokensPerSec = batchSize * maxNewTokens / (averageLatency / 1000);
+                    printf(
+                        "[BENCHMARK] batch_size %d input_length %d output_length %d latency(ms) %.2f tokensPerSec "
+                        "%.2f\n",
+                        batchSize, maxInputLength, maxNewTokens, averageLatency, tokensPerSec);
                 }
             }
             catch (std::runtime_error& e)
@@ -154,8 +160,9 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                 if (worldConfig.getRank() == 0)
                 {
                     printf("%s", e.what());
-                    printf("[BENCHMARK] batch_size %d input_length %d output_length %d latency(ms) N/A\n", batchSize,
-                        maxInputLength, maxNewTokens);
+                    printf(
+                        "[BENCHMARK] batch_size %d input_length %d output_length %d latency(ms) N/A tokensPerSec N/A\n",
+                        batchSize, maxInputLength, maxNewTokens);
                 }
                 continue;
             }
@@ -177,6 +184,8 @@ int main(int argc, char* argv[])
         "Specify batch size(s) you want to benchmark. Multiple batch sizes can be separated by \";\", example: "
         "\"1;8;64\".",
         cxxopts::value<std::string>()->default_value("8"));
+    options.add_options()(
+        "beam_width", "Specify beam width you want to benchmark.", cxxopts::value<int>()->default_value("1"));
     options.add_options()("input_output_len",
         "Specify input-output length(s) you want to benchmark. Multiple input lengths can be separated by \";\", "
         "example: \"60,20;128,20\".",
@@ -190,8 +199,12 @@ int main(int argc, char* argv[])
         cxxopts::value<int>()->default_value("10"));
     options.add_options()("duration", "Minimal duration of iterations to measure in seconds.",
         cxxopts::value<int>()->default_value("60"));
+
     options.add_options()(
         "num_micro_batches", "Number of micro batches if enabling pipeline parallelism.", cxxopts::value<int>());
+    options.add_options()("max_tokens_in_paged_kvcache", "Max tokens in paged K-V Cache.", cxxopts::value<int>());
+    options.add_options()(
+        "kv_cache_free_gpu_mem_fraction", "K-V Cache Free Gpu Mem Fraction.", cxxopts::value<float>());
 
     options.add_options()("enable_cuda_graph", "Execute GPT session with CUDA graph.");
 
@@ -219,6 +232,9 @@ int main(int argc, char* argv[])
     {
         batchSizes.push_back(std::stoi(token));
     }
+
+    // Argument: beam width
+    auto const beamWidth = result["beam_width"].as<int>();
 
     // Argument: Input-output lengths
     std::istringstream ssInOutLenArg;
@@ -264,11 +280,21 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    GptSession::Config sessionConfig{0, 0, 0};
     // Argument: Number of micro batches
-    std::optional<SizeType> numMicroBatches{std::nullopt};
     if (result.count("num_micro_batches"))
     {
-        numMicroBatches = result["num_micro_batches"].as<int>();
+        sessionConfig.numMicroBatches = result["num_micro_batches"].as<int>();
+    }
+    // Argument: Max tokens in paged K-V Cache
+    if (result.count("max_tokens_in_paged_kvcache"))
+    {
+        sessionConfig.kvCacheConfig.maxTokens = result["max_tokens_in_paged_kvcache"].as<int>();
+    }
+    // Argument: K-V Cache Free Gpu Mem Fraction
+    if (result.count("kv_cache_free_gpu_mem_fraction"))
+    {
+        sessionConfig.kvCacheConfig.freeGpuMemoryFraction = result["kv_cache_free_gpu_mem_fraction"].as<float>();
     }
 
     // Argument: Enable CUDA graph
@@ -279,8 +305,8 @@ int main(int argc, char* argv[])
     try
     {
         benchmarkGptSession(result["model"].as<std::string>(), result["engine_dir"].as<std::string>(), batchSizes,
-            inOutLen, logger, result["warm_up"].as<int>(), result["num_runs"].as<int>(), result["duration"].as<int>(),
-            numMicroBatches, enableCudaGraph);
+            beamWidth, inOutLen, logger, result["warm_up"].as<int>(), result["num_runs"].as<int>(),
+            result["duration"].as<int>(), sessionConfig, enableCudaGraph);
     }
     catch (const std::exception& e)
     {

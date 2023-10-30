@@ -25,6 +25,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, T5Tokenizer
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization import QuantMode
 
 from build import find_engines  # isort:skip
 
@@ -48,6 +49,7 @@ def TRTGPT(args, config):
     paged_kv_cache = config['plugin_config']['paged_kv_cache']
     tokens_per_block = config['plugin_config']['tokens_per_block']
     use_custom_all_reduce = config['plugin_config']['use_custom_all_reduce']
+    quant_mode = QuantMode(config['builder_config'].get('quant_mode', 0))
 
     model_config = tensorrt_llm.runtime.ModelConfig(
         vocab_size=vocab_size,
@@ -60,6 +62,7 @@ def TRTGPT(args, config):
         tokens_per_block=tokens_per_block,
         paged_kv_cache=paged_kv_cache,
         dtype=dtype,
+        quant_mode=quant_mode,
         use_custom_all_reduce=use_custom_all_reduce,
     )
 

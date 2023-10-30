@@ -140,7 +140,6 @@ def main(args):
         config_path = os.path.join(args.engine_dir, 'config.json')
         with open(config_path, 'r') as f:
             config = json.load(f)
-
         tensorrt_llm_llama = TRTLLaMA(args, config)
 
     if test_hf:
@@ -156,6 +155,7 @@ def main(args):
 
     def summarize_tensorrt_llm(datapoint):
         batch_size = len(datapoint['article'])
+        assert batch_size > 0, f"Validation dataset is corrupt (0 samples found). The dataset is loaded from ~/.cache/huggingface/datasets/ccdv___cnn_dailymail"
 
         line = copy.copy(datapoint['article'])
         line_encoded = []

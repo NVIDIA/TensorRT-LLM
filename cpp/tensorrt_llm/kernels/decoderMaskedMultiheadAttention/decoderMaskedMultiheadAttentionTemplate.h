@@ -44,9 +44,13 @@ namespace kernels
 // Use HMMA to compute with FP16/BF16 inputs and FP32 accumulators.
 // #define MMHA_USE_HMMA
 
-// Apply the FP8 scaling to Q instead of K.
+// Pre-scale Q or P to reduce number of instructions for dequantizing KV cache.
+// If you notice a decrease in accuracy when the fp8 kv cache is enabled,
+//  consider disabling the two flags.
 #ifdef ENABLE_FP8
+// Apply the FP8 scaling to Q instead of K.
 #define MMHA_FP8_SCALE_Q_INSTEAD_OF_K
+// Apply the FP8 scaling to P instead of V.
 #define MMHA_FP8_SCALE_P_INSTEAD_OF_V
 #endif // !defined ENABLE_FP8
 
@@ -1428,8 +1432,9 @@ __global__ void masked_multihead_attention_kernel(
 
     // Quant/Dequant scales for 8bits kv cache.
     using T_scale = typename kv_cache_scale_type_t<T, Tcache>::Type;
-    T_scale kv_scale_orig_quant;
-    float kv_scale_quant_orig = (ENABLE_8BITS_CACHE ? params.kv_scale_quant_orig[0] : 1.0f);
+    T_scale kv_scale_orig_quant, kv_scale_quant_orig;
+    const float kv_scale_quant_orig_f = (ENABLE_8BITS_CACHE ? params.kv_scale_quant_orig[0] : 1.0f);
+    convert_from_float(&kv_scale_quant_orig, kv_scale_quant_orig_f);
     convert_from_float(&kv_scale_orig_quant, (ENABLE_8BITS_CACHE ? params.kv_scale_orig_quant[0] : 1.0f));
 
     // Up to QK_VECS_PER_Dh_MAX threads load Q and K + the bias values for the current timestep.
@@ -1640,7 +1645,7 @@ __global__ void masked_multihead_attention_kernel(
             zero(scaled_q);
             if (is_valid_qk_vec)
             {
-                scaled_q = mul<Qk_vec_k, float, Qk_vec_k>(kv_scale_quant_orig, q);
+                scaled_q = mul<Qk_vec_k, Tk, Qk_vec_k>(kv_scale_quant_orig, q);
             }
             reinterpret_cast<Qk_vec_k*>(&q_smem[qk_vec_idx])[0] = scaled_q;
         }
@@ -1895,7 +1900,8 @@ __global__ void masked_multihead_attention_kernel(
             {
                 if constexpr (ENABLE_8BITS_CACHE)
                 {
-                    qk_ = Qk_dot<T, THREADS_PER_KEY>::scale_dot(q_vec, k_vec, kv_scale_quant_orig) * params.inv_sqrt_dh;
+                    qk_ = Qk_dot<T, THREADS_PER_KEY>::scale_dot(q_vec, k_vec, kv_scale_quant_orig_f)
+                        * params.inv_sqrt_dh;
                 }
                 else
                 {
@@ -2011,7 +2017,8 @@ __global__ void masked_multihead_attention_kernel(
             {
                 if constexpr (ENABLE_8BITS_CACHE)
                 {
-                    qk_ = Qk_dot<T, THREADS_PER_KEY>::scale_dot(q_vec, k_vec, kv_scale_quant_orig) * params.inv_sqrt_dh;
+                    qk_ = Qk_dot<T, THREADS_PER_KEY>::scale_dot(q_vec, k_vec, kv_scale_quant_orig_f)
+                        * params.inv_sqrt_dh;
                 }
                 else
                 {
@@ -2136,7 +2143,7 @@ __global__ void masked_multihead_attention_kernel(
 
 // Normalize the logits.
 #ifdef MMHA_FP8_SCALE_P_INSTEAD_OF_V
-    float logit_scale = (FP8_KV_CACHE ? kv_scale_quant_orig : 1.0f);
+    float logit_scale = (FP8_KV_CACHE ? kv_scale_quant_orig_f : 1.0f);
 #else
     float logit_scale = 1.f;
 #endif // MMHA_FP8_SCALE_P_INSTEAD_OF_V
@@ -2265,7 +2272,7 @@ __global__ void masked_multihead_attention_kernel(
                 // Load the logits from shared memory.
                 // Note that fma will convert 8bit vec to the accumulation data type (float by default).
                 Logit_value_fma<Tk, V_vec_accum, V_vec_m, INT8_KV_CACHE, FP8_KV_CACHE>(
-                    out, reinterpret_cast<Tk*>(logits_smem + local_time_idx), v_vec, kv_scale_quant_orig, is_mask);
+                    out, reinterpret_cast<Tk*>(logits_smem + local_time_idx), v_vec, kv_scale_quant_orig_f, is_mask);
             }
         }
 
@@ -2295,7 +2302,7 @@ __global__ void masked_multihead_attention_kernel(
                     // Load the logits from shared memory.
                     // Note that fma will convert 8bit vec to the accumulation data type (float by default).
                     Logit_value_fma<Tk, V_vec_accum, V_vec_m, INT8_KV_CACHE, FP8_KV_CACHE>(
-                        out, reinterpret_cast<Tk*>(logits_smem + local_time_idx), v_vec, kv_scale_quant_orig, false);
+                        out, reinterpret_cast<Tk*>(logits_smem + local_time_idx), v_vec, kv_scale_quant_orig_f, false);
                 }
             }
         }

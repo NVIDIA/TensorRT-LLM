@@ -278,6 +278,8 @@ void IGptDecoder::gatherTree(ITensor& finalOutputIds, DecodingOutput const& deco
     auto const beamWidth = finalOutputIdsShape.d[1];
     auto const maxSeqLength = finalOutputIdsShape.d[2];
 
+    TLLM_CHECK_WITH_INFO(beamWidth > 1, "gatherTree is only needed for beam search.");
+
     TLLM_CHECK_WITH_INFO(decodingOutputIdsShape.d[0] == batchSize,
         common::fmtstr(
             "Decoder batch size (%d) does not match final batch size (%d)", decodingOutputIdsShape.d[0], batchSize));
@@ -290,48 +292,41 @@ void IGptDecoder::gatherTree(ITensor& finalOutputIds, DecodingOutput const& deco
 
     auto const& stream = manager.getStream();
 
-    if (beamWidth > 1)
-    {
-        tensorrt_llm::kernels::invokeInitializeOutput(bufferCast<TokenIdType>(finalOutputIds),
-            bufferCast<TokenIdType>(*decodingInput.endIds), batchSize * beamWidth, maxSeqLength, stream.get());
-        sync_check_cuda_error();
+    tensorrt_llm::kernels::invokeInitializeOutput(bufferCast<TokenIdType>(finalOutputIds),
+        bufferCast<TokenIdType>(*decodingInput.endIds), batchSize * beamWidth, maxSeqLength, stream.get());
+    sync_check_cuda_error();
 
-        tensorrt_llm::kernels::BeamHypotheses beamHypotheses;
-        beamHypotheses.sequence_lengths_src = bufferCast<SizeType>(*decodingOutput.lengths);
-        beamHypotheses.parent_ids_src = bufferCast<TokenIdType>(*decodingOutput.parentIds);
-        beamHypotheses.output_ids_src = bufferCast<TokenIdType>(*decodingOutput.ids);
-        beamHypotheses.log_probs_src = nullptr;
-        beamHypotheses.max_seq_len = maxSeqLength;
-        beamHypotheses.length_penalties
-            = nullptr; // TODO (bhsueh) should set length penalties, this should be a gpu tensor When it is set as
-                       // nullptr, the kernel will use default value (1.0f) automatically.
+    tensorrt_llm::kernels::BeamHypotheses beamHypotheses;
+    beamHypotheses.sequence_lengths_src = bufferCast<SizeType>(*decodingOutput.lengths);
+    beamHypotheses.parent_ids_src = bufferCast<TokenIdType>(*decodingOutput.parentIds);
+    beamHypotheses.output_ids_src = bufferCast<TokenIdType>(*decodingOutput.ids);
+    beamHypotheses.log_probs_src = nullptr;
+    beamHypotheses.max_seq_len = maxSeqLength;
+    beamHypotheses.length_penalties
+        = nullptr; // TODO (bhsueh) should set length penalties, this should be a gpu tensor When it is set as
+                   // nullptr, the kernel will use default value (1.0f) automatically.
 
-        beamHypotheses.output_ids_tgt = bufferCast<TokenIdType>(*decodingOutput.beamHypotheses.outputIdsTgt);
-        beamHypotheses.sequence_lengths_tgt = bufferCast<SizeType>(*decodingOutput.beamHypotheses.sequenceLengthsTgt);
-        beamHypotheses.cum_log_probs = bufferCast<float>(*decodingOutput.beamHypotheses.cumLogProbs);
-        beamHypotheses.normed_scores = bufferCast<float>(*decodingOutput.beamHypotheses.normedScores);
-        beamHypotheses.log_probs = bufferCast<float>(*decodingOutput.beamHypotheses.logProbs);
-        beamHypotheses.min_normed_scores = bufferCast<float>(*decodingOutput.beamHypotheses.minNormedScores);
-        beamHypotheses.num_beams = bufferCast<SizeType>(*decodingOutput.beamHypotheses.numBeams);
-        beamHypotheses.is_done = bufferCast<bool>(*decodingOutput.beamHypotheses.isDone);
-        beamHypotheses.input_lengths = bufferCast<SizeType>(*decodingInput.lengths);
+    beamHypotheses.output_ids_tgt = bufferCast<TokenIdType>(*decodingOutput.beamHypotheses.outputIdsTgt);
+    beamHypotheses.sequence_lengths_tgt = bufferCast<SizeType>(*decodingOutput.beamHypotheses.sequenceLengthsTgt);
+    beamHypotheses.cum_log_probs = bufferCast<float>(*decodingOutput.beamHypotheses.cumLogProbs);
+    beamHypotheses.normed_scores = bufferCast<float>(*decodingOutput.beamHypotheses.normedScores);
+    beamHypotheses.log_probs = bufferCast<float>(*decodingOutput.beamHypotheses.logProbs);
+    beamHypotheses.min_normed_scores = bufferCast<float>(*decodingOutput.beamHypotheses.minNormedScores);
+    beamHypotheses.num_beams = bufferCast<SizeType>(*decodingOutput.beamHypotheses.numBeams);
+    beamHypotheses.is_done = bufferCast<bool>(*decodingOutput.beamHypotheses.isDone);
+    beamHypotheses.input_lengths = bufferCast<SizeType>(*decodingInput.lengths);
 
-        tensorrt_llm::kernels::invokeInsertUnfinishedPath(beamHypotheses, bufferCast<bool>(*decodingOutput.finished),
-            bufferCast<float>(*decodingOutput.cumLogProbs), batchSize, beamWidth, stream.get());
-        sync_check_cuda_error();
+    tensorrt_llm::kernels::invokeInsertUnfinishedPath(beamHypotheses, bufferCast<bool>(*decodingOutput.finished),
+        bufferCast<float>(*decodingOutput.cumLogProbs), batchSize, beamWidth, stream.get());
+    sync_check_cuda_error();
 
-        tensorrt_llm::kernels::invokeFinalize(bufferCast<TokenIdType>(finalOutputIds),
-            bufferCast<SizeType>(*decodingOutput.lengths), bufferCast<float>(*decodingOutput.cumLogProbs),
-            nullptr, // output_logs
-            beamHypotheses.output_ids_tgt, beamHypotheses.sequence_lengths_tgt, beamHypotheses.normed_scores,
-            beamHypotheses.cum_log_probs, beamHypotheses.log_probs, beamHypotheses.num_beams,
-            beamHypotheses.input_lengths, beamWidth, maxSeqLength, batchSize, stream.get());
-        sync_check_cuda_error();
-    }
-    else
-    {
-        manager.copy(*decodingOutput.ids, finalOutputIds);
-        sync_check_cuda_error();
-    }
+    tensorrt_llm::kernels::invokeFinalize(bufferCast<TokenIdType>(finalOutputIds),
+        bufferCast<SizeType>(*decodingOutput.lengths), bufferCast<float>(*decodingOutput.cumLogProbs),
+        nullptr, // output_logs
+        beamHypotheses.output_ids_tgt, beamHypotheses.sequence_lengths_tgt, beamHypotheses.normed_scores,
+        beamHypotheses.cum_log_probs, beamHypotheses.log_probs, beamHypotheses.num_beams, beamHypotheses.input_lengths,
+        beamWidth, maxSeqLength, batchSize, stream.get());
+    sync_check_cuda_error();
+
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }

@@ -273,13 +273,9 @@ class GptServer
 {
 public:
     GptServer(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, int32_t maxBeamWidth,
-        batch_scheduler::SchedulerPolicy schedulerPolicy, std::optional<int32_t> maxNumSequences,
-        std::optional<int32_t> maxTokensInPagedKvCache, std::optional<float> kvCacheFreeGpuMemFraction,
-        std::optional<bool> enableTrtOverlap, std::shared_ptr<Recorder> recorder,
-        std::optional<uint64_t> terminateReqId)
+        batch_scheduler::SchedulerPolicy schedulerPolicy, TrtGptModelOptionalParams const& optionalParams,
+        std::shared_ptr<Recorder> recorder, std::optional<uint64_t> terminateReqId)
     {
-        const TrtGptModelOptionalParams& optionalParams = TrtGptModelOptionalParams(
-            maxNumSequences, maxTokensInPagedKvCache, kvCacheFreeGpuMemFraction, enableTrtOverlap);
         mBatchManager = std::make_shared<GptManager>(
             trtEnginePath, modelType, maxBeamWidth, schedulerPolicy,
             [this](int max_num_requests) { return getInferenceRequests(max_num_requests); },
@@ -460,10 +456,8 @@ std::pair<std::vector<std::vector<int32_t>>, std::vector<int32_t>> parseDataset(
 }
 
 void benchmarkGptManager(std::string const& modelName, std::filesystem::path const& engineDir, std::string const& type,
-    std::string const& datasetPath, std::shared_ptr<nvinfer1::ILogger> const& logger,
-    std::optional<int32_t> maxNumSequences, std::optional<int32_t> maxTokensInPagedKvCache,
-    std::optional<float> kvCacheFreeGpuMemFraction, std::optional<bool> enableTrtOverlap,
-    batch_scheduler::SchedulerPolicy schedulerPolicy)
+    std::string const& datasetPath, int beamWidth, std::shared_ptr<nvinfer1::ILogger> const& logger,
+    TrtGptModelOptionalParams const& optionalParams, batch_scheduler::SchedulerPolicy schedulerPolicy)
 {
     auto const worldConfig = WorldConfig::mpi(*logger);
 
@@ -482,6 +476,11 @@ void benchmarkGptManager(std::string const& modelName, std::filesystem::path con
         TLLM_LOG_ERROR(errStr);
     }
 
+    ITensor::SharedPtr beamWidthBuffer = BufferManager::cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    auto beamWidthBufferPtr = bufferCast<SizeType>(*beamWidthBuffer);
+    *beamWidthBufferPtr = beamWidth;
+    auto beamWidthTensor = NamedTensor(beamWidthBuffer, "beam_width");
+
     // Load dataset
     auto dataset = parseDataset(datasetPath);
     std::vector<std::vector<NamedTensor>> tensors_list;
@@ -494,15 +493,16 @@ void benchmarkGptManager(std::string const& modelName, std::filesystem::path con
         auto input_ids_tensor = NamedTensor(nvinfer1::DataType::kINT32, input_ids_shape, "input_ids", input_ids.data());
         auto request_output_len_tensor
             = NamedTensor(nvinfer1::DataType::kINT32, {1, 1}, "request_output_len", &request_output_len);
-        std::vector<NamedTensor> tensors = {input_ids_tensor, request_output_len_tensor};
-        tensors_list.push_back(tensors);
+        std::vector<NamedTensor> tensors
+            = {std::move(input_ids_tensor), std::move(request_output_len_tensor), beamWidthTensor};
+        tensors_list.emplace_back(std::move(tensors));
     }
 
-    const int maxBeamWidth = 1;
+    const int maxBeamWidth = beamWidth;
     auto recorder = std::make_shared<Recorder>();
     uint64_t terminateReqId = num_samples + 1;
-    auto gptServer = std::make_shared<GptServer>(engineDir, modelType, maxBeamWidth, schedulerPolicy, maxNumSequences,
-        maxTokensInPagedKvCache, kvCacheFreeGpuMemFraction, enableTrtOverlap, recorder, terminateReqId);
+    auto gptServer = std::make_shared<GptServer>(
+        engineDir, modelType, maxBeamWidth, schedulerPolicy, optionalParams, recorder, terminateReqId);
 
     if (worldConfig.getRank() == 0)
     {
@@ -537,16 +537,18 @@ int main(int argc, char* argv[])
         "type", "Batching type: IFB or V1(non-IFB) batching.", cxxopts::value<std::string>()->default_value("IFB"));
     options.add_options()("dataset", "Dataset that is used for benchmarking BatchManager.",
         cxxopts::value<std::string>()->default_value(""));
-
-    options.add_options()("max_num_sequences", "Max number of Sequences.", cxxopts::value<int>()->default_value("-1"));
     options.add_options()(
-        "max_tokens_in_paged_kvcache", "Max tokens in paged K-V Cache.", cxxopts::value<int>()->default_value("-1"));
-    options.add_options()("kv_cache_free_gpu_mem_fraction", "K-V Cache Free Gpu Mem Fraction.",
-        cxxopts::value<float>()->default_value("-1"));
+        "beam_width", "Specify beam width you want to benchmark.", cxxopts::value<int>()->default_value("1"));
+
+    options.add_options()("max_num_sequences", "Max number of Sequences.", cxxopts::value<int>());
+    options.add_options()("max_tokens_in_paged_kvcache", "Max tokens in paged K-V Cache.", cxxopts::value<int>());
+    options.add_options()(
+        "kv_cache_free_gpu_mem_fraction", "K-V Cache Free Gpu Mem Fraction.", cxxopts::value<float>());
+    options.add_options()(
+        "enable_trt_overlap", "Overlap TRT context preparation and execution", cxxopts::value<bool>());
+
     options.add_options()("scheduler_policy", "Choose scheduler policy between max_utilization/guaranteed_no_evict.",
         cxxopts::value<std::string>()->default_value("guaranteed_no_evict"));
-    options.add_options()("enable_trt_overlap", "Overlap TRT context preparation and execution",
-        cxxopts::value<bool>()->default_value("false"));
 
     options.add_options()("log_level", "Choose log level between verbose/info/warning/error/internal_error.",
         cxxopts::value<std::string>()->default_value("error"));
@@ -573,32 +575,29 @@ int main(int argc, char* argv[])
     // Argument: Dataset
     auto const datasetPath = result["dataset"].as<std::string>();
 
+    // Argument: beam width
+    auto const beamWidth = result["beam_width"].as<int>();
+
+    TrtGptModelOptionalParams optionalParams;
     // Argument: Max Num Sequences
-    std::optional<int32_t> maxNumSequences = std::nullopt;
-    if (result["max_num_sequences"].as<int>() != -1)
+    if (result.count("max_num_sequences"))
     {
-        maxNumSequences = result["max_num_sequences"].as<int>();
+        optionalParams.maxNumSequences = result["max_num_sequences"].as<int>();
     }
-
     // Argument: Max tokens in paged K-V Cache
-    std::optional<int32_t> maxTokensInPagedKvCache = std::nullopt;
-    if (result["max_tokens_in_paged_kvcache"].as<int>() != -1)
+    if (result.count("max_tokens_in_paged_kvcache"))
     {
-        maxTokensInPagedKvCache = result["max_tokens_in_paged_kvcache"].as<int>();
+        optionalParams.kvCacheConfig.maxTokens = result["max_tokens_in_paged_kvcache"].as<int>();
     }
-
     // Argument: K-V Cache Free Gpu Mem Fraction
-    std::optional<float> kvCacheFreeGpuMemFraction = std::nullopt;
-    if (result["kv_cache_free_gpu_mem_fraction"].as<float>() != -1)
+    if (result.count("kv_cache_free_gpu_mem_fraction"))
     {
-        kvCacheFreeGpuMemFraction = result["kv_cache_free_gpu_mem_fraction"].as<float>();
+        optionalParams.kvCacheConfig.freeGpuMemoryFraction = result["kv_cache_free_gpu_mem_fraction"].as<float>();
     }
-
     // Argument: Enable TRT overlap
-    std::optional<bool> enableTrtOverlap = std::nullopt;
-    if (result["enable_trt_overlap"].as<bool>() != -1)
+    if (result.count("enable_trt_overlap"))
     {
-        enableTrtOverlap = result["enable_trt_overlap"].as<bool>();
+        optionalParams.enableTrtOverlap = result["enable_trt_overlap"].as<bool>();
     }
 
     // Argument: Scheduler policy
@@ -652,8 +651,7 @@ int main(int argc, char* argv[])
     try
     {
         benchmarkGptManager(result["model"].as<std::string>(), result["engine_dir"].as<std::string>(), type,
-            datasetPath, logger, maxNumSequences, maxTokensInPagedKvCache, kvCacheFreeGpuMemFraction, enableTrtOverlap,
-            schedulerPolicy);
+            datasetPath, beamWidth, logger, optionalParams, schedulerPolicy);
     }
     catch (const std::exception& e)
     {
