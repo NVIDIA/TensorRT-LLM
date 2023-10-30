@@ -1481,7 +1481,8 @@ inline __device__ Float8_ fma(__nv_bfloat16 a, int64_t b, Float8_ fc)
 template <typename Acc, typename A, typename B>
 inline __device__ Acc mul(A a, B b)
 {
-    return Acc{}; // for compile
+    // This will error out when multiply operation is not supported.
+    return Acc(a * b);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2191,6 +2192,15 @@ inline __device__ float4 mul(float4 fa, fp8_4_t b)
     fc.w = fa.w * fb1.y;
 
     return fc;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ Float4_ mul(float4 fa, fp8_4_t b)
+{
+    float4 fc = mul<float4, float4, fp8_4_t>(fa, b);
+    return reinterpret_cast<Float4_&>(fc);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
