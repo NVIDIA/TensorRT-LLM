@@ -166,20 +166,25 @@ def parse_ft_config(ini_file):
     n_positions = gpt_config.getint('internlm', 'max_position_embeddings')
     vocab_size = gpt_config.getint('internlm', 'vocab_size')
     hidden_act = gpt_config.get('internlm', 'hidden_act')
-    inter_size = gpt_config.getint('internlm', 'intermediate_size', fallback=None)
-    n_kv_head = gpt_config.getint('internlm', 'num_key_value_heads', fallback=n_head)
+    inter_size = gpt_config.getint('internlm',
+                                   'intermediate_size',
+                                   fallback=None)
+    n_kv_head = gpt_config.getint('internlm',
+                                  'num_key_value_heads',
+                                  fallback=n_head)
     attn_bias = gpt_config.getboolean('internlm', 'bias', fallback=False)
 
     if inter_size is None:
-        inter_size = math.ceil(8/3 * n_embd / 256) * 256
+        inter_size = math.ceil(8 / 3 * n_embd / 256) * 256
 
     return n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, n_kv_head, attn_bias
 
 
-def load_from_hf_internlm(tensorrt_llm_internlm: tensorrt_llm.models.InternLMForCausalLM,
-                       hf_internlm,
-                       mapping=Mapping(),
-                       dtype='float32'):
+def load_from_hf_internlm(
+        tensorrt_llm_internlm: tensorrt_llm.models.InternLMForCausalLM,
+        hf_internlm,
+        mapping=Mapping(),
+        dtype='float32'):
     tensorrt_llm.logger.info('Loading weights from HF InternLM...')
     tik = time.time()
 
@@ -256,7 +261,8 @@ def load_from_hf_internlm(tensorrt_llm_internlm: tensorrt_llm.models.InternLMFor
             if idx >= tensorrt_llm_internlm.num_layers:
                 continue
             if 'input_layernorm.weight' in k:
-                tensorrt_llm_internlm.layers[idx].input_layernorm.weight.value = v
+                tensorrt_llm_internlm.layers[
+                    idx].input_layernorm.weight.value = v
             elif 'post_attention_layernorm.weight' in k:
                 dst = tensorrt_llm_internlm.layers[idx].post_layernorm.weight
                 dst.value = v
@@ -332,7 +338,7 @@ def load_from_hf_internlm(tensorrt_llm_internlm: tensorrt_llm.models.InternLMFor
                     dst.value = np.ascontiguousarray(split_v)
             elif 'self_attn.o_proj.bias' in k:
                 dst = tensorrt_llm_internlm.layers[idx].attention.dense.bias
-                split_v = v # no need to divide among ranks?
+                split_v = v  # no need to divide among ranks?
                 dst.value = np.ascontiguousarray(split_v)
             elif 'mlp.up_proj.weight' in k:
                 dst = tensorrt_llm_internlm.layers[idx].mlp.gate.weight
@@ -486,7 +492,8 @@ def load_from_meta_internlm(
                 embed)  # cache the embedding, not needed if no refit
         return load_from_meta_internlm.saved_embed
 
-    tensorrt_llm.logger.info('Loading weights from Meta InternLM checkpoints ...')
+    tensorrt_llm.logger.info(
+        'Loading weights from Meta InternLM checkpoints ...')
     tik = time.time()
 
     quant_mode = getattr(tensorrt_llm_internlm, 'quant_mode', QuantMode(0))
@@ -513,7 +520,8 @@ def load_from_meta_internlm(
     for l in layers_range:
         prefix = f'layers.{l}.attention.'
         q_weight = permute(ckpt[prefix + 'wq.weight'].clone(),
-                           nH=(tensorrt_llm_internlm.num_heads // mapping.tp_size),
+                           nH=(tensorrt_llm_internlm.num_heads //
+                               mapping.tp_size),
                            d=tensorrt_llm_internlm.hidden_size,
                            dH=head_size)
         if num_kv_heads < mapping.tp_size and num_ckpts >= mapping.tp_size:
@@ -556,9 +564,11 @@ def load_from_meta_internlm(
             if idx >= tensorrt_llm_internlm.num_layers:
                 continue
             if 'attention_norm.weight' in k:
-                tensorrt_llm_internlm.layers[idx].input_layernorm.weight.value = v
+                tensorrt_llm_internlm.layers[
+                    idx].input_layernorm.weight.value = v
             elif 'ffn_norm.weight' in k:
-                tensorrt_llm_internlm.layers[idx].post_layernorm.weight.value = v
+                tensorrt_llm_internlm.layers[
+                    idx].post_layernorm.weight.value = v
             elif 'feed_forward.w3.weight' in k:
                 tensorrt_llm_internlm.layers[idx].mlp.gate.weight.value = v
             elif 'feed_forward.w2.weight' in k:
@@ -566,7 +576,8 @@ def load_from_meta_internlm(
             elif 'feed_forward.w1.weight' in k:
                 tensorrt_llm_internlm.layers[idx].mlp.fc.weight.value = v
             elif 'attention.wo.weight' in k:
-                tensorrt_llm_internlm.layers[idx].attention.dense.weight.value = v
+                tensorrt_llm_internlm.layers[
+                    idx].attention.dense.weight.value = v
             elif 'attention.qkv.weight' in k:
                 tensorrt_llm_internlm.layers[idx].attention.qkv.weight.value = v
 
@@ -787,9 +798,8 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
             dst.value = np.ascontiguousarray(t)
 
             dst = tensorrt_llm_internlm.layers[idx].attention.dense.bias
-            t = fromfile(
-                dir_path,
-                'model.layers.' + str(i) + '.attention.dense.bias.bin')
+            t = fromfile(dir_path,
+                         'model.layers.' + str(i) + '.attention.dense.bias.bin')
             dst.value = np.ascontiguousarray(t)
 
         dst = tensorrt_llm_internlm.layers[idx].post_layernorm.weight
@@ -899,9 +909,9 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
 
 
 def load_from_gptq_internlm(tensorrt_llm_internlm,
-                         quant_ckpt_path,
-                         mapping=Mapping(),
-                         dtype="float16"):
+                            quant_ckpt_path,
+                            mapping=Mapping(),
+                            dtype="float16"):
     tensorrt_llm.logger.info(
         'Loading weights from groupwise GPTQ InternLM safetensors...')
     tik = time.time()
@@ -1032,9 +1042,11 @@ def load_from_gptq_internlm(tensorrt_llm_internlm,
             idx = idx - mapping.pp_rank * layers_per_pipeline_stage
 
             if 'input_layernorm.weight' in k:
-                tensorrt_llm_internlm.layers[idx].input_layernorm.weight.value = v
+                tensorrt_llm_internlm.layers[
+                    idx].input_layernorm.weight.value = v
             elif 'post_attention_layernorm.weight' in k:
-                tensorrt_llm_internlm.layers[idx].post_layernorm.weight.value = v
+                tensorrt_llm_internlm.layers[
+                    idx].post_layernorm.weight.value = v
             elif 'self_attn.o_proj.qweight' in k:
                 split_v_suf = []
                 for suf in suffixs:
@@ -1103,9 +1115,9 @@ def load_from_gptq_internlm(tensorrt_llm_internlm,
 
 
 def load_from_awq_internlm(tensorrt_llm_internlm: InternLMForCausalLM,
-                        quant_ckpt_path,
-                        mapping=Mapping(),
-                        dtype="float16"):
+                           quant_ckpt_path,
+                           mapping=Mapping(),
+                           dtype="float16"):
     tensorrt_llm.logger.info(
         'Loading weights from groupwise AWQ InternLM safetensors...')
     tik = time.time()
@@ -1120,7 +1132,7 @@ def load_from_awq_internlm(tensorrt_llm_internlm: InternLMForCausalLM,
         }
     elif quant_ckpt_path.endswith(".pt"):
         awq_internlm = torch.load(quant_ckpt_path,
-                               map_location=torch.device('cpu'))
+                                  map_location=torch.device('cpu'))
     else:
         assert False, "Quantized checkpoint format not supported!"
 
@@ -1202,9 +1214,12 @@ def load_from_awq_internlm(tensorrt_llm_internlm: InternLMForCausalLM,
         return weight, scale
 
     def process_and_assign_qkv_weight(awq_internlm, prefix, mOp):
-        q_weight = awq_internlm[prefix + "self_attn.q_proj.weight"].T.contiguous()
-        k_weight = awq_internlm[prefix + "self_attn.k_proj.weight"].T.contiguous()
-        v_weight = awq_internlm[prefix + "self_attn.v_proj.weight"].T.contiguous()
+        q_weight = awq_internlm[prefix +
+                                "self_attn.q_proj.weight"].T.contiguous()
+        k_weight = awq_internlm[prefix +
+                                "self_attn.k_proj.weight"].T.contiguous()
+        v_weight = awq_internlm[prefix +
+                                "self_attn.v_proj.weight"].T.contiguous()
         k = q_weight.shape[0]
 
         q_weight = q_weight.split(q_weight.shape[1] // mapping.tp_size,
@@ -1305,7 +1320,8 @@ def load_from_awq_internlm(tensorrt_llm_internlm: InternLMForCausalLM,
 
     v = awq_internlm['model.norm.weight']
     if mapping.is_last_pp_rank():
-        tensorrt_llm_internlm.ln_f.weight.value = v.to(torch_dtype).cpu().numpy()
+        tensorrt_llm_internlm.ln_f.weight.value = v.to(
+            torch_dtype).cpu().numpy()
 
     #lm_head
     if pad_vocab:

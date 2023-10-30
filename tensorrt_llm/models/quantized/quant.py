@@ -18,7 +18,7 @@ import numpy as np
 
 from ...layers import ColumnLinear, RowLinear
 from ...models import (BloomForCausalLM, FalconForCausalLM, GPTJForCausalLM,
-                       GPTLMHeadModel, LLaMAForCausalLM, InternLMForCausalLM)
+                       GPTLMHeadModel, InternLMForCausalLM, LLaMAForCausalLM)
 from ...quantization import QuantMode
 from ...quantization.layers import FP8Linear, FP8RowLinear
 

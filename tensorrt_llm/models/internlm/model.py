@@ -172,22 +172,23 @@ class InternLMModel(Module):
                 tp_rank=mapping.tp_rank)
 
         self.layers = ModuleList([
-            InternLMDecoderLayer(layer_id=i,
-                              hidden_size=hidden_size,
-                              num_attention_heads=num_heads,
-                              num_kv_heads=num_kv_heads,
-                              max_position_embeddings=max_position_embeddings,
-                              dtype=dtype,
-                              hidden_act=hidden_act,
-                              attn_bias=attn_bias,
-                              mlp_hidden_size=mlp_hidden_size,
-                              position_embedding_type=position_embedding_type,
-                              rotary_base=rotary_base,
-                              rotary_scaling=rotary_scaling,
-                              tp_group=mapping.tp_group,
-                              tp_size=mapping.tp_size,
-                              quant_mode=quant_mode,
-                              rms_norm_eps=rms_norm_eps)
+            InternLMDecoderLayer(
+                layer_id=i,
+                hidden_size=hidden_size,
+                num_attention_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                max_position_embeddings=max_position_embeddings,
+                dtype=dtype,
+                hidden_act=hidden_act,
+                attn_bias=attn_bias,
+                mlp_hidden_size=mlp_hidden_size,
+                position_embedding_type=position_embedding_type,
+                rotary_base=rotary_base,
+                rotary_scaling=rotary_scaling,
+                tp_group=mapping.tp_group,
+                tp_size=mapping.tp_size,
+                quant_mode=quant_mode,
+                rms_norm_eps=rms_norm_eps)
             for i in self.get_transformer_layers(self.mapping, num_layers)
         ])
 
@@ -304,11 +305,11 @@ class InternLMForCausalLM(InternLMModel, GenerationMixin):
         self.embedding_sharding_dim = embedding_sharding_dim
 
         super().__init__(num_layers, num_heads, num_kv_heads, hidden_size,
-                         vocab_size, hidden_act, attn_bias, max_position_embeddings, dtype,
-                         mlp_hidden_size, position_embedding_type, rotary_base,
-                         rotary_scaling, mapping, quant_mode,
-                         use_parallel_embedding, embedding_sharding_dim,
-                         rms_norm_eps)
+                         vocab_size, hidden_act, attn_bias,
+                         max_position_embeddings, dtype, mlp_hidden_size,
+                         position_embedding_type, rotary_base, rotary_scaling,
+                         mapping, quant_mode, use_parallel_embedding,
+                         embedding_sharding_dim, rms_norm_eps)
 
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
         if self.mapping.is_last_pp_rank():
