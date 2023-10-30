@@ -470,7 +470,11 @@ def build_rank_engine(builder: Builder,
         network.plugin_config.set_gpt_attention_plugin(
             dtype=args.use_gpt_attention_plugin)
     if args.use_gemm_plugin:
-        network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
+        if not args.enable_fp8:
+            network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
+        else:
+            logger.info(
+                "Gemm plugin does not support FP8. Disabled Gemm plugin.")
     if args.use_layernorm_plugin:
         network.plugin_config.set_layernorm_plugin(
             dtype=args.use_layernorm_plugin)
@@ -575,6 +579,7 @@ def build(rank, args):
             use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
             gather_all_token_logits=args.gather_all_token_logits,
             fp8=args.enable_fp8,
+            quant_mode=args.quant_mode,
             use_parallel_embedding=args.use_parallel_embedding)
 
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.world_size,

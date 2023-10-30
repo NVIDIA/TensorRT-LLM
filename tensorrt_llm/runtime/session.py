@@ -160,11 +160,9 @@ class Session(object):
             context = self.context
         for i in inputs:
             if self.engine.get_tensor_mode(i.name) != trt.TensorIOMode.INPUT:
-                logger.error(f"Tensor:{i.name} is not an input tensor")
-                return None
+                raise ValueError(f"Tensor:{i.name} is not an input tensor")
             if self.engine.get_tensor_dtype(i.name) != i.dtype:
-                logger.error(f"Tensor:{i.name} has wrong dtype")
-                return None
+                raise ValueError(f"Tensor:{i.name} has wrong dtype")
             context.set_input_shape(i.name, i.shape)
 
         outputs = []

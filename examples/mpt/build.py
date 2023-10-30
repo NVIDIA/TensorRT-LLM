@@ -466,7 +466,11 @@ def build_rank_engine(builder: Builder,
         network.plugin_config.set_gpt_attention_plugin(
             dtype=args.use_gpt_attention_plugin)
     if args.use_gemm_plugin:
-        network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
+        if not args.enable_fp8:
+            network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
+        else:
+            logger.info(
+                "Gemm plugin does not support FP8. Disabled Gemm plugin.")
     if args.use_layernorm_plugin:
         network.plugin_config.set_layernorm_plugin(
             dtype=args.use_layernorm_plugin)

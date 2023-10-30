@@ -22,6 +22,7 @@ import torch
 from transformers import AutoTokenizer, T5Tokenizer
 
 import tensorrt_llm
+from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 
 from build import get_engine_name  # isort:skip
@@ -52,6 +53,7 @@ def read_config(config_path: Path):
     gather_all_token_logits = config['builder_config'][
         'gather_all_token_logits']
     use_custom_all_reduce = config['plugin_config']['use_custom_all_reduce']
+    quant_mode = QuantMode(config['builder_config']['quant_mode'])
 
     model_config = ModelConfig(num_heads=num_heads,
                                num_kv_heads=num_kv_heads,
@@ -64,6 +66,7 @@ def read_config(config_path: Path):
                                tokens_per_block=tokens_per_block,
                                use_prompt_tuning=use_prompt_tuning,
                                dtype=dtype,
+                               quant_mode=quant_mode,
                                gather_all_token_logits=gather_all_token_logits,
                                use_custom_all_reduce=use_custom_all_reduce)
 
