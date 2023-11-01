@@ -138,6 +138,7 @@ void RuntimeBuffers::create(TllmRuntime& runtime, GptModelConfig const& modelCon
 
     if (modelConfig.usePagedKvCache())
     {
+        std::cout << "hh inserting kv_cache_block_pointers_" << std::to_string(firstLayerId) << std::endl;
         auto const kvCacheBlockPointersType
             = engine.getTensorDataType(("kv_cache_block_pointers_" + std::to_string(firstLayerId)).c_str());
         kvCacheBlockPointersHost = manager.emptyTensor(MemoryType::kCPU, kvCacheBlockPointersType);
