@@ -177,7 +177,7 @@ Example:
 # For 7B models
 python hf_internlm_convert.py -i ./internlm-chat-7b -o ./internlm-chat-7b/smooth_internlm/sq0.5/ -sq 0.5 --tensor-parallelism 1 --storage-type fp16
 # For 20B models
-python hf_internlm_convert.py -i ./internlm-chat-20b -o ./internlm-chat-20b/smooth_internlm/sq0.8/ -sq 0.8 --tensor-parallelism 1 --storage-type fp16
+python hf_internlm_convert.py -i ./internlm-chat-20b -o ./internlm-chat-20b/smooth_internlm/sq0.5/ -sq 0.5 --tensor-parallelism 1 --storage-type fp16
 ```
 
 [`build.py`](./build.py) add new options for the support of INT8 inference of SmoothQuant models.
@@ -197,7 +197,7 @@ python build.py --ft_model_dir=./internlm-chat-7b/smooth_internlm/sq0.5/1-gpu/ \
                 --output_dir ./internlm-chat-7b/trt_engines/smoothquant/1-gpu
 
 # 20B model
-python build.py --ft_model_dir=./internlm-chat-20b/smooth_internlm/sq0.8/1-gpu/ \
+python build.py --ft_model_dir=./internlm-chat-20b/smooth_internlm/sq0.5/1-gpu/ \
                 --use_smooth_quant \
                 --output_dir ./internlm-chat-20b/trt_engines/smoothquant/1-gpu
 
@@ -210,7 +210,7 @@ python build.py --ft_model_dir=./internlm-chat-7b/smooth_internlm/sq0.5/1-gpu/ \
                 --output_dir ./internlm-chat-7b/trt_engines/smoothquant/1-gpu
 
 # 20B model
-python build.py --ft_model_dir=./internlm-chat-20b/smooth_internlm/sq0.8/1-gpu/ \
+python build.py --ft_model_dir=./internlm-chat-20b/smooth_internlm/sq0.5/1-gpu/ \
                 --use_smooth_quant \
                 --per_token \
                 --per_channel \
