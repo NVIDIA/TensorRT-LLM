@@ -178,7 +178,7 @@ void GemmPlugin::setGemmConfig()
         mCublasWrapper->setFP32GemmConfig();
     }
 #ifdef ENABLE_BF16
-    else if (mType == DataType::kBF16)
+    else if (mType == DataType::kFP8)
     {
         mCublasWrapper->setBF16GemmConfig();
     }

@@ -33,7 +33,7 @@ RmsnormPlugin::RmsnormPlugin(float eps, nvinfer1::DataType type)
     : mEps(eps)
     , mType(type)
 {
-    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16),
+    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kFP8),
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
 }
 
@@ -44,7 +44,7 @@ RmsnormPlugin::RmsnormPlugin(const void* data, size_t length)
     read(d, mEps);
     read(d, mType);
     TLLM_CHECK(d == a + length);
-    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16), "Unsupported data type");
+    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kFP8), "Unsupported data type");
 }
 
 // IPluginV2DynamicExt Methods
@@ -110,7 +110,7 @@ int RmsnormPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nv
         invokeGeneralRmsNorm(output, input, weight, (float*) nullptr, mEps, m, n, stream);
     }
 #ifdef ENABLE_BF16
-    else if (mType == DataType::kBF16)
+    else if (mType == DataType::kFP8)
     {
         const __nv_bfloat16* input = reinterpret_cast<const __nv_bfloat16*>(inputs[0]);
         const __nv_bfloat16* weight = reinterpret_cast<const __nv_bfloat16*>(inputs[1]);

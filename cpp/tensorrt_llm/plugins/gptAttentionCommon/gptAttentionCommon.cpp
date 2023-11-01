@@ -252,7 +252,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int num_heads, int num_kv_hea
     , mRotaryEmbeddingMaxPositions(rotary_embedding_max_positions)
     , mPositionEmbeddingType(position_embedding_type)
     , mEnableContextFMHA(context_fmha_type != ContextFMHAType::DISABLED)
-    , mFMHAForceFP32Acc(context_fmha_type == ContextFMHAType::ENABLED_WITH_FP32_ACC || type == DataType::kBF16)
+    , mFMHAForceFP32Acc(context_fmha_type == ContextFMHAType::ENABLED_WITH_FP32_ACC || type == DataType::kFP8)
     , mMaskType(mask_type)
     , mType(type)
     , mMultiBlockMode(multi_block_mode)
@@ -267,9 +267,9 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int num_heads, int num_kv_hea
     , mCrossAttention(cross_attention)
     , mMaxDistance(max_distance)
 {
-    mEnableContextFMHA = mEnableContextFMHA && (mType == DataType::kHALF || mType == DataType::kBF16);
+    mEnableContextFMHA = mEnableContextFMHA && (mType == DataType::kHALF || mType == DataType::kFP8);
     TLLM_CHECK(isRoPE() == (rotary_embedding_dim != 0));
-    TLLM_CHECK_WITH_INFO((tc::getSMVersion() >= 80) || (mType != DataType::kBF16),
+    TLLM_CHECK_WITH_INFO((tc::getSMVersion() >= 80) || (mType != DataType::kFP8),
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
 }
 
@@ -318,7 +318,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(const void* data, size_t leng
     mKVCacheQuantMode = tc::QuantMode(kvCacheQuantMode);
 
     TLLM_CHECK(d == a + length);
-    TLLM_CHECK_WITH_INFO((tc::getSMVersion() >= 80) || (mType != DataType::kBF16),
+    TLLM_CHECK_WITH_INFO((tc::getSMVersion() >= 80) || (mType != DataType::kFP8),
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
 }
 
@@ -1001,7 +1001,7 @@ int GPTAttentionPluginCommon::initialize() noexcept
         {
             data_type = DATA_TYPE_FP16;
         }
-        else if (mType == DataType::kBF16)
+        else if (mType == DataType::kFP8)
         {
             data_type = DATA_TYPE_BF16;
         }

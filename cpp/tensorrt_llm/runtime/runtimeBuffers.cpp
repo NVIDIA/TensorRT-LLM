@@ -196,7 +196,7 @@ void RuntimeBuffers::createCustomAllReduceWorkspace(SizeType maxBatchSize, SizeT
 
     commPtrs = manager.cpu(
         ITensor::makeShape({static_cast<SizeType>(mIpcMemoryHandles.size()) * worldConfig.getTensorParallelism()}),
-        nvinfer1::DataType::kINT64);
+        nvinfer1::DataType::kINT32);
     const auto commPtrsData = bufferCast<void*>(*commPtrs);
 
     for (size_t memIdx = 0; memIdx < mIpcMemoryHandles.size(); memIdx++)

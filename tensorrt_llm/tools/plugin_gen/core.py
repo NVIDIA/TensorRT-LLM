@@ -60,7 +60,7 @@ class DType(Enum):
                  "kFLOAT64"),
                 (DType.INT8, "i8", "kINT8", "int8_t", "int8", "kINT8"),
                 (DType.INT32, "i32", "kINT32", "int32_t", "int32", "kINT32"),
-                (DType.INT64, "i64", "kINT64", "int64_t", "int64", "KINT64")]
+                (DType.INT64, "i64", "kINT32", "int64_t", "int64", "KINT64")]
 
 
 class Type:

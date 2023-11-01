@@ -965,9 +965,6 @@ void gatherLastTokenLogits(ITensor& output, ITensor const& input, ITensor const&
     {
     case nvinfer1::DataType::kFLOAT: invokeGatherLastTokenLogits<float>(output, input, lastTokenIds, stream); break;
     case nvinfer1::DataType::kHALF: invokeGatherLastTokenLogits<half>(output, input, lastTokenIds, stream); break;
-    case nvinfer1::DataType::kBF16:
-        invokeGatherLastTokenLogits<__nv_bfloat16>(output, input, lastTokenIds, stream);
-        break;
     case nvinfer1::DataType::kFP8:
         invokeGatherLastTokenLogits<__nv_fp8_e4m3>(output, input, lastTokenIds, stream);
         break;

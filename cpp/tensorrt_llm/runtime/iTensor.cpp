@@ -167,11 +167,7 @@ std::ostream& tensorrt_llm::runtime::operator<<(std::ostream& out, ITensor const
     case nvinfer1::DataType::kBOOL: printTensor<bool>(tensor, out); break;
     case nvinfer1::DataType::kINT8: printTensor<std::int8_t>(tensor, out); break;
     case nvinfer1::DataType::kINT32: printTensor<std::int32_t>(tensor, out); break;
-    case nvinfer1::DataType::kINT64: printTensor<std::int64_t>(tensor, out); break;
     case nvinfer1::DataType::kUINT8: printTensor<std::uint8_t>(tensor, out); break;
-#ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16: printTensor<__nv_bfloat16>(tensor, out); break;
-#endif
     default: TLLM_THROW("Unsupported data type");
     }
 

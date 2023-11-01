@@ -79,13 +79,13 @@ TEST_F(TorchTest, Aten)
     }
 
     auto constexpr fillValue = 1;
-    auto tensorHostBase = manager.allocate(MemoryType::kPINNED, shapeTllm, nvinfer1::DataType::kINT64);
+    auto tensorHostBase = manager.allocate(MemoryType::kPINNED, shapeTllm, nvinfer1::DataType::kINT32);
 
     for (auto memoryType : {MemoryType::kCPU, MemoryType::kGPU, MemoryType::kPINNED})
     {
         for (auto dtype : {nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF, nvinfer1::DataType::kINT8,
-                 nvinfer1::DataType::kUINT8, nvinfer1::DataType::kINT32, nvinfer1::DataType::kINT64,
-                 nvinfer1::DataType::kBF16, nvinfer1::DataType::kFP8, nvinfer1::DataType::kBOOL})
+                 nvinfer1::DataType::kUINT8, nvinfer1::DataType::kINT32, nvinfer1::DataType::kINT32,
+                 nvinfer1::DataType::kFP8, nvinfer1::DataType::kFP8, nvinfer1::DataType::kBOOL})
         {
             ITensor::SharedPtr tensorTllm{manager.allocate(memoryType, shapeTllm, dtype)};
 
@@ -109,8 +109,8 @@ TEST_F(TorchTest, Aten)
                 checkFilled<nvinfer1::DataType::kINT8>(*tensorHost, fillValue);
                 checkFilled<nvinfer1::DataType::kUINT8>(*tensorHost, fillValue);
                 checkFilled<nvinfer1::DataType::kINT32>(*tensorHost, fillValue);
-                checkFilled<nvinfer1::DataType::kINT64>(*tensorHost, fillValue);
-                checkFilled<nvinfer1::DataType::kBF16>(*tensorHost, fillValue);
+                checkFilled<nvinfer1::DataType::kINT32>(*tensorHost, fillValue);
+                checkFilled<nvinfer1::DataType::kFP8>(*tensorHost, fillValue);
                 checkFilled<nvinfer1::DataType::kBOOL>(*tensorHost, fillValue);
             }
 

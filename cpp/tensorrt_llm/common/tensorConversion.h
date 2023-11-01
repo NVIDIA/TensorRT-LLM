@@ -30,12 +30,10 @@ inline DataType toTllmDataType(nvinfer1::DataType type)
     {
     case nvinfer1::DataType::kFLOAT: return DataType::TYPE_FP32;
     case nvinfer1::DataType::kHALF: return DataType::TYPE_FP16;
-    case nvinfer1::DataType::kBF16: return DataType::TYPE_BF16;
     case nvinfer1::DataType::kFP8: return DataType::TYPE_FP8_E4M3;
     case nvinfer1::DataType::kINT8: return DataType::TYPE_INT8;
     case nvinfer1::DataType::kUINT8: return DataType::TYPE_UINT8;
     case nvinfer1::DataType::kINT32: return DataType::TYPE_INT32;
-    case nvinfer1::DataType::kINT64: return DataType::TYPE_INT64;
     case nvinfer1::DataType::kBOOL: return DataType::TYPE_BOOL;
     default: TLLM_THROW("Unsupported data type: %d", static_cast<int>(type));
     }

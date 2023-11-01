@@ -98,7 +98,7 @@ bool GPTAttentionPlugin::supportsFormatCombination(
     else if (mPagedKVCache && pos == getKVCacheBlockPointersIdx())
     {
         // pointers to kv cache blocks
-        return inOut[pos].type == nvinfer1::DataType::kINT64 && inOut[pos].format == TensorFormat::kLINEAR;
+        return inOut[pos].type == nvinfer1::DataType::kINT32 && inOut[pos].format == TensorFormat::kLINEAR;
     }
     else if (mKVCacheQuantMode.hasInt8KvCache()
         && (!mPagedKVCache && (pos == getPastKeyValueIdx() || pos == nbInputs + 1)))
@@ -389,7 +389,7 @@ int GPTAttentionPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
         return enqueueDispatchKVCacheType<float>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }
 #ifdef ENABLE_BF16
-    else if (mType == DataType::kBF16)
+    else if (mType == DataType::kFP8)
     {
         return enqueueDispatchKVCacheType<__nv_bfloat16>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }

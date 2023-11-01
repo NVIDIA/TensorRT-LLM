@@ -85,7 +85,7 @@ bool AllreducePlugin::supportsFormatCombination(
 
     if (nbInputs == 2 && pos == 1)
     {
-        return (inOut[pos].type == nvinfer1::DataType::kINT64) && (inOut[pos].format == TensorFormat::kLINEAR);
+        return (inOut[pos].type == nvinfer1::DataType::kINT32) && (inOut[pos].format == TensorFormat::kLINEAR);
     }
     else
     {
@@ -167,7 +167,7 @@ int AllreducePlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const 
         type = datatype_enum::TYPE_FP16;
         break;
 #ifdef ENABLE_BF16
-    case DataType::kBF16:
+    case DataType::kFP8:
         sizePerElem = sizeof(__nv_bfloat16);
         type = datatype_enum::TYPE_BF16;
         break;

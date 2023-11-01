@@ -34,7 +34,7 @@
 std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap()
 {
     static std::unordered_map<nvinfer1::DataType, ncclDataType_t> dtypeMap = {{nvinfer1::DataType::kFLOAT, ncclFloat32},
-        {nvinfer1::DataType::kHALF, ncclFloat16}, {nvinfer1::DataType::kBF16, ncclBfloat16}};
+        {nvinfer1::DataType::kHALF, ncclFloat16}, {nvinfer1::DataType::kFP8, ncclBfloat16}};
     return &dtypeMap;
 }
 

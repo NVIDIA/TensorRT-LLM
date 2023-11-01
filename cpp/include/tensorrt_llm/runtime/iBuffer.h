@@ -96,11 +96,6 @@ struct CppDataType<nvinfer1::DataType::kINT32>
     using type = std::int32_t;
 };
 
-template <>
-struct CppDataType<nvinfer1::DataType::kINT64>
-{
-    using type = std::int64_t;
-};
 
 template <>
 struct CppDataType<nvinfer1::DataType::kINT32, true>
@@ -108,11 +103,6 @@ struct CppDataType<nvinfer1::DataType::kINT32, true>
     using type = std::uint32_t;
 };
 
-template <>
-struct CppDataType<nvinfer1::DataType::kINT64, true>
-{
-    using type = std::uint64_t;
-};
 
 template <bool kUnsigned>
 struct CppDataType<nvinfer1::DataType::kBOOL, kUnsigned>
@@ -126,13 +116,6 @@ struct CppDataType<nvinfer1::DataType::kUINT8, kUnsigned>
     using type = std::uint8_t;
 };
 
-#ifdef ENABLE_BF16
-template <>
-struct CppDataType<nvinfer1::DataType::kBF16>
-{
-    using type = __nv_bfloat16;
-};
-#endif
 
 #ifdef ENABLE_FP8
 template <>
@@ -160,7 +143,7 @@ public:
     {
     }
 
-    static auto constexpr kTrtPointerType = nvinfer1::DataType::kINT64;
+    static auto constexpr kTrtPointerType = nvinfer1::DataType::kINT32;
 
     constexpr operator nvinfer1::DataType() const noexcept // NOLINT(*-explicit-constructor)
     {
@@ -191,10 +174,8 @@ public:
     {
         switch (static_cast<nvinfer1::DataType>(*this))
         {
-        case nvinfer1::DataType::kINT64: return 8;
         case nvinfer1::DataType::kINT32: [[fallthrough]];
         case nvinfer1::DataType::kFLOAT: return 4;
-        case nvinfer1::DataType::kBF16: [[fallthrough]];
         case nvinfer1::DataType::kHALF: return 2;
         case nvinfer1::DataType::kBOOL: [[fallthrough]];
         case nvinfer1::DataType::kUINT8: [[fallthrough]];
@@ -249,13 +230,13 @@ struct TRTDataType<std::uint32_t>
 template <>
 struct TRTDataType<std::int64_t>
 {
-    static constexpr auto value = nvinfer1::DataType::kINT64;
+    static constexpr auto value = nvinfer1::DataType::kINT32;
 };
 
 template <>
 struct TRTDataType<std::uint64_t>
 {
-    static constexpr auto value = BufferDataType{nvinfer1::DataType::kINT64, true};
+    static constexpr auto value = BufferDataType{nvinfer1::DataType::kINT32, true};
 };
 
 template <>
@@ -274,7 +255,7 @@ struct TRTDataType<std::uint8_t>
 template <>
 struct TRTDataType<__nv_bfloat16>
 {
-    static constexpr auto value = nvinfer1::DataType::kBF16;
+    static constexpr auto value = nvinfer1::DataType::kFP8;
 };
 #endif
 

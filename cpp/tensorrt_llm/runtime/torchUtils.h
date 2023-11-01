@@ -86,10 +86,10 @@ public:
         case IBuffer::DataType::kINT8: return torch::kInt8;
         case IBuffer::DataType::kUINT8: return torch::kUInt8;
         case IBuffer::DataType::kINT32: return torch::kInt32;
-        case IBuffer::DataType::kINT64: return torch::kInt64;
+        case IBuffer::DataType::kINT32: return torch::kInt64;
         case IBuffer::DataType::kBOOL: return at::ScalarType::Bool;
         case IBuffer::DataType::kFP8: return at::ScalarType::Bits8;
-        case IBuffer::DataType::kBF16: return at::ScalarType::BFloat16;
+        case IBuffer::DataType::kFP8: return at::ScalarType::BFloat16;
         default: TLLM_THROW("unsupported data type");
         }
     }
@@ -103,10 +103,10 @@ public:
         case torch::kInt8: return IBuffer::DataType::kINT8;
         case torch::kUInt8: return IBuffer::DataType::kUINT8;
         case torch::kInt32: return IBuffer::DataType::kINT32;
-        case torch::kInt64: return IBuffer::DataType::kINT64;
+        case torch::kInt64: return IBuffer::DataType::kINT32;
         case at::ScalarType::Bool: return IBuffer::DataType::kBOOL;
         case at::ScalarType::Bits8: return IBuffer::DataType::kFP8;
-        case at::ScalarType::BFloat16: return IBuffer::DataType::kBF16;
+        case at::ScalarType::BFloat16: return IBuffer::DataType::kFP8;
         default: TLLM_THROW("unsupported data type");
         }
     }

@@ -336,7 +336,7 @@ TEST_F(TllmBuffersTest, TensorOutput)
     CudaAllocatorAsync allocator{streamPtr};
     for (auto dataType :
         {nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF, nvinfer1::DataType::kBOOL, nvinfer1::DataType::kINT8,
-            nvinfer1::DataType::kINT32, nvinfer1::DataType::kINT64, nvinfer1::DataType::kUINT8})
+            nvinfer1::DataType::kINT32, nvinfer1::DataType::kINT32, nvinfer1::DataType::kUINT8})
     {
         DeviceTensor tensor{dims, dataType, allocator};
         TLLM_CUDA_CHECK(cudaMemsetAsync(tensor.data(), 0, tensor.getSizeInBytes(), streamPtr->get()));

@@ -59,7 +59,7 @@ bool IdentityPlugin::supportsFormatCombination(
     case 0:
         return (input.type == DataType::kHALF || input.type == DataType::kFLOAT
 #ifdef ENABLE_BF16
-                   || input.type == DataType::kBF16
+                   || input.type == DataType::kFP8
 #endif
                    )
             && input.format == nvinfer1::TensorFormat::kLINEAR;
@@ -96,7 +96,7 @@ int IdentityPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const n
         count *= sizeof(float);
     }
 #ifdef ENABLE_BF16
-    else if (inputDesc[0].type == DataType::kBF16)
+    else if (inputDesc[0].type == DataType::kFP8)
     {
         count *= sizeof(__nv_bfloat16);
     }

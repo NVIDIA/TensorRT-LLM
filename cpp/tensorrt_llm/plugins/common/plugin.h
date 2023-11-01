@@ -98,7 +98,7 @@ inline cudaDataType_t trtToCublasDtype(nvinfer1::DataType type)
     case nvinfer1::DataType::kFLOAT: return CUDA_R_32F;
     case nvinfer1::DataType::kHALF: return CUDA_R_16F;
 #if defined(NV_TENSORRT_MAJOR) && NV_TENSORRT_MAJOR >= 9
-    case nvinfer1::DataType::kBF16: return CUDA_R_16BF;
+    case nvinfer1::DataType::kFP8: return CUDA_R_16BF;
 #endif
     default: TLLM_THROW("Not supported data type for cuBLAS");
     }
