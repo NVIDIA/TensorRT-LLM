@@ -175,7 +175,7 @@ Unlike the FP16 build where the HF weights are processed and loaded into the Ten
 Example:
 ```bash
 # For 7B models
-python hf_internlm_convert.py -i ./internlm-chat-7b -o ./internlm-chat-7b/smooth_internlm/sq0.8/ -sq 0.8 --tensor-parallelism 1 --storage-type fp16
+python hf_internlm_convert.py -i ./internlm-chat-7b -o ./internlm-chat-7b/smooth_internlm/sq0.5/ -sq 0.5 --tensor-parallelism 1 --storage-type fp16
 # For 20B models
 python hf_internlm_convert.py -i ./internlm-chat-20b -o ./internlm-chat-20b/smooth_internlm/sq0.8/ -sq 0.8 --tensor-parallelism 1 --storage-type fp16
 ```
@@ -192,18 +192,18 @@ Examples of build invocations:
 ```bash
 # Build model for SmoothQuant in the _per_tensor_ mode.
 # 7B model
-python build.py --ft_model_dir=./internlm-chat-7b/smooth_internlm/sq0.8/1-gpu/ \
+python build.py --ft_model_dir=./internlm-chat-7b/smooth_internlm/sq0.5/1-gpu/ \
                 --use_smooth_quant \
                 --output_dir ./internlm-chat-7b/trt_engines/smoothquant/1-gpu
 
 # 20B model
 python build.py --ft_model_dir=./internlm-chat-20b/smooth_internlm/sq0.8/1-gpu/ \
-                --use_smooth_quant
+                --use_smooth_quant \
                 --output_dir ./internlm-chat-20b/trt_engines/smoothquant/1-gpu
 
 # OR build model for SmoothQuant in the _per_token_ + _per_channel_ mode
 # 7B model
-python build.py --ft_model_dir=./internlm-chat-7b/smooth_internlm/sq0.8/1-gpu/ \
+python build.py --ft_model_dir=./internlm-chat-7b/smooth_internlm/sq0.5/1-gpu/ \
                 --use_smooth_quant \
                 --per_token \
                 --per_channel \
