@@ -30,7 +30,7 @@ Prerequisites:
 - [TensorRT 9.1.0.4 for TensorRT-LLM](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/secure/9.1.0/tars/tensorrt-9.1.0.4.windows10.x86_64.cuda-12.2.llm.beta.zip)
 
 ```
-pip install tensorrt_llm --extra-index-url https://pypi.nvidia.com --extra-index-url https://download.pytorch.org/whl/nightly/cu121
+pip install tensorrt_llm --extra-index-url https://pypi.nvidia.com --extra-index-url https://download.pytorch.org/whl/cu121
 ```
 
 ## Detailed Setup
@@ -118,7 +118,7 @@ The above command will generate `build\tensorrt_llm-0.5.0-py3-none-any.whl`. Oth
 
 To download and install the wheel, in Powershell, run:
 ```
-pip install tensorrt_llm --extra-index-url https://pypi.nvidia.com --extra-index-url https://download.pytorch.org/whl/nightly/cu121
+pip install tensorrt_llm --extra-index-url https://pypi.nvidia.com --extra-index-url https://download.pytorch.org/whl/cu121
 ```
 
 Alternatively, if you built the wheel from source, run:
