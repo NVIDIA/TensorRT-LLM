@@ -65,7 +65,6 @@ if(BUILD_BATCH_MANAGER)
 else()
   add_library(${BATCH_MANAGER_TARGET} STATIC IMPORTED)
   if(NOT WIN32) # Linux
-    add_library(${BATCH_MANAGER_TARGET} STATIC IMPORTED)
     execute_process(
       COMMAND ${Python3_EXECUTABLE} "-c"
               "import torch; print(torch.compiled_with_cxx11_abi(),end='');"
