@@ -27,12 +27,11 @@ def generate_output(engine: str,
                     pp_size: int = 1,
                     max_output_len: int = 8):
 
-    model = 'llama-7b-hf'
+    model = 'llama-2-70b-hf'
     resources_dir = Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
     hf_dir = models_dir / model
     tp_pp_dir = 'tp' + str(tp_size) + '-pp' + str(pp_size) + '-gpu/'
-    engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_dir
 
     data_dir = resources_dir / 'data'
     input_file = data_dir / 'input_tokens.npy'
@@ -44,8 +43,12 @@ def generate_output(engine: str,
 
     output_name += '_tp' + str(tp_size) + '_pp' + str(pp_size)
 
+    engine_dir = "/engines/fp16_public_w4-b64"
+    tokenizer_dir = "/models/"
+    # print("Generating output for engine input_file: ", input_file, " output_file:", output_dir)
+
     run.generate(engine_dir=str(engine_dir),
-                 tokenizer_dir=str(hf_dir),
+                 tokenizer_dir=str(tokenizer_dir),
                  input_file=str(input_file),
                  output_npy=str(output_dir / (output_name + '.npy')),
                  output_csv=str(output_dir / (output_name + '.csv')),
@@ -54,16 +57,16 @@ def generate_output(engine: str,
 
 
 def generate_outputs(num_beams, only_multi_gpu=False):
-    tp_pp_sizes = [(1, 1)] if not only_multi_gpu else [(4, 1), (2, 2), (1, 4)]
+    tp_pp_sizes = [(4, 1)]
     for tp_size, pp_size in tp_pp_sizes:
         print(
             f'Generating outputs for Llama FP16 with TP={tp_size} and PP={pp_size}'
         )
-        generate_output(engine='fp16-plugin-packed-paged',
+        generate_output(engine='fp16_public_w4-b64',
                         num_beams=num_beams,
                         tp_size=tp_size,
                         pp_size=pp_size,
-                        output_name='output_tokens_fp16_plugin_packed_paged')
+                        output_name='output_tokens_fp16_public_w4-b64')
 
 
 if __name__ == '__main__':

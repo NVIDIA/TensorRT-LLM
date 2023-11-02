@@ -233,7 +233,7 @@ def generate(
     decoder = tensorrt_llm.runtime.GenerationSession(model_config,
                                                      engine_buffer,
                                                      runtime_mapping,
-                                                     debug_mode=False,
+                                                     debug_mode=True,
                                                      debug_tensors_to_save=None)
     if runtime_rank == 0:
         print(f"Running the {dtype} engine ...")

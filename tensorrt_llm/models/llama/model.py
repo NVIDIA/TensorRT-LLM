@@ -213,11 +213,13 @@ class LLaMAModel(Module):
             hidden_states = self.vocab_embedding(input_ids)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
+        print("hh forward registering past_key_value")
         self.register_network_output(f"embd", hidden_states)
 
         for layer, past, pointer in zip(
                 self.layers, kv_cache_params.past_key_value,
                 kv_cache_params.kv_cache_block_pointers):
+            self.register_network_output(f"pointer_{layer.layer_id}", kv_cache_params.pointer)
             hidden_states = layer(
                 hidden_states,
                 use_cache=use_cache,
@@ -371,6 +373,7 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
         '''
 
         # Prepare inputs
+        print("prepare input llama/model.py")
         head_size = self.hidden_size // self.num_heads
         remove_input_padding = default_net().plugin_config.remove_input_padding
         use_gpt_attention_plugin = default_net(

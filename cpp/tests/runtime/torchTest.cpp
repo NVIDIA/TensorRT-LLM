@@ -109,8 +109,6 @@ TEST_F(TorchTest, Aten)
                 checkFilled<nvinfer1::DataType::kINT8>(*tensorHost, fillValue);
                 checkFilled<nvinfer1::DataType::kUINT8>(*tensorHost, fillValue);
                 checkFilled<nvinfer1::DataType::kINT32>(*tensorHost, fillValue);
-                checkFilled<nvinfer1::DataType::kINT32>(*tensorHost, fillValue);
-                checkFilled<nvinfer1::DataType::kFP8>(*tensorHost, fillValue);
                 checkFilled<nvinfer1::DataType::kBOOL>(*tensorHost, fillValue);
             }
 

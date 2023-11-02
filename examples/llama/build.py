@@ -188,7 +188,7 @@ def parse_arguments():
                         action='store_true')
     parser.add_argument('--visualize', default=False, action='store_true')
     parser.add_argument('--enable_debug_output',
-                        default=False,
+                        default=True,
                         action='store_true')
     parser.add_argument('--gpus_per_node', type=int, default=8)
     parser.add_argument('--builder_opt', type=int, default=None)
@@ -613,7 +613,6 @@ def build_rank_engine(builder: Builder,
     with net_guard(network):
         # Prepare
         network.set_named_parameters(tensorrt_llm_llama.named_parameters())
-
         # Forward
         inputs = tensorrt_llm_llama.prepare_inputs(args.max_batch_size,
                                                    args.max_input_len,
@@ -624,10 +623,13 @@ def build_rank_engine(builder: Builder,
         if args.enable_debug_output:
             # mark intermediate nodes' outputs
             for k, v in tensorrt_llm_llama.named_network_outputs():
+                print("hh marked ouput:", k)
                 v = v.trt_tensor
                 v.name = k
                 network.trt_network.mark_output(v)
                 v.dtype = dtype
+                print("hh marked ouput shape and dtype:", v.shape, v.dtype)
+            exit(0)
         if args.visualize:
             model_path = os.path.join(args.output_dir, 'test.onnx')
             to_onnx(network.trt_network, model_path)

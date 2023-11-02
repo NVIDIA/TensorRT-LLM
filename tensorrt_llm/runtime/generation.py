@@ -300,6 +300,7 @@ class GenerationSession(object):
                  debug_tensors_to_save=None,
                  cuda_graph_mode=False,
                  stream: torch.cuda.Stream = None):
+        print("hh GenerationSession init debug_mode:", debug_mode)
         assert isinstance(model_config, ModelConfig)
         self._model_config = model_config
         self.mapping = mapping
@@ -1429,8 +1430,7 @@ class GenerationSession(object):
             context = self.runtime.ctx_context
             self.runtime._set_shape(context, ctx_shape)
             self.runtime._set_buffer(context, ctx_buffer)
-            if self.debug_mode:
-                self.debug_buffer = ctx_buffer
+            self.debug_buffer = ctx_buffer
             if self.cuda_graph_mode:
                 # context mode, clean cuda graph instances
                 self.cuda_graph_instances = [None for _ in range(2)]
@@ -1452,6 +1452,8 @@ class GenerationSession(object):
             raise RuntimeError('Executing TRT engine failed!')
         if self.debug_mode:
             torch.cuda.synchronize()
+            if step == 0:
+                print("hh debug buffer", self.debug_buffer.keys())
 
         context_logits = None
         if self.mapping.is_last_pp_rank():
@@ -1531,8 +1533,7 @@ class GenerationSession(object):
                 tasks, prompt_vocab_size, encoder_output, encoder_input_lengths)
             self.runtime._set_shape(next_context, next_step_shape)
             self.runtime._set_buffer(next_context, next_step_buffer)
-            if self.debug_mode:
-                self.debug_buffer = next_step_buffer
+            self.debug_buffer = next_step_buffer
             if self.cuda_graph_mode:
                 # capture cuda graph
                 CUASSERT(
