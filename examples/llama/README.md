@@ -161,7 +161,7 @@ and then export the scaling factors needed for INT8 KV cache inference.
 Example:
 
 ```bash
-python3 hf_llama_convert.py -i /llama-models/llama-7b-hf -o /llama/smooth_llama_7B/int8_kv_cache/ --calibrate-kv-cache -t fp16
+python3 hf_llama_convert.py -i llama-7b-hf -o smooth_llama_7B/int8_kv_cache/ --calibrate-kv-cache -t fp16
 ```
 
 [`build.py`](./build.py) add new options for the support of INT8 KV cache.
@@ -174,7 +174,7 @@ Examples of INT8 weight-only quantization + INT8 KV cache
 
 ```bash
 # Build model with both INT8 weight-only and INT8 KV cache enabled
-python build.py --ft_model_dir=/llama/smooth_llama_7B/int8_kv_cache/1-gpu/ \
+python build.py --ft_model_dir=smooth_llama_7B/int8_kv_cache/1-gpu/ \
                 --dtype float16 \
                 --use_gpt_attention_plugin float16 \
                 --use_gemm_plugin float16 \
@@ -199,7 +199,7 @@ The smoothquant supports both LLaMA v1 and LLaMA v2. Unlike the FP16 build where
 
 Example:
 ```bash
-python3 hf_llama_convert.py -i /llama-models/llama-7b-hf -o /llama/smooth_llama_7B/sq0.8/ -sq 0.8 --tensor-parallelism 1 --storage-type fp16
+python3 hf_llama_convert.py -i llama-7b-hf -o smooth_llama_7B/sq0.8/ -sq 0.8 --tensor-parallelism 1 --storage-type fp16
 ```
 
 [`build.py`](./build.py) add new options for the support of INT8 inference of SmoothQuant models.
@@ -213,11 +213,11 @@ Examples of build invocations:
 
 ```bash
 # Build model for SmoothQuant in the _per_tensor_ mode.
-python3 build.py --ft_model_dir=/llama/smooth_llama_7B/sq0.8/1-gpu/ \
+python3 build.py --ft_model_dir=smooth_llama_7B/sq0.8/1-gpu/ \
                  --use_smooth_quant
 
 # Build model for SmoothQuant in the _per_token_ + _per_channel_ mode
-python3 build.py --ft_model_dir=/llama/smooth_llama_7B/sq0.8/1-gpu/ \
+python3 build.py --ft_model_dir=smooth_llama_7B/sq0.8/1-gpu/ \
                  --use_smooth_quant \
                  --per_token \
                  --per_channel
@@ -358,10 +358,10 @@ python3 run.py --max_output_len=50 \
 
 ```bash
 # Run summarization using the LLaMA 7B model in FP16.
-python summarize.py --test_trt_llm \
-                    --hf_model_location ./tmp/llama/7B/ \
+python summarize.py --test_trt_llm --test_hf \
+                    --hf_model_location llama-7b-hf/ \
                     --data_type fp16 \
-                    --engine_dir ./tmp/llama/7B/trt_engines/fp16/1-gpu/
+                    --engine_dir llama_outputs
 
 # Run summarization using the LLaMA 7B model quantized to INT8.
 python summarize.py --test_trt_llm \
