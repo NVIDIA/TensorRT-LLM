@@ -30,7 +30,7 @@ TensorRT-LLM InternLM builds TensorRT engine(s) from HF checkpoint. If no checkp
 
 InternLM has released several checkpoints of different size or capabilities under https://huggingface.co/internlm. Users can pick any one repository and follow instructions to prepare the checkpoint.
 
-Below examples use `internlm-chat-7b` and `internlm-chat-20b` and assume these repositories are cloned or linked under this directory, for example `./internlm-chat-7b/`.
+Below examples use [internlm-chat-7b](https://huggingface.co/internlm/internlm-chat-7b) and [internlm-chat-20b](https://huggingface.co/internlm/internlm-chat-20b) and assume these repositories are cloned or linked under this directory, for example `./internlm-chat-7b/`.
 
 <!-- Need to prepare the HF InternLM checkpoint first by following the guides here https://huggingface.co/internlm/internlm-chat-7b. InternLM has released more variants under https://huggingface.co/internlm and quantized models (in AWQ format) under https://huggingface.co/lmdeploy. -->
 
@@ -343,7 +343,7 @@ To run the GPTQ LLaMa example, the following steps are required:
 
     ```bash
     # Build the InternLM 7B model using 2-way tensor parallelism and apply INT4 GPTQ quantization.
-    # Compressed checkpoint safetensors are generated seperately from GPTQ.
+    # Compressed checkpoint safetensors are generated separately from GPTQ.
     python build.py --model_dir ./tmp/internlm-chat-7b/ \
                     --quant_ckpt_path ./internlm-7b-4bit-gs128.safetensors \
                     --dtype float16 \

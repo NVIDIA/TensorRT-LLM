@@ -141,9 +141,9 @@ def split(v, tp_size, idx, dim=0):
     if tp_size == 1:
         return v
     if len(v.shape) == 1:
-        return np.ascontiguousarray(np.split(v, tp_size)[idx])
+        return np.ascontiguousarray(np.split(v, tp_size)[idx].copy())
     else:
-        return np.ascontiguousarray(np.split(v, tp_size, axis=dim)[idx])
+        return np.ascontiguousarray(np.split(v, tp_size, axis=dim)[idx].copy())
 
 
 def dup_kv_weight(v, num_head, tp_size):
@@ -286,9 +286,7 @@ def load_from_hf_internlm(
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    # workaround for trt not supporting int8 inputs in plugins currently
-                    dst.value = processed_torch_weights.view(
-                        dtype=torch.float32).numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_internlm.layers[
                         idx].attention.qkv.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -307,18 +305,6 @@ def load_from_hf_internlm(
                     v = v.reshape(3, q_emb)
                     split_v = split(v, mapping.tp_size, mapping.tp_rank, dim=1)
                     split_v = split_v.reshape(3 * (q_emb // mapping.tp_size))
-                # if use_weight_only:
-                #     v = np.ascontiguousarray(split_v.transpose())
-                #     processed_torch_weights, torch_weight_scales = \
-                #         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
-                #         torch.tensor(v), plugin_weight_only_quant_type)
-                #     # workaround for trt not supporting int8 inputs in plugins currently
-                #     dst.value = processed_torch_weights.view(
-                #         dtype=torch.float32).numpy()
-                #     scales = tensorrt_llm_internlm.layers[
-                #         idx].attention.qkv.per_channel_scale
-                #     scales.value = torch_weight_scales.numpy()
-                # else:
                 dst.value = np.ascontiguousarray(split_v)
             elif 'self_attn.o_proj.weight' in k:
                 dst = tensorrt_llm_internlm.layers[idx].attention.dense.weight
@@ -328,9 +314,7 @@ def load_from_hf_internlm(
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    # workaround for trt not supporting int8 inputs in plugins currently
-                    dst.value = processed_torch_weights.view(
-                        dtype=torch.float32).numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_internlm.layers[
                         idx].attention.dense.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -348,9 +332,7 @@ def load_from_hf_internlm(
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    # workaround for trt not supporting int8 inputs in plugins currently
-                    dst.value = processed_torch_weights.view(
-                        dtype=torch.float32).numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_internlm.layers[
                         idx].mlp.gate.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -364,9 +346,7 @@ def load_from_hf_internlm(
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    # workaround for trt not supporting int8 inputs in plugins currently
-                    dst.value = processed_torch_weights.view(
-                        dtype=torch.float32).numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_internlm.layers[
                         idx].mlp.proj.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -380,9 +360,7 @@ def load_from_hf_internlm(
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    # workaround for trt not supporting int8 inputs in plugins currently
-                    dst.value = processed_torch_weights.view(
-                        dtype=torch.float32).numpy()
+                    dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_internlm.layers[
                         idx].mlp.fc.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -682,9 +660,6 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
     # Int8 KV cache
     use_int8_kv_cache = quant_mode.has_int8_kv_cache()
 
-    def sq_trick(x):
-        return x.view(np.float32) if use_smooth_quant else x
-
     # Debug
     suffix = gen_suffix(mapping.tp_rank, use_smooth_quant, quant_per_channel)
     # The type of weights.
@@ -734,8 +709,7 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
         if t is not None:
             dst = tensorrt_llm_internlm.layers[idx].attention.qkv.weight
             if use_smooth_quant:
-                dst.value = sq_trick(
-                    np.ascontiguousarray(np.transpose(t, [1, 0])))
+                dst.value = (np.ascontiguousarray(np.transpose(t, [1, 0])))
                 set_smoothquant_scale_factors(
                     tensorrt_llm_internlm.layers[idx].attention.qkv,
                     tensorrt_llm_internlm.layers[idx].input_layernorm.
@@ -765,7 +739,7 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
             'model.layers.' + str(i) + '.attention.dense.weight.' + suffix,
             [n_embd // mapping.tp_size, n_embd], w_type)
         if use_smooth_quant:
-            dst.value = sq_trick(np.ascontiguousarray(np.transpose(t, [1, 0])))
+            dst.value = (np.ascontiguousarray(np.transpose(t, [1, 0])))
             dense_scale = getattr(tensorrt_llm_internlm.layers[idx].attention,
                                   "quantization_scaling_factor", None)
             set_smoothquant_scale_factors(
@@ -779,9 +753,7 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
         elif use_weight_only:
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            # workaround for trt not supporting int8 inputs in plugins currently
-            dst.value = processed_torch_weights.view(
-                dtype=torch.float32).numpy()
+            dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_internlm.layers[
                 i].attention.dense.per_channel_scale
             scales.value = torch_weight_scales.numpy()
@@ -809,7 +781,7 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
                      [n_embd, inter_size // mapping.tp_size], w_type)
 
         if use_smooth_quant:
-            tensorrt_llm_internlm.layers[idx].mlp.fc.weight.value = sq_trick(
+            tensorrt_llm_internlm.layers[idx].mlp.fc.weight.value = (
                 np.ascontiguousarray(np.transpose(t, [1, 0])))
             set_smoothquant_scale_factors(
                 tensorrt_llm_internlm.layers[idx].mlp.fc,
@@ -824,9 +796,7 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
             dst = tensorrt_llm_internlm.layers[i].mlp.fc.weight
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            # workaround for trt not supporting int8 inputs in plugins currently
-            dst.value = processed_torch_weights.view(
-                dtype=torch.float32).numpy()
+            dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_internlm.layers[i].mlp.fc.per_channel_scale
             scales.value = torch_weight_scales.numpy()
         else:
@@ -838,7 +808,7 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
                      'model.layers.' + str(i) + '.mlp.gate.weight.' + suffix,
                      [n_embd, inter_size // mapping.tp_size], w_type)
         if use_smooth_quant:
-            tensorrt_llm_internlm.layers[idx].mlp.gate.weight.value = sq_trick(
+            tensorrt_llm_internlm.layers[idx].mlp.gate.weight.value = (
                 np.ascontiguousarray(np.transpose(t, [1, 0])))
             set_smoothquant_scale_factors(
                 tensorrt_llm_internlm.layers[idx].mlp.gate,
@@ -853,9 +823,7 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
             dst = tensorrt_llm_internlm.layers[i].mlp.gate.weight
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            # workaround for trt not supporting int8 inputs in plugins currently
-            dst.value = processed_torch_weights.view(
-                dtype=torch.float32).numpy()
+            dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_internlm.layers[i].mlp.gate.per_channel_scale
             scales.value = torch_weight_scales.numpy()
         else:
@@ -867,7 +835,7 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
                      'model.layers.' + str(i) + '.mlp.proj.weight.' + suffix,
                      [inter_size // mapping.tp_size, n_embd], w_type)
         if use_smooth_quant:
-            tensorrt_llm_internlm.layers[idx].mlp.proj.weight.value = sq_trick(
+            tensorrt_llm_internlm.layers[idx].mlp.proj.weight.value = (
                 np.ascontiguousarray(np.transpose(t, [1, 0])))
             proj_scale = getattr(tensorrt_llm_internlm.layers[idx].mlp,
                                  "quantization_scaling_factor", None)
@@ -882,9 +850,7 @@ def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
             dst = tensorrt_llm_internlm.layers[i].mlp.proj.weight
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            # workaround for trt not supporting int8 inputs in plugins currently
-            dst.value = processed_torch_weights.view(
-                dtype=torch.float32).numpy()
+            dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_internlm.layers[i].mlp.proj.per_channel_scale
             scales.value = torch_weight_scales.numpy()
         else:

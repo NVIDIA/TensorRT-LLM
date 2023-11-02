@@ -428,7 +428,6 @@ def parse_arguments():
             args.multiple_of)
         args.rms_norm_eps = meta_config["norm_eps"]
     elif args.ft_model_dir is not None:
-        # Not tested
         n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, n_kv_head, attn_bias = parse_ft_config(
             Path(args.ft_model_dir) / "config.ini")
         args.inter_size = inter_size  # override the inter_size for InternLM
@@ -666,7 +665,7 @@ def build(rank, args):
         if args.parallel_build and cur_rank != rank:
             continue
         # NOTE: when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
-        int8_trt_flag = args.quant_mode.has_act_and_weight_quant() or (
+        int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
             not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
         builder_config = builder.create_builder_config(
             name=MODEL_NAME,
