@@ -51,8 +51,13 @@ if(NOT WIN32) # Linux
   endif()
 else() # Windows
   # AMD64, IA64, ARM64, EM64T, X86
-  set(BATCH_MANAGER_TARGET_ARCH "${CMAKE_SYSTEM_PROCESSOR}-WINDOWS")
-  string(TOLOWER ${BATCH_MANAGER_TARGET_ARCH} BATCH_MANAGER_TARGET_ARCH)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64")
+    set(BATCH_MANAGER_TARGET_ARCH "x86_64-windows-msvc")
+  else()
+    message(
+      FATAL_ERROR
+        "The system processor type is unsupported: ${CMAKE_SYSTEM_PROCESSOR}")
+  endif()
 endif()
 
 if(BUILD_BATCH_MANAGER)
