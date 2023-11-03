@@ -12,13 +12,10 @@ The TensorRT-LLM InternLM implementation can be found in [tensorrt_llm/models/in
 
 ## Support Matrix
   * FP16 / BF16
-  <!-- * FP8 -->
   * INT8 & INT4 Weight-Only
   * Smooth Quant
   * INT8 KV Cache
-  <!-- * FP8 KV CACHE -->
-  * Tensor Parallel
-  <!-- * STRONGLY TYPED -->
+  * Tensor Parallel & Pipeline Parallel
 
 ## Usage
 
@@ -31,8 +28,6 @@ TensorRT-LLM InternLM builds TensorRT engine(s) from HF checkpoint. If no checkp
 InternLM has released several checkpoints of different size or capabilities under https://huggingface.co/internlm. Users can pick any one repository and follow instructions to prepare the checkpoint.
 
 Below examples use [internlm-chat-7b](https://huggingface.co/internlm/internlm-chat-7b) and [internlm-chat-20b](https://huggingface.co/internlm/internlm-chat-20b) and assume these repositories are cloned or linked under this directory, for example `./internlm-chat-7b/`.
-
-<!-- Need to prepare the HF InternLM checkpoint first by following the guides here https://huggingface.co/internlm/internlm-chat-7b. InternLM has released more variants under https://huggingface.co/internlm and quantized models (in AWQ format) under https://huggingface.co/lmdeploy. -->
 
 Normally `build.py` only requires single GPU, but if you've already got all the GPUs needed while inferencing, you could enable parallel building to make the engine building process faster by adding `--parallel_build` argument. Please note that currently `parallel_build` feature only supports single node.
 
@@ -242,122 +237,6 @@ python summarize.py --test_trt_llm --test_hf \
                     --data_type fp16 \
                     --engine_dir ./internlm-chat-20b/trt_engines/smoothquant/1-gpu
 ```
-
-#### FP8 Post-Training Quantization
-TODO
-<!--
-The examples below uses the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
-
-First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
-
-After successfully running the script, the output should be in .npz format, e.g. `quantized_fp8/internlm_tp_1_rank0.npz`,
-where FP8 scaling factors are stored.
-
-```bash
-# Quantize HF InternLM 70B into FP8 and export a single-rank checkpoint
-python quantize.py --model_dir ./tmp/internlm/70B \
-                   --dtype float16 \
-                   --qformat fp8 \
-                   --export_path ./quantized_fp8 \
-                   --calib_size 512 \
-
-# Build InternLM 70B TP=2 using original HF checkpoint + PTQ scaling factors from the single-rank checkpoint
-python build.py --model_dir ./tmp/internlm/70B \
-                --quantized_fp8_model_path ./quantized_fp8/internlm_tp1_rank0.npz \
-                --dtype float16 \
-                --use_gpt_attention_plugin float16 \
-                --use_gemm_plugin float16 \
-                --output_dir ./tmp/internlm/70B/trt_engines/fp8/2-gpu/ \
-                --remove_input_padding \
-                --enable_fp8 \
-                --fp8_kv_cache \
-                --world_size 2 \
-                --tp_size 2
-```
--->
-#### Groupwise quantization (AWQ/GPTQ)
-TODO
-<!--
-One can enable AWQ/GPTQ INT4 weight only quantization with these options when building engine with `build.py`:
-
-- `--use_weight_only` enables weight only GEMMs in the network.
-- `--per_group` enable groupwise weight only quantization, for GPT-J example, we support AWQ with the group size default as 128.
-- `--weight_only_precision` should specify the weight only quantization format. Supported formats are `int4_awq` or `int4_gptq`.
-- `--quant_ckpt_path` passes the quantized checkpoint to build the engine.
-
-AWQ/GPTQ examples below involves 2 steps:
-1. Weight quantization
-2. Build TRT-LLM engine
-
-##### AWQ
-1. Weight quantization:
-
-    NVIDIA AMMO toolkit is used for AWQ weight quantization. Please see [examples/quantization/README.md](/examples/quantization/README.md#preparation) for AMMO installation instructions.
-
-    ```bash
-    # Quantize HF InternLM 7B checkpoint into INT4 AWQ format
-    python quantize.py --model_dir ./tmp/internlm-chat-7b \
-                    --dtype float16 \
-                    --qformat int4_awq \
-                    --export_path ./internlm-7b-4bit-gs128-awq.pt \
-                    --calib_size 32
-    ```
-    The quantized model checkpoint is saved to path `./internlm-7b-4bit-gs128-awq.pt` for future TRT-LLM engine build.
-
-2. Build TRT-LLM engine:
-
-    ```bash
-    python build.py --model_dir ./tmp/internlm-chat-7b/ \
-                    --quant_ckpt_path ./internlm-7b-4bit-gs128-awq.pt \
-                    --dtype float16 \
-                    --remove_input_padding \
-                    --use_gpt_attention_plugin float16 \
-                    --enable_context_fmha \
-                    --use_gemm_plugin float16 \
-                    --use_weight_only \
-                    --weight_only_precision int4_awq \
-                    --per_group \
-                    --output_dir ./tmp/internlm-chat-7b/trt_engines/int4_AWQ/1-gpu/
-    ```
-
-##### GPTQ
-To run the GPTQ LLaMa example, the following steps are required:
-
-1. Weight quantization:
-
-    Quantized weights for GPTQ are generated using [GPTQ-for-LLaMa](https://github.com/qwopqwop200/GPTQ-for-LLaMa.git) as follow:
-
-    ```bash
-    git clone https://github.com/qwopqwop200/GPTQ-for-LLaMa.git
-    cd GPTQ-for-LLaMa
-    pip install -r requirements.txt
-
-    # Quantize weights into INT4 and save as safetensors
-    # Quantized weight with parameter "--act-order" is not supported in TRT-LLM
-    python internlm.py ./tmp/internlm-chat-7b/ c4 --wbits 4 --true-sequential --groupsize 128 --save_safetensors ./internlm-7b-4bit-gs128.safetensors
-    ```
-
-    Let us build the TRT-LLM engine with the saved `./internlm-7b-4bit-gs128.safetensors`.
-
-2. Build TRT-LLM engine:
-
-    ```bash
-    # Build the InternLM 7B model using 2-way tensor parallelism and apply INT4 GPTQ quantization.
-    # Compressed checkpoint safetensors are generated separately from GPTQ.
-    python build.py --model_dir ./tmp/internlm-chat-7b/ \
-                    --quant_ckpt_path ./internlm-7b-4bit-gs128.safetensors \
-                    --dtype float16 \
-                    --remove_input_padding \
-                    --use_gpt_attention_plugin float16 \
-                    --enable_context_fmha \
-                    --use_gemm_plugin float16 \
-                    --use_weight_only \
-                    --weight_only_precision int4_gptq \
-                    --per_group \
-                    --world_size 2 \
-                    --tp_size 2 \
-                    --output_dir ./tmp/internlm-chat-7b/trt_engines/int4_GPTQ/2-gpu/
-    ``` -->
 
 ### Run
 
