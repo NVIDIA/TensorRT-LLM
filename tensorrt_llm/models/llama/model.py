@@ -372,7 +372,8 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                        max_new_tokens,
                        use_cache,
                        max_beam_width,
-                       max_num_tokens: int = None):
+                       max_num_tokens: int = None,
+                       gather_all_token_logits: bool = False):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -408,7 +409,8 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
             dtype=self.dtype,
             num_heads=self.num_heads,
             mapping=self.mapping,
-            max_num_tokens=max_num_tokens)
+            max_num_tokens=max_num_tokens,
+            gather_all_token_logits=gather_all_token_logits)
 
         return (model_inputs['input_ids'], model_inputs['position_ids'], True,
                 model_inputs['last_token_ids'], model_inputs['attention_mask'],

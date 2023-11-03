@@ -211,6 +211,9 @@ def parse_arguments():
         'For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded '
         '(0.45734 vs 0.45755 for LLaMA-v2 7B using ammo/examples/hf/instruct_eval/mmlu.py).'
     )
+    parser.add_argument('--gather_all_token_logits',
+                        action='store_true',
+                        default=False)
 
     # Arguments related to the quantization of the model.
     parser.add_argument(
@@ -629,7 +632,8 @@ def build_rank_engine(builder: Builder,
                                                    args.max_input_len,
                                                    args.max_output_len, True,
                                                    args.max_beam_width,
-                                                   args.max_num_tokens)
+                                                   args.max_num_tokens,
+                                                   gather_all_token_logits=args.gather_all_token_logits)
         tensorrt_llm_llama(*inputs)
         if args.enable_debug_output:
             # mark intermediate nodes' outputs
@@ -693,7 +697,8 @@ def build(rank, args):
             fp8=args.quant_mode.has_fp8_qdq(),
             quant_mode=args.quant_mode,
             strongly_typed=args.strongly_typed,
-            opt_level=args.builder_opt)
+            opt_level=args.builder_opt,
+            gather_all_token_logits=args.gather_all_token_logits)
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.tp_size,
                                       args.pp_size, cur_rank)
         engine = build_rank_engine(builder, builder_config, engine_name,
