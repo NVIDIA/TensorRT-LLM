@@ -30,6 +30,14 @@ The following command can be used to run the BERT model on a single GPU:
 python3 run.py
 ```
 
+#### Building from a pretrained model
+
+Building from a pretrained model can be enabled with the `--pretrained_model_name_or_path` option along with the name of the model.
+
+```bash
+python3 build.py --dtype=float16 --log_level=verbose --pretrained_model_name_or_path <hf-bert-model-name-or-path>
+```
+
 #### Fused MultiHead Attention (FMHA)
 
 You can enable the FMHA kernels for BERT by adding `--enable_context_fmha` to the invocation of `build.py`. Note that it is disabled by default because of possible accuracy issues due to the use of Flash Attention.
