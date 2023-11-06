@@ -84,6 +84,9 @@ def parse_arguments():
     parser.add_argument('--enable_context_fmha_fp32_acc',
                         default=False,
                         action='store_true')
+    parser.add_argument('--pretrained_model_name_or_path',
+                        type=str,
+                        default=None)
     parser.add_argument(
         '--model',
         default=tensorrt_llm.models.BertModel.__name__,
@@ -129,7 +132,11 @@ if __name__ == '__main__':
 
     output_name = 'hidden_states'
     if args.model == tensorrt_llm.models.BertModel.__name__:
-        hf_bert = BertModel(bert_config, add_pooling_layer=False)
+        if args.pretrained_model_name_or_path:
+            hf_bert = BertModel.from_pretrained(args.pretrained_model_name_or_path)
+            bert_config = hf_bert.config
+        else:
+            hf_bert = BertModel(bert_config, add_pooling_layer=False)
         tensorrt_llm_bert = tensorrt_llm.models.BertModel(
             num_layers=bert_config.num_hidden_layers,
             num_heads=bert_config.num_attention_heads,
@@ -152,7 +159,11 @@ if __name__ == '__main__':
         )
 
     elif args.model == tensorrt_llm.models.BertForQuestionAnswering.__name__:
-        hf_bert = BertForQuestionAnswering(bert_config)
+        if args.pretrained_model_name_or_path:
+            hf_bert = BertForQuestionAnswering.from_pretrained(args.pretrained_model_name_or_path)
+            bert_config = hf_bert.config
+        else:
+            hf_bert = BertForQuestionAnswering(bert_config)
         tensorrt_llm_bert = tensorrt_llm.models.BertForQuestionAnswering(
             num_layers=bert_config.num_hidden_layers,
             num_heads=bert_config.num_attention_heads,
