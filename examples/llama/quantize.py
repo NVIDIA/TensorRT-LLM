@@ -55,8 +55,10 @@ def get_calib_dataloader(data="cnn_dailymail",
 
     batch_encoded = tokenizer.batch_encode_plus(dataset,
                                                 return_tensors="pt",
-                                                padding=True,
+                                                padding="max_length",
+                                                truncation=True,
                                                 max_length=block_size)
+
     batch_encoded = batch_encoded["input_ids"]
     batch_encoded = batch_encoded.cuda()
 
