@@ -12,13 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Union
+from typing import Any, Union
 
 import numpy as np
 
 from ...layers import ColumnLinear, RowLinear
-from ...models import (BloomForCausalLM, FalconForCausalLM, GPTJForCausalLM,
-                       GPTLMHeadModel, LLaMAForCausalLM)
+from ...models import (BaichuanForCausalLM, BloomForCausalLM, FalconForCausalLM,
+                       GPTJForCausalLM, GPTLMHeadModel, InternLMForCausalLM,
+                       LLaMAForCausalLM)
+from ...module import Module
 from ...quantization import QuantMode
 from ...quantization.layers import FP8Linear, FP8RowLinear
 
@@ -68,7 +70,6 @@ def _smooth_quantize_gpt(model, quant_mode):
             dtype=layer.dtype,
             quant_mode=quant_mode)
 
-    setattr(model, 'quant_mode', quant_mode)
     return model
 
 
@@ -113,7 +114,6 @@ def _smooth_quantize_llama(model, quant_mode):
             dtype=layer.dtype,
             quant_mode=quant_mode)
 
-    setattr(model, 'quant_mode', quant_mode)
     return model
 
 
@@ -160,24 +160,78 @@ def _smooth_quantize_bloom(model, quant_mode):
     return model
 
 
-def smooth_quantize(model, quant_mode):
+def _smooth_quantize_baichuan(model, quant_mode):
+    # Baichuan models' structures are similar to LLaMA so we can reuse the impl
+    return _smooth_quantize_llama(model, quant_mode)
+
+
+def _smooth_quantize_internlm(model, quant_mode):
+    assert quant_mode.has_act_and_weight_quant()
+    for layer in model.layers:
+        assert hasattr(layer,
+                       "input_layernorm"), "The layer has no input_layernorm"
+        layer.input_layernorm = SmoothQuantRmsNorm(
+            normalized_shape=layer.hidden_size,
+            dtype=layer.dtype,
+            quant_mode=quant_mode)
+        assert hasattr(layer, "attention"), "The layer has no attention"
+        layer.attention = SmoothQuantAttention(
+            layer.hidden_size,
+            num_attention_heads=layer.num_attention_heads,
+            num_kv_heads=layer.num_kv_heads,
+            max_position_embeddings=layer.max_position_embeddings,
+            num_layers=model.num_layers,
+            dtype=layer.dtype,
+            attention_mask_type=layer.attention_mask_type,
+            position_embedding_type=layer.position_embedding_type,
+            tp_group=layer.tp_group,
+            tp_size=layer.tp_size,
+            quant_mode=quant_mode,
+            bias=model.attn_bias)
+
+        assert hasattr(layer, "mlp"), "The layer has no mlp"
+        layer.mlp = SmoothQuantGatedMLP(hidden_size=model.hidden_size,
+                                        ffn_hidden_size=layer.mlp_hidden_size,
+                                        hidden_act=layer.hidden_act,
+                                        dtype=layer.dtype,
+                                        tp_group=layer.tp_group,
+                                        tp_size=layer.tp_size,
+                                        quant_mode=quant_mode,
+                                        bias=False)
+        assert hasattr(
+            layer,
+            "post_layernorm"), "The layer has no post_rmspost_layernormnorm"
+        layer.post_layernorm = SmoothQuantRmsNorm(
+            normalized_shape=layer.hidden_size,
+            dtype=layer.dtype,
+            quant_mode=quant_mode)
+
+    setattr(model, 'quant_mode', quant_mode)
+    return model
+
+
+def _smooth_quantize(model, quant_mode):
     assert isinstance(model, GPTLMHeadModel) or isinstance(model, LLaMAForCausalLM) \
-            or isinstance(model, BloomForCausalLM),\
-            "Only GPTLMHeadModel, LLaMAForCausalLM and BloomForCausalLM are well tested now"
+            or isinstance(model, BloomForCausalLM) or isinstance(model, BaichuanForCausalLM) or isinstance(model, InternLMForCausalLM), \
+            "Only GPTLMHeadModel, LLaMAForCausalLM BloomForCausalLM, InternLMForCausalLM and BaichuanForCausalLM are well tested now"
     if isinstance(model, GPTLMHeadModel):
         return _smooth_quantize_gpt(model, quant_mode)
     elif isinstance(model, LLaMAForCausalLM):
         return _smooth_quantize_llama(model, quant_mode)
     elif isinstance(model, BloomForCausalLM):
         return _smooth_quantize_bloom(model, quant_mode)
+    elif isinstance(model, BaichuanForCausalLM):
+        return _smooth_quantize_baichuan(model, quant_mode)
+    elif isinstance(model, InternLMForCausalLM):
+        return _smooth_quantize_internlm(model, quant_mode)
     else:
         assert False, f"Model {type(model).__name__} is not supported by SmoothQuant yet"
 
 
-def weight_only_quantize(model,
-                         quant_mode,
-                         exclude_modules=None,
-                         current_key_name=None):
+def _weight_only_quantize(model,
+                          quant_mode,
+                          exclude_modules=None,
+                          current_key_name=None):
     assert quant_mode.is_weight_only()
 
     exclude_modules = ['lm_head'
@@ -189,8 +243,8 @@ def weight_only_quantize(model,
         current_key_name.append(name)
 
         if len(list(module.children())) > 0:
-            weight_only_quantize(module, quant_mode, exclude_modules,
-                                 current_key_name)
+            _weight_only_quantize(module, quant_mode, exclude_modules,
+                                  current_key_name)
 
         if isinstance(module, ColumnLinear) and name not in exclude_modules:
             if not any(key in '.'.join(current_key_name)
@@ -218,18 +272,16 @@ def weight_only_quantize(model,
 
         current_key_name.pop(-1)
 
-    setattr(model, 'quant_mode', quant_mode)
-
     return model
 
 
-def weight_only_groupwise_quantize(model,
-                                   quant_mode,
-                                   group_size=128,
-                                   pre_quant_scale=False,
-                                   zero=False,
-                                   exclude_modules=None,
-                                   current_key_name=None):
+def _weight_only_groupwise_quantize(model,
+                                    quant_mode,
+                                    group_size=128,
+                                    pre_quant_scale=False,
+                                    zero=False,
+                                    exclude_modules=None,
+                                    current_key_name=None):
     exclude_modules = ['lm_head'
                        ] if exclude_modules is None else exclude_modules
 
@@ -239,9 +291,9 @@ def weight_only_groupwise_quantize(model,
         current_key_name.append(name)
 
         if len(list(module.children())) > 0:
-            weight_only_groupwise_quantize(module, quant_mode, group_size,
-                                           pre_quant_scale, zero,
-                                           exclude_modules, current_key_name)
+            _weight_only_groupwise_quantize(module, quant_mode, group_size,
+                                            pre_quant_scale, zero,
+                                            exclude_modules, current_key_name)
 
         if isinstance(module, ColumnLinear) and name not in exclude_modules:
             if not any(key in '.'.join(current_key_name)
@@ -273,8 +325,21 @@ def weight_only_groupwise_quantize(model,
 
         current_key_name.pop(-1)
 
-    setattr(model, 'quant_mode', quant_mode)
+    return model
 
+
+def quantize_model(model: Module, quant_mode: QuantMode, **kwargs: Any):
+    if quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache():
+        model = _fp8_quantize(model, quant_mode, **kwargs)
+    elif quant_mode.has_act_and_weight_quant():
+        model = _smooth_quantize(model, quant_mode)
+    elif quant_mode.is_weight_only():
+        if quant_mode.has_per_group_scaling():
+            model = _weight_only_groupwise_quantize(model, quant_mode, **kwargs)
+        else:
+            model = _weight_only_quantize(model, quant_mode, **kwargs)
+
+    setattr(model, "quant_mode", quant_mode)
     return model
 
 
@@ -364,7 +429,7 @@ def _default_fp8_quantize(model: Union[GPTLMHeadModel, LLaMAForCausalLM,
     return model
 
 
-def fp8_quantize(model, quant_mode: QuantMode, quant_scales: dict = None):
+def _fp8_quantize(model, quant_mode: QuantMode, quant_scales: dict = None):
     if isinstance(
             model,
         (FalconForCausalLM, GPTJForCausalLM, GPTLMHeadModel, LLaMAForCausalLM)):

@@ -35,9 +35,10 @@ namespace decoder_batch
 class Request
 {
 public:
-    using TensorPtr = std::shared_ptr<ITensor const>;
+    using ConstTensorPtr = std::shared_ptr<ITensor const>;
+    using TensorPtr = std::shared_ptr<ITensor>;
 
-    explicit Request(TensorPtr ids, std::optional<SizeType> maxNewTokens = std::nullopt,
+    explicit Request(ConstTensorPtr ids, std::optional<SizeType> maxNewTokens = std::nullopt,
         std::optional<SizeType> endId = std::nullopt, std::optional<SizeType> padId = std::nullopt)
         : ids{std::move(ids)}
         , maxNewTokens{maxNewTokens}
@@ -46,7 +47,7 @@ public:
     }
 
     // mandatory parameters
-    TensorPtr ids; // [inputSeqLen], the input sequence of token ids, on gpu
+    ConstTensorPtr ids; // [inputSeqLen], the input sequence of token ids, on gpu
 
     // optional parameters
     std::optional<SizeType> maxNewTokens; // maximum number of tokens to generate for this request

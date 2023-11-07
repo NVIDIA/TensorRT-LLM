@@ -16,8 +16,7 @@ import unittest
 
 from tensorrt_llm.layers import ColumnLinear, RowLinear
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import (GPTLMHeadModel, smooth_quantize,
-                                 weight_only_quantize)
+from tensorrt_llm.models import GPTLMHeadModel, quantize_model
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.quantization.layers import (SmoothQuantAttention,
                                               SmoothQuantLayerNorm,
@@ -39,7 +38,7 @@ class TestQuant(unittest.TestCase):
                                max_position_embeddings=1024,
                                dtype='float16')
 
-        quant_model = weight_only_quantize(model, mode)
+        quant_model = quantize_model(model, mode)
 
         self.assertTrue(hasattr(quant_model, 'quant_mode'))
 
@@ -82,9 +81,9 @@ class TestQuant(unittest.TestCase):
                                max_position_embeddings=1024,
                                dtype='float16')
 
-        quant_model = weight_only_quantize(model,
-                                           mode,
-                                           exclude_modules=['fc', 'dense'])
+        quant_model = quantize_model(model,
+                                     mode,
+                                     exclude_modules=['fc', 'dense'])
 
         self.assertTrue(hasattr(quant_model, 'quant_mode'))
 
@@ -111,7 +110,7 @@ class TestQuant(unittest.TestCase):
                              mapping=Mapping(world_size=1, rank=0, tp_size=1))
 
         quant_mode = QuantMode.use_smooth_quant()
-        sq_gpt = smooth_quantize(gpt, quant_mode)
+        sq_gpt = quantize_model(gpt, quant_mode)
         for layer in sq_gpt.layers:
             assert isinstance(layer.input_layernorm, SmoothQuantLayerNorm)
             assert isinstance(layer.post_layernorm, SmoothQuantLayerNorm)

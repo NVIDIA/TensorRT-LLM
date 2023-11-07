@@ -274,7 +274,11 @@ __global__ void topKStage2Sampling(const int* __restrict topKTmpIdBuf, T* topKTm
             randNum = randNum - expLogit;
             if (randNum <= 0.0f || i == k - 1)
             {
-                ids[batchId][sequenceLengths[batchId]] = topKTmpIdBuf[batchId * stride + s_id[i]] % vocabSize;
+                int idx = s_id[i];
+                // If s_id is -1 here we force output token to the last from vocabulary to get vivid indicator of smth
+                // going wrong for the debug
+                auto outputId = idx != -1 ? topKTmpIdBuf[batchId * stride + idx] % vocabSize : vocabSize - 1;
+                ids[batchId][sequenceLengths[batchId]] = outputId;
                 if (cumLogProbs != nullptr || outputLogProbs != nullptr)
                 {
                     float logProb = logf(expLogit);

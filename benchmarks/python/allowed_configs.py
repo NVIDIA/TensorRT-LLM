@@ -48,6 +48,7 @@ class BuildConfig(BaseModel, extra=Extra.allow):
     # default value to be None, not 0 or 1 to prevent misuse
     rotary_pct: Optional[float] = None
     bias: bool = True
+    quantization: Optional[str] = None
 
 
 class ModelConfig(BaseModel):
@@ -121,7 +122,7 @@ _allowed_configs = {
                     max_input_len=512,
                     max_output_len=200,
                     builder_opt=None,
-                    use_smooth_quant=True,
+                    quantization="int8_sq_per_tensor",
                 )),
     "gpt_350m_sq_per_token_channel":
     ModelConfig(name="gpt_350m_sq_per_token_channel",
@@ -138,9 +139,7 @@ _allowed_configs = {
                     max_input_len=512,
                     max_output_len=200,
                     builder_opt=None,
-                    use_smooth_quant=True,
-                    per_token=True,
-                    per_channel=True,
+                    quantization="int8_sq_per_token_channel",
                 )),
     "gpt-next_2b":
     ModelConfig(name="gpt-next_2b",
@@ -318,7 +317,7 @@ _allowed_configs = {
                                          max_input_len=512,
                                          max_output_len=200,
                                          builder_opt=None,
-                                         use_smooth_quant=True)),
+                                         quantization="int8_sq_per_tensor")),
     "gptj_6b":
     ModelConfig(name="gptj_6b",
                 family="gptj",
@@ -354,7 +353,7 @@ _allowed_configs = {
                     builder_opt=None,
                 )),
     "chatglm_6b":
-    ModelConfig(name="chatglm_6b",
+    ModelConfig(name="chatglm-6b",
                 family="chatglm",
                 benchmark_type="gpt",
                 build_config=BuildConfig(
@@ -371,8 +370,25 @@ _allowed_configs = {
                     remove_input_padding=False,
                 )),
     "chatglm2_6b":
-    ModelConfig(name="chatglm2_6b",
+    ModelConfig(name="chatglm2-6b",
                 family="chatglm2",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=28,
+                    num_heads=32,
+                    hidden_size=4096,
+                    vocab_size=65024,
+                    hidden_act='swiglu',
+                    n_positions=2048,
+                    max_batch_size=256,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                    remove_input_padding=False,
+                )),
+    "chatglm3_6b":
+    ModelConfig(name="chatglm3-6b",
+                family="chatglm3",
                 benchmark_type="gpt",
                 build_config=BuildConfig(
                     num_layers=28,

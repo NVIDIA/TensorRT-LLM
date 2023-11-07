@@ -1772,7 +1772,7 @@ def _lookup_plugin(input: Tensor, weight: Tensor, rank: int) -> Tensor:
 
     Parameters:
         input : Tensor
-            The input tensor the contains the indices to perform the lookup.
+            The input tensor contains the indices to perform the lookup.
 
         weight : Tensor
             The table to gather from.

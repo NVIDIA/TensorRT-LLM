@@ -23,6 +23,13 @@ def is_triton_installed() -> bool:
     return os.path.exists(TRITON_COMPILE_BIN)
 
 
-@pytest.mark.skipif(not is_triton_installed(), reason='triton is not installed')
+def is_trt_automation() -> bool:
+    return os.path.exists("/build/config.yml")
+
+
+@pytest.mark.skipif(
+    not is_triton_installed() or is_trt_automation(),
+    reason='triton is not installed, this test is not supported in trt automation'
+)
 def test_end_to_end():
     gen_trt_plugins(workspace=WORKSPACE, metas=[KERNEL_META_DATA])

@@ -52,18 +52,22 @@ void invokeTopkSoftMax(const T* log_probs, const T* bias, const bool* finished, 
     switch (log_beam_width)
     {
     // 0 < beam_width <= 4
-    case 0: // 1, 2
-    case 1: // 3, 4
+    case 0:        // 1, 2
+    case 1:        // 3, 4
         CASE_K(4)
-    case 2: // 4 < beam_width <= 8
+    case 2:        // 4 < beam_width <= 8
         CASE_K(8)
-    case 3: // 9 < beam_width <= 16
+#ifndef FAST_BUILD // For fast build, skip case 3, 4, 5
+    case 3:        // 9 < beam_width <= 16
         CASE_K(16)
-    case 4: // 16 < beam_width <= 32
+    case 4:        // 16 < beam_width <= 32
         CASE_K(32)
-    case 5: // 32 < beam_width <= 64
+    case 5:        // 32 < beam_width <= 64
         CASE_K(64)
-    default: throw std::runtime_error(fmtstr("Topk kernel of beam search does not support beam_width=%d", beam_width));
+#endif             // FAST_BUILD
+    default:
+        throw std::runtime_error(
+            fmtstr("%s:%d Topk kernel of beam search does not support beam_width=%d", __FILE__, __LINE__, beam_width));
     }
 }
 

@@ -74,8 +74,11 @@ class Embedding(Module):
 
 class PromptTuningEmbedding(Embedding):
     """
-        Pass all tokens though both normal and prompt embedding tables.
-    Then, combine results based on whether the token was "normal" or "prompt/virtual".
+    PromptTuningEmbedding handles fine-tuned prompts with virtual tokens. At runtime,
+    a supplementary embedding dictionary is passed. Tokens whose ids are >= vocab_size are embedded
+    with that additional dictionary.
+    The prompt tuning dictionary holds multiple tasks, and each sequence is assigned a given task.
+    Prompt-tuned tokens from a given sequence use the adequate task dictionary, as defined by the `tasks` input.
     """
 
     def __init__(self,
@@ -100,6 +103,27 @@ class PromptTuningEmbedding(Embedding):
                 tasks,
                 task_vocab_size,
                 workspace: Optional[Tensor] = None):
+        """
+            Pass all tokens through both normal and prompt embedding tables.
+            Tokens are masked so that "normal" embedding only see "normal" tokens. Same logic for "prompt" embedding.
+            After those two embedding, combine results based on whether the token was "normal" or "prompt-tuned".
+
+        Parameters:
+            tokens : Tensor
+                the ids to embbed, size [batch_size, seq_len]
+
+            prompt_embedding_table : Tensor
+                the additional embedding table for prompt-tuned tokens, size [num_tasks * num_tokens_per_task, hidden_size]
+
+            tasks: Tensor
+                the task required by each token, size [batch_size, seq_len]
+
+            task_vocab_size: Tensor
+                the number of tokens used for each task, should be equal to prompt_embedding_table's num_tokens_per_task, size [1]
+
+        Returns:
+            Tokens' embedding
+        """
         # do not use ">=" because internally the layer works with floating points
         prompt_tokens_mask = tokens > (self.vocab_size - 1)
 

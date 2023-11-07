@@ -14,7 +14,9 @@ code is located in [`examples/gptj`](./). There are three main files in that fol
 ## Support Matrix
   * FP16
   * FP8
-  * INT4 Weight-Only
+  * INT8 & INT4 per-channel weight-only
+  * Groupwise quantization (AWQ)
+  * INT8 KV CACHE (+ AWQ/per-channel weight-only)
   * FP8 KV CACHE
 
 ## Usage
@@ -129,6 +131,67 @@ You can enable the FMHA kernels for GPT by adding `--enable_context_fmha` to the
 If you find that the default fp16 accumulation (`--enable_context_fmha`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--enable_context_fmha_fp32_acc`. However, it is expected to see performance drop.
 
 Note `--enable_context_fmha` / `--enable_context_fmha_fp32_acc` has to be used together with `--use_gpt_attention_plugin float16`.
+
+#### INT8 KV cache
+INT8 KV cache could be enabled to reduce memory footprint. It will bring more performance gains when batch size gets larger.
+
+You can get the INT8 scale of KV cache through `hf_gptj_convert.py`:
+```bash
+# Enable INT8 calibration, and save scales
+python hf_gptj_convert.py -i gptj_model -o gptj_int8_model --calibrate-kv-cache -t float16
+```
+Now the FT-format checkpoint with INT8 KV cache scales is saved to `gptj_int8_model/1-gpu`.
+You can pass this `gptj_int8_model/1-gpu` directory to `build.py` through the argument called `--ft_model_dir`.
+
+INT8 KV cache could be combined with either per-channel INT8/INT4 weight-only quantization or per-group INT4 quantization (which is AWQ, actually).
+
+**INT8 KV cache + per-channel weight-only quantization**
+
+For example, you can enable INT8 KV cache together with per-channel INT8/INT4 weight-only quantization like the following command.
+
+**NOTE**: The whole checkpoint together with INT8 KV scales are passed to `--ft_model_dir`.
+```bash
+# Enable INT8 KV cache together with per-channel INT8 weight-only quantization
+python3 build.py --dtype=float16 \
+                 --log_level=verbose \
+                 --enable_context_fmha \
+                 --use_gpt_attention_plugin float16 \
+                 --use_gemm_plugin float16 \
+                 --max_batch_size=32 \
+                 --max_input_len=1919 \
+                 --max_output_len=128 \
+                 --remove_input_padding \
+                 --output_dir=gptj_engine_wo_int8_kv_cache \
+                 --use_weight_only \
+                 --weight_only_precision=int8 \
+                 --int8_kv_cache \
+                 --ft_model_dir=gptj_ft_model/1-gpu/
+```
+
+**INT8 KV cache + AWQ**
+
+In addition, you can enable INT8 KV cache together with AWQ (per-group INT4 weight-only quantization)like the following command.
+
+**NOTE**: AWQ checkpoint is passed through `--model_dir`, and the INT8 scales of KV cache is through `--ft_model_dir`.
+```bash
+# Enable INT8 KV cache together with AWQ
+python3 build.py --dtype=float16 \
+                 --log_level=verbose \
+                 --enable_context_fmha \
+                 --use_gpt_attention_plugin float16 \
+                 --use_gemm_plugin float16 \
+                 --max_batch_size=32 \
+                 --max_input_len=1919 \
+                 --max_output_len=128 \
+                 --remove_input_padding \
+                 --output_dir=gptj_engine_awq_int8_kv_cache/ \
+                 --use_weight_only \
+                 --per_group \
+                 --weight_only_precision=int4 \
+                 --model_dir=awq_int4_weight_only_quantized_models \
+                 --int8_kv_cache \
+                 --ft_model_dir=gptj_ft_model/1-gpu/
+```
 
 #### FP8 KV cache
 

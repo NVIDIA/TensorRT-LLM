@@ -88,8 +88,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
               model_cache: _tp.Optional[str] = None,
               skip_gptj=False,
               skip_llama=False,
-              skip_chatglm6b=False,
-              skip_chatglm2_6b=False,
+              skip_chatglm=False,
               only_fp8=False,
               only_multi_gpu=False,
               trt_root: _tp.Optional[str] = None) -> None:
@@ -117,15 +116,13 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                                 model_cache=model_cache,
                                 skip_gptj=skip_gptj,
                                 skip_llama=skip_llama,
-                                skip_chatglm6b=skip_chatglm6b,
-                                skip_chatglm2_6b=skip_chatglm2_6b,
+                                skip_chatglm=skip_chatglm,
                                 only_fp8=only_fp8)
 
         run_google_tests(build_dir=build_dir,
                          skip_gptj=skip_gptj,
                          skip_llama=skip_llama,
-                         skip_chatglm6b=skip_chatglm6b,
-                         skip_chatglm2_6b=skip_chatglm2_6b,
+                         skip_chatglm=skip_chatglm,
                          only_fp8=only_fp8)
 
         run_benchmarks(python_exe=python_exe,
@@ -147,8 +144,7 @@ def prepare_all_model_tests(python_exe: str,
                             model_cache: _tp.Optional[str] = None,
                             skip_gptj=False,
                             skip_llama=False,
-                            skip_chatglm6b=False,
-                            skip_chatglm2_6b=False,
+                            skip_chatglm=False,
                             only_fp8=False):
     model_cache_arg = ["--model_cache", model_cache] if model_cache else []
     only_fp8_arg = ["--only_fp8"] if only_fp8 else []
@@ -178,21 +174,13 @@ def prepare_all_model_tests(python_exe: str,
     else:
         _log.info("Skipping Lllama tests")
 
-    if not skip_chatglm6b:
-        prepare_model_tests(model_name="chatglm6b",
+    if not skip_chatglm:
+        prepare_model_tests(model_name="chatglm",
                             python_exe=python_exe,
                             root_dir=root_dir,
                             resources_dir=resources_dir)
     else:
-        _log.info("Skipping ChatGLM6B tests")
-
-    if not skip_chatglm2_6b:
-        prepare_model_tests(model_name="chatglm2-6b",
-                            python_exe=python_exe,
-                            root_dir=root_dir,
-                            resources_dir=resources_dir)
-    else:
-        _log.info("Skipping ChatGLM2-6B tests")
+        _log.info("Skipping ChatGLM tests")
 
 
 def prepare_multi_gpu_model_tests(python_exe: str,
@@ -231,13 +219,17 @@ def prepare_model_tests(model_name: str,
         str(scripts_dir / f"generate_expected_{model_name}_output.py")
     ] + only_fp8_arg + only_multi_gpu_arg
     if only_multi_gpu_arg:
-        generate_expected_output = ["mpirun", "-n", "4"
-                                    ] + generate_expected_output
+        generate_expected_output = [
+            "mpirun",
+            "-n",
+            "4",
+            "--allow-run-as-root",
+        ] + generate_expected_output
     run_command(generate_expected_output, cwd=root_dir, env=model_env)
 
 
-def run_google_tests(build_dir: _pl.Path, skip_gptj, skip_llama, skip_chatglm6b,
-                     skip_chatglm2_6b, only_fp8):
+def run_google_tests(build_dir: _pl.Path, skip_gptj, skip_llama, skip_chatglm,
+                     only_fp8):
     make_google_tests = [
         "cmake", "--build", ".", "--config", "Release", "-j", "--target",
         "google-tests"
@@ -245,16 +237,14 @@ def run_google_tests(build_dir: _pl.Path, skip_gptj, skip_llama, skip_chatglm6b,
     run_command(make_google_tests, cwd=build_dir)
 
     cpp_env = {**_os.environ}
-    ctest = ["ctest", "--output-on-failure", "--output-junit", "report.xml"]
+    ctest = ["ctest", "--output-on-failure", "--output-junit", "results.xml"]
     excluded_tests = []
     if skip_gptj:
         excluded_tests.append(".*Gptj.*")
     if skip_llama:
         excluded_tests.append(".*Llama.*")
-    if skip_chatglm6b:
-        excluded_tests.append(".*Glm6.*")
-    if skip_chatglm2_6b:
-        excluded_tests.append(".*Glm2_6.*")
+    if skip_chatglm:
+        excluded_tests.append(".*ChatGlm.*")
     if only_fp8:
         ctest.extend(["-R", ".*FP8.*"])
     else:
@@ -274,7 +264,8 @@ def run_multi_gpu_tests(build_dir: _pl.Path):
     tests_dir = build_dir / "tests"
     cpp_env = {**_os.environ}
     session_test = [
-        "mpirun", "-n", "4", "gptSessionTest", "--gtest_filter=*TP*:*PP*"
+        "mpirun", "-n", "4", "--allow-run-as-root", "gptSessionTest",
+        "--gtest_filter=*TP*:*PP*"
     ]
     run_command(session_test, cwd=tests_dir, env=cpp_env)
 
@@ -358,12 +349,9 @@ if __name__ == "__main__":
     parser.add_argument("--skip_llama",
                         action="store_true",
                         help="Skip the tests for Llama")
-    parser.add_argument("--skip_chatglm6b",
+    parser.add_argument("--skip_chatglm",
                         action="store_true",
-                        help="Skip the tests for ChatGLM6B")
-    parser.add_argument("--skip_chatglm2_6b",
-                        action="store_true",
-                        help="Skip the tests for ChatGLM2-6B")
+                        help="Skip the tests for ChatGLM")
     parser.add_argument(
         "--only_fp8",
         action="store_true",

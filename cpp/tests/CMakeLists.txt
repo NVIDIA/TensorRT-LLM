@@ -74,6 +74,7 @@ add_gtest(tllmBuffersTest runtime/tllmBuffersTest.cpp)
 add_gtest(bufferManagerTest runtime/bufferManagerTest.cpp)
 add_gtest(runtimeKernelTest runtime/runtimeKernelTest.cpp)
 add_gtest(samplingTest runtime/samplingTest.cpp)
+add_gtest(iTensorTest runtime/iTensorTest.cpp)
 add_gtest(torchTest runtime/torchTest.cpp)
 set(SAMPLING_KERNEL_TEST_SRC
     kernels/sampling/samplingTest.cpp

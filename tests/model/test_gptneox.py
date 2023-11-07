@@ -408,48 +408,6 @@ class TestGPTNeoX(unittest.TestCase):
 
         compare_max_abs_error(ref, res, "generation logits")
 
-    def test_gptneox_noplugin_unsupported(self):
-
-        use_refit = False
-        apply_query_key_layer_scaling = False
-        model = 'gptneox'
-
-        log_level = 'error'
-        dtype = 'float16'
-        world_size = 1
-        rank = 0
-        hidden_act = 'gelu'
-        n_layer = 1
-        max_length = 2
-        batch_size = 4
-        seq_len = 128
-        use_attention_plugin = False
-        use_ln_gemm_plugin = True
-        beam_width = 1
-
-        gpt_config, hf_gpt = self._gen_hf_gpt_neox(hidden_act, n_layer,
-                                                   seq_len + max_length, dtype)
-        with self.assertRaisesRegex(
-                ValueError,
-                ".*GPT-NeoX RoPE is only supported with GPTAttention plugin.*"):
-            runtime, _ = self._gen_tensorrt_llm_runtime(
-                log_level, dtype, world_size, rank, gpt_config, hf_gpt, model,
-                use_attention_plugin, batch_size, beam_width, seq_len,
-                max_length, use_refit, use_ln_gemm_plugin,
-                apply_query_key_layer_scaling)
-
-        use_ln_gemm_plugin = False
-        if trt.__version__[:3] == '8.6':
-            with self.assertRaisesRegex(
-                    AssertionError,
-                    "You need to enable the LayerNorm plugin for GPT-NeoX with TensorRT"
-            ):
-                runtime, _ = self._gen_tensorrt_llm_runtime(
-                    log_level, dtype, world_size, rank, gpt_config, hf_gpt,
-                    model, use_attention_plugin, batch_size, beam_width,
-                    seq_len, max_length, use_refit, use_ln_gemm_plugin,
-                    apply_query_key_layer_scaling)
-
 
 if __name__ == '__main__':
     unittest.main()

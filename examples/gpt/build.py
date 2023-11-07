@@ -26,7 +26,7 @@ from tensorrt_llm.builder import Builder
 from tensorrt_llm.layers import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import smooth_quantize, weight_only_quantize
+from tensorrt_llm.models import quantize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
@@ -433,11 +433,9 @@ def build_rank_engine(builder: Builder,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
         share_embedding_table=share_embedding_table)
-    if args.use_smooth_quant:
-        tensorrt_llm_gpt = smooth_quantize(tensorrt_llm_gpt, args.quant_mode)
-    elif args.use_weight_only:
-        tensorrt_llm_gpt = weight_only_quantize(tensorrt_llm_gpt,
-                                                args.quant_mode)
+
+    if args.use_smooth_quant or args.use_weight_only:
+        tensorrt_llm_gpt = quantize_model(tensorrt_llm_gpt, args.quant_mode)
 
     if args.model_dir is not None:
         gpt_dummy_fp8_scaling_factors = {
@@ -534,6 +532,9 @@ def build_rank_engine(builder: Builder,
     if rank == 0:
         config_path = args.output_dir / 'config.json'
         builder.save_config(builder_config, config_path)
+
+    tensorrt_llm.tools.cleanup(network, tensorrt_llm_gpt)
+
     return engine
 
 
@@ -576,9 +577,9 @@ def build(rank, args):
             opt_level=args.builder_opt,
             multi_query_mode=args.multi_query_mode,
             strongly_typed=args.strongly_typed,
-            use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
+            max_prompt_embedding_table_size=args.
+            max_prompt_embedding_table_size,
             gather_all_token_logits=args.gather_all_token_logits,
-            fp8=args.enable_fp8,
             quant_mode=args.quant_mode,
             use_parallel_embedding=args.use_parallel_embedding)
 
@@ -595,6 +596,7 @@ def build(rank, args):
                 )
 
         serialize_engine(engine, args.output_dir / engine_name)
+        del engine
 
     if rank == 0:
         ok = builder.save_timing_cache(builder_config, timing_cache_file)

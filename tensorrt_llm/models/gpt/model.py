@@ -376,7 +376,6 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
         self._vocab_size = vocab_size
         self._tp_size = mapping.tp_size
         self._multi_query_mode = multi_query_mode
-        self._use_prompt_tuning = use_prompt_tuning
 
         super().__init__(num_layers, num_heads, hidden_size, vocab_size,
                          hidden_act, max_position_embeddings, dtype, mapping,
@@ -444,7 +443,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                        use_cache,
                        max_beam_width: int = 1,
                        max_num_tokens: int = None,
-                       prompt_embedding_table_size: int = 128,
+                       prompt_embedding_table_size: int = 0,
                        gather_all_token_logits: bool = False):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.

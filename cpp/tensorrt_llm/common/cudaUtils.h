@@ -390,6 +390,17 @@ void print2dToScreen(const T* result, const int r, const int c, const int stride
     print2dToStream(result, r, c, stride, stdout);
 }
 
+template <typename T>
+void print2dToFile(std::string fname, const T* result, const int r, const int c, const int stride)
+{
+    FILE* fp = fopen(fname.c_str(), "wt");
+    if (fp != nullptr)
+    {
+        print2dToStream(result, r, c, stride, fp);
+        fclose(fp);
+    }
+}
+
 inline void print_float_(float x)
 {
     printf("%7.3f ", x);

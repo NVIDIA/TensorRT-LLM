@@ -19,9 +19,10 @@ import numpy as np
 import tensorrt as trt
 
 from .._common import default_net, precision
+from .._utils import numpy_fp32_to_bf16
 from ..functional import (AttentionMaskType, PositionEmbeddingType,
                           RotaryScalingType, Tensor, bert_attention, cast, clip,
-                          concat, constant, expand_dims, expand_mask,
+                          concat, constant, embedding, expand_dims, expand_mask,
                           generate_alibi_biases, generate_alibi_slopes,
                           gpt_attention, matmul, repeat_interleave, round,
                           shape, slice, softmax, split, view, where)
@@ -48,7 +49,7 @@ class RopeEmbeddingUtils:
                                  dtype=np.float32)
         concat = np.concatenate((np.sin(sinusoid_inp), np.cos(sinusoid_inp)),
                                 axis=1)
-        return np.expand_dims(concat, axis=0)
+        return np.expand_dims(concat, axis=0).astype(np.float32)
 
     @staticmethod
     def rotate_every_two(tensor: Tensor) -> Tensor:
@@ -139,6 +140,83 @@ class RopeEmbeddingUtils:
         else:
             raise ValueError('The PositionEmbeddingType is not RoPE')
         return (tensor * cos) + (rotate_func(tensor) * sin)
+
+    @staticmethod
+    def apply_rotary_pos_emb_chatglm(
+        qkv,
+        position_embedding,
+        num_attention_heads,
+        attention_head_size,
+        max_position_embeddings,
+    ) -> Tensor:
+
+        half_head_size = attention_head_size // 2
+        qkv_shape = shape(qkv)
+        qkv = qkv.view(
+            concat([
+                shape(qkv, 0),
+                shape(qkv, 1),
+                num_attention_heads,
+                3,
+                attention_head_size,
+            ]))
+        query, key, value = split(qkv, 1, dim=3)
+        q_shape = concat([
+            shape(qkv, 0),
+            shape(qkv, 1),
+            num_attention_heads,
+            attention_head_size,
+        ])
+        query = query.view(q_shape)
+        key = key.view(q_shape)
+        value = value.view(q_shape)
+
+        embedding_weight = RopeEmbeddingUtils.create_sinusoidal_positions(
+            max_position_embeddings, half_head_size)
+        embedding_weight = np.split(embedding_weight.squeeze(0), 2, axis=1)
+        embedding_weight = np.concatenate(
+            [
+                embedding_weight[0],
+                embedding_weight[0],
+                embedding_weight[1],
+                embedding_weight[1],
+            ],
+            axis=1,
+        )
+
+        embedding_weight = constant(embedding_weight)
+        position_embedding = embedding(position_embedding, embedding_weight)
+        position_embedding, block_embedding = split(
+            position_embedding,
+            1,
+            dim=1,
+        )
+        sin0, cos0 = split(position_embedding, half_head_size, dim=3)
+        sin1, cos1 = split(block_embedding, half_head_size, dim=3)
+
+        new_shape = concat([
+            shape(qkv, 0),
+            shape(qkv, 1),
+            1,
+            half_head_size,
+        ])
+        position_embedding = [
+            tensor.view(new_shape) for tensor in [cos0, cos1, sin0, sin1]
+        ]
+
+        query = RopeEmbeddingUtils.apply_rotary_pos_emb(
+            tensor=query,
+            position_embedding=position_embedding,
+            pos_emb_type=PositionEmbeddingType.chatglm)
+        key = RopeEmbeddingUtils.apply_rotary_pos_emb(
+            tensor=key,
+            position_embedding=position_embedding,
+            pos_emb_type=PositionEmbeddingType.chatglm)
+
+        qkv = concat([query, key, value], dim=2)
+        qkv = qkv.view(qkv_shape)
+
+        return qkv
 
 
 class AttentionParams(object):
@@ -381,6 +459,7 @@ class Attention(Module):
         encoder_output: Optional[Tensor] = None,
         workspace=None,
         position_embedding=None,
+        norm_before_bmm1=False,
     ):
 
         assert isinstance(hidden_states, Tensor)
@@ -399,36 +478,15 @@ class Attention(Module):
                                                  alibi_scale=alibi_scale)
 
         qkv = self.qkv(hidden_states)
+
         if self.position_embedding_type == PositionEmbeddingType.chatglm:
-            qkv = qkv.view(
-                concat([
-                    shape(qkv, 0),
-                    shape(qkv, 1), self.num_attention_heads, 3,
-                    self.attention_head_size
-                ]))
-            query, key, value = split(qkv, 1, dim=3)
-            q_shape = concat([
-                shape(qkv, 0),
-                shape(qkv, 1), self.num_attention_heads,
-                self.attention_head_size
-            ])
-            query = query.view(q_shape)
-            key = key.view(q_shape)
-            value = value.view(q_shape)
-
-            query = RopeEmbeddingUtils.apply_rotary_pos_emb(
-                query,
-                position_embedding=position_embedding,
-                pos_emb_type=PositionEmbeddingType.chatglm)
-            key = RopeEmbeddingUtils.apply_rotary_pos_emb(
-                key,
-                position_embedding=position_embedding,
-                pos_emb_type=PositionEmbeddingType.chatglm)
-
-            qkv = concat([query, key, value], dim=2)
-            qkv = qkv.view(
-                concat([shape(qkv, 0),
-                        shape(qkv, 1), self.hidden_size * 3]))
+            qkv = RopeEmbeddingUtils.apply_rotary_pos_emb_chatglm(
+                qkv,
+                position_embedding,
+                self.num_attention_heads,
+                self.attention_head_size,
+                self.max_position_embeddings,
+            )
 
         paged_kv_cache = default_net().plugin_config.paged_kv_cache
 
@@ -548,7 +606,12 @@ class Attention(Module):
             value = transpose_for_scores(value, is_kv=True)
 
             if self.rotary_enabled:
-                embed_positions = constant(self.embed_positions)
+                if self.dtype == trt.bfloat16:
+                    embed_positions = numpy_fp32_to_bf16(
+                        self.embed_positions.astype(np.float32))
+                    embed_positions = constant(embed_positions)
+                else:
+                    embed_positions = constant(self.embed_positions)
 
                 if self.rotary_embedding_dim is not None:
                     # When shape(hidden_states, 1) > 1(Context phase), the embedding start from 0,
@@ -726,10 +789,13 @@ class Attention(Module):
 
             key = key.permute([0, 1, 3, 2])
             with precision('float32'):
+                if norm_before_bmm1:
+                    # Apply norm on query earlier to prevent matmul fp16 overflow.
+                    query /= self.norm_factor
                 attention_scores = matmul(cast(query, 'float32'),
                                           cast(key, 'float32'))
-
-                attention_scores = attention_scores / self.norm_factor
+                if not norm_before_bmm1:
+                    attention_scores = attention_scores / self.norm_factor
 
                 if self.attention_mask_type in [
                         AttentionMaskType.causal,

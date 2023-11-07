@@ -16,6 +16,8 @@ These scripts accept an argument named model_version, whose value should be `v1_
   * FP16
   * BF16
   * INT4 & INT8 Weight-Only
+  * INT8 KV CACHE
+  * INT8 Smooth Quant
 
 ## Usage
 
@@ -81,6 +83,74 @@ python build.py --model_version v1_13b \
                 --output_dir ./tmp/baichuan_v1_13b/trt_engines/fp16/2-gpu/ \
                 --world_size 2
 ```
+
+#### INT8 weight only + INT8 KV cache
+For INT8 KV cache, [`hf_baichuan_convert.py`](./hf_baichuan_convert.py) features a
+`--calibrate-kv-cache, -kv` option. Setting `-kv` will calibrate the model,
+and then export the scaling factors needed for INT8 KV cache inference.
+
+
+Example:
+
+```bash
+python3 hf_baichuan_convert.py -i baichuan-inc/Baichuan-13B-Chat -o ./tmp/baichuan_v1_13b/int8_kv_cache/ --calibrate-kv-cache -t fp16
+```
+
+[`build.py`](./build.py) add new options for the support of INT8 KV cache.
+
+`--int8_kv_cache` is the command-line option to enable INT8 KV cache.
+
+In addition, it could be combined with INT8 weight-only quantization, as follows:
+
+Examples of INT8 weight-only quantization + INT8 KV cache
+
+```bash
+# Build model with both INT8 weight-only and INT8 KV cache enabled
+python build.py --model_version v1_13b \
+                --bin_model_dir=./tmp/baichuan_v1_13b/int8_kv_cache/1-gpu/ \
+                --dtype float16 \
+                --use_gpt_attention_plugin float16 \
+                --use_gemm_plugin float16 \
+                --output_dir ./tmp/baichuan_v1_13b/trt_engines/int8_kv_cache_weight_only/1-gpu \
+                --int8_kv_cache \
+                --use_weight_only
+```
+
+#### SmoothQuant
+
+The SmoothQuant supports all Baichuan model variants. Unlike the FP16 build where the HF weights are processed and loaded into the TensorRT-LLM directly, the SmoothQuant needs to load INT8 weights which should be pre-processed before building an engine.
+
+Example:
+```bash
+python3 hf_baichuan_convert.py -i baichuan-inc/Baichuan-13B-Chat -o ./tmp/baichuan_v1_13b/sq0.8/ -sq 0.8 --tensor-parallelism 1 --storage-type fp16
+```
+
+[`build.py`](./build.py) add new options for the support of INT8 inference of SmoothQuant models.
+
+`--use_smooth_quant` is the starting point of INT8 inference. By default, it
+will run the model in the _per-tensor_ mode.
+
+Then, you can add any combination of `--per-token` and `--per-channel` to get the corresponding behaviors.
+
+Examples of build invocations:
+
+```bash
+# Build model for SmoothQuant in the _per_tensor_ mode.
+python3 build.py --model_version v1_13b \
+                 --bin_model_dir=./tmp/baichuan_v1_13b/sq0.8/1-gpu/ \
+                 --use_smooth_quant \
+                 --use_gpt_attention_plugin float16 \
+
+# Build model for SmoothQuant in the _per_token_ + _per_channel_ mode
+python3 build.py --model_version v1_13b \
+                 --bin_model_dir=./tmp/baichuan_v1_13b/sq0.8/1-gpu/ \
+                 --use_smooth_quant \
+                 --use_gpt_attention_plugin float16 \
+                 --per_token \
+                 --per_channel
+```
+
+Note we use `--bin_model_dir` instead of `--model_dir` and `--meta_ckpt_dir` since SmoothQuant model needs INT8 weights and various scales from the binary files.
 
 ### Run
 

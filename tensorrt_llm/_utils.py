@@ -13,26 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
-import ctypes
 import json
 import math
-import time
+import struct
 from functools import partial
 
 import numpy as np
 import tensorrt as trt
 import torch
 
-from .logger import logger
-
 # numpy doesn't know bfloat16, define abstract binary type instead
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
 
 
-def torch_to_numpy(x):
+def torch_to_numpy(x: torch.Tensor):
+    assert isinstance(x, torch.Tensor), \
+        f'x must be a torch.Tensor object, but got {type(x)}.'
     if x.dtype != torch.bfloat16:
-        return x.numpy()
-    return x.view(torch.int16).numpy().view(np_bfloat16)
+        return x.cpu().numpy()
+    return x.view(torch.int16).cpu().numpy().view(np_bfloat16)
 
 
 fp32_array = partial(np.array, dtype=np.float32)
@@ -192,33 +191,6 @@ def dim_resolve_negative(dim, ndim):
     return tuple(pos)
 
 
-def serialize_engine(engine, path):
-    logger.info(f'Serializing engine to {path}...')
-    tik = time.time()
-    if isinstance(engine, trt.ICudaEngine):
-        engine = engine.serialize()
-    with open(path, 'wb') as f:
-        f.write(bytearray(engine))
-    tok = time.time()
-    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-    logger.info(f'Engine serialized. Total time: {t}')
-
-
-def deserialize_engine(path):
-    runtime = trt.Runtime(logger.trt_logger)
-    with open(path, 'rb') as f:
-        logger.info(f'Loading engine from {path}...')
-        tik = time.time()
-
-        engine = runtime.deserialize_cuda_engine(f.read())
-        assert engine is not None
-
-        tok = time.time()
-        t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-        logger.info(f'Engine loaded. Total time: {t}')
-    return engine
-
-
 def mpi_comm():
     from mpi4py import MPI
     return MPI.COMM_WORLD
@@ -251,50 +223,16 @@ def to_json_file(obj, json_file_path):
         writer.write(to_json_string(obj))
 
 
-_field_dtype_to_np_dtype_dict = {
-    trt.PluginFieldType.FLOAT16: np.float16,
-    trt.PluginFieldType.FLOAT32: np.float32,
-    trt.PluginFieldType.FLOAT64: np.float64,
-    trt.PluginFieldType.INT8: np.int8,
-    trt.PluginFieldType.INT16: np.int16,
-    trt.PluginFieldType.INT32: np.int32,
-}
+def numpy_fp32_to_bf16(src):
+    # Numpy doesn't support bfloat16 type
+    # Convert float32 to bfloat16 manually and assign with bf16 abstract type
+    original_shape = src.shape
+    src = src.flatten()
+    src = np.ascontiguousarray(src)
 
-
-def field_dtype_to_np_dtype(dtype):
-    ret = _field_dtype_to_np_dtype_dict.get(dtype)
-    assert ret is not None, f'Unsupported dtype: {dtype}'
-    return ret
-
-
-def convert_capsule_to_void_p(capsule):
-    ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
-    ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [
-        ctypes.py_object, ctypes.c_char_p
-    ]
-    return ctypes.pythonapi.PyCapsule_GetPointer(capsule, None)
-
-
-def get_nparray_from_void_p(void_pointer, elem_size, field_dtype):
-    ctypes.pythonapi.PyMemoryView_FromMemory.restype = ctypes.py_object
-    ctypes.pythonapi.PyMemoryView_FromMemory.argtypes = [
-        ctypes.c_char_p, ctypes.c_ssize_t, ctypes.c_int
-    ]
-    logger.info(
-        f'get_nparray: pointer = {void_pointer}, elem_size = {elem_size}')
-    char_pointer = ctypes.cast(void_pointer, ctypes.POINTER(ctypes.c_char))
-    np_dtype = field_dtype_to_np_dtype(field_dtype)
-    buf_bytes = elem_size * np.dtype(np_dtype).itemsize
-    logger.info(f'get_nparray: buf_bytes = {buf_bytes}')
-    mem_view = ctypes.pythonapi.PyMemoryView_FromMemory(
-        char_pointer, buf_bytes, 0)  # number 0 represents PyBUF_READ
-    logger.info(
-        f'get_nparray: mem_view = {mem_view}, field_dtype = {field_dtype}')
-    buf = np.frombuffer(mem_view, np_dtype)
-    return buf
-
-
-def get_scalar_from_field(field):
-    void_p = convert_capsule_to_void_p(field.data)
-    np_array = get_nparray_from_void_p(void_p, 1, field.type)
-    return np_array[0]
+    assert src.dtype == np.float32
+    dst = np.empty_like(src, dtype=np.uint16)
+    for i in range(len(dst)):
+        bytes = struct.pack('<f', src[i])
+        dst[i] = struct.unpack('<H', struct.pack('BB', bytes[2], bytes[3]))[0]
+    return dst.reshape(original_shape).view(np_bfloat16)

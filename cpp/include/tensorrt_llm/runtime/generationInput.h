@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/promptTuningParams.h"
 
 #include <optional>
 #include <utility>
@@ -26,18 +27,20 @@
 namespace tensorrt_llm::runtime
 {
 
-class GenerationInput
+template <typename TTensor, typename PromptTuningParams>
+class GenericGenerationInput
 {
 public:
-    using TensorPtr = ITensor::SharedPtr;
+    using TensorPtr = TTensor;
 
-    explicit GenerationInput(
+    explicit GenericGenerationInput(
         SizeType const endId, SizeType const padId, TensorPtr ids, TensorPtr lengths, bool packed = false)
         : endId{endId}
         , padId{padId}
         , ids{std::move(ids)}
         , lengths{std::move(lengths)}
         , packed{packed}
+        , maxNewTokens(std::nullopt)
     {
         TLLM_CHECK_WITH_INFO(static_cast<bool>(this->ids), "Invalid ids tensor");
         TLLM_CHECK_WITH_INFO(static_cast<bool>(this->lengths), "Invalid lengths tensor");
@@ -55,6 +58,22 @@ public:
     TensorPtr badWordsList;               // [2, badWordsLength] or [batchSize, 2, badWordsLength], on gpu
     TensorPtr stopWordsList;              // [batchSize, 2, stopWordsLength], on gpu
     std::optional<SizeType> maxNewTokens; // max number of tokens to generate
+
+    // Ptuning parameters
+    PromptTuningParams promptTuningParams; // See promptTuningParams.h for expected shapes
+};
+
+class GenerationInput : public GenericGenerationInput<ITensor::SharedPtr, PromptTuningParams>
+{
+public:
+    using Base = GenericGenerationInput<ITensor::SharedPtr, PromptTuningParams>;
+    using TensorPtr = Base::TensorPtr;
+
+    explicit GenerationInput(
+        SizeType const endId, SizeType const padId, TensorPtr ids, TensorPtr lengths, bool packed = false)
+        : GenericGenerationInput(endId, padId, std::move(ids), std::move(lengths), packed)
+    {
+    }
 };
 
 } // namespace tensorrt_llm::runtime

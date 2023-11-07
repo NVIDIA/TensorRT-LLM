@@ -29,7 +29,7 @@ public:
     enum class ModelVariant : std::int32_t
     {
         kGpt = 0,
-        kGlm = 1, // https://github.com/THUDM/GLM
+        kGlm = 1, // https://github.com/THUDM/GLM and https://github.com/THUDM/ChatGLM-6B
     };
 
     constexpr explicit GptModelConfig(
@@ -52,6 +52,7 @@ public:
         , mComputeContextLogits(false)
         , mModelVariant(ModelVariant::kGpt)
         , mUseCustomAllReduce(false)
+        , mMaxPromptEmbeddingTableSize(0)
     {
     }
 
@@ -196,6 +197,21 @@ public:
         mMaxNumTokens = maxNumTokens;
     }
 
+    [[nodiscard]] bool constexpr usePromptTuning() const noexcept
+    {
+        return mMaxPromptEmbeddingTableSize > 0;
+    }
+
+    [[nodiscard]] SizeType constexpr getMaxPromptEmbeddingTableSize() const noexcept
+    {
+        return mMaxPromptEmbeddingTableSize;
+    }
+
+    void constexpr setMaxPromptEmbeddingTableSize(SizeType maxPromptEmbeddingTableSize) noexcept
+    {
+        mMaxPromptEmbeddingTableSize = maxPromptEmbeddingTableSize;
+    }
+
     [[nodiscard]] bool constexpr computeContextLogits() const noexcept
     {
         return mComputeContextLogits;
@@ -246,6 +262,8 @@ private:
     bool mComputeContextLogits;
     ModelVariant mModelVariant;
     bool mUseCustomAllReduce;
+
+    SizeType mMaxPromptEmbeddingTableSize;
 };
 
 } // namespace tensorrt_llm::runtime

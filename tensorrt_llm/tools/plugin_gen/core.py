@@ -269,7 +269,7 @@ class KernelMetaData:
         if yaml_path:
             with open(yaml_path, "r") as f:
                 yaml_str = f.read()
-        yaml_data = yaml.load(yaml_str, Loader=yaml.Loader)
+        yaml_data = yaml.load(yaml_str, Loader=yaml.SafeLoader)
 
         kernel_name = yaml_data["name"]
         ios = []
@@ -682,13 +682,12 @@ class PluginCmakeCodegen:
 
 
 def setup_jinja_env() -> jinja2.Environment:
-    env = jinja2.Environment(
-        loader=jinja2.PackageLoader(
-            package_name="tensorrt_llm.tools.plugin_gen",
-            package_path="templates",
-        ),
-        undefined=jinja2.StrictUndefined,
-    )
+    env = jinja2.Environment(loader=jinja2.PackageLoader(
+        package_name="tensorrt_llm.tools.plugin_gen",
+        package_path="templates",
+    ),
+                             undefined=jinja2.StrictUndefined,
+                             autoescape=jinja2.select_autoescape())
     env.variable_start_string = '[['
     env.variable_end_string = ']]'
     return env

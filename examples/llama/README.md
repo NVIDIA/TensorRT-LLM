@@ -14,7 +14,10 @@ The TensorRT-LLM LLaMA implementation can be found in [tensorrt_llm/models/llama
   * FP16
   * FP8
   * INT8 & INT4 Weight-Only
+  * SmoothQuant
+  * Groupwise quantization (AWQ/GPTQ)
   * FP8 KV CACHE
+  * INT8 KV CACHE (+ AWQ/per-channel weight-only)
   * Tensor Parallel
   * STRONGLY TYPED
 
@@ -152,8 +155,18 @@ python build.py --meta_ckpt_dir ./tmp/llama/70B \
 
 Same instructions can be applied to fine-tuned versions of the LLaMA v2 models (e.g. 7Bf or llama-2-7b-chat).
 
-#### INT8 weight only + INT8 KV cache
-For INT8 KV cache, [`hf_llama_convert.py`](./hf_llama_convert.py) features a
+### Using RoPE Scaling
+RoPE scaling is supported through GPT Attention Plugin. You can add `--rotary_scaling <type> <factor>` during the build command to enable it.
+- The value of `type` can be either `linear` and `dynamic`.
+- The value of `factor` can be any value larger than `1.0`.
+
+The implementation is identical to Huggingface's.
+Please refer to https://huggingface.co/docs/transformers/model_doc/llama2#transformers.LlamaConfig.rope_scaling for more details.
+
+#### INT8 KV cache
+INT8 KV cache could be enabled to reduce memory footprint. It will bring more performance gains when batch size gets larger.
+
+You can get the INT8 scale of KV cache through [`hf_llama_convert.py`](./hf_llama_convert.py), which features a
 `--calibrate-kv-cache, -kv` option. Setting `-kv` will calibrate the model,
 and then export the scaling factors needed for INT8 KV cache inference.
 
@@ -166,9 +179,11 @@ python3 hf_llama_convert.py -i /llama-models/llama-7b-hf -o /llama/smooth_llama_
 
 [`build.py`](./build.py) add new options for the support of INT8 KV cache.
 
-`--int8_kv_cache` is the command-line option to enable INT8 KV cache.
+`--int8_kv_cache` is the command-line option to enable INT8 KV cache, and `--ft_model_dir` should contain the directory where the INT8 KV cache scales lie in.
 
-In addition, it could be combined with INT8 weight-only quantization, as follows:
+**INT8 KV cache + per-channel weight-only quantization**
+
+INT8 KV cache could be combined with per-channel weight-only quantization, as follows:
 
 Examples of INT8 weight-only quantization + INT8 KV cache
 
@@ -190,6 +205,38 @@ python summarize.py --test_trt_llm \
                     --hf_model_location /llama-models/llama-7b-hf \
                     --data_type fp16 \
                     --engine_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_weight_only/1-gpu \
+                    --test_hf
+```
+
+**INT8 KV cache + AWQ**
+
+In addition, you can enable INT8 KV cache together with AWQ (per-group INT4 weight-only quantization)like the following command.
+
+**NOTE**: AWQ checkpoint is passed through `--model_dir`, and the INT8 scales of KV cache is through `--ft_model_dir`.
+
+```bash
+python build.py --model_dir ./tmp/llama/7B/ \
+                --quant_ckpt_path ./llama-7b-4bit-gs128-awq.pt \
+                --dtype float16 \
+                --remove_input_padding \
+                --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
+                --use_gemm_plugin float16 \
+                --use_weight_only \
+                --weight_only_precision int4_awq \
+                --per_group \
+                --output_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_int4_AWQ/1-gpu/
+                --int8_kv_cache \ # Turn on INT8 KV cache
+                --ft_model_dir /llama/smooth_llama_7B/int8_kv_cache/1-gpu/ # Directory to look for INT8 scale of KV cache
+```
+
+Test with `summarize.py`:
+
+```bash
+python summarize.py --test_trt_llm \
+                    --hf_model_location /llama-models/llama-7b-hf \
+                    --data_type fp16 \
+                    --engine_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_int4_AWQ/1-gpu \
                     --test_hf
 ```
 

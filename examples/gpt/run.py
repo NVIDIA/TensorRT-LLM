@@ -48,27 +48,29 @@ def read_config(config_path: Path):
     num_layers = config['builder_config']['num_layers']
     paged_kv_cache = config['plugin_config']['paged_kv_cache']
     tokens_per_block = config['plugin_config']['tokens_per_block']
-    use_prompt_tuning = config['builder_config']['use_prompt_tuning']
+    max_prompt_embedding_table_size = config['builder_config'][
+        'max_prompt_embedding_table_size']
     dtype = config['builder_config']['precision']
     gather_all_token_logits = config['builder_config'][
         'gather_all_token_logits']
     use_custom_all_reduce = config['plugin_config']['use_custom_all_reduce']
     quant_mode = QuantMode(config['builder_config']['quant_mode'])
 
-    model_config = ModelConfig(num_heads=num_heads,
-                               num_kv_heads=num_kv_heads,
-                               hidden_size=hidden_size,
-                               vocab_size=vocab_size,
-                               num_layers=num_layers,
-                               gpt_attention_plugin=use_gpt_attention_plugin,
-                               remove_input_padding=remove_input_padding,
-                               paged_kv_cache=paged_kv_cache,
-                               tokens_per_block=tokens_per_block,
-                               use_prompt_tuning=use_prompt_tuning,
-                               dtype=dtype,
-                               quant_mode=quant_mode,
-                               gather_all_token_logits=gather_all_token_logits,
-                               use_custom_all_reduce=use_custom_all_reduce)
+    model_config = ModelConfig(
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        hidden_size=hidden_size,
+        vocab_size=vocab_size,
+        num_layers=num_layers,
+        gpt_attention_plugin=use_gpt_attention_plugin,
+        remove_input_padding=remove_input_padding,
+        paged_kv_cache=paged_kv_cache,
+        tokens_per_block=tokens_per_block,
+        max_prompt_embedding_table_size=max_prompt_embedding_table_size,
+        dtype=dtype,
+        quant_mode=quant_mode,
+        gather_all_token_logits=gather_all_token_logits,
+        use_custom_all_reduce=use_custom_all_reduce)
 
     dtype = config['builder_config']['precision']
     max_input_len = config['builder_config']['max_input_len']
@@ -290,7 +292,7 @@ def generate(
                   max_output_len,
                   beam_width=num_beams)
 
-    ptuning_args = [] if not model_config.use_prompt_tuning else ptuning_setup(
+    ptuning_args = [] if model_config.max_prompt_embedding_table_size == 0 else ptuning_setup(
         prompt_table, dtype, model_config.hidden_size, tasks, input_ids,
         input_lengths, model_config.remove_input_padding)
 

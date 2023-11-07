@@ -30,7 +30,7 @@ from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import fp8_quantize
+from tensorrt_llm.models import quantize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
@@ -412,9 +412,9 @@ def build_rank_engine(builder: Builder,
         quant_scales = get_scaling_factors(args.quantized_fp8_model_path,
                                            num_layers=args.n_layer,
                                            quant_mode=args.quant_mode)
-        tensorrt_llm_falcon = fp8_quantize(tensorrt_llm_falcon,
-                                           quant_mode=args.quant_mode,
-                                           quant_scales=quant_scales)
+        tensorrt_llm_falcon = quantize_model(tensorrt_llm_falcon,
+                                             quant_mode=args.quant_mode,
+                                             quant_scales=quant_scales)
     if args.model_dir is not None:
         logger.info(f'Loading HF Falcon ... from {args.model_dir}')
         tik = time.time()
@@ -497,6 +497,9 @@ def build_rank_engine(builder: Builder,
     if rank == 0:
         config_path = os.path.join(args.output_dir, 'config.json')
         builder.save_config(builder_config, config_path)
+
+    tensorrt_llm.tools.cleanup(network, tensorrt_llm_falcon)
+
     return engine
 
 
@@ -532,7 +535,6 @@ def build(rank, args):
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,
-            fp8=args.quant_mode.has_fp8_qdq(),
             quant_mode=args.quant_mode,
             strongly_typed=args.strongly_typed,
             opt_level=args.builder_opt)
@@ -549,6 +551,7 @@ def build(rank, args):
                 cache = builder_config.trt_builder_config.get_timing_cache()
 
         serialize_engine(engine, os.path.join(args.output_dir, engine_name))
+        del engine
 
     if rank == 0:
         ok = builder.save_timing_cache(

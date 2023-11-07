@@ -212,9 +212,28 @@ void GptDecoderBatch::newRequest(
     TensorPtr endIdTensorPtr{ITensor::slice(constPointerCast(dJointInput.endIds), batchIdx, localBatchSize)};
     kernels::invokeFill(*endIdTensorPtr, endId, *stream);
     dInput = std::make_unique<DecodingInput>(inputLength, localBatchSize, dJointInput.logits, endIdTensorPtr);
-    dInput->embeddingBias = request.embeddingBias;
-    dInput->badWordsList = request.badWordsList;
-    dInput->stopWordsList = request.stopWordsList;
+
+    // Here, we need to add leading 1 dimension since decoderInput expects batchSize as leading dim
+    // and decoder_batch::Request doesn't have batch dimension
+    if (request.embeddingBias)
+    {
+        TensorPtr biasView = ITensor::view(request.embeddingBias);
+        biasView->unsqueeze(0);
+        dInput->embeddingBias = biasView;
+    }
+    if (request.badWordsList)
+    {
+        TensorPtr badWordsView = ITensor::view(request.badWordsList);
+        badWordsView->unsqueeze(0);
+        dInput->badWordsList = badWordsView;
+    }
+    if (request.stopWordsList)
+    {
+        TensorPtr stopWordsView = ITensor::view(request.stopWordsList);
+        stopWordsView->unsqueeze(0);
+        dInput->stopWordsList = stopWordsView;
+    }
+
     TensorPtr sequenceLimitLength{
         ITensor::slice(constPointerCast(dJointInput.sequenceLimitLength), batchIdx, localBatchSize)};
     kernels::invokeFill(*sequenceLimitLength, inputLength + maxNewTokens, *stream);
@@ -437,10 +456,20 @@ void GptDecoderBatch::newBatch(GenerationInput const& inputs, SamplingConfig con
             inputView = ITensor::slice(inputs.ids, batchIdx, 1);
             inputView->reshape(inputShape);
         }
-        auto request = decoder_batch::Request{inputView, std::nullopt, inputs.endId, inputs.padId};
-        request.embeddingBias = inputs.embeddingBiasOpt;
-        request.badWordsList = inputs.badWordsList;
-        request.stopWordsList = inputs.stopWordsList;
+        auto request = decoder_batch::Request{inputView, inputs.maxNewTokens, inputs.endId, inputs.padId};
+
+        if (inputs.embeddingBiasOpt)
+        {
+            TLLM_THROW("newBatch doesn't support embeddingBias yet.");
+        }
+        if (inputs.badWordsList)
+        {
+            TLLM_THROW("newBatch doesn't support badWordsList yet.");
+        }
+        if (inputs.stopWordsList)
+        {
+            TLLM_THROW("newBatch doesn't support stopWordsList yet.");
+        }
         newRequest(batchIdx, request, extractSamplingConfig(samplingConfig, batchIdx));
     }
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);

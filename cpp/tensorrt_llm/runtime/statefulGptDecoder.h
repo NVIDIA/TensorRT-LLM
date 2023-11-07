@@ -90,6 +90,5 @@ private:
 
     SizeType mNbSteps;
     SizeType mMaxSequenceLength{};
-    SizeType mMaxNewTokens;
 };
 } // namespace tensorrt_llm::runtime

@@ -18,12 +18,12 @@
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/gptSession.h"
+#include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
 #include <NvInfer.h>
 #include <chrono>
 #include <cxxopts.hpp>
-#include <iostream>
 #include <sstream>
 #include <string>
 
@@ -39,14 +39,22 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
     std::shared_ptr<nvinfer1::ILogger> const& logger, int warmUp, int numRuns, int duration,
     GptSession::Config& sessionConfig, bool cudaGraphMode)
 {
-    auto const json = GptJsonConfig::parse(dataPath / "config.json");
+
+    std::string modelNameHyphen = modelName;
+    std::filesystem::path jsonFileName = dataPath / "config.json";
+    if (tc::strStartsWith(modelName, "chatglm"))
+    {
+        std::replace(modelNameHyphen.begin(), modelNameHyphen.end(), '_', '-');
+        jsonFileName = dataPath / (modelNameHyphen + std::string("-config.json"));
+    }
+    auto const json = GptJsonConfig::parse(jsonFileName);
     auto const modelConfig = json.getModelConfig();
     auto const inputPacked = modelConfig.usePackedInput();
     SizeType deviceCount{0};
     TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
     auto const worldConfig
         = WorldConfig::mpi(*logger, deviceCount, json.getTensorParallelism(), json.getPipelineParallelism());
-    auto const enginePath = dataPath / json.engineFilename(worldConfig, modelName);
+    auto const enginePath = dataPath / json.engineFilename(worldConfig, modelNameHyphen);
     auto const dtype = modelConfig.getDataType();
     auto const useHalf = (dtype == nvinfer1::DataType::kHALF);
 
@@ -78,10 +86,15 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
         auto constexpr endId = 50256;
         auto constexpr padId = 50256;
 
+        auto& memoryCounter = MemoryCounters::getInstance();
+        TLLM_LOG_INFO(memoryCounter.toString());
+
         for (auto const batchSize : batchSizes)
         {
             try
             {
+                TLLM_LOG_INFO(memoryCounter.toString());
+
                 std::vector<SizeType> inputLenghtsHost(batchSize, maxInputLength);
                 auto inputLenghts
                     = bufferManager.copyFrom(inputLenghtsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
@@ -99,6 +112,9 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                     inputIds = bufferManager.copyFrom(
                         inputsHost, ITensor::makeShape({batchSize, maxInputLength}), MemoryType::kGPU);
                 }
+
+                TLLM_LOG_INFO(memoryCounter.toString());
+
                 GenerationInput generationInput{
                     endId, padId, std::move(inputIds), std::move(inputLenghts), inputPacked};
 
@@ -106,6 +122,8 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                 GenerationOutput generationOutput{
                     bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32),
                     bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32)};
+
+                TLLM_LOG_INFO(memoryCounter.toString());
 
                 for (auto r = 0; r < warmUp; ++r)
                 {
@@ -117,6 +135,8 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                     bufferManager.getStream().synchronize();
                 }
                 cudaDeviceSynchronize();
+
+                TLLM_LOG_INFO(memoryCounter.toString());
 
                 int iterIdx = 0;
                 float curDuration = 0;
@@ -134,6 +154,9 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                     iterIdx += 1;
                     curDuration += std::chrono::duration<float, std::milli>(end - start).count();
                 }
+
+                TLLM_LOG_INFO(memoryCounter.toString());
+
                 printf("Benchmarking done. Iteration: %d, duration: %.2f sec.\n", iterIdx, curDuration / 1000);
 
                 if (worldConfig.getRank() == 0)
@@ -159,7 +182,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                 // We can ignore the OOM exception and continue the rest of the benchmark
                 if (worldConfig.getRank() == 0)
                 {
-                    printf("%s", e.what());
+                    TLLM_LOG_EXCEPTION(e);
                     printf(
                         "[BENCHMARK] batch_size %d input_length %d output_length %d latency(ms) N/A tokensPerSec N/A\n",
                         batchSize, maxInputLength, maxNewTokens);
@@ -167,6 +190,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                 continue;
             }
         }
+        TLLM_LOG_INFO(memoryCounter.toString());
     }
 }
 
@@ -200,8 +224,8 @@ int main(int argc, char* argv[])
     options.add_options()("duration", "Minimal duration of iterations to measure in seconds.",
         cxxopts::value<int>()->default_value("60"));
 
-    options.add_options()(
-        "num_micro_batches", "Number of micro batches if enabling pipeline parallelism.", cxxopts::value<int>());
+    options.add_options()("ctx_micro_batch_size", "Batch size for context phase.", cxxopts::value<int>());
+    options.add_options()("gen_micro_batch_size", "Batch size for generation phase.", cxxopts::value<int>());
     options.add_options()("max_tokens_in_paged_kvcache", "Max tokens in paged K-V Cache.", cxxopts::value<int>());
     options.add_options()(
         "kv_cache_free_gpu_mem_fraction", "K-V Cache Free Gpu Mem Fraction.", cxxopts::value<float>());
@@ -281,10 +305,15 @@ int main(int argc, char* argv[])
     }
 
     GptSession::Config sessionConfig{0, 0, 0};
-    // Argument: Number of micro batches
-    if (result.count("num_micro_batches"))
+    // Argument: Batch size for context phase
+    if (result.count("ctx_micro_batch_size"))
     {
-        sessionConfig.numMicroBatches = result["num_micro_batches"].as<int>();
+        sessionConfig.ctxMicroBatchSize = result["ctx_micro_batch_size"].as<int>();
+    }
+    // Argument: Batch size for generation phase
+    if (result.count("gen_micro_batch_size"))
+    {
+        sessionConfig.genMicroBatchSize = result["gen_micro_batch_size"].as<int>();
     }
     // Argument: Max tokens in paged K-V Cache
     if (result.count("max_tokens_in_paged_kvcache"))

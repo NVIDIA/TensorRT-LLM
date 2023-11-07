@@ -266,7 +266,7 @@ second one contains `[9, 2]` and the third one is composed of tokens `[6, 2, 4,
 1]`. In total, there are 9 tokens. That's the length. The shape of the tensor
 is `[2, 9]`.  The first row of the tensor must contain the 9 token IDs and the
 second row must store the
-[exclusive prefix-sum](https://en.wikipedia.org/wiki/Prefix_sum)
+[inclusive prefix-sum](https://en.wikipedia.org/wiki/Prefix_sum)
 of the word lengths as shown on the following diagram:
 
 ```
@@ -274,7 +274,7 @@ of the word lengths as shown on the following diagram:
    |           |       |              |
    V           V       V              V
 [  5,  7,  3,  9,  2,  6,  2,  4,  1]
-[  0,  3,  5,  9, -1, -1, -1, -1, -1]
+[  3,  5,  9, -1, -1, -1, -1, -1, -1]
 ```
 
 In case all the words are made of a single token, the inner-most dimension of

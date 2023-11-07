@@ -181,16 +181,11 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
 
         for (int i = 0; i < MAX_K; ++i)
         {
-            if (beam_hyps.num_beams != nullptr && x[total.p[i]] % vocab_size == beam_hyps.end_ids[vector_id])
+            if (i < K && beam_hyps.num_beams != nullptr && x[total.p[i]] % vocab_size == beam_hyps.end_ids[vector_id])
             {
                 // if beam_token does not belong to top num_beams tokens, it should not
                 // be added. Refer from
                 // https://github.com/huggingface/transformers/blob/v4.24.0/src/transformers/generation_beam_search.py#L257
-                if (i >= K)
-                {
-                    // do nothing
-                }
-                else
                 {
                     const float normed_score = (float) total.u[i];
                     const int num_beam = beam_hyps.num_beams[global_batch_idx];

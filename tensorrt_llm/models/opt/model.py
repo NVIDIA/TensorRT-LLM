@@ -291,7 +291,7 @@ class OPTLMHeadModel(OPTModel, GenerationMixin):
                        max_new_tokens,
                        use_cache,
                        max_beam_width,
-                       prompt_embedding_table_size=32):
+                       prompt_embedding_table_size: int = 0):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 

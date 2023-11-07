@@ -25,6 +25,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization import QuantMode
 
 from build import get_engine_name  # isort:skip
 
@@ -35,7 +36,6 @@ def TRTBaichuan(args, config):
     assert world_size == tensorrt_llm.mpi_world_size(), \
         f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
 
-    world_size = config['builder_config']['tensor_parallel']
     num_heads = config['builder_config']['num_heads'] // world_size
     hidden_size = config['builder_config']['hidden_size'] // world_size
     vocab_size = config['builder_config']['vocab_size']
@@ -45,6 +45,7 @@ def TRTBaichuan(args, config):
     remove_input_padding = config['plugin_config']['remove_input_padding']
     paged_kv_cache = config['plugin_config']['paged_kv_cache']
     tokens_per_block = config['plugin_config']['tokens_per_block']
+    quant_mode = QuantMode(config['builder_config']['quant_mode'])
 
     model_config = tensorrt_llm.runtime.ModelConfig(
         vocab_size=vocab_size,
@@ -56,7 +57,8 @@ def TRTBaichuan(args, config):
         tokens_per_block=tokens_per_block,
         remove_input_padding=remove_input_padding,
         paged_kv_cache=paged_kv_cache,
-        dtype=dtype)
+        dtype=dtype,
+        quant_mode=quant_mode)
 
     runtime_rank = tensorrt_llm.mpi_rank()
     runtime_mapping = tensorrt_llm.Mapping(world_size,

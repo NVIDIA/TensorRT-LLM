@@ -17,4 +17,4 @@ pre-commit
 einops
 parameterized
 graphviz
-pynvml
+pynvml>=11.5.0

@@ -38,9 +38,10 @@ FieldType parseJsonFieldOr(Json const& json, std::string_view name, FieldType de
     {
         value = json.at(name).template get<FieldType>();
     }
-    catch (nlohmann::json::out_of_range&)
+    catch (nlohmann::json::out_of_range& e)
     {
-        // std::cerr << e.what() << '\n';
+        TLLM_LOG_WARNING("Parameter %s cannot be read from json:", std::string(name).c_str());
+        TLLM_LOG_WARNING(e.what());
     }
     return value;
 }
@@ -102,6 +103,8 @@ GptJsonConfig parseJson(InputType&& i)
     auto const maxInputLen = parseJsonFieldOr(builderConfig, "max_input_len", 0);
     auto const maxOutputLen = parseJsonFieldOr(builderConfig, "max_output_len", 0);
     auto const maxNumTokens = parseJsonFieldOptional<SizeType>(builderConfig, "max_num_tokens");
+    auto const maxPromptEmbeddingTableSize
+        = parseJsonFieldOr<SizeType>(builderConfig, "max_prompt_embedding_table_size", 0);
 
     auto const computeContextLogits = parseJsonFieldOr(builderConfig, "gather_all_token_logits", false);
 
@@ -127,11 +130,12 @@ GptJsonConfig parseJson(InputType&& i)
     modelConfig.setMaxInputLen(maxInputLen);
     modelConfig.setMaxOutputLen(maxOutputLen);
     modelConfig.setMaxNumTokens(maxNumTokens);
+    modelConfig.setMaxPromptEmbeddingTableSize(maxPromptEmbeddingTableSize);
 
     if (name == std::string("chatglm-6b"))
     {
         modelConfig.setModelVariant(GptModelConfig::ModelVariant::kGlm);
-        // kGlm is only for ChatGLM-6B, not for ChatGLM2-6B
+        // kGlm is only for ChatGLM-6B and Glm-10B
     }
 
     return GptJsonConfig{name, precision, tensorParallelism, pipelineParallelism, modelConfig};

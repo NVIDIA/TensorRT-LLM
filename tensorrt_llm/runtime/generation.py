@@ -249,7 +249,7 @@ class ModelConfig:
     has_position_embedding: bool = True
     has_token_type_embedding: bool = False
     tokens_per_block: int = 64
-    use_prompt_tuning: bool = False
+    max_prompt_embedding_table_size: int = 0
     quant_mode: QuantMode = QuantMode(0)
     gather_all_token_logits: bool = False
     dtype: str = ""
@@ -402,7 +402,7 @@ class GenerationSession(object):
                 'attention_mask',
             ]
 
-        if model_config.use_prompt_tuning:
+        if model_config.max_prompt_embedding_table_size > 0:
             expected_tensor_names += [
                 'prompt_embedding_table', 'tasks', 'prompt_vocab_size'
             ]
@@ -1656,6 +1656,7 @@ class GenerationSession(object):
         next_step_buffer = None
         attention_mask = None
         context_logits = None
+        generation_logits = []
 
         def get_outputs_dict(output_ids):
             outputs = {}
@@ -1666,6 +1667,7 @@ class GenerationSession(object):
                         [batch_size, beam_width])
             if self.gather_all_token_logits:
                 outputs['context_logits'] = context_logits
+                outputs['generation_logits'] = generation_logits
             return outputs
 
         for step in range(0, self.max_new_tokens):
@@ -1680,6 +1682,10 @@ class GenerationSession(object):
                 encoder_input_lengths)
             if step == 0:
                 context_logits = logits
+            if self.gather_all_token_logits:
+                generation_logits.append(
+                    next_step_buffer['logits'].clone().detach())
+
             if should_stop is not None and should_stop.item():
                 final_output_ids = self.finalize_decoder(
                     context_lengths, batch_size, beam_width, scfg)
@@ -1783,12 +1789,14 @@ class GenerationSession(object):
     def decode_batch(self,
                      input_ids: Sequence[torch.Tensor],
                      sampling_config: SamplingConfig,
-                     streaming: bool = False):
+                     streaming: bool = False,
+                     **kwargs):
         input_ids, context_lengths = _prepare_input_ids(input_ids)
         return self.decode(input_ids,
                            context_lengths,
                            sampling_config,
-                           streaming=streaming)
+                           streaming=streaming,
+                           **kwargs)
 
     # As dynamic_decoder uses torch's current stream, we must ensure it runs on the same stream that
     # dynamic_decoder was set up with
@@ -1907,24 +1915,42 @@ class GenerationSession(object):
                 encoder_output, encoder_input_lengths)
 
 
-class ChatGLM6BHeadModelGenerationSession(GenerationSession):
+class ChatGLMGenerationSession(GenerationSession):
 
     def _prepare_context_inputs(self, batch_size, context_lengths,
                                 use_gpt_attention_plugin, remove_input_padding,
                                 **kwargs):
 
-        assert not remove_input_padding
         last_token_ids = context_lengths.detach().clone()
         max_context_length = kwargs.pop('max_context_length')
-        position_ids = torch.zeros([batch_size, 2, max_context_length],
-                                   dtype=torch.int32)
-        position_ids[:, 0, :] = torch.arange(max_context_length)
-        for i in range(batch_size):
-            length = context_lengths[i]
-            position_ids[i, 0, length - 1] = length - 2
-            position_ids[i, 1, length - 1] = 1
-            position_ids[i, :, length:] = 0
-        position_ids = position_ids.cuda()
+
+        if remove_input_padding:
+            input_lengths_acc = torch.cumsum(torch.cat(
+                [torch.IntTensor([0]).cuda(), context_lengths], dim=0),
+                                             dim=0)
+            position_ids = torch.zeros([1, 2, input_lengths_acc[-1]],
+                                       dtype=torch.int32)
+            for i in range(batch_size):
+                position_ids[0, 0, input_lengths_acc[i]:input_lengths_acc[
+                    i + 1]] = torch.arange(0,
+                                           context_lengths[i],
+                                           dtype=torch.int32)
+                position_ids[0, 0, input_lengths_acc[i + 1] -
+                             1] = context_lengths[i] - 2
+                position_ids[0, 1, input_lengths_acc[i + 1] - 1] = 1
+            position_ids = position_ids.int().cuda()
+            last_token_ids = torch.cumsum(last_token_ids, dim=0).int().cuda()
+        else:
+            position_ids = torch.zeros([batch_size, 2, max_context_length],
+                                       dtype=torch.int32)
+            position_ids[:, 0, :] = torch.arange(max_context_length)
+            for i in range(batch_size):
+                length = context_lengths[i]
+                position_ids[i, 0, length - 1] = length - 2
+                position_ids[i, 1, length - 1] = 1
+                position_ids[i, :, length:] = 0
+            position_ids = position_ids.cuda()
+
         inputs = {
             'position_ids': position_ids,
             'last_token_ids': last_token_ids
@@ -1937,17 +1963,25 @@ class ChatGLM6BHeadModelGenerationSession(GenerationSession):
     def _prepare_generation_inputs(self, batch_size, context_lengths,
                                    use_gpt_attention_plugin,
                                    remove_input_padding, **kwargs):
-        assert not remove_input_padding
-        last_token_ids = torch.ones_like(context_lengths)
 
         step = kwargs.pop('step')
         num_beams = kwargs.pop('num_beams')
+        last_token_ids = torch.ones_like(context_lengths)
 
-        data = []
-        for i in range(batch_size):
-            data.append([[context_lengths[i * num_beams] - 2], [step + 2]])
-        position_ids = torch.tensor(data, dtype=torch.int32, device='cuda')
-        position_ids = _tile_beam_width(position_ids, num_beams)
+        if remove_input_padding:
+            position_ids = torch.zeros([1, 2, batch_size], dtype=torch.int32)
+            for i in range(batch_size):
+                position_ids[0, 0, i] = context_lengths[i * num_beams] - 2
+                position_ids[0, 1, i] = step + 2
+            position_ids = _tile_beam_width(position_ids, num_beams)
+            position_ids = position_ids.int().cuda()
+            last_token_ids = torch.cumsum(last_token_ids, dim=0).int().cuda()
+        else:
+            data = []
+            for i in range(batch_size):
+                data.append([[context_lengths[i * num_beams] - 2], [step + 2]])
+            position_ids = torch.tensor(data, dtype=torch.int32, device='cuda')
+            position_ids = _tile_beam_width(position_ids, num_beams)
 
         inputs = {
             'position_ids': position_ids,

@@ -747,6 +747,24 @@ void invokeCopyPackedInputToOutput(ITensor& outputIds, ITensor const& inputIds, 
         maxInputLength, maxSeqLength);
 }
 
+void initOutputIds(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputLengths,
+    ITensor const& inputOffsets, TokenIdType const padId, TokenIdType const endId, SizeType const maxInputLength,
+    bool const inputPacked, CudaStream const& stream)
+{
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    kernels::invokeFill(outputIds, endId, stream);
+
+    if (inputPacked)
+    {
+        kernels::invokeCopyPackedInputToOutput(outputIds, inputIds, inputOffsets, maxInputLength, padId, stream);
+    }
+    else
+    {
+        kernels::invokeCopyInputToOutput(outputIds, inputIds, inputLengths, padId, stream);
+    }
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+}
+
 namespace
 {
 template <typename T>

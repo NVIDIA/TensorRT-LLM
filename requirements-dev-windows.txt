@@ -1,9 +1,9 @@
---pre --extra-index-url https://download.pytorch.org/whl/nightly/cu121
-# torch is CPU-only on Windows, so need to specify a torch version with GPU support
-torch==2.1.0.dev20230828+cu121
-torchvision==0.16.0.dev20230828
-torchdata==0.7.0.dev20230828
-torchtext==0.16.0.dev20230828
+--extra-index-url https://download.pytorch.org/whl/cu121
+# Default torch is CPU-only on Windows, so need to specify a torch version with GPU support
+torch==2.1.0+cu121
+torchvision==0.16.0+cu121
+torchdata==0.7.0
+torchtext==0.16.0+cpu
 tokenizers==0.13.3
 transformers==4.33.1
 diffusers==0.15.0
@@ -23,4 +23,4 @@ einops
 parameterized
 graphviz
 pywin32
-pynvml
+pynvml>=11.5.0

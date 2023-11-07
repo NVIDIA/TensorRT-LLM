@@ -148,6 +148,12 @@ public:
     int mTPSize;
     bool mRandomEndId;
 };
+
+struct MicroBatchSizes
+{
+    std::optional<SizeType> ctxMicroBatchSize{std::nullopt};
+    std::optional<SizeType> genMicroBatchSize{std::nullopt};
+};
 } // namespace
 
 class SessionTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
@@ -183,7 +189,7 @@ void verifyModelConfig(GptModelConfig const& modelConfig, ModelSpec const& model
 
 void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, ModelIds const modelIds, SizeType beamWidth,
     std::initializer_list<int> const& batchSizes, fs::path const& resultsFile,
-    std::shared_ptr<nvinfer1::ILogger> const& logger, bool cudaGraphMode, SizeType numMicroBatches)
+    std::shared_ptr<nvinfer1::ILogger> const& logger, bool cudaGraphMode, MicroBatchSizes microBatchSizes)
 {
     auto manager = BufferManager(std::make_shared<CudaStream>());
 
@@ -275,7 +281,8 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
     auto const maxBatchSize = *std::max_element(batchSizes.begin(), batchSizes.end());
     GptSession::Config sessionConfig{maxBatchSize, beamWidth, maxSeqLength};
     sessionConfig.decoderPerRequest = modelSpec.mDecoderPerRequest;
-    sessionConfig.numMicroBatches = numMicroBatches;
+    sessionConfig.ctxMicroBatchSize = microBatchSizes.ctxMicroBatchSize;
+    sessionConfig.genMicroBatchSize = microBatchSizes.genMicroBatchSize;
     sessionConfig.cudaGraphMode = cudaGraphMode;
 
     GptSession session{sessionConfig, modelConfig, worldConfig, enginePath.string(), logger};
@@ -327,6 +334,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
 
         GenerationInput generationInput{
             endId, padId, std::move(inputIds), std::move(inputLenghts), modelConfig.usePackedInput()};
+        generationInput.maxNewTokens = maxNewTokens;
 
         // runtime will allocate memory for output if this tensor is empty
         GenerationOutput generationOutput{bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32),
@@ -338,11 +346,19 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
         {
             SizeType numSteps = 0;
             generationOutput.onTokenGenerated
-                = [&numSteps, &modelSpec, maxNewTokens]([[maybe_unused]] GenerationOutput::TensorPtr const& outputIds,
-                      [[maybe_unused]] SizeType step, bool finished)
+                = [&numSteps, &modelSpec, maxNewTokens](
+                      [[maybe_unused]] GenerationOutput::TensorPtr const& outputIds, SizeType step, bool finished)
             {
+                // check that we execute the callback in each step
+                EXPECT_EQ(step, numSteps);
                 ++numSteps;
-                EXPECT_TRUE(!finished || modelSpec.mRandomEndId || numSteps == maxNewTokens);
+                if (!modelSpec.mRandomEndId)
+                {
+                    // check that we only finish after producing `maxNewTokens` tokens
+                    EXPECT_TRUE(!finished || numSteps == maxNewTokens);
+                }
+                // check that `finished` is set to true after producing `maxNewTokens` tokens
+                EXPECT_TRUE(numSteps != maxNewTokens || finished);
             };
 
             session.generate(generationOutput, generationInput, samplingConfig);
@@ -416,7 +432,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
 
 auto constexpr kBatchSizes = {1, 8};
 
-using ParamType = std::tuple<ModelParams, ModelSpec, SizeType, bool, SizeType>;
+using ParamType = std::tuple<ModelParams, ModelSpec, SizeType, bool, MicroBatchSizes>;
 
 std::string generateTestName(const testing::TestParamInfo<ParamType>& info)
 {
@@ -434,9 +450,11 @@ std::string generateTestName(const testing::TestParamInfo<ParamType>& info)
         name.append("DecoderBatch");
     if (std::get<3>(info.param))
         name.append("CudaGraph");
-    auto const numMicroBatches = std::get<4>(info.param);
-    if (numMicroBatches > 1)
-        name.append("MicroBatch" + std::to_string(numMicroBatches));
+    auto const microBatcheSizes = std::get<4>(info.param);
+    if (microBatcheSizes.ctxMicroBatchSize)
+        name.append("CBS" + std::to_string(microBatcheSizes.ctxMicroBatchSize.value()));
+    if (microBatcheSizes.genMicroBatchSize)
+        name.append("GBS" + std::to_string(microBatcheSizes.genMicroBatchSize.value()));
     if (modelSpec.mPPSize > 1)
         name.append("PP" + std::to_string(modelSpec.mPPSize));
     if (modelSpec.mTPSize > 1)
@@ -458,10 +476,8 @@ TEST_P(ParamTest, Test)
     auto const modelIds = modelParams.ids;
     auto const modelSpec = std::get<1>(GetParam());
     SizeType const beamWidth{std::get<2>(GetParam())};
-    auto const resultsPath
-        = DATA_PATH / modelDir / ((beamWidth == 1) ? "sampling" : "beam_search_" + std::to_string(beamWidth));
-    fs::path const resultsFile{resultsPath / modelSpec.mResultsFile};
-    auto const numMicroBatches = std::get<4>(GetParam());
+    auto const cudaGraphMode = std::get<3>(GetParam());
+    auto const microBatchSizes = std::get<4>(GetParam());
 
     if (!modelSpec.mUseGptAttentionPlugin && beamWidth > 1)
         GTEST_SKIP();
@@ -485,10 +501,12 @@ TEST_P(ParamTest, Test)
     std::ostringstream gpuSizePath;
     gpuSizePath << "tp" << modelSpec.mTPSize << "-pp" << modelSpec.mPPSize << "-gpu";
     auto const modelPath{ENGINGE_PATH / modelDir / modelSpec.mModelPath / gpuSizePath.str()};
-    auto const cudaGraphMode = std::get<3>(GetParam());
+    auto const resultsPath
+        = DATA_PATH / modelDir / ((beamWidth == 1) ? "sampling" : "beam_search_" + std::to_string(beamWidth));
+    fs::path const resultsFile{resultsPath / modelSpec.mResultsFile};
 
     testGptSession(
-        modelPath, modelSpec, modelIds, beamWidth, kBatchSizes, resultsFile, mLogger, cudaGraphMode, numMicroBatches);
+        modelPath, modelSpec, modelIds, beamWidth, kBatchSizes, resultsFile, mLogger, cudaGraphMode, microBatchSizes);
 }
 
 INSTANTIATE_TEST_SUITE_P(GptSessionTest, ParamTest,
@@ -535,7 +553,8 @@ INSTANTIATE_TEST_SUITE_P(GptSessionTest, ParamTest,
                 .usePagedKvCache()
                 .useDecoderPerRequest()
                 .useRandomEndId()),
-        testing::Values(1, 2), testing::Values(false, true), testing::Values(1, 3)),
+        testing::Values(1, 2), testing::Values(false, true),
+        testing::Values(MicroBatchSizes(), MicroBatchSizes{3, 3}, MicroBatchSizes{3, 6})),
     generateTestName);
 
 INSTANTIATE_TEST_SUITE_P(GptjSessionTest, ParamTest,
@@ -568,7 +587,7 @@ INSTANTIATE_TEST_SUITE_P(GptjSessionTest, ParamTest,
                 .useDecoderPerRequest()
 
                 ),
-        testing::Values(1, 2), testing::Values(false), testing::Values(1)),
+        testing::Values(1, 2), testing::Values(false), testing::Values(MicroBatchSizes())),
     generateTestName);
 
 INSTANTIATE_TEST_SUITE_P(LlamaSessionTest, ParamTest,
@@ -611,7 +630,7 @@ INSTANTIATE_TEST_SUITE_P(LlamaSessionTest, ParamTest,
                 .useTensorParallelism(2)
 
                 ),
-        testing::Values(1, 2), testing::Values(false), testing::Values(1)),
+        testing::Values(1, 2), testing::Values(false), testing::Values(MicroBatchSizes())),
     generateTestName);
 
 class LlamaSessionOnDemandTest : public SessionTest
@@ -632,7 +651,8 @@ TEST_F(LlamaSessionOnDemandTest, SamplingFP16WithAttentionPlugin)
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
     auto const modeIds = ModelIds{2, 2};
 
-    testGptSession(modelPath, modelSpec, modeIds, beamWidth, batchSizes, resultsFile, mLogger, false, 1);
+    testGptSession(
+        modelPath, modelSpec, modeIds, beamWidth, batchSizes, resultsFile, mLogger, false, MicroBatchSizes());
 }
 
 TEST_F(LlamaSessionOnDemandTest, SamplingFP16AttentionPluginDecoderBatch)
@@ -648,28 +668,34 @@ TEST_F(LlamaSessionOnDemandTest, SamplingFP16AttentionPluginDecoderBatch)
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin().usePackedInput().useDecoderPerRequest();
     auto const modeIds = ModelIds{2, 2};
 
-    testGptSession(modelPath, modelSpec, modeIds, beamWidth, batchSizes, resultsFile, mLogger, false, 1);
+    testGptSession(
+        modelPath, modelSpec, modeIds, beamWidth, batchSizes, resultsFile, mLogger, false, MicroBatchSizes());
 }
 
-class Glm6bSessionTest : public SessionTest
+class ChatGlmSessionTest : public SessionTest // for ChatGLM-6B
 {
 };
 
-class Glm2_6bSessionTest : public SessionTest
+class ChatGlm2SessionTest : public SessionTest // for ChatGLM2-6B and ChatGLM2-6B-32k
 {
 };
 
-// Engines need to be generated using cpp/tests/resources/scripts/build_gpt_engines.py.
-// Expected outputs need to be generated using cpp/tests/resources/scripts/generate_expected_gpt_output.py.
+class ChatGlm3SessionTest : public SessionTest // for ChatGLM3-6B and ChatGLM3-6B-32k
+{
+};
+
+// Engines need to be generated using cpp/tests/resources/scripts/build_chatglm_engines.py.
+// Expected outputs need to be generated using cpp/tests/resources/scripts/generate_expected_chatglm_output.py.
 
 namespace
 {
 
 // TODO: consolidate this function with testGptSession
-// Notice: both ChatGLM-6B and ChatGLM2-6B use this function, which are different at GptModelConfig::ModelVariant
-void testGlm6bSession(fs::path const& modelPath, std::string const& modelName, ModelSpec const& modelSpec,
+// Notice: all ChatGLM models (ChatGLM-6B, ChatGLM2-6B, ChatGLM3-6B, ChatGLM2-6B-32k and ChatGLM3-6B-32k) use this
+// function The differences are GptModelConfig::ModelVariant
+void testChatGlmSession(fs::path const& modelPath, std::string const& modelName, ModelSpec const& modelSpec,
     ModelIds const modelIds, SizeType beamWidth, std::initializer_list<int> const& batchSizes,
-    std::shared_ptr<nvinfer1::ILogger> const& logger, bool cudaGraphMode, SizeType numMicroBatches)
+    std::shared_ptr<nvinfer1::ILogger> const& logger, bool cudaGraphMode, MicroBatchSizes microBatchSizes)
 {
     auto manager = BufferManager(std::make_shared<CudaStream>());
 
@@ -692,7 +718,7 @@ void testGlm6bSession(fs::path const& modelPath, std::string const& modelName, M
     auto const expectedOutputData = bufferCast<TokenIdType const>(*expectedOutput);
 
     ASSERT_TRUE(fs::exists(modelPath));
-    auto const json = GptJsonConfig::parse(modelPath / "config.json");
+    auto const json = GptJsonConfig::parse(modelPath / (modelName + "-config.json"));
     auto const modelConfig = json.getModelConfig();
     verifyModelConfig(modelConfig, modelSpec);
     auto const decoderPerRequest = modelSpec.mDecoderPerRequest;
@@ -728,9 +754,9 @@ void testGlm6bSession(fs::path const& modelPath, std::string const& modelName, M
     auto const maxBatchSize = *std::max_element(batchSizes.begin(), batchSizes.end());
     GptSession::Config sessionConfig{maxBatchSize, beamWidth, maxSeqLength};
     sessionConfig.decoderPerRequest = decoderPerRequest;
-    sessionConfig.numMicroBatches = numMicroBatches;
+    sessionConfig.ctxMicroBatchSize = microBatchSizes.ctxMicroBatchSize;
+    sessionConfig.genMicroBatchSize = microBatchSizes.genMicroBatchSize;
     sessionConfig.cudaGraphMode = cudaGraphMode;
-
     GptSession session{sessionConfig, modelConfig, worldConfig, enginePath.string(), logger};
     EXPECT_EQ(session.getDevice(), worldConfig.getDevice());
     // Use bufferManager for copying data to and from the GPU
@@ -837,62 +863,74 @@ void testGlm6bSession(fs::path const& modelPath, std::string const& modelName, M
 
 } // namespace
 
-TEST_F(Glm6bSessionTest, SamplingFP16WithGptAttentionPluginBS1BM1)
+TEST_F(ChatGlmSessionTest, SamplingFP16WithGptAttentionPluginBS1BM1)
 {
-    auto const modelName{"chatglm6b"};
-    auto const modelPath{ENGINGE_PATH / modelName};
+    auto const modelName{"chatglm-6b"};
+    auto const modelPath{ENGINGE_PATH / "chatglm"};
     auto const batchSizes = {1};
     auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
     auto const modeIds = ModelIds{130005, 130005};
 
-    testGlm6bSession(modelPath, modelName, modelSpec, modeIds, 1, batchSizes, mLogger, false, 1);
+    testChatGlmSession(modelPath, modelName, modelSpec, modeIds, 1, batchSizes, mLogger, false, MicroBatchSizes());
 }
 
-TEST_F(Glm6bSessionTest, SamplingFP16WithGptAttentionPluginBS2BM1)
+TEST_F(ChatGlmSessionTest, SamplingFP16WithGptAttentionPluginBS2BM1)
 {
-    auto const modelName{"chatglm6b"};
-    auto const modelPath{ENGINGE_PATH / modelName};
+    auto const modelName{"chatglm-6b"};
+    auto const modelPath{ENGINGE_PATH / "chatglm"};
     auto const batchSizes = {2};
     auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
     auto const modeIds = ModelIds{130005, 130005};
 
-    testGlm6bSession(modelPath, modelName, modelSpec, modeIds, 1, batchSizes, mLogger, false, 1);
+    testChatGlmSession(modelPath, modelName, modelSpec, modeIds, 1, batchSizes, mLogger, false, MicroBatchSizes());
 }
 
-TEST_F(Glm2_6bSessionTest, SamplingFP16WithGptAttentionPluginBS1BM1)
+TEST_F(ChatGlm2SessionTest, SamplingFP16WithGptAttentionPluginBS1BM1)
 {
     auto const modelName{"chatglm2-6b"};
-    auto const modelPath{ENGINGE_PATH / modelName};
+    auto const modelPath{ENGINGE_PATH / "chatglm"};
     auto const batchSizes = {1};
     auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
     auto const modeIds = ModelIds{2, 2};
 
-    testGlm6bSession(modelPath, modelName, modelSpec, modeIds, 1, batchSizes, mLogger, false, 1);
+    testChatGlmSession(modelPath, modelName, modelSpec, modeIds, 1, batchSizes, mLogger, false, MicroBatchSizes());
 }
 
-TEST_F(Glm2_6bSessionTest, SamplingFP16WithGptAttentionPluginBS2BM1)
+TEST_F(ChatGlm2SessionTest, SamplingFP16WithGptAttentionPluginBS2BM1)
 {
     auto const modelName{"chatglm2-6b"};
-    auto const modelPath{ENGINGE_PATH / modelName};
+    auto const modelPath{ENGINGE_PATH / "chatglm"};
     auto const batchSizes = {2};
     auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
     auto const modeIds = ModelIds{2, 2};
 
-    testGlm6bSession(modelPath, modelName, modelSpec, modeIds, 1, batchSizes, mLogger, false, 1);
+    testChatGlmSession(modelPath, modelName, modelSpec, modeIds, 1, batchSizes, mLogger, false, MicroBatchSizes());
 }
 
-TEST_F(Glm2_6bSessionTest, SamplingFP16WithGptAttentionPluginBS1BM2)
+TEST_F(ChatGlm2SessionTest, SamplingFP16WithGptAttentionPluginBS1BM2)
 {
     auto const modelName{"chatglm2-6b"};
-    auto const modelPath{ENGINGE_PATH / modelName};
+    auto const modelPath{ENGINGE_PATH / "chatglm"};
     auto const batchSizes = {1};
     auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
     auto const modeIds = ModelIds{2, 2};
 
-    testGlm6bSession(modelPath, modelName, modelSpec, modeIds, 2, batchSizes, mLogger, false, 1);
+    testChatGlmSession(modelPath, modelName, modelSpec, modeIds, 2, batchSizes, mLogger, false, MicroBatchSizes());
+}
+
+TEST_F(ChatGlm3SessionTest, SamplingFP16WithGptAttentionPluginBS1BM1)
+{
+    auto const modelName{"chatglm3-6b"};
+    auto const modelPath{ENGINGE_PATH / "chatglm"};
+    auto const batchSizes = {1};
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
+    auto const modeIds = ModelIds{2, 2};
+
+    testChatGlmSession(modelPath, modelName, modelSpec, modeIds, 1, batchSizes, mLogger, false, MicroBatchSizes());
 }

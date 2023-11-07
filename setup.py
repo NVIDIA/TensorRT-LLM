@@ -56,13 +56,16 @@ setup(
     install_requires=required_deps,
     dependency_links=extra_URLs,
     zip_safe=True,
+    license="Apache License 2.0",
     packages=find_packages(),
+    # TODO Add windows support for python bindings.
     package_data={
         'tensorrt_llm':
         (['libs/th_common.dll', 'libs/nvinfer_plugin_tensorrt_llm.dll']
-         if platform.system() == "Windows" else
-         ['libs/libth_common.so', 'libs/libnvinfer_plugin_tensorrt_llm.so']) +
-        ['tools/plugin_gen/templates/*']
+         if platform.system() == "Windows" else [
+             'libs/libth_common.so', 'libs/libnvinfer_plugin_tensorrt_llm.so',
+             'bindings.*.so'
+         ]) + ['tools/plugin_gen/templates/*'],
     },
     python_requires=">=3.7, <4",
     distclass=BinaryDistribution,
