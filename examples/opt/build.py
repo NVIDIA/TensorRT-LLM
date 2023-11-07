@@ -25,7 +25,7 @@ from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import weight_only_quantize
+from tensorrt_llm.models import quantize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
@@ -251,8 +251,8 @@ def build_rank_engine(builder: Builder,
         embedding_sharding_dim=args.embedding_sharding_dim,
         share_embedding_table=share_embedding_table)
     if args.use_weight_only:
-        tensorrt_llm_gpt = weight_only_quantize(tensorrt_llm_gpt,
-                                                args.quant_mode)
+        tensorrt_llm_gpt = quantize_model(tensorrt_llm_gpt, args.quant_mode)
+
     if args.model_dir is not None:
         load_from_ft(tensorrt_llm_gpt,
                      args.model_dir,
@@ -313,6 +313,9 @@ def build_rank_engine(builder: Builder,
     if rank == 0:
         config_path = os.path.join(args.output_dir, 'config.json')
         builder.save_config(builder_config, config_path)
+
+    tensorrt_llm.tools.cleanup(network, tensorrt_llm_gpt)
+
     return engine
 
 
@@ -359,6 +362,7 @@ def build(rank, args):
                 cache = builder_config.trt_builder_config.get_timing_cache()
 
         serialize_engine(engine, os.path.join(args.output_dir, engine_name))
+        del engine
 
     if rank == 0:
         ok = builder.save_timing_cache(

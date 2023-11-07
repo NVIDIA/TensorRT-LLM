@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .generation import (ChatGLM6BHeadModelGenerationSession, GenerationSession,
+from .generation import (ChatGLMGenerationSession, GenerationSession,
                          ModelConfig, SamplingConfig, to_word_list_format)
 from .kv_cache_manager import GenerationSequence, KVCacheManager
 from .session import Session, TensorInfo
@@ -25,6 +25,6 @@ __all__ = [
     'SamplingConfig',
     'Session',
     'TensorInfo',
-    'ChatGLM6BHeadModelGenerationSession',
+    'ChatGLMGenerationSession',
     'to_word_list_format',
 ]

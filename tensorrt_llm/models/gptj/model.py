@@ -295,7 +295,8 @@ class GPTJForCausalLM(GPTJModel, GenerationMixin):
             use_custom_all_reduce=use_custom_all_reduce,
             paged_kv_cache=paged_kv_cache,
             tokens_per_block=tokens_per_block,
-            mapping=self.mapping)
+            mapping=self.mapping,
+            max_num_tokens=max_num_tokens)
 
         return (model_inputs['input_ids'], model_inputs['position_ids'], True,
                 model_inputs['last_token_ids'],

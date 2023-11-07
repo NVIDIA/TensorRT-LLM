@@ -26,14 +26,14 @@
 namespace tensorrt_llm::runtime
 {
 
-class GenerationOutput
+template <typename TTensor>
+class GenericGenerationOutput
 {
 public:
-    using TensorPtr = ITensor::SharedPtr;
-
+    using TensorPtr = TTensor;
     using Callback = std::function<void(TensorPtr const& ids, SizeType step, bool finished)>;
 
-    explicit GenerationOutput(TensorPtr ids, TensorPtr lengths)
+    explicit GenericGenerationOutput(TensorPtr ids, TensorPtr lengths)
         : ids{std::move(ids)}
         , lengths{std::move(lengths)}
     {
@@ -51,6 +51,18 @@ public:
 
     // callbacks
     Callback onTokenGenerated;
+};
+
+class GenerationOutput : public GenericGenerationOutput<ITensor::SharedPtr>
+{
+public:
+    using Base = GenericGenerationOutput<ITensor::SharedPtr>;
+    using TensorPtr = Base::TensorPtr;
+
+    explicit GenerationOutput(TensorPtr ids, TensorPtr lengths)
+        : GenericGenerationOutput(std::move(ids), std::move(lengths))
+    {
+    }
 };
 
 } // namespace tensorrt_llm::runtime

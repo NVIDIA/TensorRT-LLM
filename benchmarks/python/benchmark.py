@@ -18,15 +18,11 @@ from multiprocessing import Process, Queue
 from time import time
 
 import torch
-from allowed_configs import get_allowed_models
-from bert_benchmark import BERTBenchmark
-from gpt_benchmark import GPTBenchmark
 from mem_monitor import mem_monitor
-
-from tensorrt_llm.logger import logger
 
 
 def parse_arguments():
+    from allowed_configs import get_allowed_models
     parser = argparse.ArgumentParser(
         description='Benchmark TensorRT-LLM models.')
     parser.add_argument('-m',
@@ -172,18 +168,7 @@ def parse_arguments():
         help=
         'Quick sanity check with num_layer=1; will be silently ignored if --engine_dir is specified.'
     )
-    parser.add_argument(
-        '--enable_fp8',
-        default=False,
-        action='store_true',
-        help='Use FP8 Linear layer for LMHead, Attention QKV/Dense, and MLP.')
-    parser.add_argument(
-        '--fp8_kv_cache',
-        default=False,
-        action="store_true",
-        help=
-        'By default, we use dtype for KV cache. fp8_kv_cache chooses fp8 quantization for KV'
-    )
+
     parser.add_argument('--csv',
                         default=False,
                         action="store_true",
@@ -199,11 +184,38 @@ def parse_arguments():
         help=
         'Use latency-optimized all-reduce for tensor parallelism. Gives better performance with NVLink.'
     )
+    parser.add_argument(
+        '--strongly_typed',
+        default=False,
+        action='store_true',
+        help=
+        'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
+    )
+    parser.add_argument(
+        '--quantization',
+        type=str,
+        default=None,
+        choices=[
+            'fp8', 'fp8_gemm', 'fp8_kv_cache', 'int8_sq_per_tensor',
+            'int8_sq_per_token_channel', 'int8_weight_only', 'int4_weight_only',
+            'int4_weight_only_awq', 'int4_weight_only_gptq'
+        ],
+        help="Optimize the model with specified quantization recipe")
 
     return parser.parse_args()
 
 
 def main(args):
+    # We import tensorrt_llm here because MPI is initialized when
+    # tensorrt_llm is imported, but mpi4py does not work well with
+    # the start method `spawn` of Python multiprocessing,
+    # so we set the start method first, then initialize MPI.
+    from allowed_configs import get_allowed_models
+    from bert_benchmark import BERTBenchmark
+    from gpt_benchmark import GPTBenchmark
+
+    from tensorrt_llm.logger import logger
+
     logger.set_level(args.log_level)
 
     # Batch size
@@ -235,10 +247,10 @@ def main(args):
             args.max_output_len,
             args.max_batch_size,
             force_num_layer_1=args.force_num_layer_1,
-            enable_fp8=args.enable_fp8,
-            fp8_kv_cache=args.fp8_kv_cache,
             enable_cuda_graph=args.enable_cuda_graph,
-            enable_custom_all_reduce=args.enable_custom_all_reduce)
+            enable_custom_all_reduce=args.enable_custom_all_reduce,
+            strongly_typed=args.strongly_typed,
+            quantization=args.quantization)
     elif args.model in get_allowed_models(benchmark_type="bert"):
         benchmarker = BERTBenchmark(args.engine_dir,
                                     args.model,
@@ -273,8 +285,8 @@ def main(args):
         # Launch a subprocess to monitor memory usage
         q1 = Queue()  # q1 is used for sending signal to subprocess
         q2 = Queue()  # q2 is used for receiving results from subprocess
-        p = Process(target=mem_monitor, args=(q1, q2))
-        p.start()
+        mem_monitor_process = Process(target=mem_monitor, args=(q1, q2))
+        mem_monitor_process.start()
 
         iter_idx = 0
         try:
@@ -301,14 +313,14 @@ def main(args):
 
         except Exception as e:
             print("Found exception during benchmarking", e.with_traceback())
-            p.kill()
+            mem_monitor_process.kill()
             raise e
         logger.debug("Sending signal to mem monitor process, start")
         q1.put(1)
         logger.debug("Sending signal to mem monitor process, done")
         peak_gpu_used = q2.get()
         logger.debug("Get peak gpu memory usage from mem monitor process, done")
-        p.join()
+        mem_monitor_process.join()
         logger.debug("Memory monitor process joined")
 
         latency = round(sum(latencies) / iter_idx, 3)

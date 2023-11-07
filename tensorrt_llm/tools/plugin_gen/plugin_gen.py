@@ -296,14 +296,14 @@ def _mkdir(path: str):
     '''
     mkdir if not exists
     '''
-    subprocess.run(['mkdir', '-p', path], check=True)
+    subprocess.run(['/usr/bin/mkdir', '-p', path], check=True)
 
 
 def _rmdir(path: str):
     '''
     rmdir if exists
     '''
-    subprocess.run(['rm', '-rf', path], check=True)
+    subprocess.run(['/usr/bin/rm', '-rf', path], check=True)
 
 
 def _run_command(args, cwd=None):

@@ -22,7 +22,6 @@ from ..mapping import Mapping
 
 
 class GenerationMixin:
-    _use_prompt_tuning = False
 
     def get_transformer_layers(self, mapping, num_layers):
         layers_per_pipeline_stage = num_layers // mapping.pp_size
@@ -51,7 +50,7 @@ class GenerationMixin:
                              num_heads=None,
                              mapping=Mapping(),
                              max_num_tokens=None,
-                             prompt_embedding_table_size=None,
+                             prompt_embedding_table_size: int = 0,
                              is_chatglm6b=False):
 
         max_len = max_input_len + max_new_tokens
@@ -135,15 +134,30 @@ class GenerationMixin:
                          [1, 1] if enable_two_optimization_profiles else [1]),
                         ('num_tokens', num_tokens_range),
                     ]))
-                position_ids = Tensor(
-                    name='position_ids',
-                    dtype=trt.int32,
-                    shape=[1, -1],
-                    dim_range=OrderedDict([
-                        ('batch_size_fake',
-                         [1, 1] if enable_two_optimization_profiles else [1]),
-                        ('num_tokens', num_tokens_range),
-                    ]))
+                if is_chatglm6b:
+                    position_ids = Tensor(
+                        name='position_ids',
+                        dtype=trt.int32,
+                        shape=[1, 2, -1],
+                        dim_range=OrderedDict([
+                            ('batch_size_fake', [1, 1]
+                             if enable_two_optimization_profiles else [1]),
+                            ('2', [2, 2]
+                             if enable_two_optimization_profiles else [2]),
+                            ('num_tokens', num_tokens_range),
+                        ]),
+                    )
+                else:
+                    position_ids = Tensor(
+                        name='position_ids',
+                        dtype=trt.int32,
+                        shape=[1, -1],
+                        dim_range=OrderedDict([
+                            ('batch_size_fake', [1, 1]
+                             if enable_two_optimization_profiles else [1]),
+                            ('num_tokens', num_tokens_range),
+                        ]),
+                    )
             else:
                 assert dtype is not None
                 assert num_heads is not None
@@ -180,16 +194,18 @@ class GenerationMixin:
                             ('2', [2, 2]
                              if enable_two_optimization_profiles else [2]),
                             ('input_len', inlen_range),
-                        ]))
+                        ]),
+                    )
                 else:
-                    position_ids = Tensor(name='position_ids',
-                                          dtype=trt.int32,
-                                          shape=[-1, -1],
-                                          dim_range=OrderedDict([
-                                              ('batch_size_beam_width',
-                                               bb_range),
-                                              ('input_len', inlen_range),
-                                          ]))
+                    position_ids = Tensor(
+                        name='position_ids',
+                        dtype=trt.int32,
+                        shape=[-1, -1],
+                        dim_range=OrderedDict([
+                            ('batch_size_beam_width', bb_range),
+                            ('input_len', inlen_range),
+                        ]),
+                    )
             else:
                 assert dtype is not None
                 assert num_heads is not None
@@ -389,9 +405,8 @@ class GenerationMixin:
         prompt_embedding_table = None
         tasks = None
         prompt_vocab_size = None
-        if self._use_prompt_tuning:
+        if prompt_embedding_table_size > 0:
             hidden_size = num_heads * head_size
-            assert prompt_embedding_table_size is not None, "prompt_embedding_table_size cannot be None when self._use_prompt_tuning is True"
             _p_embedding_range = [
                 1, prompt_embedding_table_size // 2, prompt_embedding_table_size
             ]

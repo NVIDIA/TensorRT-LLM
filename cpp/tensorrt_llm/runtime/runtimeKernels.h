@@ -68,6 +68,10 @@ void invokeCopyInputToOutput(
 void invokeCopyPackedInputToOutput(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputOffsets,
     SizeType maxInputLength, SizeType padId, CudaStream const& stream);
 
+void initOutputIds(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputLengths,
+    ITensor const& inputOffsets, TokenIdType padId, TokenIdType endId, SizeType maxInputLength, bool inputPacked,
+    CudaStream const& stream);
+
 void scatterTensor(ITensor& output, ITensor const& input, SizeType beamWidth, CudaStream const& stream);
 
 void tileTensor(ITensor& output, ITensor const& input, SizeType beamWidth, CudaStream const& stream);

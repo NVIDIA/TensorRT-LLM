@@ -115,11 +115,38 @@ public:
     }
 
     //!
+    //! \brief Add a *unit* dimension to `shape` at the specified position.
+    //!
+    //! \param shape The shape to unsqueeze.
+    //! \param dim The dimension where unit dimension should be added.
+    //! \return A new shape with the added unit dimension.
+    //!
+    static Shape unsqueeze(Shape const& shape, SizeType dim)
+    {
+        TLLM_CHECK_WITH_INFO(dim <= shape.nbDims && dim >= 0,
+            common::fmtstr("Invalid dim %d, tensor has %d dimensions", dim, shape.nbDims));
+
+        Shape newDims{shape.nbDims + 1};
+        std::copy(shape.d, shape.d + dim, newDims.d);
+        newDims.d[dim] = 1;
+        std::copy(shape.d + dim, shape.d + shape.nbDims, newDims.d + dim + 1);
+        return newDims;
+    }
+
+    //!
     //! \brief Removes the given *unit* dimensions from this tensor.
     //!
     void squeeze(SizeType dim)
     {
         reshape(squeeze(getShape(), dim));
+    }
+
+    //!
+    //! \brief Adds a *unit* dimension at the specified position
+    //!
+    void unsqueeze(SizeType dim)
+    {
+        reshape(unsqueeze(getShape(), dim));
     }
 
     //!

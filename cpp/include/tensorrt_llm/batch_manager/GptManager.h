@@ -46,6 +46,7 @@ class GptManager
 public:
     using SizeType = tensorrt_llm::runtime::SizeType;
     using RequestList = std::list<std::shared_ptr<LlmRequest>>;
+    using TensorPtr = runtime::ITensor::SharedPtr;
 
     GptManager(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, int32_t maxBeamWidth,
         batch_scheduler::SchedulerPolicy schedulerPolicy, GetInferenceRequestsCallback getInferenceRequestsCb,
@@ -108,6 +109,9 @@ private:
     inline static const std::string kBeamWidthTensorName_ = "beam_width";
     inline static const std::string kEndIdTensorName_ = "end_id";
     inline static const std::string kPadIdTensorName_ = "pad_id";
+    inline static const std::string kBadWordsListTensorName_ = "bad_words_list";
+    inline static const std::string kStopWordsListTensorName_ = "stop_words_list";
+    inline static const std::string kEmbeddingBiasTensorName_ = "embedding_bias";
     inline static const std::string kTemperatureTensorName_ = "temperature";
     inline static const std::string kRuntimeTopKTensorName_ = "runtime_top_k";
     inline static const std::string kRuntimeTopPTensorName_ = "runtime_top_p";
@@ -116,6 +120,8 @@ private:
     inline static const std::string kMinLengthTensorName_ = "min_length";
     inline static const std::string kPresencePenaltyTensorName_ = "presence_penalty";
     inline static const std::string kRandomSeedTensorName_ = "random_seed";
+    inline static const std::string kPromptEmbeddingTableName_ = "prompt_embedding_table";
+    inline static const std::string kPromptVocabSizeName_ = "prompt_vocab_size";
     inline static const std::string kOutputIdsTensorName_ = "output_ids";
     inline static const std::string kSequenceLengthTensorName_ = "sequence_length";
 

@@ -1,0 +1,6 @@
+__pycache__/
+chatglm*-6b/
+chatglm*-6b-32k/
+trtModel/
+dataset/
+.vscode/

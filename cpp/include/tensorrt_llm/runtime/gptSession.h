@@ -53,10 +53,11 @@ namespace utils
 std::vector<uint8_t> loadEngine(std::string const& enginePath);
 }
 
-class TllmRuntime;
+class IpcMemory;
 class IStatefulGptDecoder;
 class NcclCommunicator;
 class RuntimeBuffers;
+class TllmRuntime;
 
 class GptSession
 {
@@ -85,7 +86,8 @@ public:
         bool decoderPerRequest{false};
         bool cudaGraphMode{false};
         KvCacheConfig kvCacheConfig{};
-        std::optional<SizeType> numMicroBatches = std::nullopt;
+        std::optional<SizeType> ctxMicroBatchSize = std::nullopt;
+        std::optional<SizeType> genMicroBatchSize = std::nullopt;
     };
 
     GptSession(Config const& sessionConfig, GptModelConfig const& modelConfig, WorldConfig const& worldConfig,
@@ -136,13 +138,19 @@ private:
 
     void setup(Config const& sessionConfig);
 
-    void createContexts(SizeType numMicroBatches, bool useCudaGraphs);
+    void createContexts(SizeType numBatchesCtx, SizeType numBatchesGen, bool useCudaGraphs);
     void createBuffers(SizeType numMicroBatches);
     void createDecoders(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength,
         nvinfer1::DataType logitsType, bool decoderPerRequest, SizeType numMicroBatches);
     void createKvCacheManager(
         SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength, KvCacheConfig const& config);
     void createCustomAllReduceWorkspace(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength);
+
+    void executeContextStep(std::vector<GenerationInput> const& microBatches,
+        std::vector<SizeType> const& microBatchOffsets, KvCacheManager const* kvCacheManager);
+    SizeType executeGenerationStep(SizeType step, std::vector<GenerationInput> const& microBatches,
+        std::vector<SizeType> const& microBatchOffsets, KvCacheManager* kvCacheManager,
+        std::vector<bool>& microBatchesFinished);
 
     //! @brief Execute decoder on last PP rank, receive decoder output on other PP ranks.
     void decoderStepAsync(SizeType decoderStep, SizeType microBatchId);
@@ -156,11 +164,11 @@ private:
 
     void kvCacheAddSequences(SizeType beamWidth, SizeType microBatchId, SizeType firstBatchIdx);
 
-    ITensor::SharedPtr initNewTokens(
-        GenerationInput const& inputs, SamplingConfig const& samplingConfig, SizeType microBatchId);
+    //! @brief Populate outputIds and return reference to newTokens tensor
+    ITensor::SharedPtr initDecoder(ITensor& outputIds, GenerationInput const& inputs,
+        SamplingConfig const& samplingConfig, SizeType microBatchId) const;
 
-    std::function<void(SizeType microBatchId, SizeType step, bool finished)> createOnTokenGeneratedCallback(
-        GenerationOutput& outputs, SizeType numMicroBatches);
+    std::function<void(SizeType step, bool finished)> createOnTokenGeneratedCallback(GenerationOutput& outputs);
 
     class CudaGraphExecutor
     {
@@ -196,6 +204,45 @@ private:
         cudaGraphExec_t mInstance;
     };
 
+    class MicroBatchConfig
+    {
+    public:
+        MicroBatchConfig()
+            : numCtxBatches{1}
+            , numGenBatches{1}
+            , ctxBatchSize{0}
+            , genBatchSize{0}
+        {
+        }
+
+        explicit MicroBatchConfig(SizeType maxBatchSize, SizeType pipelineParallelism,
+            std::optional<SizeType> genMicroBatchSize, std::optional<SizeType> ctxMicroBatchSize);
+
+        constexpr SizeType numCtxPerGen() const
+        {
+            return numCtxBatches / numGenBatches;
+        }
+
+        //! @details First 2 * numGenBatches contexts are for generation phase, next numCtxBatches are for context
+        //!          phase. Use numCtxPerGen() contexts for the context batches of each generation batch.
+        constexpr SizeType getCtxContextId(SizeType generationBatchId, SizeType contextBatchId) const
+        {
+            return 2 * numGenBatches + generationBatchId * numCtxPerGen() + contextBatchId;
+        }
+
+        //! @details First 2 * numGenBatches contexts are for generation phase, flip-flop between 2 of them for each
+        //!          generation batch.
+        constexpr SizeType getGenContextId(SizeType flipFlopId, SizeType generationBatchId) const
+        {
+            return flipFlopId * numGenBatches + generationBatchId;
+        }
+
+        SizeType numCtxBatches;
+        SizeType numGenBatches;
+        SizeType ctxBatchSize;
+        SizeType genBatchSize;
+    };
+
     friend class batch_manager::TrtGptModelV1;
 
 private:
@@ -206,13 +253,17 @@ private:
     std::shared_ptr<CudaStream> mCommStream;
     CudaEvent mCommEvent{};
 
+    // tensor parallelism with custom allreduce plugin
+    ITensor::SharedPtr mCommPtrs;
+    std::vector<std::shared_ptr<IpcMemory>> mIpcMemoryHandles;
+
     SizeType mDecoderMaxSequenceLength{};
 
     LoggerPtr mLogger;
     std::shared_ptr<TllmRuntime> mRuntime;
     std::shared_ptr<KvCacheManager> mKvCacheManager;
 
-    SizeType mNumMicroBatches;
+    MicroBatchConfig mMicroBatchConfig;
     // for each micro batch
     std::vector<std::shared_ptr<IStatefulGptDecoder>> mDecoders;
     std::vector<std::shared_ptr<RuntimeBuffers>> mBuffers;

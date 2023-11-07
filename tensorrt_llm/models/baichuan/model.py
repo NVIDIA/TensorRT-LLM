@@ -22,6 +22,7 @@ from ...layers import (Attention, AttentionMaskType, AttentionParams,
                        RmsNorm)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
+from ...quantization import QuantMode
 from ..generation_mixin import GenerationMixin
 
 
@@ -32,13 +33,28 @@ class BaichuanDecoderLayer(Module):
                  num_attention_heads,
                  max_position_embeddings,
                  position_embedding_type,
+                 num_kv_heads=None,
                  dtype=None,
+                 attention_mask_type=AttentionMaskType.causal,
                  hidden_act='silu',
                  mlp_hidden_size=None,
                  tp_group=None,
                  tp_size=1,
-                 tp_rank=0):
+                 tp_rank=0,
+                 quant_mode=QuantMode(0)):
         super().__init__()
+        # used for quantizing model
+        self.hidden_size = hidden_size
+        self.num_attention_heads = num_attention_heads
+        self.num_kv_heads = num_kv_heads
+        self.max_position_embeddings = max_position_embeddings
+        self.dtype = dtype
+        self.hidden_act = hidden_act
+        self.tp_group = tp_group
+        self.tp_size = tp_size
+        self.mlp_hidden_size = mlp_hidden_size
+        self.attention_mask_type = attention_mask_type
+        self.position_embedding_type = position_embedding_type
         self.input_layernorm = RmsNorm(normalized_shape=hidden_size,
                                        dtype=dtype)
 
@@ -46,23 +62,27 @@ class BaichuanDecoderLayer(Module):
         self.attention = Attention(
             hidden_size,
             num_attention_heads,
+            num_kv_heads=num_kv_heads,
             max_position_embeddings=max_position_embeddings,
             dtype=dtype,
-            attention_mask_type=AttentionMaskType.causal,
+            attention_mask_type=attention_mask_type,
             bias=False,
             position_embedding_type=position_embedding_type,
             tp_group=tp_group,
             tp_size=tp_size,
-            tp_rank=tp_rank)
+            tp_rank=tp_rank,
+            use_int8_kv_cache=quant_mode.has_int8_kv_cache(),
+            quant_mode=quant_mode)
         if not mlp_hidden_size:
-            mlp_hidden_size = hidden_size * 4
+            self.mlp_hidden_size = hidden_size * 4
         self.mlp = GatedMLP(hidden_size=hidden_size,
-                            ffn_hidden_size=mlp_hidden_size,
+                            ffn_hidden_size=self.mlp_hidden_size,
                             hidden_act=hidden_act,
                             dtype=dtype,
                             bias=False,
                             tp_group=tp_group,
-                            tp_size=tp_size)
+                            tp_size=tp_size,
+                            quant_mode=quant_mode)
         self.post_layernorm = RmsNorm(normalized_shape=hidden_size, dtype=dtype)
 
     def forward(self,
@@ -101,6 +121,7 @@ class BaichuanModel(Module):
     def __init__(self,
                  num_layers,
                  num_heads,
+                 num_kv_heads,
                  hidden_size,
                  vocab_size,
                  hidden_act,
@@ -108,8 +129,10 @@ class BaichuanModel(Module):
                  position_embedding_type,
                  dtype,
                  mlp_hidden_size=None,
-                 mapping=Mapping()):
+                 mapping=Mapping(),
+                 quant_mode=QuantMode(0)):
         super().__init__()
+        self.mapping = mapping
         self.num_layers = num_layers
         self.vocab_embedding = Embedding(vocab_size, hidden_size, dtype=dtype)
 
@@ -119,12 +142,14 @@ class BaichuanModel(Module):
                 num_attention_heads=num_heads,
                 max_position_embeddings=max_position_embeddings,
                 position_embedding_type=position_embedding_type,
+                num_kv_heads=num_kv_heads,
                 dtype=dtype,
                 hidden_act=hidden_act,
                 mlp_hidden_size=mlp_hidden_size,
                 tp_group=mapping.tp_group,
                 tp_size=mapping.tp_size,
-                tp_rank=mapping.tp_rank) for _ in range(num_layers)
+                tp_rank=mapping.tp_rank,
+                quant_mode=quant_mode) for _ in range(num_layers)
         ])
 
         self.ln_f = RmsNorm(normalized_shape=hidden_size, dtype=dtype)
@@ -176,6 +201,7 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
     def __init__(self,
                  num_layers,
                  num_heads,
+                 num_kv_heads,
                  hidden_size,
                  vocab_size,
                  hidden_act,
@@ -183,22 +209,35 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
                  position_embedding_type,
                  dtype,
                  mlp_hidden_size=None,
-                 mapping=Mapping()):
+                 mapping=Mapping(),
+                 quant_mode=QuantMode(0)):
         if isinstance(dtype, str):
-            self._kv_dtype = str_dtype_to_trt(dtype)
+            self.dtype = str_dtype_to_trt(dtype)
         else:
             assert isinstance(dtype, trt.DataType)
-            self._kv_dtype = dtype
-        self._num_layers = num_layers
+            self.dtype = dtype
+
+        self.num_layers = num_layers
         self.num_heads = num_heads
-        self.num_kv_heads = num_heads
+        if num_kv_heads is None or num_kv_heads <= 0:
+            num_kv_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self.tp_size = mapping.tp_size
-        super().__init__(num_layers, num_heads, hidden_size, vocab_size,
-                         hidden_act, max_position_embeddings,
+
+        self.kv_dtype = self.dtype
+        if quant_mode.has_int8_kv_cache():
+            self.kv_dtype = str_dtype_to_trt('int8')
+        elif quant_mode.has_fp8_kv_cache():
+            self.kv_dtype = str_dtype_to_trt('fp8')
+
+        self.quant_mode = quant_mode
+
+        super().__init__(num_layers, num_heads, num_kv_heads, hidden_size,
+                         vocab_size, hidden_act, max_position_embeddings,
                          position_embedding_type, dtype, mlp_hidden_size,
-                         mapping)
+                         mapping, quant_mode)
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
         self.lm_head = ColumnLinear(hidden_size,
                                     vocab_size_padded,
@@ -229,11 +268,11 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
 
         # [batch_size, hidden_size] -> [batch_size, vocab_size]
         lm_logits = self.lm_head(hidden_states)
-        lm_logits.mark_output('logits', self._kv_dtype)
+        lm_logits.mark_output('logits', self.dtype)
 
         if use_cache and default_net().plugin_config.paged_kv_cache == False:
             for i, present in enumerate(presents):
-                present.mark_output(f'present_key_value_{i}', self._kv_dtype)
+                present.mark_output(f'present_key_value_{i}', self.kv_dtype)
             return (lm_logits, presents)
 
         return lm_logits
@@ -253,8 +292,6 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
 
         # Prepare inputs
         head_size = self.hidden_size // self.num_heads
-        num_heads_kv = (self.num_kv_heads + self.tp_size - 1) // self.tp_size
-
         remove_input_padding = default_net().plugin_config.remove_input_padding
         use_gpt_attention_plugin = default_net(
         ).plugin_config.gpt_attention_plugin
@@ -267,15 +304,18 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
             max_beam_width,
             max_input_len,
             max_new_tokens,
-            num_heads_kv,
+            self.num_kv_heads,
             head_size,
-            self._num_layers,
-            self._kv_dtype,
+            self.num_layers,
+            self.kv_dtype,
             remove_input_padding=remove_input_padding,
             use_gpt_attention_plugin=use_gpt_attention_plugin,
             use_gemm_plugin=use_gemm_plugin,
             paged_kv_cache=paged_kv_cache,
             tokens_per_block=tokens_per_block,
+            dtype=self.dtype,
+            num_heads=self.num_heads,
+            mapping=self.mapping,
             max_num_tokens=max_num_tokens)
 
         return (model_inputs['input_ids'], model_inputs['position_ids'], True,

@@ -27,10 +27,14 @@ project(tensorrt_llm LANGUAGES CXX)
 
 # Build options
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
+option(BUILD_PYBIND "Build Python bindings for C++ runtime and batch manager"
+       OFF)
 option(BUILD_TESTS "Build Google tests" ON)
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
 option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
+option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
+option(FAST_MATH "Compiling in fast math mode" OFF)
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
@@ -71,6 +75,11 @@ if(BUILD_BENCHMARKS)
   message(STATUS "Building benchmarks")
 else()
   message(STATUS "Not building benchmarks")
+endif()
+
+if(FAST_BUILD)
+  add_compile_definitions("FAST_BUILD")
+  message(WARNING "Skip some kernels to accelerate compilation")
 endif()
 
 # Determine CUDA version before enabling the language extension
@@ -229,6 +238,10 @@ endif()
 
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
+if(FAST_MATH)
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math")
+  message("CMAKE_CUDA_FLAGS: ${CMAKE_CUDA_FLAGS}")
+endif()
 
 set(COMMON_HEADER_DIRS ${PROJECT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIR})
 message(STATUS "COMMON_HEADER_DIRS: ${COMMON_HEADER_DIRS}")
@@ -332,4 +345,12 @@ endif()
 if(BUILD_BENCHMARKS)
   add_subdirectory(${TRT_LLM_ROOT_DIR}/benchmarks/cpp
                    ${CMAKE_BINARY_DIR}/benchmarks)
+endif()
+
+# Measure the compile time
+option(MEASURE_BUILD_TIME "Measure the build time of each module" OFF)
+if(MEASURE_BUILD_TIME)
+  set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CMAKE_COMMAND} -E time")
+  set_property(GLOBAL PROPERTY RULE_LAUNCH_CUSTOM "${CMAKE_COMMAND} -E time")
+  set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK "${CMAKE_COMMAND} -E time")
 endif()

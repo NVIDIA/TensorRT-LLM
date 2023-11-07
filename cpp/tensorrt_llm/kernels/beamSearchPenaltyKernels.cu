@@ -171,10 +171,17 @@ template <typename T>
 void invokeAddBiasApplyPenalties(T* logits, const int** output_ids_ptr, const int** parent_ids_ptr,
     const int* input_lengths, const int* sequence_lengths, const T* bias, const int ite, const int local_batch_size,
     const int batch_size, const int beam_width, const int vocab_size, const int vocab_size_padded, const int* end_ids,
-    const float* temperatures, const float* repetition_penalties, const RepetitionPenaltyType repetition_penalty_type,
+    const float* temperatures, const std::vector<float>& h_temperatures, const float* repetition_penalties,
+    const std::vector<float>& h_repetition_penalties, const RepetitionPenaltyType repetition_penalty_type,
     const int* min_lengths, const int max_seq_len, cudaStream_t stream)
 {
-    if (bias != nullptr || temperatures != nullptr || vocab_size != vocab_size_padded)
+
+#define ALL_OF(p_, sz_, dt_, v_) (std::all_of(p_, p_ + sz_, [&](dt_ b) { return b == v_; }))
+
+    if (bias != nullptr
+        || (temperatures != nullptr
+            && !ALL_OF(std::begin(h_temperatures) + ite * local_batch_size, local_batch_size, float, 1.0f))
+        || vocab_size != vocab_size_padded)
     {
         dim3 block(512);
         if (std::is_same<T, half>::value && vocab_size % 2 == 0 && vocab_size_padded % 2 == 0)
@@ -199,14 +206,19 @@ void invokeAddBiasApplyPenalties(T* logits, const int** output_ids_ptr, const in
             size_t smem_size = (sizeof(T) * max_seq_len + 31) / 32 * 32 + sizeof(int) * max_seq_len;
             dim3 block(256);
             dim3 grid(beam_width * local_batch_size);
-            if (repetition_penalty_type == RepetitionPenaltyType::Multiplicative)
+            float default_value = getDefaultPenaltyValue(repetition_penalty_type);
+            if (repetition_penalty_type == RepetitionPenaltyType::Multiplicative
+                && !ALL_OF(std::begin(h_repetition_penalties) + ite * local_batch_size, local_batch_size, float,
+                    default_value))
             {
                 apply_repetition_penalty<T, false><<<grid, block, smem_size, stream>>>(logits, batch_size, beam_width,
                     vocab_size, vocab_size_padded, output_ids_ptr, parent_ids_ptr, input_lengths, sequence_lengths,
                     repetition_penalties, max_seq_len);
                 sync_check_cuda_error();
             }
-            else if (repetition_penalty_type == RepetitionPenaltyType::Additive)
+            else if (repetition_penalty_type == RepetitionPenaltyType::Additive
+                && !ALL_OF(std::begin(h_repetition_penalties) + ite * local_batch_size, local_batch_size, float,
+                    default_value))
             {
                 apply_repetition_penalty<T, true><<<grid, block, smem_size, stream>>>(logits, batch_size, beam_width,
                     vocab_size, vocab_size_padded, output_ids_ptr, parent_ids_ptr, input_lengths, sequence_lengths,
@@ -224,18 +236,22 @@ void invokeAddBiasApplyPenalties(T* logits, const int** output_ids_ptr, const in
     apply_min_length_penalty<<<grid_size, block_size, 0, stream>>>(
         logits, min_lengths, end_ids, sequence_lengths, input_lengths, beam_width, vocab_size_padded);
     sync_check_cuda_error();
+
+#undef ALL_OF
 }
 
 template void invokeAddBiasApplyPenalties(float* logits, const int** output_ids_ptr, const int** parent_ids_ptr,
     const int* input_lengths, const int* sequence_lengths, const float* bias, const int ite, const int local_batch_size,
     const int batch_size, const int beam_width, const int vocab_size, const int vocab_size_padded, const int* end_ids,
-    const float* temperatures, const float* repetition_penalties, const RepetitionPenaltyType repetition_penalty_type,
+    const float* temperatures, const std::vector<float>& h_temperatures, const float* repetition_penalties,
+    const std::vector<float>& h_repetition_penalties, const RepetitionPenaltyType repetition_penalty_type,
     const int* min_lengths, int max_seq_len, cudaStream_t stream);
 
 template void invokeAddBiasApplyPenalties(half* logits, const int** output_ids_ptr, const int** parent_ids_ptr,
     const int* input_lengths, const int* sequence_lengths, const half* bias, const int ite, const int local_batch_size,
     const int batch_size, const int beam_width, const int vocab_size, const int vocab_size_padded, const int* end_ids,
-    const float* temperatures, const float* repetition_penalties, const RepetitionPenaltyType repetition_penalty_type,
+    const float* temperatures, const std::vector<float>& h_temperatures, const float* repetition_penalties,
+    const std::vector<float>& h_repetition_penalties, const RepetitionPenaltyType repetition_penalty_type,
     const int* min_lengths, int max_seq_len, cudaStream_t stream);
 
 } // namespace kernels

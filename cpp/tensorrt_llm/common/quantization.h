@@ -201,7 +201,7 @@ public:
         return quantMode;
     }
 
-    constexpr QuantMode operator+(const QuantMode& other) noexcept
+    constexpr QuantMode operator+(const QuantMode& other) const noexcept
     {
         return QuantMode(mValue | other.mValue);
     }
@@ -211,7 +211,7 @@ public:
         return *this = *this + other;
     }
 
-    constexpr QuantMode operator-(const QuantMode& other) noexcept
+    constexpr QuantMode operator-(const QuantMode& other) const noexcept
     {
         return QuantMode(mValue & ~other.mValue);
     }

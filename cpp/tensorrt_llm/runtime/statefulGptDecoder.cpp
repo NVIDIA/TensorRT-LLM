@@ -114,31 +114,9 @@ void StatefulGptDecoder::reshapeBuffers(SizeType batchSize, SizeType beamWidth, 
         dOutput.beamHypotheses.release();
     }
 
-    mMaxNewTokens = 0;
     mNbSteps = 0;
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
-
-namespace
-{
-void initOutputIds(TensorPtr const& outputIds, TensorPtr const& inputIds, TensorPtr const& inputLengths,
-    TensorPtr const& inputOffsets, SizeType const padId, SizeType const endId, SizeType const maxInputLength,
-    bool const inputPacked, CudaStream const& stream)
-{
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
-    kernels::invokeFill(*outputIds, endId, stream);
-
-    if (inputPacked)
-    {
-        kernels::invokeCopyPackedInputToOutput(*outputIds, *inputIds, *inputOffsets, maxInputLength, padId, stream);
-    }
-    else
-    {
-        kernels::invokeCopyInputToOutput(*outputIds, *inputIds, *inputLengths, padId, stream);
-    }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
-}
-} // namespace
 
 void StatefulGptDecoder::newBatch(GenerationInput const& inputs, SamplingConfig const& samplingConfig)
 {
@@ -174,11 +152,6 @@ void StatefulGptDecoder::newBatch(GenerationInput const& inputs, SamplingConfig 
         kernels::invokeInclusiveSum(*ITensor::slice(inputOffsets, 1), *inputLengths, manager, *stream);
     }
 
-    mMaxNewTokens = inputs.maxNewTokens.value_or(mMaxSequenceLength - maxInputLength);
-    TLLM_CHECK_WITH_INFO(maxInputLength + mMaxNewTokens <= mMaxSequenceLength,
-        tc::fmtstr("Input length (%d) + max new tokens (%d) must be less than max sequence length (%d).",
-            maxInputLength, mMaxNewTokens, mMaxSequenceLength));
-
     TLLM_CHECK(inputIds->getDataType() == TRTDataType<TokenIdType>::value);
     auto const endId = inputs.endId;
     auto const padId = inputs.padId;
@@ -191,9 +164,21 @@ void StatefulGptDecoder::newBatch(GenerationInput const& inputs, SamplingConfig 
     dInput.embeddingBias = inputs.embeddingBiasOpt;
     dInput.badWordsList = inputs.badWordsList;
     dInput.stopWordsList = inputs.stopWordsList;
-    kernels::invokeFill(const_cast<ITensor&>(*dInput.sequenceLimitLength), mMaxSequenceLength, *stream);
     auto inputLengthsView = ITensor::view(dInput.lengths, ITensor::makeShape({batchSize * beamWidth}));
     kernels::tileTensor(const_cast<ITensor&>(*inputLengthsView), *inputLengths, beamWidth, *stream);
+    if (inputs.maxNewTokens)
+    {
+        auto const maxNewTokens = inputs.maxNewTokens.value();
+        TLLM_CHECK_WITH_INFO(maxInputLength + maxNewTokens <= mMaxSequenceLength,
+            tc::fmtstr("Input length (%d) + max new tokens (%d) must be less than max sequence length (%d).",
+                maxInputLength, maxNewTokens, mMaxSequenceLength));
+        manager.copy(*inputLengths, const_cast<ITensor&>(*dInput.sequenceLimitLength));
+        kernels::invokeAdd(const_cast<ITensor&>(*dInput.sequenceLimitLength), maxNewTokens, *stream);
+    }
+    else
+    {
+        kernels::invokeFill(const_cast<ITensor&>(*dInput.sequenceLimitLength), mMaxSequenceLength, *stream);
+    }
 
     // output
     auto& dOutput = *mDecodingOutput;
@@ -227,8 +212,8 @@ void StatefulGptDecoder::newBatch(GenerationInput const& inputs, SamplingConfig 
     }
 
     // copy the request ids into dOutput.ids (with tiling)
-    initOutputIds(
-        dOutput.ids, inputIds, inputLengths, inputOffsets, padId, endId, maxInputLength, inputs.packed, *stream);
+    kernels::initOutputIds(
+        *dOutput.ids, *inputIds, *inputLengths, *inputOffsets, padId, endId, maxInputLength, inputs.packed, *stream);
 
     // remaining
     mNbSteps = 0;

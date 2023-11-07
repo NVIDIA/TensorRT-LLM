@@ -427,11 +427,16 @@ class TestFunctional(unittest.TestCase):
             stream = torch.cuda.current_stream()
             # NOTE: when 8-bit kv cache is used together with paged kv cache no 8-bit tensors are exposed to TRT
             int8_trt_flag = use_int8_kv_cache and not paged_kv_cache
-            fp8_trt_flag = use_fp8_kv_cache and not paged_kv_cache
-            builder_config = builder.create_builder_config(name=attention_type,
-                                                           precision=dtype,
-                                                           int8=int8_trt_flag,
-                                                           fp8=fp8_trt_flag)
+            use_fp8_kv_cache and not paged_kv_cache
+            quant_mode = QuantMode.from_description(
+                use_fp8_kv_cache=use_fp8_kv_cache
+            ) if use_fp8_kv_cache and not paged_kv_cache else QuantMode(0)
+            builder_config = builder.create_builder_config(
+                name=attention_type,
+                precision=dtype,
+                int8=int8_trt_flag,
+                quant_mode=quant_mode)
+
             if session is None:
                 engine = builder.build_engine(net, builder_config)
                 session = tensorrt_llm.runtime.Session.from_serialized_engine(

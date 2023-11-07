@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from transformers import LlamaTokenizer
+from transformers import LlamaTokenizerFast
 
 import tensorrt_llm
 from tensorrt_llm.quantization import QuantMode
@@ -51,8 +51,8 @@ def read_config(config_path: Path):
     world_size = tp_size * pp_size
     assert world_size == tensorrt_llm.mpi_world_size(), \
         f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
-    num_heads = config['builder_config']['num_heads'] // tp_size
-    hidden_size = config['builder_config']['hidden_size'] // tp_size
+    num_heads = config['builder_config']['num_heads']
+    hidden_size = config['builder_config']['hidden_size']
     vocab_size = config['builder_config']['vocab_size']
     num_layers = config['builder_config']['num_layers']
     num_kv_heads = config['builder_config'].get('num_kv_heads', num_heads)
@@ -65,21 +65,28 @@ def read_config(config_path: Path):
         )
         num_kv_heads = 1
     num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
+    assert (num_heads % tp_size) == 0
+    num_heads = num_heads // tp_size
+    hidden_size = hidden_size // tp_size
     use_custom_all_reduce = config['plugin_config'].get('use_custom_all_reduce',
                                                         False)
+    max_prompt_embedding_table_size = config['builder_config'].get(
+        'max_prompt_embedding_table_size', 0)
 
-    model_config = ModelConfig(num_heads=num_heads,
-                               num_kv_heads=num_kv_heads,
-                               hidden_size=hidden_size,
-                               vocab_size=vocab_size,
-                               num_layers=num_layers,
-                               gpt_attention_plugin=use_gpt_attention_plugin,
-                               paged_kv_cache=paged_kv_cache,
-                               tokens_per_block=tokens_per_block,
-                               remove_input_padding=remove_input_padding,
-                               dtype=dtype,
-                               quant_mode=quant_mode,
-                               use_custom_all_reduce=use_custom_all_reduce)
+    model_config = ModelConfig(
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        hidden_size=hidden_size,
+        vocab_size=vocab_size,
+        num_layers=num_layers,
+        gpt_attention_plugin=use_gpt_attention_plugin,
+        paged_kv_cache=paged_kv_cache,
+        tokens_per_block=tokens_per_block,
+        remove_input_padding=remove_input_padding,
+        dtype=dtype,
+        quant_mode=quant_mode,
+        use_custom_all_reduce=use_custom_all_reduce,
+        max_prompt_embedding_table_size=max_prompt_embedding_table_size)
 
     return model_config, tp_size, pp_size, dtype
 
@@ -121,6 +128,37 @@ def parse_input(input_text: str, input_file: str, tokenizer, end_id: int,
     return input_ids, input_lengths
 
 
+def ptuning_setup(prompt_table, dtype, hidden_size, tasks, input_ids,
+                  input_lengths, remove_input_padding):
+    if prompt_table is not None:
+        prompt_table = torch.from_numpy(np.load(prompt_table))
+        task_vocab_size = torch.tensor([prompt_table.shape[1]],
+                                       dtype=torch.int32,
+                                       device="cuda")
+        prompt_table = prompt_table.view(
+            (prompt_table.shape[0] * prompt_table.shape[1],
+             prompt_table.shape[2]))
+        prompt_table = prompt_table.cuda().to(
+            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
+    else:
+        prompt_table = torch.empty([1, hidden_size]).cuda()
+        task_vocab_size = torch.zeros([1]).cuda()
+
+    num_sequences = input_lengths.size(
+        0) if remove_input_padding else input_ids.size(0)
+
+    if tasks is not None:
+        tasks = torch.tensor([int(t) for t in tasks.split(',')],
+                             dtype=torch.int32,
+                             device="cuda")
+        assert tasks.shape[
+            0] == num_sequences, "Number of supplied tasks must match input batch size"
+    else:
+        tasks = torch.zeros([num_sequences]).cuda()
+
+    return [prompt_table, tasks, task_vocab_size]
+
+
 def print_output(output_ids, input_lengths, max_output_len, tokenizer,
                  output_csv, output_npy, sequence_lengths):
     num_beams = output_ids.size(1)
@@ -138,6 +176,7 @@ def print_output(output_ids, input_lengths, max_output_len, tokenizer,
                 print(f'Output: \"{output_text}\"')
 
     output_ids = output_ids.reshape((-1, output_ids.size(2)))
+    print(output_ids)
 
     if output_csv is not None:
         output_file = Path(output_csv)
@@ -190,6 +229,13 @@ def parse_arguments():
                         type=int,
                         help="How often to return tokens when streaming.",
                         default=5)
+    parser.add_argument(
+        '--prompt_table',
+        type=Path,
+        help="Path to .npy file, exported by nemo_prompt_convert.py")
+    parser.add_argument(
+        '--tasks',
+        help="Comma-separated list of tasks for prompt tuning: ex 0,3,1,0")
     return parser.parse_args()
 
 
@@ -205,6 +251,8 @@ def generate(
     num_beams: int = 1,
     streaming: bool = False,
     streaming_interval: int = 5,
+    prompt_table: Path = None,
+    tasks: str = None,
 ):
     tensorrt_llm.logger.set_level(log_level)
 
@@ -220,7 +268,7 @@ def generate(
                                            pp_size=pp_size)
     torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
 
-    tokenizer = LlamaTokenizer.from_pretrained(tokenizer_dir, legacy=False)
+    tokenizer = LlamaTokenizerFast.from_pretrained(tokenizer_dir, legacy=False)
 
     sampling_config = SamplingConfig(end_id=EOS_TOKEN,
                                      pad_id=PAD_TOKEN,
@@ -242,14 +290,20 @@ def generate(
     input_ids, input_lengths = parse_input(input_text, input_file, tokenizer,
                                            EOS_TOKEN,
                                            model_config.remove_input_padding)
+    print(input_ids)
 
     max_input_length = torch.max(input_lengths).item()
     decoder.setup(input_lengths.size(0), max_input_length, max_output_len,
                   num_beams)
 
+    ptuning_args = [] if model_config.max_prompt_embedding_table_size == 0 else ptuning_setup(
+        prompt_table, dtype, model_config.hidden_size, tasks, input_ids,
+        input_lengths, model_config.remove_input_padding)
+
     outputs = decoder.decode(input_ids,
                              input_lengths,
                              sampling_config,
+                             *ptuning_args,
                              streaming=streaming,
                              output_sequence_lengths=True,
                              return_dict=True)

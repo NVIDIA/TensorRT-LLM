@@ -173,13 +173,13 @@ Lovelace architectures. Certain limitations may, however, apply.
 Various numerical precisions are supported in TensorRT-LLM. The support for
 some of those numerical features require specific architectures:
 
-|                              | FP32  | FP16  | BF16  | FP8  | INT8 | INT4 |
-| :--------------------------- | :---- | :---- | :---- | :--- | :--- | :--- |
-| Volta (SM70)                 | Y     | Y     | N     | N    | Y    | Y    |
-| Turing (SM75)                | Y     | Y     | N     | N    | Y    | Y    |
-| Ampere (SM80, SM86)          | Y     | Y     | Y     | N    | Y    | Y    |
-| Ada-Lovelace (SM89)          | Y     | Y     | Y     | Y    | Y    | Y    |
-| Hopper (SM90)                | Y     | Y     | Y     | Y    | Y    | Y    |
+|                     | FP32 | FP16 | BF16 | FP8  | INT8 | INT4 |
+| :------------------ | :--- | :--- | :--- | :--- | :--- | :--- |
+| Volta (SM70)        | Y    | Y    | N    | N    | Y    | Y    |
+| Turing (SM75)       | Y    | Y    | N    | N    | Y    | Y    |
+| Ampere (SM80, SM86) | Y    | Y    | Y    | N    | Y    | Y    |
+| Ada-Lovelace (SM89) | Y    | Y    | Y    | Y    | Y    | Y    |
+| Hopper (SM90)       | Y    | Y    | Y    | Y    | Y    | Y    |
 
 In this release of TensorRT-LLM, the support for FP8 and quantized data types
 (INT8 or INT4) is not implemented for all the models. See the
@@ -217,8 +217,7 @@ The list of supported models is:
 * [Bert](examples/bert)
 * [Blip2](examples/blip2)
 * [BLOOM](examples/bloom)
-* [ChatGLM-6B](examples/chatglm6b)
-* [ChatGLM2-6B](examples/chatglm2-6b/)
+* [ChatGLM](examples/chatglm), including ChatGLM-6B, ChatGLM2-6B, ChatGLM2-6B-32k, ChatGLM3-6B, ChatGLM3-6B-32k
 * [Falcon](examples/falcon)
 * [GPT](examples/gpt)
 * [GPT-J](examples/gptj)
@@ -230,6 +229,7 @@ The list of supported models is:
 * [OPT](examples/opt)
 * [SantaCoder](examples/gpt)
 * [StarCoder](examples/gpt)
+* [InternLM](examples/internlm)
 
 ## Performance
 

@@ -27,6 +27,7 @@ namespace kernels
 //! Computes sequenceLength, finished state, cumLogProbs inplace.
 //! Sampling per request can be controlled using skipDecode, topPs and topKs parameters.
 //! Function sets workspaceSize and exits early if workspace is nullptr.
+//! If logits are Nan, we set output token to be the last in the vocabulary.
 //!
 //! \param workspace pointer to the workspace. Has to be pre-allocated by caller. Function does not take ownership of the
 //! buffer.

@@ -190,7 +190,8 @@ void BaseBeamSearchLayer<T>::forward(BeamSearchOutputParams& outputs, ForwardPar
     invokeAddBiasApplyPenalties(logits.getPtr<T>(), output_ids_ptr.template getPtr<const int*>(),
         outputs.parent_ids_ptr.template getPtr<const int*>(), input_lengths, sequence_length, embedding_bias, ite,
         local_batch_size, batch_size, beam_width, vocab_size_, vocab_size_padded_, end_ids, temperature_buf_,
-        repetition_penalty_buf_, mRepetitionPenaltyType, min_lengths_buf_, max_seq_len, stream_);
+        mTemperature, repetition_penalty_buf_, mRepetitionPenalty, mRepetitionPenaltyType, min_lengths_buf_,
+        max_seq_len, stream_);
     sync_check_cuda_error();
 
     invokeSoftMax(outputs, params);

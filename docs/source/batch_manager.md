@@ -94,17 +94,29 @@ The statistics are packaged as a JSON string. That string contains the following
   * `Active Request Count`, the number of active requests in batch manager
   * `Max Request Count`, the max number of requests batch manager can support at a time
 
-When using in-flight batching, the following additional statistics are reported:
+When using paged KV cache, following statistics are reported:
   * `Max KV cache blocks`, the maximum number of KV cache blocks per GPU
   * `Free KV cache blocks`, number of free KV cache blocks per GPU
   * `Used KV cache blocks`, number of used KV cache blocks per GPU
   * `Tokens per KV cache block`, number of tokens per KV cache block
   * `Scheduled Requests`, number of requests scheduled this iteration
+
+When using in-flight batching, the following additional statistics are reported per step/iteration:
+
+  * `Scheduled Requests`, number of total requests scheduled
   * `Context Requests`, number of requests in Context phase
-  * `Total Context Tokens`, total number of tokens across requests in context phase
-  * `Generation Requests`, number of requests in Context phase
   * `Generation Requests`, number of requests in Generation phase
-  * `MicroBatch ID`, number of requests in Generation phase
+  * `Total Context Tokens`, total number of tokens across requests in context phase
+  * `MicroBatch ID`, micro batch ID
+
+When using V1 batching, the following additional statistics are reported per V1 iteration:
+
+  * `Scheduled Requests`, number of total requests scheduled
+  * `Context Requests`, number of requests in Context phase
+  * `Total Generation Tokens`, Total number of tokens generated
+  * `Total Context Tokens`, total number of tokens across requests in context phase
+  * `Empty Generation Slots`, total number of padded Slots during generation phase
+
 
 ### GptManager Design
 

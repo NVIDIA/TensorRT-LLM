@@ -2152,7 +2152,6 @@ __global__ void masked_multihead_attention_kernel(
     const int normlization_loop_end = MULTI_BLOCK_FLAG ? timesteps_per_block : tlength;
     for (int ti = tidx; ti <= normlization_loop_end; ti += THREADS_PER_BLOCK)
     {
-
         const int time_now = MULTI_BLOCK_FLAG ? ti + c_tile_times_timesteps_per_block : ti;
 
         if (!MULTI_BLOCK_FLAG)
@@ -2308,8 +2307,11 @@ __global__ void masked_multihead_attention_kernel(
         }
     }
 
+    // Get the c_tile_id that handles the current timestep.
+    const int ctile_idx = tlength / timesteps_per_block;
+
     // One group of threads computes the product(s) for the current timestep.
-    if (vo == tlength % V_PER_ITER && is_valid_vi && (!MULTI_BLOCK_FLAG || (c_tile == gridDim.z - 1)))
+    if (vo == tlength % V_PER_ITER && is_valid_vi && (!MULTI_BLOCK_FLAG || (c_tile == ctile_idx)))
     {
         const int tokenIdx = tlength;
         const int inBlockIdx = kvCacheBuffer.getKVLocalIdx(tokenIdx, hi_kv, Dh, vi);
@@ -2396,7 +2398,6 @@ __global__ void masked_multihead_attention_kernel(
         }
 #endif // MMHA_USE_FP32_ACCUM_FOR_LOGITS
     }
-
     // Make sure we can start writing to shared memory.
     __syncthreads();
 
@@ -2428,7 +2429,7 @@ __global__ void masked_multihead_attention_kernel(
     }
 
     const auto bhi = tensorrt_llm::common::flat_index2(batch_beam_idx, hi, num_heads);
-    const auto bhi_seq_len_tile = bhi * params.max_seq_len_tile;
+    const auto bhi_seq_len_tile = bhi * params.seq_len_tile;
     // Output the final values.
     if (vo == 0 && (Dh == Dh_MAX || vi < Dh))
     {
@@ -2499,9 +2500,7 @@ __global__ void masked_multihead_attention_kernel(
 
             float final_max = -FLT_MAX;
             float thread_partial_max = -FLT_MAX;
-            if (tidx < gridDim.z)
-                thread_partial_max = params.partial_max[bhi_seq_len_tile + tidx];
-            // final_max = fmaxf(final_max, thread_partial_max);
+            thread_partial_max = params.partial_max[bhi_seq_len_tile + min(tidx, gridDim.x - 1)];
 
             // Make sure we can start writing to shared memory.
             __syncthreads();
@@ -2548,34 +2547,29 @@ __global__ void masked_multihead_attention_kernel(
             // Shared memory to store partial outputs for each oi. -> size: gridDim.z * Dh * 4 Bytes. Reuse qk_smem.
             T* out_oi_smem = reinterpret_cast<T*>(smem_);
 
-            // Number of threads to utilize: THREADS_PER_VALUE * gridDim.z (THREADS_PER_VALUE for vectorized output
-            // and gridDim.z for all the partial outputs)
-            int threads_boundary = THREADS_PER_VALUE * gridDim.z; // should be smaller than THREADS_PER_BLOCK
-            assert(threads_boundary <= THREADS_PER_BLOCK);
-
             const auto o_idx = chunk_index<T, V_vec_k, THREADS_PER_VALUE>(tidx);
             // The partial output region this thread takes care of
             const auto oo = o_idx.x;
             // The hidden dimensions computed by this particular thread. (refer to vi)
             const auto oi = o_idx.y;
 
+            // Within the bound.
+            const bool within_bound = oo < gridDim.z;
+
             // Load partial output
             int thread_partial_out_offset = oo * params.batch_size * num_heads * params.hidden_size_per_head;
             // Load partial max (different to thread_partial_max since the threadIdx rule changes here)
-            float thread_partial_max_for_out = params.partial_max[bhi_seq_len_tile + oo];
+            float thread_partial_max_for_out = within_bound ? params.partial_max[bhi_seq_len_tile + oo] : final_max;
 
             // Load the partial outputs.
-            V_vec_k thread_partial_out
-                = *reinterpret_cast<const V_vec_k*>(&params.partial_out[thread_partial_out_offset + bhi * Dh + oi]);
-
-            if (tidx >= threads_boundary)
-            {
-                zero(thread_partial_out);
-            }
+            V_vec_k zero_k;
+            zero(zero_k);
+            V_vec_k thread_partial_out = within_bound
+                ? *reinterpret_cast<const V_vec_k*>(&params.partial_out[thread_partial_out_offset + bhi * Dh + oi])
+                : zero_k;
 
             Tk factor_compute;
             convert_from_float(&factor_compute, __expf(thread_partial_max_for_out - final_max));
-
             thread_partial_out = mul<V_vec_k, Tk, V_vec_k>(factor_compute, thread_partial_out);
 
             // Make sure we can start writing to shared memory.
@@ -2620,7 +2614,6 @@ __global__ void masked_multihead_attention_kernel(
                 convert_from_float(&inv_sum_compute, inv_sum);
 
                 thread_partial_out = mul<V_vec_k, Tk, V_vec_k>(inv_sum_compute, thread_partial_out);
-
                 *reinterpret_cast<V_vec_k*>(&params.out[bhi * Dh + oi]) = thread_partial_out;
             }
 

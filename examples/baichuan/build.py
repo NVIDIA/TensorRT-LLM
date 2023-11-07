@@ -15,6 +15,7 @@
 import argparse
 import os
 import time
+from pathlib import Path
 
 import onnx
 import tensorrt as trt
@@ -29,12 +30,12 @@ from tensorrt_llm.builder import Builder
 from tensorrt_llm.layers.attention import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import BaichuanForCausalLM, weight_only_quantize
+from tensorrt_llm.models import BaichuanForCausalLM, quantize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 
-from weight import load_from_hf_baichuan  # isort:skip
+from weight import load_from_hf_baichuan, load_from_binary, parse_bin_config  # isort:skip
 
 # 2 routines: get_engine_name, serialize_engine
 # are direct copy from gpt example, TODO: put in utils?
@@ -115,9 +116,8 @@ def parse_arguments():
                         type=int,
                         default=1,
                         help='world size, only support tensor parallelism now')
-    parser.add_argument('--model_dir',
-                        type=str,
-                        default='baichuan-inc/Baichuan-13B-Chat')
+    parser.add_argument('--model_dir', type=str, default=None)
+    parser.add_argument('--bin_model_dir', type=str, default=None)
     parser.add_argument('--model_version',
                         type=str,
                         default='v1_13b',
@@ -180,6 +180,38 @@ def parse_arguments():
                         default=False,
                         action='store_true')
 
+    # Arguments related to the quantization of the model.
+    parser.add_argument(
+        '--use_smooth_quant',
+        default=False,
+        action="store_true",
+        help=
+        'Use the SmoothQuant method to quantize activations and weights for the various GEMMs.'
+        'See --per_channel and --per_token for finer-grained quantization options.'
+    )
+    parser.add_argument(
+        '--per_channel',
+        default=False,
+        action="store_true",
+        help=
+        'By default, we use a single static scaling factor for the GEMM\'s result. '
+        'per_channel instead uses a different static scaling factor for each channel. '
+        'The latter is usually more accurate, but a little slower.')
+    parser.add_argument(
+        '--per_token',
+        default=False,
+        action="store_true",
+        help=
+        'By default, we use a single static scaling factor to scale activations in the int8 range. '
+        'per_token chooses at run time, and for each token, a custom scaling factor. '
+        'The latter is usually more accurate, but a little slower.')
+    parser.add_argument(
+        '--int8_kv_cache',
+        default=False,
+        action="store_true",
+        help=
+        'By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV'
+    )
     parser.add_argument(
         '--use_weight_only',
         default=False,
@@ -222,11 +254,15 @@ def parse_arguments():
 
     args = parser.parse_args()
 
-    if args.use_weight_only:
-        args.quant_mode = QuantMode.use_weight_only(
-            args.weight_only_precision == 'int4')
-    else:
-        args.quant_mode = QuantMode(0)
+    assert not (
+        args.use_smooth_quant and args.use_weight_only
+    ), "You cannot enable both SmoothQuant and INT8 weight-only together."
+
+    if not args.remove_input_padding:
+        if args.use_gpt_attention_plugin:
+            logger.warning(
+                f"It is recommended to specify --remove_input_padding when using GPT attention plugin"
+            )
 
     if args.use_inflight_batching:
         if not args.use_gpt_attention_plugin:
@@ -245,6 +281,18 @@ def parse_arguments():
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha
 
+    if args.use_smooth_quant:
+        args.quant_mode = QuantMode.use_smooth_quant(args.per_token,
+                                                     args.per_channel)
+    elif args.use_weight_only:
+        args.quant_mode = QuantMode.use_weight_only(
+            args.weight_only_precision == 'int4')
+    else:
+        args.quant_mode = QuantMode(0)
+
+    if args.int8_kv_cache:
+        args.quant_mode = args.quant_mode.set_int8_kv_cache()
+
     if args.model_dir is not None:
         hf_config = AutoConfig.from_pretrained(args.model_dir,
                                                trust_remote_code=True)
@@ -259,6 +307,16 @@ def parse_arguments():
             args.n_positions = hf_config.model_max_length
         args.vocab_size = hf_config.vocab_size
         args.hidden_act = hf_config.hidden_act
+    elif args.bin_model_dir is not None:
+        n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, _ = parse_bin_config(
+            Path(args.bin_model_dir) / "config.ini")
+        args.inter_size = inter_size
+        args.n_embd = n_embd
+        args.n_head = n_head
+        args.n_layer = n_layer
+        args.n_positions = n_positions
+        args.vocab_size = vocab_size
+        args.hidden_act = hidden_act
     else:
         # default values are based on v1_13b, change them based on model_version
         if args.model_version == 'v1_7b':
@@ -286,9 +344,6 @@ def parse_arguments():
             args.vocab_size = 125696
             args.hidden_act = 'silu'
 
-    if args.dtype == 'bfloat16':
-        assert args.use_gemm_plugin, "Please use gemm plugin when dtype is bfloat16"
-
     return args
 
 
@@ -301,7 +356,10 @@ def build_rank_engine(builder: Builder,
        @param args: The cmd line arguments.
        @return: The built engine.
     '''
-    kv_dtype = str_dtype_to_trt(args.dtype)
+    dtype = str_dtype_to_trt(args.dtype)
+    mapping = Mapping(world_size=args.world_size,
+                      rank=rank,
+                      tp_size=args.world_size)
     if args.model_version == 'v1_7b' or args.model_version == 'v2_7b':
         position_embedding_type = PositionEmbeddingType.rope_gpt_neox
     else:
@@ -311,23 +369,19 @@ def build_rank_engine(builder: Builder,
     tensorrt_llm_baichuan = BaichuanForCausalLM(
         num_layers=args.n_layer,
         num_heads=args.n_head,
+        num_kv_heads=None,
         hidden_size=args.n_embd,
         vocab_size=args.vocab_size,
         hidden_act=args.hidden_act,
         max_position_embeddings=args.n_positions,
         position_embedding_type=position_embedding_type,
-        dtype=kv_dtype,
+        dtype=dtype,
         mlp_hidden_size=args.inter_size,
-        mapping=Mapping(world_size=args.world_size,
-                        rank=rank,
-                        tp_size=args.world_size))
-    if args.use_weight_only and args.weight_only_precision == 'int8':
-        tensorrt_llm_baichuan = weight_only_quantize(
-            tensorrt_llm_baichuan, QuantMode.use_weight_only())
-    elif args.use_weight_only and args.weight_only_precision == 'int4':
-        tensorrt_llm_baichuan = weight_only_quantize(
-            tensorrt_llm_baichuan,
-            QuantMode.use_weight_only(use_int4_weights=True))
+        mapping=mapping,
+        quant_mode=args.quant_mode)
+    if args.use_smooth_quant or args.use_weight_only:
+        tensorrt_llm_baichuan = quantize_model(tensorrt_llm_baichuan,
+                                               args.quant_mode)
     if args.model_dir is not None:
         logger.info(
             f'Loading HF Baichuan {args.model_version} ... from {args.model_dir}'
@@ -351,6 +405,12 @@ def build_rank_engine(builder: Builder,
                               args.world_size,
                               dtype=args.dtype)
         del hf_baichuan
+    elif args.bin_model_dir is not None:
+        load_from_binary(tensorrt_llm_baichuan,
+                         args.bin_model_dir,
+                         mapping,
+                         fp16=(args.dtype == 'float16'),
+                         multi_query_mode=False)
 
     # Module -> Network
     network = builder.create_network()
@@ -360,6 +420,12 @@ def build_rank_engine(builder: Builder,
             dtype=args.use_gpt_attention_plugin)
     if args.use_gemm_plugin:
         network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
+    # Quantization plugins.
+    if args.use_smooth_quant:
+        network.plugin_config.set_smooth_quant_gemm_plugin(dtype=args.dtype)
+        network.plugin_config.set_rmsnorm_quantization_plugin(dtype=args.dtype)
+        network.plugin_config.set_quantize_tensor_plugin()
+        network.plugin_config.set_quantize_per_token_plugin()
     assert not (args.enable_context_fmha and args.enable_context_fmha_fp32_acc)
     if args.enable_context_fmha:
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
@@ -393,7 +459,7 @@ def build_rank_engine(builder: Builder,
                 v = v.trt_tensor
                 v.name = k
                 network.trt_network.mark_output(v)
-                v.dtype = kv_dtype
+                v.dtype = dtype
         if args.visualize:
             model_path = os.path.join(args.output_dir, 'test.onnx')
             to_onnx(network.trt_network, model_path)
@@ -407,6 +473,9 @@ def build_rank_engine(builder: Builder,
     if rank == 0:
         config_path = os.path.join(args.output_dir, 'config.json')
         builder.save_config(builder_config, config_path)
+
+    tensorrt_llm.tools.cleanup(network, tensorrt_llm_baichuan)
+
     return engine
 
 
@@ -425,6 +494,9 @@ def build(rank, args):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
+        # NOTE(nkorobov): when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
+        int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
+            not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
         builder_config = builder.create_builder_config(
             name=model_name,
             precision=args.dtype,
@@ -441,7 +513,8 @@ def build(rank, args):
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,
-            int8=args.quant_mode.has_act_or_weight_quant())
+            int8=int8_trt_flag,
+            quant_mode=args.quant_mode)
         engine_name = get_engine_name(model_name, args.dtype, args.world_size,
                                       cur_rank)
         engine = build_rank_engine(builder, builder_config, engine_name,
@@ -454,6 +527,7 @@ def build(rank, args):
                 cache = builder_config.trt_builder_config.get_timing_cache()
 
         serialize_engine(engine, os.path.join(args.output_dir, engine_name))
+        del engine
 
     if rank == 0:
         ok = builder.save_timing_cache(

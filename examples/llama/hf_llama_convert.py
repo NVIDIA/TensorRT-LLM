@@ -44,7 +44,6 @@ def merge_qkv_scales(q_name, hf_model, scales, llama_qkv_para):
 
     scales[layer_name_qkv]["x"] = scales[layer_name_q]["x"]
     scales[layer_name_qkv]["w"] = weight.abs().max(dim=1)[0]
-    print(scales[layer_name_q])
     scales[layer_name_qkv]["y"] = torch.cat([
         scales[layer_name_q]["y"], scales[layer_name_k]["y"],
         scales[layer_name_v]["y"]
@@ -188,6 +187,7 @@ def hf_gpt_converter(args):
             smooth_llama_model(model, act_range, args.smoothquant,
                                llama_qkv_para, llama_smoother)
 
+    args.multi_query_mode = model.config.num_attention_heads != model.config.num_key_value_heads
     config = configparser.ConfigParser()
     config["llama"] = {}
     for key in vars(args):
@@ -319,9 +319,6 @@ if __name__ == "__main__":
                         type=str,
                         default="fp32",
                         choices=["fp32", "fp16"])
-    parser.add_argument("--multi-query-mode",
-                        action="store_true",
-                        help="Use multi-query-attention.")
 
     args = parser.parse_args()
     print("\n=============== Argument ===============")

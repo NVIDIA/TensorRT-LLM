@@ -16,7 +16,8 @@ import logging
 import os
 
 import tensorrt as trt
-from mpi4py import MPI
+
+from ._utils import mpi_rank, mpi_world_size
 
 try:
     from polygraphy.logger import G_LOGGER
@@ -62,8 +63,8 @@ class Logger(metaclass=Singleton):
             self._polygraphy_logger.module_severity = severity_map[
                 min_severity][2]
 
-        self.mpi_rank = MPI.COMM_WORLD.Get_rank()
-        self.mpi_size = MPI.COMM_WORLD.Get_size()
+        self.mpi_rank = mpi_rank()
+        self.mpi_size = mpi_world_size()
         if invalid_severity:
             self.warning(
                 f"Requested log level {environ_severity} is invalid. Using 'warning' instead"

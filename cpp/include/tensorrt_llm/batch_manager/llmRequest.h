@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 
 #include <assert.h>
@@ -41,10 +43,14 @@ public:
     using TokenIdType = runtime::TokenIdType;
     using RequestIdType = std::uint64_t;
     using BeamTokens = std::vector<std::vector<TokenIdType>>;
+    using TensorPtr = runtime::ITensor::SharedPtr;
 
     LlmRequest(RequestIdType requestId, SizeType maxNewTokens, std::shared_ptr<std::vector<TokenIdType>> input_tokens,
         runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType> endId = std::nullopt,
-        std::optional<SizeType> padId = std::nullopt)
+        std::optional<SizeType> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
+        std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
+        std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
+        std::optional<SizeType> promptVocabSize = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(input_tokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -54,10 +60,25 @@ public:
         , mEndId(endId)
         , mPadId(padId)
         , mBatchSlot(-1)
+        , mEmbeddingBias(embeddingBias)
+        , mBadWordsList(badWordsList)
+        , mStopWordsList(stopWordsList)
+        , mPromptEmbeddingTable(promptEmbeddingTable)
+        , mPromptVocabSize(promptVocabSize)
     {
         mMaxSentTokenPos = mPromptLen - 1;
         // Scatter the input tokens to other beam
         mTokens = std::make_shared<BeamTokens>(mSamplingConfig.beamWidth, *input_tokens);
+
+        if ((mPromptEmbeddingTable.has_value() && !mPromptVocabSize.has_value())
+            || (!mPromptEmbeddingTable.has_value() && mPromptVocabSize.has_value()))
+        {
+            std::string errStr
+                = "Prompt embedding table and prompt vocab size tensors must both be provided for requests with prompt "
+                  "tuning enabled.";
+            TLLM_LOG_ERROR(errStr);
+            throw std::runtime_error(errStr);
+        }
     }
 
     /// @brief Get total number of tokens for this req (prompt + generated)
@@ -102,6 +123,14 @@ public:
     SizeType getMaxNumGeneratedTokens() const
     {
         return getMaxBeamNumTokens() - mPromptLen;
+    }
+
+    /// @brief Add new generated tokens to the vector of tokens
+    /// @param token The token to add
+    /// @param beam The beam to which to add the new token
+    void addNewToken(TokenIdType token, SizeType beam)
+    {
+        mTokens->at(beam).push_back(token);
     }
 
     /// @brief Add new generated tokens to the vector of tokens
@@ -174,6 +203,46 @@ public:
         mMaxSentTokenPos = pos;
     }
 
+    std::optional<TensorPtr> getPromptEmbeddingTable() const
+    {
+        return mPromptEmbeddingTable;
+    }
+
+    void movePromptEmbeddingTableToGpu(runtime::BufferManager const& manager)
+    {
+        if (!mPromptEmbeddingTable.has_value()
+            || mPromptEmbeddingTable.value()->getMemoryType() == runtime::MemoryType::kGPU)
+        {
+            return;
+        }
+        else
+        {
+            TensorPtr gpuPromptEmbeddingTable
+                = manager.copyFrom(*mPromptEmbeddingTable.value(), runtime::MemoryType::kGPU);
+            mPromptEmbeddingTable = gpuPromptEmbeddingTable;
+        }
+    }
+
+    std::optional<SizeType> getPromptVocabSize() const
+    {
+        return mPromptVocabSize;
+    }
+
+    std::optional<TensorPtr> getEmbeddingBias() const
+    {
+        return mEmbeddingBias;
+    }
+
+    std::optional<TensorPtr> getBadWordsList() const
+    {
+        return mBadWordsList;
+    }
+
+    std::optional<TensorPtr> getStopWordsList() const
+    {
+        return mStopWordsList;
+    }
+
     RequestIdType mRequestId;
     SizeType mPromptLen;
     SizeType mMaxNewTokens;
@@ -188,6 +257,13 @@ public:
 private:
     std::shared_ptr<BeamTokens> mTokens;
     SizeType mMaxSentTokenPos;
+
+    std::optional<TensorPtr> mEmbeddingBias;
+    std::optional<TensorPtr> mBadWordsList;
+    std::optional<TensorPtr> mStopWordsList;
+
+    std::optional<TensorPtr> mPromptEmbeddingTable;
+    std::optional<SizeType> mPromptVocabSize;
 };
 
 } // namespace tensorrt_llm::batch_manager

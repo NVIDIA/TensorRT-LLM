@@ -42,7 +42,6 @@ def read_config(config_path: Path):
     multi_query_mode = config['builder_config']['multi_query_mode']
     paged_kv_cache = config['plugin_config']['paged_kv_cache']
     tokens_per_block = config['plugin_config']['tokens_per_block']
-    use_prompt_tuning = config['builder_config']['use_prompt_tuning']
     num_kv_heads = 1 if multi_query_mode else num_heads
     dtype = config['builder_config']['precision']
 
@@ -55,13 +54,13 @@ def read_config(config_path: Path):
                                remove_input_padding=remove_input_padding,
                                paged_kv_cache=paged_kv_cache,
                                tokens_per_block=tokens_per_block,
-                               use_prompt_tuning=use_prompt_tuning,
                                dtype=dtype)
 
     dtype = config['builder_config']['precision']
     max_input_len = config['builder_config']['max_input_len']
+    use_prompt_tuning = config['builder_config']['use_prompt_tuning']
 
-    return model_config, world_size, dtype, max_input_len
+    return model_config, world_size, dtype, max_input_len, use_prompt_tuning
 
 
 def parse_input(input_text: str, input_file: str, tokenizer, pad_id: int,
@@ -234,7 +233,8 @@ def generate(
 
     engine_dir = Path(engine_dir)
     config_path = engine_dir / 'config.json'
-    model_config, world_size, dtype, max_input_len = read_config(config_path)
+    model_config, world_size, dtype, max_input_len, use_prompt_tuning = read_config(
+        config_path)
 
     runtime_rank = tensorrt_llm.mpi_rank()
     runtime_mapping = tensorrt_llm.Mapping(world_size,
@@ -284,7 +284,7 @@ def generate(
                   max_output_len,
                   beam_width=num_beams)
 
-    ptuning_args = [] if not model_config.use_prompt_tuning else ptuning_setup(
+    ptuning_args = [] if not use_prompt_tuning else ptuning_setup(
         prompt_table, dtype, model_config.hidden_size, tasks, input_ids,
         input_lengths, model_config.remove_input_padding)
 

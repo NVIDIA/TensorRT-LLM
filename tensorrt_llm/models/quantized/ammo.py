@@ -27,6 +27,29 @@ except ImportError:
 from ...logger import logger
 
 
+def _register_falcon_linears(model):
+    """Register Falcon linear modules as Quantiation.
+
+    As falcon models could use remote code, which will be loaded dynamically,
+    to build their model. Therefore, we need to register the linear on the fly
+    before quantization.
+
+    """
+    if type(model).__name__ in ["RWForCausalLM", "FalconForCausalLM"]:
+        from ammo.torch.quantization import tensor_quant
+        from ammo.torch.quantization.nn.modules.quant_module import \
+            QuantLinearConvBase
+
+        linear_type = type(model.transformer.h[0].self_attention.dense)
+
+        class QuantFalconLinearRW1B(linear_type,
+                                    QuantLinearConvBase):  # type: ignore
+            default_quant_desc_weight = tensor_quant.QUANT_DESC_8BIT_LINEAR_WEIGHT_PER_ROW
+
+        atq.module_mapping.QUANT_MODULE_MAPPING[
+            linear_type] = QuantFalconLinearRW1B.convert
+
+
 def _quantize_model(model: torch.nn.Module,
                     qformat: Literal['fp8', 'int8_sq', 'int4_awq'],
                     calib_dataloader: DataLoader,
@@ -50,6 +73,8 @@ def _quantize_model(model: torch.nn.Module,
         for idx, data in enumerate(calib_dataloader):
             logger.debug(f"Calibrating batch {idx}")
             model(data)
+
+    _register_falcon_linears(model)
 
     logger.debug("Starting quantization...")
     atq.quantize(model, quant_cfg, forward_loop=calibrate_loop)

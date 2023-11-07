@@ -286,6 +286,9 @@ def build_rank_engine(builder: Builder,
     if rank == 0:
         config_path = args.output_dir / args.component / 'config.json'
         builder.save_config(builder_config, config_path)
+
+    tensorrt_llm.tools.cleanup(network, tllm_model)
+
     return engine
 
 

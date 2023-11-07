@@ -223,6 +223,11 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
         else:
             v = torch_to_numpy(v.to(torch_dtype).detach().cpu())
         if 'model.embed_tokens.weight' in k:
+            if hf_llama.config.tie_word_embeddings:
+                # lm_head.weight has the same weights as embedding
+                if mapping.is_last_pp_rank():
+                    tensorrt_llm_llama.lm_head.weight.value = np.ascontiguousarray(
+                        split(v, mapping.tp_size, mapping.tp_rank))
             if tensorrt_llm_llama.use_parallel_embedding:
                 v = split(v, mapping.tp_size, mapping.tp_rank,
                           tensorrt_llm_llama.embedding_sharding_dim)
@@ -818,7 +823,8 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
 def load_from_gptq_llama(tensorrt_llm_llama,
                          quant_ckpt_path,
                          mapping=Mapping(),
-                         dtype="float16"):
+                         dtype="float16",
+                         ft_model_dir=None):
     tensorrt_llm.logger.info(
         'Loading weights from groupwise GPTQ LLaMA safetensors...')
     tik = time.time()
@@ -1019,7 +1025,8 @@ def load_from_gptq_llama(tensorrt_llm_llama,
 def load_from_awq_llama(tensorrt_llm_llama: LLaMAForCausalLM,
                         quant_ckpt_path,
                         mapping=Mapping(),
-                        dtype="float16"):
+                        dtype="float16",
+                        ft_model_dir=None):
     tensorrt_llm.logger.info(
         'Loading weights from groupwise AWQ LLaMA safetensors...')
     tik = time.time()
@@ -1052,11 +1059,22 @@ def load_from_awq_llama(tensorrt_llm_llama: LLaMAForCausalLM,
         "post_layernorm.weight",
     ]
 
-    getattr(tensorrt_llm_llama, 'quant_mode', QuantMode(0))
+    quant_mode = getattr(tensorrt_llm_llama, 'quant_mode', QuantMode(0))
+    # Int8 KV cache
+    use_int8_kv_cache = quant_mode.has_int8_kv_cache()
 
     packer = torch.ops.fastertransformer.pack_int8_tensor_to_packed_int4
     preprocessor = torch.ops.fastertransformer.preprocess_weights_for_mixed_gemm
     torch_dtype = str_dtype_to_torch(dtype)
+
+    def fromfile(dir_path, name, shape=None, dtype=None):
+        p = dir_path + '/' + name
+        if Path(p).exists():
+            t = np.fromfile(p, dtype=dtype)
+            if shape is not None:
+                t = t.reshape(shape)
+            return t
+        return None
 
     def AWQ_quantize_pack_preprocess(weight, scale):
         scale = scale.repeat_interleave(group_size, dim=0)
@@ -1216,6 +1234,18 @@ def load_from_awq_llama(tensorrt_llm_llama: LLaMAForCausalLM,
         mPrefix = prefix + "mlp.gate_proj"
         mOp = tensorrt_llm_llama.layers[layer_idx].mlp.fc
         process_and_assign_weight(awq_llama, mPrefix, mOp, 1)
+
+        if use_int8_kv_cache:
+            assert ft_model_dir, "You must pass --ft_model_dir to tell TRT-LLM where to look for scales of INT8 kv cache."
+            t = fromfile(
+                ft_model_dir, 'model.layers.' + str(layer_idx) +
+                '.attention.query_key_value.scale_y_quant_orig.bin', [1],
+                np.float32)
+            assert t is not None, f"{ft_model_dir} does not contain model.layers.{layer_idx}.attention.query_key_value.scale_y_quant_orig.bin"
+            tensorrt_llm_llama.layers[
+                layer_idx].attention.kv_orig_quant_scale.value = 1.0 / t
+            tensorrt_llm_llama.layers[
+                layer_idx].attention.kv_quant_orig_scale.value = t
 
     v = awq_llama['model.norm.weight']
     if mapping.is_last_pp_rank():

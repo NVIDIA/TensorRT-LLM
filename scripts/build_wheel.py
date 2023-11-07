@@ -51,7 +51,8 @@ def main(build_type: str = "Release",
          use_ccache: bool = False,
          cpp_only: bool = False,
          install: bool = False,
-         skip_building_wheel: bool = False):
+         skip_building_wheel: bool = False,
+         python_bindings: bool = False):
     project_dir = Path(__file__).parent.resolve().parent
     os.chdir(project_dir)
     build_run = partial(run, shell=True, check=True)
@@ -142,22 +143,28 @@ def main(build_type: str = "Release",
 
     build_pyt = "OFF" if cpp_only else "ON"
     th_common_lib = "" if cpp_only else "th_common"
+    build_pybind = "ON" if python_bindings else "OFF"
+    bindings_lib = "bindings" if python_bindings else ""
 
     with working_directory(build_dir):
         cmake_def_args = " ".join(cmake_def_args)
         if clean or first_build:
             build_run(
-                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" {cmake_cuda_architectures}'
-                f' {cmake_def_args} -S "{source_dir}"')
+                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
+                f' {cmake_cuda_architectures} {cmake_def_args} -S "{source_dir}"'
+            )
         build_run(
-            f'cmake --build . --config {build_type} --parallel {job_count} --target tensorrt_llm tensorrt_llm_static nvinfer_plugin_tensorrt_llm {th_common_lib} '
+            f'cmake --build . --config {build_type} --parallel {job_count} '
+            f'--target tensorrt_llm tensorrt_llm_static nvinfer_plugin_tensorrt_llm {th_common_lib} {bindings_lib}'
             f'{" ".join(extra_make_targets)}')
 
     if cpp_only:
         assert not install, "Installing is not supported for cpp_only builds"
         return
 
-    lib_dir = project_dir / "tensorrt_llm/libs"
+    pkg_dir = project_dir / "tensorrt_llm"
+    assert pkg_dir.is_dir(), f"{pkg_dir} is not a directory"
+    lib_dir = pkg_dir / "libs"
     if lib_dir.exists():
         rmtree(lib_dir)
     lib_dir.mkdir(parents=True)
@@ -175,6 +182,15 @@ def main(build_type: str = "Release",
             build_dir /
             "tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so",
             lib_dir / "libnvinfer_plugin_tensorrt_llm.so")
+
+    if python_bindings:
+        # TODO Add windows support for python bindings.
+        pybind_lib = list(
+            (build_dir / "tensorrt_llm" / "pybind").glob("bindings.*.so"))
+        assert len(
+            pybind_lib
+        ) == 1, f"Exactly one pybind library should be present: {pybind_lib}"
+        copy(pybind_lib[0], pkg_dir)
 
     if dist_dir is None:
         dist_dir = project_dir / "build"
@@ -244,5 +260,9 @@ if __name__ == "__main__":
         action="store_true",
         help=
         "Do not build the *.whl files (they are only needed for distribution).")
+    parser.add_argument("--python_bindings",
+                        "-p",
+                        action="store_true",
+                        help="Build the python bindings for the C++ runtime.")
     args = parser.parse_args()
     main(**vars(args))

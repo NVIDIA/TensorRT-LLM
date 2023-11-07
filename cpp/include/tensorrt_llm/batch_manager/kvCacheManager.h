@@ -33,6 +33,16 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
+using SizeType = tensorrt_llm::runtime::SizeType;
+
+struct KvCacheStats
+{
+    SizeType maxNumBlocks;
+    SizeType freeNumBlocks;
+    SizeType usedNumBlocks;
+    SizeType toksPerBlock;
+};
+
 // Basic building block of a paged KV cache - a single
 // cache block. This class just holds metadata, no pointers
 // since it is reused across all layers.
@@ -229,6 +239,17 @@ public:
     [[nodiscard]] SizeType getNumFreeBlocks() const
     {
         return mBlockManager.getNumFreeBlocks();
+    }
+
+    [[nodiscard]] KvCacheStats getKvCacheStats() const
+    {
+        KvCacheStats kvCacheStats;
+        kvCacheStats.maxNumBlocks = getMaxNumBlocks();
+        kvCacheStats.freeNumBlocks = getNumFreeBlocks();
+        kvCacheStats.usedNumBlocks = getUsedNumBlocks();
+        kvCacheStats.toksPerBlock = getTokensPerBlock();
+
+        return kvCacheStats;
     }
 
     // Volume of [2, numKvHeads, tokensPerBlock, sizePerHead]
