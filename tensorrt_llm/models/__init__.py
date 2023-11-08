@@ -18,6 +18,7 @@ from .bloom.model import BloomForCausalLM, BloomModel
 from .chatglm2_6b.model import ChatGLM2HeadModel, ChatGLM2Model
 from .chatglm6b.model import ChatGLM6BHeadModel, ChatGLM6BModel
 from .enc_dec.model import DecoderModel, EncoderModel
+from .flan_t5.model import FlanT5DecoderModel, FlanT5EncoderModel
 from .falcon.model import FalconForCausalLM, FalconModel
 from .gpt.model import GPTLMHeadModel, GPTModel
 from .gptj.model import GPTJForCausalLM, GPTJModel
@@ -56,4 +57,6 @@ __all__ = [
     'BaichuanForCausalLM',
     'EncoderModel',
     'DecoderModel',
+    'FlanT5EncoderModel',
+    'FlanT5DecoderModel',
 ]
