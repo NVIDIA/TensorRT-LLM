@@ -2,7 +2,7 @@
 
 TensorRT-LLM
 ===========================
-<h4> A TensorRT Toolbox for Large Language Models </h4>
+<h4> A TensorRT Toolbox for Optimized Large Language Model Inference</h4>
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://nvidia.github.io/TensorRT-LLM/)
 [![python](https://img.shields.io/badge/python-3.10.12-green)](https://www.python.org/downloads/release/python-31012/)
@@ -14,6 +14,25 @@ TensorRT-LLM
 
 ---
 <div align="left">
+
+## Latest News
+* [2023/11/03] [TensorRT-LLM is up to **4.6x faster on H100 than A100**, achieving **10,000 tok/s at 100ms to first token.**](./docs/source/blogs/H100vsA100.md)
+
+<img src="./docs/source/blogs/media/TRT_LLM_v0-5-0_H100vA100_tps.png" alt="max throughput" width="450" height="auto">
+<img src="./docs/source/blogs/media/TRT_LLM_v0-5-0_H100vA100_1st.png" alt="1st token latency" width="450" height="auto">
+
+H100 FP8 increases max throughput, decreases 1st token latency, and reduces memory consumption. At peak, TensorRT-LLM on H100 can achieve >10K token/s or <10ms to first token. See full [performance data](#performance).
+
+* [2023/10/22] [🚀 RAG on Windows using TensorRT-LLM and LlamaIndex 🦙](https://github.com/NVIDIA/trt-llm-rag-windows#readme)
+* [2023/10/19] Getting Started Guide - [Optimizing Inference on Large Language Models with NVIDIA TensorRT-LLM, Now Publicly Available
+](https://developer.nvidia.com/blog/optimizing-inference-on-llms-with-tensorrt-llm-now-publicly-available/)
+* [2023/10/17] [Large Language Models up to 4x Faster on RTX With TensorRT-LLM for Windows
+](https://blogs.nvidia.com/blog/2023/10/17/tensorrt-llm-windows-stable-diffusion-rtx/)
+* [2023/9/9] [NVIDIA TensorRT-LLM Supercharges Large Language Model Inference on NVIDIA H100 GPUs](https://developer.nvidia.com/blog/nvidia-tensorrt-llm-supercharges-large-language-model-inference-on-nvidia-h100-gpus/)
+
+[2023/10/31 - Phind](https://www.phind.com/blog/phind-model-beats-gpt4-fast) ; [2023/10/12 - Databricks (MosaicML)](https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices) ;
+[2023/10/4 - Perplexity](https://blog.perplexity.ai/blog/introducing-pplx-api) ;
+[2023/9/27 - CloudFlare](https://www.cloudflare.com/press-releases/2023/cloudflare-powers-hyper-local-ai-inference-with-nvidia/);
 
 
 ## Table of Contents
