@@ -69,6 +69,8 @@ class GPTBenchmark(BaseBenchmark):
             self.serialize_path = os.path.join(engine_dir, self.engine_name)
             with open(self.serialize_path, 'rb') as f:
                 engine_buffer = f.read()
+            if not hasattr(self, "num_kv_heads") or self.num_kv_heads is None:
+                self.num_kv_heads = self.num_heads
         else:
             # Build engine
             self.world_size = tensorrt_llm.mpi_world_size()
