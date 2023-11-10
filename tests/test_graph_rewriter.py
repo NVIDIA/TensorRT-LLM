@@ -72,6 +72,10 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
                 name='host_past_key_value_lengths',
                 shape=shape_dict['host_past_key_value_lengths'],
                 dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            host_max_kv_cache_lengths_tensor = Tensor(
+                name='host_max_kv_cache_lengths',
+                shape=shape_dict['host_max_kv_cache_lengths'],
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
             context_lengths_tensor = Tensor(
                 name='context_lengths',
                 shape=shape_dict['context_lengths'],
@@ -119,6 +123,7 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
                 past_key_value=past_key_value_tensor,
                 sequence_length=sequence_length_tensor,
                 host_past_key_value_lengths=host_past_key_value_lengths_tensor,
+                host_max_kv_cache_lengths=host_max_kv_cache_lengths_tensor,
                 context_lengths=context_lengths_tensor,
                 cache_indirection=cache_indirection_tensor,
                 host_request_types=host_request_types_tensor,
@@ -129,7 +134,6 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
                 max_context_length=in_len,
                 rotary_embedding_dim=rotary_embedding_dim,
                 position_embedding_type=position_embedding_type,
-                multi_block_mode=False,
                 kv_orig_quant_scale=None,
                 kv_quant_orig_scale=None,
                 kv_cache_quant_mode=QuantMode.from_description(
@@ -169,7 +173,8 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
         'cache_indirection': (batch_size, 1, max_seq_len),
         'input': (batch_size, in_len, hidden_size),
         'output': (batch_size, in_len, hidden_size),
-        'host_past_key_value_lengths': (batch_size, )
+        'host_past_key_value_lengths': (batch_size, ),
+        'host_max_kv_cache_lengths': (1, )
     }
 
     weight = torch.randn(shape_dict['weight'],

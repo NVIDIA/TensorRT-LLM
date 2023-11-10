@@ -22,7 +22,6 @@
 #include "tensorrt_llm/runtime/tensorView.h"
 
 #include <initializer_list>
-#include <limits>
 #include <memory>
 
 using namespace tensorrt_llm::runtime;
@@ -44,11 +43,8 @@ nvinfer1::Dims ITensor::makeShape(std::initializer_list<SizeType> const& dims)
 {
     TLLM_CHECK_WITH_INFO(dims.size() <= nvinfer1::Dims::MAX_DIMS, "Number of dimensions is too large");
     nvinfer1::Dims shape{};
-    shape.nbDims = dims.size();
-    for (std::size_t i = 0; i < dims.size(); ++i)
-    {
-        shape.d[i] = std::data(dims)[i];
-    }
+    shape.nbDims = static_cast<decltype(Shape::nbDims)>(dims.size());
+    std::copy(dims.begin(), dims.end(), shape.d);
     return shape;
 }
 
@@ -95,6 +91,32 @@ ITensor::UniquePtr ITensor::wrap(void* data, nvinfer1::DataType type, nvinfer1::
     default: TLLM_THROW("Unknown memory type");
     }
     return result;
+}
+
+ITensor::Shape ITensor::squeeze(Shape const& shape, SizeType dim)
+{
+    TLLM_CHECK_WITH_INFO(0 < shape.nbDims, "Cannot squeeze 1-dimensional tensor");
+    TLLM_CHECK_WITH_INFO(
+        dim < shape.nbDims, tc::fmtstr("Invalid index %d, tensor has %d dimensions", dim, shape.nbDims));
+    TLLM_CHECK_WITH_INFO(shape.d[dim] == 1, "Can only squeeze dimension of size 1");
+
+    Shape newDims{shape.nbDims - 1};
+    std::copy(shape.d, shape.d + dim, newDims.d);
+    std::copy(shape.d + dim + 1, shape.d + shape.nbDims, newDims.d + dim);
+    return newDims;
+}
+
+ITensor::Shape ITensor::unsqueeze(Shape const& shape, SizeType dim)
+{
+    TLLM_CHECK_WITH_INFO(shape.nbDims < Shape::MAX_DIMS, "Too many dimensions to unsqueeze");
+    TLLM_CHECK_WITH_INFO(
+        0 <= dim && dim <= shape.nbDims, common::fmtstr("Invalid dim %d, tensor has %d dimensions", dim, shape.nbDims));
+
+    Shape newDims{shape.nbDims + 1};
+    std::copy(shape.d, shape.d + dim, newDims.d);
+    newDims.d[dim] = 1;
+    std::copy(shape.d + dim, shape.d + shape.nbDims, newDims.d + dim + 1);
+    return newDims;
 }
 
 namespace

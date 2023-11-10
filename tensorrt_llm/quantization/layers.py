@@ -634,6 +634,9 @@ class SmoothQuantMLP(Module):
     def forward(self, hidden_states, workspace=None):
         inter = self.fc(hidden_states)
         inter = ACT2FN[self.hidden_act](inter)
+        if default_net(
+        ).strongly_typed and inter.dtype != self.proj.smoother.value:
+            inter = cast(inter, self.proj.smoother.value)
         inter = inter / self.proj.smoother.value
         if self.quant_mode.has_act_and_weight_quant():
             if self.quant_mode.has_act_static_scaling():
@@ -966,6 +969,9 @@ class SmoothQuantGatedMLP(SmoothQuantMLP):
         inter = ACT2FN[self.hidden_act](inter)
         gate = self.gate(hidden_states)
         inter_x_gate = inter * gate
+        if default_net(
+        ).strongly_typed and inter_x_gate.dtype != self.proj.smoother.value.dtype:
+            inter_x_gate = cast(inter_x_gate, self.proj.smoother.value.dtype)
         inter_x_gate = inter_x_gate / self.proj.smoother.value
         if self.quant_mode.has_act_and_weight_quant():
             if self.quant_mode.has_act_static_scaling():
@@ -997,7 +1003,6 @@ class SmoothQuantAttention(Module):
                  tp_group=None,
                  tp_size=1,
                  tp_rank=0,
-                 multi_block_mode=False,
                  scale_alibi_bias=False,
                  paged_kv_cache=False,
                  quant_mode=QuantMode(0)):
@@ -1027,7 +1032,6 @@ class SmoothQuantAttention(Module):
         self.scale_alibi_bias = scale_alibi_bias
 
         self.position_embedding_type = position_embedding_type
-        self.multi_block_mode = multi_block_mode
         self.paged_kv_cache = paged_kv_cache
 
         self.rotary_embedding_dim = 0
@@ -1087,8 +1091,6 @@ class SmoothQuantAttention(Module):
             qkv = self.qkv(hidden_states)
         else:
             raise ValueError("smooth_quant_gemm_plugin is not set")
-        if not default_net().plugin_config.gpt_attention_plugin:
-            raise ValueError("gpt_attention_plugin is not set")
 
         alibi_slopes = None
         if self.position_embedding_type == PositionEmbeddingType.alibi:
@@ -1125,6 +1127,8 @@ class SmoothQuantAttention(Module):
                 sequence_length=attention_params.sequence_length,
                 host_past_key_value_lengths=kv_cache_params.
                 host_past_key_value_lengths,
+                host_max_kv_cache_lengths=kv_cache_params.
+                host_max_kv_cache_lengths,
                 context_lengths=attention_params.context_lengths,
                 cache_indirection=kv_cache_params.cache_indirection,
                 host_request_types=attention_params.host_request_types,
@@ -1134,7 +1138,6 @@ class SmoothQuantAttention(Module):
                 q_scaling=self.q_scaling,
                 rotary_embedding_dim=self.rotary_embedding_dim,
                 position_embedding_type=self.position_embedding_type,
-                multi_block_mode=self.multi_block_mode,
                 kv_orig_quant_scale=kv_quant_scale,
                 kv_quant_orig_scale=kv_dequant_scale,
                 kv_cache_quant_mode=self.quant_mode,
@@ -1238,7 +1241,9 @@ class SmoothQuantAttention(Module):
             if use_cache and self.quant_mode.has_int8_kv_cache():
                 past_key_value = quantize_tensor(
                     past_key_value, self.kv_quantization_scale.value)
-
+        if default_net(
+        ).strongly_typed and context.dtype != self.dense.smoother.value.dtype:
+            context = cast(context, self.dense.smoother.value.dtype)
         context = context / self.dense.smoother.value
         if self.quant_mode.has_act_and_weight_quant():
             if self.quant_mode.has_act_static_scaling():

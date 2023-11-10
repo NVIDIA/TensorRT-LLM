@@ -42,16 +42,12 @@ public:
 
     void* data() override
     {
-        if (getSize() == 0)
-            return nullptr;
-        return mTensor.data_ptr();
+        return TLLM_LIKELY(getSize() > 0) ? mTensor.data_ptr() : nullptr;
     }
 
     [[nodiscard]] void const* data() const override
     {
-        if (getSize() == 0)
-            return nullptr;
-        return mTensor.data_ptr();
+        return TLLM_LIKELY(getSize() > 0) ? mTensor.data_ptr() : nullptr;
     }
 
     [[nodiscard]] size_t getSize() const override
@@ -76,17 +72,7 @@ public:
 
     void resize(std::size_t newSize) override
     {
-        TLLM_CHECK(newSize <= getCapacity());
-
-        if (newSize != getSize())
-        {
-            using dimType = std::remove_reference_t<decltype(mDims.d[0])>;
-            auto constexpr max_size = std::numeric_limits<dimType>::max();
-            TLLM_CHECK_WITH_INFO(newSize <= max_size, "New size is too large. Use reshape() instead.");
-            mTensor.resize_({static_cast<at::IntArrayRef::value_type>(newSize)});
-            mDims.nbDims = 1;
-            mDims.d[0] = static_cast<dimType>(newSize);
-        }
+        ITensor::resize(newSize);
     }
 
     void release() override

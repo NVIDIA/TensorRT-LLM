@@ -55,21 +55,24 @@ void select_zero_bias(const WeightOnlyParams& params, cudaStream_t stream)
 }
 
 template <WeightOnlyQuantType QType, typename WeightOnlyFlag, int N_PER_BLOCK, int BATCH, int BLOCK_SIZE>
-void select_activation(WeightOnlyActivationType atype, const WeightOnlyParams& params, cudaStream_t stream)
+void select_activation(const WeightOnlyParams& params, cudaStream_t stream)
 {
-    switch (atype)
+    switch (params.act_func_type)
     {
-    case WeightOnlyActivationType::Gelu:
+        // Currently, activation function is not called in the plugin
+#if 0
+    case WeightOnlyActivationFunctionType::Gelu:
     {
         select_zero_bias<QType, WeightOnlyFlag, GeluActivation, N_PER_BLOCK, BATCH, BLOCK_SIZE>(params, stream);
         break;
     }
-    case WeightOnlyActivationType::Relu:
+    case WeightOnlyActivationFunctionType::Relu:
     {
         select_zero_bias<QType, WeightOnlyFlag, ReluActivation, N_PER_BLOCK, BATCH, BLOCK_SIZE>(params, stream);
         break;
     }
-    case WeightOnlyActivationType::Identity:
+#endif
+    case WeightOnlyActivationFunctionType::Identity:
     {
         select_zero_bias<QType, WeightOnlyFlag, IdentityActivation, N_PER_BLOCK, BATCH, BLOCK_SIZE>(params, stream);
         break;
@@ -83,18 +86,15 @@ void select_activation(WeightOnlyActivationType atype, const WeightOnlyParams& p
 }
 
 template <typename WeightOnlyFlag, int N_PER_BLOCK, int BATCH, int BLOCK_SIZE>
-void select_quant_type(
-    WeightOnlyQuantType qtype, WeightOnlyActivationType atype, const WeightOnlyParams& params, cudaStream_t stream)
+void select_quant_type(const WeightOnlyParams& params, cudaStream_t stream)
 {
-    if (qtype == WeightOnlyQuantType::Int4b)
+    if (params.quant_type == WeightOnlyQuantType::Int4b)
     {
-        select_activation<WeightOnlyQuantType::Int4b, WeightOnlyFlag, N_PER_BLOCK, BATCH, BLOCK_SIZE>(
-            atype, params, stream);
+        select_activation<WeightOnlyQuantType::Int4b, WeightOnlyFlag, N_PER_BLOCK, BATCH, BLOCK_SIZE>(params, stream);
     }
-    else if (qtype == WeightOnlyQuantType::Int8b)
+    else if (params.quant_type == WeightOnlyQuantType::Int8b)
     {
-        select_activation<WeightOnlyQuantType::Int8b, WeightOnlyFlag, N_PER_BLOCK, BATCH, BLOCK_SIZE>(
-            atype, params, stream);
+        select_activation<WeightOnlyQuantType::Int8b, WeightOnlyFlag, N_PER_BLOCK, BATCH, BLOCK_SIZE>(params, stream);
     }
     else
     {
@@ -103,16 +103,15 @@ void select_quant_type(
 }
 
 template <int N_PER_BLOCK, int BATCH, int BLOCK_SIZE>
-void select_groupwise_weight_only(WeightOnlyQuantType qtype, WeightOnlyType wtype, WeightOnlyActivationType atype,
-    const WeightOnlyParams& params, cudaStream_t stream)
+void select_groupwise_weight_only(const WeightOnlyParams& params, cudaStream_t stream)
 {
-    if (wtype == WeightOnlyType::GroupWise && params.group_size == 64)
+    if (params.weight_only_type == WeightOnlyType::GroupWise && params.group_size == 64)
     {
-        select_quant_type<WeightOnlyGroupWise<64>, N_PER_BLOCK, BATCH, BLOCK_SIZE>(qtype, atype, params, stream);
+        select_quant_type<WeightOnlyGroupWise<64>, N_PER_BLOCK, BATCH, BLOCK_SIZE>(params, stream);
     }
-    else if (wtype == WeightOnlyType::GroupWise && params.group_size == 128)
+    else if (params.weight_only_type == WeightOnlyType::GroupWise && params.group_size == 128)
     {
-        select_quant_type<WeightOnlyGroupWise<128>, N_PER_BLOCK, BATCH, BLOCK_SIZE>(qtype, atype, params, stream);
+        select_quant_type<WeightOnlyGroupWise<128>, N_PER_BLOCK, BATCH, BLOCK_SIZE>(params, stream);
     }
     else
     {
@@ -120,33 +119,40 @@ void select_groupwise_weight_only(WeightOnlyQuantType qtype, WeightOnlyType wtyp
     }
 }
 
-void weight_only_batched_gemv_launcher(WeightOnlyQuantType qtype, WeightOnlyType wtype, WeightOnlyActivationType atype,
-    const WeightOnlyParams& params, cudaStream_t stream)
+void weight_only_batched_gemv_launcher(const WeightOnlyParams& params, cudaStream_t stream)
 {
-    if (wtype == WeightOnlyType::PerChannel)
+    assert(params.act_func_type == WeightOnlyActivationFunctionType::Identity);
+    assert(params.weight_only_type == WeightOnlyType::GroupWise
+        || (params.weight_only_type == WeightOnlyType::PerChannel && params.bias == nullptr
+            && params.zeros == nullptr));
+    if (params.weight_only_type == WeightOnlyType::PerChannel)
     {
-        if (qtype == WeightOnlyQuantType::Int4b)
+        if (params.quant_type == WeightOnlyQuantType::Int4b)
         {
             switch (params.m)
             {
             case 1:
             {
-                select_activation<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel, 1, 1, 192>(atype, params, stream);
+                WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel,
+                    IdentityActivation, false, false, 1, 1, 192>::run(params, stream);
                 break;
             }
             case 2:
             {
-                select_activation<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel, 2, 2, 128>(atype, params, stream);
+                WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel,
+                    IdentityActivation, false, false, 2, 2, 128>::run(params, stream);
                 break;
             }
             case 3:
             {
-                select_activation<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel, 2, 3, 256>(atype, params, stream);
+                WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel,
+                    IdentityActivation, false, false, 2, 3, 256>::run(params, stream);
                 break;
             }
             case 4:
             {
-                select_activation<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel, 4, 4, 256>(atype, params, stream);
+                WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel,
+                    IdentityActivation, false, false, 4, 4, 256>::run(params, stream);
                 break;
             }
             default:
@@ -156,28 +162,32 @@ void weight_only_batched_gemv_launcher(WeightOnlyQuantType qtype, WeightOnlyType
             }
             }
         }
-        else if (qtype == WeightOnlyQuantType::Int8b)
+        else if (params.quant_type == WeightOnlyQuantType::Int8b)
         {
             switch (params.m)
             {
             case 1:
             {
-                select_activation<WeightOnlyQuantType::Int8b, WeightOnlyPerChannel, 2, 1, 256>(atype, params, stream);
+                WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int8b, WeightOnlyPerChannel,
+                    IdentityActivation, false, false, 2, 1, 256>::run(params, stream);
                 break;
             }
             case 2:
             {
-                select_activation<WeightOnlyQuantType::Int8b, WeightOnlyPerChannel, 2, 2, 256>(atype, params, stream);
+                WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int8b, WeightOnlyPerChannel,
+                    IdentityActivation, false, false, 2, 2, 256>::run(params, stream);
                 break;
             }
             case 3:
             {
-                select_activation<WeightOnlyQuantType::Int8b, WeightOnlyPerChannel, 2, 3, 256>(atype, params, stream);
+                WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int8b, WeightOnlyPerChannel,
+                    IdentityActivation, false, false, 2, 3, 256>::run(params, stream);
                 break;
             }
             case 4:
             {
-                select_activation<WeightOnlyQuantType::Int8b, WeightOnlyPerChannel, 2, 4, 256>(atype, params, stream);
+                WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int8b, WeightOnlyPerChannel,
+                    IdentityActivation, false, false, 2, 4, 256>::run(params, stream);
                 break;
             }
             default:
@@ -188,28 +198,28 @@ void weight_only_batched_gemv_launcher(WeightOnlyQuantType qtype, WeightOnlyType
             }
         }
     }
-    else if (wtype == WeightOnlyType::GroupWise)
+    else if (params.weight_only_type == WeightOnlyType::GroupWise)
     {
         switch (params.m)
         {
         case 1:
         {
-            select_groupwise_weight_only<2, 1, 256>(qtype, wtype, atype, params, stream);
+            select_groupwise_weight_only<2, 1, 256>(params, stream);
             break;
         }
         case 2:
         {
-            select_groupwise_weight_only<2, 2, 256>(qtype, wtype, atype, params, stream);
+            select_groupwise_weight_only<2, 2, 256>(params, stream);
             break;
         }
         case 3:
         {
-            select_groupwise_weight_only<2, 3, 128>(qtype, wtype, atype, params, stream);
+            select_groupwise_weight_only<2, 3, 128>(params, stream);
             break;
         }
         case 4:
         {
-            select_groupwise_weight_only<2, 4, 128>(qtype, wtype, atype, params, stream);
+            select_groupwise_weight_only<2, 4, 128>(params, stream);
             break;
         }
         default:

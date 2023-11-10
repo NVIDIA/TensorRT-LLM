@@ -164,6 +164,34 @@ the MHA/MQA kernel. The scaling factor to dequantize those values is stored in
 the `kv_quant_orig_scale` tensor. That tensor contains a single value (per
 tensor scaling).
 
+
+## Sliding Window Attention, Cyclic (Rolling Buffer) KV Cache
+
+TensorRT-LLM has a feature called `Cyclic KV Cache`, which treats the kv cache
+as a circular buffer. This means that it only stores the kv cache for the last N
+tokens, where N is determined by the `max_kv_cache_length` parameter in
+`GenerationSession.setup`. You can see examples of this in the `run.py` or
+`summarize.py` files. When the cache is full, new tokens’ kv cache will
+overwrite the "least recently used" caches.
+
+In the context phase, if the input length surpasses the `max_kv_cache_length`,
+`Sliding Window Attention` will be activated. This serves the same function as
+the `sliding window_size`.
+
+This feature helps to reduce the memory footprint of the kv cache when
+dealing with very long sequences.
+
+_Note that when using beam search, cyclic kv cache may not perform as well as
+full kv cache when the current step exceeds `max_kv_cache_length`.
+This issue will be addressed in future releases._
+
+_The experimental feature, which allows different `max_kv_cache_length` values
+for each layer, is also supported. To utilize this feature, simply provide an
+`int32 torch.Tensor` with a shape of `[num_layers]` to the `GenerationSession.setup`.
+This tensor will serve as the buffer for `max_kv_cache_length`,
+setting unique values for each layer. However, it’s important to note that the
+memory allocation for the kv cache still relies on the buffer’s maximum value._
+
 ## Beam-Search
 
 The GPT attention operator supports beam-search. In the context phase, a single

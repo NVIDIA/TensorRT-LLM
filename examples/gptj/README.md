@@ -117,7 +117,6 @@ python build.py --model_dir gptj_model \
                 --dtype float16 \
                 --use_gpt_attention_plugin float16 \
                 --enable_context_fmha \
-                --enable_two_optimization_profiles \
                 --output_dir gptj_engine_fp8_quantized \
                 --enable_fp8 \
                 --fp8_kv_cache \
@@ -220,7 +219,7 @@ The linear layer in the AWQ int4 weight only quantized weights should have 3 par
 To run a TensorRT-LLM GPT-J model:
 
 ```bash
-python3 run.py --max_output_len=50 --engine_dir=gptj_engine
+python3 run.py --max_output_len=50 --engine_dir=gptj_engine --hf_model_location=gptj_model
 ```
 
 ## Summarization using the GPT-J model

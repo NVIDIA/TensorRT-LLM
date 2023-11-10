@@ -20,7 +20,6 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-void weight_only_batched_gemv_launcher(WeightOnlyQuantType qtype, WeightOnlyType wtype, WeightOnlyActivationType atype,
-    const WeightOnlyParams& params, cudaStream_t stream);
+void weight_only_batched_gemv_launcher(const WeightOnlyParams& params, cudaStream_t stream);
 }
 } // namespace tensorrt_llm

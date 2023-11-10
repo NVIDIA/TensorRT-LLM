@@ -252,7 +252,7 @@ int BertAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
     if (mEnableContextFMHA && !mRelativeAttention)
     {
         // b, max_seqlen, actual_total_seqlen
-        mFMHARunner->setup(request_batch_size, request_seq_len, request_batch_size * request_seq_len);
+        mFMHARunner->setup(request_batch_size, request_seq_len, request_seq_len, request_batch_size * request_seq_len);
         mFMHARunner->run(const_cast<T*>(attention_input), cu_seqlens, context_buf_, stream);
     }
     else

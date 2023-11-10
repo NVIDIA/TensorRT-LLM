@@ -4,6 +4,24 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
+namespace
+{
+template <typename T>
+struct Vec2Type;
+
+template <>
+struct Vec2Type<half>
+{
+    using type = half2;
+};
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && defined(ENABLE_BF16))
+template <>
+struct Vec2Type<__nv_bfloat16>
+{
+    using type = __nv_bfloat162;
+};
+#endif
+}; // namespace
 
 template <typename T, int kProcessRows, typename AccessType>
 __global__ void apply_per_channel_scale(T* smoothed_act, const T* act, const T* per_channel_scale, int rows, int cols)
@@ -21,13 +39,18 @@ __global__ void apply_per_channel_scale(T* smoothed_act, const T* act, const T* 
     for (int i = 0; i < kProcessRows; ++i)
     {
         *reinterpret_cast<AccessType*>(act_vec) = reinterpret_cast<const AccessType*>(act + i * cols)[col_offset];
-        if constexpr (std::is_same_v<T, half> && kElems % 2 == 0)
+        if constexpr ((std::is_same_v<T, half>
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && defined(ENABLE_BF16))
+                          || std::is_same_v<T, __nv_bfloat16>
+#endif
+                          ) &&(kElems % 2 == 0))
         {
+            using Vec2 = typename Vec2Type<T>::type;
 #pragma unroll
             for (int j = 0; j < kElems; j += 2)
             {
-                *reinterpret_cast<half2*>(act_vec + j)
-                    = __hmul2(*reinterpret_cast<half2*>(act_vec + j), *reinterpret_cast<half2*>(scale + j));
+                *reinterpret_cast<Vec2*>(act_vec + j)
+                    = __hmul2(*reinterpret_cast<Vec2*>(act_vec + j), *reinterpret_cast<Vec2*>(scale + j));
             }
         }
         else
@@ -35,7 +58,7 @@ __global__ void apply_per_channel_scale(T* smoothed_act, const T* act, const T* 
 #pragma unroll
             for (int j = 0; j < kElems; ++j)
             {
-                act_vec[j] *= scale[j];
+                act_vec[j] = static_cast<T>(static_cast<float>(act_vec[j]) * static_cast<float>(scale[j]));
             }
         }
         reinterpret_cast<AccessType*>(smoothed_act + i * cols)[col_offset] = *reinterpret_cast<AccessType*>(act_vec);
@@ -85,6 +108,9 @@ void apply_per_channel_scale_kernel_launcher(
         T * smoothed_act, const T* act, const T* per_channel_scale, int rows, int cols, cudaStream_t stream)
 
 INSTANTIATE_PREQUANT_SCALE(half);
+#if defined(ENABLE_BF16)
+INSTANTIATE_PREQUANT_SCALE(__nv_bfloat16);
+#endif
 
 } // namespace kernels
 } // namespace tensorrt_llm

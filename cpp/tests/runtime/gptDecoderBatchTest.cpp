@@ -120,8 +120,10 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> con
     SizeType constexpr maxInputLength{8};
     SizeType constexpr maxNewTokens{2};
     auto constexpr maxSeqLength = maxInputLength + maxNewTokens;
+    // We set maxKvCacheLength = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
+    auto const maxKvCacheLength = maxSeqLength;
 
-    decoder.setup(batchSize, maxBeamWidth, maxSeqLength, modelConfig.getDataType());
+    decoder.setup(batchSize, maxBeamWidth, maxSeqLength, maxKvCacheLength, modelConfig.getDataType());
 
     std::vector<SizeType> const inputLengths{4, 5, 6, 7};
     std::vector<SizeType> tiledInputLengths;
@@ -240,8 +242,10 @@ void testDecoderWavefront(
     SizeType constexpr maxInputLength{8};
     SizeType constexpr maxNewTokens{8};
     auto constexpr maxSeqLength = maxInputLength + maxNewTokens;
+    // We set maxKvCacheLength = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
+    auto const maxKvCacheLength = maxSeqLength;
 
-    decoder.setup(batchSize, maxBeamWidth, maxSeqLength, modelConfig.getDataType());
+    decoder.setup(batchSize, maxBeamWidth, maxSeqLength, maxKvCacheLength, modelConfig.getDataType());
 
     std::vector<SizeType> const inputLengths{4, 5, 6, 7};
     std::vector<SizeType> tiledInputLengths;

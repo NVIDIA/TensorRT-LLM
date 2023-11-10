@@ -60,7 +60,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("ids", &tpr::GenerationInput::ids)
         .def_readwrite("lengths", &tpr::GenerationInput::lengths)
         .def_readwrite("packed", &tpr::GenerationInput::packed)
-        .def_readwrite("embedding_bias", &tpr::GenerationInput::embeddingBiasOpt)
+        .def_readwrite("embedding_bias", &tpr::GenerationInput::embeddingBias)
         .def_readwrite("bad_words_list", &tpr::GenerationInput::badWordsList)
         .def_readwrite("stop_words_list", &tpr::GenerationInput::stopWordsList)
         .def_readwrite("max_new_tokens", &tpr::GenerationInput::maxNewTokens)
@@ -75,9 +75,11 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("context_logits", &tpr::GenerationOutput::contextLogits);
 
     py::class_<tb::kv_cache_manager::KvCacheConfig>(m, "KvCacheConfig")
-        .def(py::init<std::optional<tr::SizeType>, std::optional<float>>(), py::arg("max_tokens") = py::none(),
+        .def(py::init<std::optional<tr::SizeType>, std::optional<tr::SizeType>, std::optional<float>>(),
+            py::arg("max_tokens") = py::none(), py::arg("max_kv_cache_length") = py::none(),
             py::arg("free_gpu_memory_fraction") = py::none())
         .def_readwrite("max_tokens", &tb::kv_cache_manager::KvCacheConfig::maxTokens)
+        .def_readwrite("max_kv_cache_length", &tb::kv_cache_manager::KvCacheConfig::maxKvCacheLength)
         .def_readwrite("free_gpu_memory_fraction", &tb::kv_cache_manager::KvCacheConfig::freeGpuMemoryFraction);
 
     py::class_<tr::GptSession::Config>(m, "GptSessionConfig")

@@ -164,15 +164,15 @@ class BaichuanModel(Module):
 
         hidden_states = self.vocab_embedding(input_ids)
 
-        if kv_cache_params.past_key_value is None:
-            kv_cache_params.past_key_value = tuple([None] * len(self.layers))
+        kv_cache_params.fill_none_tensor_list(len(self.layers))
 
         if use_cache:
             presents = []
 
-        for layer, past, pointer in zip(
+        for layer, past, pointer, max_kv_cache_length in zip(
                 self.layers, kv_cache_params.past_key_value,
-                kv_cache_params.kv_cache_block_pointers):
+                kv_cache_params.kv_cache_block_pointers,
+                kv_cache_params.host_max_kv_cache_lengths):
             hidden_states = layer(
                 hidden_states,
                 use_cache=use_cache,
@@ -181,6 +181,7 @@ class BaichuanModel(Module):
                     past_key_value=[past],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
+                    host_max_kv_cache_lengths=max_kv_cache_length,
                     kv_cache_block_pointers=[pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params)
@@ -208,6 +209,7 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
                  max_position_embeddings,
                  position_embedding_type,
                  dtype,
+                 logits_dtype='float32',
                  mlp_hidden_size=None,
                  mapping=Mapping(),
                  quant_mode=QuantMode(0)):
@@ -231,6 +233,12 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
             self.kv_dtype = str_dtype_to_trt('int8')
         elif quant_mode.has_fp8_kv_cache():
             self.kv_dtype = str_dtype_to_trt('fp8')
+
+        if isinstance(logits_dtype, str):
+            self._logits_dtype = str_dtype_to_trt(logits_dtype)
+        else:
+            assert isinstance(logits_dtype, trt.DataType)
+            self._logits_dtype = logits_dtype
 
         self.quant_mode = quant_mode
 
@@ -268,7 +276,7 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
 
         # [batch_size, hidden_size] -> [batch_size, vocab_size]
         lm_logits = self.lm_head(hidden_states)
-        lm_logits.mark_output('logits', self.dtype)
+        lm_logits.mark_output('logits', self._logits_dtype)
 
         if use_cache and default_net().plugin_config.paged_kv_cache == False:
             for i, present in enumerate(presents):
@@ -324,6 +332,8 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
                     past_key_value=model_inputs['past_key_value'],
                     host_past_key_value_lengths=model_inputs[
                         'host_past_key_value_lengths'],
+                    host_max_kv_cache_lengths=model_inputs[
+                        'host_max_kv_cache_lengths'],
                     kv_cache_block_pointers=model_inputs[
                         'kv_cache_block_pointers_list'],
                     cache_indirection=model_inputs['cache_indirection'],

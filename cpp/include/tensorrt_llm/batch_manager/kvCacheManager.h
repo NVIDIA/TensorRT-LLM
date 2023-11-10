@@ -217,7 +217,7 @@ public:
 
     KVCacheManager(SizeType numLayers, SizeType numHeads, SizeType numKvHeads, SizeType hiddenSize,
         SizeType tokensPerBlock, SizeType maxNumBlocks, SizeType maxBatchSize, SizeType maxBeamWidth,
-        SizeType maxBlocksPerSeq, nvinfer1::DataType dtype, CudaStreamPtr stream);
+        SizeType maxBlocksPerSeq, SizeType maxKvCacheLength, nvinfer1::DataType dtype, CudaStreamPtr stream);
 
     void startScheduling();
 
@@ -330,6 +330,9 @@ private:
     SizeType mMaxBeamWidth;
     // Maximum number of blocks per sequence
     SizeType mMaxBlocksPerSeq;
+    // Maximum kv cache length per sequence
+    // Enable cyclic kv cache when it exceeds
+    SizeType mMaxKvCacheLength;
     // Pools
     std::vector<runtime::ITensor::SharedPtr> mPools;
     // Block manager

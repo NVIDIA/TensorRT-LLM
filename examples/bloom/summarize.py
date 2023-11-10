@@ -170,7 +170,8 @@ def main(args):
             tensorrt_llm_bloom.setup(line_encoded.size(0),
                                      max_context_length=line_encoded.size(1),
                                      max_new_tokens=output_len,
-                                     beam_width=num_beams)
+                                     beam_width=num_beams,
+                                     max_kv_cache_length=args.max_kv_cache_len)
 
             output_ids = tensorrt_llm_bloom.decode(
                 line_encoded,
@@ -358,6 +359,12 @@ if __name__ == '__main__':
     parser.add_argument('--engine_dir', type=str, default='bloom_outputs')
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--max_ite', type=int, default=20)
+    parser.add_argument('--max_kv_cache_len',
+                        type=int,
+                        default=None,
+                        help='The max kv cache length. \
+              If the final sequence length exceeds the kv cache length, we will enable cyclic kv cache. \
+              If it is set to None, we will use the max sequence length.')
     parser.add_argument('--check_accuracy', action='store_true')
     parser.add_argument('--tensorrt_llm_rouge1_threshold',
                         type=float,

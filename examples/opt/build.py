@@ -108,6 +108,14 @@ def parse_arguments():
     parser.add_argument('--enable_context_fmha_fp32_acc',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--multi_block_mode',
+        default=False,
+        action='store_true',
+        help=
+        'Split long kv sequence into multiple blocks (applied to generation MHA kernels). \
+                        It is beneifical when batchxnum_heads cannot fully utilize GPU.'
+    )
     parser.add_argument('--gpus_per_node', type=int, default=8)
     parser.add_argument(
         '--output_dir',
@@ -183,6 +191,13 @@ def parse_arguments():
         choices=['float16', 'float32', 'bfloat16'],
         help=
         "Activates the lookup plugin which enables embedding sharing. It is also required for language modeling embedding weight sharing."
+    )
+    parser.add_argument(
+        '--strongly_typed',
+        default=False,
+        action="store_true",
+        help=
+        'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
     )
     args = parser.parse_args()
     if args.use_weight_only:
@@ -282,6 +297,8 @@ def build_rank_engine(builder: Builder,
     if args.enable_context_fmha_fp32_acc:
         network.plugin_config.set_context_fmha(
             ContextFMHAType.enabled_with_fp32_acc)
+    if args.multi_block_mode:
+        network.plugin_config.enable_mmha_multi_block_mode()
     if args.use_weight_only:
         assert (args.dtype == 'float16')
         network.plugin_config.set_weight_only_quant_matmul_plugin(
@@ -348,7 +365,8 @@ def build(rank, args):
             max_output_len=args.max_output_len,
             use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
             int8=(args.quant_mode.has_act_or_weight_quant()
-                  or args.quant_mode.has_int8_kv_cache()))
+                  or args.quant_mode.has_int8_kv_cache()),
+            strongly_typed=args.strongly_typed)
 
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.world_size,
                                       cur_rank)

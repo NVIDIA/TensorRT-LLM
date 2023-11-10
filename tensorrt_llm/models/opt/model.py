@@ -166,13 +166,14 @@ class OPTModel(Module):
                                        prompt_embedding_table, prompt_tasks,
                                        prompt_vocab_size)
 
-        if kv_cache_params.past_key_value is None:
-            kv_cache_params.past_key_value = tuple([None] * len(self.layers))
+        kv_cache_params.fill_none_tensor_list(len(self.layers))
 
         if use_cache:
             presents = []
 
-        for layer, past in zip(self.layers, kv_cache_params.past_key_value):
+        for layer, past, max_kv_cache_length in zip(
+                self.layers, kv_cache_params.past_key_value,
+                kv_cache_params.host_max_kv_cache_lengths):
             hidden_states = layer(
                 hidden_states,
                 use_cache=use_cache,
@@ -181,6 +182,7 @@ class OPTModel(Module):
                     past_key_value=[past],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
+                    host_max_kv_cache_lengths=max_kv_cache_length,
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params)
             if use_cache:
@@ -332,6 +334,8 @@ class OPTLMHeadModel(OPTModel, GenerationMixin):
                     past_key_value=model_inputs['past_key_value'],
                     host_past_key_value_lengths=model_inputs[
                         'host_past_key_value_lengths'],
+                    host_max_kv_cache_lengths=model_inputs[
+                        'host_max_kv_cache_lengths'],
                     cache_indirection=model_inputs['cache_indirection'],
                 ),
                 AttentionParams(

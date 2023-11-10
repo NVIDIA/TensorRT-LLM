@@ -29,7 +29,8 @@ using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 
 RuntimeBuffers::GenerationConfig RuntimeBuffers::GenerationConfig::fromInput(ITensor const& inputIds,
-    ITensor const& inputLengthsHost, bool const inputPacked, SizeType const beamWidth, SizeType const maxSequenceLength)
+    ITensor const& inputLengthsHost, bool const inputPacked, SizeType const beamWidth, SizeType const maxKvCacheLength,
+    SizeType const maxSequenceLength)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto const batchSize = static_cast<SizeType>(inputLengthsHost.getSize());
@@ -57,7 +58,7 @@ RuntimeBuffers::GenerationConfig RuntimeBuffers::GenerationConfig::fromInput(ITe
         "generated.");
 
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
-    return GenerationConfig{batchSize, beamWidth, maxInputLength, maxSequenceLength, inputLengthSum};
+    return GenerationConfig{batchSize, beamWidth, maxInputLength, maxKvCacheLength, maxSequenceLength, inputLengthSum};
 }
 
 void RuntimeBuffers::clear()
@@ -154,6 +155,10 @@ void RuntimeBuffers::create(TllmRuntime& runtime, GptModelConfig const& modelCon
     if (modelConfig.useGptAttentionPlugin())
     {
         pastKeyValueLengths = manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32);
+        for (SizeType i = 0; i < modelConfig.getNbLayers(); ++i)
+        {
+            maxKvCacheLengths.emplace_back(manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32));
+        }
     }
     else
     {
@@ -179,7 +184,7 @@ void RuntimeBuffers::create(TllmRuntime& runtime, GptModelConfig const& modelCon
 }
 
 void RuntimeBuffers::initFromInput(ITensor const& inputIds, TensorPtr const& inputLengths, bool inputPacked,
-    SizeType beamWidth, SizeType maxSequenceLength, BufferManager& manager)
+    SizeType beamWidth, SizeType maxKvCacheLength, SizeType maxSequenceLength, BufferManager& manager)
 {
     contextLengthsDevice = inputLengths;
     contextLengthsHost->reshape(inputLengths->getShape());
@@ -187,7 +192,7 @@ void RuntimeBuffers::initFromInput(ITensor const& inputIds, TensorPtr const& inp
     manager.getStream().synchronize(); // wait for context lengths to be copied to host
 
     generationConfig = RuntimeBuffers::GenerationConfig::fromInput(
-        inputIds, *contextLengthsHost, inputPacked, beamWidth, maxSequenceLength);
+        inputIds, *contextLengthsHost, inputPacked, beamWidth, maxKvCacheLength, maxSequenceLength);
 }
 
 void RuntimeBuffers::reshape(GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
@@ -197,7 +202,7 @@ void RuntimeBuffers::reshape(GptModelConfig const& modelConfig, WorldConfig cons
     auto const batchSize = generationConfig.batchSize;
     auto const beamWidth = generationConfig.beamWidth;
     auto const maxInputLength = generationConfig.maxInputLength;
-    auto const maxSeqLength = generationConfig.maxSeqLength;
+    auto const maxKvCacheLength = generationConfig.maxKvCacheLength;
 
     if (worldConfig.isLastPipelineParallelRank() && !modelConfig.computeContextLogits())
     {
@@ -207,15 +212,15 @@ void RuntimeBuffers::reshape(GptModelConfig const& modelConfig, WorldConfig cons
 
     lastTokenIds->reshape(ITensor::makeShape({batchSize}));
 
-    auto kvCacheReserve
-        = ITensor::makeShape({batchSize, 2, modelConfig.getNbKvHeads(), maxSeqLength, modelConfig.getSizePerHead()});
+    auto kvCacheReserve = ITensor::makeShape(
+        {batchSize, 2, modelConfig.getNbKvHeads(), maxKvCacheLength, modelConfig.getSizePerHead()});
     auto kvCacheShape
         = ITensor::makeShape({batchSize, 2, modelConfig.getNbKvHeads(), maxInputLength, modelConfig.getSizePerHead()});
     if (modelConfig.usePagedKvCache())
     {
         auto const localNbLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
         auto const tokensPerBlock = modelConfig.getTokensPerBlock();
-        auto const maxBlocksPerSeq = (maxSeqLength + tokensPerBlock - 1) / tokensPerBlock;
+        auto const maxBlocksPerSeq = (maxKvCacheLength + tokensPerBlock - 1) / tokensPerBlock;
 
         // reserve batchSize * beamWidth and resize to batchSize
         auto cacheBlockPointersShape = ITensor::makeShape({localNbLayers, batchSize * beamWidth, 2, maxBlocksPerSeq});
@@ -233,6 +238,10 @@ void RuntimeBuffers::reshape(GptModelConfig const& modelConfig, WorldConfig cons
     if (modelConfig.useGptAttentionPlugin())
     {
         pastKeyValueLengths->reshape(ITensor::makeShape({batchSize}));
+        for (SizeType i = 0; i < modelConfig.getNbLayers(); ++i)
+        {
+            maxKvCacheLengths[i]->reshape(ITensor::makeShape({1}));
+        }
         requestTypes->reshape(ITensor::makeShape({batchSize}));
     }
     else
@@ -243,7 +252,7 @@ void RuntimeBuffers::reshape(GptModelConfig const& modelConfig, WorldConfig cons
         utils::reshapeBufferVector(presentKeysVals, kvCacheShape);
     }
 
-    auto const cacheIndirShape = ITensor::makeShape({batchSize, beamWidth, maxSeqLength});
+    auto const cacheIndirShape = ITensor::makeShape({batchSize, beamWidth, maxKvCacheLength});
     cacheIndirectionDecoderInput->reshape(cacheIndirShape);
     cacheIndirectionDecoderOutput->reshape(cacheIndirShape);
 
@@ -327,6 +336,7 @@ std::vector<RuntimeBuffers> RuntimeBuffers::split(
             if (modelConfig.useGptAttentionPlugin())
             {
                 buffers.pastKeyValueLengths = ITensor::slice(pastKeyValueLengths, offset, batchSize);
+                buffers.maxKvCacheLengths = maxKvCacheLengths;
                 buffers.requestTypes = ITensor::slice(requestTypes, offset, batchSize);
             }
             else
@@ -522,6 +532,12 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
         auto RequestTypesPtr = bufferCast<int32_t>(*requestTypes);
         TLLM_CHECK(requestTypes->getSize() == static_cast<std::size_t>(batchSize));
         std::fill_n(RequestTypesPtr, batchSize, 0);
+
+        // Set maxKvCacheLengths buffer to the same value currently.
+        for (auto layer = 0; layer < modelConfig.getNbLayers(); ++layer)
+        {
+            bufferCast<SizeType>(*maxKvCacheLengths[layer])[0] = generationConfig.maxKvCacheLength;
+        }
 
         auto const& inputShape = inputIds->getShape();
         auto const contextLengthsHostPtr = bufferCast<SizeType const>(*contextLengthsHost);
@@ -787,6 +803,12 @@ void RuntimeBuffers::getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outpu
         inputBuffers.insert_or_assign("host_past_key_value_lengths", pastKeyValueLengths);
         inputBuffers.insert_or_assign("host_request_types", requestTypes);
         inputBuffers.insert_or_assign("sequence_length", sequenceLengths);
+
+        for (SizeType i = 0; i < modelConfig.getNbLayers(); ++i)
+        {
+            std::string name = "host_max_kv_cache_length_" + std::to_string(i);
+            inputBuffers.insert_or_assign(name, maxKvCacheLengths[i]);
+        }
 
         if (modelConfig.usePackedInput())
         {

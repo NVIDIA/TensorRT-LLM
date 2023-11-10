@@ -200,7 +200,8 @@ def main(args):
             tensorrt_llm_llama.setup(batch_size,
                                      max_context_length=max_length,
                                      max_new_tokens=output_len,
-                                     beam_width=num_beams)
+                                     beam_width=num_beams,
+                                     max_kv_cache_length=args.max_kv_cache_len)
 
             if tensorrt_llm_llama.remove_input_padding:
                 output_ids = tensorrt_llm_llama.decode_batch(
@@ -390,6 +391,12 @@ if __name__ == '__main__':
                         choices=['fp32', 'fp16'],
                         default='fp16')
     parser.add_argument('--dataset_path', type=str, default='')
+    parser.add_argument('--max_kv_cache_len',
+                        type=int,
+                        default=None,
+                        help='The max kv cache length. \
+              If the final sequence length exceeds the kv cache length, we will enable cyclic kv cache. \
+              If it is set to None, we will use the max sequence length.')
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument('--engine_dir', type=str, default='llama_outputs')
     parser.add_argument('--batch_size', type=int, default=1)

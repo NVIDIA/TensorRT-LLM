@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import tensorrt as trt
 
@@ -144,9 +144,11 @@ class Session(object):
             logger.info(
                 f"Tensor:{name=:}, {mode=:}, {shape=:}, {dtype=:}, {tformat=:}")
 
-    def infer_shapes(self,
-                     inputs: List[TensorInfo],
-                     context=None) -> List[TensorInfo]:
+    def infer_shapes(
+            self,
+            inputs: List[TensorInfo],
+            context: Optional[trt.IExecutionContext] = None
+    ) -> List[TensorInfo]:
         '''
         @brief: Set input shapes to given context, and infer the output shapes from the given input shapes.
                This function should be called every time when the input shapes are changed before calling run().
@@ -163,7 +165,10 @@ class Session(object):
                 raise ValueError(f"Tensor:{i.name} is not an input tensor")
             if self.engine.get_tensor_dtype(i.name) != i.dtype:
                 raise ValueError(f"Tensor:{i.name} has wrong dtype")
-            context.set_input_shape(i.name, i.shape)
+            if not context.set_input_shape(i.name, i.shape):
+                raise RuntimeError(
+                    f"Could not set shape {i.shape} for tensor {i.name}. Please check the profile range for which your model was build."
+                )
 
         outputs = []
         for i in range(self.engine.num_io_tensors):

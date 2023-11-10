@@ -64,15 +64,7 @@ public:
 
     void resize(std::size_t newSize) override
     {
-        if (newSize != getSize())
-        {
-            using dimType = std::remove_reference_t<decltype(mDims.d[0])>;
-            auto constexpr max_size = std::numeric_limits<dimType>::max();
-            TLLM_CHECK_WITH_INFO(newSize <= max_size, "New size is too large. Use reshape() instead.");
-            Base::resize(newSize);
-            mDims.nbDims = 1;
-            mDims.d[0] = static_cast<dimType>(newSize);
-        }
+        ITensor::resize(newSize);
     }
 
     void release() override

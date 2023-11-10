@@ -175,6 +175,14 @@ def parse_arguments():
     parser.add_argument('--enable_context_fmha_fp32_acc',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--multi_block_mode',
+        default=False,
+        action='store_true',
+        help=
+        'Split long kv sequence into multiple blocks (applied to generation MHA kernels). \
+                        It is beneifical when batchxnum_heads cannot fully utilize GPU.'
+    )
     parser.add_argument('--gpus_per_node', type=int, default=8)
     parser.add_argument(
         '--output_dir',
@@ -202,6 +210,14 @@ def parse_arguments():
         'By default the embedding lookup table is sharded along vocab dimension (--embedding_sharding_dim=0). '
         'To shard it along hidden dimension, set --embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when --embedding_sharding_dim=0'
+    )
+
+    parser.add_argument(
+        '--strongly_typed',
+        default=False,
+        action="store_true",
+        help=
+        'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
     )
 
     args = parser.parse_args()
@@ -317,6 +333,8 @@ def build_rank_engine(builder: Builder,
     if args.enable_context_fmha_fp32_acc:
         network.plugin_config.set_context_fmha(
             ContextFMHAType.enabled_with_fp32_acc)
+    if args.multi_block_mode:
+        network.plugin_config.enable_mmha_multi_block_mode()
     if args.use_weight_only_quant_matmul_plugin:
         network.plugin_config.set_weight_only_quant_matmul_plugin(
             dtype=args.use_weight_only_quant_matmul_plugin)
@@ -385,7 +403,8 @@ def build(rank, args):
             max_input_len=args.max_input_len,
             int8=args.use_weight_only_quant_matmul_plugin
             or args.use_weight_only_groupwise_quant_matmul_plugin,
-            max_output_len=args.max_output_len)
+            max_output_len=args.max_output_len,
+            strongly_typed=args.strongly_typed)
 
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.world_size,
                                       cur_rank)

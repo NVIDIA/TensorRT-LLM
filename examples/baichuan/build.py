@@ -126,6 +126,11 @@ def parse_arguments():
                         type=str,
                         default='float16',
                         choices=['float32', 'bfloat16', 'float16'])
+    parser.add_argument('--logits_dtype',
+                        type=str,
+                        default='float32',
+                        choices=['float16', 'float32'])
+
     parser.add_argument(
         '--timing_cache',
         type=str,
@@ -163,6 +168,14 @@ def parse_arguments():
     parser.add_argument('--enable_context_fmha_fp32_acc',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--multi_block_mode',
+        default=False,
+        action='store_true',
+        help=
+        'Split long kv sequence into multiple blocks (applied to generation MHA kernels). \
+                        It is beneifical when batchxnum_heads cannot fully utilize GPU.'
+    )
     parser.add_argument('--parallel_build', default=False, action='store_true')
     parser.add_argument('--visualize', default=False, action='store_true')
     parser.add_argument('--enable_debug_output',
@@ -251,6 +264,14 @@ def parse_arguments():
         type=int,
         default=None,
         help='Define the max number of tokens supported by the engine')
+
+    parser.add_argument(
+        '--strongly_typed',
+        default=False,
+        action="store_true",
+        help=
+        'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
+    )
 
     args = parser.parse_args()
 
@@ -378,7 +399,8 @@ def build_rank_engine(builder: Builder,
         dtype=dtype,
         mlp_hidden_size=args.inter_size,
         mapping=mapping,
-        quant_mode=args.quant_mode)
+        quant_mode=args.quant_mode,
+        logits_dtype=args.logits_dtype)
     if args.use_smooth_quant or args.use_weight_only:
         tensorrt_llm_baichuan = quantize_model(tensorrt_llm_baichuan,
                                                args.quant_mode)
@@ -408,6 +430,7 @@ def build_rank_engine(builder: Builder,
     elif args.bin_model_dir is not None:
         load_from_binary(tensorrt_llm_baichuan,
                          args.bin_model_dir,
+                         args.model_version,
                          mapping,
                          fp16=(args.dtype == 'float16'),
                          multi_query_mode=False)
@@ -432,6 +455,8 @@ def build_rank_engine(builder: Builder,
     if args.enable_context_fmha_fp32_acc:
         network.plugin_config.set_context_fmha(
             ContextFMHAType.enabled_with_fp32_acc)
+    if args.multi_block_mode:
+        network.plugin_config.enable_mmha_multi_block_mode()
     if args.use_weight_only:
         network.plugin_config.set_weight_only_quant_matmul_plugin(
             dtype='float16')
@@ -514,7 +539,8 @@ def build(rank, args):
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,
             int8=int8_trt_flag,
-            quant_mode=args.quant_mode)
+            quant_mode=args.quant_mode,
+            strongly_typed=args.strongly_typed)
         engine_name = get_engine_name(model_name, args.dtype, args.world_size,
                                       cur_rank)
         engine = build_rank_engine(builder, builder_config, engine_name,

@@ -35,6 +35,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import quantize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
+from tensorrt_llm.profiler import check_gpt_mem_usage
 from tensorrt_llm.quantization import QuantMode
 
 from weight import parse_ft_config  # isort:skip
@@ -184,6 +185,14 @@ def parse_arguments():
     parser.add_argument('--enable_context_fmha_fp32_acc',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--multi_block_mode',
+        default=False,
+        action='store_true',
+        help=
+        'Split long kv sequence into multiple blocks (applied to generation MHA kernels). \
+                        It is beneifical when batchxnum_heads cannot fully utilize GPU.'
+    )
     parser.add_argument('--visualize', default=False, action='store_true')
     parser.add_argument('--enable_debug_output',
                         default=False,
@@ -411,7 +420,7 @@ def parse_arguments():
             args.n_kv_head = hf_config.num_key_value_heads
         args.n_layer = hf_config.num_hidden_layers
         args.n_positions = hf_config.max_position_embeddings
-        args.vocab_size = hf_config.vocab_size
+        args.vocab_size = hf_config.vocab_size if args.vocab_size is None else args.vocab_size
         args.hidden_act = hf_config.hidden_act
         args.rms_norm_eps = hf_config.rms_norm_eps
     elif args.meta_ckpt_dir is not None:
@@ -437,7 +446,7 @@ def parse_arguments():
         args.n_head = n_head
         args.n_layer = n_layer
         args.n_positions = n_positions
-        args.vocab_size = vocab_size
+        args.vocab_size = vocab_size if args.vocab_size is None else args.vocab_size
         args.hidden_act = hidden_act
         args.rms_norm_eps = 1e-06
         logger.warning("Set rms_norm_eps to 1e-06 directly.")
@@ -593,6 +602,8 @@ def build_rank_engine(builder: Builder,
     if args.enable_context_fmha_fp32_acc:
         network.plugin_config.set_context_fmha(
             ContextFMHAType.enabled_with_fp32_acc)
+    if args.multi_block_mode:
+        network.plugin_config.enable_mmha_multi_block_mode()
     if args.use_weight_only:
         if args.per_group:
             network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
@@ -696,6 +707,26 @@ def build(rank, args):
         engine = build_rank_engine(builder, builder_config, engine_name,
                                    cur_rank, args)
         assert engine is not None, f'Failed to build engine for rank {cur_rank}'
+
+        local_num_kv_heads = (args.n_kv_head + args.world_size -
+                              1) // args.world_size
+        kv_dtype = str_dtype_to_trt(args.dtype)
+        if args.quant_mode.has_int8_kv_cache():
+            kv_dtype = str_dtype_to_trt('int8')
+        elif args.quant_mode.has_fp8_kv_cache():
+            kv_dtype = str_dtype_to_trt('fp8')
+        check_gpt_mem_usage(
+            engine=engine,
+            kv_dtype=kv_dtype,
+            use_gpt_attention_plugin=args.use_gpt_attention_plugin,
+            paged_kv_cache=args.paged_kv_cache,
+            max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
+            max_input_len=args.max_input_len,
+            max_output_len=args.max_output_len,
+            local_num_kv_heads=local_num_kv_heads,
+            head_size=args.n_embd / args.n_head,
+            num_layers=args.n_layer)
 
         if cur_rank == 0:
             # Use in-memory timing cache for multiple builder passes.

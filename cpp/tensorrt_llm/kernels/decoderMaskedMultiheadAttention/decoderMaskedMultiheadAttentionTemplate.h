@@ -1244,10 +1244,10 @@ template <
     // The number of threads per value.
     unsigned THREADS_PER_VALUE = threads_per_value<T>(dh_max(Dh)),
     // The unroll factor for loading from K cache.
-    unsigned K_LOOP_UNROLL = 8,
-    // The unroll factor for loading from V cache.
     // Set it default to 4 for higher occupancy (by reducing registers usage).
-    unsigned V_LOOP_UNROLL = 4>
+    unsigned K_LOOP_UNROLL = 4,
+    // The unroll factor for loading from V cache.
+    unsigned V_LOOP_UNROLL = 8>
 __global__ void masked_multihead_attention_kernel(
     Multihead_attention_params<T, DO_CROSS_ATTENTION> params, KVCacheBuffer kvCacheBuffer)
 {
@@ -1271,10 +1271,11 @@ __global__ void masked_multihead_attention_kernel(
     static_assert(Dh_MAX >= WARP_SIZE);
     static_assert(Dh_MAX >= Dh);
 
-    // The maximum sequence length in the kv_cache, i.e., an upper bound on L.
+    // The maximum sequence length in the cyclic kv_cache, i.e., an upper bound on L.
     // Note that the maximum sequence length supported by the model might be greater than this.
-    const auto max_seq_len = static_cast<unsigned>(params.memory_max_len);
-    assert(max_seq_len > 0);
+    // Note max_kv_cache_length is maximum of cyclic_kv_cache_length among all layers.
+    // By default, you can assume that they are the same.
+    const auto cyclic_kv_cache_len = static_cast<unsigned>(params.cyclic_kv_cache_length);
     // The current timestep (including paddings).
     // It is only used to calculate the smem stride.
     const auto timestep = static_cast<unsigned>(DO_MULTI_BLOCK ? params.timesteps_per_block : params.timestep);
@@ -1298,8 +1299,7 @@ __global__ void masked_multihead_attention_kernel(
 #ifndef MMHA_USE_FP32_ACCUM_FOR_LOGITS
     if (sizeof(Tk) != 4)
     {
-        // TODO - change to tlength
-        const auto max_timesteps = DO_CROSS_ATTENTION ? max_seq_len : min(timestep, max_seq_len);
+        const auto max_timesteps = DO_CROSS_ATTENTION ? cyclic_kv_cache_len : min(timestep, cyclic_kv_cache_len);
         logits_smem_ += divUp(max_timesteps + 1, 4u) * 16;
     }
     Tk* logits_smem = reinterpret_cast<Tk*>(logits_smem_);
@@ -1345,6 +1345,7 @@ __global__ void masked_multihead_attention_kernel(
     // Use alignment for safely casting the shared buffers as Qk_vec_k and K_vec_k.
     // Shared memory to store Q inputs.
     __shared__ __align__(mmha::const_max(sizeof(Qk_vec_k), sizeof(K_vec_k))) Tk q_smem[Dh_MAX];
+    __shared__ __align__(mmha::const_max(sizeof(Qk_vec_k), sizeof(K_vec_k))) Tk k_smem[Dh_MAX];
 
     // Make sure the hidden dimension per head is a multiple of the number of threads per value.
     static_assert(Dh_MAX % THREADS_PER_VALUE == 0); // trivially satisfied since THREADS_PER_VALUE == Dh_MAX / p
@@ -1420,8 +1421,17 @@ __global__ void masked_multihead_attention_kernel(
     const int tlength = DO_CROSS_ATTENTION
         ? params.memory_length_per_sample[batch_beam_idx] - 1
         : (params.length_per_sample ? (params.length_per_sample[batch_beam_idx] - 1) : static_cast<int>(timestep));
+    // We will use cyclic kv cache when it exceeds the limit.
+    // The length position for storing new key and value.
+    const int cyclic_tlength = tlength % cyclic_kv_cache_len;
+    // The actual kv cache length.
+    // tlength is the past length actually.
+    const int kv_loop_length = min(tlength, cyclic_kv_cache_len);
     // The context length for beam searching optimization (all points to beam 0).
-    const int input_length = params.input_lengths[batch_beam_idx];
+    // TODO: with cyclic kv cache, we set it 0 for now (will optimize in the future)
+    // as context kv cache might be overwritten by the new kv cache
+    const int beam0_context_length
+        = HAS_BEAMS && tlength > cyclic_kv_cache_len ? 0 : params.input_lengths[batch_beam_idx];
 
     // The offset in the Q and K buffer also accounts for the batch.
     const auto qk_vec_idx = tidx * QK_VEC_SIZE;
@@ -1474,8 +1484,8 @@ __global__ void masked_multihead_attention_kernel(
         if constexpr (DO_CROSS_ATTENTION)
         {
             const auto k_idx = QK_VEC_SIZE * tidx;
-            const int inBlockIdx = kvCacheBuffer.getKVLocalIdx(tlength, hi, Dh, k_idx);
-            Tcache* k_cache = reinterpret_cast<Tcache*>(kvCacheBuffer.getKBlockPtr(batch_beam_idx, tlength));
+            const int inBlockIdx = kvCacheBuffer.getKVLocalIdx(cyclic_tlength, hi, Dh, k_idx);
+            Tcache* k_cache = reinterpret_cast<Tcache*>(kvCacheBuffer.getKBlockPtr(batch_beam_idx, cyclic_tlength));
 
             k = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<const Qk_vec_m*>(&k_cache[inBlockIdx]));
         }
@@ -1572,7 +1582,7 @@ __global__ void masked_multihead_attention_kernel(
         const bool do_rotary = is_valid_qk_vec && QK_VEC_SIZE * tidx < params.rotary_embedding_dim;
 
         T* q_smem_ = reinterpret_cast<T*>(smem_);
-        T* k_smem = q_smem_ + params.rotary_embedding_dim;
+        T* k_smem_ = q_smem_ + params.rotary_embedding_dim;
 
         const int half_rotary_dim = params.rotary_embedding_dim / 2;
         const int half_idx = qk_vec_idx / half_rotary_dim;
@@ -1586,7 +1596,7 @@ __global__ void masked_multihead_attention_kernel(
             *reinterpret_cast<Qk_vec_k*>(q_smem_ + half_idx * smem_pitch + intra_half_idx) = q;
             if (HANDLE_KV)
             {
-                *reinterpret_cast<Qk_vec_k*>(k_smem + half_idx * smem_pitch + intra_half_idx) = k;
+                *reinterpret_cast<Qk_vec_k*>(k_smem_ + half_idx * smem_pitch + intra_half_idx) = k;
             }
         }
 
@@ -1599,12 +1609,12 @@ __global__ void masked_multihead_attention_kernel(
             mmha::vec_from_smem_transpose(q, q_smem_, transpose_idx, smem_pitch);
             if (HANDLE_KV)
             {
-                mmha::vec_from_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
+                mmha::vec_from_smem_transpose(k, k_smem_, transpose_idx, smem_pitch);
 
                 mmha::apply_rotary_embedding(q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim,
                     rotary_embedding_base, rotary_embedding_scale, tlength);
 
-                mmha::write_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
+                mmha::write_smem_transpose(k, k_smem_, transpose_idx, smem_pitch);
             }
             else
             {
@@ -1621,7 +1631,7 @@ __global__ void masked_multihead_attention_kernel(
             q = *reinterpret_cast<Qk_vec_k*>(q_smem_ + half_idx * smem_pitch + intra_half_idx);
             if (HANDLE_KV)
             {
-                k = *reinterpret_cast<Qk_vec_k*>(k_smem + half_idx * smem_pitch + intra_half_idx);
+                k = *reinterpret_cast<Qk_vec_k*>(k_smem_ + half_idx * smem_pitch + intra_half_idx);
             }
         }
 
@@ -1631,7 +1641,7 @@ __global__ void masked_multihead_attention_kernel(
     }
 
     // For the same reason as HANDLE_KV, no compute needed in Cross-Attention's 1st step
-
+    // Store Q K vectors to shared memory, and calculate QK.
     if (qk_vec_idx < Dh_MAX)
     {
 
@@ -1658,31 +1668,10 @@ __global__ void masked_multihead_attention_kernel(
             reinterpret_cast<Qk_vec_k*>(&q_smem[qk_vec_idx])[0] = is_valid_qk_vec ? q : zero_q;
         }
 
-        // Write the K values to the global memory cache.
-        //
-        // NOTE: The stores are uncoalesced as we have multiple chunks of 16B spread across the memory
-        // system. We designed it this way as it allows much better memory loads (and there are many
-        // more loads) + the stores are really "write and forget" since we won't need the ack before
-        // the end of the kernel. There's plenty of time for the transactions to complete.
-
-        // For MQA/GQA mode, write only with the first Q head of each group per KV head.
-        if (HANDLE_KV && hi == (hi_kv * qhead_per_kv) && (IS_Dh_MAX || is_valid_qk_vec))
-        {
-            // Trigger the stores to global memory.
-            const auto k_idx = QK_VEC_SIZE * tidx;
-            const int inBlockIdx = kvCacheBuffer.getKVLocalIdx(tlength, hi_kv, Dh, k_idx);
-            // The base pointer for the value in the cache buffer.
-            Tcache* k_cache = reinterpret_cast<Tcache*>(kvCacheBuffer.getKBlockPtr(batch_beam_idx, tlength));
-
-            if constexpr (ENABLE_8BITS_CACHE)
-            {
-                store_8bits_kv_cache_vec(reinterpret_cast<Tcache*>(k_cache), k, inBlockIdx, kv_scale_orig_quant);
-            }
-            else
-            {
-                *reinterpret_cast<Qk_vec_m*>(&k_cache[inBlockIdx]) = vec_conversion<Qk_vec_m, Qk_vec_k>(k);
-            }
-        }
+        // Store the K values to shared memory.
+        // We store K values from shared memory to global memory
+        //  when the target position of K cache in global memory has been accessed (in the case of cyclic kv cache)
+        reinterpret_cast<Qk_vec_k*>(&k_smem[qk_vec_idx])[0] = k;
 
         // Compute \sum_i Q[i] * K^T[i] for the current timestep.
         qk = dot<Qk_vec_accum, Qk_vec_k>(q, k);
@@ -1736,7 +1725,9 @@ __global__ void masked_multihead_attention_kernel(
         }
         else
         {
-            qk_smem[tlength] = qk;
+            // We need to store the qk result to the end of the qk_smem for cyclic kv cache (+ 1 for smem memory
+            // allocation) because the previous cache will still write to the new_cache_pos of qk_smem.
+            qk_smem[kv_loop_length] = qk;
         }
     }
 
@@ -1778,17 +1769,22 @@ __global__ void masked_multihead_attention_kernel(
 
     // Pick a number of keys to make sure all the threads of a warp enter (due to shfl_sync).
     // Take all previous cache as context when we have no beam searching in order to batch as many LDGs as possible.
-    const int context_length = HAS_BEAMS ? input_length : tlength;
+    const int context_length = HAS_BEAMS ? beam0_context_length : kv_loop_length;
     const auto context_ti_end = MULTI_BLOCK_FLAG
         ? divUp(timesteps_per_block, UNROLLED_K_PER_WARP) * UNROLLED_K_PER_WARP
         : divUp(static_cast<unsigned>(context_length), UNROLLED_K_PER_WARP) * UNROLLED_K_PER_WARP;
 
     // The generation ti_end.
-    const auto generation_ti_end = MULTI_BLOCK_FLAG ? divUp(timesteps_per_block, K_PER_WARP) * K_PER_WARP
-                                                    : divUp(static_cast<unsigned>(tlength), K_PER_WARP) * K_PER_WARP;
+    const auto generation_ti_end = MULTI_BLOCK_FLAG
+        ? divUp(timesteps_per_block, K_PER_WARP) * K_PER_WARP
+        : divUp(static_cast<unsigned>(kv_loop_length), K_PER_WARP) * K_PER_WARP;
 
     // Iterate over the keys/timesteps to compute the various (Q*K^T)_{ti} values.
-    const auto bi_seq_len_offset = static_cast<std::size_t>(batch_beam_idx) * max_seq_len;
+    // Note max_kv_cache_length is maximum of cyclic_kv_cache_length among all layers.
+    // By default, you can assume that they are the same.
+    const auto bi_seq_len_offset = static_cast<std::size_t>(batch_beam_idx) * params.max_kv_cache_length;
+    // Beam indices are based on the max_kv_cache_length while each layer may have different cyclic_kv_cache_length
+    // So we need to rebuild the beam_indices if max_kv_cache_length is not equal to cyclic_kv_cache_length.
     const int* beam_indices = HAS_BEAMS ? &params.cache_indir[bi_seq_len_offset] : nullptr;
 
     const auto c_tile_times_timesteps_per_block = c_tile * timesteps_per_block; // 0 if !MULTI_BLOCK_FLAG
@@ -1940,11 +1936,11 @@ __global__ void masked_multihead_attention_kernel(
     }
 
     // Handle generation key cache with beam searching.
-    // Note that it may be overlapped with the context key loop, but it won't impact the correctness.
-    if (HAS_BEAMS && (!MULTI_BLOCK_FLAG || (c_tile + 1) * timesteps_per_block > input_length))
+    // Note that it may be overlapped with the context key loop, but it won't impact the corretness.
+    if (HAS_BEAMS && (!MULTI_BLOCK_FLAG || (c_tile + 1) * timesteps_per_block > beam0_context_length))
     {
         // The input length;
-        const int input_length_ = MULTI_BLOCK_FLAG ? input_length % timesteps_per_block : input_length;
+        const int input_length_ = MULTI_BLOCK_FLAG ? beam0_context_length % timesteps_per_block : beam0_context_length;
         // The beginning of the generation.
         const int generation_start_ti = k_idx.x + input_length_ / K_PER_WARP * K_PER_WARP;
 
@@ -1960,7 +1956,7 @@ __global__ void masked_multihead_attention_kernel(
             for (int k_vec_i = 0; k_vec_i < K_VECS_PER_THREAD; ++k_vec_i)
             {
                 const int jj = min(k_idx.y + k_vec_i * K_ELTS_PER_CHUNK, Dh - K_VEC_SIZE);
-                const int valid_time_now = min(time_now, tlength - 1);
+                const int valid_time_now = min(time_now, kv_loop_length - 1);
                 int beam_offset = beam_indices[valid_time_now];
                 const int seqIdx = batch_idx * beam_width + beam_offset;
                 // Base pointer to k cache block for beam's batch, before offsetting with indirection buffer
@@ -1971,7 +1967,7 @@ __global__ void masked_multihead_attention_kernel(
             }
 
             // Is it active?
-            const bool is_active = time_now >= input_length && time_now < tlength;
+            const bool is_active = time_now >= context_length && time_now < kv_loop_length;
 
             if (implicit_rel_attn_bias)
             {
@@ -2092,6 +2088,34 @@ __global__ void masked_multihead_attention_kernel(
     // Make sure the products are in shared memory.
     __syncthreads();
 
+    // After the syncthreads, the target k position (cyclic kv cache) should also have been used by the k loop.
+    // Write the K values to the global memory cache.
+    //
+    // NOTE: The stores are uncoalesced as we have multiple chunks of 16B spread across the memory
+    // system. We designed it this way as it allows much better memory loads (and there are many
+    // more loads) + the stores are really "write and forget" since we won't need the ack before
+    // the end of the kernel. There's plenty of time for the transactions to complete.
+
+    // For MQA/GQA mode, write only with the first Q head of each group per KV head.
+    if (HANDLE_KV && hi == (hi_kv * qhead_per_kv) && qk_vec_idx < Dh)
+    {
+        // Trigger the stores to global memory.
+        Qk_vec_k k_vec = *reinterpret_cast<Qk_vec_k*>(&k_smem[qk_vec_idx]);
+        const auto k_idx = QK_VEC_SIZE * tidx;
+        const int inBlockIdx = kvCacheBuffer.getKVLocalIdx(cyclic_tlength, hi_kv, Dh, k_idx);
+        // The base pointer for the value in the cache buffer.
+        Tcache* k_cache = reinterpret_cast<Tcache*>(kvCacheBuffer.getKBlockPtr(batch_beam_idx, cyclic_tlength));
+
+        if constexpr (ENABLE_8BITS_CACHE)
+        {
+            store_8bits_kv_cache_vec(reinterpret_cast<Tcache*>(k_cache), k_vec, inBlockIdx, kv_scale_orig_quant);
+        }
+        else
+        {
+            *reinterpret_cast<Qk_vec_m*>(&k_cache[inBlockIdx]) = vec_conversion<Qk_vec_m, Qk_vec_k>(k_vec);
+        }
+    }
+
     // The warps finalize the reduction.
     qk_max = lane < WARPS_PER_BLOCK ? red_smem[lane] : -FLT_MAX;
 #pragma unroll
@@ -2107,7 +2131,7 @@ __global__ void masked_multihead_attention_kernel(
     float sum = 0.f;
 
     // Each thread will handle one float (either qk_smem/logit).
-    const int logit_loop_end = MULTI_BLOCK_FLAG ? timesteps_per_block : tlength;
+    const int logit_loop_end = MULTI_BLOCK_FLAG ? timesteps_per_block : kv_loop_length;
     for (int ti = tidx; ti <= logit_loop_end; ti += THREADS_PER_BLOCK)
     {
 
@@ -2123,13 +2147,13 @@ __global__ void masked_multihead_attention_kernel(
         else
         {
             // Not supported yet: multi-block mode with FP8_MHA
-            if (time_now < tlength && ti != timesteps_per_block)
+            if (time_now < kv_loop_length && ti != timesteps_per_block)
             {
                 float logit = __expf(qk_smem[ti] - qk_max);
                 sum += logit;
                 qk_smem[ti] = logit;
             }
-            else if (time_now == tlength)
+            else if (time_now == kv_loop_length)
             {
                 float logit = __expf(qk_current_smem[0] - qk_max);
                 sum += logit;
@@ -2149,7 +2173,7 @@ __global__ void masked_multihead_attention_kernel(
 #endif // MMHA_FP8_SCALE_P_INSTEAD_OF_V
     float inv_sum = __fdividef(logit_scale, sum + 1.e-6f);
 
-    const int normlization_loop_end = MULTI_BLOCK_FLAG ? timesteps_per_block : tlength;
+    const int normlization_loop_end = MULTI_BLOCK_FLAG ? timesteps_per_block : kv_loop_length;
     for (int ti = tidx; ti <= normlization_loop_end; ti += THREADS_PER_BLOCK)
     {
         const int time_now = MULTI_BLOCK_FLAG ? ti + c_tile_times_timesteps_per_block : ti;
@@ -2161,11 +2185,11 @@ __global__ void masked_multihead_attention_kernel(
         else
         {
             // no scaling factor inv_sum applied here, will apply the scaling factor after all blocks finished
-            if (time_now < tlength && ti != timesteps_per_block)
+            if (time_now < kv_loop_length && ti != timesteps_per_block)
             {
                 convert_from_float(&logits_smem[ti], qk_smem[ti]);
             }
-            else if (time_now == tlength)
+            else if (time_now == kv_loop_length)
             {
                 convert_from_float(&logits_current_smem[0], qk_current_smem[0]);
             }
@@ -2198,7 +2222,7 @@ __global__ void masked_multihead_attention_kernel(
     V_vec_k v_bias;
     zero(v_bias);
     // if( vo == params.timestep % V_PER_ITER ) {
-    if (is_valid_vi && HANDLE_KV && vo == tlength % V_PER_ITER)
+    if (is_valid_vi && HANDLE_KV && vo == kv_loop_length % V_PER_ITER)
     {
         // Trigger the loads from the V bias buffer.
         if (params.v_bias != nullptr)
@@ -2236,9 +2260,9 @@ __global__ void masked_multihead_attention_kernel(
         // Handle both context and generation value cache without beam searching.
         // Explicit batching of LDGs (by V_LOOP_UNROLL) as it doesn't depend on indirection tables.
         // Take all previous cache as context when we have no beam searching in order to batch as many LDGs as possible.
-        const int context_length = HAS_BEAMS ? input_length : tlength;
+        const int context_length = HAS_BEAMS ? beam0_context_length : kv_loop_length;
         int context_v_loop_end = MULTI_BLOCK_FLAG ? timesteps_per_block : context_length;
-        int generation_v_loop_end = MULTI_BLOCK_FLAG ? timesteps_per_block : tlength;
+        int generation_v_loop_end = MULTI_BLOCK_FLAG ? timesteps_per_block : kv_loop_length;
         for (int ti = vo; ti < context_v_loop_end; ti += UNROLLED_V_PER_ITER)
         {
             V_vec_m v_vec_cache[V_LOOP_UNROLL];
@@ -2247,7 +2271,7 @@ __global__ void masked_multihead_attention_kernel(
             {
                 // Fetch offset based on cache_indir when beam sampling
                 int time_idx = ti + v_loop * V_PER_ITER + (MULTI_BLOCK_FLAG ? c_tile_times_timesteps_per_block : 0);
-                time_idx = min(time_idx, tlength - 1);
+                time_idx = min(time_idx, kv_loop_length - 1);
                 int rowIdx = batch_idx * beam_width;
 
                 const int inBlockIdx = kvCacheBuffer.getKVLocalIdx(time_idx, hi_kv, Dh, vi);
@@ -2278,16 +2302,17 @@ __global__ void masked_multihead_attention_kernel(
         // Handle generation value cache with beam searching.
         if (HAS_BEAMS)
         {
-            const auto generation_start_ti = MULTI_BLOCK_FLAG ? vo : (vo + (input_length / V_PER_ITER) * V_PER_ITER);
+            const auto generation_start_ti
+                = MULTI_BLOCK_FLAG ? vo : (vo + (beam0_context_length / V_PER_ITER) * V_PER_ITER);
             // Only the last few blocks need to handle the generation value cache.
-            if (!MULTI_BLOCK_FLAG || (c_tile + 1) * timesteps_per_block > input_length)
+            if (!MULTI_BLOCK_FLAG || (c_tile + 1) * timesteps_per_block > beam0_context_length)
             {
                 for (int ti = generation_start_ti; ti < generation_v_loop_end; ti += V_PER_ITER)
                 {
                     // Fetch offset based on cache_indir when beam sampling
                     int time_idx = ti + (MULTI_BLOCK_FLAG ? c_tile_times_timesteps_per_block : 0);
                     int local_time_idx = ti;
-                    if (time_idx < input_length || (MULTI_BLOCK_FLAG && time_idx >= tlength))
+                    if (time_idx < beam0_context_length || (MULTI_BLOCK_FLAG && time_idx >= kv_loop_length))
                     {
                         continue;
                     }
@@ -2307,13 +2332,16 @@ __global__ void masked_multihead_attention_kernel(
         }
     }
 
+    // Make sure we can overwrite the v cache if using cyclic kv cache.
+    __syncthreads();
+
     // Get the c_tile_id that handles the current timestep.
     const int ctile_idx = tlength / timesteps_per_block;
 
     // One group of threads computes the product(s) for the current timestep.
-    if (vo == tlength % V_PER_ITER && is_valid_vi && (!MULTI_BLOCK_FLAG || (c_tile == ctile_idx)))
+    if (vo == kv_loop_length % V_PER_ITER && is_valid_vi && (!MULTI_BLOCK_FLAG || (c_tile == ctile_idx)))
     {
-        const int tokenIdx = tlength;
+        const int tokenIdx = cyclic_tlength;
         const int inBlockIdx = kvCacheBuffer.getKVLocalIdx(tokenIdx, hi_kv, Dh, vi);
         // The base pointer for the value in the cache buffer.
         Tcache* v_cache_base = reinterpret_cast<Tcache*>(kvCacheBuffer.getBlockPtr(v_cache_base_row_ptr, tokenIdx));
@@ -2380,7 +2408,7 @@ __global__ void masked_multihead_attention_kernel(
         // out = fma(logits_smem[params.timestep], cast_to_float(v), out);
         if (!MULTI_BLOCK_FLAG)
         {
-            out = fma(logits_smem[tlength], cast_to_float(v), out);
+            out = fma(logits_smem[kv_loop_length], cast_to_float(v), out);
         }
         else
         {
@@ -2390,7 +2418,7 @@ __global__ void masked_multihead_attention_kernel(
        // out = fma(logits_smem[params.timestep], v, out);
         if (!MULTI_BLOCK_FLAG)
         {
-            out = fma(logits_smem[tlength], v, out);
+            out = fma(logits_smem[kv_loop_length], v, out);
         }
         else
         { // MULTI_BLOCK_FLAG // Not supported yet: multi-block mode with FP8_MHA

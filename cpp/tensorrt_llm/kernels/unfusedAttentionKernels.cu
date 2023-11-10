@@ -1629,7 +1629,7 @@ INSTANTIATE_TRANSPOSE_4D(half);
 
 template <typename T, typename T_cache, typename KVCacheBuffer>
 __global__ void transpose4dBatchMajorKVCache(const T* kSrc, const T* vSrc, KVCacheBuffer kvCacheBuffer,
-    const int headNum, const int sizePerHead, const int seqLen, const float* kvScaleOrigQuant,
+    const int headNum, const int sizePerHead, const int seqLen, const int maxKvCacheLen, const float* kvScaleOrigQuant,
     const int* sequence_lengths)
 {
     // We allow only fp32/fp16/bf16 as input types
@@ -1655,13 +1655,19 @@ __global__ void transpose4dBatchMajorKVCache(const T* kSrc, const T* vSrc, KVCac
     }
 
     // Get linear token index
-    const int tokenIdx = idx / sizePerHeadDivX;
+    int tokenIdx = idx / sizePerHeadDivX;
+    // Apply cyclic kv cache if tokenIdx >= max_kv_cache_length.
+    // which means we will drop the tokens in the beginning if seqLen > max_kv_cache_length.
+    const int tokenIdxLowerBound = max(sequence_lengths[batchIdx] - maxKvCacheLen, 0);
     // Get channel index
     const int channelIdx = idx % sizePerHeadDivX;
-    if (tokenIdx >= sequence_lengths[batchIdx])
+    if (tokenIdx >= sequence_lengths[batchIdx] || tokenIdx < tokenIdxLowerBound)
     {
         return;
     }
+
+    // Apply cyclic kv cache if tokenIdx >= max_kv_cache_length.
+    tokenIdx = tokenIdx % maxKvCacheLen;
 
     // Get pointer to the dst block given sequence, head and token ids
     auto valDst = handle_k ? reinterpret_cast<T_dst*>(kvCacheBuffer.getKBlockPtr(batchIdx, tokenIdx))
@@ -1697,7 +1703,7 @@ __global__ void transpose4dBatchMajorKVCache(const T* kSrc, const T* vSrc, KVCac
 
 template <typename T, typename KVCacheBuffer>
 void invokeTranspose4dBatchMajor(const T* kSrc, const T* vSrc, KVCacheBuffer& kvTable, const int localBatchSize,
-    const int seqLen, const int maxSeqLen, const int sizePerHead, const int localHeadNum,
+    const int seqLen, const int maxKvCacheLen, const int sizePerHead, const int localHeadNum,
     const KvCacheDataType cache_type, const float* kvScaleOrigQuant, const int* sequence_lengths, cudaStream_t stream)
 {
     // Block handles both K and V tile.
@@ -1710,25 +1716,25 @@ void invokeTranspose4dBatchMajor(const T* kSrc, const T* vSrc, KVCacheBuffer& kv
     if (cache_type == KvCacheDataType::INT8)
     {
         transpose4dBatchMajorKVCache<T, int8_t, KVCacheBuffer><<<gridSz, blockSz, 0, stream>>>(
-            kSrc, vSrc, kvTable, localHeadNum, sizePerHead, seqLen, kvScaleOrigQuant, sequence_lengths);
+            kSrc, vSrc, kvTable, localHeadNum, sizePerHead, seqLen, maxKvCacheLen, kvScaleOrigQuant, sequence_lengths);
     }
 #ifdef ENABLE_FP8
     else if (cache_type == KvCacheDataType::FP8)
     {
         transpose4dBatchMajorKVCache<T, __nv_fp8_e4m3, KVCacheBuffer><<<gridSz, blockSz, 0, stream>>>(
-            kSrc, vSrc, kvTable, localHeadNum, sizePerHead, seqLen, kvScaleOrigQuant, sequence_lengths);
+            kSrc, vSrc, kvTable, localHeadNum, sizePerHead, seqLen, maxKvCacheLen, kvScaleOrigQuant, sequence_lengths);
     }
 #endif // ENABLE_FP8
     else
     {
         transpose4dBatchMajorKVCache<T, T, KVCacheBuffer><<<gridSz, blockSz, 0, stream>>>(
-            kSrc, vSrc, kvTable, localHeadNum, sizePerHead, seqLen, kvScaleOrigQuant, sequence_lengths);
+            kSrc, vSrc, kvTable, localHeadNum, sizePerHead, seqLen, maxKvCacheLen, kvScaleOrigQuant, sequence_lengths);
     }
 }
 
 #define INSTANTIATE_TRANSPOSE_4D_BATCH_MAJOR_KV_CACHE_TYPE(T, KVCacheBuffer)                                           \
     template void invokeTranspose4dBatchMajor(const T* kSrc, const T* vSrc, KVCacheBuffer& kvTable,                    \
-        const int localBatchSize, const int seqLen, const int maxSeqLen, const int sizePerHead,                        \
+        const int localBatchSize, const int seqLen, const int maxKvCacheLen, const int sizePerHead,                    \
         const int localHeadNum, const KvCacheDataType cache_type, const float* kvScaleOrigQuant,                       \
         const int* sequence_lengths, cudaStream_t stream)
 
