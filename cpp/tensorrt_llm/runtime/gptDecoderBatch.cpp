@@ -83,7 +83,7 @@ GptDecoderBatch::GptDecoderBatch(
     auto& dInput = mJointDecodingInput;
     auto dummyLogits = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     auto endIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-    dInput = std::make_unique<DecodingInput>(0, 0, std::move(dummyLogits), std::move(endIds));
+    dInput = std::make_unique<DecodingInput>(0, 0, 0, std::move(dummyLogits), std::move(endIds));
 
     dInput->sequenceLimitLength = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     dInput->lengths = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
@@ -104,8 +104,8 @@ GptDecoderBatch::GptDecoderBatch(
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatch::setup(
-    SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxSequenceLength, nvinfer1::DataType dtype)
+void GptDecoderBatch::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxKvCacheLength,
+    SizeType maxSequenceLength, nvinfer1::DataType dtype)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(maxBatchSize > 0);
@@ -114,6 +114,7 @@ void GptDecoderBatch::setup(
 
     mActualBatchSize = maxBatchSize;
     mMaxSequenceLength = maxSequenceLength;
+    mMaxKvCacheLength = maxKvCacheLength;
 
     auto const maxBatchSizeShape = ITensor::makeShape({maxBatchSize});
     auto const maxBatchSizeXmaxBeamWidth = ITensor::makeShape({maxBatchSize, maxBeamWidth});
@@ -211,7 +212,8 @@ void GptDecoderBatch::newRequest(
 
     TensorPtr endIdTensorPtr{ITensor::slice(constPointerCast(dJointInput.endIds), batchIdx, localBatchSize)};
     kernels::invokeFill(*endIdTensorPtr, endId, *stream);
-    dInput = std::make_unique<DecodingInput>(inputLength, localBatchSize, dJointInput.logits, endIdTensorPtr);
+    dInput = std::make_unique<DecodingInput>(
+        inputLength, mMaxKvCacheLength, localBatchSize, dJointInput.logits, endIdTensorPtr);
 
     // Here, we need to add leading 1 dimension since decoderInput expects batchSize as leading dim
     // and decoder_batch::Request doesn't have batch dimension
@@ -458,17 +460,30 @@ void GptDecoderBatch::newBatch(GenerationInput const& inputs, SamplingConfig con
         }
         auto request = decoder_batch::Request{inputView, inputs.maxNewTokens, inputs.endId, inputs.padId};
 
-        if (inputs.embeddingBiasOpt)
+        if (inputs.embeddingBias)
         {
             TLLM_THROW("newBatch doesn't support embeddingBias yet.");
         }
         if (inputs.badWordsList)
         {
-            TLLM_THROW("newBatch doesn't support badWordsList yet.");
+            auto const& shape = inputs.badWordsList->getShape();
+            if (shape.nbDims == 2)
+            {
+                request.badWordsList = inputs.badWordsList;
+            }
+            else
+            {
+                assert(shape.nbDims == 3);
+                TensorPtr badWordsListView = ITensor::slice(inputs.badWordsList, batchIdx, 1);
+                badWordsListView->squeeze(0);
+                request.badWordsList = badWordsListView;
+            }
         }
         if (inputs.stopWordsList)
         {
-            TLLM_THROW("newBatch doesn't support stopWordsList yet.");
+            TensorPtr stopWordsListView = ITensor::slice(inputs.stopWordsList, batchIdx, 1);
+            stopWordsListView->squeeze(0);
+            request.stopWordsList = stopWordsListView;
         }
         newRequest(batchIdx, request, extractSamplingConfig(samplingConfig, batchIdx));
     }

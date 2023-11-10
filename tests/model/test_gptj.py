@@ -223,6 +223,7 @@ class TestGPTJ(unittest.TestCase):
                        last_token_ids,
                        cache_indirection,
                        host_past_key_value_lengths,
+                       host_max_kv_cache_lengths,
                        sequence_length,
                        host_context_lengths=None):
 
@@ -238,6 +239,8 @@ class TestGPTJ(unittest.TestCase):
             }
             for i in range(gpt_config.n_layer):
                 ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
+                ctx_buffer[
+                    f'host_max_kv_cache_length_{i}'] = host_max_kv_cache_lengths
                 ctx_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[
                     i]
 
@@ -312,6 +315,9 @@ class TestGPTJ(unittest.TestCase):
                                               dtype=torch.int32).cpu()
             host_past_key_value_lengths = torch.tensor([0] * batch_size,
                                                        dtype=torch.int32)
+            host_max_kv_cache_lengths = torch.tensor([total_seq_len],
+                                                     dtype=torch.int32)
+
             host_context_lengths = ctx_context_lengths.cpu(
             ) if enable_remove_input_padding else None
 
@@ -323,6 +329,7 @@ class TestGPTJ(unittest.TestCase):
                 last_token_ids=ctx_last_token_ids,
                 cache_indirection=cache_indirections[0],
                 host_past_key_value_lengths=host_past_key_value_lengths,
+                host_max_kv_cache_lengths=host_max_kv_cache_lengths,
                 sequence_length=sequence_length_buffer,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types)
@@ -387,6 +394,9 @@ class TestGPTJ(unittest.TestCase):
             host_past_key_value_lengths = torch.tensor([seq_len] * batch_size,
                                                        dtype=torch.int32)
 
+            host_max_kv_cache_lengths = torch.tensor([total_seq_len],
+                                                     dtype=torch.int32)
+
             host_request_types = torch.tensor([1] * batch_size,
                                               dtype=torch.int32).cpu()
             host_context_lengths = gen_context_lengths.cpu(
@@ -404,6 +414,7 @@ class TestGPTJ(unittest.TestCase):
                 last_token_ids=gen_last_token_ids,
                 cache_indirection=cache_indirections[1],
                 host_past_key_value_lengths=host_past_key_value_lengths,
+                host_max_kv_cache_lengths=host_max_kv_cache_lengths,
                 sequence_length=sequence_length_buffer,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types)

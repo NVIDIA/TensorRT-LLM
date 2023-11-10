@@ -99,8 +99,8 @@ public:
 
     ~mhaImpl() {}
 
-    void setup(const int b, const int s, const int total_seqlen, const bool has_alibi, const bool scale_alibi,
-        const int tp_size, const int tp_rank)
+    void setup(const int b, const int s, const int sliding_window_size, const int total_seqlen, const bool has_alibi,
+        const bool scale_alibi, const int tp_size, const int tp_rank)
     {
         const float inv_sqrt_scale = (1.f / (sqrtf(mHeadSize) * mQScaling));
         // Note that we apply scales and bias in the order of
@@ -170,10 +170,18 @@ public:
             launch_params.use_tma = true;
         }
 
+        // alibi.
         if (has_alibi)
         {
             params.has_alibi = true;
             params.alibi_params = AlibiParams(mNumHeads, s, tp_size, tp_rank, scale_after_alibi);
+        }
+
+        // Sliding_window_causal mask.
+        if (s > sliding_window_size && launch_params.attention_mask_type == ContextAttentionMaskType::CAUSAL)
+        {
+            params.sliding_window_size = sliding_window_size;
+            launch_params.attention_mask_type = ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL;
         }
     }
 
@@ -271,8 +279,6 @@ public:
     {
         // BF16 FMHA only accumulates on FP32
         launch_params.force_fp32_acc = mDataType == DATA_TYPE_BF16 || force_fp32_acc;
-        // sliding_window_causal is disabled temporally.
-        // TODO (perkzz): It will be enabled when the sliding window attention is fully supported.
         launch_params.attention_mask_type
             = causal_mask ? ContextAttentionMaskType::CAUSAL : ContextAttentionMaskType::PADDING;
         params.h_kv = num_kv_heads;
@@ -360,10 +366,10 @@ FusedMHARunnerV2::FusedMHARunnerV2(
 
 FusedMHARunnerV2::~FusedMHARunnerV2() = default;
 
-void FusedMHARunnerV2::setup(const int b, const int s, const int total_seqlen, const bool has_alibi,
-    const bool scale_alibi, const int tp_size, const int tp_rank)
+void FusedMHARunnerV2::setup(const int b, const int s, const int sliding_window_size, const int total_seqlen,
+    const bool has_alibi, const bool scale_alibi, const int tp_size, const int tp_rank)
 {
-    pimpl->setup(b, s, total_seqlen, has_alibi, scale_alibi, tp_size, tp_rank);
+    pimpl->setup(b, s, sliding_window_size, total_seqlen, has_alibi, scale_alibi, tp_size, tp_rank);
 }
 
 bool FusedMHARunnerV2::fmha_supported()

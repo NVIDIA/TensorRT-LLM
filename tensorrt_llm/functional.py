@@ -3051,6 +3051,7 @@ def gpt_attention(
         past_key_value: Tensor,
         sequence_length: Tensor,
         host_past_key_value_lengths: Tensor,
+        host_max_kv_cache_lengths: Tensor,
         context_lengths: Tensor,
         cache_indirection: Tensor,
         host_request_types: Tensor,
@@ -3065,7 +3066,6 @@ def gpt_attention(
         rotary_embedding_max_positions: int = 1024,
         position_embedding_type: PositionEmbeddingType = PositionEmbeddingType.
     learned_absolute,
-        multi_block_mode: bool = False,
         kv_orig_quant_scale: Tensor = None,
         kv_quant_orig_scale: Tensor = None,
         kv_cache_quant_mode: QuantMode = None,
@@ -3113,6 +3113,11 @@ def gpt_attention(
 
         host past_key_value_length: Tensor
             An INT32 tensor of shape [batch_size].
+
+        host max_kv_cache_lengths: Tensor
+            An INT32 tensor of shape [1].
+            by default, the max_kv_cache_length is determined by the shape of cache_indir_table.
+            And we support flexible max_kv_cache_length (or max_past_length) for each layer.
 
         context_lengths: Tensor
             The tensor that stores the context-phase sequence length of each request. Its shape
@@ -3170,10 +3175,6 @@ def gpt_attention(
                 * PositionEmbeddingType.rope_gpt_neox
                 * PositionEmbeddingType.alibi
                 * PositionEmbeddingType.alibi_with_scale
-
-        multi_block_mode: bool
-            Do we enable multi-block for the masked MHA. See Generation Phase
-            in docs/gpt_attention.md,
 
         kv_orig_quant_scale: Tensor
             The tensor to store the scaling factor for quantization to INT8/FP8
@@ -3252,6 +3253,7 @@ def gpt_attention(
     assert host_context_lengths is not None or not default_net(
     ).plugin_config.remove_input_padding
     assert isinstance(max_context_length, int)
+    assert host_max_kv_cache_lengths is not None
 
     paged_kv_cache_flag = default_net().plugin_config.paged_kv_cache
 
@@ -3308,8 +3310,9 @@ def gpt_attention(
                                                       np.int32),
                                 trt.PluginFieldType.INT32)
     multi_block_mode = trt.PluginField(
-        "multi_block_mode", np.array(np.int8(multi_block_mode), dtype=np.int8),
-        trt.PluginFieldType.INT8)
+        "multi_block_mode",
+        np.array(np.int8(default_net().plugin_config.multi_block_mode),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
     tp_size = trt.PluginField("tp_size", np.array(tp_size, dtype=np.int32),
                               trt.PluginFieldType.INT32)
     tp_rank = trt.PluginField("tp_rank", np.array(tp_rank, dtype=np.int32),
@@ -3360,6 +3363,7 @@ def gpt_attention(
         tensor,
         sequence_length,
         host_past_key_value_lengths,
+        host_max_kv_cache_lengths,
         context_lengths,
         cache_indirection,
         host_request_types,
@@ -3404,7 +3408,7 @@ def gpt_attention(
 
     if kv_cache_quant_mode.has_int8_kv_cache() and not paged_kv_cache_flag:
         # past key value
-        layer.get_input(6).set_dynamic_range(-127, 127)
+        layer.get_input(7).set_dynamic_range(-127, 127)
         # present key value
         layer.get_output(1).set_dynamic_range(-127, 127)
 

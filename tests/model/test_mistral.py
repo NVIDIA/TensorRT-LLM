@@ -24,7 +24,7 @@ import numpy as np
 import pytest
 import torch
 from parameterized import parameterized
-from transformers import LlamaConfig, LlamaForCausalLM
+from transformers import MistralConfig, MistralForCausalLM
 
 import tensorrt_llm
 from tensorrt_llm import Builder
@@ -40,12 +40,12 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import getSMVersion
 
 
-class TestLLaMA(unittest.TestCase):
+class TestMistral(unittest.TestCase):
     EOS_TOKEN = 2
     PAD_TOKEN = 2
 
-    def _gen_tensorrt_llm_network(self, network, hf_llama,
-                                  llama_config: LlamaConfig, batch_size,
+    def _gen_tensorrt_llm_network(self, network, hf_mistral,
+                                  mistral_config: MistralConfig, batch_size,
                                   beam_width, input_len, output_len, dtype,
                                   rank, tensor_parallel):
         list(range(tensor_parallel))
@@ -54,34 +54,34 @@ class TestLLaMA(unittest.TestCase):
             kv_dtype = str_dtype_to_trt(dtype)
 
             # Initialize model
-            tensorrt_llm_llama = tensorrt_llm.models.LLaMAForCausalLM(
-                num_layers=llama_config.num_hidden_layers,
-                num_heads=llama_config.num_attention_heads,
-                num_kv_heads=llama_config.num_key_value_heads,
-                hidden_size=llama_config.hidden_size,
-                vocab_size=llama_config.vocab_size,
-                hidden_act=llama_config.hidden_act,
-                max_position_embeddings=llama_config.max_position_embeddings,
+            tensorrt_llm_mistral = tensorrt_llm.models.LLaMAForCausalLM(
+                num_layers=mistral_config.num_hidden_layers,
+                num_heads=mistral_config.num_attention_heads,
+                num_kv_heads=mistral_config.num_key_value_heads,
+                hidden_size=mistral_config.hidden_size,
+                vocab_size=mistral_config.vocab_size,
+                hidden_act=mistral_config.hidden_act,
+                max_position_embeddings=mistral_config.max_position_embeddings,
                 dtype=kv_dtype,
-                mlp_hidden_size=llama_config.intermediate_size,
+                mlp_hidden_size=mistral_config.intermediate_size,
                 position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
                 mapping=tensorrt_llm.Mapping(world_size=tensor_parallel,
                                              tp_size=tensor_parallel),
             )
-            load_from_hf_llama(tensorrt_llm_llama,
-                               hf_llama,
+            load_from_hf_llama(tensorrt_llm_mistral,
+                               hf_mistral,
                                dtype=dtype,
                                mapping=tensorrt_llm.Mapping(
                                    world_size=tensor_parallel,
                                    rank=rank,
                                    tp_size=tensor_parallel))
             # Prepare
-            network.set_named_parameters(tensorrt_llm_llama.named_parameters())
-            inputs = tensorrt_llm_llama.prepare_inputs(batch_size, input_len,
-                                                       output_len, True,
-                                                       beam_width)
+            network.set_named_parameters(
+                tensorrt_llm_mistral.named_parameters())
+            inputs = tensorrt_llm_mistral.prepare_inputs(
+                batch_size, input_len, output_len, True, beam_width)
             # Forward
-            tensorrt_llm_llama(*inputs)
+            tensorrt_llm_mistral(*inputs)
 
         return network
 
@@ -158,22 +158,9 @@ class TestLLaMA(unittest.TestCase):
 
     def load_test_cases():
         test_cases = list(
-            product([False], [False, True], [
-                ContextFMHAType.disabled, ContextFMHAType.enabled,
-                ContextFMHAType.enabled_with_fp32_acc
-            ], [False, True], ['float16'], [0]))
-        test_cases.append(
-            (False, True, ContextFMHAType.disabled, False, 'bfloat16', 0))
-        test_cases.append(
-            (False, True, ContextFMHAType.enabled, False, 'float16', 1))  # MQA
-        test_cases.append(
-            (False, True, ContextFMHAType.disabled, False, 'float32', 0))
-        test_cases.append((False, True, ContextFMHAType.disabled, False,
-                           'bfloat16', 2))  # GQA
-        test_cases.append(
-            (False, True, ContextFMHAType.enabled, False, 'float16', 2))  # GQA
-        test_cases.append((False, True, ContextFMHAType.enabled_with_fp32_acc,
-                           False, 'float16', 4))  # GQA
+            product([False], [False, True],
+                    [ContextFMHAType.disabled, ContextFMHAType.enabled],
+                    [False, True], ['float16', 'bfloat16'], [2, 4]))
         return test_cases
 
     def custom_name_func(testcase_func, param_num, param):
@@ -183,8 +170,8 @@ class TestLLaMA(unittest.TestCase):
         )
 
     @parameterized.expand(load_test_cases, name_func=custom_name_func)
-    def test_llama(self, use_refit, fast_building, context_fmha_flag,
-                   enable_remove_input_padding, dtype, num_kv_heads):
+    def test_mistral(self, use_refit, fast_building, context_fmha_flag,
+                     enable_remove_input_padding, dtype, num_kv_heads):
 
         # Skip tests that are not supported in pre-ampere architecture
         if getSMVersion() < 80:
@@ -212,39 +199,37 @@ class TestLLaMA(unittest.TestCase):
         world_size = 1
         head_size = 32
         rank = 0
-        llama_config = LlamaConfig()
-        llama_config.hidden_act = 'silu'
-        llama_config.num_hidden_layers = 2
-        llama_config.max_position_embeddings = 64
-        llama_config.vocab_size = 128
-        llama_config.num_attention_heads = 2 if num_kv_heads <= 1 else 2 * num_kv_heads
-        llama_config.hidden_size = llama_config.num_attention_heads * head_size
-        llama_config.intermediate_size = ((
-            (llama_config.hidden_size * 4 * 2 // 3) + head_size - 1) //
-                                          head_size) * head_size
-        if hasattr(llama_config, "num_key_value_heads"):
-            llama_config.num_key_value_heads = num_kv_heads if num_kv_heads != 0 else llama_config.num_attention_heads
-            print(llama_config.num_key_value_heads)
-            assert (llama_config.num_attention_heads %
-                    llama_config.num_key_value_heads) == 0
-        llama_config.pad_token_id = self.PAD_TOKEN
-        llama_config.eos_token_id = self.EOS_TOKEN
+        mistral_config = MistralConfig()
+        mistral_config.hidden_act = 'silu'
+        mistral_config.num_hidden_layers = 2
+        mistral_config.max_position_embeddings = 64
+        mistral_config.vocab_size = 128
+        mistral_config.num_attention_heads = 2 * num_kv_heads
+        mistral_config.hidden_size = mistral_config.num_attention_heads * head_size
+        mistral_config.intermediate_size = ((
+            (mistral_config.hidden_size * 4 * 2 // 3) + head_size - 1) //
+                                            head_size) * head_size
+        mistral_config.num_key_value_heads = num_kv_heads
+        assert (mistral_config.num_attention_heads %
+                mistral_config.num_key_value_heads) == 0
+        mistral_config.pad_token_id = self.PAD_TOKEN
+        mistral_config.eos_token_id = self.EOS_TOKEN
         seed_idx = random.randint(0, len(PRECHECKED_GOOD_RANDOM_SEEDS) - 1)
         torch.manual_seed(PRECHECKED_GOOD_RANDOM_SEEDS[seed_idx])
-        hf_llama = LlamaForCausalLM(llama_config).cuda()
+        hf_mistral = MistralForCausalLM(mistral_config).cuda()
         runtime, _ = self._gen_tensorrt_llm_runtime(
-            log_level, dtype, world_size, rank, llama_config, hf_llama, model,
-            use_plugin, batch_size, beam_width, input_len, output_len,
+            log_level, dtype, world_size, rank, mistral_config, hf_mistral,
+            model, use_plugin, batch_size, beam_width, input_len, output_len,
             use_refit, fast_building, context_fmha_flag,
             enable_remove_input_padding)
         key_value_cache_buffers = []
-        head_size = llama_config.hidden_size // llama_config.num_attention_heads
-        for i in range(llama_config.num_hidden_layers):
+        head_size = mistral_config.hidden_size // mistral_config.num_attention_heads
+        for i in range(mistral_config.num_hidden_layers):
             key_value_cache_buffers.append(
                 torch.zeros((
                     batch_size,
                     2,
-                    llama_config.num_key_value_heads,
+                    mistral_config.num_key_value_heads,
                     max_seq_len,
                     head_size,
                 ),
@@ -270,7 +255,7 @@ class TestLLaMA(unittest.TestCase):
         sequence_length_buffer = ctx_context_lengths.detach().clone()
 
         with torch.no_grad():
-            hf_outputs = hf_llama.forward(ctx_ids)
+            hf_outputs = hf_mistral.forward(ctx_ids)
         torch.cuda.synchronize()
         ref = hf_outputs.logits[:, -1, :]
 
@@ -312,9 +297,9 @@ class TestLLaMA(unittest.TestCase):
 
         ctx_shape = {k: v.shape for k, v in ctx_buffer.items()}
 
-        kv_shape = (batch_size, 2, llama_config.num_key_value_heads,
+        kv_shape = (batch_size, 2, mistral_config.num_key_value_heads,
                     max_seq_len, head_size)
-        for i in range(llama_config.num_hidden_layers):
+        for i in range(mistral_config.num_hidden_layers):
             ctx_shape[f'past_key_value_{i}'] = kv_shape
             ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             ctx_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
@@ -348,7 +333,7 @@ class TestLLaMA(unittest.TestCase):
                                               dtype=torch.int32)
 
         with torch.no_grad():
-            hf_outputs = hf_llama.forward(
+            hf_outputs = hf_mistral.forward(
                 step1_id,
                 past_key_values=hf_outputs.past_key_values,
                 use_cache=True)
@@ -375,12 +360,12 @@ class TestLLaMA(unittest.TestCase):
 
         step1_shape = {k: v.shape for k, v in step1_buffer.items()}
 
-        for i in range(llama_config.num_hidden_layers):
+        for i in range(mistral_config.num_hidden_layers):
             step1_shape[f'past_key_value_{i}'] = kv_shape
             step1_shape[f'host_max_kv_cache_length_{i}'] = (1, )
         step1_shape['sequence_length'] = (batch_size, )
         step1_shape['host_past_key_value_lengths'] = (batch_size, )
-        for i in range(llama_config.num_hidden_layers):
+        for i in range(mistral_config.num_hidden_layers):
             step1_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             step1_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
             step1_buffer[f'host_max_kv_cache_length_{i}'] = torch.tensor(
@@ -406,7 +391,7 @@ class TestLLaMA(unittest.TestCase):
         test_cases.extend(
             list(
                 product([
-                    ("llama-7b-hf", "7B"),
+                    ("mistral-7b-hf", "mistral-7b"),
                 ], [
                     (1, 0),
                     (2, 0),
@@ -416,16 +401,6 @@ class TestLLaMA(unittest.TestCase):
                     0,
                     1,
                 ])))
-        test_cases.extend(
-            list(
-                product([
-                    ("llama-7b-4gqa-hf", "7B-4GQA"),
-                ], [(1, 0), (2, 0), (2, 1), (4, 0), (4, 1)], [-1, 0, 1])))
-        test_cases.extend(
-            list(
-                product([
-                    ("llama-7b-4gqa-hf", "7B-4GQA"),
-                ], [(8, 0), (8, 7)], [-1, 0, 1])))
         return test_cases
 
     def loader_name_func(testcase_func, param_num, param):
@@ -444,15 +419,13 @@ class TestLLaMA(unittest.TestCase):
         model_root = os.getenv("LLM_MODELS_ROOT")
         if model_root is None:
             pytest.skip("Skipping since real weights are unavailable.")
-        model_root = Path(
-            model_root,
-            "llama-synthetic" if paths[0].find("gqa") >= 0 else "llama-models")
         hf_path = Path(model_root, paths[0])
-        meta_path = Path(model_root, paths[1])
+        mistralai_path = Path(model_root, paths[1])
         if not hf_path.exists():
             pytest.skip(f"Skipping since the path {hf_path} does not exist.")
-        if not meta_path.exists():
-            pytest.skip(f"Skipping since the path {meta_path} does not exist.")
+        if not mistralai_path.exists():
+            pytest.skip(
+                f"Skipping since the path {mistralai_path} does not exist.")
 
         def print_corner(name, t: np.ndarray):
             if len(t.shape) == 1:
@@ -481,120 +454,121 @@ class TestLLaMA(unittest.TestCase):
         dtype = "float16"
         use_parallel_embedding = (emb_sharding_dim >= 0)
         embedding_sharding_dim = abs(emb_sharding_dim)
-        hf_llama = LlamaForCausalLM.from_pretrained(
+        hf_mistral = MistralForCausalLM.from_pretrained(
             hf_path,
             device_map={
                 "model": "cpu",
                 "lm_head": "cpu"
             },  # Load to CPU memory
             torch_dtype="auto")
-        assert hf_llama.config.torch_dtype == torch.float16
-        kv_dtype = trt.float16 if hf_llama.config.torch_dtype == torch.float16 else trt.float32
+        assert hf_mistral.config.torch_dtype == torch.float16
+        kv_dtype = trt.float16 if hf_mistral.config.torch_dtype == torch.float16 else trt.float32
         max_context_length = 128  # for loader tests this value does not matter
-        tensorrt_llm_llama_wHF = tensorrt_llm.models.LLaMAForCausalLM(
-            num_layers=hf_llama.config.num_hidden_layers,
-            num_heads=hf_llama.config.num_attention_heads,
-            num_kv_heads=hf_llama.config.num_key_value_heads,
-            hidden_size=hf_llama.config.hidden_size,
-            vocab_size=hf_llama.config.vocab_size,
-            hidden_act=hf_llama.config.hidden_act,
-            max_position_embeddings=hf_llama.config.max_position_embeddings,
+        tensorrt_llm_mistral_wHF = tensorrt_llm.models.LLaMAForCausalLM(
+            num_layers=hf_mistral.config.num_hidden_layers,
+            num_heads=hf_mistral.config.num_attention_heads,
+            num_kv_heads=hf_mistral.config.num_key_value_heads,
+            hidden_size=hf_mistral.config.hidden_size,
+            vocab_size=hf_mistral.config.vocab_size,
+            hidden_act=hf_mistral.config.hidden_act,
+            max_position_embeddings=hf_mistral.config.max_position_embeddings,
             dtype=kv_dtype,
-            mlp_hidden_size=hf_llama.config.intermediate_size,
+            mlp_hidden_size=hf_mistral.config.intermediate_size,
             position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
             mapping=tensorrt_llm.Mapping(world_size=tp_size,
                                          rank=rank,
                                          tp_size=tp_size),
             use_parallel_embedding=use_parallel_embedding,
             embedding_sharding_dim=embedding_sharding_dim)
-        # print_layers(tensorrt_llm_llama_wHF)
-        load_from_hf_llama(tensorrt_llm_llama_wHF,
-                           hf_llama,
+        # print_layers(tensorrt_llm_mistral_wHF)
+        load_from_hf_llama(tensorrt_llm_mistral_wHF,
+                           hf_mistral,
                            mapping=tensorrt_llm.Mapping(world_size=tp_size,
                                                         rank=rank,
                                                         tp_size=tp_size),
                            dtype=dtype)
-        # print_layers(tensorrt_llm_llama_wHF)
+        # print_layers(tensorrt_llm_mistral_wHF)
 
-        tensorrt_llm_llama_wMETA = tensorrt_llm.models.LLaMAForCausalLM(
-            num_layers=hf_llama.config.num_hidden_layers,
-            num_heads=hf_llama.config.num_attention_heads,
-            num_kv_heads=hf_llama.config.num_key_value_heads,
-            hidden_size=hf_llama.config.hidden_size,
-            vocab_size=hf_llama.config.vocab_size,
-            hidden_act=hf_llama.config.hidden_act,
-            max_position_embeddings=hf_llama.config.max_position_embeddings,
+        tensorrt_llm_mistral_wMAI = tensorrt_llm.models.LLaMAForCausalLM(
+            num_layers=hf_mistral.config.num_hidden_layers,
+            num_heads=hf_mistral.config.num_attention_heads,
+            num_kv_heads=hf_mistral.config.num_key_value_heads,
+            hidden_size=hf_mistral.config.hidden_size,
+            vocab_size=hf_mistral.config.vocab_size,
+            hidden_act=hf_mistral.config.hidden_act,
+            max_position_embeddings=hf_mistral.config.max_position_embeddings,
             dtype=kv_dtype,
-            mlp_hidden_size=hf_llama.config.intermediate_size,
+            mlp_hidden_size=hf_mistral.config.intermediate_size,
             position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
             mapping=tensorrt_llm.Mapping(world_size=tp_size,
                                          rank=rank,
                                          tp_size=tp_size),
             use_parallel_embedding=use_parallel_embedding,
             embedding_sharding_dim=embedding_sharding_dim)
-        # print_layers(tensorrt_llm_llama_wMETA)
-        load_from_meta_llama(tensorrt_llm_llama_wMETA,
-                             meta_path,
+        # print_layers(tensorrt_llm_mistral_wMAI)
+        load_from_meta_llama(tensorrt_llm_mistral_wMAI,
+                             mistralai_path,
                              mapping=tensorrt_llm.Mapping(world_size=tp_size,
                                                           rank=rank,
                                                           tp_size=tp_size),
                              dtype=dtype)
-        # print_layers(tensorrt_llm_llama_wMETA)
+        # print_layers(tensorrt_llm_mistral_wMAI)
         # token embedding
         np.testing.assert_allclose(
-            tensorrt_llm_llama_wHF.vocab_embedding.weight._value,
-            tensorrt_llm_llama_wMETA.vocab_embedding.weight._value,
+            tensorrt_llm_mistral_wHF.vocab_embedding.weight._value,
+            tensorrt_llm_mistral_wMAI.vocab_embedding.weight._value,
             atol=1e-3)
         # output
         np.testing.assert_allclose(
-            tensorrt_llm_llama_wHF.lm_head.weight._value,
-            tensorrt_llm_llama_wMETA.lm_head.weight._value,
+            tensorrt_llm_mistral_wHF.lm_head.weight._value,
+            tensorrt_llm_mistral_wMAI.lm_head.weight._value,
             atol=1e-3)
         # norm
-        np.testing.assert_allclose(tensorrt_llm_llama_wHF.ln_f.weight._value,
-                                   tensorrt_llm_llama_wMETA.ln_f.weight._value,
+        np.testing.assert_allclose(tensorrt_llm_mistral_wHF.ln_f.weight._value,
+                                   tensorrt_llm_mistral_wMAI.ln_f.weight._value,
                                    atol=1e-3)
         # Checking all of the layers takes too much time, just check one random layer
-        l = np.random.randint(0, tensorrt_llm_llama_wHF.num_layers)
-        # for l in range(tensorrt_llm_llama_wHF.num_layers):
+        l = np.random.randint(0, tensorrt_llm_mistral_wHF.num_layers)
+        # for l in range(tensorrt_llm_mistral_wHF.num_layers):
         if l >= 0:
             print(f"Checking Layer-{l} weights ...", flush=True)
             # layer{l}.input_layernorm
-            np.testing.assert_allclose(
-                tensorrt_llm_llama_wHF.layers[l].input_layernorm.weight._value,
-                tensorrt_llm_llama_wMETA.layers[l].input_layernorm.weight.
-                _value,
-                atol=1e-3)
+            np.testing.assert_allclose(tensorrt_llm_mistral_wHF.layers[l].
+                                       input_layernorm.weight._value,
+                                       tensorrt_llm_mistral_wMAI.layers[l].
+                                       input_layernorm.weight._value,
+                                       atol=1e-3)
             # layer{l}.post_layernorm
             np.testing.assert_allclose(
-                tensorrt_llm_llama_wHF.layers[l].post_layernorm.weight._value,
-                tensorrt_llm_llama_wMETA.layers[l].post_layernorm.weight._value,
+                tensorrt_llm_mistral_wHF.layers[l].post_layernorm.weight._value,
+                tensorrt_llm_mistral_wMAI.layers[l].post_layernorm.weight.
+                _value,
                 atol=1e-3)
             # layer{l}.mlp.gate
             np.testing.assert_allclose(
-                tensorrt_llm_llama_wHF.layers[l].mlp.gate.weight._value,
-                tensorrt_llm_llama_wMETA.layers[l].mlp.gate.weight._value,
+                tensorrt_llm_mistral_wHF.layers[l].mlp.gate.weight._value,
+                tensorrt_llm_mistral_wMAI.layers[l].mlp.gate.weight._value,
                 atol=1e-3)
             # layer{l}.mlp.proj
             np.testing.assert_allclose(
-                tensorrt_llm_llama_wHF.layers[l].mlp.proj.weight._value,
-                tensorrt_llm_llama_wMETA.layers[l].mlp.proj.weight._value,
+                tensorrt_llm_mistral_wHF.layers[l].mlp.proj.weight._value,
+                tensorrt_llm_mistral_wMAI.layers[l].mlp.proj.weight._value,
                 atol=1e-3)
             # layer{l}.mlp.fc
             np.testing.assert_allclose(
-                tensorrt_llm_llama_wHF.layers[l].mlp.fc.weight._value,
-                tensorrt_llm_llama_wMETA.layers[l].mlp.fc.weight._value,
+                tensorrt_llm_mistral_wHF.layers[l].mlp.fc.weight._value,
+                tensorrt_llm_mistral_wMAI.layers[l].mlp.fc.weight._value,
                 atol=1e-3)
             # layer{l}.dense
-            np.testing.assert_allclose(
-                tensorrt_llm_llama_wHF.layers[l].attention.dense.weight._value,
-                tensorrt_llm_llama_wMETA.layers[l].attention.dense.weight.
-                _value,
-                atol=1e-3)
+            np.testing.assert_allclose(tensorrt_llm_mistral_wHF.layers[l].
+                                       attention.dense.weight._value,
+                                       tensorrt_llm_mistral_wMAI.layers[l].
+                                       attention.dense.weight._value,
+                                       atol=1e-3)
             # layer{l}.qkv
             np.testing.assert_allclose(
-                tensorrt_llm_llama_wHF.layers[l].attention.qkv.weight._value,
-                tensorrt_llm_llama_wMETA.layers[l].attention.qkv.weight._value,
+                tensorrt_llm_mistral_wHF.layers[l].attention.qkv.weight._value,
+                tensorrt_llm_mistral_wMAI.layers[l].attention.qkv.weight._value,
                 atol=1e-3)
         return
 

@@ -54,7 +54,7 @@ public:
     bool packed;       // indicates if ids are packed or padded to maxInputLength
 
     // optional parameters
-    TensorPtr embeddingBiasOpt;           // [vocabSizePadded], on gpu
+    TensorPtr embeddingBias;              // [vocabSizePadded], on gpu
     TensorPtr badWordsList;               // [2, badWordsLength] or [batchSize, 2, badWordsLength], on gpu
     TensorPtr stopWordsList;              // [batchSize, 2, stopWordsLength], on gpu
     std::optional<SizeType> maxNewTokens; // max number of tokens to generate

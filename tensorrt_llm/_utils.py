@@ -34,6 +34,12 @@ def torch_to_numpy(x: torch.Tensor):
     return x.view(torch.int16).cpu().numpy().view(np_bfloat16)
 
 
+def numpy_to_torch(x):
+    if x.dtype != np_bfloat16:
+        return torch.tensor(x)
+    return torch.tensor(x.view(np.int16)).view(torch.bfloat16)
+
+
 fp32_array = partial(np.array, dtype=np.float32)
 fp16_array = partial(np.array, dtype=np.float16)
 int32_array = partial(np.array, dtype=np.int32)

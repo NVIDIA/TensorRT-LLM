@@ -160,6 +160,7 @@ def main(build_type: str = "Release",
 
     if cpp_only:
         assert not install, "Installing is not supported for cpp_only builds"
+        assert not python_bindings, "Python bindings are not supported for cpp_only builds"
         return
 
     pkg_dir = project_dir / "tensorrt_llm"

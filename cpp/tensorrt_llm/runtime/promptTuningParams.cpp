@@ -21,7 +21,7 @@ namespace tensorrt_llm::runtime
 
 void PromptTuningParams::fillTasksTensor(TensorPtr tasksHost, const SizeType batchSize,
     const SizeType numContextRequests, const std::vector<SizeType>& reqBeamWidths,
-    const std::vector<SizeType>& reqPromptLengths, BufferManager& manager, bool packedInput)
+    const std::vector<SizeType>& reqPromptLengths, BufferManager const& manager, bool packedInput)
 {
     auto const& tasksHostShape = tasksHost->getShape();
     TLLM_CHECK_WITH_INFO(tasksHostShape.nbDims == 1, "tasksHost expected to have dimension [batchSize]");

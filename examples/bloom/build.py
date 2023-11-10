@@ -159,6 +159,14 @@ def parse_arguments():
                         default=False,
                         action='store_true')
     parser.add_argument(
+        '--multi_block_mode',
+        default=False,
+        action='store_true',
+        help=
+        'Split long kv sequence into multiple blocks (applied to generation MHA kernels). \
+                        It is beneifical when batchxnum_heads cannot fully utilize GPU.'
+    )
+    parser.add_argument(
         '--use_layernorm_plugin',
         nargs='?',
         const='float16',
@@ -261,6 +269,13 @@ def parse_arguments():
         default=False,
         choices=['float16', 'float32', 'bfloat16'],
         help="Activates the lookup plugin which enables embedding sharing.")
+    parser.add_argument(
+        '--strongly_typed',
+        default=False,
+        action="store_true",
+        help=
+        'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
+    )
 
     args = parser.parse_args()
     logger.set_level(args.log_level)
@@ -395,6 +410,8 @@ def build_rank_engine(builder: Builder,
     if args.enable_context_fmha_fp32_acc:
         network.plugin_config.set_context_fmha(
             ContextFMHAType.enabled_with_fp32_acc)
+    if args.multi_block_mode:
+        network.plugin_config.enable_mmha_multi_block_mode()
     # Quantization plugins.
     if args.use_smooth_quant:
         network.plugin_config.set_smooth_quant_gemm_plugin(dtype=args.dtype)
@@ -476,7 +493,8 @@ def build(rank, args):
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             int8=int8_trt_flag,
-            quant_mode=args.quant_mode)
+            quant_mode=args.quant_mode,
+            strongly_typed=args.strongly_typed)
         builder_config.trt_builder_config.builder_optimization_level = 1
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.world_size,
                                       cur_rank)

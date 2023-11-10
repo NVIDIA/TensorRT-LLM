@@ -29,14 +29,17 @@ class KvCacheConfig
 public:
     using SizeType = tensorrt_llm::runtime::SizeType;
 
-    explicit KvCacheConfig(
-        std::optional<SizeType> maxTokens = std::nullopt, std::optional<float> freeGpuMemoryFraction = std::nullopt)
+    explicit KvCacheConfig(std::optional<SizeType> maxTokens = std::nullopt,
+        std::optional<SizeType> maxKvCacheLength = std::nullopt,
+        std::optional<float> freeGpuMemoryFraction = std::nullopt)
         : maxTokens{maxTokens}
+        , maxKvCacheLength{maxKvCacheLength}
         , freeGpuMemoryFraction{freeGpuMemoryFraction}
     {
     }
 
     std::optional<SizeType> maxTokens;
+    std::optional<SizeType> maxKvCacheLength;
     std::optional<float> freeGpuMemoryFraction;
 
     static constexpr auto kDefaultGpuMemFraction = 0.85f;

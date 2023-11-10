@@ -90,8 +90,8 @@ typename tl::DynamicDecodeLayer<T>::ForwardParams prepareInputs(DecodingInput co
     TLLM_CHECK(input.logits->getDataType() == TRTDataType<T>::value);
 
     auto constexpr ite = 0; // no pipeline parallelism
-    typename tl::DynamicDecodeLayer<T>::ForwardParams forwardParams{input.step, ite, input.maxLength, input.batchSize,
-        tcc::toTllmTensor(*input.logits), tcc::toTllmTensor(*input.endIds)};
+    typename tl::DynamicDecodeLayer<T>::ForwardParams forwardParams{input.step, ite, input.maxLength,
+        input.maxKvCacheLength, input.batchSize, tcc::toTllmTensor(*input.logits), tcc::toTllmTensor(*input.endIds)};
 
     if (input.cacheIndirection)
     {

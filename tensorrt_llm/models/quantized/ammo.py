@@ -107,16 +107,13 @@ def quantize_and_export(model: torch.nn.Module,
 
     if export_path:
         with torch.inference_mode():
-            if qformat == "int4_awq":
-                torch.save(model.state_dict(), export_path)
-            else:
-                export_model_config(
-                    model,
-                    model_type,
-                    torch.float16,
-                    quantization=qformat,
-                    export_dir=export_path,
-                    inference_tensor_parallel=tensor_parallel_size,
-                )
+            export_model_config(
+                model,
+                model_type,
+                torch.float16,
+                quantization=qformat,
+                export_dir=export_path,
+                inference_tensor_parallel=tensor_parallel_size,
+            )
         logger.info(f"Quantized model exported to :{export_path}")
     return model

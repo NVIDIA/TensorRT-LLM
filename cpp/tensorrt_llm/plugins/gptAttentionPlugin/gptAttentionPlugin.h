@@ -43,9 +43,10 @@ namespace tensorrt_llm::plugins
 //                      enable_remove_input_padding
 //     1.  sequence_length [batch_size]
 //     2.  host_past_key_value_lengths [batch_size] (int32)
-//     3.  context_lengths [batch_size]
-//     4.  cache_indir [num_gen_requests, beam_width, memory_max_len] (required in beamsearch)
-//     5.  host_request_types [batch_size] int32. 0: context; 1: generation: 2: none. When not in inflight-batching
+//     3.  host_max_kv_cache_lengths [1] (int32)
+//     4.  context_lengths [batch_size]
+//     5.  cache_indir [num_gen_requests, beam_width, memory_max_len] (required in beamsearch)
+//     6.  host_request_types [batch_size] int32. 0: context; 1: generation: 2: none. When not in inflight-batching
 //     mode,
 //                      all elements must be identical.
 //     6.  past_key_value_pool [batch_size, 2, local_num_kv_heads, max_seq_len, head_size] or
@@ -145,46 +146,51 @@ private:
         return 2;
     }
 
-    IndexType getContextLengthsIdx() const
+    IndexType getHostMaxKvCacheLengthIdx() const
     {
         return 3;
     }
 
-    IndexType getCacheIndirIdx() const
+    IndexType getContextLengthsIdx() const
     {
         return 4;
     }
 
-    IndexType getRequestTypesIdx() const
+    IndexType getCacheIndirIdx() const
     {
         return 5;
+    }
+
+    IndexType getRequestTypesIdx() const
+    {
+        return 6;
     }
 
     IndexType getKVCacheBlockPointersIdx() const
     {
         // NOTE We either provide this tensor when mPagedKVCache is true or PastKeyValue otherwise
-        return 6;
+        return 7;
     }
 
     IndexType getPastKeyValueIdx() const
     {
         // NOTE We either provide this tensor when mPagedKVCache is false or KVCacheBlockPointers otherwise
-        return 6;
+        return 7;
     }
 
     IndexType getKVCacheQuantizationScaleIdx() const
     {
-        return 7;
+        return 8;
     }
 
     IndexType getKVCacheDequantizationScaleIdx() const
     {
-        return 8;
+        return 9;
     }
 
     IndexType getAlibiSlopesIdx() const
     {
-        return (mKVCacheQuantMode.hasKvCacheQuant() ? 9 : 7);
+        return (mKVCacheQuantMode.hasKvCacheQuant() ? 10 : 8);
     }
 
     IndexType getRelativeAttentionBiasIdx() const
@@ -216,7 +222,7 @@ private:
     IndexType getQKVBiasTensorIdx() const
     {
         TLLM_CHECK(mQKVBiasEnabled);
-        return (mKVCacheQuantMode.hasKvCacheQuant() ? 9 : 7) + (isALiBi() ? 1 : 0) + (mRemovePadding ? 1 : 0);
+        return (mKVCacheQuantMode.hasKvCacheQuant() ? 10 : 8) + (isALiBi() ? 1 : 0) + (mRemovePadding ? 1 : 0);
     }
 };
 

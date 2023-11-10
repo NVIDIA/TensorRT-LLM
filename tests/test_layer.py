@@ -691,6 +691,11 @@ class TestLayer(unittest.TestCase):
             host_past_key_value_lengths = torch.tensor([0] * batch_size,
                                                        dtype=torch.int32)
 
+            # the max kv cache length for each layer.
+            # single tensor since we only have 1 layer here.
+            host_max_kv_cache_lengths = torch.tensor([max_seq_len],
+                                                     dtype=torch.int32)
+
             sequence_length = torch.full([batch_size],
                                          seq_len,
                                          dtype=torch.int32,
@@ -762,6 +767,10 @@ class TestLayer(unittest.TestCase):
                     name='host_past_key_value_lengths',
                     shape=tuple(host_past_key_value_lengths.shape),
                     dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+                host_max_kv_cache_lengths_tensor = Tensor(
+                    name='host_max_kv_cache_lengths',
+                    shape=tuple(host_max_kv_cache_lengths.shape),
+                    dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                 cache_indirection_tensor = Tensor(
                     name='cache_indirection',
                     shape=tuple(cache_indirection.shape),
@@ -792,6 +801,8 @@ class TestLayer(unittest.TestCase):
                         past_key_value=[past_key_value_tensor],
                         host_past_key_value_lengths=
                         host_past_key_value_lengths_tensor,
+                        host_max_kv_cache_lengths=
+                        host_max_kv_cache_lengths_tensor,
                         cache_indirection=cache_indirection_tensor),
                     attention_params=AttentionParams(
                         sequence_length=sequence_length_tensor,
@@ -820,6 +831,7 @@ class TestLayer(unittest.TestCase):
                 'past_key_value': past_key_value,
                 'sequence_length': sequence_length,
                 'host_past_key_value_lengths': host_past_key_value_lengths,
+                'host_max_kv_cache_lengths': host_max_kv_cache_lengths,
                 'context_lengths': context_lengths,
                 'host_request_types': host_request_types,
                 'cache_indirection': cache_indirection

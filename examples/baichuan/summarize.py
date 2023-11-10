@@ -182,10 +182,12 @@ def main(args):
             end_id=end_id, pad_id=pad_id, top_k=top_k, num_beams=num_beams)
 
         with torch.no_grad():
-            tensorrt_llm_baichuan.setup(batch_size,
-                                        max_context_length=max_length,
-                                        max_new_tokens=output_len,
-                                        beam_width=num_beams)
+            tensorrt_llm_baichuan.setup(
+                batch_size,
+                max_context_length=max_length,
+                max_new_tokens=output_len,
+                beam_width=num_beams,
+                max_kv_cache_length=args.max_kv_cache_len)
             if tensorrt_llm_baichuan.remove_input_padding:
                 output_ids = tensorrt_llm_baichuan.decode_batch(
                     line_encoded, sampling_config)
@@ -381,6 +383,12 @@ if __name__ == '__main__':
     parser.add_argument('--engine_dir', type=str, default='baichuan_outputs')
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--max_ite', type=int, default=20)
+    parser.add_argument('--max_kv_cache_len',
+                        type=int,
+                        default=None,
+                        help='The max kv cache length. \
+              If the final sequence length exceeds the kv cache length, we will enable cyclic kv cache. \
+              If it is set to None, we will use the max sequence length.')
     parser.add_argument('--check_accuracy', action='store_true')
     parser.add_argument('--tensorrt_llm_rouge1_threshold',
                         type=float,

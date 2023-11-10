@@ -84,8 +84,8 @@ nvinfer1::DimsExprs GPTAttentionPlugin::getOutputDimensions(
 bool GPTAttentionPlugin::supportsFormatCombination(
     int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
 {
-    if (pos == getSequenceLengthIdx() || pos == getHostPastKeyValueLengthsIdx() || pos == getContextLengthsIdx()
-        || pos == getCacheIndirIdx() || pos == getRequestTypesIdx())
+    if (pos == getSequenceLengthIdx() || pos == getHostPastKeyValueLengthsIdx() || pos == getHostMaxKvCacheLengthIdx()
+        || pos == getContextLengthsIdx() || pos == getCacheIndirIdx() || pos == getRequestTypesIdx())
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32;
     }
@@ -131,9 +131,6 @@ void GPTAttentionPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc
     const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
 {
     TLLM_CHECK(mHeadSize > 0);
-
-    // pre-check whether FMHA is supported in order to save memory allocation
-    mEnableContextFMHA = mEnableContextFMHA && MHARunner::fmha_supported(getHeadSize(), mSM);
 }
 
 size_t GPTAttentionPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
@@ -258,7 +255,15 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     // -- max_encoder_context_len: len of encoder input (in cross attn). Also called encoder_input_seq_length
 
     const int beamWidth = inputDesc[getCacheIndirIdx()].dims.d[1];
-    const int maxSeqLen = isCrossAttention() ? max_encoder_context_len : inputDesc[getCacheIndirIdx()].dims.d[2];
+
+    // Commonly, cyclic kv cache length, and max kv cache length will be the same
+    // unless each layer has different max kv cache length.
+    // the kv_cache capacity.
+    const int max_kv_cache_length
+        = isCrossAttention() ? max_encoder_context_len : inputDesc[getCacheIndirIdx()].dims.d[2];
+    // The cyclic_kv_cache_length will determine the cyclic kv cache position of new tokens.
+    // Note that this cyclic_kv_cache_length might be smaller than the actual kv cache capactity (max_kv_cache_length).
+    const int cyclic_kv_cache_length = reinterpret_cast<const int*>(inputs[getHostMaxKvCacheLengthIdx()])[0];
 
     const float* kv_scale_orig_quant = nullptr;
     const float* kv_scale_quant_orig = nullptr;
@@ -308,9 +313,10 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             num_encoder_tokens = inputDesc[getCrossQKVIdx()].dims.d[1];
         }
 
-        EnqueueContextParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, max_context_len, maxSeqLen,
-            context_lengths, kv_scale_orig_quant, kv_scale_quant_orig, alibi_slopes, context_buf_, key_value_cache,
-            block_pointers, batch_size, localNbTokens, max_blocks_per_sequence, workspace};
+        EnqueueContextParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, max_context_len,
+            max_kv_cache_length, cyclic_kv_cache_length, context_lengths, kv_scale_orig_quant, kv_scale_quant_orig,
+            alibi_slopes, context_buf_, key_value_cache, block_pointers, batch_size, localNbTokens,
+            max_blocks_per_sequence, workspace};
         if (isRelativePosition())
         {
             enqueue_params.relative_attention_bias = static_cast<const T*>(inputs[getRelativeAttentionBiasIdx()]);
@@ -340,8 +346,8 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         int32_t const past_kv_len = *std::max_element(past_kv_len_list, past_kv_len_list + localNbSeq);
         EnqueueGenerationParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, sequence_length,
             past_kv_len, beamWidth, context_lengths, kv_scale_orig_quant, kv_scale_quant_orig, alibi_slopes,
-            context_buf_, key_value_cache, block_pointers, maxSeqLen, num_requests, max_blocks_per_sequence,
-            cache_indir, workspace};
+            context_buf_, key_value_cache, block_pointers, max_kv_cache_length, cyclic_kv_cache_length, num_requests,
+            max_blocks_per_sequence, cache_indir, workspace};
         if (isRelativePosition())
         {
             enqueue_params.relative_attention_bias = static_cast<const T*>(inputs[getRelativeAttentionBiasIdx()]);

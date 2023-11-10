@@ -83,7 +83,8 @@ struct FusedQKVMaskedAttentionDispatchParams
     float rotary_embedding_scale;
     int rotary_embedding_max_positions;
     PositionEmbeddingType position_embedding_type;
-    int max_seq_len;
+    int max_kv_cache_length;
+    int cyclic_kv_cache_length;
     const int* input_lengths;
     int step;
     float q_scaling;
@@ -157,7 +158,8 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     params.cache_indir = input_params.cache_indir;
     params.batch_size = input_params.inference_batch_size;
     params.beam_width = input_params.beam_width;
-    params.memory_max_len = input_params.max_seq_len;
+    params.max_kv_cache_length = input_params.max_kv_cache_length;
+    params.cyclic_kv_cache_length = input_params.cyclic_kv_cache_length;
     params.length_per_sample = input_params.sequence_lengths; // max_input_length + current output length
     // timestep for shared memory size calculation and rotary embedding computation
     params.timestep = input_params.step - 1;
@@ -267,10 +269,13 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int num_heads, int num_kv_hea
     , mCrossAttention(cross_attention)
     , mMaxDistance(max_distance)
 {
-    mEnableContextFMHA = mEnableContextFMHA && (mType == DataType::kHALF || mType == DataType::kBF16);
+    // pre-check whether FMHA is supported in order to save memory allocation
+    mEnableContextFMHA = mEnableContextFMHA && (mType == DataType::kHALF || mType == DataType::kBF16)
+        && MHARunner::fmha_supported(getHeadSize(), mSM);
+
     TLLM_CHECK(isRoPE() == (rotary_embedding_dim != 0));
-    TLLM_CHECK_WITH_INFO((tc::getSMVersion() >= 80) || (mType != DataType::kBF16),
-        "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
+    TLLM_CHECK_WITH_INFO(
+        (mSM >= 80) || (mType != DataType::kBF16), "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
 }
 
 const int GPTAttentionPluginCommon::getHeadSize(bool checkInit) const
@@ -318,8 +323,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(const void* data, size_t leng
     mKVCacheQuantMode = tc::QuantMode(kvCacheQuantMode);
 
     TLLM_CHECK(d == a + length);
-    TLLM_CHECK_WITH_INFO((tc::getSMVersion() >= 80) || (mType != DataType::kBF16),
-        "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
+    TLLM_CHECK_WITH_INFO(
+        (mSM >= 80) || (mType != DataType::kBF16), "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
 }
 
 size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(
@@ -380,12 +385,12 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForGeneration(DataType type, in
     size_t generation_workspace_size = 0;
 
     const int batch_beam = total_num_seq;
-    int32_t const maxSeqLenTile = getMaxSeqLenTile(size);
+    int32_t const maxSeqLenTile = getMaxNumSeqLenTile();
 
-    const size_t partial_out_size = mMultiBlockMode ? size * batch_beam * mNumHeads * mHeadSize * maxSeqLenTile : 0;
-    const size_t partial_sum_size = mMultiBlockMode ? sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile : 0;
-    const size_t partial_max_size = mMultiBlockMode ? sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile : 0;
-    const size_t block_counter_size = mMultiBlockMode ? sizeof(int) * batch_beam * mNumHeads : 0;
+    const size_t partial_out_size = size * batch_beam * mNumHeads * mHeadSize * maxSeqLenTile;
+    const size_t partial_sum_size = sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile;
+    const size_t partial_max_size = sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile;
+    const size_t block_counter_size = sizeof(int) * batch_beam * mNumHeads;
 
     const int NUM_BUFFERS = 4;
     size_t workspaces[NUM_BUFFERS];
@@ -397,18 +402,13 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForGeneration(DataType type, in
     return generation_workspace_size;
 }
 
-int GPTAttentionPluginCommon::getMaxSeqLenTile(int elemSize) const
+int GPTAttentionPluginCommon::getMaxNumSeqLenTile(int batch_beam_size) const
 {
     if (mMultiBlockMode)
     {
-        const int threads_per_value = pow2roundup(getHeadSize()) * elemSize / 16;
-
-        // max_seq_len_tile to make sure: seq_len_tile * threads_per_value <= threads_per_block (for
-        // multi_block_mode)
-        const int max_seq_len_tile
-            = 256 / threads_per_value; // for allocate partial output results memory. Regardless to THDS_PER_BLOCK
-                                       // (which may be smaller than 256 like being 128)
-        return max_seq_len_tile;
+        // And we allocate the buffer based on the maximum number of blocks per sequence (batch_beam_size = 1).
+        // Assume we can only have 1 block (large block size like 1024) in SM, and we only want one wave of blocks.
+        return tc::divUp(mMultiProcessorCount, batch_beam_size * mNumHeads);
     }
     return 0;
 }
@@ -439,7 +439,8 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
     {
         using BufferDataType = typename KVCacheBufferDataType<KVCacheBuffer>::Type;
         kv_cache_buffer = KVCacheBuffer(params.batch_size, 1,
-            isCrossAttention() ? params.cross_qkv_length : params.max_seq_length, num_kv_heads * head_size * elem_size);
+            isCrossAttention() ? params.cross_qkv_length : params.max_kv_cache_length,
+            num_kv_heads * head_size * elem_size);
         kv_cache_buffer.data = reinterpret_cast<BufferDataType*>(params.key_value_cache);
     }
 
@@ -524,6 +525,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
     decoder_params.seqLengths = params.context_lengths;
     decoder_params.batchSize = params.batch_size;
     decoder_params.maxSeqLength = params.input_seq_length;
+    decoder_params.maxKvCacheLength = params.cyclic_kv_cache_length;
     decoder_params.numTokens = params.num_tokens;
     decoder_params.attentionMaskType = mMaskType;
     invokeBuildDecoderInfo(decoder_params, stream);
@@ -563,12 +565,14 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
     {
         invokeApplyBiasRopeUpdateKVCache(const_cast<T*>(params.attention_input), kv_cache_buffer,
             const_cast<T*>(params.qkv_bias), params.context_lengths, mRemovePadding ? padding_offset : nullptr,
-            params.batch_size, params.input_seq_length, params.num_tokens, mNumHeads, mNumKVHeads, getHeadSize(),
-            mRotaryEmbeddingDim, mRotaryEmbeddingBase, mRotaryEmbeddingScaleType, mRotaryEmbeddingScale,
-            mRotaryEmbeddingMaxPositions, position_embedding_type, (float*) nullptr, 0, cache_type,
-            params.kv_scale_orig_quant, stream);
-        mFMHARunner->setup(params.batch_size, params.input_seq_length, params.num_tokens, isALiBi(), isAliBiWithScale(),
-            mTpSize, mTpRank);
+            params.batch_size, params.input_seq_length, params.cyclic_kv_cache_length, params.num_tokens, mNumHeads,
+            mNumKVHeads, getHeadSize(), mRotaryEmbeddingDim, mRotaryEmbeddingBase, mRotaryEmbeddingScaleType,
+            mRotaryEmbeddingScale, mRotaryEmbeddingMaxPositions, position_embedding_type, (float*) nullptr, 0,
+            cache_type, params.kv_scale_orig_quant, stream);
+        // we will apply limited_length_causal when the max_past_length(cyclic_kv_cache_length) is set.
+        // the token will pay attention to previous tokens while starting from max(0, rowIdx - cyclic_kv_cache_length);
+        mFMHARunner->setup(params.batch_size, params.input_seq_length, params.cyclic_kv_cache_length, params.num_tokens,
+            isALiBi(), isAliBiWithScale(), mTpSize, mTpRank);
         mFMHARunner->run(const_cast<T*>(params.attention_input), cu_seqlens, params.context_buf, stream);
     }
     else
@@ -611,7 +615,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
         // write KV to cache
         invokeTranspose4dBatchMajor(k_buf_2_, v_buf_2_, kv_cache_buffer, params.batch_size,
             isCrossAttention() ? params.cross_qkv_length : params.input_seq_length,
-            isCrossAttention() ? params.cross_qkv_length : params.max_seq_length, getHeadSize(), mNumKVHeads,
+            isCrossAttention() ? params.cross_qkv_length : params.cyclic_kv_cache_length, getHeadSize(), mNumKVHeads,
             cache_type, params.kv_scale_orig_quant,
             isCrossAttention() ? params.encoder_input_lengths : params.context_lengths, stream);
         sync_check_cuda_error();
@@ -704,8 +708,9 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
             // In implicit mode, relative_attention_bias is relative_attention_table [num_heads, num_buckets], with
             // necessary params (max_distance, num_buckets) passed at the end
             invokeAddRelativeAttentionBiasUnaligned(qk_buf_float_, relative_attention_bias, params.batch_size,
-                mNumHeads, attention_seq_len_1, isCrossAttention() ? params.cross_qkv_length : params.max_seq_length,
-                stream, max_distance > 0, relative_attention_bias_stride, max_distance, true /* bidirectional */);
+                mNumHeads, attention_seq_len_1,
+                isCrossAttention() ? params.cross_qkv_length : params.cyclic_kv_cache_length, stream, max_distance > 0,
+                relative_attention_bias_stride, max_distance, true /* bidirectional */);
         }
 
         if (is_qk_buf_float_ == true)
@@ -808,6 +813,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
                 stream);
         }
     }
+
     return 0;
 }
 
@@ -865,19 +871,23 @@ int GPTAttentionPluginCommon::enqueueGeneration(
 
     int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(params.workspace);
     size_t offset = 0;
-    int32_t const maxSeqLenTile = getMaxSeqLenTile(sizeof(T));
+    // Runtime check to see the actual number of blocks per sequence we need.
+    int32_t const max_num_seq_len_tiles = getMaxNumSeqLenTile(batch_beam);
+    const bool enable_multi_block = mMultiBlockMode && max_num_seq_len_tiles > 1;
     const size_t partial_out_size
-        = mMultiBlockMode ? sizeof(T) * batch_beam * mNumHeads * mHeadSize * maxSeqLenTile : 0;
-    const size_t partial_sum_size = mMultiBlockMode ? sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile : 0;
-    const size_t partial_max_size = mMultiBlockMode ? sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile : 0;
-    const size_t block_counter_size = mMultiBlockMode ? sizeof(int) * batch_beam * mNumHeads : 0;
+        = enable_multi_block ? sizeof(T) * batch_beam * mNumHeads * mHeadSize * max_num_seq_len_tiles : 0;
+    const size_t partial_sum_size
+        = enable_multi_block ? sizeof(float) * batch_beam * mNumHeads * max_num_seq_len_tiles : 0;
+    const size_t partial_max_size
+        = enable_multi_block ? sizeof(float) * batch_beam * mNumHeads * max_num_seq_len_tiles : 0;
+    const size_t block_counter_size = enable_multi_block ? sizeof(int) * batch_beam * mNumHeads : 0;
 
     // Workspace pointer shift
     T* partial_out = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, partial_out_size));
     float* partial_sum = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, partial_sum_size));
     float* partial_max = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, partial_max_size));
     int* block_counter = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, block_counter_size));
-    if (mMultiBlockMode)
+    if (enable_multi_block)
     {
         TLLM_CUDA_CHECK(cudaMemsetAsync(block_counter, 0, block_counter_size, stream));
     }
@@ -894,7 +904,8 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     else
     {
         using BufferDataType = typename KVCacheBufferDataType<KVCacheBuffer>::Type;
-        kv_cache_buffer = KVCacheBuffer(batch_beam, 1, params.max_seq_length, num_kv_heads * head_size * elem_size);
+        kv_cache_buffer
+            = KVCacheBuffer(batch_beam, 1, params.max_kv_cache_length, num_kv_heads * head_size * elem_size);
         kv_cache_buffer.data = reinterpret_cast<BufferDataType*>(params.key_value_cache);
     }
     sync_check_cuda_error();
@@ -919,7 +930,8 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     dispatch_params.size_per_head = getHeadSize();
     dispatch_params.rotary_embedding_dim = mRotaryEmbeddingDim;
     dispatch_params.position_embedding_type = mPositionEmbeddingType;
-    dispatch_params.max_seq_len = params.max_seq_length; // difference between max_seq_lengths and max_seq_length?
+    dispatch_params.max_kv_cache_length = params.max_kv_cache_length;
+    dispatch_params.cyclic_kv_cache_length = params.cyclic_kv_cache_length;
     dispatch_params.input_lengths = params.context_lengths;
     dispatch_params.step = step;
     dispatch_params.q_scaling = q_scaling;
@@ -931,8 +943,8 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     dispatch_params.qkv_scale_out = qkv_scale_out;
     dispatch_params.attention_out_scale = attention_out_scale;
     dispatch_params.quant_option = quant_option;
-    dispatch_params.multi_block_mode = mMultiBlockMode;
-    dispatch_params.max_seq_len_tile = getMaxSeqLenTile(sizeof(T));
+    dispatch_params.multi_block_mode = enable_multi_block;
+    dispatch_params.max_seq_len_tile = max_num_seq_len_tiles;
     dispatch_params.partial_out = partial_out;
     dispatch_params.partial_sum = partial_sum;
     dispatch_params.partial_max = partial_max;
@@ -962,6 +974,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(
         Cross_multihead_attention_params<DataType> mmhca_params;
         fusedQKV_masked_attention_dispatch(mmhca_params, dispatch_params, stream);
     }
+
     return 0;
 }
 

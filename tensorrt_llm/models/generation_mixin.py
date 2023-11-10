@@ -318,6 +318,7 @@ class GenerationMixin:
         context_lengths = None
         host_context_lengths = None
         host_past_key_value_lengths = None
+        host_max_kv_cache_lengths = None
         attention_mask = None
         cache_indirection = None
         host_request_types = None
@@ -377,6 +378,19 @@ class GenerationMixin:
                     ('batch_size_last_token_ids', bb_range),
                 ]),
             )
+
+        if use_gpt_attention_plugin:
+            host_max_kv_cache_lengths = []
+            for i in range(num_layers):
+                host_kv_cache_length_tensor = Tensor(
+                    name=f'host_max_kv_cache_length_{i}',
+                    dtype=trt.int32,
+                    shape=[1],
+                    dim_range=OrderedDict([
+                        ('scalar',
+                         [1, 1] if enable_two_optimization_profiles else [1])
+                    ]))
+                host_max_kv_cache_lengths.append(host_kv_cache_length_tensor)
 
         cache_indirection = Tensor(
             name='cache_indirection',
@@ -460,6 +474,7 @@ class GenerationMixin:
             'attention_mask': attention_mask,
             'sequence_length': sequence_length,
             'host_past_key_value_lengths': host_past_key_value_lengths,
+            'host_max_kv_cache_lengths': host_max_kv_cache_lengths,
             'past_key_value': past_key_value,
             'last_token_ids': last_token_ids,
             'cache_indirection': cache_indirection,

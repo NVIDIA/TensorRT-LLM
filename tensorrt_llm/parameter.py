@@ -46,18 +46,18 @@ class Parameter:
             else:
                 v_range = 0.1
 
-            # value ~ U[-1, 1]
             if dtype == trt.DataType.INT8:
-                value = torch.randint(-128,
-                                      128, (shape),
+                value = torch.randint(int(-128 * v_range),
+                                      int(128 * v_range), (shape),
                                       dtype=trt_dtype_to_torch(dtype),
                                       device='cuda')
+                # value ~ U[int(-128 * v_range), int(128 * v_range)]
             else:
                 value = torch.randn(
                     (shape), dtype=trt_dtype_to_torch(dtype),
                     device='cuda') * 2 - 1
-            # value ~ U[-v_range, v_range]
-            value = value * v_range
+                # value ~ N[-v_range, v_range]
+                value = value * v_range
         self._value = self._regularize_value(value)
 
     @property

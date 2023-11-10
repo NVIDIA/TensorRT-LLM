@@ -104,6 +104,12 @@ def parse_input(input_text: str, input_file: str, tokenizer, end_id: int,
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--max_output_len', type=int, required=True)
+    parser.add_argument('--max_kv_cache_len',
+                        type=int,
+                        default=None,
+                        help='The max kv cache length. \
+              If the final sequence length exceeds the kv cache length, we will enable cyclic kv cache. \
+              If it is set to None, we will use the max sequence length.')
     parser.add_argument('--log_level', type=str, default='error')
     parser.add_argument('--model_version',
                         type=str,
@@ -179,6 +185,7 @@ def generate(
     output_csv: str = None,
     output_npy: str = None,
     tokenizer_dir: str = None,
+    max_kv_cache_len: int = None,
     num_beams: int = 1,
 ):
     tensorrt_llm.logger.set_level(log_level)
@@ -231,7 +238,8 @@ def generate(
     decoder.setup(input_lengths.size(0),
                   max_input_length,
                   max_output_len,
-                  beam_width=num_beams)
+                  beam_width=num_beams,
+                  max_kv_cache_length=max_kv_cache_len)
 
     output_ids = decoder.decode(input_ids, input_lengths, sampling_config)
     torch.cuda.synchronize()

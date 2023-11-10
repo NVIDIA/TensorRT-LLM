@@ -73,8 +73,8 @@ public:
     using TensorPtr = std::shared_ptr<ITensor>;
 
     //! Setup the decoder before calling `forward()`, also calls reshapeBuffers
-    virtual void setup(
-        SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxSequenceLength, nvinfer1::DataType dtype)
+    virtual void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxKvCacheLength,
+        SizeType maxSequenceLength, nvinfer1::DataType dtype)
         = 0;
 
     //! @brief Initialize the decoder with new batch of inputs.

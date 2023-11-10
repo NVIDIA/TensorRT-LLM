@@ -192,14 +192,13 @@ class TestFunctional(unittest.TestCase):
 
         remove_input_padding = True
 
-        def _construct_execution(session, input_tensor, weight, bias,
-                                 pointer_array, sequence_length,
-                                 host_past_key_value_lengths, context_lengths,
-                                 max_context_length, cache_indirection,
-                                 num_heads, hidden_size, num_kv_heads, output,
-                                 dtype, kv_int8_quant_scale,
-                                 kv_int8_dequant_scale, host_context_lengths,
-                                 host_request_types):
+        def _construct_execution(
+                session, input_tensor, weight, bias, pointer_array,
+                sequence_length, host_past_key_value_lengths,
+                host_max_kv_cache_lengths, context_lengths, max_context_length,
+                cache_indirection, num_heads, hidden_size, num_kv_heads, output,
+                dtype, kv_int8_quant_scale, kv_int8_dequant_scale,
+                host_context_lengths, host_request_types):
             head_size = hidden_size // num_heads
             # construct trt network
             builder = tensorrt_llm.Builder()
@@ -208,6 +207,8 @@ class TestFunctional(unittest.TestCase):
             net.plugin_config.set_context_fmha(context_fmha_type)
             net.plugin_config.enable_remove_input_padding()
             net.plugin_config.enable_paged_kv_cache(tokens_per_block)
+            if enable_multi_block_mmha:
+                net.plugin_config.enable_mmha_multi_block_mode()
 
             with tensorrt_llm.net_guard(net):
                 x_tensor = Tensor(name='input',
@@ -220,6 +221,10 @@ class TestFunctional(unittest.TestCase):
                 host_past_key_value_lengths_tensor = Tensor(
                     name='host_past_key_value_lengths',
                     shape=tuple(host_past_key_value_lengths.shape),
+                    dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+                host_max_kv_cache_lengths_tensor = Tensor(
+                    name='host_max_kv_cache_lengths',
+                    shape=tuple(host_max_kv_cache_lengths.shape),
                     dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                 input_lengths_tensor = Tensor(
                     name='context_lengths',
@@ -309,6 +314,7 @@ class TestFunctional(unittest.TestCase):
                     sequence_length=sequence_length_tensor,
                     host_past_key_value_lengths=
                     host_past_key_value_lengths_tensor,
+                    host_max_kv_cache_lengths=host_max_kv_cache_lengths_tensor,
                     context_lengths=input_lengths_tensor,
                     cache_indirection=cache_indirection_tensor,
                     host_request_types=host_request_types_tensor,
@@ -323,7 +329,6 @@ class TestFunctional(unittest.TestCase):
                     rotary_embedding_max_positions=configuration.
                     max_position_embeddings,
                     position_embedding_type=position_embedding_type,
-                    multi_block_mode=enable_multi_block_mmha,
                     kv_orig_quant_scale=kv_int8_quant_scale_tensor,
                     kv_quant_orig_scale=kv_int8_dequant_scale_tensor,
                     kv_cache_quant_mode=QuantMode.from_description(
@@ -341,6 +346,7 @@ class TestFunctional(unittest.TestCase):
                 'input': input_tensor,
                 'sequence_length': sequence_length,
                 'host_past_key_value_lengths': host_past_key_value_lengths,
+                'host_max_kv_cache_lengths': host_max_kv_cache_lengths,
                 'context_lengths': context_lengths,
                 'cache_indirection': cache_indirection,
                 'host_request_types': host_request_types,
@@ -686,6 +692,7 @@ class TestFunctional(unittest.TestCase):
                                           blocks,
                                           tokens_per_block,
                                           max_blocks_per_seq,
+                                          max_seq_len,
                                           beam_width=beam_width)
 
         torch_cache_list = [None] * num_req
@@ -759,6 +766,9 @@ class TestFunctional(unittest.TestCase):
                 host_past_key_value_length_list,
                 dtype=torch.int32,
                 device='cpu').reshape(-1)
+            host_max_kv_cache_lengths = torch.tensor([max_seq_len],
+                                                     dtype=torch.int32,
+                                                     device='cpu')
             total_num_tokens = int(sum(host_input_lengths))
             max_context_length = in_len
             context_lengths = host_context_lengths.cuda()
@@ -799,10 +809,11 @@ class TestFunctional(unittest.TestCase):
             session, output = _construct_execution(
                 session, input_tensor, weight_plugin, bias_plugin,
                 dense_pointer_arrays, sequence_lengths,
-                host_past_key_value_lengths, context_lengths,
-                max_context_length, cache_indirection, num_heads, hidden_size,
-                num_kv_heads, output, dtype, kv_int8_quant_scale,
-                kv_int8_dequant_scale, host_context_lengths, host_request_types)
+                host_past_key_value_lengths, host_max_kv_cache_lengths,
+                context_lengths, max_context_length, cache_indirection,
+                num_heads, hidden_size, num_kv_heads, output, dtype,
+                kv_int8_quant_scale, kv_int8_dequant_scale,
+                host_context_lengths, host_request_types)
 
             del session
             session = None

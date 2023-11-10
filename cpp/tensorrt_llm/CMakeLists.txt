@@ -84,14 +84,6 @@ if(BUILD_BATCH_MANAGER)
 else()
   add_library(${BATCH_MANAGER_TARGET} STATIC IMPORTED)
   if(NOT WIN32) # Linux
-    execute_process(
-      COMMAND ${Python3_EXECUTABLE} "-c"
-              "import torch; print(torch.compiled_with_cxx11_abi(),end='');"
-      RESULT_VARIABLE _PYTHON_SUCCESS
-      OUTPUT_VARIABLE USE_CXX11_ABI)
-
-    message(STATUS "USE_CXX11_ABI: ${USE_CXX11_ABI}")
-
     if(USE_CXX11_ABI)
       set(BATCH_MANAGER_LIB_LOC
           "${CMAKE_CURRENT_SOURCE_DIR}/batch_manager/${BATCH_MANAGER_TARGET_ARCH}/libtensorrt_llm_batch_manager_static.a"
