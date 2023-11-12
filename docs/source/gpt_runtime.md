@@ -97,7 +97,7 @@ member variables and exposed through getters and setters):
 
 Familiarity with
 [MPI](https://en.wikipedia.org/wiki/Message_Passing_Interface), is not required
-to utilize the TensorRT-LMM C++ runtime. There are two main things
+to utilize the TensorRT-LLM C++ runtime. There are two main things
 you need to know: (1) The C++ Runtime in TensorRT-LLM uses
 [processes](https://en.wikipedia.org/wiki/Process_(computing)) to execute
 TensorRT engines on the different GPUs. Those GPUs can be located on a single
