@@ -33,8 +33,7 @@ For practical examples of H200's performance:
 **Max Throughput TP8:**
 an online chat agent scenario (ISL/OSL=80/200) with GPT3-175B on a full HGX (TP8) H200 is 1.6x more performant than H100.
 
-<img src="media/H200launch_Llama70B_tps.png" alt="max throughput llama TP1" width="250" height="auto">
-<img src="media/H200launch_GPT175B_tps.png" alt="max throughput GPT TP8" width="250" height="auto">
+<img src="media/H200launch_tps.png" alt="max throughput llama TP1" width="500" height="auto">
 
 <sub>Preliminary measured performance, subject to change.
 TensorRT-LLM v0.5.0, TensorRT v9.1.0.4. | Llama-70B: H100 FP8 BS 8, H200 FP8 BS 32 | GPT3-175B: H100 FP8 BS 64, H200 FP8 BS 128 </sub>
