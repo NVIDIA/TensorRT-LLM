@@ -34,17 +34,18 @@ Here're some examples:
 # Try use_gemm_plugin to prevent accuracy issue.
 
 # Build Yi-6B model using a single GPU with bfloat16 datatype
-python build_yi.py \
+python build.py \
     --model_dir 01-ai/Yi-6B \
     --dtype bfloat16 \
     --log_level info \
     --output_dir trtllm_models \
     --remove_input_padding \
     --use_gpt_attention_plugin bfloat16 \
-    --use_gemm_plugin bfloat16
+    --use_gemm_plugin bfloat16 \
+    --enable_context_fmha
 
 # Build the Yi-34B model using a 4 GPU devices, with tensor parallelism and pipeline parallelism
-python build_yi.py \
+python build.py \
     --world_size 4 \
     --tp_size 2 \
     --pp_size 2 \
@@ -57,6 +58,7 @@ python build_yi.py \
     --remove_input_padding \
     --use_gpt_attention_plugin bfloat16 \
     --use_gemm_plugin bfloat16 \
+    --enable_context_fmha \
     --parallel_build \
     --use_parallel_embedding
 ```
@@ -75,7 +77,7 @@ python run.py \
 
 # run Yi-34B with 4 GPU devices (tensor_parallel=2 and pipeline_parallel=2)
 mpirun -n 4 --allow-run-as-root \
-    python run_yi.py \
+    python run.py \
         --max_output_len 100 \
         --log_level info \
         --engine_dir trtllm_models \

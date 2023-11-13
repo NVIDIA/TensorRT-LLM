@@ -24,7 +24,7 @@ from transformers import AutoTokenizer
 import tensorrt_llm
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 
-from build_yi import get_engine_name
+from build import get_engine_name
 
 def throttle_generator(generator, stream_interval):
     for i, out in enumerate(generator):

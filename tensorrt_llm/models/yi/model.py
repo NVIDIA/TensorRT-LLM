@@ -194,9 +194,11 @@ class YiModel(Module):
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
         
-        for layer, past, pointer in zip(
-                self.layers, kv_cache_params.past_key_value,
-                kv_cache_params.kv_cache_block_pointers):
+        for layer, past, pointer, max_kv_cache_length in zip(
+                self.layers,
+                kv_cache_params.past_key_value,
+                kv_cache_params.kv_cache_block_pointers,
+                kv_cache_params.host_max_kv_cache_lengths):
             hidden_states = layer(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -205,6 +207,7 @@ class YiModel(Module):
                     past_key_value=[past],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
+                    host_max_kv_cache_lengths=max_kv_cache_length,
                     kv_cache_block_pointers=[pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
@@ -385,6 +388,8 @@ class YiForCausalLM(YiModel, GenerationMixin):
                     past_key_value=model_inputs['past_key_value'],
                     host_past_key_value_lengths=model_inputs[
                         'host_past_key_value_lengths'],
+                    host_max_kv_cache_lengths=model_inputs[
+                    'host_max_kv_cache_lengths'],
                     kv_cache_block_pointers=model_inputs[
                         'kv_cache_block_pointers_list'],
                     cache_indirection=model_inputs['cache_indirection'],
