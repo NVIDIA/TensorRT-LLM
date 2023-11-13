@@ -44,6 +44,11 @@ def read_config(config_path: Path):
     tokens_per_block = config['plugin_config']['tokens_per_block']
     dtype = config['builder_config']['precision']
 
+    num_kv_heads = (num_kv_heads + world_size - 1) // world_size
+    assert (num_heads % world_size) == 0
+    num_heads = num_heads // world_size
+    hidden_size = hidden_size // world_size
+
     model_config = ModelConfig(num_heads=num_heads,
                                num_kv_heads=num_kv_heads,
                                hidden_size=hidden_size,

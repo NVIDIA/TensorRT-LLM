@@ -55,7 +55,6 @@ def write_zero_bias(weight_name: str, weight_file_path: str,
     bias.tofile(bias_file_path)
 
 
-
 def convert_weight_to_ft_each(out_dir: str, tensor_parallelism: int,
                               tensor_name: str, config: Dict[str, Any],
                               data: np.ndarray, data_type: torch.dtype):
