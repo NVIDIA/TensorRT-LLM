@@ -19,8 +19,7 @@ TensorRT-LLM
 ## Latest News
 * [2023/11/13] [**H200** achieves nearly **12,000 tok/sec on Llama2-13B**](./docs/source/blogs/H200launch.md)
 
-<img src="./docs/source/blogs/media/H200launch_Llama70B_tps.png" alt="H200 Llama2 70B" width="250" height="auto">
-<img src="./docs/source/blogs/media/H200launch_GPT175B_tps.png" alt="H200 GPT3 175B" width="250" height="auto">
+<img src="./docs/source/blogs/media/H200launch_tps.png" alt="H200 TPS" width="500" height="auto">
 
 H200 FP8 achieves 11,819 tok/s on Llama2-13B on a single GPU, and is up to 1.9x faster than H100.
 
