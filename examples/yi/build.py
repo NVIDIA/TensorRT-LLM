@@ -30,7 +30,7 @@ from tensorrt_llm.models import YiForCausalLM
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
-from weight_yi import load_from_hf_yi
+from weight import load_from_hf_yi
 
 def get_engine_name(model, dtype, tp_size, pp_size, rank):
     return f'{model}_{dtype}_tp{tp_size}_pp{pp_size}_rank{rank}.engine'
