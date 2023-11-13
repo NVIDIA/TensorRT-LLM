@@ -17,13 +17,15 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
+* [2023/11/13] [**H200** achieves nearly **12,000 tok/sec on Llama2-13B**](./docs/source/blogs/H200launch.md)
+
+<img src="./docs/source/blogs/media/H200launch_Llama70B_tps.png" alt="H200 Llama2 70B" width="250" height="auto">
+<img src="./docs/source/blogs/media/H200launch_GPT175B_tps.png" alt="H200 GPT3 175B" width="250" height="auto">
+
+H200 FP8 achieves 11,819 tok/s on Llama2-13B on a single GPU, and is up to 1.9x faster than H100.
+
+
 * [2023/11/03] [TensorRT-LLM is up to **4.6x faster on H100 than A100**, achieving **10,000 tok/s at 100ms to first token.**](./docs/source/blogs/H100vsA100.md)
-
-<img src="./docs/source/blogs/media/TRT_LLM_v0-5-0_H100vA100_tps.png" alt="max throughput" width="450" height="auto">
-<img src="./docs/source/blogs/media/TRT_LLM_v0-5-0_H100vA100_1st.png" alt="1st token latency" width="450" height="auto">
-
-H100 FP8 increases max throughput, decreases 1st token latency, and reduces memory consumption. At peak, TensorRT-LLM on H100 can achieve >10K token/s or <10ms to first token. See full [performance data](#performance).
-
 * [2023/10/22] [🚀 RAG on Windows using TensorRT-LLM and LlamaIndex 🦙](https://github.com/NVIDIA/trt-llm-rag-windows#readme)
 * [2023/10/19] Getting Started Guide - [Optimizing Inference on Large Language Models with NVIDIA TensorRT-LLM, Now Publicly Available
 ](https://developer.nvidia.com/blog/optimizing-inference-on-llms-with-tensorrt-llm-now-publicly-available/)
