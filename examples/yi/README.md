@@ -49,15 +49,15 @@ python build.py \
     --enable_context_fmha \
     --use_fused_mlp
 
-# Build the Yi-34B model using a 4 GPU devices, with tensor parallelism and pipeline parallelism
+# Build the Yi-34B model using a 4 GPU devices with tensor parallelism
 python build.py \
     --world_size 4 \
-    --tp_size 2 \
-    --pp_size 2 \
+    --tp_size 4 \
+    --pp_size 1 \
     --model_dir 01-ai/Yi-34B \
     --dtype bfloat16 \
     --log_level info \
-    --output_dir trtllm_models/yi-34b_tp2_pp2 \
+    --output_dir trtllm_models/yi-34b_tp4_pp1 \
     --max_input_len 1024 \
     --max_output_len 512 \
     --remove_input_padding \
@@ -81,11 +81,11 @@ python run.py \
     --tokenizer_dir 01-ai/Yi-6B \
     --input_text "1,2,3,4,5,6,7,"
 
-# run Yi-34B with 4 GPU devices (tensor_parallel=2 and pipeline_parallel=2)
+# run Yi-34B with 4 GPU devices (tensor_parallel=4)
 mpirun -n 4 --allow-run-as-root \
     python run.py \
         --max_output_len 100 \
         --log_level info \
-        --engine_dir trtllm_models/yi-34b_tp2_pp2 \
+        --engine_dir trtllm_models/yi-34b_tp4_pp1 \
         --tokenizer_dir 01-ai/Yi-34B \
         --input_text "1,2,3,4,5,6,7,"
