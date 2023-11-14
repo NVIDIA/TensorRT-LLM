@@ -61,7 +61,7 @@ setup(
         'tensorrt_llm':
         (['libs/th_common.dll', 'libs/nvinfer_plugin_tensorrt_llm.dll']
          if platform.system() == "Windows" else
-         ['libs/libth_common.so', 'libs/libnvinfer_plugin_tensorrt_llm.so']) +
+         ['libs/libth_common.so', 'libs/libnvinfer_plugin_tensorrt_llm.so', 'libs/pygptmanager.cpython-310-x86_64-linux-gnu.so']) +
         ['tools/plugin_gen/templates/*']
     },
     python_requires=">=3.7, <4",
