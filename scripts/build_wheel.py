@@ -175,6 +175,9 @@ def main(build_type: str = "Release",
             build_dir /
             "tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so",
             lib_dir / "libnvinfer_plugin_tensorrt_llm.so")
+        print(f"copying pygptmanager")
+        copy(build_dir / "pygptmanager.cpython-310-x86_64-linux-gnu.so",
+            lib_dir / "pygptmanager.cpython-310-x86_64-linux-gnu.so")
 
     if dist_dir is None:
         dist_dir = project_dir / "build"
