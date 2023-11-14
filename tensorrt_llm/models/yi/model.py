@@ -16,8 +16,8 @@ from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
 from ...functional import gather_last_token_logits, recv, send
 from ...layers import (Attention, AttentionMaskType, AttentionParams,
-                       ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
-                       PositionEmbeddingType, RmsNorm)
+                       ColumnLinear, Embedding, GatedMLP, FusedGatedMLP,
+                       KeyValueCacheParams, PositionEmbeddingType, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
 from ..generation_mixin import GenerationMixin
@@ -39,6 +39,7 @@ class YiDecoderLayer(Module):
                  rope_scaling,
                  intermediate_size,
                  rms_norm_eps,
+                 use_fused_mlp,
                  tp_group,
                  tp_size,
                  layer_id):
@@ -61,7 +62,8 @@ class YiDecoderLayer(Module):
             tp_size=tp_size,
             instance_id=2*layer_id)
         
-        self.mlp = GatedMLP(
+        ClsMLP = FusedGatedMLP if use_fused_mlp is True else GatedMLP
+        self.mlp = ClsMLP(
             hidden_size=hidden_size,
             ffn_hidden_size=intermediate_size,
             hidden_act=hidden_act,
@@ -133,7 +135,8 @@ class YiModel(Module):
                  mapping,
                  use_parallel_embedding,
                  embedding_sharding_dim,
-                 rms_norm_eps):
+                 rms_norm_eps,
+                 use_fused_mlp):
 
         super().__init__()
         self.mapping = mapping
@@ -161,6 +164,7 @@ class YiModel(Module):
                         rope_scaling=rope_scaling,
                         intermediate_size=intermediate_size,
                         rms_norm_eps=rms_norm_eps,
+                        use_fused_mlp=use_fused_mlp,
                         tp_group=mapping.tp_group,
                         tp_size=mapping.tp_size,
                         layer_id=i)
@@ -244,7 +248,8 @@ class YiForCausalLM(YiModel, GenerationMixin):
                  mapping=Mapping(),
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
-                 rms_norm_eps=1e-5):
+                 rms_norm_eps=1e-5,
+                 use_fused_mlp=False):
         
         if isinstance(dtype, str):
             self.dtype = str_dtype_to_trt(dtype)
@@ -268,7 +273,8 @@ class YiForCausalLM(YiModel, GenerationMixin):
             mapping=mapping,
             use_parallel_embedding=use_parallel_embedding,
             embedding_sharding_dim=embedding_sharding_dim,
-            rms_norm_eps=rms_norm_eps)
+            rms_norm_eps=rms_norm_eps,
+            use_fused_mlp=use_fused_mlp)
         
         self.num_hidden_layers = num_hidden_layers
         self.hidden_size = hidden_size

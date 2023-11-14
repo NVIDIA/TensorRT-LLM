@@ -115,6 +115,13 @@ def parse_arguments():
                         default=False,
                         action='store_true')
     parser.add_argument(
+        '--use_fused_mlp',
+        default=False,
+        action='store_true',
+        help=
+        'Enable horizontal fusion in GatedMLP, reduces layer input traffic and potentially improves performance. '
+    )
+    parser.add_argument(
         '--use_parallel_embedding',
         action='store_true',
         default=False,
@@ -229,7 +236,8 @@ def build_rank_engine(builder: Builder,
         mapping=mapping,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
-        rms_norm_eps=args.rms_norm_eps)
+        rms_norm_eps=args.rms_norm_eps,
+        use_fused_mlp=args.use_fused_mlp)
 
     if args.model_dir is not None:
         logger.info(f'Loading HF Yi ... from {args.model_dir}')
