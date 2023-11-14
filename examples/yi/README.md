@@ -46,7 +46,8 @@ python build.py \
     --remove_input_padding \
     --use_gpt_attention_plugin bfloat16 \
     --use_gemm_plugin bfloat16 \
-    --enable_context_fmha
+    --enable_context_fmha \
+    --use_fused_mlp
 
 # Build the Yi-34B model using a 4 GPU devices, with tensor parallelism and pipeline parallelism
 python build.py \
@@ -64,7 +65,8 @@ python build.py \
     --use_gemm_plugin bfloat16 \
     --enable_context_fmha \
     --parallel_build \
-    --use_parallel_embedding
+    --use_parallel_embedding \
+    --use_fused_mlp
 ```
 ### Run
 
