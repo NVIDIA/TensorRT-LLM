@@ -59,6 +59,7 @@ class PluginConfig(object):
     def init(self):
         self.bert_attention_plugin = False
         self.gpt_attention_plugin = False
+        self.multi_block_mode = False
         self.identity_plugin = False
         self.gemm_plugin = False
         self.smooth_quant_gemm_plugin = False
@@ -109,6 +110,11 @@ class PluginConfig(object):
 
     def set_gpt_attention_plugin(self, dtype='float16'):
         self.gpt_attention_plugin = dtype
+        return self
+
+    def enable_mmha_multi_block_mode(self):
+        self.multi_block_mode = True
+        logger.info(f"Generation Multi Block Mode Enabled")
         return self
 
     def set_bert_attention_plugin(self, dtype='float16'):

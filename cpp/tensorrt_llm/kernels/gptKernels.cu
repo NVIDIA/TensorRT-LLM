@@ -133,8 +133,8 @@ __global__ void computePaddingOffsets(int* paddingOffsets, const int* seqOffsets
 // This kernel computes the attention mask. We must compute this on-the-fly in the future.
 
 template <typename AttentionMaskDataType>
-__global__ void computeAttentionMask(
-    AttentionMaskDataType* attentionMask, const int* seqOffsets, int maxSeqLength, AttentionMaskType attentionMaskType)
+__global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, const int* seqOffsets, int maxSeqLength,
+    int maxKvCacheLength, AttentionMaskType attentionMaskType)
 {
     // The index of the sequence in the batch.
     int batchIdx = blockIdx.y;
@@ -173,12 +173,22 @@ __global__ void computeAttentionMask(
             break;
         case AttentionMaskType::CAUSAL:
             isValid = rowIdx < seqLength && colIdx < seqLength && colIdx <= rowIdx;
+            // Sliding_window_causal when there are not enough kv cache.
+            isValid = isValid && colIdx >= max(0, rowIdx - maxKvCacheLength);
             // seq_length==4, max_seq_len==5
             // 1 0 0 0 0
             // 1 1 0 0 0
             // 1 1 1 0 0
             // 1 1 1 1 0
             // 0 0 0 0 0
+
+            // seq_length==6, max_seq_len==6, max_kv_cache_length = 2
+            // 1 0 0 0 0 0
+            // 1 1 0 0 0 0
+            // 1 1 1 0 0 0
+            // 0 1 1 1 0 0
+            // 0 0 1 1 1 0
+            // 0 0 0 1 1 1
             break;
         case AttentionMaskType::BIDIRECTIONAL:
             // clang-format off
@@ -222,8 +232,8 @@ void invokeBuildDecoderInfo(const BuildDecoderInfoParams<T>& params, cudaStream_
             blocksPerSeq *= 2;
         }
         dim3 grid(blocksPerSeq, params.batchSize);
-        computeAttentionMask<<<grid, THREADS_PER_BLOCK, 0, stream>>>(
-            params.attentionMask, params.seqOffsets, params.maxSeqLength, params.attentionMaskType);
+        computeAttentionMask<<<grid, THREADS_PER_BLOCK, 0, stream>>>(params.attentionMask, params.seqOffsets,
+            params.maxSeqLength, params.maxKvCacheLength, params.attentionMaskType);
     }
 }
 

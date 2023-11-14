@@ -287,15 +287,15 @@ class GPTModel(Module):
                                        prompt_vocab_size,
                                        workspace=workspace)
 
-        if kv_cache_params.past_key_value is None:
-            kv_cache_params.past_key_value = tuple([None] * len(self.layers))
+        kv_cache_params.fill_none_tensor_list(len(self.layers))
 
         if use_cache:
             presents = []
 
-        for layer, past, pointer in zip(
+        for layer, past, pointer, max_kv_cache_length in zip(
                 self.layers, kv_cache_params.past_key_value,
-                kv_cache_params.kv_cache_block_pointers):
+                kv_cache_params.kv_cache_block_pointers,
+                kv_cache_params.host_max_kv_cache_lengths):
             hidden_states = layer(
                 hidden_states,
                 use_cache=use_cache,
@@ -304,6 +304,7 @@ class GPTModel(Module):
                     past_key_value=[past],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
+                    host_max_kv_cache_lengths=max_kv_cache_length,
                     kv_cache_block_pointers=[pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
@@ -491,6 +492,8 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                     past_key_value=model_inputs['past_key_value'],
                     host_past_key_value_lengths=model_inputs[
                         'host_past_key_value_lengths'],
+                    host_max_kv_cache_lengths=model_inputs[
+                        'host_max_kv_cache_lengths'],
                     kv_cache_block_pointers=model_inputs[
                         'kv_cache_block_pointers_list'],
                     cache_indirection=model_inputs['cache_indirection'],

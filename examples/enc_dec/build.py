@@ -130,6 +130,14 @@ def parse_arguments(args, component):
         choices=['float16', 'float32', 'bfloat16'],
         help="Activates the lookup plugin which enables embedding sharing.")
 
+    parser.add_argument(
+        '--strongly_typed',
+        default=False,
+        action="store_true",
+        help=
+        'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
+    )
+
     args = parser.parse_args(args)
     logger.set_level(args.log_level)
 
@@ -325,7 +333,7 @@ def build(rank, args):
             cross_attention=(args.component == 'decoder'),
             has_position_embedding=args.has_position_embedding,
             has_token_type_embedding=args.has_token_type_embedding,
-        )
+            strongly_typed=args.strongly_typed)
 
         engine_name = get_engine_name(MODEL_NAME, args.dtype, world_size,
                                       cur_rank)

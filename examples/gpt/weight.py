@@ -20,8 +20,9 @@ import numpy as np
 import torch
 
 import tensorrt_llm
-from tensorrt_llm._utils import (pad_vocab_size, str_dtype_to_np,
-                                 str_dtype_to_torch, torch_to_numpy)
+from tensorrt_llm._utils import (numpy_to_torch, pad_vocab_size,
+                                 str_dtype_to_np, str_dtype_to_torch,
+                                 torch_to_numpy)
 from tensorrt_llm.functional import is_gated_activation
 from tensorrt_llm.models import GPTLMHeadModel
 from tensorrt_llm.quantization import QuantMode
@@ -259,11 +260,11 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
                     is_qkv=True)
             elif use_weight_only:
                 processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
-                    torch.tensor(t), plugin_weight_only_quant_type)
-                dst.value = processed_torch_weights.numpy()
+                    numpy_to_torch(t), plugin_weight_only_quant_type)
+                dst.value = torch_to_numpy(processed_torch_weights)
                 scales = tensorrt_llm_gpt.layers[
                     i].attention.qkv.per_channel_scale
-                scales.value = torch_weight_scales.numpy()
+                scales.value = torch_to_numpy(torch_weight_scales)
             else:
                 dst.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
         if bias:
@@ -305,11 +306,11 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
                 [1, n_embd // tensor_parallel], dtype=np.float32)
         elif use_weight_only:
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
-                torch.tensor(t), plugin_weight_only_quant_type)
-            dst.value = processed_torch_weights.numpy()
+                numpy_to_torch(t), plugin_weight_only_quant_type)
+            dst.value = torch_to_numpy(processed_torch_weights)
             scales = tensorrt_llm_gpt.layers[
                 i].attention.dense.per_channel_scale
-            scales.value = torch_weight_scales.numpy()
+            scales.value = torch_to_numpy(torch_weight_scales)
         else:
             dst.value = np.ascontiguousarray(np.transpose(t, [1, 0]))
 
@@ -355,10 +356,10 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
         elif use_weight_only:
             dst = tensorrt_llm_gpt.layers[i].mlp.fc.weight
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
-                torch.tensor(t), plugin_weight_only_quant_type)
-            dst.value = processed_torch_weights.numpy()
+                numpy_to_torch(t), plugin_weight_only_quant_type)
+            dst.value = torch_to_numpy(processed_torch_weights)
             scales = tensorrt_llm_gpt.layers[i].mlp.fc.per_channel_scale
-            scales.value = torch_weight_scales.numpy()
+            scales.value = torch_to_numpy(torch_weight_scales)
         else:
             tensorrt_llm_gpt.layers[
                 i].mlp.fc.weight.value = np.ascontiguousarray(
@@ -403,10 +404,10 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
         elif use_weight_only:
             dst = tensorrt_llm_gpt.layers[i].mlp.proj.weight
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
-                torch.tensor(t), plugin_weight_only_quant_type)
-            dst.value = processed_torch_weights.numpy()
+                numpy_to_torch(t), plugin_weight_only_quant_type)
+            dst.value = torch_to_numpy(processed_torch_weights)
             scales = tensorrt_llm_gpt.layers[i].mlp.proj.per_channel_scale
-            scales.value = torch_weight_scales.numpy()
+            scales.value = torch_to_numpy(torch_weight_scales)
         else:
             tensorrt_llm_gpt.layers[i].mlp.proj.weight.value = (
                 np.ascontiguousarray(np.transpose(t, [1, 0])))

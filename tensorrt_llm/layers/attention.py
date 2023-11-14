@@ -19,7 +19,7 @@ import numpy as np
 import tensorrt as trt
 
 from .._common import default_net, precision
-from .._utils import numpy_fp32_to_bf16
+from .._utils import numpy_fp32_to_bf16, trt_dtype_to_np
 from ..functional import (AttentionMaskType, PositionEmbeddingType,
                           RotaryScalingType, Tensor, bert_attention, cast, clip,
                           concat, constant, embedding, expand_dims, expand_mask,
@@ -36,17 +36,15 @@ from .linear import ColumnLinear, RowLinear
 class RopeEmbeddingUtils:
 
     @staticmethod
-    def create_sinusoidal_positions(
-        num_pos: int,
-        dim: int,
-        theta: float = 10000.0,
-    ):
-        inv_freq = 1.0 / (theta**(np.arange(0, dim, 2) / dim)).astype(
-            np.float32)
+    def create_sinusoidal_positions(num_pos: int,
+                                    dim: int,
+                                    theta: float = 10000.0,
+                                    dtype=np.float32):
+        inv_freq = 1.0 / (theta**(np.arange(0, dim, 2) / dim)).astype(dtype)
         sinusoid_inp = np.einsum("i , j -> i j",
-                                 np.arange(num_pos, dtype=np.float32),
+                                 np.arange(num_pos, dtype=dtype),
                                  inv_freq,
-                                 dtype=np.float32)
+                                 dtype=dtype)
         concat = np.concatenate((np.sin(sinusoid_inp), np.cos(sinusoid_inp)),
                                 axis=1)
         return np.expand_dims(concat, axis=0).astype(np.float32)
@@ -64,7 +62,9 @@ class RopeEmbeddingUtils:
         x2 = slice(tensor, [0, 0, 0, 1], shape_tensor, [1, 1, 1, 2])
         x1 = expand_dims(x1, 4)
         x2 = expand_dims(x2, 4)
-        zero = constant(np.ascontiguousarray(np.zeros([1], dtype=np.float32)))
+        zero = constant(
+            np.ascontiguousarray(np.zeros([1],
+                                          dtype=trt_dtype_to_np(x2.dtype))))
         x2 = zero - x2
         x = concat([x2, x1], 4)
         return view(
@@ -86,7 +86,9 @@ class RopeEmbeddingUtils:
         x1 = slice(tensor, [0, 0, 0, 0], shape_tensor, [1, 1, 1, 1])
         x2 = slice(tensor, concat([0, 0, 0, last_dim]), shape_tensor,
                    [1, 1, 1, 1])
-        zero = constant(np.ascontiguousarray(np.zeros([1], dtype=np.float32)))
+        zero = constant(
+            np.ascontiguousarray(np.zeros([1],
+                                          dtype=trt_dtype_to_np(x2.dtype))))
         x2 = zero - x2
         x = concat([x2, x1], 3)
         return x
@@ -273,11 +275,13 @@ class KeyValueCacheParams:
     def __init__(self,
                  past_key_value: List[Tensor] = None,
                  host_past_key_value_lengths: Tensor = None,
+                 host_max_kv_cache_lengths: List[Tensor] = None,
                  kv_cache_block_pointers: List[Tensor] = None,
                  cache_indirection: Tensor = None,
                  past_key_value_length: Tensor = None):
         self.past_key_value = past_key_value
         self.host_past_key_value_lengths = host_past_key_value_lengths
+        self.host_max_kv_cache_lengths = host_max_kv_cache_lengths
         self.kv_cache_block_pointers = kv_cache_block_pointers
         self.cache_indirection = cache_indirection
         # self.past_key_value_length = past_key_value_length
@@ -292,9 +296,17 @@ class KeyValueCacheParams:
             return None
         return self.kv_cache_block_pointers[0]
 
+    def fill_none_tensor_list(self, list_size):
+        if self.past_key_value is None:
+            self.past_key_value = tuple([None] * list_size)
+        if self.host_max_kv_cache_lengths is None:
+            self.host_max_kv_cache_lengths = tuple([None] * list_size)
+
     def is_valid(self, gpt_attention_plugin):
         if gpt_attention_plugin:
             if self.host_past_key_value_lengths is None:
+                return False
+            if self.host_max_kv_cache_lengths is None:
                 return False
             if self.cache_indirection is None:
                 return False
@@ -323,7 +335,6 @@ class Attention(Module):
         tp_group=None,
         tp_size=1,
         tp_rank=0,
-        multi_block_mode=False,
         quant_mode: QuantMode = QuantMode(0),
         q_scaling=1.0,
         cross_attention=False,
@@ -365,7 +376,6 @@ class Attention(Module):
         #   - True,  inv_sqrt_Dh * Q*K^T + inv_sqrt_Dh * alibi_bias
         self.scale_alibi_bias = position_embedding_type == PositionEmbeddingType.alibi_with_scale
         self.position_embedding_type = position_embedding_type
-        self.multi_block_mode = multi_block_mode
         self.relative_attention = relative_attention
         self.max_distance = max_distance
         self.rotary_embedding_base = rotary_embedding_base
@@ -387,7 +397,9 @@ class Attention(Module):
                                             rotary_embedding_percentage)
             self.rotary_enabled = True
             self.embed_positions = RopeEmbeddingUtils.create_sinusoidal_positions(
-                self.max_position_embeddings, self.rotary_embedding_dim)
+                self.max_position_embeddings,
+                self.rotary_embedding_dim,
+            )
 
         self.quant_mode = quant_mode
         if use_int8_kv_cache:
@@ -529,6 +541,8 @@ class Attention(Module):
                 sequence_length=attention_params.sequence_length,
                 host_past_key_value_lengths=kv_cache_params.
                 host_past_key_value_lengths,
+                host_max_kv_cache_lengths=kv_cache_params.
+                host_max_kv_cache_lengths,
                 context_lengths=attention_params.context_lengths,
                 cache_indirection=kv_cache_params.cache_indirection,
                 host_request_types=attention_params.host_request_types,
@@ -542,7 +556,6 @@ class Attention(Module):
                 rotary_embedding_scale=self.rotary_embedding_scale,
                 rotary_embedding_max_positions=self.max_position_embeddings,
                 position_embedding_type=self.position_embedding_type,
-                multi_block_mode=self.multi_block_mode,
                 kv_orig_quant_scale=kv_orig_quant_scale,
                 kv_quant_orig_scale=kv_quant_orig_scale,
                 kv_cache_quant_mode=self.quant_mode,
@@ -612,6 +625,10 @@ class Attention(Module):
                     embed_positions = constant(embed_positions)
                 else:
                     embed_positions = constant(self.embed_positions)
+
+                if default_net().strongly_typed and (embed_positions.dtype !=
+                                                     value.dtype):
+                    embed_positions = cast(embed_positions, value.dtype)
 
                 if self.rotary_embedding_dim is not None:
                     # When shape(hidden_states, 1) > 1(Context phase), the embedding start from 0,
@@ -807,6 +824,10 @@ class Attention(Module):
                     attention_scores = attention_scores + bias
 
             attention_probs = softmax(attention_scores, dim=-1)
+
+            if default_net().strongly_typed and (attention_probs.dtype !=
+                                                 value.dtype):
+                attention_probs = cast(attention_probs, value.dtype)
 
             context = matmul(attention_probs, value).permute([0, 2, 1, 3])
             context = context.view(

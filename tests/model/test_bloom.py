@@ -209,6 +209,8 @@ class TestBloom(unittest.TestCase):
                                            dtype=torch.int32).cuda()
         ctx_host_past_key_value_lengths = torch.tensor([0] * batch_size,
                                                        dtype=torch.int32)
+        host_max_kv_cache_lengths = torch.tensor([total_length],
+                                                 dtype=torch.int32)
 
         cache_indirections = [
             torch.full((
@@ -259,6 +261,7 @@ class TestBloom(unittest.TestCase):
                                       device='cuda')
             ctx_shape.update({
                 f'past_key_value_{i}': shape,
+                f'host_max_kv_cache_length_{i}': (1, ),
             })
             shape = (batch_size, 2, bloom_config.n_head, seq_len,
                      bloom_config.hidden_size // bloom_config.n_head)
@@ -269,6 +272,8 @@ class TestBloom(unittest.TestCase):
                 torch.zeros(shape,
                             dtype=str_dtype_to_torch(dtype),
                             device='cuda'),
+                f'host_max_kv_cache_length_{i}':
+                host_max_kv_cache_lengths,
             })
 
         context = runtime.ctx_context
@@ -305,6 +310,8 @@ class TestBloom(unittest.TestCase):
         gen_host_past_key_value_lengths = torch.tensor([seq_len + step - 1] *
                                                        batch_size,
                                                        dtype=torch.int32)
+        gen_host_max_kv_cache_lengths = torch.tensor([total_length],
+                                                     dtype=torch.int32)
         step1_buffer = {
             'input_ids': gen_id,
             'context_lengths': gen_context_lengths.contiguous(),
@@ -331,10 +338,13 @@ class TestBloom(unittest.TestCase):
                      bloom_config.hidden_size // bloom_config.n_head)
             step1_shape.update({
                 f'past_key_value_{i}': shape,
+                f'host_max_kv_cache_length_{i}': (1, ),
             })
             step1_buffer.update({
                 f'past_key_value_{i}':
                 ctx_buffer[f'present_key_value_{i}'],
+                f'host_max_kv_cache_length_{i}':
+                host_max_kv_cache_lengths,
             })
 
         context = runtime.context_1

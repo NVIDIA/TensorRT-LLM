@@ -79,10 +79,12 @@ public:
     class ForwardParams
     {
     public:
-        ForwardParams(int step, int ite, int maxInputLength, int localBatchSize, tc::Tensor logits, tc::Tensor endIds)
+        ForwardParams(int step, int ite, int maxInputLength, int maxKvCacheLength, int localBatchSize,
+            tc::Tensor logits, tc::Tensor endIds)
             : step{step}
             , ite{ite}
             , max_input_length{maxInputLength}
+            , max_kv_cache_length{maxKvCacheLength}
             , local_batch_size{localBatchSize}
             , logits{std::move(logits)}
             , end_ids{std::move(endIds)}
@@ -93,6 +95,7 @@ public:
         int step;
         int ite;
         int max_input_length;
+        int max_kv_cache_length;
         int local_batch_size;
         tc::Tensor logits;  // [batch_size, beam_width, vocab_size_padded], on gpu
         tc::Tensor end_ids; // [batch_size], on gpu

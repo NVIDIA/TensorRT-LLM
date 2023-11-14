@@ -44,7 +44,8 @@ optional object to log information, warnings and errors:
 
 using namespace tensorrt_llm::runtime;
 
-GptSession session(modelConfig,   // Description of the model,
+GptSession session(sessionConfig, // Configuration of the session,
+                   modelConfig,   // Description of the model,
                    worldConfig,   // Description of the environment,
                    engineBuffer,  // The compiled TensorRT engine (const void*),
                    engineSize,    // The size in bytes of the TensorRT engine (size_t),
@@ -55,6 +56,35 @@ The above constructor accepts a `const void*` pointer to the engine and the
 associated size (in bytes) of that buffer. There exist other overloaded
 versions that take `std::vector<uint8_t>` or `std::string` arguments to
 encapsulate the engine.
+
+#### Session Configuration
+
+The session configuration is an instance of the
+[`GptSession::Config`](source:cpp/include/tensorrt_llm/runtime/gptSession.h) class.
+The constructor of this class requires three arguments:
+
+ * `maxBatchSize`, the maximum number of sequences in a batch,
+ * `maxBeamWidth`, the maximum width of the beams in beam-search,
+ * `maxSequenceLength`, the length of the longest input sequence,
+
+Additionally, the class encapsulates the following optional parameters
+(they are declared as public member variables and can be accessed directly):
+
+ * `decoderPerRequest`, whether the session will use a different decoder per
+   request. It must be set to `true` when running in-flight batching,
+ * `cudaGraphMode`, whether the session will use CUDA graphs for the engine
+   execution in generation phase,
+ * `kvCacheConfig` encapsulates parameters to configure paged KV cache, when the paged KV cache is enabled in the engine:
+    * `maxTokens`, the maximum number of tokens that will have to be
+       stored in the paged KV cache,
+    * `freeGpuMemoryFraction`, the fraction of free GPU memory that will be
+      reserved for paged KV cache,
+ * `ctxMicroBatchSize`, the micro batch size to be used in context phase.
+   Batches entered in `GptSession::generation` will be split into smaller
+   micro batches of this size,
+ * `genMicroBatchSize`, the micro batch size to be used in generation phase,
+   Batches entered in `GptSession::generation` will be split into smaller
+   micro batches of this size.
 
 #### Model Configuration
 
@@ -152,7 +182,7 @@ MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 tensorrt_llm::runtime::WorldConfig worldConfig(tensorParallelism, pipelineParallelism, rank);
 
 // Create the GPT session (as shown above).
-tensorrt_llm::runtime::GptSession session(modelConfig, worldConfig, ...);
+tensorrt_llm::runtime::GptSession session(sessionConfig, modelConfig, worldConfig, ...);
 ```
 
 For simplicity, TensorRT-LLM provides users with the following simplified API:
@@ -168,22 +198,6 @@ installed on the system (talk to your system administrator if needed):
 # Launch the program using two processes (worldSize == 2 and ranks == {0, 1}).
 mpirun -n 2 ...
 ```
-
-### Setup
-
-***GptSession***
-
-The `GptSession::setup` member function must be called to prepare the runtime
-to execute the inference on a batch of input sequences. That member function
-takes four arguments:
-
- * `batchSize`, the number of sequences in the batch,
- * `beamWidth`, the width of the beams in beam-search,
- * `maxSequenceLength`, the length of the longest input sequence,
- * `decoderPerRequest`, is the session asked to use a different decoder per
-   request. It must be set to `true` when running in-flight batching,
- * `maxTokensInPagedKvCache`, the maximum number of tokens that will have to be
-   stored in the KV cache when the paged KV cache is enabled.
 
 ### Generation
 
@@ -230,10 +244,10 @@ populates an instance of the
    sequences). It can be set to the same value as `endId`,
  * `ids`, is the tensor of input IDs. That tensor must be allocated on the GPU.
    When the input tensor is padded, the shape of `ids` is `[batchSize,
-   maxInputLength]`, where `batchSize` and `maxInputLength` correspond to the
-   arguments passed to the `GptSession::setup` member function. When the input
-   is packed, the shape of `ids` is `[numTokens]`, where `numTokens` is the sum
-   of the lengths of the different sequences in the batch,
+   maxInputLength]`, where `batchSize` and `maxInputLength` must respect the
+   maximum sizes in `sessionConfig` passed to the `GptSession` constructor.
+   When the input is packed, the shape of `ids` is `[numTokens]`, where
+   `numTokens` is the sum of the lengths of the different sequences in the batch,
  * `lengths`, is the tensor of input sequence lengths. That tensor must be
    allocated on the GPU and contain `batchSize` values,
  * `packed`, indicates if the `ids` tensor is packed or padded. In this

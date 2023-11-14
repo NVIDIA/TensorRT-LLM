@@ -497,7 +497,8 @@ class TestGPT(unittest.TestCase):
             blocks = batch_size * beam_width * max_blocks_per_seq
             kv_cache_manager = KVCacheManager(key_value_cache_buffers, blocks,
                                               tokens_per_block,
-                                              max_blocks_per_seq, beam_width)
+                                              max_blocks_per_seq, total_length,
+                                              beam_width)
 
             # Add sequences to the manager
             for bi in range(batch_size):
@@ -513,6 +514,7 @@ class TestGPT(unittest.TestCase):
                        last_token_ids,
                        cache_indirection,
                        host_past_key_value_lengths,
+                       host_max_kv_cache_lengths,
                        sequence_length=None,
                        host_context_lengths=None):
 
@@ -543,12 +545,16 @@ class TestGPT(unittest.TestCase):
                     ctx_buffer[
                         f'kv_cache_block_pointers_{idx}'] = kv_cache_block_pointers[
                             idx].reshape(shape).contiguous()
+                    ctx_buffer[
+                        f'host_max_kv_cache_length_{idx}'] = host_max_kv_cache_lengths
             else:
                 for i in range(gpt_config.n_layer):
                     ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[
                         i]
                     ctx_buffer[
                         f'present_key_value_{i}'] = key_value_cache_buffers[i]
+                    ctx_buffer[
+                        f'host_max_kv_cache_length_{i}'] = host_max_kv_cache_lengths
 
             ctx_shape = {
                 key: buffer.shape
@@ -599,6 +605,8 @@ class TestGPT(unittest.TestCase):
 
             host_past_key_value_lengths = torch.tensor([0] * batch_size,
                                                        dtype=torch.int32)
+            host_max_kv_cache_lengths = torch.tensor([total_length],
+                                                     dtype=torch.int32)
 
             host_context_lengths = ctx_context_lengths.cpu(
             ) if enable_remove_input_padding else None
@@ -617,6 +625,7 @@ class TestGPT(unittest.TestCase):
                 last_token_ids=ctx_last_token_ids,
                 cache_indirection=cache_indirections[0],
                 host_past_key_value_lengths=host_past_key_value_lengths,
+                host_max_kv_cache_lengths=host_max_kv_cache_lengths,
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types)
@@ -667,6 +676,8 @@ class TestGPT(unittest.TestCase):
             host_past_key_value_lengths = torch.tensor([seq_len + step - 1] *
                                                        batch_size,
                                                        dtype=torch.int32)
+            host_max_kv_cache_lengths = torch.tensor([seq_len + step],
+                                                     dtype=torch.int32)
 
             host_context_lengths = gen_context_lengths.cpu(
             ) if enable_remove_input_padding else None
@@ -684,6 +695,7 @@ class TestGPT(unittest.TestCase):
                 last_token_ids=gen_last_token_ids,
                 cache_indirection=cache_indirections[1],
                 host_past_key_value_lengths=host_past_key_value_lengths,
+                host_max_kv_cache_lengths=host_max_kv_cache_lengths,
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types)
@@ -739,6 +751,9 @@ class TestGPT(unittest.TestCase):
                 [0] * num_context_input + [seq_len] * num_generation_input,
                 dtype=torch.int32)
 
+            host_max_kv_cache_lengths = torch.tensor([total_length],
+                                                     dtype=torch.int32)
+
             context_lengths = torch.tensor([seq_len] * batch_size,
                                            dtype=torch.int32).cuda()
             if enable_remove_input_padding:
@@ -761,6 +776,7 @@ class TestGPT(unittest.TestCase):
                 last_token_ids=gen_last_token_ids,
                 cache_indirection=cache_indirections[0],
                 host_past_key_value_lengths=host_past_key_value_lengths,
+                host_max_kv_cache_lengths=host_max_kv_cache_lengths,
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types,

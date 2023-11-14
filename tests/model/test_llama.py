@@ -318,6 +318,9 @@ class TestLLaMA(unittest.TestCase):
             ctx_shape[f'past_key_value_{i}'] = kv_shape
             ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             ctx_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
+            ctx_buffer[f'host_max_kv_cache_length_{i}'] = torch.tensor(
+                [max_seq_len], dtype=torch.int32)
+            ctx_shape[f'host_max_kv_cache_length_{i}'] = (1, )
         ctx_buffer['sequence_length'] = sequence_length_buffer
         ctx_shape['sequence_length'] = ctx_buffer['sequence_length'].shape
         ctx_shape['host_past_key_value_lengths'] = (batch_size, )
@@ -374,11 +377,14 @@ class TestLLaMA(unittest.TestCase):
 
         for i in range(llama_config.num_hidden_layers):
             step1_shape[f'past_key_value_{i}'] = kv_shape
+            step1_shape[f'host_max_kv_cache_length_{i}'] = (1, )
         step1_shape['sequence_length'] = (batch_size, )
         step1_shape['host_past_key_value_lengths'] = (batch_size, )
         for i in range(llama_config.num_hidden_layers):
             step1_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             step1_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
+            step1_buffer[f'host_max_kv_cache_length_{i}'] = torch.tensor(
+                [max_seq_len], dtype=torch.int32)
         step1_buffer[
             'host_past_key_value_lengths'] = sequence_length_buffer.cpu()
         sequence_length_buffer = torch.add(sequence_length_buffer, step)

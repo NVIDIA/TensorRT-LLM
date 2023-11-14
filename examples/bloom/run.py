@@ -31,6 +31,12 @@ PAD_TOKEN = 3
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--max_output_len', type=int, required=True)
+    parser.add_argument('--max_kv_cache_len',
+                        type=int,
+                        default=None,
+                        help='The max kv cache length. \
+              If the final sequence length exceeds the kv cache length, we will enable cyclic kv cache. \
+              If it is set to None, we will use the max sequence length.')
     parser.add_argument('--log_level', type=str, default='error')
     parser.add_argument('--engine_dir', type=str, default='bloom_outputs')
     parser.add_argument('--tokenizer_dir',
@@ -91,7 +97,8 @@ if __name__ == '__main__':
                                                      runtime_mapping)
     decoder.setup(input_ids.size(0),
                   max_context_length=input_ids.size(1),
-                  max_new_tokens=args.max_output_len)
+                  max_new_tokens=args.max_output_len,
+                  max_kv_cache_length=args.max_kv_cache_len)
     output_ids = decoder.decode(input_ids, input_lengths, sampling_config)
     torch.cuda.synchronize()
 

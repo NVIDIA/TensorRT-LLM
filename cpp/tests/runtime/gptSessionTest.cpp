@@ -739,6 +739,7 @@ void testChatGlmSession(fs::path const& modelPath, std::string const& modelName,
     samplingConfig.randomSeed = std::vector{1ull};
     samplingConfig.topK = std::vector{1};
     samplingConfig.topP = std::vector{1.0f};
+    samplingConfig.lengthPenalty = std::vector{1.0f};
 
     auto const padId = modelIds.padId;
     auto const endId = modelIds.endId;

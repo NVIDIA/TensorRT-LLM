@@ -28,6 +28,12 @@ from build import get_engine_name  # isort:skip
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--max_output_len', type=int, required=True)
+    parser.add_argument('--max_kv_cache_len',
+                        type=int,
+                        default=None,
+                        help='The max kv cache length. \
+              If the final sequence length exceeds the kv cache length, we will enable cyclic kv cache. \
+              If it is set to None, we will use the max sequence length.')
     parser.add_argument('--log_level', type=str, default='error')
     parser.add_argument('--engine_dir', type=str, default='gptneox_outputs')
     parser.add_argument('--tokenizer_dir',
@@ -95,7 +101,9 @@ if __name__ == '__main__':
                                                      runtime_mapping,
                                                      debug_mode=False)
     if remove_input_padding:
-        decoder.setup(1, torch.max(input_lengths).item(), args.max_output_len)
+        decoder.setup(1,
+                      torch.max(input_lengths).item(), args.max_output_len,
+                      args.max_kv_cache_len)
     else:
         decoder.setup(input_ids.size(0), input_ids.size(1), args.max_output_len)
     output_ids = decoder.decode(input_ids, input_lengths, sampling_config)

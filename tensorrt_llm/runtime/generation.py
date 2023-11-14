@@ -390,10 +390,11 @@ class GenerationSession(object):
 
         if model_config.gpt_attention_plugin:
             expected_tensor_names += [
-                'sequence_length',
-                'context_lengths',
-                'host_request_types',
-                'host_past_key_value_lengths',
+                'sequence_length', 'context_lengths', 'host_request_types',
+                'host_past_key_value_lengths'
+            ]
+            expected_tensor_names += [
+                f'host_max_kv_cache_length_{i}' for i in range(self.num_layers)
             ]
             if model_config.remove_input_padding:
                 expected_tensor_names.append('host_context_lengths')
@@ -698,6 +699,7 @@ class GenerationSession(object):
                      device=padded_input_ids.device)),
                 axis=-1)
 
+        # Note: we still allocate max_seq_length size of parent ids (not max_kv_cache_length).
         self.parent_ids = torch.zeros(
             (batch_size, scfg.num_beams, self.max_seq_length),
             dtype=torch.int32,
@@ -784,6 +786,7 @@ class GenerationSession(object):
               max_context_length: int,
               max_new_tokens: int,
               beam_width: int = 1,
+              max_kv_cache_length: Optional[int] = None,
               encoder_max_input_length: Optional[int] = None):
         # Store these params related to buffer size to check against
         # the input shape with the params given in decode()
@@ -793,6 +796,50 @@ class GenerationSession(object):
         self.max_seq_length = max_context_length + max_new_tokens
         self.beam_width = beam_width
         self.encoder_max_input_length = encoder_max_input_length
+        if max_kv_cache_length is None:
+            self.max_kv_cache_length = self.max_seq_length
+            logger.info(
+                "The max_kv_cache_length is not set, we will use max_seq_length by default."
+            )
+            self.host_max_kv_cache_lengths = [
+                torch.ones((1, ), dtype=torch.int32) * self.max_kv_cache_length
+                for i in range(self.num_layers)
+            ]
+        elif isinstance(max_kv_cache_length, int):
+            if max_kv_cache_length > self.max_seq_length:
+                logger.warning(
+                    "The value of max_kv_cache_length should ideally not exceed max_seq_length. "
+                    "Therefore, it has been adjusted to match the value of max_seq_length."
+                )
+            self.max_kv_cache_length = min(max_kv_cache_length,
+                                           self.max_seq_length)
+            self.host_max_kv_cache_lengths = [
+                torch.ones((1, ), dtype=torch.int32) * self.max_kv_cache_length
+                for i in range(self.num_layers)
+            ]
+        elif isinstance(max_kv_cache_length, torch.Tensor):
+            self.max_kv_cache_length = int(
+                torch.max(max_kv_cache_length).item())
+            if self.max_kv_cache_length > self.max_seq_length:
+                logger.warning(
+                    "The value of max_kv_cache_length should ideally not exceed max_seq_length. "
+                    "Therefore, it has been adjusted to match the value of max_seq_length."
+                )
+            self.max_kv_cache_length = min(self.max_kv_cache_length,
+                                           self.max_seq_length)
+            if max_kv_cache_length.shape[0] != self.num_layers:
+                logger.error(
+                    "max_kv_cache_length tensor's size is not equal to num_layers!"
+                )
+                assert False
+            self.host_max_kv_cache_lengths = [
+                torch.minimum(
+                    max_kv_cache_length.to(torch.int32)[i],
+                    torch.IntTensor([self.max_seq_length]))
+                for i in range(self.num_layers)
+            ]
+        else:
+            assert False, "invalid max_kv_cache_length!"
 
         self.buffer = {}
         if self.mapping.is_last_pp_rank():
@@ -810,7 +857,7 @@ class GenerationSession(object):
 
         if self.paged_kv_cache:
             blocks = batch_size * beam_width * math.ceil(
-                self.max_seq_length / self.tokens_per_block)
+                self.max_kv_cache_length / self.tokens_per_block)
             cache_shape = (
                 blocks,
                 2,
@@ -823,7 +870,7 @@ class GenerationSession(object):
                 batch_size,
                 2,
                 self.num_heads_kv,
-                self.max_seq_length,
+                self.max_kv_cache_length,
                 self.head_size,
             )
             if self.cross_attention:
@@ -1021,7 +1068,7 @@ class GenerationSession(object):
                         f'past_key_value_{idx}':
                         key_value_cache,
                         f'present_key_value_{idx}':
-                        key_value_cache
+                        key_value_cache,
                     })
                     if self.cross_attention:
                         cross_cache_shape = self.buffer[
@@ -1047,6 +1094,14 @@ class GenerationSession(object):
                 'host_past_key_value_lengths': (batch_size, ),
                 'host_request_types': host_request_types.shape,
             })
+            for idx in range(self.first_layer, self.last_layer):
+                ctx_shape.update({
+                    f'host_max_kv_cache_length_{idx}': (1, ),
+                })
+                ctx_buffer.update({
+                    f'host_max_kv_cache_length_{idx}':
+                    self.host_max_kv_cache_lengths[idx],
+                })
             ctx_buffer.update({
                 'sequence_length':
                 self.sequence_length_buffer,
@@ -1229,6 +1284,14 @@ class GenerationSession(object):
                 'host_request_types':
                 host_request_types.shape
             })
+            for idx in range(self.first_layer, self.last_layer):
+                next_step_shape.update({
+                    f'host_max_kv_cache_length_{idx}': (1, ),
+                })
+                next_step_buffer.update({
+                    f'host_max_kv_cache_length_{idx}':
+                    self.host_max_kv_cache_lengths[idx],
+                })
             next_step_buffer.update({
                 # Sequence lengths are not used in the context phase actually.
                 'sequence_length':
@@ -1595,14 +1658,15 @@ class GenerationSession(object):
                     (batch_size, beam_width, -1)).to(self.decoder_logits_dtype)
                 decode_step = step + max_context_length
                 should_stop = self.dynamic_decoder.forward(
-                    next_token_logits, decode_step, max_context_length, ite,
-                    batch_size, self.end_ids, self.embedding_bias_opt,
-                    context_lengths, sequence_limit_lengths, stop_words_list,
-                    bad_words_list, no_repeat_ngram_size,
-                    this_src_cache_indirection, self.output_ids,
-                    self.new_tokens, self.finished, self.sequence_length_buffer,
-                    self.cum_log_probs, self.log_probs, self.parent_ids,
-                    this_tgt_cache_indirection, self.beam_hyps_output_ids_tgt,
+                    next_token_logits, decode_step, max_context_length,
+                    self.max_kv_cache_length, ite, batch_size, self.end_ids,
+                    self.embedding_bias_opt, context_lengths,
+                    sequence_limit_lengths, stop_words_list, bad_words_list,
+                    no_repeat_ngram_size, this_src_cache_indirection,
+                    self.output_ids, self.new_tokens, self.finished,
+                    self.sequence_length_buffer, self.cum_log_probs,
+                    self.log_probs, self.parent_ids, this_tgt_cache_indirection,
+                    self.beam_hyps_output_ids_tgt,
                     self.beam_hyps_sequence_lengths_tgt,
                     self.beam_hyps_cum_log_probs, self.beam_hyps_normed_scores,
                     self.beam_hyps_log_probs, self.beam_hyps_min_normed_scores,
@@ -1851,7 +1915,7 @@ class GenerationSession(object):
             torch.full((
                 batch_size,
                 beam_width,
-                self.max_seq_length,
+                self.max_kv_cache_length,
             ),
                        0,
                        dtype=torch.int32,
@@ -1859,7 +1923,7 @@ class GenerationSession(object):
             torch.full((
                 batch_size,
                 beam_width,
-                self.max_seq_length,
+                self.max_kv_cache_length,
             ),
                        0,
                        dtype=torch.int32,
@@ -1875,7 +1939,7 @@ class GenerationSession(object):
 
         # Init KV cache block manager
         if self.paged_kv_cache:
-            max_blocks_per_seq = math.ceil(self.max_seq_length /
+            max_blocks_per_seq = math.ceil(self.max_kv_cache_length /
                                            self.tokens_per_block)
             blocks = batch_size * beam_width * max_blocks_per_seq
             memory_pools = [
@@ -1885,6 +1949,7 @@ class GenerationSession(object):
             self.kv_cache_manager = KVCacheManager(memory_pools, blocks,
                                                    self.tokens_per_block,
                                                    max_blocks_per_seq,
+                                                   self.max_kv_cache_length,
                                                    beam_width)
 
             # Add sequences to the manager

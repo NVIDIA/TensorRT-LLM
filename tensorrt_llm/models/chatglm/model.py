@@ -70,7 +70,6 @@ class ChatGLMDecoderLayer(Module):
             tp_group=args.mapping.tp_group,
             tp_size=args.mapping.tp_size,
             tp_rank=args.mapping.rank,
-            multi_block_mode=args.multi_block_mode,
             quant_mode=args.quant_mode,
             q_scaling=1.0,
             cross_attention=False,
@@ -193,20 +192,24 @@ class ChatGLMModel(Module):
 
         hidden_states = self.embedding(input_ids)
 
+        kv_cache_params.fill_none_tensor_list(len(self.layers))
+
         if self.use_cache:
             presents = []
 
-        for layer, past_key_value, kv_cache_block_pointers in zip(
+        for layer, past, pointer, max_kv_cache_length in zip(
                 self.layers, kv_cache_params.past_key_value,
-                kv_cache_params.kv_cache_block_pointers):
+                kv_cache_params.kv_cache_block_pointers,
+                kv_cache_params.host_max_kv_cache_lengths):
             layer_output = layer(
                 hidden_states,
                 position_ids,
                 kv_cache_params=KeyValueCacheParams(
-                    past_key_value=[past_key_value],
-                    kv_cache_block_pointers=[kv_cache_block_pointers],
+                    past_key_value=[past],
+                    kv_cache_block_pointers=[pointer],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
+                    host_max_kv_cache_lengths=max_kv_cache_length,
                     cache_indirection=kv_cache_params.cache_indirection,
                 ),
                 attention_params=attention_params,
@@ -232,7 +235,6 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
                 argNamespace.__setattr__(key, value)
             assert "model_version" in args.keys(), "model_version not set"
             # Other default values
-            argNamespace.multi_block_mode = False
             argNamespace.norm_epsilon = 1.0e-5
             argNamespace.tokens_per_block = 64
             argNamespace.use_cache = True
@@ -272,6 +274,12 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
             self.kv_dtype = str_dtype_to_trt('int8')
         elif args.quant_mode.has_fp8_kv_cache():
             self.kv_dtype = str_dtype_to_trt('fp8')
+
+        if isinstance(args.logits_dtype, str):
+            self._logits_dtype = str_dtype_to_trt(args.logits_dtype)
+        else:
+            assert isinstance(args.logits_dtype, trt.DataType)
+            self._logits_dtype = args.logits_dtype
 
         self.hidden_size = args.hidden_size
         self.mapping = args.mapping
@@ -317,7 +325,7 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
             default_net().plugin_config.remove_input_padding)
 
         lm_logits = self.lm_head(hidden_states)
-        lm_logits.mark_output('logits', self.dtype)
+        lm_logits.mark_output('logits', self._logits_dtype)
 
         if self.use_cache and default_net(
         ).plugin_config.paged_kv_cache == False:
@@ -373,6 +381,8 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
                     past_key_value=model_inputs['past_key_value'],
                     host_past_key_value_lengths=model_inputs[
                         'host_past_key_value_lengths'],
+                    host_max_kv_cache_lengths=model_inputs[
+                        'host_max_kv_cache_lengths'],
                     kv_cache_block_pointers=model_inputs[
                         'kv_cache_block_pointers_list'],
                     cache_indirection=model_inputs['cache_indirection'],

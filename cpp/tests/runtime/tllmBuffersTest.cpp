@@ -36,9 +36,6 @@ protected:
     void SetUp() override
     {
         mDeviceCount = tc::getDeviceCount();
-
-        if (mDeviceCount == 0)
-            GTEST_SKIP();
     }
 
     void TearDown() override {}
@@ -48,6 +45,9 @@ protected:
 
 TEST_F(TllmBuffersTest, Stream)
 {
+    if (mDeviceCount == 0)
+        GTEST_SKIP();
+
     CudaStream stream{};
     EXPECT_NE(stream.get(), nullptr);
     auto ptr = std::make_shared<CudaStream>();
@@ -109,6 +109,9 @@ TEST_F(TllmBuffersTest, HostAllocator)
 
 TEST_F(TllmBuffersTest, CudaAllocatorAsync)
 {
+    if (mDeviceCount == 0)
+        GTEST_SKIP();
+
     auto streamPtr = std::make_shared<CudaStream>();
     auto constexpr size = 1024;
     CudaAllocatorAsync allocator{streamPtr};
@@ -171,6 +174,9 @@ void testBuffer(IBuffer& buffer, std::int32_t typeSize)
 
 TEST_F(TllmBuffersTest, DeviceBuffer)
 {
+    if (mDeviceCount == 0)
+        GTEST_SKIP();
+
     auto streamPtr = std::make_shared<CudaStream>();
     auto constexpr size = 1024;
     CudaAllocatorAsync allocator{streamPtr};
@@ -186,6 +192,9 @@ TEST_F(TllmBuffersTest, DeviceBuffer)
 
 TEST_F(TllmBuffersTest, DeviceTensor)
 {
+    if (mDeviceCount == 0)
+        GTEST_SKIP();
+
     auto streamPtr = std::make_shared<CudaStream>();
     nvinfer1::Dims constexpr dims{3, 16, 8, 4};
     CudaAllocatorAsync allocator{streamPtr};
@@ -228,91 +237,11 @@ TEST_F(TllmBuffersTest, BufferSlice)
     EXPECT_EQ(uniqueSlice->getSize(), sizeSlice - 1);
 }
 
-TEST_F(TllmBuffersTest, TensorSlice)
-{
-    auto dims = ITensor::makeShape({16, 8, 4});
-    HostAllocator allocator{};
-    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
-    auto tensor = std::make_shared<HostTensor>(dims, dataType, allocator);
-    auto offset = dims.d[0] / 4;
-    auto slice = ITensor::slice(tensor, offset);
-    auto const sizeSlice = 3 * tensor->getSize() / 4;
-    EXPECT_EQ(slice->getShape().d[0], dims.d[0] - offset);
-    EXPECT_EQ(slice->getSize(), sizeSlice);
-    EXPECT_EQ(slice->getCapacity(), sizeSlice);
-    EXPECT_EQ(static_cast<std::uint8_t*>(slice->data()) - static_cast<std::uint8_t*>(tensor->data()),
-        offset * ITensor::volume(dims) / dims.d[0] * BufferDataType(dataType).getSize());
-
-    auto dimsNew = ITensor::makeShape({12, 32});
-    EXPECT_EQ(ITensor::volume(dimsNew), sizeSlice);
-    EXPECT_NO_THROW(slice->reshape(dimsNew));
-    EXPECT_EQ(slice->getShape().d[1], dimsNew.d[1]);
-    dimsNew.d[0] = 6;
-    EXPECT_LT(ITensor::volume(dimsNew), sizeSlice);
-    EXPECT_NO_THROW(slice->reshape(dimsNew));
-    EXPECT_EQ(slice->getShape().d[0], dimsNew.d[0]);
-    dimsNew.d[0] = 16;
-    EXPECT_GT(ITensor::volume(dimsNew), sizeSlice);
-    EXPECT_THROW(slice->reshape(dimsNew), std::runtime_error);
-
-    EXPECT_NO_THROW(slice->resize(sizeSlice));
-    EXPECT_NO_THROW(slice->resize(sizeSlice / 2));
-    EXPECT_EQ(slice->getShape().d[0], sizeSlice / 2);
-    EXPECT_THROW(slice->resize(sizeSlice * 2), std::runtime_error);
-    EXPECT_NO_THROW(slice->release());
-    EXPECT_EQ(slice->data(), nullptr);
-    EXPECT_NE(tensor->data(), nullptr);
-
-    std::shared_ptr<HostTensor const> constTensor{tensor};
-    auto constSlice = ITensor::slice(constTensor, offset);
-    EXPECT_EQ(constSlice->getShape().d[0], dims.d[0] - offset);
-    auto uniqueSlice = ITensor::slice(std::move(constSlice), 1);
-    EXPECT_EQ(uniqueSlice->getShape().d[0], dims.d[0] - offset - 1);
-}
-
-TEST_F(TllmBuffersTest, TensorSqueeze)
-{
-    auto dims = ITensor::makeShape({16, 1, 4});
-    HostAllocator allocator{};
-    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
-    auto tensor = std::make_shared<HostTensor>(dims, dataType, allocator);
-
-    auto squeezeDim = 0;
-    EXPECT_THROW(tensor->squeeze(squeezeDim), std::runtime_error);
-    squeezeDim = 1;
-    auto squeezed = ITensor::view(tensor, ITensor::squeeze(dims, squeezeDim));
-
-    EXPECT_EQ(squeezed->getSize(), tensor->getSize());
-    EXPECT_EQ(squeezed->getShape().nbDims, tensor->getShape().nbDims - 1);
-    EXPECT_EQ(squeezed->getShape().d[0], tensor->getShape().d[0]);
-    EXPECT_EQ(squeezed->getShape().d[1], tensor->getShape().d[2]);
-
-    EXPECT_NO_THROW(squeezed->release());
-    EXPECT_EQ(squeezed->data(), nullptr);
-    EXPECT_NE(tensor->data(), nullptr);
-}
-
-TEST_F(TllmBuffersTest, TensorView)
-{
-    auto const dims = ITensor::makeShape({16, 1, 4});
-    HostAllocator allocator{};
-    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
-    auto tensor = std::make_shared<HostTensor>(dims, dataType, allocator);
-
-    auto const viewDims = ITensor::makeShape({16, 1, 2});
-
-    auto view = ITensor::view(tensor, viewDims);
-    EXPECT_EQ(view->getSize(), tensor->getSize() / 2);
-    EXPECT_EQ(view->getShape().nbDims, tensor->getShape().nbDims);
-    EXPECT_EQ(view->getShape().d[2], tensor->getShape().d[2] / 2);
-
-    EXPECT_NO_THROW(view->release());
-    EXPECT_EQ(view->data(), nullptr);
-    EXPECT_NE(tensor->data(), nullptr);
-}
-
 TEST_F(TllmBuffersTest, BufferOutput)
 {
+    if (mDeviceCount == 0)
+        GTEST_SKIP();
+
     auto streamPtr = std::make_shared<CudaStream>();
     CudaAllocatorAsync allocator{streamPtr};
     for (std::size_t size : {0, 16})
@@ -331,6 +260,9 @@ TEST_F(TllmBuffersTest, BufferOutput)
 
 TEST_F(TllmBuffersTest, TensorOutput)
 {
+    if (mDeviceCount == 0)
+        GTEST_SKIP();
+
     auto streamPtr = std::make_shared<CudaStream>();
     nvinfer1::Dims constexpr dims{3, 16, 8, 4};
     CudaAllocatorAsync allocator{streamPtr};

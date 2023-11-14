@@ -29,9 +29,10 @@ class DecodingInput
 public:
     using TensorPtr = std::shared_ptr<ITensor const>;
 
-    DecodingInput(SizeType maxLength, SizeType batchSize, TensorPtr logits, TensorPtr endIds)
+    DecodingInput(SizeType maxLength, SizeType maxKvCacheLength, SizeType batchSize, TensorPtr logits, TensorPtr endIds)
         : step{maxLength}
         , maxLength{maxLength}
+        , maxKvCacheLength{maxKvCacheLength}
         , batchSize{batchSize}
         , logits{std::move(logits)}
         , endIds{std::move(endIds)}
@@ -43,6 +44,7 @@ public:
     // mandatory parameters
     SizeType step;
     SizeType maxLength;
+    SizeType maxKvCacheLength;
     SizeType batchSize;
     TensorPtr logits; // [batchSize, beamWidth, vocabSizePadded], on gpu
     TensorPtr endIds; // [batchSize * beamWidth], on gpu

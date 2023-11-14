@@ -86,6 +86,7 @@ private:
     std::shared_ptr<TrtGptModel> mTrtGptModel;
     SizeType mMaxInputLen;
     SizeType mMaxOutputLen;
+    SizeType mMaxKvCacheLen;
     SizeType mMaxNumSequences;
     std::optional<uint64_t> mTerminateReqId;
 

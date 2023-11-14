@@ -102,9 +102,12 @@ struct Multihead_attention_params_base
     int batch_size = 0;
     // The beam width
     int beam_width = 0;
-    // The sequence length.
-    // TODO: change name max_seq_len
-    int memory_max_len = 0;
+    // By default, max_kv_cache_length == cyclic_kv_cache_length
+    // unless each layer has different cyclic kv cache length.
+    // Max cache capacity (used to allocate KV cache)
+    int max_kv_cache_length = 0;
+    // Cyclic kv cache capacity (used to get the cyclic kv cache position for new tokens)
+    int cyclic_kv_cache_length = 0;
     // The number of heads (H).
     int num_heads = 0;
     // Controls MHA/MQA/GQA
@@ -148,7 +151,7 @@ struct Multihead_attention_params_base
     bool fp8_kv_cache = false;
 
     // Multi-block setups
-    bool multi_block_mode = false;
+    mutable bool multi_block_mode = false;
 
     // Number of streaming processors on the device.
     // Tune block size to maximum occupancy.

@@ -117,8 +117,8 @@ void GptSession::createBuffers(SizeType numMicroBatches)
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptSession::createDecoders(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength,
-    nvinfer1::DataType logitsType, bool decoderPerRequest, SizeType numMicroBatches)
+void GptSession::createDecoders(SizeType batchSize, SizeType beamWidth, SizeType maxKvCacheLength,
+    SizeType maxSequenceLength, nvinfer1::DataType logitsType, bool decoderPerRequest, SizeType numMicroBatches)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto const vocabSize = mModelConfig.getVocabSize();
@@ -133,14 +133,14 @@ void GptSession::createDecoders(SizeType batchSize, SizeType beamWidth, SizeType
             mDecoders.emplace_back(std::make_shared<GptDecoderBatch>(vocabSize, vocabSizePadded, stream));
         else
             mDecoders.emplace_back(std::make_shared<StatefulGptDecoder>(vocabSize, vocabSizePadded, stream));
-        mDecoders.back()->setup(batchSize, beamWidth, maxSequenceLength, logitsType);
+        mDecoders.back()->setup(batchSize, beamWidth, maxKvCacheLength, maxSequenceLength, logitsType);
     }
 
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptSession::createKvCacheManager(
-    SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength, KvCacheConfig const& config)
+void GptSession::createKvCacheManager(SizeType batchSize, SizeType beamWidth, SizeType maxKvCacheLength,
+    SizeType maxSequenceLength, KvCacheConfig const& config)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto const localNbLayers = mModelConfig.getNbLayers(mWorldConfig.getPipelineParallelism());
@@ -168,8 +168,9 @@ void GptSession::createKvCacheManager(
     auto const maxNumBlocks = tc::ceilDiv(maxNumTokens, tokensPerBlock);
     auto const maxBlocksPerSeq = tc::ceilDiv(maxSequenceLength, tokensPerBlock);
 
-    mKvCacheManager = std::make_shared<bmkv::KVCacheManager>(localNbLayers, nbHeads, nbKvHeads, hiddenSize,
-        tokensPerBlock, maxNumBlocks, batchSize, beamWidth, maxBlocksPerSeq, kvDtype, mRuntime->getStreamPtr());
+    mKvCacheManager
+        = std::make_shared<bmkv::KVCacheManager>(localNbLayers, nbHeads, nbKvHeads, hiddenSize, tokensPerBlock,
+            maxNumBlocks, batchSize, beamWidth, maxBlocksPerSeq, maxKvCacheLength, kvDtype, mRuntime->getStreamPtr());
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -232,6 +233,9 @@ void GptSession::setup(Config const& sessionConfig)
     auto const maxBatchSize = sessionConfig.maxBatchSize;
     auto const maxBeamWidth = sessionConfig.maxBeamWidth;
     auto const maxSequenceLength = sessionConfig.maxSequenceLength;
+    auto const maxKvCacheLength = sessionConfig.kvCacheConfig.maxKvCacheLength.has_value()
+        ? std::min(sessionConfig.kvCacheConfig.maxKvCacheLength.value(), maxSequenceLength)
+        : maxSequenceLength;
 
     mMicroBatchConfig = MicroBatchConfig(maxBatchSize, mWorldConfig.getPipelineParallelism(),
         sessionConfig.genMicroBatchSize, sessionConfig.ctxMicroBatchSize);
@@ -244,16 +248,18 @@ void GptSession::setup(Config const& sessionConfig)
     // gptDecoderBatch does not resize buffers, but allows smaller batchSize and beamWidth.
     // TODO refactor batch manager to remove dependency on maxSequenceLength.
     mDecoderMaxSequenceLength = maxSequenceLength;
+    mDecoderMaxKvCacheLength = maxKvCacheLength;
 
     if (mModelConfig.usePagedKvCache())
     {
-        createKvCacheManager(maxBatchSize, maxBeamWidth, maxSequenceLength, sessionConfig.kvCacheConfig);
+        createKvCacheManager(
+            maxBatchSize, maxBeamWidth, maxKvCacheLength, maxSequenceLength, sessionConfig.kvCacheConfig);
     }
 
     if (mWorldConfig.isLastPipelineParallelRank())
     {
         auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
-        createDecoders(mMicroBatchConfig.genBatchSize, maxBeamWidth, maxSequenceLength, logitsType,
+        createDecoders(mMicroBatchConfig.genBatchSize, maxBeamWidth, maxKvCacheLength, maxSequenceLength, logitsType,
             sessionConfig.decoderPerRequest, mMicroBatchConfig.numGenBatches);
     }
 
@@ -272,8 +278,8 @@ void GptSession::setup(Config const& sessionConfig)
     for (auto& buffers : mBuffers)
     {
         // we don't know maxInputLength yet and ignore it for pre-allocation
-        buffers->generationConfig
-            = RuntimeBuffers::GenerationConfig{mMicroBatchConfig.genBatchSize, maxBeamWidth, 0, maxSequenceLength};
+        buffers->generationConfig = RuntimeBuffers::GenerationConfig{
+            mMicroBatchConfig.genBatchSize, maxBeamWidth, 0, maxKvCacheLength, maxSequenceLength};
         buffers->reshape(mModelConfig, mWorldConfig);
     }
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
@@ -403,8 +409,9 @@ std::vector<GenerationInput> splitInputs(GenerationInput const& inputs, SizeType
         auto const offset = microBatchOffsets[batchId];
         auto const batchSize = microBatchOffsets[batchId + 1] - offset;
 
-        if (inputs.embeddingBiasOpt)
-            batch.embeddingBiasOpt = inputs.embeddingBiasOpt;
+        if (inputs.embeddingBias)
+            batch.embeddingBias = inputs.embeddingBias;
+
         if (inputs.badWordsList)
         {
             auto const& shape = inputs.badWordsList->getShape();
@@ -414,7 +421,7 @@ std::vector<GenerationInput> splitInputs(GenerationInput const& inputs, SizeType
             }
             else
             {
-                assert(nbDims == 3);
+                assert(shape.nbDims == 3);
                 batch.badWordsList = ITensor::slice(inputs.badWordsList, offset, batchSize);
             }
         }
@@ -524,7 +531,7 @@ void GptSession::generateBatched(
         auto const& microBatchInputs = microBatches.at(microBatchId);
         auto& buffers = *mBuffers.at(microBatchId);
         buffers.initFromInput(*microBatchInputs.ids, microBatchInputs.lengths, microBatchInputs.packed, beamWidth,
-            mDecoderMaxSequenceLength, manager);
+            mDecoderMaxKvCacheLength, mDecoderMaxSequenceLength, manager);
         buffers.reshape(mModelConfig, mWorldConfig);
         buffers.reset(manager);
     }

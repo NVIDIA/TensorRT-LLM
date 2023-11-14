@@ -22,6 +22,7 @@ include(CheckLanguage)
 include(cmake/modules/set_ifndef.cmake)
 include(cmake/modules/find_library_create_target.cmake)
 include(cmake/modules/resolve_dirs.cmake)
+include(cmake/modules/parse_make_options.cmake)
 
 project(tensorrt_llm LANGUAGES CXX)
 
@@ -246,6 +247,22 @@ endif()
 set(COMMON_HEADER_DIRS ${PROJECT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIR})
 message(STATUS "COMMON_HEADER_DIRS: ${COMMON_HEADER_DIRS}")
 
+if(NOT WIN32 AND NOT DEFINED USE_CXX11_ABI)
+  find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+  execute_process(
+    COMMAND ${Python3_EXECUTABLE} "-c"
+            "import torch; print(torch.compiled_with_cxx11_abi(),end='');"
+    RESULT_VARIABLE _PYTHON_SUCCESS
+    OUTPUT_VARIABLE USE_CXX11_ABI)
+  # Convert the bool variable to integer.
+  if(USE_CXX11_ABI)
+    set(USE_CXX11_ABI 1)
+  else()
+    set(USE_CXX11_ABI 0)
+  endif()
+  message(STATUS "USE_CXX11_ABI is set by python Torch to ${USE_CXX11_ABI}")
+endif()
+
 if(BUILD_PYT)
   # Build TORCH_CUDA_ARCH_LIST
   set(TORCH_CUDA_ARCH_LIST "")
@@ -304,27 +321,39 @@ print(os.path.dirname(torch.__file__),end='');"
   message(STATUS "TORCH_CXX_FLAGS: ${TORCH_CXX_FLAGS}")
   add_compile_options(${TORCH_CXX_FLAGS})
   add_compile_definitions(TORCH_CUDA=1)
+
+  if(DEFINED USE_CXX11_ABI)
+    parse_make_options(${TORCH_CXX_FLAGS} "TORCH_CXX_FLAGS")
+    if(DEFINED TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI
+       AND NOT ${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} EQUAL ${USE_CXX11_ABI})
+      message(
+        WARNING
+          "The libtorch compilation options _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} "
+          "found by CMake conflict with the project setting USE_CXX11_ABI=${USE_CXX11_ABI}, and the project "
+          "setting will be discarded.")
+    endif()
+  endif()
+
+elseif(NOT WIN32)
+  if(NOT USE_CXX11_ABI)
+    add_compile_options("-D_GLIBCXX_USE_CXX11_ABI=0")
+  endif()
+  message(STATUS "Build without PyTorch, USE_CXX11_ABI=${USE_CXX11_ABI}")
 endif()
 
 file(STRINGS "${TRT_INCLUDE_DIR}/NvInferVersion.h" VERSION_STRINGS
      REGEX "#define NV_TENSORRT_.*")
 foreach(TYPE MAJOR MINOR PATCH BUILD)
-  string(REGEX MATCH "NV_TENSORRT_${TYPE} [0-9]" TRT_TYPE_STRING
+  string(REGEX MATCH "NV_TENSORRT_${TYPE} [0-9]+" TRT_TYPE_STRING
                ${VERSION_STRINGS})
-  string(REGEX MATCH "[0-9]" TRT_${TYPE} ${TRT_TYPE_STRING})
-endforeach(TYPE)
-
-foreach(TYPE MAJOR MINOR PATCH)
-  string(REGEX MATCH "NV_TENSORRT_SONAME_${TYPE} [0-9]" TRT_TYPE_STRING
-               ${VERSION_STRINGS})
-  string(REGEX MATCH "[0-9]" TRT_SO_${TYPE} ${TRT_TYPE_STRING})
+  string(REGEX MATCH "[0-9]+" TRT_${TYPE} ${TRT_TYPE_STRING})
 endforeach(TYPE)
 
 set(TRT_VERSION
     "${TRT_MAJOR}.${TRT_MINOR}.${TRT_PATCH}"
     CACHE STRING "TensorRT project version")
 set(TRT_SOVERSION
-    "${TRT_SO_MAJOR}"
+    "${TRT_MAJOR}"
     CACHE STRING "TensorRT library so version")
 message(
   STATUS

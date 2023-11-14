@@ -76,6 +76,10 @@ def parse_arguments(args):
                         type=str,
                         default='float16',
                         choices=['float32', 'float16', 'bfloat16'])
+    parser.add_argument('--logits_dtype',
+                        type=str,
+                        default='float32',
+                        choices=['float16', 'float32'])
     parser.add_argument(
         '--timing_cache',
         type=str,
@@ -141,6 +145,14 @@ def parse_arguments(args):
     parser.add_argument('--enable_context_fmha_fp32_acc',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--multi_block_mode',
+        default=False,
+        action='store_true',
+        help=
+        'Split long kv sequence into multiple blocks (applied to generation MHA kernels). \
+                        It is beneifical when batchxnum_heads cannot fully utilize GPU.'
+    )
     parser.add_argument('--gpus_per_node', type=int, default=8)
     parser.add_argument('--builder_opt', type=int, default=None)
     parser.add_argument(
@@ -413,6 +425,8 @@ def build_rank_engine(builder: Builder,
     if args.enable_context_fmha_fp32_acc:
         network.plugin_config.set_context_fmha(
             ContextFMHAType.enabled_with_fp32_acc)
+    if args.multi_block_mode:
+        network.plugin_config.enable_mmha_multi_block_mode()
     if args.remove_input_padding:
         network.plugin_config.enable_remove_input_padding()
     if args.paged_kv_cache:

@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <ostream>
@@ -48,6 +49,9 @@ public:
     using UniqueConstPtr = std::unique_ptr<ITensor const>;
     using SharedConstPtr = std::shared_ptr<ITensor const>;
     using Shape = nvinfer1::Dims;
+    using DimType = std::remove_reference_t<decltype(Shape::d[0])>;
+
+    ~ITensor() override = default;
 
     //!
     //! \brief Returns the tensor dimensions.
@@ -59,7 +63,13 @@ public:
     //!
     virtual void reshape(Shape const& dims) = 0;
 
-    ~ITensor() override = default;
+    void resize(std::size_t newSize) override
+    {
+        if (newSize == getSize())
+            return;
+
+        reshape(makeShape({castSize(newSize)}));
+    }
 
     //!
     //! \brief Not allowed to copy.
@@ -101,18 +111,7 @@ public:
     //! \param dim The dimension that should be removed ("squeezed").
     //! \return A new shape without the unit dimension.
     //!
-    static Shape squeeze(Shape const& shape, SizeType dim)
-    {
-        TLLM_CHECK_WITH_INFO(shape.nbDims > 0, "Cannot squeeze 1-dimensional tensor");
-        TLLM_CHECK_WITH_INFO(
-            dim < shape.nbDims, common::fmtstr("Invalid index %d, tensor has %d dimensions", dim, shape.nbDims));
-        TLLM_CHECK_WITH_INFO(shape.d[dim] == 1, "Can only squeeze dimension of size 1");
-
-        Shape newDims{shape.nbDims - 1};
-        std::copy(shape.d, shape.d + dim, newDims.d);
-        std::copy(shape.d + dim + 1, shape.d + shape.nbDims, newDims.d + dim);
-        return newDims;
-    }
+    static Shape squeeze(Shape const& shape, SizeType dim);
 
     //!
     //! \brief Add a *unit* dimension to `shape` at the specified position.
@@ -121,17 +120,7 @@ public:
     //! \param dim The dimension where unit dimension should be added.
     //! \return A new shape with the added unit dimension.
     //!
-    static Shape unsqueeze(Shape const& shape, SizeType dim)
-    {
-        TLLM_CHECK_WITH_INFO(dim <= shape.nbDims && dim >= 0,
-            common::fmtstr("Invalid dim %d, tensor has %d dimensions", dim, shape.nbDims));
-
-        Shape newDims{shape.nbDims + 1};
-        std::copy(shape.d, shape.d + dim, newDims.d);
-        newDims.d[dim] = 1;
-        std::copy(shape.d + dim, shape.d + shape.nbDims, newDims.d + dim + 1);
-        return newDims;
-    }
+    static Shape unsqueeze(Shape const& shape, SizeType dim);
 
     //!
     //! \brief Removes the given *unit* dimensions from this tensor.
@@ -251,6 +240,13 @@ public:
 
 protected:
     ITensor() = default;
+
+    static DimType castSize(size_t newSize)
+    {
+        TLLM_CHECK_WITH_INFO(
+            newSize <= std::numeric_limits<DimType>::max(), "New size is too large. Use reshape() instead.");
+        return static_cast<DimType>(newSize);
+    }
 };
 
 //! \brief Utility function to print a shape.

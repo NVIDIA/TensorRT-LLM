@@ -21,46 +21,9 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel, GeluActivation,
-    true, true, 1, 1, 192>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel, GeluActivation,
-    true, false, 1, 1, 192>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel, GeluActivation,
-    false, true, 1, 1, 192>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel, GeluActivation,
-    false, false, 1, 1, 192>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel, ReluActivation,
-    true, true, 1, 1, 192>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel, ReluActivation,
-    true, false, 1, 1, 192>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel, ReluActivation,
-    false, true, 1, 1, 192>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel, ReluActivation,
-    false, false, 1, 1, 192>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel,
-    IdentityActivation, true, true, 1, 1, 192>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel,
-    IdentityActivation, true, false, 1, 1, 192>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel,
-    IdentityActivation, false, true, 1, 1, 192>;
 template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyPerChannel,
     IdentityActivation, false, false, 1, 1, 192>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<64>, GeluActivation,
-    true, true, 2, 1, 256>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<64>, GeluActivation,
-    true, false, 2, 1, 256>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<64>, GeluActivation,
-    false, true, 2, 1, 256>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<64>, GeluActivation,
-    false, false, 2, 1, 256>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<64>, ReluActivation,
-    true, true, 2, 1, 256>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<64>, ReluActivation,
-    true, false, 2, 1, 256>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<64>, ReluActivation,
-    false, true, 2, 1, 256>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<64>, ReluActivation,
-    false, false, 2, 1, 256>;
+
 template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<64>,
     IdentityActivation, true, true, 2, 1, 256>;
 template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<64>,
@@ -69,22 +32,7 @@ template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, 
     IdentityActivation, false, true, 2, 1, 256>;
 template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<64>,
     IdentityActivation, false, false, 2, 1, 256>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<128>,
-    GeluActivation, true, true, 2, 1, 256>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<128>,
-    GeluActivation, true, false, 2, 1, 256>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<128>,
-    GeluActivation, false, true, 2, 1, 256>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<128>,
-    GeluActivation, false, false, 2, 1, 256>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<128>,
-    ReluActivation, true, true, 2, 1, 256>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<128>,
-    ReluActivation, true, false, 2, 1, 256>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<128>,
-    ReluActivation, false, true, 2, 1, 256>;
-template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<128>,
-    ReluActivation, false, false, 2, 1, 256>;
+
 template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<128>,
     IdentityActivation, true, true, 2, 1, 256>;
 template struct WeightOnlyBatchedGemvKernelLauncher<WeightOnlyQuantType::Int4b, WeightOnlyGroupWise<128>,

@@ -8,6 +8,7 @@ TensorRT-LLM
 [![python](https://img.shields.io/badge/python-3.10.12-green)](https://www.python.org/downloads/release/python-31012/)
 [![cuda](https://img.shields.io/badge/cuda-12.2-green)](https://developer.nvidia.com/cuda-downloads)
 [![trt](https://img.shields.io/badge/TRT-9.1-green)](https://developer.nvidia.com/tensorrt)
+[![version](https://img.shields.io/badge/release-0.5.0-green)](./setup.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](./LICENSE)
 
 [Architecture](./docs/source/architecture.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Results](./docs/source/performance.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](./examples/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](./docs/source/)
@@ -16,13 +17,14 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
+* [2023/11/13] [**H200** achieves nearly **12,000 tok/sec on Llama2-13B**](./docs/source/blogs/H200launch.md)
+
+<img src="./docs/source/blogs/media/H200launch_tps.png" alt="H200 TPS" width="500" height="auto">
+
+H200 FP8 achieves 11,819 tok/s on Llama2-13B on a single GPU, and is up to 1.9x faster than H100.
+
+
 * [2023/11/03] [TensorRT-LLM is up to **4.6x faster on H100 than A100**, achieving **10,000 tok/s at 100ms to first token.**](./docs/source/blogs/H100vsA100.md)
-
-<img src="./docs/source/blogs/media/TRT_LLM_v0-5-0_H100vA100_tps.png" alt="max throughput" width="450" height="auto">
-<img src="./docs/source/blogs/media/TRT_LLM_v0-5-0_H100vA100_1st.png" alt="1st token latency" width="450" height="auto">
-
-H100 FP8 increases max throughput, decreases 1st token latency, and reduces memory consumption. At peak, TensorRT-LLM on H100 can achieve >10K token/s or <10ms to first token. See full [performance data](#performance).
-
 * [2023/10/22] [🚀 RAG on Windows using TensorRT-LLM and LlamaIndex 🦙](https://github.com/NVIDIA/trt-llm-rag-windows#readme)
 * [2023/10/19] Getting Started Guide - [Optimizing Inference on Large Language Models with NVIDIA TensorRT-LLM, Now Publicly Available
 ](https://developer.nvidia.com/blog/optimizing-inference-on-llms-with-tensorrt-llm-now-publicly-available/)

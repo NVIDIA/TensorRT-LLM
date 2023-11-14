@@ -282,6 +282,7 @@ public:
 
         const auto& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
         const CUfunction func = findIter->second.mDeviceFunction;
+
         void* kernelParams[] = {&params, nullptr};
 
         if (!forceUnroll)

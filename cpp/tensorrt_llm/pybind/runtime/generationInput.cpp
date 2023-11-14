@@ -40,8 +40,8 @@ std::shared_ptr<tr::GenerationInput> GenerationInput::toTrtLlm() const
 {
     auto input = std::make_shared<tr::GenerationInput>(
         endId, padId, tr::TorchView::of(ids.value()), tr::TorchView::of(lengths.value()), packed);
-    if (embeddingBiasOpt)
-        input->embeddingBiasOpt = tr::TorchView::of(embeddingBiasOpt.value());
+    if (embeddingBias)
+        input->embeddingBias = tr::TorchView::of(embeddingBias.value());
     if (badWordsList)
         input->badWordsList = tr::TorchView::of(badWordsList.value());
     if (stopWordsList)

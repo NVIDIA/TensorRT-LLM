@@ -49,8 +49,7 @@ enum class ContextAttentionMaskType
 {
     PADDING,
     CAUSAL,
-    // The past attention length is limited.
-    LIMITED_LENGTH_CAUSAL
+    SLIDING_WINDOW_CAUSAL
 };
 
 constexpr int32_t kSM_70 = 70;

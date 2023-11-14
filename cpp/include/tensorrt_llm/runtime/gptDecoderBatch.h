@@ -44,8 +44,8 @@ public:
     GptDecoderBatch(std::size_t vocabSize, std::size_t vocabSizePadded, CudaStreamPtr stream);
 
     //! Setup the decoder before calling `forward()`
-    void setup(
-        SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxSequenceLength, nvinfer1::DataType dtype) override;
+    void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxKvCacheLength, SizeType maxSequenceLength,
+        nvinfer1::DataType dtype) override;
 
     //! @brief Initialize the decoder at `batchIdx` with a new `request`.
     void newRequest(
@@ -166,6 +166,7 @@ private:
     std::vector<SizeType> mMaxNewTokens;
     std::vector<SizeType> mBeamWidths;
     SizeType mMaxSequenceLength{};
+    SizeType mMaxKvCacheLength{};
     SizeType mActualBatchSize{};
 };
 } // namespace tensorrt_llm::runtime

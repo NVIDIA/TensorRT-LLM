@@ -206,6 +206,7 @@ def gen_suffix(rank, use_smooth_quant, quant_per_channel):
 
 def load_from_binary(tensorrt_llm_baichuan: BaichuanForCausalLM,
                      dir_path,
+                     model_version,
                      mapping=Mapping(),
                      fp16=False,
                      multi_query_mode=False):
@@ -313,6 +314,12 @@ def load_from_binary(tensorrt_llm_baichuan: BaichuanForCausalLM,
     # share input embedding
     lm_head_weight = fromfile(dir_path, 'lm_head.weight.bin',
                               [vocab_size, n_embd])
+    if model_version.startswith('v2'):
+        # baichuan v2 models use NormHead
+        tensorrt_llm.logger.info(
+            f'Normalizing lm_head.weight for {model_version}')
+        lm_head_weight = lm_head_weight / np.linalg.norm(
+            lm_head_weight, axis=1, keepdims=True)
 
     if vocab_size % mapping.tp_size != 0:
         # padding
