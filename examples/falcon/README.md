@@ -4,16 +4,17 @@ This document shows how to build and run a Falcon model in TensorRT-LLM on singl
 
 ## Overview
 
-The TensorRT-LLM Falcon implementation can be found in [tensorrt_llm/models/falcon/model.py](../../tensorrt_llm/models/falcon/model.py). The TensorRT-LLM Falcon example code is located in [`examples/falcon`](./). There are three main files in that folder:
+The TensorRT-LLM Falcon implementation can be found in [tensorrt_llm/models/falcon/model.py](../../tensorrt_llm/models/falcon/model.py). The TensorRT-LLM Falcon example code is located in [`examples/falcon`](./). There are three main files:
 
  * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Falcon model,
  * [`run.py`](./run.py) to run the inference on an input text,
- * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
+ * and a shared [`../summarize.py`](../summarize.py)to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
 
 ## Support Matrix
   * FP16
   * BF16
   * FP8
+  * Groupwise quantization (AWQ)
   * STRONGLY TYPED
   * FP8 KV CACHE
   * Tensor Parallel
@@ -155,6 +156,46 @@ python build.py --model_dir falcon/180b \
                 --parallel_build
 ```
 
+#### Groupwise quantization (AWQ)
+One can enable AWQ INT4 weight only quantization with these options when building engine with `build.py`:
+
+- `--use_weight_only` enables weight only GEMMs in the network.
+- `--per_group` enable groupwise weight only quantization, for Falcon example, we support AWQ with the group size default as 128.
+- `--weight_only_precision` should specify the weight only quantization format. Supported formats are `int4_awq` or `int4_gptq`.
+- `--group_size` passes the group size for AWQ with default as 128.
+- `--quant_ckpt_path` passes the quantized checkpoint to build the engine.
+
+AWQ example below involves 2 steps:
+1. Weight quantization:
+
+    NVIDIA AMMO toolkit is used for AWQ weight quantization. Please see [examples/quantization/README.md](/examples/quantization/README.md#preparation) for AMMO installation instructions.
+
+    ```bash
+    # Quantize HF Falcon 180B checkpoint into INT4 AWQ format
+    python quantize.py --model_dir falcon/180B/ \
+                    --dtype float16 \
+                    --qformat int4_awq \
+                    --export_path ./quantized_int4_awq \
+                    --calib_size 32
+    ```
+    The quantized model checkpoint is saved to path `./quantized_int4_awq/falcon_tp1_rank0.npz` for future TRT-LLM engine build.
+
+2. Build TRT-LLM engine:
+
+    ```bash
+    python build.py --model_dir falcon/180B/ \
+                    --quant_ckpt_path ./quantized_int4_awq/falcon_tp1_rank0.npz \
+                    --dtype float16 \
+                    --remove_input_padding \
+                    --use_gpt_attention_plugin float16 \
+                    --enable_context_fmha \
+                    --use_gemm_plugin float16 \
+                    --use_weight_only \
+                    --weight_only_precision int4_awq \
+                    --per_group \
+                    --output_dir ./tmp/falcon/180B/trt_engines/int4_AWQ/1-gpu/
+    ```
+
 ### 4. Run
 
 ```bash
@@ -162,26 +203,26 @@ pip install -r requirements.txt
 ```
 
 ```bash
-python summarize.py --test_trt_llm \
-                    --hf_model_location falcon/rw-1b \
-                    --data_type float16 \
-                    --engine_dir falcon/rw-1b/trt_engines/fp16/1-gpu/
+python ../summarize.py --test_trt_llm \
+                       --hf_model_dir falcon/rw-1b \
+                       --data_type float16 \
+                       --engine_dir falcon/rw-1b/trt_engines/fp16/1-gpu/
 
-python summarize.py --test_trt_llm \
-                      --hf_model_location falcon/7b-instruct \
-                      --data_type bfloat16 \
-                      --engine_dir falcon/7b-instruct/trt_engines/bf16/1-gpu
+python ../summarize.py --test_trt_llm \
+                       --hf_model_dir falcon/7b-instruct \
+                       --data_type bfloat16 \
+                       --engine_dir falcon/7b-instruct/trt_engines/bf16/1-gpu
 
 mpirun -n 2 --allow-run-as-root --oversubscribe \
-    python summarize.py --test_trt_llm \
-                      --hf_model_location falcon/40b-instruct \
-                      --data_type bfloat16 \
-                      --engine_dir falcon/40b-instruct/trt_engines/bf16/2-gpu
+    python ../summarize.py --test_trt_llm \
+                           --hf_model_dir falcon/40b-instruct \
+                           --data_type bfloat16 \
+                           --engine_dir falcon/40b-instruct/trt_engines/bf16/2-gpu
 mpirun -n 8 --allow-run-as-root --oversubscribe \
-    python summarize.py --test_trt_llm \
-                      --hf_model_location falcon/180b \
-                      --data_type bfloat16 \
-                      --engine_dir falcon/180b/trt_engines/bf16/8-gpu
+    python ../summarize.py --test_trt_llm \
+                           --hf_model_dir falcon/180b \
+                           --data_type bfloat16 \
+                           --engine_dir falcon/180b/trt_engines/bf16/8-gpu
 ```
 
 ## Troubleshooting

@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <limits>
 
 namespace tensorrt_llm
 {
@@ -64,6 +65,11 @@ struct KVBlockArray
         const float tokensPerBlockSeqLog2 = log2(mTokensPerBlock);
         TLLM_CHECK_WITH_INFO(
             ceil(tokensPerBlockSeqLog2) == floor(tokensPerBlockSeqLog2), "tokensPerBlock must be power of 2");
+        // NOTE: pointer offset arithmetic offset is performed on int32_t (see this.getRowPtr).
+        // If needed, we could do it on uint32_t or even uint64_t, but that might have performance implications
+        TLLM_CHECK_WITH_INFO(static_cast<int64_t>(mMaxSeqs - 1) * mMaxBlocksPerSeq * 2 + maxBlocksPerSeq
+                <= std::numeric_limits<int32_t>::max(),
+            "kv cache is too large for gpt_attention_plugin");
         mTokensPerBlockLog2 = static_cast<int>(tokensPerBlockSeqLog2);
     }
 
@@ -140,6 +146,11 @@ struct KVLinearBuffer
         , mMaxSeqLen(tokensPerBlock)
         , mBytesPerSeq(tokensPerBlock * sizePerToken)
     {
+        // NOTE: pointer offset arithmetic offset is performed on int32_t (see this.getRowPtr).
+        // If needed, we could do it on uint32_t or even uint64_t, but that might have performance implications
+        TLLM_CHECK_WITH_INFO(
+            static_cast<int64_t>(mMaxSeqs - 1) * mBytesPerSeq * 2 + mBytesPerSeq <= std::numeric_limits<int32_t>::max(),
+            "kv cache is too large for gpt_attention_plugin");
     }
 
     __host__ __device__ inline void** getRowPtr(KVIdxType kvIdx, int32_t seqIdx)

@@ -55,18 +55,17 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     auto const beamWidth = samplingConfig.beamWidth;
     SizeType constexpr batchSize{4};
 
-    decoder->setup(samplingConfig, batchSize);
-
-    int constexpr endId{50257};
     SizeType constexpr maxInputLength{8};
     SizeType constexpr maxNewTokens{2};
     auto constexpr maxSeqLength = maxInputLength + maxNewTokens;
+    decoder->setup(samplingConfig, batchSize, maxSeqLength);
 
     // set up inputs
     auto logits = std::shared_ptr(
         manager.gpu(ITensor::makeShape({batchSize, beamWidth, vocabSizePadded}), modelConfig.getDataType()));
     manager.setZero(*logits);
 
+    int constexpr endId{50257};
     std::vector<int> const endIdsVec(batchSize * beamWidth, endId);
     auto endIds
         = std::shared_ptr(manager.copyFrom(endIdsVec, ITensor::makeShape({batchSize, beamWidth}), MemoryType::kGPU));

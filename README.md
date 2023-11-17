@@ -43,17 +43,22 @@ H200 FP8 achieves 11,819 tok/s on Llama2-13B on a single GPU, and is up to 1.9x 
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Support Matrix](#support-matrix)
+  - [Devices](#devices)
+  - [Precision](#precision)
+  - [Key Features](#key-features)
+  - [Models](#models)
 - [Performance](#performance)
 - [Advanced Topics](#advanced-topics)
   - [Quantization](#quantization)
   - [In-flight Batching](#in-flight-batching)
   - [Attention](#attention)
   - [Graph Rewriting](#graph-rewriting)
-  - [Benchmarking](#benchmarking)
+  - [Benchmark](#benchmark)
 - [Troubleshooting](#troubleshooting)
-- [Release Notes](#release-notes)
-  - [Changelog](#changelog)
-  - [Known issues](#known-issues)
+- [Release notes](#release-notes)
+  - [Change Log](#change-log)
+  - [Known Issues](#known-issues)
+  - [Report Issues](#report-issues)
 
 ## TensorRT-LLM Overview
 
@@ -154,14 +159,14 @@ See the BLOOM [example](examples/bloom) for more details and options regarding t
 
 ***3. Run***
 
-The `summarize.py` script can be used to perform the summarization of articles
+The `../summarize.py` script can be used to perform the summarization of articles
 from the CNN Daily dataset:
 
 ```python
-python summarize.py --test_trt_llm \
-                    --hf_model_location ./bloom/560M/ \
-                    --data_type fp16 \
-                    --engine_dir ./bloom/560M/trt_engines/fp16/1-gpu/
+python ../summarize.py --test_trt_llm \
+                       --hf_model_dir ./bloom/560M/ \
+                       --data_type fp16 \
+                       --engine_dir ./bloom/560M/trt_engines/fp16/1-gpu/
 ```
 
 More details about the script and how to run the BLOOM model can be found in
@@ -237,19 +242,26 @@ The list of supported models is:
 * [Bert](examples/bert)
 * [Blip2](examples/blip2)
 * [BLOOM](examples/bloom)
-* [ChatGLM](examples/chatglm), including ChatGLM-6B, ChatGLM2-6B, ChatGLM2-6B-32k, ChatGLM3-6B, ChatGLM3-6B-32k
+* [ChatGLM](examples/chatglm)
 * [Falcon](examples/falcon)
+* [Flan-T5](examples/enc_dec)
 * [GPT](examples/gpt)
 * [GPT-J](examples/gptj)
 * [GPT-Nemo](examples/gpt)
 * [GPT-NeoX](examples/gptneox)
+* [InternLM](examples/internlm)
 * [LLaMA](examples/llama)
 * [LLaMA-v2](examples/llama)
+* [Mistral](examples/llama)
 * [MPT](examples/mpt)
 * [OPT](examples/opt)
+* [Qwen](examples/qwen)
+* [Replit Code](examples/mpt)
 * [SantaCoder](examples/gpt)
 * [StarCoder](examples/gpt)
-* [InternLM](examples/internlm)
+* [T5](examples/enc_dec)
+
+Note: [Encoder-Decoder](examples/enc_dec/) provides general encoder-decoder support that contains many encoder-decoder models such as T5, Flan-T5, etc. We unroll the exact model names in the list above to let users find specific models easiler.
 
 ## Performance
 
@@ -310,6 +322,33 @@ however, that it is recommended to use the C++ version.
 may happen. One possible solution is to reduce the amount of memory needed by
 reducing the maximum batch size, input and output lengths. Another option is to
 enable plugins, for example: `--use_gpt_attention_plugin`.
+
+* MPI + Slurm
+
+TensorRT-LLM is a [MPI](https://en.wikipedia.org/wiki/Message_Passing_Interface)-aware package that uses [`mpi4py`](https://mpi4py.readthedocs.io/en/stable/). If you are running scripts in a [Slurm](https://slurm.schedmd.com/) environment, you might encounter interferences:
+```
+--------------------------------------------------------------------------
+PMI2_Init failed to initialize.  Return code: 14
+--------------------------------------------------------------------------
+--------------------------------------------------------------------------
+The application appears to have been direct launched using "srun",
+but OMPI was not built with SLURM's PMI support and therefore cannot
+execute. There are several options for building PMI support under
+SLURM, depending upon the SLURM version you are using:
+
+  version 16.05 or later: you can use SLURM's PMIx support. This
+  requires that you configure and build SLURM --with-pmix.
+
+  Versions earlier than 16.05: you must use either SLURM's PMI-1 or
+  PMI-2 support. SLURM builds PMI-1 by default, or you can manually
+  install PMI-2. You must then build Open MPI using --with-pmi pointing
+  to the SLURM PMI library location.
+
+Please configure as appropriate and try again.
+--------------------------------------------------------------------------
+```
+As a rule of thumb, if you are running TensorRT-LLM interactively on a Slurm node, prefix your commands with `mpirun -n 1` to run TensorRT-LLM in a dedicated MPI environment, not the one provided by your Slurm allocation.
+For example: `mpirun -n 1 python3 examples/gpt/build.py ...`
 
 ## Release notes
 

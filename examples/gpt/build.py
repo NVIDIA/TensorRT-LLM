@@ -89,6 +89,8 @@ def parse_arguments(args):
     parser.add_argument('--n_embd', type=int, default=1024)
     parser.add_argument('--n_head', type=int, default=16)
     parser.add_argument('--hidden_act', type=str, default='gelu')
+    parser.add_argument('--rotary_base', type=float, default=10000.0)
+    parser.add_argument('--rotary_scaling', nargs=2, type=str, default=None)
     parser.add_argument(
         '--rotary_pct',
         type=float,
@@ -302,6 +304,14 @@ def parse_arguments(args):
         action='store_true',
         help=
         'Activates latency-optimized algorithm for all-reduce instead of NCCL.')
+    parser.add_argument(
+        '--use_lora_plugin',
+        nargs='?',
+        const=None,
+        default=False,
+        choices=['float16', 'float32', 'bfloat16'],
+        help="Activates the lora plugin which enables embedding sharing.")
+
     args = parser.parse_args(args)
     logger.set_level(args.log_level)
 
@@ -332,7 +342,7 @@ def parse_arguments(args):
         args.multi_query_mode = multi_query_mode
     plugins_args = [
         'use_gpt_attention_plugin', 'use_gemm_plugin', 'use_layernorm_plugin',
-        'use_lookup_plugin'
+        'use_lookup_plugin', 'use_lora_plugin'
     ]
     for plugin_arg in plugins_args:
         if getattr(args, plugin_arg) is None:
@@ -378,6 +388,16 @@ def parse_arguments(args):
 
     if args.enable_fp8:
         args.quant_mode = args.quant_mode.set_fp8_qdq()
+
+    if args.rotary_scaling is not None:
+        assert args.use_gpt_attention_plugin, "RoPE scaling is only supported through GPT attention plugin."
+        rotary_scaling = {
+            "type": args.rotary_scaling[0],
+            "factor": float(args.rotary_scaling[1])
+        }
+        assert rotary_scaling["type"] in ["linear", "dynamic"]
+        assert rotary_scaling["factor"] > 1.0
+        args.rotary_scaling = rotary_scaling
 
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha
@@ -428,6 +448,8 @@ def build_rank_engine(builder: Builder,
         position_embedding_type=PositionEmbeddingType.learned_absolute
         if args.rotary_pct == 0.0 else PositionEmbeddingType.rope_gpt_neox,
         rotary_embedding_percentage=args.rotary_pct,
+        rotary_base=args.rotary_base,
+        rotary_scaling=args.rotary_scaling,
         dtype=kv_dtype,
         logits_dtype=args.logits_dtype,
         mapping=Mapping(world_size=args.world_size,
@@ -437,7 +459,7 @@ def build_rank_engine(builder: Builder,
         apply_query_key_layer_scaling,
         quant_mode=args.quant_mode,
         bias=args.bias,
-        multi_query_mode=args.multi_query_mode,
+        num_kv_heads=1 if args.multi_query_mode else args.n_head,
         use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
@@ -497,6 +519,8 @@ def build_rank_engine(builder: Builder,
         network.plugin_config.enable_remove_input_padding()
     if args.paged_kv_cache:
         network.plugin_config.enable_paged_kv_cache(args.tokens_per_block)
+    if args.use_lora_plugin:
+        network.plugin_config.set_lora_plugin(dtype=args.use_lora_plugin)
 
     # Quantization plugins.
     if args.use_smooth_quant:
@@ -582,12 +606,12 @@ def build(rank, args):
             max_position_embeddings=args.n_positions,
             apply_query_key_layer_scaling=apply_query_key_layer_scaling,
             max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,
             int8=int8_trt_flag,
             opt_level=args.builder_opt,
-            multi_query_mode=args.multi_query_mode,
             strongly_typed=args.strongly_typed,
             max_prompt_embedding_table_size=args.
             max_prompt_embedding_table_size,

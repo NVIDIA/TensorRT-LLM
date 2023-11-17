@@ -47,8 +47,9 @@ class Parameter:
                 v_range = 0.1
 
             if dtype == trt.DataType.INT8:
-                value = torch.randint(int(-128 * v_range),
-                                      int(128 * v_range), (shape),
+                upper = math.ceil(128 * v_range)
+                value = torch.randint(-upper,
+                                      upper, (shape),
                                       dtype=trt_dtype_to_torch(dtype),
                                       device='cuda')
                 # value ~ U[int(-128 * v_range), int(128 * v_range)]

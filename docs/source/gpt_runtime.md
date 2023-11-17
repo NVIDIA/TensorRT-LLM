@@ -322,6 +322,11 @@ batchSize, beamWidth]`_.
    that enabling that computation may have an impact on performance (the final
    LM head has to perform a matrix multiplication on all the context tokens
    instead of a just the last one),
+ * `generationLogits`, is a tensor of values on the GPU (same datatype as the
+   computation type) to store the logits for the generation. Its shape is
+   `[batchSize, beamWidth, maxOutputLen-1, vocabSizePadded]`. This buffer will only be
+   filled in if the TensorRT engine was built with the
+   `gather_all_token_logits` parameter enabled.
  * `onTokenGenerated`, is a callback function invoked in the generation loop to
    pass newly generated tokens to the caller while the loop continues to
    execute. An implementation of that callback must accept the output `ids`

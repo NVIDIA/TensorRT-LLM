@@ -1013,4 +1013,87 @@ void gatherLastTokenLogits(ITensor& output, ITensor const& input, ITensor const&
     }
 }
 
+// In the following kernel, we launch a grid with microBatchSize * beamWidth blocks of threads. Each thread block
+// copies a `vocabSizePadded` length logits tensor from the "inputLogits (microBatchSize, beamWidth, vocabSizePadded)"
+// to the "outputGenerationLogits (batchSize, beamWidth, outPutLen, vocabSizePadded)"
+template <typename T>
+__global__ void copyLatestTokenLogitsInGenerationKernel(T* outputGenerationLogits, T const* inputLogits, int step,
+    int firstBatchSlotIdx, int beamWidth, int outPutLen, int vocabSizePadded)
+{
+    // The relatively batch slot index that this thread block in microBatchSize.
+    int relativeBatchSlotIdx = blockIdx.x / beamWidth;
+
+    // The Absolute batch slot index in batchSize.
+    int absoluteBatchSlotIdx = firstBatchSlotIdx + relativeBatchSlotIdx;
+
+    // The beam index that this thread block process
+    int mbeamIdx = blockIdx.x % beamWidth;
+
+    // The output pointer.
+    const unsigned int outputOffset
+        = (absoluteBatchSlotIdx * beamWidth * outPutLen + mbeamIdx * outPutLen + step) * vocabSizePadded;
+    T* outputPtr = &outputGenerationLogits[outputOffset];
+
+    // The input pointer.
+    const unsigned int inputOffset = (relativeBatchSlotIdx * beamWidth + mbeamIdx) * vocabSizePadded;
+    T const* inputPtr = &inputLogits[inputOffset];
+
+    // The threads in the block collaborate to copy the logits.
+    for (int idx = threadIdx.x; idx < vocabSizePadded; idx += blockDim.x)
+    {
+        outputPtr[idx] = inputPtr[idx];
+    }
+}
+
+template <typename T>
+void invokeCopyLatestTokenLogitsInGeneration(ITensor& output, ITensor const& input, SizeType step,
+    SizeType firstBatchSlotIdx, SizeType microBatchSize, SizeType beamWidth, CudaStream const& stream)
+{
+    auto const& outputShape = output.getShape();
+    auto const maxBatchSize = static_cast<std::uint32_t>(outputShape.d[0]);
+    auto const _beamWidth = static_cast<std::uint32_t>(outputShape.d[1]);
+    auto const outPutLen = static_cast<std::uint32_t>(outputShape.d[2]);
+    auto const vocabSizePadded = static_cast<std::uint32_t>(outputShape.d[3]);
+
+    TLLM_CHECK_WITH_INFO(maxBatchSize >= microBatchSize, "Invalid output shape: dim[0]");
+    TLLM_CHECK_WITH_INFO(_beamWidth == beamWidth, "Invalid output shape: dim[1]");
+    TLLM_CHECK_WITH_INFO(outPutLen >= step, "Invalid output shape: dim[2]");
+
+    auto const& inputShape = input.getShape();
+    TLLM_CHECK_WITH_INFO(inputShape.d[0] == microBatchSize, "Invalid input shape: dim[0]");
+    TLLM_CHECK_WITH_INFO(inputShape.d[1] == beamWidth, "Invalid input shape: dim[1]");
+    TLLM_CHECK_WITH_INFO(inputShape.d[2] == vocabSizePadded, "Invalid input shape: dim[2]");
+
+    dim3 const blockSize{256, 1};
+    dim3 const gridSize{static_cast<std::uint32_t>(microBatchSize * beamWidth), 1};
+
+    copyLatestTokenLogitsInGenerationKernel<<<gridSize, blockSize, 0, stream.get()>>>(
+        bufferCast<T>(output), bufferCast<T>(input), step, firstBatchSlotIdx, beamWidth, outPutLen, vocabSizePadded);
+}
+
+void copyLatestTokenLogitsInGeneration(ITensor& output, ITensor const& input, SizeType step, SizeType firstBatchSlotIdx,
+    SizeType microBatchSize, SizeType beamWidth, CudaStream const& stream)
+{
+    switch (input.getDataType())
+    {
+    case nvinfer1::DataType::kFLOAT:
+        invokeCopyLatestTokenLogitsInGeneration<float>(
+            output, input, step, firstBatchSlotIdx, microBatchSize, beamWidth, stream);
+        break;
+    case nvinfer1::DataType::kHALF:
+        invokeCopyLatestTokenLogitsInGeneration<half>(
+            output, input, step, firstBatchSlotIdx, microBatchSize, beamWidth, stream);
+        break;
+    case nvinfer1::DataType::kBF16:
+        invokeCopyLatestTokenLogitsInGeneration<__nv_bfloat16>(
+            output, input, step, firstBatchSlotIdx, microBatchSize, beamWidth, stream);
+        break;
+    case nvinfer1::DataType::kFP8:
+        invokeCopyLatestTokenLogitsInGeneration<__nv_fp8_e4m3>(
+            output, input, step, firstBatchSlotIdx, microBatchSize, beamWidth, stream);
+        break;
+    default: TLLM_CHECK_WITH_INFO(false, "data type not supported");
+    }
+}
+
 } // namespace tensorrt_llm::runtime::kernels

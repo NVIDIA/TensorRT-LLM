@@ -288,12 +288,12 @@ int WeightOnlyQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDesc* input
     const int ws_size = m_weightOnlyGemmRunner->getWorkspaceSize(m, n, k);
     const auto& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
     TLLM_CHECK_WITH_INFO(bestTactic, "No valid weight only groupwise GEMM tactic");
-    TLLM_CHECK_WITH_INFO(mType == nvinfer1::DataType::kHALF ||
 #if defined(ENABLE_BF16)
-            mType == nvinfer1::DataType::kBF16
-#endif
-        ,
+    TLLM_CHECK_WITH_INFO(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16,
         "No valid weightOnlyQuantMatmul configuration");
+#else
+    TLLM_CHECK_WITH_INFO(mType == nvinfer1::DataType::kHALF, "No valid weightOnlyQuantMatmul configuration");
+#endif
 
     tensorrt_llm::kernels::WeightOnlyQuantType weight_only_quant_type;
     tensorrt_llm::kernels::WeightOnlyActivationType weight_only_act_type;

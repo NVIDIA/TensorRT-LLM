@@ -50,6 +50,7 @@ public:
         , mMaxOutputLen(0)
         , mMaxNumTokens(std::nullopt)
         , mComputeContextLogits(false)
+        , mComputeGenerationLogits(false)
         , mModelVariant(ModelVariant::kGpt)
         , mUseCustomAllReduce(false)
         , mMaxPromptEmbeddingTableSize(0)
@@ -222,6 +223,16 @@ public:
         mComputeContextLogits = computeContextLogits;
     }
 
+    [[nodiscard]] bool constexpr computeGenerationLogits() const noexcept
+    {
+        return mComputeGenerationLogits;
+    }
+
+    void constexpr computeGenerationLogits(bool computeGenerationLogits) noexcept
+    {
+        mComputeGenerationLogits = computeGenerationLogits;
+    }
+
     [[nodiscard]] ModelVariant getModelVariant() const
     {
         return mModelVariant;
@@ -260,6 +271,7 @@ private:
     std::optional<SizeType> mMaxNumTokens;
 
     bool mComputeContextLogits;
+    bool mComputeGenerationLogits;
     ModelVariant mModelVariant;
     bool mUseCustomAllReduce;
 

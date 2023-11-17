@@ -4,11 +4,11 @@ This document explains how to build the [GPT-NeoX](https://huggingface.co/Eleuth
 
 ## Overview
 
-The TensorRT-LLM GPT-NeoX implementation can be found in [`tensorrt_llm/models/gptneox/model.py`](../../tensorrt_llm/models/gptneox/model.py). The TensorRT-LLM GPT-NeoX example code is located in [`examples/gptneox`](./). There are three main files in that folder:
+The TensorRT-LLM GPT-NeoX implementation can be found in [`tensorrt_llm/models/gptneox/model.py`](../../tensorrt_llm/models/gptneox/model.py). The TensorRT-LLM GPT-NeoX example code is located in [`examples/gptneox`](./). There are three main files:
 
  * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the GPT-NeoX model,
  * [`run.py`](./run.py) to run the inference on an input text,
- * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
+ * and a shared [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
 
 ## Support Matrix
   * FP16
@@ -101,36 +101,36 @@ As previously explained, the first step is to build the TensorRT engine as descr
 pip install -r requirements.txt
 ```
 
-The summarization can be done using the [`summarize.py`](./summarize.py) script as follows:
+The summarization can be done using the [`../summarize.py`](../summarize.py) script as follows:
 
 ```bash
 # Run the summarization task using a TensorRT-LLM model and a single GPU.
-python3 summarize.py --engine_dir gptneox_engine        \
-                     --model_dir gptneox_model          \
-                     --batch_size 1                     \
-                     --test_trt_llm                     \
-                     --tensorrt_llm_rouge1_threshold 14 \
-                     --data_type fp16                   \
-                     --check_accuracy 2>&1 | tee summary_trt_llm.log
+python3 ../summarize.py --engine_dir gptneox_engine        \
+                        --hf_model_dir gptneox_model          \
+                        --batch_size 1                     \
+                        --test_trt_llm                     \
+                        --tensorrt_llm_rouge1_threshold 14 \
+                        --data_type fp16                   \
+                        --check_accuracy 2>&1 | tee summary_trt_llm.log
 
 # Run the summarization task using a HF model and a single GPU.
-python3 summarize.py --engine_dir gptneox_engine        \
-                     --model_dir gptneox_model          \
-                     --batch_size 1                     \
-                     --test_hf                          \
-                     --tensorrt_llm_rouge1_threshold 14 \
-                     --data_type fp16                   \
-                     --check_accuracy 2>&1 | tee summary_hf.log
+python3 ../summarize.py --engine_dir gptneox_engine        \
+                        --hf_model_dir gptneox_model          \
+                        --batch_size 1                     \
+                        --test_hf                          \
+                        --tensorrt_llm_rouge1_threshold 14 \
+                        --data_type fp16                   \
+                        --check_accuracy 2>&1 | tee summary_hf.log
 
 # Run the summarization task using a TensorRT-LLM model and 2-way tensor parallelism.
 mpirun -n 2 --allow-run-as-root                         \
-python3 summarize.py --engine_dir gptneox_engine_tp2    \
-                     --model_dir gptneox_model          \
-                     --batch_size 1                     \
-                     --test_trt_llm                     \
-                     --tensorrt_llm_rouge1_threshold 14 \
-                     --data_type fp16                   \
-                     --check_accuracy 2>&1 | tee summary_trt_llm_tp2.log
+python3 ../summarize.py --engine_dir gptneox_engine_tp2    \
+                        --hf_model_dir gptneox_model          \
+                        --batch_size 1                     \
+                        --test_trt_llm                     \
+                        --tensorrt_llm_rouge1_threshold 14 \
+                        --data_type fp16                   \
+                        --check_accuracy 2>&1 | tee summary_trt_llm_tp2.log
 ```
 
 ## Apply groupwise quantization GPTQ
@@ -205,25 +205,25 @@ Install the requirements first.
 pip install -r requirements.txt
 ```
 
-Then use the [`summarize.py`](./summarize.py) script to summarize.
+Then use the [`../summarize.py`](../summarize.py) script to summarize.
 
 ```bash
 # Run the summarization task using a TensorRT-LLM model and a single GPU.
-python3 summarize.py --engine_dir gptneox_engine_gptq     \
-                     --model_dir gptneox_model            \
-                     --batch_size 1                       \
-                     --test_trt_llm                       \
-                     --tensorrt_llm_rouge1_threshold 14   \
-                     --data_type fp16                     \
-                     --check_accuracy 2>&1 | tee summary_trt_llm_gptq.log
+python3 ../summarize.py --engine_dir gptneox_engine_gptq     \
+                        --hf_model_dir gptneox_model            \
+                        --batch_size 1                       \
+                        --test_trt_llm                       \
+                        --tensorrt_llm_rouge1_threshold 14   \
+                        --data_type fp16                     \
+                        --check_accuracy 2>&1 | tee summary_trt_llm_gptq.log
 
 # Run the summarization task using a TensorRT-LLM model and 2-way tensor parallelism.
 mpirun -n 2 --allow-run-as-root                           \
-python3 summarize.py --engine_dir gptneox_engine_gptq_tp2 \
-                     --model_dir gptneox_model            \
-                     --batch_size 1                       \
-                     --test_trt_llm                       \
-                     --tensorrt_llm_rouge1_threshold 14   \
-                     --data_type fp16                     \
-                     --check_accuracy 2>&1 | tee summary_trt_llm_gptq_tp2.log
+python3 ../summarize.py --engine_dir gptneox_engine_gptq_tp2 \
+                        --hf_model_dir gptneox_model            \
+                        --batch_size 1                       \
+                        --test_trt_llm                       \
+                        --tensorrt_llm_rouge1_threshold 14   \
+                        --data_type fp16                     \
+                        --check_accuracy 2>&1 | tee summary_trt_llm_gptq_tp2.log
 ```

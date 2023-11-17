@@ -46,8 +46,10 @@ public:
     TensorPtr lengths; // [batchSize, beamWidth]
 
     // optional parameters
-    TensorPtr logProbs;      // [request_output_length, batch_size * beam_width], must be float*, on gpu
-    TensorPtr contextLogits; // [batch_size, max_input_length, vocab_size_padded]
+    TensorPtr cumLogProbs;      // [batchSize, beamWidth], must be float*, on gpu
+    TensorPtr logProbs;         // [batchSize, beamWidth, maxInputLength + maxNewTokens], must be float*, on gpu
+    TensorPtr contextLogits;    // [batch_size, max_input_length, vocab_size_padded]
+    TensorPtr generationLogits; // [batch_size, beam_width, max_output_length-1, vocab_size_padded]
 
     // callbacks
     Callback onTokenGenerated;

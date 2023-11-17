@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import tensorrt as trt
+import torch
 
 from .._utils import trt_dtype_to_torch
 from ..logger import logger
@@ -143,6 +144,25 @@ class Session(object):
             ])
             logger.info(
                 f"Tensor:{name=:}, {mode=:}, {shape=:}, {dtype=:}, {tformat=:}")
+
+    def set_shapes(self,
+                   tensor_dict: Dict[str, torch.Tensor],
+                   context: Optional[trt.IExecutionContext] = None):
+        if context is None:
+            context = self.context
+
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                ok = context.set_input_shape(name, tensor_dict[name].shape)
+                logger.debug(
+                    f"setting input tensor {name} with shape {tensor_dict[name].shape}"
+                )
+                if not ok:
+                    raise ValueError(
+                        f"Couldn't assign {name} with shape {tensor_dict[name].shape}, "
+                        f"engine supports [min, opt, max] = {self.engine.get_profile_shape(context.active_optimization_profile, name)}"
+                    )
 
     def infer_shapes(
             self,

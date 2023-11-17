@@ -63,6 +63,8 @@ class GptSession
 {
     using KvCacheManager = batch_manager::kv_cache_manager::KVCacheManager;
     using KvCacheConfig = batch_manager::kv_cache_manager::KvCacheConfig;
+    using TensorPtr = runtime::ITensor::SharedPtr;
+    using TokenGeneratedCallback = std::function<void(SizeType step, bool finished)>;
 
 public:
     using LoggerPtr = std::shared_ptr<nvinfer1::ILogger>;
@@ -108,7 +110,7 @@ public:
 
     [[nodiscard]] nvinfer1::ILogger& getLogger() const;
 
-    [[nodiscard]] BufferManager& getBufferManager() const;
+    [[nodiscard]] BufferManager const& getBufferManager() const;
 
     [[nodiscard]] GptModelConfig const& getModelConfig() const
     {
@@ -133,8 +135,9 @@ private:
         return !mCudaGraphInstances.empty();
     }
 
-    void generateBatched(GenerationOutput& outputs, std::vector<GenerationInput> const& microBatches,
-        SamplingConfig const& samplingConfig);
+    void generateBatched(std::vector<GenerationOutput>& microBatchesOutputs,
+        std::vector<GenerationInput> const& microBatchesInputs, SamplingConfig const& samplingConfig,
+        TokenGeneratedCallback const& onTokenGenerated);
 
     void setup(Config const& sessionConfig);
 
@@ -148,9 +151,9 @@ private:
 
     void executeContextStep(std::vector<GenerationInput> const& microBatches,
         std::vector<SizeType> const& microBatchOffsets, KvCacheManager const* kvCacheManager);
-    SizeType executeGenerationStep(SizeType step, std::vector<GenerationInput> const& microBatches,
-        std::vector<SizeType> const& microBatchOffsets, KvCacheManager* kvCacheManager,
-        std::vector<bool>& microBatchesFinished);
+    SizeType executeGenerationStep(SizeType step, std::vector<GenerationInput> const& microBatchesInputs,
+        std::vector<GenerationOutput>& microBatchesOutputs, std::vector<SizeType> const& microBatchOffsets,
+        KvCacheManager* kvCacheManager, std::vector<bool>& microBatchesFinished);
 
     //! @brief Execute decoder on last PP rank, receive decoder output on other PP ranks.
     void decoderStepAsync(SizeType decoderStep, SizeType microBatchId);
@@ -158,17 +161,17 @@ private:
     //! @brief Synchronize with the decoder and return the `shouldStop` flag.
     bool shouldStopSync(SizeType batchSize, SizeType beamWidth, SizeType microBatchId);
 
-    //! @brief Collect final output ids on last PP rank and send them to first PP rank.
+    //! @brief Collect final output ids and log probs on last PP rank and send them to first PP rank.
     //! @details Receives are asynchronous on host, so synchronization is required before access.
-    void finalizeOutputIds(SizeType microBatchId);
+    void finalize(SizeType microBatchId);
 
     void kvCacheAddSequences(SizeType beamWidth, SizeType microBatchId, SizeType firstBatchIdx);
 
     //! @brief Populate outputIds and return reference to newTokens tensor
-    ITensor::SharedPtr initDecoder(ITensor& outputIds, GenerationInput const& inputs,
+    ITensor::SharedPtr initDecoder(ITensor& outputIds, GenerationInput const& inputs, GenerationOutput const& outputs,
         SamplingConfig const& samplingConfig, SizeType microBatchId) const;
 
-    std::function<void(SizeType step, bool finished)> createOnTokenGeneratedCallback(GenerationOutput& outputs);
+    TokenGeneratedCallback createOnTokenGeneratedCallback(GenerationOutput& outputs);
 
     class CudaGraphExecutor
     {

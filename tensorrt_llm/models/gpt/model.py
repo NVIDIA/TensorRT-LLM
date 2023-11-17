@@ -23,7 +23,8 @@ from ...functional import (Tensor, gather_last_token_logits,
                            is_gated_activation, non_gated_version)
 from ...layers import (MLP, Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
-                       LayerNorm, PositionEmbeddingType, PromptTuningEmbedding)
+                       LayerNorm, LoraParams, PositionEmbeddingType,
+                       PromptTuningEmbedding)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
 from ...quantization import QuantMode
@@ -110,9 +111,11 @@ class GPTDecoderLayer(Module):
                  position_embedding_type=PositionEmbeddingType.learned_absolute,
                  quant_mode=QuantMode(0),
                  rotary_embedding_percentage=1.0,
+                 rotary_base=10000.0,
+                 rotary_scaling=None,
                  inter_size=None,
                  bias=True,
-                 multi_query_mode=False,
+                 num_kv_heads=None,
                  tp_group=None,
                  tp_size=1,
                  tp_rank=0,
@@ -135,7 +138,7 @@ class GPTDecoderLayer(Module):
         self.attention = Attention(
             hidden_size,
             num_attention_heads,
-            1 if multi_query_mode else num_attention_heads,
+            num_kv_heads,
             max_position_embeddings,
             num_layers,
             apply_query_key_layer_scaling,
@@ -143,6 +146,8 @@ class GPTDecoderLayer(Module):
             attention_mask_type=attention_mask_type,
             position_embedding_type=position_embedding_type,
             rotary_embedding_percentage=rotary_embedding_percentage,
+            rotary_embedding_base=rotary_base,
+            rotary_embedding_scaling=rotary_scaling,
             bias=bias,
             tp_group=tp_group,
             tp_size=tp_size,
@@ -172,7 +177,8 @@ class GPTDecoderLayer(Module):
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None,
-                workspace=None):
+                workspace=None,
+                lora_params=None):
 
         assert isinstance(hidden_states, Tensor)
 
@@ -185,7 +191,8 @@ class GPTDecoderLayer(Module):
                                           use_cache=use_cache,
                                           kv_cache_params=kv_cache_params,
                                           attention_params=attention_params,
-                                          workspace=workspace)
+                                          workspace=workspace,
+                                          lora_params=lora_params)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -218,10 +225,12 @@ class GPTModel(Module):
                  apply_query_key_layer_scaling=False,
                  position_embedding_type=PositionEmbeddingType.learned_absolute,
                  rotary_embedding_percentage=1.0,
+                 rotary_base=10000.0,
+                 rotary_scaling=None,
                  inter_size=None,
                  bias=True,
                  quant_mode=QuantMode(0),
-                 multi_query_mode=False,
+                 num_kv_heads=None,
                  use_prompt_tuning=False,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0):
@@ -255,7 +264,9 @@ class GPTModel(Module):
                 hidden_act=hidden_act,
                 position_embedding_type=position_embedding_type,
                 rotary_embedding_percentage=rotary_embedding_percentage,
-                multi_query_mode=multi_query_mode,
+                rotary_base=rotary_base,
+                rotary_scaling=rotary_scaling,
+                num_kv_heads=num_kv_heads,
                 tp_group=mapping.tp_group,
                 tp_size=mapping.tp_size,
                 tp_rank=mapping.tp_rank,
@@ -278,7 +289,8 @@ class GPTModel(Module):
                 prompt_embedding_table=None,
                 prompt_tasks=None,
                 prompt_vocab_size=None,
-                workspace=None):
+                workspace=None,
+                lora_params=None):
 
         hidden_states = self.embedding(input_ids,
                                        position_ids,
@@ -292,10 +304,18 @@ class GPTModel(Module):
         if use_cache:
             presents = []
 
-        for layer, past, pointer, max_kv_cache_length in zip(
-                self.layers, kv_cache_params.past_key_value,
-                kv_cache_params.kv_cache_block_pointers,
-                kv_cache_params.host_max_kv_cache_lengths):
+        for layer_idx, (layer, past, pointer, max_kv_cache_length) in enumerate(
+                zip(self.layers, kv_cache_params.past_key_value,
+                    kv_cache_params.kv_cache_block_pointers,
+                    kv_cache_params.host_max_kv_cache_lengths)):
+            lora_param = None
+            if lora_params.lora_ranks is not None:
+                lora_param = LoraParams(
+                    lora_ranks=lora_params.lora_ranks,
+                    lora_weights_pointers_list=[
+                        lora_params.lora_weights_pointers_list[layer_idx]
+                    ])
+
             hidden_states = layer(
                 hidden_states,
                 use_cache=use_cache,
@@ -308,7 +328,8 @@ class GPTModel(Module):
                     kv_cache_block_pointers=[pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
-                workspace=workspace)
+                workspace=workspace,
+                lora_params=lora_param)
 
             if use_cache:
                 presents.append(hidden_states[1])
@@ -336,10 +357,12 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                  apply_query_key_layer_scaling=False,
                  position_embedding_type=PositionEmbeddingType.learned_absolute,
                  rotary_embedding_percentage=1.0,
+                 rotary_base=10000.0,
+                 rotary_scaling=None,
                  inter_size=None,
                  bias=True,
                  quant_mode=QuantMode(0),
-                 multi_query_mode=False,
+                 num_kv_heads=None,
                  use_prompt_tuning=False,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
@@ -376,14 +399,30 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
         self._hidden_size = hidden_size
         self._vocab_size = vocab_size
         self._tp_size = mapping.tp_size
-        self._multi_query_mode = multi_query_mode
+        self._num_kv_heads = num_kv_heads if num_kv_heads else num_heads
 
-        super().__init__(num_layers, num_heads, hidden_size, vocab_size,
-                         hidden_act, max_position_embeddings, dtype, mapping,
-                         apply_query_key_layer_scaling, position_embedding_type,
-                         rotary_embedding_percentage, inter_size, bias,
-                         quant_mode, multi_query_mode, use_prompt_tuning,
-                         use_parallel_embedding, embedding_sharding_dim)
+        super().__init__(
+            num_layers=num_layers,
+            num_heads=num_heads,
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            hidden_act=hidden_act,
+            max_position_embeddings=max_position_embeddings,
+            dtype=dtype,
+            mapping=mapping,
+            apply_query_key_layer_scaling=apply_query_key_layer_scaling,
+            position_embedding_type=position_embedding_type,
+            rotary_embedding_percentage=rotary_embedding_percentage,
+            rotary_base=rotary_base,
+            rotary_scaling=rotary_scaling,
+            inter_size=inter_size,
+            bias=bias,
+            quant_mode=quant_mode,
+            num_kv_heads=num_kv_heads,
+            use_prompt_tuning=use_prompt_tuning,
+            use_parallel_embedding=use_parallel_embedding,
+            embedding_sharding_dim=embedding_sharding_dim,
+        )
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
 
         share_weight = None
@@ -409,13 +448,15 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                 prompt_embedding_table=None,
                 prompt_tasks=None,
                 prompt_vocab_size=None,
-                workspace=None):
+                workspace=None,
+                lora_params=None):
 
         hidden_states = super().forward(input_ids, position_ids, use_cache,
                                         attention_mask, kv_cache_params,
                                         attention_params,
                                         prompt_embedding_table, prompt_tasks,
-                                        prompt_vocab_size, workspace)
+                                        prompt_vocab_size, workspace,
+                                        lora_params)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -454,7 +495,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
 
         # Prepare inputs
         head_size = self._hidden_size // self._num_heads
-        num_heads_kv = 1 if self._multi_query_mode else self._num_heads
+        num_heads_kv = self._num_kv_heads
         remove_input_padding = default_net().plugin_config.remove_input_padding
         use_gpt_attention_plugin = default_net(
         ).plugin_config.gpt_attention_plugin
@@ -463,6 +504,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
         tokens_per_block = default_net().plugin_config.tokens_per_block
         use_custom_all_reduce = default_net(
         ).plugin_config.use_custom_all_reduce
+        use_lora_plugin = default_net().plugin_config.lora_plugin
 
         model_inputs = self.prepare_basic_inputs(
             max_batch_size=max_batch_size,
@@ -484,7 +526,8 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             gather_all_token_logits=gather_all_token_logits,
             mapping=self.mapping,
             max_num_tokens=max_num_tokens,
-            prompt_embedding_table_size=prompt_embedding_table_size)
+            prompt_embedding_table_size=prompt_embedding_table_size,
+            use_lora_plugin=use_lora_plugin)
 
         return (model_inputs['input_ids'], model_inputs['position_ids'], True,
                 model_inputs['last_token_ids'], model_inputs['attention_mask'],
@@ -506,4 +549,6 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                     host_request_types=model_inputs['host_request_types']),
                 model_inputs['prompt_embedding_table'], model_inputs['tasks'],
                 model_inputs['prompt_vocab_size'],
-                model_inputs['all_reduce_workspace'])
+                model_inputs['all_reduce_workspace'],
+                LoraParams(model_inputs['lora_ranks'],
+                           model_inputs['lora_weights_pointers_list']))

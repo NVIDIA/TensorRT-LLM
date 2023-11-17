@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/generationInput.h"
+#include "tensorrt_llm/runtime/generationOutput.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 
@@ -78,7 +79,9 @@ public:
         = 0;
 
     //! @brief Initialize the decoder with new batch of inputs.
-    virtual void newBatch(GenerationInput const& inputs, SamplingConfig const& samplingConfig) = 0;
+    virtual void newBatch(
+        GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig)
+        = 0;
 
     //! @brief Run one step for all requests without blocking the host thread.
     virtual void forwardAsync(decoder::Output& output, decoder::Input const& input) = 0;
@@ -94,10 +97,16 @@ public:
     }
 
     //! @brief Gather final beam search results for all requests.
-    virtual TensorPtr getFinalOutputIds() const = 0;
+    virtual void finalize() const = 0;
 
     //! @returns [batchSize, beamWidth, maxSequenceLength], all token ids, on gpu
     virtual TensorPtr getOutputIds() const = 0;
+
+    //! @returns [batchSize, maxBeamWidth], cumulative log probabilities (per beam), on gpu
+    virtual TensorPtr getCumLogProbs() const = 0;
+
+    //! @returns [batchSize, maxBeamWidth, maxSequenceLength], log probabilities (per beam), on gpu
+    virtual TensorPtr getLogProbs() const = 0;
 
     //! @returns [batchSize, beamWidth], latests generated tokens (per beam), on gpu
     virtual TensorPtr getNewTokens() const = 0;

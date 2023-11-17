@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <pybind11/functional.h>
 #include <pybind11/operators.h>
 #include <torch/extension.h>
 
@@ -72,7 +73,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("ids", &tpr::GenerationOutput::ids)
         .def_readwrite("lengths", &tpr::GenerationOutput::lengths)
         .def_readwrite("log_probs", &tpr::GenerationOutput::logProbs)
-        .def_readwrite("context_logits", &tpr::GenerationOutput::contextLogits);
+        .def_readwrite("context_logits", &tpr::GenerationOutput::contextLogits)
+        .def_readwrite("on_token_generated", &tpr::GenerationOutput::onTokenGenerated);
 
     py::class_<tb::kv_cache_manager::KvCacheConfig>(m, "KvCacheConfig")
         .def(py::init<std::optional<tr::SizeType>, std::optional<tr::SizeType>, std::optional<float>>(),
@@ -175,6 +177,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property("compute_context_logits",
             py::overload_cast<>(&tr::GptModelConfig::computeContextLogits, py::const_),
             py::overload_cast<bool>(&tr::GptModelConfig::computeContextLogits))
+        .def_property("compute_generation_logits",
+            py::overload_cast<>(&tr::GptModelConfig::computeGenerationLogits, py::const_),
+            py::overload_cast<bool>(&tr::GptModelConfig::computeGenerationLogits))
         .def_property("model_variant", &tr::GptModelConfig::getModelVariant, &tr::GptModelConfig::setModelVariant)
         .def_property("use_custom_all_reduce", py::overload_cast<>(&tr::GptModelConfig::useCustomAllReduce, py::const_),
             py::overload_cast<bool>(&tr::GptModelConfig::useCustomAllReduce));

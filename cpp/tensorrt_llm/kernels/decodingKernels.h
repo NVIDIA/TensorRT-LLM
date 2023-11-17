@@ -62,5 +62,8 @@ void invokeInitializeOutput(int* output_ids, const int* end_ids, int batch_beam,
 void invokeCopyNextStepIds(int* next_step_ids, int** output_ids_ptr, const int* sequence_lengths, int batch_size,
     int beam_width, int max_seq_len, cudaStream_t stream);
 
+void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_tiled, const int* sequence_lengths,
+    int batch_size, int beam_width, int max_seq_len, cudaStream_t stream);
+
 } // namespace kernels
 } // namespace tensorrt_llm

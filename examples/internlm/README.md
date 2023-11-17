@@ -4,11 +4,11 @@ This document shows how to build and run InternLM 7B / 20B models in TensorRT-LL
 
 ## Overview
 
-The TensorRT-LLM InternLM implementation can be found in [tensorrt_llm/models/internlm/model.py](../../tensorrt_llm/models/internlm/model.py). The TensorRT-LLM InternLM example code is located in [`examples/internlm`](./). There are three main files in that folder::
+The TensorRT-LLM InternLM implementation can be found in [tensorrt_llm/models/internlm/model.py](../../tensorrt_llm/models/internlm/model.py). The TensorRT-LLM InternLM example code is located in [`examples/internlm`](./). There are three main files:
 
  * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the InternLM model,
  * [`run.py`](./run.py) to run the inference on an input text,
- * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
+ * and a shared [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
 
 ## Support Matrix
   * FP16 / BF16
@@ -139,7 +139,7 @@ python build.py --ft_model_dir=./internlm-chat-20b/smooth_internlm/int8_kv_cache
                 --use_weight_only
 ```
 
-Test with `run.py` or `summarize.py`:
+Test with `run.py` or `../summarize.py`:
 
 ```bash
 python run.py --max_output_len=120 \
@@ -152,15 +152,15 @@ python run.py --max_output_len=120 \
               --tokenizer_dir ./internlm-chat-20b/ \
               --engine_dir ./internlm-chat-20b/trt_engines/int8_kv_cache_weight_only/1-gpu
 
-python summarize.py --test_trt_llm --test_hf \
-                    --hf_model_location ./internlm-chat-7b \
-                    --data_type fp16 \
-                    --engine_dir ./internlm-chat-7b/trt_engines/int8_kv_cache_weight_only/1-gpu
+python ../summarize.py --test_trt_llm --test_hf \
+                       --hf_model_dir ./internlm-chat-7b \
+                       --data_type fp16 \
+                       --engine_dir ./internlm-chat-7b/trt_engines/int8_kv_cache_weight_only/1-gpu
 
-python summarize.py --test_trt_llm --test_hf \
-                    --hf_model_location ./internlm-chat-20b \
-                    --data_type fp16 \
-                    --engine_dir ./internlm-chat-20b/trt_engines/int8_kv_cache_weight_only/1-gpu
+python ../summarize.py --test_trt_llm --test_hf \
+                       --hf_model_dir ./internlm-chat-20b \
+                       --data_type fp16 \
+                       --engine_dir ./internlm-chat-20b/trt_engines/int8_kv_cache_weight_only/1-gpu
 ```
 
 #### SmoothQuant
@@ -214,7 +214,7 @@ python build.py --ft_model_dir=./internlm-chat-20b/smooth_internlm/sq0.5/1-gpu/ 
 
 Note we use `--ft_model_dir` instead of `--model_dir` and `--meta_ckpt_dir` since SmoothQuant model needs INT8 weights and various scales from the binary files.
 
-Test with `run.py` or `summarize.py`:
+Test with `run.py` or `../summarize.py`:
 
 ```bash
 python run.py --max_output_len=120 \
@@ -227,15 +227,15 @@ python run.py --max_output_len=120 \
               --tokenizer_dir ./internlm-chat-20b/ \
               --engine_dir ./internlm-chat-20b/trt_engines/smoothquant/1-gpu
 
-python summarize.py --test_trt_llm --test_hf \
-                    --hf_model_location ./internlm-chat-7b \
-                    --data_type fp16 \
-                    --engine_dir ./internlm-chat-7b/trt_engines/smoothquant/1-gpu
+python ../summarize.py --test_trt_llm --test_hf \
+                       --hf_model_dir ./internlm-chat-7b \
+                       --data_type fp16 \
+                       --engine_dir ./internlm-chat-7b/trt_engines/smoothquant/1-gpu
 
-python summarize.py --test_trt_llm --test_hf \
-                    --hf_model_location ./internlm-chat-20b \
-                    --data_type fp16 \
-                    --engine_dir ./internlm-chat-20b/trt_engines/smoothquant/1-gpu
+python ../summarize.py --test_trt_llm --test_hf \
+                       --hf_model_dir ./internlm-chat-20b \
+                       --data_type fp16 \
+                       --engine_dir ./internlm-chat-20b/trt_engines/smoothquant/1-gpu
 ```
 
 ### Run
@@ -280,28 +280,28 @@ mpirun -n 4 --allow-run-as-root \
 
 ```bash
 # Run summarization using the InternLM 7B model in FP16.
-python summarize.py --test_trt_llm --test_hf \
-                    --hf_model_location ./internlm-chat-7b/ \
-                    --data_type fp16 \
-                    --engine_dir ./internlm-chat-7b/trt_engines/fp16/1-gpu/
+python ../summarize.py --test_trt_llm --test_hf \
+                       --hf_model_dir ./internlm-chat-7b/ \
+                       --data_type fp16 \
+                       --engine_dir ./internlm-chat-7b/trt_engines/fp16/1-gpu/
 
 # Run summarization using the InternLM 7B model quantized to INT8.
-python summarize.py --test_trt_llm --test_hf \
-                    --hf_model_location ./internlm-chat-7b/ \
-                    --data_type fp16 \
-                    --engine_dir ./internlm-chat-7b/trt_engines/weight_only/1-gpu/
+python ../summarize.py --test_trt_llm --test_hf \
+                       --hf_model_dir ./internlm-chat-7b/ \
+                       --data_type fp16 \
+                       --engine_dir ./internlm-chat-7b/trt_engines/weight_only/1-gpu/
 
 # Run summarization using the InternLM 7B model in FP16 using two GPUs.
 mpirun -n 2 --allow-run-as-root \
-    python summarize.py --test_trt_llm --test_hf \
-                        --hf_model_location ./internlm-chat-7b/ \
-                        --data_type fp16 \
-                        --engine_dir ./internlm-chat-7b/trt_engines/fp16/2-gpu/
+    python ../summarize.py --test_trt_llm --test_hf \
+                           --hf_model_dir ./internlm-chat-7b/ \
+                           --data_type fp16 \
+                           --engine_dir ./internlm-chat-7b/trt_engines/fp16/2-gpu/
 
 # Run summarization using the InternLM 20B model in BF16 using 4 GPUs.
 mpirun -n 4 --allow-run-as-root \
-    python summarize.py --test_trt_llm --test_hf \
-                        --hf_model_location ./internlm-chat-20b/ \
-                        --data_type bf16 \
-                        --engine_dir ./internlm-chat-20b/trt_engines/bf16/4-gpu/
+    python ../summarize.py --test_trt_llm --test_hf \
+                           --hf_model_dir ./internlm-chat-20b/ \
+                           --data_type bf16 \
+                           --engine_dir ./internlm-chat-20b/trt_engines/bf16/4-gpu/
 ```

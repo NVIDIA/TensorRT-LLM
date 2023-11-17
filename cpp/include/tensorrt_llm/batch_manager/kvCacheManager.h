@@ -309,8 +309,8 @@ public:
     }
 
     [[nodiscard]] static SizeType getMaxNumTokens(KvCacheConfig const& config, nvinfer1::DataType dtype,
-        tensorrt_llm::runtime::GptModelConfig const& modelConfig,
-        tensorrt_llm::runtime::WorldConfig const& worldConfig);
+        tensorrt_llm::runtime::GptModelConfig const& modelConfig, tensorrt_llm::runtime::WorldConfig const& worldConfig,
+        runtime::BufferManager const& bufferManager);
 
 private:
     void resetBlockPointers(SizeType batchSlotIdx, SizeType beamWidth);

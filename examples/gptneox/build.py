@@ -400,6 +400,7 @@ def build(rank, args):
             max_position_embeddings=args.n_positions,
             apply_query_key_layer_scaling=apply_query_key_layer_scaling,
             max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
             max_input_len=args.max_input_len,
             int8=args.use_weight_only_quant_matmul_plugin
             or args.use_weight_only_groupwise_quant_matmul_plugin,

@@ -14,8 +14,6 @@
 # limitations under the License.
 import argparse
 import json
-import os
-import re
 from pathlib import Path
 
 import torch
@@ -32,13 +30,16 @@ from build import find_engines  # isort:skip
 def parse_arguments(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        '--model_version',
+        '--model_name',
         '-m',
         type=str,
-        default="3",
-        choices=["1", "2", "3", "2-32k", "3-32k"],
+        required=True,
+        choices=[
+            "chatglm_6b", "chatglm2_6b", "chatglm2_6b_32k", "chatglm3_6b",
+            "chatglm3_6b_base", "chatglm3_6b_32k", "glm_10b"
+        ],
         help=
-        '1, 2, 3, 2-32k, 3-32k for ChatGLM-6B, ChatGLM2-6B, ChatGLM3-6B, ChatGLM2-32k and ChatGLM3-32k respectively'
+        'the name of the model, use "_" rather than "-" to connect the name parts'
     )
     parser.add_argument('--max_output_len', type=int, default=1024)
     parser.add_argument('--log_level', type=str, default='error')
@@ -73,44 +74,15 @@ def parse_arguments(args=None):
     return parser.parse_args(args)
 
 
-def process_response(responseList):
-    for i, response in enumerate(responseList):
-        response = response.strip()
-        punkts = [
-            [",", "，"],
-            ["!", "！"],
-            [":", "："],
-            [";", "；"],
-            ["\?", "？"],
-        ]
-        for item in punkts:
-            response = re.sub(r"([\u4e00-\u9fff])%s" % item[0],
-                              r"\1%s" % item[1], response)
-            response = re.sub(r"%s([\u4e00-\u9fff])" % item[0],
-                              r"%s\1" % item[1], response)
-
-        responseList[i] = response
-    return responseList
-
-
 if __name__ == '__main__':
     args = parse_arguments()
     tensorrt_llm.logger.set_level(args.log_level)
 
-    if args.model_version == "1":
-        model_name = "chatglm-6b"
-    elif args.model_version in ["2", "3"]:
-        model_name = "chatglm%s-6b" % args.model_version
-    else:
-        model_name = "chatglm%s-6b-32k" % args.model_version.split("-")[0]
-
-    config_path = os.path.join(args.engine_dir, model_name + '-config.json')
+    config_path = Path(args.engine_dir) / (args.model_name + '-config.json')
     with open(config_path, 'r') as f:
         config = json.load(f)
 
     dtype = config['builder_config']['precision']
-    end_id = config['builder_config']['eos_token_id']
-    pad_id = config['builder_config']['pad_token_id']
     max_batch_size = config['builder_config']['max_batch_size']
     max_input_len = config['builder_config']['max_input_len']
     max_output_len = config['builder_config']['max_output_len']
@@ -138,16 +110,21 @@ if __name__ == '__main__':
 
     serialize_path = find_engines(
         Path(args.engine_dir),
-        model_name=model_name,
+        model_name=args.model_name,
         dtype=dtype,
         tp_size=world_size,
         rank=runtime_rank,
     )[0]
 
     if args.tokenizer_dir is None:
-        args.tokenizer_dir = model_name
+        args.tokenizer_dir = args.model_name
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.tokenizer_dir, trust_remote_code=True)
+    end_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id
+    if args.model_name in ["glm_10b"]:
+        sop_id = tokenizer.sop_token_id
+        eop_id = tokenizer.eop_token_id
     input_ids = None
     input_text = None
     if args.input_tokens is None:
@@ -171,6 +148,13 @@ if __name__ == '__main__':
                                         max_input_len, input_lengths)
         else:
             max_input_len = max_input_len_real
+        if args.model_name in ["glm_10b"]:
+            input_ids = torch.cat(
+                (input_ids, input_ids.new_full((batch_size, 1), sop_id)),
+                dim=-1,
+            )
+            input_lengths += 1
+            max_input_len_real += 1
 
     else:
         input_ids = []
@@ -182,7 +166,6 @@ if __name__ == '__main__':
         input_ids = torch.tensor(input_ids,
                                  dtype=torch.int32).cuda().unsqueeze(0)
 
-    input_ids_padding = input_ids.clone()
     if remove_input_padding:
         input_ids_no_padding = torch.zeros(1,
                                            torch.sum(input_lengths),
@@ -221,14 +204,14 @@ if __name__ == '__main__':
         hidden_size=config['builder_config']['hidden_size'] // world_size,
         gpt_attention_plugin=use_gpt_attention_plugin,
         remove_input_padding=config['builder_config']['remove_input_padding'],
-        model_name=model_name,
+        model_name=args.model_name,
         paged_kv_cache=config['builder_config']['paged_kv_cache'],
         quant_mode=QuantMode(config['builder_config']['quant_mode']),
         dtype=dtype,
     )
 
     sampling_config = SamplingConfig(
-        end_id=end_id,
+        end_id=eop_id if args.model_name in ["glm_10b"] else end_id,
         pad_id=pad_id,
         num_beams=beam_width,
         temperature=args.temperature,
@@ -240,18 +223,22 @@ if __name__ == '__main__':
     with open(serialize_path, 'rb') as f:
         engine_buffer = f.read()
 
-    if model_name == "chatglm-6b":
-        decoder = ChatGLMGenerationSession(
-            model_config,
-            engine_buffer,
-            runtime_mapping,
-        )
-    else:
-        decoder = GenerationSession(
-            model_config,
-            engine_buffer,
-            runtime_mapping,
-        )
+    if args.model_name in ["chatglm_6b", "glm_10b"]:
+        session = ChatGLMGenerationSession
+    elif args.model_name in [
+            "chatglm2_6b",
+            "chatglm2_6b_32k",
+            "chatglm3_6b",
+            "chatglm3_6b_base",
+            "chatglm3_6b_32k",
+    ]:
+        session = GenerationSession
+    decoder = session(
+        model_config,
+        engine_buffer,
+        runtime_mapping,
+    )
+
     decoder.setup(
         len(input_text),
         max_input_len,
@@ -266,17 +253,31 @@ if __name__ == '__main__':
         return_dict=True,
     )
     torch.cuda.synchronize()
+
     output_ids = output["output_ids"]
     output_lengths = output["sequence_lengths"]
 
     if runtime_rank == 0:
+
+        if args.model_name in ["chatglm_6b"]:
+            from process import process_response_chatglm_6b as process_response
+        elif args.model_name in [
+                "chatglm2_6b",
+                "chatglm2_6b_32k",
+                "chatglm3_6b",
+                "chatglm3_6b_base",
+                "chatglm3_6b_32k",
+                "glm_10b",
+        ]:
+            from process import process_response
+
         for i in range(batch_size):
             print("\nInput  %2d ---> len=%d\n%s" %
                   (i, input_lengths[i], input_text[i]))
             print("\nOutput %2d --->" % i)
-            output_ids__one_batch = output_ids[i, :, input_lengths[i]:]
+            output_ids_one_batch = output_ids[i, :, input_lengths[i]:]
             output_lengths_one_batch = output_lengths[i]
-            output_token_list = tokenizer.batch_decode(output_ids__one_batch,
+            output_token_list = tokenizer.batch_decode(output_ids_one_batch,
                                                        skip_special_tokens=True)
             output_token_list = process_response(output_token_list)
             for j, (length, simple_output) in enumerate(

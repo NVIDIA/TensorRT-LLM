@@ -226,7 +226,7 @@ void mmha_launch_kernel_ex(
     }
 
     // If blocks with larger block size already fill all SMs, then disable the multi blocks mode.
-    mmha::multi_block_grid_setup<T, Dh>(grid, params, dynamic_block_size, available_blocks, tlength, DO_MULTI_BLOCK);
+    mmha::multi_block_grid_setup<T, Dh>(grid, params, available_blocks, dynamic_block_size, tlength, DO_MULTI_BLOCK);
 
     // Launch kernels based on the valid block size.
     switch (dynamic_block_size)

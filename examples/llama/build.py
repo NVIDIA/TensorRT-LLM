@@ -23,10 +23,11 @@ import torch
 import torch.multiprocessing as mp
 from transformers import LlamaConfig, LlamaForCausalLM
 from weight import (get_scaling_factors, load_from_awq_llama, load_from_binary,
-                    load_from_gptq_llama, load_from_hf_llama,
-                    load_from_meta_llama)
+                    load_from_gptq_llama, load_from_hf_checkpoint,
+                    load_from_hf_llama, load_from_meta_llama)
 
 import tensorrt_llm
+from tensorrt_llm import profiler
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.layers.attention import PositionEmbeddingType
@@ -35,7 +36,6 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import quantize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
-from tensorrt_llm.profiler import check_gpt_mem_usage
 from tensorrt_llm.quantization import QuantMode
 
 from weight import parse_ft_config  # isort:skip
@@ -194,6 +194,9 @@ def parse_arguments():
                         It is beneifical when batchxnum_heads cannot fully utilize GPU.'
     )
     parser.add_argument('--visualize', default=False, action='store_true')
+    parser.add_argument('--load_by_shard',
+                        action='store_true',
+                        help='Load a pretrained model shard-by-shard.')
     parser.add_argument('--enable_debug_output',
                         default=False,
                         action='store_true')
@@ -352,6 +355,9 @@ def parse_arguments():
         type=int,
         default=0,
         help='Setting to a value > 0 enables support for prompt tuning.')
+    parser.add_argument('--gather_all_token_logits',
+                        action='store_true',
+                        default=False)
 
     args = parser.parse_args()
     tensorrt_llm.logger.set_level(args.log_level)
@@ -494,6 +500,7 @@ def build_rank_engine(builder: Builder,
     assert args.n_layer % args.pp_size == 0, \
         f"num_layers {args.n_layer} must be a multiple of pipeline parallelism size {args.pp_size}"
 
+    profiler.print_memory_usage(f'Rank {rank} Engine build starts')
     # Initialize Module
     tensorrt_llm_llama = tensorrt_llm.models.LLaMAForCausalLM(
         num_layers=args.n_layer,
@@ -553,27 +560,35 @@ def build_rank_engine(builder: Builder,
     elif args.model_dir is not None:
         logger.info(f'Loading HF LLaMA ... from {args.model_dir}')
         tik = time.time()
-        hf_llama = LlamaForCausalLM.from_pretrained(
-            args.model_dir,
-            device_map={
-                "model": "cpu",
-                "lm_head": "cpu"
-            },  # Load to CPU memory
-            torch_dtype="auto")
+        if not args.load_by_shard:
+            hf_llama = LlamaForCausalLM.from_pretrained(
+                args.model_dir,
+                device_map={
+                    "model": "cpu",
+                    "lm_head": "cpu"
+                },  # Load to CPU memory
+                torch_dtype='auto',
+            )
+            load_from_hf_llama(tensorrt_llm_llama,
+                               hf_llama,
+                               mapping=mapping,
+                               dtype=args.dtype)
+            del hf_llama
+        else:
+            load_from_hf_checkpoint(tensorrt_llm_llama,
+                                    args.model_dir,
+                                    mapping,
+                                    dtype=args.dtype)
         tok = time.time()
         t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
         logger.info(f'HF LLaMA loaded. Total time: {t}')
-        load_from_hf_llama(tensorrt_llm_llama,
-                           hf_llama,
-                           mapping=mapping,
-                           dtype=args.dtype)
-        del hf_llama
     elif args.ft_model_dir is not None:
         load_from_binary(tensorrt_llm_llama,
                          args.ft_model_dir,
                          mapping,
                          fp16=(args.dtype == 'float16'),
                          multi_query_mode=(args.n_kv_head != args.n_head))
+    profiler.print_memory_usage(f'Rank {rank} model weight loaded.')
 
     # Module -> Network
     network = builder.create_network()
@@ -632,7 +647,7 @@ def build_rank_engine(builder: Builder,
             args.max_beam_width,
             args.max_num_tokens,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size,
-        )
+            gather_all_token_logits=args.gather_all_token_logits)
         tensorrt_llm_llama(*inputs)
         if args.enable_debug_output:
             # mark intermediate nodes' outputs
@@ -674,6 +689,8 @@ def build(rank, args):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
+        tik = time.time()
+
         # NOTE: when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
         int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
             not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
@@ -692,6 +709,7 @@ def build(rank, args):
             hidden_act=args.hidden_act,
             max_position_embeddings=args.n_positions,
             max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,
@@ -701,6 +719,7 @@ def build(rank, args):
             opt_level=args.builder_opt,
             max_prompt_embedding_table_size=args.
             max_prompt_embedding_table_size,
+            gather_all_token_logits=args.gather_all_token_logits,
         )
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.tp_size,
                                       args.pp_size, cur_rank)
@@ -715,7 +734,7 @@ def build(rank, args):
             kv_dtype = str_dtype_to_trt('int8')
         elif args.quant_mode.has_fp8_kv_cache():
             kv_dtype = str_dtype_to_trt('fp8')
-        check_gpt_mem_usage(
+        profiler.check_gpt_mem_usage(
             engine=engine,
             kv_dtype=kv_dtype,
             use_gpt_attention_plugin=args.use_gpt_attention_plugin,
@@ -735,6 +754,12 @@ def build(rank, args):
 
         serialize_engine(engine, os.path.join(args.output_dir, engine_name))
         del engine
+        profiler.print_memory_usage(f'Rank {cur_rank} Engine serialized')
+
+        tok = time.time()
+        t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
+        logger.info(
+            f'Rank {cur_rank} Engine build time: {t} - {tok - tik} (sec)')
 
     if rank == 0:
         ok = builder.save_timing_cache(

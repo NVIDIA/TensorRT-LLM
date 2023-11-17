@@ -48,6 +48,8 @@ class LLaMADecoderLayer(Module):
                  tp_size=1,
                  quant_mode=QuantMode(0),
                  rms_norm_eps=1e-06,
+                 attn_bias=False,
+                 mlp_bias=False,
                  use_fused_mlp=False):
         super().__init__()
         self._layer_id = layer_id  # useful for debugging
@@ -74,7 +76,7 @@ class LLaMADecoderLayer(Module):
             max_position_embeddings,
             dtype=dtype,
             attention_mask_type=AttentionMaskType.causal,
-            bias=False,
+            bias=attn_bias,
             position_embedding_type=position_embedding_type,
             rotary_embedding_base=rotary_base,
             rotary_embedding_scaling=rotary_scaling,
@@ -91,7 +93,7 @@ class LLaMADecoderLayer(Module):
                           ffn_hidden_size=self.mlp_hidden_size,
                           hidden_act=hidden_act,
                           dtype=dtype,
-                          bias=False,
+                          bias=mlp_bias,
                           tp_group=tp_group,
                           tp_size=tp_size,
                           quant_mode=quant_mode,
@@ -162,6 +164,8 @@ class LLaMAModel(Module):
                  embedding_sharding_dim=0,
                  rms_norm_eps=1e-06,
                  use_fused_mlp=False,
+                 attn_bias=False,
+                 mlp_bias=False,
                  use_prompt_tuning: bool = False):
         super().__init__()
         self.mapping = mapping
@@ -197,6 +201,8 @@ class LLaMAModel(Module):
                               tp_size=mapping.tp_size,
                               quant_mode=quant_mode,
                               rms_norm_eps=rms_norm_eps,
+                              attn_bias=attn_bias,
+                              mlp_bias=mlp_bias,
                               use_fused_mlp=use_fused_mlp)
             for i in self.get_transformer_layers(self.mapping, num_layers)
         ])
@@ -292,6 +298,8 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                  embedding_sharding_dim=0,
                  rms_norm_eps=1e-06,
                  use_fused_mlp=False,
+                 attn_bias=False,
+                 mlp_bias=False,
                  use_prompt_tuning: bool = False):
 
         if isinstance(dtype, str):
@@ -330,7 +338,8 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                          mlp_hidden_size, position_embedding_type, rotary_base,
                          rotary_scaling, mapping, quant_mode,
                          use_parallel_embedding, embedding_sharding_dim,
-                         rms_norm_eps, use_fused_mlp, use_prompt_tuning)
+                         rms_norm_eps, use_fused_mlp, attn_bias, mlp_bias,
+                         use_prompt_tuning)
 
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
         if self.mapping.is_last_pp_rank():
@@ -391,16 +400,15 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                 return lm_logits
             return hidden_states
 
-    def prepare_inputs(
-        self,
-        max_batch_size,
-        max_input_len,
-        max_new_tokens,
-        use_cache,
-        max_beam_width,
-        max_num_tokens: int = None,
-        prompt_embedding_table_size: int = 0,
-    ):
+    def prepare_inputs(self,
+                       max_batch_size,
+                       max_input_len,
+                       max_new_tokens,
+                       use_cache,
+                       max_beam_width,
+                       max_num_tokens: int = None,
+                       prompt_embedding_table_size: int = 0,
+                       gather_all_token_logits: bool = False):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -438,6 +446,7 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
             mapping=self.mapping,
             max_num_tokens=max_num_tokens,
             prompt_embedding_table_size=prompt_embedding_table_size,
+            gather_all_token_logits=gather_all_token_logits,
         )
 
         return (

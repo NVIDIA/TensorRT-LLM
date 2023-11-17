@@ -52,13 +52,33 @@ class Module(object):
             type(self).__name__, name))
 
     def __setattr__(self, name, value) -> None:
-        if isinstance(value, Parameter):
-            parameters = self.__dict__.get('_parameters')
-            parameters[name] = value
+        # Improved module setattr to handle one edge case:
+        # attribute could be first set to None and later reset to Parameter / Module class
+
+        try:
+            super().__getattribute__(name)
+
+        except AttributeError:
+            # if base class doesn't have the attribute, no matter we init or reset:
+            # - keep Parameter and Module attrs in this Module class
+            # - leave all other attrs in base class
+            if isinstance(value, Parameter):
+                self.__dict__.get('_parameters')[name] = value
+            elif isinstance(value, Module):
+                self.__dict__.get('_modules')[name] = value
+            else:
+                super().__setattr__(name, value)
+
         else:
-            modules = self.__dict__.get('_modules')
-            if isinstance(value, Module):
-                modules[name] = value
+            # if base class has the attribute, reset as follows:
+            # - when reset as Parameter or Module attr, remove from base & add to this Module class
+            # - other types reset and remain in base class
+            if isinstance(value, Parameter):
+                super().__delattr__(name)
+                self.__dict__.get('_parameters')[name] = value
+            elif isinstance(value, Module):
+                super().__delattr__(name)
+                self.__dict__.get('_modules')[name] = value
             else:
                 super().__setattr__(name, value)
 

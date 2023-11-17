@@ -27,7 +27,7 @@ import tensorrt_llm
 import tensorrt_llm.logger as logger
 from tensorrt_llm._utils import str_dtype_to_torch, torch_to_numpy
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import InternLMForCausalLM
+from tensorrt_llm.models import LLaMAForCausalLM
 from tensorrt_llm.models.quantized.quant import get_dummy_quant_scales
 from tensorrt_llm.quantization import QuantMode
 
@@ -181,7 +181,7 @@ def parse_ft_config(ini_file):
 
 
 def load_from_hf_internlm(
-        tensorrt_llm_internlm: tensorrt_llm.models.InternLMForCausalLM,
+        tensorrt_llm_internlm: tensorrt_llm.models.LLaMAForCausalLM,
         hf_internlm,
         mapping=Mapping(),
         dtype='float32'):
@@ -374,7 +374,7 @@ def load_from_hf_internlm(
 
 
 def load_from_meta_internlm(
-        tensorrt_llm_internlm: tensorrt_llm.models.InternLMForCausalLM,
+        tensorrt_llm_internlm: tensorrt_llm.models.LLaMAForCausalLM,
         meta_ckpt_dir,
         mapping=Mapping(),
         dtype="float32"):
@@ -565,7 +565,7 @@ def load_from_meta_internlm(
     return
 
 
-def load_from_binary(tensorrt_llm_internlm: InternLMForCausalLM,
+def load_from_binary(tensorrt_llm_internlm: LLaMAForCausalLM,
                      dir_path,
                      mapping=Mapping(),
                      fp16=False,
@@ -1078,7 +1078,7 @@ def load_from_gptq_internlm(tensorrt_llm_internlm,
     return
 
 
-def load_from_awq_internlm(tensorrt_llm_internlm: InternLMForCausalLM,
+def load_from_awq_internlm(tensorrt_llm_internlm: LLaMAForCausalLM,
                            quant_ckpt_path,
                            mapping=Mapping(),
                            dtype="float16"):

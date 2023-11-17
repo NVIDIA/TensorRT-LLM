@@ -145,12 +145,15 @@ def smooth_ln_fcs(ln, fcs, act_scales, alpha=0.5):
 
 
 @torch.no_grad()
-def capture_activation_range(model, tokenizer, num_samples=512, seq_len=512):
+def capture_activation_range(model,
+                             tokenizer,
+                             dataset,
+                             num_samples=512,
+                             seq_len=512):
     model.eval()
-    next(model.parameters()).device
+    device = next(model.parameters()).device
     act_scales = defaultdict(lambda: {"x": None, "y": None, "w": None})
 
-    test_token_num = 923
     tokenizer.pad_token = tokenizer.eos_token
 
     def stat_tensor(name, tensor, act_scales, key):
@@ -181,22 +184,18 @@ def capture_activation_range(model, tokenizer, num_samples=512, seq_len=512):
                 m.register_forward_hook(
                     functools.partial(stat_input_hook, name=name)))
 
-    from datasets import load_dataset
-    dataset_cnn = load_dataset("ccdv/cnn_dailymail", '3.0.0')
-
     for i in tqdm(range(num_samples), desc="calibrating model"):
-        datapoint = dataset_cnn['train'][i:i + 1]
+        datapoint = dataset['train'][i:i + 1]
         line = copy.copy(datapoint['article'])
         line[0] = line[0] + ' TL;DR: '
         line[0] = line[0].strip()
         line[0] = line[0].replace(" n't", "n't")
-        line_encoded = tokenizer(line,
-                                 return_tensors="pt",
-                                 padding=True,
-                                 truncation=True)["input_ids"].type(torch.int64)
-        line_encoded = line_encoded[:, -test_token_num:]
-        line_encoded = line_encoded.cuda()
-        model(line_encoded)
+        input_ids = tokenizer(line,
+                              return_tensors="pt",
+                              max_length=seq_len,
+                              padding=True,
+                              truncation=True).input_ids.to(device)
+        model(input_ids)
 
     for h in hooks:
         h.remove()

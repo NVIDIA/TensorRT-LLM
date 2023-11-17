@@ -462,7 +462,7 @@ def build(rank, args):
         if args.parallel_build and cur_rank != rank:
             continue
         # NOTE(nkorobov): when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
-        int8_trt_flag = args.quant_mode.has_act_and_weight_quant() or (
+        int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
             not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
 
         builder_config = builder.create_builder_config(
@@ -478,10 +478,10 @@ def build(rank, args):
             hidden_act=args.hidden_act,
             max_position_embeddings=args.n_positions,
             max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,
-            fp8=args.enable_fp8,
             int8=int8_trt_flag,
             quant_mode=args.quant_mode,
             strongly_typed=args.strongly_typed)

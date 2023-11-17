@@ -107,6 +107,7 @@ GptJsonConfig parseJson(InputType&& i)
         = parseJsonFieldOr<SizeType>(builderConfig, "max_prompt_embedding_table_size", 0);
 
     auto const computeContextLogits = parseJsonFieldOr(builderConfig, "gather_all_token_logits", false);
+    auto const computeGenerationLogits = parseJsonFieldOr(builderConfig, "gather_all_token_logits", false);
 
     auto const& pluginConfig = json.at("plugin_config");
     auto const pagedKvCache = pluginConfig.at("paged_kv_cache");
@@ -125,6 +126,7 @@ GptJsonConfig parseJson(InputType&& i)
     modelConfig.setQuantMode(quantMode);
     modelConfig.setNbKvHeads(numKvHeads);
     modelConfig.computeContextLogits(computeContextLogits);
+    modelConfig.computeGenerationLogits(computeGenerationLogits);
 
     modelConfig.setMaxBatchSize(maxBatchSize);
     modelConfig.setMaxInputLen(maxInputLen);
@@ -132,10 +134,10 @@ GptJsonConfig parseJson(InputType&& i)
     modelConfig.setMaxNumTokens(maxNumTokens);
     modelConfig.setMaxPromptEmbeddingTableSize(maxPromptEmbeddingTableSize);
 
-    if (name == std::string("chatglm-6b"))
+    if (name == std::string("chatglm_6b") || name == std::string("glm_10b"))
     {
         modelConfig.setModelVariant(GptModelConfig::ModelVariant::kGlm);
-        // kGlm is only for ChatGLM-6B and Glm-10B
+        // kGlm is only for ChatGLM-6B and GLM-10B
     }
 
     return GptJsonConfig{name, precision, tensorParallelism, pipelineParallelism, modelConfig};

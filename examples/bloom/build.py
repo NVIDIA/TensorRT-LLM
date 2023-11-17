@@ -17,12 +17,15 @@ import os
 import time
 from pathlib import Path
 
+import onnx
 import tensorrt as trt
 import torch
 import torch.multiprocessing as mp
+from onnx import TensorProto, helper
 from transformers import BloomConfig, BloomForCausalLM
 
 import tensorrt_llm
+from tensorrt_llm import profiler
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
@@ -32,13 +35,13 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 
-from weight import load_from_hf_bloom, load_from_bin, parse_config, check_embedding_share  # isort:skip
+# isort: off
+from weight import (check_embedding_share, load_from_bin, load_from_hf_bloom,
+                    load_from_hf_checkpoint, parse_config)
+
+# isort: on
 
 MODEL_NAME = "bloom"
-
-import onnx
-import tensorrt as trt
-from onnx import TensorProto, helper
 
 
 def trt_dtype_to_onnx(dtype):
@@ -178,6 +181,9 @@ def parse_arguments():
     )
     parser.add_argument('--parallel_build', default=False, action='store_true')
     parser.add_argument('--visualize', default=False, action='store_true')
+    parser.add_argument('--load_by_shard',
+                        action='store_true',
+                        help='Load a pretrained model shard-by-shard.')
     parser.add_argument('--enable_debug_output',
                         default=False,
                         action='store_true')
@@ -325,6 +331,8 @@ def build_rank_engine(builder: Builder,
     '''
     kv_dtype = str_dtype_to_trt(args.dtype)
 
+    profiler.print_memory_usage(f'Rank {rank} Engine build starts')
+
     # Share_embedding_table can be set True only when:
     # 1) the weight for lm_head() does not exist while other weights exist
     # 2) For multiple-processes, use_parallel_embedding=True and embedding_sharding_dim == 0.
@@ -366,20 +374,32 @@ def build_rank_engine(builder: Builder,
     if args.model_dir is not None:
         logger.info(f'Loading HF BLOOM ... from {args.model_dir}')
         tik = time.time()
-        hf_bloom = BloomForCausalLM.from_pretrained(args.model_dir,
-                                                    torch_dtype="auto")
+        if not args.load_by_shard:
+            hf_bloom = BloomForCausalLM.from_pretrained(args.model_dir,
+                                                        torch_dtype="auto")
+            print(hf_bloom)
+            load_from_hf_bloom(
+                tensorrt_llm_bloom,
+                hf_bloom,
+                rank,
+                args.world_size,
+                fp16=(args.dtype == 'float16'),
+                use_parallel_embedding=args.use_parallel_embedding,
+                sharding_dim=args.embedding_sharding_dim,
+                share_embedding_table=share_embedding_table)
+            del hf_bloom
+        else:
+            load_from_hf_checkpoint(
+                tensorrt_llm_bloom,
+                model_dir=args.model_dir,
+                dtype=args.dtype,
+                use_parallel_embedding=args.use_parallel_embedding,
+                sharding_dim=args.embedding_sharding_dim,
+                share_embedding_table=share_embedding_table)
         tok = time.time()
         t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
         logger.info(f'HF BLOOM loaded. Total time: {t}')
-        print(hf_bloom)
-        load_from_hf_bloom(tensorrt_llm_bloom,
-                           hf_bloom,
-                           rank,
-                           args.world_size,
-                           fp16=(args.dtype == 'float16'),
-                           use_parallel_embedding=args.use_parallel_embedding,
-                           sharding_dim=args.embedding_sharding_dim,
-                           share_embedding_table=share_embedding_table)
+
     elif args.bin_model_dir is not None:
         load_from_bin(tensorrt_llm_bloom,
                       args.bin_model_dir,
@@ -389,6 +409,7 @@ def build_rank_engine(builder: Builder,
                       use_parallel_embedding=args.use_parallel_embedding,
                       sharding_dim=args.embedding_sharding_dim,
                       share_embedding_table=share_embedding_table)
+    profiler.print_memory_usage(f'Rank {rank} model weight loaded.')
 
     # Module -> Network
     network = builder.create_network()
@@ -490,6 +511,7 @@ def build(rank, args):
             vocab_size=args.vocab_size,
             max_position_embeddings=args.n_positions,
             max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             int8=int8_trt_flag,
@@ -509,6 +531,7 @@ def build(rank, args):
 
         serialize_engine(engine, os.path.join(args.output_dir, engine_name))
         del engine
+        profiler.print_memory_usage(f'Rank {cur_rank} Engine serialized')
 
     if rank == 0:
         ok = builder.save_timing_cache(

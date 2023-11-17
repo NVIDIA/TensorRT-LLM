@@ -361,9 +361,11 @@ def build(rank, args):
             hidden_act=args.hidden_act,
             max_position_embeddings=args.n_positions,
             max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
-            use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
+            max_prompt_embedding_table_size=args.
+            max_prompt_embedding_table_size,
             int8=(args.quant_mode.has_act_or_weight_quant()
                   or args.quant_mode.has_int8_kv_cache()),
             strongly_typed=args.strongly_typed)

@@ -1361,7 +1361,6 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
 
     switch (position_embedding_type)
     {
-    case PositionEmbeddingType::kRELATIVE:
     case PositionEmbeddingType::kROPE_GPTJ:
     {
         mmha::apply_rotary_embedding(

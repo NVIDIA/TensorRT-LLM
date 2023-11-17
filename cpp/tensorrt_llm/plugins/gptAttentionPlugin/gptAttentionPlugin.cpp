@@ -250,7 +250,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     // such model has an encoder context (for cross attn) and an decoder context (for self attn)
     // clarify 3 lens:
     // -- max_context_len: len of decoder input. No "max" concept, it's what it is given.
-    //                     Also called (decoder_)input_seq_length
+    //                     Also called (decoder_)input_seq_length, normally 1 for encoder-decoder start token
     // -- max_seq_len: max allowed len of decoder output, i.e. final results
     // -- max_encoder_context_len: len of encoder input (in cross attn). Also called encoder_input_seq_length
 

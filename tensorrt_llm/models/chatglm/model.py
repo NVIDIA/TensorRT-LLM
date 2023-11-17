@@ -18,8 +18,8 @@ import tensorrt as trt
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
-from ...functional import (PositionEmbeddingType, Tensor,
-                           gather_last_token_logits)
+from ...functional import (PositionEmbeddingType, Tensor, concat,
+                           gather_last_token_logits, shape)
 from ...layers import (MLP, Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, KeyValueCacheParams, LayerNorm,
                        RmsNorm)
@@ -33,15 +33,33 @@ class ChatGLMDecoderLayer(Module):
 
         super().__init__()
 
-        self.model_version = args.model_version
+        self.model_name = args.model_name
         self.use_cache = args.use_cache
+        rotary_embedding_scaling = None
 
-        if self.model_version == "1":
+        if self.model_name in ["chatglm_6b"]:
             self.alpha = (2 * args.num_layers)**0.5
             self.norm = LayerNorm
-        else:
+            attention_mask_type = AttentionMaskType.bidirectional
+            position_embedding_type = PositionEmbeddingType.chatglm
+        elif args.model_name in [
+                "chatglm2_6b", "chatglm2_6b_32k", "chatglm3_6b",
+                "chatglm3_6b_base", "chatglm3_6b_32k"
+        ]:
             self.apply_residual_connection_post_layernorm = args.apply_residual_connection_post_layernorm
             self.norm = RmsNorm if args.rmsnorm else LayerNorm
+            attention_mask_type = AttentionMaskType.causal
+            position_embedding_type = PositionEmbeddingType.rope_gptj
+            if args.model_name in ["chatglm2_6b_32k", "chatglm3_6b_32k"]:
+                rotary_embedding_scaling = {
+                    "type": "linear",
+                    "factor": args.rotary_embedding_scaling
+                }
+        elif args.model_name in ["glm_10b"]:
+            self.apply_residual_connection_post_layernorm = args.apply_residual_connection_post_layernorm
+            self.norm = LayerNorm
+            attention_mask_type = AttentionMaskType.bidirectionalglm
+            position_embedding_type = PositionEmbeddingType.learned_absolute
 
         self.pre_norm = self.norm(
             normalized_shape=args.hidden_size,
@@ -57,14 +75,12 @@ class ChatGLMDecoderLayer(Module):
             max_position_embeddings=args.max_seq_length,
             num_layers=args.num_layers,
             apply_query_key_layer_scaling=args.apply_query_key_layer_scaling,
-            attention_mask_type=AttentionMaskType.bidirectional
-            if args.model_version == "1" else AttentionMaskType.causal,
+            attention_mask_type=attention_mask_type,
             bias=args.qkv_bias,
             dtype=args.dtype,
-            position_embedding_type=PositionEmbeddingType.chatglm
-            if args.model_version == "1" else PositionEmbeddingType.rope_gptj,
+            position_embedding_type=position_embedding_type,
             rotary_embedding_base=10000.0,
-            rotary_embedding_scaling=None,
+            rotary_embedding_scaling=rotary_embedding_scaling,
             use_int8_kv_cache=args.quant_mode.has_int8_kv_cache(),
             rotary_embedding_percentage=0.5,
             tp_group=args.mapping.tp_group,
@@ -123,7 +139,7 @@ class ChatGLMDecoderLayer(Module):
         if self.use_cache:
             attention_output, presents = attention_output
 
-        if self.model_version == "1":
+        if self.model_name in ["chatglm_6b"]:
             residual = norm_output
 
             norm_input = residual * self.alpha + attention_output
@@ -136,7 +152,10 @@ class ChatGLMDecoderLayer(Module):
 
             output = residual * self.alpha + mlp_output
 
-        else:
+        elif self.model_name in [
+                "chatglm2_6b", "chatglm2_6b_32k", "chatglm3_6b",
+                "chatglm3_6b_base", "chatglm3_6b_32k", "glm_10b"
+        ]:
             residual = norm_output if self.apply_residual_connection_post_layernorm else hidden_states
 
             norm_input = residual + attention_output
@@ -158,7 +177,15 @@ class ChatGLMModel(Module):
 
         super().__init__()
 
-        self.norm = LayerNorm if args.model_version == "1" else RmsNorm
+        self.model_name = args.model_name
+
+        if args.model_name in ["chatglm_6b", "glm_10b"]:
+            self.norm = LayerNorm
+        elif args.model_name in [
+                "chatglm2_6b", "chatglm2_6b_32k", "chatglm3_6b",
+                "chatglm3_6b_base", "chatglm3_6b_32k"
+        ]:
+            self.norm = RmsNorm
         self.use_cache = args.use_cache
 
         self.embedding = Embedding(
@@ -171,6 +198,28 @@ class ChatGLMModel(Module):
             tp_rank=0,  #args.mapping.rank,
             instance_id=args.num_layers * 2,
         )
+
+        if args.model_name in ["glm_10b"]:
+            self.position_embeddings = Embedding(
+                args.max_seq_length + 1,
+                args.hidden_size,
+                dtype=args.dtype,
+                tp_size=1,  #args.mapping.tp_size,
+                tp_group=None,  #args.mapping.tp_group,
+                sharding_dim=0,
+                tp_rank=0,  #args.mapping.rank,
+                instance_id=args.num_layers * 2,
+            )
+            self.block_embeddings = Embedding(
+                args.max_seq_length + 1,
+                args.hidden_size,
+                dtype=args.dtype,
+                tp_size=1,  #args.mapping.tp_size,
+                tp_group=None,  #args.mapping.tp_group,
+                sharding_dim=0,
+                tp_rank=0,  #args.mapping.rank,
+                instance_id=args.num_layers * 2,
+            )
 
         self.layers = ModuleList(
             ChatGLMDecoderLayer(i, args) for i in range(args.num_layers))
@@ -191,6 +240,21 @@ class ChatGLMModel(Module):
     ):
 
         hidden_states = self.embedding(input_ids)
+
+        if self.model_name in ["glm_10b"]:
+            position_ids_list = position_ids.split(1, dim=1)
+            position_embedding = self.position_embeddings(position_ids_list[0])
+            block_embedding = self.block_embeddings(position_ids_list[1])
+            position_embedding = position_embedding + block_embedding
+
+            position_embedding = position_embedding.view(
+                concat([
+                    shape(input_ids, 0),
+                    shape(input_ids, 1),
+                    4096,
+                ]))
+
+            hidden_states = hidden_states + position_embedding
 
         kv_cache_params.fill_none_tensor_list(len(self.layers))
 
@@ -230,30 +294,39 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
     def __init__(self, **args):
 
         if "args" not in args.keys():
-            argNamespace = argparse.Namespace()
+            new_args = argparse.Namespace()
             for key, value in args.items():
-                argNamespace.__setattr__(key, value)
-            assert "model_version" in args.keys(), "model_version not set"
+                new_args.__setattr__(key, value)
+            assert "model_name" in args.keys(), "model_name not set"
             # Other default values
-            argNamespace.norm_epsilon = 1.0e-5
-            argNamespace.tokens_per_block = 64
-            argNamespace.use_cache = True
-            if argNamespace.model_version == "1":
-                argNamespace.ffn_hidden_size = 16384
-                argNamespace.linear_bias = True
-                argNamespace.max_seq_length = min(
-                    2048, argNamespace.max_position_embeddings)
-                argNamespace.num_kv_heads = 32
-                argNamespace.qkv_bias = True
-            else:
-                argNamespace.apply_residual_connection_post_layernorm = False
-                argNamespace.ffn_hidden_size = 13696
-                argNamespace.linear_bias = False
-                argNamespace.num_kv_heads = 2
-                argNamespace.qkv_bias = True
-                argNamespace.rmsnorm = True
-
-            args = argNamespace
+            new_args.norm_epsilon = 1.0e-5
+            new_args.tokens_per_block = 64
+            new_args.use_cache = True
+            if new_args.model_name in ["chatglm_6b"]:
+                new_args.ffn_hidden_size = 16384
+                new_args.linear_bias = True
+                new_args.max_seq_length = min(2048,
+                                              new_args.max_position_embeddings)
+                new_args.num_kv_heads = 32
+                new_args.qkv_bias = True
+            elif new_args.model_name in ["glm_10b"]:
+                new_args.ffn_hidden_size = 16384
+                new_args.linear_bias = True
+                new_args.max_seq_length = min(1024,
+                                              new_args.max_position_embeddings)
+                new_args.num_kv_heads = 32
+                new_args.qkv_bias = True
+            elif new_args.model_name in [
+                    "chatglm2_6b", "chatglm2_6b_32k", "chatglm3_6b",
+                    "chatglm3_6b_base", "chatglm3_6b_32k"
+            ]:
+                new_args.apply_residual_connection_post_layernorm = False
+                new_args.ffn_hidden_size = 13696
+                new_args.linear_bias = False
+                new_args.num_kv_heads = 2
+                new_args.qkv_bias = True
+                new_args.rmsnorm = True
+            args = new_args
         else:
             args = args["args"]
 
@@ -270,21 +343,21 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
             self.kv_dtype = args.dtype
         self.dtype = self.kv_dtype
 
+        if isinstance(args.logits_dtype, str):
+            self.logits_dtype = str_dtype_to_trt(args.logits_dtype)
+        else:
+            assert isinstance(args.logits_dtype, trt.DataType)
+            self.logits_dtype = args.logits_dtype
+
         if args.quant_mode.has_int8_kv_cache():
             self.kv_dtype = str_dtype_to_trt('int8')
         elif args.quant_mode.has_fp8_kv_cache():
             self.kv_dtype = str_dtype_to_trt('fp8')
 
-        if isinstance(args.logits_dtype, str):
-            self._logits_dtype = str_dtype_to_trt(args.logits_dtype)
-        else:
-            assert isinstance(args.logits_dtype, trt.DataType)
-            self._logits_dtype = args.logits_dtype
-
         self.hidden_size = args.hidden_size
         self.mapping = args.mapping
         self.max_num_tokens = args.max_output_len + args.max_input_len
-        self.model_version = args.model_version
+        self.model_name = args.model_name
         self.num_heads = args.num_heads
         self.num_kv_heads = args.num_kv_heads
         self.num_layers = args.num_layers
@@ -325,7 +398,7 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
             default_net().plugin_config.remove_input_padding)
 
         lm_logits = self.lm_head(hidden_states)
-        lm_logits.mark_output('logits', self._logits_dtype)
+        lm_logits.mark_output('logits', self.logits_dtype)
 
         if self.use_cache and default_net(
         ).plugin_config.paged_kv_cache == False:
@@ -372,7 +445,7 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
             mapping=self.mapping,
             max_num_tokens=self.max_num_tokens,
             prompt_embedding_table_size=0,
-            is_chatglm6b=(self.model_version == "1"),
+            position_encoding_2d=(self.model_name in ["chatglm_6b", "glm_10b"]),
         )
 
         return (model_inputs['input_ids'], model_inputs['position_ids'],

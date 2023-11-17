@@ -520,3 +520,176 @@ def get_scaling_factors(
         f'Expect scaling factor {k} of length {num_layers}, got {len(v)}'
 
     return scaling_factor
+
+
+def load_from_awq_falcon(
+        tensorrt_llm_falcon: tensorrt_llm.models.FalconForCausalLM,
+        quant_ckpt_path,
+        mapping=Mapping(),
+        dtype="float16"):
+    tensorrt_llm.logger.info(
+        'Loading weights from groupwise AWQ Falcon checkpoint...')
+    tik = time.time()
+
+    packer = torch.ops.fastertransformer.pack_int8_tensor_to_packed_int4
+    preprocessor = torch.ops.fastertransformer.preprocess_weights_for_mixed_gemm
+    torch_dtype = tensorrt_llm._utils.str_dtype_to_torch(dtype)
+
+    if quant_ckpt_path.endswith(".npz"):
+        awq_falcon = np.load(quant_ckpt_path)
+        awq_prefix = "_np:"
+        awq_suffix_list = [
+            ":weight",
+            ":weights_scaling_factor",
+            ":prequant_scaling_factor",
+        ]
+        awq_key_list = [
+            "vocab_embedding:weight",  # embedding
+            "lm_head",  # lm_head
+            "final_layernorm",  # ln_f
+            "attention:qkv:",  # attention.qkv
+            "attention:dense",  # attention.dense
+            "mlp:proj",  # mlp.proj
+            "mlp:fc",  # mlp.fc
+            "input_layernorm",  # input_layernorm.weight
+            "mlp_layernorm",  # mlp_layernorm.weight
+        ]
+        split_sym = ":"
+        AMMO_WEIGHT_SCALING_FACTOR_COEFF = 7
+
+        def load(key):
+            v = torch.from_numpy(awq_falcon[awq_prefix + key]).to(torch_dtype)
+            if "weights_scaling_factor" in key:
+                v *= AMMO_WEIGHT_SCALING_FACTOR_COEFF  # For AMMO *.npz checkpoints
+            return v
+
+        group_size = load("layers:0:attention:dense:weight").numel() // load(
+            "layers:0:attention:dense:weights_scaling_factor").numel()
+    else:
+        raise ValueError("Unsupported AWQ quantized checkpoint format")
+
+    def torch_split(v, dim):
+        if v.shape[dim] % mapping.tp_size != 0:
+            tensorrt_llm.logger.error(
+                "Current weight shape is invalid for mapping.tp_size=" +
+                str(mapping.tp_size))
+            raise ValueError("Invalid TP size")
+        return v.split(v.shape[dim] // mapping.tp_size,
+                       dim=dim)[mapping.tp_rank]
+
+    def AWQ_quantize_pack_preprocess(weight, scale):
+        weight /= scale.repeat_interleave(group_size, dim=0)
+        qweight_int8 = torch.clamp(torch.round(weight.cuda()).char(), -8, 7)
+        int4_weight = preprocessor(packer(qweight_int8.cpu()), torch.quint4x2)
+        return int4_weight.view(torch.int8)
+
+    def process_and_assign_weight(mOp, v, tp_dim=0):
+        weight = v[0].T.contiguous()
+        [k, n] = weight.shape
+        weight = torch_split(weight, tp_dim)
+        amax = v[1].reshape((n, k // group_size)).T.contiguous()
+        amax = torch_split(amax, tp_dim)
+        pre_quant_scale = v[2].reshape((1, k))
+        if tp_dim == 0:
+            pre_quant_scale = torch_split(pre_quant_scale, 1)
+        scale = amax / 8.0
+        mOp.qweight.value = AWQ_quantize_pack_preprocess(weight, scale)
+        mOp.scale.value = scale.to(torch_dtype)
+        mOp.pre_quant_scale.value = pre_quant_scale.to(torch_dtype)
+
+    def get_scale(weight):
+        [k, n] = weight.shape
+        weight_t = weight.T.contiguous()
+        weight_t = weight_t.reshape(n, k // group_size, group_size)
+        weight_t = torch.abs(weight_t.reshape(-1, group_size))
+        amax, idx = weight_t.max(1)
+        amax = amax.reshape(n, k // group_size).T.contiguous()
+        scale = amax / 8
+        return scale
+
+    def process_and_assign_qkv_weight(prefix, mOp):
+        q_weight = load(prefix + "q" + awq_suffix_list[0])
+        k_weight = load(prefix + "k" + awq_suffix_list[0])
+        v_weight = load(prefix + "v" + awq_suffix_list[0])
+        dim_k = q_weight.shape[0]
+        q_weight = torch_split(q_weight, 1)
+        k_weight = torch_split(k_weight, 1)
+        v_weight = torch_split(v_weight, 1)
+        qkv_pre_quant_scale = load(prefix + "q" + awq_suffix_list[2]).reshape(
+            (1, dim_k))
+        qkv_weights = torch.cat((q_weight, k_weight, v_weight), dim=1)
+        qkv_scale = get_scale(qkv_weights)
+
+        mOp.pre_quant_scale.value = qkv_pre_quant_scale.to(torch_dtype)
+        mOp.qweight.value = AWQ_quantize_pack_preprocess(qkv_weights, qkv_scale)
+        mOp.scale.value = qkv_scale.to(torch_dtype)
+
+    # Load weights from AWQ checkpoint into TRT-LLM module
+    # 1. embedding
+    v = load(awq_key_list[0])
+    # TRT-LLM requires vocab_size to be multiple of 64 for successful GEMM
+    if v.shape[0] % 64 != 0:
+        v = torch.nn.functional.pad(v, [0, 0, 0, 64 - v.shape[0] % 64])
+    if mapping.is_first_pp_rank():
+        tensorrt_llm_falcon.embedding.weight.value = v.to(torch_dtype)
+
+    # 2. lm_head
+    v = [load(awq_key_list[1] + suf) for suf in awq_suffix_list]
+    if v[0].shape[0] % 64 != 0:
+        v[0] = torch.nn.functional.pad(v[0], [0, 0, 0, 64 - v[0].shape[0] % 64])
+        v[1] = torch.nn.functional.pad(v[1], [0, 0, 0, 64 - v[1].shape[0] % 64],
+                                       value=1)
+    if mapping.is_last_pp_rank():
+        process_and_assign_weight(tensorrt_llm_falcon.lm_head, v, 1)
+
+    # 3. ln_f
+    v_weight = load(awq_key_list[2] + split_sym + "weight")
+    v_bias = load(awq_key_list[2] + split_sym + "bias")
+    if mapping.is_last_pp_rank():
+        tensorrt_llm_falcon.ln_f.weight.value = v_weight.to(torch_dtype)
+        tensorrt_llm_falcon.ln_f.bias.value = v_bias.to(torch_dtype)
+
+    # 4. Weights inside each layer
+    num_hidden_layers = tensorrt_llm_falcon.num_layers
+    layers_per_pipeline_stage = num_hidden_layers // mapping.pp_size
+    layers_range = list(
+        range(mapping.pp_rank * layers_per_pipeline_stage,
+              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
+
+    for l in layers_range:
+        layer_idx = l - mapping.pp_rank * layers_per_pipeline_stage
+        prefix = "layers" + split_sym + str(layer_idx) + split_sym
+        tensorrt_llm.logger.info(f'Process weights in layer: {layer_idx}')
+        layer = tensorrt_llm_falcon.layers[layer_idx]
+
+        # 4.1 attention.qkv
+        process_and_assign_qkv_weight(prefix + awq_key_list[3],
+                                      layer.attention.qkv)
+
+        # 4.2 attention.dense
+        v = [load(prefix + awq_key_list[4] + suf) for suf in awq_suffix_list]
+        process_and_assign_weight(layer.attention.dense, v, 0)
+
+        # 4.3 mlp.proj
+        v = [load(prefix + awq_key_list[5] + suf) for suf in awq_suffix_list]
+        process_and_assign_weight(layer.mlp.proj, v, 0)
+
+        # 4.4 mlp.fc
+        v = [load(prefix + awq_key_list[6] + suf) for suf in awq_suffix_list]
+        process_and_assign_weight(layer.mlp.fc, v, 1)
+
+        # 4.5 input_layernorm
+        v = load(prefix + awq_key_list[7] + split_sym + "weight")
+        layer.input_layernorm.weight.value = v.to(torch_dtype)
+        v = load(prefix + awq_key_list[7] + split_sym + "bias")
+        layer.input_layernorm.bias.value = v.to(torch_dtype)
+
+        # 4.6 mlp_layernorm
+        v = load(prefix + awq_key_list[8] + split_sym + "weight")
+        layer.mlp_layernorm.weight.value = v.to(torch_dtype)
+        v = load(prefix + awq_key_list[8] + split_sym + "bias")
+        layer.mlp_layernorm.bias.value = v.to(torch_dtype)
+
+    tok = time.time()
+    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
+    tensorrt_llm.logger.info(f'Weights loaded. Elapsed time: {t}')

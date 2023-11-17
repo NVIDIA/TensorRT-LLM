@@ -1,3 +1,4 @@
+import inspect
 import json
 import tempfile
 from pathlib import Path
@@ -208,6 +209,10 @@ def test_gpt_model_config():
     gpt_model_config.compute_context_logits = True
     assert gpt_model_config.compute_context_logits
 
+    assert not gpt_model_config.compute_generation_logits
+    gpt_model_config.compute_generation_logits = True
+    assert gpt_model_config.compute_generation_logits
+
     assert gpt_model_config.model_variant == _tb.GptModelVariant.GPT
     model_variant = _tb.GptModelVariant.GLM
     gpt_model_config.model_variant = model_variant
@@ -341,3 +346,11 @@ def test_gpt_json_config():
         world_config) == json_config["name"] + "_float32_tp1_rank3.engine"
     assert gpt_json_config.engine_filename(
         world_config, "llama") == "llama_float32_tp1_rank3.engine"
+
+
+def test_gpt_session():
+    members = {name: tpe for (name, tpe) in inspect.getmembers(_tb.GptSession)}
+    assert isinstance(members["model_config"], property)
+    assert isinstance(members["world_config"], property)
+    assert isinstance(members["device"], property)
+    assert "generate" in members

@@ -70,9 +70,9 @@ public:
     TensorPtr finished;    // [batchSize, beamWidth], mandatory in beam search and to determine whether to stop
                            // according to DecodingInput.sequenceLimitLength, on gpu
     TensorPtr finishedSum; // [1], the sum of finished sequences, in pinned memory
-    TensorPtr logProbs;    // [maxNewTokens, batchSize, beamWidth], must be float*, on gpu
 
     // mandatory parameters for beam search
+    TensorPtr logProbs;         // [batchSize, beamWidth, maxSeqLen], must be float*, on gpu
     TensorPtr cumLogProbs;      // [batchSize, beamWidth], optional for sampling, on gpu
     TensorPtr parentIds;        // [batchSize, beamWidth, maxSeqLen], on gpu
     TensorPtr lengths;          // [batchSize, beamWidth], total sequence lengths including padding, on gpu

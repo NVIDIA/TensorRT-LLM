@@ -5,14 +5,13 @@ multiple GPUs or multiple nodes with multiple GPUs.
 
 ## Overview
 
-The TensorRT-LLM GPT implementation can be found in [`tensorrt_llm/models/gpt/model.py`](../../tensorrt_llm/models/gpt/model.py). The TensorRT-LLM GPT example
-code is located in [`examples/gpt`](./). There are four main files in that folder:
+The TensorRT-LLM GPT implementation can be found in [`tensorrt_llm/models/gpt/model.py`](../../tensorrt_llm/models/gpt/model.py). The TensorRT-LLM GPT example code is located in [`examples/gpt`](./). There are four main files:
 
  * [`hf_gpt_convert.py`](./hf_gpt_convert.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers)
     format to the [FasterTransformer (FT)](https://github.com/NVIDIA/FasterTransformer) format,
  * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the GPT model,
  * [`run.py`](./run.py) to run the inference on an input text,
- * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
+ * and a shared [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
 
 ## Support Matrix
   * FP16
@@ -257,17 +256,18 @@ python3 build.py --model_dir=./c-model/gpt2/fp16/1-gpu \
                  --hidden_act gelu
 ```
 
-The summarization can be done using the [`summarize.py`](./summarize.py) script as follows:
+The summarization can be done using the [`../summarize.py`](../summarize.py) script as follows:
 
 ```bash
 # Run the summarization task.
-python3 summarize.py --engine_dir trt_engine/gpt2/fp16/1-gpu \
-                     --test_hf \
-                     --batch_size 1 \
-                     --test_trt_llm \
-                     --hf_model_location=gpt2 \
-                     --check_accuracy \
-                     --tensorrt_llm_rouge1_threshold=14
+python3 ../summarize.py --engine_dir trt_engine/gpt2/fp16/1-gpu \
+                        --hf_model_dir gpt2 \
+                        --test_trt_llm \
+                        --test_hf \
+                        --batch_size 1 \
+                        --check_accuracy \
+                        --tensorrt_llm_rouge1_threshold=14 \
+                        --no_add_special_tokens
 ```
 
 ## SmoothQuant
@@ -534,5 +534,5 @@ python3 hf_gpt_convert.py -i gpt2 -o ./c-model/gpt2 --tensor-parallelism 2 --sto
 
 python3 build.py --model_dir=./c-model/gpt2/2-gpu --dtype bfloat16 --world_size=2 --remove_input_padding --use_gpt_attention_plugin --use_gemm_plugin --parallel_build --max_input_len 1000 --use_parallel_embedding --embedding_sharding_dim 0 --use_lookup_plugin --use_embedding_sharing --output_dir=trt_engine/gpt2/bfloat16/2-gpu
 
-mpirun -np 2 python3 summarize.py --engine_dir trt_engine/gpt2/bfloat16/2-gpu --batch_size 10 --test_trt_llm --check_accuracy --tensorrt_llm_rouge1_threshold=14 --dataset_path ./dataset
+mpirun -np 2 python3 ../summarize.py --engine_dir trt_engine/gpt2/bfloat16/2-gpu --hf_model_dir gpt2 --batch_size 10 --test_trt_llm --check_accuracy --tensorrt_llm_rouge1_threshold=14 --dataset_path ./dataset --no_add_special_tokens
 ```

@@ -353,7 +353,7 @@ _allowed_configs = {
                     builder_opt=None,
                 )),
     "chatglm_6b":
-    ModelConfig(name="chatglm-6b",
+    ModelConfig(name="chatglm_6b",
                 family="chatglm",
                 benchmark_type="gpt",
                 build_config=BuildConfig(
@@ -370,7 +370,7 @@ _allowed_configs = {
                     remove_input_padding=False,
                 )),
     "chatglm2_6b":
-    ModelConfig(name="chatglm2-6b",
+    ModelConfig(name="chatglm2_6b",
                 family="chatglm2",
                 benchmark_type="gpt",
                 build_config=BuildConfig(
@@ -387,7 +387,7 @@ _allowed_configs = {
                     remove_input_padding=False,
                 )),
     "chatglm3_6b":
-    ModelConfig(name="chatglm3-6b",
+    ModelConfig(name="chatglm3_6b",
                 family="chatglm3",
                 benchmark_type="gpt",
                 build_config=BuildConfig(

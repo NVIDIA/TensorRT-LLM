@@ -30,6 +30,7 @@ init_ubuntu() {
     fi
     apt-get clean
     rm -rf /var/lib/apt/lists/*
+    echo "export LD_LIBRARY_PATH=/usr/local/cuda/lib64:\$LD_LIBRARY_PATH" >> "${ENV}"
     # Remove previous TRT installation
     if [[ $(apt list --installed | grep libnvinfer) ]]; then
         apt-get remove --purge -y libnvinfer*
@@ -63,10 +64,11 @@ init_centos() {
     yum -y update
     yum -y install centos-release-scl-rh epel-release
     # https://gitlab.com/nvidia/container-images/cuda
+    echo "export LD_LIBRARY_PATH=/usr/local/cuda/lib64:\$LD_LIBRARY_PATH" >> "${ENV}"
     CUDA_VERSION=$(nvcc --version | sed -n 's/^.*release \([0-9]\+\.[0-9]\+\).*$/\1/p')
     YUM_CUDA=${CUDA_VERSION/./-}
     # Consistent with manylinux2014 centos-7 based version
-    yum -y install wget rh-python${PY_VERSION} rh-python${PY_VERSION}-python-devel rh-git227 devtoolset-10 libffi-devel
+    yum -y install wget git-lfs rh-python${PY_VERSION} rh-python${PY_VERSION}-python-devel rh-git227 devtoolset-10 libffi-devel
     yum -y install openmpi3 openmpi3-devel
     echo "source scl_source enable rh-git227 rh-python38" >> "${ENV}"
     echo "source scl_source enable devtoolset-10" >> "${DEVTOOLSET_ENV_FILE}"

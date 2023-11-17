@@ -45,14 +45,15 @@ class IGptDecoder
 public:
     virtual ~IGptDecoder() = default;
 
-    virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize) = 0;
+    virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType maxSequenceLength) = 0;
 
     virtual bool forward(DecodingOutput& output, DecodingInput const& input) = 0;
 
     virtual void forwardAsync(DecodingOutput& output, DecodingInput const& input) = 0;
 
-    static void gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput,
-        DecodingInput const& decodingInput, BufferManager const& manager);
+    virtual void gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput,
+        DecodingInput const& decodingInput, BufferManager const& manager)
+        = 0;
 
     static std::unique_ptr<IGptDecoder> create(
         nvinfer1::DataType dtype, size_t vocabSize, size_t vocabSizePadded, BufferManager::CudaStreamPtr const& stream);
@@ -64,19 +65,27 @@ class GptDecoder : public virtual IGptDecoder
 
 public:
     using CudaStreamPtr = BufferManager::CudaStreamPtr;
+    using TensorPtr = std::shared_ptr<ITensor>;
 
     GptDecoder(size_t vocabSize, size_t vocabSizePadded, CudaStreamPtr const& stream);
 
-    void setup(SamplingConfig const& samplingConfig, size_t batchSize) override;
+    void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType maxSequenceLength) override;
 
     bool forward(DecodingOutput& output, DecodingInput const& input) override;
 
     void forwardAsync(DecodingOutput& output, DecodingInput const& input) override;
 
+    void gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
+        BufferManager const& manager) override;
+
 private:
     BufferManager mManager;
+
     common::CudaAllocator mAllocator;
     std::shared_ptr<tensorrt_llm::layers::DynamicDecodeLayer<T>> mDynamicDecodeLayer;
+
+    TensorPtr mLogProbsTiled; // Buffer used to store the transpose of the logProbs. Needed because the kernels have
+                              // been written to use that shape.
 };
 
 inline std::unique_ptr<IGptDecoder> IGptDecoder::create(

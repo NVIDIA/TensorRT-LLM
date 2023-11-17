@@ -2,28 +2,53 @@
 
 set -ex
 
+NVCC_VERSION_OUTPUT=$(nvcc --version)
+if [[ $(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1) != ${CUDA_VER} ]]; then
+  echo "The version of pre-installed CUDA is not equal to ${CUDA_VER}."
+  exit 1
+fi
+
 install_ubuntu_requirements() {
-    CUDNN_VERSION="8"
+    apt-get update && apt-get install -y --no-install-recommends gnupg2 curl ca-certificates
+    ARCH=$(uname -m)
+    if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
+    if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
+    curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${ARCH}/cuda-keyring_1.0-1_all.deb
+    dpkg -i cuda-keyring_1.0-1_all.deb
+
     apt-get update
-    apt-get install -y --no-install-recommends libcudnn${CUDNN_VERSION} libcudnn${CUDNN_VERSION}-dev libnccl-dev
+    if [[ $(apt list --installed | grep libcudnn8) ]]; then
+      apt-get remove --purge -y libcudnn8*
+    fi
+    if [[ $(apt list --installed | grep libnccl) ]]; then
+      apt-get remove --purge -y --allow-change-held-packages libnccl*
+    fi
+    if [[ $(apt list --installed | grep libcublas) ]]; then
+      apt-get remove --purge -y --allow-change-held-packages libcublas*
+    fi
+    CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
+    apt-get install -y --no-install-recommends libcudnn8=${CUDNN_VER} libcudnn8-dev=${CUDNN_VER}
+    apt-get install -y --no-install-recommends libnccl2=${NCCL_VER} libnccl-dev=${NCCL_VER}
+    apt-get install -y --no-install-recommends libcublas-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} libcublas-dev-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER}
     apt-get clean
     rm -rf /var/lib/apt/lists/*
 }
 
 install_centos_requirements() {
-    CUDNN_VERSION="8"
+    CUDNN_VER=$(echo $CUDNN_VER | sed 's/+/./g')
+    CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
     yum -y update
     yum -y install epel-release
-    yum -y install libcudnn${CUDNN_VERSION} libcudnn${CUDNN_VERSION}-devel libnccl-devel
+    yum remove -y libcudnn* && yum -y install libcudnn8-${CUDNN_VER} libcudnn8-devel-${CUDNN_VER}
+    yum remove -y libnccl* && yum -y install libnccl-${NCCL_VER} libnccl-devel-${NCCL_VER}
+    yum remove -y libcublas* && yum -y install libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER} libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}
     yum clean all
 }
 
 install_tensorrt() {
-    TENSOR_RT_VERSION="9.1.0.4"
-    CUDA_VERSION="12.2"
-
     PY_VERSION=$(python -c 'import sys; print(".".join(map(str, sys.version_info[0:2])))')
     PARSED_PY_VERSION=$(echo "${PY_VERSION//./}")
+    TRT_CUDA_VERSION="12.2"
 
     if [ -z "$RELEASE_URL_TRT" ];then
         ARCH=${TRT_TARGETARCH}
@@ -32,11 +57,11 @@ install_tensorrt() {
         if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
         if [ "$ARCH" = "x86_64" ];then DIR_NAME="x64-agnostic"; else DIR_NAME=${ARCH};fi
         if [ "$ARCH" = "aarch64" ];then OS="ubuntu-22.04"; else OS="linux";fi
-        RELEASE_URL_TRT=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/secure/9.1.0/tars/tensorrt-${TENSOR_RT_VERSION}.${OS}.${ARCH}-gnu.cuda-${CUDA_VERSION}.tar.gz;
+        RELEASE_URL_TRT=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/secure/9.1.0/tars/tensorrt-${TRT_VER}.${OS}.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz;
     fi
     wget --no-verbose ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
     tar -xf /tmp/TensorRT.tar -C /usr/local/
-    mv /usr/local/TensorRT-${TENSOR_RT_VERSION} /usr/local/tensorrt
+    mv /usr/local/TensorRT-${TRT_VER} /usr/local/tensorrt
     pip install /usr/local/tensorrt/python/tensorrt-*-cp${PARSED_PY_VERSION}-*.whl
     rm -rf /tmp/TensorRT.tar
     echo 'export LD_LIBRARY_PATH=/usr/local/tensorrt/lib:$LD_LIBRARY_PATH' >> "${ENV}"

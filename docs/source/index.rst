@@ -19,6 +19,7 @@ Welcome to TensorRT-LLM's documentation!
    2023-05-19-how-to-debug.md
    2023-05-17-how-to-add-a-new-model.md
    graph-rewriting.md
+   memory.md
 
 Python API
 ----------

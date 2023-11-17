@@ -97,6 +97,10 @@ def quantize_and_export(model: torch.nn.Module,
         model_type = "gpt2"
     elif "Falcon" in model_cls_name or "RW" in model_cls_name:
         model_type = "falcon"
+    elif "ChatGLM" in model_cls_name:
+        model_type = "chatglm"
+    elif "MPT" in model_cls_name:
+        model_type = "mpt"
     else:
         raise NotImplementedError(
             f"Deploying quantized model {model_cls_name} is not supported")

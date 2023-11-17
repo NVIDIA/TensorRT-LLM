@@ -31,7 +31,7 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 
-from weight import load_from_ft, parse_ft_config, check_embedding_share  # isort:skip
+from weight import get_scaling_factors, load_from_ft, parse_ft_config, check_embedding_share  # isort:skip
 
 MODEL_NAME = "gpt"
 
@@ -87,6 +87,7 @@ def parse_arguments(args):
     parser.add_argument('--n_positions', type=int, default=1024)
     parser.add_argument('--n_embd', type=int, default=1024)
     parser.add_argument('--n_head', type=int, default=16)
+    parser.add_argument('--n_kv_head', type=int, default=None)
     parser.add_argument('--hidden_act', type=str, default='gelu')
     parser.add_argument(
         '--rotary_pct',
@@ -152,14 +153,6 @@ def parse_arguments(args):
         default='gpt_outputs',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
-    )
-    parser.add_argument(
-        "--multi_query_mode",
-        "-mq",
-        default=False,
-        action='store_true',
-        help=
-        "Whether this model uses multi-query attention mechanism (default: False)"
     )
     parser.add_argument('--remove_input_padding',
                         default=False,
@@ -300,6 +293,11 @@ def parse_arguments(args):
         choices=PositionEmbeddingType.choices(),
         help='Set the position embedding type.',
     )
+    parser.add_argument(
+        '--quantized_fp8_model_path',
+        type=str,
+        default=None,
+        help='Path of a quantized model checkpoint in .npz format')
     args = parser.parse_args(args)
     logger.set_level(args.log_level)
 
@@ -309,7 +307,8 @@ def parse_arguments(args):
 
     if args.model_dir is not None:
         logger.info(f"Setting model configuration from {args.model_dir}.")
-        n_embd, n_head, n_layer, n_positions, vocab_size, _, hidden_act, rotary_pct, bias, inter_size, multi_query_mode, dtype, prompt_num_tasks, prompt_max_vocab_size, position_embedding_type = parse_ft_config(
+
+        n_embd, n_head, n_layer, n_positions, vocab_size, _, hidden_act, rotary_pct, bias, inter_size, n_kv_head, dtype, prompt_num_tasks, prompt_max_vocab_size, position_embedding_type = parse_ft_config(
             Path(args.model_dir) / "config.ini")
         args.n_embd = n_embd
         args.n_head = n_head
@@ -321,7 +320,7 @@ def parse_arguments(args):
         args.bias = bias
         args.dtype = dtype
         args.inter_size = inter_size
-        args.multi_query_mode = multi_query_mode
+        args.n_kv_head = n_kv_head
         args.position_embedding_type = position_embedding_type
     plugins_args = [
         'use_gpt_attention_plugin', 'use_gemm_plugin', 'use_layernorm_plugin',
@@ -432,38 +431,27 @@ def build_rank_engine(builder: Builder,
         apply_query_key_layer_scaling,
         quant_mode=args.quant_mode,
         bias=args.bias,
-        multi_query_mode=args.multi_query_mode,
+        num_kv_heads=args.n_kv_head,
         use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
         share_embedding_table=share_embedding_table)
 
-    if args.use_smooth_quant or args.use_weight_only:
-        tensorrt_llm_gpt = quantize_model(tensorrt_llm_gpt, args.quant_mode)
+    quantize_kwargs = {}
+    if args.enable_fp8 or args.fp8_kv_cache:
+        logger.info(f'Loading scaling factors from '
+                    f'{args.quantized_fp8_model_path}')
+        quant_scales = get_scaling_factors(args.quantized_fp8_model_path,
+                                           num_layers=args.n_layer,
+                                           quant_mode=args.quant_mode)
+        quantize_kwargs = {"quant_scales": quant_scales}
+    tensorrt_llm_gpt = quantize_model(tensorrt_llm_gpt, args.quant_mode,
+                                      **quantize_kwargs)
 
     if args.model_dir is not None:
-        gpt_dummy_fp8_scaling_factors = {
-            'fc_act': [0.5 for _ in range(args.n_layer)],
-            'fc_weights': [0.5 for _ in range(args.n_layer)],
-            'proj_act': [0.5 for _ in range(args.n_layer)],
-            'proj_weights': [0.5 for _ in range(args.n_layer)],
-            'qkv_act': [0.5 for _ in range(args.n_layer)],
-            'qkv_weights': [0.5 for _ in range(args.n_layer)],
-            'qkv_output': [0.5 for _ in range(args.n_layer)],
-            'dense_act': [0.5 for _ in range(args.n_layer)],
-            'dense_weights': [0.5 for _ in range(args.n_layer)],
-        }
-
-        load_from_ft(tensorrt_llm_gpt,
-                     args.model_dir,
-                     rank,
-                     args.world_size,
-                     args.dtype,
-                     args.use_parallel_embedding,
-                     args.embedding_sharding_dim,
-                     share_embedding_table,
-                     scaling_factors=gpt_dummy_fp8_scaling_factors
-                     if args.enable_fp8 else None)
+        load_from_ft(tensorrt_llm_gpt, args.model_dir, rank, args.world_size,
+                     args.dtype, args.use_parallel_embedding,
+                     args.embedding_sharding_dim, share_embedding_table)
 
     # Module -> Network
     network = builder.create_network()
@@ -566,18 +554,19 @@ def build(rank, args):
             parallel_build=args.parallel_build,
             num_layers=args.n_layer,
             num_heads=args.n_head,
+            num_kv_heads=args.n_kv_head if args.n_kv_head else args.n_head,
             hidden_size=args.n_embd,
             vocab_size=args.vocab_size,
             hidden_act=args.hidden_act,
             max_position_embeddings=args.n_positions,
             apply_query_key_layer_scaling=apply_query_key_layer_scaling,
             max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,
             int8=int8_trt_flag,
             opt_level=args.builder_opt,
-            multi_query_mode=args.multi_query_mode,
             strongly_typed=args.strongly_typed,
             use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
             quant_mode=args.quant_mode,

@@ -92,31 +92,18 @@ namespace threadblock
 namespace detail
 {
 
-/// Partial specialization for half <= int32_t x 8 epilogues avoids shared memory bank conflicts.
-template <typename ThreadblockShape, typename WarpShape, typename InstructionShape, typename ThreadMap>
-struct DefaultIteratorsTensorOp<cutlass::half_t, int32_t, 8, ThreadblockShape, WarpShape, InstructionShape, ThreadMap>
-{
-
-    using WarpTileIterator
-        = cutlass::epilogue::warp::TileIteratorTensorOp<WarpShape, InstructionShape, int32_t, layout::RowMajor>;
-
-    using SharedLoadIterator = cutlass::epilogue::threadblock::SharedLoadIterator<ThreadMap, int32_t>;
-
-    static int const kFragmentsPerIteration = 1;
-};
-
 /// Partial specialization for bfloat16_t <= int32_t x 8 epilogues avoids shared memory bank conflicts.
 template <typename ThreadblockShape, typename WarpShape, typename InstructionShape, typename ThreadMap>
 struct DefaultIteratorsTensorOp<cutlass::bfloat16_t, int32_t, 8, ThreadblockShape, WarpShape, InstructionShape,
     ThreadMap>
 {
-
     using WarpTileIterator
-        = cutlass::epilogue::warp::TileIteratorTensorOp<WarpShape, InstructionShape, int32_t, layout::RowMajor>;
+        = cutlass::epilogue::warp::TileIteratorTensorOpMixed<WarpShape, InstructionShape, int32_t, 32, 16, 8, 8>;
 
-    using SharedLoadIterator = cutlass::epilogue::threadblock::SharedLoadIterator<ThreadMap, int32_t>;
+    using SharedLoadIterator
+        = cutlass::epilogue::threadblock::SharedLoadIteratorMixed<ThreadMap, int32_t, 32, 16, 8, 8>;
 
-    static int const kFragmentsPerIteration = 1;
+    static int const kFragmentsPerIteration = 2;
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

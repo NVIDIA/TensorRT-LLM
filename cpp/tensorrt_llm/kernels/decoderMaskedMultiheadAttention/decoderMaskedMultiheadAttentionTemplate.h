@@ -1411,7 +1411,8 @@ __global__ void masked_multihead_attention_kernel(
     bool has_relative_attention_bias = params.relative_attention_bias != nullptr;
     // Compute relative attention bias on the fly, with relative attention table [head_num/TP, num_buckets] passed in.
     // num_buckets passed as relative_attention_bias_stride, max_distance passed as params.max_distance
-    const bool implicit_rel_attn_bias = DO_CROSS_ATTENTION && params.max_distance != 0 && has_relative_attention_bias;
+    // this is a common optimization for both self attention and cross attention
+    const bool implicit_rel_attn_bias = params.max_distance != 0 && has_relative_attention_bias;
     int relative_attention_bias_stride
         = params.relative_attention_bias_stride; // num_buckets might be modified below, save it beforehand
     int max_distance = params.max_distance;
@@ -1693,12 +1694,15 @@ __global__ void masked_multihead_attention_kernel(
 
     // Pre-compute the pointer for the relative attention bias.
     const T* relative_attention_bias_ptr = nullptr;
+    const T* relative_attention_bias_ptr_fixed = nullptr; // record the base for offset
     if (has_relative_attention_bias)
     {
+        // "hi" is unsigned, subtracting int from unsigned int causes underflow. Cast to int
         int64_t offset = implicit_rel_attn_bias
-            ? (hi * relative_attention_bias_stride - tlength)
-            : (hi * relative_attention_bias_stride + tlength) * relative_attention_bias_stride;
+            ? ((int64_t) hi * relative_attention_bias_stride - tlength)
+            : ((int64_t) hi * relative_attention_bias_stride + tlength) * relative_attention_bias_stride;
         relative_attention_bias_ptr = &params.relative_attention_bias[offset];
+        relative_attention_bias_ptr_fixed = &params.relative_attention_bias[offset];
     }
 
     // Load the value.
@@ -1706,7 +1710,7 @@ __global__ void masked_multihead_attention_kernel(
     if (has_relative_attention_bias && tidx == 0)
     {
         // TODO: Use a better way to convert from T to float.
-        add(relative_attention_bias, relative_attention_bias_ptr[tlength]);
+        relative_attention_bias = add(relative_attention_bias, relative_attention_bias_ptr[tlength]);
     }
 
     // Store that value in shared memory. Keep the Q*K^T value in register for softmax.
@@ -1769,7 +1773,19 @@ __global__ void masked_multihead_attention_kernel(
 
     // Pick a number of keys to make sure all the threads of a warp enter (due to shfl_sync).
     // Take all previous cache as context when we have no beam searching in order to batch as many LDGs as possible.
-    const int context_length = HAS_BEAMS ? beam0_context_length : kv_loop_length;
+    const int context_length
+        = DO_CROSS_ATTENTION ? kv_loop_length : (HAS_BEAMS ? beam0_context_length : kv_loop_length);
+    // Clarifications:
+    // - in self attn, input_length is input text length, tlength is current timestep
+    // - in cross attn, input_length is *decoder* input length (usually 1), tlength is *encoder* input context length
+    // - in beam search, since the cache during generation is organized differently, the following KV compute needs
+    // split into context cache compute and generation cache compute
+    // - for self attn, no-beam search: entire cache can be treated as context cache --> context_length = tlength
+    // - for self attn, beam search: cache of input text length is context cache, other are generation cache -->
+    // context_length = input_length
+    // - for cross attn, no-beam/beam search: cache length is fixed, not differ context/generation cache -->
+    // context_length = tlength Suggestion: we could have a flag HANDLE_GEN_CACHE
+
     const auto context_ti_end = MULTI_BLOCK_FLAG
         ? divUp(timesteps_per_block, UNROLLED_K_PER_WARP) * UNROLLED_K_PER_WARP
         : divUp(static_cast<unsigned>(context_length), UNROLLED_K_PER_WARP) * UNROLLED_K_PER_WARP;
@@ -1872,7 +1888,7 @@ __global__ void masked_multihead_attention_kernel(
                 relative_position_if_large = min(relative_position_if_large, num_buckets - 1);
                 relative_buckets += is_small ? relative_position : relative_position_if_large;
                 relative_attention_bias_ptr
-                    = relative_attention_bias_ptr + (tlength - local_time_now) + relative_buckets;
+                    = relative_attention_bias_ptr_fixed + (tlength - local_time_now) + relative_buckets;
             }
 
             // Prefetch the relative attention bias.
@@ -1880,7 +1896,7 @@ __global__ void masked_multihead_attention_kernel(
             if (is_active && has_relative_attention_bias)
             {
                 // TODO: Use a better way to convert from T to float.
-                add(relative_attention_bias, relative_attention_bias_ptr[local_time_now]);
+                relative_attention_bias = add(relative_attention_bias, relative_attention_bias_ptr[local_time_now]);
             }
 
             // Compute the dot product between Q and K.
@@ -1937,7 +1953,9 @@ __global__ void masked_multihead_attention_kernel(
 
     // Handle generation key cache with beam searching.
     // Note that it may be overlapped with the context key loop, but it won't impact the corretness.
-    if (HAS_BEAMS && (!MULTI_BLOCK_FLAG || (c_tile + 1) * timesteps_per_block > beam0_context_length))
+    // Can skip in cross attention mode.
+    if (HAS_BEAMS && !DO_CROSS_ATTENTION
+        && (!MULTI_BLOCK_FLAG || (c_tile + 1) * timesteps_per_block > beam0_context_length))
     {
         // The input length;
         const int input_length_ = MULTI_BLOCK_FLAG ? beam0_context_length % timesteps_per_block : beam0_context_length;
@@ -1987,7 +2005,8 @@ __global__ void masked_multihead_attention_kernel(
                         * (num_buckets - max_exact));
                 relative_position_if_large = min(relative_position_if_large, num_buckets - 1);
                 relative_buckets += is_small ? relative_position : relative_position_if_large;
-                relative_attention_bias_ptr = relative_attention_bias_ptr + (tlength - time_now) + relative_buckets;
+                relative_attention_bias_ptr
+                    = relative_attention_bias_ptr_fixed + (tlength - time_now) + relative_buckets;
             }
 
             // Prefetch the relative attention bias.
@@ -1995,7 +2014,7 @@ __global__ void masked_multihead_attention_kernel(
             if (is_active && has_relative_attention_bias)
             {
                 // TODO: Use a better way to convert from T to float.
-                add(relative_attention_bias, relative_attention_bias_ptr[time_now]);
+                relative_attention_bias = add(relative_attention_bias, relative_attention_bias_ptr[time_now]);
             }
 
             // Perform the dot product and normalize qk.
@@ -2260,7 +2279,8 @@ __global__ void masked_multihead_attention_kernel(
         // Handle both context and generation value cache without beam searching.
         // Explicit batching of LDGs (by V_LOOP_UNROLL) as it doesn't depend on indirection tables.
         // Take all previous cache as context when we have no beam searching in order to batch as many LDGs as possible.
-        const int context_length = HAS_BEAMS ? beam0_context_length : kv_loop_length;
+        const int context_length
+            = DO_CROSS_ATTENTION ? kv_loop_length : (HAS_BEAMS ? beam0_context_length : kv_loop_length);
         int context_v_loop_end = MULTI_BLOCK_FLAG ? timesteps_per_block : context_length;
         int generation_v_loop_end = MULTI_BLOCK_FLAG ? timesteps_per_block : kv_loop_length;
         for (int ti = vo; ti < context_v_loop_end; ti += UNROLLED_V_PER_ITER)
@@ -2300,7 +2320,7 @@ __global__ void masked_multihead_attention_kernel(
         }
 
         // Handle generation value cache with beam searching.
-        if (HAS_BEAMS)
+        if (HAS_BEAMS && !DO_CROSS_ATTENTION)
         {
             const auto generation_start_ti
                 = MULTI_BLOCK_FLAG ? vo : (vo + (beam0_context_length / V_PER_ITER) * V_PER_ITER);

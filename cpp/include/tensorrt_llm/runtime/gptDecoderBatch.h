@@ -20,6 +20,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/runtime/generationOutput.h"
 #include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tensorrt_llm/runtime/iGptDecoderBatch.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -51,7 +52,8 @@ public:
     void newRequest(
         SizeType batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig) override;
 
-    void newBatch(GenerationInput const& inputs, SamplingConfig const& samplingConfig) override;
+    void newBatch(
+        GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig) override;
 
     TokenPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) override;
 
@@ -85,14 +87,10 @@ public:
 
     //! @brief Gather final beam search results for request `batchIdx`.
     //! Result will only be available after event returned.
-    //! @returns [maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token ids without
-    //! padding for request `batchIdx`, on gpu
-    [[nodiscard]] std::tuple<CudaEvent, TensorPtr> getFinalOutputIds(SizeType batchIdx) const override;
+    [[nodiscard]] CudaEvent finalize(SizeType batchIdx) const;
 
     //! @brief Gather final beam search results for all requests.
-    //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token
-    //! ids without padding, on gpu
-    [[nodiscard]] TensorPtr getFinalOutputIds() const override;
+    void finalize() const override;
 
     //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], contains parent ids collected during beam
     //! search without padding, on gpu
@@ -117,6 +115,28 @@ public:
     [[nodiscard]] TensorPtr getCumLogProbs() const override
     {
         return ITensor::slice(mJointDecodingOutput->cumLogProbs, 0, mActualBatchSize);
+    }
+
+    //! @returns [maxBeamWidth], cumulative log probabilities (per beam), on gpu
+    [[nodiscard]] TensorPtr getCumLogProbs(SizeType batchIdx) const
+    {
+        auto tensor = ITensor::slice(mJointDecodingOutput->cumLogProbs, batchIdx, 1);
+        tensor->squeeze(0);
+        return tensor;
+    }
+
+    //! @returns [batchSize, maxBeamWidth, maxSequenceLength], log probabilities (per beam), on gpu
+    [[nodiscard]] TensorPtr getLogProbs() const override
+    {
+        return ITensor::slice(mJointDecodingOutput->logProbs, 0, mActualBatchSize);
+    }
+
+    //! @returns [maxBeamWidth, maxSequenceLength], log probabilities (per beam), on gpu
+    [[nodiscard]] TensorPtr getLogProbs(SizeType batchIdx) const
+    {
+        auto tensor = ITensor::slice(mJointDecodingOutput->logProbs, batchIdx, 1);
+        tensor->squeeze(0);
+        return tensor;
     }
 
     //! @returns [batchSize, maxBeamWidth], tokens generated in last forward pass, on gpu
