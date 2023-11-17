@@ -16,6 +16,7 @@
  */
 #include "generationOutput.h"
 
+#include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
 
 namespace tr = tensorrt_llm::runtime;
@@ -34,6 +35,12 @@ std::shared_ptr<tr::GenerationOutput> GenerationOutput::toTrtLlm() const
     {
         output->contextLogits = tr::TorchView::of(contextLogits.value());
     }
-    // TODO(mseznec): add support for onTokenGenerated
+
+    if (onTokenGenerated)
+    {
+        output->onTokenGenerated = [delegate = onTokenGenerated](
+                                       tr::GenerationOutput::TensorPtr const& ids, tr::SizeType step, bool finished)
+        { delegate(tr::Torch::tensor(ids), step, finished); };
+    }
     return output;
 }

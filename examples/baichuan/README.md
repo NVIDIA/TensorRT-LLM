@@ -4,11 +4,11 @@ This document shows how to build and run a Baichuan models (including `v1_7b`/`v
 
 ## Overview
 
-The TensorRT-LLM Baichuan implementation can be found in [tensorrt_llm/models/baichuan/model.py](../../tensorrt_llm/models/baichuan/model.py). The TensorRT-LLM Baichuan example code is located in [`examples/baichuan`](./). There are three main files in that folder::
+The TensorRT-LLM Baichuan implementation can be found in [tensorrt_llm/models/baichuan/model.py](../../tensorrt_llm/models/baichuan/model.py). The TensorRT-LLM Baichuan example code is located in [`examples/baichuan`](./). There are three main files:
 
  * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Baichuan model,
  * [`run.py`](./run.py) to run the inference on an input text,
- * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
+ * and a shared [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
 
 These scripts accept an argument named model_version, whose value should be `v1_7b`/`v1_13b`/`v2_7b`/`v2_13b` and the default value is `v1_13b`.
 
@@ -193,26 +193,23 @@ mpirun -n 2 --allow-run-as-root \
 
 ```bash
 # Run summarization using the Baichuan V1 13B model in FP16.
-python summarize.py --model_version v1_13b \
-                    --test_trt_llm \
-                    --hf_model_location baichuan-inc/Baichuan-13B-Chat \
-                    --data_type fp16 \
-                    --engine_dir ./tmp/baichuan_v1_13b/trt_engines/fp16/1-gpu/
+python ../summarize.py --test_trt_llm \
+                       --hf_model_dir baichuan-inc/Baichuan-13B-Chat \
+                       --data_type fp16 \
+                       --engine_dir ./tmp/baichuan_v1_13b/trt_engines/fp16/1-gpu/
 
 # Run summarization using the Baichuan V1 13B model quantized to INT8.
-python summarize.py --model_version v1_13b \
-                    --test_trt_llm \
-                    --hf_model_location baichuan-inc/Baichuan-13B-Chat \
-                    --data_type fp16 \
-                    --engine_dir ./tmp/baichuan_v1_13b/trt_engines/int8_weight_only/1-gpu/
+python ../summarize.py --test_trt_llm \
+                       --hf_model_dir baichuan-inc/Baichuan-13B-Chat \
+                       --data_type fp16 \
+                       --engine_dir ./tmp/baichuan_v1_13b/trt_engines/int8_weight_only/1-gpu/
 
 # Run summarization using the Baichuan V1 13B model in FP16 using two GPUs.
 mpirun -n 2 --allow-run-as-root \
-    python summarize.py --model_version v1_13b \
-                        --test_trt_llm \
-                        --hf_model_location baichuan-inc/Baichuan-13B-Chat \
-                        --data_type fp16 \
-                        --engine_dir ./tmp/baichuan_v1_13b/trt_engines/fp16/2-gpu/
+    python ../summarize.py --test_trt_llm \
+                           --hf_model_dir baichuan-inc/Baichuan-13B-Chat \
+                           --data_type fp16 \
+                           --engine_dir ./tmp/baichuan_v1_13b/trt_engines/fp16/2-gpu/
 ```
 
 ### Known Issues

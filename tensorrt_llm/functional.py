@@ -599,6 +599,7 @@ class AttentionMaskType(IntEnum):
     padding = 0
     causal = 1
     bidirectional = 2
+    bidirectionalglm = 3  # TODO: merge this mask into bidirectional
 
 
 class LayerNormType(IntEnum):
@@ -610,6 +611,12 @@ class LayerNormType(IntEnum):
 class LayerNormPositionType(IntEnum):
     pre_layernorm = 0
     post_layernorm = 1
+
+
+class MLPType(IntEnum):
+    MLP = 0
+    GatedMLP = 1
+    FusedGatedMLP = 2
 
 
 def activation(input: Tensor, act_type: trt.ActivationType) -> Tensor:
@@ -2939,7 +2946,8 @@ def bert_attention(tensor: Tensor,
                    q_scaling: float,
                    relative_attention: bool = False,
                    relative_attention_bias: Tensor = None,
-                   max_distance: int = 0) -> Tuple[Tensor]:
+                   max_distance: int = 0,
+                   max_input_length: Tensor = None) -> Tuple[Tensor]:
     '''
     Add an operation that performs the multi-head attention in BERT.
 
@@ -2990,6 +2998,9 @@ def bert_attention(tensor: Tensor,
             Implicit mode is only enabled when passing in non-zero positive max_distance value.
             See relative attention bias in docs/gpt_attention.md
 
+        max_input_length: Tensor = None
+            The maximum input sequence length represented by Tensor shape. Requires for remove_input_padding to pre-define plugin workspace size.
+
     Returns:
         The tensor produced by that layer.
     '''
@@ -3025,14 +3036,22 @@ def bert_attention(tensor: Tensor,
     max_distance = trt.PluginField("max_distance",
                                    np.array(max_distance, dtype=np.int32),
                                    trt.PluginFieldType.INT32)
+    remove_padding = trt.PluginField(
+        "remove_padding",
+        np.array(np.int8(default_net().plugin_config.remove_input_padding),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
     pfc = trt.PluginFieldCollection([
         nheads, head_size, q_scaling, enable_qk_half_accum, context_fmha_type,
-        pf_type, do_relative_attention, max_distance
+        pf_type, do_relative_attention, max_distance, remove_padding
     ])
 
     attn_plug = attn_plg_creator.create_plugin("padding_attn", pfc)
     plug_inputs = [tensor, input_lengths]
+    if max_input_length is not None:
+        # for remove padding mode
+        plug_inputs += [max_input_length]
     if relative_attention_bias is not None:
+        # for relative attention mode
         plug_inputs += [relative_attention_bias]
 
     plug_inputs = [i.trt_tensor for i in plug_inputs]
@@ -3198,6 +3217,7 @@ def gpt_attention(
                 * tensorrt_llm.layers.AttentionMaskType.padding for BERT,
                 * tensorrt_llm.layers.AttentionMaskType.causal for GPT,
                 * tensorrt_llm.layers.AttentionMaskType.bidirectional for ChatGLM-6B,
+                * tensorrt_llm.layers.AttentionMaskType.bidirectionalglm for GLM-10B,
 
         alibi_slopes: Tensor
             The ALiBi slopes. The ALiBi bias is computed on-the-fly in the kernel
@@ -3874,3 +3894,109 @@ def non_gated_version(activation):
     if is_gated_activation(activation):
         return GATED_ACT_2_ACT[activation]
     return activation
+
+
+def lora_plugin(
+    input: Tensor = None,
+    in_hidden_size: int = 0,
+    out_hidden_size: int = 0,
+    host_request_types: Tensor = None,
+    transa: bool = False,
+    transb: bool = False,
+    host_context_lengths: Tensor = None,  # for pad-free input mode
+    max_context_length: int = 0,
+    max_low_rank: int = 0,
+    lora_ranks: Tensor = None,
+    lora_weights_pointers: Tensor = None,
+):
+    '''
+    Parameters:
+        lora_ids : cpu Tensor = None
+            A tensor that contains the lora ids of different inputs.
+
+        in_hidden_size/out_hidden_size : int
+            the lora computation workflow is
+            [M, in_hidden_size] -> [M, low_rank] -> [M, out_hidden_size]
+
+        host_request_types : Tensor = None
+            The tensor on the host that indicates if a request is in context or
+            generation phase. Its shape is [batch_size]. See Inflight Batching
+            in docs/gpt_attention.md,
+
+        transa : bool
+            Is the first input transposed? Set to 'True' if you want the first
+            input to be transposed, 'False' otherwise.
+
+        transb : bool
+            Is the second input transposed? Set to 'True' if you want the
+            second input to be transposed, 'False' otherwise.
+
+        host_context_lengths: cpu Tensor = None
+            A host tensor that contains the lengths of the different inputs,
+
+        max_context_length : int
+            Maximum length during context phase, used to determine the workspace size.
+
+        max_low_rank : int
+            Maximum low_rank, used to determine the workspace size.
+
+        lora_ranks : cpu Tensor with shape [batch_size]
+            The low_rank of each request
+
+        lora_weights_pointers : cpu int64 Tensor with shape [batch_size, 2]
+            The weights pointers of each request. Consist of in_pointer and out_pointer.
+
+    Return:
+        The tensor produced by that layer.
+
+    '''
+    assert host_context_lengths is not None or not default_net(
+    ).plugin_config.remove_input_padding
+
+    trt.get_plugin_registry().plugin_creator_list
+    in_hidden_size = trt.PluginField("in_hidden_size",
+                                     np.array(in_hidden_size, dtype=np.int32),
+                                     trt.PluginFieldType.INT32)
+    out_hidden_size = trt.PluginField("out_hidden_size",
+                                      np.array(out_hidden_size, dtype=np.int32),
+                                      trt.PluginFieldType.INT32)
+    transa = 1 if transa else 0
+    transa = trt.PluginField("transa", np.array(transa, dtype=np.int32),
+                             trt.PluginFieldType.INT32)
+    transb = 1 if transb else 0
+    transb = trt.PluginField("transb", np.array(transb, dtype=np.int32),
+                             trt.PluginFieldType.INT32)
+
+    plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'Lora', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+
+    p_dtype = default_net().plugin_config.lora_plugin
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    remove_input_padding = trt.PluginField(
+        "remove_input_padding",
+        np.array(np.int8(default_net().plugin_config.remove_input_padding),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    max_context_length_filed = trt.PluginField(
+        "max_context_length", np.array(max_context_length, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+    max_low_rank_filed = trt.PluginField("max_low_rank",
+                                         np.array(max_low_rank, dtype=np.int32),
+                                         trt.PluginFieldType.INT32)
+
+    pfc = trt.PluginFieldCollection([
+        in_hidden_size, out_hidden_size, transa, transb, pf_type,
+        remove_input_padding, max_context_length_filed, max_low_rank_filed
+    ])
+    lora_plug = plg_creator.create_plugin("lora", pfc)
+
+    plug_inputs = [input, host_request_types, lora_ranks, lora_weights_pointers]
+    if default_net().plugin_config.remove_input_padding:
+        plug_inputs += [host_context_lengths]
+
+    plug_inputs = [i.trt_tensor for i in plug_inputs]
+    layer = default_trtnet().add_plugin_v2(plug_inputs, lora_plug)
+
+    return _create_tensor(layer.get_output(0), layer)

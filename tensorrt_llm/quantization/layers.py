@@ -998,6 +998,7 @@ class SmoothQuantAttention(Module):
                  apply_query_key_layer_scaling=False,
                  attention_mask_type=AttentionMaskType.padding,
                  bias=True,
+                 qkv_bias_only=False,
                  dtype=None,
                  position_embedding_type=PositionEmbeddingType.learned_absolute,
                  tp_group=None,
@@ -1064,7 +1065,7 @@ class SmoothQuantAttention(Module):
             hidden_size,
             hidden_size +
             2 * self.num_kv_heads * tp_size * self.attention_head_size,
-            bias=bias,
+            bias=(bias or qkv_bias_only),
             dtype=dtype,
             tp_group=tp_group,
             tp_size=tp_size,
@@ -1079,13 +1080,16 @@ class SmoothQuantAttention(Module):
                                           tp_size=tp_size,
                                           quant_mode=quant_mode)
 
+        self.use_lora = False
+
     def forward(self,
                 hidden_states: Tensor,
                 attention_mask=None,
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None,
-                workspace=None):
+                workspace=None,
+                lora_params=None):
         # TODO add in-flight batching to SmoothQuant
         if default_net().plugin_config.smooth_quant_gemm_plugin:
             qkv = self.qkv(hidden_states)

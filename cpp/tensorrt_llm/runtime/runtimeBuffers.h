@@ -106,6 +106,10 @@ public:
     // decoder
     TensorPtr nbFinished;
 
+    // Log probs
+    TensorPtr cumLogProbs;
+    TensorPtr logProbs;
+
     // pipeline parallelism
     TensorPtr hiddenStates;
 
@@ -134,6 +138,9 @@ public:
 
     void postContextStep(std::vector<RuntimeBuffers> const& contextBuffers, BufferManager& manager,
         GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
+
+    void postEachGenerationStep(BufferManager& manager, TensorPtr outputGenerationLogits, SizeType step,
+        SizeType firstBatchSlotIdx, SizeType microBatchSize, SizeType beamWidth, WorldConfig const& worldConfig);
 
     void prepareContextStep(TensorPtr const& inputIds, TokenIdType padId, BufferManager& manager,
         KvCacheManager const* kvCacheManager, SizeType firstBatchSlotIdx, GptModelConfig const& modelConfig,

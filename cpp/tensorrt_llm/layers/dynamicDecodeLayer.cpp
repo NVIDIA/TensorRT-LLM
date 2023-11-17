@@ -321,7 +321,7 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
                 = outputs.cum_log_probs->slice({dynamic_decode_batch_size * beam_width}, dynamic_id_offset);
 
             dynamic_decode_outputs.beamHypotheses = outputs.beamHypotheses;
-            dynamic_decode_outputs.output_log_probs = outputs.output_log_probs;
+            dynamic_decode_outputs.output_log_probs = outputs.output_log_probs_tiled;
 
             // only OnlineBeamSearchLayer support beam_search_diversity_rate
             // when beamHypotheses is used
@@ -365,11 +365,11 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
             decode_outputs.cum_log_probs
                 = outputs.cum_log_probs->slice({local_batch_size * beam_width}, local_batch_offset);
         }
-        if (outputs.output_log_probs)
+        if (outputs.output_log_probs_tiled)
         {
             auto const generationStep = step - params.max_input_length;
             TLLM_CHECK(generationStep >= 0);
-            Tensor& output_log_probs = outputs.output_log_probs.value();
+            Tensor& output_log_probs = outputs.output_log_probs_tiled.value();
             size_t step_offset = generationStep * batch_size * beam_width;
             decode_outputs.output_log_probs
                 = output_log_probs.slice({output_log_probs.shape[0] - generationStep, local_batch_size * beam_width},
@@ -411,6 +411,17 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
 
     invokeCopyNextStepIds(outputs.newTokens.template getPtr<int>(), idsPtrHost,
         outputs.sequence_length->template getPtr<int>(), batch_size, beam_width, max_seq_len, stream_);
+
+    // Transpose the output log probs from [max_seq_len, bs, beam_width] to [batch_size, beam_width, max_seq_len]
+    if (outputs.output_log_probs_tiled)
+    {
+        auto logProbsMaxSeqLen = outputs.output_log_probs_tiled.value().shape[0];
+
+        invokeTransposeLogProbs(outputs.output_log_probs.value().template getPtr<float>(),
+            outputs.output_log_probs_tiled.value().template getPtr<float>(),
+            outputs.sequence_length->template getPtr<int>(), batch_size, beam_width, logProbsMaxSeqLen, stream_);
+    }
+
     sync_check_cuda_error();
 }
 

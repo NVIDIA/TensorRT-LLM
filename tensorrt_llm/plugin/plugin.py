@@ -79,6 +79,7 @@ class PluginConfig(object):
         self.paged_kv_cache = False
         self.tokens_per_block = 0
         self.lookup_plugin = False
+        self.lora_plugin = False
 
     def enable_qk_half_accum(self):
         self.attention_qk_half_accumulation = True
@@ -174,4 +175,8 @@ class PluginConfig(object):
 
     def set_lookup_plugin(self, dtype='float16'):
         self.lookup_plugin = dtype
+        return self
+
+    def set_lora_plugin(self, dtype='float16'):
+        self.lora_plugin = dtype
         return self

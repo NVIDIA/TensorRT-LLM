@@ -16,6 +16,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
+from typing import Union
 
 import numpy as np
 import torch
@@ -46,6 +47,8 @@ def read_config(config_path: Path):
     use_gpt_attention_plugin = config['plugin_config']['gpt_attention_plugin']
     remove_input_padding = config['plugin_config']['remove_input_padding']
     dtype = config['builder_config']['precision']
+    gather_all_token_logits = config['builder_config'][
+        'gather_all_token_logits']
     tp_size = config['builder_config']['tensor_parallel']
     pp_size = config['builder_config']['pipeline_parallel']
     world_size = tp_size * pp_size
@@ -85,6 +88,7 @@ def read_config(config_path: Path):
         remove_input_padding=remove_input_padding,
         dtype=dtype,
         quant_mode=quant_mode,
+        gather_all_token_logits=gather_all_token_logits,
         use_custom_all_reduce=use_custom_all_reduce,
         max_prompt_embedding_table_size=max_prompt_embedding_table_size)
 
@@ -92,7 +96,8 @@ def read_config(config_path: Path):
 
 
 def parse_input(input_text: str, input_file: str, tokenizer, end_id: int,
-                remove_input_padding: bool):
+                remove_input_padding: bool, input_tokens_limit: Union[int,
+                                                                      None]):
     input_tokens = []
     if input_file is None:
         input_tokens.append(
@@ -108,9 +113,22 @@ def parse_input(input_text: str, input_file: str, tokenizer, end_id: int,
             for row in inputs:
                 row = row[row != end_id]
                 input_tokens.append(row)
+        elif input_file.endswith('.txt'):
+            with open(input_file, 'r', encoding='utf-8',
+                      errors='replace') as txt_file:
+                input_text = txt_file.read()
+                input_tokens.append(
+                    tokenizer.encode(input_text, add_special_tokens=False))
         else:
             print('Input file format not supported.')
             raise SystemExit
+
+    # Cap max input tokens
+    if input_tokens_limit is not None:
+        print(
+            f"Maximum input number of tokens found as {max([len(x) for x in input_tokens])};"
+            f" will be capped to {input_tokens_limit}")
+        input_tokens = [x[-input_tokens_limit:] for x in input_tokens]
 
     input_ids = None
     input_lengths = torch.tensor([len(x) for x in input_tokens],
@@ -176,7 +194,6 @@ def print_output(output_ids, input_lengths, max_output_len, tokenizer,
                 print(f'Output: \"{output_text}\"')
 
     output_ids = output_ids.reshape((-1, output_ids.size(2)))
-    print(output_ids)
 
     if output_csv is not None:
         output_file = Path(output_csv)
@@ -217,6 +234,11 @@ def parse_arguments():
         type=str,
         help=
         'CSV or Numpy file containing tokenized input. Alternative to text input.',
+        default=None)
+    parser.add_argument(
+        '--input_tokens_limit',
+        type=int,
+        help='Truncate input tokens if number exceeds the set limit value',
         default=None)
     parser.add_argument('--output_csv',
                         type=str,
@@ -260,6 +282,7 @@ def generate(
     streaming_interval: int = 5,
     prompt_table: Path = None,
     tasks: str = None,
+    input_tokens_limit: Union[None, int] = None,
 ):
     tensorrt_llm.logger.set_level(log_level)
 
@@ -294,10 +317,13 @@ def generate(
     if runtime_rank == 0:
         print(f"Running the {dtype} engine ...")
 
-    input_ids, input_lengths = parse_input(input_text, input_file, tokenizer,
-                                           EOS_TOKEN,
-                                           model_config.remove_input_padding)
-    print(input_ids)
+    input_ids, input_lengths = parse_input(
+        input_text,
+        input_file,
+        tokenizer,
+        EOS_TOKEN,
+        model_config.remove_input_padding,
+        input_tokens_limit=input_tokens_limit)
 
     max_input_length = torch.max(input_lengths).item()
     decoder.setup(input_lengths.size(0),
@@ -332,6 +358,16 @@ def generate(
             sequence_lengths = outputs['sequence_lengths']
             print_output(output_ids, input_lengths, max_output_len, tokenizer,
                          output_csv, output_npy, sequence_lengths)
+
+        if model_config.gather_all_token_logits:
+            if runtime_mapping.is_last_pp_rank():
+                print(
+                    f"context_logits.shape: {outputs['context_logits'].shape}")
+                print(
+                    f"generation_logits.shape: {len(outputs['generation_logits']), outputs['generation_logits'][0].shape}"
+                )
+                print(outputs['context_logits'])
+                print(outputs['generation_logits'])
 
 
 if __name__ == '__main__':

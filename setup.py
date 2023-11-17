@@ -64,7 +64,7 @@ setup(
         (['libs/th_common.dll', 'libs/nvinfer_plugin_tensorrt_llm.dll']
          if platform.system() == "Windows" else [
              'libs/libth_common.so', 'libs/libnvinfer_plugin_tensorrt_llm.so',
-             'bindings.*.so'
+             'bindings.*.so', 'bindings.pyi'
          ]) + ['tools/plugin_gen/templates/*'],
     },
     python_requires=">=3.7, <4",

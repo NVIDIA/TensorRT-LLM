@@ -43,20 +43,33 @@ public:
         nvinfer1::DataType dtype) override;
 
     //! @brief Initialize the decoder with new batch of inputs.
-    void newBatch(GenerationInput const& input, SamplingConfig const& samplingConfig) override;
+    void newBatch(
+        GenerationInput const& input, GenerationOutput const& output, SamplingConfig const& samplingConfig) override;
 
     void forwardAsync(decoder::Output& output, decoder::Input const& input) override;
 
     void forwardSync() override;
 
     //! @brief Gather final results for all requests.
-    [[nodiscard]] TensorPtr getFinalOutputIds() const override;
+    void finalize() const override;
 
     //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token
     //! ids without padding, on gpu
     [[nodiscard]] TensorPtr getOutputIds() const override
     {
         return mDecodingOutput->ids;
+    }
+
+    //! @returns [batchSize, maxBeamWidth], cumulative log probabilities (per beam), on gpu
+    [[nodiscard]] TensorPtr getCumLogProbs() const override
+    {
+        return mDecodingOutput->cumLogProbs;
+    }
+
+    //! @returns [batchSize, maxBeamWidth], cumulative log probabilities (per beam), on gpu
+    [[nodiscard]] TensorPtr getLogProbs() const override
+    {
+        return mDecodingOutput->logProbs;
     }
 
     //! @returns [batchSize, maxBeamWidth], tokens generated in last forward pass, on gpu

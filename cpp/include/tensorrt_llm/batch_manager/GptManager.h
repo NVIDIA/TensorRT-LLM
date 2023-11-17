@@ -121,10 +121,13 @@ private:
     inline static const std::string kMinLengthTensorName_ = "min_length";
     inline static const std::string kPresencePenaltyTensorName_ = "presence_penalty";
     inline static const std::string kRandomSeedTensorName_ = "random_seed";
+    inline static const std::string kReturnLogProbsTensorName_ = "return_log_probs";
     inline static const std::string kPromptEmbeddingTableName_ = "prompt_embedding_table";
     inline static const std::string kPromptVocabSizeName_ = "prompt_vocab_size";
     inline static const std::string kOutputIdsTensorName_ = "output_ids";
     inline static const std::string kSequenceLengthTensorName_ = "sequence_length";
+    inline static const std::string kLogProbsTensorName_ = "output_log_probs";
+    inline static const std::string kCumLogProbsTensorName_ = "cum_log_probs";
 
     std::shared_ptr<nvinfer1::ILogger> mLogger{};
 };

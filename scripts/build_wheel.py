@@ -52,7 +52,8 @@ def main(build_type: str = "Release",
          cpp_only: bool = False,
          install: bool = False,
          skip_building_wheel: bool = False,
-         python_bindings: bool = False):
+         python_bindings: bool = False,
+         benchmarks: bool = False):
     project_dir = Path(__file__).parent.resolve().parent
     os.chdir(project_dir)
     build_run = partial(run, shell=True, check=True)
@@ -145,6 +146,7 @@ def main(build_type: str = "Release",
     th_common_lib = "" if cpp_only else "th_common"
     build_pybind = "ON" if python_bindings else "OFF"
     bindings_lib = "bindings" if python_bindings else ""
+    benchmarks_lib = "benchmarks" if benchmarks else ""
 
     with working_directory(build_dir):
         cmake_def_args = " ".join(cmake_def_args)
@@ -155,7 +157,7 @@ def main(build_type: str = "Release",
             )
         build_run(
             f'cmake --build . --config {build_type} --parallel {job_count} '
-            f'--target tensorrt_llm tensorrt_llm_static nvinfer_plugin_tensorrt_llm {th_common_lib} {bindings_lib}'
+            f'--target tensorrt_llm tensorrt_llm_static nvinfer_plugin_tensorrt_llm {th_common_lib} {bindings_lib} {benchmarks_lib}'
             f'{" ".join(extra_make_targets)}')
 
     if cpp_only:
@@ -192,6 +194,10 @@ def main(build_type: str = "Release",
             pybind_lib
         ) == 1, f"Exactly one pybind library should be present: {pybind_lib}"
         copy(pybind_lib[0], pkg_dir)
+        build_run(f"{sys.executable} -m pip install pybind11-stubgen")
+        build_run(
+            f"cd {pkg_dir} && {sys.executable} -m pybind11_stubgen -o . bindings"
+        )
 
     if dist_dir is None:
         dist_dir = project_dir / "build"
@@ -265,5 +271,8 @@ if __name__ == "__main__":
                         "-p",
                         action="store_true",
                         help="Build the python bindings for the C++ runtime.")
+    parser.add_argument("--benchmarks",
+                        action="store_true",
+                        help="Build the benchmarks for the C++ runtime.")
     args = parser.parse_args()
     main(**vars(args))

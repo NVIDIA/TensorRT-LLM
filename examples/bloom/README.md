@@ -4,11 +4,11 @@ This document shows how to build and run a BLOOM model in TensorRT-LLM on both s
 
 ## Overview
 
-The TensorRT-LLM BLOOM implementation can be found in [tensorrt_llm/models/bloom/model.py](../../tensorrt_llm/models/bloom/model.py). The TensorRT-LLM BLOOM example code is located in [`examples/bloom`](./). There are three main files in that folder::
+The TensorRT-LLM BLOOM implementation can be found in [tensorrt_llm/models/bloom/model.py](../../tensorrt_llm/models/bloom/model.py). The TensorRT-LLM BLOOM example code is located in [`examples/bloom`](./). There are three main files:
 
  * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the BLOOM model,
  * [`run.py`](./run.py) to run the inference on an input text,
- * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
+ * and a shared [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
 
 ## Support Matrix
   * FP16
@@ -174,25 +174,25 @@ Note we use `--bin_model_dir` instead of `--model_dir` since SmoothQuant model n
 ### 4. Run
 
 ```bash
-python summarize.py --test_trt_llm \
-                    --hf_model_location ./bloom/560M/ \
-                    --data_type fp16 \
-                    --engine_dir ./bloom/560M/trt_engines/fp16/1-gpu/
+python ../summarize.py --test_trt_llm \
+                       --hf_model_dir ./bloom/560M/ \
+                       --data_type fp16 \
+                       --engine_dir ./bloom/560M/trt_engines/fp16/1-gpu/
 
-python summarize.py --test_trt_llm \
-                    --hf_model_location ./bloom/560M/ \
-                    --data_type fp16 \
-                    --engine_dir ./bloom/560M/trt_engines/int8_weight_only/1-gpu/
+python ../summarize.py --test_trt_llm \
+                       --hf_model_dir ./bloom/560M/ \
+                       --data_type fp16 \
+                       --engine_dir ./bloom/560M/trt_engines/int8_weight_only/1-gpu/
 
 mpirun -n 2 --allow-run-as-root \
-    python summarize.py --test_trt_llm \
-                        --hf_model_location ./bloom/560M/ \
-                        --data_type fp16 \
-                        --engine_dir ./bloom/560M/trt_engines/fp16/2-gpu/
+    python ../summarize.py --test_trt_llm \
+                           --hf_model_dir ./bloom/560M/ \
+                           --data_type fp16 \
+                           --engine_dir ./bloom/560M/trt_engines/fp16/2-gpu/
 
 mpirun -n 8 --allow-run-as-root \
-    python summarize.py --test_trt_llm \
-                        --hf_model_location ./bloom/176B/ \
-                        --data_type fp16 \
-                        --engine_dir ./bloom/176B/trt_engines/fp16/8-gpu/
+    python ../summarize.py --test_trt_llm \
+                           --hf_model_dir ./bloom/176B/ \
+                           --data_type fp16 \
+                           --engine_dir ./bloom/176B/trt_engines/fp16/8-gpu/
 ```

@@ -83,6 +83,9 @@ void RuntimeBuffers::clear()
     cacheIndirectionDecoderInput = nullptr;
     cacheIndirectionDecoderOutput = nullptr;
 
+    cumLogProbs = nullptr;
+    logProbs = nullptr;
+
     hiddenStates = nullptr;
 
     allocated = false;
@@ -155,10 +158,8 @@ void RuntimeBuffers::create(TllmRuntime& runtime, GptModelConfig const& modelCon
     if (modelConfig.useGptAttentionPlugin())
     {
         pastKeyValueLengths = manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32);
-        for (SizeType i = 0; i < modelConfig.getNbLayers(); ++i)
-        {
-            maxKvCacheLengths.emplace_back(manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32));
-        }
+        maxKvCacheLengths
+            = utils::createBufferVector(runtime, localNbLayers, MemoryType::kCPU, nvinfer1::DataType::kINT32);
     }
     else
     {
@@ -238,11 +239,8 @@ void RuntimeBuffers::reshape(GptModelConfig const& modelConfig, WorldConfig cons
     if (modelConfig.useGptAttentionPlugin())
     {
         pastKeyValueLengths->reshape(ITensor::makeShape({batchSize}));
-        for (SizeType i = 0; i < modelConfig.getNbLayers(); ++i)
-        {
-            maxKvCacheLengths[i]->reshape(ITensor::makeShape({1}));
-        }
         requestTypes->reshape(ITensor::makeShape({batchSize}));
+        utils::reshapeBufferVector(maxKvCacheLengths, ITensor::makeShape({1}));
     }
     else
     {
@@ -511,6 +509,21 @@ void RuntimeBuffers::postContextStep(std::vector<RuntimeBuffers> const& contextB
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
+void RuntimeBuffers::postEachGenerationStep(BufferManager& manager, TensorPtr outputGenerationLogits, SizeType step,
+    SizeType firstBatchSlotIdx, SizeType microBatchSize, SizeType beamWidth, WorldConfig const& worldConfig)
+{
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+
+    if (worldConfig.isLastPipelineParallelRank())
+    {
+        kernels::copyLatestTokenLogitsInGeneration(
+            *outputGenerationLogits, *logits, step, firstBatchSlotIdx, microBatchSize, beamWidth, manager.getStream());
+        manager.getStream().synchronize();
+    }
+
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+}
+
 void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType const padId, BufferManager& manager,
     KvCacheManager const* kvCacheManager, SizeType firstBatchSlotIdx, GptModelConfig const& modelConfig,
     WorldConfig const& worldConfig)
@@ -523,6 +536,9 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
     // use context lengths only in context step
     sequenceLengths = contextLengthsDevice;
 
+    // get local number of layers.
+    auto const localNbLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
+
     if (modelConfig.useGptAttentionPlugin())
     {
         auto pastKeyValueLengthsPtr = bufferCast<SizeType>(*pastKeyValueLengths);
@@ -534,7 +550,7 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
         std::fill_n(RequestTypesPtr, batchSize, 0);
 
         // Set maxKvCacheLengths buffer to the same value currently.
-        for (auto layer = 0; layer < modelConfig.getNbLayers(); ++layer)
+        for (auto layer = 0; layer < localNbLayers; ++layer)
         {
             bufferCast<SizeType>(*maxKvCacheLengths[layer])[0] = generationConfig.maxKvCacheLength;
         }
@@ -803,12 +819,7 @@ void RuntimeBuffers::getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outpu
         inputBuffers.insert_or_assign("host_past_key_value_lengths", pastKeyValueLengths);
         inputBuffers.insert_or_assign("host_request_types", requestTypes);
         inputBuffers.insert_or_assign("sequence_length", sequenceLengths);
-
-        for (SizeType i = 0; i < modelConfig.getNbLayers(); ++i)
-        {
-            std::string name = "host_max_kv_cache_length_" + std::to_string(i);
-            inputBuffers.insert_or_assign(name, maxKvCacheLengths[i]);
-        }
+        utils::insertTensorVector(inputBuffers, "host_max_kv_cache_length_", maxKvCacheLengths, firstLayerId);
 
         if (modelConfig.usePackedInput())
         {

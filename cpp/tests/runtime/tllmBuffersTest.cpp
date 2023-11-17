@@ -294,7 +294,7 @@ void testBufferType()
     using limits = std::numeric_limits<T>;
     static_assert(dataType.isPointer() || dataType.isUnsigned() != limits::is_signed);
     static_assert(std::is_same_v<T,
-        typename CppDataType<dataType.getDataType(), dataType.isUnsigned(), dataType.isPointer()>::type>);
+        typename DataTypeTraits<dataType.getDataType(), dataType.isUnsigned(), dataType.isPointer()>::type>);
     IBuffer::SharedPtr buffer{std::make_shared<HostBuffer>(size, dataType, allocator)};
     auto bufferPtr = bufferCast<T>(*buffer);
     auto constexpr max = limits::max();

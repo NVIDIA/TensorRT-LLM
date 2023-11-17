@@ -143,7 +143,7 @@ class GPTBenchmark(BaseBenchmark):
             quant_mode=self.quant_mode,
             use_custom_all_reduce=self.enable_custom_all_reduce,
         )
-        if model_name == 'chatglm-6b':
+        if model_name == 'chatglm_6b':
             self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
                 end_id=130005,
                 pad_id=3,
@@ -152,16 +152,7 @@ class GPTBenchmark(BaseBenchmark):
                 top_p=top_p)
             self.decoder = tensorrt_llm.runtime.ChatGLMGenerationSession(
                 model_config, engine_buffer, self.runtime_mapping)
-        elif model_name == 'chatglm2-6b':
-            self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
-                end_id=2,
-                pad_id=0,
-                num_beams=num_beams,
-                top_k=top_k,
-                top_p=top_p)
-            self.decoder = tensorrt_llm.runtime.GenerationSession(
-                model_config, engine_buffer, self.runtime_mapping)
-        elif model_name == 'chatglm3-6b':
+        elif model_name in ['chatglm2_6b', 'chatglm3_6b']:
             self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
                 end_id=2,
                 pad_id=0,
@@ -402,7 +393,7 @@ class GPTBenchmark(BaseBenchmark):
                 apply_query_key_layer_scaling=builder_config.
                 apply_query_key_layer_scaling,
                 quant_mode=self.quant_mode,
-                model_version="1")
+                model_name="chatglm_6b")
         elif family == "chatglm2":
             tensorrt_llm_model = tensorrt_llm.models.ChatGLMHeadModel(
                 num_layers=self.num_layers,
@@ -418,7 +409,7 @@ class GPTBenchmark(BaseBenchmark):
                 apply_query_key_layer_scaling=builder_config.
                 apply_query_key_layer_scaling,
                 quant_mode=self.quant_mode,
-                model_version="2")
+                model_name="chatglm2_6b")
         elif family == "chatglm3":
             tensorrt_llm_model = tensorrt_llm.models.ChatGLMHeadModel(
                 num_layers=self.num_layers,
@@ -434,7 +425,7 @@ class GPTBenchmark(BaseBenchmark):
                 apply_query_key_layer_scaling=builder_config.
                 apply_query_key_layer_scaling,
                 quant_mode=self.quant_mode,
-                model_version="3")
+                model_name="chatglm3_6b")
         elif family == "bloom":
             tensorrt_llm_model = tensorrt_llm.models.BloomForCausalLM(
                 num_layers=self.num_layers,
@@ -458,6 +449,7 @@ class GPTBenchmark(BaseBenchmark):
                 max_position_embeddings=self.n_positions,
                 dtype=kv_dtype,
                 bias=self.bias,
+                quant_mode=self.quant_mode,
                 use_alibi=self.use_alibi,
                 new_decoder_architecture=self.new_decoder_architecture,
                 parallel_attention=self.parallel_attention,

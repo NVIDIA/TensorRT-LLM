@@ -5,11 +5,11 @@ This document explains how to build the [GPT-J](https://huggingface.co/EleutherA
 ## Overview
 
 The TensorRT-LLM GPT-J implementation can be found in [`tensorrt_llm/models/gptj/model.py`](../../tensorrt_llm/models/gptj/model.py). The TensorRT-LLM GPT-J example
-code is located in [`examples/gptj`](./). There are three main files in that folder:
+code is located in [`examples/gptj`](./). There are three main files:
 
  * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the GPT-J model,
  * [`run.py`](./run.py) to run the inference on an input text,
- * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
+ * and a shared [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
 
 ## Support Matrix
   * FP16
@@ -235,19 +235,18 @@ As previously explained, the first step is to build the TensorRT engine as descr
 pip install -r requirements.txt
 ```
 
-The summarization can be done using the [`summarize.py`](./summarize.py) script as follows:
+The summarization can be done using the [`../summarize.py`](../summarize.py) script as follows:
 
 ```bash
 # Run the summarization task.
-python3 summarize.py --engine_dir gptj_engine \
-                     --model_dir gptj_model \
-                     --test_hf \
-                     --batch_size 1 \
-                     --test_trt_llm \
-                     --tensorrt_llm_rouge1_threshold 14 \
-                     --data_type fp16 \
-                     --check_accuracy
-
+python3 ../summarize.py --engine_dir gptj_engine \
+                        --hf_model_dir gptj_model \
+                        --test_hf \
+                        --batch_size 1 \
+                        --test_trt_llm \
+                        --tensorrt_llm_rouge1_threshold 14 \
+                        --data_type fp16 \
+                        --check_accuracy
 ```
 
 ## Known issues

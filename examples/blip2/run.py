@@ -42,7 +42,8 @@ def TRTOPT(args, config):
     vocab_size = config['builder_config']['vocab_size']
     num_layers = config['builder_config']['num_layers']
     remove_input_padding = config['plugin_config']['remove_input_padding']
-    use_prompt_tuning = config['builder_config']['use_prompt_tuning']
+    max_prompt_embedding_table_size = config['builder_config'].get(
+        'max_prompt_embedding_table_size', 0)
 
     model_config = tensorrt_llm.runtime.ModelConfig(
         vocab_size=vocab_size,
@@ -52,7 +53,7 @@ def TRTOPT(args, config):
         hidden_size=hidden_size,
         gpt_attention_plugin=use_gpt_attention_plugin,
         remove_input_padding=remove_input_padding,
-        use_prompt_tuning=use_prompt_tuning,
+        max_prompt_embedding_table_size=max_prompt_embedding_table_size,
         dtype=dtype)
 
     runtime_rank = tensorrt_llm.mpi_rank()

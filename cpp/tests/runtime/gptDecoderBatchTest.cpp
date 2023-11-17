@@ -90,7 +90,8 @@ void verifyResults(BufferManager& manager, GptDecoderBatch const& decoder,
     }
 }
 
-void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> const& samplingConfigs, int maxBeamWidth)
+void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> const& samplingConfigs, int maxBeamWidth,
+    bool computeLogProbs)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     SizeType constexpr tensorParallelism{1};
@@ -172,7 +173,11 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> con
         auto input = std::shared_ptr(manager.gpu(shape, TRTDataType<SizeType>::value));
         kernels::invokeFill(*input, tokenId, *streamPtr);
         inputIds.emplace_back(input);
-        decoder.newRequest(b, decoder_batch::Request{inputIds[b], maxNewTokens, endId, padId}, samplingConfigs[b]);
+
+        auto decoderRequest = decoder_batch::Request{inputIds[b], maxNewTokens, endId};
+        decoderRequest.computeCumLogProbs = computeLogProbs;
+        decoderRequest.computeLogProbs = computeLogProbs;
+        decoder.newRequest(b, decoderRequest, samplingConfigs[b]);
     }
     cudaDeviceSynchronize();
 
@@ -206,13 +211,16 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> con
     EXPECT_NO_THROW(decoder.forward(outputs, inputs));
     EXPECT_THAT(decoder.getNbSteps(), ::testing::Each(maxNewTokens));
 
-    decoder.newRequest(0, decoder_batch::Request{inputIds[0], maxNewTokens}, samplingConfigs[0]);
+    auto decoderRequest = decoder_batch::Request{inputIds[0], maxNewTokens};
+    decoderRequest.computeCumLogProbs = computeLogProbs;
+    decoderRequest.computeLogProbs = computeLogProbs;
+    decoder.newRequest(0, decoderRequest, samplingConfigs[0]);
     EXPECT_FALSE(decoder.getFinished()[0]);
     EXPECT_EQ(decoder.getNbSteps()[0], 0);
 }
 
-void testDecoderWavefront(
-    nvinfer1::DataType const dtype, std::vector<SamplingConfig> const& samplingConfigs, int maxBeamWidth)
+void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingConfig> const& samplingConfigs,
+    int maxBeamWidth, bool computeLogProbs)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     SizeType constexpr tensorParallelism{1};
@@ -302,7 +310,11 @@ void testDecoderWavefront(
         auto input = std::shared_ptr(manager.gpu(shape, TRTDataType<SizeType>::value));
         kernels::invokeFill(*input, tokenId, *streamPtr);
         inputIds.emplace_back(input);
-        decoder.newRequest(b, decoder_batch::Request{inputIds[b], maxNewTokens, endId, padId}, samplingConfigs[b]);
+
+        auto decoderRequest = decoder_batch::Request{inputIds[b], maxNewTokens, endId};
+        decoderRequest.computeCumLogProbs = computeLogProbs;
+        decoderRequest.computeLogProbs = computeLogProbs;
+        decoder.newRequest(b, decoderRequest, samplingConfigs[b]);
 
         decoder.forward(outputs, inputs);
 
@@ -335,7 +347,7 @@ struct BeamConfig
     std::vector<SizeType> beamWidths;
 };
 
-class ParamTest : public ::testing::TestWithParam<std::tuple<nvinfer1::DataType, BeamConfig>>
+class ParamTest : public ::testing::TestWithParam<std::tuple<nvinfer1::DataType, BeamConfig, bool>>
 {
 };
 
@@ -343,32 +355,39 @@ TEST_P(ParamTest, Test)
 {
     nvinfer1::DataType const dtype{std::get<0>(GetParam())};
     BeamConfig const beamConfig{std::get<1>(GetParam())};
+    bool const computeLogProbs{std::get<2>(GetParam())};
     std::vector<SamplingConfig> samplingConfigs;
     for (auto const beamWidth : beamConfig.beamWidths)
     {
         samplingConfigs.emplace_back(beamWidth);
     }
 
-    testDecoder(dtype, samplingConfigs, beamConfig.maxBeamWidth);
+    testDecoder(dtype, samplingConfigs, beamConfig.maxBeamWidth, computeLogProbs);
 }
 
-INSTANTIATE_TEST_SUITE_P(GptDecoderTest, ParamTest,
+INSTANTIATE_TEST_SUITE_P(GptDecoderBatchTest, ParamTest,
     testing::Combine(testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF),
         testing::Values(BeamConfig{1, {1, 1, 1}}, BeamConfig{3, {3, 3, 3, 3}}, BeamConfig{4, {1, 1}},
-            BeamConfig{4, {3, 3, 3}}, BeamConfig{4, {1, 2, 3, 4}})),
+            BeamConfig{4, {3, 3, 3}}, BeamConfig{4, {1, 2, 3, 4}}),
+        testing::Values(false, true)),
     [](const testing::TestParamInfo<ParamTest::ParamType>& info)
     {
         std::string name{std::get<0>(info.param) == nvinfer1::DataType::kFLOAT ? "Float" : "Half"};
         BeamConfig const beamConfig = std::get<1>(info.param);
+        bool const computeLogProbs = std::get<2>(info.param);
         name.append("MaxBeamWidth" + std::to_string(beamConfig.maxBeamWidth));
-        for (auto const beamWdith : beamConfig.beamWidths)
+        for (auto const beamWidth : beamConfig.beamWidths)
         {
-            name.append("Bw" + std::to_string(beamWdith));
+            name.append("Bw" + std::to_string(beamWidth));
+        }
+        if (computeLogProbs)
+        {
+            name.append("LogProbs");
         }
         return name;
     });
 
-class ParamWavefrontTest : public ::testing::TestWithParam<std::tuple<nvinfer1::DataType, BeamConfig>>
+class ParamWavefrontTest : public ::testing::TestWithParam<std::tuple<nvinfer1::DataType, BeamConfig, bool>>
 {
 };
 
@@ -376,27 +395,34 @@ TEST_P(ParamWavefrontTest, Test)
 {
     nvinfer1::DataType const dtype{std::get<0>(GetParam())};
     BeamConfig const beamConfig{std::get<1>(GetParam())};
+    bool const computeLogProbs{std::get<2>(GetParam())};
     std::vector<SamplingConfig> samplingConfigs;
     for (auto const beamWidth : beamConfig.beamWidths)
     {
         samplingConfigs.emplace_back(beamWidth);
     }
 
-    testDecoderWavefront(dtype, samplingConfigs, beamConfig.maxBeamWidth);
+    testDecoderWavefront(dtype, samplingConfigs, beamConfig.maxBeamWidth, computeLogProbs);
 }
 
-INSTANTIATE_TEST_SUITE_P(GptDecoderTest, ParamWavefrontTest,
+INSTANTIATE_TEST_SUITE_P(GptDecoderBatchTest, ParamWavefrontTest,
     testing::Combine(testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF),
         testing::Values(BeamConfig{1, {1, 1, 1}}, BeamConfig{3, {3, 3, 3, 3}}, BeamConfig{4, {1, 1}},
-            BeamConfig{4, {3, 3, 3}}, BeamConfig{4, {1, 2, 3, 4}})),
+            BeamConfig{4, {3, 3, 3}}, BeamConfig{4, {1, 2, 3, 4}}),
+        testing::Values(false, true)),
     [](const testing::TestParamInfo<ParamTest::ParamType>& info)
     {
         std::string name{std::get<0>(info.param) == nvinfer1::DataType::kFLOAT ? "Float" : "Half"};
         BeamConfig const beamConfig = std::get<1>(info.param);
+        bool const computeLogProbs = std::get<2>(info.param);
         name.append("MaxBeamWidth" + std::to_string(beamConfig.maxBeamWidth));
         for (auto const beamWdith : beamConfig.beamWidths)
         {
             name.append("Bw" + std::to_string(beamWdith));
+        }
+        if (computeLogProbs)
+        {
+            name.append("LogProbs");
         }
         return name;
     });

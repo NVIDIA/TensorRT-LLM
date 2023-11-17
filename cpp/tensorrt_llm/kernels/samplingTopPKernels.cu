@@ -203,7 +203,6 @@ __global__ void topPSsampling(T* sortedLogProbs, int* sortedIdVals, int** ids, i
      * output.
      */
 
-    __shared__ int stopShared;
     __shared__ float randNumS;
 
     const int tid = threadIdx.x;
@@ -233,7 +232,6 @@ __global__ void topPSsampling(T* sortedLogProbs, int* sortedIdVals, int** ids, i
     // will choose the token which probability makes cumulative probability sum to exceed P'
     if (threadIdx.x == 0)
     {
-        stopShared = 0;
         randNumS = curand_uniform(curandstate + blockIdx.x) * probThreshold;
     }
 

@@ -129,14 +129,16 @@ public:
         std::optional<tc::Tensor> parent_ids;      // [max_seq_len, batch_size * beam_width], necessary in beam search
         std::optional<tc::Tensor> sequence_length; // [batch_size * beam_width], optional
         std::optional<tc::Tensor>
-            output_log_probs;      // [request_ouptut_length, batch_size * beam_width], must be float*, optional
+            output_log_probs_tiled; // [request_output_length, batch_size, beam_width], must be float*, optional
         std::optional<tc::Tensor>
-            tgt_cache_indirection; // [local_batch_size, beam_width, max_seq_len], the k/v cache index for beam search
+            output_log_probs;       // [batchSize, beam_width, request_ouptut_length], must be float*, optional
+        std::optional<tc::Tensor>
+            tgt_cache_indirection;  // [local_batch_size, beam_width, max_seq_len], the k/v cache index for beam search
         std::shared_ptr<kernels::BeamHypotheses>
-            beamHypotheses;        // a special structure which maintains some pointers of beam search
+            beamHypotheses;         // a special structure which maintains some pointers of beam search
 
-        tc::Tensor output_ids_ptr; // [batch_size] int* (2-d array), each int* has [beam_width, max_seq_len]
-        tc::Tensor parent_ids_ptr; // [batch_size] int* (2-d array), each int* has [beam_width, max_seq_len]
+        tc::Tensor output_ids_ptr;  // [batch_size] int* (2-d array), each int* has [beam_width, max_seq_len]
+        tc::Tensor parent_ids_ptr;  // [batch_size] int* (2-d array), each int* has [beam_width, max_seq_len]
     };
 
     void forward(OutputParams& outputs, ForwardParams const& params);

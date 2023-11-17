@@ -170,6 +170,8 @@ class MemoryMonitor:
         self,
         device: Optional[Union[torch.device, int]] = None,
     ) -> int:
+        if device is None:
+            device = torch.cuda.current_device()
         index = device.index if isinstance(device, torch.device) else device
         if index not in self.device_handles:
             handle = pynvml.nvmlDeviceGetHandleByIndex(index)

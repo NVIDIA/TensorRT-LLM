@@ -12,9 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from .generation import SamplingConfig  # autoflake: skip
 from .generation import (ChatGLMGenerationSession, GenerationSession,
-                         ModelConfig, SamplingConfig, to_word_list_format)
+                         ModelConfig, to_word_list_format)
 from .kv_cache_manager import GenerationSequence, KVCacheManager
+from .lora_manager import LoraManager  # autoflake: skip
+from .model_runner import ModelRunner
 from .session import Session, TensorInfo
 
 __all__ = [
@@ -22,9 +25,11 @@ __all__ = [
     'GenerationSession',
     'GenerationSequence',
     'KVCacheManager',
+    'LoraManager'
     'SamplingConfig',
     'Session',
     'TensorInfo',
     'ChatGLMGenerationSession',
     'to_word_list_format',
+    'ModelRunner',
 ]

@@ -27,6 +27,11 @@ DOCKER_PROGRESS    ?= auto
 CUDA_ARCHS         ?=
 BUILD_WHEEL_ARGS   ?= $(shell grep 'ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))
 TORCH_INSTALL_TYPE ?= skip
+CUDA_VERSION       ?=
+CUDNN_VERSION      ?=
+NCCL_VERSION       ?=
+CUBLAS_VERSION     ?=
+TRT_VERSION        ?=
 
 define add_local_user
 	docker build \
@@ -50,6 +55,11 @@ endef
 		$(if $(BASE_TAG), --build-arg BASE_TAG=$(BASE_TAG)) \
 		$(if $(BUILD_WHEEL_ARGS), --build-arg BUILD_WHEEL_ARGS="$(BUILD_WHEEL_ARGS)") \
 		$(if $(TORCH_INSTALL_TYPE), --build-arg TORCH_INSTALL_TYPE="$(TORCH_INSTALL_TYPE)") \
+		$(if $(CUDA_VERSION), --build-arg CUDA_VER="$(CUDA_VERSION)") \
+		$(if $(CUDNN_VERSION), --build-arg CUDNN_VER="$(CUDNN_VERSION)") \
+		$(if $(NCCL_VERSION), --build-arg NCCL_VER="$(NCCL_VERSION)") \
+		$(if $(CUBLAS_VERSION), --build-arg CUBLAS_VER="$(CUBLAS_VERSION)") \
+		$(if $(TRT_VERSION), --build-arg TRT_VER="$(TRT_VERSION)") \
 		$(if $(STAGE), --target $(STAGE)) \
 		--file Dockerfile.multi \
 		--tag $(IMAGE_WITH_TAG) \
@@ -92,23 +102,29 @@ wheel_%: STAGE = wheel
 
 release_%: STAGE = release
 
+# For x86_64 and aarch64
 jenkins_%: IMAGE_WITH_TAG = $(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 jenkins_%: STAGE = devel
 
+# For x86_64
 centos7_%: IMAGE_WITH_TAG = $(shell grep 'LLM_CENTOS7_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 centos7_%: STAGE = devel
-centos7_%: TORCH_INSTALL_TYPE = src_cxx11_abi
 centos7_%: BASE_IMAGE = nvidia/cuda
-centos7_%: BASE_TAG = 12.2.0-devel-centos7
+centos7_%: BASE_TAG = 12.2.2-devel-centos7
 
+# For x86_64 and aarch64
 ubuntu22_%: STAGE = devel
-ubuntu22_%: TORCH_INSTALL_TYPE = src_cxx11_abi
 ubuntu22_%: BASE_IMAGE = nvidia/cuda
-ubuntu22_%: BASE_TAG = 12.2.0-devel-ubuntu22.04
+ubuntu22_%: BASE_TAG = 12.2.2-devel-ubuntu22.04
 
+# For x86_64 and aarch64
 old-cuda_%: IMAGE_WITH_TAG = $(shell grep 'LLM_OLD_CUDA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 old-cuda_%: BASE_TAG = 23.07-py3
 old-cuda_%: STAGE = devel
+old-cuda_%: CUDA_VERSION = 12.1
+old-cuda_%: CUDNN_VERSION = 8.9.3.28-1+cuda12.1
+old-cuda_%: NCCL_VERSION = 2.18.3-1+cuda12.1
+old-cuda_%: CUBLAS_VERSION = 12.1.3.1-1
 
 build: devel_build ;
 

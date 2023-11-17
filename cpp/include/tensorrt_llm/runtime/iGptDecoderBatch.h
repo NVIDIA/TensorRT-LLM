@@ -39,10 +39,12 @@ public:
     using TensorPtr = std::shared_ptr<ITensor>;
 
     explicit Request(ConstTensorPtr ids, std::optional<SizeType> maxNewTokens = std::nullopt,
-        std::optional<SizeType> endId = std::nullopt, std::optional<SizeType> padId = std::nullopt)
+        std::optional<SizeType> endId = std::nullopt)
         : ids{std::move(ids)}
         , maxNewTokens{maxNewTokens}
         , endId{endId}
+        , computeCumLogProbs(false)
+        , computeLogProbs(false)
     {
     }
 
@@ -55,6 +57,9 @@ public:
     TensorPtr embeddingBias;              // [vocabSizePadded], on gpu
     TensorPtr badWordsList;               // [2, badWordsLength], on gpu
     TensorPtr stopWordsList;              // [2, stopWordsLength], on gpu
+
+    bool computeCumLogProbs;              // boolean that controls if cumLogProbs should be computed for that request
+    bool computeLogProbs;                 // boolean that controls if cumLogProbs should be computed for that request
 };
 
 class Input : public decoder::Input
@@ -128,9 +133,7 @@ public:
 
     //! @brief Gather final beam search results for request `batchIdx`.
     //! Result will only be available after event returned
-    //! @returns [maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token ids without
-    //! padding for request `batchIdx`, on gpu
-    virtual std::tuple<CudaEvent, TensorPtr> getFinalOutputIds(SizeType batchIdx) const = 0;
+    virtual CudaEvent finalize(SizeType batchIdx) const = 0;
 
     //! @returns [batchSize, beamWidth], marks finished requests (per beam), on gpu
     virtual TensorPtr getFinishedBeams() const = 0;
@@ -143,6 +146,15 @@ public:
 
     //! @returns [batchSize, beamWidth], cumulative log probabilities (per beam), on gpu
     virtual TensorPtr getCumLogProbs() const = 0;
+
+    //! @returns [beamWidth], cumulative log probabilities (per beam) for request batchIdx, on gpu
+    virtual TensorPtr getCumLogProbs(SizeType batchIdx) const = 0;
+
+    //! @returns [batchSize, beamWidth, maxSeqLen], log probabilities (per beam), on gpu
+    virtual TensorPtr getLogProbs() const = 0;
+
+    //! @returns [beamWidth, maxSeqLen], cumulative log probabilities (per beam) for request batchIdx, on gpu
+    virtual TensorPtr getLogProbs(SizeType batchIdx) const = 0;
 
     virtual TensorPtr getParentIds() const = 0;
 

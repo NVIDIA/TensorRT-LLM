@@ -544,9 +544,10 @@ class FLayerScope:
         FLayerInfoMemo.cur_flayer = self.layer
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        assert self.layer.layer_name != "", f"FLayer {self.layer.layer_kind} without a plugin name detected"
-        FLayerInfoMemo.instance().add(self.layer.layer_name, self.layer)
         FLayerInfoMemo.cur_flayer = None
+        if exc_type is None:
+            assert self.layer.layer_name != "", f"FLayer {self.layer.layer_kind} without a plugin name detected"
+            FLayerInfoMemo.instance().add(self.layer.layer_name, self.layer)
 
 
 def record_signature(f):

@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
+
 #include <cstdlib>
 #include <memory>
 #include <mpi.h>
@@ -24,16 +26,7 @@
 #include <vector>
 
 #define COMM_WORLD MpiComm(MPI_COMM_WORLD)
-#define MPICHECK(cmd)                                                                                                  \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        int e = cmd;                                                                                                   \
-        if (e != MPI_SUCCESS)                                                                                          \
-        {                                                                                                              \
-            printf("Failed: MPI error %s:%d '%d'\n", __FILE__, __LINE__, e);                                           \
-            exit(EXIT_FAILURE);                                                                                        \
-        }                                                                                                              \
-    } while (0)
+#define MPICHECK(cmd) TLLM_MPI_CHECK(cmd)
 
 // A wrapper module of the MPI library.
 namespace tensorrt_llm::mpi

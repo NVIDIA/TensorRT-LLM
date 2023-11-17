@@ -333,12 +333,13 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
     const half* biases_ptr = (mQuantAlgo & BIAS) ? reinterpret_cast<const half*>(inputs[mBiasesInputIdx]) : nullptr;
     const half* act_ptr = reinterpret_cast<const half*>((mQuantAlgo & PRE_QUANT_SCALE) ? workspace : inputs[0]);
 
-    TLLM_CHECK_WITH_INFO(mType == nvinfer1::DataType::kHALF
 #if defined(ENABLE_BF16)
-            || mType == nvinfer1::DataType::kBF16
-#endif
-        ,
+    TLLM_CHECK_WITH_INFO(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16,
         "No valid weightOnlyGropwiseQuantMatmul configuration");
+#else
+    TLLM_CHECK_WITH_INFO(mType == nvinfer1::DataType::kHALF, "No valid weightOnlyGropwiseQuantMatmul configuration");
+#endif
+
     tensorrt_llm::kernels::WeightOnlyActivationType weight_only_act_type;
     int real_n = n * INT8_INT4_RATIO;
     if (mType == nvinfer1::DataType::kHALF)

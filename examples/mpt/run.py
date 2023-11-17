@@ -22,6 +22,7 @@ import torch
 from transformers import AutoTokenizer, T5Tokenizer
 
 import tensorrt_llm
+from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 
 from build import get_engine_name  # isort:skip
@@ -39,11 +40,16 @@ def read_config(config_path: Path):
     hidden_size = config['builder_config']['hidden_size'] // world_size
     vocab_size = config['builder_config']['vocab_size']
     num_layers = config['builder_config']['num_layers']
-    multi_query_mode = config['builder_config']['multi_query_mode']
+    num_kv_heads = config['builder_config'].get('num_kv_heads', num_heads)
     paged_kv_cache = config['plugin_config']['paged_kv_cache']
     tokens_per_block = config['plugin_config']['tokens_per_block']
-    num_kv_heads = 1 if multi_query_mode else num_heads
     dtype = config['builder_config']['precision']
+    quant_mode = QuantMode(config['builder_config']['quant_mode'])
+
+    num_kv_heads = (num_kv_heads + world_size - 1) // world_size
+    assert (num_heads % world_size) == 0
+    num_heads = num_heads // world_size
+    hidden_size = hidden_size // world_size
 
     model_config = ModelConfig(num_heads=num_heads,
                                num_kv_heads=num_kv_heads,
@@ -54,6 +60,7 @@ def read_config(config_path: Path):
                                remove_input_padding=remove_input_padding,
                                paged_kv_cache=paged_kv_cache,
                                tokens_per_block=tokens_per_block,
+                               quant_mode=quant_mode,
                                dtype=dtype)
 
     dtype = config['builder_config']['precision']

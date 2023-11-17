@@ -217,7 +217,7 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     masked_multihead_attention(params, input_params.kv_block_array, stream);
 }
 
-#define INSTANTIATE_MMHA_DISPATH(T_MMHA, T)                                                                            \
+#define INSTANTIATE_MMHA_DISPATCH(T_MMHA, T)                                                                           \
     template void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, false>&,                       \
         const FusedQKVMaskedAttentionDispatchParams<T, KVLinearBuffer>&, cudaStream_t stream);                         \
     template void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, true>&,                        \
@@ -226,12 +226,12 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
         const FusedQKVMaskedAttentionDispatchParams<T, KVBlockArray>&, cudaStream_t stream);                           \
     template void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, true>&,                        \
         const FusedQKVMaskedAttentionDispatchParams<T, KVBlockArray>&, cudaStream_t stream);
-INSTANTIATE_MMHA_DISPATH(float, float)
-INSTANTIATE_MMHA_DISPATH(uint16_t, half)
+INSTANTIATE_MMHA_DISPATCH(float, float)
+INSTANTIATE_MMHA_DISPATCH(uint16_t, half)
 #ifdef ENABLE_BF16
-INSTANTIATE_MMHA_DISPATH(__nv_bfloat16, __nv_bfloat16)
+INSTANTIATE_MMHA_DISPATCH(__nv_bfloat16, __nv_bfloat16)
 #endif
-#undef INSTANTIATE_MMHA_DISPATH
+#undef INSTANTIATE_MMHA_DISPATCH
 
 GPTAttentionPluginCommon::GPTAttentionPluginCommon(int num_heads, int num_kv_heads, int head_size, int unidirectional,
     float q_scaling, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
@@ -498,7 +498,8 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
     const size_t qk_buf_float_size = mEnableContextFMHA ? 0
                                                         : sizeof(float) * params.batch_size * mNumHeads
             * params.input_seq_length * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
-    const size_t padding_offset_size = sizeof(int) * params.batch_size * params.input_seq_length;
+    const size_t padding_offset_size
+        = sizeof(int) * params.batch_size * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
 
     const bool is_qk_buf_float_ = true;
 
@@ -517,14 +518,17 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
     int* padding_offset = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, padding_offset_size));
 
     // build attention_mask, cu_seqlens, and padding_offset tensors
+    // Note: self attn and cross attn should use different params
+    // cross attn's seqlen info is from encoder input lengths, not decoder input lengths!
+    // moreover, attn mask for cross attn should be set separately (see below)
     BuildDecoderInfoParams<T> decoder_params;
     memset(&decoder_params, 0, sizeof(decoder_params));
     decoder_params.seqOffsets = cu_seqlens;
     decoder_params.paddingOffsets = padding_offset;
-    decoder_params.attentionMask = attention_mask;
-    decoder_params.seqLengths = params.context_lengths;
+    decoder_params.attentionMask = isCrossAttention() ? nullptr : attention_mask; // manually set for cross attn
+    decoder_params.seqLengths = isCrossAttention() ? params.encoder_input_lengths : params.context_lengths;
     decoder_params.batchSize = params.batch_size;
-    decoder_params.maxSeqLength = params.input_seq_length;
+    decoder_params.maxSeqLength = isCrossAttention() ? params.cross_qkv_length : params.input_seq_length;
     decoder_params.maxKvCacheLength = params.cyclic_kv_cache_length;
     decoder_params.numTokens = params.num_tokens;
     decoder_params.attentionMaskType = mMaskType;
@@ -533,9 +537,27 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
 
     // In cross attention context phase, the attention mask should be a matrix of all ones.
     // We reassign attention_mask to override what previous invokeBuildDecoderInfo() does
+    // also, invokeBuildDecoderInfo can only handle square mask, not cross B x q_len x kv_len mask
+    // TODO: put this logic in the kernel above. currently not much concern because q_len is mostly = 1
     if (isCrossAttention())
     {
-        std::vector<T> h_attention_mask(params.batch_size * params.cross_qkv_length * params.input_seq_length, 1.);
+        std::vector<T> h_attention_mask(params.batch_size * params.input_seq_length * params.cross_qkv_length, 1.);
+        std::vector<int32_t> h_encoder_input_lengths(params.batch_size);
+        cudaMemcpyAsync(h_encoder_input_lengths.data(), params.encoder_input_lengths,
+            sizeof(int32_t) * params.batch_size, cudaMemcpyDeviceToHost, stream);
+        for (int bi = 0; bi < params.batch_size; bi++)
+        {
+            int b_offset = bi * params.input_seq_length * params.cross_qkv_length;
+            for (int qi = 0; qi < params.input_seq_length; qi++)
+            {
+                int q_offset = b_offset + qi * params.cross_qkv_length;
+                if (h_encoder_input_lengths[bi] < params.cross_qkv_length)
+                {
+                    std::fill(h_attention_mask.begin() + q_offset + h_encoder_input_lengths[bi],
+                        h_attention_mask.begin() + q_offset + params.cross_qkv_length, 0.f);
+                }
+            }
+        }
         cudaMemcpyAsync(attention_mask, h_attention_mask.data(),
             sizeof(T) * params.batch_size * params.cross_qkv_length * params.input_seq_length, cudaMemcpyHostToDevice,
             stream);
@@ -580,6 +602,8 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
         // FIXME: a temporary solution to make sure the padding part of key/value buffer is 0
         // NOTE: pointer subtraction is used below since there could be some extra gap due to alignment.
         //  Otherwise, we could do cudaMemsetAsync(k_buf_2_, 0, k_buf_2_size + v_buf_2_size, stream);
+        // cudaMemsetAsync(k_buf_2_, 0, reinterpret_cast<int8_t*>(qk_buf_) - reinterpret_cast<int8_t*>(k_buf_2_),
+        // stream);
         cudaMemsetAsync(k_buf_2_, 0,
             reinterpret_cast<int8_t*>(v_buf_2_) - reinterpret_cast<int8_t*>(k_buf_2_) + v_buf_2_size, stream);
 
@@ -698,23 +722,22 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
             }
         }
 
-        // add relative position bias
-        if (isRelativePosition())
-        {
-            // Add relative_attention_bias
-            // QK is (batch_size, local_head_num, q_length, k_length), relative_attention_bias is (1, local_head_num,
-            // max_output_len + 1, max_output_len + 1).
-            // broadcast along 1st dim. max_seq_len is already max_output_len + 1.
-            // In implicit mode, relative_attention_bias is relative_attention_table [num_heads, num_buckets], with
-            // necessary params (max_distance, num_buckets) passed at the end
-            invokeAddRelativeAttentionBiasUnaligned(qk_buf_float_, relative_attention_bias, params.batch_size,
-                mNumHeads, attention_seq_len_1,
-                isCrossAttention() ? params.cross_qkv_length : params.cyclic_kv_cache_length, stream, max_distance > 0,
-                relative_attention_bias_stride, max_distance, true /* bidirectional */);
-        }
-
         if (is_qk_buf_float_ == true)
         {
+            // add relative position bias
+            if (isRelativePosition())
+            {
+                // Add relative_attention_bias
+                // QK is (batch_size, local_head_num, q_length, k_length), relative_attention_bias is (1,
+                // local_head_num, max_output_len + 1, max_output_len + 1). broadcast along 1st dim. max_seq_len is
+                // already max_output_len + 1. In implicit mode, relative_attention_bias is relative_attention_table
+                // [num_heads, num_buckets], with necessary params (max_distance, num_buckets) passed at the end
+                invokeAddRelativeAttentionBiasUnaligned(qk_buf_float_, relative_attention_bias, params.batch_size,
+                    mNumHeads, attention_seq_len_1,
+                    isCrossAttention() ? params.cross_qkv_length : params.cyclic_kv_cache_length, stream,
+                    max_distance > 0, relative_attention_bias_stride, max_distance, true /* bidirectional */);
+            }
+
             MaskedSoftmaxParam<T, float> param;
             param.attention_score = qk_buf_;       // (batch_size, head_num, q_length, k_length)
             param.qk = qk_buf_float_;              // (batch_size, head_num, q_length, k_length)
@@ -729,6 +752,19 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
         }
         else
         {
+            // add relative position bias
+            if (isRelativePosition())
+            {
+                // Add relative_attention_bias
+                // QK is (batch_size, local_head_num, q_length, k_length), relative_attention_bias is (1,
+                // local_head_num, max_output_len + 1, max_output_len + 1). broadcast along 1st dim. max_seq_len is
+                // already max_output_len + 1. In implicit mode, relative_attention_bias is relative_attention_table
+                // [num_heads, num_buckets], with necessary params (max_distance, num_buckets) passed at the end
+                invokeAddRelativeAttentionBiasUnaligned(qk_buf_, relative_attention_bias, params.batch_size, mNumHeads,
+                    attention_seq_len_1, isCrossAttention() ? params.cross_qkv_length : params.cyclic_kv_cache_length,
+                    stream, max_distance > 0, relative_attention_bias_stride, max_distance, true /* bidirectional */);
+            }
+
             MaskedSoftmaxParam<T, T> param;
             param.attention_score = qk_buf_;       // (batch_size, head_num, q_length, k_length)
             param.qk = qk_buf_;                    // (batch_size, head_num, q_length, k_length)
@@ -935,7 +971,6 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     dispatch_params.input_lengths = params.context_lengths;
     dispatch_params.step = step;
     dispatch_params.q_scaling = q_scaling;
-    dispatch_params.relative_attention_bias_stride = relative_attention_bias_stride;
     dispatch_params.linear_bias_slopes = isALiBi() ? params.alibi_slopes : nullptr;
     dispatch_params.ia3_tasks = ia3_tasks;
     dispatch_params.ia3_key_weights = ia3_key_weights;

@@ -51,7 +51,8 @@ class GenerationMixin:
                              mapping=Mapping(),
                              max_num_tokens=None,
                              prompt_embedding_table_size: int = 0,
-                             is_chatglm6b=False):
+                             position_encoding_2d=False,
+                             use_lora_plugin: bool = False):
 
         max_len = max_input_len + max_new_tokens
 
@@ -134,7 +135,7 @@ class GenerationMixin:
                          [1, 1] if enable_two_optimization_profiles else [1]),
                         ('num_tokens', num_tokens_range),
                     ]))
-                if is_chatglm6b:
+                if position_encoding_2d:
                     position_ids = Tensor(
                         name='position_ids',
                         dtype=trt.int32,
@@ -184,7 +185,7 @@ class GenerationMixin:
                                        ('batch_size_beam_width', bb_range),
                                        ('input_len', inlen_range),
                                    ]))
-                if is_chatglm6b:
+                if position_encoding_2d:
                     position_ids = Tensor(
                         name='position_ids',
                         dtype=trt.int32,
@@ -381,7 +382,7 @@ class GenerationMixin:
 
         if use_gpt_attention_plugin:
             host_max_kv_cache_lengths = []
-            for i in range(num_layers):
+            for i in layers_range:
                 host_kv_cache_length_tensor = Tensor(
                     name=f'host_max_kv_cache_length_{i}',
                     dtype=trt.int32,
@@ -467,6 +468,29 @@ class GenerationMixin:
                      [1, 1] if enable_two_optimization_profiles else [1])
                 ]))
 
+        lora_weights_pointers_list = None
+        lora_ranks = None
+        if use_lora_plugin:
+            lora_weights_pointers_list = []
+            for i in layers_range:
+                lora_weights_pointers = Tensor(
+                    name=f'lora_weights_pointers_{i}',
+                    dtype=trt.int64,
+                    shape=[-1, 2],
+                    dim_range=OrderedDict([
+                        ('batch_size_beam_width', bb_range),
+                        ('in_out',
+                         [2, 2] if enable_two_optimization_profiles else [2]),
+                    ]))
+                lora_weights_pointers_list.append(lora_weights_pointers)
+
+            lora_ranks = Tensor(
+                name='lora_ranks',
+                dtype=trt.int32,
+                shape=[-1],
+                dim_range=OrderedDict([('batch_size_beam_width', bb_range)]),
+            )
+
         return {
             'input_ids': input_ids,
             'hidden_states_input': hidden_states,
@@ -486,4 +510,6 @@ class GenerationMixin:
             'tasks': tasks,
             'prompt_vocab_size': prompt_vocab_size,
             'all_reduce_workspace': all_reduce_workspace,
+            'lora_ranks': lora_ranks,
+            'lora_weights_pointers_list': lora_weights_pointers_list,
         }

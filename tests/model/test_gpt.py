@@ -30,6 +30,8 @@ from transformers import GPT2Config, GPT2LMHeadModel
 import tensorrt_llm
 from tensorrt_llm import Builder
 from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm.functional import RotaryScalingType
+from tensorrt_llm.layers import PositionEmbeddingType
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
@@ -898,6 +900,36 @@ class TestGPT(unittest.TestCase):
         ref = ref_output_ids[:, -max_new_tokens:]
 
         np.testing.assert_allclose(ref.cpu().numpy(), res.cpu().numpy())
+
+    def test_rope_scaling_is_set_in_attention(self):
+        num_layers = 2
+        position_embedding_type = PositionEmbeddingType.rope_gpt_neox
+        rotary_embedding_percentage = 0.3
+        rotary_base = 99999.1
+        rotary_scaling = {"type": "linear", "factor": 2.72}
+        tensorrt_llm_gpt = tensorrt_llm.models.GPTLMHeadModel(
+            num_layers=num_layers,
+            num_heads=4,
+            hidden_size=128,
+            vocab_size=256,
+            hidden_act='gelu',
+            max_position_embeddings=1024,
+            dtype=trt.float16,
+            position_embedding_type=position_embedding_type,
+            rotary_embedding_percentage=rotary_embedding_percentage,
+            rotary_base=rotary_base,
+            rotary_scaling=rotary_scaling,
+        )
+        for layer_i in range(num_layers):
+            assert tensorrt_llm_gpt.layers[
+                layer_i].attention.rotary_embedding_base == rotary_base
+            assert tensorrt_llm_gpt.layers[
+                layer_i].attention.rotary_embedding_scale == rotary_scaling[
+                    "factor"]
+            assert tensorrt_llm_gpt.layers[
+                layer_i].attention.rotary_embedding_scale_type == RotaryScalingType.linear
+            assert tensorrt_llm_gpt.layers[
+                layer_i].attention.position_embedding_type == position_embedding_type
 
 
 if __name__ == '__main__':

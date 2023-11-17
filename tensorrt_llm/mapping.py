@@ -64,6 +64,9 @@ class Mapping(object):
         self.tp_group = self.tp_groups[self.pp_rank]
         self.pp_group = self.pp_groups[self.tp_rank]
 
+    def has_tp(self):
+        return self.tp_size > 1
+
     def is_last_pp_rank(self):
         return self.pp_rank == self.pp_size - 1
 

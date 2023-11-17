@@ -41,10 +41,13 @@ GptDecoder<T>::GptDecoder(size_t vocabSize, size_t vocabSizePadded, CudaStreamPt
 
     mDynamicDecodeLayer = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(
         vocabSize, vocabSizePadded, stream->get(), &mAllocator, isFreeBufferAfterForward, &prop);
+
+    auto constexpr nvFloatType = TRTDataType<float>::value;
+    mLogProbsTiled = mManager.emptyTensor(MemoryType::kGPU, nvFloatType);
 }
 
 template <typename T>
-void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize)
+void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType maxSequenceLength)
 {
     typename layers::DynamicDecodeLayer<T>::SetupParams setupParams;
 
@@ -71,6 +74,10 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
     setupParams.length_penalty = samplingConfig.lengthPenalty;
 
     mDynamicDecodeLayer->setup(batchSize, samplingConfig.beamWidth, setupParams);
+
+    mLogProbsTiled->reshape(
+        ITensor::makeShape({maxSequenceLength, static_cast<SizeType>(batchSize), samplingConfig.beamWidth}));
+    mManager.setZero(*mLogProbsTiled);
 }
 
 namespace
@@ -128,7 +135,7 @@ typename tl::DynamicDecodeLayer<T>::ForwardParams prepareInputs(DecodingInput co
 
 template <typename T>
 typename tl::DynamicDecodeLayer<T>::OutputParams prepareOutputs(
-    DecodingOutput& output, DecodingInput::TensorPtr const& inputLengths)
+    DecodingOutput& output, DecodingInput::TensorPtr const& inputLengths, DecodingOutput::TensorPtr& logProbsTiled)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     typename tl::DynamicDecodeLayer<T>::OutputParams outputParams(tcc::toTllmTensor(*output.ids));
@@ -168,6 +175,7 @@ typename tl::DynamicDecodeLayer<T>::OutputParams prepareOutputs(
     if (output.logProbs)
     {
         outputParams.output_log_probs = tcc::toTllmTensor(*output.logProbs);
+        outputParams.output_log_probs_tiled = tcc::toTllmTensor(*logProbsTiled);
     }
 
     outputParams.beamHypotheses = std::make_shared<tensorrt_llm::kernels::BeamHypotheses>();
@@ -218,7 +226,7 @@ bool GptDecoder<T>::forward(DecodingOutput& output, DecodingInput const& input)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto forwardParams = prepareInputs<T>(input);
-    auto outputParams = prepareOutputs<T>(output, input.lengths);
+    auto outputParams = prepareOutputs<T>(output, input.lengths, mLogProbsTiled);
 
     BufferManager::ITensorPtr finishedSum;
     std::int32_t* finishedSumHost = nullptr;
@@ -256,19 +264,14 @@ void GptDecoder<T>::forwardAsync(DecodingOutput& output, DecodingInput const& in
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto forwardParams = prepareInputs<T>(input);
-    auto outputParams = prepareOutputs<T>(output, input.lengths);
+    auto outputParams = prepareOutputs<T>(output, input.lengths, mLogProbsTiled);
 
     mDynamicDecodeLayer->forward(outputParams, forwardParams);
 }
 
-namespace tensorrt_llm::runtime
-{
-template class GptDecoder<float>;
-template class GptDecoder<half>;
-} // namespace tensorrt_llm::runtime
-
 // this should be similar to gatherTree in cpp/tensorrt_llm/thop/gatherTreeOp.cpp
-void IGptDecoder::gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput,
+template <typename T>
+void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput,
     DecodingInput const& decodingInput, BufferManager const& manager)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
@@ -300,7 +303,7 @@ void IGptDecoder::gatherTree(ITensor& finalOutputIds, DecodingOutput const& deco
     beamHypotheses.sequence_lengths_src = bufferCast<SizeType>(*decodingOutput.lengths);
     beamHypotheses.parent_ids_src = bufferCast<TokenIdType>(*decodingOutput.parentIds);
     beamHypotheses.output_ids_src = bufferCast<TokenIdType>(*decodingOutput.ids);
-    beamHypotheses.log_probs_src = nullptr;
+    beamHypotheses.log_probs_src = bufferCast<float>(*mLogProbsTiled);
     beamHypotheses.max_seq_len = maxSeqLength;
     beamHypotheses.length_penalties
         = nullptr; // TODO (bhsueh) should set length penalties, this should be a gpu tensor When it is set as
@@ -316,17 +319,24 @@ void IGptDecoder::gatherTree(ITensor& finalOutputIds, DecodingOutput const& deco
     beamHypotheses.is_done = bufferCast<bool>(*decodingOutput.beamHypotheses.isDone);
     beamHypotheses.input_lengths = bufferCast<SizeType>(*decodingInput.lengths);
 
+    // This is where transpose is done
     tensorrt_llm::kernels::invokeInsertUnfinishedPath(beamHypotheses, bufferCast<bool>(*decodingOutput.finished),
         bufferCast<float>(*decodingOutput.cumLogProbs), batchSize, beamWidth, stream.get());
     sync_check_cuda_error();
 
     tensorrt_llm::kernels::invokeFinalize(bufferCast<TokenIdType>(finalOutputIds),
         bufferCast<SizeType>(*decodingOutput.lengths), bufferCast<float>(*decodingOutput.cumLogProbs),
-        nullptr, // output_logs
-        beamHypotheses.output_ids_tgt, beamHypotheses.sequence_lengths_tgt, beamHypotheses.normed_scores,
-        beamHypotheses.cum_log_probs, beamHypotheses.log_probs, beamHypotheses.num_beams, beamHypotheses.input_lengths,
-        beamWidth, maxSeqLength, batchSize, stream.get());
+        decodingOutput.logProbs ? bufferCast<float>(*decodingOutput.logProbs) : nullptr, beamHypotheses.output_ids_tgt,
+        beamHypotheses.sequence_lengths_tgt, beamHypotheses.normed_scores, beamHypotheses.cum_log_probs,
+        beamHypotheses.log_probs, beamHypotheses.num_beams, beamHypotheses.input_lengths, beamWidth, maxSeqLength,
+        batchSize, stream.get());
     sync_check_cuda_error();
 
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
+
+namespace tensorrt_llm::runtime
+{
+template class GptDecoder<float>;
+template class GptDecoder<half>;
+} // namespace tensorrt_llm::runtime

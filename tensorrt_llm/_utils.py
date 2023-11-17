@@ -17,6 +17,7 @@ import json
 import math
 import struct
 from functools import partial
+from pathlib import Path, PosixPath
 
 import numpy as np
 import tensorrt as trt
@@ -30,14 +31,29 @@ def torch_to_numpy(x: torch.Tensor):
     assert isinstance(x, torch.Tensor), \
         f'x must be a torch.Tensor object, but got {type(x)}.'
     if x.dtype != torch.bfloat16:
-        return x.cpu().numpy()
-    return x.view(torch.int16).cpu().numpy().view(np_bfloat16)
+        return x.detach().cpu().numpy()
+    return x.view(torch.int16).detach().cpu().numpy().view(np_bfloat16)
 
 
 def numpy_to_torch(x):
     if x.dtype != np_bfloat16:
         return torch.tensor(x)
     return torch.tensor(x.view(np.int16)).view(torch.bfloat16)
+
+
+def numpy_to_dtype(x, dtype: str):
+    if x.dtype == np_bfloat16:
+        # BF16 --> non-BF16 or BF16
+        if dtype != 'bfloat16':
+            torch_to_numpy(numpy_to_torch(x).to(str_dtype_to_torch(dtype)))
+        else:
+            return x
+    else:
+        # non-BF16 types --> non-BF16 or BF16
+        if dtype != 'bfloat16':
+            return x.astype(str_dtype_to_np(dtype))
+        else:
+            return torch_to_numpy(torch.from_numpy(x).to(torch.bfloat16))
 
 
 fp32_array = partial(np.array, dtype=np.float32)
@@ -115,14 +131,12 @@ _np_to_trt_dtype_dict = {
     np.dtype('int32'): trt.int32,
     np.dtype('float16'): trt.float16,
     np.dtype('float32'): trt.float32,
+    np_bfloat16: trt.bfloat16,
+    np.bool_: trt.bool,
 }
 
 
 def np_dtype_to_trt(dtype):
-    if trt_version() >= '7.0' and dtype == np.bool_:
-        return trt.bool
-    if trt_version() >= '9.0' and dtype == np_bfloat16:
-        return trt.bfloat16
     ret = _np_to_trt_dtype_dict.get(dtype)
     assert ret is not None, f'Unsupported dtype: {dtype}'
     return ret
@@ -134,12 +148,11 @@ _trt_to_np_dtype_dict = {
     trt.float16: np.float16,
     trt.float32: np.float32,
     trt.bool: np.bool_,
+    trt.bfloat16: np_bfloat16,
 }
 
 
 def trt_dtype_to_np(dtype):
-    if trt_version() >= '9.0' and dtype == trt.bfloat16:
-        return np_bfloat16
     ret = _trt_to_np_dtype_dict.get(dtype)
     assert ret is not None, f'Unsupported dtype: {dtype}'
     return ret
@@ -162,12 +175,11 @@ _trt_to_torch_dtype_dict = {
     trt.float32: torch.float32,
     trt.int32: torch.int32,
     trt.int8: torch.int8,
+    trt.bfloat16: torch.bfloat16
 }
 
 
 def trt_dtype_to_torch(dtype):
-    if trt_version() >= '9.0' and dtype == trt.bfloat16:
-        return torch.bfloat16
     ret = _trt_to_torch_dtype_dict.get(dtype)
     assert ret is not None, f'Unsupported dtype: {dtype}'
     return ret
@@ -242,3 +254,18 @@ def numpy_fp32_to_bf16(src):
         bytes = struct.pack('<f', src[i])
         dst[i] = struct.unpack('<H', struct.pack('BB', bytes[2], bytes[3]))[0]
     return dst.reshape(original_shape).view(np_bfloat16)
+
+
+def fromfile(dir_path, name, shape=None, dtype=None):
+    dtype = np_dtype if dtype is None else dtype
+    p = dir_path
+    if not isinstance(p, PosixPath):
+        p = Path(p)
+    p = p / name
+
+    if Path(p).exists():
+        t = np.fromfile(p, dtype=dtype)
+        if shape is not None:
+            t = t.reshape(shape)
+        return t
+    return None

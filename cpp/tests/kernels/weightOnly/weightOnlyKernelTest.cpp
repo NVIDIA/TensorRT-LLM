@@ -9,7 +9,6 @@
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/kernelLauncher.h"
 
 #include <algorithm>
-#include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -64,11 +63,19 @@ struct BType<WeightOnlyQuantType::Int8b>
 struct CutlassKernel;
 struct CudaKernel;
 
+void simple_assert(bool flag)
+{
+    if (!flag)
+    {
+        throw std::runtime_error("assert failed");
+    }
+}
+
 template <typename KernelFlag, WeightOnlyActivationType AFlag, WeightOnlyQuantType BFlag>
 float benchmark_perchannel(void* act, void* weight, void* scales, void* zeros, void* bias, void* out, int m, int n,
     int k, int group_size, int warmup, int iter)
 {
-    assert(zeros == nullptr && bias == nullptr && group_size == 0);
+    simple_assert(zeros == nullptr && bias == nullptr && group_size == 0);
     cudaStream_t s;
     cudaStreamCreate(&s);
     cudaEvent_t begin, end;
@@ -115,7 +122,6 @@ float benchmark_perchannel(void* act, void* weight, void* scales, void* zeros, v
             cudaEventSynchronize(end);
             float time;
             cudaEventElapsedTime(&time, begin, end);
-            fast_time = std::min(fast_time, time);
             if (time < fast_time)
             {
                 fast_time = time;
@@ -127,7 +133,6 @@ float benchmark_perchannel(void* act, void* weight, void* scales, void* zeros, v
         {
             gemm.gemm(act, weight, scales, out, m, n, k, best_config, ws_ptr, ws_bytes, s);
         }
-        cudaProfilerStart();
         cudaEventRecord(begin, s);
         for (int i = 0; i < iter; ++i)
         {
@@ -151,7 +156,7 @@ template <typename KernelFlag, WeightOnlyActivationType AFlag, WeightOnlyQuantTy
 float benchmark_groupwise(void* act, void* weight, void* scales, void* zeros, void* bias, void* out, int m, int n,
     int k, int group_size, int warmup, int iter)
 {
-    assert(zeros && bias && (group_size == 64 || group_size == 128));
+    simple_assert(zeros && bias && (group_size == 64 || group_size == 128));
     cudaStream_t s;
     cudaStreamCreate(&s);
     cudaEvent_t begin, end;
@@ -198,7 +203,6 @@ float benchmark_groupwise(void* act, void* weight, void* scales, void* zeros, vo
             cudaEventSynchronize(end);
             float time;
             cudaEventElapsedTime(&time, begin, end);
-            fast_time = std::min(fast_time, time);
             if (time < fast_time)
             {
                 fast_time = time;
@@ -210,7 +214,6 @@ float benchmark_groupwise(void* act, void* weight, void* scales, void* zeros, vo
         {
             gemm.gemm(act, weight, scales, zeros, bias, out, m, n, k, group_size, best_config, ws_ptr, ws_bytes, s);
         }
-        cudaProfilerStart();
         cudaEventRecord(begin, s);
         for (int i = 0; i < iter; ++i)
         {
@@ -379,11 +382,20 @@ bool benchmark(int m, int n, int k, int group_size, int warmup, int iter)
     }
 
     float time1, time2;
-    time1 = benchmark_perchannel<CudaKernel, AFlag, BFlag>(
-        d_act.data(), d_weight.data(), d_scales.data(), p_zeros, p_bias, d_out.data(), m, n, k, 0, warmup, iter);
+    std::function<decltype(benchmark_perchannel<CudaKernel, AFlag, BFlag>)> benchmark_func_cuda
+        = benchmark_perchannel<CudaKernel, AFlag, BFlag>;
+    std::function<decltype(benchmark_perchannel<CutlassKernel, AFlag, BFlag>)> benchmark_func_cutlass
+        = benchmark_perchannel<CutlassKernel, AFlag, BFlag>;
+    if (group_size != 0)
+    {
+        benchmark_func_cuda = benchmark_groupwise<CudaKernel, AFlag, BFlag>;
+        benchmark_func_cutlass = benchmark_groupwise<CutlassKernel, AFlag, BFlag>;
+    }
+    time1 = benchmark_func_cuda(d_act.data(), d_weight.data(), d_scales.data(), p_zeros, p_bias, d_out.data(), m, n, k,
+        group_size, warmup, iter);
     d_out.copy_to(h_out1.data());
-    time2 = benchmark_perchannel<CutlassKernel, AFlag, BFlag>(
-        d_act.data(), d_weight.data(), d_scales.data(), p_zeros, p_bias, d_out.data(), m, n, k, 0, warmup, iter);
+    time2 = benchmark_func_cutlass(d_act.data(), d_weight.data(), d_scales.data(), p_zeros, p_bias, d_out.data(), m, n,
+        k, group_size, warmup, iter);
     d_out.copy_to(h_out2.data());
     float quant_scale = 1.f / (1 << (8 / elem_per_byte - 1));
     bool pass = compare<AT>(h_out1.data(), h_out2.data(), m * n, quant_scale);

@@ -20,7 +20,6 @@ import shutil as _shutil
 import subprocess as _sp
 import sys
 import typing as _tp
-from collections import OrderedDict as _OrderedDict
 from pathlib import Path as _Path
 
 import torch.multiprocessing as _mp
@@ -35,11 +34,11 @@ engine_target_path = _pl.Path(
 import build as _ecb
 
 
-def build_engine(model_version: str, weight_dir: _pl.Path, engine_dir: _pl.Path,
+def build_engine(model_name: str, weight_dir: _pl.Path, engine_dir: _pl.Path,
                  world_size, *args):
     args = [
         '-m',
-        str(model_version),
+        str(model_name),
         '--log_level=error',
         '--model_dir',
         str(weight_dir),
@@ -47,6 +46,8 @@ def build_engine(model_version: str, weight_dir: _pl.Path, engine_dir: _pl.Path,
         str(engine_dir),
         '--max_batch_size=2',
         '--max_beam_width=2',
+        "--max_input_len=512",
+        "--max_output_len=512",
         '--builder_opt=0',
         f'--world_size={world_size}',
     ] + list(args)
@@ -64,14 +65,8 @@ def run_command(command: _tp.Sequence[str], *, cwd=None, **kwargs) -> None:
 
 def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
 
-    model_name_dict = _OrderedDict([
-        ["chatglm-6b", "1"],
-        ["chatglm2-6b", "2"],
-        ["chatglm3-6b", "3"],
-    ])
-    hf_dir_list = [
-        resources_dir / model_name for model_name in model_name_dict.keys()
-    ]
+    model_name_list = ["chatglm_6b", "chatglm2_6b", "chatglm3_6b"]
+    hf_dir_list = [resources_dir / model_name for model_name in model_name_list]
     trt_dir = resources_dir / "trtModel"
 
     run_command(
@@ -80,21 +75,23 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
         cwd=resources_dir)
 
     # Clone the model directory
-    for model_name, hf_dir in zip(model_name_dict.keys(), hf_dir_list):
+    for model_name, hf_dir in zip(model_name_list, hf_dir_list):
         if not _Path(hf_dir).exists():
             run_command(
                 [
                     "git",
                     "clone",
-                    "https://huggingface.co/THUDM/" + model_name,
+                    "https://huggingface.co/THUDM/" +
+                    model_name.replace("_", "-"),
+                    model_name,
                 ],
                 cwd=resources_dir,
             )
 
     print("\nBuilding engines")
-    for model, hf_dir in zip(model_name_dict.items(), hf_dir_list):
-        print("Building %s" % model[0])
-        build_engine(model[1], hf_dir, trt_dir, world_size)
+    for model_name, hf_dir in zip(model_name_list, hf_dir_list):
+        print("Building %s" % model_name)
+        build_engine(model_name, hf_dir, trt_dir, world_size)
 
     if not _Path(engine_target_path).exists():
         _Path(engine_target_path).mkdir(parents=True, exist_ok=True)

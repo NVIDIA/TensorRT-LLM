@@ -81,4 +81,7 @@ void tileTensorInplace(ITensor& tensor, SizeType beamWidth, CudaStream const& st
 void gatherLastTokenLogits(
     ITensor& output, ITensor const& input, ITensor const& lastTokenIds, CudaStream const& stream);
 
+void copyLatestTokenLogitsInGeneration(ITensor& output, ITensor const& input, SizeType step, SizeType firstBatchSlotIdx,
+    SizeType microBatchSize, SizeType beamWidth, CudaStream const& stream);
+
 } // namespace tensorrt_llm::runtime::kernels

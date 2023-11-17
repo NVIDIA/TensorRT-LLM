@@ -43,6 +43,7 @@ public:
     using TokenIdType = runtime::TokenIdType;
     using RequestIdType = std::uint64_t;
     using BeamTokens = std::vector<std::vector<TokenIdType>>;
+    using VecLogProbs = std::vector<float>;
     using TensorPtr = runtime::ITensor::SharedPtr;
 
     LlmRequest(RequestIdType requestId, SizeType maxNewTokens, std::shared_ptr<std::vector<TokenIdType>> input_tokens,
@@ -50,7 +51,7 @@ public:
         std::optional<SizeType> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
         std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
-        std::optional<SizeType> promptVocabSize = std::nullopt)
+        std::optional<SizeType> promptVocabSize = std::nullopt, bool returnLogProbs = false)
         : mRequestId(requestId)
         , mPromptLen(input_tokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -60,11 +61,15 @@ public:
         , mEndId(endId)
         , mPadId(padId)
         , mBatchSlot(-1)
+        , mOrigPromptLen(input_tokens->size())
         , mEmbeddingBias(embeddingBias)
         , mBadWordsList(badWordsList)
         , mStopWordsList(stopWordsList)
         , mPromptEmbeddingTable(promptEmbeddingTable)
         , mPromptVocabSize(promptVocabSize)
+        , mReturnLogProbs(returnLogProbs)
+        , mLogProbs(samplingConfig.beamWidth)
+        , mCumLogProbs(samplingConfig.beamWidth)
     {
         mMaxSentTokenPos = mPromptLen - 1;
         // Scatter the input tokens to other beam
@@ -168,17 +173,29 @@ public:
         // As a temporary solution, we currently reset the tokens to the prompt
         if (mSamplingConfig.beamWidth > 1)
         {
-            for (auto& beamTokens : *mTokens)
+            for (std::size_t beam = 0; beam < mTokens->size(); ++beam)
             {
+                auto& beamTokens = mTokens->at(beam);
                 beamTokens.resize(mPromptLen);
+                if (mReturnLogProbs)
+                {
+                    mLogProbs.at(beam).clear();
+                }
             }
         }
         else
         {
             SizeType newPromptLen = std::min(maxInputLen, mPromptLen + getMaxNumGeneratedTokens());
-            for (auto& beamTokens : *mTokens)
+            for (std::size_t beam = 0; beam < mTokens->size(); ++beam)
             {
+                auto& beamTokens = mTokens->at(beam);
                 beamTokens.resize(newPromptLen);
+
+                if (mReturnLogProbs)
+                {
+                    auto& logProb = mLogProbs.at(beam);
+                    logProb.resize(newPromptLen - mPromptLen);
+                }
             }
             mMaxNewTokens -= (newPromptLen - mPromptLen);
             mPromptLen = newPromptLen;
@@ -187,16 +204,16 @@ public:
         mBatchSlot = -1;
     }
 
-    /// @brief Get the maximum position of the tokens returned to the client. Use to ensure we don't return to client
-    /// duplicated token positions.
+    /// @brief Get the maximum position of the tokens returned to the client. Use to ensure we don't return to
+    /// client duplicated token positions.
     /// @return The maximum position of the tokens sent to the client
     SizeType getMaxSentTokenPos() const
     {
         return mMaxSentTokenPos;
     }
 
-    /// @brief Sets the maximum position of the tokens returned to the client. Use to ensure we don't return to client
-    /// duplicated token positions.
+    /// @brief Sets the maximum position of the tokens returned to the client. Use to ensure we don't return to
+    /// client duplicated token positions.
     /// @param pos The maximum position
     void setMaxSentTokenPos(SizeType pos)
     {
@@ -243,6 +260,42 @@ public:
         return mStopWordsList;
     }
 
+    bool returnLogProbs() const
+    {
+        return mReturnLogProbs;
+    }
+
+    std::vector<VecLogProbs> const& getLogProbs() const
+    {
+        return mLogProbs;
+    }
+
+    VecLogProbs const& getLogProbs(SizeType beam) const
+    {
+        return mLogProbs.at(beam);
+    }
+
+    void setLogProbs(VecLogProbs const& logProbs, SizeType beam)
+    {
+        mLogProbs.at(beam).resize(mPromptLen - mOrigPromptLen);
+        mLogProbs.at(beam).insert(mLogProbs.at(beam).end(), logProbs.begin(), logProbs.end());
+    }
+
+    VecLogProbs const& getCumLogProbs() const
+    {
+        return mCumLogProbs;
+    }
+
+    void setCumLogProb(float cumLogProb, SizeType beam)
+    {
+        mCumLogProbs.at(beam) = cumLogProb;
+    }
+
+    SizeType getOrigPromptLen() const
+    {
+        return mOrigPromptLen;
+    }
+
     RequestIdType mRequestId;
     SizeType mPromptLen;
     SizeType mMaxNewTokens;
@@ -255,6 +308,7 @@ public:
     SizeType mBatchSlot;
 
 private:
+    SizeType mOrigPromptLen;
     std::shared_ptr<BeamTokens> mTokens;
     SizeType mMaxSentTokenPos;
 
@@ -264,6 +318,11 @@ private:
 
     std::optional<TensorPtr> mPromptEmbeddingTable;
     std::optional<SizeType> mPromptVocabSize;
+
+    bool mReturnLogProbs;
+
+    std::vector<VecLogProbs> mLogProbs; // [beamSize, seqLen]
+    VecLogProbs mCumLogProbs;           // [beamSize]
 };
 
 } // namespace tensorrt_llm::batch_manager

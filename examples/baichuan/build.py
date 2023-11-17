@@ -536,6 +536,7 @@ def build(rank, args):
             max_position_embeddings=args.n_positions,
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
+            max_beam_width=args.max_beam_width,
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,
             int8=int8_trt_flag,

@@ -18,6 +18,7 @@
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/gptSession.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
@@ -37,7 +38,7 @@ namespace
 void benchmarkGptSession(std::string const& modelName, std::filesystem::path const& dataPath,
     std::vector<int> const& batchSizes, int beamWidth, std::vector<std::vector<int>> const& inOutLen,
     std::shared_ptr<nvinfer1::ILogger> const& logger, int warmUp, int numRuns, int duration,
-    GptSession::Config& sessionConfig, bool cudaGraphMode)
+    GptSession::Config& sessionConfig, bool cudaGraphMode, bool printAllLogits)
 {
 
     std::string modelNameHyphen = modelName;
@@ -60,7 +61,6 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
 
     SamplingConfig samplingConfig{beamWidth};
     samplingConfig.temperature = std::vector{1.0f};
-    samplingConfig.minLength = std::vector{1};
     samplingConfig.randomSeed = std::vector{42ull};
     samplingConfig.topK = std::vector{1};
     samplingConfig.topP = std::vector{0.0f};
@@ -77,6 +77,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
         auto const maxNewTokens = inOut[1];
 
         sessionConfig.maxSequenceLength = maxInputLength + maxNewTokens;
+        samplingConfig.minLength = std::vector{maxNewTokens};
 
         GptSession session{sessionConfig, modelConfig, worldConfig, enginePath.string(), logger};
 
@@ -102,6 +103,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                 // copy inputs and wrap into shared_ptr
                 GenerationInput::TensorPtr inputIds;
                 std::vector<int32_t> inputsHost(batchSize * maxInputLength, padId);
+
                 if (inputPacked)
                 {
                     inputIds = bufferManager.copyFrom(
@@ -123,6 +125,17 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                     bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32),
                     bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32)};
 
+                if (session.getModelConfig().computeContextLogits())
+                {
+                    generationOutput.contextLogits
+                        = bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
+                }
+                if (session.getModelConfig().computeGenerationLogits())
+                {
+                    generationOutput.generationLogits
+                        = bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
+                    bufferManager.setZero(*generationOutput.generationLogits);
+                }
                 TLLM_LOG_INFO(memoryCounter.toString());
 
                 for (auto r = 0; r < warmUp; ++r)
@@ -167,6 +180,30 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                         "[BENCHMARK] batch_size %d input_length %d output_length %d latency(ms) %.2f tokensPerSec "
                         "%.2f\n",
                         batchSize, maxInputLength, maxNewTokens, averageLatency, tokensPerSec);
+                }
+
+                // logits are store in last rank
+                if (worldConfig.getRank() == worldConfig.getSize() - 1)
+                {
+                    if (session.getModelConfig().computeContextLogits() && printAllLogits)
+                    {
+                        std::cout << "generationOutput.contextLogits.shape: "
+                                  << generationOutput.contextLogits->getShape()
+                                  << std::endl; // (batchsize, prompt_len, vocabsize)
+                        std::cout << "generationOutput.contextLogits" << *generationOutput.contextLogits << std::endl;
+                    }
+
+                    if (session.getModelConfig().computeGenerationLogits() && printAllLogits)
+                    {
+                        std::cout << "generationOutput.generationLogits.shape: "
+                                  << generationOutput.generationLogits->getShape()
+                                  << std::endl; // (batchsize, beamwidth, maxNewTokens-1, vocabsize)
+                        generationOutput.generationLogits->reshape(ITensor::makeShape({batchSize * beamWidth,
+                            maxNewTokens - 1, modelConfig.getVocabSizePadded(worldConfig.getSize())}));
+
+                        std::cout << "generationOutput.generationLogits: " << *generationOutput.generationLogits
+                                  << std::endl;
+                    }
                 }
             }
             catch (std::runtime_error& e)
@@ -231,6 +268,7 @@ int main(int argc, char* argv[])
         "kv_cache_free_gpu_mem_fraction", "K-V Cache Free Gpu Mem Fraction.", cxxopts::value<float>());
 
     options.add_options()("enable_cuda_graph", "Execute GPT session with CUDA graph.");
+    options.add_options()("print_all_logits", "Print all context and generation logits.");
 
     auto result = options.parse(argc, argv);
 
@@ -328,6 +366,7 @@ int main(int argc, char* argv[])
 
     // Argument: Enable CUDA graph
     auto enableCudaGraph = result.count("enable_cuda_graph") > 0;
+    auto printAllLogits = result.count("print_all_logits") > 0;
 
     initTrtLlmPlugins(logger.get());
 
@@ -335,7 +374,7 @@ int main(int argc, char* argv[])
     {
         benchmarkGptSession(result["model"].as<std::string>(), result["engine_dir"].as<std::string>(), batchSizes,
             beamWidth, inOutLen, logger, result["warm_up"].as<int>(), result["num_runs"].as<int>(),
-            result["duration"].as<int>(), sessionConfig, enableCudaGraph);
+            result["duration"].as<int>(), sessionConfig, enableCudaGraph, printAllLogits);
     }
     catch (const std::exception& e)
     {

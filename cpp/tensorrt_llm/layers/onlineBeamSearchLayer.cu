@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/beamSearchTopkKernels.h"
+#include "tensorrt_llm/layers/fillBuffers.h"
 #include "tensorrt_llm/layers/onlineBeamSearchLayer.h"
 
 using namespace tensorrt_llm::common;
@@ -49,7 +50,7 @@ __global__ void update_kernel(bool* finished, int** parent_ids_ptr, int* sequenc
 
         // Increase the seq_len even if the request has finished.
         // On the following iteration we check if the sequence has finished before
-        if (!finished[beam_idx])
+        if (!finished[blockIdx.x * beam_width + beam_idx])
         {
             s_sequence_lengths[beam_idx]++;
         }
@@ -96,25 +97,7 @@ void OnlineBeamSearchLayer<T>::setup(size_t batch_size, SetupParams const& setup
     mDiversityRate = setupParams.beam_search_diversity_rate.value_or(std::vector<float>(0.0f));
     mLengthPenalty = setupParams.length_penalty.value_or(std::vector<float>(0.0f));
 
-    auto fillBuffers
-        = [this, &batch_size](auto const& optParam, auto const defaultValue, auto& hostBuffer, auto& deviceBuffer)
-    {
-        hostBuffer.resize(batch_size);
-        if (!optParam)
-        {
-            std::fill(std::begin(hostBuffer), std::end(hostBuffer), defaultValue);
-        }
-        else if (optParam->size() == 1)
-        {
-            std::fill(std::begin(hostBuffer), std::end(hostBuffer), optParam->front());
-        }
-        else
-        {
-            TLLM_CHECK_WITH_INFO(optParam->size() == batch_size, "Argument vector size mismatch.");
-            std::copy(optParam->begin(), optParam->end(), std::begin(hostBuffer));
-        }
-        cudaAutoCpy(deviceBuffer, hostBuffer.data(), batch_size, stream_);
-    };
+    FillBuffers const fillBuffers{batch_size, stream_};
 
     fillBuffers(setupParams.beam_search_diversity_rate, 0.0f, mDiversityRate, diversity_rates_buf_);
     fillBuffers(setupParams.length_penalty, 0.0f, mLengthPenalty, length_penalties_buf_);
@@ -153,7 +136,6 @@ void OnlineBeamSearchLayer<T>::invokeSoftMax(BeamSearchOutputParams& outputs, So
         beamHypotheses.end_ids = end_ids;
     }
 
-    output_log_probs = (outputs.output_log_probs) ? outputs.output_log_probs->template getPtr<float>() : nullptr;
     invokeTopkSoftMax(logits.template getPtr<T>(), (const T*) (nullptr), finished, sequence_lengths,
         outputs.cum_log_probs->template getPtr<float>(), output_log_probs, output_ids_ptr.getPtr<int*>(),
         topk_softmax_workspace_, topk_softmax_workspace_size_, &beamHypotheses, local_batch_size, beam_width,

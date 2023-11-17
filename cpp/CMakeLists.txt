@@ -237,6 +237,24 @@ if(WIN32)
   set(CMAKE_CXX_FLAGS "/DNOMINMAX ${CMAKE_CXX_FLAGS}")
 endif()
 
+if((MSVC))
+  if((MSVC_VERSION GREATER_EQUAL 1914))
+    # MSVC does not apply the correct __cplusplus version per the C++ standard
+    # by default. This is required for compiling CUTLASS 3.0 kernels on windows
+    # with C++-17 constexpr enabled. The 2017 15.7 MSVC adds /Zc:__cplusplus to
+    # set __cplusplus to 201703 with std=c++17. See
+    # https://learn.microsoft.com/en-us/cpp/build/reference/zc-cplusplus for
+    # more info.
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zc:__cplusplus")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler  /Zc:__cplusplus")
+  else()
+    message(
+      FATAL_ERROR
+        "Build is only supported with Visual Studio 2017 version 15.7 or higher"
+    )
+  endif()
+endif()
+
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
 if(FAST_MATH)

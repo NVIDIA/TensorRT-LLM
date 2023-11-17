@@ -494,16 +494,14 @@ def build_rank_engine(builder: Builder,
 
     assert args.n_layer % args.pp_size == 0, \
         f"num_layers {args.n_layer} must be a multiple of pipeline parallelism size {args.pp_size}"
-
     # Initialize Module
-    tensorrt_llm_internlm = tensorrt_llm.models.InternLMForCausalLM(
+    tensorrt_llm_internlm = tensorrt_llm.models.LLaMAForCausalLM(
         num_layers=args.n_layer,
         num_heads=args.n_head,
         num_kv_heads=args.n_kv_head,
         hidden_size=args.n_embd,
         vocab_size=args.vocab_size,
         hidden_act=args.hidden_act,
-        attn_bias=args.attn_bias,
         max_position_embeddings=args.n_positions,
         dtype=dtype,
         mlp_hidden_size=args.inter_size,
@@ -513,6 +511,8 @@ def build_rank_engine(builder: Builder,
         rotary_scaling=args.rotary_scaling,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
+        use_fused_mlp=False,
+        attn_bias=args.attn_bias,
         quant_mode=args.quant_mode,
         rms_norm_eps=args.rms_norm_eps)
     if args.use_smooth_quant:
@@ -688,6 +688,7 @@ def build(rank, args):
             hidden_act=args.hidden_act,
             max_position_embeddings=args.n_positions,
             max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,

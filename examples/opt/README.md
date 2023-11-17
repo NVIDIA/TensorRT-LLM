@@ -5,13 +5,12 @@ multiple GPUs or multiple nodes with multiple GPUs.
 
 ## Overview
 
-The TensorRT-LLM OPT implementation can be found in [`tensorrt_llm/models/opt/model.py`](../../tensorrt_llm/models/opt/model.py). The TensorRT-LLM OPT example
-code is located in [`examples/opt`](./). There are four main files in that folder:
+The TensorRT-LLM OPT implementation can be found in [`tensorrt_llm/models/opt/model.py`](../../tensorrt_llm/models/opt/model.py). The TensorRT-LLM OPT example code is located in [`examples/opt`](./). There are four main files:
 
  * [`hf_opt_convert.py`](./hf_opt_convert.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers)
     format to the [FasterTransformer (FT)](https://github.com/NVIDIA/FasterTransformer) format,
  * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the OPT model,
- * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
+ * and a shared [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
 
 ## Support Matrix
   * FP16
@@ -151,44 +150,48 @@ The script can also perform the same summarization using the HF OPT model.
 
 ```bash
 # OPT-125M
-python3 summarize.py --engine_dir trt_engine/opt-125m/fp16/1-gpu \
-                     --test_hf \
-                     --batch_size 1 \
-                     --test_trt_llm \
-                     --hf_model_location opt-125m \
-                     --data_type fp16 \
-                     --check_accuracy \
-                     --tensorrt_llm_rouge1_threshold=14
+python3 ../summarize.py --engine_dir trt_engine/opt-125m/fp16/1-gpu \
+                        --test_hf \
+                        --batch_size 1 \
+                        --test_trt_llm \
+                        --hf_model_dir opt-125m \
+                        --data_type fp16 \
+                        --check_accuracy \
+                        --tensorrt_llm_rouge1_threshold=14 \
+                        --no_add_special_tokens
 
 # OPT-350M
-python3 summarize.py --engine_dir trt_engine/opt-350m/fp16/1-gpu \
-                     --test_hf \
-                     --batch_size 1 \
-                     --test_trt_llm \
-                     --hf_model_location opt-350m \
-                     --data_type fp16 \
-                     --check_accuracy \
-                     --tensorrt_llm_rouge1_threshold=20
+python3 ../summarize.py --engine_dir trt_engine/opt-350m/fp16/1-gpu \
+                        --test_hf \
+                        --batch_size 1 \
+                        --test_trt_llm \
+                        --hf_model_dir opt-350m \
+                        --data_type fp16 \
+                        --check_accuracy \
+                        --tensorrt_llm_rouge1_threshold=20 \
+                        --no_add_special_tokens
 
 # OPT-2.7B
-python3 summarize.py --engine_dir trt_engine/opt-2.7b/fp16/1-gpu \
-                     --test_hf \
-                     --batch_size 1 \
-                     --test_trt_llm \
-                     --hf_model_location opt-2.7b \
-                     --data_type fp16 \
-                     --check_accuracy \
-                     --tensorrt_llm_rouge1_threshold=21
+python3 ../summarize.py --engine_dir trt_engine/opt-2.7b/fp16/1-gpu \
+                        --test_hf \
+                        --batch_size 1 \
+                        --test_trt_llm \
+                        --hf_model_dir opt-2.7b \
+                        --data_type fp16 \
+                        --check_accuracy \
+                        --tensorrt_llm_rouge1_threshold=21 \
+                        --no_add_special_tokens
 
 # OPT-66B
 mpirun -n 4 --allow-run-as-root \
-    python3 summarize.py --engine_dir trt_engines/opt-66b/fp16/4-gpu \
-                         --batch_size 1 \
-                         --test_trt_llm \
-                         --hf_model_location opt-66b \
-                         --data_type fp16 \
-                         --check_accuracy \
-                         --tensorrt_llm_rouge1_threshold=21
+    python3 ../summarize.py --engine_dir trt_engines/opt-66b/fp16/4-gpu \
+                            --batch_size 1 \
+                            --test_trt_llm \
+                            --hf_model_dir opt-66b \
+                            --data_type fp16 \
+                            --check_accuracy \
+                            --tensorrt_llm_rouge1_threshold=21 \
+                            --no_add_special_tokens
 ```
 
 #### Fused MultiHead Attention (FMHA)

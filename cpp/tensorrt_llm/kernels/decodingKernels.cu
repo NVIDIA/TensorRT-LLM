@@ -416,8 +416,13 @@ __global__ void finalize(int* output_ids, int* sequence_lengths, float* cum_log_
                 = topk_output_ids[blockIdx.x * (beam_width * 2) * max_seq_len + s_rank[beam_idx] * max_seq_len + i];
             if (output_log_probs != nullptr)
             {
-                output_log_probs[blockIdx.x * beam_width * max_seq_len + beam_idx * max_seq_len + i]
-                    = topk_log_probs[blockIdx.x * (beam_width * 2) * max_seq_len + s_rank[beam_idx] * max_seq_len + i];
+                int input_len = input_lengths[blockIdx.x * beam_width + beam_idx];
+                if (i >= input_len)
+                {
+                    output_log_probs[blockIdx.x * beam_width * max_seq_len + beam_idx * max_seq_len + i - input_len]
+                        = topk_log_probs[blockIdx.x * (beam_width * 2) * max_seq_len + s_rank[beam_idx] * max_seq_len
+                            + i];
+                }
             }
         }
     }
@@ -469,6 +474,33 @@ void invokeCopyNextStepIds(int* next_step_ids, int** output_ids_ptr, const int* 
     dim3 grid(divUp(batch_size * beam_width, block.x));
     copyNextStepIds<<<grid, block, 0, stream>>>(
         next_step_ids, output_ids_ptr, sequence_lengths, batch_size, beam_width, max_seq_len);
+}
+
+__global__ void transposeLogProbs(float* output_log_probs, float* output_log_probs_tiled, const int* sequence_lengths,
+    int batch_size, int beam_width, int max_seq_len)
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    const int batch_idx = index / (beam_width * max_seq_len);
+    const int tmp_idx = index % (beam_width * max_seq_len);
+    const int beam_idx = tmp_idx / max_seq_len;
+    const int pos = tmp_idx % max_seq_len;
+
+    if (batch_idx < batch_size && pos < sequence_lengths[batch_idx])
+    {
+
+        output_log_probs[index]
+            = output_log_probs_tiled[pos * batch_size * beam_width + batch_idx * beam_width + beam_idx];
+    }
+}
+
+void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_tiled, const int* sequence_lengths,
+    int batch_size, int beam_width, int max_seq_len, cudaStream_t stream)
+{
+    dim3 block(256);
+    dim3 grid(divUp(batch_size * beam_width * max_seq_len, block.x));
+    transposeLogProbs<<<grid, block, 0, stream>>>(
+        output_log_probs, output_log_probs_tiled, sequence_lengths, batch_size, beam_width, max_seq_len);
 }
 
 } // namespace kernels

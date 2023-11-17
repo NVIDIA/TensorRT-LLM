@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
-ARG BASE_TAG=23.08-py3
+ARG BASE_TAG=23.10-py3
 
 FROM ${BASE_IMAGE}:${BASE_TAG} as base
 
@@ -19,10 +19,16 @@ COPY docker/common/install_cmake.sh install_cmake.sh
 RUN bash ./install_cmake.sh && rm install_cmake.sh
 
 # Download & install internal TRT release
-ARG RELEASE_URL_TRT
-ARG TARGETARCH
-ENV RELEASE_URL_TRT=$RELEASE_URL_TRT
-ENV TRT_TARGETARCH=$TARGETARCH
+ARG TRT_VER="9.1.0.4"
+ENV TRT_VER=$TRT_VER
+ARG CUDA_VER="12.2"
+ENV CUDA_VER=$CUDA_VER
+ARG CUDNN_VER="8.9.4.25-1+cuda12.2"
+ENV CUDNN_VER=$CUDNN_VER
+ARG NCCL_VER="2.18.3-1+cuda12.2"
+ENV NCCL_VER=$NCCL_VER
+ARG CUBLAS_VER="12.2.5.6-1"
+ENV CUBLAS_VER=$CUBLAS_VER
 COPY docker/common/install_tensorrt.sh install_tensorrt.sh
 RUN bash ./install_tensorrt.sh && rm install_tensorrt.sh
 

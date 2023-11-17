@@ -195,12 +195,23 @@ __global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, const
             isValid = (rowIdx <  seqLength - 1 && colIdx < seqLength - 1) ||
                       (rowIdx == seqLength - 1 && colIdx < seqLength);
             // clang-format on
-            // seq_length==4, max_seq_len==5, only use in context phase
+            // seq_length==4, max_seq_len==5
             // 1 1 1 0 0
             // 1 1 1 0 0
             // 1 1 1 0 0
             // 1 1 1 1 0
             // 0 0 0 0 0
+        case AttentionMaskType::BIDIRECTIONALGLM:
+            // clang-format off
+            isValid = (colIdx < seqLength - 1) ||
+                      (rowIdx == maxSeqLength - 1 && colIdx == maxSeqLength - 1);
+            // clang-format on
+            // seq_length==4, max_seq_len==5
+            // 1 1 1 1 0
+            // 1 1 1 1 0
+            // 1 1 1 1 0
+            // 1 1 1 1 0
+            // 1 1 1 1 1
             break;
         }
 

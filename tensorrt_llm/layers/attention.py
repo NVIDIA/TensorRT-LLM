@@ -31,6 +31,7 @@ from ..parameter import Parameter
 from ..quantization import QuantMode
 from ..quantization.layers import FP8Linear, FP8RowLinear
 from .linear import ColumnLinear, RowLinear
+from .lora import Lora
 
 
 class RopeEmbeddingUtils:
@@ -150,6 +151,7 @@ class RopeEmbeddingUtils:
         num_attention_heads,
         attention_head_size,
         max_position_embeddings,
+        rotary_embedding_scale,
     ) -> Tensor:
 
         half_head_size = attention_head_size // 2
@@ -175,6 +177,7 @@ class RopeEmbeddingUtils:
 
         embedding_weight = RopeEmbeddingUtils.create_sinusoidal_positions(
             max_position_embeddings, half_head_size)
+        embedding_weight /= rotary_embedding_scale
         embedding_weight = np.split(embedding_weight.squeeze(0), 2, axis=1)
         embedding_weight = np.concatenate(
             [
@@ -324,6 +327,7 @@ class Attention(Module):
         max_position_embeddings=1024,
         num_layers=1,
         apply_query_key_layer_scaling=False,
+        attention_head_size=None,
         attention_mask_type=AttentionMaskType.padding,
         bias=True,
         dtype=None,
@@ -348,7 +352,7 @@ class Attention(Module):
 
         self.cross_attention = cross_attention
         self.attention_mask_type = attention_mask_type
-        self.attention_head_size = hidden_size // num_attention_heads
+        self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
         assert num_attention_heads % tp_size == 0, \
         "num_attention_heads must be divisible by tp_size"
         self.num_attention_heads = num_attention_heads // tp_size
@@ -421,15 +425,16 @@ class Attention(Module):
 
         self.use_fp8_qdq = self.quant_mode.has_fp8_qdq()
         if self.use_fp8_qdq:
-            self.qkv = FP8Linear(hidden_size,
-                                 hidden_size +
-                                 (2 * tp_size * self.num_attention_kv_heads *
-                                  self.attention_head_size),
-                                 bias=bias,
-                                 dtype=dtype,
-                                 tp_group=tp_group,
-                                 tp_size=tp_size,
-                                 gather_output=False)
+            self.qkv = FP8Linear(
+                hidden_size,
+                tp_size * self.num_attention_heads * self.attention_head_size +
+                (2 * tp_size * self.num_attention_kv_heads *
+                 self.attention_head_size),
+                bias=bias,
+                dtype=dtype,
+                tp_group=tp_group,
+                tp_size=tp_size,
+                gather_output=False)
             self.dense = FP8RowLinear(hidden_size,
                                       hidden_size,
                                       bias=dense_bias,
@@ -438,16 +443,20 @@ class Attention(Module):
                                       tp_size=tp_size,
                                       instance_id=instance_id)
         else:
-            self.qkv = ColumnLinear(hidden_size,
-                                    hidden_size +
-                                    (2 * tp_size * self.num_attention_kv_heads *
-                                     self.attention_head_size),
-                                    bias=bias,
-                                    dtype=dtype,
-                                    tp_group=tp_group,
-                                    tp_size=tp_size,
-                                    gather_output=False)
-            self.dense = RowLinear(hidden_size,
+            # out dim is not necessarily hidden_size + kv specific size (in MQA/GQA), but num_heads * heads_size
+            # example: d_model != num_heads * head_size in Flan-T5
+            self.qkv = ColumnLinear(
+                hidden_size,
+                tp_size * self.num_attention_heads * self.attention_head_size +
+                (2 * tp_size * self.num_attention_kv_heads *
+                 self.attention_head_size),
+                bias=bias,
+                dtype=dtype,
+                tp_group=tp_group,
+                tp_size=tp_size,
+                gather_output=False)
+            self.dense = RowLinear(tp_size * self.num_attention_heads *
+                                   self.attention_head_size,
                                    hidden_size,
                                    bias=dense_bias,
                                    dtype=dtype,
@@ -461,18 +470,25 @@ class Attention(Module):
                                                    tp_size, num_buckets),
                                             dtype=dtype)
 
-    def forward(
-        self,
-        hidden_states: Tensor,
-        attention_mask=None,
-        use_cache=False,
-        kv_cache_params=None,
-        attention_params=None,
-        encoder_output: Optional[Tensor] = None,
-        workspace=None,
-        position_embedding=None,
-        norm_before_bmm1=False,
-    ):
+        self.qkv_lora = Lora(
+            in_hidden_size=hidden_size,
+            out_hidden_size=hidden_size +
+            (2 * tp_size * self.num_attention_kv_heads *
+             self.attention_head_size),
+            max_low_rank=hidden_size,
+        )
+
+    def forward(self,
+                hidden_states: Tensor,
+                attention_mask=None,
+                use_cache=False,
+                kv_cache_params=None,
+                attention_params=None,
+                encoder_output: Optional[Tensor] = None,
+                workspace=None,
+                position_embedding=None,
+                norm_before_bmm1=False,
+                lora_params=None):
 
         assert isinstance(hidden_states, Tensor)
 
@@ -491,6 +507,15 @@ class Attention(Module):
 
         qkv = self.qkv(hidden_states)
 
+        if default_net().plugin_config.lora_plugin:
+            qkv = qkv + self.qkv_lora(
+                hidden_states,
+                host_request_types=attention_params.host_request_types,
+                host_context_lengths=attention_params.host_context_lengths,
+                max_context_length=attention_params.max_context_length,
+                lora_ranks=lora_params.lora_ranks,
+                lora_weights_pointers=lora_params.lora_weights_pointers_list[0])
+
         if self.position_embedding_type == PositionEmbeddingType.chatglm:
             qkv = RopeEmbeddingUtils.apply_rotary_pos_emb_chatglm(
                 qkv,
@@ -498,7 +523,10 @@ class Attention(Module):
                 self.num_attention_heads,
                 self.attention_head_size,
                 self.max_position_embeddings,
+                self.rotary_embedding_scale,
             )
+            self.rotary_embedding_scale_type = RotaryScalingType.none
+            self.rotary_embedding_scale = 1.0
 
         paged_kv_cache = default_net().plugin_config.paged_kv_cache
 
@@ -529,7 +557,8 @@ class Attention(Module):
 
         if default_net().plugin_config.gpt_attention_plugin:
             assert self.attention_mask_type in [
-                AttentionMaskType.causal, AttentionMaskType.bidirectional
+                AttentionMaskType.causal, AttentionMaskType.bidirectional,
+                AttentionMaskType.bidirectionalglm
             ], 'Plugin only support masked MHA.'
             kv_orig_quant_scale = self.kv_orig_quant_scale.value if self.quant_mode.has_kv_cache_quant(
             ) else None
@@ -847,9 +876,10 @@ class BertAttention(Module):
     def __init__(self,
                  hidden_size,
                  num_attention_heads,
-                 num_kv_heads=None,
                  max_position_embeddings=1024,
                  num_layers=1,
+                 attention_head_size=None,
+                 num_kv_heads=None,
                  q_scaling=1.0,
                  apply_query_key_layer_scaling=False,
                  bias=True,
@@ -862,7 +892,7 @@ class BertAttention(Module):
                  num_buckets=0):
         super().__init__()
 
-        self.attention_head_size = hidden_size // num_attention_heads
+        self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
         self.num_attention_heads = num_attention_heads // tp_size
         self.num_attention_kv_heads = (
             num_kv_heads + tp_size - 1
@@ -886,16 +916,20 @@ class BertAttention(Module):
         self.relative_attention = relative_attention
         self.max_distance = max_distance
 
-        self.qkv = ColumnLinear(hidden_size,
-                                hidden_size +
-                                (2 * tp_size * self.num_attention_kv_heads *
-                                 self.attention_head_size),
-                                bias=bias,
-                                dtype=dtype,
-                                tp_group=tp_group,
-                                tp_size=tp_size,
-                                gather_output=False)
-        self.dense = RowLinear(hidden_size,
+        # out dim is not necessarily hidden_size + kv specific size (in MQA/GQA), but num_heads * heads_size
+        # example: d_model != num_heads * head_size in Flan-T5
+        self.qkv = ColumnLinear(
+            hidden_size,
+            tp_size * self.num_attention_heads * self.attention_head_size +
+            (2 * tp_size * self.num_attention_kv_heads *
+             self.attention_head_size),
+            bias=bias,
+            dtype=dtype,
+            tp_group=tp_group,
+            tp_size=tp_size,
+            gather_output=False)
+        self.dense = RowLinear(tp_size * self.num_attention_heads *
+                               self.attention_head_size,
                                hidden_size,
                                bias=bias,
                                dtype=dtype,
@@ -911,7 +945,9 @@ class BertAttention(Module):
     def forward(self,
                 hidden_states: Tensor,
                 attention_mask=None,
-                input_lengths=None):
+                input_lengths=None,
+                workspace=None,
+                max_input_length=None):
         assert isinstance(hidden_states, Tensor)
 
         qkv = self.qkv(hidden_states)
@@ -928,7 +964,8 @@ class BertAttention(Module):
                 relative_attention=self.relative_attention,
                 max_distance=self.max_distance,
                 relative_attention_bias=self.rel_attn_table.value
-                if self.relative_attention else None)
+                if self.relative_attention else None,
+                max_input_length=max_input_length)
         else:
             # plain TRT mode
             def transpose_for_scores(x):
@@ -958,6 +995,6 @@ class BertAttention(Module):
                 concat([shape(context, 0),
                         shape(context, 1), self.hidden_size]))
 
-        context = self.dense(context)
+        context = self.dense(context, workspace)
 
         return context
