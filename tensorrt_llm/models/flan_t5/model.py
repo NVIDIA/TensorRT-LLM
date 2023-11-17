@@ -705,7 +705,7 @@ class FlanT5DecoderModel(Module):
         kv_cache_params=None,
         attention_params=None,
     ):
-        assert last_token_ids is not None, "Expecting last token ids to be not None"
+        # assert last_token_ids is not None, "Expecting last token ids to be not None"
         assert isinstance(decoder_input_ids, Tensor)
 
         hidden_states = self.embedding(decoder_input_ids, position_ids,
@@ -932,12 +932,13 @@ class FlanT5DecoderModel(Module):
             dim_range=OrderedDict([("encoder_max_input_length",
                                     [encoder_inlen_range])]),
         )
-        last_token_ids = Tensor(
-            name="last_token_ids",
-            dtype=trt.int32,
-            shape=[-1],
-            dim_range=OrderedDict([("batch_size_last_token_ids", [bb_range])]),
-        )
+        # last_token_ids = Tensor(
+        #     name="last_token_ids",
+        #     dtype=trt.int32,
+        #     shape=[-1],
+        #     dim_range=OrderedDict([("batch_size_last_token_ids", [bb_range])]),
+        # )
+        last_token_ids = None
         if not use_gpt_attention_plugin:
             attention_mask = Tensor(
                 name='attention_mask',
