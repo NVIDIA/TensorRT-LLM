@@ -14,6 +14,8 @@
 # limitations under the License.
 import tensorrt as trt
 
+from tensorrt_llm.quantization import QuantMode
+
 from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
 from ...functional import gather_last_token_logits, recv, send, layer_norm, group_norm, view, matmul, silu, sigmoid, squared_relu, Tensor
@@ -26,34 +28,34 @@ from ...module import Module, ModuleList
 from ...quantization import QuantMode
 from ..generation_mixin import GenerationMixin
 
-class RWKVSelfAttentionLayer(Module):
+class RwkvSelfAttentionLayer(Module):
     def __init__(self, 
                   num_att, 
                   num_head, 
-                  num_embd, 
+                  hidden_size, 
                   dtype = None
                   ):
         super().__init__()
         self.num_att = num_att
         self.num_head = num_head
-        self.num_embd = num_embd
+        self.hidden_size = hidden_size
         self.dtype = dtype
         
-        self.rxw = ColumnLinear(num_embd, num_embd)
-        self.kxw = ColumnLinear(num_embd, num_embd)
-        self.vxw = ColumnLinear(num_embd, num_embd)
-        self.gxw = ColumnLinear(num_embd, num_embd)
-        self.oxw = ColumnLinear(num_embd, num_embd)
+        self.rxw = ColumnLinear(hidden_size, hidden_size)
+        self.kxw = ColumnLinear(hidden_size, hidden_size)
+        self.vxw = ColumnLinear(hidden_size, hidden_size)
+        self.gxw = ColumnLinear(hidden_size, hidden_size)
+        self.oxw = ColumnLinear(hidden_size, hidden_size)
         
-        self.ln_w = Parameter(shape=(num_embd), dtype=dtype)
-        self.ln_b = Parameter(shape=(num_embd), dtype=dtype)
-        self.lx_w = Parameter(shape=(num_embd), dtype='float32')  # special case
-        self.lx_b = Parameter(shape=(num_embd), dtype='float32')  # special case
+        self.ln_w = Parameter(shape=(hidden_size), dtype=dtype)
+        self.ln_b = Parameter(shape=(hidden_size), dtype=dtype)
+        self.lx_w = Parameter(shape=(hidden_size), dtype='float32')  # special case
+        self.lx_b = Parameter(shape=(hidden_size), dtype='float32')  # special case
         
-        self.k_mix = Parameter(shape=(num_embd), dtype=dtype)
-        self.v_mix = Parameter(shape=(num_embd), dtype=dtype)
-        self.r_mix = Parameter(shape=(num_embd), dtype=dtype)
-        self.g_mix = Parameter(shape=(num_embd), dtype=dtype)
+        self.k_mix = Parameter(shape=(hidden_size), dtype=dtype)
+        self.v_mix = Parameter(shape=(hidden_size), dtype=dtype)
+        self.r_mix = Parameter(shape=(hidden_size), dtype=dtype)
+        self.g_mix = Parameter(shape=(hidden_size), dtype=dtype)
         
         self.t_decay = Parameter(shape=(num_head, num_att // num_head, 1), dtype='float32') # special case
         self.t_first = Parameter(shape=(num_head, num_att // num_head, 1), dtype='float32') # special case
@@ -67,7 +69,7 @@ class RWKVSelfAttentionLayer(Module):
         
         T = x.shape[0] # query length
         H = self.num_head
-        S = self.num_embd // self.num_head
+        S = self.hidden_size // self.num_head
         
         r = self.rxw(rx).to('float32').view(T, H, S).transpose(0, 1)
         k = self.kxw(kx).to('float32').view(T, H, S).transpose(0, 1).transpose(-2, -1)
@@ -92,28 +94,28 @@ class RWKVSelfAttentionLayer(Module):
         return x + out, xx[-1, :], s
         
 
-class RWKVFeedForwardLayer(Module):
+class RwkvFeedForwardLayer(Module):
     def __init__(self, 
                   num_att, 
                   num_head, 
-                  num_embd, 
+                  hidden_size, 
                   dtype = None
                   ):
         super().__init__()
         self.num_att = num_att
         self.num_head = num_head
-        self.num_embd = num_embd
+        self.hidden_size = hidden_size
         self.dtype = dtype
         
-        self.rxw = ColumnLinear(num_embd, num_embd)
-        self.kxw = ColumnLinear(num_embd, num_embd)
-        self.vxw = ColumnLinear(num_embd, num_embd)
+        self.rxw = ColumnLinear(hidden_size, hidden_size)
+        self.kxw = ColumnLinear(hidden_size, hidden_size)
+        self.vxw = ColumnLinear(hidden_size, hidden_size)
         
-        self.ln_w = Parameter(shape=(num_embd), dtype=dtype)
-        self.ln_b = Parameter(shape=(num_embd), dtype=dtype)
+        self.ln_w = Parameter(shape=(hidden_size), dtype=dtype)
+        self.ln_b = Parameter(shape=(hidden_size), dtype=dtype)
         
-        self.k_mix = Parameter(shape=(num_embd), dtype=dtype)
-        self.r_mix = Parameter(shape=(num_embd), dtype=dtype)
+        self.k_mix = Parameter(shape=(hidden_size), dtype=dtype)
+        self.r_mix = Parameter(shape=(hidden_size), dtype=dtype)
         
     def forward(self, x, sx):
         xx = layer_norm(x, (x.shape[-1],), weight=self.ln_w, bias=self.ln_b)
@@ -125,12 +127,12 @@ class RWKVFeedForwardLayer(Module):
         out = r * self.vxw(vx)
         return x + out, xx[-1, :]
 
-class RWKVDecoderLayer(Module):
+class RwkvDecoderLayer(Module):
     def __init__(self, 
                   layer_id,
                   num_att, 
                   num_head, 
-                  num_embd, 
+                  hidden_size, 
                   rescale_layer, 
                   dtype = None
                   ):
@@ -138,17 +140,17 @@ class RWKVDecoderLayer(Module):
         self._layer_id = layer_id
         self.num_att = num_att
         self.num_head = num_head
-        self.num_embd = num_embd
+        self.hidden_size = hidden_size
         self.rescale_layer = rescale_layer
         self.dtype = dtype
         
-        self.attention = RWKVSelfAttentionLayer(self.num_att, 
+        self.attention = RwkvSelfAttentionLayer(self.num_att, 
                                                 self.num_head, 
-                                                self.num_embd, 
+                                                self.hidden_size, 
                                                 self.dtype)
-        self.feed_forward = RWKVFeedForwardLayer(self.num_att, 
+        self.feed_forward = RwkvFeedForwardLayer(self.num_att, 
                                                 self.num_head, 
-                                                self.num_embd, 
+                                                self.hidden_size, 
                                                 self.dtype)
         
     def forward(self, 
@@ -165,11 +167,11 @@ class RWKVDecoderLayer(Module):
         return x, input_states, hidden_states, output_states
             
 
-class RWKVModel(Module):
+class RwkvModel(Module):
     def __init__(self, 
                  num_layers, 
                  num_att, 
-                 num_embd, 
+                 hidden_size, 
                  num_head,
                  rescale_layer,
                  vocab_size, 
@@ -187,7 +189,7 @@ class RWKVModel(Module):
         if self.mapping.is_first_pp_rank():
             self.vocab_embedding = EmbeddingCls(
                 num_embeddings=vocab_size,
-                embedding_dim=num_embd,
+                embedding_dim=hidden_size,
                 dtype=dtype,
                 tp_size=mapping.tp_size if use_parallel_embedding else 1,
                 tp_group=mapping.tp_group if use_parallel_embedding else None,
@@ -200,21 +202,25 @@ class RWKVModel(Module):
         layer_modules = []
         index = 0
         for i in self.get_transformer_layers(self.mapping, num_layers):
-            layer_modules.append(RWKVDecoderLayer(layer_id=i, 
+            layer_modules.append(RwkvDecoderLayer(layer_id=i, 
                                                     num_att=num_att, 
                                                     num_head=num_head, 
-                                                    num_embd=num_embd, 
+                                                    hidden_size=hidden_size, 
                                                     rescale_layer=rescale_layer if index % rescale_layer == 0 else 0, 
                                                     dtype=dtype))
             index += 1
         
         self.layers = ModuleList(layer_modules)
+        self.embedding_weight = Parameter(shape=(vocab_size, hidden_size))
+        self.ln_out_w = Parameter(shape=(hidden_size))
+        self.ln_out_b = Parameter(shape=(hidden_size))
+        self.head_layer = ColumnLinear(vocab_size, hidden_size)
         
         if self.mapping.is_last_pp_rank():
             # TODO(Rinne): add process for this case
             raise NotImplementedError
         
-    
+    # TODO(Rinne): deal with batch decode
     def forward(self,
                 input_ids,
                 input_states=None,
@@ -243,6 +249,14 @@ class RWKVModel(Module):
         for layer in self.layers:
             embeddings, input_states, hidden_states, output_states = \
                 layer(embeddings, input_states, hidden_states, output_states)
+        
+        # TODO(Rinne): deal with strategy
+        embeddings = embeddings[-1, :]
+        
+        embeddings = layer_norm(embeddings, (hidden_states, ), self.ln_out_w, self.ln_out_b)
+        
+        # TODO(Rinne): deal with quantization here
+        embeddings = self.head_layer(embeddings)
 
         if self.mapping.is_last_pp_rank():
             raise NotImplementedError
@@ -250,3 +264,71 @@ class RWKVModel(Module):
             embeddings = send(embeddings, self.mapping.next_pp_rank())
             
         return embeddings, input_states, hidden_states, output_states
+    
+    
+class RwkvForCausalLM(RwkvModel, GenerationMixin):
+    def __init__(self, 
+                 num_layers, 
+                 num_att, 
+                 hidden_size, 
+                 num_head, 
+                 rescale_layer, 
+                 vocab_size, 
+                 dtype, 
+                 mapping=Mapping(), 
+                 quant_mode=QuantMode(0), 
+                 use_parallel_embedding=False, 
+                 embedding_sharding_dim=0, 
+                 use_prompt_tuning: bool = False):
+        
+        if isinstance(dtype, str):
+            self.dtype = str_dtype_to_trt(dtype)
+        else:
+            assert isinstance(dtype, trt.DataType)
+            self.dtype = dtype
+            
+        self.num_layers = num_layers
+        self.num_att = num_att
+        self.hidden_size = hidden_size
+        self.num_head = num_head
+        self.rescale_layer = rescale_layer
+        self.vocab_size = vocab_size
+        
+        self.kv_dtype = self.dtype
+        if quant_mode.has_int8_kv_cache():
+            self.kv_dtype = str_dtype_to_trt('int8')
+        elif quant_mode.has_fp8_kv_cache():
+            self.kv_dtype = str_dtype_to_trt('fp8')
+
+        self.quant_mode = quant_mode
+        self.use_parallel_embedding = use_parallel_embedding
+        self.embedding_sharding_dim = embedding_sharding_dim
+        
+        super().__init__(num_layers, 
+                         num_att, 
+                         hidden_size, 
+                         num_head, 
+                         rescale_layer, 
+                         vocab_size,
+                         dtype, 
+                         mapping, 
+                         quant_mode, 
+                         use_parallel_embedding, 
+                         embedding_sharding_dim, 
+                         use_prompt_tuning)
+        
+        vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
+        if self.mapping.is_last_pp_rank():
+            self.lm_head = ColumnLinear(hidden_size,
+                                        vocab_size_padded,
+                                        bias=False,
+                                        dtype=dtype,
+                                        tp_group=mapping.tp_group,
+                                        tp_size=mapping.tp_size,
+                                        gather_output=True)
+            
+    def forward(self):
+         raise NotImplementedError
+     
+    def prepare_inputs(self):
+         raise NotImplementedError
