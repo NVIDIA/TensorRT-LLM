@@ -47,6 +47,7 @@ def main(build_type: str = "Release",
          extra_make_targets: str = "",
          trt_root: str = None,
          nccl_root: str = None,
+         cudnn_root: str = None,
          clean: bool = False,
          use_ccache: bool = False,
          cpp_only: bool = False,
@@ -121,6 +122,9 @@ def main(build_type: str = "Release",
     if nccl_root is not None:
         cmake_def_args.append(f"-DNCCL_LIB_DIR={nccl_root}/lib")
         cmake_def_args.append(f"-DNCCL_INCLUDE_DIR={nccl_root}/include")
+    
+    if cudnn_root is not None:
+        cmake_def_args.append(f"-DCUDNN_ROOT_DIR={cudnn_root}")
 
     source_dir = project_dir / "cpp"
 
@@ -232,6 +236,8 @@ if __name__ == "__main__":
                         help="Directory to find TensorRT headers/libs")
     parser.add_argument("--nccl_root",
                         help="Directory to find NCCL headers/libs")
+    parser.add_argument("--cudnn_root",
+                        help="Directory to find cuDNN headers/libs")
     parser.add_argument("--build_dir",
                         type=Path,
                         help="Directory where cpp sources are built")
