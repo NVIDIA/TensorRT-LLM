@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .generation import (ChatGLM6BHeadModelGenerationSession, GenerationSession,
-                         ModelConfig, SamplingConfig, to_word_list_format)
+                         ModelConfig, SamplingConfig, to_word_list_format,
+                         StoppingCriteriaList, StoppingCriteria, DebugStoppingCriteria, AccurateStopWordsCriteria,
+                         LogitsProcessorList, LogitsProcessor, DebugLogitsProcessor, SelectTokensAtBeginLogitsProcessor)
 from .kv_cache_manager import GenerationSequence, KVCacheManager
 from .session import Session, TensorInfo
 
@@ -23,6 +25,14 @@ __all__ = [
     'GenerationSequence',
     'KVCacheManager',
     'SamplingConfig',
+    "StoppingCriteriaList",
+    "StoppingCriteria",
+    "DebugStoppingCriteria",
+    "AccurateStopWordsCriteria",
+    "LogitsProcessorList",
+    "LogitsProcessor",
+    "DebugLogitsProcessor",
+    "SelectTokensAtBeginLogitsProcessor",
     'Session',
     'TensorInfo',
     'ChatGLM6BHeadModelGenerationSession',
