@@ -3,6 +3,7 @@ import json
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import torch
 
 import tensorrt_llm.bindings as _tb
@@ -333,7 +334,7 @@ def test_gpt_json_config():
         json.dump(json_dict, fp)
         fp.close()
 
-        gpt_json_config = _tb.GptJsonConfig.parse_file(fp.name)
+        gpt_json_config = _tb.GptJsonConfig.parse_file(Path(fp.name))
         Path(fp.name).unlink()
 
     rank = 3
@@ -354,3 +355,103 @@ def test_gpt_session():
     assert isinstance(members["world_config"], property)
     assert isinstance(members["device"], property)
     assert "generate" in members
+
+
+def test_llm_request():
+    beam_width = 2
+    sampling_config = _tb.SamplingConfig(beam_width)
+    kwargs = {
+        "request_id": 0,
+        "max_new_tokens": 5,
+        "sampling_config": sampling_config,
+        "input_tokens": [0, 1, 2],
+        "is_streaming": True,
+        "pad_id": 99,
+        "end_id": 100,
+        "prompt_embedding_table": torch.tensor((10, 10)),
+        "prompt_vocab_size": 2,
+        "embedding_bias": torch.tensor((10, 10)),
+        "stop_words_list": torch.tensor((10, 10)),
+        "bad_words_list": torch.tensor((10, 10)),
+        "return_log_probs": True
+    }
+    llm_request = _tb.LlmRequest(**kwargs)
+
+    assert llm_request.request_id == 0
+    assert llm_request.prompt_len == 3
+    assert llm_request.sampling_config.beam_width == sampling_config.beam_width
+    assert llm_request.is_streaming
+    assert llm_request.pad_id == 99
+    assert llm_request.end_id == 100
+    assert llm_request.batch_slot == -1  # batch_slot is still uninitialized
+    assert torch.equal(llm_request.prompt_embedding_table,
+                       kwargs["prompt_embedding_table"])
+    assert llm_request.prompt_vocab_size == 2
+    assert torch.equal(llm_request.embedding_bias, kwargs["embedding_bias"])
+    assert torch.equal(llm_request.stop_words_list, kwargs["stop_words_list"])
+    assert torch.equal(llm_request.bad_words_list, kwargs["bad_words_list"])
+
+    assert llm_request.get_num_tokens(0) == 3
+    assert llm_request.max_beam_num_tokens == 3
+    assert llm_request.get_token(1, 2) == 2
+    assert llm_request.get_tokens(1) == [0, 1, 2]
+    assert llm_request.max_num_generated_tokens == 0
+
+    llm_request.add_new_token(42, 0)
+    assert llm_request.get_token(0, 3) == 42
+
+    llm_request.add_new_tokens([43, 44])
+    assert llm_request.get_token(0, 4) == 43
+    assert llm_request.get_token(1, 3) == 44
+
+    llm_request.set_generated_tokens([[10, 11], [12, 13]])
+    assert llm_request.get_tokens(0) == [0, 1, 2, 10, 11]
+    assert llm_request.max_num_generated_tokens == 2
+
+    llm_request.pause(0)
+    assert llm_request.state == _tb.LlmRequestState.REQUEST_STATE_CONTEXT_INIT
+
+    llm_request.max_sent_token_pos = 1
+    assert llm_request.max_sent_token_pos == 1
+
+    assert llm_request.return_log_probs
+    llm_request.set_log_probs([0.1], 0)
+    llm_request.set_log_probs([0.2], 1)
+    assert np.allclose(llm_request.get_log_probs(0), np.array([0.1]))
+    assert np.allclose(llm_request.log_probs, np.array([[0.1], [0.2]]))
+
+    llm_request.set_cum_log_prob(0.1, 0)
+    llm_request.set_cum_log_prob(0.2, 1)
+    assert np.allclose(llm_request.cum_log_probs, np.array([0.1, 0.2]))
+
+    assert llm_request.orig_prompt_len == 3
+
+    assert not llm_request.draft_tokens
+    llm_request.draft_tokens = [1, 2, 3]
+    assert llm_request.draft_tokens == [1, 2, 3]
+
+
+def test_inference_request():
+    vm = {"test": torch.tensor((10, 10))}
+    ir = _tb.InferenceRequest(vm, 42)
+    assert ir.request_id == 42
+    ir.is_streaming = True
+    assert ir.is_streaming
+
+    data_tensor = torch.tensor((5, 5))
+    ir.emplace_input_tensor("data", data_tensor)
+    assert torch.equal(ir.get_input_tensor("data"), data_tensor)
+
+
+def test_trt_gpt_model_optional_params():
+    opt_params = _tb.TrtGptModelOptionalParams()
+
+    kv_cache_config = _tb.KvCacheConfig(10, 10, 0.5)
+    opt_params.kv_cache_config = kv_cache_config
+    assert opt_params.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
+
+    opt_params.max_num_sequences = 10
+    assert opt_params.max_num_sequences == 10
+
+    opt_params.enable_trt_overlap = True
+    assert opt_params.enable_trt_overlap

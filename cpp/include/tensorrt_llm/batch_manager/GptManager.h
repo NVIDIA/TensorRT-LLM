@@ -72,6 +72,8 @@ public:
 
     BatchManagerErrorCode_t waitUntilTerminate();
 
+    BatchManagerErrorCode_t shutdown();
+
     virtual ~GptManager();
 
 protected:
@@ -107,7 +109,7 @@ private:
     // Boolean that controls if prompt should be included in output tokens for non-streaming
     bool mExcludeInputInOutput;
 
-    std::atomic<bool> destructor_called_;
+    std::atomic<bool> shutdown_requested_;
     void decoupled_execution_loop();
     std::shared_ptr<std::thread> worker_thread_;
     inline static const std::string kInputIdsTensorName_ = "input_ids";

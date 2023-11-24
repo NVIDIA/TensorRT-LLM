@@ -289,7 +289,8 @@ class GPTBenchmark(BaseBenchmark):
             max_batch_size=self.max_batch_size,
             max_input_len=self.max_input_len,
             max_output_len=self.max_output_len,
-            int8=self.quant_mode.has_act_and_weight_quant(),
+            int8=self.quant_mode.has_act_and_weight_quant()
+            or self.quant_mode.is_int8_weight_only(),
             quant_mode=self.quant_mode,
             use_refit=self.refit,
             opt_level=self.builder_opt,

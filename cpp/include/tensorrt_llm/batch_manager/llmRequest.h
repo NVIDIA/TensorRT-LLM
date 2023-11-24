@@ -36,7 +36,8 @@ enum LlmRequestState_t
     REQUEST_STATE_GENERATION_COMPLETE = 3
 };
 
-class LlmRequest
+template <typename TTensor>
+class GenericLlmRequest
 {
 public:
     using SizeType = runtime::SizeType;
@@ -45,12 +46,13 @@ public:
     using VecTokens = std::vector<TokenIdType>;
     using VecLogProbs = std::vector<float>;
     using BeamTokens = std::vector<VecTokens>;
-    using TensorPtr = runtime::ITensor::SharedPtr;
+    using TensorPtr = TTensor;
 
-    LlmRequest(RequestIdType requestId, SizeType maxNewTokens, std::shared_ptr<std::vector<TokenIdType>> inputTokens,
-        runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType> endId = std::nullopt,
-        std::optional<SizeType> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
-        std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
+    GenericLlmRequest(RequestIdType requestId, SizeType maxNewTokens,
+        std::shared_ptr<std::vector<TokenIdType>> inputTokens, runtime::SamplingConfig samplingConfig, bool isStreaming,
+        std::optional<SizeType> endId = std::nullopt, std::optional<SizeType> padId = std::nullopt,
+        std::optional<TensorPtr> embeddingBias = std::nullopt, std::optional<TensorPtr> badWordsList = std::nullopt,
+        std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType> promptVocabSize = std::nullopt, bool returnLogProbs = false,
         std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt)
@@ -242,21 +244,6 @@ public:
         return mPromptEmbeddingTable;
     }
 
-    void movePromptEmbeddingTableToGpu(runtime::BufferManager const& manager)
-    {
-        if (!mPromptEmbeddingTable.has_value()
-            || mPromptEmbeddingTable.value()->getMemoryType() == runtime::MemoryType::kGPU)
-        {
-            return;
-        }
-        else
-        {
-            TensorPtr gpuPromptEmbeddingTable
-                = manager.copyFrom(*mPromptEmbeddingTable.value(), runtime::MemoryType::kGPU);
-            mPromptEmbeddingTable = gpuPromptEmbeddingTable;
-        }
-    }
-
     std::optional<SizeType> getPromptVocabSize() const
     {
         return mPromptVocabSize;
@@ -329,7 +316,7 @@ public:
     std::optional<SizeType> mPadId;
     SizeType mBatchSlot;
 
-private:
+protected:
     SizeType mOrigPromptLen;
     BeamTokens mTokens;
     SizeType mMaxSentTokenPos;
@@ -346,6 +333,46 @@ private:
     std::vector<VecLogProbs> mLogProbs; // [beamSize, seqLen]
     VecLogProbs mCumLogProbs;           // [beamSize]
     std::shared_ptr<VecTokens> mDraftTokens;
+};
+
+class LlmRequest : public GenericLlmRequest<runtime::ITensor::SharedPtr>
+{
+public:
+    using Base = GenericLlmRequest<runtime::ITensor::SharedPtr>;
+    using TensorPtr = Base::TensorPtr;
+    using SizeType = Base::SizeType;
+    using TokenIdType = Base::TokenIdType;
+    using RequestIdType = Base::RequestIdType;
+    using VecLogProbs = Base::VecLogProbs;
+    using BeamTokens = Base::BeamTokens;
+    using VecTokens = Base::VecTokens;
+
+    LlmRequest(RequestIdType requestId, SizeType maxNewTokens, std::shared_ptr<std::vector<TokenIdType>> inputTokens,
+        runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType> endId = std::nullopt,
+        std::optional<SizeType> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
+        std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
+        std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
+        std::optional<SizeType> promptVocabSize = std::nullopt, bool returnLogProbs = false,
+        std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt)
+        : Base(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming, endId, padId, embeddingBias,
+            badWordsList, stopWordsList, promptEmbeddingTable, promptVocabSize, returnLogProbs, draftTokens)
+    {
+    }
+
+    void movePromptEmbeddingTableToGpu(runtime::BufferManager const& manager)
+    {
+        if (!mPromptEmbeddingTable.has_value()
+            || mPromptEmbeddingTable.value()->getMemoryType() == runtime::MemoryType::kGPU)
+        {
+            return;
+        }
+        else
+        {
+            TensorPtr gpuPromptEmbeddingTable
+                = manager.copyFrom(*mPromptEmbeddingTable.value(), runtime::MemoryType::kGPU);
+            mPromptEmbeddingTable = gpuPromptEmbeddingTable;
+        }
+    }
 };
 
 } // namespace tensorrt_llm::batch_manager
