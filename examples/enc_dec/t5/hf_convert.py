@@ -73,6 +73,10 @@ def split_and_convert_process(key, val, factor, saved_dir):
         # and split on num_heads // split_factor dim
         split_dim = 0
         val = np.ascontiguousarray(val.transpose(1, 0))
+        if val.shape[0] % factor != 0:
+            LOGGER.error(
+                f"[ERROR] Relative attention table, number of heads {val.shape[0]} is not divisible by TP size {factor}!"
+            )  # assert doesn't work
         split_vals = np.split(val, factor, axis=split_dim)
         for j in range(factor):
             saved_path = saved_dir / f"{saved_key}.{j:d}.bin"

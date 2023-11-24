@@ -19,9 +19,12 @@ from pathlib import Path
 from typing import Union
 
 import onnx
-import tensorrt as trt
+
+# isort: off
 import torch
 import torch.multiprocessing as mp
+import tensorrt as trt
+# isort: on
 from onnx import TensorProto, helper
 from transformers import AutoModelForCausalLM, FalconConfig
 from weight import (get_scaling_factors, load_from_awq_falcon,
@@ -560,8 +563,6 @@ def build_rank_engine(builder: Builder,
     if rank == 0:
         config_path = os.path.join(args.output_dir, 'config.json')
         builder.save_config(builder_config, config_path)
-
-    tensorrt_llm.tools.cleanup(network, tensorrt_llm_falcon)
 
     return engine
 

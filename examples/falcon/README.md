@@ -4,11 +4,10 @@ This document shows how to build and run a Falcon model in TensorRT-LLM on singl
 
 ## Overview
 
-The TensorRT-LLM Falcon implementation can be found in [tensorrt_llm/models/falcon/model.py](../../tensorrt_llm/models/falcon/model.py). The TensorRT-LLM Falcon example code is located in [`examples/falcon`](./). There are three main files:
+The TensorRT-LLM Falcon implementation can be found in [tensorrt_llm/models/falcon/model.py](../../tensorrt_llm/models/falcon/model.py). The TensorRT-LLM Falcon example code is located in [`examples/falcon`](./). There are two main files:
 
  * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Falcon model,
- * [`run.py`](./run.py) to run the inference on an input text,
- * and a shared [`../summarize.py`](../summarize.py)to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
+ * [`run.py`](./run.py) to run the inference on an input text.
 
 ## Support Matrix
   * FP16

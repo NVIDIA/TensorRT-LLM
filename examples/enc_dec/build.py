@@ -415,8 +415,6 @@ def build_rank_engine(builder: Builder,
     # Network -> Engine
     engine = builder.build_engine(network, builder_config)
 
-    tensorrt_llm.tools.cleanup(network, tllm_model)
-
     return engine
 
 

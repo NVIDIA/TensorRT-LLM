@@ -64,11 +64,19 @@ public:
     // mandatory parameters
     TensorPtr ids; // [batchSize, beamWidth, maxSeqLen], on gpu, must contain previously generated token ids for all
                    // steps before DecodingInput.step
-    TensorPtr newTokens; // [batchSize, beamWidth] on gpu.
+    TensorPtr newTokensSteps; // [maxTokensPerStep, batchSize, beamWidth] new tokens at each generated token of
+                              // maxTokensPerStep, on gpu.
+    TensorPtr newTokens;      // [batchSize, beamWidth] usually a view of newTokensSteps for the current token, on gpu.
+    std::vector<TensorPtr> newTokensVec; // vector of size maxTokensPerStep with tensor [batchSize, beamWidth].
+                                         // Vector of views on newTokensSteps for each token. Elements are on gpu.
 
     // optional parameters
-    TensorPtr finished;    // [batchSize, beamWidth], mandatory in beam search and to determine whether to stop
-                           // according to DecodingInput.sequenceLimitLength, on gpu
+    TensorPtr finishedSteps; // [maxTokensPerStep, batchSize, beamWidth] finished states at each generated token of
+                             // maxTokensPerStep, on gpu
+    TensorPtr finished;      // [batchSize, beamWidth], usually a view of finishedSteps for current token.
+                        // Set to true by decoding if any of the stop conditions are met or if DecodingInput.finished is
+                        // true. In beam search and to determine whether to stop according to
+                        // DecodingInput.sequenceLimitLength, on gpu
     TensorPtr finishedSum; // [1], the sum of finished sequences, in pinned memory
 
     // mandatory parameters for beam search

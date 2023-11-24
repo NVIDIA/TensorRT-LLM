@@ -130,6 +130,11 @@ typename tl::DynamicDecodeLayer<T>::ForwardParams prepareInputs(DecodingInput co
         forwardParams.stop_words_list = tcc::toTllmTensor(*input.stopWordsList);
     }
 
+    if (input.finished)
+    {
+        forwardParams.finished = tcc::toTllmTensor(*input.finished);
+    }
+
     return forwardParams;
 }
 
@@ -330,6 +335,47 @@ void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& de
         beamHypotheses.sequence_lengths_tgt, beamHypotheses.normed_scores, beamHypotheses.cum_log_probs,
         beamHypotheses.log_probs, beamHypotheses.num_beams, beamHypotheses.input_lengths, beamWidth, maxSeqLength,
         batchSize, stream.get());
+    sync_check_cuda_error();
+
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+}
+
+void IGptDecoder::acceptTokens(const ITensor& targetTokenIds, const ITensor& draftTokenIds,
+    const ITensor& contextLengths, const ITensor& numDraftTokens, ITensor& sequenceLengths, const ITensor& finishedVec,
+    ITensor& finishedFinal, ITensor& finishedSum, BufferManager::CudaStreamPtr const& stream)
+{
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+
+    auto const targetTokenIdsShape = targetTokenIds.getShape();
+    auto const batchSize = targetTokenIdsShape.d[0];
+    auto const beamWidth = targetTokenIdsShape.d[1];
+    auto const maxSeqLength = targetTokenIdsShape.d[2];
+    auto const maxDraftTokens = draftTokenIds.getShape().d[2];
+
+    TLLM_CHECK_WITH_INFO(
+        beamWidth == 1, common::fmtstr("Beam width (%d) > 1 is not supported for the speculative decoding", beamWidth));
+
+    TLLM_CHECK_WITH_INFO(draftTokenIds.getShape().d[0] == batchSize,
+        common::fmtstr("Draft tokens batch size (%d) is not equal to target batch size (%d)",
+            draftTokenIds.getShape().d[0], batchSize));
+
+    TLLM_CHECK_WITH_INFO(contextLengths.getShape().d[0] == batchSize,
+        common::fmtstr("Context length batch size (%d) is not equal to batch size (%d)", contextLengths.getShape().d[0],
+            batchSize));
+
+    TLLM_CHECK_WITH_INFO(numDraftTokens.getShape().d[0] == batchSize,
+        common::fmtstr("Num draft tokens batch size (%d) is not equal to batch size (%d)",
+            numDraftTokens.getShape().d[0], batchSize));
+
+    TLLM_CHECK_WITH_INFO(sequenceLengths.getShape().d[0] == batchSize,
+        common::fmtstr("Sequence length batch size (%d) is not equal to batch size (%d)",
+            sequenceLengths.getShape().d[0], batchSize));
+
+    tensorrt_llm::kernels::invokeAcceptTokens(bufferCast<SizeType>(draftTokenIds), bufferCast<SizeType>(targetTokenIds),
+        bufferCast<SizeType>(contextLengths), bufferCast<SizeType>(numDraftTokens),
+        bufferCast<SizeType>(sequenceLengths), bufferCast<bool>(finishedVec), bufferCast<bool>(finishedFinal),
+        bufferCast<int>(finishedSum), batchSize, beamWidth, maxSeqLength, maxDraftTokens, stream->get());
+
     sync_check_cuda_error();
 
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);

@@ -692,7 +692,7 @@ namespace
 
 // TODO: consolidate this function with testGptSession
 // Notice: all ChatGLM / GLM models use this
-// function The differences are GptModelConfig::ModelVariant
+// The differences are GptModelConfig::ModelVariant
 void testChatGlmSession(fs::path const& modelPath, std::string const& modelName, ModelSpec const& modelSpec,
     ModelIds const modelIds, SizeType beamWidth, std::initializer_list<int> const& batchSizes,
     std::shared_ptr<nvinfer1::ILogger> const& logger, bool cudaGraphMode, MicroBatchSizes microBatchSizes)
@@ -718,7 +718,7 @@ void testChatGlmSession(fs::path const& modelPath, std::string const& modelName,
     auto const expectedOutputData = bufferCast<TokenIdType const>(*expectedOutput);
 
     ASSERT_TRUE(fs::exists(modelPath));
-    auto const json = GptJsonConfig::parse(modelPath / (modelName + "-config.json"));
+    auto const json = GptJsonConfig::parse(modelPath / "config.json");
     auto const modelConfig = json.getModelConfig();
     verifyModelConfig(modelConfig, modelSpec);
     auto const decoderPerRequest = modelSpec.mDecoderPerRequest;
@@ -867,7 +867,7 @@ void testChatGlmSession(fs::path const& modelPath, std::string const& modelName,
 TEST_F(ChatGlmSessionTest, SamplingFP16WithGptAttentionPluginBS1BM1)
 {
     auto const modelName{"chatglm_6b"};
-    auto const modelPath{ENGINE_PATH / "chatglm"};
+    auto const modelPath{ENGINE_PATH / modelName};
     auto const batchSizes = {1};
     auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
@@ -879,7 +879,7 @@ TEST_F(ChatGlmSessionTest, SamplingFP16WithGptAttentionPluginBS1BM1)
 TEST_F(ChatGlm2SessionTest, SamplingFP16WithGptAttentionPluginBS1BM1)
 {
     auto const modelName{"chatglm2_6b"};
-    auto const modelPath{ENGINE_PATH / "chatglm"};
+    auto const modelPath{ENGINE_PATH / modelName};
     auto const batchSizes = {1};
     auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
@@ -891,7 +891,7 @@ TEST_F(ChatGlm2SessionTest, SamplingFP16WithGptAttentionPluginBS1BM1)
 TEST_F(ChatGlm2SessionTest, SamplingFP16WithGptAttentionPluginBS2BM1)
 {
     auto const modelName{"chatglm2_6b"};
-    auto const modelPath{ENGINE_PATH / "chatglm"};
+    auto const modelPath{ENGINE_PATH / modelName};
     auto const batchSizes = {2};
     auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
@@ -903,7 +903,7 @@ TEST_F(ChatGlm2SessionTest, SamplingFP16WithGptAttentionPluginBS2BM1)
 TEST_F(ChatGlm2SessionTest, SamplingFP16WithGptAttentionPluginBS1BM2)
 {
     auto const modelName{"chatglm2_6b"};
-    auto const modelPath{ENGINE_PATH / "chatglm"};
+    auto const modelPath{ENGINE_PATH / modelName};
     auto const batchSizes = {1};
     auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
@@ -915,7 +915,7 @@ TEST_F(ChatGlm2SessionTest, SamplingFP16WithGptAttentionPluginBS1BM2)
 TEST_F(ChatGlm3SessionTest, SamplingFP16WithGptAttentionPluginBS1BM1)
 {
     auto const modelName{"chatglm3_6b"};
-    auto const modelPath{ENGINE_PATH / "chatglm"};
+    auto const modelPath{ENGINE_PATH / modelName};
     auto const batchSizes = {1};
     auto constexpr dtype = nvinfer1::DataType::kHALF;
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();

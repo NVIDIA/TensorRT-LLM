@@ -15,14 +15,28 @@
  * limitations under the License.
  */
 
+#include <memory>
 #include <pybind11/functional.h>
 #include <pybind11/operators.h>
+#include <pybind11/stl.h>
 #include <torch/extension.h>
+#include <vector>
 
+#include "batch_manager/gptManager.h"
+#include "batch_manager/inferenceRequest.h"
+#include "batch_manager/llmRequest.h"
+#include "batch_manager/namedTensor.h"
 #include "runtime/generationInput.h"
 #include "runtime/generationOutput.h"
+#include "tensorrt_llm/batch_manager/BatchManager.h"
+#include "tensorrt_llm/batch_manager/batchScheduler.h"
+#include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
+#include "utils/pathCaster.h"
 
+#include "tensorrt_llm/batch_manager/GptManager.h"
+#include "tensorrt_llm/batch_manager/inferenceRequest.h"
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
+#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
@@ -31,9 +45,13 @@
 
 namespace py = pybind11;
 namespace tb = tensorrt_llm::batch_manager;
+namespace tbb = tensorrt_llm::batch_manager::batch_scheduler;
+namespace tbk = tensorrt_llm::batch_manager::kv_cache_manager;
+namespace tpb = tensorrt_llm::pybind::batch_manager;
 namespace tc = tensorrt_llm::common;
 namespace tr = tensorrt_llm::runtime;
 namespace tpr = tensorrt_llm::pybind::runtime;
+using SizeType = tr::SizeType;
 
 #if not defined(TRTLLM_PYBIND_MODULE)
 #error "TRTLLM_PYBIND_MODULE must be defined"
@@ -53,8 +71,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("prompt_tuning_enabled", &tpr::PromptTuningParams::promptTuningEnabled);
 
     py::class_<tpr::GenerationInput>(m, "GenerationInput")
-        .def(py::init<tr::SizeType, tr::SizeType, tpr::GenerationInput::TensorPtr, tpr::GenerationInput::TensorPtr,
-                 bool>(),
+        .def(py::init<SizeType, SizeType, tpr::GenerationInput::TensorPtr, tpr::GenerationInput::TensorPtr, bool>(),
             py::arg("end_id"), py::arg("pad_id"), py::arg("ids"), py::arg("lengths"), py::arg("packed") = false)
         .def_readwrite("end_id", &tpr::GenerationInput::endId)
         .def_readwrite("pad_id", &tpr::GenerationInput::padId)
@@ -76,16 +93,16 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("context_logits", &tpr::GenerationOutput::contextLogits)
         .def_readwrite("on_token_generated", &tpr::GenerationOutput::onTokenGenerated);
 
-    py::class_<tb::kv_cache_manager::KvCacheConfig>(m, "KvCacheConfig")
-        .def(py::init<std::optional<tr::SizeType>, std::optional<tr::SizeType>, std::optional<float>>(),
+    py::class_<tbk::KvCacheConfig>(m, "KvCacheConfig")
+        .def(py::init<std::optional<SizeType>, std::optional<SizeType>, std::optional<float>>(),
             py::arg("max_tokens") = py::none(), py::arg("max_kv_cache_length") = py::none(),
             py::arg("free_gpu_memory_fraction") = py::none())
-        .def_readwrite("max_tokens", &tb::kv_cache_manager::KvCacheConfig::maxTokens)
-        .def_readwrite("max_kv_cache_length", &tb::kv_cache_manager::KvCacheConfig::maxKvCacheLength)
-        .def_readwrite("free_gpu_memory_fraction", &tb::kv_cache_manager::KvCacheConfig::freeGpuMemoryFraction);
+        .def_readwrite("max_tokens", &tbk::KvCacheConfig::maxTokens)
+        .def_readwrite("max_kv_cache_length", &tbk::KvCacheConfig::maxKvCacheLength)
+        .def_readwrite("free_gpu_memory_fraction", &tbk::KvCacheConfig::freeGpuMemoryFraction);
 
     py::class_<tr::GptSession::Config>(m, "GptSessionConfig")
-        .def(py::init<tr::SizeType, tr::SizeType, tr::SizeType>(), py::arg("max_batch_size"), py::arg("max_beam_width"),
+        .def(py::init<SizeType, SizeType, SizeType>(), py::arg("max_batch_size"), py::arg("max_beam_width"),
             py::arg("max_sequence_length"))
         .def_readwrite("max_batch_size", &tr::GptSession::Config::maxBatchSize)
         .def_readwrite("max_beam_width", &tr::GptSession::Config::maxBeamWidth)
@@ -148,9 +165,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def(py::self != py::self);
 
     py::class_<tr::GptModelConfig>(m, "GptModelConfig")
-        .def(py::init<tr::SizeType, tr::SizeType, tr::SizeType, tr::SizeType, nvinfer1::DataType>(),
-            py::arg("vocab_size"), py::arg("num_layers"), py::arg("num_heads"), py::arg("hidden_size"),
-            py::arg("data_type"))
+        .def(py::init<SizeType, SizeType, SizeType, SizeType, nvinfer1::DataType>(), py::arg("vocab_size"),
+            py::arg("num_layers"), py::arg("num_heads"), py::arg("hidden_size"), py::arg("data_type"))
         .def_property_readonly("vocab_size", &tr::GptModelConfig::getVocabSize)
         .def("vocab_size_padded", &tr::GptModelConfig::getVocabSizePadded, py::arg("world_size"))
         .def("num_layers", &tr::GptModelConfig::getNbLayers, py::arg("pipeline_parallelism") = 1)
@@ -185,7 +201,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
             py::overload_cast<bool>(&tr::GptModelConfig::useCustomAllReduce));
 
     py::class_<tr::WorldConfig>(m, "WorldConfig")
-        .def(py::init<tr::SizeType, tr::SizeType, tr::SizeType, tr::SizeType>(), py::arg("tensor_parallelism") = 1,
+        .def(py::init<SizeType, SizeType, SizeType, SizeType>(), py::arg("tensor_parallelism") = 1,
             py::arg("pipeline_parallelism") = 1, py::arg("rank") = 0,
             py::arg("gpus_per_node") = tr::WorldConfig::kDefaultGpusPerNode)
         .def_property_readonly("size", &tr::WorldConfig::getSize)
@@ -199,13 +215,12 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("pipeline_parallel_rank", &tr::WorldConfig::getPipelineParallelRank)
         .def_property_readonly("tensor_parallel_rank", &tr::WorldConfig::getTensorParallelRank)
         .def_static("mpi",
-            py::overload_cast<tr::SizeType, std::optional<tr::SizeType>, std::optional<tr::SizeType>>(
-                &tr::WorldConfig::mpi),
+            py::overload_cast<SizeType, std::optional<SizeType>, std::optional<SizeType>>(&tr::WorldConfig::mpi),
             py::arg("gpus_per_node") = tr::WorldConfig::kDefaultGpusPerNode, py::arg("tensor_parallelism") = py::none(),
             py::arg("pipeline_parallelism") = py::none());
 
     py::class_<tr::SamplingConfig>(m, "SamplingConfig")
-        .def(py::init<tr::SizeType>(), py::arg("beam_width") = 1)
+        .def(py::init<SizeType>(), py::arg("beam_width") = 1)
         .def_readwrite("beam_width", &tr::SamplingConfig::beamWidth)
         .def_readwrite("temperature", &tr::SamplingConfig::temperature)
         .def_readwrite("min_length", &tr::SamplingConfig::minLength)
@@ -221,13 +236,12 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("length_penalty", &tr::SamplingConfig::lengthPenalty);
 
     py::class_<tr::GptJsonConfig>(m, "GptJsonConfig")
-        .def(py::init<std::string, std::string, tr::SizeType, tr::SizeType, tr::GptModelConfig>(), py::arg("name"),
+        .def(py::init<std::string, std::string, SizeType, SizeType, tr::GptModelConfig>(), py::arg("name"),
             py::arg("precision"), py::arg("tensor_parallelism"), py::arg("pipeline_parallelism"),
             py::arg("model_config"))
         .def_static("parse", py::overload_cast<std::string const&>(&tr::GptJsonConfig::parse), py::arg("json"))
         .def_static(
-            "parse_file", [](std::string const& file) { return tr::GptJsonConfig::parse(std::filesystem::path(file)); },
-            py::arg("file"))
+            "parse_file", py::overload_cast<std::filesystem::path const&>(&tr::GptJsonConfig::parse), py::arg("path"))
         .def_property_readonly("model_config", &tr::GptJsonConfig::getModelConfig)
         .def_property_readonly("name", &tr::GptJsonConfig::getName)
         .def_property_readonly("precision", &tr::GptJsonConfig::getPrecision)
@@ -254,4 +268,104 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
                 tr::SamplingConfig const& samplingConfig)
             { self.generate(*outputs.toTrtLlm(), *inputs.toTrtLlm(), samplingConfig); },
             py::arg("outputs"), py::arg("inputs"), py::arg("sampling_config"));
+
+    py::enum_<tb::LlmRequestState_t>(m, "LlmRequestState")
+        .value("REQUEST_STATE_UNKNOWN", tb::LlmRequestState_t::REQUEST_STATE_UNKNOWN)
+        .value("REQUEST_STATE_CONTEXT_INIT", tb::LlmRequestState_t::REQUEST_STATE_CONTEXT_INIT)
+        .value("REQUEST_STATE_GENERATION_IN_PROGRESS", tb::LlmRequestState_t::REQUEST_STATE_GENERATION_IN_PROGRESS)
+        .value("REQUEST_STATE_GENERATION_COMPLETE", tb::LlmRequestState_t::REQUEST_STATE_GENERATION_COMPLETE);
+
+    using LlmRequest = tpb::LlmRequest;
+    py::class_<LlmRequest>(m, "LlmRequest")
+        .def(py::init<LlmRequest::RequestIdType, LlmRequest::SizeType, std::vector<LlmRequest::TokenIdType>,
+                 tr::SamplingConfig, bool, std::optional<LlmRequest::SizeType>, std::optional<LlmRequest::SizeType>,
+                 std::optional<LlmRequest::TensorPtr>, std::optional<LlmRequest::TensorPtr>,
+                 std::optional<LlmRequest::TensorPtr>, std::optional<LlmRequest::TensorPtr>,
+                 std::optional<LlmRequest::SizeType>, bool, std::optional<LlmRequest::VecTokens>>(),
+            py::arg("request_id"), py::arg("max_new_tokens"), py::arg("input_tokens"), py::arg("sampling_config"),
+            py::arg("is_streaming"), py::arg("end_id") = std::nullopt, py::arg("pad_id") = std::nullopt,
+            py::arg("embedding_bias") = std::nullopt, py::arg("bad_words_list") = std::nullopt,
+            py::arg("stop_words_list") = std::nullopt, py::arg("prompt_embedding_table") = std::nullopt,
+            py::arg("prompt_vocab_size") = std::nullopt, py::arg("return_log_probs") = false,
+            py::arg("draft_tokens") = std::nullopt)
+        .def("get_num_tokens", &LlmRequest::getNumTokens, py::arg("beam"))
+        .def_property_readonly("max_beam_num_tokens", &LlmRequest::getMaxBeamNumTokens)
+        .def("get_token", &LlmRequest::getToken, py::arg("beam"), py::arg("pos"))
+        .def("get_tokens", &LlmRequest::getTokens, py::arg("beam"))
+        .def_property_readonly("max_num_generated_tokens", &LlmRequest::getMaxNumGeneratedTokens)
+        .def("add_new_token", &LlmRequest::addNewToken, py::arg("token"), py::arg("beam"))
+        .def("add_new_tokens", &LlmRequest::addNewTokens, py::arg("beam_tokens"))
+        .def("set_generated_tokens", &LlmRequest::setGeneratedTokens, py::arg("generated_beam_tokens"))
+        .def("pause", &LlmRequest::pause, py::arg("max_input_len"))
+        .def_property("max_sent_token_pos", &LlmRequest::getMaxSentTokenPos, &LlmRequest::setMaxSentTokenPos)
+        .def_property_readonly("prompt_embedding_table", &LlmRequest::getPromptEmbeddingTable)
+        .def_property_readonly("prompt_vocab_size", &LlmRequest::getPromptVocabSize)
+        .def_property_readonly("embedding_bias", &LlmRequest::getEmbeddingBias)
+        .def_property_readonly("bad_words_list", &LlmRequest::getBadWordsList)
+        .def_property_readonly("stop_words_list", &LlmRequest::getStopWordsList)
+        .def_readwrite("request_id", &LlmRequest::mRequestId)
+        .def_readwrite("prompt_len", &LlmRequest::mPromptLen)
+        .def_readwrite("max_new_tokens", &LlmRequest::mMaxNewTokens)
+        .def_readwrite("sampling_config", &LlmRequest::mSamplingConfig)
+        .def_readwrite("state", &LlmRequest::mState)
+        .def_readwrite("is_streaming", &LlmRequest::mIsStreaming)
+        .def_readwrite("end_id", &LlmRequest::mEndId)
+        .def_readwrite("pad_id", &LlmRequest::mPadId)
+        .def_readwrite("batch_slot", &LlmRequest::mBatchSlot)
+        .def_property_readonly("return_log_probs", &LlmRequest::returnLogProbs)
+        .def_property_readonly("log_probs", py::overload_cast<>(&LlmRequest::getLogProbs, py::const_))
+        .def("get_log_probs", py::overload_cast<SizeType>(&LlmRequest::getLogProbs, py::const_))
+        .def("set_log_probs", &LlmRequest::setLogProbs, py::arg("log_probs"), py::arg("beam"))
+        .def_property_readonly("cum_log_probs", &LlmRequest::getCumLogProbs)
+        .def("set_cum_log_prob", &LlmRequest::setCumLogProb, py::arg("cum_log_prob"), py::arg("beam"))
+        .def_property_readonly("orig_prompt_len", &LlmRequest::getOrigPromptLen)
+        .def("has_draft_tokens", &LlmRequest::hasDraftTokens)
+        .def_property(
+            "draft_tokens", [](LlmRequest& self) { return *self.getDraftTokens(); },
+            [](LlmRequest& self, LlmRequest::VecTokens& draftTokens)
+            { self.setDraftTokens(std::make_shared<LlmRequest::VecTokens>(std::move(draftTokens))); });
+
+    using InferenceRequest = tpb::InferenceRequest;
+    py::class_<InferenceRequest>(m, "InferenceRequest")
+        .def(py::init<uint64_t>())
+        .def(py::init<InferenceRequest::TensorMap const&, uint64_t>())
+        .def("get_input_tensor", &InferenceRequest::getInputTensor, py::arg("input_tensor_name"))
+        .def("emplace_input_tensor", &InferenceRequest::emplaceInputTensor, py::arg("input_tensor_name"),
+            py::arg("input_tensor"))
+        .def_property("is_streaming", &InferenceRequest::isStreaming, &InferenceRequest::setIsStreaming)
+        .def_property_readonly("request_id", &InferenceRequest::getRequestId);
+
+    py::enum_<tb::TrtGptModelType>(m, "TrtGptModelType")
+        .value("V1", tb::TrtGptModelType::V1)
+        .value("InflightBatching", tb::TrtGptModelType::InflightBatching)
+        .value("InflightFusedBatching", tb::TrtGptModelType::InflightFusedBatching);
+
+    py::enum_<tbb::SchedulerPolicy>(m, "SchedulerPolicy")
+        .value("MAX_UTILIZATION", tbb::SchedulerPolicy::MAX_UTILIZATION)
+        .value("GUARANTEED_NO_EVICT", tbb::SchedulerPolicy::GUARANTEED_NO_EVICT);
+
+    py::class_<tb::TrtGptModelOptionalParams>(m, "TrtGptModelOptionalParams")
+        .def(py::init<tbk::KvCacheConfig, std::optional<SizeType>, bool>(),
+            py::arg("kv_cache_config") = tbk::KvCacheConfig{}, py::arg("max_num_sequences") = py::none(),
+            py::arg("enable_trt_overlap") = true)
+        .def_readwrite("kv_cache_config", &tb::TrtGptModelOptionalParams::kvCacheConfig)
+        .def_readwrite("max_num_sequences", &tb::TrtGptModelOptionalParams::maxNumSequences)
+        .def_readwrite("enable_trt_overlap", &tb::TrtGptModelOptionalParams::enableTrtOverlap);
+
+    py::class_<tpb::NamedTensor>(m, "NamedTensor")
+        .def(py::init<tpb::NamedTensor::TensorPtr, std::string>(), py::arg("tensor"), py::arg("name"))
+        .def_readwrite("tensor", &tpb::NamedTensor::tensor)
+        .def_readwrite("name", &tpb::NamedTensor::name);
+
+    py::class_<tpb::GptManager>(m, "GptManager")
+        .def(py::init<std::filesystem::path const&, tb::TrtGptModelType, int32_t, tb::batch_scheduler::SchedulerPolicy,
+                 tpb::GetInferenceRequestsCallback, tpb::SendResponseCallback, tb::PollStopSignalCallback,
+                 tb::ReturnBatchManagerStatsCallback, const tb::TrtGptModelOptionalParams&, std::optional<uint64_t>>(),
+            py::arg("trt_engine_path"), py::arg("model_type"), py::arg("max_beam_width"), py::arg("scheduler_policy"),
+            py::arg("get_inference_requests_cb"), py::arg("send_response_cb"), py::arg("poll_stop_signal_cb") = nullptr,
+            py::arg("return_batch_manager_stats_cb") = nullptr,
+            py::arg("optional_params") = tb::TrtGptModelOptionalParams(), py::arg("terminate_req_id") = std::nullopt)
+        .def("shutdown", &tpb::GptManager::exit)
+        .def("__enter__", &tpb::GptManager::enter)
+        .def("__exit__", &tpb::GptManager::exit);
 }

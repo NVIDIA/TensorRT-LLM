@@ -50,6 +50,7 @@ private:
             nullptr,                            // output_ids
             nullptr,                            // sequence_length
             nullptr,                            // finished_buffer
+            nullptr,                            // finished_buffer
             nullptr,                            // cum_log_probs
             nullptr,                            // output_log_probs
             nullptr,                            // log_probs
@@ -69,6 +70,7 @@ private:
             nullptr,                            // output_ids
             nullptr,                            // sequence_length
             nullptr,                            // finished_buffer
+            nullptr,                            // finished_buffer
             nullptr,                            // cum_log_probs
             nullptr,                            // output_log_probs
             nullptr,                            // log_probs
@@ -85,8 +87,8 @@ private:
         // Perform batched TopP sampling
         tk::invokeBatchTopPSampling<T>(workspaceDevice->data(), workspaceSize, cubTempStorageSize,
             bufferCast<int*>(*this->mIdsPtrHost), bufferCast<int32_t>(*this->mSeqLengthsDevice),
-            bufferCast<bool>(*this->mFinishedDevice), bufferCast<float>(*this->mCumLogProbsDevice),
-            bufferCast<float>(*this->mOutputLogProbsDevice),
+            bufferCast<bool>(*this->mFinishedDevice), bufferCast<bool>(*this->mFinishedDevice),
+            bufferCast<float>(*this->mCumLogProbsDevice), bufferCast<float>(*this->mOutputLogProbsDevice),
             // Note that the kernel needs vocab probs instead of
             // log-prob if cum_log_probs or output_log_probs are
             // provided. It's because the sampling layer already

@@ -3,8 +3,10 @@ import json
 import os
 from pathlib import Path
 
-import tensorrt as trt
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from transformers import AutoTokenizer
 
 import tensorrt_llm

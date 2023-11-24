@@ -29,6 +29,7 @@ from ..functional import (AttentionMaskType, PositionEmbeddingType,
 from ..module import Module
 from ..parameter import Parameter
 from ..quantization import QuantMode
+from ..quantization.functional import dequantize, quantize
 from ..quantization.layers import FP8Linear, FP8RowLinear
 from .linear import ColumnLinear, RowLinear
 from .lora import Lora
@@ -121,7 +122,8 @@ class RopeEmbeddingUtils:
         elif pos_emb_type == PositionEmbeddingType.chatglm:
             assert len(position_embedding) == 4
             cos0, cos1, sin0, sin1 = position_embedding
-
+            if default_net().strongly_typed and tensor.dtype != cos0.dtype:
+                tensor = cast(tensor, cos0.dtype)
             shape_tensor = concat([
                 shape(tensor, i) / 2 if i == (tensor.ndim() -
                                               1) else shape(tensor, i)
@@ -217,6 +219,12 @@ class RopeEmbeddingUtils:
             tensor=key,
             position_embedding=position_embedding,
             pos_emb_type=PositionEmbeddingType.chatglm)
+
+        if default_net().strongly_typed:
+            if query.dtype != value.dtype:
+                query = cast(query, value.dtype)
+            if key.dtype != value.dtype:
+                key = cast(key, value.dtype)
 
         qkv = concat([query, key, value], dim=2)
         qkv = qkv.view(qkv_shape)
@@ -731,6 +739,10 @@ class Attention(Module):
                     past_key_value = dequantize_tensor(
                         past_key_value, self.kv_quant_orig_scale.value)
 
+                if self.use_fp8_qdq and self.quant_mode.has_kv_cache_quant():
+                    past_key_value = dequantize(past_key_value,
+                                                self.kv_quant_orig_scale.value)
+
                 # past_key_value [bs, 2, num_heads, max_seq_len, head_dim]
                 past_key, past_value = split(past_key_value, 1, dim=1)
 
@@ -771,6 +783,11 @@ class Attention(Module):
 
                     past_key_value = quantize_tensor(
                         past_key_value, self.kv_orig_quant_scale.value)
+
+                if self.use_fp8_qdq and self.quant_mode.has_kv_cache_quant():
+                    past_key_value = quantize(past_key_value,
+                                              self.kv_orig_quant_scale.value,
+                                              dtype='fp8')
 
             # MQA broadcast
             if self.num_attention_heads // self.num_attention_kv_heads > 1:

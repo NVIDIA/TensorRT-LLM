@@ -44,7 +44,7 @@ protected:
     {
         size_t workspaceSize;
         tk::invokeTopKSampling<T>(nullptr, workspaceSize, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-            this->mMaxTopK, 1.0f, params.vocabSize, nullptr, this->mStream->get(), params.batchSize, nullptr);
+            nullptr, this->mMaxTopK, 1.0f, params.vocabSize, nullptr, this->mStream->get(), params.batchSize, nullptr);
         return workspaceSize;
     }
 
@@ -59,8 +59,8 @@ protected:
             // preprocesses log_prob_buf when those are provided.
             bufferCast<T>(*this->mProbsDevice), bufferCast<int*>(*this->mIdsPtrHost),
             bufferCast<int32_t>(*this->mSeqLengthsDevice), bufferCast<bool>(*this->mFinishedDevice),
-            bufferCast<float>(*this->mCumLogProbsDevice), bufferCast<float>(*this->mOutputLogProbsDevice),
-            this->mCurandStatesDevice, this->mMaxTopK,
+            bufferCast<bool>(*this->mFinishedDevice), bufferCast<float>(*this->mCumLogProbsDevice),
+            bufferCast<float>(*this->mOutputLogProbsDevice), this->mCurandStatesDevice, this->mMaxTopK,
             hasDiffRuntimeArgs ? bufferCast<int32_t>(*this->mTopKsDevice) : nullptr, params.topP,
             hasDiffRuntimeArgs ? bufferCast<float>(*this->mTopPsDevice) : nullptr, params.vocabSize,
             bufferCast<int32_t>(*this->mEndIdsDevice), this->mStream->get(), params.batchSize,

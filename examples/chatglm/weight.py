@@ -29,6 +29,15 @@ from tensorrt_llm.models.quantized.quant import get_dummy_quant_scales
 from tensorrt_llm.quantization import QuantMode
 
 
+def split(weight: np.ndarray, tp_size: int, rank: int = 0, dim: int = 0):
+    if tp_size == 1:
+        return weight
+    elif weight.ndim == 1:
+        return np.ascontiguousarray(np.split(weight, tp_size)[rank].copy())
+    return np.ascontiguousarray(
+        np.split(weight, tp_size, axis=dim)[rank].copy())
+
+
 def split_matrix(weight: np.ndarray, tp_size: int, rank: int, dim: int):
     return np.ascontiguousarray(split(weight, tp_size, rank, dim=dim))
 
@@ -81,7 +90,7 @@ def load_quant_weight(src, value_dst, scale_dst, plugin_weight_only_quant_type):
 def load_from_hf(
     trt_model,
     hf_model_dir,
-    mapping=None,
+    mapping=Mapping(),
     dtype="float32",
     model_name=None,
     multi_query_mode=False,
@@ -100,9 +109,9 @@ def load_from_hf(
 
     hf_model = transformers.AutoModel.from_pretrained(hf_model_dir,
                                                       trust_remote_code=True)
-    num_layers = hf_model.config.num_layers
     hidden_size = hf_model.config.hidden_size
     num_heads = hf_model.config.num_attention_heads
+    num_layers = hf_model.config.num_layers
 
     torch_type = str_dtype_to_torch(dtype)
     quant_mode = getattr(trt_model, 'quant_mode', QuantMode(0))
@@ -344,7 +353,8 @@ def load_from_hf(
                 scale_dst=dst.per_channel_scale,
                 plugin_weight_only_quant_type=plugin_weight_only_quant_type)
         else:
-            dst.weight.value = torch_to_numpy(split_weight)
+            dst.weight.value = np.ascontiguousarray(
+                torch_to_numpy(split_weight))
         feed_weight_count += 1
 
         # Dense multiplication bias, only GLM-10B
@@ -462,7 +472,8 @@ def load_from_hf(
                 scale_dst=dst.per_channel_scale,
                 plugin_weight_only_quant_type=plugin_weight_only_quant_type)
         else:
-            dst.weight.value = torch_to_numpy(split_weight)
+            dst.weight.value = np.ascontiguousarray(
+                torch_to_numpy(split_weight))
         feed_weight_count += 1
 
         # Multilayer perceptron 4h -> h bias, only GLM-10B
@@ -496,115 +507,6 @@ def load_from_hf(
         return None
     tensorrt_llm.logger.info("Loading weights finish in %.2fs" % (tok - tik))
     return trt_model
-
-
-def load_from_hf_checkpoint(
-        trtllm_falcon: tensorrt_llm.models.FalconForCausalLM,
-        model_dir: Union[str, Path],
-        mapping=Mapping(),
-        dtype: Union[str, torch.dtype] = torch.float32,
-):
-    logger.info('Loading weights from HF Falcon...')
-    tik = time.time()
-
-    model_dir = Path(model_dir)
-    if isinstance(dtype, str):
-        dtype = tensorrt_llm._utils.str_dtype_to_torch(dtype)
-
-    def is_bias(_name):
-        return 'bias' in _name
-
-    layers_range = trtllm_falcon.get_transformer_layers(
-        trtllm_falcon.mapping, trtllm_falcon.num_layers)
-    for model_file in iterate_shard_files(model_dir, mapping.tp_rank):
-        logger.debug(f'Loading file {str(model_file)}...')
-        state_dict = load_state_dict(model_file, dtype)
-        for name, param in state_dict.items():
-            logger.debug(f'Converting weight {name}...')
-            i = retrieved_layer_index_from_name(name)
-            if i is None:
-                layer = None
-            else:
-                if i not in layers_range:
-                    continue
-                layer = trtllm_falcon.layers[i - layers_range[0]]
-
-            if 'self_attention.query_key_value' in name:
-                if not is_bias(name):
-                    layer.attention.qkv.weight.value = split_qkv_weight(
-                        trtllm_falcon,
-                        param,
-                        mapping.tp_size,
-                        mapping.tp_rank,
-                        is_bias=False,
-                        num_kv_heads=trtllm_falcon.num_kv_heads)
-                else:
-                    layer.attention.qkv.bias.value = split_qkv_weight(
-                        trtllm_falcon,
-                        param,
-                        mapping.tp_size,
-                        mapping.tp_rank,
-                        is_bias=True,
-                        num_kv_heads=trtllm_falcon.num_kv_heads)
-            elif 'self_attention.dense' in name:
-                if not is_bias(name):
-                    layer.attention.dense.weight.value = split_matrix(
-                        param, mapping.tp_size, mapping.tp_rank, dim=1)
-                else:
-                    layer.attention.dense.bias.value = param
-            elif 'mlp.dense_h_to_4h' in name:
-                if not is_bias(name):
-                    layer.mlp.fc.weight.value = split_matrix(param,
-                                                             mapping.tp_size,
-                                                             mapping.tp_rank,
-                                                             dim=0)
-                else:
-                    layer.mlp.fc.bias.value = split_matrix(param,
-                                                           mapping.tp_size,
-                                                           mapping.tp_rank,
-                                                           dim=0)
-            elif 'mlp.dense_4h_to_h' in name:
-                if not is_bias(name):
-                    layer.mlp.proj.weight.value = split_matrix(param,
-                                                               mapping.tp_size,
-                                                               mapping.tp_rank,
-                                                               dim=1)
-                else:
-                    layer.mlp.proj.bias.value = param
-            elif 'ln_attn' in name or 'input_layernorm' in name:
-                if not is_bias(name):
-                    layer.input_layernorm.weight.value = param
-                else:
-                    layer.input_layernorm.bias.value = param
-            elif 'ln_mlp' in name:
-                assert layer.mlp_layernorm is not None
-                if not is_bias(name):
-                    layer.mlp_layernorm.weight.value = param
-                else:
-                    layer.mlp_layernorm.bias.value = param
-            elif 'post_attention_layernorm' in name:
-                assert layer.post_layernorm is not None
-                if not is_bias(name):
-                    layer.post_layernorm.weight.value = param
-                else:
-                    layer.post_layernorm.bias.value = param
-            elif 'word_embeddings' in name:
-                if mapping.is_first_pp_rank():
-                    trtllm_falcon.embedding.weight.value = param.copy()
-                if mapping.is_last_pp_rank():
-                    trtllm_falcon.lm_head.weight.value = split_matrix(
-                        param, mapping.tp_size, mapping.tp_rank, dim=0)
-            elif 'ln_f' in name:
-                if mapping.is_last_pp_rank():
-                    if not is_bias(name):
-                        trtllm_falcon.ln_f.weight.value = param
-                    else:
-                        trtllm_falcon.ln_f.bias.value = param
-        del state_dict
-
-    tok = time.time()
-    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-    logger.info(f'Weights loaded. Total time: {t}')
 
 
 def get_scaling_factors(

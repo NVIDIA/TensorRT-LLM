@@ -93,40 +93,50 @@ def get_model(ckpt_path, dtype="float16", cache_dir=None):
     return model
 
 
-def get_args():
+def parse_arguments(args):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model_dir",
-                        type=str,
-                        required=True,
-                        help="Directory of a HF model checkpoint")
-    parser.add_argument("--dtype", help="Model data type.", default="float16")
     parser.add_argument(
-        "--qformat",
+        '--model_name',
+        '-m',
         type=str,
-        choices=['fp8', 'int4_awq'],
-        default='fp8',
-        help='Quantization format. Currently only fp8 is supported. '
-        'For int8 smoothquant, use smoothquant.py instead. ')
+        required=True,
+        choices=[
+            "chatglm_6b", "chatglm2_6b", "chatglm2_6b_32k", "chatglm3_6b",
+            "chatglm3_6b_base", "chatglm3_6b_32k", "glm_10b"
+        ],
+        help=
+        'the name of the model, use "_" rather than "-" to connect the name parts'
+    )
+    parser.add_argument("--dtype", help="Model data type.", default="float16")
+    parser.add_argument("--qformat",
+                        type=str,
+                        choices=['fp8', 'int4_awq'],
+                        default='int4_awq',
+                        help='Quantization format.'
+                        'For int8 smoothquant, use smoothquant.py instead.')
     parser.add_argument("--calib_size",
                         type=int,
-                        default=512,
+                        default=32,
                         help="Number of samples for calibration.")
-    parser.add_argument("--export_path", default="exported_model")
+    parser.add_argument('--model_dir', type=str, default=None)
+    parser.add_argument("--export_path", default="awq")
     parser.add_argument("--cache_dir",
                         type=str,
-                        default=None,
+                        default="dataset/",
                         help="Directory of dataset cache.")
     parser.add_argument('--seed', type=int, default=None, help='Random seed')
     args = parser.parse_args()
     return args
 
 
-def main():
+def main(args=None):
     if not torch.cuda.is_available():
         raise EnvironmentError("GPU is required for inference.")
 
-    args = get_args()
+    args = parse_arguments(args)
 
+    if args.model_dir is None:
+        args.model_dir = args.model_name
     if args.seed is not None:
         random.seed(args.seed)
         np.random.seed(args.seed)

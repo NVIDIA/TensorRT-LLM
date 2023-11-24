@@ -4,11 +4,10 @@ This document shows how to build and run InternLM 7B / 20B models in TensorRT-LL
 
 ## Overview
 
-The TensorRT-LLM InternLM implementation can be found in [tensorrt_llm/models/internlm/model.py](../../tensorrt_llm/models/internlm/model.py). The TensorRT-LLM InternLM example code is located in [`examples/internlm`](./). There are three main files:
+The TensorRT-LLM InternLM implementation can be found in [tensorrt_llm/models/internlm/model.py](../../tensorrt_llm/models/internlm/model.py). The TensorRT-LLM InternLM example code is located in [`examples/internlm`](./). There are two main files:
 
  * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the InternLM model,
- * [`run.py`](./run.py) to run the inference on an input text,
- * and a shared [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
+ * [`run.py`](./run.py) to run the inference on an input text.
 
 ## Support Matrix
   * FP16 / BF16

@@ -20,8 +20,11 @@ from itertools import product
 
 import numpy as np
 import pytest
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from parameterized import parameterized
 from transformers import GPTJConfig, GPTJForCausalLM
 
@@ -114,6 +117,15 @@ class TestGPTJ(unittest.TestCase):
         fp16 = (dtype == 'float16')
 
         with tempfile.TemporaryDirectory() as tmpdirname:
+
+            builder_config = builder.create_builder_config(
+                name='gptj',
+                precision=dtype,
+                timing_cache='model.cache',
+                tensor_parallel=world_size,  # TP only
+                use_refit=use_refit,
+                strongly_typed=fp16,
+            )
             network = builder.create_network()
             if use_attention_plugin:
                 network.plugin_config.set_gpt_attention_plugin(dtype)
@@ -128,13 +140,6 @@ class TestGPTJ(unittest.TestCase):
                                            batch_size, beam_width, input_len,
                                            output_len, fp16, world_size)
 
-            builder_config = builder.create_builder_config(
-                name='gptj',
-                precision=dtype,
-                timing_cache='model.cache',
-                tensor_parallel=world_size,  # TP only
-                use_refit=use_refit,
-            )
             engine_buffer = builder.build_engine(network, builder_config)
             assert engine_buffer is not None
             runtime = tensorrt_llm.runtime.generation._Runtime(

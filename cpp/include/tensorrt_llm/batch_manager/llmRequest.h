@@ -36,24 +36,28 @@ enum LlmRequestState_t
     REQUEST_STATE_GENERATION_COMPLETE = 3
 };
 
-class LlmRequest
+template <typename TTensor>
+class GenericLlmRequest
 {
 public:
     using SizeType = runtime::SizeType;
     using TokenIdType = runtime::TokenIdType;
     using RequestIdType = std::uint64_t;
-    using BeamTokens = std::vector<std::vector<TokenIdType>>;
+    using VecTokens = std::vector<TokenIdType>;
     using VecLogProbs = std::vector<float>;
-    using TensorPtr = runtime::ITensor::SharedPtr;
+    using BeamTokens = std::vector<VecTokens>;
+    using TensorPtr = TTensor;
 
-    LlmRequest(RequestIdType requestId, SizeType maxNewTokens, std::shared_ptr<std::vector<TokenIdType>> input_tokens,
-        runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType> endId = std::nullopt,
-        std::optional<SizeType> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
-        std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
+    GenericLlmRequest(RequestIdType requestId, SizeType maxNewTokens,
+        std::shared_ptr<std::vector<TokenIdType>> inputTokens, runtime::SamplingConfig samplingConfig, bool isStreaming,
+        std::optional<SizeType> endId = std::nullopt, std::optional<SizeType> padId = std::nullopt,
+        std::optional<TensorPtr> embeddingBias = std::nullopt, std::optional<TensorPtr> badWordsList = std::nullopt,
+        std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
-        std::optional<SizeType> promptVocabSize = std::nullopt, bool returnLogProbs = false)
+        std::optional<SizeType> promptVocabSize = std::nullopt, bool returnLogProbs = false,
+        std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt)
         : mRequestId(requestId)
-        , mPromptLen(input_tokens->size())
+        , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
         , mSamplingConfig(samplingConfig)
         , mState(REQUEST_STATE_CONTEXT_INIT)
@@ -61,7 +65,7 @@ public:
         , mEndId(endId)
         , mPadId(padId)
         , mBatchSlot(-1)
-        , mOrigPromptLen(input_tokens->size())
+        , mOrigPromptLen(inputTokens->size())
         , mEmbeddingBias(embeddingBias)
         , mBadWordsList(badWordsList)
         , mStopWordsList(stopWordsList)
@@ -70,10 +74,11 @@ public:
         , mReturnLogProbs(returnLogProbs)
         , mLogProbs(samplingConfig.beamWidth)
         , mCumLogProbs(samplingConfig.beamWidth)
+        , mDraftTokens(draftTokens.value_or(std::make_shared<VecTokens>()))
     {
         mMaxSentTokenPos = mPromptLen - 1;
         // Scatter the input tokens to other beam
-        mTokens = std::make_shared<BeamTokens>(mSamplingConfig.beamWidth, *input_tokens);
+        mTokens = BeamTokens(mSamplingConfig.beamWidth, *inputTokens);
 
         if ((mPromptEmbeddingTable.has_value() && !mPromptVocabSize.has_value())
             || (!mPromptEmbeddingTable.has_value() && mPromptVocabSize.has_value()))
@@ -91,7 +96,7 @@ public:
     /// @return  The number of tokens
     SizeType getNumTokens(SizeType beam) const
     {
-        return mTokens->at(beam).size();
+        return mTokens.at(beam).size();
     }
 
     /// @brief Get max number of tokens across all beams
@@ -101,7 +106,7 @@ public:
         SizeType maxTokens = 0;
         for (SizeType beam = 0; beam < mSamplingConfig.beamWidth; ++beam)
         {
-            maxTokens = std::max(maxTokens, static_cast<SizeType>(mTokens->at(beam).size()));
+            maxTokens = std::max(maxTokens, static_cast<SizeType>(mTokens.at(beam).size()));
         }
         return maxTokens;
     }
@@ -112,19 +117,33 @@ public:
     /// @return  The token index
     TokenIdType getToken(SizeType beam, SizeType pos) const
     {
-        return mTokens->at(beam).at(pos);
+        return mTokens.at(beam).at(pos);
     }
 
     /// @brief Get the tokens at a given beam index
-    /// @param beam  The beam index
-    /// @return  A vector of tokens for this beam index, includes the prompt
-    std::vector<TokenIdType> getTokens(SizeType beam) const
+    /// @param beam The beam index
+    /// @return A vector of tokens for this beam index, includes the prompt
+    std::vector<TokenIdType> const& getTokens(SizeType beam) const
     {
-        return mTokens->at(beam);
+        return mTokens.at(beam);
+    }
+
+    /// @brief Get the draft tokens
+    /// @return shared_ptr to vector of draft tokens
+    std::shared_ptr<std::vector<TokenIdType>> const& getDraftTokens() const
+    {
+        return mDraftTokens;
+    }
+
+    /// @brief Returns true if request has draft tokens
+    /// @return flag
+    bool hasDraftTokens() const
+    {
+        return mDraftTokens && mDraftTokens->size() > 0;
     }
 
     /// @brief Get the maximum number of generated tokens among all rays in beam
-    /// @return  The number of generated tokens (doesn't include the prompt tokens)
+    /// @return The number of generated tokens (doesn't include the prompt tokens)
     SizeType getMaxNumGeneratedTokens() const
     {
         return getMaxBeamNumTokens() - mPromptLen;
@@ -135,7 +154,7 @@ public:
     /// @param beam The beam to which to add the new token
     void addNewToken(TokenIdType token, SizeType beam)
     {
-        mTokens->at(beam).push_back(token);
+        mTokens.at(beam).push_back(token);
     }
 
     /// @brief Add new generated tokens to the vector of tokens
@@ -147,7 +166,7 @@ public:
         for (std::size_t beam = 0; beam < beamTokens.size(); ++beam)
         {
             const auto outputId = beamTokens[beam];
-            mTokens->at(beam).push_back(outputId);
+            mTokens.at(beam).push_back(outputId);
         }
     }
 
@@ -158,7 +177,7 @@ public:
         assert(generatedBeamTokens.size() == mSamplingConfig.beamWidth);
         for (std::size_t beam = 0; beam < generatedBeamTokens.size(); ++beam)
         {
-            auto& beamTokens = (*mTokens)[beam];
+            auto& beamTokens = mTokens[beam];
             beamTokens.resize(mPromptLen);
             beamTokens.insert(beamTokens.end(), generatedBeamTokens[beam].begin(), generatedBeamTokens[beam].end());
         }
@@ -173,9 +192,9 @@ public:
         // As a temporary solution, we currently reset the tokens to the prompt
         if (mSamplingConfig.beamWidth > 1)
         {
-            for (std::size_t beam = 0; beam < mTokens->size(); ++beam)
+            for (std::size_t beam = 0; beam < mTokens.size(); ++beam)
             {
-                auto& beamTokens = mTokens->at(beam);
+                auto& beamTokens = mTokens.at(beam);
                 beamTokens.resize(mPromptLen);
                 if (mReturnLogProbs)
                 {
@@ -186,9 +205,9 @@ public:
         else
         {
             SizeType newPromptLen = std::min(maxInputLen, mPromptLen + getMaxNumGeneratedTokens());
-            for (std::size_t beam = 0; beam < mTokens->size(); ++beam)
+            for (std::size_t beam = 0; beam < mTokens.size(); ++beam)
             {
-                auto& beamTokens = mTokens->at(beam);
+                auto& beamTokens = mTokens.at(beam);
                 beamTokens.resize(newPromptLen);
 
                 if (mReturnLogProbs)
@@ -223,21 +242,6 @@ public:
     std::optional<TensorPtr> getPromptEmbeddingTable() const
     {
         return mPromptEmbeddingTable;
-    }
-
-    void movePromptEmbeddingTableToGpu(runtime::BufferManager const& manager)
-    {
-        if (!mPromptEmbeddingTable.has_value()
-            || mPromptEmbeddingTable.value()->getMemoryType() == runtime::MemoryType::kGPU)
-        {
-            return;
-        }
-        else
-        {
-            TensorPtr gpuPromptEmbeddingTable
-                = manager.copyFrom(*mPromptEmbeddingTable.value(), runtime::MemoryType::kGPU);
-            mPromptEmbeddingTable = gpuPromptEmbeddingTable;
-        }
     }
 
     std::optional<SizeType> getPromptVocabSize() const
@@ -296,6 +300,11 @@ public:
         return mOrigPromptLen;
     }
 
+    void setDraftTokens(const std::shared_ptr<VecTokens>& draftTokens)
+    {
+        mDraftTokens = draftTokens;
+    }
+
     RequestIdType mRequestId;
     SizeType mPromptLen;
     SizeType mMaxNewTokens;
@@ -307,9 +316,9 @@ public:
     std::optional<SizeType> mPadId;
     SizeType mBatchSlot;
 
-private:
+protected:
     SizeType mOrigPromptLen;
-    std::shared_ptr<BeamTokens> mTokens;
+    BeamTokens mTokens;
     SizeType mMaxSentTokenPos;
 
     std::optional<TensorPtr> mEmbeddingBias;
@@ -323,6 +332,47 @@ private:
 
     std::vector<VecLogProbs> mLogProbs; // [beamSize, seqLen]
     VecLogProbs mCumLogProbs;           // [beamSize]
+    std::shared_ptr<VecTokens> mDraftTokens;
+};
+
+class LlmRequest : public GenericLlmRequest<runtime::ITensor::SharedPtr>
+{
+public:
+    using Base = GenericLlmRequest<runtime::ITensor::SharedPtr>;
+    using TensorPtr = Base::TensorPtr;
+    using SizeType = Base::SizeType;
+    using TokenIdType = Base::TokenIdType;
+    using RequestIdType = Base::RequestIdType;
+    using VecLogProbs = Base::VecLogProbs;
+    using BeamTokens = Base::BeamTokens;
+    using VecTokens = Base::VecTokens;
+
+    LlmRequest(RequestIdType requestId, SizeType maxNewTokens, std::shared_ptr<std::vector<TokenIdType>> inputTokens,
+        runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType> endId = std::nullopt,
+        std::optional<SizeType> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
+        std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
+        std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
+        std::optional<SizeType> promptVocabSize = std::nullopt, bool returnLogProbs = false,
+        std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt)
+        : Base(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming, endId, padId, embeddingBias,
+            badWordsList, stopWordsList, promptEmbeddingTable, promptVocabSize, returnLogProbs, draftTokens)
+    {
+    }
+
+    void movePromptEmbeddingTableToGpu(runtime::BufferManager const& manager)
+    {
+        if (!mPromptEmbeddingTable.has_value()
+            || mPromptEmbeddingTable.value()->getMemoryType() == runtime::MemoryType::kGPU)
+        {
+            return;
+        }
+        else
+        {
+            TensorPtr gpuPromptEmbeddingTable
+                = manager.copyFrom(*mPromptEmbeddingTable.value(), runtime::MemoryType::kGPU);
+            mPromptEmbeddingTable = gpuPromptEmbeddingTable;
+        }
+    }
 };
 
 } // namespace tensorrt_llm::batch_manager

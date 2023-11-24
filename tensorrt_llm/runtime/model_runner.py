@@ -24,7 +24,8 @@ import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization import QuantMode
-from tensorrt_llm.runtime import GenerationSession, ModelConfig, SamplingConfig
+from tensorrt_llm.runtime import (ChatGLMGenerationSession, GenerationSession,
+                                  ModelConfig, SamplingConfig)
 
 
 def get_engine_name(model: str, dtype: str, tp_size: int, pp_size: int,
@@ -206,9 +207,9 @@ class ModelRunner:
             engine_buffer = f.read()
 
         if model_config.model_name in ('chatglm_6b', 'glm_10b'):
-            session_cls = tensorrt_llm.runtime.ChatGLMGenerationSession
+            session_cls = ChatGLMGenerationSession
         else:
-            session_cls = tensorrt_llm.runtime.GenerationSession
+            session_cls = GenerationSession
         session = session_cls(model_config,
                               engine_buffer,
                               runtime_mapping,
@@ -256,9 +257,9 @@ class ModelRunner:
         input_lengths = torch.tensor(input_lengths, dtype=torch.int32)
         return batch_input_ids, input_lengths
 
-    def _prepare_outputs(self, outputs: dict,
+    def _prepare_outputs(self, outputs: Optional[dict],
                          input_lengths: torch.Tensor) -> dict:
-        if 'context_logits' in outputs:
+        if outputs is not None and 'context_logits' in outputs:
             batch_size = input_lengths.size(0)
             context_logits = outputs['context_logits']
             if self.remove_input_padding:

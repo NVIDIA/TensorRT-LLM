@@ -45,15 +45,17 @@ class GptManager
 {
 public:
     using SizeType = tensorrt_llm::runtime::SizeType;
+    using TokenIdType = tensorrt_llm::runtime::TokenIdType;
     using RequestList = std::list<std::shared_ptr<LlmRequest>>;
     using TensorPtr = runtime::ITensor::SharedPtr;
 
-    GptManager(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, int32_t maxBeamWidth,
+    GptManager(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, SizeType maxBeamWidth,
         batch_scheduler::SchedulerPolicy schedulerPolicy, GetInferenceRequestsCallback getInferenceRequestsCb,
         SendResponseCallback sendResponseCb, PollStopSignalCallback pollStopSignalCb = nullptr,
         ReturnBatchManagerStatsCallback returnBatchManagerStatsCb = nullptr,
         const TrtGptModelOptionalParams& optionalParams = TrtGptModelOptionalParams(),
-        std::optional<uint64_t> terminateReqId = std::nullopt);
+        std::optional<uint64_t> terminateReqId = std::nullopt, std::optional<SizeType> maxDraftTokens = std::nullopt,
+        bool excludeInputInOutput = false);
 
     /* Wraps the user-provided callback for requests.
        Adds requests to request table.
@@ -70,6 +72,8 @@ public:
 
     BatchManagerErrorCode_t waitUntilTerminate();
 
+    BatchManagerErrorCode_t shutdown();
+
     virtual ~GptManager();
 
 protected:
@@ -78,17 +82,23 @@ protected:
     virtual BatchManagerErrorCode_t step(RequestList& activeRequests, std::set<uint64_t>& activeRequestsIds);
 
 private:
+    SizeType getMaxInputLen() const;
+    SizeType getMaxOutputLen() const;
+    SizeType getMaxNumSequences() const;
+
     void validateLlmRequest(LlmRequest& newReq) const;
     static std::shared_ptr<LlmRequest> fillLlmRequest(std::shared_ptr<InferenceRequest> newReq);
-    static std::shared_ptr<std::vector<int32_t>> getReqInputTokens(std::shared_ptr<InferenceRequest> new_req);
-    static int32_t getMaxNewTokens(std::shared_ptr<InferenceRequest> newReq);
+    static std::shared_ptr<std::vector<TokenIdType>> getReqInputTokens(std::shared_ptr<InferenceRequest> newReq);
+    static SizeType getMaxNewTokens(std::shared_ptr<InferenceRequest> newReq);
+
+    GetInferenceRequestsCallback mGetInferenceRequestsCb;
+    SendResponseCallback mSendResponseCb;
+    PollStopSignalCallback mPollStopSignalCb;
+    ReturnBatchManagerStatsCallback mReturnBatchManagerStatsCb;
 
     std::shared_ptr<TrtGptModel> mTrtGptModel;
-    SizeType mMaxInputLen;
-    SizeType mMaxOutputLen;
-    SizeType mMaxKvCacheLen;
-    SizeType mMaxNumSequences;
     std::optional<uint64_t> mTerminateReqId;
+    std::optional<SizeType> mMaxDraftTokens;
 
     // Iteration counter - incremented every iteration of the generation loop
     int64_t mIterationCounter;
@@ -96,16 +106,14 @@ private:
     RequestList mActiveRequests;
     // IDs of live requests
     std::set<uint64_t> mActiveRequestsIds;
+    // Boolean that controls if prompt should be included in output tokens for non-streaming
+    bool mExcludeInputInOutput;
 
-    GetInferenceRequestsCallback mGetInferenceRequestsCb;
-    SendResponseCallback mSendResponseCb;
-    PollStopSignalCallback mPollStopSignalCb;
-    ReturnBatchManagerStatsCallback mReturnBatchManagerStatsCb;
-
-    std::atomic<bool> destructor_called_;
+    std::atomic<bool> shutdown_requested_;
     void decoupled_execution_loop();
     std::shared_ptr<std::thread> worker_thread_;
     inline static const std::string kInputIdsTensorName_ = "input_ids";
+    inline static const std::string kDraftInputIdsTensorName_ = "draft_input_ids";
     inline static const std::string kMaxNewTokensTensorName_ = "request_output_len";
     inline static const std::string kBeamWidthTensorName_ = "beam_width";
     inline static const std::string kEndIdTensorName_ = "end_id";

@@ -19,8 +19,11 @@ import time
 from pathlib import Path
 
 import numpy as np
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 
 from ._utils import str_dtype_to_trt
 from .logger import logger

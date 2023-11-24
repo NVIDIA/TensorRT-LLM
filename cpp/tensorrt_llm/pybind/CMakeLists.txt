@@ -24,7 +24,14 @@ endif()
 
 find_package(pybind11 REQUIRED)
 
-set(SRCS bindings.cpp runtime/generationInput.cpp runtime/generationOutput.cpp)
+set(SRCS
+    bindings.cpp
+    batch_manager/gptManager.cpp
+    batch_manager/llmRequest.cpp
+    batch_manager/inferenceRequest.cpp
+    batch_manager/namedTensor.cpp
+    runtime/generationInput.cpp
+    runtime/generationOutput.cpp)
 
 pybind11_add_module(${TRTLLM_PYBIND_MODULE} ${SRCS})
 

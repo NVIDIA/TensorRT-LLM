@@ -21,8 +21,10 @@ import evaluate
 import numpy as np
 import torch
 from datasets import load_dataset
+from qwen.utils.utils import make_context
 from transformers import (AutoModel, AutoModelForCausalLM,
-                          AutoModelForSeq2SeqLM, AutoTokenizer, T5Tokenizer)
+                          AutoModelForSeq2SeqLM, AutoTokenizer,
+                          GenerationConfig, T5Tokenizer)
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
@@ -47,6 +49,7 @@ DEFAULT_HF_MODEL_DIRS = {
     'internlm': 'internlm/internlm-chat-7b',
     'llama': 'meta-llama/Llama-2-7b-hf',
     'opt': 'facebook/opt-350m',
+    'qwen': 'Qwen/Qwen-7B',
 }
 
 DTYPE_STR_MAPPING = {
@@ -95,10 +98,28 @@ def main(args):
     logger.info(
         f'Load tokenizer takes: {profiler.elapsed_time_in_sec("load tokenizer")} sec'
     )
-    if not model_name.startswith('chatglm'):
-        tokenizer.pad_token = tokenizer.eos_token
-    if model_name == 'falcon' and tokenizer.pad_token_id is None:
+
+    # TODO: The below lines are used to be compatible with the original code; may need fix
+    if model_name.startswith('chatglm'):
+        pass
+    elif model_name == 'falcon' and tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    elif model_name == 'qwen':
+        tokenizer.pad_token_id = tokenizer.im_end_id
+    else:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if model_name == 'falcon':
+        pad_id = tokenizer.pad_token_id
+        end_id = tokenizer.eos_token_id
+    elif model_name == 'qwen':
+        pad_id = tokenizer.pad_token_id
+        end_id = tokenizer.im_end_id
+    else:
+        pad_id = tokenizer.encode(tokenizer.pad_token,
+                                  add_special_tokens=False)[0]
+        end_id = tokenizer.encode(tokenizer.eos_token,
+                                  add_special_tokens=False)[0]
 
     if args.eval_task == 'code_completion':
         dataset_name = "openai_humaneval"
@@ -117,26 +138,15 @@ def main(args):
     max_batch_size = args.batch_size
 
     # runtime parameters
-    # repetition_penalty = 1
     top_k = args.top_k
+    top_p = args.top_p
     output_len = args.output_len
-    # TODO: The below lines are used to be compatible with the original code; may need fix
-    test_token_num = 800 if model_name.startswith('chatglm') else 923
-    # top_p = 0.0
+    test_token_num = args.max_input_length
     # random_seed = 5
     temperature = 1
     num_beams = args.num_beams
     length_penalty = args.length_penalty
-
-    # TODO: The below lines are used to be compatible with the original code; may need fix
-    if model_name == 'falcon':
-        pad_id = tokenizer.pad_token_id
-        end_id = tokenizer.eos_token_id
-    else:
-        pad_id = tokenizer.encode(tokenizer.pad_token,
-                                  add_special_tokens=False)[0]
-        end_id = tokenizer.encode(tokenizer.eos_token,
-                                  add_special_tokens=False)[0]
+    repetition_penalty = args.repetition_penalty
 
     if test_trt_llm:
         runner = ModelRunner.from_dir(args.engine_dir,
@@ -161,6 +171,9 @@ def main(args):
             device_map='auto' if args.hf_device_map_auto else None)
         if not args.hf_device_map_auto:
             model.cuda()
+        if model_name == 'qwen':
+            model.generation_config = GenerationConfig.from_pretrained(
+                args.hf_model_dir, trust_remote_code=True)
         profiler.stop('load HF model')
         logger.info(
             f'Load HF model takes: {profiler.elapsed_time_in_sec("load HF model")} sec'
@@ -187,15 +200,29 @@ def main(args):
         for i in range(batch_size):
             curr_text = batch_input_texts[i] + append_str
             curr_text = curr_text.strip().replace(" n't", "n't")
-            input_ids = tokenizer.encode(curr_text,
-                                         return_tensors='pt',
-                                         add_special_tokens=add_special_tokens,
-                                         truncation=True,
-                                         max_length=test_token_num)
+
             # TODO: The below lines are used to be compatible with the original code; may need fix
             if model_name.startswith(('chatglm2', 'chatglm3')):
                 input_ids = tokenizer.encode(curr_text, return_tensors='pt')
                 input_ids = input_ids[:, :test_token_num]
+            elif model_name == 'qwen':
+                # use make_content to generate prompt
+                system_prompt = "You are a useful assistant, please directly output the corresponding summary according to the article entered by the user."
+                _, input_id_list = make_context(
+                    tokenizer=tokenizer,
+                    query=curr_text,
+                    history=[],
+                    system=system_prompt,
+                    max_input_length=test_token_num,
+                )
+                input_ids = torch.tensor(input_id_list).unsqueeze(0)
+            else:
+                input_ids = tokenizer.encode(
+                    curr_text,
+                    return_tensors='pt',
+                    add_special_tokens=add_special_tokens,
+                    truncation=True,
+                    max_length=test_token_num)
 
             batch_input_ids.append(input_ids)
         return batch_input_ids
@@ -218,8 +245,10 @@ def main(args):
                 end_id=end_id,
                 pad_id=pad_id,
                 top_k=top_k,
+                top_p=top_p,
                 num_beams=num_beams,
                 length_penalty=length_penalty,
+                repetition_penalty=repetition_penalty,
                 output_sequence_lengths=True,
                 return_dict=True)
             torch.cuda.synchronize()
@@ -509,30 +538,33 @@ if __name__ == '__main__':
         type=str,
         choices=['fp32', 'fp16', 'bf16', 'float32', 'float16', 'bfloat16'],
         default='fp16')
+    parser.add_argument('--engine_dir', type=str, default='engine_outputs')
+    parser.add_argument('--eval_task',
+                        type=str,
+                        default='summarize',
+                        choices=['summarize', 'code_completion'])
+    parser.add_argument('--eval_ppl', action='store_true')
+    parser.add_argument('--check_accuracy', action='store_true')
+    parser.add_argument('--tensorrt_llm_rouge1_threshold',
+                        type=float,
+                        default=15.0)
     parser.add_argument('--dataset_path', type=str, default='')
     parser.add_argument('--log_level', type=str, default='info')
-    parser.add_argument('--engine_dir', type=str, default='engine_outputs')
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--max_ite', type=int, default=20)
     parser.add_argument('--output_len', type=int, default=100)
+    parser.add_argument('--max_input_length', type=int, default=923)
     parser.add_argument('--max_kv_cache_length',
                         type=int,
                         default=None,
                         help='The max kv cache length. \
               If the final sequence length exceeds the kv cache length, we will enable cyclic kv cache. \
               If it is set to None, we will use the max sequence length.')
-    parser.add_argument('--check_accuracy', action='store_true')
-    parser.add_argument('--tensorrt_llm_rouge1_threshold',
-                        type=float,
-                        default=15.0)
     parser.add_argument('--num_beams', type=int, default=1)
     parser.add_argument('--top_k', type=int, default=1)
-    parser.add_argument('--eval_task',
-                        type=str,
-                        default='summarize',
-                        choices=['summarize', 'code_completion'])
+    parser.add_argument('--top_p', type=float, default=0.0)
     parser.add_argument('--length_penalty', type=float, default=1.0)
-    parser.add_argument('--eval_ppl', action='store_true')
+    parser.add_argument('--repetition_penalty', type=float, default=1.0)
     parser.add_argument('--debug_mode',
                         default=False,
                         action='store_true',

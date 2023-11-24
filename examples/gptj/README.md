@@ -5,11 +5,10 @@ This document explains how to build the [GPT-J](https://huggingface.co/EleutherA
 ## Overview
 
 The TensorRT-LLM GPT-J implementation can be found in [`tensorrt_llm/models/gptj/model.py`](../../tensorrt_llm/models/gptj/model.py). The TensorRT-LLM GPT-J example
-code is located in [`examples/gptj`](./). There are three main files:
+code is located in [`examples/gptj`](./). There are two main files:
 
  * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the GPT-J model,
- * [`run.py`](./run.py) to run the inference on an input text,
- * and a shared [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
+ * [`run.py`](./run.py) to run the inference on an input text.
 
 ## Support Matrix
   * FP16

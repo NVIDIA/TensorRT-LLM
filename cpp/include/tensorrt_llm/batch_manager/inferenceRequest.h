@@ -38,33 +38,34 @@
 namespace tensorrt_llm::batch_manager
 {
 
-class InferenceRequest
+template <typename TTensor, typename TTensorMap>
+class GenericInferenceRequest
 {
 public:
-    using TensorPtr = tensorrt_llm::runtime::ITensor::SharedPtr;
-    using TensorMap = tensorrt_llm::runtime::StringPtrMap<tensorrt_llm::runtime::ITensor>;
+    using TensorPtr = TTensor;
+    using TensorMap = TTensorMap;
 
-    InferenceRequest(uint64_t requestId)
+    GenericInferenceRequest(uint64_t requestId)
         : mRequestId(requestId)
         , mIsStreaming(false)
     {
     }
 
-    InferenceRequest(TensorMap const& inputTensors, uint64_t requestId)
+    GenericInferenceRequest(TensorMap const& inputTensors, uint64_t requestId)
         : mInputTensors(inputTensors)
         , mRequestId(requestId)
         , mIsStreaming(false)
     {
     }
 
-    InferenceRequest(TensorMap&& inputTensors, uint64_t requestId)
+    GenericInferenceRequest(TensorMap&& inputTensors, uint64_t requestId)
         : mInputTensors(std::move(inputTensors))
         , mRequestId(requestId)
         , mIsStreaming(false)
     {
     }
 
-    ~InferenceRequest() {}
+    ~GenericInferenceRequest() {}
 
     template <typename T>
     std::tuple<bool, T> getScalarValueFromTensor(
@@ -139,6 +140,36 @@ public:
         return mRequestId;
     }
 
+protected:
+    TensorMap mInputTensors;
+    uint64_t mRequestId;
+    bool mIsStreaming;
+};
+
+class InferenceRequest : public GenericInferenceRequest<tensorrt_llm::runtime::ITensor::SharedPtr,
+                             tensorrt_llm::runtime::StringPtrMap<tensorrt_llm::runtime::ITensor>>
+{
+public:
+    using Base = GenericInferenceRequest<tensorrt_llm::runtime::ITensor::SharedPtr,
+        tensorrt_llm::runtime::StringPtrMap<tensorrt_llm::runtime::ITensor>>;
+    using TensorPtr = Base::TensorPtr;
+    using TensorMap = Base::TensorMap;
+
+    InferenceRequest(uint64_t requestId)
+        : Base(requestId)
+    {
+    }
+
+    InferenceRequest(TensorMap const& inputTensors, uint64_t requestId)
+        : Base(inputTensors, requestId)
+    {
+    }
+
+    InferenceRequest(TensorMap&& inputTensors, uint64_t requestId)
+        : Base(inputTensors, requestId)
+    {
+    }
+
     const std::vector<int64_t> serialize() const
     {
         std::list<int64_t> packed;
@@ -184,11 +215,6 @@ public:
         ir->setIsStreaming(IsStreaming);
         return ir;
     }
-
-private:
-    TensorMap mInputTensors;
-    uint64_t mRequestId;
-    bool mIsStreaming;
 };
 
 } // namespace tensorrt_llm::batch_manager

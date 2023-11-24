@@ -16,8 +16,10 @@ import argparse
 import os
 from collections import OrderedDict
 
-import tensorrt as trt
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from transformers import BertConfig, BertForQuestionAnswering, BertModel
 
 import tensorrt_llm

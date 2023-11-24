@@ -102,6 +102,7 @@ GptJsonConfig parseJson(InputType&& i)
     auto const maxBatchSize = parseJsonFieldOr(builderConfig, "max_batch_size", 0);
     auto const maxInputLen = parseJsonFieldOr(builderConfig, "max_input_len", 0);
     auto const maxOutputLen = parseJsonFieldOr(builderConfig, "max_output_len", 0);
+    auto const maxDraftLen = parseJsonFieldOr(builderConfig, "max_draft_len", 0);
     auto const maxNumTokens = parseJsonFieldOptional<SizeType>(builderConfig, "max_num_tokens");
     auto const maxPromptEmbeddingTableSize
         = parseJsonFieldOr<SizeType>(builderConfig, "max_prompt_embedding_table_size", 0);
@@ -132,6 +133,7 @@ GptJsonConfig parseJson(InputType&& i)
     modelConfig.setMaxInputLen(maxInputLen);
     modelConfig.setMaxOutputLen(maxOutputLen);
     modelConfig.setMaxNumTokens(maxNumTokens);
+    modelConfig.setMaxDraftLen(maxDraftLen);
     modelConfig.setMaxPromptEmbeddingTableSize(maxPromptEmbeddingTableSize);
 
     if (name == std::string("chatglm_6b") || name == std::string("glm_10b"))

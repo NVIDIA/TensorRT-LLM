@@ -503,5 +503,71 @@ void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_ti
         output_log_probs, output_log_probs_tiled, sequence_lengths, batch_size, beam_width, max_seq_len);
 }
 
+__global__ void acceptTokensKernel(const int* draft_tokens, const int* target_tokens, const int* context_lengths,
+    const int* nums_draft_tokens, int* sequence_lengths, const bool* finished, bool* finished_final, int* finished_sum,
+    int batch_size, int beam_width, int max_seq_len, int max_draft_tokens)
+{
+    int thread_finished_count = 0;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < batch_size * beam_width;
+         index += blockDim.x * gridDim.x)
+    {
+        const auto num_draft_tokens = nums_draft_tokens[index];
+
+        const auto context_length = context_lengths[index];
+        auto& sequence_length = sequence_lengths[index];
+        int finished_draft_idx = 0;
+        for (int ti = context_length; ti < min(sequence_length, context_length + num_draft_tokens);
+             ++ti, ++finished_draft_idx)
+        {
+            const auto draft_idx = ti - context_length;
+            const auto target_token_idx = index * max_seq_len + ti;
+            const auto draft_token_idx = index * max_draft_tokens + draft_idx;
+            // Check if draft tokens are the same as target tokens
+            // FIXME(nkorobov); compare logits here
+            const bool accepted = draft_tokens[draft_token_idx] == target_tokens[target_token_idx];
+            if (!accepted)
+            {
+                // Set sequence length to the numAcceptedTokens + 1
+                sequence_length = min(ti + 1, max_seq_len);
+                // FIXME(nkorobov): do we need to set endIds here?
+                break;
+            }
+        }
+        bool finish = finished[finished_draft_idx * batch_size * beam_width + index];
+        finished_final[index] = finish;
+        thread_finished_count += static_cast<int>(finish);
+    }
+
+    if (finished_sum)
+    {
+        int block_finished_count = 0;
+        if (blockDim.x <= 32)
+        {
+            block_finished_count = warpReduceSum(thread_finished_count);
+        }
+        else
+        {
+            block_finished_count = blockReduceSum(thread_finished_count);
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0)
+        {
+            finished_sum[0] = block_finished_count;
+        }
+    }
+}
+
+void invokeAcceptTokens(const int* draft_tokens, const int* target_tokens, const int* context_lengths,
+    const int* nums_draft_tokens, int* sequence_lengths, const bool* finished, bool* finished_final, int* finished_sum,
+    int batch_size, int beam_width, int max_seq_len, int max_draft_tokens, cudaStream_t stream)
+{
+    dim3 block(min(256, batch_size * beam_width));
+    dim3 grid(1);
+    acceptTokensKernel<<<grid, block, 0, stream>>>(draft_tokens, target_tokens, context_lengths, nums_draft_tokens,
+        sequence_lengths, finished, finished_final, finished_sum, batch_size, beam_width, max_seq_len,
+        max_draft_tokens);
+}
+
 } // namespace kernels
 } // namespace tensorrt_llm

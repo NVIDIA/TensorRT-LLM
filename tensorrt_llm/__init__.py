@@ -29,6 +29,7 @@ from .mapping import Mapping
 from .module import Module
 from .network import Network, net_guard
 from .parameter import Parameter
+from .version import __version__
 
 __all__ = [
     'logger',
@@ -53,6 +54,7 @@ __all__ = [
     'models',
     'quantization',
     'tools',
+    '__version__',
 ]
 
 _init(log_level="error")

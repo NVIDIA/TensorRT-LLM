@@ -16,25 +16,19 @@
  */
 #include "tensorrt_llm/batch_manager/GptManager.h"
 #include "tensorrt_llm/batch_manager/NamedTensor.h"
-#include "tensorrt_llm/batch_manager/callbacks.h"
 #include "tensorrt_llm/batch_manager/inferenceRequest.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
-#include "tensorrt_llm/runtime/gptJsonConfig.h"
-#include "tensorrt_llm/runtime/gptSession.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
-#include <NvInfer.h>
-#include <NvInferPlugin.h>
 #include <chrono>
 #include <cxxopts.hpp>
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <string>
 
-using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::batch_manager;
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::mpi;
@@ -456,7 +450,7 @@ std::pair<std::vector<std::vector<int32_t>>, std::vector<int32_t>> parseDataset(
 }
 
 void benchmarkGptManager(std::string const& modelName, std::filesystem::path const& engineDir, std::string const& type,
-    std::string const& datasetPath, int beamWidth, std::shared_ptr<nvinfer1::ILogger> const& logger,
+    std::string const& datasetPath, int beamWidth, int warmUp, std::shared_ptr<nvinfer1::ILogger> const& logger,
     TrtGptModelOptionalParams const& optionalParams, batch_scheduler::SchedulerPolicy schedulerPolicy)
 {
     auto const worldConfig = WorldConfig::mpi(*logger);
@@ -506,6 +500,19 @@ void benchmarkGptManager(std::string const& modelName, std::filesystem::path con
 
     if (worldConfig.getRank() == 0)
     {
+        // Warm up
+        for (auto i = 1; i < warmUp + 1; ++i)
+        {
+            // skip terminateReqId
+            if (i == terminateReqId)
+            {
+                i += 1;
+            }
+            gptServer->enqueue(tensors_list[0], i, false);
+        }
+        gptServer->waitForEmpty();
+
+        // Benchmark
         recorder->initialize();
         for (int i = 0; i < tensors_list.size(); ++i)
         {
@@ -539,6 +546,8 @@ int main(int argc, char* argv[])
         cxxopts::value<std::string>()->default_value(""));
     options.add_options()(
         "beam_width", "Specify beam width you want to benchmark.", cxxopts::value<int>()->default_value("1"));
+    options.add_options()(
+        "warm_up", "Specify warm up iterations before benchmark starts.", cxxopts::value<int>()->default_value("2"));
 
     options.add_options()("max_num_sequences", "Max number of Sequences.", cxxopts::value<int>());
     options.add_options()("max_tokens_in_paged_kvcache", "Max tokens in paged K-V Cache.", cxxopts::value<int>());
@@ -651,7 +660,7 @@ int main(int argc, char* argv[])
     try
     {
         benchmarkGptManager(result["model"].as<std::string>(), result["engine_dir"].as<std::string>(), type,
-            datasetPath, beamWidth, logger, optionalParams, schedulerPolicy);
+            datasetPath, beamWidth, result["warm_up"].as<int>(), logger, optionalParams, schedulerPolicy);
     }
     catch (const std::exception& e)
     {

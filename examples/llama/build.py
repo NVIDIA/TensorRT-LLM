@@ -18,9 +18,11 @@ import os
 import time
 from pathlib import Path
 
-import tensorrt as trt
+# isort: off
 import torch
 import torch.multiprocessing as mp
+import tensorrt as trt
+# isort: on
 from transformers import LlamaConfig, LlamaForCausalLM
 from weight import (get_scaling_factors, load_from_awq_llama, load_from_binary,
                     load_from_gptq_llama, load_from_hf_checkpoint,
@@ -178,6 +180,7 @@ def parse_arguments():
                         type=str,
                         default=False,
                         choices=['float16', 'float32', 'bfloat16'])
+
     parser.add_argument('--parallel_build', default=False, action='store_true')
     parser.add_argument('--enable_context_fmha',
                         default=False,
@@ -307,6 +310,14 @@ def parse_arguments():
         help='Quantize weights for the various GEMMs to INT4/INT8.'
         'See --weight_only_precision to set the precision')
     parser.add_argument(
+        '--disable_weight_only_quant_plugin',
+        default=False,
+        action="store_true",
+        help=
+        'By default, using plugin implementation for weight quantization. Enabling disable_weight_only_quant_plugin flag will use ootb implementation instead of plugin.'
+        'You must also use --use_weight_only for that argument to have an impact.'
+    )
+    parser.add_argument(
         '--weight_only_precision',
         const='int8',
         type=str,
@@ -360,7 +371,7 @@ def parse_arguments():
                         default=False)
 
     args = parser.parse_args()
-    tensorrt_llm.logger.set_level(args.log_level)
+    logger.set_level(args.log_level)
 
     assert not (
         args.use_smooth_quant and args.use_weight_only
@@ -396,7 +407,7 @@ def parse_arguments():
             per_token=False,
             per_channel=False,
             per_group=args.per_group,
-            use_int4_weights=args.weight_only_precision == "int4")
+            use_int4_weights="int4" in args.weight_only_precision)
     else:
         args.quant_mode = QuantMode(0)
 
@@ -464,6 +475,11 @@ def parse_arguments():
         assert (args.n_kv_head % args.tp_size) == 0 or (args.tp_size % args.n_kv_head) == 0, \
             "MQA/GQA requires either the number of K/V heads to be divisible by the tensor parallelism size OR " \
             "the tensor parallelism size to be divisible by the number of K/V heads."
+
+    if args.weight_only_precision == 'int4_awq':
+        if args.vocab_size % 64 != 0:
+            args.vocab_size = int((args.vocab_size + 63) / 64) * 64
+            logger.info("To use awq we pad it to {}.".format(args.vocab_size))
 
     assert args.pp_size * args.tp_size == args.world_size
 
@@ -569,10 +585,12 @@ def build_rank_engine(builder: Builder,
                 },  # Load to CPU memory
                 torch_dtype='auto',
             )
+            use_gemm_woq_plugin = not args.disable_weight_only_quant_plugin
             load_from_hf_llama(tensorrt_llm_llama,
                                hf_llama,
                                mapping=mapping,
-                               dtype=args.dtype)
+                               dtype=args.dtype,
+                               use_gemm_woq_plugin=use_gemm_woq_plugin)
             del hf_llama
         else:
             load_from_hf_checkpoint(tensorrt_llm_llama,
@@ -582,6 +600,7 @@ def build_rank_engine(builder: Builder,
         tok = time.time()
         t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
         logger.info(f'HF LLaMA loaded. Total time: {t}')
+
     elif args.ft_model_dir is not None:
         load_from_binary(tensorrt_llm_llama,
                          args.ft_model_dir,
@@ -604,7 +623,6 @@ def build_rank_engine(builder: Builder,
                 "Gemm plugin does not support FP8. Disabled Gemm plugin.")
     if args.use_rmsnorm_plugin:
         network.plugin_config.set_rmsnorm_plugin(dtype=args.use_rmsnorm_plugin)
-
     # Quantization plugins.
     if args.use_smooth_quant:
         network.plugin_config.set_smooth_quant_gemm_plugin(dtype=args.dtype)
@@ -619,7 +637,8 @@ def build_rank_engine(builder: Builder,
             ContextFMHAType.enabled_with_fp32_acc)
     if args.multi_block_mode:
         network.plugin_config.enable_mmha_multi_block_mode()
-    if args.use_weight_only:
+
+    if args.use_weight_only and not args.disable_weight_only_quant_plugin:
         if args.per_group:
             network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
                 dtype='float16')
@@ -669,8 +688,6 @@ def build_rank_engine(builder: Builder,
     if rank == 0:
         config_path = os.path.join(args.output_dir, 'config.json')
         builder.save_config(builder_config, config_path)
-
-    tensorrt_llm.tools.cleanup(network, tensorrt_llm_llama)
 
     return engine
 

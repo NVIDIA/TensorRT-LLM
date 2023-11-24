@@ -64,9 +64,9 @@ the
 //! \param outputIds output buffer [batchSize][maxSeqLen]. Contains pointers to rows with output tokens per request.
 //! \param sequenceLength input/output buffer [batchSize]. Current sequence length of the request up to, but excluding
 endId token.
-//! \param finishedBuf input/output buffer [batchSize]. Flag if sequence has finished (if finished || outputId ==
+//! \param finishedInput input buffer [batchSize]. Exit early if true.
+//! \param finishedOutput output buffer [batchSize]. Set flag if sequence has finished (if finished || outputId ==
 endId).
-//! If true, request exits early.
 //! \param cumLogProbs input/output buffer [batchSize]. Cumulative log probability of selected tokens. Ignored if
 nullptr.
 //! \param outputLogProbs output buffer [batchSize]. Log probs is the probability
@@ -94,17 +94,18 @@ nullptr.
  */
 template <typename T>
 void invokeBatchTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize, int** outputIds,
-    int* sequenceLength, bool* finishedBuf, float* cumLogProbs, float* outputLogProbs, const T* logProbs,
-    const int* idVals, int* offsetBuf, int* beginOffsetBuf, curandState_t* curandstate, const int batchSize,
-    const size_t vocabSizePadded, const int* endIds, const float maxTopP, const float* topPs, cudaStream_t stream,
-    const bool* skipDecode);
+    int* sequenceLength, const bool* finishedInput, bool* finishedOutput, float* cumLogProbs, float* outputLogProbs,
+    const T* logProbs, const int* idVals, int* offsetBuf, int* beginOffsetBuf, curandState_t* curandstate,
+    const int batchSize, const size_t vocabSizePadded, const int* endIds, const float maxTopP, const float* topPs,
+    cudaStream_t stream, const bool* skipDecode);
 
 //! \brief Specialization of invokeBatchTopPSampling with topPs=nullptr
 template <typename T>
 void invokeTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize, int** outputIds,
-    int* sequenceLength, bool* finishedBuf, float* cumLogProbs, float* outputLogProbs, const T* logProbs,
-    const int* idVals, int* offsetBuf, int* beginOffsetBuf, curandState_t* curandstate, const int batchSize,
-    const size_t vocabSizePadded, const int* endIds, const float topPp, cudaStream_t stream, const bool* skipDecode);
+    int* sequenceLength, const bool* finishedInput, bool* finishedOutput, float* cumLogProbs, float* outputLogProbs,
+    const T* logProbs, const int* idVals, int* offsetBuf, int* beginOffsetBuf, curandState_t* curandstate,
+    const int batchSize, const size_t vocabSizePadded, const int* endIds, const float topPp, cudaStream_t stream,
+    const bool* skipDecode);
 
 //! \brief Compute the topp decay by https://arxiv.org/pdf/2206.04624.pdf
 //!        In short, the formula is

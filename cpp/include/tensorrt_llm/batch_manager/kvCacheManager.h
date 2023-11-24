@@ -168,7 +168,7 @@ class BlockManager
 public:
     using SizeType = tensorrt_llm::runtime::SizeType;
 
-    explicit BlockManager(std::size_t blocksInPool);
+    explicit BlockManager(SizeType blocksInPool);
 
     void startScheduling();
 
@@ -179,22 +179,22 @@ public:
     // Simulate freeing all blocks for that sequence to check impact on number of free blocks
     void schedulingFreeAllBlocks(GenerationRequest& sequence);
 
-    [[nodiscard]] std::size_t getNumFreeBlocks() const
+    [[nodiscard]] SizeType getNumFreeBlocks() const
     {
         return mFreeBlocks.size();
     }
 
-    [[nodiscard]] std::size_t getNumAllocatedBlocks() const
+    [[nodiscard]] SizeType getNumAllocatedBlocks() const
     {
         return mAllocatedBlocks.size();
     }
 
-    [[nodiscard]] bool hasFreeBlocks(std::size_t numRequired = 1) const
+    [[nodiscard]] bool hasFreeBlocks(SizeType numRequired = 1) const
     {
         return getNumFreeBlocks() >= numRequired;
     }
 
-    [[nodiscard]] bool schedulingHasFreeBlocks(std::size_t numRequired = 1) const
+    [[nodiscard]] bool schedulingHasFreeBlocks(SizeType numRequired = 1) const
     {
         return mSchedulingNumFreeBlocks >= numRequired;
     }
@@ -205,7 +205,7 @@ private:
     // List of allocated blocks for each sequences
     std::vector<std::vector<KVCacheBlock>> mAllocatedBlocks;
     // Used to keep track of number of free blocks during scheduling
-    std::size_t mSchedulingNumFreeBlocks;
+    SizeType mSchedulingNumFreeBlocks;
 };
 
 class KVCacheManager

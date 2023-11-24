@@ -52,7 +52,8 @@ class GenerationMixin:
                              max_num_tokens=None,
                              prompt_embedding_table_size: int = 0,
                              position_encoding_2d=False,
-                             use_lora_plugin: bool = False):
+                             use_lora_plugin: bool = False,
+                             max_draft_len=0):
 
         max_len = max_input_len + max_new_tokens
 
@@ -60,6 +61,14 @@ class GenerationMixin:
         bb_range_gen = [
             1, (max_batch_size * max_beam_width + 1) // 2,
             max_batch_size * max_beam_width
+        ]
+        bbd_range_ctx = [
+            bb_range_cxt[i] * ((max_draft_len + 1) if i != 0 else 1)
+            for i in range(len(bb_range_cxt))
+        ]
+        bbd_range_gen = [
+            bb_range_gen[i] * ((max_draft_len + 1) if i != 0 else 1)
+            for i in range(len(bb_range_gen))
         ]
         _bs_range = [1, (max_batch_size + 1) // 2, max_batch_size]
         _beam_width_range = [1, (max_beam_width + 1) // 2, max_beam_width]
@@ -94,6 +103,7 @@ class GenerationMixin:
             enable_two_optimization_profiles = not use_in_flight_batching
         if enable_two_optimization_profiles:
             bb_range = [bb_range_cxt, bb_range_gen]
+            bbd_range = [bbd_range_ctx, bbd_range_gen]
             bs_range = [_bs_range, _bs_range]
             beam_width_range = [_beam_width_range, _beam_width_range]
             inlen_range = [inlen_range_cxt, inlen_range_gen]
@@ -106,6 +116,7 @@ class GenerationMixin:
             num_tokens_range = [num_tokens_range_ctx, num_tokens_range_gen]
         else:
             bb_range = [bb_range_gen]
+            bbd_range = [bbd_range_gen]
             bs_range = [_bs_range]
             beam_width_range = [_beam_width_range]
             inlen_range = [[1, 1, max_input_len]]
@@ -376,7 +387,7 @@ class GenerationMixin:
                 dtype=trt.int32,
                 shape=[-1],
                 dim_range=OrderedDict([
-                    ('batch_size_last_token_ids', bb_range),
+                    ('batch_size_last_token_ids', bbd_range),
                 ]),
             )
 

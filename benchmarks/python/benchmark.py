@@ -14,11 +14,9 @@
 # limitations under the License.
 import argparse
 import multiprocessing as mp
-from multiprocessing import Process, Queue
 from time import time
 
 import torch
-from mem_monitor import mem_monitor
 
 
 def parse_arguments():
@@ -213,6 +211,7 @@ def main(args):
     from allowed_configs import get_allowed_models
     from bert_benchmark import BERTBenchmark
     from gpt_benchmark import GPTBenchmark
+    from mem_monitor import MemoryMonitor
 
     from tensorrt_llm.logger import logger
 
@@ -282,11 +281,8 @@ def main(args):
         torch.cuda.empty_cache()
         latencies = []
 
-        # Launch a subprocess to monitor memory usage
-        q1 = Queue()  # q1 is used for sending signal to subprocess
-        q2 = Queue()  # q2 is used for receiving results from subprocess
-        mem_monitor_process = Process(target=mem_monitor, args=(q1, q2))
-        mem_monitor_process.start()
+        memory_monitor = MemoryMonitor()
+        memory_monitor.start()
 
         iter_idx = 0
         try:
@@ -313,15 +309,12 @@ def main(args):
 
         except Exception as e:
             print("Found exception during benchmarking", e.with_traceback())
-            mem_monitor_process.kill()
+            memory_monitor.kill()
             raise e
-        logger.debug("Sending signal to mem monitor process, start")
-        q1.put(1)
-        logger.debug("Sending signal to mem monitor process, done")
-        peak_gpu_used = q2.get()
-        logger.debug("Get peak gpu memory usage from mem monitor process, done")
-        mem_monitor_process.join()
-        logger.debug("Memory monitor process joined")
+
+        memory_monitor.stop()
+        _, peak_gpu_used = memory_monitor.get_peak_memory_usage("GiB")
+        peak_gpu_used = round(peak_gpu_used, 3)
 
         latency = round(sum(latencies) / iter_idx, 3)
         latencies.sort()
