@@ -65,5 +65,9 @@ void invokeCopyNextStepIds(int* next_step_ids, int** output_ids_ptr, const int* 
 void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_tiled, const int* sequence_lengths,
     int batch_size, int beam_width, int max_seq_len, cudaStream_t stream);
 
+void invokeAcceptTokens(const int* draft_tokens, const int* target_tokens, const int* context_lengths,
+    const int* nums_draft_tokens, int* sequence_lengths, const bool* finished, bool* finished_final, int* finished_sum,
+    int batch_size, int beam_width, int max_seq_len, int max_draft_tokens, cudaStream_t stream);
+
 } // namespace kernels
 } // namespace tensorrt_llm

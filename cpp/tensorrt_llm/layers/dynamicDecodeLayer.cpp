@@ -226,7 +226,7 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
 
         invokeBanRepeatNgram(logits.template getPtrWithOffset<T>(decode_vocab_size_units_offset),
             outputs.output_ids_ptr.template getPtr<const int*>(),
-            outputs.finished.value_or(Tensor{}).template getPtr<bool>(),
+            params.finished.value_or(Tensor{}).template getPtr<bool>(),
             outputs.parent_ids.value_or(Tensor{}).template getPtr<const int>(), batch_size, local_batch_size,
             beam_width, no_repeat_ngram_size_buf, id_offset, vocab_size_padded_, step, stream_);
     }
@@ -341,6 +341,7 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
             step, ite, logits_slice, end_id_slice, static_cast<std::int32_t>(max_seq_len)};
 
         decode_input_tensors.embedding_bias = params.embedding_bias;
+        decode_input_tensors.finished = params.finished;
 
         if (params.input_lengths)
         {

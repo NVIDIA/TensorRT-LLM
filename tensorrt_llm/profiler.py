@@ -14,9 +14,12 @@
 # limitations under the License.
 import time
 from functools import partial
-from typing import Literal, Optional, Union
+from typing import Literal, Optional, Tuple, Union
 
+# isort: off
+import torch
 import tensorrt as trt
+# isort: on
 
 try:
     import psutil
@@ -28,10 +31,27 @@ except ImportError:
     pynvml = None
 import traceback
 
-import torch
-
 from tensorrt_llm.builder import _is_building
 from tensorrt_llm.logger import logger
+
+if psutil is None:
+    logger.warning("A required package 'psutil' is not installed. Will not "
+                   "monitor the host memory usages. Please install the package "
+                   "first, e.g, 'pip install psutil'.")
+if pynvml is None:
+    logger.warning(
+        "A required package 'psutil' is not installed. Will not "
+        "monitor the device memory usages. Please install the package "
+        "first, e.g, 'pip install pynvml>=11.5.0'.")
+elif pynvml.__version__ < '11.5.0':
+    logger.warning(f'Found pynvml=={pynvml.__version__}. Please use '
+                   f'pynvml>=11.5.0 to get accurate memory usage')
+    # Support legacy pynvml. Note that an old API could return
+    # wrong GPU memory usage.
+    _device_get_memory_info_fn = pynvml.nvmlDeviceGetMemoryInfo
+else:
+    _device_get_memory_info_fn = partial(pynvml.nvmlDeviceGetMemoryInfo,
+                                         version=pynvml.nvmlMemory_v2)
 
 
 class Timer:
@@ -88,72 +108,22 @@ def summary():
     _default_timer.summary()
 
 
-_pynvml_initialized = False
+MemUnitType = Literal['GiB', 'MiB', 'KiB']
 
 
-def initialize_pynvml():
-    global _pynvml_initialized
-    if pynvml is not None and not _pynvml_initialized:
-        pynvml.nvmlInit()
-        _pynvml_initialized = True
+class PyNVMLContext:
+
+    def __enter__(self):
+        if pynvml is not None:
+            pynvml.nvmlInit()
+
+    def __exit__(self, type, value, traceback):
+        if pynvml is not None:
+            pynvml.nvmlShutdown()
 
 
-def finalize_pynvml():
-    global _pynvml_initialized
-    if pynvml is not None and _pynvml_initialized:
-        pynvml.nvmlInvmlShutdownnit()
-        _pynvml_initialized = False
-
-
-class MemoryMonitor:
-
-    TAG = '[MemUsage]'
-    UnitType = Literal['GiB', 'MiB', 'KiB']
-    units = {'GiB': 1 << 30, 'MiB': 1 << 20, 'KiB': 1 << 10}
-    # For convenience.
-    _rename_map = {'GB': 'GiB', 'MB': 'MiB', 'KiB': 'KB'}
-
-    _maybe_warned = False
-
-    def __init__(self):
-        # bytes
-        self._peak_host_memory = 0
-        self._peak_device_memory = 0
-        self._check_required_packages()
-
-        self.device_handles = {}
-        initialize_pynvml()
-
-        if pynvml.__version__ < '11.5.0':
-            logger.warning(f'Found pynvml=={pynvml.__version__}. Please use '
-                           f'pynvml>=11.5.0 to get accurate memory usage')
-            # Support legacy pynvml. Note that an old API could return
-            # wrong GPU memory usage.
-            self._device_mem__fn = pynvml.nvmlDeviceGetMemoryInfo
-        else:
-            self._device_mem__fn = partial(pynvml.nvmlDeviceGetMemoryInfo,
-                                           version=pynvml.nvmlMemory_v2)
-
-    @classmethod
-    def _check_required_packages(cls):
-        if cls._maybe_warned:
-            return
-        if psutil is None:
-            # Warning once.
-            logger.warning(
-                "A required package 'psutil' is not installed. Will not "
-                "monitor the host memory usages. Please install the package "
-                "first, e.g, 'pip install psutil'.")
-            return
-        if pynvml is None:
-            # Warning once.
-            logger.warning(
-                "A required package 'psutil' is not installed. Will not "
-                "monitor the host memory usages. Please install the package "
-                "first, e.g, 'pip install pynvml>=11.5.0'.")
-        cls._maybe_warned = True
-
-    def host_memory_info(self) -> int:
+def host_memory_info() -> Tuple[int, int, int]:
+    if psutil is not None:
         process = psutil.Process()
         # USS reports the amount of memory that would be freed if the process
         # was terminated right now.
@@ -162,118 +132,72 @@ class MemoryMonitor:
         total_mem = vmem.total
         free_mem = vmem.available
         alloc_mem = process.memory_full_info().uss
-        if alloc_mem > self._peak_host_memory:
-            self._peak_host_memory = alloc_mem
         return alloc_mem, free_mem, total_mem
+    return 0, 0, 0  # used, free, total
 
-    def device_memory_info(
-        self,
-        device: Optional[Union[torch.device, int]] = None,
-    ) -> int:
+
+def device_memory_info(
+        device: Optional[Union[torch.device,
+                               int]] = None) -> Tuple[int, int, int]:
+    if pynvml is not None:
         if device is None:
             device = torch.cuda.current_device()
         index = device.index if isinstance(device, torch.device) else device
-        if index not in self.device_handles:
+        with PyNVMLContext():
             handle = pynvml.nvmlDeviceGetHandleByIndex(index)
-            self.device_handles[index] = handle
-        mem_info = self._device_mem__fn(self.device_handles[index])
-        if mem_info.used > self._peak_device_memory:
-            self._peak_device_memory = mem_info.used
+            mem_info = _device_get_memory_info_fn(handle)
         return mem_info.used, mem_info.free, mem_info.total
-
-    @staticmethod
-    def _normalize_unit_name(unit: str):
-        # Rename GB -> GiB.
-        return {'GB': 'GiB', 'MB': 'MiB', 'KiB': 'KB'}[unit]
-
-    @classmethod
-    def _format(cls, mem_bytes: int, unit: UnitType) -> str:
-        if unit not in cls.units:
-            unit = cls._rename_map[unit]
-        mem_usage = float(mem_bytes) / cls.units[unit]
-        return f'{mem_usage:.4f} ({unit})'
-
-    @classmethod
-    def _print_message(cls, msg: str, tag: Optional[str] = None):
-        if tag:
-            msg = f'{tag} - {msg}'
-        logger.info(f'{cls.TAG} {msg}')
-
-    def print_host_memory_usage(self,
-                                tag: Optional[str] = None,
-                                unit: UnitType = 'GiB'):
-        if psutil is None:
-            return
-        alloc_mem, _, _ = self.host_memory_info()
-        msg = f'Allocated Host Memory {self._format(alloc_mem, unit)}'
-        self._print_message(msg, tag)
-
-    def print_device_memory_usage(
-        self,
-        tag: Optional[str] = None,
-        unit: UnitType = 'GB',
-        device: Optional[Union[torch.device, int]] = None,
-    ):
-        alloc_mem, _, _ = self.device_memory_info(device)
-        msg = f'Allocated Device Memory {self._format(alloc_mem, unit)}'
-        self._print_message(msg, tag)
-
-    def print_memory_usage(
-        self,
-        tag: Optional[str] = None,
-        unit: UnitType = 'GiB',
-        device: Optional[Union[torch.device, int]] = None,
-    ):
-        alloc_host_mem, _, _ = self.host_memory_info()
-        alloc_device_mem, _, _ = self.device_memory_info(device=device)
-        msg = f'Allocated Memory: Host {self._format(alloc_host_mem, unit)} '\
-              f'Device {self._format(alloc_device_mem, unit)}'
-        self._print_message(msg, tag)
-
-    def print_peak_memory_usage(self, unit: UnitType = 'GiB'):
-        self._print_message(
-            f'Peak Memory Usage: '
-            f'Host {self._format(self._peak_host_memory, unit)} '
-            f'Device {self._format(self._peak_device_memory, unit)}')
+    return 0, 0, 0  # used, free, total
 
 
-if psutil is not None and pynvml is not None:
-    _default_memory_monitor = MemoryMonitor()
-else:
-    _default_memory_monitor = None
+def bytes_to_target_unit(mem_bytes: int, unit: MemUnitType) -> float:
+    units = {'GiB': 1 << 30, 'MiB': 1 << 20, 'KiB': 1 << 10}
+    _rename_map = {'GB': 'GiB', 'MB': 'MiB', 'KB': 'KiB'}
+    if unit not in units:
+        unit = _rename_map[unit]
+    return float(mem_bytes) / units[unit]
 
 
-def host_memory_info():
-    if _default_memory_monitor is not None:
-        return _default_memory_monitor.host_memory_info()
+def _format(mem_bytes: int, unit: MemUnitType) -> str:
+    mem_usage = bytes_to_target_unit(mem_bytes, unit)
+    return f'{mem_usage:.4f} ({unit})'
 
 
-def device_memory_info(device: Optional[Union[torch.device, int]] = None):
-    if _default_memory_monitor is not None:
-        return _default_memory_monitor.device_memory_info(device)
+def _print_mem_message(msg: str, tag: Optional[str] = None):
+    if tag:
+        msg = f'{tag} - {msg}'
+    logger.info(f'[MemUsage] {msg}')
 
 
 def print_host_memory_usage(tag: Optional[str] = None,
-                            unit: MemoryMonitor.UnitType = 'GiB'):
-    if _default_memory_monitor is not None:
-        _default_memory_monitor.print_host_memory_usage(tag=tag, unit=unit)
+                            unit: MemUnitType = 'GiB'):
+    if psutil is None:
+        return
+    alloc_mem, _, _ = host_memory_info()
+    msg = f'Allocated Host Memory {_format(alloc_mem, unit)}'
+    _print_mem_message(msg, tag)
 
 
-def print_device_memory_usage(tag: Optional[str] = None,
-                              unit: MemoryMonitor.UnitType = 'GiB'):
-    if _default_memory_monitor is not None:
-        _default_memory_monitor.print_device_memory_usage(tag=tag, unit=unit)
+def print_device_memory_usage(
+    tag: Optional[str] = None,
+    unit: MemUnitType = 'GiB',
+    device: Optional[Union[torch.device, int]] = None,
+):
+    alloc_mem, _, _ = device_memory_info(device)
+    msg = f'Allocated Device Memory {_format(alloc_mem, unit)}'
+    _print_mem_message(msg, tag)
 
 
-def print_memory_usage(tag: Optional[str] = None,
-                       unit: MemoryMonitor.UnitType = 'GiB'):
-    if _default_memory_monitor is not None:
-        _default_memory_monitor.print_memory_usage(tag=tag, unit=unit)
-
-
-def print_peak_memory_usage(unit: MemoryMonitor.UnitType = 'GiB'):
-    if _default_memory_monitor is not None:
-        _default_memory_monitor.print_peak_memory_usage(unit=unit)
+def print_memory_usage(
+    tag: Optional[str] = None,
+    unit: MemUnitType = 'GiB',
+    device: Optional[Union[torch.device, int]] = None,
+):
+    alloc_host_mem, _, _ = host_memory_info()
+    alloc_device_mem, _, _ = device_memory_info(device=device)
+    msg = f'Allocated Memory: Host {_format(alloc_host_mem, unit)} '\
+            f'Device {_format(alloc_device_mem, unit)}'
+    _print_mem_message(msg, tag)
 
 
 @_is_building
@@ -311,16 +235,14 @@ def check_gpt_mem_usage(engine, kv_dtype, use_gpt_attention_plugin,
     _, _, total_mem = device_memory_info(torch.cuda.current_device())
     if est_memory_size > total_mem:
         logger.warning(
-            f'Engine is successfully built, but GPU Memory ({total_mem:.2f} GB)',
+            f'Engine is successfully built, but GPU Memory ({total_mem:.2f} GB)'
             ' may not be enough when inferencing on max shape.')
         if paged_kv_cache:
-            logger.warning(
-                f'Since paged_kv_cache is enabled, the max KV Cache ',
-                'memory size is a estimate for very extreme cases, ',
-                'it\'s possible that most cases won\'t meet OOM.')
+            logger.warning(f'Since paged_kv_cache is enabled, the max KV Cache '
+                           'memory size is a estimate for very extreme cases, '
+                           'it\'s possible that most cases won\'t meet OOM.')
         else:
-            logger.warning(
-                f'Enabling `--paged_kv_cache` could help reduce the ',
-                'GPU memory usage on runtime.')
+            logger.warning(f'Enabling `--paged_kv_cache` could help reduce the '
+                           'GPU memory usage on runtime.')
 
     return est_memory_size

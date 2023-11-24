@@ -126,7 +126,7 @@ __global__ void computePaddingOffsets(int* paddingOffsets, const int* seqOffsets
     // Iterate over the tokens to update the number of padded elements.
     for (int tokenIdx = threadIdx.x; tokenIdx < seqLength; tokenIdx += blockDim.x)
     {
-        paddingOffsets[seqBegin + tokenIdx] = paddingOffset + max(0, tokenIdx - seqLength);
+        paddingOffsets[seqBegin + tokenIdx] = paddingOffset;
     }
 }
 
@@ -152,7 +152,7 @@ __global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, const
     int seqLength = seqEnd - seqBegin;
 
     // Iterate over the tokens to update the number of padded elements.
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < maskSize; idx += blockDim.x)
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < maskSize; idx += gridDim.x * blockDim.x)
     {
         // The position in the matrix.
         int rowIdx = idx / maxSeqLength;
@@ -235,8 +235,7 @@ void invokeBuildDecoderInfo(const BuildDecoderInfoParams<T>& params, cudaStream_
     // Compute the attention mask, if needed.
     if (params.attentionMask != nullptr)
     {
-        // large value like 512 hurts kernel perf at long sequence length. Keep small for now.
-        const int MIN_BLOCKS = 16;
+        const int MIN_BLOCKS = 512;
         int blocksPerSeq = 16;
         while (blocksPerSeq * params.batchSize < MIN_BLOCKS)
         {

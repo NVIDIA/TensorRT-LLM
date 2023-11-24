@@ -54,6 +54,7 @@ public:
         , mModelVariant(ModelVariant::kGpt)
         , mUseCustomAllReduce(false)
         , mMaxPromptEmbeddingTableSize(0)
+        , mMaxDraftLen(0)
     {
     }
 
@@ -253,6 +254,16 @@ public:
         mUseCustomAllReduce = customAllReduce;
     }
 
+    void constexpr setMaxDraftLen(SizeType maxDraftLen) noexcept
+    {
+        mMaxDraftLen = maxDraftLen;
+    }
+
+    [[nodiscard]] SizeType constexpr getMaxTokensPerStep() const noexcept
+    {
+        return mMaxDraftLen + 1;
+    }
+
 private:
     SizeType mVocabSize;
     SizeType mNbLayers;
@@ -276,6 +287,7 @@ private:
     bool mUseCustomAllReduce;
 
     SizeType mMaxPromptEmbeddingTableSize;
+    SizeType mMaxDraftLen;
 };
 
 } // namespace tensorrt_llm::runtime

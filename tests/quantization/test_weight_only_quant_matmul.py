@@ -18,13 +18,17 @@ import unittest
 
 import _utils
 import pytest
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from parameterized import parameterized
 from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
+from tensorrt_llm.functional import constant
 from tensorrt_llm.quantization.functional import weight_only_quant_matmul
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -45,16 +49,17 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
         # Init operands for multiplication in int32
         mat1 = torch.eye(weights.shape[0], dtype=torch_dtype)
 
-        return self._run_matmul_plugin(mat1, weights, scales, dtype, wTypeId)
+        return self._run_matmul(mat1, weights, scales, dtype, wTypeId, True)
 
-    def _run_matmul_plugin(self, mat1, processed_torch_weights,
-                           torch_weight_scales, dtype, wTypeId):
+    def _run_matmul(self, mat1, processed_torch_weights, torch_weight_scales,
+                    dtype, wTypeId, use_plugin):
         # Create builder
         builder = tensorrt_llm.Builder()
         # Create empty network
         net = builder.create_network()
-        # Allow SQ plugin of dtype type
-        net.plugin_config.set_weight_only_quant_matmul_plugin(dtype)
+        # Allow WQ plugin of dtype type
+        if use_plugin:
+            net.plugin_config.set_weight_only_quant_matmul_plugin(dtype)
         with tensorrt_llm.net_guard(net):
             network = tensorrt_llm.default_trtnet()
             # Init TensorRT-LLM tensor for mat1
@@ -62,16 +67,12 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
                        shape=mat1.shape,
                        dtype=tensorrt_llm._utils.str_dtype_to_trt(dtype))
             # Init TensorRT-LLM tensor for weight
-            y = Tensor(name='y',
-                       shape=processed_torch_weights.shape,
-                       dtype=tensorrt_llm._utils.str_dtype_to_trt("int8"))
-
+            weights = constant(processed_torch_weights.numpy())
             # Init TensorRT-LLM tensor for per channel scaling
-            scale = Tensor(name='scale',
-                           shape=torch_weight_scales.shape,
-                           dtype=tensorrt_llm._utils.str_dtype_to_trt(dtype))
+            scale = constant(torch_weight_scales.numpy())
             # Get output tensor for WOQ Matmul
-            output = weight_only_quant_matmul(x, y, scale, wTypeId).trt_tensor
+            output = weight_only_quant_matmul(x, weights, scale,
+                                              wTypeId).trt_tensor
             output.name = 'output'
             network.mark_output(output)
             output.dtype = tensorrt_llm._utils.str_dtype_to_trt(dtype)
@@ -86,28 +87,28 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
 
         # Infer engine
         with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(
-                feed_dict={
-                    'x': mat1.numpy(),
-                    'y': processed_torch_weights.numpy(),
-                    'scale': torch_weight_scales.numpy()
-                })
+            outputs = runner.infer(feed_dict={
+                'x': mat1.numpy(),
+            })
 
         return torch.tensor(outputs['output'])
 
-    def _woq_matmul(self, m, n, k, dtype, wTypeId):
+    def _woq_matmul(self, m, n, k, dtype, wTypeId, use_plugin=True):
         # Init operands for multiplication in int32
         mat1 = _utils.woq_gen_weights(m, k, dtype) * 200.0
         weight = _utils.woq_gen_weights(k, n, dtype)
 
         ref_torch_weights, processed_torch_weights, torch_weight_scales = _utils.woq_conversion(
             weight, wTypeId)
-        if wTypeId == 2:
+        if wTypeId == 2 and use_plugin:
             ref_torch_weights = torch.ops.fastertransformer.unpack_int4_packed_tensor_to_int8(
                 ref_torch_weights)
+        if not use_plugin:
+            processed_torch_weights = ref_torch_weights
 
-        output = self._run_matmul_plugin(mat1, processed_torch_weights,
-                                         torch_weight_scales, dtype, wTypeId)
+        output = self._run_matmul(mat1, processed_torch_weights,
+                                  torch_weight_scales, dtype, wTypeId,
+                                  use_plugin)
 
         ref = _utils.woq_gt_matmul(m, mat1, ref_torch_weights,
                                    torch_weight_scales, dtype)
@@ -124,17 +125,18 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
         '''
 
     @parameterized.expand([
-        (1, 1024, 4096, 'float16', 1),
-        (128, 6144, 12288, 'float16', 1),  #FP16 * INT8
-        (1, 1024, 4096, 'float16', 2),
-        (128, 6144, 12288, 'float16', 2)
+        (1, 1024, 4096, 'float16', 1, True),
+        (1, 1024, 4096, 'float16', 1, False),
+        (128, 6144, 12288, 'float16', 1, True),  #FP16 * INT8
+        (1, 1024, 4096, 'float16', 2, True),
+        (128, 6144, 12288, 'float16', 2, True),
     ])  #FP16 * INT4
     @pytest.mark.skipif(
         getSMVersion() < 80,
         reason="weight only groupwise contains bug in pre-ampere architecture"
     )  # Skip tests that are not supported in pre-ampere architecture
-    def test_matmul(self, m, n, k, dtype, wTypeId):
-        self._woq_matmul(m, n, k, dtype, wTypeId)
+    def test_matmul(self, m, n, k, dtype, wTypeId, use_plugin):
+        self._woq_matmul(m, n, k, dtype, wTypeId, use_plugin)
 
     @parameterized.expand([
         (1024, 4096, 'float16', 1), (4096, 512, 'float16', 1),
@@ -150,19 +152,6 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
         weight_act = self._unconvert_weights(perm_int, scale, dtype, wTypeId)
 
         _utils.woq_assert_colwise_near_eq(weight_ref, weight_act, wTypeId)
-
-    def test_weight_only_matmul_no_plugin(self):
-        # Create builder
-        builder = tensorrt_llm.Builder()
-        # Create empty network
-        net = builder.create_network()
-        with tensorrt_llm.net_guard(net):
-            tensorrt_llm.default_trtnet()
-            # Get output tensor for SQ gemm
-            with self.assertRaisesRegex(
-                    TypeError,
-                    "Weight Only Qunat MatMul is only supported with plugin"):
-                weight_only_quant_matmul(None, None, None, 0)
 
 
 if __name__ == '__main__':

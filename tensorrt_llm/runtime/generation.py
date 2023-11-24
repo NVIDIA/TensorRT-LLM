@@ -20,8 +20,11 @@ from functools import wraps
 from typing import Dict, List, Optional, Sequence, Union
 
 import numpy as np
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from cuda import cudart
 
 from .._ipc_utils import IpcMemory, set_peer_access
@@ -944,10 +947,16 @@ class GenerationSession(object):
             # They will take turns to act as input and output buffers.
             # Not applicable to cross KV buffers as it's constant
             for i in range(self.first_layer, self.last_layer):
+                trt_dtype = self.runtime.engine.get_tensor_dtype(
+                    f'present_key_value_{i}')
+                if trt_dtype == trt.fp8:
+                    # PyTorch doesn't support fp8 datatype, use int8 instead of it because int8 datatype size is same with fp8.
+                    # TODO: Remove this section when PyTorch support fp8 datatype
+                    dtype = torch.int8
+                else:
+                    dtype = self._tensor_dtype(f'present_key_value_{i}')
                 self.buffer[f'1_present_key_value_{i}'] = torch.empty(
-                    cache_shape,
-                    dtype=self._tensor_dtype(f'present_key_value_{i}'),
-                    device=self.device)
+                    cache_shape, dtype=dtype, device=self.device)
 
         if self.use_custom_all_reduce and self.mapping.tp_size > 1:
             set_peer_access(self.mapping)
@@ -1778,9 +1787,9 @@ class GenerationSession(object):
                     sequence_limit_lengths, stop_words_list, bad_words_list,
                     no_repeat_ngram_size, this_src_cache_indirection,
                     self.output_ids, self.new_tokens, self.finished,
-                    self.sequence_length_buffer, self.cum_log_probs,
-                    self.log_probs, self.parent_ids, this_tgt_cache_indirection,
-                    self.beam_hyps_output_ids_tgt,
+                    self.finished, self.sequence_length_buffer,
+                    self.cum_log_probs, self.log_probs, self.parent_ids,
+                    this_tgt_cache_indirection, self.beam_hyps_output_ids_tgt,
                     self.beam_hyps_sequence_lengths_tgt,
                     self.beam_hyps_cum_log_probs, self.beam_hyps_normed_scores,
                     self.beam_hyps_log_probs, self.beam_hyps_min_normed_scores,
@@ -2109,12 +2118,35 @@ class GenerationSession(object):
 
 class ChatGLMGenerationSession(GenerationSession):
 
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        engine_buffer,
+        mapping: Mapping,
+        debug_mode=False,
+        debug_tensors_to_save=None,
+        cuda_graph_mode=False,
+        stream: torch.cuda.Stream = None,
+    ):
+
+        super().__init__(
+            model_config,
+            engine_buffer,
+            mapping,
+            debug_mode,
+            debug_tensors_to_save,
+            cuda_graph_mode,
+            stream,
+        )
+
+        self.mask_index_tensor = None
+
     def _prepare_context_inputs(self, batch_size, context_lengths,
                                 use_gpt_attention_plugin, remove_input_padding,
                                 **kwargs):
 
-        last_token_ids = context_lengths.detach().clone()
         max_context_length = kwargs.pop('max_context_length')
+        last_token_ids = context_lengths.detach().clone()
 
         if remove_input_padding:
             input_lengths_acc = torch.cumsum(torch.cat(
@@ -2136,11 +2168,32 @@ class ChatGLMGenerationSession(GenerationSession):
             position_ids = torch.zeros([batch_size, 2, max_context_length],
                                        dtype=torch.int32)
             position_ids[:, 0, :] = torch.arange(max_context_length)
-            for i in range(batch_size):
-                length = context_lengths[i]
-                position_ids[i, 0, length - 1] = length - 2
-                position_ids[i, 1, length - 1] = 1
-                position_ids[i, :, length:] = 0
+
+            if kwargs["pad_id"] == 50256:  # specialization for GLM-10B
+                self.mask_index_tensor = torch.zeros([batch_size],
+                                                     dtype=torch.int32)
+                for i in range(batch_size):
+                    length = context_lengths[i]
+                    mask_index = torch.where(
+                        kwargs["input_ids"][i] == 50260)[0].int()
+                    gmask_index = torch.where(
+                        kwargs["input_ids"][i] == 50263)[0].int()
+                    smask_index = torch.where(
+                        kwargs["input_ids"][i] == 50264)[0].int()
+                    tail_index = torch.Tensor([max_context_length]).int().cuda()
+                    mask_index = torch.cat([
+                        mask_index.int(), gmask_index, smask_index, tail_index
+                    ],
+                                           dim=0).min()
+                    position_ids[i, 0, max_context_length - 1] = int(mask_index)
+                    position_ids[i, 1, max_context_length - 1] = 1
+                    self.mask_index_tensor[i] = int(mask_index)
+            else:
+                for i in range(batch_size):
+                    length = context_lengths[i]
+                    position_ids[i, 0, length - 1] = length - 2
+                    position_ids[i, 1, length - 1] = 1
+
             position_ids = position_ids.cuda()
 
         inputs = {
@@ -2170,8 +2223,13 @@ class ChatGLMGenerationSession(GenerationSession):
             last_token_ids = torch.cumsum(last_token_ids, dim=0).int().cuda()
         else:
             data = []
-            for i in range(batch_size):
-                data.append([[context_lengths[i * num_beams] - 2], [step + 2]])
+            if self.mask_index_tensor is not None:  # specialization for GLM-10B
+                for i in range(batch_size):
+                    data.append([[self.mask_index_tensor[i]], [step + 2]])
+            else:
+                for i in range(batch_size):
+                    data.append([[context_lengths[i * num_beams] - 2],
+                                 [step + 2]])
             position_ids = torch.tensor(data, dtype=torch.int32, device='cuda')
             position_ids = _tile_beam_width(position_ids, num_beams)
 

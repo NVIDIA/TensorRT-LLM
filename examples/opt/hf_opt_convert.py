@@ -120,6 +120,7 @@ def split_and_convert(args):
 
     # load position_embedding from rank 0
     model = AutoModelForCausalLM.from_pretrained(args.in_file,
+                                                 torch_dtype="auto",
                                                  device_map="auto")
     hf_config = vars(model.config)
 

@@ -43,9 +43,8 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
 
     std::string modelNameHyphen = modelName;
     std::filesystem::path jsonFileName = dataPath / "config.json";
-    if (tc::strStartsWith(modelName, "chatglm"))
+    if (tc::strStartsWith(modelName, "chatglm") || tc::strStartsWith(modelName, "glm"))
     {
-        std::replace(modelNameHyphen.begin(), modelNameHyphen.end(), '_', '-');
         jsonFileName = dataPath / (modelNameHyphen + std::string("-config.json"));
     }
     auto const json = GptJsonConfig::parse(jsonFileName);

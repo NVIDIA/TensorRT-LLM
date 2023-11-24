@@ -87,6 +87,7 @@ set(SAMPLING_KERNEL_TEST_SRC
     kernels/sampling/samplingUtilsTest.cu)
 add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
 add_gtest(weightOnlyKernelTest kernels/weightOnly/weightOnlyKernelTest.cpp)
+add_gtest(decodingKernelsTest kernels/decodingKernelTest.cpp)
 
 if(BUILD_BATCH_MANAGER)
   add_subdirectory(batch_manager)

@@ -62,9 +62,10 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
 }
 
 void StatefulGptDecoder::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxKvCacheLength,
-    SizeType maxSequenceLength, nvinfer1::DataType dtype)
+    SizeType maxSequenceLength, SizeType maxTokensPerStep, nvinfer1::DataType dtype)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_CHECK(maxTokensPerStep == 1);
     mDecoder = IGptDecoder::create(dtype, mVocabSize, mVocabSizePadded, mStream);
 
     reshapeBuffers(maxBatchSize, maxBeamWidth, maxKvCacheLength, maxSequenceLength);
@@ -102,6 +103,7 @@ void StatefulGptDecoder::reshapeBuffers(
     mBufferManager.setZero(*dOutput.newTokens);
     dOutput.parentIds->reshape(outputIdsShape);
     dOutput.finished->reshape(batchSizeXbeamWidth);
+    dInput.finished = ITensor::view(dOutput.finished);
     mBufferManager.setZero(*dOutput.finished);
     mBufferManager.setZero(*dOutput.finishedSum);
 

@@ -103,27 +103,29 @@ def build_engines():
     print("\nBuilding fp16 engines")
     fp16_weight_dir_1_gpu = fp16_weight_dir / '1-gpu'
     build_engine(fp16_weight_dir_1_gpu, engine_dir / 'fp16-default/1-gpu',
-                 '--dtype=float16')
+                 '--dtype=float16', '--strongly_typed')
     build_engine(fp16_weight_dir_1_gpu, engine_dir / 'fp16-plugin/1-gpu',
-                 '--dtype=float16', '--use_gpt_attention_plugin=float16')
+                 '--dtype=float16', '--use_gpt_attention_plugin=float16',
+                 '--strongly_typed')
 
     # Skip tests that are not supported in pre-ampere architecture
     if getSMVersion() >= 80:
         build_engine(fp16_weight_dir_1_gpu,
                      engine_dir / 'fp16-plugin-fmha/1-gpu', '--dtype=float16',
                      '--use_gpt_attention_plugin=float16',
-                     '--enable_context_fmha')
+                     '--enable_context_fmha', '--strongly_typed')
 
     build_engine(fp16_weight_dir_1_gpu, engine_dir / 'fp16-plugin-packed/1-gpu',
                  '--dtype=float16', '--use_gpt_attention_plugin=float16',
-                 '--remove_input_padding')
+                 '--remove_input_padding', '--strongly_typed')
 
     # Skip tests that are not supported in pre-ampere architecture
     if getSMVersion() >= 80:
         build_engine(fp16_weight_dir_1_gpu,
                      engine_dir / 'fp16-plugin-packed-fmha/1-gpu',
                      '--dtype=float16', '--use_gpt_attention_plugin=float16',
-                     '--remove_input_padding', '--enable_context_fmha')
+                     '--remove_input_padding', '--enable_context_fmha',
+                     '--strongly_typed')
 
     print("Done.")
 

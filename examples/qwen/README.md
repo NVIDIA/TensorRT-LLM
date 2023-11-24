@@ -4,11 +4,10 @@ This document shows how to build and run a Qwen model in TensorRT-LLM on both si
 
 ## Overview
 
-The TensorRT-LLM Qwen implementation can be found in [model.py](model.py). The TensorRT-LLM Qwen example code is located in [`examples/qwen`](./). There are three main files in that folder::
+The TensorRT-LLM Qwen implementation can be found in [model.py](model.py). The TensorRT-LLM Qwen example code is located in [`examples/qwen`](./). There are two main files:
 
  * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Qwen model,
- * [`run.py`](./run.py) to run the inference on an input text,
- * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
+ * [`run.py`](./run.py) to run the inference on an input text.
 
 ## Support Matrix
   * FP16
@@ -188,21 +187,25 @@ python3 run.py --max_new_tokens=50 \
                --engine_dir=./tmp/Qwen/7B/trt_engines/int8_kv_cache_weight_only/1-gpu
 ```
 
-Test with `summarize.py`:
+Test with `../summarize.py`:
 
 
 - validate huggingface
 ```bash
-python3 summarize.py --backend=hf \
-    --tokenizer_dir ./tmp/Qwen/7B \
-    --hf_model_dir ./tmp/Qwen/7B
+python3 ../summarize.py --test_hf \
+                        --tokenizer_dir ./tmp/Qwen/7B \
+                        --hf_model_dir ./tmp/Qwen/7B \
+                        --max_input_length 2048 \
+                        --output_len 2048
 ```
 
 - validate trt-llm
 ```bash
-python3 summarize.py --backend=trt_llm \
-    --tokenizer_dir ./tmp/Qwen/7B \
-    --engine_dir ./tmp/Qwen/7B/trt_engines/int8_kv_cache_weight_only/1-gpu
+python3 ../summarize.py --test_trt_llm \
+                        --tokenizer_dir ./tmp/Qwen/7B \
+                        --engine_dir ./tmp/Qwen/7B/trt_engines/int8_kv_cache_weight_only/1-gpu \
+                        --max_input_length 2048 \
+                        --output_len 2048
 ```
 
 #### SmoothQuant
@@ -248,10 +251,12 @@ python3 run.py --max_new_tokens=50 \
 
 - summarize
 ```bash
-python summarize.py --backend=trt_llm \
-                    --tokenizer_dir ./tmp/Qwen/7B/ \
-                    --data_type fp16 \
-                    --engine_dir=./tmp/Qwen/7B/trt_engines/sq0.5/1-gpu/
+python ../summarize.py --test_trt_llm \
+                       --tokenizer_dir ./tmp/Qwen/7B/ \
+                       --data_type fp16 \
+                       --engine_dir=./tmp/Qwen/7B/trt_engines/sq0.5/1-gpu/ \
+                       --max_input_length 2048 \
+                       --output_len 2048
 ```
 
 
@@ -300,46 +305,58 @@ Output: "我是来自阿里云的大规模语言模型，我叫通义千问。"
 
 ```bash
 # Run summarization using the Qwen 7B model in FP16.
-python summarize.py --backend=trt_llm \
-                    --tokenizer_dir ./tmp/Qwen/7B/ \
-                    --data_type fp16 \
-                    --engine_dir ./tmp/Qwen/7B/trt_engines/fp16/1-gpu/
+python ../summarize.py --test_trt_llm \
+                       --tokenizer_dir ./tmp/Qwen/7B/ \
+                       --data_type fp16 \
+                       --engine_dir ./tmp/Qwen/7B/trt_engines/fp16/1-gpu/ \
+                       --max_input_length 2048 \
+                       --output_len 2048
 
 # Run summarization using the Qwen 7B model in BF16.
-python summarize.py --backend=trt_llm \
-                    --tokenizer_dir ./tmp/Qwen/7B/ \
-                    --data_type fp16 \
-                    --engine_dir ./tmp/Qwen/7B/trt_engines/bf16/1-gpu/
+python ../summarize.py --test_trt_llm \
+                       --tokenizer_dir ./tmp/Qwen/7B/ \
+                       --data_type fp16 \
+                       --engine_dir ./tmp/Qwen/7B/trt_engines/bf16/1-gpu/ \
+                       --max_input_length 2048 \
+                       --output_len 2048
 
 # Run summarization using the Qwen 7B model quantized to INT8.
-python summarize.py --backend=trt_llm \
-                    --tokenizer_dir  ./tmp/Qwen/7B/ \
-                    --data_type fp16 \
-                    --engine_dir ./tmp/Qwen/7B/trt_engines/int8_weight_only/1-gpu/
+python ../summarize.py --test_trt_llm \
+                       --tokenizer_dir  ./tmp/Qwen/7B/ \
+                       --data_type fp16 \
+                       --engine_dir ./tmp/Qwen/7B/trt_engines/int8_weight_only/1-gpu/ \
+                       --max_input_length 2048 \
+                       --output_len 2048
 
 # Run summarization using the Qwen 7B model quantized to INT4.
-python summarize.py --backend=trt_llm \
-                    --tokenizer_dir  ./tmp/Qwen/7B/ \
-                    --data_type fp16 \
-                    --engine_dir ./tmp/Qwen/7B/trt_engines/int4_weight_only/1-gpu/
+python ../summarize.py --test_trt_llm \
+                       --tokenizer_dir  ./tmp/Qwen/7B/ \
+                       --data_type fp16 \
+                       --engine_dir ./tmp/Qwen/7B/trt_engines/int4_weight_only/1-gpu/ \
+                       --max_input_length 2048 \
+                       --output_len 2048
 
 # Run summarization using the Qwen 7B model in FP16 using two GPUs.
 mpirun -n 2 --allow-run-as-root \
-    python summarize.py --backend=trt_llm \
-                        --tokenizer_dir  ./tmp/Qwen/7B/ \
-                        --data_type fp16 \
-                        --engine_dir ./tmp/Qwen/7B/trt_engines/fp16/2-gpu/
+    python ../summarize.py --test_trt_llm \
+                           --tokenizer_dir  ./tmp/Qwen/7B/ \
+                           --data_type fp16 \
+                           --engine_dir ./tmp/Qwen/7B/trt_engines/fp16/2-gpu/ \
+                           --max_input_length 2048 \
+                           --output_len 2048
 
 # Run summarization using the Qwen 14B model in FP16 using two GPUs.
 mpirun -n 2 --allow-run-as-root \
-    python summarize.py --backend=trt_llm \
-                        --tokenizer_dir  ./tmp/Qwen/14B/ \
-                        --data_type fp16 \
-                        --engine_dir ./tmp/Qwen/14B/trt_engines/fp16/2-gpu/
+    python ../summarize.py --test_trt_llm \
+                           --tokenizer_dir  ./tmp/Qwen/14B/ \
+                           --data_type fp16 \
+                           --engine_dir ./tmp/Qwen/14B/trt_engines/fp16/2-gpu/ \
+                           --max_input_length 2048 \
+                           --output_len 2048
 ```
 **Demo output of summarize.py:**
 ```python
-python3 summarize.py --backend=trt_llm --tokenizer_dir /llm-models/Qwen-7B-Chat/ --engine_dir /engine_qwen
+python3 ../summarize.py --test_trt_llm --tokenizer_dir /llm-models/Qwen-7B-Chat/ --engine_dir /engine_qwen --max_input_length 2048 --output_len 2048
 ```
 ```
 [11/09/2023-02:21:10] [TRT-LLM] [I] Load tokenizer takes: 0.4043385982513428 sec
@@ -363,4 +380,4 @@ load rouge done
 ```
 
 ## Credits
-This Qwen model example exists thanks to Tltin (TltinDeng01@gmail.com) and Zhaohb (zhaohbcloud@126.com).
+This Qwen model example exists thanks to Tlntin (TlntinDeng01@gmail.com) and zhaohb (zhaohbcloud@126.com).

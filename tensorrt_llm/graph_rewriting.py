@@ -1,4 +1,5 @@
 import inspect
+import weakref
 from copy import copy
 from dataclasses import dataclass, field
 from functools import wraps
@@ -17,11 +18,15 @@ class Layer:
     '''
 
     def __init__(self, network: Network, trt_layer: trt.ILayer):
-        self.network = network
+        self._network = weakref.ref(network)
         self.trt_layer = trt_layer
 
         assert isinstance(self.network, Network)
         assert isinstance(self.trt_layer, trt.ILayer)
+
+    @property
+    def network(self):
+        return self._network()
 
     def get_inputs(self, *indices: int):
         '''

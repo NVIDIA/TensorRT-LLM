@@ -261,7 +261,7 @@ The list of supported models is:
 * [StarCoder](examples/gpt)
 * [T5](examples/enc_dec)
 
-Note: [Encoder-Decoder](examples/enc_dec/) provides general encoder-decoder support that contains many encoder-decoder models such as T5, Flan-T5, etc. We unroll the exact model names in the list above to let users find specific models easiler.
+Note: [Encoder-Decoder](examples/enc_dec/) provides general encoder-decoder support that contains many encoder-decoder models such as T5, Flan-T5, etc. We unroll the exact model names in the list above to let users find specific models easier.
 
 ## Performance
 

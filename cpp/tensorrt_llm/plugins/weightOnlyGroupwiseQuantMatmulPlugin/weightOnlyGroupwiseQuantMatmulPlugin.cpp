@@ -308,11 +308,17 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
     }
     const int n = inputDesc[mWeightInputIdx].dims.d[1];
     const int k = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
+    bool use_cuda_kernel = m < SMALL_M_FAST_PATH && mCudaKernelEnabled;
+    bool use_pre_quant_scale = mQuantAlgo & PRE_QUANT_SCALE;
 
-    // mQuantAlgo = pre_quant_scale * 4 + zero * 2 + bias
-    if (mQuantAlgo & PRE_QUANT_SCALE)
+    const half* zeros_ptr = (mQuantAlgo & ZERO) ? reinterpret_cast<const half*>(inputs[mZerosInputIdx]) : nullptr;
+    const half* biases_ptr = (mQuantAlgo & BIAS) ? reinterpret_cast<const half*>(inputs[mBiasesInputIdx]) : nullptr;
+    const half* act_ptr = reinterpret_cast<const half*>(inputs[0]);
+
+    if (use_pre_quant_scale && !use_cuda_kernel)
     {
         // Apply pre-quant per channel scale on activations
+        act_ptr = reinterpret_cast<const half*>(workspace);
         if (mType == nvinfer1::DataType::kHALF)
         {
             tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<half>(reinterpret_cast<half*>(workspace),
@@ -328,10 +334,6 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
         }
 #endif
     }
-
-    const half* zeros_ptr = (mQuantAlgo & ZERO) ? reinterpret_cast<const half*>(inputs[mZerosInputIdx]) : nullptr;
-    const half* biases_ptr = (mQuantAlgo & BIAS) ? reinterpret_cast<const half*>(inputs[mBiasesInputIdx]) : nullptr;
-    const half* act_ptr = reinterpret_cast<const half*>((mQuantAlgo & PRE_QUANT_SCALE) ? workspace : inputs[0]);
 
 #if defined(ENABLE_BF16)
     TLLM_CHECK_WITH_INFO(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16,
@@ -350,14 +352,18 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
     {
         weight_only_act_type = tensorrt_llm::kernels::WeightOnlyActivationType::BF16;
     }
-    if (m < SMALL_M_FAST_PATH && mCudaKernelEnabled)
+    if (use_cuda_kernel)
     {
         // Use CUDA kernels for small batch size
         // The CUDA kernel is designed for ColumnMajorTileInterleave weight layout used in fpAIntB cutlass kernel
         // when sm >= 75 and the preprocessing of cutlass on sm70 does not interleave the weights.
+        const void* pre_quant_scale = nullptr;
+        if (use_pre_quant_scale)
+            pre_quant_scale = inputs[mPreQuantScaleInputIdx];
         tensorrt_llm::kernels::WeightOnlyParams params{reinterpret_cast<const uint8_t*>(inputs[mWeightInputIdx]),
-            inputs[mScalesInputIdx], zeros_ptr, act_ptr, biases_ptr, outputs[0], m, real_n, k, mGroupSize,
-            tensorrt_llm::kernels::WeightOnlyQuantType::Int4b, tensorrt_llm::kernels::WeightOnlyType::GroupWise,
+            inputs[mScalesInputIdx], zeros_ptr, act_ptr, pre_quant_scale, biases_ptr, outputs[0], m, real_n, k,
+            mGroupSize, tensorrt_llm::kernels::WeightOnlyQuantType::Int4b,
+            tensorrt_llm::kernels::WeightOnlyType::GroupWise,
             tensorrt_llm::kernels::WeightOnlyActivationFunctionType::Identity, weight_only_act_type};
         tensorrt_llm::kernels::weight_only_batched_gemv_launcher(params, stream);
     }

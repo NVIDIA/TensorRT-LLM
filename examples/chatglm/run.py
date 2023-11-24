@@ -43,8 +43,9 @@ def parse_arguments(args=None):
     )
     parser.add_argument('--max_output_len', type=int, default=1024)
     parser.add_argument('--log_level', type=str, default='error')
-    parser.add_argument('--engine_dir', type=str, default='trtModel')
+    parser.add_argument('--engine_dir', type=str, default=None)
     parser.add_argument('--beam_width', type=int, default=1)
+    parser.add_argument('--streaming', default=False, action='store_true')
     parser.add_argument(
         '--input_text',
         type=str,
@@ -71,14 +72,20 @@ def parse_arguments(args=None):
     parser.add_argument('--top_k', type=int, default=1)
     parser.add_argument('--top_p', type=float, default=0.0)
     parser.add_argument('--random_seed', type=int, default=1)
-    return parser.parse_args(args)
+
+    args = parser.parse_args(args)
+
+    if args.engine_dir is None:
+        args.engine_dir = Path("output_" + args.model_name)
+
+    return args
 
 
 if __name__ == '__main__':
     args = parse_arguments()
     tensorrt_llm.logger.set_level(args.log_level)
 
-    config_path = Path(args.engine_dir) / (args.model_name + '-config.json')
+    config_path = Path(args.engine_dir) / 'config.json'
     with open(config_path, 'r') as f:
         config = json.load(f)
 
@@ -89,9 +96,11 @@ if __name__ == '__main__':
     max_beam_width = config['builder_config']['max_beam_width']
     remove_input_padding = config['builder_config']['remove_input_padding']
     use_gpt_attention_plugin = config['plugin_config']['gpt_attention_plugin']
-    world_size = config['builder_config']['tensor_parallel']
-    assert world_size == tensorrt_llm.mpi_world_size(
-    ), f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
+    tp_size = config['builder_config']['tensor_parallel']
+    pp_size = config['builder_config']['pipeline_parallel']
+    world_size = tp_size * pp_size
+    assert world_size == tensorrt_llm.mpi_world_size(), \
+        f'Engine world size ({tp_size} * {pp_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
 
     if args.max_output_len > max_output_len:
         print("Truncate max_output_len as %d" % max_output_len)
@@ -199,9 +208,10 @@ if __name__ == '__main__':
     model_config = ModelConfig(
         vocab_size=config['builder_config']['vocab_size'],
         num_layers=config['builder_config']['num_layers'],
-        num_heads=config['builder_config']['num_heads'] // world_size,
-        num_kv_heads=config['builder_config']['num_kv_heads'] // world_size,
-        hidden_size=config['builder_config']['hidden_size'] // world_size,
+        num_heads=config['builder_config']['num_heads'] // tp_size,
+        num_kv_heads=(config['builder_config']['num_kv_heads'] + tp_size - 1) //
+        tp_size,
+        hidden_size=config['builder_config']['hidden_size'] // tp_size,
         gpt_attention_plugin=use_gpt_attention_plugin,
         remove_input_padding=config['builder_config']['remove_input_padding'],
         model_name=args.model_name,
@@ -251,11 +261,8 @@ if __name__ == '__main__':
         sampling_config,
         output_sequence_lengths=True,
         return_dict=True,
+        streaming=args.streaming,
     )
-    torch.cuda.synchronize()
-
-    output_ids = output["output_ids"]
-    output_lengths = output["sequence_lengths"]
 
     if runtime_rank == 0:
 
@@ -271,18 +278,44 @@ if __name__ == '__main__':
         ]:
             from process import process_response
 
-        for i in range(batch_size):
-            print("\nInput  %2d ---> len=%d\n%s" %
-                  (i, input_lengths[i], input_text[i]))
+        if args.streaming:  # streaming output
+            print("#" * 80)
+            # only print the first batch and the first beam to show the effect,
+            # actually all beams of all batches are available
+            print("Input  %2d ---> len=%d\n%s" %
+                  (0, input_lengths[0], input_text[0]))
             print("\nOutput %2d --->" % i)
-            output_ids_one_batch = output_ids[i, :, input_lengths[i]:]
-            output_lengths_one_batch = output_lengths[i]
-            output_token_list = tokenizer.batch_decode(output_ids_one_batch,
-                                                       skip_special_tokens=True)
-            output_token_list = process_response(output_token_list)
-            for j, (length, simple_output) in enumerate(
-                    zip(output_lengths_one_batch, output_token_list)):
-                print("\n  Beam %2d ---> len=%d\n%s" %
-                      (j, length, simple_output))
 
-    print("Finished!")
+            for output_item in output:
+                output_id = output_item["output_ids"]
+                output_sequence_lengths = output_item["sequence_lengths"]
+                output_id = output_id[0, 0, output_sequence_lengths[0, 0] - 1]
+                output_word = tokenizer.convert_ids_to_tokens(int(output_id))
+                output_word = output_word.replace("▁", " ")  # For English
+                output_word = tokenizer.convert_tokens_to_string(output_word)
+                print(output_word, end="", flush=True)
+            print("\n" + "#" * 80)
+        else:  # regular output
+            torch.cuda.synchronize()
+            output_ids = output["output_ids"]
+            output_lengths = output["sequence_lengths"]
+            print("#" * 80)
+            for i in range(batch_size):
+                print("Input  %2d ---> len=%d\n%s" %
+                      (i, input_lengths[i], input_text[i]))
+                print("\nOutput %2d --->" % i)
+                output_ids_one_batch = output_ids[i, :, input_lengths[i]:]
+                output_lengths_one_batch = output_lengths[i] - input_lengths[
+                    i] + 1
+                output_token_list = tokenizer.batch_decode(
+                    output_ids_one_batch, skip_special_tokens=True)
+                output_token_list = process_response(output_token_list)
+                for j, (length, simple_output) in enumerate(
+                        zip(output_lengths_one_batch, output_token_list)):
+                    print("  Beam %2d ---> len=%d\n%s" %
+                          (j, length, simple_output))
+                print("#" * 80)
+
+    del decoder
+
+    print(f"Finished from worker {runtime_rank}")

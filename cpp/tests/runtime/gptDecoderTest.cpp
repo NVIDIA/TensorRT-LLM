@@ -97,6 +97,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     outputs.lengths
         = manager.copyFrom(sequenceLengthsVec, ITensor::makeShape({batchSize, beamWidth}), MemoryType::kGPU);
     outputs.finished = manager.gpu(ITensor::makeShape({batchSize, beamWidth}), nvinfer1::DataType::kBOOL);
+    inputs.finished = ITensor::view(outputs.finished);
     manager.setZero(*outputs.finished);
     outputs.finishedSum = BufferManager::pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
     auto* finishedSumHost = bufferCast<std::int32_t>(*outputs.finishedSum);

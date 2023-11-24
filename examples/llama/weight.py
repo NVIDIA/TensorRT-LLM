@@ -23,7 +23,8 @@ from safetensors import safe_open
 
 import tensorrt_llm
 import tensorrt_llm.logger as logger
-from tensorrt_llm._utils import str_dtype_to_torch, torch_to_numpy
+from tensorrt_llm._utils import (str_dtype_to_np, str_dtype_to_torch,
+                                 torch_to_numpy)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import LLaMAForCausalLM
 from tensorrt_llm.models.quantized.quant import get_dummy_quant_scales
@@ -184,7 +185,8 @@ def parse_ft_config(ini_file):
 def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                        hf_llama,
                        mapping=Mapping(),
-                       dtype='float32'):
+                       dtype='float32',
+                       use_gemm_woq_plugin=True):
     tensorrt_llm.logger.info('Loading weights from HF LLaMA...')
     tik = time.time()
 
@@ -224,6 +226,7 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
     layers_range = list(
         range(mapping.pp_rank * layers_per_pipeline_stage,
               (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
+    vocab_size = hf_llama.config.vocab_size
     for k, v in model_params.items():
         if isinstance(v, list):
             v = [torch_to_numpy(vv.to(torch_dtype).detach().cpu()) for vv in v]
@@ -245,7 +248,6 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                 tensorrt_llm_llama.ln_f.weight.value = v
         elif 'lm_head.weight' in k:
             if mapping.is_last_pp_rank():
-                vocab_size = tensorrt_llm_llama.vocab_embedding.num_embeddings
                 if vocab_size % mapping.tp_size != 0:
                     # padding
                     vocab_size_padded = tensorrt_llm_llama.lm_head.out_features * mapping.tp_size
@@ -260,8 +262,6 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
             if layer_idx is None or int(layer_idx) not in layers_range:
                 continue
             idx = int(layer_idx) - mapping.pp_rank * layers_per_pipeline_stage
-            if idx >= tensorrt_llm_llama.num_layers:
-                continue
             if 'input_layernorm.weight' in k:
                 tensorrt_llm_llama.layers[idx].input_layernorm.weight.value = v
             elif 'post_attention_layernorm.weight' in k:
@@ -287,7 +287,11 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    dst.value = processed_torch_weights.numpy()
+                    if not use_gemm_woq_plugin:
+                        dst.value = torch.tensor(v).numpy().astype(
+                            str_dtype_to_np(dtype))
+                    else:
+                        dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_llama.layers[
                         idx].attention.qkv.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -301,7 +305,11 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    dst.value = processed_torch_weights.numpy()
+                    if not use_gemm_woq_plugin:
+                        dst.value = torch.tensor(v).numpy().astype(
+                            str_dtype_to_np(dtype))
+                    else:
+                        dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_llama.layers[
                         idx].attention.dense.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -315,7 +323,13 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    dst.value = processed_torch_weights.numpy()
+
+                    if not use_gemm_woq_plugin:
+                        dst.value = torch.tensor(v).numpy().astype(
+                            str_dtype_to_np(dtype))
+                    else:
+                        dst.value = processed_torch_weights.numpy()
+
                     scales = tensorrt_llm_llama.layers[
                         idx].mlp.gate.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -329,7 +343,11 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    dst.value = processed_torch_weights.numpy()
+                    if not use_gemm_woq_plugin:
+                        dst.value = torch.tensor(v).numpy().astype(
+                            str_dtype_to_np(dtype))
+                    else:
+                        dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_llama.layers[
                         idx].mlp.proj.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -343,7 +361,12 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
-                    dst.value = processed_torch_weights.numpy()
+
+                    if not use_gemm_woq_plugin:
+                        dst.value = torch.tensor(v).numpy().astype(
+                            str_dtype_to_np(dtype))
+                    else:
+                        dst.value = processed_torch_weights.numpy()
                     scales = tensorrt_llm_llama.layers[
                         idx].mlp.fc.per_channel_scale
                     scales.value = torch_weight_scales.numpy()
@@ -649,9 +672,10 @@ def load_from_meta_llama(
 
     head_size = tensorrt_llm_llama.hidden_size // tensorrt_llm_llama.num_heads
     ckpt = get_current_weights(num_ckpts)
+    layers_per_pipeline_stage = tensorrt_llm_llama.num_layers // mapping.pp_size
     layers_range = list(
-        range(mapping.pp_rank * tensorrt_llm_llama.num_layers,
-              (mapping.pp_rank + 1) * tensorrt_llm_llama.num_layers, 1))
+        range(mapping.pp_rank * layers_per_pipeline_stage,
+              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
 
     for l in layers_range:
         prefix = f'layers.{l}.attention.'
@@ -692,12 +716,9 @@ def load_from_meta_llama(
         else:
             # layer specific weights
             layer_idx = extract_layer_idx(k)
-            if layer_idx is None:
+            if layer_idx is None or int(layer_idx) not in layers_range:
                 continue
-            idx = int(
-                layer_idx) - mapping.pp_rank * tensorrt_llm_llama.num_layers
-            if idx >= tensorrt_llm_llama.num_layers:
-                continue
+            idx = int(layer_idx) - mapping.pp_rank * layers_per_pipeline_stage
             if 'attention_norm.weight' in k:
                 tensorrt_llm_llama.layers[idx].input_layernorm.weight.value = v
             elif 'ffn_norm.weight' in k:
@@ -875,7 +896,11 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
             elif use_weight_only:
                 processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                     torch.tensor(t), plugin_weight_only_quant_type)
-                dst.value = processed_torch_weights.numpy()
+                if not use_gemm_woq_plugin:
+                    dst.value = torch.tensor(t).numpy().astype(
+                        str_dtype_to_np(dtype))
+                else:
+                    dst.value = processed_torch_weights.numpy()
                 scales = tensorrt_llm_llama.layers[
                     idx].attention.qkv.per_channel_scale
                 scales.value = torch_weight_scales.numpy()
@@ -902,7 +927,11 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
         elif use_weight_only:
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            dst.value = processed_torch_weights.numpy()
+            if not use_gemm_woq_plugin:
+                dst.value = torch.tensor(t).numpy().astype(
+                    str_dtype_to_np(dtype))
+            else:
+                dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_llama.layers[
                 idx].attention.dense.per_channel_scale
             scales.value = torch_weight_scales.numpy()
@@ -934,7 +963,11 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
             dst = tensorrt_llm_llama.layers[idx].mlp.fc.weight
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            dst.value = processed_torch_weights.numpy()
+            if not use_gemm_woq_plugin:
+                dst.value = torch.tensor(t).numpy().astype(
+                    str_dtype_to_np(dtype))
+            else:
+                dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_llama.layers[idx].mlp.fc.per_channel_scale
             scales.value = torch_weight_scales.numpy()
         else:
@@ -962,8 +995,13 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
             dst = tensorrt_llm_llama.layers[idx].mlp.gate.weight
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            dst.value = processed_torch_weights.numpy()
+            if not use_gemm_woq_plugin:
+                dst.value = torch.tensor(t).numpy().astype(
+                    str_dtype_to_np(dtype))
+            else:
+                dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_llama.layers[idx].mlp.gate.per_channel_scale
+
             scales.value = torch_weight_scales.numpy()
         else:
             tensorrt_llm_llama.layers[
@@ -990,7 +1028,11 @@ def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
             dst = tensorrt_llm_llama.layers[idx].mlp.proj.weight
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            dst.value = processed_torch_weights.numpy()
+            if not use_gemm_woq_plugin:
+                dst.value = torch.tensor(t).numpy().astype(
+                    str_dtype_to_np(dtype))
+            else:
+                dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_llama.layers[idx].mlp.proj.per_channel_scale
             scales.value = torch_weight_scales.numpy()
         else:
@@ -1353,7 +1395,7 @@ def load_from_awq_llama(tensorrt_llm_llama: LLaMAForCausalLM,
     # 1. vocab_embedding
     v = load(awq_key_list[0])
     # TRT-LLM requires vocab_size to be multiple of 64 for successful GEMM
-    if v[0].shape[0] % 64 != 0:
+    if v.shape[0] % 64 != 0:
         v = torch.nn.functional.pad(v, [0, 0, 0, 64 - v.shape[0] % 64])
     if mapping.is_first_pp_rank():
         tensorrt_llm_llama.vocab_embedding.weight.value = v.to(
@@ -1363,8 +1405,10 @@ def load_from_awq_llama(tensorrt_llm_llama: LLaMAForCausalLM,
     v = [load(awq_key_list[1] + suf) for suf in awq_suffix_list]
     if v[0].shape[0] % 64 != 0:
         v[0] = torch.nn.functional.pad(v[0], [0, 0, 0, 64 - v[0].shape[0] % 64])
-        v[1] = torch.nn.functional.pad(v[1], [0, 0, 0, 64 - v[1].shape[0] % 64],
-                                       value=1)
+        scale_align = 64 * (v[0].shape[1] // group_size)
+        v[1] = v[1].reshape(-1)
+        v[1] = torch.nn.functional.pad(
+            v[1], [0, scale_align - v[1].shape[0] % scale_align], value=1)
     if mapping.is_last_pp_rank():
         process_and_assign_weight(tensorrt_llm_llama.lm_head, v, 1)
 

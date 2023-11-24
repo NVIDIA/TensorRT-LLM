@@ -16,9 +16,9 @@ import numpy as np
 import tensorrt as trt
 
 from .._common import default_net, default_trtnet
-from .._utils import int32_array, str_dtype_to_trt
+from .._utils import str_dtype_to_trt
 from ..functional import (Tensor, _create_tensor, allgather, allreduce, cast,
-                          concat, constant, matmul, shape, slice)
+                          matmul)
 from ..module import Module
 from ..parameter import Parameter
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
@@ -97,22 +97,8 @@ class Linear(Module):
             x = x + self.bias.value
 
         if self.gather_output and self.tp_size > 1 and self.tp_group is not None:
-            # 1. [dim0, local_dim] -> [dim0 * tp_size, local_dim]
-            x = allgather(x, self.tp_group)
-
-            # 2. [dim0 * tp_size, local_dim] -> [dim0, local_dim * tp_size]
-            # 2.1 split
-            split_size = shape(x, dim=0) / self.tp_size
-            ndim = x.ndim()
-            starts = [constant(int32_array([0])) for _ in range(ndim)]
-            sizes = [shape(x, dim=d) for d in range(ndim)]
-            sizes[0] = split_size
-            sections = []
-            for i in range(self.tp_size):
-                starts[0] = split_size * i
-                sections.append(slice(x, concat(starts), concat(sizes)))
-            # 2.2 concat
-            x = concat(sections, dim=1)
+            # [dim0, local_dim] -> [dim0 * tp_size, local_dim] --> [dim0, local_dim * tp_size]
+            x = allgather(x, self.tp_group, gather_dim=1)
 
         return x
 

@@ -40,13 +40,13 @@ class GptDecoderBatch : public IGptDecoderBatch
 {
 public:
     using CudaStreamPtr = std::shared_ptr<CudaStream>;
-    using TensorPtr = std::shared_ptr<ITensor>;
+    using TensorPtr = ITensor::SharedPtr;
 
     GptDecoderBatch(std::size_t vocabSize, std::size_t vocabSizePadded, CudaStreamPtr stream);
 
     //! Setup the decoder before calling `forward()`
     void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxKvCacheLength, SizeType maxSequenceLength,
-        nvinfer1::DataType dtype) override;
+        SizeType maxTokensPerStep, nvinfer1::DataType dtype) override;
 
     //! @brief Initialize the decoder at `batchIdx` with a new `request`.
     void newRequest(
@@ -69,6 +69,7 @@ public:
         return {mFinished.begin(), mFinished.begin() + mActualBatchSize};
     }
 
+    //! @param batchIdx index of the batch
     //! @returns [maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token ids without
     //! padding for request `batchIdx`, on gpu
     [[nodiscard]] TensorPtr getOutputIds(SizeType batchIdx) const override
@@ -99,18 +100,6 @@ public:
         return ITensor::slice(mJointDecodingOutput->parentIds, 0, mActualBatchSize);
     }
 
-    //! @returns [batchSize, maxBeamWidth], marks finished requests (per beam), on gpu
-    [[nodiscard]] TensorPtr getFinishedBeams() const override
-    {
-        return ITensor::slice(mJointDecodingOutput->finished, 0, mActualBatchSize);
-    }
-
-    //! @returns [batchSize, maxBeamWidth], total sequence lengths (per beam), on gpu
-    [[nodiscard]] TensorPtr getOutputLengths() const override
-    {
-        return ITensor::slice(mJointDecodingOutput->lengths, 0, mActualBatchSize);
-    }
-
     //! @returns [batchSize, maxBeamWidth], cumulative log probabilities (per beam), on gpu
     [[nodiscard]] TensorPtr getCumLogProbs() const override
     {
@@ -139,10 +128,21 @@ public:
         return tensor;
     }
 
-    //! @returns [batchSize, maxBeamWidth], tokens generated in last forward pass, on gpu
-    [[nodiscard]] TensorPtr getNewTokens() const override
+    //! @brief Get maxTokensPerStep tokens generated in the last forward pass
+    //! @returns [maxTokensPerStep, batchSize, maxBeamWidth], tokens generated in last forward pass, on gpu
+    [[nodiscard]] TensorPtr getAllNewTokens() const override
     {
-        return ITensor::slice(mJointDecodingOutput->newTokens, 0, mActualBatchSize);
+        return mJointDecodingOutput->newTokensSteps;
+    }
+
+    //! @brief Get tokens generated in one step of last forward pass
+    //! @param iter The iteration within [0; maxTokensPerStep) for which to get the tokens
+    //! @returns [batchSize, beamWidth], tokens generated in `iter` (per beam), on gpu
+    [[nodiscard]] TensorPtr getNewTokens(SizeType iter = 0) const override
+    {
+        TensorPtr newTokensView = std::move(ITensor::slice(mJointDecodingOutput->newTokensSteps, iter, 1));
+        newTokensView->squeeze(0);
+        return ITensor::slice(newTokensView, 0, mActualBatchSize);
     }
 
     //! @returns [batchSize], the number of generation steps executed on each request
@@ -180,13 +180,18 @@ private:
     DecodingInputPtr mJointDecodingInput;
     DecodingOutputPtr mJointDecodingOutput;
 
+    std::vector<TensorPtr> mDraftTokenIds;
+    TensorPtr mNumDraftTokens;
+
     std::vector<SizeType> mNbSteps;
     std::vector<bool> mFinished;
     TensorPtr mFinishedSum;
     std::vector<SizeType> mMaxNewTokens;
     std::vector<SizeType> mBeamWidths;
+    std::vector<SizeType> mGeneratedTokensPerStep;
     SizeType mMaxSequenceLength{};
     SizeType mMaxKvCacheLength{};
     SizeType mActualBatchSize{};
+    SizeType mMaxTokensPerStep{};
 };
 } // namespace tensorrt_llm::runtime

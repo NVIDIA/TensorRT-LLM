@@ -91,6 +91,7 @@ class GPTBenchmark(BaseBenchmark):
             self.use_layernorm_plugin = False
             self.use_rmsnorm_plugin = False
             self.use_lookup_plugin = non_mha_plg_dtype
+            self.use_weight_only_quant_gemm_plugin = non_mha_plg_dtype
             self.enable_context_fmha = use_mha_plugin
 
             self.remove_input_padding = use_non_mha_plugin
@@ -505,7 +506,7 @@ class GPTBenchmark(BaseBenchmark):
                 dtype=self.dtype)
             network.plugin_config.set_quantize_tensor_plugin()
             network.plugin_config.set_quantize_per_token_plugin()
-        elif self.use_weight_only:
+        elif self.use_weight_only and self.use_weight_only_quant_gemm_plugin:
             network.plugin_config.set_weight_only_quant_matmul_plugin(
                 dtype=self.dtype)
 

@@ -525,8 +525,6 @@ def build_rank_engine(builder: Builder,
         config_path = args.output_dir / 'config.json'
         builder.save_config(builder_config, config_path)
 
-    tensorrt_llm.tools.cleanup(network, tensorrt_llm_gpt)
-
     return engine
 
 

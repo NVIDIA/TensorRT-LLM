@@ -47,7 +47,8 @@ BertAttentionPlugin::BertAttentionPlugin(int num_heads, int head_size, float q_s
     , mRemovePadding(remove_padding)
 {
     // pre-check whether FMHA is supported in order to save memory allocation
-    mEnableContextFMHA = mEnableContextFMHA && (mType == DataType::kHALF) && MHARunner::fmha_supported(mHeadSize, mSM);
+    mEnableContextFMHA = mEnableContextFMHA && (mType == DataType::kHALF) && MHARunner::fmha_supported(mHeadSize, mSM)
+        && !mRelativeAttention;
 }
 
 // Parameterized constructor
@@ -266,7 +267,9 @@ int BertAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
 
     T* linear_bias_slopes = nullptr;
 
-    if (mEnableContextFMHA && !mRelativeAttention)
+    // FMHA doesn't apply to MHA with relative attention bias, i.e. softmax(QK + bias) * V
+    // We update mEnableContextFMHA in constructor to check this condition
+    if (mEnableContextFMHA)
     {
         // b, max_seqlen, actual_total_seqlen
         mFMHARunner->setup(request_batch_size, request_seq_len, request_seq_len, request_batch_size * request_seq_len);

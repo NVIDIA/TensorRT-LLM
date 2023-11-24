@@ -61,8 +61,8 @@ def main(build_type: str = "Release",
     if not (project_dir / "3rdparty/cutlass/.git").exists():
         build_run('git submodule update --init --recursive')
 
-    requirements_filename = "requirements-windows.txt" if platform.system(
-    ) == "Windows" else "requirements.txt"
+    requirements_filename = "requirements-dev-windows.txt" if platform.system(
+    ) == "Windows" else "requirements-dev.txt"
     build_run(
         f"{sys.executable} -m pip install -r {requirements_filename} --extra-index-url https://pypi.ngc.nvidia.com"
     )
@@ -187,17 +187,26 @@ def main(build_type: str = "Release",
             lib_dir / "libnvinfer_plugin_tensorrt_llm.so")
 
     if python_bindings:
-        # TODO Add windows support for python bindings.
-        pybind_lib = list(
-            (build_dir / "tensorrt_llm" / "pybind").glob("bindings.*.so"))
-        assert len(
-            pybind_lib
-        ) == 1, f"Exactly one pybind library should be present: {pybind_lib}"
-        copy(pybind_lib[0], pkg_dir)
-        build_run(f"{sys.executable} -m pip install pybind11-stubgen")
-        build_run(
-            f"cd {pkg_dir} && {sys.executable} -m pybind11_stubgen -o . bindings"
-        )
+
+        def get_pybind_lib():
+            pybind_build_dir = (build_dir / "tensorrt_llm" / "pybind")
+            if platform.system() == "Windows":
+                pybind_lib = list(
+                    (pybind_build_dir / str(build_type)).glob("bindings.*.pyd"))
+            else:
+                pybind_lib = list(pybind_build_dir.glob("bindings.*.so"))
+
+            assert len(
+                pybind_lib
+            ) == 1, f"Exactly one pybind library should be present: {pybind_lib}"
+            return pybind_lib[0]
+
+        copy(get_pybind_lib(), pkg_dir)
+
+        with working_directory(project_dir):
+            build_run(f"{sys.executable} -m pip install pybind11-stubgen")
+        with working_directory(pkg_dir):
+            build_run(f"{sys.executable} -m pybind11_stubgen -o . bindings")
 
     if dist_dir is None:
         dist_dir = project_dir / "build"
@@ -212,7 +221,7 @@ def main(build_type: str = "Release",
         )
 
     if install:
-        build_run(f"{sys.executable} -m pip install -e .")
+        build_run(f"{sys.executable} -m pip install -e .[devel]")
 
 
 if __name__ == "__main__":

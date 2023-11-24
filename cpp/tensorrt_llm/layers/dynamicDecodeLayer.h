@@ -101,6 +101,7 @@ public:
         tc::Tensor end_ids; // [batch_size], on gpu
 
         // optional parameters
+        std::optional<tc::Tensor> finished;              // [batch_size * beam_width], optional
         std::optional<tc::Tensor> src_cache_indirection; // [local_batch_size, beam_width, max_seq_len] - the k/v cache
                                                          // index for beam search, mandatory for beam search, on gpu
         std::optional<tc::Tensor> sequence_limit_length; // [batch_size], on gpu

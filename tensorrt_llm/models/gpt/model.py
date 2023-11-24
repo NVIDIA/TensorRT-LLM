@@ -486,7 +486,8 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                        max_beam_width: int = 1,
                        max_num_tokens: int = None,
                        prompt_embedding_table_size: int = 0,
-                       gather_all_token_logits: bool = False):
+                       gather_all_token_logits: bool = False,
+                       max_draft_len: int = 0):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -527,7 +528,8 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             mapping=self.mapping,
             max_num_tokens=max_num_tokens,
             prompt_embedding_table_size=prompt_embedding_table_size,
-            use_lora_plugin=use_lora_plugin)
+            use_lora_plugin=use_lora_plugin,
+            max_draft_len=max_draft_len)
 
         return (model_inputs['input_ids'], model_inputs['position_ids'], True,
                 model_inputs['last_token_ids'], model_inputs['attention_mask'],

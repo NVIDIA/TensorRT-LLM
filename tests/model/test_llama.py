@@ -105,6 +105,14 @@ class TestLLaMA(unittest.TestCase):
         builder = Builder()
 
         with tempfile.TemporaryDirectory() as tmpdirname:
+            builder_config = builder.create_builder_config(
+                name=model_name,
+                precision=dtype,
+                timing_cache='model.cache',
+                tensor_parallel=world_size,  # TP only
+                use_refit=use_refit,
+                strongly_typed=(dtype == "float16"),
+            )
             network = builder.create_network()
             if use_plugin:
                 network.plugin_config.set_gpt_attention_plugin(dtype)
@@ -118,13 +126,6 @@ class TestLLaMA(unittest.TestCase):
                                            batch_size, beam_width, input_len,
                                            output_len, dtype, rank, world_size)
 
-            builder_config = builder.create_builder_config(
-                name=model_name,
-                precision=dtype,
-                timing_cache='model.cache',
-                tensor_parallel=world_size,  # TP only
-                use_refit=use_refit,
-            )
             engine_buffer = builder.build_engine(network, builder_config)
             return engine_buffer
 

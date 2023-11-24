@@ -13,21 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+import weakref
 from collections import OrderedDict
 from enum import IntEnum
 from functools import partial
 from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
+from packaging import version
 
 from . import graph_rewriting as gw
 from ._common import default_net, default_trtnet, precision
 from ._utils import (bf16_array, dim_resolve_negative, dim_to_trt_axes,
                      fp16_array, fp32_array, int32_array, np_dtype_to_trt,
                      str_dtype_to_np, str_dtype_to_trt, torch_to_numpy,
-                     trt_dtype_to_torch)
+                     trt_dtype_to_torch, trt_version)
 from .logger import logger
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE
 from .quantization import QuantMode
@@ -185,12 +190,14 @@ class Tensor(object):
             self.is_tensor_wrapper = True
             assert network is not None
             self.trt_tensor = trt_tensor
-            self.network = network
+            self._network = weakref.ref(network)
             assert not is_network_input, "is_network_input should be False when trt_tensor is not None"
             return
 
-        # defining an input placeholder for the network
-        self.network = default_net()
+        # be cautious here, the weakref is critical to avoid circular referencing before Network and Tensor
+        # using strong reference will likely cause significant peak memory increase, since Network objects
+        # holds the weights data.
+        self._network = weakref.ref(default_net())
         if is_network_input:
             if dim_range is not None:
                 assert isinstance(dim_range, OrderedDict)
@@ -221,6 +228,10 @@ class Tensor(object):
             self.dtype = dtype
             self.shape = shape
             self.location = location
+
+    @property
+    def network(self):
+        return self._network()
 
     @property
     def name(self):
@@ -871,11 +882,15 @@ def interpolate(input: Tensor,
         ]
     layer.shape = updated_shape
 
+    if version.parse(trt_version()) >= version.parse("10.0.0"):
+        mode_enum = trt.InterpolationMode
+    else:
+        mode_enum = trt.ResizeMode
     if mode in ['nearest', 'nearest-exact'] or mode is None:
-        layer.resize_mode = trt.ResizeMode.NEAREST
+        layer.resize_mode = mode_enum.NEAREST
         layer.coordinate_transformation = trt.ResizeCoordinateTransformation.ASYMMETRIC
     elif mode in ['linear', 'bilinear', 'trilinear']:
-        layer.resize_mode = trt.ResizeMode.LINEAR
+        layer.resize_mode = mode_enum.LINEAR
         if align_corners:
             layer.coordinate_transformation = trt.ResizeCoordinateTransformation.ALIGN_CORNERS
         else:
@@ -885,12 +900,12 @@ def interpolate(input: Tensor,
             layer.coordinate_transformation = trt.ResizeCoordinateTransformation.HALF_PIXEL
 
     elif mode in ['bicubic']:
-        layer.resize_mode = trt.ResizeMode.CUBIC
+        layer.resize_mode = mode_enum.CUBIC
 
         layer.coordinate_transformation = trt.ResizeCoordinateTransformation.HALF_PIXEL
 
     else:
-        layer.resize_mode = trt.ResizeMode.NEAREST
+        layer.resize_mode = mode_enum.NEAREST
         layer.coordinate_transformation = trt.ResizeCoordinateTransformation.ASYMMETRIC
 
     return _create_tensor(layer.get_output(0), layer)
@@ -932,7 +947,6 @@ def matmul(input: Tensor,
         else trt.MatrixOperation.NONE
     layer = default_trtnet().add_matrix_multiply(input.trt_tensor, op0,
                                                  mat2.trt_tensor, op1)
-
     return _create_tensor(layer.get_output(0), layer)
 
 
@@ -1918,22 +1932,9 @@ def embedding(input: Tensor,
                                                 input.trt_tensor, 0)
             x = _create_tensor(layer.get_output(0), layer)
 
-            # 1. [dim0, local_dim] -> [dim0 * tp_size, local_dim]
-            x = allgather(x, tp_group)
+            # [dim0, local_dim] -> [dim0 * tp_size, local_dim] --> [dim0, local_dim * tp_size]
+            x = allgather(x, tp_group, gather_dim=-1)
 
-            # 2. [dim0 * tp_size, local_dim] -> [dim0, local_dim * tp_size]
-            # 2.1 split
-            split_size = shape(x, dim=0) / tp_size
-            ndim = x.ndim()
-            starts = [constant(int32_array([0])) for _ in range(ndim)]
-            sizes = [shape(x, dim=d) for d in range(ndim)]
-            sizes[0] = split_size
-            sections = []
-            for i in range(tp_size):
-                starts[0] = split_size * i
-                sections.append(slice(x, concat(starts), concat(sizes)))
-            # 2.2 concat
-            x = concat(sections, dim=(x.ndim() - 1))
         else:
             raise ValueError(
                 'Tensor Parallelism only support splitting Embedding lookup along hidden (sharding_dim==1) and vocab (sharding_dim==0) dimensionis'
@@ -2462,7 +2463,9 @@ def avg_pool2d(input: Tensor,
     layer = default_trtnet().add_pooling(input.trt_tensor,
                                          trt.PoolingType.AVERAGE, kernel_size)
     if stride is None:
-        layer.stride = kernel_size
+        stride = kernel_size
+    if version.parse(trt_version()) >= version.parse("10.0.0"):
+        layer.stride_nd = stride
     else:
         layer.stride = stride
 
@@ -2511,8 +2514,11 @@ def conv2d(input: Tensor,
                                                 kernel_size, weight, bias)
     layer.stride_nd = stride
     layer.padding_nd = padding
-    layer.dilation = dilation
     layer.num_groups = groups
+    if version.parse(trt_version()) >= version.parse("10.0.0"):
+        layer.dilation_nd = dilation
+    else:
+        layer.dilation = dilation
 
     if not is_weight_constant:
         layer.set_input(1, weight.trt_tensor)
@@ -2801,21 +2807,23 @@ def allreduce(tensor: Tensor,
     return _create_tensor(layer.get_output(0), layer)
 
 
-def allgather(tensor: Tensor, group: List[int]) -> Tensor:
+def allgather(tensor: Tensor, group: List[int], gather_dim: int = 0) -> Tensor:
     '''
     Add an operation that performs a collective all-gather.
 
-    Let's define 'world_size' as the length of the 'group' list. That functions
-    creates a layer to gather 'world_size' tensors distributed
-    amongst the 'world_size' participating ranks (one GPU per rank).
+    Let's define 'group_size' as the length of the 'group' list. That functions
+    creates a layer to gather 'group_size' tensors distributed
+    amongst the 'group_size' participating ranks (one GPU per rank).
 
     The list 'group' contains the identifiers of the ranks participating into
     the collective operation.
 
+    Note that 'group' here can be either TP group or PP group, because allgather communication is not limited to a specific split pattern. Therefore 'group_size' does not need to equal MPI 'world_size'.
+
     The tensors in the different ranks must be 1D tensors (or views) and the
     output tensor will have that same shape.
 
-    Given the 'section_size = input.shape[0] / world_size', each rank
+    Given the 'section_size = input.shape[0] / group_size', each rank
     contributes a section of its input tensor that correspond to
     'rank*section_size:(rank+1)*section_size'.
 
@@ -2831,6 +2839,9 @@ def allgather(tensor: Tensor, group: List[int]) -> Tensor:
         group : List[int]
             The ranks participating into the all-gather operation.
 
+        gather_dim: int = 0
+            Gather along given dimension. By default 0, i.e. treated as 1D tensor.
+
     Returns:
         The tensor produced by that layer.
     '''
@@ -2838,6 +2849,7 @@ def allgather(tensor: Tensor, group: List[int]) -> Tensor:
         'AllGather', '1', TRT_LLM_PLUGIN_NAMESPACE)
     assert allgather_plg_creator is not None
 
+    group_size = len(group)
     group = trt.PluginField("group", np.array(group, dtype=np.int32),
                             trt.PluginFieldType.INT32)
 
@@ -2851,7 +2863,34 @@ def allgather(tensor: Tensor, group: List[int]) -> Tensor:
     plug_inputs = [tensor.trt_tensor]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, allgather)
-    return _create_tensor(layer.get_output(0), layer)
+
+    x = _create_tensor(layer.get_output(0), layer)
+
+    # gather along a given dimension other than dim0
+    if gather_dim != 0:
+        # also support -1 type of dim representation
+        if gather_dim < 0:
+            gather_dim = x.ndim() + gather_dim
+
+        # plugin above gathers as 1D flattened tensor
+        # 1. [dim0, ...dimi, ...dimN] -> [group_size * dim0, ...dimi, ...dimN]
+
+        # now we need to gather-by-dim via split-concat
+        # 2. [group_size * dim0, ...dimi, ...dimN] -> [dim0, ...group_size * dimi, ...dimN]
+        # 2.1 split
+        split_size = shape(x, dim=0) / group_size
+        ndim = x.ndim()
+        starts = [constant(int32_array([0])) for _ in range(ndim)]
+        sizes = [shape(x, dim=d) for d in range(ndim)]
+        sizes[0] = split_size
+        sections = []
+        for i in range(group_size):
+            starts[0] = split_size * i
+            sections.append(slice(x, concat(starts), concat(sizes)))
+        # 2.2 concat
+        x = concat(sections, dim=gather_dim)
+
+    return x
 
 
 def send(tensor: Tensor, tgt: int) -> Tensor:

@@ -16,9 +16,11 @@ import argparse
 import os
 import time
 
-import tensorrt as trt
+# isort: off
 import torch
 import torch.multiprocessing as mp
+import tensorrt as trt
+# isort: on
 from transformers import AutoConfig, AutoModelForCausalLM
 from weight import load_from_ft, load_from_hf_qwen
 

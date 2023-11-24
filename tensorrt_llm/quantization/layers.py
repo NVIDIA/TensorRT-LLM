@@ -18,7 +18,6 @@ import numpy as np
 import tensorrt as trt
 
 from .._common import default_net, precision
-from .._utils import int32_array
 from ..functional import (ACT2FN, Tensor, allgather, allreduce, cast, concat,
                           constant, generate_alibi_slopes, gpt_attention,
                           matmul, mul, shape, slice, softmax, split, where)
@@ -145,22 +144,8 @@ class SmoothQuantLinear(Module):
             x = x + self.bias.value
 
         if self.gather_output and self.tp_size > 1 and self.tp_group is not None:
-            # 1. [dim0, local_dim] -> [dim0 * tp_size, local_dim]
-            x = allgather(x, self.tp_group)
-
-            # 2. [dim0 * tp_size, local_dim] -> [dim0, local_dim * tp_size]
-            # 2.1 split
-            split_size = shape(x, dim=0) / self.tp_size
-            ndim = x.ndim()
-            starts = [constant(int32_array([0])) for _ in range(ndim)]
-            sizes = [shape(x, dim=d) for d in range(ndim)]
-            sizes[0] = split_size
-            sections = []
-            for i in range(self.tp_size):
-                starts[0] = split_size * i
-                sections.append(slice(x, concat(starts), concat(sizes)))
-            # 2.2 concat
-            x = concat(sections, dim=1)
+            # [dim0, local_dim] -> [dim0 * tp_size, local_dim] --> [dim0, local_dim * tp_size]
+            x = allgather(x, self.tp_group, gather_dim=1)
 
         return x
 
@@ -362,6 +347,12 @@ class WeightOnlyQuantLinear(Module):
             self.register_parameter('bias', None)
 
     def forward(self, x):
+        # ootb has not supported int4 yet.
+        if self.weight_only_quant_mode == 2 and not default_net(
+        ).plugin_config.weight_only_quant_matmul_plugin:
+            raise TypeError(
+                "Int4 Weight Only Qunat MatMul is only supported with plugin")
+
         x = weight_only_quant_matmul(x, self.weight.value,
                                      self.per_channel_scale.value,
                                      self.weight_only_quant_mode)
@@ -370,22 +361,8 @@ class WeightOnlyQuantLinear(Module):
             x = x + self.bias.value
 
         if self.gather_output and self.tp_size > 1 and self.tp_group is not None:
-            # 1. [dim0, local_dim] -> [dim0 * tp_size, local_dim]
-            x = allgather(x, self.tp_group)
-
-            # 2. [dim0 * tp_size, local_dim] -> [dim0, local_dim * tp_size]
-            # 2.1 split
-            split_size = shape(x, dim=0) / self.tp_size
-            ndim = x.ndim()
-            starts = [constant(int32_array([0])) for _ in range(ndim)]
-            sizes = [shape(x, dim=d) for d in range(ndim)]
-            sizes[0] = split_size
-            sections = []
-            for i in range(self.tp_size):
-                starts[0] = split_size * i
-                sections.append(slice(x, concat(starts), concat(sizes)))
-            # 2.2 concat
-            x = concat(sections, dim=1)
+            # [dim0, local_dim] -> [dim0 * tp_size, local_dim] --> [dim0, local_dim * tp_size]
+            x = allgather(x, self.tp_group, gather_dim=1)
 
         return x
 
@@ -503,22 +480,8 @@ class WeightOnlyGroupwiseQuantLinear(Module):
                                                self.quant_algo, self.group_size)
 
         if self.gather_output and self.tp_size > 1 and self.tp_group is not None:
-            # 1. [dim0, local_dim] -> [dim0 * tp_size, local_dim]
-            x = allgather(x, self.tp_group)
-
-            # 2. [dim0 * tp_size, local_dim] -> [dim0, local_dim * tp_size]
-            # 2.1 split
-            split_size = shape(x, dim=0) / self.tp_size
-            ndim = x.ndim()
-            starts = [constant(int32_array([0])) for _ in range(ndim)]
-            sizes = [shape(x, dim=d) for d in range(ndim)]
-            sizes[0] = split_size
-            sections = []
-            for i in range(self.tp_size):
-                starts[0] = split_size * i
-                sections.append(slice(x, concat(starts), concat(sizes)))
-            # 2.2 concat
-            x = concat(sections, dim=1)
+            # [dim0, local_dim] -> [dim0 * tp_size, local_dim] --> [dim0, local_dim * tp_size]
+            x = allgather(x, self.tp_group, gather_dim=1)
 
         return x
 
@@ -635,8 +598,8 @@ class SmoothQuantMLP(Module):
         inter = self.fc(hidden_states)
         inter = ACT2FN[self.hidden_act](inter)
         if default_net(
-        ).strongly_typed and inter.dtype != self.proj.smoother.value:
-            inter = cast(inter, self.proj.smoother.value)
+        ).strongly_typed and inter.dtype != self.proj.smoother.value.dtype:
+            inter = cast(inter, self.proj.smoother.value.dtype)
         inter = inter / self.proj.smoother.value
         if self.quant_mode.has_act_and_weight_quant():
             if self.quant_mode.has_act_static_scaling():

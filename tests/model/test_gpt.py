@@ -22,8 +22,11 @@ from itertools import product
 
 import numpy as np
 import pytest
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from parameterized import parameterized
 from transformers import GPT2Config, GPT2LMHeadModel
 
@@ -130,6 +133,16 @@ class TestGPT(unittest.TestCase):
         fp16 = (dtype == 'float16')
 
         with tempfile.TemporaryDirectory() as tmpdirname:
+
+            builder_config = builder.create_builder_config(
+                name='gpt',
+                precision=dtype,
+                timing_cache='model.cache',
+                tensor_parallel=world_size,  # TP only
+                use_refit=use_refit,
+                gather_all_token_logits=gather_all_token_logits,
+                strongly_typed=fp16,
+            )
             network = builder.create_network()
             if use_plugin:
                 network.plugin_config.set_gpt_attention_plugin(dtype)
@@ -148,14 +161,6 @@ class TestGPT(unittest.TestCase):
                                            apply_query_key_layer_scaling,
                                            gather_all_token_logits)
 
-            builder_config = builder.create_builder_config(
-                name='gpt',
-                precision=dtype,
-                timing_cache='model.cache',
-                tensor_parallel=world_size,  # TP only
-                use_refit=use_refit,
-                gather_all_token_logits=gather_all_token_logits,
-            )
             engine_buffer = builder.build_engine(network, builder_config)
             runtime = tensorrt_llm.runtime.generation._Runtime(
                 engine_buffer, mapping)

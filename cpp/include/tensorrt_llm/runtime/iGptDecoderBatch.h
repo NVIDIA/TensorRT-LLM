@@ -21,6 +21,7 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iStatefulGptDecoder.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/utils/sessionUtils.h"
 
 #include <cstdint>
 #include <memory>
@@ -35,12 +36,14 @@ namespace decoder_batch
 class Request
 {
 public:
-    using ConstTensorPtr = std::shared_ptr<ITensor const>;
-    using TensorPtr = std::shared_ptr<ITensor>;
+    using ConstTensorPtr = ITensor::SharedConstPtr;
+    using TensorPtr = ITensor::SharedPtr;
+    using BufferPtr = IBuffer::SharedPtr;
 
-    explicit Request(ConstTensorPtr ids, std::optional<SizeType> maxNewTokens = std::nullopt,
+    explicit Request(ConstTensorPtr ids, SizeType inputLen, std::optional<SizeType> maxNewTokens = std::nullopt,
         std::optional<SizeType> endId = std::nullopt)
         : ids{std::move(ids)}
+        , inputLen(inputLen)
         , maxNewTokens{maxNewTokens}
         , endId{endId}
         , computeCumLogProbs(false)
@@ -48,42 +51,68 @@ public:
     {
     }
 
+    // the number of tokens generated per step
+    SizeType generatedTokensPerStep() const
+    {
+        return draftTokens ? draftTokens->getSize() + 1 : 1;
+    }
+
     // mandatory parameters
     ConstTensorPtr ids; // [inputSeqLen], the input sequence of token ids, on gpu
+    SizeType inputLen;  // the input length without draft tokens
 
     // optional parameters
     std::optional<SizeType> maxNewTokens; // maximum number of tokens to generate for this request
     std::optional<SizeType> endId;        // end token id
-    TensorPtr embeddingBias;              // [vocabSizePadded], on gpu
-    TensorPtr badWordsList;               // [2, badWordsLength], on gpu
-    TensorPtr stopWordsList;              // [2, stopWordsLength], on gpu
+    BufferPtr draftTokens;   // [generatedTokensPerStep - 1], on gpu, draft tokens from speculative decoding
+    TensorPtr embeddingBias; // [vocabSizePadded], on gpu
+    TensorPtr badWordsList;  // [2, badWordsLength], on gpu
+    TensorPtr stopWordsList; // [2, stopWordsLength], on gpu
 
-    bool computeCumLogProbs;              // boolean that controls if cumLogProbs should be computed for that request
-    bool computeLogProbs;                 // boolean that controls if cumLogProbs should be computed for that request
+    bool computeCumLogProbs; // boolean that controls if cumLogProbs should be computed for that request
+    bool computeLogProbs;    // boolean that controls if cumLogProbs should be computed for that request
 };
 
-class Input : public decoder::Input
+class Input
 {
 public:
-    using Base = decoder::Input;
+    using TensorConstPtr = ITensor::SharedConstPtr;
+    using TensorPtr = ITensor::SharedPtr;
 
-    explicit Input(TensorPtr logits)
-        : Base{std::move(logits)}
-    {
-        auto const batchSize = this->logits->getShape().d[0];
-        active.resize(batchSize, true);
-    }
-
-    explicit Input(TensorPtr logits, std::vector<bool> const& active)
-        : Base{std::move(logits)}
+    explicit Input(std::vector<TensorConstPtr> const& logits, std::vector<bool> const& active)
+        : logits{logits}
         , active{active}
     {
-        auto const batchSize = static_cast<std::size_t>(this->logits->getShape().d[0]);
-        TLLM_CHECK_WITH_INFO(this->active.size() == batchSize, "'active' vector size does not match logits batchSize");
+        TLLM_CHECK_WITH_INFO(
+            this->active.size() == logits.size(), "'active' vector size does not match logits vector size");
     }
+
+    explicit Input(std::vector<TensorConstPtr> const& logits)
+        : Input{logits, std::vector<bool>(logits.size(), true)}
+    {
+    }
+
+    explicit Input(std::vector<TensorPtr> const& logits, std::vector<bool> const& active)
+        : Input{
+            utils::transformVector(logits, [](auto& x) { return std::const_pointer_cast<ITensor const>(x); }), active}
+    {
+    }
+
+    explicit Input(std::vector<TensorPtr> const& logits)
+        : Input{logits, std::vector<bool>(logits.size(), true)}
+    {
+    }
+
+    // mandatory parameters
+    std::vector<TensorConstPtr>
+        logits; // batchSize * [1, beamWidth, vocabSizePadded] or [generatedTokensPerStep, 1, vocabSizePadded], on gpu
 
     // control activity of decoder slots in batch
     std::vector<bool> active; // [batchSize]
+
+    // parameters for beam search
+    TensorConstPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen] - indices into KV cache of different rays
+                                     // within one beam for beam search, on gpu
 };
 
 using Output = decoder::Output;
@@ -127,6 +156,7 @@ public:
         forwardSync(*forwardAsync(output, input));
     }
 
+    //! @param batchIdx index of the batch
     //! @returns [maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token
     //! ids without padding for request `batchIdx`, on gpu
     virtual TensorPtr getOutputIds(SizeType batchIdx) const = 0;
@@ -134,12 +164,6 @@ public:
     //! @brief Gather final beam search results for request `batchIdx`.
     //! Result will only be available after event returned
     virtual CudaEvent finalize(SizeType batchIdx) const = 0;
-
-    //! @returns [batchSize, beamWidth], marks finished requests (per beam), on gpu
-    virtual TensorPtr getFinishedBeams() const = 0;
-
-    //! @returns [batchSize, beamWidth], total sequence lengths (per beam), on gpu
-    virtual TensorPtr getOutputLengths() const = 0;
 
     //! @returns [batchSize (actual)], marks finished requests (per batch)
     virtual std::vector<bool> getFinished() const = 0;

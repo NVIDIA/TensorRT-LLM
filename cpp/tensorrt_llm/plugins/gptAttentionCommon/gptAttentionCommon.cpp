@@ -271,7 +271,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int num_heads, int num_kv_hea
 {
     // pre-check whether FMHA is supported in order to save memory allocation
     mEnableContextFMHA = mEnableContextFMHA && (mType == DataType::kHALF || mType == DataType::kBF16)
-        && MHARunner::fmha_supported(getHeadSize(), mSM);
+        && MHARunner::fmha_supported(getHeadSize(), mSM) && !mCrossAttention
+        && mPositionEmbeddingType != tensorrt_llm::kernels::PositionEmbeddingType::kRELATIVE;
 
     TLLM_CHECK(isRoPE() == (rotary_embedding_dim != 0));
     TLLM_CHECK_WITH_INFO(
@@ -583,7 +584,8 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
     // in context phase, currently FMHA runner has two restrictions:
     // 1. only apply to self attention. If want fused multi-head cross attention, FMHCA kernels and runner is needed
     // 2. doesn't apply to MHA with relative attention bias, i.e. softmax(QK + bias) * V
-    if (mEnableContextFMHA && !isCrossAttention() && !isRelativePosition())
+    // We update mEnableContextFMHA in constructor to check these conditions
+    if (mEnableContextFMHA)
     {
         invokeApplyBiasRopeUpdateKVCache(const_cast<T*>(params.attention_input), kv_cache_buffer,
             const_cast<T*>(params.qkv_bias), params.context_lengths, mRemovePadding ? padding_offset : nullptr,

@@ -40,7 +40,7 @@ public:
 
     //! Setup the decoder before calling `forward()`
     void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxKvCacheLength, SizeType maxSequenceLength,
-        nvinfer1::DataType dtype) override;
+        SizeType maxTokensPerStep, nvinfer1::DataType dtype) override;
 
     //! @brief Initialize the decoder with new batch of inputs.
     void newBatch(
@@ -53,6 +53,7 @@ public:
     //! @brief Gather final results for all requests.
     void finalize() const override;
 
+    //! @param step index within tokens generated in one step
     //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token
     //! ids without padding, on gpu
     [[nodiscard]] TensorPtr getOutputIds() const override
@@ -72,10 +73,22 @@ public:
         return mDecodingOutput->logProbs;
     }
 
-    //! @returns [batchSize, maxBeamWidth], tokens generated in last forward pass, on gpu
-    [[nodiscard]] TensorPtr getNewTokens() const override
+    //! @brief Get tokens generated in one step of last forward pass
+    //! @param iter The iteration within [0; maxTokensPerStep) for which to get the tokens
+    //! @returns [batchSize, beamWidth], tokens generated in `iter` (per beam), on gpu
+    [[nodiscard]] TensorPtr getNewTokens(SizeType iter = 0) const override
     {
+        TLLM_CHECK(iter == 0);
         return mDecodingOutput->newTokens;
+    }
+
+    //! @brief Get tokens generated in the last forward pass
+    //! @returns [batchSize, maxBeamWidth], tokens generated in last forward pass, on gpu
+    [[nodiscard]] TensorPtr getAllNewTokens() const override
+    {
+        TensorPtr newTokens = std::move(ITensor::view(mDecodingOutput->newTokensSteps));
+        newTokens->unsqueeze(0);
+        return newTokens;
     }
 
     //! @returns [1], number of finished sequences, in pinned host memory

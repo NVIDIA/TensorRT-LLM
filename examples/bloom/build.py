@@ -18,9 +18,12 @@ import time
 from pathlib import Path
 
 import onnx
-import tensorrt as trt
+
+# isort: off
 import torch
 import torch.multiprocessing as mp
+import tensorrt as trt
+# isort: on
 from onnx import TensorProto, helper
 from transformers import BloomConfig, BloomForCausalLM
 
@@ -476,8 +479,6 @@ def build_rank_engine(builder: Builder,
     if rank == 0:
         config_path = os.path.join(args.output_dir, 'config.json')
         builder.save_config(builder_config, config_path)
-
-    tensorrt_llm.tools.cleanup(network, tensorrt_llm_bloom)
 
     return engine
 

@@ -45,7 +45,9 @@ def get_engine_name(model, dtype, tp_size, rank):
 
 def serialize_engine(engine, path):
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        # engine object is already complies with python buffer protocol, no need to
+        # convert it to bytearray before write, converting to bytearray consumes lots of memory
+        f.write(engine)
 
 
 class BaseBenchmark(object):

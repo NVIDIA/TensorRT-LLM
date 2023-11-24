@@ -159,7 +159,7 @@ struct BlockPrefixCallbackOp
 
 template <typename T>
 __device__ void epilogue(int batchId, int currentStep, int offset, int** ids, int* sortedIdVals, T* sortedLogProbs,
-    float* cumLogProbs, float* outputLogProbs, const int* endIds, int* sequenceLengths, bool* finishedBuf)
+    float* cumLogProbs, float* outputLogProbs, const int* endIds, int* sequenceLengths, bool* finishedOutput)
 {
     ids[batchId][currentStep] = sortedIdVals[offset];
 
@@ -175,26 +175,26 @@ __device__ void epilogue(int batchId, int currentStep, int offset, int** ids, in
             outputLogProbs[batchId] = lprob;
         }
     }
-    if (sequenceLengths != nullptr && finishedBuf != nullptr)
+    if (sequenceLengths != nullptr && finishedOutput != nullptr)
     {
         if (ids[batchId][currentStep] == endIds[batchId])
         {
-            finishedBuf[batchId] = true;
+            finishedOutput[batchId] = true;
             // Do not increase seq len when EOS is generated. Seq len should always contain only tokens to be outputted
         }
         else
         {
-            finishedBuf[batchId] = false;
+            finishedOutput[batchId] = false;
             sequenceLengths[batchId] += 1;
         }
     }
 }
 
 template <typename T, int blockSize>
-__global__ void topPSsampling(T* sortedLogProbs, int* sortedIdVals, int** ids, int* sequenceLength, bool* finishedBuf,
-    float* cumLogProbs, float* outputLogProbs, const int* beginOffsetBuf, const int* offsetBuf, const int vocabSize,
-    curandState_t* curandstate, const float topP, const float* topPs, const int* endIds, const int batchSize,
-    const bool* skipDecode)
+__global__ void topPSsampling(T* sortedLogProbs, int* sortedIdVals, int** ids, int* sequenceLength,
+    const bool* finishedInput, bool* finishedOutput, float* cumLogProbs, float* outputLogProbs,
+    const int* beginOffsetBuf, const int* offsetBuf, const int vocabSize, curandState_t* curandstate, const float topP,
+    const float* topPs, const int* endIds, const int batchSize, const bool* skipDecode)
 {
     /**
      * Each block processes one request row sorted in descending order by probabilities.
@@ -214,8 +214,12 @@ __global__ void topPSsampling(T* sortedLogProbs, int* sortedIdVals, int** ids, i
     }
 
     // Exit early if sequence has finished
-    if (finishedBuf != nullptr && finishedBuf[batchId] == true)
+    if (finishedInput != nullptr && finishedInput[batchId] == true)
     {
+        if (finishedOutput != nullptr)
+        {
+            finishedOutput[batchId] = true;
+        }
         ids[batchId][sequenceLength[batchId]] = endIds[batchId];
         return;
     }
@@ -244,7 +248,7 @@ __global__ void topPSsampling(T* sortedLogProbs, int* sortedIdVals, int** ids, i
         {
             int offset = batchId * vocabSize;
             epilogue(batchId, currentStep, offset, ids, sortedIdVals, sortedLogProbs, cumLogProbs, outputLogProbs,
-                endIds, sequenceLength, finishedBuf);
+                endIds, sequenceLength, finishedOutput);
         }
         return;
     }
@@ -285,16 +289,16 @@ __global__ void topPSsampling(T* sortedLogProbs, int* sortedIdVals, int** ids, i
     if (threadIdx.x == min(blockDim.x - count, blockDim.x - 1))
     {
         epilogue(batchId, currentStep, offset + selectedTokenId, ids, sortedIdVals, sortedLogProbs, cumLogProbs,
-            outputLogProbs, endIds, sequenceLength, finishedBuf);
+            outputLogProbs, endIds, sequenceLength, finishedOutput);
     }
 }
 
 template <typename T>
 void invokeBatchTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize, int** outputIds,
-    int* sequenceLength, bool* finishedBuf, float* cumLogProbs, float* outputLogProbs, const T* logProbs,
-    const int* idVals, int* offsetBuf, int* beginOffsetBuf, curandState_t* curandstate, const int batchSize,
-    const size_t vocabSizePadded, const int* endIds, const float maxTopP, const float* topPs, cudaStream_t stream,
-    const bool* skipDecode)
+    int* sequenceLength, const bool* finishedInput, bool* finishedOutput, float* cumLogProbs, float* outputLogProbs,
+    const T* logProbs, const int* idVals, int* offsetBuf, int* beginOffsetBuf, curandState_t* curandstate,
+    const int batchSize, const size_t vocabSizePadded, const int* endIds, const float maxTopP, const float* topPs,
+    cudaStream_t stream, const bool* skipDecode)
 {
     // Here, we put batch size as an argument because the batch size of
     // initialization and inference may be different due to pipeline parallelism.
@@ -338,42 +342,45 @@ void invokeBatchTopPSampling(void* workspace, size_t& workspaceSize, size_t& cub
     dim3 grid(batchSize);
     // Sample with Top P given sorted tokens
     topPSsampling<T, SAMPLING_BLOCK_SIZE><<<grid, SAMPLING_BLOCK_SIZE, 0, stream>>>(sortedLogProbs, sortedIdVals,
-        outputIds, sequenceLength, finishedBuf, cumLogProbs, outputLogProbs, beginOffsetBuf, offsetBuf + 1, vocabSize,
-        curandstate, maxTopP, topPs, endIds, batchSize, skipDecode);
+        outputIds, sequenceLength, finishedInput, finishedOutput, cumLogProbs, outputLogProbs, beginOffsetBuf,
+        offsetBuf + 1, vocabSize, curandstate, maxTopP, topPs, endIds, batchSize, skipDecode);
 }
 
 template void invokeBatchTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize,
-    int** outputIds, int* sequenceLength, bool* finishedBuf, float* cumLogProbs, float* outputLogProbs,
-    const float* logProbs, const int* idVals, int* offsetBuf, int* beginOffsetBuf, curandState_t* curandstate,
-    const int batchSize, const size_t vocabSizePadded, const int* endIds, const float maxTopP, const float* topPs,
-    cudaStream_t stream, const bool* skipDecode);
+    int** outputIds, int* sequenceLength, const bool* finishedInput, bool* finishedOutput, float* cumLogProbs,
+    float* outputLogProbs, const float* logProbs, const int* idVals, int* offsetBuf, int* beginOffsetBuf,
+    curandState_t* curandstate, const int batchSize, const size_t vocabSizePadded, const int* endIds,
+    const float maxTopP, const float* topPs, cudaStream_t stream, const bool* skipDecode);
 
 template void invokeBatchTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize,
-    int** outputIds, int* sequenceLength, bool* finishedBuf, float* cumLogProbs, float* outputLogProbs,
-    const half* logProbs, const int* idVals, int* offsetBuf, int* beginOffsetBuf, curandState_t* curandstate,
-    const int batchSize, const size_t vocabSizePadded, const int* endIds, const float maxTopP, const float* topPs,
-    cudaStream_t stream, const bool* skipDecode);
+    int** outputIds, int* sequenceLength, const bool* finishedInput, bool* finishedOutput, float* cumLogProbs,
+    float* outputLogProbs, const half* logProbs, const int* idVals, int* offsetBuf, int* beginOffsetBuf,
+    curandState_t* curandstate, const int batchSize, const size_t vocabSizePadded, const int* endIds,
+    const float maxTopP, const float* topPs, cudaStream_t stream, const bool* skipDecode);
 
 template <typename T>
 void invokeTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize, int** outputIds,
-    int* sequenceLength, bool* finishedBuf, float* cumLogProbs, float* outputLogProbs, const T* logProbs,
-    const int* idVals, int* offsetBuf, int* beginOffsetBuf, curandState_t* curandstate, const int batchSize,
-    const size_t vocabSizePadded, const int* endIds, const float topP, cudaStream_t stream, const bool* skipDecode)
+    int* sequenceLength, const bool* finishedInput, bool* finishedOutput, float* cumLogProbs, float* outputLogProbs,
+    const T* logProbs, const int* idVals, int* offsetBuf, int* beginOffsetBuf, curandState_t* curandstate,
+    const int batchSize, const size_t vocabSizePadded, const int* endIds, const float topP, cudaStream_t stream,
+    const bool* skipDecode)
 {
-    invokeBatchTopPSampling(workspace, workspaceSize, cubTempStorageSize, outputIds, sequenceLength, finishedBuf,
-        cumLogProbs, outputLogProbs, logProbs, idVals, offsetBuf, beginOffsetBuf, curandstate, batchSize,
-        vocabSizePadded, endIds, topP, nullptr, stream, skipDecode);
+    invokeBatchTopPSampling(workspace, workspaceSize, cubTempStorageSize, outputIds, sequenceLength, finishedInput,
+        finishedOutput, cumLogProbs, outputLogProbs, logProbs, idVals, offsetBuf, beginOffsetBuf, curandstate,
+        batchSize, vocabSizePadded, endIds, topP, nullptr, stream, skipDecode);
 }
 
 template void invokeTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize, int** outputIds,
-    int* sequenceLength, bool* finishedBuf, float* cumLogProbs, float* outputLogProbs, const float* logProbs,
-    const int* idVals, int* offsetBuf, int* beginOffsetBuf, curandState_t* curandstate, const int batchSize,
-    const size_t vocabSizePadded, const int* endIds, const float topP, cudaStream_t stream, const bool* skipDecode);
+    int* sequenceLength, const bool* finishedInput, bool* finishedOutput, float* cumLogProbs, float* outputLogProbs,
+    const float* logProbs, const int* idVals, int* offsetBuf, int* beginOffsetBuf, curandState_t* curandstate,
+    const int batchSize, const size_t vocabSizePadded, const int* endIds, const float topP, cudaStream_t stream,
+    const bool* skipDecode);
 
 template void invokeTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize, int** outputIds,
-    int* sequenceLength, bool* finishedBuf, float* cumLogProbs, float* outputLogProbs, const half* logProbs,
-    const int* idVals, int* offsetBuf, int* beginOffsetBuf, curandState_t* curandstate, const int batchSize,
-    const size_t vocabSizePadded, const int* endIds, const float topP, cudaStream_t stream, const bool* skipDecode);
+    int* sequenceLength, const bool* finishedInput, bool* finishedOutput, float* cumLogProbs, float* outputLogProbs,
+    const half* logProbs, const int* idVals, int* offsetBuf, int* beginOffsetBuf, curandState_t* curandstate,
+    const int batchSize, const size_t vocabSizePadded, const int* endIds, const float topP, cudaStream_t stream,
+    const bool* skipDecode);
 
 template <typename T>
 __global__ void addBiasSoftMax(

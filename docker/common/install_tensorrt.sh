@@ -2,6 +2,24 @@
 
 set -ex
 
+TRT_VER="9.1.0.4"
+CUDA_VER="12.2"
+CUDNN_VER="8.9.4.25-1+cuda12.2"
+NCCL_VER="2.18.3-1+cuda12.2"
+CUBLAS_VER="12.2.5.6-1"
+
+for i in "$@"; do
+    case $i in
+        --TRT_VER=?*) TRT_VER="${i#*=}";;
+        --CUDA_VER=?*) CUDA_VER="${i#*=}";;
+        --CUDNN_VER=?*) CUDNN_VER="${i#*=}";;
+        --NCCL_VER=?*) NCCL_VER="${i#*=}";;
+        --CUBLAS_VER=?*) CUBLAS_VER="${i#*=}";;
+        *) ;;
+    esac
+    shift
+done
+
 NVCC_VERSION_OUTPUT=$(nvcc --version)
 if [[ $(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1) != ${CUDA_VER} ]]; then
   echo "The version of pre-installed CUDA is not equal to ${CUDA_VER}."
@@ -64,7 +82,7 @@ install_tensorrt() {
     mv /usr/local/TensorRT-${TRT_VER} /usr/local/tensorrt
     pip install /usr/local/tensorrt/python/tensorrt-*-cp${PARSED_PY_VERSION}-*.whl
     rm -rf /tmp/TensorRT.tar
-    echo 'export LD_LIBRARY_PATH=/usr/local/tensorrt/lib:$LD_LIBRARY_PATH' >> "${ENV}"
+    echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/tensorrt/lib' >> "${ENV}"
 }
 
 # Install base packages depending on the base OS

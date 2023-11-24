@@ -133,7 +133,9 @@ void GptSession::createDecoders(SizeType batchSize, SizeType beamWidth, SizeType
             mDecoders.emplace_back(std::make_shared<GptDecoderBatch>(vocabSize, vocabSizePadded, stream));
         else
             mDecoders.emplace_back(std::make_shared<StatefulGptDecoder>(vocabSize, vocabSizePadded, stream));
-        mDecoders.back()->setup(batchSize, beamWidth, maxKvCacheLength, maxSequenceLength, logitsType);
+        constexpr SizeType maxTokensPerStep = 1;
+        mDecoders.back()->setup(
+            batchSize, beamWidth, maxKvCacheLength, maxSequenceLength, maxTokensPerStep, logitsType);
     }
 
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);

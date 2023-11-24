@@ -5,11 +5,10 @@ This document explains how to build the [ChatGLM-6B](https://huggingface.co/THUD
 ## Overview
 
 The TensorRT-LLM ChatGLM implementation can be found in [`tensorrt_llm/models/chatglm/model.py`](../../tensorrt_llm/models/chatglm/model.py).
-The TensorRT-LLM ChatGLM example code is located in [`examples/chatglm`](./). There are three main files:
+The TensorRT-LLM ChatGLM example code is located in [`examples/chatglm`](./). There are two main files:
 
 * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the ChatGLM model.
 * [`run.py`](./run.py) to run the inference on an input text.
-* and a shared [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
 
 ## Support Matrix
 

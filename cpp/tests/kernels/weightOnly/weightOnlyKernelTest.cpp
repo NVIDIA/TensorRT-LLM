@@ -83,8 +83,8 @@ float benchmark_perchannel(void* act, void* weight, void* scales, void* zeros, v
     cudaEventCreate(&end);
     if constexpr (std::is_same_v<KernelFlag, CudaKernel>)
     {
-        WeightOnlyParams params{reinterpret_cast<uint8_t*>(weight), scales, zeros, act, bias, out, m, n, k, group_size,
-            BFlag, WeightOnlyType::PerChannel, WeightOnlyActivationFunctionType::Identity, AFlag};
+        WeightOnlyParams params{reinterpret_cast<uint8_t*>(weight), scales, zeros, act, nullptr, bias, out, m, n, k,
+            group_size, BFlag, WeightOnlyType::PerChannel, WeightOnlyActivationFunctionType::Identity, AFlag};
         for (int i = 0; i < warmup; ++i)
         {
             tensorrt_llm::kernels::weight_only_batched_gemv_launcher(params, s);
@@ -164,8 +164,8 @@ float benchmark_groupwise(void* act, void* weight, void* scales, void* zeros, vo
     cudaEventCreate(&end);
     if constexpr (std::is_same_v<KernelFlag, CudaKernel>)
     {
-        WeightOnlyParams params{reinterpret_cast<uint8_t*>(weight), scales, zeros, act, bias, out, m, n, k, group_size,
-            BFlag, WeightOnlyType::GroupWise, WeightOnlyActivationFunctionType::Identity, AFlag};
+        WeightOnlyParams params{reinterpret_cast<uint8_t*>(weight), scales, zeros, act, nullptr, bias, out, m, n, k,
+            group_size, BFlag, WeightOnlyType::GroupWise, WeightOnlyActivationFunctionType::Identity, AFlag};
         for (int i = 0; i < warmup; ++i)
         {
             tensorrt_llm::kernels::weight_only_batched_gemv_launcher(params, s);

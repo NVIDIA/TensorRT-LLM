@@ -3,8 +3,10 @@ import json
 import time
 from pathlib import Path
 
-import tensorrt as trt
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from transformers import AutoConfig, AutoTokenizer, T5ForConditionalGeneration
 
 import tensorrt_llm
@@ -487,11 +489,12 @@ if __name__ == "__main__":
                                          "\n".join(hf_output_text)).ratio()
             print(output_text)
             print(hf_output_text)
-            assert match_rate > 0.95, f"Incorrect results! Match rate {match_rate}"
+            if inference_dtype != "float32":
+                print("")
+                print(
+                    f"[CAVEAT] Comparing TRT-LLM {inference_dtype} results with HF float32 results. Close match are not expected!"
+                )
+            assert match_rate > 0.9, f"Incorrect results! Match rate {match_rate}"
             print(
                 f"TRT-LLM results match HF FP32 results with literal match rate {match_rate}"
             )
-            if inference_dtype != "float32":
-                print(
-                    f"Caveat: comparing TRT-LLM {inference_dtype} results with HF float32 results. Close match are not expected."
-                )

@@ -312,6 +312,13 @@ def parse_arguments(args):
         choices=['float16', 'float32', 'bfloat16'],
         help="Activates the lora plugin which enables embedding sharing.")
 
+    parser.add_argument(
+        '--max_draft_len',
+        type=int,
+        default=0,
+        help=
+        'Maximum lengths of draft tokens for speculative decoding target model.'
+    )
     args = parser.parse_args(args)
     logger.set_level(args.log_level)
 
@@ -400,7 +407,7 @@ def parse_arguments(args):
         args.rotary_scaling = rotary_scaling
 
     if args.max_num_tokens is not None:
-        assert args.enable_context_fmha
+        assert args.enable_context_fmha or args.enable_context_fmha_fp32_acc
 
     return args
 
@@ -555,7 +562,8 @@ def build_rank_engine(builder: Builder,
             args.max_beam_width,
             args.max_num_tokens,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size,
-            gather_all_token_logits=args.gather_all_token_logits)
+            gather_all_token_logits=args.gather_all_token_logits,
+            max_draft_len=args.max_draft_len)
         tensorrt_llm_gpt(*inputs)
 
     tensorrt_llm.graph_rewriting.optimize(network)
@@ -567,8 +575,6 @@ def build_rank_engine(builder: Builder,
     if rank == 0:
         config_path = args.output_dir / 'config.json'
         builder.save_config(builder_config, config_path)
-
-    tensorrt_llm.tools.cleanup(network, tensorrt_llm_gpt)
 
     return engine
 
@@ -610,6 +616,7 @@ def build(rank, args):
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,
+            max_draft_len=args.max_draft_len,
             int8=int8_trt_flag,
             opt_level=args.builder_opt,
             strongly_typed=args.strongly_typed,

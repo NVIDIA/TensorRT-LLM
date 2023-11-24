@@ -15,8 +15,11 @@
 import unittest
 
 import numpy as np
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from transformers import GPT2Config
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
 

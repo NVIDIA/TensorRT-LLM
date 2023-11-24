@@ -19,22 +19,23 @@ COPY docker/common/install_cmake.sh install_cmake.sh
 RUN bash ./install_cmake.sh && rm install_cmake.sh
 
 # Download & install internal TRT release
-ARG TRT_VER="9.1.0.4"
-ENV TRT_VER=$TRT_VER
-ARG CUDA_VER="12.2"
-ENV CUDA_VER=$CUDA_VER
-ARG CUDNN_VER="8.9.4.25-1+cuda12.2"
-ENV CUDNN_VER=$CUDNN_VER
-ARG NCCL_VER="2.18.3-1+cuda12.2"
-ENV NCCL_VER=$NCCL_VER
-ARG CUBLAS_VER="12.2.5.6-1"
-ENV CUBLAS_VER=$CUBLAS_VER
+ARG TRT_VER CUDA_VER CUDNN_VER NCCL_VER CUBLAS_VER
 COPY docker/common/install_tensorrt.sh install_tensorrt.sh
-RUN bash ./install_tensorrt.sh && rm install_tensorrt.sh
+RUN bash ./install_tensorrt.sh \
+    --TRT_VER=${TRT_VER} \
+    --CUDA_VER=${CUDA_VER} \
+    --CUDNN_VER=${CUDNN_VER} \
+    --NCCL_VER=${NCCL_VER} \
+    --CUBLAS_VER=${CUBLAS_VER} && \
+    rm install_tensorrt.sh
 
 # Install latest Polygraphy
 COPY docker/common/install_polygraphy.sh install_polygraphy.sh
 RUN bash ./install_polygraphy.sh && rm install_polygraphy.sh
+
+# Install mpi4py
+COPY docker/common/install_mpi4py.sh install_mpi4py.sh
+RUN bash ./install_mpi4py.sh && rm install_mpi4py.sh
 
 # Install PyTorch
 ARG TORCH_INSTALL_TYPE="skip"
@@ -49,7 +50,7 @@ COPY benchmarks benchmarks
 COPY scripts scripts
 COPY tensorrt_llm tensorrt_llm
 COPY 3rdparty 3rdparty
-COPY setup.py requirements.txt ./
+COPY setup.py requirements.txt requirements-dev.txt ./
 
 ARG BUILD_WHEEL_ARGS="--clean --trt_root /usr/local/tensorrt"
 RUN python3 scripts/build_wheel.py ${BUILD_WHEEL_ARGS}

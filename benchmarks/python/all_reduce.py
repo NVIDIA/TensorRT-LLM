@@ -15,8 +15,10 @@
 
 from argparse import ArgumentParser
 
-import tensorrt as trt
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from cuda import cuda, cudart
 from mpi4py import MPI
 from polygraphy.backend.trt import CreateConfig, EngineFromNetwork

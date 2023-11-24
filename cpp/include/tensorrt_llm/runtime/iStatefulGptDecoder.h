@@ -75,7 +75,7 @@ public:
 
     //! Setup the decoder before calling `forward()`, also calls reshapeBuffers
     virtual void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxKvCacheLength,
-        SizeType maxSequenceLength, nvinfer1::DataType dtype)
+        SizeType maxSequenceLength, SizeType maxTokensPerStep, nvinfer1::DataType dtype)
         = 0;
 
     //! @brief Initialize the decoder with new batch of inputs.
@@ -108,8 +108,14 @@ public:
     //! @returns [batchSize, maxBeamWidth, maxSequenceLength], log probabilities (per beam), on gpu
     virtual TensorPtr getLogProbs() const = 0;
 
-    //! @returns [batchSize, beamWidth], latests generated tokens (per beam), on gpu
-    virtual TensorPtr getNewTokens() const = 0;
+    //! @brief Get tokens generated in one step of last forward pass
+    //! @param iter The iteration within [0; maxTokensPerStep) for which to get the tokens
+    //! @returns [batchSize, beamWidth], tokens generated in `iter` (per beam), on gpu
+    virtual TensorPtr getNewTokens(SizeType iter = 0) const = 0;
+
+    //! @brief Get maxTokensPerStep tokens generated in the last forward pass
+    //! @returns [maxTokensPerStep, batchSize, maxBeamWidth], tokens generated in last forward pass, on gpu
+    virtual TensorPtr getAllNewTokens() const = 0;
 
     //! @returns [1], number of finished sequences, in pinned host memory
     virtual TensorPtr getNbFinished() const = 0;

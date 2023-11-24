@@ -55,6 +55,10 @@ public:
         DecodingInput const& decodingInput, BufferManager const& manager)
         = 0;
 
+    static void acceptTokens(const ITensor& targetTokenIds, const ITensor& draftTokenIds, const ITensor& contextLengths,
+        const ITensor& numDraftTokens, ITensor& sequenceLengths, const ITensor& finishedVec, ITensor& finishedFinal,
+        ITensor& finishedSum, BufferManager::CudaStreamPtr const& stream);
+
     static std::unique_ptr<IGptDecoder> create(
         nvinfer1::DataType dtype, size_t vocabSize, size_t vocabSizePadded, BufferManager::CudaStreamPtr const& stream);
 };
