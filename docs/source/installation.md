@@ -194,5 +194,5 @@ headers contained under `cpp` should not be included directly since they might
 change in future versions.
 
 For examples of how to use the C++ runtime, see the unit tests in
-[gptSessionTest.cpp](cpp/tests/runtime/gptSessionTest.cpp) and the related
-[CMakeLists.txt](cpp/tests/CMakeLists.txt) file.
+[gptSessionTest.cpp](/cpp/tests/runtime/gptSessionTest.cpp) and the related
+[CMakeLists.txt](/cpp/tests/CMakeLists.txt) file.
