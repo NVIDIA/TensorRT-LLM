@@ -22,6 +22,7 @@ from .falcon.model import FalconForCausalLM, FalconModel
 from .gpt.model import GPTLMHeadModel, GPTModel
 from .gptj.model import GPTJForCausalLM, GPTJModel
 from .gptneox.model import GPTNeoXForCausalLM, GPTNeoXModel
+from .internlm.model import InternLMForCausalLM, InternLMModel
 from .llama.model import LLaMAForCausalLM, LLaMAModel
 from .opt.model import OPTLMHeadModel, OPTModel
 from .quantized.quant import (fp8_quantize, smooth_quantize,
@@ -56,4 +57,6 @@ __all__ = [
     'BaichuanForCausalLM',
     'EncoderModel',
     'DecoderModel',
+    'InternLMForCausalLM',
+    'InternLMModel',
 ]

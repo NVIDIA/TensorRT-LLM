@@ -131,6 +131,7 @@ This release of TensorRT-LLM contains the following examples:
 | OPT                         | Y    | Y    | Y    | .    | .       | .     | .     | .         | .          |
 | SantaCoder                  | Y    | Y    | Y    | .    | .       | .     | .     | .         | .          |
 | StarCoder                   | Y    | Y    | Y    | .    | .       | .     | .     | .         | .          |
+| InternLM                    | Y    | Y    | Y    | ?    | Y       | Y     | Y     | ?         | ?          |
 
 ## Technical Detail: The `QuantMode` Flags
 
