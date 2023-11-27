@@ -24,12 +24,12 @@ doxygen Doxygen # build C++ docs
 make html
 ```
 
-And the finally the generated html pages will locate in the `build/html` directory.
+And the finally the generated html pages will be located in the `build/html` directory.
 
 
 ## Preview the docs locally
 
-The basic way to preview the docs is using the `http.serve`:
+The basic way to preview the docs is by using the `http.serve`:
 
 ```sh
 cd build/html
