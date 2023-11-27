@@ -1,6 +1,6 @@
 # Docs
 
-This directory contains the stuff for building static html documentations based on [sphinx](https://www.sphinx-doc.org/en/master/).
+This directory contains the stuff for building static HTML documentations based on [sphinx](https://www.sphinx-doc.org/en/master/).
 
 
 ## Build the docs
@@ -24,7 +24,7 @@ doxygen Doxygen # build C++ docs
 make html
 ```
 
-And the finally the generated html pages will locate in the `build/html` directory.
+And finally, the generated HTML pages will be located in the `build/html` directory.
 
 
 ## Preview the docs locally
@@ -37,4 +37,4 @@ cd build/html
 python3 -m http.server 8081
 ```
 
-And you can visit the page with your web browser with url `http://localhost:8081`.
+And you can visit the page with your web browser with URL `http://localhost:8081`.
