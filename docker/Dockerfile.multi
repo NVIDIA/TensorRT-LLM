@@ -5,7 +5,7 @@ ARG BASE_TAG=23.08-py3
 FROM ${BASE_IMAGE}:${BASE_TAG} as base
 
 # `BASH_ENV` is only used for non-interactive bash.
-ENV BASH_ENV="/tmp/bash_env"
+# ENV BASH_ENV="/tmp/bash_env"
 SHELL ["/bin/bash", "-c"]
 
 FROM base as devel
