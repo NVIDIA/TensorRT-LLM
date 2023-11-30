@@ -145,11 +145,26 @@ example:
 
 ```bash
 # Build TensorRT-LLM for Ampere.
-python3 ./scripts/build_wheel.py --cuda_architectures "80-real;86-real"
+python3 ./scripts/build_wheel.py --cuda_architectures "80-real;86-real" --trt_root /usr/local/tensorrt
 ```
 
 The list of supported architectures can be found in the
 [`CMakeLists.txt`](source:cpp/CMakeLists.txt) file.
+
+### Build the Python Bindings for the C++ Runtime
+
+The C++ Runtime, in particular, [`GptSession`](../../cpp/include/tensorrt_llm/runtime/gptSession.h) can be exposed to
+Python via [bindings](../../cpp/tensorrt_llm/pybind/bindings.cpp). This is currently an opt-in feature which needs to be
+explicitly activated during compilation time. The corresponding option `--python_bindings` can be specified
+to `build_wheel.py` in the standard way:
+
+```bash
+python3 ./scripts/build_wheel.py --python_bindings --trt_root /usr/local/tensorrt
+```
+
+After installing the resulting wheel as described above, the C++ Runtime bindings will be available in
+package `tensorrt_llm.bindings`. Running `help` on this package in a Python interpreter will provide on overview of the
+relevant classes. The [associated unit tests](../../tests/bindings) should also be consulted for understanding the API.
 
 ### Link with the TensorRT-LLM C++ Runtime
 

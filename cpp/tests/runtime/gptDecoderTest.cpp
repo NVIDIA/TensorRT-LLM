@@ -55,23 +55,22 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     auto const beamWidth = samplingConfig.beamWidth;
     SizeType constexpr batchSize{4};
 
-    decoder->setup(samplingConfig, batchSize);
-
-    int constexpr endId{50257};
     SizeType constexpr maxInputLength{8};
     SizeType constexpr maxNewTokens{2};
     auto constexpr maxSeqLength = maxInputLength + maxNewTokens;
+    decoder->setup(samplingConfig, batchSize, maxSeqLength);
 
     // set up inputs
     auto logits = std::shared_ptr(
         manager.gpu(ITensor::makeShape({batchSize, beamWidth, vocabSizePadded}), modelConfig.getDataType()));
     manager.setZero(*logits);
 
+    int constexpr endId{50257};
     std::vector<int> const endIdsVec(batchSize * beamWidth, endId);
     auto endIds
         = std::shared_ptr(manager.copyFrom(endIdsVec, ITensor::makeShape({batchSize, beamWidth}), MemoryType::kGPU));
 
-    DecodingInput inputs{maxInputLength, batchSize, logits, endIds};
+    DecodingInput inputs{maxInputLength, maxSeqLength, batchSize, logits, endIds};
     std::vector<std::int32_t> sequenceLimitLengthsVec(batchSize, maxSeqLength);
     inputs.sequenceLimitLength
         = manager.copyFrom(sequenceLimitLengthsVec, ITensor::makeShape({batchSize}), MemoryType::kGPU);
@@ -98,6 +97,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     outputs.lengths
         = manager.copyFrom(sequenceLengthsVec, ITensor::makeShape({batchSize, beamWidth}), MemoryType::kGPU);
     outputs.finished = manager.gpu(ITensor::makeShape({batchSize, beamWidth}), nvinfer1::DataType::kBOOL);
+    inputs.finished = ITensor::view(outputs.finished);
     manager.setZero(*outputs.finished);
     outputs.finishedSum = BufferManager::pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
     auto* finishedSumHost = bufferCast<std::int32_t>(*outputs.finishedSum);

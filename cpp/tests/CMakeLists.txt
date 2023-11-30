@@ -74,8 +74,20 @@ add_gtest(tllmBuffersTest runtime/tllmBuffersTest.cpp)
 add_gtest(bufferManagerTest runtime/bufferManagerTest.cpp)
 add_gtest(runtimeKernelTest runtime/runtimeKernelTest.cpp)
 add_gtest(samplingTest runtime/samplingTest.cpp)
-add_gtest(torchTest runtime/torchTest.cpp)
-target_link_libraries(torchTest PUBLIC ${TORCH_LIBRARIES})
+add_gtest(iTensorTest runtime/iTensorTest.cpp)
+if(${BUILD_PYT})
+  add_gtest(torchTest runtime/torchTest.cpp)
+  target_link_libraries(torchTest PUBLIC ${TORCH_LIBRARIES})
+endif()
+set(SAMPLING_KERNEL_TEST_SRC
+    kernels/sampling/samplingTest.cpp
+    kernels/sampling/samplingTopKTest.cpp
+    kernels/sampling/samplingTopPTest.cpp
+    kernels/sampling/samplingPenaltyTest.cpp
+    kernels/sampling/samplingUtilsTest.cu)
+add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
+add_gtest(weightOnlyKernelTest kernels/weightOnly/weightOnlyKernelTest.cpp)
+add_gtest(decodingKernelsTest kernels/decodingKernelTest.cpp)
 
 if(BUILD_BATCH_MANAGER)
   add_subdirectory(batch_manager)

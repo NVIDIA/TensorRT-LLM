@@ -73,7 +73,7 @@ public:
     const int getHeadSize(bool checkInit = true) const;
 
 protected:
-    int getMaxSeqLenTile(int elemSize) const;
+    int getMaxNumSeqLenTile(int batch_beam_size = 1) const;
     size_t getWorkspaceSizeForContext(
         nvinfer1::DataType type, int32_t nbReq, int32_t max_input_length, int32_t cross_qkv_length = 0) const noexcept;
     // total_num_seq is the sum of beam_width for multiple requests
@@ -85,7 +85,12 @@ protected:
         T const* attention_input;
         T const* qkv_bias;
         int32_t input_seq_length; // padded input length
-        int32_t max_seq_length;   // cache capacity
+        // By default, max_kv_cache_length == cyclic_kv_cache_length
+        // unless each layer has different cyclic kv cache length.
+        // Max cache capacity (used to allocate KV cache)
+        int32_t max_kv_cache_length;
+        // Cyclic kv cache capacity (used to get the cyclic kv cache position for new tokens)
+        int32_t cyclic_kv_cache_length;
         int32_t const* context_lengths;
         float const* kv_scale_orig_quant;
         float const* kv_scale_quant_orig;
@@ -125,7 +130,12 @@ protected:
         T* context_buf;
         void* key_value_cache;
         void* block_pointers;
-        int32_t max_seq_length; // cache capacity
+        // By default, max_kv_cache_length == cyclic_kv_cache_length
+        // unless each layer has different cyclic kv cache length.
+        // Max cache capacity (used to allocate KV cache)
+        int32_t max_kv_cache_length;
+        // Cyclic kv cache capacity (used to get the cyclic kv cache position for new tokens)
+        int32_t cyclic_kv_cache_length;
         int32_t num_requests;
         int32_t max_blocks_per_sequence;
         int32_t const* cache_indir;

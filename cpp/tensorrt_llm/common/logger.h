@@ -47,11 +47,7 @@ public:
         ERROR = 40
     };
 
-    static Logger* getLogger()
-    {
-        thread_local auto* instance = new Logger();
-        return instance;
-    }
+    static Logger* getLogger();
 
     Logger(Logger const&) = delete;
     void operator=(Logger const&) = delete;

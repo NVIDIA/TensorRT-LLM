@@ -39,17 +39,17 @@ public:
         = 0;
 
     virtual void forward(th::Tensor& logits, // (batch_size, beam_width, hidden_size)
-        int step, int max_input_length, uint64_t ite, int local_batch_size, th::Tensor end_id,
+        int step, int max_input_length, int max_kv_cache_length, uint64_t ite, int local_batch_size, th::Tensor end_id,
         th::optional<th::Tensor> embedding_bias_opt, th::optional<th::Tensor> input_lengths_opt,
         th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
         th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
         th::optional<th::Tensor> src_cache_indirection_opt,
         // Outputs
         th::Tensor& output_token_ids, th::Tensor& newTokens, th::Tensor& should_stop,
-        th::optional<th::Tensor> finished_opt, th::optional<th::Tensor> sequence_lengths_opt,
-        th::optional<th::Tensor> cum_log_probs_opt, th::optional<th::Tensor> output_log_probs_opt,
-        th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,
-        th::optional<th::Tensor> beam_hyps_output_ids_tgt_opt,
+        th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
+        th::optional<th::Tensor> sequence_lengths_opt, th::optional<th::Tensor> cum_log_probs_opt,
+        th::optional<th::Tensor> output_log_probs_opt, th::optional<th::Tensor> parent_ids_opt,
+        th::optional<th::Tensor> tgt_cache_indirection_opt, th::optional<th::Tensor> beam_hyps_output_ids_tgt_opt,
         th::optional<th::Tensor> beam_hyps_sequence_lengths_tgt_opt,
         th::optional<th::Tensor> beam_hyps_cum_log_probs_opt, th::optional<th::Tensor> beam_hyps_normed_scores_opt,
         th::optional<th::Tensor> beam_hyps_log_probs_opt, th::optional<th::Tensor> beam_hyps_min_normed_scores_opt,
@@ -77,17 +77,17 @@ public:
         th::optional<th::Tensor> top_p_reset_ids_opt) override;
 
     void forward(th::Tensor& logits, // (batch_size, beam_width, hidden_size)
-        int step, int max_input_length, uint64_t ite, int local_batch_size, th::Tensor end_id,
+        int step, int max_input_length, int max_kv_cache_length, uint64_t ite, int local_batch_size, th::Tensor end_id,
         th::optional<th::Tensor> embedding_bias_opt, th::optional<th::Tensor> input_lengths_opt,
         th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
         th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
         th::optional<th::Tensor> src_cache_indirection_opt,
         // Outputs
         th::Tensor& output_token_ids, th::Tensor& newTokens, th::Tensor& should_stop,
-        th::optional<th::Tensor> finished_opt, th::optional<th::Tensor> sequence_lengths_opt,
-        th::optional<th::Tensor> cum_log_probs_opt, th::optional<th::Tensor> output_log_probs_opt,
-        th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,
-        th::optional<th::Tensor> beam_hyps_output_ids_tgt_opt,
+        th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
+        th::optional<th::Tensor> sequence_lengths_opt, th::optional<th::Tensor> cum_log_probs_opt,
+        th::optional<th::Tensor> output_log_probs_opt, th::optional<th::Tensor> parent_ids_opt,
+        th::optional<th::Tensor> tgt_cache_indirection_opt, th::optional<th::Tensor> beam_hyps_output_ids_tgt_opt,
         th::optional<th::Tensor> beam_hyps_sequence_lengths_tgt_opt,
         th::optional<th::Tensor> beam_hyps_cum_log_probs_opt, th::optional<th::Tensor> beam_hyps_normed_scores_opt,
         th::optional<th::Tensor> beam_hyps_log_probs_opt, th::optional<th::Tensor> beam_hyps_min_normed_scores_opt,
@@ -121,14 +121,15 @@ public:
         th::optional<th::Tensor> top_p_reset_ids_opt);
 
     th::Tensor forward(th::Tensor logits, // (batch_size, beam_width, vocab_size)
-        int64_t step, int64_t max_input_length, int64_t ite, int64_t local_batch_size, th::Tensor end_id,
-        th::optional<th::Tensor> embedding_bias_opt,
+        int64_t step, int64_t max_input_length, int64_t max_kv_cache_length, int64_t ite, int64_t local_batch_size,
+        th::Tensor end_id, th::optional<th::Tensor> embedding_bias_opt,
         th::optional<th::Tensor> input_lengths_opt, // length of input contexts.
         th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
         th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
         th::optional<th::Tensor> src_cache_indirection_opt,
         // output buffers.
-        th::Tensor output_token_ids, th::Tensor newTokens, th::optional<th::Tensor> finished_opt,
+        th::Tensor output_token_ids, th::Tensor newTokens, th::optional<th::Tensor> finished_input,
+        th::optional<th::Tensor> finished_output,
         th::optional<th::Tensor> seuqence_lengths_opt, // length of the current sequences.
         th::optional<th::Tensor> cum_log_probs_opt, th::optional<th::Tensor> output_log_probs_opt,
         th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,

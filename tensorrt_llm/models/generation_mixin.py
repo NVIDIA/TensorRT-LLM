@@ -49,7 +49,11 @@ class GenerationMixin:
                              dtype=None,
                              num_heads=None,
                              mapping=Mapping(),
-                             max_num_tokens=None):
+                             max_num_tokens=None,
+                             prompt_embedding_table_size: int = 0,
+                             position_encoding_2d=False,
+                             use_lora_plugin: bool = False,
+                             max_draft_len=0):
 
         max_len = max_input_len + max_new_tokens
 
@@ -57,6 +61,14 @@ class GenerationMixin:
         bb_range_gen = [
             1, (max_batch_size * max_beam_width + 1) // 2,
             max_batch_size * max_beam_width
+        ]
+        bbd_range_ctx = [
+            bb_range_cxt[i] * ((max_draft_len + 1) if i != 0 else 1)
+            for i in range(len(bb_range_cxt))
+        ]
+        bbd_range_gen = [
+            bb_range_gen[i] * ((max_draft_len + 1) if i != 0 else 1)
+            for i in range(len(bb_range_gen))
         ]
         _bs_range = [1, (max_batch_size + 1) // 2, max_batch_size]
         _beam_width_range = [1, (max_beam_width + 1) // 2, max_beam_width]
@@ -91,6 +103,7 @@ class GenerationMixin:
             enable_two_optimization_profiles = not use_in_flight_batching
         if enable_two_optimization_profiles:
             bb_range = [bb_range_cxt, bb_range_gen]
+            bbd_range = [bbd_range_ctx, bbd_range_gen]
             bs_range = [_bs_range, _bs_range]
             beam_width_range = [_beam_width_range, _beam_width_range]
             inlen_range = [inlen_range_cxt, inlen_range_gen]
@@ -103,6 +116,7 @@ class GenerationMixin:
             num_tokens_range = [num_tokens_range_ctx, num_tokens_range_gen]
         else:
             bb_range = [bb_range_gen]
+            bbd_range = [bbd_range_gen]
             bs_range = [_bs_range]
             beam_width_range = [_beam_width_range]
             inlen_range = [[1, 1, max_input_len]]
@@ -132,15 +146,30 @@ class GenerationMixin:
                          [1, 1] if enable_two_optimization_profiles else [1]),
                         ('num_tokens', num_tokens_range),
                     ]))
-                position_ids = Tensor(
-                    name='position_ids',
-                    dtype=trt.int32,
-                    shape=[1, -1],
-                    dim_range=OrderedDict([
-                        ('batch_size_fake',
-                         [1, 1] if enable_two_optimization_profiles else [1]),
-                        ('num_tokens', num_tokens_range),
-                    ]))
+                if position_encoding_2d:
+                    position_ids = Tensor(
+                        name='position_ids',
+                        dtype=trt.int32,
+                        shape=[1, 2, -1],
+                        dim_range=OrderedDict([
+                            ('batch_size_fake', [1, 1]
+                             if enable_two_optimization_profiles else [1]),
+                            ('2', [2, 2]
+                             if enable_two_optimization_profiles else [2]),
+                            ('num_tokens', num_tokens_range),
+                        ]),
+                    )
+                else:
+                    position_ids = Tensor(
+                        name='position_ids',
+                        dtype=trt.int32,
+                        shape=[1, -1],
+                        dim_range=OrderedDict([
+                            ('batch_size_fake', [1, 1]
+                             if enable_two_optimization_profiles else [1]),
+                            ('num_tokens', num_tokens_range),
+                        ]),
+                    )
             else:
                 assert dtype is not None
                 assert num_heads is not None
@@ -167,13 +196,28 @@ class GenerationMixin:
                                        ('batch_size_beam_width', bb_range),
                                        ('input_len', inlen_range),
                                    ]))
-                position_ids = Tensor(name='position_ids',
-                                      dtype=trt.int32,
-                                      shape=[-1, -1],
-                                      dim_range=OrderedDict([
-                                          ('batch_size_beam_width', bb_range),
-                                          ('input_len', inlen_range),
-                                      ]))
+                if position_encoding_2d:
+                    position_ids = Tensor(
+                        name='position_ids',
+                        dtype=trt.int32,
+                        shape=[-1, 2, -1],
+                        dim_range=OrderedDict([
+                            ('batch_size_beam_width', bb_range),
+                            ('2', [2, 2]
+                             if enable_two_optimization_profiles else [2]),
+                            ('input_len', inlen_range),
+                        ]),
+                    )
+                else:
+                    position_ids = Tensor(
+                        name='position_ids',
+                        dtype=trt.int32,
+                        shape=[-1, -1],
+                        dim_range=OrderedDict([
+                            ('batch_size_beam_width', bb_range),
+                            ('input_len', inlen_range),
+                        ]),
+                    )
             else:
                 assert dtype is not None
                 assert num_heads is not None
@@ -286,6 +330,7 @@ class GenerationMixin:
         context_lengths = None
         host_context_lengths = None
         host_past_key_value_lengths = None
+        host_max_kv_cache_lengths = None
         attention_mask = None
         cache_indirection = None
         host_request_types = None
@@ -342,9 +387,22 @@ class GenerationMixin:
                 dtype=trt.int32,
                 shape=[-1],
                 dim_range=OrderedDict([
-                    ('batch_size_last_token_ids', bb_range),
+                    ('batch_size_last_token_ids', bbd_range),
                 ]),
             )
+
+        if use_gpt_attention_plugin:
+            host_max_kv_cache_lengths = []
+            for i in layers_range:
+                host_kv_cache_length_tensor = Tensor(
+                    name=f'host_max_kv_cache_length_{i}',
+                    dtype=trt.int32,
+                    shape=[1],
+                    dim_range=OrderedDict([
+                        ('scalar',
+                         [1, 1] if enable_two_optimization_profiles else [1])
+                    ]))
+                host_max_kv_cache_lengths.append(host_kv_cache_length_tensor)
 
         cache_indirection = Tensor(
             name='cache_indirection',
@@ -370,6 +428,80 @@ class GenerationMixin:
                      if enable_two_optimization_profiles else [workspace_size])
                 ]))
 
+        prompt_embedding_table = None
+        tasks = None
+        prompt_vocab_size = None
+        if prompt_embedding_table_size > 0:
+            hidden_size = num_heads * head_size
+            _p_embedding_range = [
+                1, prompt_embedding_table_size // 2, prompt_embedding_table_size
+            ]
+            if enable_two_optimization_profiles:
+                p_embedding_range = [_p_embedding_range, _p_embedding_range]
+            else:
+                p_embedding_range = [_p_embedding_range]
+
+            prompt_embedding_table = Tensor(
+                name='prompt_embedding_table',
+                dtype=dtype,
+                shape=[-1, hidden_size],
+                dim_range=OrderedDict([
+                    ('prompt_embedding_table_size', p_embedding_range),
+                    ('hidden_size', [hidden_size, hidden_size]
+                     if enable_two_optimization_profiles else [hidden_size]),
+                ]))
+            if remove_input_padding:
+                tasks = Tensor(
+                    name='tasks',
+                    dtype=trt.int32,
+                    shape=[1, -1],
+                    dim_range=OrderedDict([
+                        ('batch_size_fake',
+                         [1, 1] if enable_two_optimization_profiles else [1]),
+                        ('input_len_task', num_tokens_range),
+                    ]))
+            else:
+                tasks = Tensor(
+                    name='tasks',
+                    dtype=trt.int32,
+                    shape=[-1, 1],
+                    dim_range=OrderedDict([
+                        ('batch_size_beam_width', bb_range),
+                        ('broadcast_dim',
+                         [1, 1] if enable_two_optimization_profiles else [1]),
+                    ]))
+            prompt_vocab_size = Tensor(
+                name='prompt_vocab_size',
+                dtype=trt.int32,
+                shape=[1],
+                dim_range=OrderedDict([
+                    ('size',
+                     [1, 1] if enable_two_optimization_profiles else [1])
+                ]))
+
+        lora_weights_pointers_list = None
+        lora_ranks = None
+        if use_lora_plugin:
+            lora_weights_pointers_list = []
+            for i in layers_range:
+                lora_weights_pointers = Tensor(
+                    name=f'lora_weights_pointers_{i}',
+                    dtype=trt.int64,
+                    shape=[-1, 2],
+                    dim_range=OrderedDict([
+                        ('batch_size_beam_width', bb_range),
+                        ('in_out',
+                         [2, 2] if enable_two_optimization_profiles else [2]),
+                    ]))
+                lora_weights_pointers_list.append(lora_weights_pointers)
+
+            lora_ranks = Tensor(
+                name='lora_ranks',
+                dtype=trt.int32,
+                shape=[-1],
+                dim_range=OrderedDict([('batch_size_beam_width', bb_range)]),
+            )
+
         return {
             'input_ids': input_ids,
             'hidden_states_input': hidden_states,
@@ -377,6 +509,7 @@ class GenerationMixin:
             'attention_mask': attention_mask,
             'sequence_length': sequence_length,
             'host_past_key_value_lengths': host_past_key_value_lengths,
+            'host_max_kv_cache_lengths': host_max_kv_cache_lengths,
             'past_key_value': past_key_value,
             'last_token_ids': last_token_ids,
             'cache_indirection': cache_indirection,
@@ -384,5 +517,10 @@ class GenerationMixin:
             'context_lengths': context_lengths,
             'host_context_lengths': host_context_lengths,
             'host_request_types': host_request_types,
+            'prompt_embedding_table': prompt_embedding_table,
+            'tasks': tasks,
+            'prompt_vocab_size': prompt_vocab_size,
             'all_reduce_workspace': all_reduce_workspace,
+            'lora_ranks': lora_ranks,
+            'lora_weights_pointers_list': lora_weights_pointers_list,
         }

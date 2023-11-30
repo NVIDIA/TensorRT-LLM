@@ -32,22 +32,30 @@ logging.basicConfig(format=log_format)
 LOGGER = logging.getLogger(__name__)
 
 
-def prompt_convert(args, prompt_config, prompt_weights):
-    prompt_templates = prompt_config["task_templates"]
+def prompt_convert(out_file, prompt_config, prompt_weights):
+    nemo_type = "peft_tuning" if "peft" in prompt_config else "prompt_learning"
 
-    actual_task_id = 0
     vtokens_embeddings = []
     vtokens_len = []
-    for task_name_id, prompt_task in enumerate(prompt_templates):
-        prompt_task_name = prompt_task["taskname"]
-        LOGGER.info(f"Task {actual_task_id}: {prompt_task['taskname']}")
-        prompt_task_weights = prompt_weights["prompt_table"].get(
-            f"prompt_table.{prompt_task_name}.prompt_embeddings.weight")
-        if prompt_task_weights is None:
-            continue
+
+    if nemo_type == "peft_tuning":
+        prompt_task_weights = prompt_weights[
+            "model.embedding.adapter_layer.ptuning_adapter.inference_table"]
         vtokens_embeddings.append(prompt_task_weights)
         vtokens_len.append(prompt_task_weights.shape[0])
-        actual_task_id += 1
+    else:
+        prompt_templates = prompt_config["task_templates"]
+        actual_task_id = 0
+        for task_name_id, prompt_task in enumerate(prompt_templates):
+            prompt_task_name = prompt_task["taskname"]
+            LOGGER.info(f"Task {actual_task_id}: {prompt_task['taskname']}")
+            prompt_task_weights = prompt_weights["prompt_table"].get(
+                f"prompt_table.{prompt_task_name}.prompt_embeddings.weight")
+            if prompt_task_weights is None:
+                continue
+            vtokens_embeddings.append(prompt_task_weights)
+            vtokens_len.append(prompt_task_weights.shape[0])
+            actual_task_id += 1
 
     max_vtoken_len = max(vtokens_len)
     embedding_dim = vtokens_embeddings[0].shape[1]
@@ -59,7 +67,7 @@ def prompt_convert(args, prompt_config, prompt_weights):
         vtokens_embeddings[i] = padded_table
 
     vtokens_embeddings = torch.stack(vtokens_embeddings)
-    np.save(args.out_file, torch_to_numpy(vtokens_embeddings))
+    np.save(out_file, torch_to_numpy(vtokens_embeddings))
 
 
 def main(args):
@@ -84,7 +92,7 @@ def main(args):
             weight_path,
             map_location=cpu_map_location,
         )
-    prompt_convert(args, prompt_config, prompt_weights)
+    prompt_convert(args.out_file, prompt_config, prompt_weights)
 
     LOGGER.info("Spent %s (h:m:s) to convert the prompt model",
                 datetime.datetime.now() - start_time)

@@ -293,6 +293,9 @@ class TestGPTNeoX(unittest.TestCase):
             ctx_shape[f'past_key_value_{i}'] = shape
             ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             ctx_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
+            ctx_buffer[f'host_max_kv_cache_length_{i}'] = torch.tensor(
+                [total_seq_len], dtype=torch.int32)
+            ctx_shape[f'host_max_kv_cache_length_{i}'] = (1, )
         sequence_length_buffer = torch.add(sequence_length_buffer, step)
         ctx_buffer['sequence_length'] = sequence_length_buffer
         ctx_shape['sequence_length'] = ctx_buffer['sequence_length'].shape
@@ -384,11 +387,14 @@ class TestGPTNeoX(unittest.TestCase):
         step1_shape = {k: v.shape for k, v in step1_buffer.items()}
         for i in range(gpt_config.num_hidden_layers):
             step1_shape[f'past_key_value_{i}'] = shape
+            step1_shape[f'host_max_kv_cache_length_{i}'] = (1, )
         step1_shape['sequence_length'] = (batch_size, )
         step1_shape['host_past_key_value_lengths'] = (batch_size, )
         for i in range(gpt_config.num_hidden_layers):
             step1_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             step1_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
+            step1_buffer[f'host_max_kv_cache_length_{i}'] = torch.tensor(
+                [total_seq_len], dtype=torch.int32)
         # For step 1, the sequence_lengths = context_lengths + 1.
         sequence_length_buffer = torch.add(sequence_length_buffer, step)
         step1_buffer['sequence_length'] = sequence_length_buffer
@@ -407,48 +413,6 @@ class TestGPTNeoX(unittest.TestCase):
                                    atol=1e-1)
 
         compare_max_abs_error(ref, res, "generation logits")
-
-    def test_gptneox_noplugin_unsupported(self):
-
-        use_refit = False
-        apply_query_key_layer_scaling = False
-        model = 'gptneox'
-
-        log_level = 'error'
-        dtype = 'float16'
-        world_size = 1
-        rank = 0
-        hidden_act = 'gelu'
-        n_layer = 1
-        max_length = 2
-        batch_size = 4
-        seq_len = 128
-        use_attention_plugin = False
-        use_ln_gemm_plugin = True
-        beam_width = 1
-
-        gpt_config, hf_gpt = self._gen_hf_gpt_neox(hidden_act, n_layer,
-                                                   seq_len + max_length, dtype)
-        with self.assertRaisesRegex(
-                ValueError,
-                ".*GPT-NeoX RoPE is only supported with GPTAttention plugin.*"):
-            runtime, _ = self._gen_tensorrt_llm_runtime(
-                log_level, dtype, world_size, rank, gpt_config, hf_gpt, model,
-                use_attention_plugin, batch_size, beam_width, seq_len,
-                max_length, use_refit, use_ln_gemm_plugin,
-                apply_query_key_layer_scaling)
-
-        use_ln_gemm_plugin = False
-        if trt.__version__[:3] == '8.6':
-            with self.assertRaisesRegex(
-                    AssertionError,
-                    "You need to enable the LayerNorm plugin for GPT-NeoX with TensorRT"
-            ):
-                runtime, _ = self._gen_tensorrt_llm_runtime(
-                    log_level, dtype, world_size, rank, gpt_config, hf_gpt,
-                    model, use_attention_plugin, batch_size, beam_width,
-                    seq_len, max_length, use_refit, use_ln_gemm_plugin,
-                    apply_query_key_layer_scaling)
 
 
 if __name__ == '__main__':

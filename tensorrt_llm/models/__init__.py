@@ -15,8 +15,7 @@
 from .baichuan.model import BaichuanForCausalLM
 from .bert.model import BertForQuestionAnswering, BertModel
 from .bloom.model import BloomForCausalLM, BloomModel
-from .chatglm2_6b.model import ChatGLM2HeadModel, ChatGLM2Model
-from .chatglm6b.model import ChatGLM6BHeadModel, ChatGLM6BModel
+from .chatglm.model import ChatGLMHeadModel, ChatGLMModel
 from .enc_dec.model import DecoderModel, EncoderModel
 from .falcon.model import FalconForCausalLM, FalconModel
 from .gpt.model import GPTLMHeadModel, GPTModel
@@ -24,9 +23,9 @@ from .gptj.model import GPTJForCausalLM, GPTJModel
 from .gptneox.model import GPTNeoXForCausalLM, GPTNeoXModel
 from .llama.model import LLaMAForCausalLM, LLaMAModel
 from .opt.model import OPTLMHeadModel, OPTModel
-from .quantized.quant import (fp8_quantize, smooth_quantize,
-                              weight_only_groupwise_quantize,
-                              weight_only_quantize)
+from .qwen.model import QWenForCausalLM
+
+from .quantized.quant import quantize_model  # noqa # isort:skip
 
 __all__ = [
     'BertModel',
@@ -45,15 +44,11 @@ __all__ = [
     'GPTJForCausalLM',
     'GPTNeoXModel',
     'GPTNeoXForCausalLM',
-    'smooth_quantize',
-    'weight_only_quantize',
-    'weight_only_groupwise_quantize',
-    'fp8_quantize',
-    'ChatGLM6BHeadModel',
-    'ChatGLM6BModel',
-    'ChatGLM2HeadModel',
-    'ChatGLM2Model',
+    'quantize_model',
+    'ChatGLMHeadModel',
+    'ChatGLMModel',
     'BaichuanForCausalLM',
+    'QWenForCausalLM',
     'EncoderModel',
     'DecoderModel',
 ]

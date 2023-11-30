@@ -45,14 +45,16 @@ class GptManager
 {
 public:
     using SizeType = tensorrt_llm::runtime::SizeType;
+    using TokenIdType = tensorrt_llm::runtime::TokenIdType;
     using RequestList = std::list<std::shared_ptr<LlmRequest>>;
+    using TensorPtr = runtime::ITensor::SharedPtr;
 
-    GptManager(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, int32_t maxBeamWidth,
+    GptManager(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, SizeType maxBeamWidth,
         batch_scheduler::SchedulerPolicy schedulerPolicy, GetInferenceRequestsCallback getInferenceRequestsCb,
         SendResponseCallback sendResponseCb, PollStopSignalCallback pollStopSignalCb = nullptr,
         ReturnBatchManagerStatsCallback returnBatchManagerStatsCb = nullptr,
         const TrtGptModelOptionalParams& optionalParams = TrtGptModelOptionalParams(),
-        std::optional<uint64_t> terminateReqId = std::nullopt);
+        std::optional<uint64_t> terminateReqId = std::nullopt, std::optional<SizeType> maxDraftTokens = std::nullopt);
 
     /* Wraps the user-provided callback for requests.
        Adds requests to request table.
@@ -77,16 +79,23 @@ protected:
     virtual BatchManagerErrorCode_t step(RequestList& activeRequests, std::set<uint64_t>& activeRequestsIds);
 
 private:
+    SizeType getMaxInputLen() const;
+    SizeType getMaxOutputLen() const;
+    SizeType getMaxNumSequences() const;
+
     void validateLlmRequest(LlmRequest& newReq) const;
     static std::shared_ptr<LlmRequest> fillLlmRequest(std::shared_ptr<InferenceRequest> newReq);
-    static std::shared_ptr<std::vector<int32_t>> getReqInputTokens(std::shared_ptr<InferenceRequest> new_req);
-    static int32_t getMaxNewTokens(std::shared_ptr<InferenceRequest> newReq);
+    static std::shared_ptr<std::vector<TokenIdType>> getReqInputTokens(std::shared_ptr<InferenceRequest> newReq);
+    static SizeType getMaxNewTokens(std::shared_ptr<InferenceRequest> newReq);
+
+    GetInferenceRequestsCallback mGetInferenceRequestsCb;
+    SendResponseCallback mSendResponseCb;
+    PollStopSignalCallback mPollStopSignalCb;
+    ReturnBatchManagerStatsCallback mReturnBatchManagerStatsCb;
 
     std::shared_ptr<TrtGptModel> mTrtGptModel;
-    SizeType mMaxInputLen;
-    SizeType mMaxOutputLen;
-    SizeType mMaxNumSequences;
     std::optional<uint64_t> mTerminateReqId;
+    std::optional<SizeType> mMaxDraftTokens;
 
     // Iteration counter - incremented every iteration of the generation loop
     int64_t mIterationCounter;
@@ -95,19 +104,18 @@ private:
     // IDs of live requests
     std::set<uint64_t> mActiveRequestsIds;
 
-    GetInferenceRequestsCallback mGetInferenceRequestsCb;
-    SendResponseCallback mSendResponseCb;
-    PollStopSignalCallback mPollStopSignalCb;
-    ReturnBatchManagerStatsCallback mReturnBatchManagerStatsCb;
-
     std::atomic<bool> destructor_called_;
     void decoupled_execution_loop();
     std::shared_ptr<std::thread> worker_thread_;
     inline static const std::string kInputIdsTensorName_ = "input_ids";
+    inline static const std::string kDraftInputIdsTensorName_ = "draft_input_ids";
     inline static const std::string kMaxNewTokensTensorName_ = "request_output_len";
     inline static const std::string kBeamWidthTensorName_ = "beam_width";
     inline static const std::string kEndIdTensorName_ = "end_id";
     inline static const std::string kPadIdTensorName_ = "pad_id";
+    inline static const std::string kBadWordsListTensorName_ = "bad_words_list";
+    inline static const std::string kStopWordsListTensorName_ = "stop_words_list";
+    inline static const std::string kEmbeddingBiasTensorName_ = "embedding_bias";
     inline static const std::string kTemperatureTensorName_ = "temperature";
     inline static const std::string kRuntimeTopKTensorName_ = "runtime_top_k";
     inline static const std::string kRuntimeTopPTensorName_ = "runtime_top_p";
@@ -116,7 +124,13 @@ private:
     inline static const std::string kMinLengthTensorName_ = "min_length";
     inline static const std::string kPresencePenaltyTensorName_ = "presence_penalty";
     inline static const std::string kRandomSeedTensorName_ = "random_seed";
+    inline static const std::string kReturnLogProbsTensorName_ = "return_log_probs";
+    inline static const std::string kPromptEmbeddingTableName_ = "prompt_embedding_table";
+    inline static const std::string kPromptVocabSizeName_ = "prompt_vocab_size";
     inline static const std::string kOutputIdsTensorName_ = "output_ids";
+    inline static const std::string kSequenceLengthTensorName_ = "sequence_length";
+    inline static const std::string kLogProbsTensorName_ = "output_log_probs";
+    inline static const std::string kCumLogProbsTensorName_ = "cum_log_probs";
 
     std::shared_ptr<nvinfer1::ILogger> mLogger{};
 };

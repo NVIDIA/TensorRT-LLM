@@ -214,12 +214,9 @@ void BaseSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams 
         float default_value = getDefaultPenaltyValue(repetition_penalty_type_);
         if (!ALL_OF(std::begin(mRepetitionPenalty) + ite * local_batch_size, local_batch_size, float, default_value))
         {
-            auto* const input_lengths
-                = params.input_lengths ? params.input_lengths->template getPtr<const int>() : nullptr;
             invokeBatchApplyRepetitionPenalty(logits, repetition_penalty_buf_ + ite * local_batch_size,
                 outputs.output_ids_ptr.template getPtr<const int*>(), outputs.sequence_length->getPtr<const int>(),
-                batch_size, local_batch_size, vocab_size_padded_, input_lengths, repetition_penalty_type_,
-                params.max_seq_len, stream_);
+                batch_size, vocab_size_padded_, repetition_penalty_type_, params.max_seq_len, stream_);
             sync_check_cuda_error();
         }
     }

@@ -21,6 +21,7 @@
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
 
+#include <csignal>
 #include <cstdlib>
 #include <mpi.h>
 
@@ -40,15 +41,18 @@ void initMpi(nvinfer1::ILogger& logger, int threadMode = MPI_THREAD_FUNNELED)
     }
 
     int initialized = 0;
-    TLLM_MPI_CHECK(MPI_Initialized(&initialized), logger);
+    TLLM_MPI_CHECK(MPI_Initialized(&initialized));
     if (!initialized)
     {
         logger.log(
             nvinfer1::ILogger::Severity::kINFO, tc::fmtstr("Initializing MPI with thread mode %d", threadMode).c_str());
         int providedMode;
-        TLLM_MPI_CHECK(MPI_Init_thread(nullptr, nullptr, threadMode, &providedMode), logger);
+        TLLM_MPI_CHECK(MPI_Init_thread(nullptr, nullptr, threadMode, &providedMode));
         TLLM_CHECK_WITH_INFO(providedMode >= threadMode, "MPI_Init_thread failed");
         std::atexit([]() { MPI_Finalize(); });
+
+        auto previousHandler = std::signal(SIGABRT, [](int signal) { MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); });
+        TLLM_CHECK_WITH_INFO(previousHandler != SIG_ERR, "Signal handler setup failed");
     }
 
     mpiInitialized = true;
@@ -61,7 +65,7 @@ bool WorldConfig::validConfig(nvinfer1::ILogger& logger, SizeType tensorParallel
     initMpi(logger);
 
     int mpiSize;
-    TLLM_MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &mpiSize), logger);
+    TLLM_MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &mpiSize));
     return mpiSize == tensorParallelism * pipelineParallelism;
 }
 
@@ -71,8 +75,8 @@ WorldConfig WorldConfig::mpi(nvinfer1::ILogger& logger, SizeType gpusPerNode, st
     initMpi(logger);
 
     int mpiSize, mpiRank;
-    TLLM_MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &mpiSize), logger);
-    TLLM_MPI_CHECK(MPI_Comm_rank(MPI_COMM_WORLD, &mpiRank), logger);
+    TLLM_MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &mpiSize));
+    TLLM_MPI_CHECK(MPI_Comm_rank(MPI_COMM_WORLD, &mpiRank));
     logger.log(nvinfer1::ILogger::Severity::kINFO, tc::fmtstr("MPI size: %d, rank: %d", mpiSize, mpiRank).c_str());
 
     auto pp = pipelineParallelism.value_or(1);

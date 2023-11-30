@@ -54,8 +54,8 @@ public:
     OptVec<SizeType> topPResetIds;         // [batch_size]
 
     // beam search layer
-    std::optional<FloatType> beamSearchDiversityRate;
-    std::optional<FloatType> lengthPenalty;
+    OptVec<FloatType> beamSearchDiversityRate;
+    OptVec<FloatType> lengthPenalty;
 };
 
 } // namespace tensorrt_llm::runtime

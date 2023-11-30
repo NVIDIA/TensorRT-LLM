@@ -33,7 +33,6 @@ public:
     void recv(th::Tensor& tensor, int64_t fromRank) const;
 
 private:
-    std::shared_ptr<nvinfer1::ILogger> mLogger;
     int32_t mRank;
     std::shared_ptr<tensorrt_llm::runtime::NcclCommunicator> mPipelineComm;
 };

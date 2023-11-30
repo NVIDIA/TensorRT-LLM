@@ -244,6 +244,7 @@ __global__ void topk_stage_2_opt3(const int* __restrict topk_tmp_id_buf, T* topk
     const int batch_id = blockIdx.x;
     const bool IS_FP16 = std::is_same<T, half>::value;
     const T MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
+    const float length_penalty{beam_hyps.length_penalties == nullptr ? 1.0f : beam_hyps.length_penalties[batch_id]};
 
     typedef cub::BlockReduce<TopK_2<T>, BLOCK_SIZE_> BlockReduce;
     __shared__ typename BlockReduce::TempStorage temp_storage;
@@ -304,8 +305,7 @@ __global__ void topk_stage_2_opt3(const int* __restrict topk_tmp_id_buf, T* topk
                 else
                 {
                     const int global_batch_idx = beam_hyps.ite * beam_hyps.local_batch_size + batch_id;
-                    const float normed_score
-                        = apply_length_penalty(s_val[total.p], beam_hyps.step, beam_hyps.length_penalty);
+                    const float normed_score = apply_length_penalty(s_val[total.p], beam_hyps.step, length_penalty);
                     const int num_beam = beam_hyps.num_beams[global_batch_idx];
                     int beam_idx = num_beam;
                     // If there are beam_width finished sentences, check that the score of
@@ -444,6 +444,7 @@ __global__ void topk_stage_2_opt2_general(const int* __restrict topk_tmp_id_buf,
     const int batch_id = blockIdx.x;
     const bool IS_FP16 = std::is_same<T, half>::value;
     const T MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
+    const float length_penalty{beam_hyps.length_penalties == nullptr ? 1.0f : beam_hyps.length_penalties[batch_id]};
 
     typedef cub::BlockReduce<TopK_2<T>, BLOCK_SIZE> BlockReduce;
     __shared__ typename BlockReduce::TempStorage temp_storage;
@@ -503,8 +504,7 @@ __global__ void topk_stage_2_opt2_general(const int* __restrict topk_tmp_id_buf,
                 else
                 {
                     const int global_batch_idx = beam_hyps.ite * beam_hyps.local_batch_size + batch_id;
-                    const float normed_score
-                        = apply_length_penalty(s_val[total.p], beam_hyps.step, beam_hyps.length_penalty);
+                    const float normed_score = apply_length_penalty(s_val[total.p], beam_hyps.step, length_penalty);
                     const int num_beam = beam_hyps.num_beams[global_batch_idx];
                     int beam_idx = num_beam;
                     // If there are beam_width finished sentences, check that the score of
@@ -762,6 +762,7 @@ __global__ void insertUnfinishedPath(BeamHypotheses beam_hyps, const bool* finis
     const int bid = blockIdx.x;
     const int tgt_start_idx = beam_hyps.num_beams[bid];
     const int max_seq_len{beam_hyps.max_seq_len};
+    const float length_penalty{beam_hyps.length_penalties == nullptr ? 1.0f : beam_hyps.length_penalties[bid]};
     if (beam_hyps.is_done[bid])
     {
         return;
@@ -801,7 +802,7 @@ __global__ void insertUnfinishedPath(BeamHypotheses beam_hyps, const bool* finis
             // TODO huggingface uses total length to normalize the scores, instead of number of generated tokens.
             // Check that is it reasonable or not.
             beam_hyps.normed_scores[tgt_beam_idx] = apply_length_penalty(cum_log_probs[src_beam_idx],
-                finished[src_beam_idx] ? last_token_idx + 1 : last_token_idx, beam_hyps.length_penalty);
+                finished[src_beam_idx] ? last_token_idx + 1 : last_token_idx, length_penalty);
             beam_hyps.cum_log_probs[tgt_beam_idx] = cum_log_probs[src_beam_idx];
 
             beam_hyps.num_beams[bid]++;

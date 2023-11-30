@@ -35,6 +35,20 @@
 
 namespace tensorrt_llm::plugins
 {
+enum class WeightTypeId
+{
+    INT8 = 1,
+    INT4 = 2,
+};
+
+constexpr int32_t INT8_BITS = 8;
+constexpr int32_t INT4_BITS = 4;
+constexpr int32_t INT8_INT4_RATIO = INT8_BITS / INT4_BITS;
+
+inline int32_t getWeightTypeMultiplier(WeightTypeId weightTypeId)
+{
+    return weightTypeId == WeightTypeId::INT8 ? 1 : INT8_INT4_RATIO;
+}
 
 using WeightOnlyGemmRunner = tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunnerInterface;
 using WeightOnlyGemmRunnerPtr = std::shared_ptr<WeightOnlyGemmRunner>;
@@ -45,7 +59,7 @@ class WeightOnlyQuantGemmPluginProfiler : public GemmPluginProfiler<tensorrt_llm
 public:
     using Config = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
 
-    void setWeightTypeId(int weightId)
+    void setWeightTypeId(WeightTypeId weightId)
     {
         mWeightTypeId = weightId;
     }
@@ -58,7 +72,7 @@ protected:
     std::vector<Config> getTactics(int m, int n, int k) const override;
 
 private:
-    int mWeightTypeId;
+    WeightTypeId mWeightTypeId;
 };
 
 class WeightOnlyQuantMatmulPlugin : public BasePlugin
@@ -67,9 +81,7 @@ public:
     using PluginProfilerPtr = std::shared_ptr<WeightOnlyQuantGemmPluginProfiler>;
     WeightOnlyQuantMatmulPlugin() = delete;
 
-    // int8 weight only : weightTypeId = 1;
-    // int4 weight only : weightTypeId = 2;
-    WeightOnlyQuantMatmulPlugin(nvinfer1::DataType type, int weightTypeId, const PluginProfilerPtr& profiler);
+    WeightOnlyQuantMatmulPlugin(nvinfer1::DataType type, WeightTypeId weightTypeId, const PluginProfilerPtr& profiler);
 
     WeightOnlyQuantMatmulPlugin(const void* data, size_t length, const PluginProfilerPtr& profiler);
 
@@ -103,9 +115,7 @@ public:
     void destroy() noexcept override;
 
 private:
-    // int8 weight only : weightTypeId = 1;
-    // int4 weight only : weightTypeId = 2;
-    void init(nvinfer1::DataType type, int weightTypeId);
+    void init(nvinfer1::DataType type, WeightTypeId weightTypeId);
 
     void configGemm();
 
@@ -115,7 +125,7 @@ private:
     WeightOnlyGemmRunnerPtr m_weightOnlyGemmRunner;
     size_t m_workspaceMaxSize;
     nvinfer1::DataType mType;
-    int mWeightTypeId;
+    WeightTypeId mWeightTypeId;
     bool mCudaKernelEnabled;
 
     // When M is smaller than this value, we trigger a fast path

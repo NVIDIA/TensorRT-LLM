@@ -20,6 +20,10 @@
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 
+#if defined(ENABLE_BF16)
+#include <cuda_bf16.h>
+#endif
+
 #include <type_traits>
 #include <vector>
 

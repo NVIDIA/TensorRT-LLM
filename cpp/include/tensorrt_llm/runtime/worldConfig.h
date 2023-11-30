@@ -93,9 +93,15 @@ public:
         return getPipelineParallelRank() == 0;
     }
 
+    //! \brief Is my rank the last rank in its pipeline?
     [[nodiscard]] bool constexpr isLastPipelineParallelRank() const noexcept
     {
         return getPipelineParallelRank() == getPipelineParallelism() - 1;
+    }
+
+    [[nodiscard]] SizeType constexpr getLastRank() const noexcept
+    {
+        return getSize() - 1;
     }
 
     [[nodiscard]] std::vector<SizeType> getPipelineParallelGroup() const;

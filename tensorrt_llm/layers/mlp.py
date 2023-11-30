@@ -12,6 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import numpy as np
+
+from .._utils import trt_dtype_to_np
 from ..functional import ACT2FN
 from ..module import Module
 from ..quantization import QuantMode
@@ -101,6 +104,16 @@ class GatedMLP(MLP):
                          quant_mode=quant_mode,
                          instance_id=instance_id)
 
+        self.hidden_size = hidden_size
+        self.ffn_hidden_size = ffn_hidden_size
+        self.hidden_act = hidden_act
+        self.bias = bias
+        self.dtype = dtype
+        self.tp_group = tp_group
+        self.tp_size = tp_size
+        self.quant_mode = quant_mode
+        self.instance_id = instance_id
+
         if self.use_fp8_qdq:
             self.gate = FP8Linear(hidden_size,
                                   ffn_hidden_size,
@@ -123,4 +136,97 @@ class GatedMLP(MLP):
         inter = ACT2FN[self.hidden_act](inter)
         gate = self.gate(hidden_states)
         output = self.proj(inter * gate, workspace)
+        return output
+
+
+class FusedGatedMLP(GatedMLP):
+
+    def __init__(self,
+                 hidden_size,
+                 ffn_hidden_size,
+                 hidden_act,
+                 bias=True,
+                 dtype=None,
+                 tp_group=None,
+                 tp_size=1,
+                 quant_mode=QuantMode(0),
+                 instance_id: int = 0):
+        super().__init__(hidden_size,
+                         ffn_hidden_size,
+                         hidden_act,
+                         bias=bias,
+                         dtype=dtype,
+                         tp_group=tp_group,
+                         tp_size=tp_size,
+                         quant_mode=quant_mode,
+                         instance_id=instance_id)
+
+    def forward(self, hidden_states, workspace=None):
+        # Combine the following pattern
+        #
+        #   SiLU(FC(x)) + Gate(x)
+        #
+        # into:
+        #
+        #   SwiGLU(FusedFC(x))
+        #
+        # Upside is we don't need to modify 4 different weight loading paths just to concat weights
+
+        _np_dtype = trt_dtype_to_np(self.dtype)
+        concat_weight = np.concatenate(
+            [self.gate.weight.raw_value, self.fc.weight.raw_value],
+            axis=0).astype(_np_dtype)
+        if self.bias:
+            concat_bias = np.concatenate(
+                [self.gate.bias.raw_value, self.fc.bias.raw_value],
+                axis=0).astype(_np_dtype)
+
+        if self.use_fp8_qdq:
+            gate_weights_scaling_factor = self.gate.weights_scaling_factor.raw_value
+            fc_weights_scaling_factor = self.fc.weights_scaling_factor.raw_value
+            fc_activation_scaling_factor = self.fc.activation_scaling_factor.raw_value
+            gate_activation_scaling_factor = self.gate.activation_scaling_factor.raw_value
+            assert fc_activation_scaling_factor == gate_activation_scaling_factor, "Activation scales should be identical"
+
+        # Remove dangling TRT-LLM parameter references after the graph rewrite.
+        for param, _ in list(self.gate.named_parameters()):
+            self.gate._parameters.pop(param)
+        self.gate = None
+
+        if self.use_fp8_qdq:
+            self.fc = FP8Linear(self.hidden_size,
+                                self.ffn_hidden_size * 2,
+                                bias=self.bias,
+                                dtype=self.dtype,
+                                tp_group=self.tp_group,
+                                tp_size=self.tp_size,
+                                gather_output=False)
+        else:
+            self.fc = ColumnLinear(self.hidden_size,
+                                   self.ffn_hidden_size * 2,
+                                   bias=self.bias,
+                                   dtype=self.dtype,
+                                   tp_group=self.tp_group,
+                                   tp_size=self.tp_size,
+                                   gather_output=False)
+
+        self.fc.weight.value = concat_weight
+
+        if self.use_fp8_qdq:
+            self.fc.activation_scaling_factor.value = fc_activation_scaling_factor
+            # TODO: need to align with quantization toolkit; preferably put a constraint to equalize
+            # fc/gate weight scaling factor to allow horizontal fusion without accuracy loss
+            self.fc.weights_scaling_factor.value = max(
+                gate_weights_scaling_factor, fc_weights_scaling_factor)
+
+        if self.bias:
+            self.fc.bias.value = concat_bias
+        inter = self.fc(hidden_states)
+        if self.hidden_act == 'silu':
+            inter = ACT2FN['swiglu'](inter)
+        else:
+            raise NotImplementedError(
+                f"Activation {self.hidden_act} not yet implemented for FusedGatedMLP"
+            )
+        output = self.proj(inter, workspace)
         return output

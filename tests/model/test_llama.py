@@ -318,6 +318,9 @@ class TestLLaMA(unittest.TestCase):
             ctx_shape[f'past_key_value_{i}'] = kv_shape
             ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             ctx_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
+            ctx_buffer[f'host_max_kv_cache_length_{i}'] = torch.tensor(
+                [max_seq_len], dtype=torch.int32)
+            ctx_shape[f'host_max_kv_cache_length_{i}'] = (1, )
         ctx_buffer['sequence_length'] = sequence_length_buffer
         ctx_shape['sequence_length'] = ctx_buffer['sequence_length'].shape
         ctx_shape['host_past_key_value_lengths'] = (batch_size, )
@@ -374,11 +377,14 @@ class TestLLaMA(unittest.TestCase):
 
         for i in range(llama_config.num_hidden_layers):
             step1_shape[f'past_key_value_{i}'] = kv_shape
+            step1_shape[f'host_max_kv_cache_length_{i}'] = (1, )
         step1_shape['sequence_length'] = (batch_size, )
         step1_shape['host_past_key_value_lengths'] = (batch_size, )
         for i in range(llama_config.num_hidden_layers):
             step1_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             step1_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
+            step1_buffer[f'host_max_kv_cache_length_{i}'] = torch.tensor(
+                [max_seq_len], dtype=torch.int32)
         step1_buffer[
             'host_past_key_value_lengths'] = sequence_length_buffer.cpu()
         sequence_length_buffer = torch.add(sequence_length_buffer, step)
@@ -427,10 +433,10 @@ class TestLLaMA(unittest.TestCase):
             expand_params(x) if isinstance(x, (list, tuple)) else str(x)
             for x in params
         ])
-        nam = expand_params(param.args)
+        name = expand_params(param.args)
         return "%s_%s" % (
             testcase_func.__name__,
-            parameterized.to_safe_name(nam),
+            parameterized.to_safe_name(name),
         )
 
     @parameterized.expand(get_loader_test_cases, name_func=loader_name_func)
@@ -448,14 +454,14 @@ class TestLLaMA(unittest.TestCase):
         if not meta_path.exists():
             pytest.skip(f"Skipping since the path {meta_path} does not exist.")
 
-        def print_corner(nam, t: np.ndarray):
+        def print_corner(name, t: np.ndarray):
             if len(t.shape) == 1:
                 tl = t[:2]
                 br = t[-2:]
             elif len(t.shape) == 2:
                 tl = t[:2, :2]
                 br = t[-2:, -2:]
-            print(nam, np.concatenate([tl, br]).flatten())
+            print(name, np.concatenate([tl, br]).flatten())
 
         def print_layers(m: tensorrt_llm.models.LLaMAForCausalLM):
             print_corner("vocab", m.vocab_embedding.weight._value)

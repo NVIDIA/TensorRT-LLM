@@ -54,15 +54,17 @@ public:
     class ForwardParams : public SoftmaxParams
     {
     public:
-        ForwardParams(
-            int step, int ite, tc::Tensor logits, tc::Tensor endIds, tc::Tensor src_cache_indirection, int max_seq_len)
+        ForwardParams(int step, int ite, tc::Tensor logits, tc::Tensor endIds, tc::Tensor src_cache_indirection,
+            int max_kv_cache_length, int max_seq_len)
             : SoftmaxParams(step, ite, std::move(logits), std::move(endIds))
             , src_cache_indirection{std::move(src_cache_indirection)}
+            , max_kv_cache_length{max_kv_cache_length}
             , max_seq_len{max_seq_len}
         {
         }
 
         // mandatory parameters
+        int max_kv_cache_length;
         int max_seq_len;
         tc::Tensor src_cache_indirection; // [local_batch_size, beam_width, max_seq_len]
 
@@ -101,18 +103,20 @@ protected:
     size_t topk_softmax_workspace_size_;
     void* topk_softmax_workspace_ = nullptr;
 
-    float mTemperature;
-    int mMinLength;
-    float mRepetitionPenalty;
+    std::vector<float> mTemperature;
+    std::vector<int> mMinLength;
+    std::vector<float> mRepetitionPenalty;
+    float* temperature_buf_;
+    int* min_lengths_buf_;
+    float* repetition_penalty_buf_;
     tensorrt_llm::kernels::RepetitionPenaltyType mRepetitionPenaltyType;
-
-    virtual void allocateBuffer(size_t batch_size, size_t beam_width) = 0;
 
     virtual void invokeSoftMax(BeamSearchOutputParams& outputs, SoftmaxParams const& params) = 0;
 
-    void setupBase(SetupParams const& setupParams);
+    void setupBase(size_t batch_size, SetupParams const& setupParams);
 
 private:
+    void allocateBuffer(size_t batch_size);
     void freeBuffer();
 };
 

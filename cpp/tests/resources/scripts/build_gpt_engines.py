@@ -41,7 +41,7 @@ def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, world_size, *args):
         '--builder_opt=0',
         f'--world_size={world_size}',
     ] + list(args)
-    print("Runnning: " + " ".join(args))
+    print("Running: " + " ".join(args))
     _egb.run_build(args)
 
 
@@ -147,7 +147,8 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
                  engine_dir / 'fp16-plugin-packed-paged' / tp_pp_dir, tp_size,
                  '--dtype=float16', '--use_gpt_attention_plugin=float16',
                  '--remove_input_padding', '--paged_kv_cache',
-                 '--enable_context_fmha', '--max_num_tokens=10000')
+                 '--enable_context_fmha_fp32_acc', '--max_num_tokens=10000',
+                 '--max_draft_len=5')
 
     print("Done.")
 

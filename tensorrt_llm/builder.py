@@ -21,6 +21,8 @@ from typing import Optional, Union
 import tensorrt as trt
 from packaging import version
 
+from tensorrt_llm.quantization import QuantMode
+
 from ._utils import to_dict, to_json_file, trt_version
 from .logger import logger
 from .network import Network
@@ -99,7 +101,6 @@ class Builder():
                               tensor_parallel: int = 1,
                               use_refit: bool = False,
                               int8: bool = False,
-                              fp8: bool = False,
                               strongly_typed: bool = False,
                               opt_level: Optional[int] = None,
                               **kwargs) -> BuilderConfig:
@@ -114,6 +115,7 @@ class Builder():
         '''
         self.strongly_typed = strongly_typed
 
+        quant_mode = kwargs.get("quant_mode", QuantMode(0))
         if not strongly_typed and precision not in self._ALLOWED_PRECISIONS:
             logger.error(
                 f"precision should be one of {self._ALLOWED_PRECISIONS}")
@@ -125,6 +127,8 @@ class Builder():
 
         config = self.trt_builder.create_builder_config()
         if not strongly_typed:
+            fp8 = quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache()
+
             if precision == 'float16':
                 config.set_flag(trt.BuilderFlag.FP16)
                 config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
@@ -173,7 +177,6 @@ class Builder():
                                      tensor_parallel=tensor_parallel,
                                      use_refit=use_refit,
                                      int8=int8,
-                                     fp8=fp8,
                                      **kwargs)
 
     def _add_optimization_profile(self, network: Network,

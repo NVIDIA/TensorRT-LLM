@@ -1,0 +1,15 @@
+datasets~=2.3.2
+evaluate~=0.4.1
+rouge_score~=0.1.2
+transformers~=4.33.1
+transformers-stream-generator
+sentencepiece~=0.1.99
+tiktoken
+einops
+
+# optional dependencies
+gradio==3.40.1
+mdtex2html
+sse_starlette
+aiohttp_sse_client
+openai

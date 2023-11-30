@@ -114,7 +114,8 @@ void BufferManager::copy(IBuffer const& src, void* dst, MemoryType dstType) cons
 
 void BufferManager::copy(IBuffer const& src, IBuffer& dst) const
 {
-    TLLM_CHECK_WITH_INFO(src.getDataType() == dst.getDataType(), "Incompatible data types");
+    TLLM_CHECK_WITH_INFO(src.getDataType() == dst.getDataType(),
+        tc::fmtstr("Incompatible data types: %s != %s", src.getDataTypeName(), dst.getDataTypeName()));
     TLLM_CHECK_WITH_INFO(src.getSizeInBytes() == dst.getSizeInBytes(),
         tc::fmtstr("Incompatible buffer sizes: %lu != %lu", src.getSizeInBytes(), dst.getSizeInBytes()));
     copy(src, dst.data(), dst.getMemoryType());
@@ -191,4 +192,50 @@ void BufferManager::initMemoryPool(int device)
     // set memory pool threshold to avoid shrinking the pool
     auto maxThreshold = std::numeric_limits<std::uint64_t>::max();
     TLLM_CUDA_CHECK(cudaMemPoolSetAttribute(memPool, cudaMemPoolAttrReleaseThreshold, &maxThreshold));
+}
+
+std::size_t BufferManager::memoryPoolReserved(int device)
+{
+    ::cudaMemPool_t memPool;
+    TLLM_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&memPool, device));
+    std::size_t reserved = 0;
+    TLLM_CUDA_CHECK(cudaMemPoolGetAttribute(memPool, cudaMemPoolAttrReservedMemCurrent, &reserved));
+    return reserved;
+}
+
+std::size_t BufferManager::memoryPoolUsed(int device)
+{
+    ::cudaMemPool_t memPool;
+    TLLM_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&memPool, device));
+    std::size_t used = 0;
+    TLLM_CUDA_CHECK(cudaMemPoolGetAttribute(memPool, cudaMemPoolAttrUsedMemCurrent, &used));
+    return used;
+}
+
+void BufferManager::memoryPoolTrimTo(int device, std::size_t size)
+{
+    ::cudaMemPool_t memPool;
+    TLLM_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&memPool, device));
+    TLLM_CUDA_CHECK(cudaMemPoolTrimTo(memPool, size));
+}
+
+std::size_t BufferManager::memoryPoolReserved() const
+{
+    return memoryPoolReserved(mStream->getDevice());
+}
+
+std::size_t BufferManager::memoryPoolUsed() const
+{
+    return memoryPoolUsed(mStream->getDevice());
+}
+
+std::size_t BufferManager::memoryPoolFree() const
+{
+    return memoryPoolFree(mStream->getDevice());
+}
+
+void BufferManager::memoryPoolTrimTo(std::size_t size)
+{
+    mStream->synchronize();
+    memoryPoolTrimTo(mStream->getDevice(), size);
 }

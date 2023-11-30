@@ -59,7 +59,7 @@ def preprocess_groupwise_weight_params(qweight_unpacked_int8, scales_fp16,
     preprocessor = torch.ops.fastertransformer.preprocess_weights_for_mixed_gemm
 
     qweight_interleaved = preprocessor(packer(qweight_unpacked_int8),
-                                       torch.quint4x2).view(torch.float32)
+                                       torch.quint4x2).view(torch.int8)
 
     # zeros = zeros * scales
     zeros_x_scales_fp16 = (-qzeros_unpacked_int8 + 8 * UINT4_TO_INT4_FLAG -

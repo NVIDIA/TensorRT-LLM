@@ -5,14 +5,12 @@ multiple GPUs or multiple nodes with multiple GPUs.
 
 ## Overview
 
-The TensorRT-LLM GPT implementation can be found in [`tensorrt_llm/models/gpt/model.py`](../../tensorrt_llm/models/gpt/model.py). The TensorRT-LLM GPT example
-code is located in [`examples/gpt`](./). There are four main files in that folder:
+The TensorRT-LLM GPT implementation can be found in [`tensorrt_llm/models/gpt/model.py`](../../tensorrt_llm/models/gpt/model.py). The TensorRT-LLM GPT example code is located in [`examples/gpt`](./). There are three main files:
 
  * [`hf_gpt_convert.py`](./hf_gpt_convert.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers)
     format to the [FasterTransformer (FT)](https://github.com/NVIDIA/FasterTransformer) format,
  * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the GPT model,
- * [`run.py`](./run.py) to run the inference on an input text,
- * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
+ * [`run.py`](./run.py) to run the inference on an input text.
 
 ## Support Matrix
   * FP16
@@ -40,9 +38,9 @@ rm -rf gpt2 && git clone https://huggingface.co/gpt2-medium gpt2
 pushd gpt2 && rm pytorch_model.bin model.safetensors && wget -q https://huggingface.co/gpt2-medium/resolve/main/pytorch_model.bin && popd
 ```
 
-### 2. Convert weights from HF Tranformers to FT format
+### 2. Convert weights from HF Transformers to FT format
 
-TensorRT-LLM can directly load weights from FT. The [`hf_gpt_convert.py`](./hf_gpt_convert.py) script allows you to convert weights from HF Tranformers
+TensorRT-LLM can directly load weights from FT. The [`hf_gpt_convert.py`](./hf_gpt_convert.py) script allows you to convert weights from HF Transformers
 format to FT format.
 
 ```bash
@@ -206,7 +204,7 @@ mpirun -np 4 python3 run.py --engine_dir santacoder_outputs_tp4 --tokenizer ./sa
 
 ## GPT Variant - StarCoder
 
-For StarCoder, the steps are similar execpt that `santacoder` is swapped with `starcoder`.
+For StarCoder, the steps are similar except that `santacoder` is swapped with `starcoder`.
 
 ```bash
 git clone https://huggingface.co/bigcode/starcoder
@@ -257,17 +255,18 @@ python3 build.py --model_dir=./c-model/gpt2/fp16/1-gpu \
                  --hidden_act gelu
 ```
 
-The summarization can be done using the [`summarize.py`](./summarize.py) script as follows:
+The summarization can be done using the [`../summarize.py`](../summarize.py) script as follows:
 
 ```bash
 # Run the summarization task.
-python3 summarize.py --engine_dir trt_engine/gpt2/fp16/1-gpu \
-                     --test_hf \
-                     --batch_size 1 \
-                     --test_trt_llm \
-                     --hf_model_location=gpt2 \
-                     --check_accuracy \
-                     --tensorrt_llm_rouge1_threshold=14
+python3 ../summarize.py --engine_dir trt_engine/gpt2/fp16/1-gpu \
+                        --hf_model_dir gpt2 \
+                        --test_trt_llm \
+                        --test_hf \
+                        --batch_size 1 \
+                        --check_accuracy \
+                        --tensorrt_llm_rouge1_threshold=14 \
+                        --no_add_special_tokens
 ```
 
 ## SmoothQuant
@@ -523,9 +522,9 @@ python3 build.py --model_dir=./c-model/gpt2/2-gpu --dtype float16 --world_size=2
 ### 3. Embedding sharing
 In some examples, the embedding lookup table is used both in embedding() and lm_head() layers. Sharing the embedding lookup table can reduce memory consumption.
 
-With flag `--use_embedding_sharing` for  `build.py`, we will try to enable this feature. However it only takes effect when the following criterias are met:
+With flag `--use_embedding_sharing` for  `build.py`, we will try to enable this feature. However it only takes effect when the following criteria are met:
 - The weight is shared between two layers. If we found the weight for lm_head() layer, we cannot enable it.
-- For muliple processes case, `--use_parallel_embedding` must be set. And we only support sharing when the embedding lookup table is sharded along the vocab dimension (`--embedding_sharding_dim 0`, as is the default value), which minimizes the overall communication cost.
+- For multiple processes case, `--use_parallel_embedding` must be set. And we only support sharing when the embedding lookup table is sharded along the vocab dimension (`--embedding_sharding_dim 0`, as is the default value), which minimizes the overall communication cost.
 - For TensorRT 9.0 version, the engine size is expected to be reduced when the lookup and gemm plugin are enabled.
 
 Here is an example for using embedding parallelism and sharing feature:
@@ -534,5 +533,5 @@ python3 hf_gpt_convert.py -i gpt2 -o ./c-model/gpt2 --tensor-parallelism 2 --sto
 
 python3 build.py --model_dir=./c-model/gpt2/2-gpu --dtype bfloat16 --world_size=2 --remove_input_padding --use_gpt_attention_plugin --use_gemm_plugin --parallel_build --max_input_len 1000 --use_parallel_embedding --embedding_sharding_dim 0 --use_lookup_plugin --use_embedding_sharing --output_dir=trt_engine/gpt2/bfloat16/2-gpu
 
-mpirun -np 2 python3 summarize.py --engine_dir trt_engine/gpt2/bfloat16/2-gpu --batch_size 10 --test_trt_llm --check_accuracy --tensorrt_llm_rouge1_threshold=14 --dataset_path ./dataset
+mpirun -np 2 python3 ../summarize.py --engine_dir trt_engine/gpt2/bfloat16/2-gpu --hf_model_dir gpt2 --batch_size 10 --test_trt_llm --check_accuracy --tensorrt_llm_rouge1_threshold=14 --dataset_path ./dataset --no_add_special_tokens
 ```

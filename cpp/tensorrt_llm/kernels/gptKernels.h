@@ -30,8 +30,11 @@ enum class AttentionMaskType
     PADDING = 0,
     // Mask the padded tokens and all the tokens that come after in a sequence.
     CAUSAL = 1,
-    // See ChatGLM mask.
-    BIDIRECTIONAL = 2
+    // See ChatGLM-6B mask.
+    BIDIRECTIONAL = 2,
+    // See GLM-10B mask.
+    // TODO: merge this mask into BIDIRECTIONAL
+    BIDIRECTIONALGLM = 3
 };
 
 enum class PositionEmbeddingType : int8_t
@@ -58,7 +61,7 @@ struct BuildDecoderInfoParams
 {
     // The offsets to the 1st token in each sequence. Shape: [batchSize+1].
     int* seqOffsets;
-    // The number of padded tokens in the corresponding padded tensor. Shape: [numTokens].
+    // The number of padded tokens in the corresponding padded tensor before the current token. Shape: [numTokens].
     int* paddingOffsets;
 
     // The mask to mark invalid tokens in Attention - that's not used by the plugins as it can be
@@ -73,6 +76,9 @@ struct BuildDecoderInfoParams
     int batchSize;
     // The maximum length of a sequence; it includes input and output.
     int maxSeqLength;
+    // The kv cache capacity.
+    // We will apply the limited_length_causal mask when there are not enough kv cache.
+    int maxKvCacheLength;
     // The number of tokens in total. It's \sum_{ii=0}^{batchSize} seqLengths[ii].
     int numTokens;
     // The type of attention.

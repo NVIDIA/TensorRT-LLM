@@ -385,7 +385,10 @@ int GemmPlugin::initialize() noexcept
     return 0;
 }
 
-void GemmPlugin::destroy() noexcept {}
+void GemmPlugin::destroy() noexcept
+{
+    delete this;
+}
 
 size_t GemmPlugin::getSerializationSize() const noexcept
 {

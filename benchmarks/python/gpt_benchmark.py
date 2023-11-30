@@ -24,8 +24,7 @@ import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.layers import PositionEmbeddingType
-from tensorrt_llm.models import (fp8_quantize, smooth_quantize,
-                                 weight_only_quantize)
+from tensorrt_llm.models import quantize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
@@ -57,10 +56,11 @@ class GPTBenchmark(BaseBenchmark):
         self.refit = refit
         self.num_beams = num_beams
         self.build_time = 0
-        self.mode = mode  # plugin or ootb
+        self.mode = mode  # plugin or ootb or ootb-except-mha
         self.fuse_bias = True
 
         self.cuda_graph_mode = kwargs.get('enable_cuda_graph', False)
+        self.strongly_typed = kwargs.get('strongly_typed', False)
         self.enable_custom_all_reduce = enable_custom_all_reduce
 
         if engine_dir is not None:
@@ -73,30 +73,35 @@ class GPTBenchmark(BaseBenchmark):
             # Build engine
             self.world_size = tensorrt_llm.mpi_world_size()
             self.apply_query_key_layer_scaling = False
-            self.use_smooth_quant = False
-            # this attribute is not stored in allowed_config
-            self.enable_fp8 = kwargs.get('enable_fp8', False)
-            self.fp8_kv_cache = kwargs.get('fp8_kv_cache', False)
 
             self.use_weight_only = False
+            self.per_group = False
             self.weight_only_precision = 'int8'
             self.per_token = False
             self.per_channel = False
 
-            is_plugin_mode = mode == 'plugin'
-            plg_dtype = dtype if is_plugin_mode else False
-            self.use_gpt_attention_plugin = plg_dtype
-            self.use_gemm_plugin = plg_dtype
+            use_mha_plugin = mode == 'plugin' or mode == 'ootb-except-mha'
+            mha_plg_dtype = dtype if use_mha_plugin else False
+            use_non_mha_plugin = mode == 'plugin'
+            non_mha_plg_dtype = dtype if use_non_mha_plugin else False
+
+            self.use_gpt_attention_plugin = mha_plg_dtype
+            self.use_gemm_plugin = non_mha_plg_dtype
             # Starting TRT9.1 OOTB norm layer sees improvement over plugin norm layer
             self.use_layernorm_plugin = False
             self.use_rmsnorm_plugin = False
-            self.use_lookup_plugin = plg_dtype
-            self.enable_context_fmha = True
-            self.quant_mode = QuantMode(0)
-            self.remove_input_padding = is_plugin_mode
+            self.use_lookup_plugin = non_mha_plg_dtype
+            self.enable_context_fmha = use_mha_plugin
+
+            self.remove_input_padding = use_non_mha_plugin
 
             for key, value in get_build_config(model_name).items():
                 setattr(self, key, value)
+
+            if self.quantization is None:
+                self.quantization = kwargs.get('quantization', None)
+
+            self.set_quantization()
 
             # Override the n_position/max_input_len/max_output_len/max_batch_size to value from cmd line if that's specified.
             if n_positions is not None:
@@ -123,22 +128,6 @@ class GPTBenchmark(BaseBenchmark):
                 self.num_kv_heads = self.num_heads
             if kwargs.get('force_num_layer_1', False):
                 self.num_layers = 1
-
-            if self.use_smooth_quant:
-                self.quant_mode = QuantMode.use_smooth_quant(
-                    self.per_token, self.per_channel)
-            elif self.use_weight_only:
-                self.quant_mode = QuantMode.use_weight_only(
-                    self.weight_only_precision == 'int4')
-
-            if self.enable_fp8:
-                self.quant_mode = self.quant_mode.set_fp8_qdq()
-
-            if self.fp8_kv_cache:
-                # Watch out, enable_fp8 and fp8_kv_cache are not exclusive
-                assert self.use_gpt_attention_plugin, "GPT attention plugin needed"
-                self.quant_mode = self.quant_mode.set_fp8_kv_cache()
-
             engine_buffer = self.build()
 
         assert engine_buffer is not None
@@ -161,7 +150,16 @@ class GPTBenchmark(BaseBenchmark):
                 num_beams=num_beams,
                 top_k=top_k,
                 top_p=top_p)
-            self.decoder = tensorrt_llm.runtime.ChatGLM6BHeadModelGenerationSession(
+            self.decoder = tensorrt_llm.runtime.ChatGLMGenerationSession(
+                model_config, engine_buffer, self.runtime_mapping)
+        elif model_name in ['chatglm2_6b', 'chatglm3_6b']:
+            self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
+                end_id=2,
+                pad_id=0,
+                num_beams=num_beams,
+                top_k=top_k,
+                top_p=top_p)
+            self.decoder = tensorrt_llm.runtime.GenerationSession(
                 model_config, engine_buffer, self.runtime_mapping)
         else:
             self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
@@ -202,6 +200,75 @@ class GPTBenchmark(BaseBenchmark):
         self.decoder.setup(batch_size, inlen, outlen, beam_width=self.num_beams)
         return (input_ids, input_lengths)
 
+    def set_quantization(self):
+        self.quant_mode = QuantMode(0)
+
+        if self.quantization == "fp8":
+            self.strongly_typed = True
+            self.quant_mode = self.quant_mode.set_fp8_qdq()
+            self.quant_mode = self.quant_mode.set_fp8_kv_cache()
+
+        elif self.quantization == "fp8_gemm":
+            self.strongly_typed = True
+            self.quant_mode = self.quant_mode.set_fp8_qdq()
+
+        elif self.quantization == "fp8_kv_cache":
+            self.strongly_typed = True
+            self.quant_mode = self.quant_mode.set_fp8_kv_cache()
+
+        elif self.quantization == "int8_sq_per_tensor":
+            self.use_smooth_quant = True
+            self.quant_mode = QuantMode.use_smooth_quant(
+                self.per_token, self.per_channel)
+
+        elif self.quantization == "int8_sq_per_token_channel":
+            self.use_smooth_quant = True
+            self.per_token = True
+            self.per_channel = True
+            self.quant_mode = QuantMode.use_smooth_quant(
+                self.per_token, self.per_channel)
+
+        elif self.quantization == "int8_weight_only":
+            self.use_smooth_quant = False
+            self.use_weight_only = True
+            self.weight_only_precision = 'int8'
+            self.quant_mode = QuantMode.use_weight_only(False)
+
+        elif self.quantization == "int4_weight_only":
+            self.use_weight_only = True
+            self.weight_only_precision = 'int4'
+            self.quant_mode = QuantMode.use_weight_only(True)
+
+        elif self.quantization == "int4_weight_only_awq":
+            self.use_weight_only = True
+            self.per_group = True
+            self.weight_only_precision = 'int4_awq'
+            self.quant_mode = QuantMode.from_description(
+                quantize_weights=True,
+                quantize_activations=False,
+                per_token=False,
+                per_channel=False,
+                per_group=True,
+                use_int4_weights=True)
+
+        elif self.quantization == "int4_weight_only_gptq":
+            self.use_weight_only = True
+            self.per_group = True
+            self.weight_only_precision = 'int4_gptq'
+            self.quant_mode = QuantMode.from_description(
+                quantize_weights=True,
+                quantize_activations=False,
+                per_token=False,
+                per_channel=False,
+                per_group=True,
+                use_int4_weights=True)
+
+        elif self.quantization == None:
+            pass
+
+        else:
+            raise Exception(f'{0} is invalid config: {self.quantization}')
+
     def build(self):
         builder = Builder()
         builder_config = builder.create_builder_config(
@@ -222,10 +289,10 @@ class GPTBenchmark(BaseBenchmark):
             max_input_len=self.max_input_len,
             max_output_len=self.max_output_len,
             int8=self.quant_mode.has_act_and_weight_quant(),
-            fp8=self.quant_mode.has_fp8_qdq(),
             quant_mode=self.quant_mode,
             use_refit=self.refit,
-            opt_level=self.builder_opt)
+            opt_level=self.builder_opt,
+            strongly_typed=self.strongly_typed)
         engine_name = get_engine_name(self.model_name, self.dtype,
                                       self.world_size, self.runtime_rank)
 
@@ -312,7 +379,7 @@ class GPTBenchmark(BaseBenchmark):
                 apply_query_key_layer_scaling=builder_config.
                 apply_query_key_layer_scaling)
         elif family == "chatglm":
-            tensorrt_llm_model = tensorrt_llm.models.ChatGLM6BHeadModel(
+            tensorrt_llm_model = tensorrt_llm.models.ChatGLMHeadModel(
                 num_layers=self.num_layers,
                 num_heads=self.num_heads,
                 hidden_size=self.hidden_size,
@@ -325,7 +392,40 @@ class GPTBenchmark(BaseBenchmark):
                     tp_size=self.world_size),  # TP only
                 apply_query_key_layer_scaling=builder_config.
                 apply_query_key_layer_scaling,
-                quant_mode=self.quant_mode)
+                quant_mode=self.quant_mode,
+                model_name="chatglm_6b")
+        elif family == "chatglm2":
+            tensorrt_llm_model = tensorrt_llm.models.ChatGLMHeadModel(
+                num_layers=self.num_layers,
+                num_heads=self.num_heads,
+                hidden_size=self.hidden_size,
+                vocab_size=self.vocab_size,
+                hidden_act=self.hidden_act,
+                max_position_embeddings=self.n_positions,
+                dtype=kv_dtype,
+                mapping=tensorrt_llm.Mapping(
+                    world_size=self.world_size,
+                    tp_size=self.world_size),  # TP only
+                apply_query_key_layer_scaling=builder_config.
+                apply_query_key_layer_scaling,
+                quant_mode=self.quant_mode,
+                model_name="chatglm2_6b")
+        elif family == "chatglm3":
+            tensorrt_llm_model = tensorrt_llm.models.ChatGLMHeadModel(
+                num_layers=self.num_layers,
+                num_heads=self.num_heads,
+                hidden_size=self.hidden_size,
+                vocab_size=self.vocab_size,
+                hidden_act=self.hidden_act,
+                max_position_embeddings=self.n_positions,
+                dtype=kv_dtype,
+                mapping=tensorrt_llm.Mapping(
+                    world_size=self.world_size,
+                    tp_size=self.world_size),  # TP only
+                apply_query_key_layer_scaling=builder_config.
+                apply_query_key_layer_scaling,
+                quant_mode=self.quant_mode,
+                model_name="chatglm3_6b")
         elif family == "bloom":
             tensorrt_llm_model = tensorrt_llm.models.BloomForCausalLM(
                 num_layers=self.num_layers,
@@ -337,6 +437,7 @@ class GPTBenchmark(BaseBenchmark):
                 mapping=tensorrt_llm.Mapping(
                     world_size=self.world_size,
                     tp_size=self.world_size),  # TP only
+                quant_mode=self.quant_mode,
                 use_parallel_embedding=(self.model_name == 'bloom_176b'))
         elif family == "falcon":
             tensorrt_llm_model = tensorrt_llm.models.FalconForCausalLM(
@@ -348,6 +449,7 @@ class GPTBenchmark(BaseBenchmark):
                 max_position_embeddings=self.n_positions,
                 dtype=kv_dtype,
                 bias=self.bias,
+                quant_mode=self.quant_mode,
                 use_alibi=self.use_alibi,
                 new_decoder_architecture=self.new_decoder_architecture,
                 parallel_attention=self.parallel_attention,
@@ -356,27 +458,34 @@ class GPTBenchmark(BaseBenchmark):
         else:
             raise Exception(f'Unexpected model: {self.model_name}')
 
-        if self.use_smooth_quant:
-            tensorrt_llm_model = smooth_quantize(tensorrt_llm_model,
-                                                 self.quant_mode)
-        elif self.use_weight_only and self.weight_only_precision == 'int8':
-            tensorrt_llm_model = weight_only_quantize(
-                tensorrt_llm_model, QuantMode.use_weight_only())
-        elif self.use_weight_only and self.weight_only_precision == 'int4':
-            tensorrt_llm_model = weight_only_quantize(
-                tensorrt_llm_model,
-                QuantMode.use_weight_only(use_int4_weights=True))
-        elif self.enable_fp8 or self.fp8_kv_cache:
-            tensorrt_llm_model = fp8_quantize(tensorrt_llm_model,
-                                              self.quant_mode)
+        quant_kwargs = {}
+        if family == "llama" and self.use_weight_only:
+            if self.weight_only_precision == 'int4_awq':
+                quant_kwargs = {
+                    "group_size": 128,
+                    "zero": False,
+                    "pre_quant_scale": True,
+                    "exclude_modules": [],
+                }
+            elif self.weight_only_precision == 'int4_gptq':
+                quant_kwargs = {
+                    "group_size": 128,
+                    "zero": True,
+                    "pre_quant_scale": False,
+                }
+        tensorrt_llm_model = quantize_model(tensorrt_llm_model, self.quant_mode,
+                                            **quant_kwargs)
 
         # Module -> Network
         network = builder.create_network()
         network.trt_network.name = engine_name
+
+        not_fp8_quantization = self.quantization is None or "fp8" not in self.quantization
+
         if self.use_gpt_attention_plugin:
             network.plugin_config.set_gpt_attention_plugin(
                 dtype=self.use_gpt_attention_plugin)
-        if self.use_gemm_plugin:
+        if self.use_gemm_plugin and not_fp8_quantization:
             network.plugin_config.set_gemm_plugin(dtype=self.use_gemm_plugin)
         if self.use_layernorm_plugin:
             network.plugin_config.set_layernorm_plugin(
@@ -409,7 +518,7 @@ class GPTBenchmark(BaseBenchmark):
             network.plugin_config.set_nccl_plugin(self.dtype,
                                                   self.enable_custom_all_reduce)
 
-        # Use the plugin for the embedding parallism and sharing
+        # Use the plugin for the embedding parallelism and sharing
         network.plugin_config.set_lookup_plugin(dtype=self.use_lookup_plugin)
 
         with net_guard(network):

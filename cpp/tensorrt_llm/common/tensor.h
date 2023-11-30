@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
+#include <functional>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -227,10 +228,6 @@ public:
     std::string toString() const;
     std::string getNumpyTypeDesc(DataType type) const;
 
-    void saveNpy(const std::string& filename) const;
-    static Tensor loadNpy(const std::string& npy_file, const MemoryType where);
-
-    static DataType typeFromNumpyDesc(std::string type);
     static size_t getTypeSize(DataType type);
 
     template <typename T>
@@ -413,10 +410,6 @@ public:
     }
 
     Tensor slice(std::vector<size_t> shape, size_t offset = 0) const;
-
-private:
-    static void parseNpyIntro(FILE*& f_ptr, uint32_t& header_len, uint32_t& start_data);
-    static int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, DataType& type, std::vector<size_t>& shape);
 };
 
 class TensorMap
@@ -638,8 +631,6 @@ public:
     }
 
     std::string toString();
-    static TensorMap fromNpyFolder(const std::string& base_folder);
-    void saveNpy(const std::string& base_folder);
 };
 
 } // namespace common

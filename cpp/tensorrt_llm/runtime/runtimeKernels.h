@@ -31,8 +31,8 @@ template <typename T>
 void invokeFillBatch(
     IBuffer& buffer, IBuffer const& indices, std::size_t stride, IBuffer const& values, CudaStream const& stream);
 
-template <typename T>
-void invokeCopyBatch(IBuffer const&, IBuffer&, IBuffer const&, IBuffer const&, std::size_t, CudaStream const&);
+void invokeCopyBatch(IBuffer const& srcBuffer, IBuffer& dstBuffer, IBuffer const& srcOffsets, IBuffer const& dstOffsets,
+    IBuffer const& sizes, std::size_t maxStride, CudaStream const& stream);
 
 template <typename T>
 void invokeAdd(IBuffer& buffer, T value, CudaStream const& stream);
@@ -68,6 +68,10 @@ void invokeCopyInputToOutput(
 void invokeCopyPackedInputToOutput(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputOffsets,
     SizeType maxInputLength, SizeType padId, CudaStream const& stream);
 
+void initOutputIds(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputLengths,
+    ITensor const& inputOffsets, TokenIdType padId, TokenIdType endId, SizeType maxInputLength, bool inputPacked,
+    CudaStream const& stream);
+
 void scatterTensor(ITensor& output, ITensor const& input, SizeType beamWidth, CudaStream const& stream);
 
 void tileTensor(ITensor& output, ITensor const& input, SizeType beamWidth, CudaStream const& stream);
@@ -76,5 +80,8 @@ void tileTensorInplace(ITensor& tensor, SizeType beamWidth, CudaStream const& st
 
 void gatherLastTokenLogits(
     ITensor& output, ITensor const& input, ITensor const& lastTokenIds, CudaStream const& stream);
+
+void copyLatestTokenLogitsInGeneration(ITensor& output, ITensor const& input, SizeType step, SizeType firstBatchSlotIdx,
+    SizeType microBatchSize, SizeType beamWidth, CudaStream const& stream);
 
 } // namespace tensorrt_llm::runtime::kernels

@@ -68,84 +68,108 @@ struct MemoryTypeString<MemoryType::kPINNED>
 
 //! \brief For converting a TensorRT data type to a C++ data type.
 template <nvinfer1::DataType kDataType, bool kIsUnsigned = false, bool kIsPointer = false>
-struct CppDataType
+struct DataTypeTraits
 {
 };
 
 template <>
-struct CppDataType<nvinfer1::DataType::kFLOAT>
+struct DataTypeTraits<nvinfer1::DataType::kFLOAT>
 {
     using type = float;
+    static char constexpr name[] = "float";
+    static auto constexpr size = sizeof(type);
 };
 
 template <>
-struct CppDataType<nvinfer1::DataType::kHALF>
+struct DataTypeTraits<nvinfer1::DataType::kHALF>
 {
     using type = half;
+    static char constexpr name[] = "half";
+    static auto constexpr size = sizeof(type);
 };
 
 template <>
-struct CppDataType<nvinfer1::DataType::kINT8>
+struct DataTypeTraits<nvinfer1::DataType::kINT8>
 {
     using type = std::int8_t;
+    static char constexpr name[] = "int8";
+    static auto constexpr size = sizeof(type);
 };
 
 template <>
-struct CppDataType<nvinfer1::DataType::kINT32>
+struct DataTypeTraits<nvinfer1::DataType::kINT32>
 {
     using type = std::int32_t;
+    static char constexpr name[] = "int32";
+    static auto constexpr size = sizeof(type);
 };
 
 template <>
-struct CppDataType<nvinfer1::DataType::kINT64>
+struct DataTypeTraits<nvinfer1::DataType::kINT64>
 {
     using type = std::int64_t;
+    static char constexpr name[] = "int64";
+    static auto constexpr size = sizeof(type);
 };
 
 template <>
-struct CppDataType<nvinfer1::DataType::kINT32, true>
+struct DataTypeTraits<nvinfer1::DataType::kINT32, true>
 {
     using type = std::uint32_t;
+    static char constexpr name[] = "uint32";
+    static auto constexpr size = sizeof(type);
 };
 
 template <>
-struct CppDataType<nvinfer1::DataType::kINT64, true>
+struct DataTypeTraits<nvinfer1::DataType::kINT64, true>
 {
     using type = std::uint64_t;
+    static char constexpr name[] = "uint64";
+    static auto constexpr size = sizeof(type);
 };
 
 template <bool kUnsigned>
-struct CppDataType<nvinfer1::DataType::kBOOL, kUnsigned>
+struct DataTypeTraits<nvinfer1::DataType::kBOOL, kUnsigned>
 {
     using type = bool;
+    static char constexpr name[] = "bool";
+    static auto constexpr size = sizeof(type);
 };
 
 template <bool kUnsigned>
-struct CppDataType<nvinfer1::DataType::kUINT8, kUnsigned>
+struct DataTypeTraits<nvinfer1::DataType::kUINT8, kUnsigned>
 {
     using type = std::uint8_t;
+    static char constexpr name[] = "uint8";
+    static auto constexpr size = sizeof(type);
 };
 
 #ifdef ENABLE_BF16
 template <>
-struct CppDataType<nvinfer1::DataType::kBF16>
+struct DataTypeTraits<nvinfer1::DataType::kBF16>
 {
     using type = __nv_bfloat16;
+    static char constexpr name[] = "bfloat16";
+    static auto constexpr size = sizeof(type);
 };
 #endif
 
 #ifdef ENABLE_FP8
 template <>
-struct CppDataType<nvinfer1::DataType::kFP8>
+struct DataTypeTraits<nvinfer1::DataType::kFP8>
 {
     using type = __nv_fp8_e4m3;
+    static char constexpr name[] = "fp8";
+    static auto constexpr size = sizeof(type);
 };
 #endif
 
 template <nvinfer1::DataType kDataType, bool kUnsigned>
-struct CppDataType<kDataType, kUnsigned, true>
+struct DataTypeTraits<kDataType, kUnsigned, true>
 {
-    using type = typename CppDataType<kDataType, kUnsigned, false>::type*;
+    using type = typename DataTypeTraits<kDataType, kUnsigned, false>::type*;
+    static char constexpr name[] = "*";
+    static auto constexpr size = sizeof(type);
 };
 
 //! \brief A wrapper around `nvinfer1::DataType` that provides a support for pointer types.
@@ -377,10 +401,14 @@ public:
     //!
     [[nodiscard]] virtual DataType getDataType() const = 0;
 
+    virtual char const* getDataTypeName() const;
+
     //!
     //! \brief Returns the memory type of the buffer.
     //!
     [[nodiscard]] virtual MemoryType getMemoryType() const = 0;
+
+    virtual char const* getMemoryTypeName() const;
 
     //!
     //! \brief Resizes the buffer. This is a no-op if the new size is smaller than or equal to the current capacity.

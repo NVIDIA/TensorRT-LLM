@@ -79,7 +79,7 @@ class TestFunctional(unittest.TestCase):
         ref = ref.reshape(batch_size, num_heads, 1, seq_len)
 
         # We only require that the alibi bias matches in the "valid" regions. Our TRT,
-        # implementation differs in this regard for efficieny reasons but it does not matter
+        # implementation differs in this regard for efficiency reasons but it does not matter
         # because these values will get masked before the softmax.
         binary_mask = binary_mask.cpu().numpy().reshape(batch_size, 1, 1,
                                                         seq_len)

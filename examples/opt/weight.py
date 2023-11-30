@@ -37,9 +37,9 @@ def split(v, tp_size, idx, dim=0):
     if tp_size == 1:
         return v
     if len(v.shape) == 1:
-        return np.ascontiguousarray(np.split(v, tp_size)[idx])
+        return np.ascontiguousarray(np.split(v, tp_size)[idx].copy())
     elif len(v.shape) == 2:
-        return np.ascontiguousarray(np.split(v, tp_size, axis=dim)[idx])
+        return np.ascontiguousarray(np.split(v, tp_size, axis=dim)[idx].copy())
     return None
 
 
@@ -106,7 +106,7 @@ def load_from_ft(tensorrt_llm_gpt: OPTLMHeadModel,
     if pe is not None:
         tensorrt_llm_gpt.embedding.position_embedding.weight.value = (pe)
 
-    # For tensor parallism for vocab_embedding.weight
+    # For tensor parallelism for vocab_embedding.weight
     vocab_embedding_weight = fromfile(dir_path, 'model.wte.bin',
                                       [vocab_size, n_embd])
     if not use_parallel_embedding:
@@ -165,9 +165,7 @@ def load_from_ft(tensorrt_llm_gpt: OPTLMHeadModel,
         if use_weight_only:
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            # workaround for trt not supporting int8 inputs in plugins currently
-            dst.value = processed_torch_weights.view(
-                dtype=torch.float32).numpy()
+            dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_gpt.layers[i].attention.qkv.per_channel_scale
             scales.value = torch_weight_scales.numpy()
         else:
@@ -185,9 +183,7 @@ def load_from_ft(tensorrt_llm_gpt: OPTLMHeadModel,
         if use_weight_only:
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            # workaround for trt not supporting int8 inputs in plugins currently
-            dst.value = processed_torch_weights.view(
-                dtype=torch.float32).numpy()
+            dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_gpt.layers[
                 i].attention.dense.per_channel_scale
             scales.value = torch_weight_scales.numpy()
@@ -215,9 +211,7 @@ def load_from_ft(tensorrt_llm_gpt: OPTLMHeadModel,
         if use_weight_only:
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            # workaround for trt not supporting int8 inputs in plugins currently
-            dst.value = processed_torch_weights.view(
-                dtype=torch.float32).numpy()
+            dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_gpt.layers[i].mlp.fc.per_channel_scale
             scales.value = torch_weight_scales.numpy()
         else:
@@ -235,9 +229,7 @@ def load_from_ft(tensorrt_llm_gpt: OPTLMHeadModel,
         if use_weight_only:
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
-            # workaround for trt not supporting int8 inputs in plugins currently
-            dst.value = processed_torch_weights.view(
-                dtype=torch.float32).numpy()
+            dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_gpt.layers[i].mlp.proj.per_channel_scale
             scales.value = torch_weight_scales.numpy()
         else:

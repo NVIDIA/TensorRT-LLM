@@ -5,16 +5,17 @@ This document explains how to build the [GPT-J](https://huggingface.co/EleutherA
 ## Overview
 
 The TensorRT-LLM GPT-J implementation can be found in [`tensorrt_llm/models/gptj/model.py`](../../tensorrt_llm/models/gptj/model.py). The TensorRT-LLM GPT-J example
-code is located in [`examples/gptj`](./). There are three main files in that folder:
+code is located in [`examples/gptj`](./). There are two main files:
 
  * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the GPT-J model,
- * [`run.py`](./run.py) to run the inference on an input text,
- * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
+ * [`run.py`](./run.py) to run the inference on an input text.
 
 ## Support Matrix
   * FP16
   * FP8
-  * INT4 Weight-Only
+  * INT8 & INT4 per-channel weight-only
+  * Groupwise quantization (AWQ)
+  * INT8 KV CACHE (+ AWQ/per-channel weight-only)
   * FP8 KV CACHE
 
 ## Usage
@@ -115,7 +116,6 @@ python build.py --model_dir gptj_model \
                 --dtype float16 \
                 --use_gpt_attention_plugin float16 \
                 --enable_context_fmha \
-                --enable_two_optimization_profiles \
                 --output_dir gptj_engine_fp8_quantized \
                 --enable_fp8 \
                 --fp8_kv_cache \
@@ -130,12 +130,73 @@ If you find that the default fp16 accumulation (`--enable_context_fmha`) cannot 
 
 Note `--enable_context_fmha` / `--enable_context_fmha_fp32_acc` has to be used together with `--use_gpt_attention_plugin float16`.
 
+#### INT8 KV cache
+INT8 KV cache could be enabled to reduce memory footprint. It will bring more performance gains when batch size gets larger.
+
+You can get the INT8 scale of KV cache through `hf_gptj_convert.py`:
+```bash
+# Enable INT8 calibration, and save scales
+python hf_gptj_convert.py -i gptj_model -o gptj_int8_model --calibrate-kv-cache -t float16
+```
+Now the FT-format checkpoint with INT8 KV cache scales is saved to `gptj_int8_model/1-gpu`.
+You can pass this `gptj_int8_model/1-gpu` directory to `build.py` through the argument called `--ft_model_dir`.
+
+INT8 KV cache could be combined with either per-channel INT8/INT4 weight-only quantization or per-group INT4 quantization (which is AWQ, actually).
+
+**INT8 KV cache + per-channel weight-only quantization**
+
+For example, you can enable INT8 KV cache together with per-channel INT8/INT4 weight-only quantization like the following command.
+
+**NOTE**: The whole checkpoint together with INT8 KV scales are passed to `--ft_model_dir`.
+```bash
+# Enable INT8 KV cache together with per-channel INT8 weight-only quantization
+python3 build.py --dtype=float16 \
+                 --log_level=verbose \
+                 --enable_context_fmha \
+                 --use_gpt_attention_plugin float16 \
+                 --use_gemm_plugin float16 \
+                 --max_batch_size=32 \
+                 --max_input_len=1919 \
+                 --max_output_len=128 \
+                 --remove_input_padding \
+                 --output_dir=gptj_engine_wo_int8_kv_cache \
+                 --use_weight_only \
+                 --weight_only_precision=int8 \
+                 --int8_kv_cache \
+                 --ft_model_dir=gptj_ft_model/1-gpu/
+```
+
+**INT8 KV cache + AWQ**
+
+In addition, you can enable INT8 KV cache together with AWQ (per-group INT4 weight-only quantization)like the following command.
+
+**NOTE**: AWQ checkpoint is passed through `--model_dir`, and the INT8 scales of KV cache is through `--ft_model_dir`.
+```bash
+# Enable INT8 KV cache together with AWQ
+python3 build.py --dtype=float16 \
+                 --log_level=verbose \
+                 --enable_context_fmha \
+                 --use_gpt_attention_plugin float16 \
+                 --use_gemm_plugin float16 \
+                 --max_batch_size=32 \
+                 --max_input_len=1919 \
+                 --max_output_len=128 \
+                 --remove_input_padding \
+                 --output_dir=gptj_engine_awq_int8_kv_cache/ \
+                 --use_weight_only \
+                 --per_group \
+                 --weight_only_precision=int4 \
+                 --model_dir=awq_int4_weight_only_quantized_models \
+                 --int8_kv_cache \
+                 --ft_model_dir=gptj_ft_model/1-gpu/
+```
+
 #### FP8 KV cache
 
 One can enable FP8 for KV cache to reduce memory footprint used by KV cache and improve the accuracy over INT8 KV cache. There are 3 options need to be added to the invocation of `build.py` for that:
 
 - `--enable_fp8` enables FP8 GEMMs in the network.
-- `--fp8_kv_cache` to enable FP8 accurancy for KV cache.
+- `--fp8_kv_cache` to enable FP8 accuracy for KV cache.
 - `--quantized_fp8_model_path` to provide path to the quantized model calibrated for FP8. For more details see [quantization docs](../quantization/README.md).
 
 #### AWQ INT4 weight only quantization
@@ -157,7 +218,7 @@ The linear layer in the AWQ int4 weight only quantized weights should have 3 par
 To run a TensorRT-LLM GPT-J model:
 
 ```bash
-python3 run.py --max_output_len=50 --engine_dir=gptj_engine
+python3 run.py --max_output_len=50 --engine_dir=gptj_engine --hf_model_location=gptj_model
 ```
 
 ## Summarization using the GPT-J model
@@ -173,19 +234,18 @@ As previously explained, the first step is to build the TensorRT engine as descr
 pip install -r requirements.txt
 ```
 
-The summarization can be done using the [`summarize.py`](./summarize.py) script as follows:
+The summarization can be done using the [`../summarize.py`](../summarize.py) script as follows:
 
 ```bash
 # Run the summarization task.
-python3 summarize.py --engine_dir gptj_engine \
-                     --model_dir gptj_model \
-                     --test_hf \
-                     --batch_size 1 \
-                     --test_trt_llm \
-                     --tensorrt_llm_rouge1_threshold 14 \
-                     --data_type fp16 \
-                     --check_accuracy
-
+python3 ../summarize.py --engine_dir gptj_engine \
+                        --hf_model_dir gptj_model \
+                        --test_hf \
+                        --batch_size 1 \
+                        --test_trt_llm \
+                        --tensorrt_llm_rouge1_threshold 14 \
+                        --data_type fp16 \
+                        --check_accuracy
 ```
 
 ## Known issues

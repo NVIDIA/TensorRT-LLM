@@ -83,7 +83,7 @@ mkdir -p build && cd build
 cmake .. && make
 cd ..
 ```
-As mentioned in the previouse section, it is necessary to have the TensorRT-LLM C++ runtime library.
+As mentioned in the previous section, it is necessary to have the TensorRT-LLM C++ runtime library.
 If you want to specify the library paths, run:
 ```bash
 cmake -DTRT_LIB_DIR=</path/to/trt_lib> -DTRT_INCLUDE_DIR=</path/to/trt_headers> -DTRT_LLM_LIB_DIR=</path/to/trt_llm_lib> -DTRT_LLM_INCLUDE_DIR=</path/to/trt_llm_headers> ..
@@ -121,9 +121,9 @@ It is recommended to manually update the generated functions by `link.py` to ret
 ### 2. The shared memory required by a generated kernel may exceed the hardware limitation.
 
 The AoT compiler does not verify the limitations of shared memory size during compilation time, which could potentially lead to the out-of-resource errors during runtime.
-It would be helpful to verify if the requirment of the dynamic shared meory size in a generated kernel exceeds the hardware limitation.
+It would be helpful to verify if the requirement of the dynamic shared memory size in a generated kernel exceeds the hardware limitation.
 You can find the number at the line of `cuLaunchKernel` call in the generated `.c` file.
-For instnace, the shared memory size is 114690 btyes in our example.
+For instance, the shared memory size is 114690 bytes in our example.
 ```c++
 CUresult fmha_d64_fp16_0eb6b090_0d1d2d3d4d5d67(CUstream stream, unsigned int gX, unsigned int gY, unsigned int gZ, CUdeviceptr Out, CUdeviceptr L, CUdeviceptr M, CUdeviceptr Q, CUdeviceptr K, CUdeviceptr V, float sm_scale, int32_t seq_len) {
     if (fmha_d64_fp16_0eb6b090_0d1d2d3d4d5d67_func == NULL)
