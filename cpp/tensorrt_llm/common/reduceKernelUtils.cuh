@@ -296,6 +296,11 @@ struct TopK
 
     __device__ __forceinline__ void insert(T elem, int elem_id)
     {
+        if (elem_id < 0)
+        {
+            return;
+        }
+
         if (elem > u[MAX_K - 1] || (p[MAX_K - 1] == -1) || ((elem == u[MAX_K - 1]) && (elem_id < p[MAX_K - 1])))
         // if (elem > u[MAX_K-1] || ((elem == u[MAX_K-1]) && (elem_id < p[MAX_K-1])))
         {

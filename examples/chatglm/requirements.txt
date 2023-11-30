@@ -1,0 +1,5 @@
+datasets~=2.14.5
+evaluate~=0.4.1
+protobuf
+rouge_score~=0.1.2
+sentencepiece

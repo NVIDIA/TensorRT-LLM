@@ -240,7 +240,7 @@ class CppCodeTranspiler:
         self.name_to_dim.clear()
 
         is_left_identical_dims = self.is_cur_identical_dims(lefts[0])
-        # process left, and record the named dimentions
+        # process left, and record the named dimensions
         for left in lefts:
             arg_name = left.arg_name
             argument = self.name_to_arg[arg_name]

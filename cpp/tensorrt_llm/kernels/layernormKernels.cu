@@ -198,12 +198,10 @@ void dispatch_layernorm_type_square_method(const T* input, const T* gamma, const
     float* scale_orig_quant_per_token, int8_t* normed_output_quant, const dim3 grid, const dim3 block,
     const size_t shmem_size, cudaStream_t stream)
 {
-    bool use_shmem = true;
     if (shmem_size >= (48 << 10))
     {
         cudaError_t ret = cudaFuncSetAttribute(
             generalLayerNorm<T, USE_DIFF_OF_SQUARES>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size);
-        use_shmem = ret == cudaSuccess;
     }
     generalLayerNorm<T, USE_DIFF_OF_SQUARES><<<grid, block, shmem_size, stream>>>(input, gamma, beta, normed_output,
         eps, tokens, hidden_dim, scale_orig_quant_per_tensor, scale_orig_quant_per_token, normed_output_quant, true);

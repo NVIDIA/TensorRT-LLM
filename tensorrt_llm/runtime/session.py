@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import tensorrt as trt
+import torch
 
 from .._utils import trt_dtype_to_torch
 from ..logger import logger
@@ -144,9 +145,30 @@ class Session(object):
             logger.info(
                 f"Tensor:{name=:}, {mode=:}, {shape=:}, {dtype=:}, {tformat=:}")
 
-    def infer_shapes(self,
-                     inputs: List[TensorInfo],
-                     context=None) -> List[TensorInfo]:
+    def set_shapes(self,
+                   tensor_dict: Dict[str, torch.Tensor],
+                   context: Optional[trt.IExecutionContext] = None):
+        if context is None:
+            context = self.context
+
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                ok = context.set_input_shape(name, tensor_dict[name].shape)
+                logger.debug(
+                    f"setting input tensor {name} with shape {tensor_dict[name].shape}"
+                )
+                if not ok:
+                    raise ValueError(
+                        f"Couldn't assign {name} with shape {tensor_dict[name].shape}, "
+                        f"engine supports [min, opt, max] = {self.engine.get_profile_shape(context.active_optimization_profile, name)}"
+                    )
+
+    def infer_shapes(
+            self,
+            inputs: List[TensorInfo],
+            context: Optional[trt.IExecutionContext] = None
+    ) -> List[TensorInfo]:
         '''
         @brief: Set input shapes to given context, and infer the output shapes from the given input shapes.
                This function should be called every time when the input shapes are changed before calling run().
@@ -160,12 +182,13 @@ class Session(object):
             context = self.context
         for i in inputs:
             if self.engine.get_tensor_mode(i.name) != trt.TensorIOMode.INPUT:
-                logger.error(f"Tensor:{i.name} is not an input tensor")
-                return None
+                raise ValueError(f"Tensor:{i.name} is not an input tensor")
             if self.engine.get_tensor_dtype(i.name) != i.dtype:
-                logger.error(f"Tensor:{i.name} has wrong dtype")
-                return None
-            context.set_input_shape(i.name, i.shape)
+                raise ValueError(f"Tensor:{i.name} has wrong dtype")
+            if not context.set_input_shape(i.name, i.shape):
+                raise RuntimeError(
+                    f"Could not set shape {i.shape} for tensor {i.name}. Please check the profile range for which your model was build."
+                )
 
         outputs = []
         for i in range(self.engine.num_io_tensors):

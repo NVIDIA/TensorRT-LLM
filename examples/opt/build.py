@@ -25,7 +25,7 @@ from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import weight_only_quantize
+from tensorrt_llm.models import quantize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
@@ -108,6 +108,14 @@ def parse_arguments():
     parser.add_argument('--enable_context_fmha_fp32_acc',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--multi_block_mode',
+        default=False,
+        action='store_true',
+        help=
+        'Split long kv sequence into multiple blocks (applied to generation MHA kernels). \
+                        It is beneifical when batchxnum_heads cannot fully utilize GPU.'
+    )
     parser.add_argument('--gpus_per_node', type=int, default=8)
     parser.add_argument(
         '--output_dir',
@@ -184,6 +192,13 @@ def parse_arguments():
         help=
         "Activates the lookup plugin which enables embedding sharing. It is also required for language modeling embedding weight sharing."
     )
+    parser.add_argument(
+        '--strongly_typed',
+        default=False,
+        action="store_true",
+        help=
+        'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
+    )
     args = parser.parse_args()
     if args.use_weight_only:
         args.quant_mode = QuantMode.use_weight_only(
@@ -251,8 +266,8 @@ def build_rank_engine(builder: Builder,
         embedding_sharding_dim=args.embedding_sharding_dim,
         share_embedding_table=share_embedding_table)
     if args.use_weight_only:
-        tensorrt_llm_gpt = weight_only_quantize(tensorrt_llm_gpt,
-                                                args.quant_mode)
+        tensorrt_llm_gpt = quantize_model(tensorrt_llm_gpt, args.quant_mode)
+
     if args.model_dir is not None:
         load_from_ft(tensorrt_llm_gpt,
                      args.model_dir,
@@ -282,6 +297,8 @@ def build_rank_engine(builder: Builder,
     if args.enable_context_fmha_fp32_acc:
         network.plugin_config.set_context_fmha(
             ContextFMHAType.enabled_with_fp32_acc)
+    if args.multi_block_mode:
+        network.plugin_config.enable_mmha_multi_block_mode()
     if args.use_weight_only:
         assert (args.dtype == 'float16')
         network.plugin_config.set_weight_only_quant_matmul_plugin(
@@ -313,6 +330,7 @@ def build_rank_engine(builder: Builder,
     if rank == 0:
         config_path = os.path.join(args.output_dir, 'config.json')
         builder.save_config(builder_config, config_path)
+
     return engine
 
 
@@ -341,11 +359,14 @@ def build(rank, args):
             hidden_act=args.hidden_act,
             max_position_embeddings=args.n_positions,
             max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
-            use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
-            int8=(args.quant_mode.has_act_and_weight_quant()
-                  or args.quant_mode.has_int8_kv_cache()))
+            max_prompt_embedding_table_size=args.
+            max_prompt_embedding_table_size,
+            int8=(args.quant_mode.has_act_or_weight_quant()
+                  or args.quant_mode.has_int8_kv_cache()),
+            strongly_typed=args.strongly_typed)
 
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.world_size,
                                       cur_rank)
@@ -359,6 +380,7 @@ def build(rank, args):
                 cache = builder_config.trt_builder_config.get_timing_cache()
 
         serialize_engine(engine, os.path.join(args.output_dir, engine_name))
+        del engine
 
     if rank == 0:
         ok = builder.save_timing_cache(

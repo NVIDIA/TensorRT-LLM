@@ -18,10 +18,11 @@ import pynvml
 
 
 def get_memory_info(handle):
-    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle,
+                                              version=pynvml.nvmlMemory_v2)
     total = round(mem_info.total / 1024 / 1024 / 1024, 2)
     used = round(mem_info.used / 1024 / 1024 / 1024, 2)
-    free = round(mem_info.used / 1024 / 1024 / 1024, 2)
+    free = round(mem_info.free / 1024 / 1024 / 1024, 2)
     return total, used, free
 
 

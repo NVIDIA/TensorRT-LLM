@@ -16,23 +16,17 @@
 
 #pragma once
 
+#include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
+
 #include <cstdlib>
+#include <memory>
 #include <mpi.h>
 #include <stdio.h>
 #include <unordered_map>
 #include <vector>
 
 #define COMM_WORLD MpiComm(MPI_COMM_WORLD)
-#define MPICHECK(cmd)                                                                                                  \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        int e = cmd;                                                                                                   \
-        if (e != MPI_SUCCESS)                                                                                          \
-        {                                                                                                              \
-            printf("Failed: MPI error %s:%d '%d'\n", __FILE__, __LINE__, e);                                           \
-            exit(EXIT_FAILURE);                                                                                        \
-        }                                                                                                              \
-    } while (0)
+#define MPICHECK(cmd) TLLM_MPI_CHECK(cmd)
 
 // A wrapper module of the MPI library.
 namespace tensorrt_llm::mpi
@@ -44,9 +38,14 @@ enum MpiType
     MPI_TYPE_BYTE,
     MPI_TYPE_CHAR,
     MPI_TYPE_INT,
+    MPI_TYPE_FLOAT,
+    MPI_TYPE_DOUBLE,
     MPI_TYPE_INT64_T,
+    MPI_TYPE_INT32_T,
+    MPI_TYPE_UINT64_T,
     MPI_TYPE_UINT32_T,
     MPI_TYPE_UNSIGNED_LONG_LONG,
+    MPI_TYPE_SIZETYPE,
 };
 
 // A wrapper of MPI_Op type.
@@ -85,6 +84,22 @@ struct MpiComm
         : group(g){};
 };
 
+class MpiRequest
+{
+public:
+    MpiRequest() {}
+
+    ~MpiRequest() {}
+
+    void wait()
+    {
+        // TODO: Don't ignore return status
+        MPI_Wait(&mRequest, MPI_STATUS_IGNORE);
+    }
+
+    MPI_Request mRequest;
+};
+
 MPI_Datatype getMpiDtype(MpiType dtype);
 
 void initialize(int* argc, char*** argv);
@@ -97,6 +112,7 @@ void barrier();
 int getCommWorldRank();
 int getCommWorldSize();
 
+std::shared_ptr<MpiRequest> bcast_async(void* buffer, size_t size, MpiType dtype, int root, MpiComm comm);
 void bcast(void* buffer, size_t size, MpiType dtype, int root, MpiComm comm);
 void bcast(std::vector<int64_t>& packed, int root, MpiComm comm);
 void comm_split(MpiComm comm, int color, int key, MpiComm* newcomm);

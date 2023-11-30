@@ -19,6 +19,7 @@ Welcome to TensorRT-LLM's documentation!
    2023-05-19-how-to-debug.md
    2023-05-17-how-to-add-a-new-model.md
    graph-rewriting.md
+   memory.md
 
 Python API
 ----------
@@ -27,7 +28,7 @@ Python API
 - :doc:`tensorrt_llm.functional <python-api/tensorrt_llm.functional>`
 - :doc:`tensorrt_llm.models <python-api/tensorrt_llm.models>`
 - :doc:`tensorrt_llm.plugin <python-api/tensorrt_llm.plugin>`
-- :doc:`tensorrt_llm.qunatization <python-api/tensorrt_llm.quantization>`
+- :doc:`tensorrt_llm.quantization <python-api/tensorrt_llm.quantization>`
 - :doc:`tensorrt_llm.runtime <python-api/tensorrt_llm.runtime>`
 
 

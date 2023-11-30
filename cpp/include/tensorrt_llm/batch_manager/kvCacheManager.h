@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/batch_manager/kvCacheConfig.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -31,6 +32,16 @@
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
+
+using SizeType = tensorrt_llm::runtime::SizeType;
+
+struct KvCacheStats
+{
+    SizeType maxNumBlocks;
+    SizeType freeNumBlocks;
+    SizeType usedNumBlocks;
+    SizeType toksPerBlock;
+};
 
 // Basic building block of a paged KV cache - a single
 // cache block. This class just holds metadata, no pointers
@@ -173,6 +184,11 @@ public:
         return mFreeBlocks.size();
     }
 
+    [[nodiscard]] std::size_t getNumAllocatedBlocks() const
+    {
+        return mAllocatedBlocks.size();
+    }
+
     [[nodiscard]] bool hasFreeBlocks(std::size_t numRequired = 1) const
     {
         return getNumFreeBlocks() >= numRequired;
@@ -189,7 +205,7 @@ private:
     // List of allocated blocks for each sequences
     std::vector<std::vector<KVCacheBlock>> mAllocatedBlocks;
     // Used to keep track of number of free blocks during scheduling
-    SizeType mSchedulingNumFreeBlocks;
+    std::size_t mSchedulingNumFreeBlocks;
 };
 
 class KVCacheManager
@@ -201,7 +217,7 @@ public:
 
     KVCacheManager(SizeType numLayers, SizeType numHeads, SizeType numKvHeads, SizeType hiddenSize,
         SizeType tokensPerBlock, SizeType maxNumBlocks, SizeType maxBatchSize, SizeType maxBeamWidth,
-        SizeType maxBlocksPerSeq, nvinfer1::DataType dtype, CudaStreamPtr stream);
+        SizeType maxBlocksPerSeq, SizeType maxKvCacheLength, nvinfer1::DataType dtype, CudaStreamPtr stream);
 
     void startScheduling();
 
@@ -213,6 +229,27 @@ public:
     [[nodiscard]] SizeType getMaxNumBlocks() const
     {
         return mMaxNumBlocks;
+    }
+
+    [[nodiscard]] SizeType getUsedNumBlocks() const
+    {
+        return mBlockManager.getNumAllocatedBlocks();
+    }
+
+    [[nodiscard]] SizeType getNumFreeBlocks() const
+    {
+        return mBlockManager.getNumFreeBlocks();
+    }
+
+    [[nodiscard]] KvCacheStats getKvCacheStats() const
+    {
+        KvCacheStats kvCacheStats;
+        kvCacheStats.maxNumBlocks = getMaxNumBlocks();
+        kvCacheStats.freeNumBlocks = getNumFreeBlocks();
+        kvCacheStats.usedNumBlocks = getUsedNumBlocks();
+        kvCacheStats.toksPerBlock = getTokensPerBlock();
+
+        return kvCacheStats;
     }
 
     // Volume of [2, numKvHeads, tokensPerBlock, sizePerHead]
@@ -251,10 +288,11 @@ public:
 
     void schedulingRemoveSequence(SizeType batchSlotIdx);
 
-    void getBlockPointersOfBatch(runtime::ITensor::SharedPtr dstPointers, SizeType batchSize, SizeType beamWidth) const;
+    void getBlockPointersOfBatch(
+        runtime::ITensor& dstPointers, SizeType firstBatchSlotIdx, SizeType batchSize, SizeType beamWidth) const;
 
-    void copyBlockPointers(runtime::ITensor::SharedPtr dstPointers, SizeType dstSlotOffset, SizeType batchSlotIdx,
-        SizeType beamWidth) const;
+    void copyBlockPointers(
+        runtime::ITensor& dstPointers, SizeType dstSlotOffset, SizeType batchSlotIdx, SizeType beamWidth) const;
 
     // Volume of [2, numKvHeads, tokensPerBlock, sizePerHead]
     [[nodiscard]] static SizeType constexpr calculatePageSize(tensorrt_llm::runtime::GptModelConfig const& modelConfig)
@@ -270,7 +308,13 @@ public:
             * modelConfig.getSizePerHead();
     }
 
+    [[nodiscard]] static SizeType getMaxNumTokens(KvCacheConfig const& config, nvinfer1::DataType dtype,
+        tensorrt_llm::runtime::GptModelConfig const& modelConfig, tensorrt_llm::runtime::WorldConfig const& worldConfig,
+        runtime::BufferManager const& bufferManager);
+
 private:
+    void resetBlockPointers(SizeType batchSlotIdx, SizeType beamWidth);
+
     void cacheNewBlockPointer(const GenerationRequest& seq, SizeType batchSlotIdx);
 
 private:
@@ -286,6 +330,9 @@ private:
     SizeType mMaxBeamWidth;
     // Maximum number of blocks per sequence
     SizeType mMaxBlocksPerSeq;
+    // Maximum kv cache length per sequence
+    // Enable cyclic kv cache when it exceeds
+    SizeType mMaxKvCacheLength;
     // Pools
     std::vector<runtime::ITensor::SharedPtr> mPools;
     // Block manager

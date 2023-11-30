@@ -30,6 +30,8 @@ from transformers import GPT2Config, GPT2LMHeadModel
 import tensorrt_llm
 from tensorrt_llm import Builder
 from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm.functional import RotaryScalingType
+from tensorrt_llm.layers import PositionEmbeddingType
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
@@ -497,7 +499,8 @@ class TestGPT(unittest.TestCase):
             blocks = batch_size * beam_width * max_blocks_per_seq
             kv_cache_manager = KVCacheManager(key_value_cache_buffers, blocks,
                                               tokens_per_block,
-                                              max_blocks_per_seq, beam_width)
+                                              max_blocks_per_seq, total_length,
+                                              beam_width)
 
             # Add sequences to the manager
             for bi in range(batch_size):
@@ -513,6 +516,7 @@ class TestGPT(unittest.TestCase):
                        last_token_ids,
                        cache_indirection,
                        host_past_key_value_lengths,
+                       host_max_kv_cache_lengths,
                        sequence_length=None,
                        host_context_lengths=None):
 
@@ -543,12 +547,16 @@ class TestGPT(unittest.TestCase):
                     ctx_buffer[
                         f'kv_cache_block_pointers_{idx}'] = kv_cache_block_pointers[
                             idx].reshape(shape).contiguous()
+                    ctx_buffer[
+                        f'host_max_kv_cache_length_{idx}'] = host_max_kv_cache_lengths
             else:
                 for i in range(gpt_config.n_layer):
                     ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[
                         i]
                     ctx_buffer[
                         f'present_key_value_{i}'] = key_value_cache_buffers[i]
+                    ctx_buffer[
+                        f'host_max_kv_cache_length_{i}'] = host_max_kv_cache_lengths
 
             ctx_shape = {
                 key: buffer.shape
@@ -599,6 +607,8 @@ class TestGPT(unittest.TestCase):
 
             host_past_key_value_lengths = torch.tensor([0] * batch_size,
                                                        dtype=torch.int32)
+            host_max_kv_cache_lengths = torch.tensor([total_length],
+                                                     dtype=torch.int32)
 
             host_context_lengths = ctx_context_lengths.cpu(
             ) if enable_remove_input_padding else None
@@ -617,6 +627,7 @@ class TestGPT(unittest.TestCase):
                 last_token_ids=ctx_last_token_ids,
                 cache_indirection=cache_indirections[0],
                 host_past_key_value_lengths=host_past_key_value_lengths,
+                host_max_kv_cache_lengths=host_max_kv_cache_lengths,
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types)
@@ -667,6 +678,8 @@ class TestGPT(unittest.TestCase):
             host_past_key_value_lengths = torch.tensor([seq_len + step - 1] *
                                                        batch_size,
                                                        dtype=torch.int32)
+            host_max_kv_cache_lengths = torch.tensor([seq_len + step],
+                                                     dtype=torch.int32)
 
             host_context_lengths = gen_context_lengths.cpu(
             ) if enable_remove_input_padding else None
@@ -684,6 +697,7 @@ class TestGPT(unittest.TestCase):
                 last_token_ids=gen_last_token_ids,
                 cache_indirection=cache_indirections[1],
                 host_past_key_value_lengths=host_past_key_value_lengths,
+                host_max_kv_cache_lengths=host_max_kv_cache_lengths,
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types)
@@ -739,6 +753,9 @@ class TestGPT(unittest.TestCase):
                 [0] * num_context_input + [seq_len] * num_generation_input,
                 dtype=torch.int32)
 
+            host_max_kv_cache_lengths = torch.tensor([total_length],
+                                                     dtype=torch.int32)
+
             context_lengths = torch.tensor([seq_len] * batch_size,
                                            dtype=torch.int32).cuda()
             if enable_remove_input_padding:
@@ -761,6 +778,7 @@ class TestGPT(unittest.TestCase):
                 last_token_ids=gen_last_token_ids,
                 cache_indirection=cache_indirections[0],
                 host_past_key_value_lengths=host_past_key_value_lengths,
+                host_max_kv_cache_lengths=host_max_kv_cache_lengths,
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types,
@@ -882,6 +900,36 @@ class TestGPT(unittest.TestCase):
         ref = ref_output_ids[:, -max_new_tokens:]
 
         np.testing.assert_allclose(ref.cpu().numpy(), res.cpu().numpy())
+
+    def test_rope_scaling_is_set_in_attention(self):
+        num_layers = 2
+        position_embedding_type = PositionEmbeddingType.rope_gpt_neox
+        rotary_embedding_percentage = 0.3
+        rotary_base = 99999.1
+        rotary_scaling = {"type": "linear", "factor": 2.72}
+        tensorrt_llm_gpt = tensorrt_llm.models.GPTLMHeadModel(
+            num_layers=num_layers,
+            num_heads=4,
+            hidden_size=128,
+            vocab_size=256,
+            hidden_act='gelu',
+            max_position_embeddings=1024,
+            dtype=trt.float16,
+            position_embedding_type=position_embedding_type,
+            rotary_embedding_percentage=rotary_embedding_percentage,
+            rotary_base=rotary_base,
+            rotary_scaling=rotary_scaling,
+        )
+        for layer_i in range(num_layers):
+            assert tensorrt_llm_gpt.layers[
+                layer_i].attention.rotary_embedding_base == rotary_base
+            assert tensorrt_llm_gpt.layers[
+                layer_i].attention.rotary_embedding_scale == rotary_scaling[
+                    "factor"]
+            assert tensorrt_llm_gpt.layers[
+                layer_i].attention.rotary_embedding_scale_type == RotaryScalingType.linear
+            assert tensorrt_llm_gpt.layers[
+                layer_i].attention.position_embedding_type == position_embedding_type
 
 
 if __name__ == '__main__':

@@ -17,6 +17,7 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/bufferView.h"
 
@@ -78,4 +79,32 @@ std::ostream& tensorrt_llm::runtime::operator<<(std::ostream& output, IBuffer co
     auto tensor = ITensor::wrap(data, buffer.getDataType(),
         ITensor::makeShape({static_cast<SizeType>(buffer.getSize())}), buffer.getCapacity());
     return output << *tensor;
+}
+
+char const* IBuffer::getDataTypeName() const
+{
+    switch (getDataType())
+    {
+    case nvinfer1::DataType::kINT64: return DataTypeTraits<nvinfer1::DataType::kINT64>::name;
+    case nvinfer1::DataType::kINT32: return DataTypeTraits<nvinfer1::DataType::kINT32>::name;
+    case nvinfer1::DataType::kFLOAT: return DataTypeTraits<nvinfer1::DataType::kFLOAT>::name;
+    case nvinfer1::DataType::kBF16: return DataTypeTraits<nvinfer1::DataType::kBF16>::name;
+    case nvinfer1::DataType::kHALF: return DataTypeTraits<nvinfer1::DataType::kHALF>::name;
+    case nvinfer1::DataType::kBOOL: return DataTypeTraits<nvinfer1::DataType::kBOOL>::name;
+    case nvinfer1::DataType::kUINT8: return DataTypeTraits<nvinfer1::DataType::kUINT8>::name;
+    case nvinfer1::DataType::kINT8: return DataTypeTraits<nvinfer1::DataType::kINT8>::name;
+    case nvinfer1::DataType::kFP8: return DataTypeTraits<nvinfer1::DataType::kFP8>::name;
+    }
+    TLLM_THROW("Unknown data type");
+}
+
+char const* IBuffer::getMemoryTypeName() const
+{
+    switch (getMemoryType())
+    {
+    case MemoryType::kPINNED: return MemoryTypeString<MemoryType::kPINNED>::value;
+    case MemoryType::kCPU: return MemoryTypeString<MemoryType::kCPU>::value;
+    case MemoryType::kGPU: return MemoryTypeString<MemoryType::kGPU>::value;
+    }
+    TLLM_THROW("Unknown memory type");
 }

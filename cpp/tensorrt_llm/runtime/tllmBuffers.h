@@ -101,7 +101,7 @@ public:
         TLLM_CHECK_WITH_INFO(static_cast<bool>(mCudaStream), "Undefined CUDA stream");
     }
 
-    CudaStreamPtr getCudaStream() const
+    [[nodiscard]] CudaStreamPtr getCudaStream() const
     {
         return mCudaStream;
     }
@@ -236,13 +236,14 @@ public:
     //!
     //! \brief Construct an empty buffer.
     //!
-    explicit GenericBuffer(nvinfer1::DataType type, TAllocator allocator = {})
+    explicit GenericBuffer(nvinfer1::DataType type, TAllocator allocator = {}) // NOLINT(*-pro-type-member-init)
         : GenericBuffer{0, type, std::move(allocator)} {};
 
     //!
     //! \brief Construct a buffer with the specified allocation size in number of elements.
     //!
-    explicit GenericBuffer(std::size_t size, nvinfer1::DataType type, TAllocator allocator = {})
+    explicit GenericBuffer( // NOLINT(*-pro-type-member-init)
+        std::size_t size, nvinfer1::DataType type, TAllocator allocator = {})
         : GenericBuffer{size, size, type, std::move(allocator)} {};
 
     GenericBuffer(GenericBuffer&& buf) noexcept
@@ -280,21 +281,21 @@ public:
     //!
     void* data() override
     {
-        return mBuffer;
+        return TLLM_LIKELY(mSize > 0) ? mBuffer : nullptr;
     }
 
     //!
     //! \brief Returns pointer to underlying array.
     //!
-    const void* data() const override
+    [[nodiscard]] void const* data() const override
     {
-        return mBuffer;
+        return TLLM_LIKELY(mSize > 0) ? mBuffer : nullptr;
     }
 
     //!
     //! \brief Returns the size (in number of elements) of the buffer.
     //!
-    std::size_t getSize() const override
+    [[nodiscard]] std::size_t getSize() const override
     {
         return mSize;
     }
@@ -302,7 +303,7 @@ public:
     //!
     //! \brief Returns the capacity of the buffer.
     //!
-    std::size_t getCapacity() const override
+    [[nodiscard]] std::size_t getCapacity() const override
     {
         return mCapacity;
     }
@@ -310,7 +311,7 @@ public:
     //!
     //! \brief Returns the type of the buffer.
     //!
-    nvinfer1::DataType getDataType() const override
+    [[nodiscard]] nvinfer1::DataType getDataType() const override
     {
         return mType;
     }
@@ -318,7 +319,7 @@ public:
     //!
     //! \brief Returns the memory type of the buffer.
     //!
-    MemoryType getMemoryType() const override
+    [[nodiscard]] MemoryType getMemoryType() const override
     {
         return mAllocator.getMemoryType();
     }
@@ -328,11 +329,7 @@ public:
     //!
     void resize(std::size_t newSize) override
     {
-        if (newSize == 0)
-        {
-            release();
-        }
-        else if (mCapacity < newSize)
+        if (mCapacity < newSize)
         {
             mAllocator.deallocate(mBuffer, toBytes(mCapacity));
             mBuffer = mAllocator.allocate(toBytes(newSize));
@@ -444,7 +441,7 @@ public:
         return *this;
     }
 
-    nvinfer1::Dims const& getShape() const override
+    [[nodiscard]] nvinfer1::Dims const& getShape() const override
     {
         return mDims;
     }
@@ -457,15 +454,7 @@ public:
 
     void resize(std::size_t newSize) override
     {
-        if (newSize != getSize())
-        {
-            using dimType = std::remove_reference_t<decltype(mDims.d[0])>;
-            auto constexpr max_size = std::numeric_limits<dimType>::max();
-            TLLM_CHECK_WITH_INFO(newSize <= max_size, "New size is too large. Use reshape() instead.");
-            Base::resize(newSize);
-            mDims.nbDims = 1;
-            mDims.d[0] = static_cast<dimType>(newSize);
-        }
+        ITensor::resize(newSize);
     }
 
     void release() override

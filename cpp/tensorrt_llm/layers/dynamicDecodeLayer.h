@@ -22,6 +22,7 @@
 #include "tensorrt_llm/layers/onlineBeamSearchLayer.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
 #include "tensorrt_llm/layers/topPSamplingLayer.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 
 #include <optional>
 #include <string>
@@ -69,8 +70,8 @@ public:
         std::optional<std::vector<std::int32_t>> top_p_reset_ids; // [batch_size]
 
         // omlineBeamSearchLayer
-        std::optional<float> beam_search_diversity_rate;
-        std::optional<float> length_penalty;
+        std::optional<std::vector<float>> beam_search_diversity_rate;
+        std::optional<std::vector<float>> length_penalty;
     };
 
     void setup(size_t batch_size, size_t beam_width, SetupParams const& setupParams);
@@ -78,10 +79,12 @@ public:
     class ForwardParams
     {
     public:
-        ForwardParams(int step, int ite, int maxInputLength, int localBatchSize, tc::Tensor logits, tc::Tensor endIds)
+        ForwardParams(int step, int ite, int maxInputLength, int maxKvCacheLength, int localBatchSize,
+            tc::Tensor logits, tc::Tensor endIds)
             : step{step}
             , ite{ite}
             , max_input_length{maxInputLength}
+            , max_kv_cache_length{maxKvCacheLength}
             , local_batch_size{localBatchSize}
             , logits{std::move(logits)}
             , end_ids{std::move(endIds)}
@@ -92,11 +95,13 @@ public:
         int step;
         int ite;
         int max_input_length;
+        int max_kv_cache_length;
         int local_batch_size;
         tc::Tensor logits;  // [batch_size, beam_width, vocab_size_padded], on gpu
         tc::Tensor end_ids; // [batch_size], on gpu
 
         // optional parameters
+        std::optional<tc::Tensor> finished;              // [batch_size * beam_width], optional
         std::optional<tc::Tensor> src_cache_indirection; // [local_batch_size, beam_width, max_seq_len] - the k/v cache
                                                          // index for beam search, mandatory for beam search, on gpu
         std::optional<tc::Tensor> sequence_limit_length; // [batch_size], on gpu
@@ -125,14 +130,16 @@ public:
         std::optional<tc::Tensor> parent_ids;      // [max_seq_len, batch_size * beam_width], necessary in beam search
         std::optional<tc::Tensor> sequence_length; // [batch_size * beam_width], optional
         std::optional<tc::Tensor>
-            output_log_probs;      // [request_ouptut_length, batch_size * beam_width], must be float*, optional
+            output_log_probs_tiled; // [request_output_length, batch_size, beam_width], must be float*, optional
         std::optional<tc::Tensor>
-            tgt_cache_indirection; // [local_batch_size, beam_width, max_seq_len], the k/v cache index for beam search
+            output_log_probs;       // [batchSize, beam_width, request_ouptut_length], must be float*, optional
+        std::optional<tc::Tensor>
+            tgt_cache_indirection;  // [local_batch_size, beam_width, max_seq_len], the k/v cache index for beam search
         std::shared_ptr<kernels::BeamHypotheses>
-            beamHypotheses;        // a special structure which maintains some pointers of beam search
+            beamHypotheses;         // a special structure which maintains some pointers of beam search
 
-        tc::Tensor output_ids_ptr; // [batch_size] int* (2-d array), each int* has [beam_width, max_seq_len]
-        tc::Tensor parent_ids_ptr; // [batch_size] int* (2-d array), each int* has [beam_width, max_seq_len]
+        tc::Tensor output_ids_ptr;  // [batch_size] int* (2-d array), each int* has [beam_width, max_seq_len]
+        tc::Tensor parent_ids_ptr;  // [batch_size] int* (2-d array), each int* has [beam_width, max_seq_len]
     };
 
     void forward(OutputParams& outputs, ForwardParams const& params);
@@ -149,9 +156,8 @@ private:
     size_t vocab_size_;
     size_t vocab_size_padded_;
     cudaDeviceProp* cuda_device_prop_;
-    int** output_ids_ptr = nullptr;
-    int** parent_ids_ptr = nullptr;
     int* zero_parent_ids = nullptr;
+    runtime::IBuffer::SharedPtr mIdsPtrHost;
 
     bool has_diff_runtime_args_ = false;
     int* h_pinned_finished_sum_ = nullptr;

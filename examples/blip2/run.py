@@ -42,7 +42,8 @@ def TRTOPT(args, config):
     vocab_size = config['builder_config']['vocab_size']
     num_layers = config['builder_config']['num_layers']
     remove_input_padding = config['plugin_config']['remove_input_padding']
-    use_prompt_tuning = config['builder_config']['use_prompt_tuning']
+    max_prompt_embedding_table_size = config['builder_config'].get(
+        'max_prompt_embedding_table_size', 0)
 
     model_config = tensorrt_llm.runtime.ModelConfig(
         vocab_size=vocab_size,
@@ -52,7 +53,7 @@ def TRTOPT(args, config):
         hidden_size=hidden_size,
         gpt_attention_plugin=use_gpt_attention_plugin,
         remove_input_padding=remove_input_padding,
-        use_prompt_tuning=use_prompt_tuning,
+        max_prompt_embedding_table_size=max_prompt_embedding_table_size,
         dtype=dtype)
 
     runtime_rank = tensorrt_llm.mpi_rank()
@@ -90,23 +91,18 @@ def ptuning_setup(prompt_table, dtype, hidden_size, tasks, input_ids,
         prompt_table = torch.empty([1, hidden_size]).cuda()
         task_vocab_size = torch.zeros([1]).cuda()
 
+    num_sequences = input_lengths.size(
+        0) if remove_input_padding else input_ids.size(0)
+
     if tasks is not None:
         tasks = torch.tensor([int(t) for t in tasks.split(',')],
                              dtype=torch.int32,
                              device="cuda")
-        assert tasks.shape[0] == input_ids.shape[
-            0], "Number of supplied tasks must match input batch size"
+        assert tasks.shape[
+            0] == num_sequences, "Number of supplied tasks must match input batch size"
     else:
-        tasks = torch.zeros([input_ids.size(0)], dtype=torch.int32).cuda()
+        tasks = torch.zeros([num_sequences], dtype=torch.int32).cuda()
 
-    if remove_input_padding:
-        tasks = torch.concat([
-            torch.full([input_lengths[b].item()],
-                       tasks[b].item(),
-                       dtype=torch.int32) for b in range(len(input_lengths))
-        ]).unsqueeze(0).cuda()
-    else:
-        tasks = tasks.unsqueeze(-1)  #.expand(*input_ids.shape)
     return [prompt_table, tasks, task_vocab_size]
 
 

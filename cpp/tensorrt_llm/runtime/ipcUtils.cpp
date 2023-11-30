@@ -60,7 +60,6 @@ IpcMemory::IpcMemory(WorldConfig worldConfig, std::size_t bufferSize)
 
 void IpcMemory::allocateIpcMemory()
 {
-    // void* mBufferPtr;
     TLLM_CUDA_CHECK(cudaMalloc(&mBufferPtr, mBufferSize));
     TLLM_CUDA_CHECK(cudaMemset(mBufferPtr, 0, mBufferSize));
 

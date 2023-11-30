@@ -28,19 +28,20 @@ template <typename T, int MAX_K>
 void topK_softMax_kernelLauncher(const T* log_probs, const T* bias, const bool* finished, const int* sequence_lengths,
     float* cum_log_probs, float* output_log_probs, int** output_ids_ptr, void* temp_storage,
     const int temp_storage_size, BeamHypotheses* beam_hyps, const int batch_size, const int beam_width,
-    const int vocab_size, const int* end_ids, T diversity_rate, const float length_penalty, cudaStream_t stream);
+    const int vocab_size, const int* end_ids, const float* diversity_rates, const float* length_penalties,
+    cudaStream_t stream);
 
 #define CASE_K(MAX_K)                                                                                                  \
     topK_softMax_kernelLauncher<T, MAX_K>(log_probs, bias, finished, sequence_lengths, cum_log_probs,                  \
         output_log_probs, output_ids_ptr, temp_storage, temp_storage_size, beam_hyps, batch_size, beam_width,          \
-        vocab_size, end_ids, diversity_rate, length_penalty, stream);                                                  \
+        vocab_size, end_ids, diversity_rates, length_penalties, stream);                                               \
     break;
 
 template <typename T>
 void invokeTopkSoftMax(const T* log_probs, const T* bias, const bool* finished, const int* sequence_lengths,
     float* cum_log_probs, float* output_log_probs, int** output_ids_ptr, void* temp_storage,
     const int temp_storage_size, BeamHypotheses* beam_hyps, const int batch_size, const int beam_width,
-    const int vocab_size, const int* end_ids, const float diversity_rate, const float length_penalty,
+    const int vocab_size, const int* end_ids, const float* diversity_rates, const float* length_penalties,
     cudaStream_t stream)
 {
     int log_beam_width(0);
@@ -51,18 +52,22 @@ void invokeTopkSoftMax(const T* log_probs, const T* bias, const bool* finished, 
     switch (log_beam_width)
     {
     // 0 < beam_width <= 4
-    case 0: // 1, 2
-    case 1: // 3, 4
+    case 0:        // 1, 2
+    case 1:        // 3, 4
         CASE_K(4)
-    case 2: // 4 < beam_width <= 8
+    case 2:        // 4 < beam_width <= 8
         CASE_K(8)
-    case 3: // 9 < beam_width <= 16
+#ifndef FAST_BUILD // For fast build, skip case 3, 4, 5
+    case 3:        // 9 < beam_width <= 16
         CASE_K(16)
-    case 4: // 16 < beam_width <= 32
+    case 4:        // 16 < beam_width <= 32
         CASE_K(32)
-    case 5: // 32 < beam_width <= 64
+    case 5:        // 32 < beam_width <= 64
         CASE_K(64)
-    default: throw std::runtime_error(fmtstr("Topk kernel of beam search does not support beam_width=%d", beam_width));
+#endif             // FAST_BUILD
+    default:
+        throw std::runtime_error(
+            fmtstr("%s:%d Topk kernel of beam search does not support beam_width=%d", __FILE__, __LINE__, beam_width));
     }
 }
 
@@ -71,13 +76,13 @@ void invokeTopkSoftMax(const T* log_probs, const T* bias, const bool* finished, 
 template void invokeTopkSoftMax<float>(const float* log_probs, const float* bias, const bool* finished,
     const int* sequence_lengths, float* cum_log_probs, float* output_log_probs, int** output_ids_ptr, void* tmp_storage,
     const int temp_storage_size, BeamHypotheses* beam_hyps, const int batch_size, const int beam_width,
-    const int vocab_size, const int* end_ids, const float diversity_rate, const float length_penalty,
+    const int vocab_size, const int* end_ids, const float* diversity_rates, const float* length_penalties,
     cudaStream_t stream);
 
 template void invokeTopkSoftMax<half>(const half* log_probs, const half* bias, const bool* finished,
     const int* sequence_lengths, float* cum_log_probs, float* output_log_probs, int** output_ids_ptr, void* tmp_storage,
     const int temp_storage_size, BeamHypotheses* beam_hyps, const int batch_size, const int beam_width,
-    const int vocab_size, const int* end_ids, const float diversity_rate, const float length_penalty,
+    const int vocab_size, const int* end_ids, const float* diversity_rates, const float* length_penalties,
     cudaStream_t stream);
 
 } // namespace kernels

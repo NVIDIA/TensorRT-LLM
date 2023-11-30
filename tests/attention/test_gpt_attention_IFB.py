@@ -71,53 +71,59 @@ class TestFunctional(unittest.TestCase):
         test_cases = []
         test_cases += list(
             product(['gpt2_attention', 'llama_attention', 'gptj_attention'],
-                    [ContextFMHAType.disabled], ['float16'], [2], [128], [4],
-                    [64], [0], [False], [False], [1], [True, False]))
+                    [ContextFMHAType.disabled], ['float16'], [2], [128], [8],
+                    [4], [64], [0], [False], [False], [1], [True, False]))
 
         # TODO: add more unit tests
         test_cases += list(
             product(['llama_attention'], [
                 ContextFMHAType.disabled, ContextFMHAType.enabled,
                 ContextFMHAType.enabled_with_fp32_acc
-            ], ['float16'], [2], [90], [4], [32], [0], [False], [False], [1],
-                    [False]))
+            ], ['float16'], [2], [90], [8], [4], [32], [0], [False], [False],
+                    [1], [False]))
 
         # Test cases for the multi-block MMHA.
         test_cases += list(
             product(['llama_attention'], [
                 ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
-            ], ['float16', 'float32'], [2], [2048], [4], [64], [0], [True],
+            ], ['float16', 'float32'], [2], [2048], [8], [4], [64], [0], [True],
                     [False], [1], [True, False]))
+        test_cases += list(
+            product(['llama_attention'],
+                    [ContextFMHAType.enabled_with_fp32_acc], ['float16'], [16],
+                    [2048], [32], [4], [64], [0], [True], [False], [1],
+                    [False]))
 
         # Test cases for the int8 K/V cache.
         test_cases += list(
             product(['gpt2_attention'], [ContextFMHAType.disabled],
-                    ['float16', 'float32'], [2], [128], [4], [64], [0], [False],
-                    [True], [1], [False]))
+                    ['float16', 'float32'], [2], [128], [8], [4], [64], [0],
+                    [False], [True], [1], [False]))
 
         # test cases for multi-query attention
         test_cases += list(
             product(['gpt_bigcode_attention'], [
                 ContextFMHAType.disabled, ContextFMHAType.enabled,
                 ContextFMHAType.enabled_with_fp32_acc
-            ], ['float16'], [2], [128], [4], [64], [1], [False], [False], [1],
-                    [False]))
+            ], ['float16'], [2], [128], [8], [4], [64], [1], [False], [False],
+                    [1], [False]))
 
         # test cases for beam search
         test_cases += list(
             product(['gpt2_attention'], [ContextFMHAType.disabled], ['float16'],
-                    [2], [128], [4], [64], [0], [False], [False], [4], [False]))
+                    [2], [128], [8], [4], [64], [0], [False], [False], [4],
+                    [False]))
 
         # test cases for grouped-query attention
         test_cases += list(
             product(['llama_attention'], [ContextFMHAType.disabled],
-                    ['float16'], [2], [128], [8], [32], [2, 4], [False],
+                    ['float16'], [2], [128], [8], [8], [32], [2, 4], [False],
                     [False], [1], [False]))
 
         # test cases for rotary scaling
         test_cases += list(
             product(['llama_attention'], [ContextFMHAType.disabled],
-                    ['float32'], [2], [128], [8], [32], [2, 8], [False],
+                    ['float32'], [2], [128], [8], [8], [32], [2, 8], [False],
                     [False], [1], [False], [10000.0, 1000000.0], [
                         {
                             "type": "linear",
@@ -143,6 +149,7 @@ class TestFunctional(unittest.TestCase):
                                dtype,
                                batch_size,
                                in_len,
+                               out_len,
                                num_heads,
                                head_size,
                                num_kv_heads,
@@ -185,14 +192,13 @@ class TestFunctional(unittest.TestCase):
 
         remove_input_padding = True
 
-        def _construct_execution(session, input_tensor, weight, bias,
-                                 pointer_array, sequence_length,
-                                 host_past_key_value_lengths, context_lengths,
-                                 max_context_length, cache_indirection,
-                                 num_heads, hidden_size, num_kv_heads, output,
-                                 dtype, kv_int8_quant_scale,
-                                 kv_int8_dequant_scale, host_context_lengths,
-                                 host_request_types):
+        def _construct_execution(
+                session, input_tensor, weight, bias, pointer_array,
+                sequence_length, host_past_key_value_lengths,
+                host_max_kv_cache_lengths, context_lengths, max_context_length,
+                cache_indirection, num_heads, hidden_size, num_kv_heads, output,
+                dtype, kv_int8_quant_scale, kv_int8_dequant_scale,
+                host_context_lengths, host_request_types):
             head_size = hidden_size // num_heads
             # construct trt network
             builder = tensorrt_llm.Builder()
@@ -201,6 +207,8 @@ class TestFunctional(unittest.TestCase):
             net.plugin_config.set_context_fmha(context_fmha_type)
             net.plugin_config.enable_remove_input_padding()
             net.plugin_config.enable_paged_kv_cache(tokens_per_block)
+            if enable_multi_block_mmha:
+                net.plugin_config.enable_mmha_multi_block_mode()
 
             with tensorrt_llm.net_guard(net):
                 x_tensor = Tensor(name='input',
@@ -213,6 +221,10 @@ class TestFunctional(unittest.TestCase):
                 host_past_key_value_lengths_tensor = Tensor(
                     name='host_past_key_value_lengths',
                     shape=tuple(host_past_key_value_lengths.shape),
+                    dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+                host_max_kv_cache_lengths_tensor = Tensor(
+                    name='host_max_kv_cache_lengths',
+                    shape=tuple(host_max_kv_cache_lengths.shape),
                     dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                 input_lengths_tensor = Tensor(
                     name='context_lengths',
@@ -302,6 +314,7 @@ class TestFunctional(unittest.TestCase):
                     sequence_length=sequence_length_tensor,
                     host_past_key_value_lengths=
                     host_past_key_value_lengths_tensor,
+                    host_max_kv_cache_lengths=host_max_kv_cache_lengths_tensor,
                     context_lengths=input_lengths_tensor,
                     cache_indirection=cache_indirection_tensor,
                     host_request_types=host_request_types_tensor,
@@ -316,7 +329,6 @@ class TestFunctional(unittest.TestCase):
                     rotary_embedding_max_positions=configuration.
                     max_position_embeddings,
                     position_embedding_type=position_embedding_type,
-                    multi_block_mode=enable_multi_block_mmha,
                     kv_orig_quant_scale=kv_int8_quant_scale_tensor,
                     kv_quant_orig_scale=kv_int8_dequant_scale_tensor,
                     kv_cache_quant_mode=QuantMode.from_description(
@@ -334,6 +346,7 @@ class TestFunctional(unittest.TestCase):
                 'input': input_tensor,
                 'sequence_length': sequence_length,
                 'host_past_key_value_lengths': host_past_key_value_lengths,
+                'host_max_kv_cache_lengths': host_max_kv_cache_lengths,
                 'context_lengths': context_lengths,
                 'cache_indirection': cache_indirection,
                 'host_request_types': host_request_types,
@@ -376,9 +389,9 @@ class TestFunctional(unittest.TestCase):
         plugin_kv_num_heads = num_kv_heads if attention_type == 'llama_attention' or attention_type == 'gpt_bigcode_attention' else num_heads
         kv_hidden_size = plugin_kv_num_heads * head_size
         qkv_hidden_size = hidden_size + 2 * kv_hidden_size
-        out_len = 8
-        max_seq_len = in_len + 24
+        max_seq_len = in_len + out_len * 3
         num_req = batch_size
+        in_lens = torch.randint(1, in_len + 1, (num_req, ))
         max_blocks_per_seq = math.ceil(max_seq_len / tokens_per_block)
         blocks = math.ceil(
             (num_req * beam_width * max_seq_len) / tokens_per_block)
@@ -413,8 +426,10 @@ class TestFunctional(unittest.TestCase):
         cache_indirection = torch.zeros(shape_dict['cache_indirection'],
                                         dtype=torch.int32,
                                         device='cuda')
-        for iteration in range(1, beam_width):
-            cache_indirection[:, iteration, in_len:] = iteration
+        for req_idx in range(num_req):
+            in_len_req = in_lens[req_idx]
+            for iteration in range(1, beam_width):
+                cache_indirection[req_idx, iteration, in_len_req:] = iteration
 
         kv_int8_dequant_scale = torch.randint(
             1,
@@ -612,11 +627,13 @@ class TestFunctional(unittest.TestCase):
         def torch_exec(step: int,
                        input: torch.Tensor,
                        ctx_attention_mask: torch.Tensor,
+                       req_idx: int,
                        layer_past=None):
             assert layer_past != None or input.shape[0] == 1
             nonlocal attention
             nonlocal attention_type
-            nonlocal in_len
+            nonlocal in_lens
+            in_len = in_lens[req_idx]
             position_ids = ctx_attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(ctx_attention_mask == 0, 1)
             if step != 0:
@@ -675,6 +692,7 @@ class TestFunctional(unittest.TestCase):
                                           blocks,
                                           tokens_per_block,
                                           max_blocks_per_seq,
+                                          max_seq_len,
                                           beam_width=beam_width)
 
         torch_cache_list = [None] * num_req
@@ -700,35 +718,38 @@ class TestFunctional(unittest.TestCase):
             batch_req_ids = []
             for req_idx in reversed(range(num_req)):
                 step = get_step(req_idx)
+                in_len_req = in_lens[req_idx]
                 if is_valid_step(step):
                     batch_req_ids.append(req_idx)
                     if step == 0:
-                        input_length_list.append([in_len])
-                        context_length_list += [in_len]
+                        input_length_list.append([in_len_req])
+                        context_length_list += [in_len_req]
                         request_type_list += [0]
                         host_past_key_value_length_list += [0]
                         sequence_selection += [req_idx * beam_width]
                         num_context_req += 1
                     else:
                         input_length_list.append([1] * beam_width)
-                        context_length_list += [in_len] * beam_width
+                        context_length_list += [in_len_req] * beam_width
                         request_type_list += [1] * beam_width
-                        host_past_key_value_length_list += [in_len + step - 1
-                                                            ] * beam_width
+                        host_past_key_value_length_list += [
+                            in_len_req + step - 1
+                        ] * beam_width
                         num_generation_req += 1
                         sequence_selection += list(
                             range(req_idx * beam_width,
                                   (req_idx + 1) * beam_width))
-                    sequence_length_list += [in_len + step] * beam_width
+                    sequence_length_list += [in_len_req + step] * beam_width
 
             num_seq = num_context_req + num_generation_req * beam_width
 
             # Check if new sequence arrived
             if iteration < num_req:
+                in_len_req = in_lens[iteration]
                 # Add sequence to the manager
                 sequence = GenerationSequence(seq_idx=iteration,
                                               batch_idx=iteration)
-                kv_cache_manager.add_sequence(sequence, in_len)
+                kv_cache_manager.add_sequence(sequence, in_len_req.clone())
 
             # Get arrays of pointers to the "pages" of KV values
             pointer_arrays = kv_cache_manager.get_pointer_arrays(beam_width)[0]
@@ -745,6 +766,9 @@ class TestFunctional(unittest.TestCase):
                 host_past_key_value_length_list,
                 dtype=torch.int32,
                 device='cpu').reshape(-1)
+            host_max_kv_cache_lengths = torch.tensor([max_seq_len],
+                                                     dtype=torch.int32,
+                                                     device='cpu')
             total_num_tokens = int(sum(host_input_lengths))
             max_context_length = in_len
             context_lengths = host_context_lengths.cuda()
@@ -785,10 +809,11 @@ class TestFunctional(unittest.TestCase):
             session, output = _construct_execution(
                 session, input_tensor, weight_plugin, bias_plugin,
                 dense_pointer_arrays, sequence_lengths,
-                host_past_key_value_lengths, context_lengths,
-                max_context_length, cache_indirection, num_heads, hidden_size,
-                num_kv_heads, output, dtype, kv_int8_quant_scale,
-                kv_int8_dequant_scale, host_context_lengths, host_request_types)
+                host_past_key_value_lengths, host_max_kv_cache_lengths,
+                context_lengths, max_context_length, cache_indirection,
+                num_heads, hidden_size, num_kv_heads, output, dtype,
+                kv_int8_quant_scale, kv_int8_dequant_scale,
+                host_context_lengths, host_request_types)
 
             del session
             session = None
@@ -796,13 +821,14 @@ class TestFunctional(unittest.TestCase):
             for req_idx in batch_req_ids:
                 step = get_step(req_idx)
                 assert is_valid_step(step)
+                in_len_req = in_lens[req_idx]
                 if step == 0:
                     ctx_attention_mask_list[req_idx] = torch.ones(
-                        (1, in_len), dtype=torch.int32, device='cuda')
+                        (1, in_len_req), dtype=torch.int32, device='cuda')
                 else:
                     if step == 1:
                         ctx_attention_mask_list[req_idx] = torch.ones(
-                            (beam_width, in_len),
+                            (beam_width, in_len_req),
                             dtype=torch.int32,
                             device='cuda')
                     ctx_attention_mask_list[req_idx] = torch.cat(
@@ -831,7 +857,7 @@ class TestFunctional(unittest.TestCase):
                 torch_in = input_tensor[:, offset:offset_next, :].reshape(
                     (local_beam_width, input_length, hidden_size))
                 torch_out, torch_cache_list[req_idx] = torch_exec(
-                    step, torch_in, ctx_attention_mask_list[req_idx],
+                    step, torch_in, ctx_attention_mask_list[req_idx], req_idx,
                     torch_cache_list[req_idx])
 
                 np.testing.assert_allclose(

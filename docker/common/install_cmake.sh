@@ -12,4 +12,4 @@ wget --no-verbose ${RELEASE_URL_CMAKE} -P /tmp
 tar -xf /tmp/${CMAKE_FILE_NAME}.tar.gz -C /usr/local/
 ln -s /usr/local/${CMAKE_FILE_NAME} /usr/local/cmake
 
-echo 'export PATH=/usr/local/cmake/bin:$PATH' >> "${BASH_ENV}"
+echo 'export PATH=/usr/local/cmake/bin:$PATH' >> "${ENV}"

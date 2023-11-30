@@ -22,7 +22,8 @@ import torch
 from transformers import AutoTokenizer, T5Tokenizer
 
 import tensorrt_llm
-from tensorrt_llm.runtime import ModelConfig, SamplingConfig
+from tensorrt_llm.quantization import QuantMode
+from tensorrt_llm.runtime import LoraManager, ModelConfig, SamplingConfig
 
 from build import get_engine_name  # isort:skip
 
@@ -47,25 +48,31 @@ def read_config(config_path: Path):
     num_layers = config['builder_config']['num_layers']
     paged_kv_cache = config['plugin_config']['paged_kv_cache']
     tokens_per_block = config['plugin_config']['tokens_per_block']
-    use_prompt_tuning = config['builder_config']['use_prompt_tuning']
+    max_prompt_embedding_table_size = config['builder_config'][
+        'max_prompt_embedding_table_size']
     dtype = config['builder_config']['precision']
     gather_all_token_logits = config['builder_config'][
         'gather_all_token_logits']
     use_custom_all_reduce = config['plugin_config']['use_custom_all_reduce']
+    quant_mode = QuantMode(config['builder_config']['quant_mode'])
+    lora_plugin = config['plugin_config']['lora_plugin']
 
-    model_config = ModelConfig(num_heads=num_heads,
-                               num_kv_heads=num_kv_heads,
-                               hidden_size=hidden_size,
-                               vocab_size=vocab_size,
-                               num_layers=num_layers,
-                               gpt_attention_plugin=use_gpt_attention_plugin,
-                               remove_input_padding=remove_input_padding,
-                               paged_kv_cache=paged_kv_cache,
-                               tokens_per_block=tokens_per_block,
-                               use_prompt_tuning=use_prompt_tuning,
-                               dtype=dtype,
-                               gather_all_token_logits=gather_all_token_logits,
-                               use_custom_all_reduce=use_custom_all_reduce)
+    model_config = ModelConfig(
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        hidden_size=hidden_size,
+        vocab_size=vocab_size,
+        num_layers=num_layers,
+        gpt_attention_plugin=use_gpt_attention_plugin,
+        remove_input_padding=remove_input_padding,
+        paged_kv_cache=paged_kv_cache,
+        tokens_per_block=tokens_per_block,
+        max_prompt_embedding_table_size=max_prompt_embedding_table_size,
+        dtype=dtype,
+        quant_mode=quant_mode,
+        gather_all_token_logits=gather_all_token_logits,
+        use_custom_all_reduce=use_custom_all_reduce,
+        lora_plugin=lora_plugin)
 
     dtype = config['builder_config']['precision']
     max_input_len = config['builder_config']['max_input_len']
@@ -179,6 +186,12 @@ def print_output(output_ids, input_lengths, sequence_lengths, tokenizer,
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--max_output_len', type=int, required=True)
+    parser.add_argument('--max_kv_cache_len',
+                        type=int,
+                        default=None,
+                        help='The max kv cache length. \
+              If the final sequence length exceeds the kv cache length, we will enable cyclic kv cache. \
+              If it is set to None, we will use the max sequence length.')
     parser.add_argument('--log_level', type=str, default='error')
     parser.add_argument('--engine_dir', type=str, default='gpt_outputs')
     parser.add_argument('--input_text',
@@ -229,6 +242,7 @@ def generate(
     output_npy: str = None,
     tokenizer_path: str = 'gpt2',
     vocab_file=None,
+    max_kv_cache_len: int = None,
     num_beams: int = 1,
     prompt_table: Path = None,
     tasks: str = None,
@@ -282,12 +296,28 @@ def generate(
                                            model_config.remove_input_padding)
 
     max_input_length = torch.max(input_lengths).item()
+
+    if model_config.lora_plugin:
+        lora_manager = LoraManager(model_dir=engine_dir,
+                                   model_config=model_config)
+        # an example under batch size 3
+        lora_uids = [
+            None, "de05b696-711c-4d7c-983d-e1fb9c1a618a",
+            "5857e9da-c7cb-4541-a419-fb364e6151a2"
+        ]
+    else:
+        lora_manager = None
+        lora_uids = None
+
     decoder.setup(input_lengths.size(0),
                   max_input_length,
                   max_output_len,
-                  beam_width=num_beams)
+                  beam_width=num_beams,
+                  max_kv_cache_length=max_kv_cache_len,
+                  lora_manager=lora_manager,
+                  lora_uids=lora_uids)
 
-    ptuning_args = [] if not model_config.use_prompt_tuning else ptuning_setup(
+    ptuning_args = [] if model_config.max_prompt_embedding_table_size == 0 else ptuning_setup(
         prompt_table, dtype, model_config.hidden_size, tasks, input_ids,
         input_lengths, model_config.remove_input_padding)
 

@@ -23,6 +23,8 @@
 #include "tensorrt_llm/layers/onlineBeamSearchLayer.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
 #include "tensorrt_llm/layers/topPSamplingLayer.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
@@ -43,6 +45,9 @@ void DynamicDecodeLayer<T>::initialize()
 
     mTopPDecode = std::make_unique<TopPSamplingLayer<T>>(
         vocab_size_, vocab_size_padded_, stream_, allocator_, false, cuda_device_prop_);
+
+    auto manager = runtime::BufferManager{std::make_shared<runtime::CudaStream>(stream_, common::getDevice(), false)};
+    mIdsPtrHost = manager.emptyBuffer(runtime::MemoryType::kPINNED, runtime::TRTDataType<int*>::value);
 }
 
 template <typename T>
@@ -147,7 +152,7 @@ void DynamicDecodeLayer<T>::setup(size_t batch_size, size_t beam_width, SetupPar
         beamSearchParams.length_penalty = setupParams.length_penalty;
 
         has_diff_runtime_args_ = hasDiffRuntimeArgs(beamSearchParams);
-        mOnlineBeamsearchDecode->setup(beamSearchParams);
+        mOnlineBeamsearchDecode->setup(batch_size, beamSearchParams);
     }
 }
 
@@ -155,16 +160,14 @@ template <typename T>
 void DynamicDecodeLayer<T>::allocateBuffer(size_t batch_size, size_t beam_width, size_t max_seq_len)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    output_ids_ptr = allocator_->reMalloc(output_ids_ptr, sizeof(int*) * 2 * batch_size, true);
-    parent_ids_ptr = output_ids_ptr + batch_size;
-    zero_parent_ids = allocator_->reMalloc(zero_parent_ids, sizeof(int*) * 2 * batch_size, true);
+    mIdsPtrHost->resize(2 * batch_size);
+    zero_parent_ids = allocator_->reMalloc(zero_parent_ids, sizeof(int*) * 2 * batch_size, false);
 }
 
 template <typename T>
 void DynamicDecodeLayer<T>::freeBuffer()
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    allocator_->free((void**) &output_ids_ptr);
     allocator_->free((void**) &zero_parent_ids);
 }
 
@@ -187,31 +190,29 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
         outputs.sequence_length.has_value(), "sequence_length tensor is mandatory in DynamicDecoderLayer.");
     allocateBuffer(batch_size, beam_width, max_seq_len);
 
-    std::vector<int*> ids_ptr_host;
-
+    // std::vector<int*> ids_ptr_host;
+    auto idsPtrHost = runtime::bufferCast<int*>(*mIdsPtrHost);
     for (int i = 0; i < batch_size; i++)
     {
-        ids_ptr_host.push_back(outputs.output_ids.template getPtrWithOffset<int32_t>(i * beam_width * max_seq_len));
+        idsPtrHost[i] = outputs.output_ids.template getPtrWithOffset<int32_t>(i * beam_width * max_seq_len);
     }
     for (int i = 0; i < batch_size; i++)
     {
         if (beam_width > 1)
         {
-            ids_ptr_host.push_back(
-                outputs.parent_ids.value().template getPtrWithOffset<int32_t>(i * beam_width * max_seq_len));
+            idsPtrHost[batch_size + i]
+                = outputs.parent_ids.value().template getPtrWithOffset<int32_t>(i * beam_width * max_seq_len);
         }
         else
         {
-            ids_ptr_host.push_back(zero_parent_ids + i * beam_width * max_seq_len);
+            idsPtrHost[batch_size + i] = zero_parent_ids + i * beam_width * max_seq_len;
         }
     }
-    cudaMemcpyAsync(
-        output_ids_ptr, ids_ptr_host.data(), sizeof(int*) * 2 * batch_size, cudaMemcpyHostToDevice, stream_);
 
     outputs.output_ids_ptr
-        = Tensor(MEMORY_GPU, DataType::TYPE_INT32_PTR, {batch_size, beam_width, max_seq_len}, output_ids_ptr);
+        = Tensor(MEMORY_GPU, DataType::TYPE_INT32_PTR, {batch_size, beam_width, max_seq_len}, idsPtrHost);
     outputs.parent_ids_ptr
-        = Tensor(MEMORY_GPU, DataType::TYPE_INT32_PTR, {batch_size, beam_width, max_seq_len}, parent_ids_ptr);
+        = Tensor(MEMORY_GPU, DataType::TYPE_INT32_PTR, {batch_size, beam_width, max_seq_len}, idsPtrHost + batch_size);
 
     if (params.no_repeat_ngram_size)
     {
@@ -225,7 +226,7 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
 
         invokeBanRepeatNgram(logits.template getPtrWithOffset<T>(decode_vocab_size_units_offset),
             outputs.output_ids_ptr.template getPtr<const int*>(),
-            outputs.finished.value_or(Tensor{}).template getPtr<bool>(),
+            params.finished.value_or(Tensor{}).template getPtr<bool>(),
             outputs.parent_ids.value_or(Tensor{}).template getPtr<const int>(), batch_size, local_batch_size,
             beam_width, no_repeat_ngram_size_buf, id_offset, vocab_size_padded_, step, stream_);
     }
@@ -294,7 +295,8 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
             auto const end_id_offset
                 = end_ids.slice({dynamic_decode_batch_size}, dynamic_ite * dynamic_decode_batch_size);
             typename BaseBeamSearchLayer<T>::ForwardParams dynamic_decode_input_tensors{step, ite, logits_offset,
-                end_id_offset, *params.src_cache_indirection, static_cast<std::int32_t>(max_seq_len)};
+                end_id_offset, *params.src_cache_indirection, static_cast<std::int32_t>(params.max_kv_cache_length),
+                static_cast<std::int32_t>(max_seq_len)};
 
             dynamic_decode_input_tensors.embedding_bias = params.embedding_bias;
 
@@ -319,7 +321,7 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
                 = outputs.cum_log_probs->slice({dynamic_decode_batch_size * beam_width}, dynamic_id_offset);
 
             dynamic_decode_outputs.beamHypotheses = outputs.beamHypotheses;
-            dynamic_decode_outputs.output_log_probs = outputs.output_log_probs;
+            dynamic_decode_outputs.output_log_probs = outputs.output_log_probs_tiled;
 
             // only OnlineBeamSearchLayer support beam_search_diversity_rate
             // when beamHypotheses is used
@@ -339,6 +341,7 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
             step, ite, logits_slice, end_id_slice, static_cast<std::int32_t>(max_seq_len)};
 
         decode_input_tensors.embedding_bias = params.embedding_bias;
+        decode_input_tensors.finished = params.finished;
 
         if (params.input_lengths)
         {
@@ -363,11 +366,11 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
             decode_outputs.cum_log_probs
                 = outputs.cum_log_probs->slice({local_batch_size * beam_width}, local_batch_offset);
         }
-        if (outputs.output_log_probs)
+        if (outputs.output_log_probs_tiled)
         {
             auto const generationStep = step - params.max_input_length;
             TLLM_CHECK(generationStep >= 0);
-            Tensor& output_log_probs = outputs.output_log_probs.value();
+            Tensor& output_log_probs = outputs.output_log_probs_tiled.value();
             size_t step_offset = generationStep * batch_size * beam_width;
             decode_outputs.output_log_probs
                 = output_log_probs.slice({output_log_probs.shape[0] - generationStep, local_batch_size * beam_width},
@@ -407,8 +410,19 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
         sync_check_cuda_error();
     }
 
-    invokeCopyNextStepIds(outputs.newTokens.template getPtr<int>(), output_ids_ptr,
+    invokeCopyNextStepIds(outputs.newTokens.template getPtr<int>(), idsPtrHost,
         outputs.sequence_length->template getPtr<int>(), batch_size, beam_width, max_seq_len, stream_);
+
+    // Transpose the output log probs from [max_seq_len, bs, beam_width] to [batch_size, beam_width, max_seq_len]
+    if (outputs.output_log_probs_tiled)
+    {
+        auto logProbsMaxSeqLen = outputs.output_log_probs_tiled.value().shape[0];
+
+        invokeTransposeLogProbs(outputs.output_log_probs.value().template getPtr<float>(),
+            outputs.output_log_probs_tiled.value().template getPtr<float>(),
+            outputs.sequence_length->template getPtr<int>(), batch_size, beam_width, logProbsMaxSeqLen, stream_);
+    }
+
     sync_check_cuda_error();
 }
 

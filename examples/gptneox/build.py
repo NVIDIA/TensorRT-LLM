@@ -28,8 +28,7 @@ import tensorrt_llm
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import (weight_only_groupwise_quantize,
-                                 weight_only_quantize)
+from tensorrt_llm.models import quantize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
@@ -176,6 +175,14 @@ def parse_arguments():
     parser.add_argument('--enable_context_fmha_fp32_acc',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--multi_block_mode',
+        default=False,
+        action='store_true',
+        help=
+        'Split long kv sequence into multiple blocks (applied to generation MHA kernels). \
+                        It is beneifical when batchxnum_heads cannot fully utilize GPU.'
+    )
     parser.add_argument('--gpus_per_node', type=int, default=8)
     parser.add_argument(
         '--output_dir',
@@ -203,6 +210,14 @@ def parse_arguments():
         'By default the embedding lookup table is sharded along vocab dimension (--embedding_sharding_dim=0). '
         'To shard it along hidden dimension, set --embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when --embedding_sharding_dim=0'
+    )
+
+    parser.add_argument(
+        '--strongly_typed',
+        default=False,
+        action="store_true",
+        help=
+        'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
     )
 
     args = parser.parse_args()
@@ -269,15 +284,22 @@ def build_rank_engine(builder: Builder,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim)
 
-    if args.use_weight_only_quant_matmul_plugin:
-        tensorrt_llm_gpt = weight_only_quantize(tensorrt_llm_gpt)
-
-    if args.use_weight_only_groupwise_quant_matmul_plugin:
-        tensorrt_llm_gpt = weight_only_groupwise_quantize(
-            model=tensorrt_llm_gpt,
-            quant_mode=QuantMode(0),
-            group_size=128,
-            zero=True)
+    if args.use_weight_only_quant_matmul_plugin or args.use_weight_only_groupwise_quant_matmul_plugin:
+        quant_mode = QuantMode.from_description(
+            quantize_weights=True,
+            quantize_activations=False,
+            per_token=False,
+            per_channel=False,
+            per_group=args.use_weight_only_groupwise_quant_matmul_plugin,
+            use_int4_weights=False)
+        quantize_kwargs = {}
+        if args.use_weight_only_groupwise_quant_matmul_plugin:
+            quantize_kwargs = {
+                "group_size": 128,
+                "zero": True,
+            }
+        tensorrt_llm_gpt = quantize_model(tensorrt_llm_gpt, quant_mode,
+                                          **quantize_kwargs)
 
     if args.model_dir is not None:
         assert hf_gpt is not None, f'Could not load weights from hf_gpt model as it is not loaded yet.'
@@ -311,6 +333,8 @@ def build_rank_engine(builder: Builder,
     if args.enable_context_fmha_fp32_acc:
         network.plugin_config.set_context_fmha(
             ContextFMHAType.enabled_with_fp32_acc)
+    if args.multi_block_mode:
+        network.plugin_config.enable_mmha_multi_block_mode()
     if args.use_weight_only_quant_matmul_plugin:
         network.plugin_config.set_weight_only_quant_matmul_plugin(
             dtype=args.use_weight_only_quant_matmul_plugin)
@@ -341,6 +365,7 @@ def build_rank_engine(builder: Builder,
     if rank == 0:
         config_path = os.path.join(args.output_dir, 'config.json')
         builder.save_config(builder_config, config_path)
+
     return engine
 
 
@@ -373,8 +398,12 @@ def build(rank, args):
             max_position_embeddings=args.n_positions,
             apply_query_key_layer_scaling=apply_query_key_layer_scaling,
             max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
             max_input_len=args.max_input_len,
-            max_output_len=args.max_output_len)
+            int8=args.use_weight_only_quant_matmul_plugin
+            or args.use_weight_only_groupwise_quant_matmul_plugin,
+            max_output_len=args.max_output_len,
+            strongly_typed=args.strongly_typed)
 
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.world_size,
                                       cur_rank)

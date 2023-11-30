@@ -26,28 +26,45 @@
 namespace tensorrt_llm::runtime
 {
 
-class GenerationOutput
+template <typename TTensor>
+class GenericGenerationOutput
 {
 public:
-    using TensorPtr = ITensor::SharedPtr;
-
+    using TensorPtr = TTensor;
     using Callback = std::function<void(TensorPtr const& ids, SizeType step, bool finished)>;
 
-    explicit GenerationOutput(TensorPtr ids)
+    explicit GenericGenerationOutput(TensorPtr ids, TensorPtr lengths)
         : ids{std::move(ids)}
+        , lengths{std::move(lengths)}
     {
         TLLM_CHECK_WITH_INFO(static_cast<bool>(this->ids), "Invalid ids tensor");
+        TLLM_CHECK_WITH_INFO(static_cast<bool>(this->lengths), "Invalid lengths tensor");
     }
 
     // mandatory parameters
-    TensorPtr ids; // [batchSize, beamWidth, maxInputLength + maxNewTokens]
+    TensorPtr ids;     // [batchSize, beamWidth, maxInputLength + maxNewTokens]
+    TensorPtr lengths; // [batchSize, beamWidth]
 
     // optional parameters
-    TensorPtr logProbs;      // [request_output_length, batch_size * beam_width], must be float*, on gpu
-    TensorPtr contextLogits; // [batch_size, max_input_length, vocab_size_padded]
+    TensorPtr cumLogProbs;      // [batchSize, beamWidth], must be float*, on gpu
+    TensorPtr logProbs;         // [batchSize, beamWidth, maxInputLength + maxNewTokens], must be float*, on gpu
+    TensorPtr contextLogits;    // [batch_size, max_input_length, vocab_size_padded]
+    TensorPtr generationLogits; // [batch_size, beam_width, max_output_length-1, vocab_size_padded]
 
     // callbacks
     Callback onTokenGenerated;
+};
+
+class GenerationOutput : public GenericGenerationOutput<ITensor::SharedPtr>
+{
+public:
+    using Base = GenericGenerationOutput<ITensor::SharedPtr>;
+    using TensorPtr = Base::TensorPtr;
+
+    explicit GenerationOutput(TensorPtr ids, TensorPtr lengths)
+        : GenericGenerationOutput(std::move(ids), std::move(lengths))
+    {
+    }
 };
 
 } // namespace tensorrt_llm::runtime

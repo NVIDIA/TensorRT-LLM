@@ -66,4 +66,10 @@ void Logger::log(std::exception const& ex, Logger::Level level)
     log(level, "%s: %s", TllmException::demangle(typeid(ex).name()).c_str(), ex.what());
 }
 
+Logger* Logger::getLogger()
+{
+    thread_local Logger instance;
+    return &instance;
+}
+
 } // namespace tensorrt_llm::common

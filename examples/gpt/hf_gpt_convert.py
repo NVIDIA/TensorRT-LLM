@@ -255,7 +255,7 @@ def hf_gpt_converter(args: ProgArgs):
                 param = concat_qkv_weight_bias(param, name, model)
                 ft_name = ft_name.replace("query", "query_key_value")
             # Needed by QKV projection weight split. With multi_query_mode one does not simply take
-            # out_dim and divide it by 3 to get local_dim becuase out_dim = local_dim + 2 * head_size
+            # out_dim and divide it by 3 to get local_dim because out_dim = local_dim + 2 * head_size
             local_dim = model.transformer.h[
                 0].attn.embed_dim if multi_query_mode else None
             if args.processes == 1:

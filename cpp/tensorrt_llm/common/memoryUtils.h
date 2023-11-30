@@ -18,7 +18,6 @@
 
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/tensor.h"
 
 #include <cassert>
 

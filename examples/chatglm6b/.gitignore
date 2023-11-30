@@ -1,7 +1,0 @@
-__pycache__/
-ftModel/
-pyTorchModel/
-trtModel/
-.vscode/
-*.nsys-rep
-*.npy

@@ -26,6 +26,7 @@
 #include "tensorrt_llm/plugins/layernormPlugin/layernormPlugin.h"
 #include "tensorrt_llm/plugins/layernormQuantizationPlugin/layernormQuantizationPlugin.h"
 #include "tensorrt_llm/plugins/lookupPlugin/lookupPlugin.h"
+#include "tensorrt_llm/plugins/loraPlugin/loraPlugin.h"
 #if ENABLE_MULTI_DEVICE
 #include "tensorrt_llm/plugins/ncclPlugin/allgatherPlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/allreducePlugin.h"
@@ -151,6 +152,7 @@ extern "C"
             weightOnlyGroupwiseQuantMatmulPluginCreator;
         static tensorrt_llm::plugins::WeightOnlyQuantMatmulPluginCreator weightOnlyQuantMatmulPluginCreator;
         static tensorrt_llm::plugins::LookupPluginCreator lookupPluginCreator;
+        static tensorrt_llm::plugins::LoraPluginCreator loraPluginCreator;
 
         static std::array pluginCreators
             = { creatorPtr(identityPluginCreator),
@@ -173,6 +175,7 @@ extern "C"
                   creatorPtr(weightOnlyGroupwiseQuantMatmulPluginCreator),
                   creatorPtr(weightOnlyQuantMatmulPluginCreator),
                   creatorPtr(lookupPluginCreator),
+                  creatorPtr(loraPluginCreator),
               };
         nbCreators = pluginCreators.size();
         return pluginCreators.data();

@@ -64,39 +64,38 @@ struct NcclDataType<std::int32_t>
 } // namespace
 
 template <typename T>
-void NcclCommunicator::send(
-    T* sendbuff, size_t count, int peer, CudaStream const& stream, nvinfer1::ILogger& logger) const
+void NcclCommunicator::send(T* sendbuff, size_t count, int peer, CudaStream const& stream) const
 {
 #if ENABLE_MULTI_DEVICE
     auto datatype = NcclDataType<std::remove_cv_t<T>>::value;
-    TLLM_NCCL_CHECK(ncclSend(sendbuff, count, datatype, peer, mComm, stream.get()), logger);
+    TLLM_NCCL_CHECK(ncclSend(sendbuff, count, datatype, peer, mComm, stream.get()));
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
 }
 
-template void NcclCommunicator::send(std::uint8_t*, size_t, int, CudaStream const&, nvinfer1::ILogger&) const;
-template void NcclCommunicator::send(std::int32_t*, size_t, int, CudaStream const&, nvinfer1::ILogger&) const;
-template void NcclCommunicator::send(std::uint8_t const*, size_t, int, CudaStream const&, nvinfer1::ILogger&) const;
-template void NcclCommunicator::send(std::int32_t const*, size_t, int, CudaStream const&, nvinfer1::ILogger&) const;
+template void NcclCommunicator::send(std::uint8_t*, size_t, int, CudaStream const&) const;
+template void NcclCommunicator::send(std::int32_t*, size_t, int, CudaStream const&) const;
+template void NcclCommunicator::send(std::uint8_t const*, size_t, int, CudaStream const&) const;
+template void NcclCommunicator::send(std::int32_t const*, size_t, int, CudaStream const&) const;
+template void NcclCommunicator::send(float const*, size_t, int, CudaStream const&) const;
 
 template <typename T>
-void NcclCommunicator::receive(
-    T* sendbuff, size_t count, int peer, CudaStream const& stream, nvinfer1::ILogger& logger) const
+void NcclCommunicator::receive(T* sendbuff, size_t count, int peer, CudaStream const& stream) const
 {
 #if ENABLE_MULTI_DEVICE
     auto datatype = NcclDataType<std::remove_cv_t<T>>::value;
-    TLLM_NCCL_CHECK(ncclRecv(sendbuff, count, datatype, peer, mComm, stream.get()), logger);
+    TLLM_NCCL_CHECK(ncclRecv(sendbuff, count, datatype, peer, mComm, stream.get()));
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
 }
 
-template void NcclCommunicator::receive(std::uint8_t*, size_t, int, CudaStream const&, nvinfer1::ILogger&) const;
-template void NcclCommunicator::receive(std::int32_t*, size_t, int, CudaStream const&, nvinfer1::ILogger&) const;
+template void NcclCommunicator::receive(std::uint8_t*, size_t, int, CudaStream const&) const;
+template void NcclCommunicator::receive(std::int32_t*, size_t, int, CudaStream const&) const;
+template void NcclCommunicator::receive(float*, size_t, int, CudaStream const&) const;
 
-std::shared_ptr<NcclCommunicator> NcclCommunicator::createPipelineComm(
-    WorldConfig const& worldConfig, nvinfer1::ILogger& logger)
+std::shared_ptr<NcclCommunicator> NcclCommunicator::createPipelineComm(WorldConfig const& worldConfig)
 {
 #if ENABLE_MULTI_DEVICE
     int const myRank = worldConfig.getRank();
@@ -108,18 +107,18 @@ std::shared_ptr<NcclCommunicator> NcclCommunicator::createPipelineComm(
         ncclGetUniqueId(&id);
         for (auto peer = 1; peer < worldSize; ++peer)
         {
-            TLLM_MPI_CHECK(MPI_Send(&id, sizeof(id), MPI_BYTE, peer, 0, MPI_COMM_WORLD), logger);
+            TLLM_MPI_CHECK(MPI_Send(&id, sizeof(id), MPI_BYTE, peer, 0, MPI_COMM_WORLD));
         }
     }
     else
     {
         auto constexpr peer = 0;
         MPI_Status status;
-        TLLM_MPI_CHECK(MPI_Recv(&id, sizeof(id), MPI_BYTE, peer, 0, MPI_COMM_WORLD, &status), logger);
+        TLLM_MPI_CHECK(MPI_Recv(&id, sizeof(id), MPI_BYTE, peer, 0, MPI_COMM_WORLD, &status));
     }
 
     auto pipelineComm = std::make_shared<NcclCommunicator>();
-    TLLM_NCCL_CHECK(ncclCommInitRank(&pipelineComm->mComm, worldSize, id, myRank), logger);
+    TLLM_NCCL_CHECK(ncclCommInitRank(&pipelineComm->mComm, worldSize, id, myRank));
 
     return pipelineComm;
 #else

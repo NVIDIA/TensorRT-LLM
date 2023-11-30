@@ -12,14 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Optional
+
 import tensorrt as trt
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
-from ...functional import gather_last_token_logits, recv, send
+from ...functional import Tensor, gather_last_token_logits, recv, send
 from ...layers import (Attention, AttentionMaskType, AttentionParams,
-                       ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
-                       PositionEmbeddingType, RmsNorm)
+                       ColumnLinear, Embedding, FusedGatedMLP, GatedMLP,
+                       KeyValueCacheParams, PositionEmbeddingType,
+                       PromptTuningEmbedding, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
 from ...quantization import QuantMode
@@ -44,7 +47,10 @@ class LLaMADecoderLayer(Module):
                  tp_group=None,
                  tp_size=1,
                  quant_mode=QuantMode(0),
-                 rms_norm_eps=1e-06):
+                 rms_norm_eps=1e-06,
+                 attn_bias=False,
+                 mlp_bias=False,
+                 use_fused_mlp=False):
         super().__init__()
         self._layer_id = layer_id  # useful for debugging
         # used for quantizing model
@@ -70,7 +76,7 @@ class LLaMADecoderLayer(Module):
             max_position_embeddings,
             dtype=dtype,
             attention_mask_type=AttentionMaskType.causal,
-            bias=False,
+            bias=attn_bias,
             position_embedding_type=position_embedding_type,
             rotary_embedding_base=rotary_base,
             rotary_embedding_scaling=rotary_scaling,
@@ -82,15 +88,16 @@ class LLaMADecoderLayer(Module):
         )
         if not mlp_hidden_size:
             self.mlp_hidden_size = hidden_size * 4
-        self.mlp = GatedMLP(hidden_size=hidden_size,
-                            ffn_hidden_size=self.mlp_hidden_size,
-                            hidden_act=hidden_act,
-                            dtype=dtype,
-                            bias=False,
-                            tp_group=tp_group,
-                            tp_size=tp_size,
-                            quant_mode=quant_mode,
-                            instance_id=2 * layer_id + 1)
+        ClsMLP = FusedGatedMLP if use_fused_mlp is True else GatedMLP
+        self.mlp = ClsMLP(hidden_size=hidden_size,
+                          ffn_hidden_size=self.mlp_hidden_size,
+                          hidden_act=hidden_act,
+                          dtype=dtype,
+                          bias=mlp_bias,
+                          tp_group=tp_group,
+                          tp_size=tp_size,
+                          quant_mode=quant_mode,
+                          instance_id=2 * layer_id + 1)
         self.post_layernorm = RmsNorm(normalized_shape=hidden_size,
                                       eps=rms_norm_eps,
                                       dtype=dtype)
@@ -155,19 +162,28 @@ class LLaMAModel(Module):
                  quant_mode=QuantMode(0),
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
-                 rms_norm_eps=1e-06):
+                 rms_norm_eps=1e-06,
+                 use_fused_mlp=False,
+                 attn_bias=False,
+                 mlp_bias=False,
+                 use_prompt_tuning: bool = False):
         super().__init__()
         self.mapping = mapping
+        self.use_prompt_tuning = use_prompt_tuning
 
+        EmbeddingCls = PromptTuningEmbedding if use_prompt_tuning else Embedding
         if self.mapping.is_first_pp_rank():
-            self.vocab_embedding = Embedding(
+            self.vocab_embedding = EmbeddingCls(
                 num_embeddings=vocab_size,
                 embedding_dim=hidden_size,
                 dtype=dtype,
                 tp_size=mapping.tp_size if use_parallel_embedding else 1,
                 tp_group=mapping.tp_group if use_parallel_embedding else None,
                 sharding_dim=embedding_sharding_dim,
-                tp_rank=mapping.tp_rank)
+                tp_rank=mapping.tp_rank,
+                instance_id=2 *
+                num_layers,  # ids in [0, 2 * (num_layers - 1) + 1] already used
+            )
 
         self.layers = ModuleList([
             LLaMADecoderLayer(layer_id=i,
@@ -184,7 +200,10 @@ class LLaMAModel(Module):
                               tp_group=mapping.tp_group,
                               tp_size=mapping.tp_size,
                               quant_mode=quant_mode,
-                              rms_norm_eps=rms_norm_eps)
+                              rms_norm_eps=rms_norm_eps,
+                              attn_bias=attn_bias,
+                              mlp_bias=mlp_bias,
+                              use_fused_mlp=use_fused_mlp)
             for i in self.get_transformer_layers(self.mapping, num_layers)
         ])
 
@@ -193,31 +212,42 @@ class LLaMAModel(Module):
                                 eps=rms_norm_eps,
                                 dtype=dtype)
 
-    def forward(self,
-                input_ids,
-                position_ids=None,
-                use_cache=False,
-                attention_mask=None,
-                kv_cache_params=None,
-                attention_params=None,
-                hidden_states=None,
-                all_reduce_workspace=None):
+    def forward(
+        self,
+        input_ids,
+        position_ids=None,
+        use_cache=False,
+        attention_mask=None,
+        kv_cache_params=None,
+        attention_params=None,
+        hidden_states=None,
+        all_reduce_workspace=None,
+        prompt_embedding_table: Optional[Tensor] = None,
+        prompt_tasks: Optional[Tensor] = None,
+        prompt_vocab_size: Optional[Tensor] = None,
+    ):
 
-        if kv_cache_params.past_key_value is None:
-            tuple([None] * len(self.layers))
+        kv_cache_params.fill_none_tensor_list(len(self.layers))
 
         if use_cache:
             presents = []
 
+        ptuning_args = []
+        if self.use_prompt_tuning:
+            ptuning_args = [
+                prompt_embedding_table, prompt_tasks, prompt_vocab_size
+            ]
         if self.mapping.is_first_pp_rank():
-            hidden_states = self.vocab_embedding(input_ids)
+            hidden_states = self.vocab_embedding(input_ids, *ptuning_args,
+                                                 all_reduce_workspace)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
         self.register_network_output(f"embd", hidden_states)
 
-        for layer, past, pointer in zip(
+        for layer, past, pointer, max_kv_cache_length in zip(
                 self.layers, kv_cache_params.past_key_value,
-                kv_cache_params.kv_cache_block_pointers):
+                kv_cache_params.kv_cache_block_pointers,
+                kv_cache_params.host_max_kv_cache_lengths):
             hidden_states = layer(
                 hidden_states,
                 use_cache=use_cache,
@@ -226,6 +256,7 @@ class LLaMAModel(Module):
                     past_key_value=[past],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
+                    host_max_kv_cache_lengths=max_kv_cache_length,
                     kv_cache_block_pointers=[pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
@@ -265,7 +296,11 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                  quant_mode=QuantMode(0),
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
-                 rms_norm_eps=1e-06):
+                 rms_norm_eps=1e-06,
+                 use_fused_mlp=False,
+                 attn_bias=False,
+                 mlp_bias=False,
+                 use_prompt_tuning: bool = False):
 
         if isinstance(dtype, str):
             self.dtype = str_dtype_to_trt(dtype)
@@ -303,7 +338,8 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                          mlp_hidden_size, position_embedding_type, rotary_base,
                          rotary_scaling, mapping, quant_mode,
                          use_parallel_embedding, embedding_sharding_dim,
-                         rms_norm_eps)
+                         rms_norm_eps, use_fused_mlp, attn_bias, mlp_bias,
+                         use_prompt_tuning)
 
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
         if self.mapping.is_last_pp_rank():
@@ -315,20 +351,27 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                                         tp_size=mapping.tp_size,
                                         gather_output=True)
 
-    def forward(self,
-                input_ids,
-                position_ids=None,
-                use_cache=False,
-                last_token_ids=None,
-                attention_mask=None,
-                kv_cache_params=None,
-                attention_params=None,
-                hidden_states=None,
-                all_reduce_workspace=None):
+    def forward(
+        self,
+        input_ids,
+        position_ids=None,
+        use_cache=False,
+        last_token_ids=None,
+        attention_mask=None,
+        kv_cache_params=None,
+        attention_params=None,
+        hidden_states=None,
+        all_reduce_workspace=None,
+        prompt_embedding_table: Optional[Tensor] = None,
+        prompt_tasks: Optional[Tensor] = None,
+        prompt_vocab_size: Optional[Tensor] = None,
+    ):
         hidden_states = super().forward(input_ids, position_ids, use_cache,
                                         attention_mask, kv_cache_params,
                                         attention_params, hidden_states,
-                                        all_reduce_workspace)
+                                        all_reduce_workspace,
+                                        prompt_embedding_table, prompt_tasks,
+                                        prompt_vocab_size)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -363,7 +406,9 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                        max_new_tokens,
                        use_cache,
                        max_beam_width,
-                       max_num_tokens: int = None):
+                       max_num_tokens: int = None,
+                       prompt_embedding_table_size: int = 0,
+                       gather_all_token_logits: bool = False):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -399,23 +444,36 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
             dtype=self.dtype,
             num_heads=self.num_heads,
             mapping=self.mapping,
-            max_num_tokens=max_num_tokens)
+            max_num_tokens=max_num_tokens,
+            prompt_embedding_table_size=prompt_embedding_table_size,
+            gather_all_token_logits=gather_all_token_logits,
+        )
 
-        return (model_inputs['input_ids'], model_inputs['position_ids'], True,
-                model_inputs['last_token_ids'], model_inputs['attention_mask'],
-                KeyValueCacheParams(
-                    past_key_value=model_inputs['past_key_value'],
-                    host_past_key_value_lengths=model_inputs[
-                        'host_past_key_value_lengths'],
-                    kv_cache_block_pointers=model_inputs[
-                        'kv_cache_block_pointers_list'],
-                    cache_indirection=model_inputs['cache_indirection'],
-                ),
-                AttentionParams(
-                    sequence_length=model_inputs['sequence_length'],
-                    context_lengths=model_inputs['context_lengths'],
-                    host_context_lengths=model_inputs['host_context_lengths'],
-                    max_context_length=max_input_len,
-                    host_request_types=model_inputs['host_request_types']),
-                model_inputs['hidden_states_input'],
-                model_inputs['all_reduce_workspace'])
+        return (
+            model_inputs['input_ids'],
+            model_inputs['position_ids'],
+            True,
+            model_inputs['last_token_ids'],
+            model_inputs['attention_mask'],
+            KeyValueCacheParams(
+                past_key_value=model_inputs['past_key_value'],
+                host_past_key_value_lengths=model_inputs[
+                    'host_past_key_value_lengths'],
+                host_max_kv_cache_lengths=model_inputs[
+                    'host_max_kv_cache_lengths'],
+                kv_cache_block_pointers=model_inputs[
+                    'kv_cache_block_pointers_list'],
+                cache_indirection=model_inputs['cache_indirection'],
+            ),
+            AttentionParams(
+                sequence_length=model_inputs['sequence_length'],
+                context_lengths=model_inputs['context_lengths'],
+                host_context_lengths=model_inputs['host_context_lengths'],
+                max_context_length=max_input_len,
+                host_request_types=model_inputs['host_request_types']),
+            model_inputs['hidden_states_input'],
+            model_inputs['all_reduce_workspace'],
+            model_inputs['prompt_embedding_table'],
+            model_inputs['tasks'],
+            model_inputs['prompt_vocab_size'],
+        )

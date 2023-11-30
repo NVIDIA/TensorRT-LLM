@@ -347,6 +347,8 @@ class TestFalcon(unittest.TestCase):
         # past kv length: (length, is_context)
         host_past_key_value_lengths = torch.tensor([0] * batch_size,
                                                    dtype=torch.int32)
+        host_max_kv_cache_lengths = torch.tensor([total_length],
+                                                 dtype=torch.int32)
 
         ctx_buffer = {
             'input_ids': ctx_input_ids.contiguous(),
@@ -374,6 +376,7 @@ class TestFalcon(unittest.TestCase):
                                 head_dim)
         for i in range(hf_config.num_hidden_layers):
             ctx_shape[f'past_key_value_{i}'] = past_kv_shape
+            ctx_shape[f'host_max_kv_cache_length_{i}'] = (1, )
             ctx_buffer[f'present_key_value_{i}'] = torch.zeros(
                 present_kv_shape,
                 dtype=str_dtype_to_torch(kv_dtype),
@@ -381,6 +384,8 @@ class TestFalcon(unittest.TestCase):
             if use_gpt_attengion_plugin:
                 ctx_buffer[f'past_key_value_{i}'] = ctx_buffer[
                     f'present_key_value_{i}']
+                ctx_buffer[
+                    f'host_max_kv_cache_length_{i}'] = host_max_kv_cache_lengths
             else:
                 ctx_buffer[f'past_key_value_{i}'] = torch.zeros(
                     (1, ), dtype=str_dtype_to_torch(kv_dtype), device=device)
@@ -450,6 +455,8 @@ class TestFalcon(unittest.TestCase):
             if use_gpt_attengion_plugin:
                 # gpt_attention_plugin shares past/present cache.
                 step1_buffer[f'present_key_value_{i}'] = kv_cache
+                step1_buffer[
+                    f'host_max_kv_cache_length_{i}'] = host_max_kv_cache_lengths
         step1_shape = {k: v.shape for k, v in step1_buffer.items()}
 
         context = runtime.context_1

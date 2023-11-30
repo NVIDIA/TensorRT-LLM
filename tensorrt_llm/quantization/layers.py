@@ -104,12 +104,8 @@ class SmoothQuantLinear(Module):
             )
 
         weights_dtype = dtype
-        # Dirty hack to make it work with SmoothQuant int8 weights
-        # reinterpreted as fp32 weights due to the int8 TRT plugin limitation.
         if quant_mode.has_act_and_weight_quant():
-            assert self.in_features % 4 == 0
-            self.in_features = self.in_features // 4
-            weights_dtype = "float32"
+            weights_dtype = "int8"
 
         self.weight = Parameter(shape=(self.out_features, self.in_features),
                                 dtype=weights_dtype)
@@ -190,17 +186,12 @@ class SmoothQuantRowLinear(Module):
                 "SmoothQuant Linear has to have act+weight quantization mode set"
             )
         weights_dtype = dtype
-        # Dirty hack to make it work with SmoothQuant int8 weights
-        # reinterpreted as fp32 weights due to the int8 TRT plugin limitation.
         if quant_mode.has_act_and_weight_quant():
-            assert self.in_features % 4 == 0
-            self.in_features = self.in_features // 4
-            weights_dtype = "float32"
+            weights_dtype = "int8"
 
         self.weight = Parameter(shape=(self.out_features, self.in_features),
                                 dtype=weights_dtype)
-        self.smoother = Parameter(shape=(1, self.in_features * 4),
-                                  dtype="float32")
+        self.smoother = Parameter(shape=(1, self.in_features), dtype="float32")
         if quant_mode.has_act_and_weight_quant():
             scale_shape = (1, self.out_features
                            ) if quant_mode.has_per_channel_scaling() else (1, 1)
@@ -352,11 +343,11 @@ class WeightOnlyQuantLinear(Module):
             quant_type_size_in_bits = 4
         self.in_features = in_features
         self.out_features = out_features // tp_size
-        # we use a fake tensor with data_type = float
+        # we use a fake tensor with data_type = int8
         self.weight = Parameter(shape=(self.in_features,
                                        int(self.out_features *
-                                           quant_type_size_in_bits / 32)),
-                                dtype="float32")
+                                           quant_type_size_in_bits / 8)),
+                                dtype="int8")
 
         scale_shape = (self.out_features, )
         self.per_channel_scale = Parameter(shape=scale_shape, dtype=dtype)
@@ -419,11 +410,11 @@ class WeightOnlyQuantRowLinear(Module):
             self.weight_only_quant_mode = 2
         self.in_features = in_features // tp_size
         self.out_features = out_features
-        #we use a fake tensor with data_type = float
+        #we use a fake tensor with data_type = int8
         self.weight = Parameter(shape=(self.in_features,
-                                       int(self.out_features / 4 /
+                                       int(self.out_features /
                                            self.weight_only_quant_mode)),
-                                dtype="float32")
+                                dtype="int8")
         self.per_channel_scale = Parameter(shape=(self.out_features, ),
                                            dtype=dtype)
 
@@ -475,8 +466,8 @@ class WeightOnlyGroupwiseQuantLinear(Module):
         self.in_features = in_features
         self.out_features = out_features // tp_size
         self.qweight = Parameter(shape=(self.in_features,
-                                        self.out_features // 8),
-                                 dtype="float32")
+                                        self.out_features // 2),
+                                 dtype="int8")
 
         scale_shape = (self.in_features // group_size, self.out_features)
         self.scale = Parameter(shape=scale_shape, dtype=dtype)
@@ -559,8 +550,8 @@ class WeightOnlyGroupwiseQuantRowLinear(Module):
         self.in_features = in_features // tp_size
         self.out_features = out_features
         self.qweight = Parameter(shape=(self.in_features,
-                                        self.out_features // 8),
-                                 dtype="float32")
+                                        self.out_features // 2),
+                                 dtype="int8")
 
         scale_shape = (self.in_features // group_size, self.out_features)
         self.scale = Parameter(shape=scale_shape, dtype=dtype)
@@ -643,6 +634,9 @@ class SmoothQuantMLP(Module):
     def forward(self, hidden_states, workspace=None):
         inter = self.fc(hidden_states)
         inter = ACT2FN[self.hidden_act](inter)
+        if default_net(
+        ).strongly_typed and inter.dtype != self.proj.smoother.value:
+            inter = cast(inter, self.proj.smoother.value)
         inter = inter / self.proj.smoother.value
         if self.quant_mode.has_act_and_weight_quant():
             if self.quant_mode.has_act_static_scaling():
@@ -975,6 +969,9 @@ class SmoothQuantGatedMLP(SmoothQuantMLP):
         inter = ACT2FN[self.hidden_act](inter)
         gate = self.gate(hidden_states)
         inter_x_gate = inter * gate
+        if default_net(
+        ).strongly_typed and inter_x_gate.dtype != self.proj.smoother.value.dtype:
+            inter_x_gate = cast(inter_x_gate, self.proj.smoother.value.dtype)
         inter_x_gate = inter_x_gate / self.proj.smoother.value
         if self.quant_mode.has_act_and_weight_quant():
             if self.quant_mode.has_act_static_scaling():
@@ -1001,12 +998,12 @@ class SmoothQuantAttention(Module):
                  apply_query_key_layer_scaling=False,
                  attention_mask_type=AttentionMaskType.padding,
                  bias=True,
+                 qkv_bias_only=False,
                  dtype=None,
                  position_embedding_type=PositionEmbeddingType.learned_absolute,
                  tp_group=None,
                  tp_size=1,
                  tp_rank=0,
-                 multi_block_mode=False,
                  scale_alibi_bias=False,
                  paged_kv_cache=False,
                  quant_mode=QuantMode(0)):
@@ -1036,7 +1033,6 @@ class SmoothQuantAttention(Module):
         self.scale_alibi_bias = scale_alibi_bias
 
         self.position_embedding_type = position_embedding_type
-        self.multi_block_mode = multi_block_mode
         self.paged_kv_cache = paged_kv_cache
 
         self.rotary_embedding_dim = 0
@@ -1069,7 +1065,7 @@ class SmoothQuantAttention(Module):
             hidden_size,
             hidden_size +
             2 * self.num_kv_heads * tp_size * self.attention_head_size,
-            bias=bias,
+            bias=(bias or qkv_bias_only),
             dtype=dtype,
             tp_group=tp_group,
             tp_size=tp_size,
@@ -1084,20 +1080,21 @@ class SmoothQuantAttention(Module):
                                           tp_size=tp_size,
                                           quant_mode=quant_mode)
 
+        self.use_lora = False
+
     def forward(self,
                 hidden_states: Tensor,
                 attention_mask=None,
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None,
-                workspace=None):
+                workspace=None,
+                lora_params=None):
         # TODO add in-flight batching to SmoothQuant
         if default_net().plugin_config.smooth_quant_gemm_plugin:
             qkv = self.qkv(hidden_states)
         else:
             raise ValueError("smooth_quant_gemm_plugin is not set")
-        if not default_net().plugin_config.gpt_attention_plugin:
-            raise ValueError("gpt_attention_plugin is not set")
 
         alibi_slopes = None
         if self.position_embedding_type == PositionEmbeddingType.alibi:
@@ -1134,6 +1131,8 @@ class SmoothQuantAttention(Module):
                 sequence_length=attention_params.sequence_length,
                 host_past_key_value_lengths=kv_cache_params.
                 host_past_key_value_lengths,
+                host_max_kv_cache_lengths=kv_cache_params.
+                host_max_kv_cache_lengths,
                 context_lengths=attention_params.context_lengths,
                 cache_indirection=kv_cache_params.cache_indirection,
                 host_request_types=attention_params.host_request_types,
@@ -1143,7 +1142,6 @@ class SmoothQuantAttention(Module):
                 q_scaling=self.q_scaling,
                 rotary_embedding_dim=self.rotary_embedding_dim,
                 position_embedding_type=self.position_embedding_type,
-                multi_block_mode=self.multi_block_mode,
                 kv_orig_quant_scale=kv_quant_scale,
                 kv_quant_orig_scale=kv_dequant_scale,
                 kv_cache_quant_mode=self.quant_mode,
@@ -1247,7 +1245,9 @@ class SmoothQuantAttention(Module):
             if use_cache and self.quant_mode.has_int8_kv_cache():
                 past_key_value = quantize_tensor(
                     past_key_value, self.kv_quantization_scale.value)
-
+        if default_net(
+        ).strongly_typed and context.dtype != self.dense.smoother.value.dtype:
+            context = cast(context, self.dense.smoother.value.dtype)
         context = context / self.dense.smoother.value
         if self.quant_mode.has_act_and_weight_quant():
             if self.quant_mode.has_act_static_scaling():

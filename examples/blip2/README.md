@@ -50,7 +50,7 @@
     ```
     The built OPT engines lie in `./trt_engine/blip-2-opt-2.7b/fp16/1-gpu`.
 
-    **UPDATE[2023-09-21]**: We have newly added INT8/INT4 weight-only support for OPT. So you can enbale it using commands as follows (take `INT4` as an example, while `INT8` is the default precision for weight-only quantization):
+    **UPDATE[2023-09-21]**: We have newly added INT8/INT4 weight-only support for OPT. So you can enable it using commands as follows (take `INT4` as an example, while `INT8` is the default precision for weight-only quantization):
     ```bash
     # OPT-2.7B
     python build.py --model_dir=./c-model/opt-2.7b/fp16/1-gpu \

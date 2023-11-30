@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/batch_manager/kvCacheConfig.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
@@ -23,16 +24,21 @@
 #include "tensorrt_llm/runtime/generationOutput.h"
 #include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <NvInferRuntime.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
+
+namespace tensorrt_llm::batch_manager
+{
+class TrtGptModelV1;
+}
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
@@ -47,34 +53,64 @@ namespace utils
 std::vector<uint8_t> loadEngine(std::string const& enginePath);
 }
 
-class TllmRuntime;
+class IpcMemory;
 class IStatefulGptDecoder;
 class NcclCommunicator;
 class RuntimeBuffers;
+class TllmRuntime;
 
 class GptSession
 {
+    using KvCacheManager = batch_manager::kv_cache_manager::KVCacheManager;
+    using KvCacheConfig = batch_manager::kv_cache_manager::KvCacheConfig;
+    using TensorPtr = runtime::ITensor::SharedPtr;
+    using TokenGeneratedCallback = std::function<void(SizeType step, bool finished)>;
+
 public:
     using LoggerPtr = std::shared_ptr<nvinfer1::ILogger>;
 
-    GptSession(GptModelConfig const& modelConfig, WorldConfig const& worldConfig, void const* engineBuffer,
-        std::size_t engineSize, LoggerPtr logger = nullptr);
+    //! @brief   Configuration for session execution and buffer sizes.
+    //!          `generate` may be called with batch size and beam width smaller than the configured parameters.
+    //! @details `maxBatchSize` will be divided by the number of micro batches to initialize each batch buffer.
+    class Config
+    {
+    public:
+        Config(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxSequenceLength)
+            : maxBatchSize{maxBatchSize}
+            , maxBeamWidth{maxBeamWidth}
+            , maxSequenceLength{maxSequenceLength}
+        {
+        }
 
-    GptSession(GptModelConfig const& modelConfig, WorldConfig const& worldConfig,
+        SizeType maxBatchSize;
+        SizeType maxBeamWidth;
+        SizeType maxSequenceLength;
+        bool decoderPerRequest{false};
+        bool cudaGraphMode{false};
+        KvCacheConfig kvCacheConfig{};
+        std::optional<SizeType> ctxMicroBatchSize = std::nullopt;
+        std::optional<SizeType> genMicroBatchSize = std::nullopt;
+    };
+
+    GptSession(Config const& sessionConfig, GptModelConfig const& modelConfig, WorldConfig const& worldConfig,
+        void const* engineBuffer, std::size_t engineSize, LoggerPtr logger = nullptr);
+
+    GptSession(Config const& sessionConfig, GptModelConfig const& modelConfig, WorldConfig const& worldConfig,
         std::vector<uint8_t> const& engineBuffer, LoggerPtr logger = nullptr)
-        : GptSession(modelConfig, worldConfig, engineBuffer.data(), engineBuffer.size(), logger)
+        : GptSession(
+            sessionConfig, modelConfig, worldConfig, engineBuffer.data(), engineBuffer.size(), std::move(logger))
     {
     }
 
-    GptSession(GptModelConfig const& modelConfig, WorldConfig const& worldConfig, std::string const& engineFile,
-        LoggerPtr logger = nullptr)
-        : GptSession(modelConfig, worldConfig, utils::loadEngine(engineFile), logger)
+    GptSession(Config const& sessionConfig, GptModelConfig const& modelConfig, WorldConfig const& worldConfig,
+        std::string const& engineFile, LoggerPtr logger = nullptr)
+        : GptSession(sessionConfig, modelConfig, worldConfig, utils::loadEngine(engineFile), std::move(logger))
     {
     }
 
     [[nodiscard]] nvinfer1::ILogger& getLogger() const;
 
-    [[nodiscard]] BufferManager& getBufferManager() const;
+    [[nodiscard]] BufferManager const& getBufferManager() const;
 
     [[nodiscard]] GptModelConfig const& getModelConfig() const
     {
@@ -91,63 +127,51 @@ public:
         return mDevice;
     }
 
-    [[nodiscard]] bool isCudaGraphMode() const noexcept
-    {
-        return mCudaGraphMode;
-    }
-
-    void setCudaGraphMode(bool value)
-    {
-        mCudaGraphMode = value;
-    }
-
-    //! @brief   Initialize buffers for the given sizes.
-    //!          `generate` may be called with batch size and beam width smaller than the setup parameters.
-    //! @details `maxBatchSize` will be devided by the number of micro batches to initialize each batch buffer.
-    void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxSequenceLength, bool decoderPerRequest,
-        std::optional<SizeType> maxTokensInPagedKvCache = std::nullopt,
-        std::optional<SizeType> numMicroBatches = std::nullopt);
-
-    void generate(GenerationOutput& outputs, GenerationInput const& inputs, SamplingConfig const& samplingConfig)
-    {
-        if (mNumMicroBatches == 1)
-            generateSingleBatch(outputs, inputs, samplingConfig);
-        else
-            generateMultiBatch(outputs, inputs, samplingConfig);
-    }
+    void generate(GenerationOutput& outputs, GenerationInput const& inputs, SamplingConfig const& samplingConfig);
 
 private:
-    void generateSingleBatch(
-        GenerationOutput& outputs, GenerationInput const& inputs, SamplingConfig const& samplingConfig);
+    [[nodiscard]] bool useCudaGraphs()
+    {
+        return !mCudaGraphInstances.empty();
+    }
 
-    void generateMultiBatch(
-        GenerationOutput& outputs, GenerationInput const& inputs, SamplingConfig const& samplingConfig);
+    void generateBatched(std::vector<GenerationOutput>& microBatchesOutputs,
+        std::vector<GenerationInput> const& microBatchesInputs, SamplingConfig const& samplingConfig,
+        TokenGeneratedCallback const& onTokenGenerated);
 
-    using KvCacheManager = batch_manager::kv_cache_manager::KVCacheManager;
+    void setup(Config const& sessionConfig);
 
-    void createContexts(SizeType numMicroBatches);
+    void createContexts(SizeType numBatchesCtx, SizeType numBatchesGen, bool useCudaGraphs);
     void createBuffers(SizeType numMicroBatches);
-    void createDecoders(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength,
+    void createDecoders(SizeType batchSize, SizeType beamWidth, SizeType maxKvCacheLength, SizeType maxSequenceLength,
         nvinfer1::DataType logitsType, bool decoderPerRequest, SizeType numMicroBatches);
-    void createKvCacheManagers(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength,
-        SizeType numMicroBatches, std::optional<SizeType> maxTokensInPagedKvCache);
+    void createKvCacheManager(SizeType batchSize, SizeType beamWidth, SizeType maxKvCacheLength,
+        SizeType maxSequenceLength, KvCacheConfig const& config);
     void createCustomAllReduceWorkspace(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength);
 
+    void executeContextStep(std::vector<GenerationInput> const& microBatches,
+        std::vector<SizeType> const& microBatchOffsets, KvCacheManager const* kvCacheManager);
+    SizeType executeGenerationStep(SizeType step, std::vector<GenerationInput> const& microBatchesInputs,
+        std::vector<GenerationOutput>& microBatchesOutputs, std::vector<SizeType> const& microBatchOffsets,
+        KvCacheManager* kvCacheManager, std::vector<bool>& microBatchesFinished);
+
     //! @brief Execute decoder on last PP rank, receive decoder output on other PP ranks.
-    void decoderStepAsync(
-        ITensor::SharedPtr& outputIds, ITensor::SharedPtr& newTokens, SizeType decoderStep, SizeType microBatchId);
+    void decoderStepAsync(SizeType decoderStep, SizeType microBatchId);
 
     //! @brief Synchronize with the decoder and return the `shouldStop` flag.
     bool shouldStopSync(SizeType batchSize, SizeType beamWidth, SizeType microBatchId);
 
-    //! @brief Collect final output ids on last PP rank and send them to first PP rank.
+    //! @brief Collect final output ids and log probs on last PP rank and send them to first PP rank.
     //! @details Receives are asynchronous on host, so synchronization is required before access.
-    void finalizeOutputIds(ITensor& outputIds, SizeType microBatchId);
+    void finalize(SizeType microBatchId);
 
-    void kvCacheAddSequences(SizeType beamWidth, SizeType microBatchId);
+    void kvCacheAddSequences(SizeType beamWidth, SizeType microBatchId, SizeType firstBatchIdx);
 
-    ITensor::SharedPtr initNewTokens(
-        GenerationInput const& inputs, SamplingConfig const& samplingConfig, SizeType microBatchId);
+    //! @brief Populate outputIds and return reference to newTokens tensor
+    ITensor::SharedPtr initDecoder(ITensor& outputIds, GenerationInput const& inputs, GenerationOutput const& outputs,
+        SamplingConfig const& samplingConfig, SizeType microBatchId) const;
+
+    TokenGeneratedCallback createOnTokenGeneratedCallback(GenerationOutput& outputs);
 
     class CudaGraphExecutor
     {
@@ -180,9 +204,49 @@ private:
         bool update(cudaGraph_t const& graph);
         void uploadToStream(CudaStream const& stream);
 
-        using cudaGraphExecPtr = cudaGraphExec_t;
-        cudaGraphExecPtr mInstance;
+        cudaGraphExec_t mInstance;
     };
+
+    class MicroBatchConfig
+    {
+    public:
+        MicroBatchConfig()
+            : numCtxBatches{1}
+            , numGenBatches{1}
+            , ctxBatchSize{0}
+            , genBatchSize{0}
+        {
+        }
+
+        explicit MicroBatchConfig(SizeType maxBatchSize, SizeType pipelineParallelism,
+            std::optional<SizeType> genMicroBatchSize, std::optional<SizeType> ctxMicroBatchSize);
+
+        constexpr SizeType numCtxPerGen() const
+        {
+            return numCtxBatches / numGenBatches;
+        }
+
+        //! @details First 2 * numGenBatches contexts are for generation phase, next numCtxBatches are for context
+        //!          phase. Use numCtxPerGen() contexts for the context batches of each generation batch.
+        constexpr SizeType getCtxContextId(SizeType generationBatchId, SizeType contextBatchId) const
+        {
+            return 2 * numGenBatches + generationBatchId * numCtxPerGen() + contextBatchId;
+        }
+
+        //! @details First 2 * numGenBatches contexts are for generation phase, flip-flop between 2 of them for each
+        //!          generation batch.
+        constexpr SizeType getGenContextId(SizeType flipFlopId, SizeType generationBatchId) const
+        {
+            return flipFlopId * numGenBatches + generationBatchId;
+        }
+
+        SizeType numCtxBatches;
+        SizeType numGenBatches;
+        SizeType ctxBatchSize;
+        SizeType genBatchSize;
+    };
+
+    friend class batch_manager::TrtGptModelV1;
 
 private:
     GptModelConfig const mModelConfig;
@@ -192,21 +256,26 @@ private:
     std::shared_ptr<CudaStream> mCommStream;
     CudaEvent mCommEvent{};
 
+    // tensor parallelism with custom allreduce plugin
+    ITensor::SharedPtr mCommPtrs;
+    std::vector<std::shared_ptr<IpcMemory>> mIpcMemoryHandles;
+
     SizeType mDecoderMaxSequenceLength{};
+    SizeType mDecoderMaxKvCacheLength{};
 
     LoggerPtr mLogger;
     std::shared_ptr<TllmRuntime> mRuntime;
+    std::shared_ptr<KvCacheManager> mKvCacheManager;
 
-    SizeType mNumMicroBatches;
+    MicroBatchConfig mMicroBatchConfig;
     // for each micro batch
     std::vector<std::shared_ptr<IStatefulGptDecoder>> mDecoders;
     std::vector<std::shared_ptr<RuntimeBuffers>> mBuffers;
-    std::vector<std::shared_ptr<KvCacheManager>> mKvCacheManagers;
     std::vector<CudaEvent> mReceivedEvents;
 
     bool mCudaGraphMode{false};
     // ping-pong instances
-    std::array<CudaGraphExecutor, 2> mCudaGraphInstances;
+    std::vector<CudaGraphExecutor> mCudaGraphInstances;
 };
 
 } // namespace tensorrt_llm::runtime

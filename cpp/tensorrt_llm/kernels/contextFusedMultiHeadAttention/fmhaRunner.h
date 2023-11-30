@@ -47,8 +47,8 @@ public:
 
     virtual ~MHARunner() = default;
 
-    virtual void setup(const int b, const int s, const int total_seqlen, const bool has_alibi = false,
-        const bool scale_alibi = false, const int tp_size = 1, const int tp_rank = 0)
+    virtual void setup(const int b, const int s, const int sliding_window_size, const int total_seqlen,
+        const bool has_alibi = false, const bool scale_alibi = false, const int tp_size = 1, const int tp_rank = 0)
         = 0;
 
     static bool fmha_supported(const int headSize, const int sm);
@@ -80,8 +80,9 @@ public:
 
     ~FusedMHARunnerV2(); // for pimpl
 
-    void setup(const int b, const int s, const int total_seqlen, const bool has_alibi = false,
-        const bool scale_alibi = false, const int tp_size = 1, const int tp_rank = 0) override;
+    void setup(const int b, const int s, const int sliding_window_size, const int total_seqlen,
+        const bool has_alibi = false, const bool scale_alibi = false, const int tp_size = 1,
+        const int tp_rank = 0) override;
 
     bool fmha_supported() override;
 

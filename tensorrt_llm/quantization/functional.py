@@ -59,6 +59,7 @@ def smooth_quant_gemm(input: Tensor, weights: Tensor, scales_a: Tensor,
         ]
         layer = default_trtnet().add_plugin_v2(plug_inputs, gemm_plug)
         layer.get_input(0).set_dynamic_range(-127, 127)
+        layer.get_input(1).set_dynamic_range(-127, 127)
         return _create_tensor(layer.get_output(0), layer)
 
 
@@ -85,6 +86,7 @@ def weight_only_quant_matmul(input: Tensor, weights: Tensor, scales: Tensor,
         matmul_plug = plg_creator.create_plugin("woq_matmul", pfc)
         plug_inputs = [input.trt_tensor, weights.trt_tensor, scales.trt_tensor]
         layer = default_trtnet().add_plugin_v2(plug_inputs, matmul_plug)
+        layer.get_input(1).set_dynamic_range(-127, 127)
         return _create_tensor(layer.get_output(0), layer)
 
 
@@ -140,6 +142,11 @@ def weight_only_groupwise_quant_matmul(input: Tensor, pre_quant_scale: Tensor,
             plug_inputs += [biases.trt_tensor]
 
         layer = default_trtnet().add_plugin_v2(plug_inputs, matmul_plug)
+        if quant_algo & PRE_QUANT_SCALE:
+            layer.get_input(2).set_dynamic_range(-127, 127)
+        else:
+            layer.get_input(1).set_dynamic_range(-127, 127)
+
         return _create_tensor(layer.get_output(0), layer)
 
 

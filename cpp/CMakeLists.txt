@@ -21,14 +21,21 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include(CheckLanguage)
 include(cmake/modules/set_ifndef.cmake)
 include(cmake/modules/find_library_create_target.cmake)
+include(cmake/modules/resolve_dirs.cmake)
+include(cmake/modules/parse_make_options.cmake)
 
 project(tensorrt_llm LANGUAGES CXX)
 
 # Build options
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
+option(BUILD_PYBIND "Build Python bindings for C++ runtime and batch manager"
+       OFF)
 option(BUILD_TESTS "Build Google tests" ON)
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
 option(NVTX_DISABLE "Disable all NVTX features" ON)
+option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
+option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
+option(FAST_MATH "Compiling in fast math mode" OFF)
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
@@ -69,6 +76,11 @@ if(BUILD_BENCHMARKS)
   message(STATUS "Building benchmarks")
 else()
   message(STATUS "Not building benchmarks")
+endif()
+
+if(FAST_BUILD)
+  add_compile_definitions("FAST_BUILD")
+  message(WARNING "Skip some kernels to accelerate compilation")
 endif()
 
 # Determine CUDA version before enabling the language extension
@@ -129,6 +141,13 @@ enable_language(CUDA)
 
 find_package(CUDAToolkit REQUIRED)
 
+resolve_dirs(CUDAToolkit_INCLUDE_DIRS "${CUDAToolkit_INCLUDE_DIRS}")
+
+message(STATUS "CUDA library status:")
+message(STATUS "    version: ${CUDAToolkit_VERSION}")
+message(STATUS "    libraries: ${CUDAToolkit_LIBRARY_DIR}")
+message(STATUS "    include path: ${CUDAToolkit_INCLUDE_DIRS}")
+
 find_library(
   CUDNN_LIB cudnn
   HINTS ${CUDNN_ROOT_DIR} ${CUDAToolkit_LIBRARY_DIR}
@@ -162,7 +181,7 @@ get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
 include_directories(
-  ${CUDA_INCLUDE_DIRS} ${CUDNN_ROOT_DIR}/include ${NCCL_INCLUDE_DIR}
+  ${CUDAToolkit_INCLUDE_DIRS} ${CUDNN_ROOT_DIR}/include ${NCCL_INCLUDE_DIR}
   ${3RDPARTY_DIR}/cutlass/include ${3RDPARTY_DIR}/NVTX/include
   ${3RDPARTY_DIR}/json/include)
 
@@ -171,7 +190,6 @@ set_ifndef(TRT_LIB_DIR ${CMAKE_BINARY_DIR})
 set_ifndef(TRT_INCLUDE_DIR /usr/include/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
 set(TRT_LIB nvinfer)
 find_library_create_target(${TRT_LIB} nvinfer SHARED ${TRT_LIB_DIR})
-find_library_create_target(nvuffparser nvparsers SHARED ${TRT_LIB_DIR})
 
 if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")
@@ -219,11 +237,49 @@ if(WIN32)
   set(CMAKE_CXX_FLAGS "/DNOMINMAX ${CMAKE_CXX_FLAGS}")
 endif()
 
+if((MSVC))
+  if((MSVC_VERSION GREATER_EQUAL 1914))
+    # MSVC does not apply the correct __cplusplus version per the C++ standard
+    # by default. This is required for compiling CUTLASS 3.0 kernels on windows
+    # with C++-17 constexpr enabled. The 2017 15.7 MSVC adds /Zc:__cplusplus to
+    # set __cplusplus to 201703 with std=c++17. See
+    # https://learn.microsoft.com/en-us/cpp/build/reference/zc-cplusplus for
+    # more info.
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zc:__cplusplus")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler  /Zc:__cplusplus")
+  else()
+    message(
+      FATAL_ERROR
+        "Build is only supported with Visual Studio 2017 version 15.7 or higher"
+    )
+  endif()
+endif()
+
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
+if(FAST_MATH)
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math")
+  message("CMAKE_CUDA_FLAGS: ${CMAKE_CUDA_FLAGS}")
+endif()
 
 set(COMMON_HEADER_DIRS ${PROJECT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIR})
 message(STATUS "COMMON_HEADER_DIRS: ${COMMON_HEADER_DIRS}")
+
+if(NOT WIN32 AND NOT DEFINED USE_CXX11_ABI)
+  find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+  execute_process(
+    COMMAND ${Python3_EXECUTABLE} "-c"
+            "import torch; print(torch.compiled_with_cxx11_abi(),end='');"
+    RESULT_VARIABLE _PYTHON_SUCCESS
+    OUTPUT_VARIABLE USE_CXX11_ABI)
+  # Convert the bool variable to integer.
+  if(USE_CXX11_ABI)
+    set(USE_CXX11_ABI 1)
+  else()
+    set(USE_CXX11_ABI 0)
+  endif()
+  message(STATUS "USE_CXX11_ABI is set by python Torch to ${USE_CXX11_ABI}")
+endif()
 
 if(BUILD_PYT)
   # Build TORCH_CUDA_ARCH_LIST
@@ -283,27 +339,39 @@ print(os.path.dirname(torch.__file__),end='');"
   message(STATUS "TORCH_CXX_FLAGS: ${TORCH_CXX_FLAGS}")
   add_compile_options(${TORCH_CXX_FLAGS})
   add_compile_definitions(TORCH_CUDA=1)
+
+  if(DEFINED USE_CXX11_ABI)
+    parse_make_options(${TORCH_CXX_FLAGS} "TORCH_CXX_FLAGS")
+    if(DEFINED TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI
+       AND NOT ${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} EQUAL ${USE_CXX11_ABI})
+      message(
+        WARNING
+          "The libtorch compilation options _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} "
+          "found by CMake conflict with the project setting USE_CXX11_ABI=${USE_CXX11_ABI}, and the project "
+          "setting will be discarded.")
+    endif()
+  endif()
+
+elseif(NOT WIN32)
+  if(NOT USE_CXX11_ABI)
+    add_compile_options("-D_GLIBCXX_USE_CXX11_ABI=0")
+  endif()
+  message(STATUS "Build without PyTorch, USE_CXX11_ABI=${USE_CXX11_ABI}")
 endif()
 
 file(STRINGS "${TRT_INCLUDE_DIR}/NvInferVersion.h" VERSION_STRINGS
      REGEX "#define NV_TENSORRT_.*")
 foreach(TYPE MAJOR MINOR PATCH BUILD)
-  string(REGEX MATCH "NV_TENSORRT_${TYPE} [0-9]" TRT_TYPE_STRING
+  string(REGEX MATCH "NV_TENSORRT_${TYPE} [0-9]+" TRT_TYPE_STRING
                ${VERSION_STRINGS})
-  string(REGEX MATCH "[0-9]" TRT_${TYPE} ${TRT_TYPE_STRING})
-endforeach(TYPE)
-
-foreach(TYPE MAJOR MINOR PATCH)
-  string(REGEX MATCH "NV_TENSORRT_SONAME_${TYPE} [0-9]" TRT_TYPE_STRING
-               ${VERSION_STRINGS})
-  string(REGEX MATCH "[0-9]" TRT_SO_${TYPE} ${TRT_TYPE_STRING})
+  string(REGEX MATCH "[0-9]+" TRT_${TYPE} ${TRT_TYPE_STRING})
 endforeach(TYPE)
 
 set(TRT_VERSION
     "${TRT_MAJOR}.${TRT_MINOR}.${TRT_PATCH}"
     CACHE STRING "TensorRT project version")
 set(TRT_SOVERSION
-    "${TRT_SO_MAJOR}"
+    "${TRT_MAJOR}"
     CACHE STRING "TensorRT library so version")
 message(
   STATUS
@@ -324,4 +392,12 @@ endif()
 if(BUILD_BENCHMARKS)
   add_subdirectory(${TRT_LLM_ROOT_DIR}/benchmarks/cpp
                    ${CMAKE_BINARY_DIR}/benchmarks)
+endif()
+
+# Measure the compile time
+option(MEASURE_BUILD_TIME "Measure the build time of each module" OFF)
+if(MEASURE_BUILD_TIME)
+  set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CMAKE_COMMAND} -E time")
+  set_property(GLOBAL PROPERTY RULE_LAUNCH_CUSTOM "${CMAKE_COMMAND} -E time")
+  set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK "${CMAKE_COMMAND} -E time")
 endif()

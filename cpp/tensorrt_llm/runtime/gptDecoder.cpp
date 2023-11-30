@@ -41,10 +41,13 @@ GptDecoder<T>::GptDecoder(size_t vocabSize, size_t vocabSizePadded, CudaStreamPt
 
     mDynamicDecodeLayer = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(
         vocabSize, vocabSizePadded, stream->get(), &mAllocator, isFreeBufferAfterForward, &prop);
+
+    auto constexpr nvFloatType = TRTDataType<float>::value;
+    mLogProbsTiled = mManager.emptyTensor(MemoryType::kGPU, nvFloatType);
 }
 
 template <typename T>
-void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize)
+void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType maxSequenceLength)
 {
     typename layers::DynamicDecodeLayer<T>::SetupParams setupParams;
 
@@ -71,6 +74,10 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
     setupParams.length_penalty = samplingConfig.lengthPenalty;
 
     mDynamicDecodeLayer->setup(batchSize, samplingConfig.beamWidth, setupParams);
+
+    mLogProbsTiled->reshape(
+        ITensor::makeShape({maxSequenceLength, static_cast<SizeType>(batchSize), samplingConfig.beamWidth}));
+    mManager.setZero(*mLogProbsTiled);
 }
 
 namespace
@@ -90,8 +97,8 @@ typename tl::DynamicDecodeLayer<T>::ForwardParams prepareInputs(DecodingInput co
     TLLM_CHECK(input.logits->getDataType() == TRTDataType<T>::value);
 
     auto constexpr ite = 0; // no pipeline parallelism
-    typename tl::DynamicDecodeLayer<T>::ForwardParams forwardParams{input.step, ite, input.maxLength, input.batchSize,
-        tcc::toTllmTensor(*input.logits), tcc::toTllmTensor(*input.endIds)};
+    typename tl::DynamicDecodeLayer<T>::ForwardParams forwardParams{input.step, ite, input.maxLength,
+        input.maxKvCacheLength, input.batchSize, tcc::toTllmTensor(*input.logits), tcc::toTllmTensor(*input.endIds)};
 
     if (input.cacheIndirection)
     {
@@ -123,12 +130,17 @@ typename tl::DynamicDecodeLayer<T>::ForwardParams prepareInputs(DecodingInput co
         forwardParams.stop_words_list = tcc::toTllmTensor(*input.stopWordsList);
     }
 
+    if (input.finished)
+    {
+        forwardParams.finished = tcc::toTllmTensor(*input.finished);
+    }
+
     return forwardParams;
 }
 
 template <typename T>
 typename tl::DynamicDecodeLayer<T>::OutputParams prepareOutputs(
-    DecodingOutput& output, DecodingInput::TensorPtr const& inputLengths)
+    DecodingOutput& output, DecodingInput::TensorPtr const& inputLengths, DecodingOutput::TensorPtr& logProbsTiled)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     typename tl::DynamicDecodeLayer<T>::OutputParams outputParams(tcc::toTllmTensor(*output.ids));
@@ -168,6 +180,7 @@ typename tl::DynamicDecodeLayer<T>::OutputParams prepareOutputs(
     if (output.logProbs)
     {
         outputParams.output_log_probs = tcc::toTllmTensor(*output.logProbs);
+        outputParams.output_log_probs_tiled = tcc::toTllmTensor(*logProbsTiled);
     }
 
     outputParams.beamHypotheses = std::make_shared<tensorrt_llm::kernels::BeamHypotheses>();
@@ -218,7 +231,7 @@ bool GptDecoder<T>::forward(DecodingOutput& output, DecodingInput const& input)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto forwardParams = prepareInputs<T>(input);
-    auto outputParams = prepareOutputs<T>(output, input.lengths);
+    auto outputParams = prepareOutputs<T>(output, input.lengths, mLogProbsTiled);
 
     BufferManager::ITensorPtr finishedSum;
     std::int32_t* finishedSumHost = nullptr;
@@ -256,19 +269,14 @@ void GptDecoder<T>::forwardAsync(DecodingOutput& output, DecodingInput const& in
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto forwardParams = prepareInputs<T>(input);
-    auto outputParams = prepareOutputs<T>(output, input.lengths);
+    auto outputParams = prepareOutputs<T>(output, input.lengths, mLogProbsTiled);
 
     mDynamicDecodeLayer->forward(outputParams, forwardParams);
 }
 
-namespace tensorrt_llm::runtime
-{
-template class GptDecoder<float>;
-template class GptDecoder<half>;
-} // namespace tensorrt_llm::runtime
-
 // this should be similar to gatherTree in cpp/tensorrt_llm/thop/gatherTreeOp.cpp
-void IGptDecoder::gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput,
+template <typename T>
+void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput,
     DecodingInput const& decodingInput, BufferManager const& manager)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
@@ -277,6 +285,8 @@ void IGptDecoder::gatherTree(ITensor& finalOutputIds, DecodingOutput const& deco
     auto const batchSize = finalOutputIdsShape.d[0];
     auto const beamWidth = finalOutputIdsShape.d[1];
     auto const maxSeqLength = finalOutputIdsShape.d[2];
+
+    TLLM_CHECK_WITH_INFO(beamWidth > 1, "gatherTree is only needed for beam search.");
 
     TLLM_CHECK_WITH_INFO(decodingOutputIdsShape.d[0] == batchSize,
         common::fmtstr(
@@ -290,45 +300,89 @@ void IGptDecoder::gatherTree(ITensor& finalOutputIds, DecodingOutput const& deco
 
     auto const& stream = manager.getStream();
 
-    if (beamWidth > 1)
-    {
-        tensorrt_llm::kernels::invokeInitializeOutput(bufferCast<TokenIdType>(finalOutputIds),
-            bufferCast<TokenIdType>(*decodingInput.endIds), batchSize * beamWidth, maxSeqLength, stream.get());
-        sync_check_cuda_error();
+    tensorrt_llm::kernels::invokeInitializeOutput(bufferCast<TokenIdType>(finalOutputIds),
+        bufferCast<TokenIdType>(*decodingInput.endIds), batchSize * beamWidth, maxSeqLength, stream.get());
+    sync_check_cuda_error();
 
-        tensorrt_llm::kernels::BeamHypotheses beamHypotheses;
-        beamHypotheses.sequence_lengths_src = bufferCast<SizeType>(*decodingOutput.lengths);
-        beamHypotheses.parent_ids_src = bufferCast<TokenIdType>(*decodingOutput.parentIds);
-        beamHypotheses.output_ids_src = bufferCast<TokenIdType>(*decodingOutput.ids);
-        beamHypotheses.log_probs_src = nullptr;
-        beamHypotheses.max_seq_len = maxSeqLength;
-        beamHypotheses.length_penalty = 1.0f;
+    tensorrt_llm::kernels::BeamHypotheses beamHypotheses;
+    beamHypotheses.sequence_lengths_src = bufferCast<SizeType>(*decodingOutput.lengths);
+    beamHypotheses.parent_ids_src = bufferCast<TokenIdType>(*decodingOutput.parentIds);
+    beamHypotheses.output_ids_src = bufferCast<TokenIdType>(*decodingOutput.ids);
+    beamHypotheses.log_probs_src = bufferCast<float>(*mLogProbsTiled);
+    beamHypotheses.max_seq_len = maxSeqLength;
+    beamHypotheses.length_penalties
+        = nullptr; // TODO (bhsueh) should set length penalties, this should be a gpu tensor When it is set as
+                   // nullptr, the kernel will use default value (1.0f) automatically.
 
-        beamHypotheses.output_ids_tgt = bufferCast<TokenIdType>(*decodingOutput.beamHypotheses.outputIdsTgt);
-        beamHypotheses.sequence_lengths_tgt = bufferCast<SizeType>(*decodingOutput.beamHypotheses.sequenceLengthsTgt);
-        beamHypotheses.cum_log_probs = bufferCast<float>(*decodingOutput.beamHypotheses.cumLogProbs);
-        beamHypotheses.normed_scores = bufferCast<float>(*decodingOutput.beamHypotheses.normedScores);
-        beamHypotheses.log_probs = bufferCast<float>(*decodingOutput.beamHypotheses.logProbs);
-        beamHypotheses.min_normed_scores = bufferCast<float>(*decodingOutput.beamHypotheses.minNormedScores);
-        beamHypotheses.num_beams = bufferCast<SizeType>(*decodingOutput.beamHypotheses.numBeams);
-        beamHypotheses.is_done = bufferCast<bool>(*decodingOutput.beamHypotheses.isDone);
-        beamHypotheses.input_lengths = bufferCast<SizeType>(*decodingInput.lengths);
+    beamHypotheses.output_ids_tgt = bufferCast<TokenIdType>(*decodingOutput.beamHypotheses.outputIdsTgt);
+    beamHypotheses.sequence_lengths_tgt = bufferCast<SizeType>(*decodingOutput.beamHypotheses.sequenceLengthsTgt);
+    beamHypotheses.cum_log_probs = bufferCast<float>(*decodingOutput.beamHypotheses.cumLogProbs);
+    beamHypotheses.normed_scores = bufferCast<float>(*decodingOutput.beamHypotheses.normedScores);
+    beamHypotheses.log_probs = bufferCast<float>(*decodingOutput.beamHypotheses.logProbs);
+    beamHypotheses.min_normed_scores = bufferCast<float>(*decodingOutput.beamHypotheses.minNormedScores);
+    beamHypotheses.num_beams = bufferCast<SizeType>(*decodingOutput.beamHypotheses.numBeams);
+    beamHypotheses.is_done = bufferCast<bool>(*decodingOutput.beamHypotheses.isDone);
+    beamHypotheses.input_lengths = bufferCast<SizeType>(*decodingInput.lengths);
 
-        tensorrt_llm::kernels::invokeInsertUnfinishedPath(beamHypotheses, bufferCast<bool>(*decodingOutput.finished),
-            bufferCast<float>(*decodingOutput.cumLogProbs), batchSize, beamWidth, stream.get());
-        sync_check_cuda_error();
+    // This is where transpose is done
+    tensorrt_llm::kernels::invokeInsertUnfinishedPath(beamHypotheses, bufferCast<bool>(*decodingOutput.finished),
+        bufferCast<float>(*decodingOutput.cumLogProbs), batchSize, beamWidth, stream.get());
+    sync_check_cuda_error();
 
-        tensorrt_llm::kernels::invokeFinalize(bufferCast<TokenIdType>(finalOutputIds),
-            bufferCast<SizeType>(*decodingOutput.lengths), bufferCast<float>(*decodingOutput.cumLogProbs),
-            nullptr, // output_logs
-            beamHypotheses.output_ids_tgt, beamHypotheses.sequence_lengths_tgt, beamHypotheses.normed_scores,
-            beamHypotheses.cum_log_probs, beamHypotheses.log_probs, beamHypotheses.num_beams,
-            beamHypotheses.input_lengths, beamWidth, maxSeqLength, batchSize, stream.get());
-        sync_check_cuda_error();
-    }
-    else
-    {
-        manager.copy(*decodingOutput.ids, finalOutputIds);
-        sync_check_cuda_error();
-    }
+    tensorrt_llm::kernels::invokeFinalize(bufferCast<TokenIdType>(finalOutputIds),
+        bufferCast<SizeType>(*decodingOutput.lengths), bufferCast<float>(*decodingOutput.cumLogProbs),
+        decodingOutput.logProbs ? bufferCast<float>(*decodingOutput.logProbs) : nullptr, beamHypotheses.output_ids_tgt,
+        beamHypotheses.sequence_lengths_tgt, beamHypotheses.normed_scores, beamHypotheses.cum_log_probs,
+        beamHypotheses.log_probs, beamHypotheses.num_beams, beamHypotheses.input_lengths, beamWidth, maxSeqLength,
+        batchSize, stream.get());
+    sync_check_cuda_error();
+
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
+
+void IGptDecoder::acceptTokens(const ITensor& targetTokenIds, const ITensor& draftTokenIds,
+    const ITensor& contextLengths, const ITensor& numDraftTokens, ITensor& sequenceLengths, const ITensor& finishedVec,
+    ITensor& finishedFinal, ITensor& finishedSum, BufferManager::CudaStreamPtr const& stream)
+{
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+
+    auto const targetTokenIdsShape = targetTokenIds.getShape();
+    auto const batchSize = targetTokenIdsShape.d[0];
+    auto const beamWidth = targetTokenIdsShape.d[1];
+    auto const maxSeqLength = targetTokenIdsShape.d[2];
+    auto const maxDraftTokens = draftTokenIds.getShape().d[2];
+
+    TLLM_CHECK_WITH_INFO(
+        beamWidth == 1, common::fmtstr("Beam width (%d) > 1 is not supported for the speculative decoding", beamWidth));
+
+    TLLM_CHECK_WITH_INFO(draftTokenIds.getShape().d[0] == batchSize,
+        common::fmtstr("Draft tokens batch size (%d) is not equal to target batch size (%d)",
+            draftTokenIds.getShape().d[0], batchSize));
+
+    TLLM_CHECK_WITH_INFO(contextLengths.getShape().d[0] == batchSize,
+        common::fmtstr("Context length batch size (%d) is not equal to batch size (%d)", contextLengths.getShape().d[0],
+            batchSize));
+
+    TLLM_CHECK_WITH_INFO(numDraftTokens.getShape().d[0] == batchSize,
+        common::fmtstr("Num draft tokens batch size (%d) is not equal to batch size (%d)",
+            numDraftTokens.getShape().d[0], batchSize));
+
+    TLLM_CHECK_WITH_INFO(sequenceLengths.getShape().d[0] == batchSize,
+        common::fmtstr("Sequence length batch size (%d) is not equal to batch size (%d)",
+            sequenceLengths.getShape().d[0], batchSize));
+
+    tensorrt_llm::kernels::invokeAcceptTokens(bufferCast<SizeType>(draftTokenIds), bufferCast<SizeType>(targetTokenIds),
+        bufferCast<SizeType>(contextLengths), bufferCast<SizeType>(numDraftTokens),
+        bufferCast<SizeType>(sequenceLengths), bufferCast<bool>(finishedVec), bufferCast<bool>(finishedFinal),
+        bufferCast<int>(finishedSum), batchSize, beamWidth, maxSeqLength, maxDraftTokens, stream->get());
+
+    sync_check_cuda_error();
+
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+}
+
+namespace tensorrt_llm::runtime
+{
+template class GptDecoder<float>;
+template class GptDecoder<half>;
+} // namespace tensorrt_llm::runtime

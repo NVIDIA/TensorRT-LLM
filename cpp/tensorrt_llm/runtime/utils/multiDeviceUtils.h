@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/stringUtils.h"
 
 #include <mpi.h>
@@ -24,30 +25,21 @@
 #include <nccl.h>
 #endif // ENABLE_MULTI_DEVICE
 
-#define TLLM_MPI_CHECK(cmd, logger)                                                                                    \
+#define TLLM_MPI_CHECK(cmd)                                                                                            \
     do                                                                                                                 \
     {                                                                                                                  \
         auto e = cmd;                                                                                                  \
-        if (e != MPI_SUCCESS)                                                                                          \
-        {                                                                                                              \
-            (logger).log(nvinfer1::ILogger::Severity::kERROR,                                                          \
-                tensorrt_llm::common::fmtstr("Failed: MPI error %s:%d '%d'", __FILE__, __LINE__, e).c_str());          \
-            exit(EXIT_FAILURE);                                                                                        \
-        }                                                                                                              \
+        TLLM_CHECK_WITH_INFO(e == MPI_SUCCESS,                                                                         \
+            tensorrt_llm::common::fmtstr("Failed: MPI error %s:%d '%d'", __FILE__, __LINE__, e).c_str());              \
     } while (0)
 
 #if ENABLE_MULTI_DEVICE
-#define TLLM_NCCL_CHECK(cmd, logger)                                                                                   \
+#define TLLM_NCCL_CHECK(cmd)                                                                                           \
     do                                                                                                                 \
     {                                                                                                                  \
         ncclResult_t r = cmd;                                                                                          \
-        if (r != ncclSuccess)                                                                                          \
-        {                                                                                                              \
-            (logger).log(nvinfer1::ILogger::Severity::kERROR,                                                          \
-                tensorrt_llm::common::fmtstr(                                                                          \
-                    "Failed, NCCL error %s:%d '%s'\n", __FILE__, __LINE__, ncclGetErrorString(r))                      \
-                    .c_str());                                                                                         \
-            exit(EXIT_FAILURE);                                                                                        \
-        }                                                                                                              \
+        TLLM_CHECK_WITH_INFO(r == ncclSuccess,                                                                         \
+            tensorrt_llm::common::fmtstr("Failed, NCCL error %s:%d '%s'\n", __FILE__, __LINE__, ncclGetErrorString(r)) \
+                .c_str());                                                                                             \
     } while (0)
 #endif // ENABLE_MULTI_DEVICE

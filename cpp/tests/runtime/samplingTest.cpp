@@ -104,7 +104,7 @@ typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferMan
     ddLayer.setup(batchSize, beamWidth, setupParams);
 
     typename tl::DynamicDecodeLayer<float>::ForwardParams forwardParams(
-        step, ite, maxInputLength, localBatchSize, logits, endIds);
+        step, ite, maxInputLength, static_cast<int>(maxSeqLength), localBatchSize, logits, endIds);
     forwardParams.no_repeat_ngram_size = noRepeatNgramSize;
 
     typename tl::DynamicDecodeLayer<float>::OutputParams outputParams(outputIds);

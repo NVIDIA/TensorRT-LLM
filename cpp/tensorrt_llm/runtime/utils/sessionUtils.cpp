@@ -89,6 +89,13 @@ void reshapeBufferVector(std::vector<ITensor::SharedPtr>& vector, nvinfer1::Dims
     }
 }
 
+std::vector<ITensor::SharedPtr> sliceBufferVector(
+    std::vector<ITensor::SharedPtr> const& vector, SizeType const offset, SizeType const size)
+{
+    return transformVector(
+        vector, [offset, size](auto const& buffer) { return std::shared_ptr{ITensor::slice(buffer, offset, size)}; });
+}
+
 void insertTensorVector(StringPtrMap<ITensor>& map, std::string const& key, std::vector<ITensor::SharedPtr> const& vec,
     SizeType const indexOffset)
 {

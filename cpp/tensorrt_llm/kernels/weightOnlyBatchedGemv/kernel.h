@@ -22,11 +22,51 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-template <WeightOnlyQuantType QType>
-struct WeightLayoutDetails;
+template <typename ActType>
+struct ActTypeDetails;
 
 template <>
-struct WeightLayoutDetails<WeightOnlyQuantType::Int4b>
+struct ActTypeDetails<half>
+{
+    using CutlassType = cutlass::half_t;
+    using Vec2 = half2;
+
+    __device__ __forceinline__ static Vec2 to_vec2(half v)
+    {
+        return __half2half2(v);
+    }
+};
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && defined(ENABLE_BF16))
+template <>
+struct ActTypeDetails<__nv_bfloat16>
+{
+    using CutlassType = cutlass::bfloat16_t;
+    using Vec2 = __nv_bfloat162;
+
+    __device__ __forceinline__ static Vec2 to_vec2(__nv_bfloat16 v)
+    {
+        return __bfloat162bfloat162(v);
+    }
+};
+#endif
+
+template <typename ActType, WeightOnlyQuantType QType>
+struct ConverterSelector
+{
+    static_assert(QType == WeightOnlyQuantType::Int4b || QType == WeightOnlyQuantType::Int8b);
+
+    using WeiType = std::conditional_t<QType == WeightOnlyQuantType::Int4b, cutlass::uint4b_t, uint8_t>;
+    static constexpr int kConvertCount = QType == WeightOnlyQuantType::Int4b ? 8 : 4;
+    using Converter
+        = cutlass::FastInterleavedAndBiasedNumericArrayConverter<typename ActTypeDetails<ActType>::CutlassType, WeiType,
+            kConvertCount>;
+};
+
+template <typename ActType, WeightOnlyQuantType QType>
+struct WeightOnlyDetails;
+
+template <typename ActType>
+struct WeightOnlyDetails<ActType, WeightOnlyQuantType::Int4b>
 {
     // Every four rows of the original weights are interleaved into a row with stride of 64, so if each thread
     // processes 32 elements(for int4, we can use ldg.128 to load weights), then every group of two adjacent threads
@@ -48,16 +88,6 @@ struct WeightLayoutDetails<WeightOnlyQuantType::Int4b>
     static constexpr int kShuffleBasicTile = 2;
     static constexpr int kShuffleContinous = 4;
     static constexpr int kShuffleStrided = 4;
-
-    // The rearrangement here counteracts the effect of cutlass::add_bias_and_interleave_int4s_inplace
-    // Input int8 data layout
-    //      [elt_7  elt_5  elt_3  elt_1  elt_6  elt_4  elt_2  elt_0] (each elt occupies 4 bits)
-    //
-    // Converted fp16 data layout
-    //      [elt_7  elt_6  elt_5  elt_4  elt_3  elt_2  elt_1  elt_0] (each elt occupies 16 bits)
-    static constexpr int kConvertCount = 8;
-    using Converter
-        = cutlass::FastInterleavedAndBiasedNumericArrayConverter<cutlass::half_t, cutlass::uint4b_t, kConvertCount>;
 
     // Each warp completes the internal reduce and writes the [Batch * NPerBlock * Interleave] results to the
     // corresponding address in shared memory
@@ -85,8 +115,8 @@ struct WeightLayoutDetails<WeightOnlyQuantType::Int4b>
     }
 };
 
-template <>
-struct WeightLayoutDetails<WeightOnlyQuantType::Int8b>
+template <typename ActType>
+struct WeightOnlyDetails<ActType, WeightOnlyQuantType::Int8b>
 {
     // Every two rows of the original weights are interleaved into a row with stride of 64, so if each thread
     // processes 16 elements(for int8, we can use ldg.128 to load weights), then every group of four adjacent threads
@@ -108,15 +138,6 @@ struct WeightLayoutDetails<WeightOnlyQuantType::Int8b>
     static constexpr int kShuffleBasicTile = 2;
     static constexpr int kShuffleContinous = 2;
     static constexpr int kShuffleStrided = 4;
-
-    // The rearrangement here counteracts the effect of cutlass::add_bias_and_interleave_int8s_inplace
-    // Input int8 data layout
-    //      [elt_3  elt_1  elt_2  elt_0] (each elt occupies 8 bits)
-    //
-    // Converted fp16 data layout
-    //      [elt_3  elt_2  elt_1  elt_0] (each elt occupies 16 bits)
-    static constexpr int kConvertCount = 4;
-    using Converter = cutlass::FastInterleavedAndBiasedNumericArrayConverter<cutlass::half_t, uint8_t, kConvertCount>;
 
     // Each warp completes the internal reduce and writes the [Batch * NPerBlock * Interleave] results to the
     // corresponding address in shared memory
@@ -145,10 +166,10 @@ struct WeightLayoutDetails<WeightOnlyQuantType::Int8b>
     }
 };
 
-template <WeightOnlyQuantType QType>
+template <typename ActType, WeightOnlyQuantType QType>
 struct WeightOnlyKernelDetails
 {
-    using Layout = WeightLayoutDetails<QType>;
+    using Layout = WeightOnlyDetails<ActType, QType>;
 
     static constexpr int kElemBits = Layout::kElemBits;
     static constexpr int kInterleave = Layout::kInterleave;
@@ -159,8 +180,20 @@ struct WeightOnlyKernelDetails
     static constexpr int kShuffleContinous = Layout::kShuffleContinous;
     static constexpr int kShuffleStrided = Layout::kShuffleStrided;
 
-    using Converter = typename Layout::Converter;
-    static constexpr int kConvertCount = Layout::kConvertCount;
+    // The rearrangement here counteracts the effect of cutlass::add_bias_and_interleave_int4/8s_inplace
+    // Input int8 data layout
+    //      [elt_3  elt_1  elt_2  elt_0] (each elt occupies 8 bits)
+    //
+    // Converted fp16/bf16 data layout
+    //      [elt_3  elt_2  elt_1  elt_0] (each elt occupies 16 bits)
+
+    // Input int8 data layout
+    //      [elt_7  elt_5  elt_3  elt_1  elt_6  elt_4  elt_2  elt_0] (each elt occupies 4 bits)
+    //
+    // Converted fp16/bf16 data layout
+    //      [elt_7  elt_6  elt_5  elt_4  elt_3  elt_2  elt_1  elt_0] (each elt occupies 16 bits)
+    static constexpr int kConvertCount = ConverterSelector<ActType, QType>::kConvertCount;
+    using Converter = typename ConverterSelector<ActType, QType>::Converter;
 
     // Use ldg128 load data from global memory
     static constexpr int kAccessSize = 128;
@@ -175,8 +208,8 @@ struct WeightOnlyKernelDetails
     static constexpr int kConvertIters = kElemsPerThread / kConvertCount;
 
     // Each thread loads 16(int8b)/32(int4b) quantized weight elements each time through ldg128
-    // So more times of ldg128 are needed to load the same number of fp16 activation elements.
-    static constexpr int kActivationElemNumPerAccess = kAccessSize / (sizeof(half) * 8);
+    // So more times of ldg128 are needed to load the same number of fp16/bf16 activation elements.
+    static constexpr int kActivationElemNumPerAccess = kAccessSize / (sizeof(ActType) * 8);
     static constexpr int kActivationAccessNum = kElemsPerThread / kActivationElemNumPerAccess;
 };
 
@@ -197,11 +230,11 @@ struct WeightOnlyProperties<WeightOnlyGroupWise<GS>>
     static constexpr int kGroupSize = GS;
 };
 
-template <WeightOnlyQuantType QType, typename WeightOnlyFlag, bool Zero, int BlockSize>
+template <typename ActType, WeightOnlyQuantType QType, typename WeightOnlyFlag, bool Zero, int BlockSize>
 struct WeightOnlyScaleLoader
 {
-    using ElemType = half;
-    using Details = WeightOnlyKernelDetails<QType>;
+    using ElemType = ActType;
+    using Details = WeightOnlyKernelDetails<ActType, QType>;
     static constexpr bool kIsFineGrained = WeightOnlyProperties<WeightOnlyFlag>::kIsFineGrained;
     static constexpr int kGroupSize = WeightOnlyProperties<WeightOnlyFlag>::kGroupSize;
 
@@ -258,19 +291,20 @@ public:
     }
 };
 
-template <WeightOnlyQuantType QType, typename WeightOnlyFlag, template <typename T> class ActOp, bool Zero, bool Bias,
-    int NPerBlock, int Batch, int BlockSize>
-__global__ void weight_only_batched_gemv(const uint8_t* qweight, const half* scales, const half* zeros, const half* in,
-    const half* bias, half* out, const int n, const int k)
+template <typename ActType, WeightOnlyQuantType QType, typename WeightOnlyFlag, template <typename T> class ActOp,
+    bool Zero, bool Bias, int NPerBlock, int Batch, int BlockSize>
+__device__ void weight_only_batched_gemv(const uint8_t* qweight, const ActType* scales, const ActType* zeros,
+    const ActType* in, const ActType* bias, ActType* out, const int n, const int k)
 {
     static_assert(NPerBlock == 1 || (NPerBlock % 2 == 0));
-    using Details = WeightOnlyKernelDetails<QType>;
+    using ActType2 = typename ActTypeDetails<ActType>::Vec2;
+    using Details = WeightOnlyKernelDetails<ActType, QType>;
 
     using Converter = typename Details::Converter;
     using AccType = typename Details::AccessType;
     using CvtSrcType = typename Converter::source_type;
     using CvtResType = typename Converter::result_type;
-    using ScaleLoader = WeightOnlyScaleLoader<QType, WeightOnlyFlag, Zero, BlockSize>;
+    using ScaleLoader = WeightOnlyScaleLoader<ActType, QType, WeightOnlyFlag, Zero, BlockSize>;
     extern __shared__ uint8_t shmem[];
     constexpr int Interleave = Details::kInterleave;
     constexpr int WarpSize = 32;
@@ -286,20 +320,20 @@ __global__ void weight_only_batched_gemv(const uint8_t* qweight, const half* sca
 
     float(*sm)[Num * Interleave] = reinterpret_cast<float(*)[Num * Interleave]>(shmem);
 
-    // In order to take advantage of hfma2, we use fp16 for accumulation within threads and fp32 for accumulation
+    // In order to take advantage of hfma2, we use fp16/bf16 for accumulation within threads and fp32 for accumulation
     // between threads.
-    half accumulator[Num];
+    ActType accumulator[Num];
     for (int i = 0; i < Num; ++i)
     {
-        accumulator[i] = __float2half_rn(0.f);
+        accumulator[i] = static_cast<ActType>(0.f);
     }
 
     // Iteration in k dimensions
     for (int local_k = tid * Details::kElemsPerThread; local_k < k * Interleave;
          local_k += BlockSize * Details::kElemsPerThread)
     {
-        half weights_f16[Details::kElemsPerThread * NPerBlock];
-        half scale[NPerBlock], zero[NPerBlock];
+        ActType weights_f16[Details::kElemsPerThread * NPerBlock];
+        ActType scale[NPerBlock], zero[NPerBlock];
 #pragma unroll
         for (int idx = 0; idx < NPerBlock; ++idx)
         {
@@ -308,7 +342,7 @@ __global__ void weight_only_batched_gemv(const uint8_t* qweight, const half* sca
             load<AccType>(weights_quantized,
                 qweight + idx * Interleave * k / Details::kElemsPerByte + local_k / Details::kElemsPerByte);
             scale_loader.load(scale[idx], zero[idx], idx);
-            half weights_vec[Details::kElemsPerThread];
+            ActType weights_vec[Details::kElemsPerThread];
 #pragma unroll
             for (int i = 0; i < Details::kConvertIters; ++i)
             {
@@ -325,9 +359,10 @@ __global__ void weight_only_batched_gemv(const uint8_t* qweight, const half* sca
                 {
                     // Dequantize the weights and arrange the shuffled elements back to the correct order in the
                     // register array
-                    half2 v = *reinterpret_cast<half2*>(weights_vec + i * Details::kShuffleBasicTile
+                    ActType2 v = *reinterpret_cast<ActType2*>(weights_vec + i * Details::kShuffleBasicTile
                         + j * Details::kShuffleContinous * Details::kShuffleBasicTile);
-                    v = __hfma2(v, __half2half2(scale[idx]), __half2half2(zero[idx]));
+                    v = __hfma2(
+                        v, ActTypeDetails<ActType>::to_vec2(scale[idx]), ActTypeDetails<ActType>::to_vec2(zero[idx]));
                     weights_f16[(i * Details::kShuffleStrided * Details::kShuffleBasicTile
                                     + j * Details::kShuffleBasicTile + 0)
                             * NPerBlock
@@ -344,7 +379,7 @@ __global__ void weight_only_batched_gemv(const uint8_t* qweight, const half* sca
 #pragma unroll
         for (int b = 0; b < Batch; ++b)
         {
-            half in_v[Details::kElemsPerThread];
+            ActType in_v[Details::kElemsPerThread];
 #pragma unroll
             for (int idx = 0; idx < Details::kActivationAccessNum; ++idx)
             {
@@ -355,11 +390,12 @@ __global__ void weight_only_batched_gemv(const uint8_t* qweight, const half* sca
             // Perform vector inner product and accumulate
             if constexpr (NPerBlock == 1)
             {
-                half2 v = __float2half2_rn(0.f);
+                ActType2 v = ActTypeDetails<ActType>::to_vec2(static_cast<ActType>(0.f));
 #pragma unroll
                 for (int y = 0; y < Details::kElemsPerThread; y += 2)
                 {
-                    v = __hfma2(*reinterpret_cast<half2*>(weights_f16 + y), *reinterpret_cast<half2*>(in_v + y), v);
+                    v = __hfma2(
+                        *reinterpret_cast<ActType2*>(weights_f16 + y), *reinterpret_cast<ActType2*>(in_v + y), v);
                 }
                 accumulator[b] += __hadd(v.x, v.y);
             }
@@ -371,9 +407,10 @@ __global__ void weight_only_batched_gemv(const uint8_t* qweight, const half* sca
 #pragma unroll
                     for (int y = 0; y < Details::kElemsPerThread; ++y)
                     {
-                        *reinterpret_cast<half2*>(accumulator + b * NPerBlock + x * 2)
-                            = __hfma2(*reinterpret_cast<half2*>(weights_f16 + y * NPerBlock + x * 2),
-                                __half2half2(in_v[y]), *reinterpret_cast<half2*>(accumulator + b * NPerBlock + x * 2));
+                        *reinterpret_cast<ActType2*>(accumulator + b * NPerBlock + x * 2)
+                            = __hfma2(*reinterpret_cast<ActType2*>(weights_f16 + y * NPerBlock + x * 2),
+                                ActTypeDetails<ActType>::to_vec2(in_v[y]),
+                                *reinterpret_cast<ActType2*>(accumulator + b * NPerBlock + x * 2));
                     }
                 }
             }
@@ -384,7 +421,7 @@ __global__ void weight_only_batched_gemv(const uint8_t* qweight, const half* sca
 #pragma unroll
     for (int i = 0; i < Num; ++i)
     {
-        reses[i] = __half2float(accumulator[i]);
+        reses[i] = static_cast<float>(accumulator[i]);
     }
 
     // Each warp completes the internal reduce and writes the [Batch * NPerBlock * Interleave] results to the
@@ -403,27 +440,64 @@ __global__ void weight_only_batched_gemv(const uint8_t* qweight, const half* sca
         float bias_v = 0.f;
         if constexpr (Bias)
         {
-            bias_v = __half2float(bias[n_start_id + nid]);
+            bias_v = static_cast<float>(bias[n_start_id + nid]);
         }
         int b = i / NPerBlock / Interleave;
-        out[b * n + n_start_id + nid] = __float2half_rn(ActOp<float>::apply(v + bias_v));
+        out[b * n + n_start_id + nid] = static_cast<ActType>(ActOp<float>::apply(v + bias_v));
     }
+}
+
+template <typename ActType, WeightOnlyQuantType QType, typename WeightOnlyFlag, template <typename T> class ActOp,
+    bool Zero, bool Bias, int NPerBlock, int Batch, int BlockSize>
+__global__ void weight_only_batched_gemv_wrapper(const uint8_t* qweight, const ActType* scales, const ActType* zeros,
+    const ActType* in, const ActType* bias, ActType* out, const int n, const int k)
+{
+    if constexpr (std::is_same_v<ActType, half>)
+    {
+        weight_only_batched_gemv<ActType, QType, WeightOnlyFlag, ActOp, Zero, Bias, NPerBlock, Batch, BlockSize>(
+            qweight, scales, zeros, in, bias, out, n, k);
+    }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && defined(ENABLE_BF16))
+    else if (std::is_same_v<ActType, nv_bfloat16>)
+    {
+        weight_only_batched_gemv<ActType, QType, WeightOnlyFlag, ActOp, Zero, Bias, NPerBlock, Batch, BlockSize>(
+            qweight, scales, zeros, in, bias, out, n, k);
+    }
+#endif
 }
 
 template <WeightOnlyQuantType QType, typename WeightOnlyFlag, template <typename T> class ActOp, bool Zero, bool Bias,
     int NPerBlock, int Batch, int BlockSize>
 struct WeightOnlyBatchedGemvKernelLauncher
 {
-    static constexpr int kInterleave = WeightLayoutDetails<QType>::kInterleave;
-
     static void run(const WeightOnlyParams& params, cudaStream_t stream)
     {
-        dim3 grid(params.n / NPerBlock / kInterleave);
-        dim3 block(BlockSize);
-        int size = sizeof(float) * BlockSize / 32 * Batch * NPerBlock * kInterleave;
-        weight_only_batched_gemv<QType, WeightOnlyFlag, ActOp, Zero, Bias, NPerBlock, Batch, BlockSize>
-            <<<grid, block, size, stream>>>(
-                params.qweight, params.scales, params.zeros, params.in, params.bias, params.out, params.n, params.k);
+        if (params.act_type == WeightOnlyActivationType::FP16)
+        {
+            constexpr int kInterleave = WeightOnlyDetails<half, QType>::kInterleave;
+            dim3 grid(params.n / NPerBlock / kInterleave);
+            dim3 block(BlockSize);
+            int size = sizeof(float) * BlockSize / 32 * Batch * NPerBlock * kInterleave;
+            weight_only_batched_gemv_wrapper<half, QType, WeightOnlyFlag, ActOp, Zero, Bias, NPerBlock, Batch,
+                BlockSize><<<grid, block, size, stream>>>(params.qweight, reinterpret_cast<const half*>(params.scales),
+                reinterpret_cast<const half*>(params.zeros), reinterpret_cast<const half*>(params.in),
+                reinterpret_cast<const half*>(params.bias), reinterpret_cast<half*>(params.out), params.n, params.k);
+        }
+#if defined(ENABLE_BF16)
+        else if (params.act_type == WeightOnlyActivationType::BF16)
+        {
+            constexpr int kInterleave = WeightOnlyDetails<nv_bfloat16, QType>::kInterleave;
+            dim3 grid(params.n / NPerBlock / kInterleave);
+            dim3 block(BlockSize);
+            int size = sizeof(float) * BlockSize / 32 * Batch * NPerBlock * kInterleave;
+            weight_only_batched_gemv_wrapper<__nv_bfloat16, QType, WeightOnlyFlag, ActOp, Zero, Bias, NPerBlock, Batch,
+                BlockSize><<<grid, block, size, stream>>>(params.qweight,
+                reinterpret_cast<const __nv_bfloat16*>(params.scales),
+                reinterpret_cast<const __nv_bfloat16*>(params.zeros), reinterpret_cast<const __nv_bfloat16*>(params.in),
+                reinterpret_cast<const __nv_bfloat16*>(params.bias), reinterpret_cast<__nv_bfloat16*>(params.out),
+                params.n, params.k);
+        }
+#endif
     }
 };
 } // namespace kernels

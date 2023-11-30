@@ -31,7 +31,7 @@ class TestFunctional(unittest.TestCase):
         tensorrt_llm.logger.set_level('error')
 
     @parameterized.expand([('float32', ), ('float16')])
-    def test_slice(self, dtype):
+    def test_slice_1(self, dtype):
         # test data
         x_shape = (1, 256)
         x_data = torch.rand(x_shape,
@@ -75,3 +75,39 @@ class TestFunctional(unittest.TestCase):
 
         # compare diff
         np.testing.assert_allclose(ref.cpu().numpy(), outputs['output'])
+
+    def test_slice_2(self):
+        dtype = 'float32'
+        x_shape = (256, )
+        slice_length = 128
+        x_data = torch.rand(x_shape,
+                            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
+
+        # construct trt network
+        builder = tensorrt_llm.Builder()
+        net = builder.create_network()
+        with tensorrt_llm.net_guard(net):
+            network = tensorrt_llm.default_trtnet()
+            x = Tensor(name='x',
+                       shape=x_shape,
+                       dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+            starts = tensorrt_llm.functional.constant(
+                np.array([0], dtype=np.int32))
+            output_length = tensorrt_llm.functional.constant(
+                np.array([0] * slice_length, dtype=np.int32))
+            sizes = tensorrt_llm.functional.shape(output_length, 0)
+
+            output = tensorrt_llm.functional.slice(x, starts,
+                                                   sizes.view([1])).trt_tensor
+            output.name = 'output'
+            network.mark_output(output)
+
+        # trt run
+        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
+        with TrtRunner(build_engine) as runner:
+            outputs = runner.infer(feed_dict={'x': x_data.numpy()})
+
+        ref = x_data[0:slice_length]
+        np.testing.assert_allclose(ref.cpu().numpy(),
+                                   outputs['output'],
+                                   atol=1e-5)

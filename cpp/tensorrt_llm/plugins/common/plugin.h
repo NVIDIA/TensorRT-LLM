@@ -122,7 +122,7 @@ size_t calculateTotalWorkspaceSize(size_t* workspaces, int count, const uintptr_
 // Like std::unique_ptr, but does not prevent generation of default copy constructor when used as class members.
 // The copy constructor produces nullptr. So the plugin default copy constructor will not really copy this, and
 // your clone() implementation is responsible for initializing such data members.
-// With this we can simplify clone() implementation when there are many data menbers including at least one unique_ptr.
+// With this we can simplify clone() implementation when there are many data members including at least one unique_ptr.
 template <typename T, typename Del = std::default_delete<T>>
 class UniqPtrWNullCopy : public std::unique_ptr<T, Del>
 {

@@ -57,6 +57,12 @@ std::string MemoryCounters::bytesToString(DiffType bytes, int precision)
     return doubleBytesToString(static_cast<double>(bytes), precision);
 }
 
+std::string MemoryCounters::toString() const
+{
+    return tensorrt_llm::common::fmtstr("[MemUsage] GPU %s, CPU %s, Pinned %s", bytesToString(this->getGpu()).c_str(),
+        bytesToString(this->getCpu()).c_str(), bytesToString(this->getPinned()).c_str());
+}
+
 void MemoryCounters::allocate(MemoryType memoryType, MemoryCounters::SizeType size)
 {
     switch (memoryType)

@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/generationInput.h"
+#include "tensorrt_llm/runtime/generationOutput.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 
@@ -73,37 +74,53 @@ public:
     using TensorPtr = std::shared_ptr<ITensor>;
 
     //! Setup the decoder before calling `forward()`, also calls reshapeBuffers
-    virtual void setup(
-        SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxSequenceLength, nvinfer1::DataType dtype)
+    virtual void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxKvCacheLength,
+        SizeType maxSequenceLength, SizeType maxTokensPerStep, nvinfer1::DataType dtype)
         = 0;
 
     //! @brief Initialize the decoder with new batch of inputs.
-    virtual void newBatch(GenerationInput const& inputs, SamplingConfig const& samplingConfig) = 0;
+    virtual void newBatch(
+        GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig)
+        = 0;
 
     //! @brief Run one step for all requests without blocking the host thread.
     virtual void forwardAsync(decoder::Output& output, decoder::Input const& input) = 0;
 
-    //! @brief Wait for the last call to `forwardAsync` to complete and return whether all sequences have finished.
-    virtual bool isFinishedSync() = 0;
+    //! @brief Wait for the last call to `forwardAsync` to complete.
+    virtual void forwardSync() = 0;
 
     //! @brief Run one step for all requests.
-    virtual bool forward(decoder::Output& output, decoder::Input const& input)
+    virtual void forward(decoder::Output& output, decoder::Input const& input)
     {
         forwardAsync(output, input);
-        return isFinishedSync();
+        return forwardSync();
     }
 
-    //! @brief Gather final results for all requests.
-    virtual TensorPtr getFinalOutputIds() const = 0;
+    //! @brief Gather final beam search results for all requests.
+    virtual void finalize() const = 0;
 
     //! @returns [batchSize, beamWidth, maxSequenceLength], all token ids, on gpu
     virtual TensorPtr getOutputIds() const = 0;
 
-    //! @returns [batchSize, beamWidth], latests generated tokens (per beam), on gpu
-    virtual TensorPtr getNewTokens() const = 0;
+    //! @returns [batchSize, maxBeamWidth], cumulative log probabilities (per beam), on gpu
+    virtual TensorPtr getCumLogProbs() const = 0;
+
+    //! @returns [batchSize, maxBeamWidth, maxSequenceLength], log probabilities (per beam), on gpu
+    virtual TensorPtr getLogProbs() const = 0;
+
+    //! @brief Get tokens generated in one step of last forward pass
+    //! @param iter The iteration within [0; maxTokensPerStep) for which to get the tokens
+    //! @returns [batchSize, beamWidth], tokens generated in `iter` (per beam), on gpu
+    virtual TensorPtr getNewTokens(SizeType iter = 0) const = 0;
+
+    //! @brief Get maxTokensPerStep tokens generated in the last forward pass
+    //! @returns [maxTokensPerStep, batchSize, maxBeamWidth], tokens generated in last forward pass, on gpu
+    virtual TensorPtr getAllNewTokens() const = 0;
 
     //! @returns [1], number of finished sequences, in pinned host memory
     virtual TensorPtr getNbFinished() const = 0;
+
+    virtual ~IStatefulGptDecoder() = default;
 
 protected:
     IStatefulGptDecoder() = default;

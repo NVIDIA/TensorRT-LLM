@@ -22,28 +22,23 @@ from tensorrt_llm.logger import logger
 TRT_LLM_PLUGIN_NAMESPACE = 'tensorrt_llm'
 
 
-def plugin_lib_path():
-    project_dir = str(Path(__file__).parent.parent.absolute())
-
-    # load tensorrt_llm plugin
-    if platform.system() != "Windows":
-        return project_dir + '/libs/libnvinfer_plugin_tensorrt_llm.so'
-    else:  # Windows
-        return project_dir + '/libs/nvinfer_plugin_tensorrt_llm.dll'
+def plugin_lib_path() -> str:
+    project_dir = Path(__file__).parent.parent.absolute()
+    dyn_lib = "libnvinfer_plugin_tensorrt_llm.so" if platform.system(
+    ) != "Windows" else "nvinfer_plugin_tensorrt_llm.dll"
+    return str(project_dir.joinpath("libs", dyn_lib))
 
 
 def _load_plugin_lib():
-    if platform.system() != "Windows":
-        handle = ctypes.CDLL(plugin_lib_path(), mode=ctypes.RTLD_GLOBAL)
-    else:  # Windows
-        handle = ctypes.CDLL(plugin_lib_path(),
-                             mode=ctypes.RTLD_GLOBAL,
-                             winmode=0)
-    if handle is None:
-        raise ImportError('TensorRT-LLM Plugin is unavailable')
-
-    handle.initTrtLlmPlugins.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-    handle.initTrtLlmPlugins.restype = ctypes.c_bool
+    winmode = 0 if platform.system() == "Windows" else None
+    handle = ctypes.CDLL(plugin_lib_path(),
+                         mode=ctypes.RTLD_GLOBAL,
+                         winmode=winmode)
+    try:
+        handle.initTrtLlmPlugins.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        handle.initTrtLlmPlugins.restype = ctypes.c_bool
+    except AttributeError as err:
+        raise ImportError('TensorRT-LLM Plugin is unavailable') from err
     assert handle.initTrtLlmPlugins(None,
                                     TRT_LLM_PLUGIN_NAMESPACE.encode('utf-8'))
 
@@ -64,6 +59,7 @@ class PluginConfig(object):
     def init(self):
         self.bert_attention_plugin = False
         self.gpt_attention_plugin = False
+        self.multi_block_mode = False
         self.identity_plugin = False
         self.gemm_plugin = False
         self.smooth_quant_gemm_plugin = False
@@ -83,6 +79,7 @@ class PluginConfig(object):
         self.paged_kv_cache = False
         self.tokens_per_block = 0
         self.lookup_plugin = False
+        self.lora_plugin = False
 
     def enable_qk_half_accum(self):
         self.attention_qk_half_accumulation = True
@@ -114,6 +111,11 @@ class PluginConfig(object):
 
     def set_gpt_attention_plugin(self, dtype='float16'):
         self.gpt_attention_plugin = dtype
+        return self
+
+    def enable_mmha_multi_block_mode(self):
+        self.multi_block_mode = True
+        logger.info(f"Generation Multi Block Mode Enabled")
         return self
 
     def set_bert_attention_plugin(self, dtype='float16'):
@@ -173,4 +175,8 @@ class PluginConfig(object):
 
     def set_lookup_plugin(self, dtype='float16'):
         self.lookup_plugin = dtype
+        return self
+
+    def set_lora_plugin(self, dtype='float16'):
+        self.lora_plugin = dtype
         return self

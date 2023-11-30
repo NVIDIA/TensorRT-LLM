@@ -15,7 +15,9 @@
 include(FetchContent)
 
 set(SRCS
+    utils/numpyUtils.cpp
     utils/sessionUtils.cpp
+    utils/debugUtils.cu
     bufferManager.cpp
     decodingOutput.cpp
     gptDecoder.cpp
@@ -27,6 +29,7 @@ set(SRCS
     ipcUtils.cpp
     memoryCounters.cpp
     ncclCommunicator.cpp
+    promptTuningParams.cpp
     runtimeBuffers.cpp
     runtimeKernels.cu
     statefulGptDecoder.cpp
@@ -39,6 +42,10 @@ include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)
 if(NOT MSVC)
   # additional warnings
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
+  if(WARNING_IS_ERROR)
+    message(STATUS "Treating warnings as errors in GCC compilation")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+  endif()
 else() # Windows
   # warning level 4
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")

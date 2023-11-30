@@ -127,6 +127,8 @@ public:
 
     static std::string bytesToString(DiffType bytes, int precision = 2);
 
+    std::string toString() const;
+
 private:
     SizeType mGpu{}, mCpu{}, mPinned{};
     DiffType mGpuDiff{}, mCpuDiff{}, mPinnedDiff{};

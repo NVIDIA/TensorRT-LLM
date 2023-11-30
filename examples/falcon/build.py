@@ -24,20 +24,19 @@ import torch
 import torch.multiprocessing as mp
 from onnx import TensorProto, helper
 from transformers import AutoModelForCausalLM, FalconConfig
+from weight import (get_scaling_factors, load_from_awq_falcon,
+                    load_from_hf_checkpoint, load_from_hf_falcon)
 
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import fp8_quantize
+from tensorrt_llm.models import quantize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
+from tensorrt_llm.profiler import check_gpt_mem_usage
 from tensorrt_llm.quantization import QuantMode
-
-from weight import get_scaling_factors  # isort:skip
-from weight import load_from_hf_falcon  # isort:skip
-from weight import load_from_hf_checkpoint  # isort:skip
 
 MODEL_NAME = 'falcon'
 
@@ -115,7 +114,7 @@ def serialize_engine(engine, path):
 
 
 def load_falcon_config(model_dir: Union[str, Path]) -> FalconConfig:
-    """ Helper utility to laod FalconConfig.
+    """ Helper utility to load FalconConfig.
 
     A pretrained checkpoint from modeling_RW.py has a different structure
     and is not compatible with `transformers.FalconConfig` and
@@ -153,6 +152,7 @@ def parse_arguments():
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument('--model_dir', type=str, default=None)
+    parser.add_argument('--quant_ckpt_path', type=str, default=None)
     parser.add_argument('--dtype',
                         type=str,
                         default='float16',
@@ -219,6 +219,14 @@ def parse_arguments():
     parser.add_argument('--enable_context_fmha_fp32_acc',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--multi_block_mode',
+        default=False,
+        action='store_true',
+        help=
+        'Split long kv sequence into multiple blocks (applied to generation MHA kernels). \
+                        It is beneifical when batchxnum_heads cannot fully utilize GPU.'
+    )
     parser.add_argument('--visualize', default=False, action='store_true')
     parser.add_argument('--load_by_shard',
                         action='store_true',
@@ -288,7 +296,33 @@ def parse_arguments():
         action='store_true',
         help=
         'Activates latency-optimized algorithm for all-reduce instead of NCCL.')
-
+    parser.add_argument(
+        '--per_group',
+        default=False,
+        action="store_true",
+        help=
+        'By default, we use a single static scaling factor to scale weights in the int4 range. '
+        'per_group chooses at run time, and for each group, a custom scaling factor. '
+        'The flag is built for GPTQ/AWQ quantization.')
+    parser.add_argument('--group_size',
+                        type=int,
+                        default=128,
+                        help='Group size used in GPTQ/AWQ quantization.')
+    parser.add_argument(
+        '--use_weight_only',
+        default=False,
+        action="store_true",
+        help='Quantize weights for the various GEMMs to INT4/INT8.'
+        'See --weight_only_precision to set the precision')
+    parser.add_argument(
+        '--weight_only_precision',
+        type=str,
+        default='int4_awq',
+        choices=['int4_awq'],
+        help=
+        'Define the precision for the weights when using weight-only quantization.'
+        'You must also use --use_weight_only for that argument to have an impact.'
+    )
     args = parser.parse_args()
 
     logger.set_level(args.log_level)
@@ -317,6 +351,15 @@ def parse_arguments():
         assert args.enable_context_fmha
 
     args.quant_mode = QuantMode(0)
+    if args.use_weight_only:
+        assert args.enable_fp8, "FP8 and Weight-only cannot be activated simultaneously!"
+        if args.weight_only_precision == 'int4_awq':
+            args.quant_mode = QuantMode.from_description(
+                quantize_weights=True,
+                quantize_activations=False,
+                per_token=False,
+                per_channel=False,
+                per_group=args.per_group)
     if args.fp8_kv_cache:
         args.quant_mode = args.quant_mode.set_fp8_kv_cache()
     if args.enable_fp8:
@@ -406,16 +449,30 @@ def build_rank_engine(builder: Builder,
         parallel_attention=args.parallel_attention,
         new_decoder_architecture=args.new_decoder_architecture)
 
-    if args.enable_fp8 or args.fp8_kv_cache:
+    quantize_kwargs = {}
+    if args.use_weight_only and args.weight_only_precision == 'int4_awq':
+        quantize_kwargs = {
+            "group_size": args.group_size,
+            "zero": False,
+            "pre_quant_scale": True,
+            "exclude_modules": [],
+        }
+    elif args.enable_fp8 or args.fp8_kv_cache:
         logger.info(f'Loading scaling factors from '
                     f'{args.quantized_fp8_model_path}')
         quant_scales = get_scaling_factors(args.quantized_fp8_model_path,
                                            num_layers=args.n_layer,
                                            quant_mode=args.quant_mode)
-        tensorrt_llm_falcon = fp8_quantize(tensorrt_llm_falcon,
-                                           quant_mode=args.quant_mode,
-                                           quant_scales=quant_scales)
-    if args.model_dir is not None:
+        quantize_kwargs = {"quant_scales": quant_scales}
+    tensorrt_llm_falcon = quantize_model(tensorrt_llm_falcon, args.quant_mode,
+                                         **quantize_kwargs)
+
+    if args.per_group:
+        load_from_awq_falcon(tensorrt_llm_falcon=tensorrt_llm_falcon,
+                             quant_ckpt_path=args.quant_ckpt_path,
+                             mapping=mapping,
+                             dtype=args.dtype)
+    elif args.model_dir is not None:
         logger.info(f'Loading HF Falcon ... from {args.model_dir}')
         tik = time.time()
         if not args.load_by_shard:
@@ -442,7 +499,11 @@ def build_rank_engine(builder: Builder,
         network.plugin_config.set_gpt_attention_plugin(
             dtype=args.use_gpt_attention_plugin)
     if args.use_gemm_plugin:
-        network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
+        if not args.enable_fp8:
+            network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
+        else:
+            logger.info(
+                "Gemm plugin does not support FP8. Disabled Gemm plugin.")
     if args.use_layernorm_plugin:
         network.plugin_config.set_layernorm_plugin(
             dtype=args.use_layernorm_plugin)
@@ -454,6 +515,12 @@ def build_rank_engine(builder: Builder,
     if args.enable_context_fmha_fp32_acc:
         network.plugin_config.set_context_fmha(
             ContextFMHAType.enabled_with_fp32_acc)
+    if args.multi_block_mode:
+        network.plugin_config.enable_mmha_multi_block_mode()
+
+    if args.per_group:
+        network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
+            dtype=args.dtype)
 
     if args.world_size > 1:
         network.plugin_config.set_nccl_plugin(args.dtype,
@@ -493,6 +560,7 @@ def build_rank_engine(builder: Builder,
     if rank == 0:
         config_path = os.path.join(args.output_dir, 'config.json')
         builder.save_config(builder_config, config_path)
+
     return engine
 
 
@@ -509,6 +577,9 @@ def build(rank, args):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
+        # NOTE: when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
+        int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
+            not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
         builder_config = builder.create_builder_config(
             name=MODEL_NAME,
             precision=args.dtype,
@@ -525,12 +596,13 @@ def build(rank, args):
             new_decoder_architecture=args.new_decoder_architecture,
             max_position_embeddings=args.n_positions,
             max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,
-            fp8=args.quant_mode.has_fp8_qdq(),
             quant_mode=args.quant_mode,
             strongly_typed=args.strongly_typed,
+            int8=int8_trt_flag,
             opt_level=args.builder_opt)
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.tp_size,
                                       args.pp_size, cur_rank)
@@ -539,12 +611,33 @@ def build(rank, args):
         assert engine is not None, \
             f'Failed to build engine for rank {cur_rank}'
 
+        local_num_kv_heads = (args.n_kv_head + args.world_size -
+                              1) // args.world_size
+        kv_dtype = str_dtype_to_trt(args.dtype)
+        if args.quant_mode.has_int8_kv_cache():
+            kv_dtype = str_dtype_to_trt('int8')
+        elif args.quant_mode.has_fp8_kv_cache():
+            kv_dtype = str_dtype_to_trt('fp8')
+        check_gpt_mem_usage(
+            engine=engine,
+            kv_dtype=kv_dtype,
+            use_gpt_attention_plugin=args.use_gpt_attention_plugin,
+            paged_kv_cache=args.paged_kv_cache,
+            max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
+            max_input_len=args.max_input_len,
+            max_output_len=args.max_output_len,
+            local_num_kv_heads=local_num_kv_heads,
+            head_size=args.n_embd / args.n_head,
+            num_layers=args.n_layer)
+
         if cur_rank == 0:
             # Use in-memory timing cache for multiple builder passes.
             if not args.parallel_build:
                 cache = builder_config.trt_builder_config.get_timing_cache()
 
         serialize_engine(engine, os.path.join(args.output_dir, engine_name))
+        del engine
 
     if rank == 0:
         ok = builder.save_timing_cache(

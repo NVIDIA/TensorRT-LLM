@@ -7,18 +7,14 @@ multiple GPUs or multiple nodes with multiple GPUs.
 
 ### 1. Build TensorRT-LLM and benchmarking source code
 
-Please follow the [`installation document`](../../../README.md) to build TensorRT-LLM.
+Please follow the [`installation document`](../../docs/source/installation.md) to build TensorRT-LLM.
+
+Note that the benchmarking source code for C++ runtime is not built by default, you can use the argument `--benchmarks` in [`build_wheel.py`](../../scripts/build_wheel.py) to build that.
 
 Windows users: Follow the
-[`Windows installation document`](../../../windows/README.md)
+[`Windows installation document`](../../windows/README.md)
 instead, and be sure to set DLL paths as specified in
-[Extra Steps for C++ Runtime Usage](../../../windows/README.md#extra-steps-for-c-runtime-usage).
-
-After that, you can build benchmarking source code for C++ runtime
-```
-cd cpp/build
-make -j benchmarks
-```
+[Extra Steps for C++ Runtime Usage](../../windows/README.md#extra-steps-for-c-runtime-usage).
 
 ### 2. Launch C++ benchmarking (Fixed BatchSize/InputLen/OutputLen)
 
@@ -44,7 +40,7 @@ Take GPT-350M as an example for single GPU
     --batch_size "1" \
     --input_output_len "60,20"
 
-# Expected ouput:
+# Expected output:
 # [BENCHMARK] batch_size 1 input_length 60 output_length 20 latency(ms) 40.81
 ```
 Take GPT-175B as an example for multiple GPUs
@@ -55,9 +51,11 @@ mpirun -n 8 ./benchmarks/gptSessionBenchmark \
     --batch_size "1" \
     --input_output_len "60,20"
 
-# Expected ouput:
+# Expected output:
 # [BENCHMARK] batch_size 1 input_length 60 output_length 20 latency(ms) 792.14
 ```
+
+If you want to obtain context and generation logits, you could build an enigne with `--gather_all_token_logits` and run gptSessionBenchmark with `--print_all_logits`. This will print a large number of logit values and has a certain impact on performance.
 
 *Please note that the expected outputs in that document are only for reference, specific performance numbers depend on the GPU you're using.*
 
