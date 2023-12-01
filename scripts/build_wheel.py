@@ -24,6 +24,7 @@ from multiprocessing import cpu_count
 from pathlib import Path
 from shutil import copy, rmtree
 from subprocess import check_output, run
+from textwrap import dedent
 from typing import List
 
 
@@ -64,7 +65,7 @@ def main(build_type: str = "Release",
     requirements_filename = "requirements-dev-windows.txt" if platform.system(
     ) == "Windows" else "requirements-dev.txt"
     build_run(
-        f"{sys.executable} -m pip install -r {requirements_filename} --extra-index-url https://pypi.ngc.nvidia.com"
+        f"\"{sys.executable}\" -m pip install -r {requirements_filename} --extra-index-url https://pypi.ngc.nvidia.com"
     )
     # Ensure TRT is installed on windows to prevent surprises.
     reqs = check_output([sys.executable, "-m", "pip", "freeze"])
@@ -86,12 +87,17 @@ def main(build_type: str = "Release",
         if cuda_architectures is not None else "")
 
     cmake_def_args = []
+    cmake_generator = ""
 
     hardware_arch = platform.machine()
 
     if platform.system() == "Windows":
         # Windows does not support multi-device currently.
         extra_cmake_vars.extend(["ENABLE_MULTI_DEVICE=0"])
+
+        # The Ninja CMake generator is used for our Windows build
+        # (Easier than MSBuild to make compatible with our Docker image)
+        cmake_generator = "-GNinja"
 
     if job_count is None:
         job_count = cpu_count()
@@ -153,7 +159,7 @@ def main(build_type: str = "Release",
         if clean or first_build:
             build_run(
                 f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
-                f' {cmake_cuda_architectures} {cmake_def_args} -S "{source_dir}"'
+                f' {cmake_cuda_architectures} {cmake_def_args} {cmake_generator} -S "{source_dir}"'
             )
         build_run(
             f'cmake --build . --config {build_type} --parallel {job_count} '
@@ -172,11 +178,10 @@ def main(build_type: str = "Release",
         rmtree(lib_dir)
     lib_dir.mkdir(parents=True)
     if platform.system() == "Windows":
-        copy(build_dir / f"tensorrt_llm/thop/{build_type}/th_common.dll",
+        copy(build_dir / f"tensorrt_llm/thop/th_common.dll",
              lib_dir / "th_common.dll")
         copy(
-            build_dir /
-            f"tensorrt_llm/plugins/{build_type}/nvinfer_plugin_tensorrt_llm.dll",
+            build_dir / f"tensorrt_llm/plugins/nvinfer_plugin_tensorrt_llm.dll",
             lib_dir / "nvinfer_plugin_tensorrt_llm.dll")
     else:
         copy(build_dir / "tensorrt_llm/thop/libth_common.so",
@@ -206,7 +211,22 @@ def main(build_type: str = "Release",
         with working_directory(project_dir):
             build_run(f"{sys.executable} -m pip install pybind11-stubgen")
         with working_directory(pkg_dir):
-            build_run(f"{sys.executable} -m pybind11_stubgen -o . bindings")
+            stubgen = "stubgen.py"
+            # Loading torch, trt before bindings is required to avoid import errors on windows.
+            stubgen_contents = """
+            # isort: off
+            import torch
+            import tensorrt as trt
+            # isort: on
+
+            from pybind11_stubgen import main
+
+            if __name__ == "__main__":
+                main()
+            """
+            (pkg_dir / stubgen).write_text(dedent(stubgen_contents))
+            build_run(f"{sys.executable} {stubgen} -o . bindings")
+            (pkg_dir / stubgen).unlink()
 
     if dist_dir is None:
         dist_dir = project_dir / "build"
@@ -221,7 +241,7 @@ def main(build_type: str = "Release",
         )
 
     if install:
-        build_run(f"{sys.executable} -m pip install -e .[devel]")
+        build_run(f"\"{sys.executable}\" -m pip install -e .[devel]")
 
 
 if __name__ == "__main__":

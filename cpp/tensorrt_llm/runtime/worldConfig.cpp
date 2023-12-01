@@ -24,6 +24,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <mpi.h>
+#include <mutex>
 
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
@@ -32,9 +33,11 @@ namespace
 {
 
 bool mpiInitialized = false;
+std::mutex mpiMutex;
 
 void initMpi(nvinfer1::ILogger& logger, int threadMode = MPI_THREAD_FUNNELED)
 {
+    std::lock_guard<std::mutex> lk(mpiMutex);
     if (mpiInitialized)
     {
         return;

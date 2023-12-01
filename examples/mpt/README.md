@@ -58,10 +58,15 @@ python3 build.py --world_size=4 \
 ### 3. Run TRT engine to check if the build was correct
 
 ```bash
-python run.py --engine_dir ./trt_engines/mpt-7b/fp16/1-gpu/ --max_output_len 10
+python ../run.py --max_output_len 10 \
+                 --engine_dir ./trt_engines/mpt-7b/fp16/1-gpu/ \
+                 --tokenizer_dir mosaicml/mpt-7b
 
 # Run 4-GPU MPT7B TRT engine on a sample input prompt
-mpirun -n 4 --allow-run-as-root python run.py --engine_dir ./trt_engines/mpt-7b/fp32/4-gpu/ --max_output_len 10
+mpirun -n 4 --allow-run-as-root \
+    python ../run.py --max_output_len 10 \
+                     --engine_dir ./trt_engines/mpt-7b/fp32/4-gpu/ \
+                     --tokenizer_dir mosaicml/mpt-7b
 ```
 
 #### MPT 30B
@@ -101,7 +106,10 @@ python3 build.py --world_size=4 \
 
 ```bash
 # Run 4-GPU MPT7B TRT engine on a sample input prompt
-mpirun -n 4 --allow-run-as-root python run.py --engine_dir ./trt_engines/mpt-30b/fp16/4-gpu/ --max_output_len 10
+mpirun -n 4 --allow-run-as-root \
+    python ../run.py --max_output_len 10 \
+                     --engine_dir ./trt_engines/mpt-30b/fp16/4-gpu/  \
+                     --tokenizer_dir mosaicml/mpt-30b
 ```
 
 #### Replit Code V-1.5 3B
@@ -156,7 +164,11 @@ Here is the partial output of above command.
 
 ```bash
 # Run 2-GPU Replit Code V-1.5 3B TRT engine on a sample input prompt
-mpirun -n 2 --allow-run-as-root python run.py --engine_dir ./trt_engines/replit-code-v1_5-3b/bf16/2-gpu/ --max_output_len 64  --input_text "def fibonacci"  --tokenizer ./replit-code-v1_5-3b/
+mpirun -n 2 --allow-run-as-root \
+    python ../run.py --max_output_len 64 \
+                     --input_text "def fibonacci" \
+                     --engine_dir ./trt_engines/replit-code-v1_5-3b/bf16/2-gpu/ \
+                     --tokenizer_dir ./replit-code-v1_5-3b/
 ```
 
 Here is the output of above command.

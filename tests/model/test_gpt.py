@@ -124,7 +124,7 @@ class TestGPT(unittest.TestCase):
                                   context_fmha_type=ContextFMHAType.disabled,
                                   enable_remove_input_padding=False,
                                   enable_paged_kv_cache=False,
-                                  tokens_per_block=64,
+                                  tokens_per_block=128,
                                   gather_all_token_logits=False):
         mapping = tensorrt_llm.Mapping(world_size, rank, tp_size=world_size)
 
@@ -434,7 +434,7 @@ class TestGPT(unittest.TestCase):
         seq_len = 128
         total_length = seq_len + max_length
         use_plugin = True
-        tokens_per_block = 64
+        tokens_per_block = 128
         gpt_config, hf_gpt = self._gen_hf_gpt(hidden_act, n_layer,
                                               seq_len + max_length, dtype)
         runtime, _ = self._gen_tensorrt_llm_runtime(
@@ -544,13 +544,20 @@ class TestGPT(unittest.TestCase):
             if enable_paged_kv_cache:
                 assert beam_width == 1
                 # for beam_width > 1 the argument must be '1' in ctx phase and 'beam_width' in gen phase
-                kv_cache_block_pointers = kv_cache_manager.get_pointer_arrays(1)
+                host_kv_cache_block_pointers = kv_cache_manager.get_pointer_arrays(
+                    1)
+                kv_cache_block_pointers = [
+                    x.to('cuda') for x in host_kv_cache_block_pointers
+                ]
 
                 for idx in range(gpt_config.n_layer):
                     shape = kv_cache_block_pointers[idx].shape
                     shape = [shape[0] * shape[1], *shape[2:]]
                     ctx_buffer[
                         f'kv_cache_block_pointers_{idx}'] = kv_cache_block_pointers[
+                            idx].reshape(shape).contiguous()
+                    ctx_buffer[
+                        f'host_kv_cache_block_pointers_{idx}'] = host_kv_cache_block_pointers[
                             idx].reshape(shape).contiguous()
                     ctx_buffer[
                         f'host_max_kv_cache_length_{idx}'] = host_max_kv_cache_lengths
@@ -610,8 +617,6 @@ class TestGPT(unittest.TestCase):
                 ctx_last_token_ids = torch.cumsum(ctx_last_token_ids,
                                                   dim=0).int()
 
-            host_past_key_value_lengths = torch.tensor([0] * batch_size,
-                                                       dtype=torch.int32)
             host_max_kv_cache_lengths = torch.tensor([total_length],
                                                      dtype=torch.int32)
 
@@ -619,6 +624,9 @@ class TestGPT(unittest.TestCase):
             ) if enable_remove_input_padding else None
             host_request_types = torch.tensor([0 for i in range(batch_size)],
                                               dtype=torch.int32).cpu()
+
+            host_past_key_value_lengths = ctx_context_lengths.detach().clone(
+            ).cpu()
 
             # We need sequence_lengths start as context_lengths for step 0 (context),
             # and it will be added one after each step.

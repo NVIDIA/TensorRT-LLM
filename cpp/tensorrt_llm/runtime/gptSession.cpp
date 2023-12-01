@@ -214,9 +214,7 @@ GptSession::MicroBatchConfig::MicroBatchConfig(SizeType maxBatchSize, SizeType p
         TLLM_CHECK(genBatchSize <= maxBatchSize);
         ctxBatchSize = ctxMicroBatchSize.value_or(genBatchSize);
         TLLM_CHECK_WITH_INFO(genBatchSize % ctxBatchSize == 0,
-            tc::fmtstr(
-                "Generation batch size (%d) must be divisible by context batch size (%d)", genBatchSize, ctxBatchSize)
-                .c_str());
+            "Generation batch size (%d) must be divisible by context batch size (%d)", genBatchSize, ctxBatchSize);
         numGenBatches = tc::ceilDiv(maxBatchSize, genBatchSize);
         numCtxBatches = numGenBatches * (genBatchSize / ctxBatchSize);
     }

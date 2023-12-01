@@ -30,90 +30,86 @@ namespace kernels
 
 __global__ void gatherTree(gatherTreeParam param)
 {
-    for (int batchbeam_idx = blockIdx.x * blockDim.x + threadIdx.x; batchbeam_idx < param.batch_size * param.beam_width;
-         batchbeam_idx += gridDim.x * blockDim.x)
+    for (int batchbeamIdx = blockIdx.x * blockDim.x + threadIdx.x; batchbeamIdx < param.batchSize * param.beamWidth;
+         batchbeamIdx += gridDim.x * blockDim.x)
     {
-        const int batch = batchbeam_idx / param.beam_width;
-        const int beam = batchbeam_idx % param.beam_width;
-        const int input_len = param.input_lengths == nullptr ? 0 : param.input_lengths[batchbeam_idx];
+        const int batch = batchbeamIdx / param.beamWidth;
+        const int beam = batchbeamIdx % param.beamWidth;
+        const int inputLen = param.inputLengths == nullptr ? 0 : param.inputLengths[batchbeamIdx];
 
-        const int* parent_ids = param.parent_ids;
-        const int* step_ids = param.step_ids;
+        const int* parentIds = param.parentIds;
+        const int* stepIds = param.stepIds;
 
-        // TODO optimize the reduce_max operation for large beam_width
-        int max_len = -1;
-        bool update_response_input_length = param.response_input_lengths != nullptr;
+        // TODO optimize the reduce_max operation for large beamWidth
+        int maxLen = -1;
+        bool updateResponseInputLength = param.responseInputLengths != nullptr;
         // int selected_beam_index = 0;
-        for (int beam_idx = 0; beam_idx < param.beam_width; beam_idx++)
+        for (int beamIdx = 0; beamIdx < param.beamWidth; beamIdx++)
         {
-            int tmp_len = param.sequence_lengths[batch * param.beam_width + beam_idx]
-                + param.max_sequence_length_final_step - 1;
-            param.sequence_lengths[batch * param.beam_width + beam_idx] = tmp_len;
-            if (update_response_input_length)
+            int tmpLen
+                = param.sequenceLengths[batch * param.beamWidth + beamIdx] + param.maxSequenceLengthFinalStep - 1;
+            param.sequenceLengths[batch * param.beamWidth + beamIdx] = tmpLen;
+            if (updateResponseInputLength)
             {
-                param.response_input_lengths[batch * param.beam_width + beam_idx] = input_len;
+                param.responseInputLengths[batch * param.beamWidth + beamIdx] = inputLen;
             }
-            if (tmp_len > max_len)
+            if (tmpLen > maxLen)
             {
-                max_len = tmp_len;
+                maxLen = tmpLen;
             }
         }
-        const int max_seq_len_b = min(param.max_seq_len, max_len);
-        if (max_seq_len_b <= 0)
+        const int maxSeqLenB = min(param.maxSeqLen, maxLen);
+        if (maxSeqLenB <= 0)
         {
             continue;
         }
 
-        const int initial_tgt_ix
-            = batch * param.beam_width * param.max_seq_len + beam * param.max_seq_len + max_seq_len_b - 1;
-        const int initial_parent_ix
-            = batch * param.beam_width * param.max_seq_len + beam * param.max_seq_len + max_seq_len_b - 1;
-        param.output_ids[initial_tgt_ix] = __ldg(step_ids + initial_parent_ix);
-        int parent = parent_ids == nullptr ? 0 : __ldg(parent_ids + initial_parent_ix) % param.beam_width;
-        bool found_bad = false;
+        const int initialTgtIx = batch * param.beamWidth * param.maxSeqLen + beam * param.maxSeqLen + maxSeqLenB - 1;
+        const int initialParentIx = batch * param.beamWidth * param.maxSeqLen + beam * param.maxSeqLen + maxSeqLenB - 1;
+        param.outputIds[initialTgtIx] = __ldg(stepIds + initialParentIx);
+        int parent = parentIds == nullptr ? 0 : __ldg(parentIds + initialParentIx) % param.beamWidth;
+        bool foundBad = false;
 
-        for (int level = max_seq_len_b - 2; level >= 0; --level)
+        for (int level = maxSeqLenB - 2; level >= 0; --level)
         {
-            const int level_beam_ix = batch * param.beam_width * param.max_seq_len + beam * param.max_seq_len + level;
-            const int level_parent_ix
-                = batch * param.beam_width * param.max_seq_len + parent * param.max_seq_len + level;
-            if (parent < 0 || parent > param.beam_width)
+            const int levelBeamIx = batch * param.beamWidth * param.maxSeqLen + beam * param.maxSeqLen + level;
+            const int levelParentIx = batch * param.beamWidth * param.maxSeqLen + parent * param.maxSeqLen + level;
+            if (parent < 0 || parent > param.beamWidth)
             {
-                param.output_ids[level_beam_ix] = param.end_tokens[batch];
+                param.outputIds[levelBeamIx] = param.endTokens[batch];
                 parent = -1;
-                found_bad = true;
+                foundBad = true;
             }
             else
             {
-                param.output_ids[level_beam_ix] = __ldg(step_ids + level_parent_ix);
-                parent = parent_ids == nullptr ? 0 : __ldg(parent_ids + level_parent_ix) % param.beam_width;
+                param.outputIds[levelBeamIx] = __ldg(stepIds + levelParentIx);
+                parent = parentIds == nullptr ? 0 : __ldg(parentIds + levelParentIx) % param.beamWidth;
             }
         }
         // set the padded part as end_token
-        // input_len
-        for (int index = max_len; index < param.max_seq_len; ++index)
+        // inputLen
+        for (int index = maxLen; index < param.maxSeqLen; ++index)
         {
-            param.output_ids[batch * param.beam_width * param.max_seq_len + beam * param.max_seq_len + index]
-                = param.end_tokens[batch];
+            param.outputIds[batch * param.beamWidth * param.maxSeqLen + beam * param.maxSeqLen + index]
+                = param.endTokens[batch];
         }
 
         // Not necessary when using a BeamSearchDecoder, but necessary
         // when a user feeds in possibly broken trajectory (i.e., non-eos
         // entries in a beam following eos entries).
-        if (!found_bad)
+        if (!foundBad)
         {
             bool finished = false;
             // skip the step 0 because it is often the start token
-            int start_step = 1;
-            for (int time = start_step; time < max_seq_len_b; ++time)
+            int startStep = 1;
+            for (int time = startStep; time < maxSeqLenB; ++time)
             {
-                const int level_beam_ix
-                    = batch * param.beam_width * param.max_seq_len + beam * param.max_seq_len + time;
+                const int levelBeamIx = batch * param.beamWidth * param.maxSeqLen + beam * param.maxSeqLen + time;
                 if (finished)
                 {
-                    param.output_ids[level_beam_ix] = param.end_tokens[batch];
+                    param.outputIds[levelBeamIx] = param.endTokens[batch];
                 }
-                else if (param.output_ids[level_beam_ix] == param.end_tokens[batch])
+                else if (param.outputIds[levelBeamIx] == param.endTokens[batch])
                 {
                     finished = true;
                 }
@@ -123,14 +119,14 @@ __global__ void gatherTree(gatherTreeParam param)
 }
 
 template <typename T>
-__device__ __forceinline__ T apply_length_penalty(T log_prob, int length, float length_penalty)
+__device__ __forceinline__ T applyLengthPenalty(T logProb, int length, float lengthPenalty)
 {
-    // score = log(prob) / (length)^length_penalty.
-    if (length_penalty == 0.0f || length == 1)
+    // score = log(prob) / (length)^lengthPenalty.
+    if (lengthPenalty == 0.0f || length == 1)
     {
-        return log_prob;
+        return logProb;
     }
-    return log_prob / static_cast<T>(powf(length, length_penalty));
+    return logProb / static_cast<T>(powf(length, lengthPenalty));
 }
 
 struct RankNorm
@@ -164,59 +160,58 @@ inline __device__ uint32_t bfe(uint32_t a, uint32_t start, uint32_t len = 1)
 
 __global__ void finalized(gatherTreeParam param)
 {
-    const int beam_idx = static_cast<int>(threadIdx.x);
-    const int beam_width{param.beam_width};
+    const int beamIdx = static_cast<int>(threadIdx.x);
+    const int beamWidth{param.beamWidth};
 
     extern __shared__ char array[];
-    int* s_rank = (int*) (array);
-    int* s_length = (int*) (s_rank + beam_width);
-    float* s_scores = (float*) (s_length + beam_width);
-    float* s_normed_scores = (float*) (s_scores + beam_width);
-    int* s_ids = (int*) (s_normed_scores + beam_width);
+    int* sRank = (int*) (array);
+    int* sLength = (int*) (sRank + beamWidth);
+    float* sScores = (float*) (sLength + beamWidth);
+    float* sNormedScores = (float*) (sScores + beamWidth);
+    int* sIds = (int*) (sNormedScores + beamWidth);
 
-    if (beam_idx < beam_width)
+    if (beamIdx < beamWidth)
     {
-        const int idx = blockIdx.x * param.beam_width + beam_idx;
-        const int num_generated_token{param.sequence_lengths[idx] - param.input_lengths[idx]};
-        s_normed_scores[beam_idx]
-            = apply_length_penalty(param.cum_log_probs[idx], num_generated_token, param.length_penalty);
-        s_length[beam_idx] = param.sequence_lengths[idx];
-        s_scores[beam_idx] = param.cum_log_probs[idx];
+        const int idx = blockIdx.x * param.beamWidth + beamIdx;
+        const int numGeneratedToken{param.sequenceLengths[idx] - param.inputLengths[idx]};
+        sNormedScores[beamIdx] = applyLengthPenalty(param.cumLogProbs[idx], numGeneratedToken, param.lengthPenalty);
+        sLength[beamIdx] = param.sequenceLengths[idx];
+        sScores[beamIdx] = param.cumLogProbs[idx];
     }
-    for (int idx = beam_idx; idx < beam_width * param.max_seq_len; idx += blockDim.x)
+    for (int idx = beamIdx; idx < beamWidth * param.maxSeqLen; idx += blockDim.x)
     {
-        s_ids[idx] = param.output_ids[blockIdx.x * param.beam_width * param.max_seq_len + idx];
+        sIds[idx] = param.outputIds[blockIdx.x * param.beamWidth * param.maxSeqLen + idx];
     }
     __syncthreads();
 
     RankNorm rankNorm;
-    rankNorm.rank = beam_idx;
-    rankNorm.norm = beam_idx < beam_width ? s_normed_scores[beam_idx] : -FLT_MAX;
+    rankNorm.rank = beamIdx;
+    rankNorm.norm = beamIdx < beamWidth ? sNormedScores[beamIdx] : -FLT_MAX;
 
-    if (beam_width < 32)
+    if (beamWidth < 32)
     {
         int warpid = threadIdx.x / 32;
         int laneid = threadIdx.x % 32;
 
-        if (warpid == 0 && beam_width > 1)
+        if (warpid == 0 && beamWidth > 1)
         {
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 1) ^ bfe(laneid, 0)); //  2
         }
 
-        if (warpid == 0 && beam_width > 2)
+        if (warpid == 0 && beamWidth > 2)
         {
             rankNorm = swap(rankNorm, 0x02, bfe(laneid, 2) ^ bfe(laneid, 1)); //  3~4
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 2) ^ bfe(laneid, 0));
         }
 
-        if (warpid == 0 && beam_width > 4)
+        if (warpid == 0 && beamWidth > 4)
         {
             rankNorm = swap(rankNorm, 0x04, bfe(laneid, 3) ^ bfe(laneid, 2)); //  5~8
             rankNorm = swap(rankNorm, 0x02, bfe(laneid, 3) ^ bfe(laneid, 1));
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 3) ^ bfe(laneid, 0));
         }
 
-        if (warpid == 0 && beam_width > 8)
+        if (warpid == 0 && beamWidth > 8)
         {
             rankNorm = swap(rankNorm, 0x08, bfe(laneid, 4) ^ bfe(laneid, 3)); // 9~16
             rankNorm = swap(rankNorm, 0x04, bfe(laneid, 4) ^ bfe(laneid, 2));
@@ -224,7 +219,7 @@ __global__ void finalized(gatherTreeParam param)
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 4) ^ bfe(laneid, 0));
         }
 
-        if (warpid == 0 && beam_width > 16)
+        if (warpid == 0 && beamWidth > 16)
         {
             rankNorm = swap(rankNorm, 0x10, bfe(laneid, 4) ^ bfe(laneid, 4)); // 17~32
             rankNorm = swap(rankNorm, 0x08, bfe(laneid, 4) ^ bfe(laneid, 3));
@@ -238,116 +233,115 @@ __global__ void finalized(gatherTreeParam param)
         // Not supported! We must have a check before calling that kernel.
     }
 
-    if (beam_idx < beam_width)
+    if (beamIdx < beamWidth)
     {
-        s_rank[beam_idx] = rankNorm.rank;
+        sRank[beamIdx] = rankNorm.rank;
     }
 
     __syncthreads();
 
-    if (beam_idx < beam_width)
+    if (beamIdx < beamWidth)
     {
-        auto src_idx{rankNorm.rank};
-        auto tgt_idx{blockIdx.x * param.beam_width + beam_idx};
-        param.sequence_lengths[tgt_idx] = s_length[src_idx];
-        param.cum_log_probs[tgt_idx] = s_scores[src_idx];
+        auto srcIdx{rankNorm.rank};
+        auto tgtIdx{blockIdx.x * param.beamWidth + beamIdx};
+        param.sequenceLengths[tgtIdx] = sLength[srcIdx];
+        param.cumLogProbs[tgtIdx] = sScores[srcIdx];
     }
 
-    for (int beam_idx = 0; beam_idx < beam_width; beam_idx++)
+    for (int beamIdx = 0; beamIdx < beamWidth; beamIdx++)
     {
-        for (int i = threadIdx.x; i < s_length[s_rank[beam_idx]]; i += blockDim.x)
+        for (int i = threadIdx.x; i < sLength[sRank[beamIdx]]; i += blockDim.x)
         {
-            param.output_ids[blockIdx.x * beam_width * param.max_seq_len + beam_idx * param.max_seq_len + i]
-                = s_ids[s_rank[beam_idx] * param.max_seq_len + i];
+            param.outputIds[blockIdx.x * beamWidth * param.maxSeqLen + beamIdx * param.maxSeqLen + i]
+                = sIds[sRank[beamIdx] * param.maxSeqLen + i];
         }
     }
 }
 
 void invokeGatherTree(gatherTreeParam param)
 {
-    int batchbeam = param.batch_size * param.beam_width;
+    int batchbeam = param.batchSize * param.beamWidth;
     dim3 grid(1), block(batchbeam);
     // though decoder do not support > 1024 for now
     if (batchbeam > 1024)
     {
-        grid.x = ceil(param.batch_size * param.beam_width / 1024.);
+        grid.x = ceil(param.batchSize * param.beamWidth / 1024.);
         block.x = 1024;
     }
     gatherTree<<<grid, block, 0, param.stream>>>(param);
     sync_check_cuda_error();
 
-    if (param.beam_width > 1)
+    if (param.beamWidth > 1)
     {
-        TLLM_CHECK_WITH_INFO(param.beam_width <= 32, "TRT-LLM does not support beam width > 32 now");
-        // sort results by normalized cum_log_probs
-        dim3 grid(param.batch_size);
-        dim3 block(divUp(param.beam_width, 32) * 32);
+        TLLM_CHECK_WITH_INFO(param.beamWidth <= 32, "TRT-LLM does not support beam width > 32 now");
+        // sort results by normalized cumLogProbs
+        dim3 grid(param.batchSize);
+        dim3 block(divUp(param.beamWidth, 32) * 32);
 
-        auto shm_size = param.beam_width * (sizeof(float) * 2 + sizeof(int) * 2 + sizeof(int) * param.max_seq_len);
+        auto shm_size = param.beamWidth * (sizeof(float) * 2 + sizeof(int) * 2 + sizeof(int) * param.maxSeqLen);
         finalized<<<grid, block, shm_size, param.stream>>>(param);
     }
 }
 
-__global__ void finalize(int* output_ids, int* sequence_lengths, float* cum_log_probs, float* output_log_probs,
-    const int* topk_output_ids, const int* topk_sequence_lengths, const float* scores, const float* topk_cum_log_probs,
-    const float* topk_log_probs, const int* num_beams, const int* input_lengths, const int beam_width,
-    const int max_seq_len)
+__global__ void finalize(int* outputIds, int* sequenceLengths, float* cumLogProbs, float* outputLogProbs,
+    const int* topKOutputIds, const int* topKSequenceLengths, const float* scores, const float* topKCumLogProbs,
+    const float* topKLogProbs, const int* numBeams, const int* inputLengths, const int beamWidth, const int maxSeqLen)
 {
-    // output_ids: [bs, beam_width, max_seq_len]
-    // sequence_lengths: [bs, beam_width]
-    // cum_log_probs: [bs, beam_width]
-    // output_log_probs: [bs, beam_width, max_seq_len]
-    // topk_output_ids: [bs, 2 * beam_width, max_seq_len + 1]
-    // topk_sequence_lengths: [bs, 2 * beam_width]
-    // scores: [bs, 2 * beam_width]
-    // topk_cum_log_probs: [bs, 2 * beam_width]
-    // topk_log_probs: [bs, 2 * beam_width, max_seq_len + 1]
-    // num_beams: [bs]
+    // outputIds: [bs, beamWidth, maxSeqLen]
+    // sequenceLengths: [bs, beamWidth]
+    // cumLogProbs: [bs, beamWidth]
+    // outputLogProbs: [bs, beamWidth, maxSeqLen]
+    // topKOutputIds: [bs, 2 * beamWidth, maxSeqLen + 1]
+    // topKSequenceLengths: [bs, 2 * beamWidth]
+    // scores: [bs, 2 * beamWidth]
+    // topKCumLogProbs: [bs, 2 * beamWidth]
+    // topKLogProbs: [bs, 2 * beamWidth, maxSeqLen + 1]
+    // numBeams: [bs]
 
-    // This kernel do a sorting for scores first, and then put the topk_output_ids
-    // into output_ids by the rank of scores.
-    // Note that we remove the start_token (the id at first position) from topk_output_ids
+    // This kernel do a sorting for scores first, and then put the topKOutputIds
+    // into outputIds by the rank of scores.
+    // Note that we remove the start_token (the id at first position) from topKOutputIds
 
     extern __shared__ char array[];
-    int* s_rank = (int*) (array);                                 // [beam_width]
-    float* s_scores = (float*) (s_rank + beam_width);             // [2 * beam_width]
-    int* s_sequence_lengths = (int*) (s_scores + beam_width * 2); // [beam_width]
-    const int num_beam = num_beams[blockIdx.x];
-    if (threadIdx.x < num_beam)
+    int* sRank = (int*) (array);                              // [beamWidth]
+    float* sScores = (float*) (sRank + beamWidth);            // [2 * beamWidth]
+    int* sSequenceLengths = (int*) (sScores + beamWidth * 2); // [beamWidth]
+    const int numBeam = numBeams[blockIdx.x];
+    if (threadIdx.x < numBeam)
     {
-        s_scores[threadIdx.x] = scores[blockIdx.x * beam_width * 2 + threadIdx.x];
+        sScores[threadIdx.x] = scores[blockIdx.x * beamWidth * 2 + threadIdx.x];
     }
     __syncthreads();
 
-    if (num_beam < 32)
+    if (numBeam < 32)
     {
-        const int beam_idx = threadIdx.x;
+        const int beamIdx = threadIdx.x;
         RankNorm rankNorm;
-        rankNorm.rank = beam_idx;
-        rankNorm.norm = beam_idx < num_beam ? s_scores[beam_idx] : -FLT_MAX;
+        rankNorm.rank = beamIdx;
+        rankNorm.norm = beamIdx < numBeam ? sScores[beamIdx] : -FLT_MAX;
 
         int warpid = threadIdx.x / 32;
         int laneid = threadIdx.x % 32;
 
-        if (warpid == 0 && num_beam > 1)
+        if (warpid == 0 && numBeam > 1)
         {
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 1) ^ bfe(laneid, 0)); //  2
         }
 
-        if (warpid == 0 && num_beam > 2)
+        if (warpid == 0 && numBeam > 2)
         {
             rankNorm = swap(rankNorm, 0x02, bfe(laneid, 2) ^ bfe(laneid, 1)); //  3~4
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 2) ^ bfe(laneid, 0));
         }
 
-        if (warpid == 0 && num_beam > 4)
+        if (warpid == 0 && numBeam > 4)
         {
             rankNorm = swap(rankNorm, 0x04, bfe(laneid, 3) ^ bfe(laneid, 2)); //  5~8
             rankNorm = swap(rankNorm, 0x02, bfe(laneid, 3) ^ bfe(laneid, 1));
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 3) ^ bfe(laneid, 0));
         }
 
-        if (warpid == 0 && num_beam > 8)
+        if (warpid == 0 && numBeam > 8)
         {
             rankNorm = swap(rankNorm, 0x08, bfe(laneid, 4) ^ bfe(laneid, 3)); // 9~16
             rankNorm = swap(rankNorm, 0x04, bfe(laneid, 4) ^ bfe(laneid, 2));
@@ -355,7 +349,7 @@ __global__ void finalize(int* output_ids, int* sequence_lengths, float* cum_log_
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 4) ^ bfe(laneid, 0));
         }
 
-        if (warpid == 0 && num_beam > 16)
+        if (warpid == 0 && numBeam > 16)
         {
             rankNorm = swap(rankNorm, 0x10, bfe(laneid, 4) ^ bfe(laneid, 4)); // 17~32
             rankNorm = swap(rankNorm, 0x08, bfe(laneid, 4) ^ bfe(laneid, 3));
@@ -364,28 +358,28 @@ __global__ void finalize(int* output_ids, int* sequence_lengths, float* cum_log_
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 4) ^ bfe(laneid, 0));
         }
 
-        if (beam_idx < beam_width)
+        if (beamIdx < beamWidth)
         {
-            s_rank[beam_idx] = rankNorm.rank;
+            sRank[beamIdx] = rankNorm.rank;
         }
 
         __syncthreads();
     }
     else
     {
-        for (int i = 0; i < beam_width; i++)
+        for (int i = 0; i < beamWidth; i++)
         {
-            float score = threadIdx.x < num_beams[blockIdx.x] ? s_scores[threadIdx.x] : -FLT_MAX;
-            float max_score = blockReduceMax<float>(score);
+            float score = threadIdx.x < numBeams[blockIdx.x] ? sScores[threadIdx.x] : -FLT_MAX;
+            float maxScore = blockReduceMax<float>(score);
 
             if (threadIdx.x == 0)
             {
-                for (int j = 0; j < beam_width * 2; j++)
+                for (int j = 0; j < beamWidth * 2; j++)
                 {
-                    if (s_scores[j] == max_score)
+                    if (sScores[j] == maxScore)
                     {
-                        s_rank[i] = j;
-                        s_scores[j] = -FLT_MAX;
+                        sRank[i] = j;
+                        sScores[j] = -FLT_MAX;
                         break;
                     }
                 }
@@ -394,86 +388,85 @@ __global__ void finalize(int* output_ids, int* sequence_lengths, float* cum_log_
         }
     }
 
-    if (threadIdx.x < beam_width)
+    if (threadIdx.x < beamWidth)
     {
-        s_sequence_lengths[threadIdx.x] = topk_sequence_lengths[blockIdx.x * beam_width * 2 + s_rank[threadIdx.x]];
-        sequence_lengths[blockIdx.x * beam_width + threadIdx.x] = s_sequence_lengths[threadIdx.x];
+        sSequenceLengths[threadIdx.x] = topKSequenceLengths[blockIdx.x * beamWidth * 2 + sRank[threadIdx.x]];
+        sequenceLengths[blockIdx.x * beamWidth + threadIdx.x] = sSequenceLengths[threadIdx.x];
 
-        if (cum_log_probs != nullptr)
+        if (cumLogProbs != nullptr)
         {
-            cum_log_probs[blockIdx.x * beam_width + threadIdx.x]
-                = topk_cum_log_probs[blockIdx.x * beam_width * 2 + s_rank[threadIdx.x]];
+            cumLogProbs[blockIdx.x * beamWidth + threadIdx.x]
+                = topKCumLogProbs[blockIdx.x * beamWidth * 2 + sRank[threadIdx.x]];
         }
     }
     __syncthreads();
 
-    for (int beam_idx = 0; beam_idx < beam_width; beam_idx++)
+    for (int beamIdx = 0; beamIdx < beamWidth; beamIdx++)
     {
         // start from step 1 to skip the start token
-        for (int i = threadIdx.x; i < s_sequence_lengths[beam_idx]; i += blockDim.x)
+        for (int i = threadIdx.x; i < sSequenceLengths[beamIdx]; i += blockDim.x)
         {
-            output_ids[blockIdx.x * beam_width * max_seq_len + beam_idx * max_seq_len + i]
-                = topk_output_ids[blockIdx.x * (beam_width * 2) * max_seq_len + s_rank[beam_idx] * max_seq_len + i];
-            if (output_log_probs != nullptr)
+            outputIds[blockIdx.x * beamWidth * maxSeqLen + beamIdx * maxSeqLen + i]
+                = topKOutputIds[blockIdx.x * (beamWidth * 2) * maxSeqLen + sRank[beamIdx] * maxSeqLen + i];
+            if (outputLogProbs != nullptr)
             {
-                int input_len = input_lengths[blockIdx.x * beam_width + beam_idx];
-                if (i >= input_len)
+                int inputLen = inputLengths[blockIdx.x * beamWidth + beamIdx];
+                if (i >= inputLen)
                 {
-                    output_log_probs[blockIdx.x * beam_width * max_seq_len + beam_idx * max_seq_len + i - input_len]
-                        = topk_log_probs[blockIdx.x * (beam_width * 2) * max_seq_len + s_rank[beam_idx] * max_seq_len
-                            + i];
+                    outputLogProbs[blockIdx.x * beamWidth * maxSeqLen + beamIdx * maxSeqLen + i - inputLen]
+                        = topKLogProbs[blockIdx.x * (beamWidth * 2) * maxSeqLen + sRank[beamIdx] * maxSeqLen + i];
                 }
             }
         }
     }
 }
 
-void invokeFinalize(int* output_ids, int* sequence_lengths, float* cum_log_probs, float* output_log_probs,
-    const int* topk_output_ids, const int* topk_sequence_lengths, const float* scores, const float* topk_cum_log_probs,
-    const float* topk_log_probs, const int* num_beams, const int* input_lengths, const int beam_width,
-    const int max_seq_len, const int batch_size, cudaStream_t stream)
+void invokeFinalize(int* outputIds, int* sequenceLengths, float* cumLogProbs, float* outputLogProbs,
+    const int* topKOutputIds, const int* topKSequenceLengths, const float* scores, const float* topKCumLogProbs,
+    const float* topKLogProbs, const int* numBeams, const int* inputLengths, const int beamWidth, const int maxSeqLen,
+    const int batchSize, cudaStream_t stream)
 {
     TLLM_LOG_DEBUG("%s %s start", __FILE__, __PRETTY_FUNCTION__);
-    dim3 block(beam_width * 2);
+    dim3 block(beamWidth * 2);
     block.x = (block.x + 31) / 32 * 32;
     TLLM_CHECK(block.x < 1024);
-    finalize<<<batch_size, block, beam_width * sizeof(int) * 2 + (beam_width * 2) * sizeof(float), stream>>>(output_ids,
-        sequence_lengths, cum_log_probs, output_log_probs, topk_output_ids, topk_sequence_lengths, scores,
-        topk_cum_log_probs, topk_log_probs, num_beams, input_lengths, beam_width, max_seq_len);
+    finalize<<<batchSize, block, beamWidth * sizeof(int) * 2 + (beamWidth * 2) * sizeof(float), stream>>>(outputIds,
+        sequenceLengths, cumLogProbs, outputLogProbs, topKOutputIds, topKSequenceLengths, scores, topKCumLogProbs,
+        topKLogProbs, numBeams, inputLengths, beamWidth, maxSeqLen);
 }
 
-__global__ void initializeOutput(int* output_ids, const int* end_ids, const int max_seq_len)
+__global__ void initializeOutput(int* outputIds, const int* endIds, const int maxSeqLen)
 {
-    for (int i = threadIdx.x; i < max_seq_len; i += blockDim.x)
+    for (int i = threadIdx.x; i < maxSeqLen; i += blockDim.x)
     {
-        output_ids[blockIdx.x * max_seq_len + i] = end_ids[blockIdx.x];
+        outputIds[blockIdx.x * maxSeqLen + i] = endIds[blockIdx.x];
     }
 }
 
-void invokeInitializeOutput(int* output_ids, const int* end_ids, int batch_beam, int max_seq_len, cudaStream_t stream)
+void invokeInitializeOutput(int* outputIds, const int* endIds, int batchBeam, int maxSeqLen, cudaStream_t stream)
 {
-    initializeOutput<<<batch_beam, 256, 0, stream>>>(output_ids, end_ids, max_seq_len);
+    initializeOutput<<<batchBeam, 256, 0, stream>>>(outputIds, endIds, maxSeqLen);
 }
 
-__global__ void copyNextStepIds(int* next_step_ids, int** output_ids_ptr, const int* sequence_lengths, int batch_size,
-    int beam_width, int max_seq_len)
+__global__ void copyNextStepIds(
+    int* nextStepIds, int** outputIdsPtr, const int* sequenceLengths, int batchSize, int beamWidth, int maxSeqLen)
 {
-    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < batch_size * beam_width;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < batchSize * beamWidth;
          index += blockDim.x * gridDim.x)
     {
-        const int batch_idx{index / beam_width};
-        const int beam_idx{index % beam_width};
-        next_step_ids[index] = output_ids_ptr[batch_idx][beam_idx * max_seq_len + sequence_lengths[index] - 1];
+        const int batchIdx{index / beamWidth};
+        const int beamIdx{index % beamWidth};
+        nextStepIds[index] = outputIdsPtr[batchIdx][beamIdx * maxSeqLen + sequenceLengths[index] - 1];
     }
 }
 
-void invokeCopyNextStepIds(int* next_step_ids, int** output_ids_ptr, const int* sequence_lengths, int batch_size,
-    int beam_width, int max_seq_len, cudaStream_t stream)
+void invokeCopyNextStepIds(int* nextStepIds, int** outputIdsPtr, const int* sequenceLengths, int batchSize,
+    int beamWidth, int maxSeqLen, cudaStream_t stream)
 {
-    dim3 block(min(256, batch_size * beam_width));
-    dim3 grid(divUp(batch_size * beam_width, block.x));
+    dim3 block(min(256, batchSize * beamWidth));
+    dim3 grid(divUp(batchSize * beamWidth, block.x));
     copyNextStepIds<<<grid, block, 0, stream>>>(
-        next_step_ids, output_ids_ptr, sequence_lengths, batch_size, beam_width, max_seq_len);
+        nextStepIds, outputIdsPtr, sequenceLengths, batchSize, beamWidth, maxSeqLen);
 }
 
 __global__ void transposeLogProbs(float* output_log_probs, float* output_log_probs_tiled, const int* sequence_lengths,
@@ -503,71 +496,208 @@ void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_ti
         output_log_probs, output_log_probs_tiled, sequence_lengths, batch_size, beam_width, max_seq_len);
 }
 
-__global__ void acceptTokensKernel(const int* draft_tokens, const int* target_tokens, const int* context_lengths,
-    const int* nums_draft_tokens, int* sequence_lengths, const bool* finished, bool* finished_final, int* finished_sum,
-    int batch_size, int beam_width, int max_seq_len, int max_draft_tokens)
+__global__ void acceptDraftTokensByIds(const int* draftIds, const int* targetIds, const int* contextLengths,
+    const int* numsDraftTokens, int* sequenceLengths, const FinishedState* finished, FinishedState* finishedFinal,
+    int* finishedSum, int batchSize, int beamWidth, int maxSeqLen, int maxDraftTokens)
 {
-    int thread_finished_count = 0;
-    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < batch_size * beam_width;
+    int threadFinishedCount = 0;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < batchSize * beamWidth;
          index += blockDim.x * gridDim.x)
     {
-        const auto num_draft_tokens = nums_draft_tokens[index];
+        const auto numDraftTokens = numsDraftTokens[index];
 
-        const auto context_length = context_lengths[index];
-        auto& sequence_length = sequence_lengths[index];
-        int finished_draft_idx = 0;
-        for (int ti = context_length; ti < min(sequence_length, context_length + num_draft_tokens);
-             ++ti, ++finished_draft_idx)
+        const auto contextLength = contextLengths[index];
+        auto& sequenceLength = sequenceLengths[index];
+        int finishedDraftIdx = 0;
+        for (int ti = contextLength; ti < min(sequenceLength, contextLength + numDraftTokens); ++ti, ++finishedDraftIdx)
         {
-            const auto draft_idx = ti - context_length;
-            const auto target_token_idx = index * max_seq_len + ti;
-            const auto draft_token_idx = index * max_draft_tokens + draft_idx;
+            const auto draftIdx = ti - contextLength;
+            const auto targetTokenIdx = index * maxSeqLen + ti;
+            const auto draftTokenIdx = index * maxDraftTokens + draftIdx;
             // Check if draft tokens are the same as target tokens
-            // FIXME(nkorobov); compare logits here
-            const bool accepted = draft_tokens[draft_token_idx] == target_tokens[target_token_idx];
+            const bool accepted = draftIds[draftTokenIdx] == targetIds[targetTokenIdx];
             if (!accepted)
             {
                 // Set sequence length to the numAcceptedTokens + 1
-                sequence_length = min(ti + 1, max_seq_len);
+                sequenceLength = min(ti + 1, maxSeqLen);
                 // FIXME(nkorobov): do we need to set endIds here?
                 break;
             }
         }
-        bool finish = finished[finished_draft_idx * batch_size * beam_width + index];
-        finished_final[index] = finish;
-        thread_finished_count += static_cast<int>(finish);
+        FinishedState finishState = finished[finishedDraftIdx * batchSize * beamWidth + index];
+        finishedFinal[index] = finishState;
+        threadFinishedCount += static_cast<int>(finishState.isFinished());
     }
 
-    if (finished_sum)
+    if (finishedSum)
     {
-        int block_finished_count = 0;
+        int blockFinishedCount = 0;
         if (blockDim.x <= 32)
         {
-            block_finished_count = warpReduceSum(thread_finished_count);
+            blockFinishedCount = warpReduceSum(threadFinishedCount);
         }
         else
         {
-            block_finished_count = blockReduceSum(thread_finished_count);
+            blockFinishedCount = blockReduceSum(threadFinishedCount);
         }
         __syncthreads();
 
         if (threadIdx.x == 0)
         {
-            finished_sum[0] = block_finished_count;
+            finishedSum[0] = blockFinishedCount;
         }
     }
 }
 
-void invokeAcceptTokens(const int* draft_tokens, const int* target_tokens, const int* context_lengths,
-    const int* nums_draft_tokens, int* sequence_lengths, const bool* finished, bool* finished_final, int* finished_sum,
-    int batch_size, int beam_width, int max_seq_len, int max_draft_tokens, cudaStream_t stream)
+void invokeAcceptDraftTokensByIds(const int* draftIds, const int* targetIds, const int* contextLengths,
+    const int* numsDraftTokens, int* sequenceLengths, const FinishedState* finished, FinishedState* finishedFinal,
+    int* finishedSum, int batchSize, int beamWidth, int maxSeqLen, int maxDraftTokens, cudaStream_t stream)
 {
-    dim3 block(min(256, batch_size * beam_width));
+    TLLM_CHECK(beamWidth == 1);
+    dim3 block(min(256, batchSize * beamWidth));
     dim3 grid(1);
-    acceptTokensKernel<<<grid, block, 0, stream>>>(draft_tokens, target_tokens, context_lengths, nums_draft_tokens,
-        sequence_lengths, finished, finished_final, finished_sum, batch_size, beam_width, max_seq_len,
-        max_draft_tokens);
+    acceptDraftTokensByIds<<<grid, block, 0, stream>>>(draftIds, targetIds, contextLengths, numsDraftTokens,
+        sequenceLengths, finished, finishedFinal, finishedSum, batchSize, beamWidth, maxSeqLen, maxDraftTokens);
 }
+
+template <typename T>
+__global__ void acceptDraftTokensByLogitsKernel(const T* draftProbs, T* targetProbs, const int* numsDraftTokens,
+    FinishedState* finished, curandState_t* curandState, int batchSize, int beamWidth, int vocabSize,
+    bool randomThreshold, float constantThreshold)
+{
+    const auto bid = blockIdx.x;
+    const auto draftTokenIdx = blockIdx.y;
+    const auto batchIdx = bid / beamWidth;
+
+    const auto numDraftTokens = numsDraftTokens[bid];
+
+    if (draftTokenIdx >= numDraftTokens)
+    {
+        return;
+    }
+
+    const auto logitsOffset = draftTokenIdx * batchSize * beamWidth * vocabSize + bid * vocabSize;
+    const auto draftProbsBatch = draftProbs + logitsOffset;
+    const auto targetProbsBatch = targetProbs + logitsOffset;
+
+    int rejected = 0;
+
+    for (int vIdx = threadIdx.x; vIdx < vocabSize; vIdx += blockDim.x)
+    {
+        if (rejected > 0)
+        {
+            break;
+        }
+
+        // FIXME(nkorobov): We compare probability distributions, but it might make sense to compare probabilities of
+        // the selected tokens based on the https://arxiv.org/pdf/2302.01318.pdf
+        const auto threshold = randomThreshold ? curand_uniform(curandState + batchIdx) : constantThreshold;
+
+        const auto targetProb = static_cast<float>(targetProbsBatch[vIdx]);
+        const auto draftProb = static_cast<float>(draftProbsBatch[vIdx]);
+
+        rejected = __syncthreads_count(targetProb < threshold * draftProb);
+    }
+    if (threadIdx.x == 0)
+    {
+        finished[draftTokenIdx * batchSize * beamWidth + bid]
+            = rejected > 0 ? FinishedState::skipDecoding() : FinishedState::empty();
+    }
+}
+
+template <typename T>
+__global__ void correctAcceptedStatesAndLogits(const T* draftProbs, T* targetProbs, T* targetLogits,
+    const int* numsDraftTokens, FinishedState* finished, int batchSize, int beamWidth, int vocabSize)
+{
+    const auto bid = blockIdx.x;
+    const auto numDraftTokens = numsDraftTokens[bid];
+
+    __shared__ int numAcceptedTokens;
+    if (threadIdx.x == 0)
+    {
+        numAcceptedTokens = numDraftTokens;
+        bool cummulativeSkipDecoding = false;
+        for (int ti = 0; ti < numDraftTokens + 1; ++ti)
+        {
+            auto& finishedState = finished[ti * batchSize * beamWidth + bid];
+            bool localSkipDecoding = finishedState.isSkipDecoding();
+            if (cummulativeSkipDecoding == false && localSkipDecoding == true)
+            {
+                numAcceptedTokens = ti;
+            }
+
+            finishedState = cummulativeSkipDecoding ? FinishedState::skipDecoding() : FinishedState::empty();
+            cummulativeSkipDecoding |= localSkipDecoding;
+        }
+    }
+    __syncthreads();
+
+    if (numAcceptedTokens < numDraftTokens)
+    {
+        const auto logitsIdx = numAcceptedTokens * batchSize * beamWidth * vocabSize + bid * vocabSize;
+        const auto draftProbBatch = draftProbs + logitsIdx;
+        auto targetProbBatch = targetProbs + logitsIdx;
+        auto targetLogitsBatch = targetLogits + logitsIdx;
+
+        float sumProbs = 0.f;
+        for (int vIdx = threadIdx.x; vIdx < vocabSize; vIdx += blockDim.x)
+        {
+            const auto correctedProb = max(static_cast<float>(targetProbBatch[vIdx] - draftProbBatch[vIdx]), 0.f);
+            sumProbs += correctedProb;
+            targetProbBatch[vIdx] = correctedProb;
+        }
+
+        __shared__ float sumProbsShared;
+        sumProbs = blockReduceSum<float>((float) sumProbs);
+        if (threadIdx.x == 0)
+        {
+            sumProbsShared = max(sumProbs, 1e-6f);
+        }
+        __syncthreads();
+
+        for (int vIdx = threadIdx.x; vIdx < vocabSize; vIdx += blockDim.x)
+        {
+            const auto correctedNormProb = static_cast<float>(targetProbBatch[vIdx]) / sumProbsShared;
+            targetLogitsBatch[vIdx] = __logf(correctedNormProb / (1.f - correctedNormProb));
+        }
+    }
+}
+
+template <typename T>
+void acceptDraftTokensByLogits(T* draftLogits, T* targetLogits, T* draftProbs, T* targetProbs,
+    const int* numsDraftTokens, FinishedState* finished, curandState_t* curandState, int batchSize, int beamWidth,
+    int vocabSize, int vocabSizePadded, int maxDraftTokens, bool randomThreshold, float constantThreshold,
+    cudaStream_t stream)
+{
+    TLLM_CHECK(beamWidth == 1);
+    {
+        invokeAddBiasSoftMax(draftLogits, draftProbs, (T*) (nullptr), nullptr, finished,
+            batchSize * beamWidth * maxDraftTokens, vocabSize, vocabSizePadded, stream);
+        invokeAddBiasSoftMax(targetLogits, targetProbs, (T*) (nullptr), nullptr, finished,
+            batchSize * beamWidth * maxDraftTokens, vocabSize, vocabSizePadded, stream);
+    }
+    {
+        dim3 block(1024);
+        dim3 grid(batchSize * beamWidth, maxDraftTokens);
+        acceptDraftTokensByLogitsKernel<<<grid, block, 0, stream>>>(draftProbs, targetProbs, numsDraftTokens, finished,
+            curandState, batchSize, beamWidth, vocabSizePadded, randomThreshold, constantThreshold);
+    }
+    {
+        dim3 block(1024);
+        dim3 grid(batchSize * beamWidth);
+        correctAcceptedStatesAndLogits<<<grid, block, 0, stream>>>(
+            draftProbs, targetProbs, targetLogits, numsDraftTokens, finished, batchSize, beamWidth, vocabSizePadded);
+    }
+}
+
+template void acceptDraftTokensByLogits(float* draftLogits, float* targetLogits, float* draftProbs, float* targetProbs,
+    const int* numsDraftTokens, FinishedState* finished, curandState_t* curandState, int batchSize, int beamWidth,
+    int vocabSize, int vocabSizePadded, int maxDraftTokens, bool randomThreshold, float constantThreshold,
+    cudaStream_t stream);
+template void acceptDraftTokensByLogits(half* draftLogits, half* targetLogits, half* draftProbs, half* targetProbs,
+    const int* numsDraftTokens, FinishedState* finished, curandState_t* curandState, int batchSize, int beamWidth,
+    int vocabSize, int vocabSizePadded, int maxDraftTokens, bool randomThreshold, float constantThreshold,
+    cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

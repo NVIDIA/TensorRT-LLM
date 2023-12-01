@@ -27,7 +27,7 @@ def serialize_engine(engine, path):
     logger.info(f'Serializing engine to {path}...')
     tik = time.time()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')

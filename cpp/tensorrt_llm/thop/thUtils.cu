@@ -38,6 +38,7 @@ tensorrt_llm::common::Tensor convert_tensor(torch::Tensor tensor)
 }
 
 // Template instantiations
+template tensorrt_llm::common::Tensor convert_tensor<uint8_t>(torch::Tensor tensor);
 template tensorrt_llm::common::Tensor convert_tensor<int8_t>(torch::Tensor tensor);
 template tensorrt_llm::common::Tensor convert_tensor<float>(torch::Tensor tensor);
 template tensorrt_llm::common::Tensor convert_tensor<half>(torch::Tensor tensor);
@@ -57,6 +58,8 @@ tensorrt_llm::common::Tensor convert_tensor(torch::Tensor tensor, tensorrt_llm::
 }
 
 // Template instantiations
+template tensorrt_llm::common::Tensor convert_tensor<uint8_t>(
+    torch::Tensor tensor, tensorrt_llm::common::MemoryType memory_type);
 template tensorrt_llm::common::Tensor convert_tensor<int8_t>(
     torch::Tensor tensor, tensorrt_llm::common::MemoryType memory_type);
 template tensorrt_llm::common::Tensor convert_tensor<float>(

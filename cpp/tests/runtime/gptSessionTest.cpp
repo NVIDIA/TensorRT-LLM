@@ -189,21 +189,49 @@ void verifyModelConfig(GptModelConfig const& modelConfig, ModelSpec const& model
 
 void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, ModelIds const modelIds, SizeType beamWidth,
     std::initializer_list<int> const& batchSizes, fs::path const& resultsFile,
-    std::shared_ptr<nvinfer1::ILogger> const& logger, bool cudaGraphMode, MicroBatchSizes microBatchSizes)
+    std::shared_ptr<nvinfer1::ILogger> const& logger, bool cudaGraphMode, MicroBatchSizes microBatchSizes,
+    bool const isChatGlmTest = false, std::string const& modelName = "")
 {
     auto manager = BufferManager(std::make_shared<CudaStream>());
 
     ASSERT_TRUE(fs::exists(DATA_PATH));
     fs::path inputPath = DATA_PATH / "input_tokens.npy";
+    std::string fileNameSuffix;
+    if (isChatGlmTest)
+    {
+        ASSERT_TRUE(fs::exists(DATA_PATH / modelName));
+        const int batchSize = *batchSizes.begin();
+        fileNameSuffix
+            = std::string("-BS") + std::to_string(batchSize) + "-BM" + std::to_string(beamWidth) + std::string(".npy");
+        inputPath = DATA_PATH / modelName / (std::string("inputId") + fileNameSuffix);
+    }
+
     auto const& givenInput = utils::loadNpy(manager, inputPath.string(), MemoryType::kCPU);
     auto const& inputShape = givenInput->getShape();
     ASSERT_EQ(inputShape.nbDims, 2);
     ASSERT_GT(inputShape.d[0], 0);
+
     auto const nbGivenInputs = static_cast<SizeType>(inputShape.d[0]);
-    auto expectedOutput = utils::loadNpy(manager, resultsFile.string(), MemoryType::kCPU);
+    std::string outputPath = resultsFile.string();
+    if (isChatGlmTest)
+    {
+        fs::path expectedOutputPath = DATA_PATH / modelName / (std::string("outputId") + fileNameSuffix);
+        outputPath = expectedOutputPath.string();
+    }
+
+    auto expectedOutput = utils::loadNpy(manager, outputPath, MemoryType::kCPU);
     auto const& outputShape = expectedOutput->getShape();
-    ASSERT_EQ(outputShape.nbDims, 2);
-    ASSERT_EQ(inputShape.d[0] * beamWidth, outputShape.d[0]);
+    if (isChatGlmTest)
+    {
+        ASSERT_EQ(outputShape.nbDims, 3);
+        ASSERT_EQ(inputShape.d[0], outputShape.d[0]);
+    }
+    else
+    {
+        ASSERT_EQ(outputShape.nbDims, 2);
+        ASSERT_EQ(inputShape.d[0] * beamWidth, outputShape.d[0]);
+    }
+
     auto const givenInputData = bufferCast<TokenIdType const>(*givenInput);
     auto expectedOutputData = bufferCast<TokenIdType>(*expectedOutput);
 
@@ -219,17 +247,40 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
     ASSERT_TRUE(fs::exists(enginePath));
 
     auto const maxInputLength = static_cast<SizeType>(inputShape.d[1]);
-    auto const maxSeqLength = static_cast<SizeType>(outputShape.d[1]);
-    ASSERT_LT(maxInputLength, maxSeqLength);
-    auto const maxNewTokens = maxSeqLength - maxInputLength;
+
+    auto const maxSeqLengthGroundTruth = isChatGlmTest ? static_cast<SizeType>(outputShape.d[2]) : 0;
+    SizeType maxNewTokens, maxSeqLength;
+    if (isChatGlmTest)
+    {
+        maxNewTokens = 512;
+        maxSeqLength = maxInputLength + maxNewTokens;
+    }
+    else
+    {
+        maxSeqLength = static_cast<SizeType>(outputShape.d[1]);
+        ASSERT_LT(maxInputLength, maxSeqLength);
+        maxNewTokens = maxSeqLength - maxInputLength;
+    }
+
     SamplingConfig samplingConfig{beamWidth};
     samplingConfig.temperature = std::vector{1.0f};
     samplingConfig.minLength = std::vector{1};
-    samplingConfig.randomSeed = std::vector{42ull};
-    samplingConfig.topK = std::vector{0};
-    samplingConfig.topP = std::vector{0.0f};
+    if (isChatGlmTest)
+    {
+        samplingConfig.randomSeed = std::vector{1ull};
+        samplingConfig.topK = std::vector{1};
+        samplingConfig.topP = std::vector{1.0f};
+        samplingConfig.lengthPenalty = std::vector{1.0f};
+    }
+    else
+    {
+        samplingConfig.randomSeed = std::vector{42ull};
+        samplingConfig.topK = std::vector{0};
+        samplingConfig.topP = std::vector{0.0f};
+    }
 
     auto const padId = modelIds.padId;
+    auto endId = modelIds.endId;
 
     std::vector<SizeType> givenInputLengths(nbGivenInputs);
     for (SizeType i = 0; i < nbGivenInputs; ++i)
@@ -239,42 +290,45 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
         givenInputLengths[i] = std::distance(seqBegin, it);
     }
 
-    std::srand(42);
-    auto endId = modelIds.endId;
-    if (modelSpec.mRandomEndId)
+    std::vector<SizeType> expectedLengths;
+    if (!isChatGlmTest)
     {
-        const auto endIdRow = std::rand() % nbGivenInputs;
-        const auto endIdBeam = std::rand() % beamWidth;
-        const auto endIdCol = givenInputLengths[endIdRow] + std::rand() % maxNewTokens;
-        auto const endIdIndex = tc::flat_index2((endIdRow * beamWidth + endIdBeam), endIdCol, maxSeqLength);
-        endId = expectedOutputData[endIdIndex];
-    }
-
-    std::vector<SizeType> expectedLengths(nbGivenInputs * beamWidth);
-    for (SizeType bi = 0; bi < nbGivenInputs; ++bi)
-    {
-        for (SizeType beam = 0; beam < beamWidth; ++beam)
+        std::srand(42);
+        if (modelSpec.mRandomEndId)
         {
-            SizeType expectedLen = givenInputLengths[bi] + maxNewTokens;
-            if (modelSpec.mRandomEndId)
+            const auto endIdRow = std::rand() % nbGivenInputs;
+            const auto endIdBeam = std::rand() % beamWidth;
+            const auto endIdCol = givenInputLengths[endIdRow] + std::rand() % maxNewTokens;
+            auto const endIdIndex = tc::flat_index2((endIdRow * beamWidth + endIdBeam), endIdCol, maxSeqLength);
+            endId = expectedOutputData[endIdIndex];
+        }
+
+        expectedLengths.resize(nbGivenInputs * beamWidth);
+        for (SizeType bi = 0; bi < nbGivenInputs; ++bi)
+        {
+            for (SizeType beam = 0; beam < beamWidth; ++beam)
             {
-                for (SizeType si = givenInputLengths[bi]; si < maxSeqLength; ++si)
+                SizeType expectedLen = givenInputLengths[bi] + maxNewTokens;
+                if (modelSpec.mRandomEndId)
                 {
-                    auto const expectIndex = tc::flat_index2((bi * beamWidth + beam), si, maxSeqLength);
-                    if (expectedOutputData[expectIndex] == endId)
+                    for (SizeType si = givenInputLengths[bi]; si < maxSeqLength; ++si)
                     {
-                        expectedLen = si;
-                        break;
+                        auto const expectIndex = tc::flat_index2((bi * beamWidth + beam), si, maxSeqLength);
+                        if (expectedOutputData[expectIndex] == endId)
+                        {
+                            expectedLen = si;
+                            break;
+                        }
+                    }
+                    // Fill new EOS token to the expected data
+                    for (SizeType si = expectedLen; si < maxSeqLength; ++si)
+                    {
+                        auto const expectIndex = tc::flat_index2((bi * beamWidth + beam), si, maxSeqLength);
+                        expectedOutputData[expectIndex] = endId;
                     }
                 }
-                // Fill new EOS token to the expected data
-                for (SizeType si = expectedLen; si < maxSeqLength; ++si)
-                {
-                    auto const expectIndex = tc::flat_index2((bi * beamWidth + beam), si, maxSeqLength);
-                    expectedOutputData[expectIndex] = endId;
-                }
+                expectedLengths[bi * beamWidth + beam] = expectedLen;
             }
-            expectedLengths[bi * beamWidth + beam] = expectedLen;
         }
     }
 
@@ -292,16 +346,19 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
 
     for (auto const batchSize : batchSizes)
     {
-        std::cout << "=== batchSize:" << batchSize << " ===\n";
+        if (!isChatGlmTest)
+        {
+            std::cout << "=== batchSize:" << batchSize << " ===\n";
+        }
 
         // use 5 to 12 tokens from input
-        std::vector<SizeType> inputLenghtsHost(batchSize);
+        std::vector<SizeType> inputLengthsHost(batchSize);
         for (SizeType i = 0; i < batchSize; ++i)
         {
             const int inputIdx = i % nbGivenInputs;
-            inputLenghtsHost[i] = givenInputLengths[inputIdx];
+            inputLengthsHost[i] = givenInputLengths[inputIdx];
         }
-        auto inputLenghts = bufferManager.copyFrom(inputLenghtsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
+        auto inputLengths = bufferManager.copyFrom(inputLengthsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
 
         // copy inputs and wrap into shared_ptr
         GenerationInput::TensorPtr inputIds;
@@ -309,14 +366,14 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
         {
             std::vector<SizeType> inputOffsetsHost(batchSize + 1);
             tc::stl_utils::inclusiveScan(
-                inputLenghtsHost.begin(), inputLenghtsHost.end(), inputOffsetsHost.begin() + 1);
+                inputLengthsHost.begin(), inputLengthsHost.end(), inputOffsetsHost.begin() + 1);
             auto const totalInputSize = inputOffsetsHost.back();
 
             std::vector<std::int32_t> inputsHost(totalInputSize);
             for (SizeType i = 0; i < batchSize; ++i)
             {
                 auto const seqBegin = givenInputData + (i % nbGivenInputs) * maxInputLength;
-                std::copy(seqBegin, seqBegin + inputLenghtsHost[i], inputsHost.begin() + inputOffsetsHost[i]);
+                std::copy(seqBegin, seqBegin + inputLengthsHost[i], inputsHost.begin() + inputOffsetsHost[i]);
             }
             inputIds = bufferManager.copyFrom(inputsHost, ITensor::makeShape({1, totalInputSize}), MemoryType::kGPU);
         }
@@ -326,15 +383,18 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
             for (SizeType i = 0; i < batchSize; ++i)
             {
                 auto const seqBegin = givenInputData + (i % nbGivenInputs) * maxInputLength;
-                std::copy(seqBegin, seqBegin + inputLenghtsHost[i], inputsHost.begin() + i * maxInputLength);
+                std::copy(seqBegin, seqBegin + inputLengthsHost[i], inputsHost.begin() + i * maxInputLength);
             }
             inputIds
                 = bufferManager.copyFrom(inputsHost, ITensor::makeShape({batchSize, maxInputLength}), MemoryType::kGPU);
         }
 
         GenerationInput generationInput{
-            endId, padId, std::move(inputIds), std::move(inputLenghts), modelConfig.usePackedInput()};
-        generationInput.maxNewTokens = maxNewTokens;
+            endId, padId, std::move(inputIds), std::move(inputLengths), modelConfig.usePackedInput()};
+        if (!isChatGlmTest)
+        {
+            generationInput.maxNewTokens = maxNewTokens;
+        }
 
         // runtime will allocate memory for output if this tensor is empty
         GenerationOutput generationOutput{bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32),
@@ -345,26 +405,30 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
         for (auto r = 0; r < repetitions; ++r)
         {
             SizeType numSteps = 0;
-            generationOutput.onTokenGenerated
-                = [&numSteps, &modelSpec, maxNewTokens](
-                      [[maybe_unused]] GenerationOutput::TensorPtr const& outputIds, SizeType step, bool finished)
+
+            if (!isChatGlmTest)
             {
-                // check that we execute the callback in each step
-                EXPECT_EQ(step, numSteps);
-                ++numSteps;
-                if (!modelSpec.mRandomEndId)
+                generationOutput.onTokenGenerated
+                    = [&numSteps, &modelSpec, maxNewTokens](
+                          [[maybe_unused]] GenerationOutput::TensorPtr const& outputIds, SizeType step, bool finished)
                 {
-                    // check that we only finish after producing `maxNewTokens` tokens
-                    EXPECT_TRUE(!finished || numSteps == maxNewTokens);
-                }
-                // check that `finished` is set to true after producing `maxNewTokens` tokens
-                EXPECT_TRUE(numSteps != maxNewTokens || finished);
-            };
+                    // check that we execute the callback in each step
+                    EXPECT_EQ(step, numSteps);
+                    ++numSteps;
+                    if (!modelSpec.mRandomEndId)
+                    {
+                        // check that we only finish after producing `maxNewTokens` tokens
+                        EXPECT_TRUE(!finished || numSteps == maxNewTokens);
+                    }
+                    // check that `finished` is set to true after producing `maxNewTokens` tokens
+                    EXPECT_TRUE(numSteps != maxNewTokens || finished);
+                };
+            }
 
             session.generate(generationOutput, generationInput, samplingConfig);
 
             // compare outputs
-            if (worldConfig.isFirstPipelineParallelRank())
+            if (!isChatGlmTest && worldConfig.isFirstPipelineParallelRank())
             {
                 if (!modelSpec.mRandomEndId)
                 {
@@ -391,13 +455,19 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
                     }
                 }
                 ASSERT_FALSE(anyMismatch) << "wrong output lengths";
+            }
 
+            if (isChatGlmTest || worldConfig.isFirstPipelineParallelRank())
+            {
                 auto const& outputIds = generationOutput.ids;
                 auto const& outputDims = outputIds->getShape();
                 EXPECT_EQ(outputDims.nbDims, 3);
                 EXPECT_EQ(outputDims.d[0], batchSize) << "r: " << r;
                 EXPECT_EQ(outputDims.d[1], beamWidth) << "r: " << r;
-                EXPECT_EQ(outputDims.d[2], maxSeqLength) << "r: " << r;
+                if (!isChatGlmTest)
+                {
+                    EXPECT_EQ(outputDims.d[2], maxSeqLength) << "r: " << r;
+                }
                 auto outputHost = bufferManager.copyFrom(*outputIds, MemoryType::kCPU);
                 auto output = bufferCast<std::int32_t>(*outputHost);
                 bufferManager.getStream().synchronize();
@@ -408,16 +478,29 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
                         bool anyMismatch = false;
                         for (auto i = 0; i < maxSeqLength; ++i)
                         {
-                            auto const outputIndex = tc::flat_index3(b, beam, i, beamWidth, maxSeqLength);
-                            auto const expectIndex
-                                = tc::flat_index2((b % nbGivenInputs * beamWidth + beam), i, maxSeqLength);
-                            if (expectedOutputData[expectIndex] == endId)
+                            int expectIndex;
+                            int outputIndex = tc::flat_index3(b, beam, i, beamWidth, maxSeqLength);
+                            if (isChatGlmTest)
+                            {
+                                expectIndex = tc::flat_index3(b, beam, i, beamWidth, maxSeqLengthGroundTruth);
+                            }
+                            else
+                            {
+                                expectIndex = tc::flat_index2((b % nbGivenInputs * beamWidth + beam), i, maxSeqLength);
+                            }
+
+                            if (!isChatGlmTest && expectedOutputData[expectIndex] == endId)
                             {
                                 break;
                             }
                             EXPECT_EQ(output[outputIndex], expectedOutputData[expectIndex])
                                 << " b: " << b << " beam: " << beam << " i: " << i;
                             anyMismatch |= (output[outputIndex] != expectedOutputData[expectIndex]);
+
+                            if (isChatGlmTest && output[outputIndex] == endId)
+                            {
+                                break;
+                            }
                         }
                         ASSERT_FALSE(anyMismatch) << "batchSize: " << batchSize << ", r: " << r << ", b: " << b;
                     }
@@ -684,186 +767,6 @@ class ChatGlm3SessionTest : public SessionTest // for ChatGLM3-6B
 {
 };
 
-// Engines need to be generated using cpp/tests/resources/scripts/build_chatglm_engines.py.
-// Expected outputs need to be generated using cpp/tests/resources/scripts/generate_expected_chatglm_output.py.
-
-namespace
-{
-
-// TODO: consolidate this function with testGptSession
-// Notice: all ChatGLM / GLM models use this
-// The differences are GptModelConfig::ModelVariant
-void testChatGlmSession(fs::path const& modelPath, std::string const& modelName, ModelSpec const& modelSpec,
-    ModelIds const modelIds, SizeType beamWidth, std::initializer_list<int> const& batchSizes,
-    std::shared_ptr<nvinfer1::ILogger> const& logger, bool cudaGraphMode, MicroBatchSizes microBatchSizes)
-{
-    auto manager = BufferManager(std::make_shared<CudaStream>());
-
-    ASSERT_TRUE(fs::exists(DATA_PATH / modelName));
-    const int batchSize = *batchSizes.begin();
-    std::string fileNameSuffix
-        = std::string("-BS") + std::to_string(batchSize) + "-BM" + std::to_string(beamWidth) + std::string(".npy");
-    fs::path givenInputPath = DATA_PATH / modelName / (std::string("inputId") + fileNameSuffix);
-    auto const& givenInput = utils::loadNpy(manager, givenInputPath.string(), MemoryType::kCPU);
-    auto const& inputShape = givenInput->getShape();
-    ASSERT_EQ(inputShape.nbDims, 2);
-    ASSERT_GT(inputShape.d[0], 0);
-    auto const nbGivenInputs = static_cast<SizeType>(inputShape.d[0]);
-    fs::path expectedOutputPath = DATA_PATH / modelName / (std::string("outputId") + fileNameSuffix);
-    auto const& expectedOutput = utils::loadNpy(manager, expectedOutputPath.string(), MemoryType::kCPU);
-    auto const& outputShape = expectedOutput->getShape();
-    ASSERT_EQ(outputShape.nbDims, 3);
-    ASSERT_EQ(inputShape.d[0], outputShape.d[0]);
-    auto const givenInputData = bufferCast<TokenIdType const>(*givenInput);
-    auto const expectedOutputData = bufferCast<TokenIdType const>(*expectedOutput);
-
-    ASSERT_TRUE(fs::exists(modelPath));
-    auto const json = GptJsonConfig::parse(modelPath / "config.json");
-    auto const modelConfig = json.getModelConfig();
-    verifyModelConfig(modelConfig, modelSpec);
-    auto const decoderPerRequest = modelSpec.mDecoderPerRequest;
-
-    const int worldSize = modelSpec.mTPSize * modelSpec.mPPSize;
-    auto const worldConfig = WorldConfig::mpi(*logger, worldSize, modelSpec.mTPSize, modelSpec.mPPSize);
-
-    auto enginePath = modelPath / json.engineFilename(worldConfig);
-    ASSERT_TRUE(fs::exists(enginePath));
-
-    auto const maxInputLength = static_cast<SizeType>(inputShape.d[1]);
-    auto const maxNewTokens = 512;
-    auto const maxSeqLengthGroundTruth = static_cast<SizeType>(outputShape.d[2]);
-    auto const maxSeqLength = maxInputLength + maxNewTokens;
-    SamplingConfig samplingConfig{beamWidth};
-    samplingConfig.temperature = std::vector{1.0f};
-    samplingConfig.minLength = std::vector{1};
-    samplingConfig.randomSeed = std::vector{1ull};
-    samplingConfig.topK = std::vector{1};
-    samplingConfig.topP = std::vector{1.0f};
-    samplingConfig.lengthPenalty = std::vector{1.0f};
-
-    auto const padId = modelIds.padId;
-    auto const endId = modelIds.endId;
-
-    std::vector<SizeType> givenInputLengths(nbGivenInputs);
-    for (SizeType i = 0; i < nbGivenInputs; ++i)
-    {
-        auto const seqBegin = givenInputData + i * maxInputLength;
-        auto const it = std::find(seqBegin, seqBegin + maxInputLength, padId);
-        givenInputLengths[i] = std::distance(seqBegin, it);
-    }
-
-    auto const maxBatchSize = *std::max_element(batchSizes.begin(), batchSizes.end());
-    GptSession::Config sessionConfig{maxBatchSize, beamWidth, maxSeqLength};
-    sessionConfig.decoderPerRequest = decoderPerRequest;
-    sessionConfig.ctxMicroBatchSize = microBatchSizes.ctxMicroBatchSize;
-    sessionConfig.genMicroBatchSize = microBatchSizes.genMicroBatchSize;
-    sessionConfig.cudaGraphMode = cudaGraphMode;
-    GptSession session{sessionConfig, modelConfig, worldConfig, enginePath.string(), logger};
-    EXPECT_EQ(session.getDevice(), worldConfig.getDevice());
-    // Use bufferManager for copying data to and from the GPU
-    auto& bufferManager = session.getBufferManager();
-
-    for (auto const batchSize : batchSizes)
-    {
-        std::vector<SizeType> inputLenghtsHost(batchSize);
-        for (SizeType i = 0; i < batchSize; ++i)
-        {
-            const int inputIdx = i % nbGivenInputs;
-            inputLenghtsHost[i] = givenInputLengths[inputIdx];
-        }
-        auto inputLenghts = bufferManager.copyFrom(inputLenghtsHost, ITensor::makeShape({batchSize}), MemoryType::kGPU);
-
-        // copy inputs and wrap into shared_ptr
-        GenerationInput::TensorPtr inputIds;
-        if (modelConfig.usePackedInput())
-        {
-            std::vector<SizeType> inputOffsetsHost(batchSize + 1);
-            tc::stl_utils::inclusiveScan(
-                inputLenghtsHost.begin(), inputLenghtsHost.end(), inputOffsetsHost.begin() + 1);
-            auto const totalInputSize = inputOffsetsHost.back();
-
-            std::vector<std::int32_t> inputsHost(totalInputSize);
-            for (SizeType i = 0; i < batchSize; ++i)
-            {
-                auto const seqBegin = givenInputData + (i % nbGivenInputs) * maxInputLength;
-                std::copy(seqBegin, seqBegin + inputLenghtsHost[i], inputsHost.begin() + inputOffsetsHost[i]);
-            }
-            inputIds = bufferManager.copyFrom(inputsHost, ITensor::makeShape({1, totalInputSize}), MemoryType::kGPU);
-        }
-        else
-        {
-            std::vector<std::int32_t> inputsHost(batchSize * maxInputLength, padId);
-            for (SizeType i = 0; i < batchSize; ++i)
-            {
-                auto const seqBegin = givenInputData + (i % nbGivenInputs) * maxInputLength;
-                std::copy(seqBegin, seqBegin + inputLenghtsHost[i], inputsHost.begin() + i * maxInputLength);
-            }
-            inputIds
-                = bufferManager.copyFrom(inputsHost, ITensor::makeShape({batchSize, maxInputLength}), MemoryType::kGPU);
-        }
-
-        GenerationInput generationInput{
-            endId, padId, std::move(inputIds), std::move(inputLenghts), modelConfig.usePackedInput()};
-
-        // runtime will allocate memory for output if this tensor is empty
-        GenerationOutput generationOutput{bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32),
-            bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32)};
-
-        // repeat the same inputs multiple times for testing idempotency of `generate()`
-        auto constexpr repetitions = 10;
-        for (auto r = 0; r < repetitions; ++r)
-        {
-            SizeType numSteps = 0;
-            // generationOutput.onTokenGenerated
-            //      = [&numSteps, maxNewTokens]([[maybe_unused]] GenerationOutput::TensorPtr const& outputIds,
-            //            [[maybe_unused]] SizeType step, bool finished)
-            // {
-            //      ++numSteps;
-            //      EXPECT_TRUE(!finished || numSteps == maxNewTokens);
-            // };
-            session.generate(generationOutput, generationInput, samplingConfig);
-            // EXPECT_EQ(numSteps, maxNewTokens);
-
-            // compare outputs
-            auto const& outputIds = generationOutput.ids;
-            auto const& outputDims = outputIds->getShape();
-            EXPECT_EQ(outputDims.nbDims, 3);
-            EXPECT_EQ(outputDims.d[0], batchSize) << "r: " << r;
-            EXPECT_EQ(outputDims.d[1], beamWidth) << "r: " << r;
-            // EXPECT_EQ(outputDims.d[2], maxSeqLength) << "r: " << r;
-            auto outputHost = bufferManager.copyFrom(*outputIds, MemoryType::kCPU);
-            auto output = bufferCast<std::int32_t>(*outputHost);
-            bufferManager.getStream().synchronize();
-            for (auto b = 0; b < batchSize; ++b)
-            {
-                for (auto beam = 0; beam < beamWidth; ++beam)
-                {
-                    bool anyMismatch = false;
-                    for (auto i = 0; i < maxSeqLength; ++i)
-                    {
-                        int outputIndex = b * beamWidth * maxSeqLength + beam * maxSeqLength + i;
-                        int expectIndex = b * beamWidth * maxSeqLengthGroundTruth + beam * maxSeqLengthGroundTruth + i;
-                        //printf("[%2d,%2d,%4d]->[%4d,%4d,%s][out=%6d,ref=%6d] %s\n", \
-                        //    b, beam, i, outputIndex, expectIndex, \
-                        //    ((output[outputIndex] == expectedOutputData[expectIndex]) ? "Y" : "N"), \
-                        //    output[outputIndex], expectedOutputData[expectIndex], \
-                        //    (output[outputIndex] == endId ? "<" : ""));
-                        EXPECT_EQ(output[outputIndex], expectedOutputData[expectIndex])
-                            << " b: " << b << " beam: " << beam << " i: " << i;
-                        anyMismatch |= (output[outputIndex] != expectedOutputData[expectIndex]);
-                        if (output[outputIndex] == endId) // exit early
-                            break;
-                    }
-                    ASSERT_FALSE(anyMismatch) << "batchSize: " << batchSize << ", r: " << r << ", b: " << b;
-                }
-            }
-            outputIds->release();
-        }
-    }
-}
-
-} // namespace
-
 TEST_F(ChatGlmSessionTest, SamplingFP16WithGptAttentionPluginBS1BM1)
 {
     auto const modelName{"chatglm_6b"};
@@ -873,7 +776,8 @@ TEST_F(ChatGlmSessionTest, SamplingFP16WithGptAttentionPluginBS1BM1)
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
     auto const modeIds = ModelIds{130005, 130005};
 
-    testChatGlmSession(modelPath, modelName, modelSpec, modeIds, 1, batchSizes, mLogger, false, MicroBatchSizes());
+    testGptSession(
+        modelPath, modelSpec, modeIds, 1, batchSizes, "", mLogger, false, MicroBatchSizes(), true, modelName);
 }
 
 TEST_F(ChatGlm2SessionTest, SamplingFP16WithGptAttentionPluginBS1BM1)
@@ -885,7 +789,8 @@ TEST_F(ChatGlm2SessionTest, SamplingFP16WithGptAttentionPluginBS1BM1)
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
     auto const modeIds = ModelIds{2, 2};
 
-    testChatGlmSession(modelPath, modelName, modelSpec, modeIds, 1, batchSizes, mLogger, false, MicroBatchSizes());
+    testGptSession(
+        modelPath, modelSpec, modeIds, 1, batchSizes, "", mLogger, false, MicroBatchSizes(), true, modelName);
 }
 
 TEST_F(ChatGlm2SessionTest, SamplingFP16WithGptAttentionPluginBS2BM1)
@@ -897,7 +802,8 @@ TEST_F(ChatGlm2SessionTest, SamplingFP16WithGptAttentionPluginBS2BM1)
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
     auto const modeIds = ModelIds{2, 2};
 
-    testChatGlmSession(modelPath, modelName, modelSpec, modeIds, 1, batchSizes, mLogger, false, MicroBatchSizes());
+    testGptSession(
+        modelPath, modelSpec, modeIds, 1, batchSizes, "", mLogger, false, MicroBatchSizes(), true, modelName);
 }
 
 TEST_F(ChatGlm2SessionTest, SamplingFP16WithGptAttentionPluginBS1BM2)
@@ -909,7 +815,8 @@ TEST_F(ChatGlm2SessionTest, SamplingFP16WithGptAttentionPluginBS1BM2)
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
     auto const modeIds = ModelIds{2, 2};
 
-    testChatGlmSession(modelPath, modelName, modelSpec, modeIds, 2, batchSizes, mLogger, false, MicroBatchSizes());
+    testGptSession(
+        modelPath, modelSpec, modeIds, 2, batchSizes, "", mLogger, false, MicroBatchSizes(), true, modelName);
 }
 
 TEST_F(ChatGlm3SessionTest, SamplingFP16WithGptAttentionPluginBS1BM1)
@@ -921,5 +828,6 @@ TEST_F(ChatGlm3SessionTest, SamplingFP16WithGptAttentionPluginBS1BM1)
     auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
     auto const modeIds = ModelIds{2, 2};
 
-    testChatGlmSession(modelPath, modelName, modelSpec, modeIds, 1, batchSizes, mLogger, false, MicroBatchSizes());
+    testGptSession(
+        modelPath, modelSpec, modeIds, 1, batchSizes, "", mLogger, false, MicroBatchSizes(), true, modelName);
 }

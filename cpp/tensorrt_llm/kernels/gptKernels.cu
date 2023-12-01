@@ -226,11 +226,16 @@ void invokeBuildDecoderInfo(const BuildDecoderInfoParams<T>& params, cudaStream_
     // Compute the sequence offsets.
     const int THREADS_PER_BLOCK = 256;
     computeSeqOffsets<THREADS_PER_BLOCK>
-        <<<1, THREADS_PER_BLOCK, 0, stream>>>(params.seqOffsets, params.seqLengths, params.batchSize);
+        <<<1, THREADS_PER_BLOCK, 0, stream>>>(params.seqQOffsets, params.seqQLengths, params.batchSize);
+    if (params.seqKVLengths)
+    {
+        computeSeqOffsets<THREADS_PER_BLOCK>
+            <<<1, THREADS_PER_BLOCK, 0, stream>>>(params.seqKVOffsets, params.seqKVLengths, params.batchSize);
+    }
 
     // Compute the padding offsets.
     computePaddingOffsets<<<params.batchSize, THREADS_PER_BLOCK, 0, stream>>>(
-        params.paddingOffsets, params.seqOffsets, params.maxSeqLength);
+        params.paddingOffsets, params.seqQOffsets, params.maxSeqLength);
 
     // Compute the attention mask, if needed.
     if (params.attentionMask != nullptr)
@@ -242,7 +247,7 @@ void invokeBuildDecoderInfo(const BuildDecoderInfoParams<T>& params, cudaStream_
             blocksPerSeq *= 2;
         }
         dim3 grid(blocksPerSeq, params.batchSize);
-        computeAttentionMask<<<grid, THREADS_PER_BLOCK, 0, stream>>>(params.attentionMask, params.seqOffsets,
+        computeAttentionMask<<<grid, THREADS_PER_BLOCK, 0, stream>>>(params.attentionMask, params.seqQOffsets,
             params.maxSeqLength, params.maxKvCacheLength, params.attentionMaskType);
     }
 }

@@ -22,21 +22,18 @@
 #include <torch/extension.h>
 #include <vector>
 
-#include "batch_manager/gptManager.h"
-#include "batch_manager/inferenceRequest.h"
-#include "batch_manager/llmRequest.h"
-#include "batch_manager/namedTensor.h"
-#include "runtime/generationInput.h"
-#include "runtime/generationOutput.h"
+#include "tensorrt_llm/pybind/batch_manager/gptManager.h"
+#include "tensorrt_llm/pybind/batch_manager/inferenceRequest.h"
+#include "tensorrt_llm/pybind/batch_manager/llmRequest.h"
+#include "tensorrt_llm/pybind/batch_manager/namedTensor.h"
+#include "tensorrt_llm/pybind/runtime/generationInput.h"
+#include "tensorrt_llm/pybind/runtime/generationOutput.h"
+#include "tensorrt_llm/pybind/utils/pathCaster.h"
+
 #include "tensorrt_llm/batch_manager/BatchManager.h"
 #include "tensorrt_llm/batch_manager/batchScheduler.h"
-#include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
-#include "utils/pathCaster.h"
-
-#include "tensorrt_llm/batch_manager/GptManager.h"
-#include "tensorrt_llm/batch_manager/inferenceRequest.h"
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
-#include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
@@ -281,13 +278,14 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
                  tr::SamplingConfig, bool, std::optional<LlmRequest::SizeType>, std::optional<LlmRequest::SizeType>,
                  std::optional<LlmRequest::TensorPtr>, std::optional<LlmRequest::TensorPtr>,
                  std::optional<LlmRequest::TensorPtr>, std::optional<LlmRequest::TensorPtr>,
-                 std::optional<LlmRequest::SizeType>, bool, std::optional<LlmRequest::VecTokens>>(),
+                 std::optional<LlmRequest::SizeType>, bool, std::optional<LlmRequest::VecTokens>,
+                 std::optional<LlmRequest::TensorPtr>>(),
             py::arg("request_id"), py::arg("max_new_tokens"), py::arg("input_tokens"), py::arg("sampling_config"),
             py::arg("is_streaming"), py::arg("end_id") = std::nullopt, py::arg("pad_id") = std::nullopt,
             py::arg("embedding_bias") = std::nullopt, py::arg("bad_words_list") = std::nullopt,
             py::arg("stop_words_list") = std::nullopt, py::arg("prompt_embedding_table") = std::nullopt,
             py::arg("prompt_vocab_size") = std::nullopt, py::arg("return_log_probs") = false,
-            py::arg("draft_tokens") = std::nullopt)
+            py::arg("draft_tokens") = std::nullopt, py::arg("draft_logits") = std::nullopt)
         .def("get_num_tokens", &LlmRequest::getNumTokens, py::arg("beam"))
         .def_property_readonly("max_beam_num_tokens", &LlmRequest::getMaxBeamNumTokens)
         .def("get_token", &LlmRequest::getToken, py::arg("beam"), py::arg("pos"))
@@ -323,15 +321,81 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property(
             "draft_tokens", [](LlmRequest& self) { return *self.getDraftTokens(); },
             [](LlmRequest& self, LlmRequest::VecTokens& draftTokens)
-            { self.setDraftTokens(std::make_shared<LlmRequest::VecTokens>(std::move(draftTokens))); });
+            { self.setDraftTokens(std::make_shared<LlmRequest::VecTokens>(std::move(draftTokens))); })
+        .def_property(
+            "draft_logits", [](LlmRequest& self) { return self.getDraftLogits(); },
+            [](LlmRequest& self, LlmRequest::TensorPtr& logits)
+            { self.setDraftLogits(std::make_optional<LlmRequest::TensorPtr>(logits)); });
+
+    py::class_<tpb::NamedTensor>(m, "NamedTensor")
+        .def(py::init<tpb::NamedTensor::TensorPtr, std::string>(), py::arg("tensor"), py::arg("name"))
+        .def_readwrite("tensor", &tpb::NamedTensor::tensor)
+        .def_readonly("name", &tpb::NamedTensor::name);
+
+    auto tensorNames = m.def_submodule("tensor_names");
+    // Input tensor names
+    tensorNames.attr("INPUT_IDS") = py::str(tb::inference_request::kInputIdsTensorName);
+    tensorNames.attr("DRAFT_INPUT_IDS") = py::str(tb::inference_request::kDraftInputIdsTensorName);
+    tensorNames.attr("DRAFT_LOGITS") = py::str(tb::inference_request::kDraftLogitsTensorName);
+    tensorNames.attr("MAX_NEW_TOKENS") = py::str(tb::inference_request::kMaxNewTokensTensorName);
+    tensorNames.attr("BEAM_WIDTH") = py::str(tb::inference_request::kBeamWidthTensorName);
+    tensorNames.attr("END_ID") = py::str(tb::inference_request::kEndIdTensorName);
+    tensorNames.attr("PAD_ID") = py::str(tb::inference_request::kPadIdTensorName);
+    tensorNames.attr("BAD_WORDS_LIST") = py::str(tb::inference_request::kBadWordsListTensorName);
+    tensorNames.attr("STOP_WORDS_LIST") = py::str(tb::inference_request::kStopWordsListTensorName);
+    tensorNames.attr("EMBEDDING_BIAS") = py::str(tb::inference_request::kEmbeddingBiasTensorName);
+    tensorNames.attr("TEMPERATURE") = py::str(tb::inference_request::kTemperatureTensorName);
+    tensorNames.attr("RUNTIME_TOP_K") = py::str(tb::inference_request::kRuntimeTopKTensorName);
+    tensorNames.attr("RUNTIME_TOP_P") = py::str(tb::inference_request::kRuntimeTopPTensorName);
+    tensorNames.attr("LENGTH_PENALTY") = py::str(tb::inference_request::kLengthPenaltyTensorName);
+    tensorNames.attr("REPETITION_PENALTY") = py::str(tb::inference_request::kRepetitionPenaltyTensorName);
+    tensorNames.attr("MIN_LENGTH") = py::str(tb::inference_request::kMinLengthTensorName);
+    tensorNames.attr("PRESENCE_PENALTY") = py::str(tb::inference_request::kPresencePenaltyTensorName);
+    tensorNames.attr("RANDOM_SEED") = py::str(tb::inference_request::kRandomSeedTensorName);
+    tensorNames.attr("RETURN_LOG_PROBS") = py::str(tb::inference_request::kReturnLogProbsTensorName);
+    tensorNames.attr("PROMPT_EMBEDDING_TABLE") = py::str(tb::inference_request::kPromptEmbeddingTableName);
+    tensorNames.attr("PROMPT_VOCAB_SIZE") = py::str(tb::inference_request::kPromptVocabSizeName);
+
+    // Output tensor names
+    tensorNames.attr("OUTPUT_IDS") = py::str(tb::inference_request::kOutputIdsTensorName);
+    tensorNames.attr("SEQUENCE_LENGTH") = py::str(tb::inference_request::kSequenceLengthTensorName);
+    tensorNames.attr("OUTPUT_LOG_PROBS") = py::str(tb::inference_request::kLogProbsTensorName);
+    tensorNames.attr("CUM_LOG_PROBS") = py::str(tb::inference_request::kCumLogProbsTensorName);
 
     using InferenceRequest = tpb::InferenceRequest;
     py::class_<InferenceRequest>(m, "InferenceRequest")
         .def(py::init<uint64_t>())
-        .def(py::init<InferenceRequest::TensorMap const&, uint64_t>())
-        .def("get_input_tensor", &InferenceRequest::getInputTensor, py::arg("input_tensor_name"))
-        .def("emplace_input_tensor", &InferenceRequest::emplaceInputTensor, py::arg("input_tensor_name"),
-            py::arg("input_tensor"))
+        .def(py::init<uint64_t, InferenceRequest::TensorMap const&>(), "deprecated: use direct tensor access instead")
+        .def_property("input_ids", &InferenceRequest::getInputIdsUnchecked, &InferenceRequest::setInputIds)
+        .def_property(
+            "draft_input_ids", &InferenceRequest::getDraftInputIdsUnchecked, &InferenceRequest::setDraftInputIds)
+        .def_property("draft_logits", &InferenceRequest::getDraftLogitsUnchecked, &InferenceRequest::setDraftLogits)
+        .def_property("max_new_tokens", &InferenceRequest::getMaxNewTokensUnchecked, &InferenceRequest::setMaxNewTokens)
+        .def_property("beam_width", &InferenceRequest::getBeamWidthUnchecked, &InferenceRequest::setBeamWidth)
+        .def_property("end_id", &InferenceRequest::getEndIdUnchecked, &InferenceRequest::setEndId)
+        .def_property("pad_id", &InferenceRequest::getPadIdUnchecked, &InferenceRequest::setPadId)
+        .def_property("bad_words_list", &InferenceRequest::getBadWordsListUnchecked, &InferenceRequest::setBadWordsList)
+        .def_property(
+            "stop_words_list", &InferenceRequest::getStopWordsListUnchecked, &InferenceRequest::setStopWordsList)
+        .def_property(
+            "embedding_bias", &InferenceRequest::getEmbeddingBiasUnchecked, &InferenceRequest::setEmbeddingBias)
+        .def_property("temperature", &InferenceRequest::getTemperatureUnchecked, &InferenceRequest::setTemperature)
+        .def_property("runtime_top_k", &InferenceRequest::getRuntimeTopKUnchecked, &InferenceRequest::setRuntimeTopK)
+        .def_property("runtime_top_p", &InferenceRequest::getRuntimeTopPUnchecked, &InferenceRequest::setRuntimeTopP)
+        .def_property(
+            "length_penalty", &InferenceRequest::getLengthPenaltyUnchecked, &InferenceRequest::setLengthPenalty)
+        .def_property("repetition_penalty", &InferenceRequest::getRepetitionPenaltyUnchecked,
+            &InferenceRequest::setRepetitionPenalty)
+        .def_property("min_length", &InferenceRequest::getMinLengthUnchecked, &InferenceRequest::setMinLength)
+        .def_property(
+            "presence_penalty", &InferenceRequest::getPresencePenaltyUnchecked, &InferenceRequest::setPresencePenalty)
+        .def_property("random_seed", &InferenceRequest::getRandomSeedUnchecked, &InferenceRequest::setRandomSeed)
+        .def_property(
+            "return_log_probs", &InferenceRequest::getReturnLogProbsUnchecked, &InferenceRequest::setReturnLogProbs)
+        .def_property("prompt_embedding_table", &InferenceRequest::getPromptEmbeddingTableUnchecked,
+            &InferenceRequest::setPromptEmbeddingTable)
+        .def_property(
+            "prompt_vocab_size", &InferenceRequest::getPromptVocabSizeUnchecked, &InferenceRequest::setPromptVocabSize)
         .def_property("is_streaming", &InferenceRequest::isStreaming, &InferenceRequest::setIsStreaming)
         .def_property_readonly("request_id", &InferenceRequest::getRequestId);
 
@@ -351,11 +415,6 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("kv_cache_config", &tb::TrtGptModelOptionalParams::kvCacheConfig)
         .def_readwrite("max_num_sequences", &tb::TrtGptModelOptionalParams::maxNumSequences)
         .def_readwrite("enable_trt_overlap", &tb::TrtGptModelOptionalParams::enableTrtOverlap);
-
-    py::class_<tpb::NamedTensor>(m, "NamedTensor")
-        .def(py::init<tpb::NamedTensor::TensorPtr, std::string>(), py::arg("tensor"), py::arg("name"))
-        .def_readwrite("tensor", &tpb::NamedTensor::tensor)
-        .def_readwrite("name", &tpb::NamedTensor::name);
 
     py::class_<tpb::GptManager>(m, "GptManager")
         .def(py::init<std::filesystem::path const&, tb::TrtGptModelType, int32_t, tb::batch_scheduler::SchedulerPolicy,

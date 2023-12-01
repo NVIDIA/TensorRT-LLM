@@ -4,10 +4,14 @@ This document shows how to build and run a BLOOM model in TensorRT-LLM on both s
 
 ## Overview
 
-The TensorRT-LLM BLOOM implementation can be found in [tensorrt_llm/models/bloom/model.py](../../tensorrt_llm/models/bloom/model.py). The TensorRT-LLM BLOOM example code is located in [`examples/bloom`](./). There are two main files:
+The TensorRT-LLM BLOOM implementation can be found in [tensorrt_llm/models/bloom/model.py](../../tensorrt_llm/models/bloom/model.py). The TensorRT-LLM BLOOM example code is located in [`examples/bloom`](./). There is one main file:
 
- * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the BLOOM model,
- * [`run.py`](./run.py) to run the inference on an input text.
+* [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the BLOOM model.
+
+In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
+
+* [`../run.py`](../run.py) to run the inference on an input text;
+* [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
   * FP16

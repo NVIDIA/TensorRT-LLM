@@ -57,6 +57,7 @@ CUDADriverWrapper::CUDADriverWrapper()
     *(void**) (&_cuModuleLoadData) = load_sym(handle, "cuModuleLoadData");
     *(void**) (&_cuLinkCreate) = load_sym(handle, "cuLinkCreate_v2");
     *(void**) (&_cuModuleGetFunction) = load_sym(handle, "cuModuleGetFunction");
+    *(void**) (&_cuModuleGetGlobal) = load_sym(handle, "cuModuleGetGlobal_v2");
     *(void**) (&_cuLinkAddFile) = load_sym(handle, "cuLinkAddFile_v2");
     *(void**) (&_cuLinkAddData) = load_sym(handle, "cuLinkAddData_v2");
     *(void**) (&_cuLaunchCooperativeKernel) = load_sym(handle, "cuLaunchCooperativeKernel");
@@ -107,6 +108,11 @@ CUresult CUDADriverWrapper::cuLinkCreate(
 CUresult CUDADriverWrapper::cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod, const char* name) const
 {
     return (*_cuModuleGetFunction)(hfunc, hmod, name);
+}
+
+CUresult CUDADriverWrapper::cuModuleGetGlobal(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, const char* name) const
+{
+    return (*_cuModuleGetGlobal)(dptr, bytes, hmod, name);
 }
 
 CUresult CUDADriverWrapper::cuLinkAddFile(CUlinkState state, CUjitInputType type, const char* path,

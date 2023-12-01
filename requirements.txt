@@ -13,3 +13,5 @@ tensorrt>=8.6.0
 torch
 transformers==4.33.1
 wheel
+optimum
+evaluate

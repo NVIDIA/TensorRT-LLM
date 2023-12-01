@@ -40,13 +40,8 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
     std::shared_ptr<nvinfer1::ILogger> const& logger, int warmUp, int numRuns, int duration,
     GptSession::Config& sessionConfig, bool cudaGraphMode, bool printAllLogits)
 {
-
     std::string modelNameHyphen = modelName;
     std::filesystem::path jsonFileName = dataPath / "config.json";
-    if (tc::strStartsWith(modelName, "chatglm") || tc::strStartsWith(modelName, "glm"))
-    {
-        jsonFileName = dataPath / (modelNameHyphen + std::string("-config.json"));
-    }
     auto const json = GptJsonConfig::parse(jsonFileName);
     auto const modelConfig = json.getModelConfig();
     auto const inputPacked = modelConfig.usePackedInput();

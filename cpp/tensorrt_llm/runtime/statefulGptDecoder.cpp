@@ -20,9 +20,11 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
 namespace tc = tensorrt_llm::common;
+namespace tk = tensorrt_llm::kernels;
 using namespace tensorrt_llm::runtime;
 
 using TensorPtr = ITensor::SharedPtr;
@@ -52,7 +54,8 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
 
     dOutput->newTokens = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
     dOutput->parentIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-    dOutput->finished = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<bool>::value);
+    dOutput->finished
+        = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<tk::FinishedState::UnderlyingType>::value);
     dOutput->finishedSum = BufferManager::pinned(ITensor::makeShape({1}), nvSizeType);
     dOutput->lengths = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     dOutput->cumLogProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);

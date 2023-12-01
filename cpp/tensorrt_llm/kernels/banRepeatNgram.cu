@@ -25,7 +25,7 @@ namespace kernels
 {
 
 template <typename T>
-__global__ void ban_repeat_ngram(T* logits, const int** output_ids_buf, const bool* finished_buf,
+__global__ void ban_repeat_ngram(T* logits, const int** output_ids_buf, const FinishedState* finished_buf,
     const int* parent_ids_buf, int batch_size, int beam_width, const int* no_repeat_ngram_size_buf, int id_offset,
     int vocab_size_padded, size_t step)
 {
@@ -60,7 +60,7 @@ __global__ void ban_repeat_ngram(T* logits, const int** output_ids_buf, const bo
     }
 
     // if the beam has already finished, skip ngram check
-    if ((finished_buf != nullptr) && (finished_buf[id_offset + local_batch_idx * beam_width + beam_idx]))
+    if ((finished_buf != nullptr) && (finished_buf[id_offset + local_batch_idx * beam_width + beam_idx].isFinished()))
     {
         return;
     }
@@ -134,9 +134,9 @@ __global__ void ban_repeat_ngram(T* logits, const int** output_ids_buf, const bo
 }
 
 template <typename T>
-void invokeBanRepeatNgram(T* logits, const int** output_ids_buf, const bool* finished_buf, const int* parent_ids_buf,
-    int batch_size, int local_batch_size, int beam_width, const int* no_repeat_ngram_size_buf, int id_offset,
-    int vocab_size_padded, size_t step, cudaStream_t stream)
+void invokeBanRepeatNgram(T* logits, const int** output_ids_buf, const FinishedState* finished_buf,
+    const int* parent_ids_buf, int batch_size, int local_batch_size, int beam_width,
+    const int* no_repeat_ngram_size_buf, int id_offset, int vocab_size_padded, size_t step, cudaStream_t stream)
 {
     // each input in the local batch can have different no_repeat_ngram_size. Use max for shmem allocation
     // getting the max of current batch and allocate shmem as needed is ideal. But here the ngram_buf is on GPU, while
@@ -160,7 +160,7 @@ void invokeBanRepeatNgram(T* logits, const int** output_ids_buf, const bool* fin
 }
 
 #define INVOKE_BAN_REPEAT_NGRAM(T)                                                                                     \
-    template void invokeBanRepeatNgram(T* logits, const int** output_ids_buf, const bool* finished_buf,                \
+    template void invokeBanRepeatNgram(T* logits, const int** output_ids_buf, const FinishedState* finished_buf,       \
         const int* parent_ids_buf, int batch_size, int local_batch_size, int beam_width,                               \
         const int* no_repeat_ngram_size_buf, int id_offset, int vocab_size_padded, size_t step, cudaStream_t stream);
 

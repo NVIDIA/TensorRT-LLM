@@ -191,17 +191,18 @@ class TestFunctional(unittest.TestCase):
                     "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
                 )
 
-        tokens_per_block = 16
+        tokens_per_block = 128
 
         remove_input_padding = True
 
         def _construct_execution(
-                session, input_tensor, weight, bias, pointer_array,
+                session, input_tensor, weight, bias, host_pointer_array,
                 sequence_length, host_past_key_value_lengths,
                 host_max_kv_cache_lengths, context_lengths, max_context_length,
                 cache_indirection, num_heads, hidden_size, num_kv_heads, output,
                 dtype, kv_int8_quant_scale, kv_int8_dequant_scale,
                 host_context_lengths, host_request_types):
+            pointer_array = host_pointer_array.to('cuda')
             head_size = hidden_size // num_heads
             # construct trt network
             builder = tensorrt_llm.Builder()
@@ -243,6 +244,10 @@ class TestFunctional(unittest.TestCase):
                     dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                 pointer_array_tensor = Tensor(
                     name='kv_cache_block_pointers',
+                    shape=tuple(pointer_array.shape),
+                    dtype=tensorrt_llm.str_dtype_to_trt('int64'))
+                host_pointer_array_tensor = Tensor(
+                    name='host_kv_cache_block_pointers',
                     shape=tuple(pointer_array.shape),
                     dtype=tensorrt_llm.str_dtype_to_trt('int64'))
                 kv_int8_quant_scale_tensor = None
@@ -312,7 +317,7 @@ class TestFunctional(unittest.TestCase):
                         }[configuration.rope_scaling["type"]]
                         rope_scale = configuration.rope_scaling["factor"]
                 outputs = tensorrt_llm.functional.gpt_attention(
-                    tensor=qkv,
+                    qkv=qkv,
                     past_key_value=None,
                     sequence_length=sequence_length_tensor,
                     host_past_key_value_lengths=
@@ -338,6 +343,7 @@ class TestFunctional(unittest.TestCase):
                         use_int8_kv_cache=use_int8_kv_cache),
                     max_context_length=max_context_length,
                     kv_cache_block_pointers=pointer_array_tensor,
+                    host_kv_cache_block_pointers=host_pointer_array_tensor,
                     host_context_lengths=host_context_lengths_tensor,
                     qkv_bias=qkv_bias)
 
@@ -353,7 +359,8 @@ class TestFunctional(unittest.TestCase):
                 'context_lengths': context_lengths,
                 'cache_indirection': cache_indirection,
                 'host_request_types': host_request_types,
-                'kv_cache_block_pointers': pointer_array
+                'kv_cache_block_pointers': pointer_array,
+                'host_kv_cache_block_pointers': host_pointer_array
             }
             if use_int8_kv_cache:
                 inputs['kv_int8_quant_scale'] = kv_int8_quant_scale

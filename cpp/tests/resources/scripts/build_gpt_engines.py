@@ -143,12 +143,20 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
                  '--dtype=float16', '--use_gpt_attention_plugin=float16',
                  '--remove_input_padding')
     # this engine can be use for in-flight batching
+    ifb_args = [
+        '--dtype=float16', '--use_gpt_attention_plugin=float16',
+        '--remove_input_padding', '--paged_kv_cache',
+        '--enable_context_fmha_fp32_acc', '--max_num_tokens=10000',
+        '--max_draft_len=5'
+    ]
     build_engine(fp16_weight_dir_x_gpu,
                  engine_dir / 'fp16-plugin-packed-paged' / tp_pp_dir, tp_size,
-                 '--dtype=float16', '--use_gpt_attention_plugin=float16',
-                 '--remove_input_padding', '--paged_kv_cache',
-                 '--enable_context_fmha_fp32_acc', '--max_num_tokens=10000',
-                 '--max_draft_len=5')
+                 *ifb_args)
+    # We build almost the same engine twice. But this one has gather_all_token_logits
+    # to extract logits from python runtime. gather_all_token_logits is not supported in C++ runtime.
+    build_engine(fp16_weight_dir_x_gpu,
+                 engine_dir / 'fp16-plugin-packed-paged-gather' / tp_pp_dir,
+                 tp_size, '--gather_all_token_logits', *ifb_args)
 
     print("Done.")
 

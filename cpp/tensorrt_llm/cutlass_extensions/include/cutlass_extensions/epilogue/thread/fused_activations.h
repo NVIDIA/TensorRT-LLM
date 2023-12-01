@@ -37,6 +37,7 @@
 #include "cutlass/array.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/thread/activation.h"
+#include "cutlass/epilogue/thread/linear_combination_generic.h"
 #include "cutlass/epilogue/thread/scale_type.h"
 #include "cutlass/functional.h"
 #include "cutlass/half.h"

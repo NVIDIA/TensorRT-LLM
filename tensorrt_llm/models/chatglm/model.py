@@ -393,9 +393,10 @@ class ChatGLMModel(Module):
         if self.use_cache:
             presents = []
 
-        for layer, past, pointer, max_kv_cache_length in zip(
+        for layer, past, pointer, host_pointer, max_kv_cache_length in zip(
                 self.layers, kv_cache_params.past_key_value,
                 kv_cache_params.kv_cache_block_pointers,
+                kv_cache_params.host_kv_cache_block_pointers,
                 kv_cache_params.host_max_kv_cache_lengths):
             layer_output = layer(
                 hidden_states,
@@ -403,6 +404,7 @@ class ChatGLMModel(Module):
                 kv_cache_params=KeyValueCacheParams(
                     past_key_value=[past],
                     kv_cache_block_pointers=[pointer],
+                    host_kv_cache_block_pointers=[host_pointer],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
                     host_max_kv_cache_lengths=max_kv_cache_length,
@@ -611,6 +613,8 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
                         'host_max_kv_cache_lengths'],
                     kv_cache_block_pointers=model_inputs[
                         'kv_cache_block_pointers_list'],
+                    host_kv_cache_block_pointers=model_inputs[
+                        'host_kv_cache_block_pointers_list'],
                     cache_indirection=model_inputs['cache_indirection'],
                 ),
                 AttentionParams(

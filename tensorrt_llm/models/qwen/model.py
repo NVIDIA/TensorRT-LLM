@@ -188,7 +188,7 @@ class QWenAttention(Module):
 
         # return outputs
         context, past_key_value = gpt_attention(
-            tensor=qkv,
+            qkv=qkv,
             past_key_value=kv_cache_params.get_first_past_key_value(),
             sequence_length=attention_params.sequence_length,
             host_past_key_value_lengths=kv_cache_params.
@@ -212,6 +212,8 @@ class QWenAttention(Module):
                 use_int8_kv_cache=self.use_int8_kv_cache),
             kv_cache_block_pointers=kv_cache_params.
             get_first_kv_cache_block_pointers(),
+            host_kv_cache_block_pointers=kv_cache_params.
+            get_first_host_kv_cache_block_pointers(),
             max_context_length=attention_params.max_context_length,
             mask_type=self.attention_mask_type.value,
             host_context_lengths=attention_params.host_context_lengths)
@@ -421,9 +423,10 @@ class QWenModel(Module):
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
         self.register_network_output(f"embd", hidden_states)
 
-        for layer, past, pointer, max_kv_cache_length in zip(
+        for layer, past, pointer, host_pointer, max_kv_cache_length in zip(
                 self.layers, kv_cache_params.past_key_value,
                 kv_cache_params.kv_cache_block_pointers,
+                kv_cache_params.host_kv_cache_block_pointers,
                 kv_cache_params.host_max_kv_cache_lengths):
             hidden_states = layer(
                 hidden_states,
@@ -434,6 +437,7 @@ class QWenModel(Module):
                     host_past_key_value_lengths,
                     host_max_kv_cache_lengths=max_kv_cache_length,
                     kv_cache_block_pointers=[pointer],
+                    host_kv_cache_block_pointers=[host_pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
                 all_reduce_workspace=all_reduce_workspace)
@@ -628,6 +632,8 @@ class QWenForCausalLM(QWenModel, GenerationMixin):
                         'host_max_kv_cache_lengths'],
                     kv_cache_block_pointers=model_inputs[
                         'kv_cache_block_pointers_list'],
+                    host_kv_cache_block_pointers=model_inputs[
+                        'host_kv_cache_block_pointers_list'],
                     cache_indirection=model_inputs['cache_indirection'],
                 ),
                 AttentionParams(

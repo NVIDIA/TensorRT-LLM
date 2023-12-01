@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional
+from typing import List, Optional
 
 import tensorrt as trt
 
@@ -21,7 +21,7 @@ from ..._utils import pad_vocab_size, str_dtype_to_trt
 from ...functional import Tensor, gather_last_token_logits, recv, send
 from ...layers import (Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, FusedGatedMLP, GatedMLP,
-                       KeyValueCacheParams, PositionEmbeddingType,
+                       KeyValueCacheParams, LoraParams, PositionEmbeddingType,
                        PromptTuningEmbedding, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
@@ -108,7 +108,8 @@ class LLaMADecoderLayer(Module):
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None,
-                all_reduce_workspace=None):
+                all_reduce_workspace=None,
+                lora_param=None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         if self._layer_id == 0:
@@ -119,7 +120,8 @@ class LLaMADecoderLayer(Module):
                                           use_cache=use_cache,
                                           kv_cache_params=kv_cache_params,
                                           attention_params=attention_params,
-                                          workspace=all_reduce_workspace)
+                                          workspace=all_reduce_workspace,
+                                          lora_param=lora_param)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -133,7 +135,9 @@ class LLaMADecoderLayer(Module):
         if self._layer_id == 0:
             self.register_network_output(f"norm1", hidden_states)
 
-        hidden_states = self.mlp(hidden_states, all_reduce_workspace)
+        hidden_states = self.mlp(hidden_states,
+                                 all_reduce_workspace,
+                                 lora_param=lora_param)
         if self._layer_id == 0:
             self.register_network_output(f"mlp", hidden_states)
 
@@ -212,20 +216,19 @@ class LLaMAModel(Module):
                                 eps=rms_norm_eps,
                                 dtype=dtype)
 
-    def forward(
-        self,
-        input_ids,
-        position_ids=None,
-        use_cache=False,
-        attention_mask=None,
-        kv_cache_params=None,
-        attention_params=None,
-        hidden_states=None,
-        all_reduce_workspace=None,
-        prompt_embedding_table: Optional[Tensor] = None,
-        prompt_tasks: Optional[Tensor] = None,
-        prompt_vocab_size: Optional[Tensor] = None,
-    ):
+    def forward(self,
+                input_ids,
+                position_ids=None,
+                use_cache=False,
+                attention_mask=None,
+                kv_cache_params=None,
+                attention_params=None,
+                hidden_states=None,
+                all_reduce_workspace=None,
+                prompt_embedding_table: Optional[Tensor] = None,
+                prompt_tasks: Optional[Tensor] = None,
+                prompt_vocab_size: Optional[Tensor] = None,
+                lora_params=None):
 
         kv_cache_params.fill_none_tensor_list(len(self.layers))
 
@@ -244,10 +247,16 @@ class LLaMAModel(Module):
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
         self.register_network_output(f"embd", hidden_states)
 
-        for layer, past, pointer, max_kv_cache_length in zip(
-                self.layers, kv_cache_params.past_key_value,
-                kv_cache_params.kv_cache_block_pointers,
-                kv_cache_params.host_max_kv_cache_lengths):
+        for layer_idx, (layer, past, pointer, host_pointer,
+                        max_kv_cache_length) in enumerate(
+                            zip(self.layers, kv_cache_params.past_key_value,
+                                kv_cache_params.kv_cache_block_pointers,
+                                kv_cache_params.host_kv_cache_block_pointers,
+                                kv_cache_params.host_max_kv_cache_lengths)):
+            lora_param = None
+            if lora_params.lora_ranks is not None:
+                lora_param = lora_params.get_layer_params(layer_idx)
+
             hidden_states = layer(
                 hidden_states,
                 use_cache=use_cache,
@@ -258,9 +267,11 @@ class LLaMAModel(Module):
                     host_past_key_value_lengths,
                     host_max_kv_cache_lengths=max_kv_cache_length,
                     kv_cache_block_pointers=[pointer],
+                    host_kv_cache_block_pointers=[host_pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
-                all_reduce_workspace=all_reduce_workspace)
+                all_reduce_workspace=all_reduce_workspace,
+                lora_param=lora_param)
 
             if use_cache:
                 presents.append(hidden_states[1])
@@ -351,27 +362,26 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                                         tp_size=mapping.tp_size,
                                         gather_output=True)
 
-    def forward(
-        self,
-        input_ids,
-        position_ids=None,
-        use_cache=False,
-        last_token_ids=None,
-        attention_mask=None,
-        kv_cache_params=None,
-        attention_params=None,
-        hidden_states=None,
-        all_reduce_workspace=None,
-        prompt_embedding_table: Optional[Tensor] = None,
-        prompt_tasks: Optional[Tensor] = None,
-        prompt_vocab_size: Optional[Tensor] = None,
-    ):
+    def forward(self,
+                input_ids,
+                position_ids=None,
+                use_cache=False,
+                last_token_ids=None,
+                attention_mask=None,
+                kv_cache_params=None,
+                attention_params=None,
+                hidden_states=None,
+                all_reduce_workspace=None,
+                prompt_embedding_table: Optional[Tensor] = None,
+                prompt_tasks: Optional[Tensor] = None,
+                prompt_vocab_size: Optional[Tensor] = None,
+                lora_params=None):
         hidden_states = super().forward(input_ids, position_ids, use_cache,
                                         attention_mask, kv_cache_params,
                                         attention_params, hidden_states,
                                         all_reduce_workspace,
                                         prompt_embedding_table, prompt_tasks,
-                                        prompt_vocab_size)
+                                        prompt_vocab_size, lora_params)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -408,7 +418,8 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                        max_beam_width,
                        max_num_tokens: int = None,
                        prompt_embedding_table_size: int = 0,
-                       gather_all_token_logits: bool = False):
+                       gather_all_token_logits: bool = False,
+                       lora_target_modules: List[str] = None):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -425,6 +436,7 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
         tokens_per_block = default_net().plugin_config.tokens_per_block
         use_custom_all_reduce = default_net(
         ).plugin_config.use_custom_all_reduce
+        use_lora_plugin = default_net().plugin_config.lora_plugin
 
         model_inputs = self.prepare_basic_inputs(
             max_batch_size,
@@ -447,7 +459,8 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
             max_num_tokens=max_num_tokens,
             prompt_embedding_table_size=prompt_embedding_table_size,
             gather_all_token_logits=gather_all_token_logits,
-        )
+            use_lora_plugin=use_lora_plugin,
+            lora_target_modules=lora_target_modules)
 
         return (
             model_inputs['input_ids'],
@@ -463,6 +476,8 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                     'host_max_kv_cache_lengths'],
                 kv_cache_block_pointers=model_inputs[
                     'kv_cache_block_pointers_list'],
+                host_kv_cache_block_pointers=model_inputs[
+                    'host_kv_cache_block_pointers_list'],
                 cache_indirection=model_inputs['cache_indirection'],
             ),
             AttentionParams(
@@ -476,4 +491,10 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
             model_inputs['prompt_embedding_table'],
             model_inputs['tasks'],
             model_inputs['prompt_vocab_size'],
+            LoraParams(
+                model_inputs['lora_ranks'],
+                model_inputs['lora_weights_pointers'],
+                host_context_lengths=model_inputs['host_context_lengths'],
+                max_context_length=max_input_len,
+                host_request_types=model_inputs['host_request_types']),
         )

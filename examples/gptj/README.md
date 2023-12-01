@@ -5,10 +5,14 @@ This document explains how to build the [GPT-J](https://huggingface.co/EleutherA
 ## Overview
 
 The TensorRT-LLM GPT-J implementation can be found in [`tensorrt_llm/models/gptj/model.py`](../../tensorrt_llm/models/gptj/model.py). The TensorRT-LLM GPT-J example
-code is located in [`examples/gptj`](./). There are two main files:
+code is located in [`examples/gptj`](./). There is one main file:
 
- * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the GPT-J model,
- * [`run.py`](./run.py) to run the inference on an input text.
+* [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the GPT-J model.
+
+In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
+
+* [`../run.py`](../run.py) to run the inference on an input text;
+* [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
   * FP16
@@ -218,7 +222,7 @@ The linear layer in the AWQ int4 weight only quantized weights should have 3 par
 To run a TensorRT-LLM GPT-J model:
 
 ```bash
-python3 run.py --max_output_len=50 --engine_dir=gptj_engine --hf_model_location=gptj_model
+python3 ../run.py --max_output_len=50 --engine_dir=gptj_engine --tokenizer_dir=gptj_model
 ```
 
 ## Summarization using the GPT-J model

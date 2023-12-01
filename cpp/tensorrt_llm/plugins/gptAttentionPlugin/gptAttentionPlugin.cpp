@@ -43,18 +43,65 @@ GPTAttentionPlugin::GPTAttentionPlugin(int num_heads, int num_kv_heads, int head
     tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
     bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
     int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled,
-    bool cross_attention, int max_distance)
+    bool cross_attention, int max_distance, bool use_paged_context_fmha, bool use_cache)
     : GPTAttentionPluginCommon(num_heads, num_kv_heads, head_size, unidirectional, q_scaling, position_embedding_type,
         rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale,
         rotary_embedding_max_positions, tp_size, tp_rank, context_fmha_type, multi_block_mode, kv_cache_quant_mode,
         remove_input_padding, mask_type, paged_kv_cache, tokens_per_block, type, max_context_length, qkv_bias_enabled,
-        cross_attention, max_distance)
+        cross_attention, max_distance, use_paged_context_fmha, use_cache)
 {
+    initEntryIdx();
 }
 
 GPTAttentionPlugin::GPTAttentionPlugin(const void* data, size_t length)
     : GPTAttentionPluginCommon(data, length)
 {
+    initEntryIdx();
+}
+
+bool GPTAttentionPlugin::isEntryUsed(const IdxEntry& entry) const
+{
+    switch (entry)
+    {
+    case IdxEntry::QKV_TENSOR: return true;
+    case IdxEntry::SEQUENCE_LENGTH: return useKVCache();
+    case IdxEntry::HOST_PAST_KEY_VALUE_LENGTHS: return useKVCache();
+    case IdxEntry::HOST_MAX_KV_CACHE_LENGTH: return true;
+    case IdxEntry::CONTEXT_LENGTHS: return true;
+    case IdxEntry::CACHE_INDIR: return useKVCache();
+    case IdxEntry::REQUEST_TYPES: return true;
+    case IdxEntry::KV_CACHE_BLOCK_POINTERS: return useKVCache() && mPagedKVCache;
+    case IdxEntry::HOST_KV_CACHE_BLOCK_POINTERS: return useKVCache() && mPagedKVCache;
+    case IdxEntry::PAST_KEY_VALUE: return useKVCache() && !mPagedKVCache;
+    case IdxEntry::KV_CACHE_QUANTIZATION_SCALE: return useKVCache() && mKVCacheQuantMode.hasKvCacheQuant();
+    case IdxEntry::KV_CACHE_DEQUANTIZATION_SCALE: return useKVCache() && mKVCacheQuantMode.hasKvCacheQuant();
+    case IdxEntry::ALIBI_SLOPES: return isALiBi();
+    case IdxEntry::RELATIVE_ATTENTION_BIAS: return isRelativePosition();
+    case IdxEntry::CROSS_QKV: return isCrossAttention();
+    case IdxEntry::CROSS_QKV_LENGTH: return isCrossAttention();
+    case IdxEntry::ENCODER_INPUT_LENGTH: return isCrossAttention();
+    case IdxEntry::HOST_CONTEXT_LENGTH: return mRemovePadding;
+    case IdxEntry::QKV_BIAS_TENSOR: return mQKVBiasEnabled;
+    default: return false;
+    }
+}
+
+void GPTAttentionPlugin::initEntryIdx()
+{
+    mEntryIdx.resize(static_cast<size_t>(IdxEntry::ENUM_SIZE));
+    size_t entryIdx = 0;
+    for (int i = 0; i < static_cast<size_t>(IdxEntry::ENUM_SIZE); i++)
+    {
+        mEntryIdx[i] = entryIdx;
+        entryIdx += isEntryUsed(static_cast<IdxEntry>(i));
+    }
+}
+
+GPTAttentionPlugin::IndexType GPTAttentionPlugin::getIdx(const IdxEntry& entry) const
+{
+    TLLM_CHECK_WITH_INFO(
+        isEntryUsed(entry), common::fmtstr("getIdx() should not be used with entry %lu\n", static_cast<size_t>(entry)));
+    return mEntryIdx[static_cast<size_t>(entry)];
 }
 
 // IPluginV2DynamicExt Methods
@@ -70,53 +117,62 @@ GPTAttentionPlugin* GPTAttentionPlugin::clone() const noexcept
 nvinfer1::DimsExprs GPTAttentionPlugin::getOutputDimensions(
     int outputIndex, const nvinfer1::DimsExprs* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
-    TLLM_CHECK(outputIndex == 0 || (!mPagedKVCache && outputIndex == 1));
+    TLLM_CHECK(outputIndex == 0 || (!mPagedKVCache && useKVCache() && outputIndex == 1));
     if (outputIndex == 0)
     {
-        auto ret = inputs[getInputTensorIdx()];
+        auto ret = inputs[getIdx(IdxEntry::QKV_TENSOR)];
         ret.d[2] = exprBuilder.operation(
             DimensionOperation::kPROD, *exprBuilder.constant(mHeadSize), *exprBuilder.constant(mNumHeads));
         return ret;
     }
-    return inputs[getPastKeyValueIdx()];
+    return inputs[getIdx(IdxEntry::PAST_KEY_VALUE)];
 }
 
 bool GPTAttentionPlugin::supportsFormatCombination(
     int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
 {
-    if (pos == getSequenceLengthIdx() || pos == getHostPastKeyValueLengthsIdx() || pos == getHostMaxKvCacheLengthIdx()
-        || pos == getContextLengthsIdx() || pos == getCacheIndirIdx() || pos == getRequestTypesIdx())
+    if (pos == getIdx(IdxEntry::CONTEXT_LENGTHS) || pos == getIdx(IdxEntry::REQUEST_TYPES)
+        || pos == getIdx(IdxEntry::HOST_MAX_KV_CACHE_LENGTH))
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32;
     }
-    else if (mKVCacheQuantMode.hasKvCacheQuant()
-        && (pos == getKVCacheDequantizationScaleIdx() || pos == getKVCacheQuantizationScaleIdx()))
+    else if (useKVCache()
+        && (pos == getIdx(IdxEntry::SEQUENCE_LENGTH) || pos == getIdx(IdxEntry::HOST_PAST_KEY_VALUE_LENGTHS)
+            || pos == getIdx(IdxEntry::CACHE_INDIR)))
+    {
+        return inOut[pos].type == nvinfer1::DataType::kINT32;
+    }
+    else if (useKVCache() && mKVCacheQuantMode.hasKvCacheQuant()
+        && (pos == getIdx(IdxEntry::KV_CACHE_DEQUANTIZATION_SCALE)
+            || pos == getIdx(IdxEntry::KV_CACHE_QUANTIZATION_SCALE)))
     {
         // kv_scale for mType->int8/fp8 and int8/fp8->mType conversion
         return inOut[pos].type == nvinfer1::DataType::kFLOAT && inOut[pos].format == TensorFormat::kLINEAR;
     }
-    else if (mPagedKVCache && pos == getKVCacheBlockPointersIdx())
+    else if (mPagedKVCache
+        && (pos == getIdx(IdxEntry::KV_CACHE_BLOCK_POINTERS) || pos == getIdx(IdxEntry::HOST_KV_CACHE_BLOCK_POINTERS)))
     {
         // pointers to kv cache blocks
         return inOut[pos].type == nvinfer1::DataType::kINT64 && inOut[pos].format == TensorFormat::kLINEAR;
     }
     else if (mKVCacheQuantMode.hasInt8KvCache()
-        && (!mPagedKVCache && (pos == getPastKeyValueIdx() || pos == nbInputs + 1)))
+        && (!mPagedKVCache && (pos == getIdx(IdxEntry::PAST_KEY_VALUE) || pos == nbInputs + 1)))
     {
         // If use Int8 K/V cache we require I/O KV values to int8
         return (inOut[pos].type == nvinfer1::DataType::kINT8) && (inOut[pos].format == TensorFormat::kLINEAR);
     }
     else if (mKVCacheQuantMode.hasFp8KvCache()
-        && (!mPagedKVCache && (pos == getPastKeyValueIdx() || pos == nbInputs + 1)))
+        && (!mPagedKVCache && (pos == getIdx(IdxEntry::PAST_KEY_VALUE) || pos == nbInputs + 1)))
     {
         // If use FP8 K/V cache we require I/O KV values to FP8
         return (inOut[pos].type == nvinfer1::DataType::kFP8) && (inOut[pos].format == TensorFormat::kLINEAR);
     }
-    else if (mRemovePadding && (pos == getHostContextLengthsIdx()))
+    else if (mRemovePadding && (pos == getIdx(IdxEntry::HOST_CONTEXT_LENGTH)))
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32 && inOut[pos].format == TensorFormat::kLINEAR;
     }
-    else if (mCrossAttention && (pos == getCrossQKVLengthIdx() || pos == getEncoderInputLengthsIdx()))
+    else if (mCrossAttention
+        && (pos == getIdx(IdxEntry::CROSS_QKV_LENGTH) || pos == getIdx(IdxEntry::ENCODER_INPUT_LENGTH)))
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32;
     }
@@ -137,12 +193,15 @@ size_t GPTAttentionPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* in
     const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept
 {
     const int max_context_length = mMaxContextLength;
-    const int cross_qkv_length = isCrossAttention() ? inputs[getCrossQKVLengthIdx()].dims.d[0] : 0;
-    const int nbReq = inputs[getSequenceLengthIdx()].dims.d[0];
-    auto const type = inputs[getInputTensorIdx()].type;
-    size_t const context_workspace_size = getWorkspaceSizeForContext(type, nbReq, max_context_length, cross_qkv_length);
+    const int cross_qkv_length = isCrossAttention() ? inputs[getIdx(IdxEntry::CROSS_QKV_LENGTH)].dims.d[0] : 0;
+    const int nbReq = inputs[getIdx(IdxEntry::CONTEXT_LENGTHS)].dims.d[0];
+    auto const type = inputs[getIdx(IdxEntry::QKV_TENSOR)].type;
+    const int max_kv_cache_length
+        = isCrossAttention() ? cross_qkv_length : (useKVCache() ? inputs[getIdx(IdxEntry::CACHE_INDIR)].dims.d[2] : 0);
+    size_t const context_workspace_size
+        = getWorkspaceSizeForContext(type, nbReq, max_context_length, max_kv_cache_length, cross_qkv_length);
 
-    const int total_num_seq = inputs[getSequenceLengthIdx()].dims.d[0];
+    const int total_num_seq = inputs[getIdx(IdxEntry::CONTEXT_LENGTHS)].dims.d[0];
     size_t const generation_workspace_size = getWorkspaceSizeForGeneration(type, total_num_seq);
 
     return std::max(context_workspace_size, generation_workspace_size);
@@ -159,9 +218,9 @@ int GPTAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc,
     const nvinfer1::PluginTensorDesc* outputDesc, const void* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream)
 {
-    int32_t const nbSeq = inputDesc[getContextLengthsIdx()].dims.d[0];
-    int32_t const beam_width = inputDesc[getCacheIndirIdx()].dims.d[1];
-    RequestType const* reqTypes = static_cast<RequestType const*>(inputs[getRequestTypesIdx()]);
+    int32_t const nbSeq = inputDesc[getIdx(IdxEntry::CONTEXT_LENGTHS)].dims.d[0];
+    int32_t const beam_width = useKVCache() ? inputDesc[getIdx(IdxEntry::CACHE_INDIR)].dims.d[1] : 1;
+    RequestType const* reqTypes = static_cast<RequestType const*>(inputs[getIdx(IdxEntry::REQUEST_TYPES)]);
 
     int32_t nbContextRequests = 0;
     int32_t contextTokenIdxEnd = 0;
@@ -173,8 +232,9 @@ int GPTAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc,
             break;
         }
         ++nbContextRequests;
-        contextTokenIdxEnd += mRemovePadding ? static_cast<int32_t const*>(inputs[getHostContextLengthsIdx()])[seqIdx]
-                                             : inputDesc[getInputTensorIdx()].dims.d[1];
+        contextTokenIdxEnd += mRemovePadding
+            ? static_cast<int32_t const*>(inputs[getIdx(IdxEntry::HOST_CONTEXT_LENGTH)])[seqIdx]
+            : inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[1];
     }
     for (int32_t seqIdx = nbContextRequests; seqIdx < nbSeq; seqIdx++)
     {
@@ -220,83 +280,101 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     //     cross_qkv_length [int] max encoder input context length (optional in cross attention mode)
     //     encoder_input_lengths [batch_size] raw sequence lengths (optional in cross attention mode)
 
-    const T* attention_input
-        = static_cast<const T*>(inputs[getInputTensorIdx()]) + inputDesc[getInputTensorIdx()].dims.d[2] * tokenIdxBeg;
-    const int* sequence_length = static_cast<const int*>(inputs[getSequenceLengthIdx()]) + seqIdxBeg;
+    const T* attention_input = static_cast<const T*>(inputs[getIdx(IdxEntry::QKV_TENSOR)])
+        + inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[2] * tokenIdxBeg;
     const T* qkv_bias = nullptr;
     if (mQKVBiasEnabled)
     {
-        qkv_bias = reinterpret_cast<const T*>(inputs[getQKVBiasTensorIdx()]);
+        qkv_bias = reinterpret_cast<const T*>(inputs[getIdx(IdxEntry::QKV_BIAS_TENSOR)]);
     }
 
-    auto const reqTypeInBatchPtr = static_cast<RequestType const*>(inputs[getRequestTypesIdx()]) + seqIdxBeg;
+    auto const reqTypeInBatchPtr = static_cast<RequestType const*>(inputs[getIdx(IdxEntry::REQUEST_TYPES)]) + seqIdxBeg;
     bool const is_context = (reqTypeInBatchPtr[0] == RequestType::kCONTEXT);
 
-    const int* context_lengths = reinterpret_cast<const int*>(inputs[getContextLengthsIdx()]) + seqIdxBeg;
+    const int* context_q_lengths = reinterpret_cast<const int*>(inputs[getIdx(IdxEntry::CONTEXT_LENGTHS)]) + seqIdxBeg;
+    const int* sequence_kv_length = useKVCache()
+        ? static_cast<const int*>(inputs[getIdx(IdxEntry::SEQUENCE_LENGTH)]) + seqIdxBeg
+        : context_q_lengths;
     // Note we still need context length during generation for MMHA optimization.
-    int32_t const max_context_len = [&]()
+    int32_t const max_context_q_len = [&]()
     {
         if (!mRemovePadding)
         {
-            return inputDesc[getInputTensorIdx()].dims.d[1];
+            return inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[1];
         }
-        auto const host_context_lengths = static_cast<int32_t const*>(inputs[getHostContextLengthsIdx()]) + seqIdxBeg;
+        auto const host_context_lengths
+            = static_cast<int32_t const*>(inputs[getIdx(IdxEntry::HOST_CONTEXT_LENGTH)]) + seqIdxBeg;
         return *std::max_element(host_context_lengths, host_context_lengths + localNbSeq);
     }();
-    TLLM_CHECK(max_context_len <= mMaxContextLength);
+    TLLM_CHECK(max_context_q_len <= mMaxContextLength);
 
-    int max_encoder_context_len = isCrossAttention() ? inputDesc[getCrossQKVLengthIdx()].dims.d[0] : 0;
+    int max_encoder_context_len = isCrossAttention() ? inputDesc[getIdx(IdxEntry::CROSS_QKV_LENGTH)].dims.d[0] : 0;
     // for enc-dec model, since decoder_input_ids could be longer than 1,
     // such model has an encoder context (for cross attn) and an decoder context (for self attn)
     // clarify 3 lens:
-    // -- max_context_len: len of decoder input. No "max" concept, it's what it is given.
+    // -- max_context_q_len: len of decoder input. No "max" concept, it's what it is given.
     //                     Also called (decoder_)input_seq_length, normally 1 for encoder-decoder start token
     // -- max_seq_len: max allowed len of decoder output, i.e. final results
     // -- max_encoder_context_len: len of encoder input (in cross attn). Also called encoder_input_seq_length
 
-    const int beamWidth = inputDesc[getCacheIndirIdx()].dims.d[1];
+    const int beamWidth = useKVCache() ? inputDesc[getIdx(IdxEntry::CACHE_INDIR)].dims.d[1] : 1;
 
     // Commonly, cyclic kv cache length, and max kv cache length will be the same
     // unless each layer has different max kv cache length.
     // the kv_cache capacity.
-    const int max_kv_cache_length
-        = isCrossAttention() ? max_encoder_context_len : inputDesc[getCacheIndirIdx()].dims.d[2];
+    const int max_kv_cache_length = isCrossAttention()
+        ? max_encoder_context_len
+        : (useKVCache() ? inputDesc[getIdx(IdxEntry::CACHE_INDIR)].dims.d[2] : 0);
     // The cyclic_kv_cache_length will determine the cyclic kv cache position of new tokens.
     // Note that this cyclic_kv_cache_length might be smaller than the actual kv cache capactity (max_kv_cache_length).
-    const int cyclic_kv_cache_length = reinterpret_cast<const int*>(inputs[getHostMaxKvCacheLengthIdx()])[0];
+    const int cyclic_kv_cache_length = isCrossAttention()
+        ? max_encoder_context_len
+        : reinterpret_cast<const int*>(inputs[getIdx(IdxEntry::HOST_MAX_KV_CACHE_LENGTH)])[0];
 
     const float* kv_scale_orig_quant = nullptr;
     const float* kv_scale_quant_orig = nullptr;
-    if (mKVCacheQuantMode.hasKvCacheQuant())
+    if (useKVCache() && mKVCacheQuantMode.hasKvCacheQuant())
     {
-        assert(inputDesc[getKVCacheQuantizationScaleIdx()].type == DataType::kFLOAT);
-        assert(inputDesc[getKVCacheDequantizationScaleIdx()].type == DataType::kFLOAT);
-        kv_scale_orig_quant = reinterpret_cast<const float*>(inputs[getKVCacheQuantizationScaleIdx()]);
-        kv_scale_quant_orig = reinterpret_cast<const float*>(inputs[getKVCacheDequantizationScaleIdx()]);
+        assert(inputDesc[getIdx(IdxEntry::KV_CACHE_QUANTIZATION_SCALE)].type == DataType::kFLOAT);
+        assert(inputDesc[getIdx(IdxEntry::KV_CACHE_DEQUANTIZATION_SCALE)].type == DataType::kFLOAT);
+        kv_scale_orig_quant = reinterpret_cast<const float*>(inputs[getIdx(IdxEntry::KV_CACHE_QUANTIZATION_SCALE)]);
+        kv_scale_quant_orig = reinterpret_cast<const float*>(inputs[getIdx(IdxEntry::KV_CACHE_DEQUANTIZATION_SCALE)]);
     }
 
     int max_blocks_per_sequence = 0;
     void* block_pointers = nullptr;
-    if (mPagedKVCache)
+    void* host_block_pointers = nullptr;
+    if (useKVCache() && mPagedKVCache)
     {
-        auto& kvCacheBlockPointers = inputDesc[getKVCacheBlockPointersIdx()];
-        auto& kvCacheBlockPointersShape = inputDesc[getKVCacheBlockPointersIdx()].dims;
+        auto& kvCacheBlockPointers = inputDesc[getIdx(IdxEntry::KV_CACHE_BLOCK_POINTERS)];
+        auto& kvCacheBlockPointersShape = inputDesc[getIdx(IdxEntry::KV_CACHE_BLOCK_POINTERS)].dims;
         max_blocks_per_sequence = kvCacheBlockPointersShape.d[kvCacheBlockPointersShape.nbDims - 1];
         auto offset = getStride(kvCacheBlockPointersShape, 0) * seqIdxBeg;
-        auto const typed_block_pointers = static_cast<void* const*>(inputs[getKVCacheBlockPointersIdx()]) + offset;
+        auto const typed_block_pointers
+            = static_cast<void* const*>(inputs[getIdx(IdxEntry::KV_CACHE_BLOCK_POINTERS)]) + offset;
         block_pointers = const_cast<void*>(static_cast<void const*>(typed_block_pointers));
+        auto const typed_host_block_pointers
+            = static_cast<void* const*>(inputs[getIdx(IdxEntry::HOST_KV_CACHE_BLOCK_POINTERS)]) + offset;
+        host_block_pointers = const_cast<void*>(static_cast<void const*>(typed_host_block_pointers));
     }
 
     T* context_buf_ = (T*) (outputs[0]) + outputDesc[0].dims.d[2] * tokenIdxBeg;
     void* key_value_cache = nullptr;
-    if (!mPagedKVCache)
+    if (useKVCache() && !mPagedKVCache)
     {
         auto const cacheElemSize = (mKVCacheQuantMode.hasKvCacheQuant() ? 1 : sizeof(T));
         key_value_cache
             = static_cast<std::byte*>(outputs[1]) + cacheElemSize * getStride(outputDesc[1].dims, 0) * seqIdxBeg;
     }
 
-    const T* alibi_slopes = isALiBi() ? static_cast<const T*>(inputs[getAlibiSlopesIdx()]) : nullptr;
+    const T* alibi_slopes = isALiBi() ? static_cast<const T*>(inputs[getIdx(IdxEntry::ALIBI_SLOPES)]) : nullptr;
+
+    int32_t const* max_context_kv_len_list = useKVCache()
+        ? static_cast<const int*>(inputs[getIdx(IdxEntry::HOST_PAST_KEY_VALUE_LENGTHS)]) + seqIdxBeg
+        : nullptr;
+    int32_t const max_context_kv_len = useKVCache()
+        ? *std::max_element(max_context_kv_len_list, max_context_kv_len_list + localNbSeq)
+        : max_context_q_len;
 
     if (is_context) // context stage
     {
@@ -304,60 +382,65 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         const int request_batch_size = batch_size;
         // num of total tokens (without paddings when remove paddings).
         int num_encoder_tokens = 0;
-        if (!mRemovePadding)
+        if (isCrossAttention())
         {
-            num_encoder_tokens = request_batch_size * max_encoder_context_len;
-        }
-        else
-        {
-            num_encoder_tokens = inputDesc[getCrossQKVIdx()].dims.d[1];
+            if (!mRemovePadding)
+            {
+                num_encoder_tokens = request_batch_size * max_encoder_context_len;
+            }
+            else
+            {
+                num_encoder_tokens = inputDesc[getIdx(IdxEntry::CROSS_QKV)].dims.d[1];
+            }
         }
 
-        EnqueueContextParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, max_context_len,
-            max_kv_cache_length, cyclic_kv_cache_length, context_lengths, kv_scale_orig_quant, kv_scale_quant_orig,
-            alibi_slopes, context_buf_, key_value_cache, block_pointers, batch_size, localNbTokens,
-            max_blocks_per_sequence, workspace};
+        EnqueueContextParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, max_context_q_len,
+            max_context_kv_len, max_kv_cache_length, cyclic_kv_cache_length, context_q_lengths, sequence_kv_length,
+            kv_scale_orig_quant, kv_scale_quant_orig, alibi_slopes, context_buf_, key_value_cache, block_pointers,
+            host_block_pointers, batch_size, localNbTokens, max_blocks_per_sequence, workspace};
         if (isRelativePosition())
         {
-            enqueue_params.relative_attention_bias = static_cast<const T*>(inputs[getRelativeAttentionBiasIdx()]);
+            enqueue_params.relative_attention_bias
+                = static_cast<const T*>(inputs[getIdx(IdxEntry::RELATIVE_ATTENTION_BIAS)]);
             enqueue_params.relative_attention_bias_stride
-                = inputDesc[getRelativeAttentionBiasIdx()].dims.d[1]; // max_seq_len or num_buckets
+                = inputDesc[getIdx(IdxEntry::RELATIVE_ATTENTION_BIAS)].dims.d[1]; // max_seq_len or num_buckets
         }
         if (isCrossAttention())
         {
-            enqueue_params.cross_qkv = static_cast<const T*>(inputs[getCrossQKVIdx()]);
+            enqueue_params.cross_qkv = static_cast<const T*>(inputs[getIdx(IdxEntry::CROSS_QKV)]);
             enqueue_params.cross_qkv_length = max_encoder_context_len;
             enqueue_params.encoder_input_lengths
-                = reinterpret_cast<const int*>(inputs[getEncoderInputLengthsIdx()]) + seqIdxBeg;
+                = reinterpret_cast<const int*>(inputs[getIdx(IdxEntry::ENCODER_INPUT_LENGTH)]) + seqIdxBeg;
             enqueue_params.num_encoder_tokens = num_encoder_tokens;
         }
 
         enqueueContext<T, KVCacheBuffer>(enqueue_params, stream);
     }
-    else // generation stage; max_context_len == input_seq_len == 1
+    else // generation stage; max_context_q_len == input_seq_len == 1
     {
+        TLLM_CHECK_WITH_INFO(useKVCache(), "KV-cache-less is only supported for context");
         int batch_beam = localNbSeq;
         TLLM_CHECK(batch_beam % beamWidth == 0);
         int32_t const num_requests = batch_beam / beamWidth;
 
-        const int* cache_indir = beamWidth == 1 ? nullptr : reinterpret_cast<const int*>(inputs[getCacheIndirIdx()]);
+        const int* cache_indir
+            = beamWidth == 1 ? nullptr : reinterpret_cast<const int*>(inputs[getIdx(IdxEntry::CACHE_INDIR)]);
 
-        int32_t const* past_kv_len_list = static_cast<const int*>(inputs[getHostPastKeyValueLengthsIdx()]) + seqIdxBeg;
-        int32_t const past_kv_len = *std::max_element(past_kv_len_list, past_kv_len_list + localNbSeq);
-        EnqueueGenerationParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, sequence_length,
-            past_kv_len, beamWidth, context_lengths, kv_scale_orig_quant, kv_scale_quant_orig, alibi_slopes,
+        EnqueueGenerationParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, sequence_kv_length,
+            max_context_kv_len, beamWidth, context_q_lengths, kv_scale_orig_quant, kv_scale_quant_orig, alibi_slopes,
             context_buf_, key_value_cache, block_pointers, max_kv_cache_length, cyclic_kv_cache_length, num_requests,
-            max_blocks_per_sequence, cache_indir, workspace};
+            max_blocks_per_sequence, cache_indir, workspace, max_context_kv_len_list};
         if (isRelativePosition())
         {
-            enqueue_params.relative_attention_bias = static_cast<const T*>(inputs[getRelativeAttentionBiasIdx()]);
+            enqueue_params.relative_attention_bias
+                = static_cast<const T*>(inputs[getIdx(IdxEntry::RELATIVE_ATTENTION_BIAS)]);
             enqueue_params.relative_attention_bias_stride
-                = inputDesc[getRelativeAttentionBiasIdx()].dims.d[1]; // max_seq_len or num_buckets
+                = inputDesc[getIdx(IdxEntry::RELATIVE_ATTENTION_BIAS)].dims.d[1]; // max_seq_len or num_buckets
         }
         if (isCrossAttention())
         {
             enqueue_params.encoder_input_lengths
-                = reinterpret_cast<const int*>(inputs[getEncoderInputLengthsIdx()]) + seqIdxBeg;
+                = reinterpret_cast<const int*>(inputs[getIdx(IdxEntry::ENCODER_INPUT_LENGTH)]) + seqIdxBeg;
         }
 
         enqueueGeneration<T, KVCacheBuffer>(enqueue_params, stream);
@@ -386,16 +469,16 @@ int GPTAttentionPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc,
     const nvinfer1::PluginTensorDesc* outputDesc, const void* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
 {
-    if (mType == DataType::kHALF)
+    if (mType == nvinfer1::DataType::kHALF)
     {
         return enqueueDispatchKVCacheType<half>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }
-    else if (mType == DataType::kFLOAT)
+    else if (mType == nvinfer1::DataType::kFLOAT)
     {
         return enqueueDispatchKVCacheType<float>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }
 #ifdef ENABLE_BF16
-    else if (mType == DataType::kBF16)
+    else if (mType == nvinfer1::DataType::kBF16)
     {
         return enqueueDispatchKVCacheType<__nv_bfloat16>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }
@@ -410,11 +493,11 @@ nvinfer1::DataType GPTAttentionPlugin::getOutputDataType(
     TLLM_CHECK(index == 0 || (!mPagedKVCache && index == 1));
     if (index == 0)
     {
-        return inputTypes[getInputTensorIdx()];
+        return inputTypes[getIdx(IdxEntry::QKV_TENSOR)];
     }
     else
     {
-        return inputTypes[getPastKeyValueIdx()];
+        return inputTypes[getIdx(IdxEntry::PAST_KEY_VALUE)];
     }
 }
 
@@ -432,7 +515,7 @@ const char* GPTAttentionPlugin::getPluginVersion() const noexcept
 
 int GPTAttentionPlugin::getNbOutputs() const noexcept
 {
-    return mPagedKVCache ? 1 : 2;
+    return (mPagedKVCache || !useKVCache()) ? 1 : 2;
 }
 
 size_t GPTAttentionPlugin::getSerializationSize() const noexcept
@@ -498,7 +581,9 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(const char* name, const Plugi
             p.getScalar<int32_t>("max_context_length").value(),
             static_cast<bool>(p.getScalar<int8_t>("qkv_bias_enabled").value()),
             static_cast<bool>(p.getScalar<int8_t>("do_cross_attention").value()),
-            static_cast<int32_t>(p.getScalar<int32_t>("max_distance").value()));
+            static_cast<int32_t>(p.getScalar<int32_t>("max_distance").value()),
+            static_cast<bool>(p.getScalar<int8_t>("use_paged_context_fmha").value()),
+            static_cast<bool>(p.getScalar<int32_t>("use_cache").value()));
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

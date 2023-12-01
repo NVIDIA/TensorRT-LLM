@@ -430,17 +430,104 @@ def test_llm_request():
     llm_request.draft_tokens = [1, 2, 3]
     assert llm_request.draft_tokens == [1, 2, 3]
 
+    logits = torch.tensor([-5, -6 - 7], dtype=torch.float)
+    llm_request.draft_logits = logits
+    assert torch.equal(llm_request.draft_logits, logits)
+
 
 def test_inference_request():
-    vm = {"test": torch.tensor((10, 10))}
-    ir = _tb.InferenceRequest(vm, 42)
+    input_ids = torch.tensor((10, 10))
+    vm = {_tb.tensor_names.INPUT_IDS: input_ids}
+    ir = _tb.InferenceRequest(42, vm)
     assert ir.request_id == 42
+    assert ir.input_ids is not None
+    assert torch.equal(ir.input_ids, input_ids)
+
+    assert not ir.is_streaming
     ir.is_streaming = True
     assert ir.is_streaming
 
     data_tensor = torch.tensor((5, 5))
-    ir.emplace_input_tensor("data", data_tensor)
-    assert torch.equal(ir.get_input_tensor("data"), data_tensor)
+
+    assert ir.draft_input_ids is None
+    ir.draft_input_ids = data_tensor
+    assert torch.equal(ir.draft_input_ids, data_tensor)
+
+    assert ir.draft_logits is None
+    ir.draft_logits = data_tensor
+    assert torch.equal(ir.draft_logits, data_tensor)
+
+    assert ir.bad_words_list is None
+    ir.bad_words_list = data_tensor
+    assert torch.equal(ir.bad_words_list, data_tensor)
+
+    assert ir.beam_width is None
+    ir.beam_width = data_tensor
+    assert torch.equal(ir.beam_width, data_tensor)
+
+    assert ir.embedding_bias is None
+    ir.embedding_bias = data_tensor
+    assert torch.equal(ir.embedding_bias, data_tensor)
+
+    assert ir.end_id is None
+    ir.end_id = data_tensor
+    assert torch.equal(ir.end_id, data_tensor)
+
+    assert ir.length_penalty is None
+    ir.length_penalty = data_tensor
+    assert torch.equal(ir.length_penalty, data_tensor)
+
+    assert ir.max_new_tokens is None
+    ir.max_new_tokens = data_tensor
+    assert torch.equal(ir.max_new_tokens, data_tensor)
+
+    assert ir.min_length is None
+    ir.min_length = data_tensor
+    assert torch.equal(ir.min_length, data_tensor)
+
+    assert ir.pad_id is None
+    ir.pad_id = data_tensor
+    assert torch.equal(ir.pad_id, data_tensor)
+
+    assert ir.presence_penalty is None
+    ir.presence_penalty = data_tensor
+    assert torch.equal(ir.presence_penalty, data_tensor)
+
+    assert ir.prompt_embedding_table is None
+    ir.prompt_embedding_table = data_tensor
+    assert torch.equal(ir.prompt_embedding_table, data_tensor)
+
+    assert ir.prompt_vocab_size is None
+    ir.prompt_vocab_size = data_tensor
+    assert torch.equal(ir.prompt_vocab_size, data_tensor)
+
+    assert ir.random_seed is None
+    ir.random_seed = data_tensor
+    assert torch.equal(ir.random_seed, data_tensor)
+
+    assert ir.repetition_penalty is None
+    ir.repetition_penalty = data_tensor
+    assert torch.equal(ir.repetition_penalty, data_tensor)
+
+    assert ir.return_log_probs is None
+    ir.return_log_probs = data_tensor
+    assert torch.equal(ir.return_log_probs, data_tensor)
+
+    assert ir.runtime_top_k is None
+    ir.runtime_top_k = data_tensor
+    assert torch.equal(ir.runtime_top_k, data_tensor)
+
+    assert ir.runtime_top_p is None
+    ir.runtime_top_p = data_tensor
+    assert torch.equal(ir.runtime_top_p, data_tensor)
+
+    assert ir.stop_words_list is None
+    ir.stop_words_list = data_tensor
+    assert torch.equal(ir.stop_words_list, data_tensor)
+
+    assert ir.temperature is None
+    ir.temperature = data_tensor
+    assert torch.equal(ir.temperature, data_tensor)
 
 
 def test_trt_gpt_model_optional_params():

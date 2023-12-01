@@ -31,15 +31,16 @@ namespace layers
 {
 
 __global__ void update_indir_cache_kernel(int* tgt_indir_cache, const int* src_indir_cache, const int** parent_ids,
-    const bool* finished, const int* sequence_lengths, const int* input_lengths, int batch_dim, int local_batch_size,
-    int beam_width, int max_kv_cache_length, int max_seq_len)
+    const FinishedState* finished, const int* sequence_lengths, const int* input_lengths, int batch_dim,
+    int local_batch_size, int beam_width, int max_kv_cache_length, int max_seq_len)
 {
     int time_step = threadIdx.x + blockIdx.x * blockDim.x;
     int bb_id = threadIdx.y + blockIdx.y * blockDim.y;   // should be just blockIdx.y?
     const int current_step{sequence_lengths[bb_id] - 1}; // the sequence_lengths is updated, need to minus 1
     const int batch_id = bb_id / beam_width;
     const int beam_id = bb_id % beam_width;
-    if (bb_id >= beam_width * local_batch_size || time_step < (max_seq_len - max_kv_cache_length) || finished[bb_id])
+    if (bb_id >= beam_width * local_batch_size || time_step < (max_seq_len - max_kv_cache_length)
+        || finished[bb_id].isFinished())
     {
         return;
     }
@@ -58,8 +59,8 @@ __global__ void update_indir_cache_kernel(int* tgt_indir_cache, const int* src_i
 }
 
 void update_indir_cache_kernelLauncher(int* tgt_indir_cache, const int* src_indir_cache, const int** parent_ids,
-    const bool* finished, const int* sequence_lengths, const int* input_lengths, int batch_dim, int local_batch_size,
-    int beam_width, int max_seq_len, int max_kv_cache_length, cudaStream_t stream)
+    const FinishedState* finished, const int* sequence_lengths, const int* input_lengths, int batch_dim,
+    int local_batch_size, int beam_width, int max_seq_len, int max_kv_cache_length, cudaStream_t stream)
 {
     const dim3 block(32);
     // Update indirections steps [input_length[bb_id], sequence_lengths[bb_id]], included
@@ -186,7 +187,9 @@ void BaseBeamSearchLayer<T>::forward(BeamSearchOutputParams& outputs, ForwardPar
     {
         update_indir_cache_kernelLauncher(outputs.tgt_cache_indirection.template getPtr<int>(),
             params.src_cache_indirection.template getPtr<const int>(),
-            outputs.parent_ids_ptr.template getPtr<const int*>(), outputs.finished->template getPtr<const bool>(),
+            outputs.parent_ids_ptr.template getPtr<const int*>(),
+            reinterpret_cast<const FinishedState*>(
+                outputs.finished->template getPtr<const FinishedState::UnderlyingType>()),
             sequence_length, input_lengths, batch_size, local_batch_size, beam_width, max_seq_len,
             params.max_kv_cache_length, stream_);
         sync_check_cuda_error();

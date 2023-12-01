@@ -16,26 +16,17 @@
 
 #pragma once
 
+#include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tmaDescriptor.h"
 #include <limits.h>
 #include <stdint.h>
+
+#include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 
 namespace tensorrt_llm
 {
 namespace kernels
 {
-enum Data_type
-{
-    DATA_TYPE_BOOL,
-    DATA_TYPE_FP16,
-    DATA_TYPE_FP32,
-    DATA_TYPE_INT4,
-    DATA_TYPE_INT8,
-    DATA_TYPE_INT32,
-    DATA_TYPE_BF16,
-    DATA_TYPE_E4M3,
-    DATA_TYPE_E5M2
-};
 
 enum class ContextFMHAType
 {
@@ -51,14 +42,6 @@ enum class ContextAttentionMaskType
     CAUSAL,
     SLIDING_WINDOW_CAUSAL
 };
-
-constexpr int32_t kSM_70 = 70;
-constexpr int32_t kSM_72 = 72;
-constexpr int32_t kSM_75 = 75;
-constexpr int32_t kSM_80 = 80;
-constexpr int32_t kSM_86 = 86;
-constexpr int32_t kSM_89 = 89;
-constexpr int32_t kSM_90 = 90;
 
 struct AlibiParams
 {
@@ -101,9 +84,9 @@ struct AlibiParams
 struct Fused_multihead_attention_params_v2
 {
     // The QKV matrices.
-    void* qkv_ptr;
+    const void* qkv_ptr;
     // The mask to implement drop-out.
-    void* packed_mask_ptr;
+    const void* packed_mask_ptr;
     // The O matrix (output).
     void* o_ptr;
 
@@ -123,7 +106,7 @@ struct Fused_multihead_attention_params_v2
     bool enable_i2f_trick;
 
     // array of length b+1 holding prefix sum of actual sequence lengths
-    int* cu_seqlens;
+    const int* cu_seqlens;
 
     // use C/32 Format.
     bool interleaved = false;
@@ -183,6 +166,102 @@ struct Fused_multihead_attention_params_v2
         use_int8_scale_max = false;
 
         h_kv = 0;
+        sliding_window_size = INT_MAX;
+        is_s_padded = false;
+
+        has_alibi = false;
+        alibi_params = AlibiParams{};
+    }
+};
+
+struct Fused_multihead_attention_paged_kv_params_v2
+{
+    // The Q matrices.
+    const void* q_ptr;
+    // Paged KV Cache buffer.
+    KVBlockArray paged_kv_cache;
+    // The O matrix (output).
+    void* o_ptr;
+    // The packed mask for random mask.
+    const void* packed_mask_ptr;
+
+    // The stride between rows of the Q matrices.
+    int64_t q_stride_in_bytes;
+    // The stride between rows of the paged KV matrices.
+    int64_t kv_stride_in_bytes;
+    // The stride between rows of O.
+    int64_t o_stride_in_bytes;
+    // The stride between matrices of packed mask.
+    int64_t packed_mask_stride_in_bytes;
+
+    // The dimensions.
+    int b, h, s, d;
+    // The scaling factors for the kernel.
+    uint32_t scale_bmm1, scale_softmax, scale_bmm2;
+
+    // Do we use Niall's trick to avoid I2F/F2I in the INT8 kernel.
+    // See https://confluence.nvidia.com/pages/viewpage.action?pageId=302779721 for details.
+    bool enable_i2f_trick;
+
+    // true: for int8, instead of doing max reduce, use max value encoded in scale factor
+    bool use_int8_scale_max = false;
+
+    // If the kernel is using alibi or not
+    bool has_alibi = false;
+    AlibiParams alibi_params;
+
+    // array of length b+1 holding prefix sum of actual kv sequence lengths.
+    const int* cu_seqlens;
+    // Chunked attention (only handles one tile of Q).
+    const int* cu_q_seqlens;
+
+    // q with shape [B, S, H, D] in const cache.
+    cudaTmaDesc tma_desc_q;
+    // Tma descriptors for paged kv cache.
+    // paged kv has [B, 2, Num_blocks] buffers,
+    //  and each points to [Tokens_per_block, H, D] contiguous memory.
+    cudaTmaDesc* tma_desc_paged_kv;
+
+    // In multi-query or grouped-query attention (MQA/GQA), several Q heads are associated with one KV head
+    int h_kv = 0;
+    int h_q_per_kv = 0;
+
+    // Sliding Window Attention
+    // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
+    int sliding_window_size = INT_MAX;
+
+    // is input/output padded
+    bool is_s_padded = false;
+
+    void clear()
+    {
+        q_ptr = nullptr;
+        o_ptr = nullptr;
+        packed_mask_ptr = nullptr;
+
+        q_stride_in_bytes = 0;
+        kv_stride_in_bytes = 0;
+        o_stride_in_bytes = 0;
+        packed_mask_stride_in_bytes = 0;
+
+        b = 0;
+        h = 0;
+        s = 0;
+        d = 0;
+        // The scaling factors for the kernel.
+        scale_bmm1 = 0;
+        scale_softmax = 0;
+        scale_bmm2 = 0;
+
+        enable_i2f_trick = false;
+
+        cu_seqlens = nullptr;
+        cu_q_seqlens = nullptr;
+        use_int8_scale_max = false;
+
+        h_kv = 0;
+        h_q_per_kv = 0;
+        sliding_window_size = INT_MAX;
         is_s_padded = false;
 
         has_alibi = false;
@@ -195,6 +274,8 @@ struct Launch_params
 {
     // seq_length to select the kernel
     int kernel_s = 0;
+    // kv_seq_length to set launch strategies.
+    int kernel_kv_s = 0;
     // flags to control small batch kernel choice
     // true: never unroll
     bool ignore_b1opt = false;
@@ -208,6 +289,10 @@ struct Launch_params
     bool use_tma = false;
     // host seqlens to set tma descriptors
     int* seqlens = nullptr;
+    // number of paged kv blocks for context sequence.
+    int blocks_per_context_sequence = 0;
+    // device ptrs on the host for paged kv cache.
+    const int64_t* paged_kv_block_ptrs = nullptr;
     // if flash attention is used (only FP16)
     bool flash_attention = false;
     // if warp_specialized kernels are used (only SM90 HGMMA + TMA)

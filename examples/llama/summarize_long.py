@@ -42,7 +42,7 @@ def parse_args():
     parser.add_argument('--dataset_path',
                         type=str,
                         default='/code/tensorrt_llm/data')
-    parser.add_argument('--max_kv_cache_len',
+    parser.add_argument('--max_kv_cache_length',
                         type=int,
                         default=4096,
                         help='The max kv cache length. \
@@ -147,7 +147,7 @@ def get_long_texts(dataset_openweb):
     for datapoint in dataset_openweb["train"]:
         text = datapoint["text"]
         approximate_tokens = len(text.split())
-        if (approximate_tokens > args.max_kv_cache_len) and (
+        if (approximate_tokens > args.max_kv_cache_length) and (
                 approximate_tokens < args.max_input_len):
             yield text
 
@@ -232,7 +232,7 @@ def summarize_tensorrt_llm(datapoint, tokenizer, tensorrt_llm_llama, args):
                                  max_context_length=max_length,
                                  max_new_tokens=args.output_len,
                                  beam_width=args.num_beams,
-                                 max_kv_cache_length=args.max_kv_cache_len)
+                                 max_kv_cache_length=args.max_kv_cache_length)
         logger.info(f"Generation session set up with the parameters: \
             batch_size: {tensorrt_llm_llama.batch_size}, \
             max_context_length: {tensorrt_llm_llama.max_context_length}, \
@@ -290,7 +290,7 @@ def main(args):
         ]
     except StopIteration:
         logger.warning(
-            f"No test data of sufficient length ({args.max_kv_cache_len}). Try decreasing the max_kv_cache_len parameter"
+            f"No test data of sufficient length ({args.max_kv_cache_length}). Try decreasing the max_kv_cache_length parameter"
         )
         return
 
