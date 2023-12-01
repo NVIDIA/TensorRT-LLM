@@ -384,6 +384,7 @@ if __name__ == "__main__":
         input_text = [
             "translate English to German: The house is wonderful.",
             "summarize: I am a high-performance inference optimizer and runtime.",
+            "During its construction, the Eiffel Tower surpassed the Washington Monument to become the tallest man-made structure in the world",
         ]
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)

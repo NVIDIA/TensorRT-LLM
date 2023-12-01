@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/namedTensor.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
@@ -190,8 +191,11 @@ public:
 protected:
     static void validateTensorName(std::string const& tensorName)
     {
-        TLLM_CHECK_WITH_INFO(std::find(kTensorNames.begin(), kTensorNames.end(), tensorName) != kTensorNames.end(),
-            "Invalid tensor name: %s", tensorName.c_str());
+        // TODO (martinma): Throw an exception if the tensor name is not valid.
+        if (std::find(kTensorNames.begin(), kTensorNames.end(), tensorName) == kTensorNames.end())
+        {
+            TLLM_LOG_WARNING("Invalid tensor name in InferenceRequest: %s", tensorName.c_str());
+        }
     }
 
     uint64_t mRequestId;
