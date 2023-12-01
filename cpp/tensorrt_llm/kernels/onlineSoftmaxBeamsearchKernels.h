@@ -16,6 +16,7 @@
 #pragma once
 
 #include "tensorrt_llm/kernels/beamSearchTopkKernels.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 
 namespace tensorrt_llm
 {
@@ -23,7 +24,7 @@ namespace kernels
 {
 
 template <typename T>
-void invokeTopkSoftMax(const T* log_probs, const T* bias, const bool* finished, const int* sequence_lengths,
+void invokeTopkSoftMax(const T* log_probs, const T* bias, const FinishedState* finished, const int* sequence_lengths,
     float* cum_log_probs, float* output_log_probs, int** output_ids_ptr, void* tmp_storage, const int temp_storage_size,
     BeamHypotheses* beam_hyps, const int batch_size, const int beam_width, const int vocab_size, const int* end_ids,
     const float* diversity_rates, const float* length_penalties, cudaStream_t stream);

@@ -50,10 +50,10 @@ PYTHONPATH=examples/llama python3 cpp/tests/resources/scripts/build_llama_engine
 End-to-end tests read inputs and expected outputs from Numpy files located at [cpp/tests/resources/data](resources/data). The expected outputs can be generated using [scripts](resources/scripts) which employ the Python runtime to run the built engines:
 
 ```bash
-PYTHONPATH=examples/gpt:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_gpt_output.py
-PYTHONPATH=examples/gptj:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_gptj_output.py
-PYTHONPATH=examples/llama:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_llama_output.py
-PYTHONPATH=examples/chatglm:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_chatglm_output.py
+PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_gpt_output.py
+PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_gptj_output.py
+PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_llama_output.py
+PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_chatglm_output.py
 ```
 
 ### Generate data with tensor and pipeline parallelism
@@ -61,7 +61,7 @@ PYTHONPATH=examples/chatglm:$PYTHONPATH python3 cpp/tests/resources/scripts/gene
 It is possible to generate tensor and pipeline parallelism data for LLaMA using 4 GPUs. To generate results from the top-level directory:
 
 ```bash
-PYTHONPATH=examples/llama mpirun -n 4 python3 cpp/tests/resources/scripts/generate_expected_llama_output.py --only_multi_gpu
+PYTHONPATH=examples mpirun -n 4 python3 cpp/tests/resources/scripts/generate_expected_llama_output.py --only_multi_gpu
 ```
 
 ### Run test

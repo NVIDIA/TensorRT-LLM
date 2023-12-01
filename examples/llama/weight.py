@@ -29,6 +29,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import LLaMAForCausalLM
 from tensorrt_llm.models.quantized.quant import get_dummy_quant_scales
 from tensorrt_llm.quantization import QuantMode
+from tensorrt_llm.runtime.lora_manager import LoraConfig
 
 
 def get_scaling_factors(
@@ -186,7 +187,8 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                        hf_llama,
                        mapping=Mapping(),
                        dtype='float32',
-                       use_gemm_woq_plugin=True):
+                       use_gemm_woq_plugin=True,
+                       lora_config=LoraConfig()):
     tensorrt_llm.logger.info('Loading weights from HF LLaMA...')
     tik = time.time()
 
@@ -233,6 +235,9 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
         else:
             v = torch_to_numpy(v.to(torch_dtype).detach().cpu())
         if 'model.embed_tokens.weight' in k:
+            if lora_config.is_valid and lora_config.embedding_weight is not None:
+                v = torch_to_numpy(
+                    lora_config.embedding_weight.to(torch_dtype).detach().cpu())
             if hf_llama.config.tie_word_embeddings:
                 # lm_head.weight has the same weights as embedding
                 if mapping.is_last_pp_rank():
@@ -248,6 +253,11 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                 tensorrt_llm_llama.ln_f.weight.value = v
         elif 'lm_head.weight' in k:
             if mapping.is_last_pp_rank():
+                if lora_config.is_valid and lora_config.lm_head_weight is not None:
+                    v = torch_to_numpy(
+                        lora_config.lm_head_weight.to(
+                            torch_dtype).detach().cpu())
+                    vocab_size = v.shape[0]
                 if vocab_size % mapping.tp_size != 0:
                     # padding
                     vocab_size_padded = tensorrt_llm_llama.lm_head.out_features * mapping.tp_size
@@ -383,6 +393,7 @@ def load_from_hf_checkpoint(
         model_dir: Union[str, Path],
         mapping=Mapping(),
         dtype: Union[str, torch.dtype] = torch.float32,
+        lora_config=LoraConfig(),
 ):
     tensorrt_llm.logger.info('Loading weights from HF LLaMA...')
     tik = time.time()
@@ -460,6 +471,10 @@ def load_from_hf_checkpoint(
                 layer = tensorrt_llm_llama.layers[i - layers_range[0]]
 
             if 'model.embed_tokens.weight' in name:
+                if lora_config.is_valid and lora_config.embedding_weight is not None:
+                    param = torch_to_numpy(
+                        lora_config.embedding_weight.to(
+                            torch_dtype).detach().cpu())
                 if hf_config.tie_word_embeddings:
                     # lm_head.weight has the same weights as embedding
                     if mapping.is_last_pp_rank():
@@ -474,6 +489,10 @@ def load_from_hf_checkpoint(
                 if mapping.is_last_pp_rank():
                     tensorrt_llm_llama.ln_f.weight.value = param
             elif 'lm_head.weight' in name:
+                if lora_config.is_valid and lora_config.lm_head_weight is not None:
+                    param = torch_to_numpy(
+                        lora_config.lm_head_weight.to(
+                            torch_dtype).detach().cpu())
                 if mapping.is_last_pp_rank():
                     tensorrt_llm_llama.lm_head.weight.value = split(
                         param, mapping.tp_size, mapping.tp_rank)

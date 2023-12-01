@@ -113,6 +113,10 @@ bool BertAttentionPlugin::supportsFormatCombination(
             return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
         }
     }
+    else
+    {
+        return false;
+    }
 }
 
 void BertAttentionPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
@@ -237,10 +241,10 @@ int BertAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
     // build attention_mask, cu_seqlens, and padding_offset tensors
     BuildDecoderInfoParams<T> params;
     memset(&params, 0, sizeof(params));
-    params.seqOffsets = cu_seqlens;
+    params.seqQOffsets = cu_seqlens;
     params.paddingOffsets = padding_offset;
     params.attentionMask = attention_mask;
-    params.seqLengths = input_lengths;
+    params.seqQLengths = input_lengths;
     params.batchSize = batch_size;
     params.maxSeqLength = input_seq_len;
     params.numTokens = num_tokens;

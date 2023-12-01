@@ -167,13 +167,13 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
     safeUpdate<int>(bad_words_list_opt, forwardParams.bad_words_list);
     safeUpdate<int>(stop_words_list_opt, forwardParams.stop_words_list);
     safeUpdate<int>(no_repeat_ngram_size_opt, forwardParams.no_repeat_ngram_size);
-    safeUpdate<int>(finished_input, forwardParams.finished);
+    safeUpdate<uint8_t>(finished_input, forwardParams.finished);
 
     auto const& output_ids_converted = convert_tensor<int>(output_token_ids);
     typename tensorrt_llm::layers::DynamicDecodeLayer<T>::OutputParams outputParams{output_ids_converted};
     outputParams.newTokens = std::move(convert_tensor<int>(newTokens));
 
-    safeUpdate<bool>(finished_output, outputParams.finished);
+    safeUpdate<uint8_t>(finished_output, outputParams.finished);
     std::int32_t* finished_sum_host = nullptr;
     if (forwardParams.sequence_limit_length && outputParams.finished.has_value())
     {
@@ -313,14 +313,11 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
 
     CHECK_INPUT(logits, scalar_type_);
     TLLM_CHECK_WITH_INFO(logits.dim() == 3,
-        tensorrt_llm::common::fmtstr("logits is of shape (batch_size, beam_width, vocab_size_padded), "
-                                     "but got dim=%d shape=%s",
-            (int) logits.dim(), tensorrt_llm::common::vec2str(convert_shape(logits)).c_str())
-            .c_str());
+        "logits is of shape (batch_size, beam_width, vocab_size_padded), but got dim=%d shape=%s", (int) logits.dim(),
+        tensorrt_llm::common::vec2str(convert_shape(logits)).c_str());
     TLLM_CHECK_WITH_INFO(static_cast<size_t>(logits.size(2)) == vocab_size_padded_,
-        tensorrt_llm::common::fmtstr("logits is of shape (batch_size, beam_width, "
-                                     "vocab_size(%ld)), but got the last dim=%ld.",
-            vocab_size_padded_, static_cast<size_t>(logits.size(2))));
+        "logits is of shape (batch_size, beam_width, vocab_size(%ld)), but got the last dim=%ld.", vocab_size_padded_,
+        static_cast<size_t>(logits.size(2)));
 
     CHECK_INPUT(end_id, torch::kInt32);
 
@@ -332,8 +329,8 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
     CHECK_OPTIONAL_INPUT(src_cache_indirection_opt, torch::kInt32);
 
     CHECK_INPUT(output_token_ids, torch::kInt32);
-    CHECK_OPTIONAL_INPUT(finished_input, torch::kBool);
-    CHECK_OPTIONAL_INPUT(finished_output, torch::kBool);
+    CHECK_OPTIONAL_INPUT(finished_input, torch::kUInt8);
+    CHECK_OPTIONAL_INPUT(finished_output, torch::kUInt8);
     CHECK_OPTIONAL_INPUT(seuqence_lengths_opt, torch::kInt32);
     CHECK_OPTIONAL_INPUT(cum_log_probs_opt, torch::kFloat32);
     CHECK_OPTIONAL_INPUT(output_log_probs_opt, torch::kFloat32);

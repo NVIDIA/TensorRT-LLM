@@ -104,7 +104,8 @@ def get_args():
         type=str,
         choices=['fp8', 'int4_awq'],
         default='fp8',
-        help='Quantization format. Currently only fp8 is supported. '
+        help=
+        'Quantization format. Currently only fp8 and int4_awq are supported. '
         'For int8 smoothquant, use smoothquant.py instead. ')
     parser.add_argument("--calib_size",
                         type=int,

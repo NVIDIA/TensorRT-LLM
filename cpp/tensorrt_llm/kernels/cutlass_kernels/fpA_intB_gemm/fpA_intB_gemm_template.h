@@ -453,7 +453,7 @@ void CutlassFpAIntBGemmRunner<T, WeightType, QuantOp>::gemm(const void* A, const
 
     if constexpr (QuantOp == cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY)
     {
-        dispatch_to_arch<tkc::EpilogueOpNoBias>((const T*) A, (const WeightType*) B, (const T*) weight_scales, nullptr,
+        dispatch_to_arch<tkc::EpilogueOpDefault>((const T*) A, (const WeightType*) B, (const T*) weight_scales, nullptr,
             nullptr, (T*) C, m, n, k, k, gemmConfig, workspace_ptr, workspace_bytes, stream, nullptr);
     }
     else

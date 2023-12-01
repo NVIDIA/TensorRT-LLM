@@ -81,7 +81,7 @@ def read_config(config_path: Path):
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument("--max_new_tokens", type=int, default=64)
-    parser.add_argument('--max_kv_cache_len',
+    parser.add_argument('--max_kv_cache_length',
                         type=int,
                         default=None,
                         help='The max kv cache length. \

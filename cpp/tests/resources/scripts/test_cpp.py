@@ -232,6 +232,7 @@ def prepare_model_tests(model_name: str,
     ] + model_cache_arg + only_fp8_arg + only_multi_gpu_arg
     run_command(build_engines, cwd=root_dir, env=model_env)
 
+    model_env["PYTHONPATH"] = "examples"
     generate_expected_output = [
         python_exe,
         str(scripts_dir / f"generate_expected_{model_name}_output.py")

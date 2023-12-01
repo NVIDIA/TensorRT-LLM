@@ -108,14 +108,16 @@ void invokeTranspose4dBatchMajor(const T* k_src, const T* v_src, KVCacheBuffer& 
     const int seq_len, const int max_kv_cache_len, const int size_per_head, const int local_head_num,
     const KvCacheDataType cache_type, const float* kvScaleOrigQuant, const int* sequence_lengths, cudaStream_t stream);
 
-template <typename T, typename KVCacheBuffer>
-void invokeApplyBiasRopeUpdateKVCache(T* QKV, KVCacheBuffer& kvTable, const T* qkv_bias, const int* seq_lens,
-    const int* padding_offset, const int batch_size, const int seq_len, const int cyclic_kv_cache_len,
-    const int token_num, const int head_num, const int kv_head_num, const int size_per_head,
-    const int rotary_embedding_dim, const float rotary_embedding_base, const RotaryScalingType rotary_scale_type,
-    const float rotary_embedding_scale, const int rotary_embedding_max_positions,
-    const PositionEmbeddingType position_embedding_type, const float* scale, const int int8_mode,
-    const KvCacheDataType cache_type, const float* kvScaleOrigQuant, cudaStream_t stream);
+// NOTE: this kernel is in-place, QKV will be modified, if other kernels need that, may need copy or use before it.
+template <typename T, typename KVCacheBuffer, bool IsGenerate = false>
+void invokeApplyBiasRopeUpdateKVCache(T* QKV, T* Q, KVCacheBuffer& kvTable, const T* qkv_bias, const int* seq_lens,
+    const int* kv_seq_lens, const int* padding_offset, const int batch_size, const int seq_len,
+    const int cyclic_kv_cache_len, const int token_num, const int head_num, const int kv_head_num,
+    const int size_per_head, const int rotary_embedding_dim, const float rotary_embedding_base,
+    const RotaryScalingType rotary_scale_type, const float rotary_embedding_scale,
+    const int rotary_embedding_max_positions, const PositionEmbeddingType position_embedding_type, const float* scale,
+    const int int8_mode, const KvCacheDataType cache_type, const float* kvScaleOrigQuant,
+    const bool enable_paged_kv_fmha, cudaStream_t stream, int beam_width = 1);
 
 template <typename T, typename BT>
 void invokeAddRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_attention_bias, const int batch_size,

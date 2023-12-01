@@ -83,32 +83,19 @@ def test_gpt_manager(variant, results_file, llm_root: _pl.Path,
     inference_request_list = []
     remaining_requests = len(given_input)
     for i, (req, length) in enumerate(zip(given_input, given_input_lengths)):
-        inference_request_list.append(
-            _tb.InferenceRequest(
-                {
-                    "input_ids":
-                    _tor.tensor([req[:length].tolist()], dtype=_tor.int32),
-                    "input_lengths":
-                    _tor.tensor([[length]], dtype=_tor.int32),
-                    "request_output_len":
-                    _tor.tensor([[length + max_new_tokens]], dtype=_tor.int32),
-                    "end_id":
-                    _tor.tensor([end_id], dtype=_tor.int32),
-                    "pad_id":
-                    _tor.tensor([pad_id], dtype=_tor.int32),
-                    "beam_width":
-                    _tor.tensor([beam_width], dtype=_tor.int32),
-                    "temperature":
-                    _tor.tensor([1.0], dtype=_tor.float32),
-                    "min_length":
-                    _tor.tensor([1], dtype=_tor.int32),
-                    "random_seed":
-                    _tor.tensor([42], dtype=_tor.int64),
-                    "runtime_top_k":
-                    _tor.tensor([0], dtype=_tor.int32),
-                    "runtime_top_p":
-                    _tor.tensor([0], dtype=_tor.float32),
-                }, i))
+        ir = _tb.InferenceRequest(i)
+        ir.input_ids = _tor.tensor([req[:length].tolist()], dtype=_tor.int32)
+        ir.max_new_tokens = _tor.tensor([[length + max_new_tokens]],
+                                        dtype=_tor.int32)
+        ir.end_id = _tor.tensor([end_id], dtype=_tor.int32)
+        ir.pad_id = _tor.tensor([pad_id], dtype=_tor.int32)
+        ir.beam_width = _tor.tensor([beam_width], dtype=_tor.int32)
+        ir.temperature = _tor.tensor([1.0], dtype=_tor.float32)
+        ir.min_length = _tor.tensor([1], dtype=_tor.int32)
+        ir.random_seed = _tor.tensor([42], dtype=_tor.int64)
+        ir.runtime_top_k = _tor.tensor([0], dtype=_tor.int32)
+        ir.runtime_top_p = _tor.tensor([0.0], dtype=_tor.float32)
+        inference_request_list.append(ir)
 
     def fetch_requests(max_num_sequences: int):
         nonlocal inference_request_list
@@ -129,10 +116,10 @@ def test_gpt_manager(variant, results_file, llm_root: _pl.Path,
         tensor_dict = {item.name: item.tensor for item in tensors}
 
         batch_idx = req_id
-        observed_output = tensor_dict["output_ids"]
+        observed_output = tensor_dict[_tb.tensor_names.OUTPUT_IDS]
 
         expected_length = expected_output_lengths[batch_idx]
-        observed_length = tensor_dict["sequence_length"].item(
+        observed_length = tensor_dict[_tb.tensor_names.SEQUENCE_LENGTH].item(
         ) - given_input_lengths[batch_idx]
         assert expected_length == observed_length, (batch_idx, expected_length,
                                                     observed_length)

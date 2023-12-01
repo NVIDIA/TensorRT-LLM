@@ -52,9 +52,11 @@ def _init(log_level=None):
         ft_decoder_lib = project_dir + '/libs/th_common.dll'
     else:
         ft_decoder_lib = project_dir + '/libs/libth_common.so'
-    if ft_decoder_lib == '':
-        raise ImportError('FT decoder layer is unavailable')
-    torch.classes.load_library(ft_decoder_lib)
+    try:
+        torch.classes.load_library(ft_decoder_lib)
+    except Exception as e:
+        msg = '\nFATAL: Decoding operators failed to load. This may be caused by the incompatibility between PyTorch and TensorRT-LLM. Please rebuild and install TensorRT-LLM.'
+        raise ImportError(str(e) + msg)
 
     global net
     logger.info('TensorRT-LLM inited.')
@@ -95,7 +97,7 @@ def serialize_engine(engine, path):
     if isinstance(engine, trt.ICudaEngine):
         engine = engine.serialize()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')

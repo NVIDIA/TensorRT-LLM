@@ -43,7 +43,7 @@ def serialize_engine(engine, path):
     logger.info(f'Serializing engine to {path}...')
     tik = time.time()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')
@@ -120,7 +120,7 @@ def parse_arguments():
     parser.add_argument(
         '--output_dir',
         type=str,
-        default='gpt_outputs',
+        default='engine_outputs',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
     )

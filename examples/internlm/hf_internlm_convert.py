@@ -192,7 +192,7 @@ def hf_gpt_converter(args):
     saved_dir.mkdir(parents=True, exist_ok=True)
 
     model = AutoModelForCausalLM.from_pretrained(args.in_file,
-                                                 torch_dtype="auto",
+                                                 torch_dtype=torch.float16,
                                                  device_map="auto",
                                                  trust_remote_code=True)
 

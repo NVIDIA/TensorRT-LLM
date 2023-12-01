@@ -543,7 +543,6 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
     {
         auto pastKeyValueLengthsPtr = bufferCast<SizeType>(*pastKeyValueLengths);
         TLLM_CHECK(pastKeyValueLengths->getSize() == static_cast<std::size_t>(batchSize));
-        std::fill_n(pastKeyValueLengthsPtr, batchSize, 0);
 
         auto RequestTypesPtr = bufferCast<int32_t>(*requestTypes);
         TLLM_CHECK(requestTypes->getSize() == static_cast<std::size_t>(batchSize));
@@ -591,6 +590,11 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
         else
         {
             TLLM_THROW("Unsupported model variant");
+        }
+
+        for (SizeType i = 0; i < batchSize; ++i)
+        {
+            pastKeyValueLengthsPtr[i] = contextLengthsHostPtr[i];
         }
 
         if (worldConfig.isPipelineParallel())
@@ -829,6 +833,8 @@ void RuntimeBuffers::getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outpu
         {
             utils::insertTensorSlices(
                 inputBuffers, "kv_cache_block_pointers_", kvCacheBlockPointersDevice, firstLayerId);
+            utils::insertTensorSlices(
+                inputBuffers, "host_kv_cache_block_pointers_", kvCacheBlockPointersHost, firstLayerId);
         }
         else
         {

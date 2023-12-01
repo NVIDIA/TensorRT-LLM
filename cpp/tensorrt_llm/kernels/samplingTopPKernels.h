@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include <curand_kernel.h>
 
 namespace tensorrt_llm
@@ -32,23 +33,6 @@ namespace kernels
 //! \param stream stream
 void invokeTopPInitialize(int* topPIdValBuf, int* topPOffsetBuf, int* beginTopPOffsetBuf, const size_t batchSize,
     const int vocabSize, cudaStream_t stream);
-
-//! \brief Applies mask, adds bias to logits and computes softmax values.
-//! Sets -MAX_FLT value for tokens in range [vocabSize; vocabSizePadded) to prevent them from being chosen.
-//! If request finished the generation, sets MAX_FLT to endId token and -MAX_FLT to all other tokens forcing to choose
-//! endId token. Otherwise, adds bias per token if bias pointer is not nullptr.
-//!
-//! \param logits input/output buffer [batchSize, vocabSize]. Logits to be modified by mask, bias and softmax.
-//! \param bias input buffer [vocabSize]. Bias to logit per token. Ignored if nullptr
-//! \param endIds input buffer [batchSize]. EOS token ids per request
-//! \param finished input buffer [batchSize] with flags set to true if request has finished the generation
-//! \param batchSize batch size
-//! \param vocabSize unpadded vocab size
-//! \param vocabSizePadded padded vocab size
-//! \param stream stream
-template <typename T>
-void invokeAddBiasSoftMax(T* logits, const T* bias, const int* endIds, const bool* finished, const int batchSize,
-    const int vocabSize, const int vocabSizePadded, cudaStream_t stream);
 
 /**
 //! \brief Given logProbs, performs top P sampling. Fills sampled tokens to outputIds.
@@ -94,18 +78,18 @@ nullptr.
  */
 template <typename T>
 void invokeBatchTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize, int** outputIds,
-    int* sequenceLength, const bool* finishedInput, bool* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    const T* logProbs, const int* idVals, int* offsetBuf, int* beginOffsetBuf, curandState_t* curandstate,
-    const int batchSize, const size_t vocabSizePadded, const int* endIds, const float maxTopP, const float* topPs,
-    cudaStream_t stream, const bool* skipDecode);
+    int* sequenceLength, const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
+    float* outputLogProbs, const T* logProbs, const int* idVals, int* offsetBuf, int* beginOffsetBuf,
+    curandState_t* curandstate, const int batchSize, const size_t vocabSizePadded, const int* endIds,
+    const float maxTopP, const float* topPs, cudaStream_t stream, const bool* skipDecode);
 
 //! \brief Specialization of invokeBatchTopPSampling with topPs=nullptr
 template <typename T>
 void invokeTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize, int** outputIds,
-    int* sequenceLength, const bool* finishedInput, bool* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    const T* logProbs, const int* idVals, int* offsetBuf, int* beginOffsetBuf, curandState_t* curandstate,
-    const int batchSize, const size_t vocabSizePadded, const int* endIds, const float topPp, cudaStream_t stream,
-    const bool* skipDecode);
+    int* sequenceLength, const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
+    float* outputLogProbs, const T* logProbs, const int* idVals, int* offsetBuf, int* beginOffsetBuf,
+    curandState_t* curandstate, const int batchSize, const size_t vocabSizePadded, const int* endIds, const float topPp,
+    cudaStream_t stream, const bool* skipDecode);
 
 //! \brief Compute the topp decay by https://arxiv.org/pdf/2206.04624.pdf
 //!        In short, the formula is

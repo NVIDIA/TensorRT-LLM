@@ -1,7 +1,6 @@
 [submodule "3rdparty/cutlass"]
 	path = 3rdparty/cutlass
 	url = https://github.com/NVIDIA/cutlass.git
-	branch = v2.10.0
 [submodule "3rdparty/json"]
 	path = 3rdparty/json
 	url = https://github.com/nlohmann/json.git

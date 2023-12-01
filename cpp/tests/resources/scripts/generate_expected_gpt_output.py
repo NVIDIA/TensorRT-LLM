@@ -22,7 +22,8 @@ import run
 def generate_output(engine: str,
                     num_beams: int,
                     output_name: str,
-                    max_output_len: int = 8):
+                    max_output_len: int = 8,
+                    output_logits: bool = False):
     tp_size = 1
     pp_size = 1
     model = 'gpt2'
@@ -41,13 +42,22 @@ def generate_output(engine: str,
 
     output_name += '_tp' + str(tp_size) + '_pp' + str(pp_size)
 
-    run.generate(engine_dir=str(engine_dir),
-                 input_file=str(input_file),
-                 tokenizer_path=str(models_dir / model),
-                 output_npy=str(output_dir / (output_name + '.npy')),
-                 output_csv=str(output_dir / (output_name + '.csv')),
-                 max_output_len=max_output_len,
-                 num_beams=num_beams)
+    output_logits_npy = None
+    if output_logits:
+        output_logits_npy = str(output_dir / (output_name + '_logits' + '.npy'))
+
+    args = run.parse_arguments([
+        '--engine_dir',
+        str(engine_dir), '--input_file',
+        str(input_file), '--tokenizer_dir',
+        str(models_dir / model), '--output_npy',
+        str(output_dir / (output_name + '.npy')), '--output_csv',
+        str(output_dir / (output_name + '.csv')), '--max_output_len',
+        str(max_output_len), '--num_beams',
+        str(num_beams), '--output_logits_npy',
+        str(output_logits_npy)
+    ])
+    run.main(args)
 
 
 def generate_outputs(num_beams):
@@ -71,9 +81,14 @@ def generate_outputs(num_beams):
     generate_output(engine='fp16-plugin-packed',
                     num_beams=num_beams,
                     output_name='output_tokens_fp16_plugin_packed')
+    generate_output(engine='fp16-plugin-packed-paged-gather',
+                    num_beams=num_beams,
+                    output_name='output_tokens_fp16_plugin_packed_paged_gather',
+                    output_logits=True)
     generate_output(engine='fp16-plugin-packed-paged',
                     num_beams=num_beams,
-                    output_name='output_tokens_fp16_plugin_packed_paged')
+                    output_name='output_tokens_fp16_plugin_packed_paged',
+                    output_logits=False)
 
 
 if __name__ == '__main__':

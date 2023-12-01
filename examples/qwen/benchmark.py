@@ -21,11 +21,13 @@ import time
 from typing import List, Tuple
 
 import torch
-from run import QWenForCausalLMGenerationSession, get_model
 from tqdm import tqdm, trange
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           PreTrainedTokenizerBase)
 from utils.utils import get_stop_words_ids, make_context
+
+import tensorrt_llm
+from tensorrt_llm.runtime import ModelRunner, SamplingConfig
 
 now_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -97,16 +99,38 @@ def run_trt_llm(
         raise Exception(
             "max batch size {} must be lower than trt_max_batch_size {}".format(
                 max_batch_size, TRT_MAX_BATCH_SIZE))
-    (model_config, sampling_config, runtime_mapping, runtime_rank,
-     serialize_path, remove_input_padding, tokenizer, eos_token_id,
-     pad_token_id) = get_model(
-         tokenizer_dir=tokenizer_dir,
-         engine_dir=engine_dir,
-     )
-    with open(serialize_path, 'rb') as f:
-        engine_buffer = f.read()
-    decoder = QWenForCausalLMGenerationSession(model_config, engine_buffer,
-                                               runtime_mapping)
+
+    # Ad hoc update to ModelRunner
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_dir,
+        legacy=False,
+        trust_remote_code=True,
+    )
+    gen_config_path = os.path.join(tokenizer_dir, 'generation_config.json')
+    with open(gen_config_path, 'r') as f:
+        gen_config = json.load(f)
+    top_k = gen_config['top_k']
+    top_p = gen_config['top_p']
+    chat_format = gen_config['chat_format']
+    if chat_format == "raw":
+        eos_token_id = gen_config['eos_token_id']
+        pad_token_id = gen_config['pad_token_id']
+    elif chat_format == "chatml":
+        pad_token_id = eos_token_id = tokenizer.im_end_id
+    else:
+        raise Exception("unknown chat format ", chat_format)
+
+    sampling_config = SamplingConfig(
+        end_id=eos_token_id,
+        pad_id=pad_token_id,
+        num_beams=1,
+        top_k=top_k,
+        top_p=top_p,
+    )
+
+    runtime_rank = tensorrt_llm.mpi_rank()
+    runner = ModelRunner.from_dir(engine_dir, rank=runtime_rank)
+    decoder = runner.session
 
     # Add the requests to the engine.
     sampling_config.num_beams = n

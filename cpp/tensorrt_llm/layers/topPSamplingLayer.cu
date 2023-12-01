@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
 #include "tensorrt_llm/layers/topPSamplingLayer.h"
@@ -242,10 +243,14 @@ void TopPSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingPa
         topp_id_vals_buf_, topp_offset_buf_, begin_topp_offset_buf_, local_batch_size, vocab_size_padded_, stream_);
     sync_check_cuda_error();
 
-    bool* finished_input = (params.finished) ? params.finished->template getPtr<bool>() : nullptr;
-    bool* finished_output = (outputs.finished) ? outputs.finished->template getPtr<bool>() : nullptr;
-    invokeAddBiasSoftMax(
-        logits, (T*) (nullptr), end_ids, finished_input, local_batch_size, vocab_size_, vocab_size_padded_, stream_);
+    FinishedState* finished_input = (params.finished)
+        ? reinterpret_cast<FinishedState*>(params.finished->template getPtr<FinishedState::UnderlyingType>())
+        : nullptr;
+    FinishedState* finished_output = (outputs.finished)
+        ? reinterpret_cast<FinishedState*>(outputs.finished->template getPtr<FinishedState::UnderlyingType>())
+        : nullptr;
+    invokeAddBiasSoftMax(logits, logits, (T*) (nullptr), end_ids, finished_input, local_batch_size, vocab_size_,
+        vocab_size_padded_, stream_);
     sync_check_cuda_error();
 
     float* cum_log_probs = (outputs.cum_log_probs) ? outputs.cum_log_probs->template getPtr<float>() : nullptr;

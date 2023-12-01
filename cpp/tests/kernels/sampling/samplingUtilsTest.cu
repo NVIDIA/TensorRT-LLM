@@ -190,7 +190,8 @@ public:
         auto biasHost = this->mBufferManager->pinned(ITensor::makeShape({vocabSize}),
             std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
         auto endIdsHost = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
-        auto finishedHost = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kBOOL);
+        auto finishedHost = this->mBufferManager->pinned(
+            ITensor::makeShape({batchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
 
         auto logitsHostPtr = bufferCast<T>(*logitsHost);
         auto refLogitsHostPtr = bufferCast<float>(*refLogitsHost);
@@ -202,17 +203,19 @@ public:
         auto biasDevice = this->mBufferManager->copyFrom(*biasHost, MemoryType::kGPU);
 
         auto endIdsHostPtr = bufferCast<int32_t>(*endIdsHost);
-        auto finishedHostPtr = bufferCast<bool>(*finishedHost);
+        auto finishedHostPtr
+            = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*finishedHost));
 
         std::mt19937 gen(42);
         std::uniform_int_distribution<> endIdsDistr(
             0, vocabSize - 1); // -1 because uniform_int_distribution generates closed interval
-        std::uniform_int_distribution<> finishedDistr(
-            0, 99);            // 99 because uniform_int_distribution generates closed interval
+        std::uniform_real_distribution<> finishedDist(0, 1); // uniform distribution between 0 and 1
+
         for (SizeType bi = 0; bi < batchSize; ++bi)
         {
             endIdsHostPtr[bi] = endIdsDistr(gen);
-            finishedHostPtr[bi] = finishedDistr(gen) > 30 ? false : true; // finished with probability 0.3
+
+            finishedHostPtr[bi] = finishedDist(gen) < 0.3 ? tk::FinishedState::finished() : tk::FinishedState::empty();
         }
 
         auto endIdsDevice = this->mBufferManager->copyFrom(*endIdsHost, MemoryType::kGPU);
@@ -222,12 +225,15 @@ public:
         if (!computeSoftmax)
         {
             tk::invokeAddBiasEndMask(bufferCast<T>(*logitsDevice), biasDevicePtr, bufferCast<int32_t>(*endIdsDevice),
-                bufferCast<bool>(*finishedDevice), batchSize, vocabSize, vocabSizePadded, this->mStream->get());
+                reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*finishedDevice)),
+                batchSize, vocabSize, vocabSizePadded, this->mStream->get());
         }
         else
         {
-            tk::invokeAddBiasSoftMax(bufferCast<T>(*logitsDevice), biasDevicePtr, bufferCast<int32_t>(*endIdsDevice),
-                bufferCast<bool>(*finishedDevice), batchSize, vocabSize, vocabSizePadded, this->mStream->get());
+            tk::invokeAddBiasSoftMax(bufferCast<T>(*logitsDevice), bufferCast<T>(*logitsDevice), biasDevicePtr,
+                bufferCast<int32_t>(*endIdsDevice),
+                reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*finishedDevice)),
+                batchSize, vocabSize, vocabSizePadded, this->mStream->get());
         }
 
         this->mStream->synchronize();
@@ -248,7 +254,7 @@ public:
                 {
                     refLogit = -MAX_T_VAL;
                 }
-                else if (finishedHostPtr[bi])
+                else if (finishedHostPtr[bi].isFinished())
                 {
                     refLogit = (vi == endIdsHostPtr[bi]) ? MAX_T_VAL : -MAX_T_VAL;
                 }

@@ -55,7 +55,8 @@ public:
         std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType> promptVocabSize = std::nullopt, bool returnLogProbs = false,
-        std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt)
+        std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
+        std::optional<TensorPtr> draftLogits = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -75,6 +76,7 @@ public:
         , mLogProbs(samplingConfig.beamWidth)
         , mCumLogProbs(samplingConfig.beamWidth)
         , mDraftTokens(draftTokens.value_or(std::make_shared<VecTokens>()))
+        , mDraftLogits(draftLogits)
     {
         mMaxSentTokenPos = mPromptLen - 1;
         // Scatter the input tokens to other beam
@@ -86,6 +88,13 @@ public:
             std::string errStr
                 = "Prompt embedding table and prompt vocab size tensors must both be provided for requests with prompt "
                   "tuning enabled.";
+            TLLM_LOG_ERROR(errStr);
+            throw std::runtime_error(errStr);
+        }
+
+        if (draftLogits.has_value() && !draftTokens.has_value())
+        {
+            std::string errStr = "Draft tokens must be specified when draft logits are given.";
             TLLM_LOG_ERROR(errStr);
             throw std::runtime_error(errStr);
         }
@@ -135,6 +144,13 @@ public:
         return mDraftTokens;
     }
 
+    /// @brief Get the logits for the draft tokens
+    /// @return Tensor of draft logits
+    std::optional<TensorPtr> getDraftLogits() const
+    {
+        return mDraftLogits;
+    }
+
     /// @brief Returns true if request has draft tokens
     /// @return flag
     bool hasDraftTokens() const
@@ -162,7 +178,7 @@ public:
     ///                   beamTokens is expected to be of size beamWidth
     void addNewTokens(const std::vector<TokenIdType>& beamTokens)
     {
-        assert(mSamplingConfig.beamWidth == beamTokens.size());
+        assert(static_cast<size_t>(mSamplingConfig.beamWidth) == beamTokens.size());
         for (std::size_t beam = 0; beam < beamTokens.size(); ++beam)
         {
             const auto outputId = beamTokens[beam];
@@ -174,7 +190,7 @@ public:
     /// @param generatedBeamTokens The generated tokens for all beams (vector of vector of tokens)
     void setGeneratedTokens(const BeamTokens& generatedBeamTokens)
     {
-        assert(generatedBeamTokens.size() == mSamplingConfig.beamWidth);
+        assert(generatedBeamTokens.size() == static_cast<size_t>(mSamplingConfig.beamWidth));
         for (std::size_t beam = 0; beam < generatedBeamTokens.size(); ++beam)
         {
             auto& beamTokens = mTokens[beam];
@@ -305,6 +321,11 @@ public:
         mDraftTokens = draftTokens;
     }
 
+    void setDraftLogits(const std::optional<TensorPtr>& draftLogits)
+    {
+        mDraftLogits = draftLogits;
+    }
+
     RequestIdType mRequestId;
     SizeType mPromptLen;
     SizeType mMaxNewTokens;
@@ -333,6 +354,7 @@ protected:
     std::vector<VecLogProbs> mLogProbs; // [beamSize, seqLen]
     VecLogProbs mCumLogProbs;           // [beamSize]
     std::shared_ptr<VecTokens> mDraftTokens;
+    std::optional<TensorPtr> mDraftLogits;
 };
 
 class LlmRequest : public GenericLlmRequest<runtime::ITensor::SharedPtr>
@@ -353,9 +375,11 @@ public:
         std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType> promptVocabSize = std::nullopt, bool returnLogProbs = false,
-        std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt)
+        std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
+        std::optional<TensorPtr> draftLogits = std::nullopt)
         : Base(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming, endId, padId, embeddingBias,
-            badWordsList, stopWordsList, promptEmbeddingTable, promptVocabSize, returnLogProbs, draftTokens)
+            badWordsList, stopWordsList, promptEmbeddingTable, promptVocabSize, returnLogProbs, draftTokens,
+            draftLogits)
     {
     }
 

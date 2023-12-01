@@ -20,6 +20,7 @@
 #include <memory>
 #include <random>
 
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/samplingPenaltyKernels.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
@@ -259,8 +260,9 @@ protected:
         std::uniform_int_distribution<>& endIdsDistr);
 
     void verifyCurrentStep(int32_t batchSize, int32_t vocabSize, int32_t maxSeqLen, int32_t step, bool greedySearch,
-        bool useSkipDecode, bool hasDiffRuntimeArgs, std::vector<bool>& refFinished, std::vector<int32_t>& refSeqLength,
-        const std::vector<bool>& finishedCurrentStep);
+        bool useSkipDecode, bool hasDiffRuntimeArgs, std::vector<tensorrt_llm::kernels::FinishedState>& refFinished,
+        std::vector<int32_t>& refSeqLength,
+        const std::vector<tensorrt_llm::kernels::FinishedState>& finishedCurrentStep);
 
 private:
     void runTest(const SamplingKernelTestParam& param, bool hasDiffRuntimeArgs, bool useSkipDecode);

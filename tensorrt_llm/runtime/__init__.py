@@ -14,7 +14,8 @@
 # limitations under the License.
 from .generation import SamplingConfig  # autoflake: skip
 from .generation import (ChatGLMGenerationSession, GenerationSession,
-                         ModelConfig, to_word_list_format)
+                         ModelConfig, QWenForCausalLMGenerationSession,
+                         to_word_list_format)
 from .kv_cache_manager import GenerationSequence, KVCacheManager
 from .lora_manager import LoraManager  # autoflake: skip
 from .model_runner import ModelRunner
@@ -30,6 +31,7 @@ __all__ = [
     'Session',
     'TensorInfo',
     'ChatGLMGenerationSession',
+    'QWenForCausalLMGenerationSession',
     'to_word_list_format',
     'ModelRunner',
 ]

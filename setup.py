@@ -91,7 +91,7 @@ setup(
             'libs/libth_common.so',
             'libs/libnvinfer_plugin_tensorrt_llm.so',
             'bindings.*.so',
-        ]) + ['bindings.pyi', 'tools/plugin_gen/templates/*'],
+        ]) + ['bindings/*.pyi', 'tools/plugin_gen/templates/*'],
     },
     python_requires=">=3.7, <4",
     distclass=BinaryDistribution,

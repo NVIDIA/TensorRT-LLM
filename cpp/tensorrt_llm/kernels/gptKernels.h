@@ -59,8 +59,10 @@ enum class RotaryScalingType : int8_t
 template <typename AttentionMaskDataType>
 struct BuildDecoderInfoParams
 {
-    // The offsets to the 1st token in each sequence. Shape: [batchSize+1].
-    int* seqOffsets;
+    // The offsets to the 1st token in each sequence of Q buffer. Shape: [batchSize+1].
+    int* seqQOffsets;
+    // The offsets to the 1st token in each sequence of KV buffer. Shape: [batchSize+1].
+    int* seqKVOffsets;
     // The number of padded tokens in the corresponding padded tensor before the current token. Shape: [numTokens].
     int* paddingOffsets;
 
@@ -69,8 +71,10 @@ struct BuildDecoderInfoParams
     // Shape: [batchSize, maxSeqLength, maxSeqLength].
     AttentionMaskDataType* attentionMask;
 
-    // The length of each sequence in the batch. Shape: [batchSize].
-    const int* seqLengths;
+    // The Q length of each sequence in the batch. Shape: [batchSize].
+    const int* seqQLengths;
+    // The KV length of each sequence in the batch. Shape: [batchSize].
+    const int* seqKVLengths;
 
     // The number of sequences in the batch.
     int batchSize;
