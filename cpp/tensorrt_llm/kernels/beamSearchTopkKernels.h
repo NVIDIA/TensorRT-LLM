@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 
-#include <cuda_runtime.h>
-
 #pragma once
+
+#include "tensorrt_llm/kernels/decodingCommon.h"
+#include <cuda_runtime.h>
 
 namespace tensorrt_llm
 {
@@ -76,7 +77,7 @@ void invokeTileEncoderResults(T* tiled_encoder_output, int* tiled_encoder_sequen
     const int* encoder_sequence_length, const size_t batch_size, const size_t beam_width, const size_t mem_max_seq_len,
     const size_t d_model, cudaStream_t stream);
 
-void invokeInsertUnfinishedPath(BeamHypotheses beam_hyps, const bool* finished, const float* cum_log_probs,
+void invokeInsertUnfinishedPath(BeamHypotheses beam_hyps, const FinishedState* finished, const float* cum_log_probs,
     const int batch_size, const int beam_width, cudaStream_t stream);
 
 void invokeCopyBatchMajorToGeneralPtr(

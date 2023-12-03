@@ -5,22 +5,26 @@ This document explains how to build the [ChatGLM-6B](https://huggingface.co/THUD
 ## Overview
 
 The TensorRT-LLM ChatGLM implementation can be found in [`tensorrt_llm/models/chatglm/model.py`](../../tensorrt_llm/models/chatglm/model.py).
-The TensorRT-LLM ChatGLM example code is located in [`examples/chatglm`](./). There are two main files:
+The TensorRT-LLM ChatGLM example code is located in [`examples/chatglm`](./). There is one main file:
 
 * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the ChatGLM model.
-* [`run.py`](./run.py) to run the inference on an input text.
+
+In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
+
+* [`../run.py`](../run.py) to run the inference on an input text;
+* [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
 
-|    Model Name    | FP16  | FMHA  |  WO   |  AWQ  |  SQ   |  TP   |  PP   | Strongly Typed | C++ Runtime | benchmark |  IFB  |
-| :--------------: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :------------: | :---------: | :-------: | :---: |
-|    chatglm_6b    |   Y   |   Y   |   Y   |       |       |   Y   |       |       Y        |      Y      |     Y     |       |
-|   chatglm2_6b    |   Y   |   Y   |   Y   |       |       |   Y   |       |       Y        |      Y      |     Y     |       |
-| chatglm2-6b_32k  |   Y   |   Y   |   Y   |       |       |   Y   |       |       Y        |      Y      |     Y     |       |
-|   chatglm3_6b    |   Y   |   Y   |   Y   |       |       |   Y   |       |       Y        |      Y      |     Y     |       |
-| chatglm3_6b_base |   Y   |   Y   |   Y   |       |       |   Y   |       |       Y        |      Y      |     Y     |       |
-| chatglm3_6b_32k  |   Y   |   Y   |   Y   |       |       |   Y   |       |       Y        |      Y      |     Y     |       |
-|     glm_10b      |   Y   |   Y   |   Y   |       |       |   Y   |       |       Y        |             |           |       |
+|    Model Name    | FP16  | FMHA  |  WO   |  AWQ  |  SQ   |  TP   |  PP   |  ST   | C++ Runtime | benchmark |  IFB  |
+| :--------------: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---------: | :-------: | :---: |
+|    chatglm_6b    |   Y   |   Y   |   Y   |       |       |   Y   |       |   Y   |      Y      |     Y     |   Y   |
+|   chatglm2_6b    |   Y   |   Y   |   Y   |       |       |   Y   |       |   Y   |      Y      |     Y     |   Y   |
+| chatglm2-6b_32k  |   Y   |   Y   |   Y   |       |       |   Y   |       |   Y   |      Y      |     Y     |   Y   |
+|   chatglm3_6b    |   Y   |   Y   |   Y   |       |       |   Y   |       |   Y   |      Y      |     Y     |   Y   |
+| chatglm3_6b_base |   Y   |   Y   |   Y   |       |       |   Y   |       |   Y   |      Y      |     Y     |   Y   |
+| chatglm3_6b_32k  |   Y   |   Y   |   Y   |       |       |   Y   |       |   Y   |      Y      |     Y     |   Y   |
+|     glm_10b      |   Y   |   Y   |   Y   |       |       |   Y   |       |   Y   |             |           |       |
 
 * Model Name: the name of the model, the same as the name on HuggingFace
 * FMHA: Fused MultiHead Attention (see introduction below)
@@ -29,6 +33,7 @@ The TensorRT-LLM ChatGLM example code is located in [`examples/chatglm`](./). Th
 * SQ:Smooth Quantization
 * TP: Tensor Parallel
 * PP: Pipeline Parallel
+* ST: Strongly Typed
 * IFB: In-flight Batching (see introduction below)
 
 ## Usage
@@ -67,44 +72,44 @@ git clone https://huggingface.co/THUDM/glm-10b          glm_10b
 
 ```bash
 # Build a default engine of ChatGLM3-6B on single GPU with FP16, GPT Attention plugin, Gemm plugin, RMS Normolization plugin
-python3 build.py -m chatglm3_6b
+python3 build.py -m chatglm3_6b --output_dir trt_engines/chatglm3_6b/fp16/1-gpu
 
 # Build a engine on single GPU with FMHA kernels (see introduction below), other configurations are the same as default example
-python3 build.py -m chatglm3_6b --enable_context_fmha  # or --enable_context_fmha_fp32_acc
+python3 build.py -m chatglm3_6b --enable_context_fmha --output_dir trt_engines/chatglm3_6b/fp16/1-gpu  # or --enable_context_fmha_fp32_acc
 
 # Build a engine on single GPU with int8/int4 Weight-Only quantization, other configurations are the same as default example
-python3 build.py -m chatglm3_6b --use_weight_only  # or --use_weight_only --weight_only_precision int4
+python3 build.py -m chatglm3_6b --use_weight_only --output_dir trt_engines/chatglm3_6b/weight_only/1-gpu  # or --use_weight_only --weight_only_precision int4
 
 # Build a engine on single GPU with int8_kv_cache and remove_input_padding, other configurations are the same as default example
-python3 build.py -m chatglm3_6b --paged_kv_cache --remove_input_padding
+python3 build.py -m chatglm3_6b --paged_kv_cache --remove_input_padding --output_dir trt_engines/chatglm3_6b/fp16/1-gpu
 
 # Build a engine on two GPU, other configurations are the same as default example
-python3 build.py -m chatglm3_6b --world_size 2
+python3 build.py -m chatglm3_6b --world_size 2 --output_dir trt_engines/chatglm3_6b/fp16/2-gpu
 
 # Build a engine of Chatglm-6B on single GPU, other configurations are the same as default example
-python3 build.py -m chatglm_6b
+python3 build.py -m chatglm_6b --output_dir trt_engines/chatglm_6b/fp16/1-gpu
 
 # Build a engine of Chatglm2-6B on single GPU, other configurations are the same as default example
-python3 build.py -m chatglm2_6b
+python3 build.py -m chatglm2_6b --output_dir trt_engines/chatglm2_6b/fp16/1-gpu
 
 # Build a engine of ChatGLM2-6B-32k on single GPU, other configurations are the same as default example
-python3 build.py -m chatglm2_6b-32k
+python3 build.py -m chatglm2_6b-32k --output_dir trt_engines/chatglm2_6b-32k/fp16/1-gpu
 
 # Build a engine of ChatGLM3-6B-Base on single GPU, other configurations are the same as default example
-python3 build.py -m chatglm3_6b_base
+python3 build.py -m chatglm3_6b_base --output_dir trt_engines/chatglm3_6b_base/fp16/1-gpu
 
 # Build a engine of ChatGLM3-6B-32k on single GPU, other configurations are the same as default example
-python3 build.py -m chatglm3_6b-32k
+python3 build.py -m chatglm3_6b-32k --output_dir trt_engines/chatglm3_6b-32k/fp16/1-gpu
 
 # Build a engine of GLM-10B on single GPU, other configurations are the same as default example
-python3 build.py -m glm_10b
+python3 build.py -m glm_10b --output_dir trt_engines/glm_10b/fp16/1-gpu
 ```
 
 #### Enabled plugins
 
-* Use `--use_gemm_plugin <DataType>` to configure GPT Attention plugin (default as float16)
-* Use `--use_gemm_plugin <DataType>` to configure GEMM normolization plugin (default as float16)
-* Use `--use_layernorm_plugin <DataType>` (for ChatGLM-6B and GLM-10B models) to configure RMS normolization plugin (default as float16)
+* Use `--use_gpt_attention_plugin <DataType>` to configure GPT Attention plugin (default as float16)
+* Use `--use_gemm_plugin <DataType>` to configure GEMM plugin (default as float16)
+* Use `--use_layernorm_plugin <DataType>` (for ChatGLM-6B and GLM-10B models) to configure layernorm normolization plugin (default as float16)
 * Use `--use_rmsnorm_plugin <DataType>` (for ChatGLM2-6B\* and ChatGLM3-6B\* models) to configure RMS normolization plugin (default as float16)
 
 #### Fused MultiHead Attention (FMHA)
@@ -139,14 +144,37 @@ python3 build.py -m glm_10b
 
 ```bash
 # Run the default engine of ChatGLM3-6B on single GPU, other model name is available if built.
-python3 run.py -m chatglm3_6b
+python3 ../run.py --input_text "What's new between ChatGLM3-6B and ChatGLM2-6B?" \
+                  --max_output_len 50 \
+                  --tokenizer_dir chatglm3_6b \
+                  --engine_dir trt_engines/chatglm3_6b/fp16/1-gpu
+
+# Run the default engine of ChatGLM3-6B on single GPU, using streaming output, other model name is available if built.
+# In this case only the first sample in the first batch is shown,
+# But actually all output of all batches are available.
+python3 ../run.py --input_text "What's new between ChatGLM3-6B and ChatGLM2-6B?" \
+                  --max_output_len 50 \
+                  --tokenizer_dir chatglm3_6b \
+                  --engine_dir trt_engines/chatglm3_6b/fp16/1-gpu \
+                  --streaming
+
+# Run the default engine of GLM3-10B on single GPU, other model name is available if built.
+# Token "[MASK]" or "[sMASK]" or "[gMASK]" must be included inside the prompt as the original model commanded.
+python3 ../run.py --input_text "Peking University is [MASK] than Tsinghua Univercity." \
+                  --max_output_len 50 \
+                  --tokenizer_dir glm_10b \
+                  --engine_dir trt_engines/glm_10b/fp16/1-gpu
 ```
 
 #### Single node, multi GPU
 
 ```bash
 # Run the Tensor Parallel 2 engine of ChatGLM3-6B on two GPU, other model name is available if built.
-mpirun -n 2 python run.py -m chatglm3_6b
+mpirun -n 2 \
+    python ../run.py --input_text "What's new between ChatGLM3-6B and ChatGLM2-6B?" \
+                     --max_output_len 50 \
+                     --tokenizer_dir chatglm3_6b \
+                     --engine_dir trt_engines/chatglm3_6b/fp16/1-gpu
 ```
 
 * `--allow-run-as-root` might be needed if using `mpirun` as root.
@@ -155,7 +183,9 @@ mpirun -n 2 python run.py -m chatglm3_6b
 
 ```bash
 # Run the summarization of ChatGLM3-6B task, other model name is available if built.
-python3 ../summarize.py -m chatglm3_6b
+python3 ../summarize.py --test_trt_llm \
+                        --hf_model_dir chatglm3_6b \
+                        --engine_dir trt_engines/chatglm3_6b/fp16/1-gpu
 ```
 
 ## Benchmark

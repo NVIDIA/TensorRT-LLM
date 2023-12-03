@@ -122,7 +122,7 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
             else:
                 position_embedding_type = PositionEmbeddingType.learned_absolute
             outputs = tensorrt_llm.functional.gpt_attention(
-                tensor=qkv,
+                qkv=qkv,
                 past_key_value=past_key_value_tensor,
                 sequence_length=sequence_length_tensor,
                 host_past_key_value_lengths=host_past_key_value_lengths_tensor,
@@ -417,7 +417,7 @@ class GPTAttentionPluginRemovePaddingRewritePass(PatternRewriter):
 
         flayer = FLayerInfoMemo.instance().get(layer.name)
         assert flayer
-        tensor_input: Tensor = flayer.get_input('tensor')
+        tensor_input: Tensor = flayer.get_input('qkv')
         if tensor_input.shape[0] == 1:  # already on remove-padding mode
             return False
 
@@ -434,11 +434,11 @@ class GPTAttentionPluginRemovePaddingRewritePass(PatternRewriter):
         with net_guard(layer.network):
             # Step 1: create new inputs and repalce the original arglist
             input = Tensor(
-                name='tensor',
+                name='qkv',
                 dtype=trt.float16,
                 shape=(1, batch_size * in_len, hidden_size),
             )
-            new_inputs['tensor'] = input
+            new_inputs['qkv'] = input
 
             # Step 2: create a new plugin instance
             new_outs = gpt_attention(**new_inputs)

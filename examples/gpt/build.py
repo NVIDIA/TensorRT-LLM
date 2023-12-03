@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import math
 import time
 from pathlib import Path
 from typing import List
@@ -54,7 +55,7 @@ def serialize_engine(engine, path):
     logger.info(f'Serializing engine to {path}...')
     tik = time.time()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')
@@ -152,7 +153,7 @@ def parse_arguments(args):
     parser.add_argument(
         '--output_dir',
         type=Path,
-        default='gpt_outputs',
+        default='engine_outputs',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
     )
@@ -232,7 +233,7 @@ def parse_arguments(args):
     )
     parser.add_argument('--tokens_per_block',
                         type=int,
-                        default=64,
+                        default=128,
                         help='Number of tokens per block in paged KV cache')
     parser.add_argument(
         '--max_prompt_embedding_table_size',
@@ -319,6 +320,33 @@ def parse_arguments(args):
         help=
         'Maximum lengths of draft tokens for speculative decoding target model.'
     )
+    parser.add_argument(
+        '--lora_target_modules',
+        nargs='+',
+        default=None,
+        choices=[
+            "attn_qkv",
+            "attn_dense",
+            "mlp_h_to_4h",
+            "mlp_gate",
+            "mlp_4h_to_h",
+        ],
+        help=
+        "Add lora in which modules. Only be activated when use_lora_plugin is enabled."
+    )
+
+    parser.add_argument(
+        '--moe_num_experts',
+        default=None,
+        type=int,
+        help='Specify the number of experts to use for MOE layers')
+    parser.add_argument(
+        '--moe_top_k',
+        default=None,
+        type=int,
+        help=
+        'Specify the top_k value to use for MOE layers. Default to 1 if --moe_num_experts is set'
+    )
     args = parser.parse_args(args)
     logger.set_level(args.log_level)
 
@@ -376,6 +404,12 @@ def parse_arguments(args):
             args.paged_kv_cache = True
             logger.info("Using paged KV cache for inflight batching mode.")
 
+    assert (math.log2(args.tokens_per_block).is_integer()
+            ), "tokens_per_block must be power of 2"
+    if args.enable_context_fmha or args.enable_context_fmha_fp32_acc:
+        assert (args.tokens_per_block >=
+                128), "Context fMHA requires >= 128 tokens per block"
+
     if args.use_smooth_quant:
         args.quant_mode = QuantMode.use_smooth_quant(args.per_token,
                                                      args.per_channel)
@@ -408,6 +442,9 @@ def parse_arguments(args):
 
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha or args.enable_context_fmha_fp32_acc
+
+    if args.moe_num_experts and args.moe_top_k is None:
+        args.moe_top_k = 1
 
     return args
 
@@ -470,7 +507,9 @@ def build_rank_engine(builder: Builder,
         use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
-        share_embedding_table=share_embedding_table)
+        share_embedding_table=share_embedding_table,
+        moe_layer_config=tensorrt_llm.moe_config.MoeLayerConfig(
+            args.moe_num_experts, args.moe_top_k))
 
     if args.use_smooth_quant or args.use_weight_only:
         tensorrt_llm_gpt = quantize_model(tensorrt_llm_gpt, args.quant_mode)
@@ -549,6 +588,9 @@ def build_rank_engine(builder: Builder,
         # Use the plugin for the embedding parallelism and sharing
         network.plugin_config.set_lookup_plugin(dtype=args.dtype)
 
+    if args.max_draft_len > 0:
+        network.plugin_config.set_paged_context_fmha()
+
     with net_guard(network):
         # Prepare
         network.set_named_parameters(tensorrt_llm_gpt.named_parameters())
@@ -563,7 +605,8 @@ def build_rank_engine(builder: Builder,
             args.max_num_tokens,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size,
             gather_all_token_logits=args.gather_all_token_logits,
-            max_draft_len=args.max_draft_len)
+            max_draft_len=args.max_draft_len,
+            lora_target_modules=args.lora_target_modules)
         tensorrt_llm_gpt(*inputs)
 
     tensorrt_llm.graph_rewriting.optimize(network)
@@ -624,7 +667,9 @@ def build(rank, args):
             max_prompt_embedding_table_size,
             gather_all_token_logits=args.gather_all_token_logits,
             quant_mode=args.quant_mode,
-            use_parallel_embedding=args.use_parallel_embedding)
+            use_parallel_embedding=args.use_parallel_embedding,
+            lora_target_modules=args.lora_target_modules,
+        )
 
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.world_size,
                                       cur_rank)

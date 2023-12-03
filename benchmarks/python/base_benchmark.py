@@ -15,11 +15,13 @@
 import json
 import os
 import subprocess
+import time
 from collections import OrderedDict
 
 import torch
 
 import tensorrt_llm
+from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization import QuantMode
 
 
@@ -44,23 +46,28 @@ def get_engine_name(model, dtype, tp_size, rank):
 
 
 def serialize_engine(engine, path):
+    logger.info(f'Serializing engine to {path}...')
+    tik = time.time()
     with open(path, 'wb') as f:
         # engine object is already complies with python buffer protocol, no need to
         # convert it to bytearray before write, converting to bytearray consumes lots of memory
         f.write(engine)
+    tok = time.time()
+    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
+    logger.info(f'Engine serialized. Total time: {t}')
 
 
 class BaseBenchmark(object):
 
-    def __init__(self, engine_dir, model_name, dtype, output_dir):
+    def __init__(self, engine_dir, model_name, dtype):
         self.engine_dir = engine_dir
         self.model_name = model_name
         self.dtype = dtype
-        self.output_dir = output_dir
         self.runtime_rank = tensorrt_llm.mpi_rank()
         self.world_size = tensorrt_llm.mpi_world_size()
         self.engine_model_name = model_name
         self.quant_mode = QuantMode(0)
+        self.enable_fp8 = False
         if engine_dir is not None:
             # Read config from engine directory
             config_path = os.path.join(engine_dir, 'config.json')
@@ -98,7 +105,7 @@ class BaseBenchmark(object):
 
         self.csv_filename = ""  # lazy init
 
-    def get_report_dict(self):
+    def get_report_dict(self, benchmark_profiler=None):
         report_fields = [
             "model_name", "world_size", "num_heads", "num_kv_heads",
             "num_layers", "hidden_size", "vocab_size", "precision",
@@ -122,9 +129,9 @@ class BaseBenchmark(object):
                                                  fp8linear=int(self.enable_fp8))
         return self.csv_filename
 
-    def print_report_header(self, csv=False):
+    def print_report_header(self, csv=False, benchmark_profiler=None):
         if csv and self.runtime_rank == 0:
-            report_dict = self.get_report_dict()
+            report_dict = self.get_report_dict(benchmark_profiler)
             line = ",".join(report_dict.keys())
             print(line)
             with open(self.get_csv_filename(), "a") as file:
@@ -136,7 +143,7 @@ class BaseBenchmark(object):
     def prepare_inputs(self, config):
         raise NotImplementedError
 
-    def run(self, inputs, config):
+    def run(self, inputs, config, benchmark_profiler=None):
         raise NotImplementedError
 
     def report(self, config, latency):

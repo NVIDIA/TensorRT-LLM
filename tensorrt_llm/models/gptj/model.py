@@ -151,9 +151,10 @@ class GPTJModel(Module):
         if use_cache:
             presents = []
 
-        for layer, past, pointer, max_kv_cache_length in zip(
+        for layer, past, pointer, host_pointer, max_kv_cache_length in zip(
                 self.layers, kv_cache_params.past_key_value,
                 kv_cache_params.kv_cache_block_pointers,
+                kv_cache_params.host_kv_cache_block_pointers,
                 kv_cache_params.host_max_kv_cache_lengths):
             hidden_states = layer(
                 hidden_states,
@@ -164,6 +165,7 @@ class GPTJModel(Module):
                     host_past_key_value_lengths,
                     host_max_kv_cache_lengths=max_kv_cache_length,
                     kv_cache_block_pointers=[pointer],
+                    host_kv_cache_block_pointers=[host_pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params)
 
@@ -309,6 +311,8 @@ class GPTJForCausalLM(GPTJModel, GenerationMixin):
                         'host_max_kv_cache_lengths'],
                     kv_cache_block_pointers=model_inputs[
                         'kv_cache_block_pointers_list'],
+                    host_kv_cache_block_pointers=model_inputs[
+                        'host_kv_cache_block_pointers_list'],
                     cache_indirection=model_inputs['cache_indirection'],
                 ),
                 AttentionParams(

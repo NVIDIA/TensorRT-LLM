@@ -128,7 +128,7 @@ class SmoothQuantLinear(Module):
         else:
             self.register_parameter('bias', None)
 
-    def forward(self, x):
+    def forward(self, x, lora_runtime_param=None):
         if self.quant_mode.has_act_static_scaling():
             per_token_scale = self.act_scale.value
         else:
@@ -195,7 +195,7 @@ class SmoothQuantRowLinear(Module):
         self.tp_size = tp_size
         self.quant_mode = quant_mode
 
-    def forward(self, x, workspace=None):
+    def forward(self, x, workspace=None, lora_runtime_param=None):
         if self.quant_mode.has_act_static_scaling():
             per_token_scale = self.act_scale.value
         else:
@@ -346,7 +346,7 @@ class WeightOnlyQuantLinear(Module):
         else:
             self.register_parameter('bias', None)
 
-    def forward(self, x):
+    def forward(self, x, lora_runtime_param=None):
         # ootb has not supported int4 yet.
         if self.weight_only_quant_mode == 2 and not default_net(
         ).plugin_config.weight_only_quant_matmul_plugin:
@@ -403,7 +403,7 @@ class WeightOnlyQuantRowLinear(Module):
         self.tp_group = tp_group
         self.tp_size = tp_size
 
-    def forward(self, x, workspace=None):
+    def forward(self, x, workspace=None, lora_runtime_param=None):
         x = weight_only_quant_matmul(x, self.weight.value,
                                      self.per_channel_scale.value,
                                      self.weight_only_quant_mode)
@@ -469,7 +469,7 @@ class WeightOnlyGroupwiseQuantLinear(Module):
         self.tp_group = tp_group
         self.gather_output = gather_output
 
-    def forward(self, x):
+    def forward(self, x, lora_runtime_param=None):
         pre_quant_scale = self.pre_quant_scale.value if self.pre_quant_scale else None
         zero = self.zero.value if self.zero else None
         bias = self.bias.value if self.bias else None
@@ -538,7 +538,7 @@ class WeightOnlyGroupwiseQuantRowLinear(Module):
         self.tp_size = tp_size
         self.tp_group = tp_group
 
-    def forward(self, x, workspace=None):
+    def forward(self, x, workspace=None, lora_runtime_param=None):
         pre_quant_scale = self.pre_quant_scale.value if self.pre_quant_scale else None
         zero = self.zero.value if self.zero else None
         bias = self.bias.value if self.bias else None
@@ -594,7 +594,7 @@ class SmoothQuantMLP(Module):
         else:
             self.register_parameter('quantization_scaling_factor', None)
 
-    def forward(self, hidden_states, workspace=None):
+    def forward(self, hidden_states, workspace=None, lora_runtime_param=None):
         inter = self.fc(hidden_states)
         inter = ACT2FN[self.hidden_act](inter)
         if default_net(
@@ -636,7 +636,7 @@ class Int8SmoothQuantRowLinear(RowLinear):
         self.prequant_scaling_factor = Parameter(shape=(self.in_features, ),
                                                  dtype=dtype)
 
-    def forward(self, x, workspace=None):
+    def forward(self, x, workspace=None, lora_runtime_param=None):
 
         if default_net().strongly_typed:
             assert x.dtype == self.dtype
@@ -709,7 +709,7 @@ class Int8SmoothQuantLinear(Linear):
         self.prequant_scaling_factor = Parameter(shape=(self.in_features, ),
                                                  dtype=dtype)
 
-    def forward(self, x):
+    def forward(self, x, lora_runtime_param=None):
         if default_net().strongly_typed:
             assert x.dtype == self.dtype
             assert x.dtype == self.weight.value.dtype
@@ -774,7 +774,8 @@ class FP8Linear(Linear):
                                                    dtype=trt.float32)
         self.weights_scaling_factor = Parameter(shape=(1, ), dtype=trt.float32)
 
-    def forward(self, x):
+    def forward(self, x, lora_runtime_param=None):
+        assert lora_runtime_param is None, "lora is not supported on FP8Linear now"
         if default_net().strongly_typed:
             assert x.dtype == self.dtype
             assert x.dtype == self.weight.value.dtype
@@ -842,7 +843,8 @@ class FP8RowLinear(RowLinear):
                                                    dtype=trt.float32)
         self.weights_scaling_factor = Parameter(shape=(1, ), dtype=trt.float32)
 
-    def forward(self, x, workspace=None):
+    def forward(self, x, workspace=None, lora_runtime_param=None):
+        assert lora_runtime_param is None, "lora is not supported on FP8RowLinear now"
         if default_net().strongly_typed:
             assert x.dtype == self.dtype
             assert x.dtype == self.weight.value.dtype
@@ -927,7 +929,7 @@ class SmoothQuantGatedMLP(SmoothQuantMLP):
         else:
             self.register_parameter('quantization_scaling_factor', None)
 
-    def forward(self, hidden_states, workspace=None):
+    def forward(self, hidden_states, workspace=None, lora_runtime_param=None):
         inter = self.fc(hidden_states)
         inter = ACT2FN[self.hidden_act](inter)
         gate = self.gate(hidden_states)
@@ -1052,7 +1054,7 @@ class SmoothQuantAttention(Module):
                 kv_cache_params=None,
                 attention_params=None,
                 workspace=None,
-                lora_params=None):
+                lora_param=None):
         # TODO add in-flight batching to SmoothQuant
         if default_net().plugin_config.smooth_quant_gemm_plugin:
             qkv = self.qkv(hidden_states)
@@ -1089,7 +1091,7 @@ class SmoothQuantAttention(Module):
             kv_dequant_scale = self.kv_quant_orig_scale.value if self.quant_mode.has_int8_kv_cache(
             ) else None
             context, past_key_value = gpt_attention(
-                tensor=qkv,
+                qkv=qkv,
                 past_key_value=kv_cache_params.get_first_past_key_value(),
                 sequence_length=attention_params.sequence_length,
                 host_past_key_value_lengths=kv_cache_params.

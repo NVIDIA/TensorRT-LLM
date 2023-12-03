@@ -495,16 +495,11 @@ void interleave_column_major_tensor(int8_t* interleaved_quantized_tensor, const 
     TLLM_CHECK_WITH_INFO(!(num_rows % elts_in_int32),
         fmtstr("The number of rows must be a multiple of %d but the number of rows is %ld.", elts_in_int32, num_rows));
 
-    TLLM_CHECK_WITH_INFO(!(num_cols % rows_per_tile),
-        fmtstr("The number of columns must be a multiple of %d but the number of columns is %lu", rows_per_tile,
-            num_cols));
-
     const uint32_t* input_byte_ptr = reinterpret_cast<const uint32_t*>(quantized_tensor);
     uint32_t* output_byte_ptr = reinterpret_cast<uint32_t*>(interleaved_quantized_tensor);
 
-    TLLM_CHECK_WITH_INFO(!(num_cols % rows_per_tile),
-        fmtstr("The number of columns must be a multiple of %d but the number of columns is %ld.", rows_per_tile,
-            num_cols));
+    TLLM_CHECK_WITH_INFO(!(num_rows % rows_per_tile),
+        fmtstr("The number of rows must be a multiple of %d but the number of rows is %ld.", rows_per_tile, num_rows));
 
     const int num_vec_rows = num_rows / elts_in_int32;
     const int vec_rows_per_tile = rows_per_tile / elts_in_int32;

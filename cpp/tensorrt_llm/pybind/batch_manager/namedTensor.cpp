@@ -17,10 +17,7 @@
 #include "namedTensor.h"
 
 #include "tensorrt_llm/batch_manager/inferenceRequest.h"
-#include "tensorrt_llm/common/stringUtils.h"
-#include "tensorrt_llm/runtime/torchUtils.h"
-#include "tensorrt_llm/runtime/torchView.h"
-#include <memory>
+#include "tensorrt_llm/runtime/torch.h"
 
 namespace tb = tensorrt_llm::batch_manager;
 
@@ -28,20 +25,8 @@ namespace tensorrt_llm::pybind::batch_manager
 {
 
 NamedTensor::NamedTensor(const tb::NamedTensor& cppNamedTensor)
-    : Base(cppNamedTensor.name)
+    : Base(runtime::Torch::tensor(cppNamedTensor.tensor), cppNamedTensor.name)
 {
-    auto cppTensor = cppNamedTensor.tensor;
-    std::vector<at::IntArrayRef::value_type> shapeValues;
-    for (int i = 0; i < cppTensor->getShape().nbDims; ++i)
-    {
-        shapeValues.push_back(cppTensor->getShape().d[i]);
-    }
-
-    tensor = at::from_blob(cppTensor->data(), shapeValues,
-        at::TensorOptions()
-            .device(runtime::TorchUtils::deviceType(cppTensor->getMemoryType()))
-            .pinned_memory(cppTensor->getMemoryType() == runtime::MemoryType::kPINNED)
-            .dtype(runtime::TorchUtils::dataType(cppTensor->getDataType())));
 }
 
 } // namespace tensorrt_llm::pybind::batch_manager

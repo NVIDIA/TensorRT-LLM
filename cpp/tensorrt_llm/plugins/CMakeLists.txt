@@ -45,7 +45,8 @@ set(PLUGIN_LISTS
     weightOnlyGroupwiseQuantMatmulPlugin
     weightOnlyQuantMatmulPlugin
     lookupPlugin
-    loraPlugin)
+    loraPlugin
+    mixtureOfExperts)
 
 foreach(PLUGIN_ITER ${PLUGIN_LISTS})
   include_directories(${PLUGIN_ITER})

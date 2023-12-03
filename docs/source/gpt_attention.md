@@ -94,6 +94,12 @@ multi-block version to become more efficient than the "vanilla" implementation
 that uses a single CUDA thread-block per head. It is controlled by an internal
 heuristic._
 
+Another note is that as the masked MHA kernels use shared memory size
+proportional to sequence length, so there can be some cases that GPU's shared
+memory is not enough when multi-block mode is not enabled. To get masked MHA
+kernel work in these cases, multi-block mode is forced on and a warning log is
+printed.
+
 ## Inflight batching
 
 TensorRT-LLM supports a feature called in-flight batching. With that feature,

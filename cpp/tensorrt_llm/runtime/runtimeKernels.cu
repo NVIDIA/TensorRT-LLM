@@ -62,6 +62,7 @@ void invokeFill(IBuffer& buffer, T const value, CudaStream const& stream)
 // template instantiation
 template void invokeFill(IBuffer&, std::int32_t, CudaStream const&);
 template void invokeFill(IBuffer&, std::int8_t, CudaStream const&);
+template void invokeFill(IBuffer&, std::uint8_t, CudaStream const&);
 template void invokeFill(IBuffer&, bool, CudaStream const&);
 template void invokeFill(IBuffer&, half, CudaStream const&);
 template void invokeFill(IBuffer&, float, CudaStream const&);

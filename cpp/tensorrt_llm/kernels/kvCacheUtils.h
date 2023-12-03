@@ -61,6 +61,7 @@ struct KVBlockArray
         : mMaxSeqs(batchSize)
         , mMaxBlocksPerSeq(maxBlocksPerSeq)
         , mTokensPerBlock(tokensPerBlock)
+        , data(nullptr)
     {
         const float tokensPerBlockSeqLog2 = log2(mTokensPerBlock);
         TLLM_CHECK_WITH_INFO(
@@ -145,6 +146,7 @@ struct KVLinearBuffer
         : mMaxSeqs(batchSize)
         , mMaxSeqLen(tokensPerBlock)
         , mBytesPerSeq(tokensPerBlock * sizePerToken)
+        , data(nullptr)
     {
         // NOTE: pointer offset arithmetic offset is performed on int32_t (see this.getRowPtr).
         // If needed, we could do it on uint32_t or even uint64_t, but that might have performance implications

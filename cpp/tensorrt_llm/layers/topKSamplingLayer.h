@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/tensor.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/layers/baseSamplingLayer.h"
 
 namespace tensorrt_llm

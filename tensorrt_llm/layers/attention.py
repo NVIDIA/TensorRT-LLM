@@ -288,12 +288,14 @@ class KeyValueCacheParams:
                  host_past_key_value_lengths: Tensor = None,
                  host_max_kv_cache_lengths: List[Tensor] = None,
                  kv_cache_block_pointers: List[Tensor] = None,
+                 host_kv_cache_block_pointers: List[Tensor] = None,
                  cache_indirection: Tensor = None,
                  past_key_value_length: Tensor = None):
         self.past_key_value = past_key_value
         self.host_past_key_value_lengths = host_past_key_value_lengths
         self.host_max_kv_cache_lengths = host_max_kv_cache_lengths
         self.kv_cache_block_pointers = kv_cache_block_pointers
+        self.host_kv_cache_block_pointers = host_kv_cache_block_pointers
         self.cache_indirection = cache_indirection
         # self.past_key_value_length = past_key_value_length
 
@@ -306,6 +308,11 @@ class KeyValueCacheParams:
         if self.kv_cache_block_pointers is None:
             return None
         return self.kv_cache_block_pointers[0]
+
+    def get_first_host_kv_cache_block_pointers(self):
+        if self.host_kv_cache_block_pointers is None:
+            return None
+        return self.host_kv_cache_block_pointers[0]
 
     def fill_none_tensor_list(self, list_size):
         if self.past_key_value is None:
@@ -478,12 +485,30 @@ class Attention(Module):
                                                    tp_size, num_buckets),
                                             dtype=dtype)
 
-        self.qkv_lora = Lora(
+        self.q_lora = Lora(
             in_hidden_size=hidden_size,
-            out_hidden_size=hidden_size +
-            (2 * tp_size * self.num_attention_kv_heads *
-             self.attention_head_size),
-            max_low_rank=hidden_size,
+            out_hidden_size=self.num_attention_heads * self.attention_head_size,
+            max_low_rank=min(
+                hidden_size,
+                self.num_attention_heads * self.attention_head_size),
+        )
+
+        self.k_lora = Lora(
+            in_hidden_size=hidden_size,
+            out_hidden_size=self.num_attention_kv_heads *
+            self.attention_head_size,
+            max_low_rank=min(
+                hidden_size,
+                self.num_attention_kv_heads * self.attention_head_size),
+        )
+
+        self.v_lora = Lora(
+            in_hidden_size=hidden_size,
+            out_hidden_size=self.num_attention_kv_heads *
+            self.attention_head_size,
+            max_low_rank=min(
+                hidden_size,
+                self.num_attention_kv_heads * self.attention_head_size),
         )
 
     def forward(self,
@@ -496,7 +521,7 @@ class Attention(Module):
                 workspace=None,
                 position_embedding=None,
                 norm_before_bmm1=False,
-                lora_params=None):
+                lora_param=None):
 
         assert isinstance(hidden_states, Tensor)
 
@@ -513,16 +538,28 @@ class Attention(Module):
                                                  tp_rank=self.tp_rank,
                                                  alibi_scale=alibi_scale)
 
-        qkv = self.qkv(hidden_states)
+        qkv_lora_param = None
+        if lora_param is not None:
+            qkv_lora_param = lora_param.get_runtime_params(0, "attn_qkv")
+        qkv = self.qkv(hidden_states, qkv_lora_param)
 
-        if default_net().plugin_config.lora_plugin:
-            qkv = qkv + self.qkv_lora(
-                hidden_states,
-                host_request_types=attention_params.host_request_types,
-                host_context_lengths=attention_params.host_context_lengths,
-                max_context_length=attention_params.max_context_length,
-                lora_ranks=lora_params.lora_ranks,
-                lora_weights_pointers=lora_params.lora_weights_pointers_list[0])
+        if default_net().plugin_config.lora_plugin and lora_param is not None:
+            q_lora_param = lora_param.get_runtime_params(0, "attn_q")
+            k_lora_param = lora_param.get_runtime_params(0, "attn_k")
+            v_lora_param = lora_param.get_runtime_params(0, "attn_v")
+
+            assert (q_lora_param is not None and k_lora_param is not None and v_lora_param is not None) or \
+                (q_lora_param is None and k_lora_param is None and v_lora_param is None), "q_lora_param, k_lora_param and v_lora_param should be all enabled or all disabled at the same time."
+            if q_lora_param is not None and k_lora_param is not None and v_lora_param is not None:
+                assert qkv_lora_param is None, "Cannot enable qkv_lora_param and split q_lora_parm, k_lora_param, v_lora_param at the same time."
+                q_lora = self.q_lora(hidden_states,
+                                     lora_runtime_param=q_lora_param)
+                k_lora = self.k_lora(hidden_states,
+                                     lora_runtime_param=k_lora_param)
+                v_lora = self.v_lora(hidden_states,
+                                     lora_runtime_param=v_lora_param)
+                qkv_lora = concat([q_lora, k_lora, v_lora], dim=2)
+                qkv = qkv + qkv_lora
 
         if self.position_embedding_type == PositionEmbeddingType.chatglm:
             qkv = RopeEmbeddingUtils.apply_rotary_pos_emb_chatglm(
@@ -573,7 +610,7 @@ class Attention(Module):
             kv_quant_orig_scale = self.kv_quant_orig_scale.value if self.quant_mode.has_kv_cache_quant(
             ) else None
             context, past_key_value = gpt_attention(
-                tensor=qkv,
+                qkv=qkv,
                 past_key_value=past_key_value,
                 sequence_length=attention_params.sequence_length,
                 host_past_key_value_lengths=kv_cache_params.
@@ -603,6 +640,8 @@ class Attention(Module):
                 tp_rank=self.tp_rank,
                 kv_cache_block_pointers=kv_cache_params.
                 get_first_kv_cache_block_pointers(),
+                host_kv_cache_block_pointers=kv_cache_params.
+                get_first_host_kv_cache_block_pointers(),
                 do_cross_attention=self.cross_attention,
                 cross_qkv=cross_qkv,
                 cross_qkv_length=attention_params.encoder_max_input_length,
@@ -611,6 +650,7 @@ class Attention(Module):
                 if self.relative_attention else None,
                 max_distance=self.max_distance,
                 host_context_lengths=attention_params.host_context_lengths,
+                use_cache=use_cache,
             )
 
         else:
@@ -880,7 +920,12 @@ class Attention(Module):
                 concat([shape(context, 0),
                         shape(context, 1), self.hidden_size]))
 
-        context = self.dense(context, workspace)
+        dense_lora_param = None
+        if lora_param is not None:
+            dense_lora_param = lora_param.get_runtime_params(0, "attn_dense")
+        context = self.dense(context,
+                             workspace,
+                             lora_runtime_param=dense_lora_param)
 
         if use_cache:
             return (context, past_key_value)

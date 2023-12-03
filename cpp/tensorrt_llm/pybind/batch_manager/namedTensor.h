@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "tensorrt_llm/batch_manager/NamedTensor.h"
+#include "tensorrt_llm/batch_manager/namedTensor.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
@@ -36,15 +36,19 @@ namespace tb = tensorrt_llm::batch_manager;
 namespace tensorrt_llm::pybind::batch_manager
 {
 
-struct NamedTensor : public tb::GenericNamedTensor<std::optional<at::Tensor>>
+class NamedTensor : public tb::GenericNamedTensor<std::optional<at::Tensor>>
 {
+public:
     using Base = tb::GenericNamedTensor<std::optional<at::Tensor>>;
     using TensorPtr = Base::TensorPtr;
 
     NamedTensor(TensorPtr _tensor, std::string _name)
-        : Base(_tensor, _name){};
+        : Base(std::move(_tensor), std::move(_name)){};
 
-    NamedTensor(const tb::NamedTensor& cppNamedTensor);
+    explicit NamedTensor(std::string _name)
+        : Base(std::move(_name)){};
+
+    explicit NamedTensor(const tb::NamedTensor& cppNamedTensor);
 };
 
 } // namespace tensorrt_llm::pybind::batch_manager

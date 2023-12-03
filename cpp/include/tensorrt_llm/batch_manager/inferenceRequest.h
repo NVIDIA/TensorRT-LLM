@@ -16,113 +16,82 @@
 
 #pragma once
 
-#include <cassert>
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <iostream>
-#include <list>
-#include <map>
-#include <memory>
-#include <mutex>
-#include <set>
-#include <string>
-#include <thread>
-#include <tuple>
-#include <vector>
-
-#include "tensorrt_llm/batch_manager/NamedTensor.h"
+#include "tensorrt_llm/batch_manager/namedTensor.h"
+#include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager
 {
 
-template <typename TTensor, typename TTensorMap>
+namespace inference_request
+{
+// Input tensors
+auto constexpr kInputIdsTensorName = "input_ids";
+auto constexpr kDraftInputIdsTensorName = "draft_input_ids";
+auto constexpr kDraftLogitsTensorName = "draft_logits";
+auto constexpr kMaxNewTokensTensorName = "request_output_len";
+auto constexpr kBeamWidthTensorName = "beam_width";
+auto constexpr kEndIdTensorName = "end_id";
+auto constexpr kPadIdTensorName = "pad_id";
+auto constexpr kBadWordsListTensorName = "bad_words_list";
+auto constexpr kStopWordsListTensorName = "stop_words_list";
+auto constexpr kEmbeddingBiasTensorName = "embedding_bias";
+auto constexpr kTemperatureTensorName = "temperature";
+auto constexpr kRuntimeTopKTensorName = "runtime_top_k";
+auto constexpr kRuntimeTopPTensorName = "runtime_top_p";
+auto constexpr kLengthPenaltyTensorName = "len_penalty";
+auto constexpr kRepetitionPenaltyTensorName = "repetition_penalty";
+auto constexpr kMinLengthTensorName = "min_length";
+auto constexpr kPresencePenaltyTensorName = "presence_penalty";
+auto constexpr kRandomSeedTensorName = "random_seed";
+auto constexpr kReturnLogProbsTensorName = "return_log_probs";
+auto constexpr kPromptEmbeddingTableName = "prompt_embedding_table";
+auto constexpr kPromptVocabSizeName = "prompt_vocab_size";
+
+// Output tensors
+auto constexpr kOutputIdsTensorName = "output_ids";
+auto constexpr kSequenceLengthTensorName = "sequence_length";
+auto constexpr kLogProbsTensorName = "output_log_probs";
+auto constexpr kCumLogProbsTensorName = "cum_log_probs";
+} // namespace inference_request
+
+template <typename TTensor, typename TNamedTensor>
 class GenericInferenceRequest
 {
 public:
     using TensorPtr = TTensor;
-    using TensorMap = TTensorMap;
+    using NamedTensorType = TNamedTensor;
+    using TensorMap = std::unordered_map<std::string, TTensor>;
 
-    GenericInferenceRequest(uint64_t requestId)
-        : mRequestId(requestId)
-        , mIsStreaming(false)
+    explicit GenericInferenceRequest(uint64_t requestId)
+        : mRequestId{requestId}
+        , mIsStreaming{false}
     {
     }
 
-    GenericInferenceRequest(TensorMap const& inputTensors, uint64_t requestId)
-        : mInputTensors(inputTensors)
-        , mRequestId(requestId)
-        , mIsStreaming(false)
+    GenericInferenceRequest(uint64_t requestId, TensorMap&& tensorMap)
+        : mRequestId{requestId}
+        , mIsStreaming{false}
+        , mInputTensors{std::move(tensorMap)}
     {
-    }
-
-    GenericInferenceRequest(TensorMap&& inputTensors, uint64_t requestId)
-        : mInputTensors(std::move(inputTensors))
-        , mRequestId(requestId)
-        , mIsStreaming(false)
-    {
-    }
-
-    ~GenericInferenceRequest() {}
-
-    template <typename T>
-    std::tuple<bool, T> getScalarValueFromTensor(
-        const std::string& inputTensorName, const std::vector<int64_t>& expectedShape, const bool is_optional) const
-    {
-        T scalarValue;
-        try
+        for (auto const& [name, tensor] : mInputTensors)
         {
-            const auto& t = getInputTensor(inputTensorName);
-            std::vector<int64_t> tensorShape(t->getShape().nbDims);
-            for (int32_t i = 0; i < t->getShape().nbDims; ++i)
-            {
-                tensorShape[i] = t->getShape().d[i];
-            }
-
-            if (tensorShape != expectedShape)
-            {
-                std::string err = "Invalid shape for " + inputTensorName + ". Expected shape: [";
-                for (auto shape : expectedShape)
-                {
-                    err += std::to_string(shape) + ",";
-                }
-                if (!expectedShape.empty())
-                {
-                    // Remove last comma
-                    err.pop_back();
-                }
-                err += "]";
-
-                throw std::runtime_error(err);
-            }
-            scalarValue = *static_cast<T*>(t->data());
+            validateTensorName(name);
         }
-        catch (const std::exception& e)
-        {
-            // If parameter is optional, just ignore it
-            if (is_optional)
-            {
-                return {false, scalarValue};
-            }
-            else
-            {
-                std::cerr << "Out of Range error for tensor: " << inputTensorName << ": " << e.what() << '\n';
-                throw;
-            }
-        }
-        return {true, scalarValue};
     }
 
-    const TensorPtr& getInputTensor(std::string const& inputTensorName) const
+    GenericInferenceRequest(uint64_t requestId, TensorMap const& tensorMap)
+        : GenericInferenceRequest(requestId, TensorMap{tensorMap})
     {
-        return mInputTensors.at(inputTensorName);
-    }
-
-    void emplaceInputTensor(std::string const& inputTensorName, TensorPtr&& inputTensor)
-    {
-        mInputTensors.emplace(inputTensorName, std::move(inputTensor));
     }
 
     void setIsStreaming(bool isStreaming)
@@ -130,91 +99,152 @@ public:
         mIsStreaming = isStreaming;
     }
 
-    bool isStreaming() const
+    [[nodiscard]] bool isStreaming() const
     {
         return mIsStreaming;
     }
 
-    uint64_t getRequestId() const
+    [[nodiscard]] uint64_t getRequestId() const
     {
         return mRequestId;
     }
 
+    static std::array constexpr kTensorNames = {
+        inference_request::kInputIdsTensorName,
+        inference_request::kDraftInputIdsTensorName,
+        inference_request::kDraftLogitsTensorName,
+        inference_request::kMaxNewTokensTensorName,
+        inference_request::kBeamWidthTensorName,
+        inference_request::kEndIdTensorName,
+        inference_request::kPadIdTensorName,
+        inference_request::kBadWordsListTensorName,
+        inference_request::kStopWordsListTensorName,
+        inference_request::kEmbeddingBiasTensorName,
+        inference_request::kTemperatureTensorName,
+        inference_request::kRuntimeTopKTensorName,
+        inference_request::kRuntimeTopPTensorName,
+        inference_request::kLengthPenaltyTensorName,
+        inference_request::kRepetitionPenaltyTensorName,
+        inference_request::kMinLengthTensorName,
+        inference_request::kPresencePenaltyTensorName,
+        inference_request::kRandomSeedTensorName,
+        inference_request::kReturnLogProbsTensorName,
+        inference_request::kPromptEmbeddingTableName,
+        inference_request::kPromptVocabSizeName,
+    };
+
+#define TENSOR_GETTER_SETTER(funcName, tensorName)                                                                     \
+                                                                                                                       \
+    [[nodiscard]] bool has##funcName() const                                                                           \
+    {                                                                                                                  \
+        return mInputTensors.find(tensorName) != mInputTensors.end();                                                  \
+    }                                                                                                                  \
+                                                                                                                       \
+    [[nodiscard]] TensorPtr const& get##funcName() const                                                               \
+    {                                                                                                                  \
+        auto it = mInputTensors.find(tensorName);                                                                      \
+        TLLM_CHECK_WITH_INFO(it != mInputTensors.end(), "Undefined tensor: %s", tensorName);                           \
+        return it->second;                                                                                             \
+    }                                                                                                                  \
+                                                                                                                       \
+    [[nodiscard]] TensorPtr get##funcName##Unchecked() const                                                           \
+    {                                                                                                                  \
+        auto it = mInputTensors.find(tensorName);                                                                      \
+        return it != mInputTensors.end() ? it->second : TensorPtr{};                                                   \
+    }                                                                                                                  \
+                                                                                                                       \
+    [[nodiscard]] NamedTensorType get##funcName##Named() const                                                         \
+    {                                                                                                                  \
+        auto it = mInputTensors.find(tensorName);                                                                      \
+        return it != mInputTensors.end() ? NamedTensorType{it->second, tensorName} : NamedTensor{tensorName};          \
+    }                                                                                                                  \
+                                                                                                                       \
+    void set##funcName(TensorPtr const& tensor)                                                                        \
+    {                                                                                                                  \
+        mInputTensors[tensorName] = tensor;                                                                            \
+    }
+
+    TENSOR_GETTER_SETTER(InputIds, inference_request::kInputIdsTensorName)
+    TENSOR_GETTER_SETTER(DraftInputIds, inference_request::kDraftInputIdsTensorName)
+    TENSOR_GETTER_SETTER(DraftLogits, inference_request::kDraftLogitsTensorName)
+    TENSOR_GETTER_SETTER(MaxNewTokens, inference_request::kMaxNewTokensTensorName)
+    TENSOR_GETTER_SETTER(BeamWidth, inference_request::kBeamWidthTensorName)
+    TENSOR_GETTER_SETTER(EndId, inference_request::kEndIdTensorName)
+    TENSOR_GETTER_SETTER(PadId, inference_request::kPadIdTensorName)
+    TENSOR_GETTER_SETTER(BadWordsList, inference_request::kBadWordsListTensorName)
+    TENSOR_GETTER_SETTER(StopWordsList, inference_request::kStopWordsListTensorName)
+    TENSOR_GETTER_SETTER(EmbeddingBias, inference_request::kEmbeddingBiasTensorName)
+    TENSOR_GETTER_SETTER(Temperature, inference_request::kTemperatureTensorName)
+    TENSOR_GETTER_SETTER(RuntimeTopK, inference_request::kRuntimeTopKTensorName)
+    TENSOR_GETTER_SETTER(RuntimeTopP, inference_request::kRuntimeTopPTensorName)
+    TENSOR_GETTER_SETTER(LengthPenalty, inference_request::kLengthPenaltyTensorName)
+    TENSOR_GETTER_SETTER(RepetitionPenalty, inference_request::kRepetitionPenaltyTensorName)
+    TENSOR_GETTER_SETTER(MinLength, inference_request::kMinLengthTensorName)
+    TENSOR_GETTER_SETTER(PresencePenalty, inference_request::kPresencePenaltyTensorName)
+    TENSOR_GETTER_SETTER(RandomSeed, inference_request::kRandomSeedTensorName)
+    TENSOR_GETTER_SETTER(ReturnLogProbs, inference_request::kReturnLogProbsTensorName)
+    TENSOR_GETTER_SETTER(PromptEmbeddingTable, inference_request::kPromptEmbeddingTableName)
+    TENSOR_GETTER_SETTER(PromptVocabSize, inference_request::kPromptVocabSizeName)
+
+#undef TENSOR_GETTER_SETTER
+
 protected:
-    TensorMap mInputTensors;
+    static void validateTensorName(std::string const& tensorName)
+    {
+        // TODO (martinma): Throw an exception if the tensor name is not valid.
+        if (std::find(kTensorNames.begin(), kTensorNames.end(), tensorName) == kTensorNames.end())
+        {
+            TLLM_LOG_WARNING("Invalid tensor name in InferenceRequest: %s", tensorName.c_str());
+        }
+    }
+
     uint64_t mRequestId;
     bool mIsStreaming;
+    TensorMap mInputTensors;
 };
 
-class InferenceRequest : public GenericInferenceRequest<tensorrt_llm::runtime::ITensor::SharedPtr,
-                             tensorrt_llm::runtime::StringPtrMap<tensorrt_llm::runtime::ITensor>>
+class InferenceRequest : public GenericInferenceRequest<tensorrt_llm::runtime::ITensor::SharedPtr, NamedTensor>
 {
 public:
-    using Base = GenericInferenceRequest<tensorrt_llm::runtime::ITensor::SharedPtr,
-        tensorrt_llm::runtime::StringPtrMap<tensorrt_llm::runtime::ITensor>>;
+    using Base = GenericInferenceRequest<tensorrt_llm::runtime::ITensor::SharedPtr, NamedTensor>;
     using TensorPtr = Base::TensorPtr;
     using TensorMap = Base::TensorMap;
 
-    InferenceRequest(uint64_t requestId)
+    explicit InferenceRequest(uint64_t requestId)
         : Base(requestId)
     {
     }
 
     InferenceRequest(TensorMap const& inputTensors, uint64_t requestId)
-        : Base(inputTensors, requestId)
+        : Base(requestId, inputTensors)
     {
     }
 
     InferenceRequest(TensorMap&& inputTensors, uint64_t requestId)
-        : Base(inputTensors, requestId)
+        : Base(requestId, std::move(inputTensors))
     {
     }
 
-    const std::vector<int64_t> serialize() const
+    [[deprecated("Use direct tensor access instead")]] [[nodiscard]] TensorPtr const& getInputTensor(
+        std::string const& inputTensorName) const
     {
-        std::list<int64_t> packed;
-        // mInputTensors
-        packed.push_back(static_cast<int64_t>(mInputTensors.size()));
-        for (auto it = mInputTensors.begin(); it != mInputTensors.end(); ++it)
-        {
-            NamedTensor nt(it->second, it->first);
-            auto packed_tensor = nt.serialize();
-            packed.push_back(static_cast<int64_t>(packed_tensor.size()));
-            packed.insert(packed.end(), packed_tensor.begin(), packed_tensor.end());
-        }
-        // mRequestId
-        packed.push_back(static_cast<int64_t>(mRequestId));
-        // mIsStreaming
-        packed.push_back(mIsStreaming ? 1 : 0);
-        // done
-        std::vector<int64_t> vpacked{
-            std::make_move_iterator(std::begin(packed)), std::make_move_iterator(std::end(packed))};
-        return vpacked;
+        auto it = Base::mInputTensors.find(inputTensorName);
+        TLLM_CHECK_WITH_INFO(it != Base::mInputTensors.end(), "Invalid input tensor name: %s", inputTensorName.c_str());
+        return it->second;
     }
 
-    static std::shared_ptr<InferenceRequest> deserialize(const std::vector<int64_t>& packed)
+    [[deprecated("Use direct tensor access instead")]] void emplaceInputTensor(
+        std::string const& inputTensorName, TensorPtr inputTensor)
     {
-        return InferenceRequest::deserialize(packed.data());
+        validateTensorName(inputTensorName);
+        Base::mInputTensors[inputTensorName] = std::move(inputTensor);
     }
 
-    static std::shared_ptr<InferenceRequest> deserialize(const int64_t* packed_ptr)
-    {
-        int64_t num_tensors = *packed_ptr++;
-        TensorMap InputTensors;
-        for (int64_t i = 0; i < num_tensors; ++i)
-        {
-            int64_t n = *packed_ptr++;
-            auto inputTensor = NamedTensor::deserialize(packed_ptr);
-            packed_ptr += n;
-            auto inputTensorName = inputTensor.name;
-            InputTensors.emplace(inputTensorName, std::move(inputTensor.tensor));
-        }
-        uint64_t RequestId = static_cast<uint64_t>(*packed_ptr++);
-        bool IsStreaming = *packed_ptr++ != 0;
-        std::shared_ptr<InferenceRequest> ir = std::make_shared<InferenceRequest>(InputTensors, RequestId);
-        ir->setIsStreaming(IsStreaming);
-        return ir;
-    }
+    [[nodiscard]] std::vector<int64_t> serialize() const;
+
+    static std::shared_ptr<InferenceRequest> deserialize(const std::vector<int64_t>& packed);
+
+    static std::shared_ptr<InferenceRequest> deserialize(const int64_t* packed_ptr);
 };
 
 } // namespace tensorrt_llm::batch_manager

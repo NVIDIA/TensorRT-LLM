@@ -16,6 +16,7 @@
 #include "tensorrt_llm/runtime/gptDecoderBatch.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
@@ -26,6 +27,7 @@
 using namespace tensorrt_llm::runtime;
 
 namespace tc = tensorrt_llm::common;
+namespace tk = tensorrt_llm::kernels;
 
 namespace
 {
@@ -94,7 +96,10 @@ GptDecoderBatch::GptDecoderBatch(
 
     dOutput->newTokensSteps = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
     dOutput->parentIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-    dOutput->finishedSteps = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<bool>::value);
+    mFinishedSteps
+        = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<tk::FinishedState::UnderlyingType>::value);
+    mDraftProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
+    mTargetProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     // use batchSize many entries instead of the usual 1
     dOutput->finishedSum = mBufferManager.emptyTensor(MemoryType::kPINNED, nvSizeType);
     mFinishedSum = mBufferManager.pinned(ITensor::makeShape({1}), nvSizeType);
@@ -104,6 +109,7 @@ GptDecoderBatch::GptDecoderBatch(
     dOutput->beamHypotheses.empty(mBufferManager);
 
     mNumDraftTokens = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
+    mCurandStates = mBufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT8);
 
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
@@ -145,8 +151,16 @@ void GptDecoderBatch::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeTy
 
     dOutput.newTokensSteps->reshape(maxTokensPerStepXmaxBatchSizeXmaxBeamWidth);
     mBufferManager.setZero(*dOutput.newTokensSteps);
-    dOutput.finishedSteps->reshape(maxBatchSizeXmaxTokensPerStepXmaxBeamWidth);
-    mBufferManager.setZero(*dOutput.finishedSteps);
+    mFinishedSteps->reshape(maxBatchSizeXmaxTokensPerStepXmaxBeamWidth);
+    mBufferManager.setZero(*mFinishedSteps);
+
+    if (mMaxTokensPerStep > 1)
+    {
+        mDraftProbs->reshape(ITensor::makeShape(
+            {maxBatchSize, maxTokensPerStep - 1, maxBeamWidth, static_cast<SizeType>(mVocabSizePadded)}));
+        mTargetProbs->reshape(ITensor::makeShape(
+            {maxBatchSize, maxTokensPerStep, maxBeamWidth, static_cast<SizeType>(mVocabSizePadded)}));
+    }
 
     dOutput.parentIds->reshape(jointOutputIdsShape);
     // use batchSize many entries instead of the usual 1
@@ -170,7 +184,10 @@ void GptDecoderBatch::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeTy
 
     // speculative decoding only works for beam width == 1
     mDraftTokenIds.resize(maxBatchSize);
+    mDraftLogits.resize(maxBatchSize);
+    mAcceptByLogits.resize(maxBatchSize);
     mNumDraftTokens->reshape(ITensor::makeShape({maxBatchSize, 1}));
+    mCurandStates->reshape(ITensor::makeShape({maxBatchSize, sizeof(curandState_t)}));
 
     mStreams.resize(maxBatchSize);
     mDecoders.resize(maxBatchSize);
@@ -283,9 +300,8 @@ void GptDecoderBatch::newRequest(
         manager.setZero(*dOutput->newTokensVec[ti]);
     }
 
-    dOutput->finishedSteps = ITensor::slice(dJointOutput.finishedSteps, batchIdx, localBatchSize);
-    manager.setZero(*dOutput->finishedSteps);
-    dOutput->finishedSteps->squeeze(0);
+    TensorPtr finishedSteps = ITensor::slice(mFinishedSteps, batchIdx, localBatchSize);
+    manager.setZero(*finishedSteps);
 
     // cumLogProb is mandatory for beamWidth > 1
     dOutput->cumLogProbs = nullptr;
@@ -316,12 +332,32 @@ void GptDecoderBatch::newRequest(
     auto generatedTokensPerStep = request.generatedTokensPerStep();
     if (generatedTokensPerStep > 1)
     {
+        TLLM_CHECK(beamWidth == 1);
         auto numDraftTokens = generatedTokensPerStep - 1;
         TensorPtr draftTokensView = ITensor::view(request.draftTokens, ITensor::makeShape({1, 1, numDraftTokens}));
         mDraftTokenIds[batchIdx] = draftTokensView;
+        mAcceptByLogits[batchIdx] = false;
+        if (request.draftLogits.has_value())
+        {
+            TensorPtr draftLogitsView = ITensor::view(request.draftLogits.value());
+            mDraftLogits[batchIdx] = draftLogitsView;
+            mAcceptByLogits[batchIdx] = true;
+        }
 
         auto numDraftTokensView = ITensor::slice(mNumDraftTokens, batchIdx, localBatchSize);
         kernels::invokeFill(*numDraftTokensView, numDraftTokens, *stream);
+
+        auto const curandStatesView = ITensor::slice(mCurandStates, batchIdx, localBatchSize);
+        auto curandState = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*curandStatesView));
+        if (samplingConfig.randomSeed.has_value())
+        {
+            tk::invokeCurandInitialize(
+                curandState, localBatchSize, samplingConfig.randomSeed.value()[0], stream->get());
+        }
+        else
+        {
+            tk::invokeCurandInitialize(curandState, localBatchSize, 0, stream->get());
+        }
     }
 
     // remaining
@@ -344,7 +380,7 @@ GptDecoderBatch::TokenPtr GptDecoderBatch::forwardAsync(
     decoder_batch::Output& output, decoder_batch::Input const& input)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
-    auto& allLogits = input.logits;
+    auto& allTargetLogits = input.logits;
 
     // TODO(nkorobov): check logits shape considering draft tokens
     auto const& jointOutputIdsShape = mJointDecodingOutput->ids->getShape();
@@ -369,10 +405,12 @@ GptDecoderBatch::TokenPtr GptDecoderBatch::forwardAsync(
     for (std::int32_t bi = 0; bi < mActualBatchSize; ++bi)
     {
         if (mFinished[bi] || !input.active.at(bi))
+        {
             continue;
+        }
 
-        auto& logits = allLogits[bi];
-        auto const& logitsShape = logits->getShape();
+        auto& targetLogits = allTargetLogits[bi];
+        auto const& logitsShape = targetLogits->getShape();
         TLLM_CHECK_WITH_INFO(logitsShape.d[0] == mGeneratedTokensPerStep[bi],
             tc::fmtstr(
                 "First dim (%d) does not match generated tokens (%d)", logitsShape.d[0], mGeneratedTokensPerStep[bi]));
@@ -385,6 +423,39 @@ GptDecoderBatch::TokenPtr GptDecoderBatch::forwardAsync(
         auto& dInput = *mDecodingInputs[bi];
         auto& dOutput = *mDecodingOutputs[bi];
         auto& decoder = *mDecoders[bi];
+
+        TensorPtr finishedSteps = ITensor::slice(mFinishedSteps, bi, singleRequest);
+        finishedSteps->squeeze(0);
+
+        if (mGeneratedTokensPerStep[bi] > 1 && mAcceptByLogits[bi])
+        {
+            auto numDraftTokens = ITensor::slice(mNumDraftTokens, bi, singleRequest);
+            auto const curandStatesView = ITensor::slice(mCurandStates, bi, singleRequest);
+            auto curandState = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*curandStatesView));
+            auto const& samplingConfig = decoder.getSamplingConfig();
+            const bool useRandomAcceptanceThreshold = !samplingConfig.draftAcceptanceThreshold.has_value();
+            const float randomAcceptanceThreshold
+                = useRandomAcceptanceThreshold ? 0 : samplingConfig.draftAcceptanceThreshold.value()[0];
+
+            TensorPtr draftProbs = ITensor::slice(mDraftProbs, bi, singleRequest);
+            TensorPtr targetProbs = ITensor::slice(mTargetProbs, bi, singleRequest);
+            draftProbs = ITensor::view(draftProbs,
+                ITensor::makeShape(
+                    {mMaxTokensPerStep - 1, singleRequest, mBeamWidths[bi], static_cast<SizeType>(mVocabSizePadded)}));
+            targetProbs = ITensor::view(targetProbs,
+                ITensor::makeShape(
+                    {mMaxTokensPerStep, singleRequest, mBeamWidths[bi], static_cast<SizeType>(mVocabSizePadded)}));
+
+            IGptDecoder::acceptDraftTokensByLogits(
+                /* [num_draft_tokens, bs, bw, vocabPadded] */ *mDraftLogits[bi],
+                /* [num_draft_tokens+1, bs, bw, vocabPadded] */ *targetLogits,
+                /* [max_draft_tokens, bs, bw, vocabPadded] */ *draftProbs,
+                /* [max_tokens_per_step, bs, bw, vocabPadded] */ *targetProbs,
+                /* [bs, bw] */ *numDraftTokens,
+                /* [max_tokens_per_step, bs, bw] */ *finishedSteps, static_cast<SizeType>(mVocabSize),
+                static_cast<SizeType>(mVocabSizePadded), useRandomAcceptanceThreshold, randomAcceptanceThreshold,
+                curandState, stream);
+        }
 
         if (srcCacheIndirection && tgtCacheIndirection)
         {
@@ -401,11 +472,10 @@ GptDecoderBatch::TokenPtr GptDecoderBatch::forwardAsync(
 
         for (std::int32_t di = 0; di < mGeneratedTokensPerStep[bi]; ++di)
         {
-            dInput.logits = ITensor::slice(logits, di, singleRequest);
+            dInput.logits = ITensor::slice(targetLogits, di, singleRequest);
             dOutput.newTokens = ITensor::view(dOutput.newTokensVec[di]);
-            dInput.finished = ITensor::slice(dOutput.finishedSteps, di, 1);
-            dOutput.finished
-                = ITensor::slice(dOutput.finishedSteps, std::min(di + 1, mGeneratedTokensPerStep[bi] - 1), 1);
+            dInput.finished = ITensor::slice(finishedSteps, di, 1);
+            dOutput.finished = ITensor::slice(finishedSteps, std::min(di + 1, mGeneratedTokensPerStep[bi] - 1), 1);
 
             decoder.forwardAsync(dOutput, dInput);
 
@@ -414,19 +484,19 @@ GptDecoderBatch::TokenPtr GptDecoderBatch::forwardAsync(
             dInput.step += 1;
         }
 
-        if (mGeneratedTokensPerStep[bi] > 1)
+        if (mGeneratedTokensPerStep[bi] > 1 && !mAcceptByLogits[bi])
         {
             auto draftTokenIds = mDraftTokenIds[bi];
             auto numDraftTokens = ITensor::slice(mNumDraftTokens, bi, singleRequest);
             // Update finished state for 0th step
-            auto finishedFinal = ITensor::slice(dOutput.finishedSteps, 0, 1);
-            IGptDecoder::acceptTokens(
+            auto finishedFinal = ITensor::slice(finishedSteps, 0, 1);
+            IGptDecoder::acceptDraftTokensByIds(
                 /* [bs=1, bw=1, max_seq_len] */ *dOutput.ids,
                 /* [bs, bw, max_draft_tokens] */ *draftTokenIds,
                 /* [bs, bw] */ *dInput.lengths,
                 /* [bs, bw] */ *numDraftTokens,
                 /* [bs, bw] */ *dOutput.lengths,
-                /* [max_draft_tokens, bs, bw] */ *dOutput.finishedSteps,
+                /* [max_tokens_per_step, bs, bw] */ *finishedSteps,
                 /* [bs, bw] */ *finishedFinal,
                 /* [1] */ *dOutput.finishedSum, stream);
         }
