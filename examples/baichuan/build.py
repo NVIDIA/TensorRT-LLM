@@ -18,9 +18,12 @@ import time
 from pathlib import Path
 
 import onnx
-import tensorrt as trt
+
+# isort: off
 import torch
 import torch.multiprocessing as mp
+import tensorrt as trt
+# isort: on
 from onnx import TensorProto, helper
 from transformers import AutoConfig, AutoModelForCausalLM
 

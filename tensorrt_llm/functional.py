@@ -20,8 +20,11 @@ from functools import partial
 from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 
 from . import graph_rewriting as gw
 from ._common import default_net, default_trtnet, precision

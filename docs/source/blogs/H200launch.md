@@ -5,15 +5,15 @@ TensorRT-LLM evaluation of the [new H200 GPU](https://nvidianews.nvidia.com/news
 
 **H200 FP8 Max throughput**
 
-|Model      | Batch Size<sup>(1)</sup> | TP<sup>(2)</sup> | Input Length | Output Length | Throughput (out tok/s) |
-|:----------|:-------------------------|:-----------------|:-------------|:--------------|-----------------------:|
-| llama_13b | 1024                     | 1                | 128          | 128           |                  11,819 |
-| llama_13b | 128                      | 1                | 128          | 2048          |                   4,750 |
-| llama_13b | 64                       | 1                | 2048         | 128           |                   1,349 |
-| llama_70b | 512                      | 1                | 128          | 128           |                   3,014 |
-| llama_70b | 512                      | 4                | 128          | 2048          |                   6,616 |
-| llama_70b | 64                       | 2                | 2048         | 128           |                     682 |
-| llama_70b | 32                       | 1                | 2048         | 128           |                     303 |
+|Model      | Batch Size<sup>(1)</sup> | TP<sup>(2)</sup> | Input Length | Output Length | Throughput (out tok/s/GPU) |
+|:----------|:-------------------------|:-----------------|:-------------|:--------------|---------------------------:|
+| llama_13b | 1024                     | 1                | 128          | 128           |                     11,819 |
+| llama_13b | 128                      | 1                | 128          | 2048          |                      4,750 |
+| llama_13b | 64                       | 1                | 2048         | 128           |                      1,349 |
+| llama_70b | 512                      | 1                | 128          | 128           |                      3,014 |
+| llama_70b | 512                      | 2                | 128          | 2048          |                      1,654 |
+| llama_70b | 64                       | 1                | 2048         | 128           |                        341 |
+| llama_70b | 32                       | 1                | 2048         | 128           |                        303 |
 
 <sub>Preliminary measured performance, subject to change. TensorRT-LLM v0.5.0, TensorRT v9.1.0.4 | H200, H100 FP8. </sub>
 

@@ -18,9 +18,11 @@ import os
 import time
 from pathlib import Path
 
-import tensorrt as trt
+# isort: off
 import torch
 import torch.multiprocessing as mp
+import tensorrt as trt
+# isort: on
 from transformers import LlamaConfig, LlamaForCausalLM
 from weight import (get_scaling_factors, load_from_awq_llama, load_from_binary,
                     load_from_gptq_llama, load_from_hf_checkpoint,

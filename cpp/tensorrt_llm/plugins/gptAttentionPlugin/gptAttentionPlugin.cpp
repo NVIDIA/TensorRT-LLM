@@ -263,7 +263,9 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         = isCrossAttention() ? max_encoder_context_len : inputDesc[getCacheIndirIdx()].dims.d[2];
     // The cyclic_kv_cache_length will determine the cyclic kv cache position of new tokens.
     // Note that this cyclic_kv_cache_length might be smaller than the actual kv cache capactity (max_kv_cache_length).
-    const int cyclic_kv_cache_length = reinterpret_cast<const int*>(inputs[getHostMaxKvCacheLengthIdx()])[0];
+    const int cyclic_kv_cache_length = isCrossAttention()
+        ? max_encoder_context_len
+        : reinterpret_cast<const int*>(inputs[getHostMaxKvCacheLengthIdx()])[0];
 
     const float* kv_scale_orig_quant = nullptr;
     const float* kv_scale_quant_orig = nullptr;

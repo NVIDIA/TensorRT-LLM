@@ -12,21 +12,22 @@ The TensorRT-LLM ChatGLM example code is located in [`examples/chatglm`](./). Th
 
 ## Support Matrix
 
-|    Model Name    | FP16  | FMHA  |  WO   |  AWQ  |  SQ   |  TP   |  PP   | Strongly Typed | C++ Runtime | benchmark |  IFB  |
-| :--------------: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :------------: | :---------: | :-------: | :---: |
-|    chatglm_6b    |   Y   |   Y   |   Y   |       |       |   Y   |       |       Y        |      Y      |     Y     |       |
-|   chatglm2_6b    |   Y   |   Y   |   Y   |       |       |   Y   |       |       Y        |      Y      |     Y     |       |
-| chatglm2-6b_32k  |   Y   |   Y   |   Y   |       |       |   Y   |       |       Y        |      Y      |     Y     |       |
-|   chatglm3_6b    |   Y   |   Y   |   Y   |       |       |   Y   |       |       Y        |      Y      |     Y     |       |
-| chatglm3_6b_base |   Y   |   Y   |   Y   |       |       |   Y   |       |       Y        |      Y      |     Y     |       |
-| chatglm3_6b_32k  |   Y   |   Y   |   Y   |       |       |   Y   |       |       Y        |      Y      |     Y     |       |
-|     glm_10b      |   Y   |   Y   |   Y   |       |       |   Y   |       |       Y        |             |           |       |
+|    Model Name    | FP16  | FMHA  |  WO   |  AWQ  |  SQ   |  TP   |  PP   |  ST   | C++ Runtime | benchmark |  IFB  |
+| :--------------: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---------: | :-------: | :---: |
+|    chatglm_6b    |   Y   |   Y   |   Y   |       |       |   Y   |       |   Y   |      Y      |     Y     |       |
+|   chatglm2_6b    |   Y   |   Y   |   Y   |       |       |   Y   |       |   Y   |      Y      |     Y     |       |
+| chatglm2-6b_32k  |   Y   |   Y   |   Y   |       |       |   Y   |       |   Y   |      Y      |     Y     |       |
+|   chatglm3_6b    |   Y   |   Y   |   Y   |       |       |   Y   |       |   Y   |      Y      |     Y     |       |
+| chatglm3_6b_base |   Y   |   Y   |   Y   |       |       |   Y   |       |   Y   |      Y      |     Y     |       |
+| chatglm3_6b_32k  |   Y   |   Y   |   Y   |       |       |   Y   |       |   Y   |      Y      |     Y     |       |
+|     glm_10b      |   Y   |   Y   |   Y   |       |       |   Y   |       |   Y   |             |           |       |
 
 * Model Name: the name of the model, the same as the name on HuggingFace
 * FMHA: Fused MultiHead Attention (see introduction below)
 * WO: Weight Only Quantization (int8 / int4)
 * AWQ: Activation Aware Weight Quantization
-* SQ:Smooth Quantization
+* SQ: Smooth Quantization
+* ST: Strongly Typed
 * TP: Tensor Parallel
 * PP: Pipeline Parallel
 * IFB: In-flight Batching (see introduction below)
@@ -102,9 +103,9 @@ python3 build.py -m glm_10b
 
 #### Enabled plugins
 
-* Use `--use_gemm_plugin <DataType>` to configure GPT Attention plugin (default as float16)
-* Use `--use_gemm_plugin <DataType>` to configure GEMM normolization plugin (default as float16)
-* Use `--use_layernorm_plugin <DataType>` (for ChatGLM-6B and GLM-10B models) to configure RMS normolization plugin (default as float16)
+* Use `--use_gpt_attention_plugin <DataType>` to configure GPT Attention plugin (default as float16)
+* Use `--use_gemm_plugin <DataType>` to configure GEMM plugin (default as float16)
+* Use `--use_layernorm_plugin <DataType>` (for ChatGLM-6B and GLM-10B models) to configure layernorm normolization plugin (default as float16)
 * Use `--use_rmsnorm_plugin <DataType>` (for ChatGLM2-6B\* and ChatGLM3-6B\* models) to configure RMS normolization plugin (default as float16)
 
 #### Fused MultiHead Attention (FMHA)
@@ -140,6 +141,13 @@ python3 build.py -m glm_10b
 ```bash
 # Run the default engine of ChatGLM3-6B on single GPU, other model name is available if built.
 python3 run.py -m chatglm3_6b
+# Run the default engine of ChatGLM3-6B on single GPU, using streaming output, other model name is available if built.
+# In this case only the first sample in the first batch is shown,
+# But actually all output of all batches are available.
+python3 run.py -m chatglm3_6b --streaming
+# Run the default engine of GLM3-10B on single GPU, other model name is available if built.
+# Token "[MASK]" or "[sMASK]" or "[gMASK]" must be included inside the prompt as the original model commanded.
+python3 run.py -m glm_10b --input_text "Peking University is [MASK] than Tsinghua Univercity."
 ```
 
 #### Single node, multi GPU

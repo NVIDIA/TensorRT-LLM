@@ -224,6 +224,7 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
     layers_range = list(
         range(mapping.pp_rank * layers_per_pipeline_stage,
               (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
+    vocab_size = hf_llama.config.vocab_size
     for k, v in model_params.items():
         if isinstance(v, list):
             v = [torch_to_numpy(vv.to(torch_dtype).detach().cpu()) for vv in v]
@@ -245,7 +246,6 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                 tensorrt_llm_llama.ln_f.weight.value = v
         elif 'lm_head.weight' in k:
             if mapping.is_last_pp_rank():
-                vocab_size = tensorrt_llm_llama.vocab_embedding.num_embeddings
                 if vocab_size % mapping.tp_size != 0:
                     # padding
                     vocab_size_padded = tensorrt_llm_llama.lm_head.out_features * mapping.tp_size

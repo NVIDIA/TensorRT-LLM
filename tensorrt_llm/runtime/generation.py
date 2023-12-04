@@ -20,8 +20,11 @@ from functools import wraps
 from typing import Dict, List, Optional, Sequence, Union
 
 import numpy as np
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from cuda import cudart
 
 from .._ipc_utils import IpcMemory, set_peer_access

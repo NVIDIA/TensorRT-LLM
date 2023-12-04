@@ -30,7 +30,7 @@ init_ubuntu() {
     fi
     apt-get clean
     rm -rf /var/lib/apt/lists/*
-    echo "export LD_LIBRARY_PATH=/usr/local/cuda/lib64:\$LD_LIBRARY_PATH" >> "${ENV}"
+    echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64' >> "${ENV}"
     # Remove previous TRT installation
     if [[ $(apt list --installed | grep libnvinfer) ]]; then
         apt-get remove --purge -y libnvinfer*
@@ -39,7 +39,6 @@ init_ubuntu() {
         apt-get remove --purge -y tensorrt*
     fi
     pip uninstall -y tensorrt
-    pip install mpi4py
 }
 
 install_gcc_centos() {
@@ -53,7 +52,7 @@ install_gcc_centos() {
     ./contrib/download_prerequisites
     ./configure --disable-multilib --enable-languages=c,c++ --with-pi
     make -j$(nproc) && make install
-    echo "export LD_LIBRARY_PATH=/usr/local/lib64:\$LD_LIBRARY_PATH" >> "${ENV}"
+    echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib64' >> "${ENV}"
     cd .. && rm -rf /tmp/gcc-*
     yum clean all
 }
@@ -64,7 +63,7 @@ init_centos() {
     yum -y update
     yum -y install centos-release-scl-rh epel-release
     # https://gitlab.com/nvidia/container-images/cuda
-    echo "export LD_LIBRARY_PATH=/usr/local/cuda/lib64:\$LD_LIBRARY_PATH" >> "${ENV}"
+    echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64' >> "${ENV}"
     CUDA_VERSION=$(nvcc --version | sed -n 's/^.*release \([0-9]\+\.[0-9]\+\).*$/\1/p')
     YUM_CUDA=${CUDA_VERSION/./-}
     # Consistent with manylinux2014 centos-7 based version
@@ -73,7 +72,7 @@ init_centos() {
     echo "source scl_source enable rh-git227 rh-python38" >> "${ENV}"
     echo "source scl_source enable devtoolset-10" >> "${DEVTOOLSET_ENV_FILE}"
     echo "source ${DEVTOOLSET_ENV_FILE}" >> "${ENV}"
-    echo 'export PATH=/usr/lib64/openmpi3/bin:$PATH' >> "${ENV}"
+    echo 'export PATH=$PATH:/usr/lib64/openmpi3/bin' >> "${ENV}"
     bash -c "pip install 'urllib3<2.0'"
     yum clean all
 }

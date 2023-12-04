@@ -19,9 +19,12 @@ from pathlib import Path
 from typing import Union
 
 import onnx
-import tensorrt as trt
+
+# isort: off
 import torch
 import torch.multiprocessing as mp
+import tensorrt as trt
+# isort: on
 from onnx import TensorProto, helper
 from transformers import AutoModelForCausalLM, FalconConfig
 from weight import (get_scaling_factors, load_from_awq_falcon,

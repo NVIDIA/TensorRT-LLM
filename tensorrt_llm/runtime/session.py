@@ -18,8 +18,10 @@ import contextlib
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-import tensorrt as trt
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 
 from .._utils import trt_dtype_to_torch
 from ..logger import logger

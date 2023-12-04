@@ -48,11 +48,12 @@ def generate(model_name, batch_size, beam_width):
         args.input_text += args.input_text[0] * (batch_size - 2)
     args.beam_width = beam_width
     args.tokenizer_dir = resources_dir / model_name
-    args.engine_dir = Path(__file__).parent.parent / "models/rt_engine/chatglm"
+    args.engine_dir = Path(__file__).parent.parent / ("models/rt_engine/" +
+                                                      model_name)
 
     tensorrt_llm.logger.set_level(args.log_level)
 
-    config_path = Path(args.engine_dir) / (model_name + '-config.json')
+    config_path = args.engine_dir / 'config.json'
     with open(config_path, 'r') as f:
         config = json.load(f)
     assert (config['builder_config']['name'] == model_name)
@@ -226,6 +227,4 @@ if __name__ == '__main__':
     generate("chatglm3_6b", batch_size=1, beam_width=1)
     generate("chatglm3_6b", batch_size=2, beam_width=1)
     generate("chatglm3_6b", batch_size=1, beam_width=2)
-    #generate("glm_10b", batch_size=1, beam_width=1)
-    #generate("glm_10b", batch_size=2, beam_width=1)
     print("Done.")

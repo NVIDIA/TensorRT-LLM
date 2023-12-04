@@ -102,9 +102,13 @@ wheel_%: STAGE = wheel
 
 release_%: STAGE = release
 
-# For x86_64 and aarch64
+# For x86_64
 jenkins_%: IMAGE_WITH_TAG = $(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 jenkins_%: STAGE = devel
+
+# For aarch64
+jenkins-aarch64_%: IMAGE_WITH_TAG = $(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L1_Nightly_GH200RemoteJob.groovy | grep -o '".*"' | tr -d '"')
+jenkins-aarch64_%: STAGE = devel
 
 # For x86_64
 centos7_%: IMAGE_WITH_TAG = $(shell grep 'LLM_CENTOS7_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
@@ -117,7 +121,7 @@ ubuntu22_%: STAGE = devel
 ubuntu22_%: BASE_IMAGE = nvidia/cuda
 ubuntu22_%: BASE_TAG = 12.2.2-devel-ubuntu22.04
 
-# For x86_64 and aarch64
+# For x86_64
 old-cuda_%: IMAGE_WITH_TAG = $(shell grep 'LLM_OLD_CUDA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 old-cuda_%: BASE_TAG = 23.07-py3
 old-cuda_%: STAGE = devel

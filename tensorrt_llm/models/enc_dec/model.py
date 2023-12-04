@@ -563,8 +563,7 @@ class EncoderModel(Module, GenerationMixin):
             @return: a list contains values which can be fed into the self.forward()
         '''
 
-        num_heads = self.num_heads
-        head_size = self.head_size
+        hidden_size = self.hidden_size
 
         bs_range = [1, (max_batch_size + 1) // 2, max_batch_size]
         inlen_range = [1, (max_input_len + 1) // 2, max_input_len]
@@ -609,12 +608,11 @@ class EncoderModel(Module, GenerationMixin):
             else:
                 hidden_states = Tensor(name='hidden_states_input',
                                        dtype=self._dtype,
-                                       shape=[1, -1, head_size * num_heads],
+                                       shape=[1, -1, hidden_size],
                                        dim_range=OrderedDict([
                                            ('batch_size_fake', [1]),
                                            ('num_tokens', [num_tokens_range]),
-                                           ('hidden_size',
-                                            [head_size * num_heads]),
+                                           ('hidden_size', [hidden_size]),
                                        ]))
         else:
             if self.mapping.is_first_pp_rank():
@@ -644,12 +642,11 @@ class EncoderModel(Module, GenerationMixin):
             else:
                 hidden_states = Tensor(name='hidden_states_input',
                                        dtype=self._dtype,
-                                       shape=[-1, -1, head_size * num_heads],
+                                       shape=[-1, -1, hidden_size],
                                        dim_range=OrderedDict([
                                            ('batch_size', [bs_range]),
                                            ('input_len', [inlen_range]),
-                                           ('hidden_size',
-                                            [head_size * num_heads]),
+                                           ('hidden_size', [hidden_size]),
                                        ]))
 
         all_reduce_workspace = None
@@ -937,12 +934,10 @@ class DecoderModel(Module, GenerationMixin):
         # Prepare inputs
         max_output_len = max_decoder_input_len + max_new_tokens
 
-        num_heads = self.num_heads
         head_size = self.head_size
         num_kv_heads = (self.num_kv_heads + self.mapping.tp_size -
                         1) // self.mapping.tp_size
 
-        self.encoder_num_heads
         encoder_head_size = self.encoder_head_size
         encoder_num_kv_heads = (self.encoder_num_kv_heads + self.mapping.tp_size
                                 - 1) // self.mapping.tp_size
@@ -1021,13 +1016,12 @@ class DecoderModel(Module, GenerationMixin):
             else:
                 hidden_states = Tensor(name='hidden_states_input',
                                        dtype=self._dtype,
-                                       shape=[1, -1, head_size * num_heads],
+                                       shape=[1, -1, self.hidden_size],
                                        dim_range=OrderedDict([
                                            ('batch_size_fake', [1]),
                                            ('decoder_num_tokens',
                                             [decoder_num_tokens_range]),
-                                           ('hidden_size',
-                                            [head_size * num_heads]),
+                                           ('hidden_size', [self.hidden_size]),
                                        ]))
         else:
             if self.mapping.is_first_pp_rank():
@@ -1059,13 +1053,12 @@ class DecoderModel(Module, GenerationMixin):
             else:
                 hidden_states = Tensor(name='hidden_states_input',
                                        dtype=self._dtype,
-                                       shape=[-1, -1, head_size * num_heads],
+                                       shape=[-1, -1, self.hidden_size],
                                        dim_range=OrderedDict([
                                            ('batch_size_beam_width', [bb_range
                                                                       ]),
                                            ('input_len', [inlen_range]),
-                                           ('hidden_size',
-                                            [head_size * num_heads]),
+                                           ('hidden_size', [self.hidden_size]),
                                        ]))
 
         encoder_input_lengths = Tensor(
