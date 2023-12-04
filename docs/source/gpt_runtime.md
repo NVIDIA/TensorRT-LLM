@@ -173,7 +173,7 @@ MPI_Init(&argc, &argv);
 // Get the number of ranks (size of the world).
 int worldSize;
 MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
-
+
 // Get the unique identifier for each rank.
 int rank;
 MPI_Comm_rank(MPI_COMM_WORLD, &rank);
