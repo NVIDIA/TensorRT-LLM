@@ -70,6 +70,7 @@
 <li class="toctree-l1"><a class="reference internal" href="batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Build TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="performance.html">Performance of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
@@ -91,7 +92,7 @@
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token.</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 </ul>
 
@@ -125,31 +126,31 @@
 the Python API as described in the <a class="reference internal" href="architecture.html"><span class="std std-doc">Architecture</span></a> document.
 That component is called the C++ runtime.</p>
 <p>The API of the C++ runtime is composed of the classes declared in
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/cpp/include/tensorrt_llm/runtime"><code class="docutils literal notranslate"><span class="pre">cpp/include/tensorrt_llm/runtime</span></code></a> and
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/include/tensorrt_llm/runtime"><code class="docutils literal notranslate"><span class="pre">cpp/include/tensorrt_llm/runtime</span></code></a> and
 implemented in
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/cpp/tensorrt_llm/runtime"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/runtime</span></code></a>. An example of
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/tensorrt_llm/runtime"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/runtime</span></code></a>. An example of
 how to use the C++ runtime for a GPT-like auto-regressive model can be found in
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/cpp/tests/runtime/gptSessionTest.cpp"><code class="docutils literal notranslate"><span class="pre">cpp/tests/runtime/gptSessionTest.cpp</span></code></a>.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/tests/runtime/gptSessionTest.cpp"><code class="docutils literal notranslate"><span class="pre">cpp/tests/runtime/gptSessionTest.cpp</span></code></a>.</p>
 <p>Even if the different components described in that document mention GPT in
 their name, they are not restricted to this specific model. Those classes can
 be used to implement auto-regressive models like BLOOM, GPT-J, GPT-NeoX or
 LLaMA, for example.</p>
 <p>Complete support of encoder-decoder models, like T5, will be added to
 TensorRT-LLM in a future release. An experimental version, only in Python for
-now, can be found in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/examples/enc_dec"><code class="docutils literal notranslate"><span class="pre">examples/enc_dec</span></code></a> folder.</p>
+now, can be found in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/examples/enc_dec"><code class="docutils literal notranslate"><span class="pre">examples/enc_dec</span></code></a> folder.</p>
 <section id="the-session">
 <h2>The Session<a class="headerlink" href="#the-session" title="Link to this heading"></a></h2>
 <p>The main component of the C++ runtime is the session. For GPT-like
 auto-regressive models, it is the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/cpp/include/tensorrt_llm/runtime/gptSession.h"><code class="docutils literal notranslate"><span class="pre">GptSession</span></code></a> class.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/include/tensorrt_llm/runtime/gptSession.h"><code class="docutils literal notranslate"><span class="pre">GptSession</span></code></a> class.</p>
 <section id="creation">
 <h3>Creation<a class="headerlink" href="#creation" title="Link to this heading"></a></h3>
 <p>The constructors of that class allow users to specify the model and the
 environment to execute it. The model is described by an instance of the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/cpp/include/tensorrt_llm/runtime/gptModelConfig.h"><code class="docutils literal notranslate"><span class="pre">GptModelConfig</span></code></a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/include/tensorrt_llm/runtime/gptModelConfig.h"><code class="docutils literal notranslate"><span class="pre">GptModelConfig</span></code></a>
 class and a pointer to the TensorRT engine that must be
 executed to perform the inference. The environment is configured through the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/cpp/include/tensorrt_llm/runtime/worldConfig.h"><code class="docutils literal notranslate"><span class="pre">WorldConfig</span></code></a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/include/tensorrt_llm/runtime/worldConfig.h"><code class="docutils literal notranslate"><span class="pre">WorldConfig</span></code></a>
 (that name comes from
 <a class="reference external" href="https://en.wikipedia.org/wiki/Message_Passing_Interface">MPI</a> and its “famous”
 <code class="docutils literal notranslate"><span class="pre">MPI_COMM_WORLD</span></code> default communicator). The constructor also accepts an
@@ -173,7 +174,7 @@ encapsulate the engine.</p>
 <section id="session-configuration">
 <h4>Session Configuration<a class="headerlink" href="#session-configuration" title="Link to this heading"></a></h4>
 <p>The session configuration is an instance of the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/cpp/include/tensorrt_llm/runtime/gptSession.h"><code class="docutils literal notranslate"><span class="pre">GptSession::Config</span></code></a> class.
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/include/tensorrt_llm/runtime/gptSession.h"><code class="docutils literal notranslate"><span class="pre">GptSession::Config</span></code></a> class.
 The constructor of this class requires three arguments:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">maxBatchSize</span></code>, the maximum number of sequences in a batch,</p></li>
@@ -206,7 +207,7 @@ micro batches of this size.</p></li>
 <section id="model-configuration">
 <h4>Model Configuration<a class="headerlink" href="#model-configuration" title="Link to this heading"></a></h4>
 <p>The model configuration is an instance of the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/cpp/include/tensorrt_llm/runtime/gptModelConfig.h"><code class="docutils literal notranslate"><span class="pre">GptModelConfig</span></code></a> class.
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/include/tensorrt_llm/runtime/gptModelConfig.h"><code class="docutils literal notranslate"><span class="pre">GptModelConfig</span></code></a> class.
 That class encapsulates the following parameters (they are declared as private
 member variables and exposed through getters and setters):</p>
 <ul class="simple">
@@ -223,7 +224,7 @@ Attention</span></a>,</p></li>
 must be used to run the model during inference,</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">useGptAttentionPlugin</span></code>, indicates if the <a class="reference internal" href="gpt_attention.html"><span class="std std-doc">GPT Attention</span></a>
 operator was compiled using the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/cpp/tensorrt_llm/plugins/gptAttentionPlugin">GPT Attention plugin</a>,</p></li>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/tensorrt_llm/plugins/gptAttentionPlugin">GPT Attention plugin</a>,</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">inputPacked</span></code>, indicates that the input must be packed (or padded when set
 to <code class="docutils literal notranslate"><span class="pre">false</span></code>). For performance reasons, it is recommended to always use packed,
 even if its default is set to <code class="docutils literal notranslate"><span class="pre">false</span></code> (will be changed in a future release).
@@ -253,7 +254,7 @@ node as well as on different nodes in a cluster. Each process is called a
 <em>rank</em> in MPI. (2) The ranks are grouped in communication groups. The
 TensorRT-LLM C++ Runtime calls that group the <em>world</em>.</p>
 <p>The world configuration is an instance of the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/cpp/include/tensorrt_llm/runtime/worldConfig.h"><code class="docutils literal notranslate"><span class="pre">WorldConfig</span></code></a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/include/tensorrt_llm/runtime/worldConfig.h"><code class="docutils literal notranslate"><span class="pre">WorldConfig</span></code></a>
 class. In this release, that class encapsulates the following parameters:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">tensorParallelism</span></code>, is the number of ranks that collaborate together to
@@ -341,9 +342,9 @@ presentation simple):</p>
 <section id="inputs-and-outputs">
 <h4>Inputs and Outputs<a class="headerlink" href="#inputs-and-outputs" title="Link to this heading"></a></h4>
 <p>The <code class="docutils literal notranslate"><span class="pre">generate</span></code> member function takes an instance of the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/cpp/include/tensorrt_llm/runtime/generationInput.h"><code class="docutils literal notranslate"><span class="pre">GenerationInput</span></code></a> class and
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/include/tensorrt_llm/runtime/generationInput.h"><code class="docutils literal notranslate"><span class="pre">GenerationInput</span></code></a> class and
 populates an instance of the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/cpp/include/tensorrt_llm/runtime/generationOutput.h"><code class="docutils literal notranslate"><span class="pre">GenerationOutput</span></code></a> class.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/include/tensorrt_llm/runtime/generationOutput.h"><code class="docutils literal notranslate"><span class="pre">GenerationOutput</span></code></a> class.</p>
 <p><em><strong>Mandatory inputs</strong></em></p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">endId</span></code>, is the token ID that marks the end of the input sequence (aka <code class="docutils literal notranslate"><span class="pre">EOS</span></code>
@@ -435,7 +436,7 @@ generation is complete.</p></li>
 </section>
 <section id="sampling-parameters">
 <h4>Sampling Parameters<a class="headerlink" href="#sampling-parameters" title="Link to this heading"></a></h4>
-<p>The <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/cpp/include/tensorrt_llm/runtime/samplingConfig.h"><code class="docutils literal notranslate"><span class="pre">SamplingConfig</span></code></a>
+<p>The <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/include/tensorrt_llm/runtime/samplingConfig.h"><code class="docutils literal notranslate"><span class="pre">SamplingConfig</span></code></a>
 class encapsulates parameters that control the
 <a class="reference external" href="https://huggingface.co/blog/how-to-generate">generation</a> of new tokens.
 Except for the <code class="docutils literal notranslate"><span class="pre">beamWidth</span></code> parameter, all the fields are optional and the
@@ -506,9 +507,9 @@ sequence. This limitation is likely to be removed in a future release.</p>
 <section id="internal-components">
 <h2>Internal Components<a class="headerlink" href="#internal-components" title="Link to this heading"></a></h2>
 <p>The <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> class encapsulates two main components. The
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/cpp/tensorrt_llm/runtime/tllmRuntime.h"><code class="docutils literal notranslate"><span class="pre">TllmRuntime</span></code></a> is in charge of the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/tensorrt_llm/runtime/tllmRuntime.h"><code class="docutils literal notranslate"><span class="pre">TllmRuntime</span></code></a> is in charge of the
 execution of the TensorRT engine. The
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/cpp/include/tensorrt_llm/runtime/gptDecoder.h"><code class="docutils literal notranslate"><span class="pre">GptDecoder</span></code></a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/include/tensorrt_llm/runtime/gptDecoder.h"><code class="docutils literal notranslate"><span class="pre">GptDecoder</span></code></a>
 does the generation of the tokens from the logits.  The <code class="docutils literal notranslate"><span class="pre">TllmRuntime</span></code> class is
 an internal component and users are not expected to use that class directly.
 The <code class="docutils literal notranslate"><span class="pre">GptDecoder</span></code> can be used directly to implement very custom generation loop

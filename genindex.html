@@ -48,6 +48,7 @@
 <li class="toctree-l1"><a class="reference internal" href="batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Build TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="performance.html">Performance of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
@@ -69,7 +70,7 @@
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token.</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 </ul>
 
@@ -480,11 +481,7 @@
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.gelu">gelu() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelRunner.generate">generate() (tensorrt_llm.runtime.ModelRunner method)</a>
-
-      <ul>
-        <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.QWenForCausalLMGenerationSession.generate">(tensorrt_llm.runtime.QWenForCausalLMGenerationSession method)</a>
 </li>
-      </ul></li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.generate_alibi_biases">generate_alibi_biases() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.generate_alibi_slopes">generate_alibi_slopes() (in module tensorrt_llm.functional)</a>
@@ -495,14 +492,12 @@
 </li>
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSequence.get_batch_idx">get_batch_idx() (tensorrt_llm.runtime.GenerationSequence method)</a>
 </li>
-      <li><a href="python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.get_first_host_kv_cache_block_pointers">get_first_host_kv_cache_block_pointers() (tensorrt_llm.layers.attention.KeyValueCacheParams method)</a>
-</li>
       <li><a href="python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.get_first_kv_cache_block_pointers">get_first_kv_cache_block_pointers() (tensorrt_llm.layers.attention.KeyValueCacheParams method)</a>
+</li>
+      <li><a href="python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.get_first_past_key_value">get_first_past_key_value() (tensorrt_llm.layers.attention.KeyValueCacheParams method)</a>
 </li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.get_first_past_key_value">get_first_past_key_value() (tensorrt_llm.layers.attention.KeyValueCacheParams method)</a>
-</li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor.get_parent">get_parent() (tensorrt_llm.functional.Tensor method)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.KVCacheManager.get_pointer_arrays">get_pointer_arrays() (tensorrt_llm.runtime.KVCacheManager method)</a>
@@ -639,10 +634,10 @@
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.PositionEmbeddingType.learned_absolute">learned_absolute (tensorrt_llm.functional.PositionEmbeddingType attribute)</a>
 </li>
-      <li><a href="python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.Linear">Linear (class in tensorrt_llm.layers.linear)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.Linear">Linear (class in tensorrt_llm.layers.linear)</a>
+</li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RotaryScalingType.linear">linear (tensorrt_llm.functional.RotaryScalingType attribute)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.models.html#tensorrt_llm.models.LLaMAForCausalLM">LLaMAForCausalLM (class in tensorrt_llm.models)</a>
@@ -654,8 +649,6 @@
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.lora_plugin">lora_plugin (tensorrt_llm.runtime.ModelConfig attribute)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.lora_plugin">lora_plugin() (in module tensorrt_llm.functional)</a>
-</li>
-      <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.lora_target_modules">lora_target_modules (tensorrt_llm.runtime.ModelConfig attribute)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.lt">lt() (in module tensorrt_llm.functional)</a>
 </li>
@@ -677,14 +670,8 @@
         <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor.max">(tensorrt_llm.functional.Tensor method)</a>
 </li>
       </ul></li>
-      <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.max_prompt_embedding_table_size">max_prompt_embedding_table_size (tensorrt_llm.runtime.GenerationSession property)</a>
-
-      <ul>
-        <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.max_prompt_embedding_table_size">(tensorrt_llm.runtime.ModelConfig attribute)</a>
+      <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.max_prompt_embedding_table_size">max_prompt_embedding_table_size (tensorrt_llm.runtime.ModelConfig attribute)</a>
 </li>
-        <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelRunner.max_prompt_embedding_table_size">(tensorrt_llm.runtime.ModelRunner property)</a>
-</li>
-      </ul></li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.maximum">maximum() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.mean">mean() (in module tensorrt_llm.functional)</a>
@@ -711,8 +698,6 @@
 </li>
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelRunner">ModelRunner (class in tensorrt_llm.runtime)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li>
     module
 
@@ -748,6 +733,8 @@
         <li><a href="python-api/tensorrt_llm.runtime.html#module-tensorrt_llm.runtime">tensorrt_llm.runtime</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.mul">mul() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.Linear.multiply_gather">multiply_gather() (tensorrt_llm.layers.linear.Linear method)</a>
@@ -888,15 +875,13 @@
         <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.quant_mode">(tensorrt_llm.runtime.ModelConfig attribute)</a>
 </li>
       </ul></li>
-      <li><a href="python-api/tensorrt_llm.models.html#tensorrt_llm.models.quantize_model">quantize_model() (in module tensorrt_llm.models)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/tensorrt_llm.models.html#tensorrt_llm.models.quantize_model">quantize_model() (in module tensorrt_llm.models)</a>
+</li>
       <li><a href="python-api/tensorrt_llm.quantization.html#tensorrt_llm.quantization.QuantMode">QuantMode (class in tensorrt_llm.quantization)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.models.html#tensorrt_llm.models.QWenForCausalLM">QWenForCausalLM (class in tensorrt_llm.models)</a>
-</li>
-      <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.QWenForCausalLMGenerationSession">QWenForCausalLMGenerationSession (class in tensorrt_llm.runtime)</a>
 </li>
   </ul></td>
 </tr></table>
@@ -1439,8 +1424,6 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request14ConstTensorPtrE">tensorrt_llm::runtime::decoder_batch::Request::ConstTensorPtr (C++ type)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request11draftLogitsE">tensorrt_llm::runtime::decoder_batch::Request::draftLogits (C++ member)</a>
-</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request11draftTokensE">tensorrt_llm::runtime::decoder_batch::Request::draftTokens (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request13embeddingBiasE">tensorrt_llm::runtime::decoder_batch::Request::embeddingBias (C++ member)</a>
@@ -1542,6 +1525,8 @@
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DecodingOutput14DecodingOutputE9TensorPtr">tensorrt_llm::runtime::DecodingOutput::DecodingOutput (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DecodingOutput8finishedE">tensorrt_llm::runtime::DecodingOutput::finished (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DecodingOutput13finishedStepsE">tensorrt_llm::runtime::DecodingOutput::finishedSteps (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DecodingOutput11finishedSumE">tensorrt_llm::runtime::DecodingOutput::finishedSum (C++ member)</a>
 </li>
@@ -1653,8 +1638,6 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10GptDecoder10gatherTreeER7ITensorRK14DecodingOutputRK13DecodingInputRK13BufferManager">tensorrt_llm::runtime::GptDecoder::gatherTree (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10GptDecoder17getSamplingConfigEv">tensorrt_llm::runtime::GptDecoder::getSamplingConfig (C++ function)</a>
-</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10GptDecoder10GptDecoderE6size_t6size_tRK13CudaStreamPtr">tensorrt_llm::runtime::GptDecoder::GptDecoder (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10GptDecoder10mAllocatorE">tensorrt_llm::runtime::GptDecoder::mAllocator (C++ member)</a>
@@ -1664,8 +1647,6 @@
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10GptDecoder14mLogProbsTiledE">tensorrt_llm::runtime::GptDecoder::mLogProbsTiled (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10GptDecoder8mManagerE">tensorrt_llm::runtime::GptDecoder::mManager (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10GptDecoder15mSamplingConfigE">tensorrt_llm::runtime::GptDecoder::mSamplingConfig (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10GptDecoder5setupERK14SamplingConfig6size_t8SizeType">tensorrt_llm::runtime::GptDecoder::setup (C++ function)</a>
 </li>
@@ -1707,15 +1688,11 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15GptDecoderBatch13GptDecoderPtrE">tensorrt_llm::runtime::GptDecoderBatch::GptDecoderPtr (C++ type)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15GptDecoderBatch15mAcceptByLogitsE">tensorrt_llm::runtime::GptDecoderBatch::mAcceptByLogits (C++ member)</a>
-</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15GptDecoderBatch16mActualBatchSizeE">tensorrt_llm::runtime::GptDecoderBatch::mActualBatchSize (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15GptDecoderBatch11mBeamWidthsE">tensorrt_llm::runtime::GptDecoderBatch::mBeamWidths (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15GptDecoderBatch14mBufferManagerE">tensorrt_llm::runtime::GptDecoderBatch::mBufferManager (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15GptDecoderBatch13mCurandStatesE">tensorrt_llm::runtime::GptDecoderBatch::mCurandStates (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15GptDecoderBatch9mDecodersE">tensorrt_llm::runtime::GptDecoderBatch::mDecoders (C++ member)</a>
 </li>
@@ -1723,15 +1700,9 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15GptDecoderBatch16mDecodingOutputsE">tensorrt_llm::runtime::GptDecoderBatch::mDecodingOutputs (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15GptDecoderBatch12mDraftLogitsE">tensorrt_llm::runtime::GptDecoderBatch::mDraftLogits (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15GptDecoderBatch11mDraftProbsE">tensorrt_llm::runtime::GptDecoderBatch::mDraftProbs (C++ member)</a>
-</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15GptDecoderBatch14mDraftTokenIdsE">tensorrt_llm::runtime::GptDecoderBatch::mDraftTokenIds (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15GptDecoderBatch9mFinishedE">tensorrt_llm::runtime::GptDecoderBatch::mFinished (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15GptDecoderBatch14mFinishedStepsE">tensorrt_llm::runtime::GptDecoderBatch::mFinishedSteps (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15GptDecoderBatch12mFinishedSumE">tensorrt_llm::runtime::GptDecoderBatch::mFinishedSum (C++ member)</a>
 </li>
@@ -1760,8 +1731,6 @@
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15GptDecoderBatch7mStreamE">tensorrt_llm::runtime::GptDecoderBatch::mStream (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15GptDecoderBatch8mStreamsE">tensorrt_llm::runtime::GptDecoderBatch::mStreams (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15GptDecoderBatch12mTargetProbsE">tensorrt_llm::runtime::GptDecoderBatch::mTargetProbs (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15GptDecoderBatch10mVocabSizeE">tensorrt_llm::runtime::GptDecoderBatch::mVocabSize (C++ member)</a>
 </li>
@@ -1805,12 +1774,12 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig18mTensorParallelismE">tensorrt_llm::runtime::GptJsonConfig::mTensorParallelism (C++ member)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig5parseERKNSt10filesystem4pathE">tensorrt_llm::runtime::GptJsonConfig::parse (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig5parseERKNSt6stringE">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13GptJsonConfig5parseERNSt7istreamE">[2]</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14GptModelConfigE">tensorrt_llm::runtime::GptModelConfig (C++ class)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14GptModelConfig20computeContextLogitsEb">tensorrt_llm::runtime::GptModelConfig::computeContextLogits (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime14GptModelConfig20computeContextLogitsEv">[1]</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14GptModelConfig23computeGenerationLogitsEb">tensorrt_llm::runtime::GptModelConfig::computeGenerationLogits (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime14GptModelConfig23computeGenerationLogitsEv">[1]</a>
@@ -2137,9 +2106,7 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11IGptDecoderE">tensorrt_llm::runtime::IGptDecoder (C++ class)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11IGptDecoder22acceptDraftTokensByIdsERK7ITensorRK7ITensorRK7ITensorRK7ITensorR7ITensorRK7ITensorR7ITensorR7ITensorRKN13BufferManager13CudaStreamPtrE">tensorrt_llm::runtime::IGptDecoder::acceptDraftTokensByIds (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11IGptDecoder25acceptDraftTokensByLogitsER7ITensorRK7ITensorR7ITensorR7ITensorRK7ITensorR7ITensor8SizeType8SizeTypebfP13curandState_tRKN13BufferManager13CudaStreamPtrE">tensorrt_llm::runtime::IGptDecoder::acceptDraftTokensByLogits (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11IGptDecoder12acceptTokensERK7ITensorRK7ITensorRK7ITensorRK7ITensorR7ITensorRK7ITensorR7ITensorR7ITensorRKN13BufferManager13CudaStreamPtrE">tensorrt_llm::runtime::IGptDecoder::acceptTokens (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11IGptDecoder6createEN8nvinfer18DataTypeE6size_t6size_tRKN13BufferManager13CudaStreamPtrE">tensorrt_llm::runtime::IGptDecoder::create (C++ function)</a>
 </li>
@@ -2148,8 +2115,6 @@
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11IGptDecoder12forwardAsyncER14DecodingOutputRK13DecodingInput">tensorrt_llm::runtime::IGptDecoder::forwardAsync (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11IGptDecoder10gatherTreeER7ITensorRK14DecodingOutputRK13DecodingInputRK13BufferManager">tensorrt_llm::runtime::IGptDecoder::gatherTree (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11IGptDecoder17getSamplingConfigEv">tensorrt_llm::runtime::IGptDecoder::getSamplingConfig (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11IGptDecoder5setupERK14SamplingConfig6size_t8SizeType">tensorrt_llm::runtime::IGptDecoder::setup (C++ function)</a>
 </li>
@@ -2264,8 +2229,6 @@
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7ITensor6resizeENSt6size_tE">tensorrt_llm::runtime::ITensor::resize (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7ITensor5ShapeE">tensorrt_llm::runtime::ITensor::Shape (C++ type)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4I0EN12tensorrt_llm7runtime7ITensor11shapeEqualsEbRK5ShapePK1T8SizeType">tensorrt_llm::runtime::ITensor::shapeEquals (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4I0ENK12tensorrt_llm7runtime7ITensor11shapeEqualsEbPK1T8SizeType">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7ITensor11shapeEqualsERK5ShapeRK5Shape">[2]</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7ITensor11shapeEqualsERK5Shape">[3]</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7ITensor11shapeEqualsERKNSt16initializer_listI8SizeTypeEE">[4]</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7ITensor14SharedConstPtrE">tensorrt_llm::runtime::ITensor::SharedConstPtr (C++ type)</a>
 </li>
@@ -2386,8 +2349,6 @@
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14SamplingConfig23beamSearchDiversityRateE">tensorrt_llm::runtime::SamplingConfig::beamSearchDiversityRate (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14SamplingConfig9beamWidthE">tensorrt_llm::runtime::SamplingConfig::beamWidth (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14SamplingConfig24draftAcceptanceThresholdE">tensorrt_llm::runtime::SamplingConfig::draftAcceptanceThreshold (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14SamplingConfig9FloatTypeE">tensorrt_llm::runtime::SamplingConfig::FloatType (C++ type)</a>
 </li>
@@ -2568,11 +2529,7 @@
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.use_gpt_attention_plugin">use_gpt_attention_plugin (tensorrt_llm.runtime.GenerationSession property)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.use_lora_plugin">use_lora_plugin (tensorrt_llm.runtime.GenerationSession property)</a>
-
-      <ul>
-        <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelRunner.use_lora_plugin">(tensorrt_llm.runtime.ModelRunner property)</a>
 </li>
-      </ul></li>
   </ul></td>
 </tr></table>
 
