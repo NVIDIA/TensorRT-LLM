@@ -17,24 +17,29 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
-* [2023/11/13] [**H200** achieves nearly **12,000 tok/sec on Llama2-13B**](./docs/source/blogs/H200launch.md)
+* [2023/12/04] [**Falcon-180B** on a **single H200** GPU with INT4 AWQ, and **6.7x faster Llama-70B** over A100](./docs/source/blogs/H200launch.md)
 
-<img src="./docs/source/blogs/media/H200launch_tps.png" alt="H200 TPS" width="500" height="auto">
+<img src="./docs/source/blogs/media/Falcon180B-H200_H200vA100.png" alt="H200 TPS" width="400" height="auto">
 
-H200 FP8 achieves 11,819 tok/s on Llama2-13B on a single GPU, and is up to 1.9x faster than H100.
+H200 with INT4 AWQ, runs Falcon-180B on a _single_ GPU.
 
+H200 is now 2.4x faster on Llama-70B with recent improvements to TensorRT-LLM GQA; up to 6.7x faster than A100.
 
-* [2023/11/03] [TensorRT-LLM is up to **4.6x faster on H100 than A100**, achieving **10,000 tok/s at 100ms to first token.**](./docs/source/blogs/H100vsA100.md)
+* [2023/11/27] [SageMaker LMI now supports TensorRT-LLM - improves throughput by 60%, compared to previous version](https://aws.amazon.com/blogs/machine-learning/boost-inference-performance-for-llms-with-new-amazon-sagemaker-containers/)
+* [2023/11/13] [H200 achieves nearly 12,000 tok/sec on Llama2-13B](./docs/source/blogs/H200launch.md)
 * [2023/10/22] [🚀 RAG on Windows using TensorRT-LLM and LlamaIndex 🦙](https://github.com/NVIDIA/trt-llm-rag-windows#readme)
 * [2023/10/19] Getting Started Guide - [Optimizing Inference on Large Language Models with NVIDIA TensorRT-LLM, Now Publicly Available
 ](https://developer.nvidia.com/blog/optimizing-inference-on-llms-with-tensorrt-llm-now-publicly-available/)
 * [2023/10/17] [Large Language Models up to 4x Faster on RTX With TensorRT-LLM for Windows
 ](https://blogs.nvidia.com/blog/2023/10/17/tensorrt-llm-windows-stable-diffusion-rtx/)
-* [2023/9/9] [NVIDIA TensorRT-LLM Supercharges Large Language Model Inference on NVIDIA H100 GPUs](https://developer.nvidia.com/blog/nvidia-tensorrt-llm-supercharges-large-language-model-inference-on-nvidia-h100-gpus/)
 
-[2023/10/31 - Phind](https://www.phind.com/blog/phind-model-beats-gpt4-fast) ; [2023/10/12 - Databricks (MosaicML)](https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices) ;
-[2023/10/4 - Perplexity](https://blog.perplexity.ai/blog/introducing-pplx-api) ;
-[2023/9/27 - CloudFlare](https://www.cloudflare.com/press-releases/2023/cloudflare-powers-hyper-local-ai-inference-with-nvidia/);
+
+[2023/11/27 - Amazon Sagemaker](https://aws.amazon.com/blogs/machine-learning/boost-inference-performance-for-llms-with-new-amazon-sagemaker-containers/)
+[2023/11/17 - Perplexity](https://blog.perplexity.ai/blog/turbocharging-llama-2-70b-with-nvidia-h100) ;
+[2023/10/31 - Phind](https://www.phind.com/blog/phind-model-beats-gpt4-fast) ;
+[2023/10/12 - Databricks (MosaicML)](https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices) ;
+[2023/10/04 - Perplexity](https://blog.perplexity.ai/blog/introducing-pplx-api) ;
+[2023/09/27 - CloudFlare](https://www.cloudflare.com/press-releases/2023/cloudflare-powers-hyper-local-ai-inference-with-nvidia/);
 
 ## Table of Contents
 
