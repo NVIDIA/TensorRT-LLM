@@ -20,8 +20,11 @@ from itertools import product
 
 import numpy as np
 import pytest
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from parameterized import parameterized
 from transformers import GPTJConfig, GPTJForCausalLM
 
@@ -427,8 +430,6 @@ class TestGPTJ(unittest.TestCase):
         compare_generation()
 
     def test_gptj_noplugin_supported(self):
-        pytest.skip(
-            "Temporarily disabled due to the MHA OOTB bug in TensorRT 9.2.")
 
         use_refit = False
 

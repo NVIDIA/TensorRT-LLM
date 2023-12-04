@@ -16,8 +16,10 @@ import os
 import time
 from collections import OrderedDict
 
-import tensorrt as trt
+# isort: off
 import torch
+import tensorrt as trt
+#isort: on
 from allowed_configs import get_build_config
 from base_benchmark import BaseBenchmark, serialize_engine
 

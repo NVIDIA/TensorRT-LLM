@@ -43,8 +43,9 @@ def parse_arguments(args=None):
     )
     parser.add_argument('--max_output_len', type=int, default=1024)
     parser.add_argument('--log_level', type=str, default='error')
-    parser.add_argument('--engine_dir', type=str, default='trtModel')
+    parser.add_argument('--engine_dir', type=str, default=None)
     parser.add_argument('--beam_width', type=int, default=1)
+    parser.add_argument('--streaming', default=False, action='store_true')
     parser.add_argument(
         '--input_text',
         type=str,
@@ -71,14 +72,20 @@ def parse_arguments(args=None):
     parser.add_argument('--top_k', type=int, default=1)
     parser.add_argument('--top_p', type=float, default=0.0)
     parser.add_argument('--random_seed', type=int, default=1)
-    return parser.parse_args(args)
+
+    args = parser.parse_args(args)
+
+    if args.engine_dir is None:
+        args.engine_dir = Path("output_" + args.model_name)
+
+    return args
 
 
 if __name__ == '__main__':
     args = parse_arguments()
     tensorrt_llm.logger.set_level(args.log_level)
 
-    config_path = Path(args.engine_dir) / (args.model_name + '-config.json')
+    config_path = Path(args.engine_dir) / 'config.json'
     with open(config_path, 'r') as f:
         config = json.load(f)
 
@@ -254,14 +261,10 @@ if __name__ == '__main__':
         sampling_config,
         output_sequence_lengths=True,
         return_dict=True,
+        streaming=args.streaming,
     )
-    torch.cuda.synchronize()
-
-    output_ids = output["output_ids"]
-    output_lengths = output["sequence_lengths"]
 
     if runtime_rank == 0:
-
         if args.model_name in ["chatglm_6b"]:
             from process import process_response_chatglm_6b as process_response
         elif args.model_name in [
@@ -274,20 +277,43 @@ if __name__ == '__main__':
         ]:
             from process import process_response
 
-        for i in range(batch_size):
-            print("\nInput  %2d ---> len=%d\n%s" %
-                  (i, input_lengths[i], input_text[i]))
+        if args.streaming:  # streaming output
+            print("#" * 80)
+            # only the first sample in the first batch is shown,
+            # but actually all output of all batches are available
+            print("Input  %2d ---> len=%d\n%s" %
+                  (0, input_lengths[0], input_text[0]))
             print("\nOutput %2d --->" % i)
-            output_ids_one_batch = output_ids[i, :, input_lengths[i]:]
-            output_lengths_one_batch = output_lengths[i]
-            output_token_list = tokenizer.batch_decode(output_ids_one_batch,
-                                                       skip_special_tokens=True)
-            output_token_list = process_response(output_token_list)
-            for j, (length, simple_output) in enumerate(
-                    zip(output_lengths_one_batch, output_token_list)):
-                print("\n  Beam %2d ---> len=%d\n%s" %
-                      (j, length, simple_output))
+            for output_item in output:
+                output_id = output_item["output_ids"]
+                output_sequence_lengths = output_item["sequence_lengths"]
+                output_id = output_id[0, 0, output_sequence_lengths[0, 0] - 1]
+                output_word = tokenizer.convert_ids_to_tokens(int(output_id))
+                output_word = output_word.replace("▁", " ")  # For English
+                output_word = tokenizer.convert_tokens_to_string(output_word)
+                print(output_word, end="", flush=True)
+            print("\n" + "#" * 80)
+        else:  # regular output
+            torch.cuda.synchronize()
+            output_ids = output["output_ids"]
+            output_lengths = output["sequence_lengths"]
+            print("#" * 80)
+            for i in range(batch_size):
+                print("Input  %2d ---> len=%d\n%s" %
+                      (i, input_lengths[i], input_text[i]))
+                print("\nOutput %2d --->" % i)
+                output_ids_one_batch = output_ids[i, :, input_lengths[i]:]
+                output_lengths_one_batch = output_lengths[i] - input_lengths[
+                    i] + 1
+                output_token_list = tokenizer.batch_decode(
+                    output_ids_one_batch, skip_special_tokens=True)
+                output_token_list = process_response(output_token_list)
+                for j, (length, simple_output) in enumerate(
+                        zip(output_lengths_one_batch, output_token_list)):
+                    print("  Beam %2d ---> len=%d\n%s" %
+                          (j, length, simple_output))
+                print("#" * 80)
 
     del decoder
 
-    print("Finished!")
+    print(f"Finished from worker {runtime_rank}")

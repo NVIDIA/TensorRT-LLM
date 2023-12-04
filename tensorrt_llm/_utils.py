@@ -20,8 +20,11 @@ from functools import partial
 from pathlib import Path, PosixPath
 
 import numpy as np
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 
 # numpy doesn't know bfloat16, define abstract binary type instead
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})

@@ -17,8 +17,11 @@ from itertools import product
 
 import numpy as np
 import pytest
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from functional.torch_ref import attention_qkvpacked_ref
 from parameterized import parameterized
 from polygraphy.backend.trt import (CreateConfig, EngineFromNetwork, Profile,

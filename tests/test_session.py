@@ -14,8 +14,10 @@
 # limitations under the License.
 import unittest
 
-import tensorrt as trt
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 
 import tensorrt_llm
 
@@ -34,7 +36,7 @@ class TestSession(unittest.TestCase):
     def test_session_debug_run(self):
         tensorrt_llm.logger.set_level('verbose')
         builder = tensorrt_llm.Builder()
-        builder_config = builder.create_builder_config("test", "test")
+        builder_config = builder.create_builder_config("test", "llmTimingCache")
         model = MyAddModule()
 
         network = builder.create_network()

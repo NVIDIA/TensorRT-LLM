@@ -63,10 +63,13 @@ class ChatGLMParams:
     default_config["chatglm_6b"] = SimpleNamespace(
         apply_query_key_layer_scaling=False,
         apply_residual_connection_post_layernorm=False,
+        dtype="float16",
         ffn_hidden_size=16384,
         hidden_act='gelu',
         hidden_size=4096,
         linear_bias=True,
+        logits_dtype="float16",
+        mapping=Mapping(),
         max_input_len=1024,
         max_output_len=1024,
         max_seq_length=2048,
@@ -75,6 +78,7 @@ class ChatGLMParams:
         num_kv_heads=32,
         num_layers=28,
         qkv_bias=True,
+        quant_mode=QuantMode(0),
         rmsnorm=False,
         rotary_embedding_scaling=1.0,
         use_cache=True,
@@ -83,10 +87,13 @@ class ChatGLMParams:
     default_config["chatglm2_6b"] = SimpleNamespace(
         apply_query_key_layer_scaling=False,
         apply_residual_connection_post_layernorm=False,
+        dtype="float16",
         ffn_hidden_size=13696,
         hidden_act='swiglu',
         hidden_size=4096,
         linear_bias=False,
+        logits_dtype="float16",
+        mapping=Mapping(),
         max_input_len=1024,
         max_output_len=1024,
         max_seq_length=32768,
@@ -95,6 +102,7 @@ class ChatGLMParams:
         num_kv_heads=2,
         num_layers=28,
         qkv_bias=True,
+        quant_mode=QuantMode(0),
         rmsnorm=True,
         rotary_embedding_scaling=1.0,
         use_cache=True,
@@ -107,10 +115,13 @@ class ChatGLMParams:
     default_config["glm_10b"] = SimpleNamespace(
         apply_query_key_layer_scaling=False,
         apply_residual_connection_post_layernorm=False,
+        dtype="float16",
         ffn_hidden_size=16384,
         hidden_act='gelu',
         hidden_size=4096,
         linear_bias=True,
+        logits_dtype="float16",
+        mapping=Mapping(),
         max_input_len=1024,
         max_output_len=1024,
         max_seq_length=2048,
@@ -119,6 +130,7 @@ class ChatGLMParams:
         num_kv_heads=32,
         num_layers=28,
         qkv_bias=True,
+        quant_mode=QuantMode(0),
         rmsnorm=False,
         rotary_embedding_scaling=1.0,
         use_cache=True,
@@ -130,13 +142,18 @@ class ChatGLMParams:
         for key, value in args.items():
             assert key in dir(
                 self), f"{key} is not in configuration of ChatGLMHeadModel"
-            self.__setattr__(key, value)
+            if value is not None:
+                self.__setattr__(key, value)
         assert self.model_name is not None, "model_name must be set for ChatGLMHeadModel"
 
         # fill other parameters as default values
         for key, value in self.default_config[self.model_name].__dict__.items():
             if self.__getattribute__(key) is None:
                 self.__setattr__(key, value)
+
+    def report(self):
+        for key, value in self.__dict__.items():
+            print(f"{key} = {value}")
 
 
 class ChatGLMDecoderLayer(Module):
@@ -148,6 +165,7 @@ class ChatGLMDecoderLayer(Module):
         self.model_name = config.model_name
         self.use_cache = config.use_cache
         self.rotary_embedding_base = 10000.0
+        rotary_embedding_scaling = None
 
         if self.model_name in ["chatglm_6b"]:
             self.alpha = (2 * config.num_layers)**0.5
@@ -162,7 +180,12 @@ class ChatGLMDecoderLayer(Module):
             self.norm = RmsNorm if config.rmsnorm else LayerNorm
             attention_mask_type = AttentionMaskType.causal
             position_embedding_type = PositionEmbeddingType.rope_gptj
-            if config.model_name in ["chatglm2_6b_32k", "chatglm3_6b_32k"]:
+            if config.model_name in ["chatglm2_6b_32k"]:
+                rotary_embedding_scaling = {
+                    "type": "linear",
+                    "factor": config.rotary_embedding_scaling
+                }
+            elif config.model_name in ["chatglm3_6b_32k"]:
                 self.rotary_embedding_base *= config.rotary_embedding_scaling
         elif config.model_name in ["glm_10b"]:
             self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
@@ -189,7 +212,7 @@ class ChatGLMDecoderLayer(Module):
             dtype=config.dtype,
             position_embedding_type=position_embedding_type,
             rotary_embedding_base=self.rotary_embedding_base,
-            rotary_embedding_scaling=None,
+            rotary_embedding_scaling=rotary_embedding_scaling,
             use_int8_kv_cache=config.quant_mode.has_int8_kv_cache(),
             rotary_embedding_percentage=0.5,
             tp_group=config.mapping.tp_group,
@@ -402,32 +425,37 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
 
     def __init__(
         self,
-        apply_query_key_layer_scaling: bool = False,
-        apply_residual_connection_post_layernorm: bool = False,
-        dtype: str = "float16",
-        enable_debug_output: bool = False,
-        ffn_hidden_size: int = 0,
-        hidden_act: str = "",
-        hidden_size: int = 0,
-        linear_bias: bool = False,
-        logits_dtype: str = "float16",
-        mapping: Mapping = Mapping(1, 0, 1, 1, 1),
-        max_input_len: int = 0,
-        max_output_len: int = 0,
-        max_seq_length: int = 0,
-        model_name: str = "",
-        norm_epsilon: float = 1.0e-5,
-        num_heads: int = 0,
-        num_kv_heads: int = 0,
-        num_layers: int = 0,
-        qkv_bias: bool = False,
-        quant_mode: QuantMode = QuantMode(0),
-        rmsnorm: bool = False,
-        rotary_embedding_scaling: float = 1.0,
-        tokens_per_block: int = 64,
-        use_cache: bool = True,
-        vocab_size: int = 0,
+        apply_query_key_layer_scaling: bool = None,
+        apply_residual_connection_post_layernorm: bool = None,
+        dtype: str = None,
+        enable_debug_output: bool = None,
+        ffn_hidden_size: int = None,
+        hidden_act: str = None,
+        hidden_size: int = None,
+        linear_bias: bool = None,
+        logits_dtype: str = None,
+        mapping: Mapping = None,
+        max_input_len: int = None,
+        max_output_len: int = None,
+        max_seq_length: int = None,
+        model_name: str = None,
+        norm_epsilon: float = None,
+        num_heads: int = None,
+        num_kv_heads: int = None,
+        num_layers: int = None,
+        qkv_bias: bool = None,
+        quant_mode: QuantMode = None,
+        rmsnorm: bool = None,
+        rotary_embedding_scaling: float = None,
+        tokens_per_block: int = None,
+        use_cache: bool = None,
+        vocab_size: int = None,
+        max_position_embeddings: int = None,
     ):
+
+        # for benchmark scripts
+        if max_seq_length is None and max_position_embeddings is not None:
+            max_seq_length = max_position_embeddings
 
         config = ChatGLMParams(
             apply_query_key_layer_scaling=apply_query_key_layer_scaling,

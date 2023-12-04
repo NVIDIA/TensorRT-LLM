@@ -17,9 +17,11 @@ import json
 import os
 import time
 
-import tensorrt as trt
+# isort: off
 import torch
 import torch.multiprocessing as mp
+import tensorrt as trt
+# isort: on
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, GPTNeoXConfig
 from weight import load_from_hf_gpt_neox

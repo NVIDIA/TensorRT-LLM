@@ -16,7 +16,10 @@ import time
 from functools import partial
 from typing import Literal, Optional, Union
 
+# isort: off
+import torch
 import tensorrt as trt
+# isort: on
 
 try:
     import psutil
@@ -27,8 +30,6 @@ try:
 except ImportError:
     pynvml = None
 import traceback
-
-import torch
 
 from tensorrt_llm.builder import _is_building
 from tensorrt_llm.logger import logger

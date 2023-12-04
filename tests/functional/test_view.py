@@ -15,8 +15,11 @@
 import unittest
 
 import numpy as np
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from polygraphy.backend.trt import (CreateConfig, EngineFromNetwork, Profile,
                                     TrtRunner)
 

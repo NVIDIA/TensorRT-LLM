@@ -16,8 +16,11 @@ import unittest
 from itertools import product
 
 import pytest
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from cuda import cudart
 from parameterized import parameterized
 from polygraphy.backend.trt import CreateConfig, EngineFromNetwork

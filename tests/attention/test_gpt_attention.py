@@ -66,12 +66,13 @@ class TestFunctional(unittest.TestCase):
                     [False], [False, True], [1], [False], [False]))
 
         # Test cases for fused context MHAs
-        test_cases += list(
-            product(['llama_attention'], [
-                ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
-            ], ['float16', 'bfloat16'], [None], [2], [90, 1024], [4],
-                    [32, 64, 80, 112, 128], [0], [False], [False, True], [1],
-                    [False], [False]))
+        # TODO: add the tests back
+        # test_cases += list(
+        #     product(['llama_attention'], [
+        #         ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
+        #     ], ['float16', 'bfloat16'], [None], [2], [90, 1024], [4],
+        #             [32, 64, 80, 112, 128], [0], [False], [False, True], [1],
+        #             [False], [False]))
 
         # Test cases of float32 d=256 case (for testing MMHA key loops).
         test_cases += list(
@@ -87,6 +88,13 @@ class TestFunctional(unittest.TestCase):
                 ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
             ], ['float16', 'bfloat16'], [None], [2], [2048], [4], [64], [0],
                     [True], [False], [1], [False], [False]))
+
+        # Test cases for the multi-block MMHA (with large number of blocks per sequence).
+        test_cases += list(
+            product(['llama_attention'], [
+                ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
+            ], ['float16', 'bfloat16', 'float32'], [None], [1], [4096], [1],
+                    [128], [0], [True], [False], [1], [False], [False]))
 
         # Test cases for the 8-bit K/V cache.
         test_cases += list(

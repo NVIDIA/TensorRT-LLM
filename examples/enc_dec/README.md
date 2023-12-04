@@ -74,14 +74,14 @@ python build.py --model_type t5 \
                 --dtype float32 \
                 --max_beam_width 1
 
-# Example 2: build flan-t5-small using 4-way tensor parallelism on a node with 8 GPUs (but only use 4 of them, for demonstration purpose), BF16, enabling beam search up to width=3
+# Example 2: build t5-small using 4-way tensor parallelism on a node with 8 GPUs (but only use 4 of them, for demonstration purpose), BF16, enabling beam search up to width=3
 python build.py --model_type t5 \
                 --world_size 4 \
                 --tp_size 4 \
                 --gpus_per_node 4 \
-                --weight_dir tmp/trt_models/flan-t5-small/tp4 \
-                -o tmp/trt_engines/flan-t5-small/4-gpu \
-                --engine_name flan-t5-small \
+                --weight_dir tmp/trt_models/t5-small/tp4 \
+                -o tmp/trt_engines/t5-small/4-gpu \
+                --engine_name t5-small \
                 --remove_input_padding \
                 --use_bert_attention_plugin \
                 --use_gpt_attention_plugin \
@@ -90,7 +90,7 @@ python build.py --model_type t5 \
                 --dtype bfloat16 \
                 --max_beam_width 3
 
-# Example 3: build flan-t5-small using 2-way tensor parallelism and 2-way pipeline parallelism on a node with 8 GPUs, FP16, enabling beam search up to width=3
+# Example 3: build flan-t5-small using 2-way tensor parallelism and 2-way pipeline parallelism on a node with 8 GPUs, BF16, enabling beam search up to width=3
 python build.py --model_type t5 \
                 --world_size 4 \
                 --tp_size 2 \
@@ -104,7 +104,7 @@ python build.py --model_type t5 \
                 --use_gpt_attention_plugin \
                 --use_gemm_plugin \
                 --use_rmsnorm_plugin \
-                --dtype float16 \
+                --dtype bfloat16 \
                 --max_beam_width 3
 ```
 
@@ -117,9 +117,15 @@ Note that during model deployment, only the TensorRT engine files are needed. Pr
 # Example 1: inference w/ single GPU, FP32, greedy search, compare results with HuggingFace FP32
 python3 run.py --engine_dir tmp/trt_engines/t5-small/1-gpu/float32/tp1 --engine_name t5-small --model_name t5-small --max_new_token=64 --num_beams=1 --compare_hf_fp32
 
-# Example 2: inference w/ 4 GPUs (4-way TP, as configured during the engine building step), BF16, greedy search
-mpirun --allow-run-as-root -np 4 python3 run.py --engine_dir tmp/trt_engines/flan-t5-small/4-gpu/bfloat16/tp4 --engine_name flan-t5-small --model_name google/flan-t5-small --max_new_token=64 --num_beams=1
+# Example 2: inference w/ 4 GPUs (4-way TP, as configured during the engine building step), BF16, greedy search, compare results with HuggingFace FP32
+mpirun --allow-run-as-root -np 4 python3 run.py --engine_dir tmp/trt_engines/t5-small/4-gpu/bfloat16/tp4 --engine_name t5-small --model_name t5-small --max_new_token=64 --num_beams=1 --compare_hf_fp32
 
-# Example 3: inference w/ 4 GPUs (2-way TP and 2-way PP, as configured during the engine building step), FP16, beam search
-mpirun --allow-run-as-root -np 4 python3 run.py --engine_dir tmp/trt_engines/flan-t5-small/4-gpu/float16/tp2 --engine_name flan-t5-small --model_name google/flan-t5-small --max_new_token=64 --num_beams=3
+# Example 3: inference w/ 4 GPUs (2-way TP and 2-way PP, as configured during the engine building step), BF16, greedy search
+mpirun --allow-run-as-root -np 4 python3 run.py --engine_dir tmp/trt_engines/flan-t5-small/4-gpu/bfloat16/tp2 --engine_name flan-t5-small --model_name google/flan-t5-small --max_new_token=64 --num_beams=1
 ```
+
+### Reminders
+
+- Flan-T5 models have known issues regarding FP16 precision and using BF16 precision is recommended, regardless of TRT-LLM. While we are working on improving FP16 results, please stay with FP32 or BF16 precision for Flan-T5 family.
+- Batched/Ragged input with beam search is having subtle issues with some sequence results being truncated. For the time being, please follow (1) if batch size = 1, no problem (2) if batched input is padded (i.e., not using `--remove_input_padding` flag), no problem (3) if batched input is ragged (i.e., using `--remove_input_padding`), only use greedy search for now.
+- For T5 and Flan-T5 family that have relative attention bias design, the relative attention table is split along `num_heads` dimension in Tensor Parallelism mode. Therefore, `num_heads` must be divisible by `tp_size`. Please be aware of this when setting the TP parameter.

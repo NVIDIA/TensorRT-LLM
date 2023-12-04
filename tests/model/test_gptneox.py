@@ -20,8 +20,11 @@ from itertools import product
 
 import numpy as np
 import pytest
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from parameterized import parameterized
 from transformers import GPTNeoXConfig, GPTNeoXForCausalLM
 

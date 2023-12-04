@@ -257,9 +257,9 @@ class ModelRunner:
         input_lengths = torch.tensor(input_lengths, dtype=torch.int32)
         return batch_input_ids, input_lengths
 
-    def _prepare_outputs(self, outputs: dict,
+    def _prepare_outputs(self, outputs: Optional[dict],
                          input_lengths: torch.Tensor) -> dict:
-        if 'context_logits' in outputs:
+        if outputs is not None and 'context_logits' in outputs:
             batch_size = input_lengths.size(0)
             context_logits = outputs['context_logits']
             if self.remove_input_padding:

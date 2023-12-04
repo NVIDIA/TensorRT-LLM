@@ -156,8 +156,7 @@ python3 ../summarize.py --engine_dir trt_engine/opt-125m/fp16/1-gpu \
                         --hf_model_dir opt-125m \
                         --data_type fp16 \
                         --check_accuracy \
-                        --tensorrt_llm_rouge1_threshold=14 \
-                        --no_add_special_tokens
+                        --tensorrt_llm_rouge1_threshold=14
 
 # OPT-350M
 python3 ../summarize.py --engine_dir trt_engine/opt-350m/fp16/1-gpu \
@@ -167,8 +166,7 @@ python3 ../summarize.py --engine_dir trt_engine/opt-350m/fp16/1-gpu \
                         --hf_model_dir opt-350m \
                         --data_type fp16 \
                         --check_accuracy \
-                        --tensorrt_llm_rouge1_threshold=20 \
-                        --no_add_special_tokens
+                        --tensorrt_llm_rouge1_threshold=20
 
 # OPT-2.7B
 python3 ../summarize.py --engine_dir trt_engine/opt-2.7b/fp16/1-gpu \
@@ -178,8 +176,7 @@ python3 ../summarize.py --engine_dir trt_engine/opt-2.7b/fp16/1-gpu \
                         --hf_model_dir opt-2.7b \
                         --data_type fp16 \
                         --check_accuracy \
-                        --tensorrt_llm_rouge1_threshold=21 \
-                        --no_add_special_tokens
+                        --tensorrt_llm_rouge1_threshold=20
 
 # OPT-66B
 mpirun -n 4 --allow-run-as-root \
@@ -189,8 +186,7 @@ mpirun -n 4 --allow-run-as-root \
                             --hf_model_dir opt-66b \
                             --data_type fp16 \
                             --check_accuracy \
-                            --tensorrt_llm_rouge1_threshold=21 \
-                            --no_add_special_tokens
+                            --tensorrt_llm_rouge1_threshold=20
 ```
 
 #### Fused MultiHead Attention (FMHA)

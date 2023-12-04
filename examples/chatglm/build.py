@@ -18,9 +18,11 @@ import time
 from pathlib import Path
 from typing import List
 
-import tensorrt as trt
+# isort: off
 import torch
 import torch.multiprocessing as mp
+import tensorrt as trt
+# isort: on
 from visualize import to_onnx
 from weight import get_scaling_factors, load_from_hf
 
@@ -104,7 +106,7 @@ def parse_arguments(args):
     )
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
-    parser.add_argument('--model_dir', type=str, default=None)
+    parser.add_argument('--model_dir', type=Path, default=None)
     parser.add_argument('--quant_ckpt_path', type=str, default="awq/")
     parser.add_argument(
         '--dtype',
@@ -207,7 +209,7 @@ def parse_arguments(args):
     parser.add_argument(
         '--output_dir',
         type=Path,
-        default='trtModel',
+        default=None,
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
     )
@@ -363,8 +365,10 @@ def parse_arguments(args):
     assert args.world_size == args.tp_size * args.pp_size  # only TP is supported now
 
     if args.model_dir is None:
-        args.model_dir = args.model_name
-    with open(Path(args.model_dir) / "config.json", "r") as f:
+        args.model_dir = Path(args.model_name)
+    if args.output_dir is None:
+        args.output_dir = Path("output_" + args.model_name)
+    with open(args.model_dir / "config.json", "r") as f:
         js = json.loads(f.read())
 
     if args.model_name in ["chatglm_6b", "glm_10b"]:
@@ -382,7 +386,6 @@ def parse_arguments(args):
             args.max_output_len,
             js["max_sequence_length"],
         )
-        args.multi_block_mode = False
         args.multi_query_mode = False
         args.norm_epsilon = js["layernorm_epsilon"]
         args.num_heads = js["num_attention_heads"]
@@ -412,7 +415,6 @@ def parse_arguments(args):
             args.max_output_len,
             js["seq_length"],
         )
-        args.multi_block_mode = False
         args.multi_query_mode = js["multi_query_attention"]
         args.norm_epsilon = js["layernorm_epsilon"]
         args.num_heads = js["num_attention_heads"]
@@ -439,7 +441,6 @@ def parse_arguments(args):
             js["max_sequence_length"],
             True,
         )
-        args.multi_block_mode = False
         args.multi_query_mode = False
         args.norm_epsilon = 1.0e-5
         args.num_heads = js["num_attention_heads"]
@@ -642,7 +643,7 @@ def build_rank_engine(
     engine = None
     engine = builder.build_engine(network, builder_config)
     if rank == 0:
-        config_path = args.output_dir / (args.model_name + '-config.json')
+        config_path = args.output_dir / 'config.json'
         builder.save_config(builder_config, config_path)
 
     return engine

@@ -137,11 +137,9 @@ The following issues are being addressed to improve the efficiency of TensorRT-L
 
 ### Fused Matmul + Gated-SiLU (LLaMA)
 
-There are different possible implementations for Matmul followed by Gated-SiLU.
-The simplest implementation uses two Matmul operations and combines the results
-in a separate CUDA kernel. That's the current implementation in TensorRT-LLM.
-The next release will include a more efficient implementation that runs a
-single Matmul.
+The current implementation combines two Matmul operations into one Matmul followed by
+a separate SwiGLU kernel (when `--use_fused_mlp` is enabled). The future release will
+include a more efficient implementation that runs single Matmul + SwiGLU fused kernel.
 
 
 ## Reproducing Benchmarked Results

@@ -109,6 +109,9 @@ inline void multi_block_grid_setup(dim3& grid, const Multihead_attention_params<
 
     params.seq_len_tile = std::min(params.seq_len_tile, max_seq_len_tile);
 
+    TLLM_CHECK_WITH_INFO(
+        params.seq_len_tile <= block_size, "The number of blocks per sequence may not exceed the thread block size.");
+
     // We should consider the new timestep.
     params.timesteps_per_block = mmha::divUp(tlength + 1, params.seq_len_tile);
 

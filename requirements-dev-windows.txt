@@ -18,9 +18,13 @@ mypy
 pytest-cov
 pytest-xdist
 pytest-forked
+pybind11-stubgen
 pre-commit
 einops
 parameterized
 graphviz
 pywin32
 pynvml>=11.5.0
+--pre --extra-index-url https://pypi.nvidia.com
+tensorrt==9.2.0.post12.dev5
+typing-extensions==4.8.0

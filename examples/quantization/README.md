@@ -20,14 +20,12 @@ docker run --gpus all --ipc=host --ulimit memlock=-1 --shm-size=20g -it <the doc
 2. Install the quantization toolkit `ammo` and the related dependencies on top of the TensorRT-LLM installation or docker file.
 
 ```bash
-# Obtain the cuda version from the system. Assuming nvcc is available in path.
-cuda_version=$(nvcc --version | grep 'release' | awk '{print $6}' | awk -F'[V.]' '{print $2$3}')
 # Obtain the python version from the system.
 python_version=$(python3 --version 2>&1 | awk '{print $2}' | awk -F. '{print $1$2}')
 # Download and install the AMMO package from the DevZone.
-wget https://developer.nvidia.com/downloads/assets/cuda/files/nvidia-ammo/nvidia_ammo-0.3.0.tar.gz
-tar -xzf nvidia_ammo-0.3.0.tar.gz
-pip install nvidia_ammo-0.3.0/nvidia_ammo-0.3.0+cu$cuda_version-cp$python_version-cp$python_version-linux_x86_64.whl
+wget https://developer.nvidia.com/downloads/assets/cuda/files/nvidia-ammo/nvidia_ammo-0.5.0.tar.gz
+tar -xzf nvidia_ammo-0.5.0.tar.gz
+pip install nvidia_ammo-0.5.0/nvidia_ammo-0.5.0-cp$python_version-cp$python_version-linux_x86_64.whl
 # Install the additional requirements
 cd <this example folder>
 pip install -r requirements.txt
@@ -85,7 +83,6 @@ with torch.inference_mode():
         model,  # The quantized model.
         decoder_type,  # The type of the model as str, e.g gptj, llama or gptnext.
         dtype,  # The exported weights data type as torch.dtype.
-        quantization,  # The quantization algorithm applied, e.g. fp8 or int8_sq.
         export_dir,  # The directory where the exported files will be stored.
         inference_gpus,  # The number of GPUs used in the inference time for tensor parallelism.
     )
