@@ -202,7 +202,8 @@ def generate(
                 if num_beams <= 1:
                     output_begin = max_input_length
                     outputs = output_ids[b][0][output_begin:].tolist()
-                    output_text = tokenizer.decode(outputs)
+                    output_text = tokenizer.decode(outputs,
+                                                   skip_special_tokens=True)
                     print(f'Output: \"{output_text}\"')
                 else:
                     for beam in range(num_beams):
@@ -210,7 +211,8 @@ def generate(
                         output_end = input_lengths[b] + max_output_len
                         outputs = output_ids[b][beam][
                             output_begin:output_end].tolist()
-                        output_text = tokenizer.decode(outputs)
+                        output_text = tokenizer.decode(outputs,
+                                                       skip_special_tokens=True)
                         print(f'Output: \"{output_text}\"')
 
         output_ids = output_ids.reshape((-1, output_ids.size(2)))
