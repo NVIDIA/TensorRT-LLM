@@ -1,23 +1,27 @@
 import argparse
+import configparser
 import time
 from pathlib import Path
 
 import torch
-import whisper
+import torch.multiprocessing as mp
+
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.network import net_guard
 
 from weight import load_whisper_from_pytorch, parse_config  # isort:skip
 from encoder import AudioEncoder
 
-MODEL_NAME = "whisper"
 
-
-def get_engine_name(model, dtype, tp_size, rank):
-    return '{}_{}_tp{}_rank{}.engine'.format(model, dtype, tp_size, rank)
+def get_engine_name(model, dtype, tp_size, pp_size, rank):
+    if pp_size == 1:
+        return '{}_{}_tp{}_rank{}.engine'.format(model, dtype, tp_size, rank)
+    return '{}_{}_tp{}_pp{}_rank{}.engine'.format(model, dtype, tp_size,
+                                                  pp_size, rank)
 
 
 def serialize_engine(engine, path):
@@ -32,15 +36,55 @@ def serialize_engine(engine, path):
 
 def parse_arguments(args, component):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_dir', type=str, default=None)
-    parser.add_argument('--dtype',
+    parser.add_argument('--world_size',
+                        type=int,
+                        default=1,
+                        help='MPI world size (must equal TP * PP)')
+    parser.add_argument('--tp_size',
+                        type=int,
+                        default=1,
+                        help='N-way tensor parallelism size')
+    parser.add_argument('--pp_size',
+                        type=int,
+                        default=1,
+                        help='N-way pipeline parallelism size')
+    parser.add_argument(
+        '--gpus_per_node',
+        type=int,
+        default=1,
+        help=
+        'Number of GPUs each node has in a multi-node setup. This is a cluster spec and can be greater/smaller than world size'
+    )
+    parser.add_argument('--parallel_build', default=False, action='store_true')
+
+    parser.add_argument('--weight_dir',
+                        '-i',
                         type=str,
-                        default='float16',
-                        choices=['float16', 'float32', 'bfloat16'])
-    parser.add_argument('--logits_dtype',
+                        default=None,
+                        help='Path to the converted weight file')
+    parser.add_argument(
+        '--output_dir',
+        '-o',
+        type=Path,
+        default='trt_engines',
+        help=
+        'The path to save the serialized engine files, timing cache file and model configs'
+    )
+    parser.add_argument(
+        '--weight_from_pytorch_ckpt',
+        default=False,
+        action='store_true',
+        help=
+        'Load weight from PyTorch checkpoint. model_dir must point to ckpt directory'
+    )
+
+
+    parser.add_argument('--engine_name',
+                        '-n',
                         type=str,
-                        default='float32',
-                        choices=['float16', 'float32'])
+                        default='enc_dec',
+                        help='TensorRT engine name prefix')
+    
     parser.add_argument(
         '--timing_cache',
         type=str,
@@ -48,16 +92,34 @@ def parse_arguments(args, component):
         help=
         'The path of to read timing cache from, will be ignored if the file does not exist'
     )
+    parser.add_argument('--model_type',
+                        type=str,
+                        choices=['t5', 'bart'],
+                        default='bart')
+    parser.add_argument(
+        '--dtype',
+        type=str,
+        default='float16',
+        choices=['float16', 'float32', 'bfloat16'],
+        help=
+        'Target inference dtype. Weights and Computation will be in this dtype, no matter what original dtype the weight checkpoint has.'
+    )
+    parser.add_argument('--logits_dtype',
+                        type=str,
+                        default='float32',
+                        choices=['float16', 'float32'])
     parser.add_argument('--log_level', type=str, default='info')
-    parser.add_argument('--vocab_size', type=int, default=51864)
-    parser.add_argument('--n_layer', type=int, default=4)
-    parser.add_argument('--n_head', type=int, default=6)
-    parser.add_argument('--hidden_act', type=str, default='gelu')
-    parser.add_argument('--inter_size', type=int, default=4096)
-    parser.add_argument('--no_bias', action="store_false")
     parser.add_argument('--max_batch_size', type=int, default=1)
-    parser.add_argument('--max_input_len', type=int, default=3000)
+    parser.add_argument('--max_encoder_input_len', type=int, default=1500)
+    parser.add_argument(
+        '--max_decoder_input_len',
+        type=int,
+        default=3,
+        help=
+        'If you want deocder_forced_input_ids feature, set to value greater than 1. Otherwise, encoder-decoder model start from decoder_start_token_id of length 1'
+    )
     parser.add_argument('--max_output_len', type=int, default=225)
+    parser.add_argument('--max_beam_width', type=int, default=1)
     parser.add_argument(
         '--use_bert_attention_plugin',
         nargs='?',
@@ -98,18 +160,27 @@ def parse_arguments(args, component):
         help=
         "Activates layernorm plugin. You can specify the plugin dtype or leave blank to use the model dtype."
     )
+    parser.add_argument(
+        '--use_rmsnorm_plugin',
+        nargs='?',
+        const=None,
+        type=str,
+        default=False,
+        choices=['float16', 'float32', 'bfloat16'],
+        help=
+        "Activates rmsnorm plugin. You can specify the plugin dtype or leave blank to use the model dtype."
+    )
+    parser.add_argument(
+        '--use_lookup_plugin',
+        nargs='?',
+        const=None,
+        default=False,
+        choices=['float16', 'float32', 'bfloat16'],
+        help="Activates the lookup plugin which enables embedding sharding.")
     parser.add_argument('--enable_qk_half_accum',
                         default=False,
                         action='store_true')
-    parser.add_argument('--gpus_per_node', type=int, default=8)
     parser.add_argument('--builder_opt', type=int, default=None)
-    parser.add_argument(
-        '--output_dir',
-        type=Path,
-        default='trt_engines',
-        help=
-        'The path to save the serialized engine files, timing cache file and model configs'
-    )
     parser.add_argument('--remove_input_padding',
                         default=False,
                         action='store_true')
@@ -120,27 +191,51 @@ def parse_arguments(args, component):
         help=
         'Seed to use when initializing the random number generator for torch.')
     parser.add_argument(
-        '--use_lookup_plugin',
-        nargs='?',
-        const=None,
+        '--use_parallel_embedding',
+        action="store_true",
         default=False,
-        choices=['float16', 'float32', 'bfloat16'],
-        help="Activates the lookup plugin which enables embedding sharing.")
+        help=
+        'By default embedding parallelism is disabled. By setting this flag, embedding parallelism is enabled'
+    )
+    parser.add_argument(
+        '--embedding_sharding_dim',
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=
+        'By default the embedding lookup table is sharded along vocab dimension (embedding_sharding_dim=0). '
+        'To shard it along hidden dimension, set embedding_sharding_dim=1'
+        'Note: embedding sharding is only enabled when embedding_sharding_dim = 0'
+    )
+    parser.add_argument(
+        '--use_custom_all_reduce',
+        action='store_true',
+        help=
+        'Activates latency-optimized algorithm for all-reduce instead of NCCL.')
+    parser.add_argument(
+        '--strongly_typed',
+        default=False,
+        action="store_true",
+        help=
+        'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
+    )
 
-    args = parser.parse_args(args)
+    # parse cmdline args
+    args = parser.parse_args()
     logger.set_level(args.log_level)
 
-    args.bias = not args.no_bias
-    if args.inter_size is None:
-        args.inter_size = 4 * args.n_embd
-
-    if args.model_dir is not None:
-        logger.info(f"Setting model configuration from {args.model_dir}.")
+    # parse model config and add to args
+    if args.weight_dir is not None:
+        logger.info(f"Setting model configuration from {args.weight_dir}.")
         args = parse_config(
-            Path(args.model_dir) / "config.ini", component, args)
+            Path(args.weight_dir) / "config.ini", component, args)
+
+    assert args.pp_size * args.tp_size == args.world_size
+
     plugins_args = [
         'use_bert_attention_plugin', 'use_gpt_attention_plugin',
-        'use_gemm_plugin', 'use_layernorm_plugin', 'use_lookup_plugin'
+        'use_gemm_plugin', 'use_layernorm_plugin', 'use_rmsnorm_plugin',
+        'use_lookup_plugin'
     ]
     for plugin_arg in plugins_args:
         if getattr(args, plugin_arg) is None:
@@ -149,6 +244,9 @@ def parse_arguments(args, component):
             )
             setattr(args, plugin_arg, args.dtype)
 
+    if args.dtype == 'bfloat16':
+        assert args.use_gemm_plugin, "Please use gemm plugin when dtype is bfloat16"
+    print(args)
     return args
 
 
@@ -161,7 +259,16 @@ def build_rank_engine(builder: Builder,
        @param args: The cmd line arguments.
        @return: The built engine.
     '''
-    kv_dtype = str_dtype_to_trt(args.dtype)
+    dtype = str_dtype_to_trt(args.dtype)
+
+    mapping = Mapping(world_size=args.world_size,
+                      rank=rank,
+                      tp_size=args.tp_size,
+                      pp_size=args.pp_size)
+
+    assert args.n_layer % args.pp_size == 0, \
+        f"num_layers {args.n_layer} must be a multiple of pipeline parallelism size {args.pp_size}"
+
 
     # Initialize Module
     if args.component == 'encoder':
@@ -170,33 +277,33 @@ def build_rank_engine(builder: Builder,
             args.n_layer,
             args.n_ctx,
             args.n_head,
-            dtype=kv_dtype)
-    # elif args.component == 'decoder':
-    #     tllm_model = tensorrt_llm.models.DecoderModel(
-    #         num_layers=args.n_layer,
-    #         num_heads=args.n_head,
-    #         hidden_size=args.hidden_size,
-    #         ffn_hidden_size=args.ffn_hidden_size,
-    #         encoder_hidden_size=args.encoder_hidden_size,
-    #         encoder_num_heads=args.encoder_num_heads,
-    #         vocab_size=args.vocab_size,
-    #         max_position_embeddings=args.n_positions,
-    #         has_position_embedding=args.has_position_embedding,
-    #         relative_attention=args.relative_attention,
-    #         max_distance=args.max_distance,
-    #         num_buckets=args.num_buckets,
-    #         has_embedding_layernorm=args.has_embedding_layernorm,
-    #         has_embedding_scale=args.has_embedding_scale,
-    #         q_scaling=args.q_scaling,
-    #         has_attention_qkvo_bias=args.has_attention_qkvo_bias,
-    #         has_mlp_bias=args.has_mlp_bias,
-    #         has_model_final_layernorm=args.has_model_final_layernorm,
-    #         layernorm_eps=args.layernorm_eps,
-    #         layernorm_position=args.layernorm_position,
-    #         layernorm_type=args.layernorm_type,
-    #         hidden_act=args.hidden_act,
-    #         dtype=kv_dtype,
-    #         logits_dtype=args.logits_dtype)
+            dtype=dtype)
+    elif args.component == 'decoder':
+        tllm_model = tensorrt_llm.models.DecoderModel(
+            num_layers=args.n_layer,
+            num_heads=args.n_head,
+            hidden_size=args.hidden_size,
+            ffn_hidden_size=args.ffn_hidden_size,
+            encoder_hidden_size=args.encoder_hidden_size,
+            encoder_num_heads=args.encoder_num_heads,
+            vocab_size=args.vocab_size,
+            max_position_embeddings=args.n_positions,
+            has_position_embedding=args.has_position_embedding,
+            relative_attention=False,
+            max_distance=0,
+            num_buckets=0,
+            has_embedding_layernorm=args.has_embedding_layernorm,
+            has_embedding_scale=args.has_embedding_scale,
+            q_scaling=args.q_scaling,
+            has_attention_qkvo_bias=args.has_attention_qkvo_bias,
+            has_mlp_bias=args.has_mlp_bias,
+            has_model_final_layernorm=args.has_model_final_layernorm,
+            layernorm_eps=args.layernorm_eps,
+            layernorm_position=args.layernorm_position,
+            layernorm_type=args.layernorm_type,
+            hidden_act=args.hidden_act,
+            dtype=dtype,
+            logits_dtype=args.logits_dtype)
 
     # No support for relative attention bias in plain TRT mode
     # (If to add such support, need to add into
@@ -205,10 +312,10 @@ def build_rank_engine(builder: Builder,
         assert args.use_bert_attention_plugin, "Relative attention bias is only supported when using BertAttention Plugin"
         assert args.use_gpt_attention_plugin, "Relative attention bias is only supported when using GPTAttention Plugin"
 
-    if args.model_dir is not None:
+    if args.weight_dir is not None:
      
         load_whisper_from_pytorch(tllm_model,
-                             args.model_dir,
+                             args.weight_dir,
                              args.component,
                              dtype=args.dtype)
 
@@ -244,9 +351,17 @@ def build_rank_engine(builder: Builder,
             inputs = tllm_model.prepare_inputs(
                 args.max_batch_size,
             )
+        
+        elif args.component == 'decoder':
+            inputs = tllm_model.prepare_inputs(
+                args.max_batch_size,
+                args.max_beam_width,
+                args.max_decoder_input_len,
+                args.max_output_len,
+                args.max_encoder_input_len,
+            )
 
-
-        tllm_model(inputs)
+        tllm_model(*inputs)
 
         # Adding debug outputs into the network --------------------------
         for k, v in tllm_model.named_network_outputs():
@@ -277,35 +392,45 @@ def build(rank, args):
     world_size = 1
     for cur_rank in range(world_size):
         builder_config = builder.create_builder_config(
-            name=MODEL_NAME,
+            name=args.engine_name,
             precision=args.dtype,
             timing_cache=timing_cache,
             tensor_parallel=world_size,  # TP only
+            pipeline_parallel=args.pp_size,
+            gpus_per_node=args.gpus_per_node,
+            parallel_build=args.parallel_build,
             num_layers=args.n_layer,
             num_heads=args.n_head,
             hidden_size=args.hidden_size,
+            head_size=args.head_size,
             vocab_size=args.vocab_size,
             hidden_act=args.hidden_act,
             max_position_embeddings=args.n_positions,
             apply_query_key_layer_scaling=apply_query_key_layer_scaling,
             max_batch_size=args.max_batch_size,
-            max_input_len=args.max_input_len,
+            max_decoder_input_len=args.max_decoder_input_len,
             max_output_len=args.max_output_len,
+            max_encoder_input_len=args.max_encoder_input_len,
             opt_level=args.builder_opt,
             cross_attention=(args.component == 'decoder'),
             has_position_embedding=args.has_position_embedding,
             has_token_type_embedding=args.has_token_type_embedding,
         )
 
-        engine_name = get_engine_name(MODEL_NAME, args.dtype, world_size,
-                                      cur_rank)
+        engine_name = get_engine_name(args.engine_name, args.dtype,
+                                      args.tp_size, args.pp_size, cur_rank)
         engine = build_rank_engine(builder, builder_config, engine_name,
                                    cur_rank, args)
         assert engine is not None, f'Failed to build engine for rank {cur_rank}'
 
         if cur_rank == 0:
+            # save build config
+            config_path = component_dir / 'config.json'
+            builder.save_config(builder_config, config_path)
+
             # Use in-memory timing cache for multiple builder passes.
-            timing_cache = builder_config.trt_builder_config.get_timing_cache()
+            if not args.parallel_build:
+                cache = builder_config.trt_builder_config.get_timing_cache()
 
         serialize_engine(engine, component_dir / engine_name)
 
@@ -337,4 +462,4 @@ def run_build(component, args=None):
 
 if __name__ == '__main__':
     run_build(component='encoder')
-    # run_build(component='decoder')
+    run_build(component='decoder')

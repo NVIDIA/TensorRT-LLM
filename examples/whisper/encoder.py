@@ -29,20 +29,6 @@ layernorm_map = {
 
 
 
-# class Cast(Module):
-
-#     def __init__(self, output_dtype: str = 'float32') -> None:
-#         super().__init__()
-#         assert output_dtype in ('float32', 'float16', 'bfloat16', 'bool',
-#                                 'int32', 'int8'), TypeError(
-#                                     "%s is not supported" % output_dtype)
-#         self.output_dtype = output_dtype
-
-#     def forward(self, x):
-#         return cast(x, self.output_dtype)
-
-        
-
 def sinusoids(length, channels, max_timescale=10000):
     """Returns sinusoids for positional embedding"""
     assert channels % 2 == 0
@@ -108,9 +94,6 @@ class EncoderLayer(Module):
             hidden_states,
             attention_mask=attention_mask,
         )
-        if layer_idx==0:
-            hidden_states.mark_output(f"attn_ln_{layer_idx}", self._dtype)
-            attention_output.mark_output(f"attn_output_{layer_idx}", self._dtype)
         hidden_states = residual + attention_output
 
 
@@ -171,7 +154,14 @@ class AudioEncoder(Module):
         self.ln_post = ln_type(normalized_shape=n_state,
                                      eps=layernorm_eps,
                                      dtype=self._dtype)
-        self.position_emb = np.expand_dims(sinusoids(self.n_ctx, self.n_state).numpy(), axis=0).astype(np.float16)
+        self.position_emb = np.expand_dims(
+            sinusoids(self.n_ctx, self.n_state).numpy(), axis=0)
+        if self._dtype==str_dtype_to_trt("float32"):
+            self.position_emb = self.position_emb.astype(np.float32)
+        else:
+            print(self._dtype)
+            self.position_emb = self.position_emb.astype(np.float16)
+        
         print(self.position_emb.shape, type(self.position_emb))
         
     def forward(self, x):
@@ -181,15 +171,12 @@ class AudioEncoder(Module):
         x = ACT2FN[self.hidden_act](x)
         x = view(x, [1, self.n_state, self.n_ctx])
         x = permute(x, [0, 2, 1])
-        # x.mark_output('conv_output', self._dtype)
 
         # add positional embeddings
         position_embedding = constant(self.position_emb)
         
-        # hidden_states = elementwise_binary(hidden_states, position_embedding, trt.ElementWiseOperation.SUM)
         hidden_states = add(x, position_embedding)
-        # hidden_states.mark_output("embed_output", self._dtype)
-        print("Done adding")
+
         # attention blocks
         for layer_idx, block in enumerate(self.blocks):
             hidden_states = block(hidden_states=hidden_states, layer_idx=layer_idx)
@@ -198,7 +185,7 @@ class AudioEncoder(Module):
         hidden_states = self.ln_post(hidden_states)
         hidden_states.mark_output('encoder_output', self._dtype)
 
-        return hidden_states, x
+        return hidden_states
 
     def prepare_inputs(self, max_batch_size=4):
         """
@@ -215,4 +202,4 @@ class AudioEncoder(Module):
                 ('batch_size', [1]), ('n_mels', [80]), ('input_length', [3000]), ('conv_unsqueeze', [1])
             ])
         )
-        return input_features
+        return [input_features]
