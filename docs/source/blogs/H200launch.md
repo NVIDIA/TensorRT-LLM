@@ -1,3 +1,5 @@
+:loudspeaker: Note: The below data is using TensorRT-LLM v0.5. There have been significant improvements in v0.6 & later. Please see updated Llama performance [here](./Falcon180B-H200.md).
+
 # H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM
 
 TensorRT-LLM evaluation of the [new H200 GPU](https://nvidianews.nvidia.com/news/nvidia-supercharges-hopper-the-worlds-leading-ai-computing-platform) achieves **11,819 tokens/s on Llama2-13B** on a single GPU. H200 is up to **1.9x faster** than H100. This performance is enabled by H200's larger, faster [HBM3e memory](#latest-hbm-memory).
