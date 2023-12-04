@@ -23,7 +23,7 @@ import torch.multiprocessing as mp
 import tensorrt as trt
 # isort: on
 from transformers import AutoConfig, AutoModelForCausalLM
-from weight import load_from_ft, load_from_hf_qwen
+from weight import load_from_ft, load_from_hf_qwen, load_from_awq_qwen
 
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_trt
@@ -126,6 +126,7 @@ def parse_arguments():
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument('--hf_model_dir', type=str, default=None)
     parser.add_argument('--ft_dir_path', type=str, default=None)
+    parser.add_argument("--quant_ckpt_path", type=str, default=None)
     parser.add_argument('--dtype',
                         type=str,
                         default='float16',
@@ -228,6 +229,12 @@ def parse_arguments():
         'By default, we use a single static scaling factor to scale weights in the int4 range. '
         'per_group chooses at run time, and for each group, a custom scaling factor. '
         'The flag is built for GPTQ/AWQ quantization.')
+    parser.add_argument(
+        "--group_size",
+        type=int,
+        default=128,
+        help="group size used in gptq/awq quantization.",
+    )
 
     parser.add_argument(
         '--use_weight_only',
@@ -242,7 +249,7 @@ def parse_arguments():
         type=str,
         nargs='?',
         default='int8',
-        choices=['int8', 'int4'],
+        choices=['int8', 'int4', 'int4_awq'],
         help=
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
@@ -444,7 +451,14 @@ def build_rank_engine(builder: Builder,
     tensorrt_llm_qwen = quantize_model(tensorrt_llm_qwen, args.quant_mode,
                                        **quantize_kwargs)
     ft_dir_path = args.ft_dir_path
-    if args.hf_model_dir is not None and \
+    if args.per_group:
+        load_from_awq_qwen(
+            tensorrt_llm_qwen=tensorrt_llm_qwen,
+            quant_ckpt_path=args.quant_ckpt_path,
+            mapping=mapping,
+            dtype=args.dtype
+        )
+    elif args.hf_model_dir is not None and \
         (ft_dir_path is None or not os.path.exists(ft_dir_path)):
         logger.info(f'Loading HF QWen ... from {args.hf_model_dir}')
         tik = time.time()

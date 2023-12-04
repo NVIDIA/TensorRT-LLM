@@ -265,6 +265,117 @@ python ../summarize.py --test_trt_llm \
                        --output_len 2048
 ```
 
+#### INT4-AWQ
+To run the AWQ Qwen example, the following steps are required:
+1. Download and install the [nvidia-ammo](https://developer.nvidia.com/downloads/assets/cuda/files/nvidia-ammo/nvidia_ammo-0.3.0.tar.gz) module. An installation code is required below. For reference, be careful not to install the cuda version, but the universal version, otherwise there will be bugs.
+```bash
+pip install nvidia_ammo-0.3.0-cp310-cp310-linux_x86_64.whl
+```
+2. Modify the ammo code and add qwen support (an error will be reported if not added). Here is a simple reference case:
+- First, write a python file in vscode and import the following function
+```python
+from tensorrt_llm.models.quantized.ammo import quantize_and_export
+```
+- Then control + left mouse button, click the `quantize_and_export` function to view its internal implementation.
+- In the if judgment below, add the following question code to support Qwen
+```bash
+    ("qwen", ): "qwen",
+```
+- After modification, it looks like this:
+```bash
+model_lookup = {
+    ("llama", "mistral"): "llama",
+    ("gptj", ): "gptj",
+    ("falcon", "rw"): "falcon",
+    ("baichuan", ): "baichuan",
+    ("mpt", ): "mpt",
+    ("gpt2", ): "gpt2",
+    ("chatglm", ): "chatglm",
+}
+```
+- Second, change save code
+- before
+```python
+if export_path:
+    with torch.inference_mode():
+        export_model_config(
+            model,
+            model_type,
+            torch.float16,
+            export_dir=export_path,
+            inference_tensor_parallel=tensor_parallel_size,
+        )
+    logger.info(f"Quantized model exported to :{export_path}")
+```
+- after
+```python
+if export_path:
+    with torch.inference_mode():
+        if qformat == "int4_awq" and model_type == "qwen":
+            torch.save(model.state_dict(), export_path)
+        else:
+            export_model_config(
+                model,
+                model_type,
+                torch.float16,
+                quantization=qformat,
+                export_dir=export_path,
+                inference_tensor_parallel=tensor_parallel_size,
+            )
+    logger.info(f"Quantized model exported to :{export_path}")
+```
+
+3. Weight quantization
+```bash
+python3 quantize.py --model_dir ./tmp/Qwen/7B \
+                    --dtype float16 \
+                    --qformat int4_awq \
+                    --export_path ./qwen_7b_4bit_gs128_awq.pt \
+                    --calib_size 32
+```
+
+4. TRT-LLM engine:
+```bash
+python build.py --hf_model_dir ./tmp/Qwen/7B \
+                --quant_ckpt_path ./qwen_7b_4bit_gs128_awq.pt \
+                --dtype float16 \
+                --remove_input_padding \
+                --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
+                --use_gemm_plugin float16 \
+                --use_weight_only \
+                --weight_only_precision int4_awq \
+                --per_group \
+                --world_size 1 \
+                --tp_size 1 \
+                --output_dir ./tmp/Qwen/7B/trt_engines/int4-awq/1-gpu
+```
+5. Run int4-awq
+```bash
+python3 ../run.py --input_text "你好，请问你叫什么？" \
+                  --max_output_len=50 \
+                  --tokenizer_dir ./tmp/Qwen/7B/ \
+                  --engine_dir=./tmp/Qwen/7B/trt_engines/int4-awq/1-gpu
+```
+
+6. Summarize
+- validate huggingface
+```bash
+python3 ../summarize.py --test_hf \
+                        --tokenizer_dir ./tmp/Qwen/7B \
+                        --hf_model_dir ./tmp/Qwen/7B \
+                        --max_input_length 2048 \
+                        --output_len 2048
+```
+
+- validate trt-llm
+```bash
+python3 ../summarize.py --test_trt_llm \
+                        --tokenizer_dir ./tmp/Qwen/7B \
+                        --engine_dir ./tmp/Qwen/7B/trt_engines/int4-awq/1-gpu \
+                        --max_input_length 2048 \
+                        --output_len 2048
+```
 
 ### Run
 
