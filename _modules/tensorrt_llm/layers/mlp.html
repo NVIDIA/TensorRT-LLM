@@ -48,6 +48,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation.html">Build TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance.html">Performance of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
@@ -66,6 +67,11 @@
 <p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 </ul>
 
         </div>
@@ -168,26 +174,15 @@
                                   <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
                                   <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
                                   <span class="n">instance_id</span><span class="o">=</span><span class="n">instance_id</span><span class="p">)</span>
-
         <span class="bp">self</span><span class="o">.</span><span class="n">hidden_act</span> <span class="o">=</span> <span class="n">hidden_act</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">dtype</span>
 
 <div class="viewcode-block" id="MLP.forward">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.MLP.forward">[docs]</a>
-    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">lora_param</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-        <span class="n">mlp_h_to_4h_param</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="n">lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">mlp_h_to_4h_param</span> <span class="o">=</span> <span class="n">lora_param</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;mlp_h_to_4h&quot;</span><span class="p">)</span>
-
-        <span class="n">mlp_4h_to_h_param</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="n">lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">mlp_4h_to_h_param</span> <span class="o">=</span> <span class="n">lora_param</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;mlp_4h_to_h&quot;</span><span class="p">)</span>
-
-        <span class="n">inter</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">mlp_h_to_4h_param</span><span class="p">)</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="n">inter</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
         <span class="n">inter</span> <span class="o">=</span> <span class="n">ACT2FN</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">hidden_act</span><span class="p">](</span><span class="n">inter</span><span class="p">)</span>
-        <span class="n">output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">inter</span><span class="p">,</span>
-                           <span class="n">workspace</span><span class="p">,</span>
-                           <span class="n">lora_runtime_param</span><span class="o">=</span><span class="n">mlp_4h_to_h_param</span><span class="p">)</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">inter</span><span class="p">,</span> <span class="n">workspace</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">output</span></div>
 </div>
 
@@ -247,27 +242,11 @@
 
 <div class="viewcode-block" id="GatedMLP.forward">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.GatedMLP.forward">[docs]</a>
-    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">lora_param</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-
-        <span class="n">mlp_h_to_4h_param</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="n">lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">mlp_h_to_4h_param</span> <span class="o">=</span> <span class="n">lora_param</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;mlp_h_to_4h&quot;</span><span class="p">)</span>
-
-        <span class="n">mlp_gate_param</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="n">lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">mlp_gate_param</span> <span class="o">=</span> <span class="n">lora_param</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;mlp_gate&quot;</span><span class="p">)</span>
-
-        <span class="n">mlp_4h_to_h_param</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="n">lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">mlp_4h_to_h_param</span> <span class="o">=</span> <span class="n">lora_param</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;mlp_4h_to_h&quot;</span><span class="p">)</span>
-
-        <span class="n">inter</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">mlp_h_to_4h_param</span><span class="p">)</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="n">inter</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
         <span class="n">inter</span> <span class="o">=</span> <span class="n">ACT2FN</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">hidden_act</span><span class="p">](</span><span class="n">inter</span><span class="p">)</span>
-        <span class="n">gate</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">gate</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">mlp_gate_param</span><span class="p">)</span>
-        <span class="n">intermediate</span> <span class="o">=</span> <span class="n">inter</span> <span class="o">*</span> <span class="n">gate</span>
-        <span class="n">output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">intermediate</span><span class="p">,</span>
-                           <span class="n">workspace</span><span class="p">,</span>
-                           <span class="n">lora_runtime_param</span><span class="o">=</span><span class="n">mlp_4h_to_h_param</span><span class="p">)</span>
+        <span class="n">gate</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">gate</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">inter</span> <span class="o">*</span> <span class="n">gate</span><span class="p">,</span> <span class="n">workspace</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">output</span></div>
 </div>
 
@@ -299,7 +278,7 @@
 
 <div class="viewcode-block" id="FusedGatedMLP.forward">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.FusedGatedMLP.forward">[docs]</a>
-    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">lora_param</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="c1"># Combine the following pattern</span>
         <span class="c1">#</span>
         <span class="c1">#   SiLU(FC(x)) + Gate(x)</span>

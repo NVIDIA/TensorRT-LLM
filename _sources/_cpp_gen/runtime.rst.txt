@@ -118,6 +118,12 @@ ________________
 .. doxygenfile:: memoryCounters.h
    :project: TensorRT-LLM
 
+promptTuningParams.h
+____________________
+
+.. doxygenfile:: promptTuningParams.h
+   :project: TensorRT-LLM
+
 samplingConfig.h
 ________________
 
@@ -134,11 +140,5 @@ worldConfig.h
 _____________
 
 .. doxygenfile:: worldConfig.h
-   :project: TensorRT-LLM
-
-promptTuningParams.h
-____________________
-
-.. doxygenfile:: promptTuningParams.h
    :project: TensorRT-LLM
 

@@ -78,6 +78,7 @@
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Build TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="performance.html">Performance of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
@@ -99,7 +100,7 @@
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token.</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 </ul>
 
@@ -139,7 +140,7 @@ Multi-query Attention (MQA) [<a class="reference external" href="https://arxiv.o
 Group-query Attention (GQA) [<a class="reference external" href="https://arxiv.org/abs/2307.09288">https://arxiv.org/abs/2307.09288</a>]
 are variants of MHA that use fewer, so-called, K/V head than the number of
 query heads.  TensorRT-LLM, MHA, MQA and GQA are implemented by the operator
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/tensorrt_llm/functional.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.functional.gpt_attention</span></code></a>.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/tensorrt_llm/functional.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.functional.gpt_attention</span></code></a>.</p>
 <section id="important-note">
 <h2>Important Note<a class="headerlink" href="#important-note" title="Link to this heading"></a></h2>
 <p>As discussed below, the current implementation supports two input modes: Padded
@@ -152,7 +153,7 @@ future</strong></em>.</p>
 <p>In TensorRT-LLM, the GPT attention operator supports two different types
 of QKV inputs: Padded and packed (i.e. non padded) inputs. The mode is
 determined by the global configuration parameter <code class="docutils literal notranslate"><span class="pre">remove_input_padding</span></code> defined
-in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/tensorrt_llm/plugin/plugin.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.plugin</span></code></a>.</p>
+in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/tensorrt_llm/plugin/plugin.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.plugin</span></code></a>.</p>
 <p>When padding is enabled (i.e. <code class="docutils literal notranslate"><span class="pre">remove_input_padding</span></code> is <code class="docutils literal notranslate"><span class="pre">False</span></code>), the sequences
 that are shorter than the <code class="docutils literal notranslate"><span class="pre">max_sequence_length</span></code> are padded to that maximum
 length. It may result in excessive memory consumption as well as unneeded
@@ -171,7 +172,7 @@ context and generation phases in auto-regressive models like GPT.</p>
 <section id="context-phase">
 <h3>Context Phase<a class="headerlink" href="#context-phase" title="Link to this heading"></a></h3>
 <p>If the <code class="docutils literal notranslate"><span class="pre">context_fmha_type</span></code> is set to <code class="docutils literal notranslate"><span class="pre">disabled</span></code> (see
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/tensorrt_llm/plugin/plugin.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.plugin</span></code></a>),
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/tensorrt_llm/plugin/plugin.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.plugin</span></code></a>),
 the implementation maps to a sequence of GPU kernels that will store the
 intermediate <code class="docutils literal notranslate"><span class="pre">Q*K^T</span></code> tensor in memory before calling the softmax operator. It
 is the slowest method and the memory footprint is significant (quadratically
@@ -214,11 +215,6 @@ minimum number of tokens (input + generated) that are required for the
 multi-block version to become more efficient than the “vanilla” implementation
 that uses a single CUDA thread-block per head. It is controlled by an internal
 heuristic.</em></p>
-<p>Another note is that as the masked MHA kernels use shared memory size
-proportional to sequence length, so there can be some cases that GPU’s shared
-memory is not enough when multi-block mode is not enabled. To get masked MHA
-kernel work in these cases, multi-block mode is forced on and a warning log is
-printed.</p>
 </section>
 </section>
 <section id="inflight-batching">
@@ -264,9 +260,9 @@ reach that point).</p>
 the different requests by a cache manager during processing. That cache manager
 keeps track of the sequences, allocate new blocks from a pool and recycle those
 blocks when required. See the simplified implementation of
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/tensorrt_llm/runtime/kv_cache_manager.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.runtime.KVCacheManager</span></code></a>.
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/tensorrt_llm/runtime/kv_cache_manager.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.runtime.KVCacheManager</span></code></a>.
 A more efficient C++ implementation is included in the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/cpp/include/tensorrt_llm/batch_manager">Batch Manager</a>.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/include/tensorrt_llm/batch_manager">Batch Manager</a>.</p>
 </section>
 </section>
 <section id="int8-fp8-kv-caches">
