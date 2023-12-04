@@ -17,7 +17,7 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
-* [2023/12/04] [**Falcon-180B** on a **single H200** GPU with INT4 AWQ, and **6.7x faster Llama-70B** over A100](./docs/source/blogs/H200launch.md)
+* [2023/12/04] [**Falcon-180B** on a **single H200** GPU with INT4 AWQ, and **6.7x faster Llama-70B** over A100](./docs/source/blogs/Falcon180B-H200.md)
 
 <img src="./docs/source/blogs/media/Falcon180B-H200_H200vA100.png" alt="H200 TPS" width="400" height="auto">
 
