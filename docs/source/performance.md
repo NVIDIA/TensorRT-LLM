@@ -12,35 +12,41 @@ performance that can be delivered by TensorRT-LLM.
 The different performance numbers below were collected using the methodology
 described in the benchmarks [folder](../../benchmarks/).
 
-## High Throughput
+## Peak Throughput
 
 The below tables provide reference data at large batch sizes, representing
-high throughput tasks.
+high throughput offline tasks.
+
+This data has been updated for v0.6.1, unless specified.
 
 ### H100 GPUs (FP8)
 
-| Model                        | Batch Size | TP (1)    | Input Length | Output Length | Throughput (out tok/s) |
-| :--------------------------- | :--------- | :-------- | :----------- | :------------ | ---------------------: |
-| GPT-J 6B                     | 64         | 1         | 128          | 128           |                 10,907 |
-| GPT-J 6B                     | 64         | 1         | 128          | 2048          |                  6,179 |
-| GPT-J 6B                     | 64         | 1         | 2048         | 128           |                  2,229 |
-| GPT-J 6B                     | 64         | 1         | 2048         | 2048          |                  2,980 |
-|                              |            |           |              |               |                        |
-| LLaMA 7B                     | 64         | 1         | 128          | 128           |                  9,193 |
-| LLaMA 7B                     | 64         | 1         | 128          | 2048          |                  5,367 |
-| LLaMA 7B                     | 64         | 1         | 2048         | 128           |                  2,058 |
-| LLaMA 7B                     | 32         | 1         | 2048         | 2048          |                  2,230 |
-|                              |            |           |              |               |                        |
-| LLaMA 70B                    | 64         | 4         | 128          | 128           |                  3,317 |
-| LLaMA 70B                    | 64         | 4         | 128          | 2048          |                  2,616 |
-| LLaMA 70B                    | 64         | 4         | 2048         | 128           |                    843 |
-| LLaMA 70B                    | 64         | 4         | 2048         | 2048          |                  1,583 |
-|                              |            |           |              |               |                        |
-| Falcon 180B                  | 96         | 8         | 128          | 128           |                  2,686 |
-| Falcon 180B                  | 96         | 8         | 128          | 2048          |                  2,073 |
-| Falcon 180B                  | 64         | 8         | 2048         | 128           |                    465 |
+| Model                        | Batch Size | TP (1)    | Input Length | Output Length | Throughput (out tok/s/GPU) |
+| :--------------------------- | :--------- | :-------- | :----------- | :------------ | -------------------------: |
+| GPT-J 6B                     | 1024       | 1         | 128          | 128           |                     26,150 |
+| GPT-J 6B                     | 120        | 1         | 128          | 2048          |                      8,011 |
+| GPT-J 6B                     | 64         | 1         | 2048         | 128           |                      2,551 |
+| GPT-J 6B                     | 64         | 1         | 2048         | 2048          |                      3,327 |
+|                              |            |           |              |               |                            |
+| LLaMA 7B                     | 768        | 1         | 128          | 128           |                     19,694 |
+| LLaMA 7B                     | 112        | 1         | 128          | 2048          |                      6,818 |
+| LLaMA 7B                     | 80         | 1         | 2048         | 128           |                      2,244 |
+| LLaMA 7B                     | 48         | 1         | 2048         | 2048          |                      2,740 |
+|                              |            |           |              |               |                            |
+| LLaMA 70B                    | 1024       | 2         | 128          | 128           |                      2,657 |
+| LLaMA 70B                    | 480        | 4         | 128          | 2048          |                      1,486 |
+| LLaMA 70B                    | 96         | 2         | 2048         | 128           |                        306 |
+| LLaMA 70B                    | 64         | 2         | 2048         | 2048          |                        547 |
+|                              |            |           |              |               |                            |
+| Falcon 180B                  | 1024       | 4         | 128          | 128           |                        987 |
+| Falcon 180B                  | 1024       | 8         | 128          | 2048          |                        724 |
+| Falcon 180B                  | 64         | 4         | 2048         | 128           |                        112 |
+| Falcon 180B                  | 64         | 4         | 2048         | 2048          |                        264 |
 
-### L40S GPUs (FP8)
+### L40S GPUs (FP8)<sup>*</sup>
+
+<sup> * The following data is from TensorRT-LLM v0.5. </sup>
+
 
 | Model                        | Batch Size | TP (1)    | Input Length | Output Length | Throughput (out tok/s) |
 | :--------------------------- | :--------- | :-------- | :----------- | :------------ | ---------------------: |
@@ -59,28 +65,28 @@ high throughput tasks.
 
 | Model                        | Batch Size | TP (1)    | Input Length | Output Length | Throughput (out tok/s) |
 | :--------------------------- | :--------- | :-------- | :----------- | :------------ | ---------------------: |
-| GPT-J 6B                     | 64         | 1         | 128          | 128           |                  3,679 |
-| GPT-J 6B                     | 32         | 1         | 128          | 2048          |                  1,558 |
-| GPT-J 6B                     | 32         | 1         | 2048         | 128           |                    526 |
-| GPT-J 6B                     | 16         | 1         | 2048         | 2048          |                    650 |
+| GPT-J 6B                     | 512        | 1         | 128          | 128           |                  6,374 |
+| GPT-J 6B                     | 120        | 2         | 128          | 2048          |                  2,192 |
+| GPT-J 6B                     | 60         | 1         | 2048         | 128           |                    670 |
+| GPT-J 6B                     | 64         | 2         | 2048         | 2048          |                    903 |
 |                              |            |           |              |               |                        |
-| LLaMA 7B                     | 64         | 1         | 128          | 128           |                  3,486 |
-| LLaMA 7B                     | 32         | 1         | 128          | 2048          |                  1,459 |
-| LLaMA 7B                     | 32         | 1         | 2048         | 128           |                    529 |
-| LLaMA 7B                     | 16         | 1         | 2048         | 2048          |                    592 |
+| LLaMA 7B                     | 384        | 1         | 128          | 128           |                  5,586 |
+| LLaMA 7B                     | 60         | 1         | 128          | 2048          |                  1,928 |
+| LLaMA 7B                     | 52         | 1         | 2048         | 128           |                    591 |
+| LLaMA 7B                     | 64         | 2         | 2048         | 2048          |                    782 |
 |                              |            |           |              |               |                        |
-| LLaMA 70B                    | 64         | 4         | 128          | 128           |                  1,237 |
-| LLaMA 70B                    | 64         | 4         | 128          | 2048          |                  1,181 |
-| LLaMA 70B                    | 64         | 4         | 2048         | 128           |                    272 |
-| LLaMA 70B                    | 64         | 4         | 2048         | 2048          |                    738 |
+| LLaMA 70B                    | 1280       | 4         | 128          | 128           |                    670 |
+| LLaMA 70B                    | 240        | 4         | 128          | 2048          |                    525 |
+| LLaMA 70B                    | 120        | 4         | 2048         | 128           |                     79 |
 |                              |            |           |              |               |                        |
-| Falcon 180B                  | 64         | 8         | 128          | 128           |                    929 |
-| Falcon 180B                  | 64         | 8         | 128          | 2048          |                    923 |
-| Falcon 180B                  | 64         | 8         | 2048         | 128           |                    202 |
+| Falcon 180B                  | 1024       | 8         | 128          | 128           |                    232 |
+| Falcon 180B                  | 128        | 8         | 128          | 2048          |                    180 |
 
 (1) TP stands for Tensor Parallelism.
 
-## Low Latency
+## Low Latency<sup>**</sup>
+
+<sup> ** The following data is from TensorRT-LLM v0.5. Low latency numbers will soon be updated to reflect real time latency with infight-batching.</sup>
 
 The below tables provide reference data at batch size 1 for first token
 latency, representing end-user's perceived latency for online streaming
