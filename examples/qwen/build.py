@@ -23,7 +23,7 @@ import torch.multiprocessing as mp
 import tensorrt as trt
 # isort: on
 from transformers import AutoConfig, AutoModelForCausalLM
-from weight import load_from_ft, load_from_hf_qwen, load_from_awq_qwen
+from weight import load_from_ft, load_from_hf_qwen, load_from_awq_qwen, load_from_gptq_qwen
 
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_trt
@@ -249,7 +249,7 @@ def parse_arguments():
         type=str,
         nargs='?',
         default='int8',
-        choices=['int8', 'int4', 'int4_awq'],
+        choices=['int8', 'int4', 'int4_awq', 'int4_gptq'],
         help=
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
@@ -452,7 +452,8 @@ def build_rank_engine(builder: Builder,
                                        **quantize_kwargs)
     ft_dir_path = args.ft_dir_path
     if args.per_group:
-        load_from_awq_qwen(
+        load_func = load_from_awq_qwen if args.weight_only_precision == 'int4_awq' else load_from_gptq_qwen
+        load_func(
             tensorrt_llm_qwen=tensorrt_llm_qwen,
             quant_ckpt_path=args.quant_ckpt_path,
             mapping=mapping,

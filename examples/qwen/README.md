@@ -264,6 +264,65 @@ python ../summarize.py --test_trt_llm \
                        --max_input_length 2048 \
                        --output_len 2048
 ```
+#### INT4-GPTQ
+To run the GPTQ Qwen example, the following steps are required:
+1. You need to install the [auto-gptq](https://github.com/PanQiWei/AutoGPTQ) module and upgrade the transformers module version, with a minimum of 4.32.0. (Note: After installing the module, it may prompt that the tensorrt_llm is not compatible with other module versions, you can ignore this warning)
+```bash
+pip install auto-gptq
+# option
+# pip install transformers -U
+```
+
+2. Weight quantization
+```bash
+python3 gptq_convert.py --hf_model_dir ./tmp/Qwen/7B \
+                        --tokenizer_dir ./tmp/Qwen/7B \
+                        --quant_ckpt_path ./tmp/Qwen/7B/int4-gptq
+```
+
+3. Build TRT-LLM engine:
+```bash
+python build.py --hf_model_dir ./tmp/Qwen/7B \
+                --quant_ckpt_path ./tmp/Qwen/7B/int4-gptq/gptq_model-4bit-128g.safetensors \
+                --dtype float16 \
+                --remove_input_padding \
+                --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
+                --use_gemm_plugin float16 \
+                --use_weight_only \
+                --weight_only_precision int4_gptq \
+                --per_group \
+                --world_size 1 \
+                --tp_size 1 \
+                --output_dir ./tmp/Qwen/7B/trt_engines/int4-gptq/1-gpu
+```
+
+4. Run int4-gptq
+```bash
+python3 ../run.py --input_text "你好，请问你叫什么？" \
+                  --max_output_len=50 \
+                  --tokenizer_dir ./tmp/Qwen/7B/ \
+                  --engine_dir=./tmp/Qwen/7B/trt_engines/int4-gptq/1-gpu
+```
+
+5. Summarize
+- validate huggingface
+```bash
+python3 ../summarize.py --test_hf \
+                        --tokenizer_dir ./tmp/Qwen/7B \
+                        --hf_model_dir ./tmp/Qwen/7B \
+                        --max_input_length 2048 \
+                        --output_len 2048
+```
+
+- validate trt-llm
+```bash
+python3 ../summarize.py --test_trt_llm \
+                        --tokenizer_dir ./tmp/Qwen/7B \
+                        --engine_dir ./tmp/Qwen/7B/trt_engines/int4-gptq/1-gpu \
+                        --max_input_length 2048 \
+                        --output_len 2048
+```
 
 #### INT4-AWQ
 To run the AWQ Qwen example, the following steps are required:
