@@ -535,3 +535,45 @@ python3 build.py --model_dir=./c-model/gpt2/2-gpu --dtype bfloat16 --world_size=
 
 mpirun -np 2 python3 ../summarize.py --engine_dir trt_engine/gpt2/bfloat16/2-gpu --hf_model_dir gpt2 --batch_size 10 --test_trt_llm --check_accuracy --tensorrt_llm_rouge1_threshold=14 --dataset_path ./dataset --no_add_special_tokens
 ```
+
+### Run LoRA with the Nemo checkpoint
+
+```bash
+git clone https://huggingface.co/nvidia/GPT-2B-001
+python3 nemo_ckpt_convert.py -i GPT-2B-001/GPT-2B-001_bf16_tp1.nemo -o /tmp/c-model/gpt-next-2B --tensor-parallelism 1 --storage-type bfloat16
+
+python3 build.py --model_dir=/tmp/c-model/gpt-next-2B/1-gpu/ \
+                 --dtype bfloat16 \
+                 --remove_input_padding \
+                 --use_gpt_attention_plugin \
+                 --output_dir /tmp/gpt-next-2B/ \
+                 --use_lora_plugin \
+                 --max_batch_size 4 \
+                 --max_input_len 512 \
+                 --max_output_len 50 \
+                 --lora_target_modules "attn_qkv"
+
+python3 nemo_lora_convert.py  -i tmp_nemo_ckpt/gpt2b_lora-900.nemo -o /tmp/gpt-next-2B/ -t bf16  # Assume lora weights are in tmp_nemo_ckpt/gpt2b_lora-900.nemo
+
+python3 ../run.py --max_output_len=20 \
+                  --vocab_file=/tmp/c-model/gpt-next-2B/1-gpu/tokenizer.model \
+                  --engine_dir /tmp/gpt-next-2B/ \
+                  --lora_dir /tmp/gpt-next-2B/ \
+                  --lora_task_uids "lora" \
+                  --no_add_special_tokens \
+                  --input_text "After Washington had returned to Williamsburg, Dinwiddie ordered him to lead a larger force to assist Trent in his work. While en route, Washington learned of Trent's retreat. Since Tanaghrisson had promised support to the British, Washington continued toward Fort Duquesne and met with the Mingo leader. Learning of a French scouting party in the area, Washington, with Tanaghrisson and his party, surprised the Canadians on May 28 in what became known as the Battle of Jumonville Glen. They killed many of the Canadians, including their commanding officer, Joseph Coulon de Jumonville, whose head was reportedly split open by Tanaghrisson with a tomahawk. The historian Fred Anderson suggests that Tanaghrisson was acting to gain the support of the British and regain authority over his own people. They had been inclined to support the French, with whom they had long trading relationships. One of Tanaghrisson's men told Contrecoeur that Jumonville had been killed by British musket fire. Question: Upon learning of a French scounting party in the area, what did Washington do? Answer:"
+```
+
+Users who want to skip LoRA module may pass uid -1 with `--lora_task_uids -1`.
+In that case, the model will not run the LoRA module and the results will be
+different.
+
+```bash
+python3 ../run.py --max_output_len=20 \
+                  --vocab_file=/tmp/c-model/gpt-next-2B/1-gpu/tokenizer.model \
+                  --engine_dir /tmp/gpt-next-2B/ \
+                  --lora_dir /tmp/gpt-next-2B/ \
+                  --lora_task_uids "-1" \
+                  --no_add_special_tokens \
+                  --input_text "After Washington had returned to Williamsburg, Dinwiddie ordered him to lead a larger force to assist Trent in his work. While en route, Washington learned of Trent's retreat. Since Tanaghrisson had promised support to the British, Washington continued toward Fort Duquesne and met with the Mingo leader. Learning of a French scouting party in the area, Washington, with Tanaghrisson and his party, surprised the Canadians on May 28 in what became known as the Battle of Jumonville Glen. They killed many of the Canadians, including their commanding officer, Joseph Coulon de Jumonville, whose head was reportedly split open by Tanaghrisson with a tomahawk. The historian Fred Anderson suggests that Tanaghrisson was acting to gain the support of the British and regain authority over his own people. They had been inclined to support the French, with whom they had long trading relationships. One of Tanaghrisson's men told Contrecoeur that Jumonville had been killed by British musket fire. Question: Upon learning of a French scounting party in the area, what did Washington do? Answer:"
+```
