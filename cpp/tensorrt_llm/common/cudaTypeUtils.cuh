@@ -364,14 +364,16 @@ __device__ inline int16_t cuda_cast<int16_t, half2>(half2 val)
 template <>
 __device__ inline int8_t cuda_cast<int8_t, float>(float val)
 {
-    union
-    {
-        int8_t int8[2];
-        int16_t int16;
-    };
+    if (val < -128.0f) {
+        return -128;
+    }
+    else if (val > 127.0f) {
+        return 127;
+    }
 
-    asm volatile("cvt.rni.sat.s8.f32 %0, %1;" : "=h"(int16) : "f"(val));
-    return int8[0];
+    int8_t result;
+    asm volatile("cvt.rni.sat.s8.f32 %0, %1;" : "=h"(result) : "f"(val));
+    return result;
 }
 
 template <>
