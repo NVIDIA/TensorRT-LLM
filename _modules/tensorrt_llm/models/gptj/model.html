@@ -1,20 +1,22 @@
 <!DOCTYPE html>
-<html class="writer-html5" lang="en" >
+<html class="writer-html5" lang="en" data-content_root="../../../../">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.models.gptj.model &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" href="../../../../_static/pygments.css" type="text/css" />
-      <link rel="stylesheet" href="../../../../_static/css/theme.css" type="text/css" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=19f00094" />
+
+  
   <!--[if lt IE 9]>
     <script src="../../../../_static/js/html5shiv.min.js"></script>
   <![endif]-->
   
         <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
         <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script data-url_root="../../../../" id="documentation_options" src="../../../../_static/documentation_options.js?v=b3ba4146"></script>
+        <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
         <script src="../../../../_static/doctools.js?v=888ff710"></script>
-        <script src="../../../../_static/sphinx_highlight.js?v=4825356b"></script>
+        <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../../../genindex.html" />
     <link rel="search" title="Search" href="../../../../search.html" /> 
@@ -47,10 +49,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance.html">Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../installation.html">Build From Sources</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../memory.html">Memory Usage of TensorRT-LLM</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -105,20 +107,19 @@
 <span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
 <span class="c1"># See the License for the specific language governing permissions and</span>
 <span class="c1"># limitations under the License.</span>
-<span class="kn">import</span> <span class="nn">math</span>
-<span class="kn">from</span> <span class="nn">collections</span> <span class="kn">import</span> <span class="n">OrderedDict</span>
 
 <span class="kn">import</span> <span class="nn">tensorrt</span> <span class="k">as</span> <span class="nn">trt</span>
 
 <span class="kn">from</span> <span class="nn">..._common</span> <span class="kn">import</span> <span class="n">default_net</span>
 <span class="kn">from</span> <span class="nn">..._utils</span> <span class="kn">import</span> <span class="n">pad_vocab_size</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span>
-<span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">assertion</span><span class="p">,</span>
-                           <span class="n">gather_last_token_logits</span><span class="p">,</span> <span class="n">shape</span><span class="p">)</span>
+<span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span>
+                           <span class="n">gather_last_token_logits</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MLP</span><span class="p">,</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span> <span class="n">AttentionParams</span><span class="p">,</span>
                        <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span> <span class="n">KeyValueCacheParams</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">...mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">...module</span> <span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
 <span class="kn">from</span> <span class="nn">...quantization</span> <span class="kn">import</span> <span class="n">QuantMode</span>
+<span class="kn">from</span> <span class="nn">..generation_mixin</span> <span class="kn">import</span> <span class="n">GenerationMixin</span>
 
 
 <span class="k">class</span> <span class="nc">GPTJDecoderLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
@@ -158,7 +159,6 @@
             <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
             <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
             <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
-            <span class="n">use_int8_kv_cache</span><span class="o">=</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_int8_kv_cache</span><span class="p">(),</span>
             <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span> <span class="o">=</span> <span class="n">MLP</span><span class="p">(</span><span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
@@ -201,7 +201,9 @@
         <span class="k">return</span> <span class="n">hidden_states</span>
 
 
-<div class="viewcode-block" id="GPTJModel"><a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTJModel">[docs]</a><span class="k">class</span> <span class="nc">GPTJModel</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<div class="viewcode-block" id="GPTJModel">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTJModel">[docs]</a>
+<span class="k">class</span> <span class="nc">GPTJModel</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">num_layers</span><span class="p">,</span>
@@ -215,6 +217,7 @@
                  <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">(),</span>
                  <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">)):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">mapping</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span><span class="n">vocab_size</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">layers</span> <span class="o">=</span> <span class="n">ModuleList</span><span class="p">([</span>
@@ -231,7 +234,9 @@
 
         <span class="bp">self</span><span class="o">.</span><span class="n">ln_f</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
-<div class="viewcode-block" id="GPTJModel.forward"><a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTJModel.forward">[docs]</a>    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+<div class="viewcode-block" id="GPTJModel.forward">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTJModel.forward">[docs]</a>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">input_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                 <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -239,15 +244,16 @@
 
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">past_key_value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">past_key_value</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">([</span><span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">))</span>
+        <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">fill_none_tensor_list</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">))</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="n">presents</span> <span class="o">=</span> <span class="p">[]</span>
 
-        <span class="k">for</span> <span class="n">layer</span><span class="p">,</span> <span class="n">past</span><span class="p">,</span> <span class="n">pointer</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
+        <span class="k">for</span> <span class="n">layer</span><span class="p">,</span> <span class="n">past</span><span class="p">,</span> <span class="n">pointer</span><span class="p">,</span> <span class="n">host_pointer</span><span class="p">,</span> <span class="n">max_kv_cache_length</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">,</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">past_key_value</span><span class="p">,</span>
-                <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">kv_cache_block_pointers</span><span class="p">):</span>
+                <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">kv_cache_block_pointers</span><span class="p">,</span>
+                <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">host_kv_cache_block_pointers</span><span class="p">,</span>
+                <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">host_max_kv_cache_lengths</span><span class="p">):</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">layer</span><span class="p">(</span>
                 <span class="n">hidden_states</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
@@ -255,7 +261,9 @@
                     <span class="n">past_key_value</span><span class="o">=</span><span class="p">[</span><span class="n">past</span><span class="p">],</span>
                     <span class="n">host_past_key_value_lengths</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
                     <span class="n">host_past_key_value_lengths</span><span class="p">,</span>
+                    <span class="n">host_max_kv_cache_lengths</span><span class="o">=</span><span class="n">max_kv_cache_length</span><span class="p">,</span>
                     <span class="n">kv_cache_block_pointers</span><span class="o">=</span><span class="p">[</span><span class="n">pointer</span><span class="p">],</span>
+                    <span class="n">host_kv_cache_block_pointers</span><span class="o">=</span><span class="p">[</span><span class="n">host_pointer</span><span class="p">],</span>
                     <span class="n">cache_indirection</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span><span class="n">cache_indirection</span><span class="p">),</span>
                 <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">)</span>
 
@@ -267,10 +275,14 @@
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">presents</span><span class="p">))</span>
-        <span class="k">return</span> <span class="n">hidden_states</span></div></div>
+        <span class="k">return</span> <span class="n">hidden_states</span></div>
+</div>
 
 
-<div class="viewcode-block" id="GPTJForCausalLM"><a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTJForCausalLM">[docs]</a><span class="k">class</span> <span class="nc">GPTJForCausalLM</span><span class="p">(</span><span class="n">GPTJModel</span><span class="p">):</span>
+
+<div class="viewcode-block" id="GPTJForCausalLM">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTJForCausalLM">[docs]</a>
+<span class="k">class</span> <span class="nc">GPTJForCausalLM</span><span class="p">(</span><span class="n">GPTJModel</span><span class="p">,</span> <span class="n">GenerationMixin</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">num_layers</span><span class="p">,</span>
@@ -319,7 +331,9 @@
                                     <span class="n">tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
                                     <span class="n">gather_output</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
-<div class="viewcode-block" id="GPTJForCausalLM.forward"><a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTJForCausalLM.forward">[docs]</a>    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+<div class="viewcode-block" id="GPTJForCausalLM.forward">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTJForCausalLM.forward">[docs]</a>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">input_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -347,14 +361,16 @@
 
         <span class="k">return</span> <span class="n">lm_logits</span></div>
 
-<div class="viewcode-block" id="GPTJForCausalLM.prepare_inputs"><a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTJForCausalLM.prepare_inputs">[docs]</a>    <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+
+<div class="viewcode-block" id="GPTJForCausalLM.prepare_inputs">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTJForCausalLM.prepare_inputs">[docs]</a>
+    <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                        <span class="n">max_batch_size</span><span class="p">,</span>
                        <span class="n">max_input_len</span><span class="p">,</span>
                        <span class="n">max_new_tokens</span><span class="p">,</span>
                        <span class="n">use_cache</span><span class="p">,</span>
                        <span class="n">max_beam_width</span><span class="p">,</span>
-                       <span class="n">max_num_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                       <span class="n">enable_two_optimization_profiles</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
+                       <span class="n">max_num_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the</span>
 <span class="sd">            ranges of the dimensions of when using TRT dynamic shapes.</span>
 
@@ -362,189 +378,58 @@
 <span class="sd">        &#39;&#39;&#39;</span>
         <span class="c1"># Prepare inputs</span>
         <span class="n">head_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hidden_size</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_heads</span>
-        <span class="n">num_heads</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_heads</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tp_size</span>
-        <span class="n">max_len</span> <span class="o">=</span> <span class="n">max_input_len</span> <span class="o">+</span> <span class="n">max_new_tokens</span>
-        <span class="n">bb_range_gen</span> <span class="o">=</span> <span class="p">[</span>
-            <span class="mi">1</span><span class="p">,</span> <span class="p">(</span><span class="n">max_batch_size</span> <span class="o">*</span> <span class="n">max_beam_width</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span>
-            <span class="n">max_batch_size</span> <span class="o">*</span> <span class="n">max_beam_width</span>
-        <span class="p">]</span>
-        <span class="n">bb_range_cxt</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="p">(</span><span class="n">max_batch_size</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="n">max_batch_size</span><span class="p">]</span>
-        <span class="n">_bs_range</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="p">(</span><span class="n">max_batch_size</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="n">max_batch_size</span><span class="p">]</span>
-        <span class="n">_beam_width_range</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="p">(</span><span class="n">max_beam_width</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="n">max_beam_width</span><span class="p">]</span>
-        <span class="n">inlen_range_cxt</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="p">(</span><span class="n">max_input_len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="n">max_input_len</span><span class="p">]</span>
-        <span class="n">inlen_range_gen</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">]</span>
-        <span class="n">_max_len_range</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="p">(</span><span class="n">max_len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="n">max_len</span><span class="p">]</span>
-        <span class="k">if</span> <span class="n">enable_two_optimization_profiles</span><span class="p">:</span>
-            <span class="n">bb_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">bb_range_cxt</span><span class="p">,</span> <span class="n">bb_range_gen</span><span class="p">]</span>
-            <span class="n">bs_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">_bs_range</span><span class="p">,</span> <span class="n">_bs_range</span><span class="p">]</span>
-            <span class="n">beam_width_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">_beam_width_range</span><span class="p">,</span> <span class="n">_beam_width_range</span><span class="p">]</span>
-            <span class="n">inlen_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">inlen_range_cxt</span><span class="p">,</span> <span class="n">inlen_range_gen</span><span class="p">]</span>
-            <span class="n">max_len_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">_max_len_range</span><span class="p">,</span> <span class="n">_max_len_range</span><span class="p">]</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">bb_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">bb_range_gen</span><span class="p">]</span>
-            <span class="n">bs_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">_bs_range</span><span class="p">]</span>
-            <span class="n">beam_width_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">_beam_width_range</span><span class="p">]</span>
-            <span class="n">inlen_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">inlen_range_cxt</span><span class="p">]</span>
-            <span class="n">max_len_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">_max_len_range</span><span class="p">]</span>
-        <span class="k">if</span> <span class="n">max_num_tokens</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">num_tokens_range</span> <span class="o">=</span> <span class="p">[</span>
-                <span class="mi">1</span><span class="p">,</span> <span class="n">max_batch_size</span> <span class="o">*</span> <span class="n">max_beam_width</span><span class="p">,</span>
-                <span class="nb">max</span><span class="p">(</span><span class="n">max_input_len</span> <span class="o">*</span> <span class="n">max_batch_size</span><span class="p">,</span>
-                    <span class="n">max_beam_width</span> <span class="o">*</span> <span class="n">max_batch_size</span><span class="p">)</span>
-            <span class="p">]</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">num_tokens_range</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="p">(</span><span class="n">max_num_tokens</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="n">max_num_tokens</span><span class="p">]</span>
-
-        <span class="n">past_key_value</span> <span class="o">=</span> <span class="p">[]</span>
-        <span class="n">sequence_length</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="n">host_past_key_value_lengths</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">num_heads_kv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_heads</span>
+        <span class="n">remove_input_padding</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span>
         <span class="n">use_gpt_attention_plugin</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">(</span>
         <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span>
-        <span class="n">remove_input_padding</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span>
+        <span class="n">use_gemm_plugin</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gemm_plugin</span>
         <span class="n">paged_kv_cache</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">paged_kv_cache</span>
         <span class="n">tokens_per_block</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">tokens_per_block</span>
+        <span class="n">use_custom_all_reduce</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">(</span>
+        <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_custom_all_reduce</span>
 
-        <span class="k">if</span> <span class="n">remove_input_padding</span><span class="p">:</span>
-            <span class="n">input_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;input_ids&#39;</span><span class="p">,</span>
-                               <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                               <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
-                               <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
-                                   <span class="p">(</span><span class="s1">&#39;batch_size_fake&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
-                                   <span class="p">(</span><span class="s1">&#39;num_tokens&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_tokens_range</span><span class="p">]),</span>
-                               <span class="p">]))</span>
-            <span class="n">position_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;position_ids&#39;</span><span class="p">,</span>
-                                  <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                                  <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
-                                  <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
-                                      <span class="p">(</span><span class="s1">&#39;batch_size_fake&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
-                                      <span class="p">(</span><span class="s1">&#39;num_tokens&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_tokens_range</span><span class="p">]),</span>
-                                  <span class="p">]))</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">input_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;input_ids&#39;</span><span class="p">,</span>
-                               <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                               <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
-                               <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
-                                   <span class="p">(</span><span class="s1">&#39;batch_size_input_ids&#39;</span><span class="p">,</span> <span class="n">bb_range</span><span class="p">),</span>
-                                   <span class="p">(</span><span class="s1">&#39;input_len&#39;</span><span class="p">,</span> <span class="n">inlen_range</span><span class="p">),</span>
-                               <span class="p">]))</span>
-            <span class="n">position_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;position_ids&#39;</span><span class="p">,</span>
-                                  <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                                  <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
-                                  <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
-                                      <span class="p">(</span><span class="s1">&#39;batch_size_position_ids&#39;</span><span class="p">,</span> <span class="n">bb_range</span><span class="p">),</span>
-                                      <span class="p">(</span><span class="s1">&#39;input_len&#39;</span><span class="p">,</span> <span class="n">inlen_range</span><span class="p">),</span>
-                                  <span class="p">]))</span>
+        <span class="n">model_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">prepare_basic_inputs</span><span class="p">(</span>
+            <span class="n">max_batch_size</span><span class="o">=</span><span class="n">max_batch_size</span><span class="p">,</span>
+            <span class="n">max_beam_width</span><span class="o">=</span><span class="n">max_beam_width</span><span class="p">,</span>
+            <span class="n">max_input_len</span><span class="o">=</span><span class="n">max_input_len</span><span class="p">,</span>
+            <span class="n">max_new_tokens</span><span class="o">=</span><span class="n">max_new_tokens</span><span class="p">,</span>
+            <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">num_heads_kv</span><span class="p">,</span>
+            <span class="n">head_size</span><span class="o">=</span><span class="n">head_size</span><span class="p">,</span>
+            <span class="n">num_layers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_num_layers</span><span class="p">,</span>
+            <span class="n">kv_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_dtype</span><span class="p">,</span>
+            <span class="n">num_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_num_heads</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">,</span>
+            <span class="n">remove_input_padding</span><span class="o">=</span><span class="n">remove_input_padding</span><span class="p">,</span>
+            <span class="n">use_gpt_attention_plugin</span><span class="o">=</span><span class="n">use_gpt_attention_plugin</span><span class="p">,</span>
+            <span class="n">use_gemm_plugin</span><span class="o">=</span><span class="n">use_gemm_plugin</span><span class="p">,</span>
+            <span class="n">use_custom_all_reduce</span><span class="o">=</span><span class="n">use_custom_all_reduce</span><span class="p">,</span>
+            <span class="n">paged_kv_cache</span><span class="o">=</span><span class="n">paged_kv_cache</span><span class="p">,</span>
+            <span class="n">tokens_per_block</span><span class="o">=</span><span class="n">tokens_per_block</span><span class="p">,</span>
+            <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span>
+            <span class="n">max_num_tokens</span><span class="o">=</span><span class="n">max_num_tokens</span><span class="p">)</span>
 
-        <span class="n">kv_cache_block_pointers_list</span> <span class="o">=</span> <span class="p">[]</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">paged_kv_cache</span><span class="p">:</span>
-            <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_num_layers</span><span class="p">):</span>
-                <span class="n">kv_dim_range</span> <span class="o">=</span> <span class="n">OrderedDict</span><span class="p">([</span>
-                    <span class="p">(</span><span class="s1">&#39;batch_size_kv&#39;</span><span class="p">,</span> <span class="n">bb_range</span><span class="p">),</span>
-                    <span class="p">(</span><span class="s1">&#39;kv&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">]</span> <span class="k">if</span> <span class="n">enable_two_optimization_profiles</span> <span class="k">else</span> <span class="p">[</span><span class="mi">2</span><span class="p">]),</span>
-                    <span class="p">(</span><span class="s1">&#39;num_heads&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_heads</span><span class="p">,</span> <span class="n">num_heads</span><span class="p">]</span>
-                     <span class="k">if</span> <span class="n">enable_two_optimization_profiles</span> <span class="k">else</span> <span class="p">[</span><span class="n">num_heads</span><span class="p">]),</span>
-                    <span class="p">(</span><span class="s1">&#39;past_key_len&#39;</span><span class="p">,</span> <span class="n">max_len_range</span><span class="p">),</span>
-                    <span class="p">(</span><span class="s1">&#39;head_size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">head_size</span><span class="p">,</span> <span class="n">head_size</span><span class="p">]</span>
-                     <span class="k">if</span> <span class="n">enable_two_optimization_profiles</span> <span class="k">else</span> <span class="p">[</span><span class="n">head_size</span><span class="p">]),</span>
-                <span class="p">])</span>
-                <span class="n">kv</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;past_key_value_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
-                            <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_dtype</span><span class="p">,</span>
-                            <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">num_heads</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">head_size</span><span class="p">],</span>
-                            <span class="n">dim_range</span><span class="o">=</span><span class="n">kv_dim_range</span><span class="p">)</span>
-                <span class="n">past_key_value</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">kv</span><span class="p">)</span>
-                <span class="c1"># TODO: Remove this when TRT fix the named dimension</span>
-                <span class="k">if</span> <span class="ow">not</span> <span class="n">remove_input_padding</span><span class="p">:</span>
-                    <span class="n">assertion</span><span class="p">(</span><span class="n">shape</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">==</span> <span class="n">shape</span><span class="p">(</span><span class="n">kv</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="s1">&#39;batch size&#39;</span><span class="p">)</span>
-
-                <span class="n">kv_cache_block_pointers_list</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">max_blocks_per_seq_range</span> <span class="o">=</span> <span class="p">[</span>
-                <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span><span class="n">max_len_range</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span> <span class="o">/</span> <span class="n">tokens_per_block</span><span class="p">),</span>
-                <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span><span class="n">max_len_range</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="mi">1</span><span class="p">]</span> <span class="o">/</span> <span class="n">tokens_per_block</span><span class="p">),</span>
-                <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span><span class="n">max_len_range</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="mi">2</span><span class="p">]</span> <span class="o">/</span> <span class="n">tokens_per_block</span><span class="p">)</span>
-            <span class="p">]</span>
-
-            <span class="n">max_blocks_per_seq_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">x</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">max_blocks_per_seq_range</span><span class="p">]</span>
-
-            <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_num_layers</span><span class="p">):</span>
-                <span class="c1"># (blocks, 2, kv_num_heads, tokens_per_block, head_size)</span>
-
-                <span class="n">kv_cache_block_pointers</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
-                    <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;kv_cache_block_pointers_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
-                    <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span>
-                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
-                    <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
-                        <span class="p">(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="n">bb_range</span><span class="p">),</span>
-                        <span class="p">(</span><span class="s1">&#39;kv&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">]),</span>
-                        <span class="p">(</span><span class="s1">&#39;max_blocks_per_seq&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">max_blocks_per_seq_range</span><span class="p">]),</span>
-                    <span class="p">]))</span>
-                <span class="n">kv_cache_block_pointers_list</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">kv_cache_block_pointers</span><span class="p">)</span>
-                <span class="n">past_key_value</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>
-
-        <span class="k">if</span> <span class="n">use_gpt_attention_plugin</span><span class="p">:</span>
-            <span class="n">dim_range</span> <span class="o">=</span> <span class="n">bb_range</span>
-            <span class="n">host_past_key_value_lengths</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
-                <span class="n">name</span><span class="o">=</span><span class="s1">&#39;host_past_key_value_lengths&#39;</span><span class="p">,</span>
-                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
-                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">(</span><span class="n">batch_size_kvl</span><span class="o">=</span><span class="n">dim_range</span><span class="p">))</span>
-
-        <span class="n">context_lengths</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="n">host_context_lengths</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="n">host_request_types</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="n">use_gpt_attention_plugin</span> <span class="ow">and</span> <span class="n">remove_input_padding</span><span class="p">:</span>
-            <span class="n">host_context_lengths</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;host_context_lengths&#39;</span><span class="p">,</span>
-                                          <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                                          <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
-                                          <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span>
-                                                                  <span class="n">bb_range</span><span class="p">)]))</span>
-        <span class="k">if</span> <span class="n">use_gpt_attention_plugin</span><span class="p">:</span>
-            <span class="n">sequence_length</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
-                <span class="n">name</span><span class="o">=</span><span class="s1">&#39;sequence_length&#39;</span><span class="p">,</span>
-                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
-                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="n">bb_range</span><span class="p">)]),</span>
-            <span class="p">)</span>
-
-            <span class="n">context_lengths</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;context_lengths&#39;</span><span class="p">,</span>
-                                     <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                                     <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
-                                     <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span>
-                                                             <span class="n">bb_range</span><span class="p">)]))</span>
-            <span class="n">host_request_types</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;host_request_types&#39;</span><span class="p">,</span>
-                                        <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                                        <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
-                                        <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span>
-                                                                <span class="n">bb_range</span><span class="p">)]))</span>
-
-        <span class="n">last_token_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;last_token_ids&#39;</span><span class="p">,</span>
-                                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
-                                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
-                                    <span class="p">(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="n">bb_range</span><span class="p">),</span>
-                                <span class="p">]))</span>
-
-        <span class="n">cache_indirection</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;cache_indirection&#39;</span><span class="p">,</span>
-                                   <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                                   <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
-                                   <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
-                                       <span class="p">(</span><span class="s1">&#39;batch_size_cache&#39;</span><span class="p">,</span> <span class="n">bs_range</span><span class="p">),</span>
-                                       <span class="p">(</span><span class="s1">&#39;beam_width&#39;</span><span class="p">,</span> <span class="n">beam_width_range</span><span class="p">),</span>
-                                       <span class="p">(</span><span class="s1">&#39;max_seq_len&#39;</span><span class="p">,</span> <span class="n">max_len_range</span><span class="p">),</span>
-                                   <span class="p">]))</span>
-
-        <span class="k">return</span> <span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">,</span> <span class="kc">True</span><span class="p">,</span> <span class="n">last_token_ids</span><span class="p">,</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;input_ids&#39;</span><span class="p">],</span> <span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;position_ids&#39;</span><span class="p">],</span> <span class="kc">True</span><span class="p">,</span>
+                <span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;last_token_ids&#39;</span><span class="p">],</span>
                 <span class="n">KeyValueCacheParams</span><span class="p">(</span>
-                    <span class="n">past_key_value</span><span class="o">=</span><span class="n">past_key_value</span><span class="p">,</span>
-                    <span class="n">host_past_key_value_lengths</span><span class="o">=</span><span class="n">host_past_key_value_lengths</span><span class="p">,</span>
-                    <span class="n">kv_cache_block_pointers</span><span class="o">=</span><span class="n">kv_cache_block_pointers_list</span><span class="p">,</span>
-                    <span class="n">cache_indirection</span><span class="o">=</span><span class="n">cache_indirection</span><span class="p">,</span>
+                    <span class="n">past_key_value</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;past_key_value&#39;</span><span class="p">],</span>
+                    <span class="n">host_past_key_value_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
+                        <span class="s1">&#39;host_past_key_value_lengths&#39;</span><span class="p">],</span>
+                    <span class="n">host_max_kv_cache_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
+                        <span class="s1">&#39;host_max_kv_cache_lengths&#39;</span><span class="p">],</span>
+                    <span class="n">kv_cache_block_pointers</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
+                        <span class="s1">&#39;kv_cache_block_pointers_list&#39;</span><span class="p">],</span>
+                    <span class="n">host_kv_cache_block_pointers</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
+                        <span class="s1">&#39;host_kv_cache_block_pointers_list&#39;</span><span class="p">],</span>
+                    <span class="n">cache_indirection</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;cache_indirection&#39;</span><span class="p">],</span>
                 <span class="p">),</span>
-                <span class="n">AttentionParams</span><span class="p">(</span><span class="n">sequence_length</span><span class="o">=</span><span class="n">sequence_length</span><span class="p">,</span>
-                                <span class="n">context_lengths</span><span class="o">=</span><span class="n">context_lengths</span><span class="p">,</span>
-                                <span class="n">host_context_lengths</span><span class="o">=</span><span class="n">host_context_lengths</span><span class="p">,</span>
-                                <span class="n">max_context_length</span><span class="o">=</span><span class="n">max_input_len</span><span class="p">,</span>
-                                <span class="n">host_request_types</span><span class="o">=</span><span class="n">host_request_types</span><span class="p">))</span></div></div>
+                <span class="n">AttentionParams</span><span class="p">(</span>
+                    <span class="n">sequence_length</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;sequence_length&#39;</span><span class="p">],</span>
+                    <span class="n">context_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;context_lengths&#39;</span><span class="p">],</span>
+                    <span class="n">host_context_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;host_context_lengths&#39;</span><span class="p">],</span>
+                    <span class="n">max_context_length</span><span class="o">=</span><span class="n">max_input_len</span><span class="p">,</span>
+                    <span class="n">host_request_types</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;host_request_types&#39;</span><span class="p">]))</span></div>
+</div>
+
 </pre></div>
 
            </div>

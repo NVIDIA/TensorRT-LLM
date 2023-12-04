@@ -1,21 +1,23 @@
 <!DOCTYPE html>
-<html class="writer-html5" lang="en" >
+<html class="writer-html5" lang="en" data-content_root="./">
 <head>
-  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Numerical Precision &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" href="_static/pygments.css" type="text/css" />
-      <link rel="stylesheet" href="_static/css/theme.css" type="text/css" />
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=19f00094" />
+
+  
   <!--[if lt IE 9]>
     <script src="_static/js/html5shiv.min.js"></script>
   <![endif]-->
   
         <script src="_static/jquery.js?v=5d32c60e"></script>
         <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script data-url_root="./" id="documentation_options" src="_static/documentation_options.js?v=b3ba4146"></script>
+        <script src="_static/documentation_options.js?v=5929fcd5"></script>
         <script src="_static/doctools.js?v=888ff710"></script>
-        <script src="_static/sphinx_highlight.js?v=4825356b"></script>
+        <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
@@ -60,10 +62,10 @@
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="performance.html">Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="installation.html">Build From Sources</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="memory.html">Memory Usage of TensorRT-LLM</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -77,6 +79,11 @@
 <p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token.</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 </ul>
 
         </div>
@@ -104,18 +111,18 @@
            <div itemprop="articleBody">
              
   <section id="numerical-precision">
-<h1>Numerical Precision<a class="headerlink" href="#numerical-precision" title="Permalink to this heading"></a></h1>
+<h1>Numerical Precision<a class="headerlink" href="#numerical-precision" title="Link to this heading"></a></h1>
 <p>This document describes the different methods implemented in TensorRT-LLM and
 contains a support matrix for the different models.</p>
 <section id="fp32-fp16-and-bf16">
-<h2>FP32, FP16 and BF16<a class="headerlink" href="#fp32-fp16-and-bf16" title="Permalink to this heading"></a></h2>
+<h2>FP32, FP16 and BF16<a class="headerlink" href="#fp32-fp16-and-bf16" title="Link to this heading"></a></h2>
 <p>The different models implemented in TensorRT-LLM work with 32-bit IEEE
 floating-point (FP32) numbers. When checkpoints are available, the models also
 support 16-bit IEEE floating-point numbers (FP16) and 16-bit Bfloat16 (BF16) as
 described <a class="reference external" href="https://en.wikipedia.org/wiki/Bfloat16_floating-point_format">here</a>.</p>
 </section>
 <section id="quantization-and-dequantization-q-dq">
-<h2>Quantization and Dequantization (Q/DQ)<a class="headerlink" href="#quantization-and-dequantization-q-dq" title="Permalink to this heading"></a></h2>
+<h2>Quantization and Dequantization (Q/DQ)<a class="headerlink" href="#quantization-and-dequantization-q-dq" title="Link to this heading"></a></h2>
 <p>Given a floating-point number <code class="docutils literal notranslate"><span class="pre">x</span></code> and a floating-point scaling factor <code class="docutils literal notranslate"><span class="pre">s</span></code>,
 TensorRT-LLM implements INT8 quantization as:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">q</span> <span class="o">=</span> <span class="n">int8</span><span class="o">.</span><span class="n">satfinite</span><span class="p">(</span><span class="n">x</span> <span class="o">*</span> <span class="n">s</span><span class="p">)</span>
@@ -159,7 +166,7 @@ different modes:</p>
 </div>
 </section>
 <section id="int8-smoothquant-w8a8">
-<h2>INT8 SmoothQuant (W8A8)<a class="headerlink" href="#int8-smoothquant-w8a8" title="Permalink to this heading"></a></h2>
+<h2>INT8 SmoothQuant (W8A8)<a class="headerlink" href="#int8-smoothquant-w8a8" title="Link to this heading"></a></h2>
 <p>The SmoothQuant technique was introduced in
 <a class="reference external" href="https://arxiv.org/abs/2211.10438">https://arxiv.org/abs/2211.10438</a>. It is a
 method to run inference using INT8 for both activations and weights while
@@ -168,43 +175,43 @@ maintaining the accuracy of the network (on downstream tasks).</p>
 weights of the model. TensorRT-LLM includes scripts to prepare the model to
 run using the SmoothQuant method.</p>
 <p>Examples of how to enable SmoothQuant for GPT, GPT-J and LLaMA can be found in
-the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/release/0.5.0/examples/quantization">examples/quantization</a> folder of that release.</p>
+the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/examples/quantization">examples/quantization</a> folder of that release.</p>
 </section>
 <section id="int4-and-int8-weight-only-w4a16-and-w8a16">
-<h2>INT4 and INT8 Weight-Only (W4A16 and W8A16)<a class="headerlink" href="#int4-and-int8-weight-only-w4a16-and-w8a16" title="Permalink to this heading"></a></h2>
+<h2>INT4 and INT8 Weight-Only (W4A16 and W8A16)<a class="headerlink" href="#int4-and-int8-weight-only-w4a16-and-w8a16" title="Link to this heading"></a></h2>
 <p>The INT4 and INT8 Weight-Only techniques consist in quantizing the weights of
 a model and dequantizing those weights on-the-fly in linear layers (Matmuls).
 The activations are encoded using floating-point values (FP16 or BF16).</p>
 <p>To use INT4/INT8 Weight-Only methods, the user must determine the scaling
 factors to use to quantize and dequantize the weights of the model.</p>
-<p>This release includes examples for <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/release/0.5.0/examples/gpt">GPT</a> and
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/release/0.5.0/examples/llama">LLaMA</a>.</p>
+<p>This release includes examples for <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/examples/gpt">GPT</a> and
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/examples/llama">LLaMA</a>.</p>
 </section>
 <section id="gptq-and-awq-w4a16">
-<h2>GPTQ and AWQ (W4A16)<a class="headerlink" href="#gptq-and-awq-w4a16" title="Permalink to this heading"></a></h2>
+<h2>GPTQ and AWQ (W4A16)<a class="headerlink" href="#gptq-and-awq-w4a16" title="Link to this heading"></a></h2>
 <p>The GPTQ and AWQ techniques are presented in
 <a class="reference external" href="https://arxiv.org/abs/2210.17323">https://arxiv.org/abs/2210.17323</a>
 and
 <a class="reference external" href="https://arxiv.org/abs/2306.00978">https://arxiv.org/abs/2306.00978</a>,
 respectively. TensorRT-LLM supports per-group scaling factors and
 zero-offsetting in linear layers to implement GPTQ and AWQ methods. See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/release/0.5.0/cpp/tensorrt_llm/plugins/weightOnlyGroupwiseQuantMatmulPlugin">WeightOnlyGroupwiseQuantMatmulPlugin</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/cpp/tensorrt_llm/plugins/weightOnlyGroupwiseQuantMatmulPlugin">WeightOnlyGroupwiseQuantMatmulPlugin</a>
 plugin and the corresponding
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/release/0.5.0/tensorrt_llm/quantization/functional.py"><code class="docutils literal notranslate"><span class="pre">weight_only_groupwise_quant_matmul</span></code></a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/tensorrt_llm/quantization/functional.py"><code class="docutils literal notranslate"><span class="pre">weight_only_groupwise_quant_matmul</span></code></a>
 Python function, for details.</p>
-<p>This release includes examples of applying GPTQ to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/release/0.5.0/examples/gpt">GPT-NeoX</a>
-and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/release/0.5.0/examples/llama">LLaMA-v2</a>, as well as an example of using AWQ with
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/release/0.5.0/examples/gptj">GPT-J</a>. Those examples are experimental implementations and
+<p>This release includes examples of applying GPTQ to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/examples/gpt">GPT-NeoX</a>
+and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/examples/llama">LLaMA-v2</a>, as well as an example of using AWQ with
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/examples/gptj">GPT-J</a>. Those examples are experimental implementations and
 are likely to evolve in a future release.</p>
 </section>
 <section id="fp8-hopper">
-<h2>FP8 (Hopper)<a class="headerlink" href="#fp8-hopper" title="Permalink to this heading"></a></h2>
+<h2>FP8 (Hopper)<a class="headerlink" href="#fp8-hopper" title="Link to this heading"></a></h2>
 <p>This release of TensorRT-LLM contains implementations of FP8 for GPT-NeMo,
 GPT-J and LLaMA. Those examples can be found in
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/release/0.5.0/examples/quantization">examples/quantization</a>.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/examples/quantization">examples/quantization</a>.</p>
 </section>
 <section id="support-matrix">
-<h2>Support matrix<a class="headerlink" href="#support-matrix" title="Permalink to this heading"></a></h2>
+<h2>Support matrix<a class="headerlink" href="#support-matrix" title="Link to this heading"></a></h2>
 <p>This release of TensorRT-LLM contains the following examples:</p>
 <table class="docutils align-default">
 <thead>
@@ -226,7 +233,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
-<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
@@ -243,18 +250,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>BLOOM</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>.</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>.</p></td>
-<td class="text-center"><p>.</p></td>
-</tr>
-<tr class="row-odd"><td class="text-left"><p>ChatGLM</p></td>
+<tr class="row-even"><td class="text-left"><p>BLIP-2</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -265,7 +261,40 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>ChatGLM-v2</p></td>
+<tr class="row-odd"><td class="text-left"><p>BLOOM</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>ChatGLM</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>ChatGLM-v2</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>ChatGLM-v3</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -280,36 +309,14 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>GPT</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>.</p></td>
-<td class="text-center"><p>.</p></td>
-</tr>
-<tr class="row-odd"><td class="text-left"><p>GPT-J</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>Y</p></td>
-<td class="text-center"><p>.</p></td>
-</tr>
-<tr class="row-even"><td class="text-left"><p>GPT-NeMo</p></td>
+<tr class="row-even"><td class="text-left"><p>Flan-T5</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -320,7 +327,40 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>GPT-NeoX</p></td>
+<tr class="row-odd"><td class="text-left"><p>GPT</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>GPT-J</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>GPT-NeMo</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>GPT-NeoX</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -330,6 +370,17 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>InternLM</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>LLaMA</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -353,6 +404,28 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 </tr>
+<tr class="row-even"><td class="text-left"><p>Mistral</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>MPT</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+</tr>
 <tr class="row-even"><td class="text-left"><p>OPT</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -364,7 +437,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>SantaCoder</p></td>
+<tr class="row-odd"><td class="text-left"><p>Replit Code</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -375,7 +448,29 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>StarCoder</p></td>
+<tr class="row-even"><td class="text-left"><p>SantaCoder</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>StarCoder</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>T5</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -390,9 +485,9 @@ GPT-J and LLaMA. Those examples can be found in
 </table>
 </section>
 <section id="technical-detail-the-quantmode-flags">
-<h2>Technical Detail: The <code class="docutils literal notranslate"><span class="pre">QuantMode</span></code> Flags<a class="headerlink" href="#technical-detail-the-quantmode-flags" title="Permalink to this heading"></a></h2>
+<h2>Technical Detail: The <code class="docutils literal notranslate"><span class="pre">QuantMode</span></code> Flags<a class="headerlink" href="#technical-detail-the-quantmode-flags" title="Link to this heading"></a></h2>
 <p>The quantization method is controlled by the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/release/0.5.0/tensorrt_llm/quantization/mode.py"><code class="docutils literal notranslate"><span class="pre">QuantMode</span></code></a> flags. The different fields
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/tensorrt_llm/quantization/mode.py"><code class="docutils literal notranslate"><span class="pre">QuantMode</span></code></a> flags. The different fields
 are:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">INT4_WEIGHTS</span></code>, the weights are quantized to 4 bits (W4A*),</p></li>

@@ -58,7 +58,7 @@ print(outputs.keys())
 print(outputs['inter'])
 ```
 
-Here is the [full example](../../tests/test_debugging_api.py).
+Here is the [full example](source:tests/test_debugging_api.py).
 
 
 ## Debug on E2E models

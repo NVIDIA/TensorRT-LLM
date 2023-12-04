@@ -16,8 +16,10 @@ how it returns completed requests to the user.
 ## The Batch Manager API
 
 A software component (called the client in the text that follows) can interact
-with the batch manager using two main callbacks. Their signatures are defined
+with the batch manager using two mandatory, and several optional callbacks. Their signatures are defined
 in the [`callbacks.h`](source:cpp/include/tensorrt_llm/batch_manager/callbacks.h) file.
+
+These callbacks are invoked in the generation loop at regular intervals and serve a variety of functions described below.
 
 ### Get and Send Callbacks
 
@@ -42,7 +44,7 @@ tensor. See
 [`InferenceRequest.h`](source:cpp/include/tensorrt_llm/batch_manager/InferenceRequest.h)
 for more details.
 
-The responses are delivered to the client through a callback of type
+Responses are delivered to the client through a callback of type
 `SendResponseCallback`. A conforming callback must accept the 64-bit
 request ID that uniquely identifies the request, the list of output tensors,
 a boolean (identifying the last response for the request when set to
@@ -85,18 +87,43 @@ callback:
 using ReturnBatchManagerStatsCallback = std::function<void(const std::string&)>;
 ```
 
-The statistics are packaged as a JSON string. That string contains three fields:
+The statistics are packaged as a JSON string. That string contains the following fields:
   * `Timestamp`, the timestamp of the request (obtained using
     `std::put_time(&tm, "%m-%d-%Y %H:%M:%S")`),
-  * `Iteration Counter`, a counter value that corresponds to the execution of a
-    given request,
-  * `Active Request Count`, the number of active requests.
+  * `Iteration Counter`, a global step counter value that increases monotonically over time
+  * `Active Request Count`, the number of active requests in batch manager
+  * `Max Request Count`, the max number of requests batch manager can support at a time
+
+When using paged KV cache, following statistics are reported:
+  * `Max KV cache blocks`, the maximum number of KV cache blocks per GPU
+  * `Free KV cache blocks`, number of free KV cache blocks per GPU
+  * `Used KV cache blocks`, number of used KV cache blocks per GPU
+  * `Tokens per KV cache block`, number of tokens per KV cache block
+  * `Scheduled Requests`, number of requests scheduled this iteration
+
+When using in-flight batching, the following additional statistics are reported per step/iteration:
+
+  * `Scheduled Requests`, number of total requests scheduled
+  * `Context Requests`, number of requests in Context phase
+  * `Generation Requests`, number of requests in Generation phase
+  * `Total Context Tokens`, total number of tokens across requests in context phase
+  * `MicroBatch ID`, micro batch ID
+
+When using V1 batching, the following additional statistics are reported per V1 iteration:
+
+  * `Scheduled Requests`, number of total requests scheduled
+  * `Context Requests`, number of requests in Context phase
+  * `Total Generation Tokens`, Total number of tokens generated
+  * `Total Context Tokens`, total number of tokens across requests in context phase
+  * `Empty Generation Slots`, total number of padded Slots during generation phase
+
 
 ### GptManager Design
 
-GptManager is designed to integrate into an inference server that's managing a pool of
+Batch Manager is designed to integrate into an inference server that's executing a pool of
 active work items populated by a stream of requests actively received
-by the server. GptManager spawns a worker thread in its constructor that then
+by the server. GptManager assumes a GPT-style autoregressive model architecture.
+GptManager spawns a worker thread in its constructor that then
 persistently runs the token generation loop. The worker thread invokes `GetInferenceRequestsCallback`
 at the start of each loop iteration, which is intended to read new
 requests. It invokes `SendResponseCallback` at the end of each iteration when one or
@@ -138,16 +165,13 @@ even in the worst case of KV cache consumption. That mode corresponds to a
 `schedulerPolicy` set to `GUARANTEED_NO_EVICT`.
 
 The `GptManager`'s worker thread terminates when the `GptManager` destructor is
-called and there are no more active requests. Alternatively, a special request
-with a `requestID` of `-1` can be sent to the `GptManager`, it will be
-interpreted as a `TERMINATE` signal. It leads to the invocation of
-`waitUntilTerminate` which returns when the worker thread has terminated.
+called and there are no more active requests.
 
 ### Multi-GPU execution
 
 When running on multiple GPUs using either tensor or pipeline parallelism, it
 is assumed that the server launches as many processes as GPU ranks, and each
-process runs its own copy of `GptManager`. The number of GPUs visible on a given
+process runs its own instance of `GptManager`. The number of GPUs visible on a given
 node can be controlled using the `CUDA_VISIBLE_DEVICES` environment variable.
 
 Care must be taken to ensure all ranks see the same inputs at each iteration of

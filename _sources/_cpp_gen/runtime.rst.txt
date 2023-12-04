@@ -136,3 +136,9 @@ _____________
 .. doxygenfile:: worldConfig.h
    :project: TensorRT-LLM
 
+promptTuningParams.h
+____________________
+
+.. doxygenfile:: promptTuningParams.h
+   :project: TensorRT-LLM
+

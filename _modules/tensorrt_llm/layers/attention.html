@@ -1,20 +1,22 @@
 <!DOCTYPE html>
-<html class="writer-html5" lang="en" >
+<html class="writer-html5" lang="en" data-content_root="../../../">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.layers.attention &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" href="../../../_static/pygments.css" type="text/css" />
-      <link rel="stylesheet" href="../../../_static/css/theme.css" type="text/css" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=19f00094" />
+
+  
   <!--[if lt IE 9]>
     <script src="../../../_static/js/html5shiv.min.js"></script>
   <![endif]-->
   
         <script src="../../../_static/jquery.js?v=5d32c60e"></script>
         <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script data-url_root="../../../" id="documentation_options" src="../../../_static/documentation_options.js?v=b3ba4146"></script>
+        <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
         <script src="../../../_static/doctools.js?v=888ff710"></script>
-        <script src="../../../_static/sphinx_highlight.js?v=4825356b"></script>
+        <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../../genindex.html" />
     <link rel="search" title="Search" href="../../../search.html" /> 
@@ -47,10 +49,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance.html">Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../installation.html">Build From Sources</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../memory.html">Memory Usage of TensorRT-LLM</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -112,19 +114,240 @@
 <span class="kn">import</span> <span class="nn">tensorrt</span> <span class="k">as</span> <span class="nn">trt</span>
 
 <span class="kn">from</span> <span class="nn">.._common</span> <span class="kn">import</span> <span class="n">default_net</span><span class="p">,</span> <span class="n">precision</span>
+<span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="n">numpy_fp32_to_bf16</span><span class="p">,</span> <span class="n">trt_dtype_to_np</span>
 <span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">AttentionMaskType</span><span class="p">,</span> <span class="n">PositionEmbeddingType</span><span class="p">,</span>
                           <span class="n">RotaryScalingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">bert_attention</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span> <span class="n">clip</span><span class="p">,</span>
-                          <span class="n">concat</span><span class="p">,</span> <span class="n">constant</span><span class="p">,</span> <span class="n">expand_mask</span><span class="p">,</span> <span class="n">generate_alibi_biases</span><span class="p">,</span>
-                          <span class="n">generate_alibi_slopes</span><span class="p">,</span> <span class="n">gpt_attention</span><span class="p">,</span> <span class="n">matmul</span><span class="p">,</span> <span class="nb">round</span><span class="p">,</span>
-                          <span class="n">shape</span><span class="p">,</span> <span class="nb">slice</span><span class="p">,</span> <span class="n">softmax</span><span class="p">,</span> <span class="n">split</span><span class="p">)</span>
+                          <span class="n">concat</span><span class="p">,</span> <span class="n">constant</span><span class="p">,</span> <span class="n">embedding</span><span class="p">,</span> <span class="n">expand_dims</span><span class="p">,</span> <span class="n">expand_mask</span><span class="p">,</span>
+                          <span class="n">generate_alibi_biases</span><span class="p">,</span> <span class="n">generate_alibi_slopes</span><span class="p">,</span>
+                          <span class="n">gpt_attention</span><span class="p">,</span> <span class="n">matmul</span><span class="p">,</span> <span class="n">repeat_interleave</span><span class="p">,</span> <span class="nb">round</span><span class="p">,</span>
+                          <span class="n">shape</span><span class="p">,</span> <span class="nb">slice</span><span class="p">,</span> <span class="n">softmax</span><span class="p">,</span> <span class="n">split</span><span class="p">,</span> <span class="n">view</span><span class="p">,</span> <span class="n">where</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">..module</span> <span class="kn">import</span> <span class="n">Module</span>
 <span class="kn">from</span> <span class="nn">..parameter</span> <span class="kn">import</span> <span class="n">Parameter</span>
 <span class="kn">from</span> <span class="nn">..quantization</span> <span class="kn">import</span> <span class="n">QuantMode</span>
+<span class="kn">from</span> <span class="nn">..quantization.functional</span> <span class="kn">import</span> <span class="n">dequantize</span><span class="p">,</span> <span class="n">quantize</span>
 <span class="kn">from</span> <span class="nn">..quantization.layers</span> <span class="kn">import</span> <span class="n">FP8Linear</span><span class="p">,</span> <span class="n">FP8RowLinear</span>
 <span class="kn">from</span> <span class="nn">.linear</span> <span class="kn">import</span> <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">RowLinear</span>
+<span class="kn">from</span> <span class="nn">.lora</span> <span class="kn">import</span> <span class="n">Lora</span>
 
 
-<div class="viewcode-block" id="AttentionParams"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams">[docs]</a><span class="k">class</span> <span class="nc">AttentionParams</span><span class="p">:</span>
+<div class="viewcode-block" id="RopeEmbeddingUtils">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.RopeEmbeddingUtils">[docs]</a>
+<span class="k">class</span> <span class="nc">RopeEmbeddingUtils</span><span class="p">:</span>
+
+<div class="viewcode-block" id="RopeEmbeddingUtils.create_sinusoidal_positions">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.RopeEmbeddingUtils.create_sinusoidal_positions">[docs]</a>
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span> <span class="nf">create_sinusoidal_positions</span><span class="p">(</span><span class="n">num_pos</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                                    <span class="n">dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                                    <span class="n">theta</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">10000.0</span><span class="p">,</span>
+                                    <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">):</span>
+        <span class="n">inv_freq</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="p">(</span><span class="n">theta</span><span class="o">**</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">dim</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span> <span class="o">/</span> <span class="n">dim</span><span class="p">))</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="n">sinusoid_inp</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s2">&quot;i , j -&gt; i j&quot;</span><span class="p">,</span>
+                                 <span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">num_pos</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">),</span>
+                                 <span class="n">inv_freq</span><span class="p">,</span>
+                                 <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="n">concat</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">((</span><span class="n">np</span><span class="o">.</span><span class="n">sin</span><span class="p">(</span><span class="n">sinusoid_inp</span><span class="p">),</span> <span class="n">np</span><span class="o">.</span><span class="n">cos</span><span class="p">(</span><span class="n">sinusoid_inp</span><span class="p">)),</span>
+                                <span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">np</span><span class="o">.</span><span class="n">expand_dims</span><span class="p">(</span><span class="n">concat</span><span class="p">,</span> <span class="n">axis</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="RopeEmbeddingUtils.rotate_every_two">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.RopeEmbeddingUtils.rotate_every_two">[docs]</a>
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span> <span class="nf">rotate_every_two</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
+        <span class="k">assert</span> <span class="n">tensor</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">4</span>
+
+        <span class="n">shape_tensor</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span>
+            <span class="n">shape</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span> <span class="o">/</span> <span class="mi">2</span> <span class="k">if</span> <span class="n">i</span> <span class="o">==</span> <span class="p">(</span><span class="n">tensor</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">-</span>
+                                          <span class="mi">1</span><span class="p">)</span> <span class="k">else</span> <span class="n">shape</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">tensor</span><span class="o">.</span><span class="n">ndim</span><span class="p">())</span>
+        <span class="p">])</span>
+        <span class="n">x1</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="n">shape_tensor</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">])</span>
+        <span class="n">x2</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">],</span> <span class="n">shape_tensor</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">])</span>
+        <span class="n">x1</span> <span class="o">=</span> <span class="n">expand_dims</span><span class="p">(</span><span class="n">x1</span><span class="p">,</span> <span class="mi">4</span><span class="p">)</span>
+        <span class="n">x2</span> <span class="o">=</span> <span class="n">expand_dims</span><span class="p">(</span><span class="n">x2</span><span class="p">,</span> <span class="mi">4</span><span class="p">)</span>
+        <span class="n">zero</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span>
+            <span class="n">np</span><span class="o">.</span><span class="n">ascontiguousarray</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="mi">1</span><span class="p">],</span>
+                                          <span class="n">dtype</span><span class="o">=</span><span class="n">trt_dtype_to_np</span><span class="p">(</span><span class="n">x2</span><span class="o">.</span><span class="n">dtype</span><span class="p">))))</span>
+        <span class="n">x2</span> <span class="o">=</span> <span class="n">zero</span> <span class="o">-</span> <span class="n">x2</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">x2</span><span class="p">,</span> <span class="n">x1</span><span class="p">],</span> <span class="mi">4</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">view</span><span class="p">(</span>
+            <span class="n">x</span><span class="p">,</span> <span class="n">concat</span><span class="p">([</span><span class="n">shape</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+                       <span class="n">shape</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+                       <span class="n">shape</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+                       <span class="n">shape</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="mi">3</span><span class="p">)</span> <span class="o">*</span> <span class="mi">2</span><span class="p">]))</span></div>
+
+
+<div class="viewcode-block" id="RopeEmbeddingUtils.rotate_half">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.RopeEmbeddingUtils.rotate_half">[docs]</a>
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span> <span class="nf">rotate_half</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
+        <span class="c1"># [bs, num_attention_kv_heads, seqlen, attention_head_size]</span>
+        <span class="k">assert</span> <span class="n">tensor</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">4</span>
+        <span class="n">shape_tensor</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span>
+            <span class="n">shape</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span> <span class="o">/</span> <span class="mi">2</span> <span class="k">if</span> <span class="n">i</span> <span class="o">==</span> <span class="p">(</span><span class="n">tensor</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">-</span>
+                                          <span class="mi">1</span><span class="p">)</span> <span class="k">else</span> <span class="n">shape</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">tensor</span><span class="o">.</span><span class="n">ndim</span><span class="p">())</span>
+        <span class="p">])</span>
+        <span class="n">last_dim</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">tensor</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">/</span> <span class="mi">2</span>
+        <span class="n">x1</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="n">shape_tensor</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">])</span>
+        <span class="n">x2</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">concat</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">last_dim</span><span class="p">]),</span> <span class="n">shape_tensor</span><span class="p">,</span>
+                   <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">])</span>
+        <span class="n">zero</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span>
+            <span class="n">np</span><span class="o">.</span><span class="n">ascontiguousarray</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="mi">1</span><span class="p">],</span>
+                                          <span class="n">dtype</span><span class="o">=</span><span class="n">trt_dtype_to_np</span><span class="p">(</span><span class="n">x2</span><span class="o">.</span><span class="n">dtype</span><span class="p">))))</span>
+        <span class="n">x2</span> <span class="o">=</span> <span class="n">zero</span> <span class="o">-</span> <span class="n">x2</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">x2</span><span class="p">,</span> <span class="n">x1</span><span class="p">],</span> <span class="mi">3</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">x</span></div>
+
+
+<div class="viewcode-block" id="RopeEmbeddingUtils.apply_rotary_pos_emb">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.RopeEmbeddingUtils.apply_rotary_pos_emb">[docs]</a>
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span> <span class="nf">apply_rotary_pos_emb</span><span class="p">(</span>
+        <span class="n">tensor</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">position_embedding</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">pos_emb_type</span><span class="p">:</span> <span class="n">PositionEmbeddingType</span> <span class="o">=</span> <span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">rope_gptj</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
+
+        <span class="n">rotate_func</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">pos_emb_type</span> <span class="o">==</span> <span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">rope_gpt_neox</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">position_embedding</span><span class="p">)</span> <span class="o">==</span> <span class="mi">2</span>
+            <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span> <span class="o">=</span> <span class="n">position_embedding</span>
+            <span class="n">sin</span> <span class="o">=</span> <span class="n">expand_dims</span><span class="p">(</span><span class="n">sin</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+            <span class="n">cos</span> <span class="o">=</span> <span class="n">expand_dims</span><span class="p">(</span><span class="n">cos</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+            <span class="n">sin</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">sin</span><span class="p">,</span> <span class="n">sin</span><span class="p">],</span> <span class="mi">3</span><span class="p">)</span>
+            <span class="n">cos</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">cos</span><span class="p">,</span> <span class="n">cos</span><span class="p">],</span> <span class="mi">3</span><span class="p">)</span>
+            <span class="n">rotate_func</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">rotate_half</span>
+        <span class="k">elif</span> <span class="n">pos_emb_type</span> <span class="o">==</span> <span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">rope_gptj</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">position_embedding</span><span class="p">)</span> <span class="o">==</span> <span class="mi">2</span>
+            <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span> <span class="o">=</span> <span class="n">position_embedding</span>
+            <span class="n">sin</span> <span class="o">=</span> <span class="n">expand_dims</span><span class="p">(</span><span class="n">sin</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+            <span class="n">cos</span> <span class="o">=</span> <span class="n">expand_dims</span><span class="p">(</span><span class="n">cos</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+            <span class="n">sin</span> <span class="o">=</span> <span class="n">repeat_interleave</span><span class="p">(</span><span class="n">sin</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">)</span>
+            <span class="n">cos</span> <span class="o">=</span> <span class="n">repeat_interleave</span><span class="p">(</span><span class="n">cos</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">)</span>
+            <span class="n">rotate_func</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">rotate_every_two</span>
+        <span class="k">elif</span> <span class="n">pos_emb_type</span> <span class="o">==</span> <span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">chatglm</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">position_embedding</span><span class="p">)</span> <span class="o">==</span> <span class="mi">4</span>
+            <span class="n">cos0</span><span class="p">,</span> <span class="n">cos1</span><span class="p">,</span> <span class="n">sin0</span><span class="p">,</span> <span class="n">sin1</span> <span class="o">=</span> <span class="n">position_embedding</span>
+            <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">strongly_typed</span> <span class="ow">and</span> <span class="n">tensor</span><span class="o">.</span><span class="n">dtype</span> <span class="o">!=</span> <span class="n">cos0</span><span class="o">.</span><span class="n">dtype</span><span class="p">:</span>
+                <span class="n">tensor</span> <span class="o">=</span> <span class="n">cast</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">cos0</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+            <span class="n">shape_tensor</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span>
+                <span class="n">shape</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span> <span class="o">/</span> <span class="mi">2</span> <span class="k">if</span> <span class="n">i</span> <span class="o">==</span> <span class="p">(</span><span class="n">tensor</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">-</span>
+                                              <span class="mi">1</span><span class="p">)</span> <span class="k">else</span> <span class="n">shape</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">tensor</span><span class="o">.</span><span class="n">ndim</span><span class="p">())</span>
+            <span class="p">])</span>
+            <span class="n">last_dim</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">tensor</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">/</span> <span class="mi">2</span>
+            <span class="n">x_part0</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="n">shape_tensor</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">])</span>
+            <span class="n">x_part1</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">concat</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">last_dim</span><span class="p">]),</span> <span class="n">shape_tensor</span><span class="p">,</span>
+                            <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">])</span>
+
+            <span class="n">y_part0</span> <span class="o">=</span> <span class="p">(</span><span class="n">x_part0</span> <span class="o">*</span>
+                       <span class="n">cos0</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">rotate_half</span><span class="p">(</span><span class="n">x_part0</span><span class="p">)</span> <span class="o">*</span> <span class="n">sin0</span><span class="p">)</span>
+            <span class="n">y_part1</span> <span class="o">=</span> <span class="p">(</span><span class="n">x_part1</span> <span class="o">*</span>
+                       <span class="n">cos1</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">rotate_half</span><span class="p">(</span><span class="n">x_part1</span><span class="p">)</span> <span class="o">*</span> <span class="n">sin1</span><span class="p">)</span>
+
+            <span class="n">result</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">y_part0</span><span class="p">,</span> <span class="n">y_part1</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">result</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">shape</span><span class="p">(</span><span class="n">tensor</span><span class="p">))</span>
+
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">&#39;The PositionEmbeddingType is not RoPE&#39;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">tensor</span> <span class="o">*</span> <span class="n">cos</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="n">rotate_func</span><span class="p">(</span><span class="n">tensor</span><span class="p">)</span> <span class="o">*</span> <span class="n">sin</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="RopeEmbeddingUtils.apply_rotary_pos_emb_chatglm">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.RopeEmbeddingUtils.apply_rotary_pos_emb_chatglm">[docs]</a>
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span> <span class="nf">apply_rotary_pos_emb_chatglm</span><span class="p">(</span>
+        <span class="n">qkv</span><span class="p">,</span>
+        <span class="n">position_embedding</span><span class="p">,</span>
+        <span class="n">num_attention_heads</span><span class="p">,</span>
+        <span class="n">attention_head_size</span><span class="p">,</span>
+        <span class="n">max_position_embeddings</span><span class="p">,</span>
+        <span class="n">rotary_embedding_scale</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
+
+        <span class="n">half_head_size</span> <span class="o">=</span> <span class="n">attention_head_size</span> <span class="o">//</span> <span class="mi">2</span>
+        <span class="n">qkv_shape</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span><span class="n">qkv</span><span class="p">)</span>
+        <span class="n">qkv</span> <span class="o">=</span> <span class="n">qkv</span><span class="o">.</span><span class="n">view</span><span class="p">(</span>
+            <span class="n">concat</span><span class="p">([</span>
+                <span class="n">shape</span><span class="p">(</span><span class="n">qkv</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+                <span class="n">shape</span><span class="p">(</span><span class="n">qkv</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+                <span class="n">num_attention_heads</span><span class="p">,</span>
+                <span class="mi">3</span><span class="p">,</span>
+                <span class="n">attention_head_size</span><span class="p">,</span>
+            <span class="p">]))</span>
+        <span class="n">query</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="o">=</span> <span class="n">split</span><span class="p">(</span><span class="n">qkv</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
+        <span class="n">q_shape</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span>
+            <span class="n">shape</span><span class="p">(</span><span class="n">qkv</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+            <span class="n">shape</span><span class="p">(</span><span class="n">qkv</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+            <span class="n">num_attention_heads</span><span class="p">,</span>
+            <span class="n">attention_head_size</span><span class="p">,</span>
+        <span class="p">])</span>
+        <span class="n">query</span> <span class="o">=</span> <span class="n">query</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">q_shape</span><span class="p">)</span>
+        <span class="n">key</span> <span class="o">=</span> <span class="n">key</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">q_shape</span><span class="p">)</span>
+        <span class="n">value</span> <span class="o">=</span> <span class="n">value</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">q_shape</span><span class="p">)</span>
+
+        <span class="n">embedding_weight</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">create_sinusoidal_positions</span><span class="p">(</span>
+            <span class="n">max_position_embeddings</span><span class="p">,</span> <span class="n">half_head_size</span><span class="p">)</span>
+        <span class="n">embedding_weight</span> <span class="o">/=</span> <span class="n">rotary_embedding_scale</span>
+        <span class="n">embedding_weight</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="n">embedding_weight</span><span class="o">.</span><span class="n">squeeze</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="mi">2</span><span class="p">,</span> <span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+        <span class="n">embedding_weight</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">(</span>
+            <span class="p">[</span>
+                <span class="n">embedding_weight</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+                <span class="n">embedding_weight</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+                <span class="n">embedding_weight</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span>
+                <span class="n">embedding_weight</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span>
+            <span class="p">],</span>
+            <span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="n">embedding_weight</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span><span class="n">embedding_weight</span><span class="p">)</span>
+        <span class="n">position_embedding</span> <span class="o">=</span> <span class="n">embedding</span><span class="p">(</span><span class="n">position_embedding</span><span class="p">,</span> <span class="n">embedding_weight</span><span class="p">)</span>
+        <span class="n">position_embedding</span><span class="p">,</span> <span class="n">block_embedding</span> <span class="o">=</span> <span class="n">split</span><span class="p">(</span>
+            <span class="n">position_embedding</span><span class="p">,</span>
+            <span class="mi">1</span><span class="p">,</span>
+            <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="n">sin0</span><span class="p">,</span> <span class="n">cos0</span> <span class="o">=</span> <span class="n">split</span><span class="p">(</span><span class="n">position_embedding</span><span class="p">,</span> <span class="n">half_head_size</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
+        <span class="n">sin1</span><span class="p">,</span> <span class="n">cos1</span> <span class="o">=</span> <span class="n">split</span><span class="p">(</span><span class="n">block_embedding</span><span class="p">,</span> <span class="n">half_head_size</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
+
+        <span class="n">new_shape</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span>
+            <span class="n">shape</span><span class="p">(</span><span class="n">qkv</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+            <span class="n">shape</span><span class="p">(</span><span class="n">qkv</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+            <span class="mi">1</span><span class="p">,</span>
+            <span class="n">half_head_size</span><span class="p">,</span>
+        <span class="p">])</span>
+        <span class="n">position_embedding</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">tensor</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">new_shape</span><span class="p">)</span> <span class="k">for</span> <span class="n">tensor</span> <span class="ow">in</span> <span class="p">[</span><span class="n">cos0</span><span class="p">,</span> <span class="n">cos1</span><span class="p">,</span> <span class="n">sin0</span><span class="p">,</span> <span class="n">sin1</span><span class="p">]</span>
+        <span class="p">]</span>
+
+        <span class="n">query</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">apply_rotary_pos_emb</span><span class="p">(</span>
+            <span class="n">tensor</span><span class="o">=</span><span class="n">query</span><span class="p">,</span>
+            <span class="n">position_embedding</span><span class="o">=</span><span class="n">position_embedding</span><span class="p">,</span>
+            <span class="n">pos_emb_type</span><span class="o">=</span><span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">chatglm</span><span class="p">)</span>
+        <span class="n">key</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">apply_rotary_pos_emb</span><span class="p">(</span>
+            <span class="n">tensor</span><span class="o">=</span><span class="n">key</span><span class="p">,</span>
+            <span class="n">position_embedding</span><span class="o">=</span><span class="n">position_embedding</span><span class="p">,</span>
+            <span class="n">pos_emb_type</span><span class="o">=</span><span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">chatglm</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">strongly_typed</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">query</span><span class="o">.</span><span class="n">dtype</span> <span class="o">!=</span> <span class="n">value</span><span class="o">.</span><span class="n">dtype</span><span class="p">:</span>
+                <span class="n">query</span> <span class="o">=</span> <span class="n">cast</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="n">value</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">key</span><span class="o">.</span><span class="n">dtype</span> <span class="o">!=</span> <span class="n">value</span><span class="o">.</span><span class="n">dtype</span><span class="p">:</span>
+                <span class="n">key</span> <span class="o">=</span> <span class="n">cast</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+
+        <span class="n">qkv</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">query</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+        <span class="n">qkv</span> <span class="o">=</span> <span class="n">qkv</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">qkv_shape</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">qkv</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="AttentionParams">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams">[docs]</a>
+<span class="k">class</span> <span class="nc">AttentionParams</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">sequence_length</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -145,14 +368,20 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">encoder_input_lengths</span> <span class="o">=</span> <span class="n">encoder_input_lengths</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">encoder_max_input_length</span> <span class="o">=</span> <span class="n">encoder_max_input_length</span>
 
-<div class="viewcode-block" id="AttentionParams.is_valid_cross_attn"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.is_valid_cross_attn">[docs]</a>    <span class="k">def</span> <span class="nf">is_valid_cross_attn</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">do_cross_attention</span><span class="p">):</span>
+<div class="viewcode-block" id="AttentionParams.is_valid_cross_attn">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.is_valid_cross_attn">[docs]</a>
+    <span class="k">def</span> <span class="nf">is_valid_cross_attn</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">do_cross_attention</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">do_cross_attention</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_input_lengths</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">return</span> <span class="kc">False</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_max_input_length</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="k">return</span> <span class="kc">False</span></div>
+                <span class="k">return</span> <span class="kc">False</span>
+        <span class="k">return</span> <span class="kc">True</span></div>
 
-<div class="viewcode-block" id="AttentionParams.is_valid"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.is_valid">[docs]</a>    <span class="k">def</span> <span class="nf">is_valid</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">gpt_attention_plugin</span><span class="p">,</span> <span class="n">remove_input_padding</span><span class="p">):</span>
+
+<div class="viewcode-block" id="AttentionParams.is_valid">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.is_valid">[docs]</a>
+    <span class="k">def</span> <span class="nf">is_valid</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">gpt_attention_plugin</span><span class="p">,</span> <span class="n">remove_input_padding</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">gpt_attention_plugin</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sequence_length</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">return</span> <span class="kc">False</span>
@@ -169,76 +398,117 @@
             <span class="k">if</span> <span class="ow">not</span> <span class="n">gpt_attention_plugin</span><span class="p">:</span>
                 <span class="k">return</span> <span class="kc">False</span>
 
-        <span class="k">return</span> <span class="kc">True</span></div></div>
+        <span class="k">return</span> <span class="kc">True</span></div>
+</div>
 
 
-<div class="viewcode-block" id="KeyValueCacheParams"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams">[docs]</a><span class="k">class</span> <span class="nc">KeyValueCacheParams</span><span class="p">:</span>
+
+<div class="viewcode-block" id="KeyValueCacheParams">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams">[docs]</a>
+<span class="k">class</span> <span class="nc">KeyValueCacheParams</span><span class="p">:</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">past_key_value</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">host_past_key_value_lengths</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">host_max_kv_cache_lengths</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">kv_cache_block_pointers</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">host_kv_cache_block_pointers</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">cache_indirection</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">past_key_value_length</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">past_key_value</span> <span class="o">=</span> <span class="n">past_key_value</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">host_past_key_value_lengths</span> <span class="o">=</span> <span class="n">host_past_key_value_lengths</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">host_max_kv_cache_lengths</span> <span class="o">=</span> <span class="n">host_max_kv_cache_lengths</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_block_pointers</span> <span class="o">=</span> <span class="n">kv_cache_block_pointers</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">host_kv_cache_block_pointers</span> <span class="o">=</span> <span class="n">host_kv_cache_block_pointers</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">cache_indirection</span> <span class="o">=</span> <span class="n">cache_indirection</span>
         <span class="c1"># self.past_key_value_length = past_key_value_length</span>
 
-<div class="viewcode-block" id="KeyValueCacheParams.get_first_past_key_value"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.get_first_past_key_value">[docs]</a>    <span class="k">def</span> <span class="nf">get_first_past_key_value</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<div class="viewcode-block" id="KeyValueCacheParams.get_first_past_key_value">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.get_first_past_key_value">[docs]</a>
+    <span class="k">def</span> <span class="nf">get_first_past_key_value</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">past_key_value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">past_key_value</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span></div>
 
-<div class="viewcode-block" id="KeyValueCacheParams.get_first_kv_cache_block_pointers"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.get_first_kv_cache_block_pointers">[docs]</a>    <span class="k">def</span> <span class="nf">get_first_kv_cache_block_pointers</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+
+<div class="viewcode-block" id="KeyValueCacheParams.get_first_kv_cache_block_pointers">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.get_first_kv_cache_block_pointers">[docs]</a>
+    <span class="k">def</span> <span class="nf">get_first_kv_cache_block_pointers</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_block_pointers</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_block_pointers</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span></div>
 
-<div class="viewcode-block" id="KeyValueCacheParams.is_valid"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.is_valid">[docs]</a>    <span class="k">def</span> <span class="nf">is_valid</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">gpt_attention_plugin</span><span class="p">):</span>
+
+<div class="viewcode-block" id="KeyValueCacheParams.get_first_host_kv_cache_block_pointers">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.get_first_host_kv_cache_block_pointers">[docs]</a>
+    <span class="k">def</span> <span class="nf">get_first_host_kv_cache_block_pointers</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">host_kv_cache_block_pointers</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">host_kv_cache_block_pointers</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span></div>
+
+
+<div class="viewcode-block" id="KeyValueCacheParams.fill_none_tensor_list">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.fill_none_tensor_list">[docs]</a>
+    <span class="k">def</span> <span class="nf">fill_none_tensor_list</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">list_size</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">past_key_value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">past_key_value</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">([</span><span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">list_size</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">host_max_kv_cache_lengths</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">host_max_kv_cache_lengths</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">([</span><span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">list_size</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="KeyValueCacheParams.is_valid">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.is_valid">[docs]</a>
+    <span class="k">def</span> <span class="nf">is_valid</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">gpt_attention_plugin</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">gpt_attention_plugin</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">host_past_key_value_lengths</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">return</span> <span class="kc">False</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">host_max_kv_cache_lengths</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">return</span> <span class="kc">False</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cache_indirection</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">return</span> <span class="kc">False</span>
 
-        <span class="k">return</span> <span class="kc">True</span></div></div>
+        <span class="k">return</span> <span class="kc">True</span></div>
+</div>
 
 
-<div class="viewcode-block" id="Attention"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention">[docs]</a><span class="k">class</span> <span class="nc">Attention</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                 <span class="n">hidden_size</span><span class="p">,</span>
-                 <span class="n">num_attention_heads</span><span class="p">,</span>
-                 <span class="n">num_kv_heads</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">max_position_embeddings</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span>
-                 <span class="n">num_layers</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
-                 <span class="n">apply_query_key_layer_scaling</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                 <span class="n">attention_mask_type</span><span class="o">=</span><span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">padding</span><span class="p">,</span>
-                 <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                 <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">position_embedding_type</span><span class="o">=</span><span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">learned_absolute</span><span class="p">,</span>
-                 <span class="n">rotary_embedding_base</span><span class="o">=</span><span class="mf">10000.0</span><span class="p">,</span>
-                 <span class="n">rotary_embedding_scaling</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">use_int8_kv_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                 <span class="n">rotary_embedding_percentage</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
-                 <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
-                 <span class="n">tp_rank</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
-                 <span class="n">multi_block_mode</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                 <span class="n">quant_mode</span><span class="p">:</span> <span class="n">QuantMode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
-                 <span class="n">q_scaling</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
-                 <span class="n">cross_attention</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                 <span class="n">relative_attention</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                 <span class="n">max_distance</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
-                 <span class="n">num_buckets</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
-                 <span class="n">instance_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">):</span>
+<div class="viewcode-block" id="Attention">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention">[docs]</a>
+<span class="k">class</span> <span class="nc">Attention</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">hidden_size</span><span class="p">,</span>
+        <span class="n">num_attention_heads</span><span class="p">,</span>
+        <span class="n">num_kv_heads</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">max_position_embeddings</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span>
+        <span class="n">num_layers</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">apply_query_key_layer_scaling</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">attention_head_size</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">attention_mask_type</span><span class="o">=</span><span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">padding</span><span class="p">,</span>
+        <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">position_embedding_type</span><span class="o">=</span><span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">learned_absolute</span><span class="p">,</span>
+        <span class="n">rotary_embedding_base</span><span class="o">=</span><span class="mf">10000.0</span><span class="p">,</span>
+        <span class="n">rotary_embedding_scaling</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">rotary_embedding_percentage</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
+        <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">tp_rank</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+        <span class="n">quant_mode</span><span class="p">:</span> <span class="n">QuantMode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+        <span class="n">q_scaling</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
+        <span class="n">cross_attention</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">relative_attention</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">max_distance</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+        <span class="n">num_buckets</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+        <span class="n">instance_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+        <span class="n">dense_bias</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span> <span class="o">=</span> <span class="n">cross_attention</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">attention_mask_type</span> <span class="o">=</span> <span class="n">attention_mask_type</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span> <span class="o">=</span> <span class="n">hidden_size</span> <span class="o">//</span> <span class="n">num_attention_heads</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span> <span class="o">=</span> <span class="n">hidden_size</span> <span class="o">//</span> <span class="n">num_attention_heads</span> <span class="k">if</span> <span class="n">attention_head_size</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">attention_head_size</span>
         <span class="k">assert</span> <span class="n">num_attention_heads</span> <span class="o">%</span> <span class="n">tp_size</span> <span class="o">==</span> <span class="mi">0</span><span class="p">,</span> \
         <span class="s2">&quot;num_attention_heads must be divisible by tp_size&quot;</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">=</span> <span class="n">num_attention_heads</span> <span class="o">//</span> <span class="n">tp_size</span>
@@ -249,6 +519,9 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span> <span class="o">=</span> <span class="n">max_position_embeddings</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">=</span> <span class="n">tp_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">tp_rank</span> <span class="o">=</span> <span class="n">tp_rank</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="k">if</span> <span class="n">dense_bias</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">dense_bias</span> <span class="o">=</span> <span class="n">bias</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span> <span class="o">=</span> <span class="n">num_layers</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">apply_query_key_layer_scaling</span> <span class="o">=</span> <span class="n">apply_query_key_layer_scaling</span>
@@ -262,13 +535,9 @@
         <span class="c1">#   - False, inv_sqrt_Dh * Q*K^T + alibi_bias</span>
         <span class="c1">#   - True,  inv_sqrt_Dh * Q*K^T + inv_sqrt_Dh * alibi_bias</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">scale_alibi_bias</span> <span class="o">=</span> <span class="n">position_embedding_type</span> <span class="o">==</span> <span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">alibi_with_scale</span>
-
         <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span> <span class="o">=</span> <span class="n">position_embedding_type</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">multi_block_mode</span> <span class="o">=</span> <span class="n">multi_block_mode</span>
-
         <span class="bp">self</span><span class="o">.</span><span class="n">relative_attention</span> <span class="o">=</span> <span class="n">relative_attention</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_distance</span> <span class="o">=</span> <span class="n">max_distance</span>
-
         <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_base</span> <span class="o">=</span> <span class="n">rotary_embedding_base</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale_type</span> <span class="o">=</span> <span class="n">RotaryScalingType</span><span class="o">.</span><span class="n">none</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale</span> <span class="o">=</span> <span class="mf">1.0</span>
@@ -278,20 +547,22 @@
                 <span class="s2">&quot;type&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="s2">&quot;linear&quot;</span> <span class="k">else</span> <span class="n">RotaryScalingType</span><span class="o">.</span><span class="n">dynamic</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale</span> <span class="o">=</span> <span class="n">rotary_embedding_scaling</span><span class="p">[</span><span class="s2">&quot;factor&quot;</span><span class="p">]</span>
             <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale</span> <span class="o">&gt;</span> <span class="mf">1.0</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rotary_enabled</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span> <span class="o">=</span> <span class="mi">0</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span><span class="o">.</span><span class="n">is_rope</span><span class="p">():</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span> <span class="o">*</span>
                                             <span class="n">rotary_embedding_percentage</span><span class="p">)</span>
-            <span class="c1"># TODO: Once we add RotaryEmbedding outside GPTAttention plugin,</span>
-            <span class="c1">#       we need to set it up here</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">rotary_enabled</span> <span class="o">=</span> <span class="kc">True</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">create_sinusoidal_positions</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span><span class="p">,</span>
+            <span class="p">)</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">dtype</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span> <span class="o">=</span> <span class="n">quant_mode</span>
-        <span class="k">if</span> <span class="n">use_int8_kv_cache</span><span class="p">:</span>
-            <span class="c1"># TODO: remove use_int8_kv_cache as can be replaced by quant_mode.has_kv_cache_quant()</span>
-            <span class="c1"># Merge int8 setting into quant_mode</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">set_int8_kv_cache</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">use_int8_kv_cache</span> <span class="o">=</span> <span class="n">use_int8_kv_cache</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">use_int8_kv_cache</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_int8_kv_cache</span><span class="p">()</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_kv_cache_quant</span><span class="p">():</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">kv_orig_quant_scale</span> <span class="o">=</span> <span class="n">Parameter</span><span class="p">(</span><span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">kv_quant_orig_scale</span> <span class="o">=</span> <span class="n">Parameter</span><span class="p">(</span><span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">)</span>
@@ -303,37 +574,43 @@
         <span class="c1"># d is head_size, kvh is the num_kv_heads and tp is tensor_parallel_size.</span>
         <span class="c1"># In ColumnLinear op, the output dim is calculated by (h + 2*kvh) * d / tp,</span>
         <span class="c1"># which matches the desired output size (h/tp + 2*kvh/tp) * d after splitting</span>
+
         <span class="bp">self</span><span class="o">.</span><span class="n">use_fp8_qdq</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_qdq</span><span class="p">()</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_fp8_qdq</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span> <span class="o">=</span> <span class="n">FP8Linear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span>
-                                 <span class="n">hidden_size</span> <span class="o">+</span>
-                                 <span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span>
-                                  <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">),</span>
-                                 <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
-                                 <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-                                 <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
-                                 <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
-                                 <span class="n">gather_output</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span> <span class="o">=</span> <span class="n">FP8Linear</span><span class="p">(</span>
+                <span class="n">hidden_size</span><span class="p">,</span>
+                <span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span> <span class="o">+</span>
+                <span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span>
+                 <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">),</span>
+                <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
+                <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+                <span class="n">gather_output</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">dense</span> <span class="o">=</span> <span class="n">FP8RowLinear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span>
                                       <span class="n">hidden_size</span><span class="p">,</span>
-                                      <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
+                                      <span class="n">bias</span><span class="o">=</span><span class="n">dense_bias</span><span class="p">,</span>
                                       <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
                                       <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
                                       <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
                                       <span class="n">instance_id</span><span class="o">=</span><span class="n">instance_id</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span> <span class="o">=</span> <span class="n">ColumnLinear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span>
-                                    <span class="n">hidden_size</span> <span class="o">+</span>
-                                    <span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span>
-                                     <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">),</span>
-                                    <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
-                                    <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-                                    <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
-                                    <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
-                                    <span class="n">gather_output</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">dense</span> <span class="o">=</span> <span class="n">RowLinear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="c1"># out dim is not necessarily hidden_size + kv specific size (in MQA/GQA), but num_heads * heads_size</span>
+            <span class="c1"># example: d_model != num_heads * head_size in Flan-T5</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span> <span class="o">=</span> <span class="n">ColumnLinear</span><span class="p">(</span>
+                <span class="n">hidden_size</span><span class="p">,</span>
+                <span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span> <span class="o">+</span>
+                <span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span>
+                 <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">),</span>
+                <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
+                <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+                <span class="n">gather_output</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">dense</span> <span class="o">=</span> <span class="n">RowLinear</span><span class="p">(</span><span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">*</span>
+                                   <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">,</span>
                                    <span class="n">hidden_size</span><span class="p">,</span>
-                                   <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
+                                   <span class="n">bias</span><span class="o">=</span><span class="n">dense_bias</span><span class="p">,</span>
                                    <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
                                    <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
                                    <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
@@ -345,25 +622,50 @@
                                                    <span class="n">tp_size</span><span class="p">,</span> <span class="n">num_buckets</span><span class="p">),</span>
                                             <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
-<div class="viewcode-block" id="Attention.forward"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.forward">[docs]</a>    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span>
-        <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-        <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-        <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-        <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-        <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-        <span class="n">encoder_output</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-    <span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">q_lora</span> <span class="o">=</span> <span class="n">Lora</span><span class="p">(</span>
+            <span class="n">in_hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">out_hidden_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">,</span>
+            <span class="n">max_low_rank</span><span class="o">=</span><span class="nb">min</span><span class="p">(</span>
+                <span class="n">hidden_size</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">),</span>
+        <span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">k_lora</span> <span class="o">=</span> <span class="n">Lora</span><span class="p">(</span>
+            <span class="n">in_hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">out_hidden_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">,</span>
+            <span class="n">max_low_rank</span><span class="o">=</span><span class="nb">min</span><span class="p">(</span>
+                <span class="n">hidden_size</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">),</span>
+        <span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">v_lora</span> <span class="o">=</span> <span class="n">Lora</span><span class="p">(</span>
+            <span class="n">in_hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">out_hidden_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">,</span>
+            <span class="n">max_low_rank</span><span class="o">=</span><span class="nb">min</span><span class="p">(</span>
+                <span class="n">hidden_size</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">),</span>
+        <span class="p">)</span>
+
+<div class="viewcode-block" id="Attention.forward">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.forward">[docs]</a>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">encoder_output</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">position_embedding</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">norm_before_bmm1</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                <span class="n">lora_param</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
 
         <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">)</span>
 
         <span class="n">alibi_slopes</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span><span class="o">.</span><span class="n">is_rope</span><span class="p">():</span>
-            <span class="k">if</span> <span class="ow">not</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span><span class="p">:</span>
-                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                    <span class="s1">&#39;RoPE is only supported with GPTAttention plugin&#39;</span><span class="p">)</span>
-        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span><span class="o">.</span><span class="n">is_alibi</span><span class="p">():</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span><span class="o">.</span><span class="n">is_alibi</span><span class="p">():</span>
             <span class="n">dtype</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">float32</span>
             <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span><span class="p">:</span>
                 <span class="n">dtype</span> <span class="o">=</span> <span class="n">hidden_states</span><span class="o">.</span><span class="n">dtype</span>
@@ -375,7 +677,40 @@
                                                  <span class="n">tp_rank</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_rank</span><span class="p">,</span>
                                                  <span class="n">alibi_scale</span><span class="o">=</span><span class="n">alibi_scale</span><span class="p">)</span>
 
-        <span class="n">qkv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="n">qkv_lora_param</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">qkv_lora_param</span> <span class="o">=</span> <span class="n">lora_param</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;attn_qkv&quot;</span><span class="p">)</span>
+        <span class="n">qkv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">qkv_lora_param</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">lora_plugin</span> <span class="ow">and</span> <span class="n">lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">q_lora_param</span> <span class="o">=</span> <span class="n">lora_param</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;attn_q&quot;</span><span class="p">)</span>
+            <span class="n">k_lora_param</span> <span class="o">=</span> <span class="n">lora_param</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;attn_k&quot;</span><span class="p">)</span>
+            <span class="n">v_lora_param</span> <span class="o">=</span> <span class="n">lora_param</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;attn_v&quot;</span><span class="p">)</span>
+
+            <span class="k">assert</span> <span class="p">(</span><span class="n">q_lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">k_lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">v_lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> \
+                <span class="p">(</span><span class="n">q_lora_param</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">k_lora_param</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">v_lora_param</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">),</span> <span class="s2">&quot;q_lora_param, k_lora_param and v_lora_param should be all enabled or all disabled at the same time.&quot;</span>
+            <span class="k">if</span> <span class="n">q_lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">k_lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">v_lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">assert</span> <span class="n">qkv_lora_param</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;Cannot enable qkv_lora_param and split q_lora_parm, k_lora_param, v_lora_param at the same time.&quot;</span>
+                <span class="n">q_lora</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">q_lora</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
+                                     <span class="n">lora_runtime_param</span><span class="o">=</span><span class="n">q_lora_param</span><span class="p">)</span>
+                <span class="n">k_lora</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">k_lora</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
+                                     <span class="n">lora_runtime_param</span><span class="o">=</span><span class="n">k_lora_param</span><span class="p">)</span>
+                <span class="n">v_lora</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">v_lora</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
+                                     <span class="n">lora_runtime_param</span><span class="o">=</span><span class="n">v_lora_param</span><span class="p">)</span>
+                <span class="n">qkv_lora</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">q_lora</span><span class="p">,</span> <span class="n">k_lora</span><span class="p">,</span> <span class="n">v_lora</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+                <span class="n">qkv</span> <span class="o">=</span> <span class="n">qkv</span> <span class="o">+</span> <span class="n">qkv_lora</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span> <span class="o">==</span> <span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">chatglm</span><span class="p">:</span>
+            <span class="n">qkv</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">apply_rotary_pos_emb_chatglm</span><span class="p">(</span>
+                <span class="n">qkv</span><span class="p">,</span>
+                <span class="n">position_embedding</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale_type</span> <span class="o">=</span> <span class="n">RotaryScalingType</span><span class="o">.</span><span class="n">none</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale</span> <span class="o">=</span> <span class="mf">1.0</span>
 
         <span class="n">paged_kv_cache</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">paged_kv_cache</span>
 
@@ -406,18 +741,21 @@
 
         <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span><span class="p">:</span>
             <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_mask_type</span> <span class="ow">in</span> <span class="p">[</span>
-                <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">bidirectional</span>
+                <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">bidirectional</span><span class="p">,</span>
+                <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">bidirectionalglm</span>
             <span class="p">],</span> <span class="s1">&#39;Plugin only support masked MHA.&#39;</span>
             <span class="n">kv_orig_quant_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_orig_quant_scale</span><span class="o">.</span><span class="n">value</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_kv_cache_quant</span><span class="p">(</span>
             <span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
             <span class="n">kv_quant_orig_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_quant_orig_scale</span><span class="o">.</span><span class="n">value</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_kv_cache_quant</span><span class="p">(</span>
             <span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
             <span class="n">context</span><span class="p">,</span> <span class="n">past_key_value</span> <span class="o">=</span> <span class="n">gpt_attention</span><span class="p">(</span>
-                <span class="n">tensor</span><span class="o">=</span><span class="n">qkv</span><span class="p">,</span>
+                <span class="n">qkv</span><span class="o">=</span><span class="n">qkv</span><span class="p">,</span>
                 <span class="n">past_key_value</span><span class="o">=</span><span class="n">past_key_value</span><span class="p">,</span>
                 <span class="n">sequence_length</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">sequence_length</span><span class="p">,</span>
                 <span class="n">host_past_key_value_lengths</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
                 <span class="n">host_past_key_value_lengths</span><span class="p">,</span>
+                <span class="n">host_max_kv_cache_lengths</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
+                <span class="n">host_max_kv_cache_lengths</span><span class="p">,</span>
                 <span class="n">context_lengths</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">context_lengths</span><span class="p">,</span>
                 <span class="n">cache_indirection</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span><span class="n">cache_indirection</span><span class="p">,</span>
                 <span class="n">host_request_types</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">host_request_types</span><span class="p">,</span>
@@ -431,7 +769,6 @@
                 <span class="n">rotary_embedding_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale</span><span class="p">,</span>
                 <span class="n">rotary_embedding_max_positions</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
                 <span class="n">position_embedding_type</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span><span class="p">,</span>
-                <span class="n">multi_block_mode</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">multi_block_mode</span><span class="p">,</span>
                 <span class="n">kv_orig_quant_scale</span><span class="o">=</span><span class="n">kv_orig_quant_scale</span><span class="p">,</span>
                 <span class="n">kv_quant_orig_scale</span><span class="o">=</span><span class="n">kv_quant_orig_scale</span><span class="p">,</span>
                 <span class="n">kv_cache_quant_mode</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">,</span>
@@ -442,6 +779,8 @@
                 <span class="n">tp_rank</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_rank</span><span class="p">,</span>
                 <span class="n">kv_cache_block_pointers</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
                 <span class="n">get_first_kv_cache_block_pointers</span><span class="p">(),</span>
+                <span class="n">host_kv_cache_block_pointers</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
+                <span class="n">get_first_host_kv_cache_block_pointers</span><span class="p">(),</span>
                 <span class="n">do_cross_attention</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">,</span>
                 <span class="n">cross_qkv</span><span class="o">=</span><span class="n">cross_qkv</span><span class="p">,</span>
                 <span class="n">cross_qkv_length</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">encoder_max_input_length</span><span class="p">,</span>
@@ -450,19 +789,27 @@
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">relative_attention</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="n">max_distance</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_distance</span><span class="p">,</span>
                 <span class="n">host_context_lengths</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">host_context_lengths</span><span class="p">,</span>
+                <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
             <span class="p">)</span>
 
         <span class="k">else</span><span class="p">:</span>
             <span class="c1"># plain TensorRT mode</span>
             <span class="k">assert</span> <span class="n">paged_kv_cache</span> <span class="o">==</span> <span class="kc">False</span>
+            <span class="n">past_key_value</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">kv_cache_params</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">get_first_past_key_value</span><span class="p">(</span>
+            <span class="p">)</span>
 
-            <span class="k">def</span> <span class="nf">transpose_for_scores</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">is_kv</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
+            <span class="k">def</span> <span class="nf">transpose_for_scores</span><span class="p">(</span><span class="n">x</span><span class="p">,</span>
+                                     <span class="n">rotary</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                                     <span class="n">is_kv</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
                 <span class="n">_num_attention_heads</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="k">if</span> <span class="n">is_kv</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span>
                 <span class="n">new_x_shape</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span>
                     <span class="n">shape</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
                     <span class="n">shape</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span> <span class="n">_num_attention_heads</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span>
                 <span class="p">])</span>
-                <span class="k">return</span> <span class="n">x</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">new_x_shape</span><span class="p">)</span><span class="o">.</span><span class="n">permute</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">])</span>
+                <span class="k">if</span> <span class="n">rotary</span><span class="p">:</span>
+                    <span class="k">return</span> <span class="n">x</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">new_x_shape</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="k">return</span> <span class="n">x</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">new_x_shape</span><span class="p">)</span><span class="o">.</span><span class="n">permute</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">])</span>
 
             <span class="c1"># qkv after projection is of shape</span>
             <span class="c1">#   [bs, seqlen, (num_attention_heads + 2 * num_attention_kv_heads), attention_head_size].</span>
@@ -481,10 +828,85 @@
                                       <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">kv_size</span><span class="p">,</span> <span class="n">kv_size</span><span class="p">],</span>
                                       <span class="n">dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
 
-            <span class="n">query</span> <span class="o">=</span> <span class="n">transpose_for_scores</span><span class="p">(</span><span class="n">query</span><span class="p">)</span>
-            <span class="n">key</span> <span class="o">=</span> <span class="n">transpose_for_scores</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">is_kv</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+            <span class="n">query</span> <span class="o">=</span> <span class="n">transpose_for_scores</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="n">rotary</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rotary_enabled</span><span class="p">)</span>
+            <span class="n">key</span> <span class="o">=</span> <span class="n">transpose_for_scores</span><span class="p">(</span><span class="n">key</span><span class="p">,</span>
+                                       <span class="n">is_kv</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                                       <span class="n">rotary</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rotary_enabled</span><span class="p">)</span>
             <span class="n">value</span> <span class="o">=</span> <span class="n">transpose_for_scores</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="n">is_kv</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_enabled</span><span class="p">:</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="n">trt</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">:</span>
+                    <span class="n">embed_positions</span> <span class="o">=</span> <span class="n">numpy_fp32_to_bf16</span><span class="p">(</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">))</span>
+                    <span class="n">embed_positions</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span><span class="n">embed_positions</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">embed_positions</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">embed_positions</span><span class="p">)</span>
+
+                <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">strongly_typed</span> <span class="ow">and</span> <span class="p">(</span><span class="n">embed_positions</span><span class="o">.</span><span class="n">dtype</span> <span class="o">!=</span>
+                                                     <span class="n">value</span><span class="o">.</span><span class="n">dtype</span><span class="p">):</span>
+                    <span class="n">embed_positions</span> <span class="o">=</span> <span class="n">cast</span><span class="p">(</span><span class="n">embed_positions</span><span class="p">,</span> <span class="n">value</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="c1"># When shape(hidden_states, 1) &gt; 1(Context phase), the embedding start from 0,</span>
+                    <span class="c1"># otherwise (Generation phase) move start to position</span>
+                    <span class="n">start</span> <span class="o">=</span> <span class="n">where</span><span class="p">(</span>
+                        <span class="n">shape</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+                        <span class="n">shape</span><span class="p">(</span><span class="n">past_key_value</span><span class="p">,</span> <span class="mi">3</span><span class="p">))</span>
+                    <span class="n">size</span> <span class="o">=</span> <span class="n">where</span><span class="p">(</span>
+                        <span class="n">shape</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">,</span> <span class="n">shape</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span> <span class="mi">1</span><span class="p">)</span>
+                    <span class="n">sincos</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">embed_positions</span><span class="p">,</span> <span class="n">concat</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="n">start</span><span class="p">,</span> <span class="mi">0</span><span class="p">]),</span>
+                                   <span class="n">concat</span><span class="p">([</span><span class="mi">1</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span><span class="p">]))</span>
+                    <span class="n">sin</span><span class="p">,</span> <span class="n">cos</span> <span class="o">=</span> <span class="n">split</span><span class="p">(</span><span class="n">sincos</span><span class="p">,</span>
+                                     <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span>
+                                     <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+
+                    <span class="n">key_rot_size</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span>
+                        <span class="n">shape</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+                        <span class="n">shape</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+                        <span class="n">shape</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span>
+                    <span class="p">])</span>
+                    <span class="n">query_rot_size</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span>
+                        <span class="n">shape</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+                        <span class="n">shape</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+                        <span class="n">shape</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span>
+                    <span class="p">])</span>
+                    <span class="n">remaining</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="mi">3</span><span class="p">)</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span>
+                    <span class="n">key_pass_size</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span>
+                        <span class="n">shape</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+                        <span class="n">shape</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+                        <span class="n">shape</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span> <span class="n">remaining</span>
+                    <span class="p">])</span>
+                    <span class="n">query_pass_size</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span>
+                        <span class="n">shape</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+                        <span class="n">shape</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+                        <span class="n">shape</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span> <span class="n">remaining</span>
+                    <span class="p">])</span>
+                    <span class="n">k_rot</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="n">key_rot_size</span><span class="p">)</span>
+                    <span class="n">k_pass</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span><span class="p">],</span>
+                                   <span class="n">key_pass_size</span><span class="p">)</span>
+
+                    <span class="n">q_rot</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="n">query_rot_size</span><span class="p">)</span>
+                    <span class="n">q_pass</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span><span class="p">],</span>
+                                   <span class="n">query_pass_size</span><span class="p">)</span>
+
+                    <span class="n">k_rot</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">apply_rotary_pos_emb</span><span class="p">(</span>
+                        <span class="n">k_rot</span><span class="p">,</span> <span class="p">[</span><span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">],</span> <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span><span class="p">)</span>
+                    <span class="n">q_rot</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">apply_rotary_pos_emb</span><span class="p">(</span>
+                        <span class="n">q_rot</span><span class="p">,</span> <span class="p">[</span><span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">],</span> <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span><span class="p">)</span>
+
+                    <span class="n">key</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">k_rot</span><span class="p">,</span> <span class="n">k_pass</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
+                    <span class="n">query</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">q_rot</span><span class="p">,</span> <span class="n">q_pass</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">key</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">apply_rotary_pos_emb</span><span class="p">(</span>
+                        <span class="n">key</span><span class="p">,</span> <span class="p">[</span><span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">],</span> <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span><span class="p">)</span>
+                    <span class="n">query</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">apply_rotary_pos_emb</span><span class="p">(</span>
+                        <span class="n">query</span><span class="p">,</span> <span class="p">[</span><span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">],</span> <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span><span class="p">)</span>
+
+                <span class="n">key</span> <span class="o">=</span> <span class="n">key</span><span class="o">.</span><span class="n">permute</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">])</span>
+                <span class="n">query</span> <span class="o">=</span> <span class="n">query</span><span class="o">.</span><span class="n">permute</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">])</span>
+
+            <span class="n">past_key_value</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">kv_cache_params</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">get_first_past_key_value</span><span class="p">(</span>
+            <span class="p">)</span>
             <span class="k">if</span> <span class="n">past_key_value</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
 
                 <span class="k">def</span> <span class="nf">dequantize_tensor</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">scale</span><span class="p">):</span>
@@ -495,6 +917,10 @@
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_int8_kv_cache</span><span class="p">:</span>
                     <span class="n">past_key_value</span> <span class="o">=</span> <span class="n">dequantize_tensor</span><span class="p">(</span>
                         <span class="n">past_key_value</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_quant_orig_scale</span><span class="o">.</span><span class="n">value</span><span class="p">)</span>
+
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_fp8_qdq</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_kv_cache_quant</span><span class="p">():</span>
+                    <span class="n">past_key_value</span> <span class="o">=</span> <span class="n">dequantize</span><span class="p">(</span><span class="n">past_key_value</span><span class="p">,</span>
+                                                <span class="bp">self</span><span class="o">.</span><span class="n">kv_quant_orig_scale</span><span class="o">.</span><span class="n">value</span><span class="p">)</span>
 
                 <span class="c1"># past_key_value [bs, 2, num_heads, max_seq_len, head_dim]</span>
                 <span class="n">past_key</span><span class="p">,</span> <span class="n">past_value</span> <span class="o">=</span> <span class="n">split</span><span class="p">(</span><span class="n">past_key_value</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
@@ -537,6 +963,20 @@
                     <span class="n">past_key_value</span> <span class="o">=</span> <span class="n">quantize_tensor</span><span class="p">(</span>
                         <span class="n">past_key_value</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_orig_quant_scale</span><span class="o">.</span><span class="n">value</span><span class="p">)</span>
 
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_fp8_qdq</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_kv_cache_quant</span><span class="p">():</span>
+                    <span class="n">past_key_value</span> <span class="o">=</span> <span class="n">quantize</span><span class="p">(</span><span class="n">past_key_value</span><span class="p">,</span>
+                                              <span class="bp">self</span><span class="o">.</span><span class="n">kv_orig_quant_scale</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
+                                              <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;fp8&#39;</span><span class="p">)</span>
+
+            <span class="c1"># MQA broadcast</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+                <span class="n">key</span> <span class="o">=</span> <span class="n">repeat_interleave</span><span class="p">(</span>
+                    <span class="n">key</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+                <span class="n">value</span> <span class="o">=</span> <span class="n">repeat_interleave</span><span class="p">(</span>
+                    <span class="n">value</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+
             <span class="n">key_length</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
 
             <span class="c1"># The following code creates a 2D tensor with 0s in the lower triangular (including the diagonal) and</span>
@@ -560,7 +1000,27 @@
                 <span class="n">mask_buf</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">select_buf</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
                 <span class="n">mask_buf</span><span class="p">[</span><span class="n">select_buf</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="s1">&#39;-inf&#39;</span><span class="p">)</span>
                 <span class="n">buffer</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span><span class="n">mask_buf</span><span class="p">)</span>
-                <span class="n">causal_mask</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span> <span class="n">starts</span><span class="p">,</span> <span class="n">sizes</span><span class="p">)</span>
+                <span class="n">generated_mask</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span> <span class="n">starts</span><span class="p">,</span> <span class="n">sizes</span><span class="p">)</span>
+
+            <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_mask_type</span> <span class="o">==</span> <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">bidirectional</span><span class="p">:</span>
+                <span class="n">query_length</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+                <span class="n">zero_buf</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">expand_dims</span><span class="p">(</span>
+                    <span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
+                              <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">),</span>
+                             <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">),</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
+
+                <span class="n">zero_buf</span><span class="p">[:,</span> <span class="p">:,</span> <span class="p">:</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="mi">1</span>
+                <span class="n">zero_buf</span> <span class="o">*=</span> <span class="o">-</span><span class="mi">10000</span>
+
+                <span class="n">mask</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span><span class="n">zero_buf</span><span class="p">)</span>
+
+                <span class="c1"># context phase, query_length</span>
+                <span class="n">mask_size</span> <span class="o">=</span> <span class="n">where</span><span class="p">(</span><span class="n">query_length</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">,</span> <span class="n">query_length</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+                <span class="n">mask_start</span> <span class="o">=</span> <span class="n">where</span><span class="p">(</span><span class="n">query_length</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">,</span>
+                                   <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span> <span class="o">-</span> <span class="n">mask_size</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+                <span class="n">start</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">mask_start</span><span class="p">,</span> <span class="n">mask_start</span><span class="p">])</span>
+                <span class="n">size</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">mask_size</span><span class="p">,</span> <span class="n">mask_size</span><span class="p">])</span>
+                <span class="n">generated_mask</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span> <span class="n">start</span><span class="p">,</span> <span class="n">size</span><span class="p">)</span>
 
             <span class="k">if</span> <span class="n">attention_mask</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">attention_mask</span> <span class="o">=</span> <span class="n">expand_mask</span><span class="p">(</span><span class="n">attention_mask</span><span class="p">,</span> <span class="n">shape</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="mi">2</span><span class="p">))</span>
@@ -571,40 +1031,60 @@
 
             <span class="n">key</span> <span class="o">=</span> <span class="n">key</span><span class="o">.</span><span class="n">permute</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">2</span><span class="p">])</span>
             <span class="k">with</span> <span class="n">precision</span><span class="p">(</span><span class="s1">&#39;float32&#39;</span><span class="p">):</span>
+                <span class="k">if</span> <span class="n">norm_before_bmm1</span><span class="p">:</span>
+                    <span class="c1"># Apply norm on query earlier to prevent matmul fp16 overflow.</span>
+                    <span class="n">query</span> <span class="o">/=</span> <span class="bp">self</span><span class="o">.</span><span class="n">norm_factor</span>
                 <span class="n">attention_scores</span> <span class="o">=</span> <span class="n">matmul</span><span class="p">(</span><span class="n">cast</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="s1">&#39;float32&#39;</span><span class="p">),</span>
                                           <span class="n">cast</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="s1">&#39;float32&#39;</span><span class="p">))</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="n">norm_before_bmm1</span><span class="p">:</span>
+                    <span class="n">attention_scores</span> <span class="o">=</span> <span class="n">attention_scores</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">norm_factor</span>
 
-                <span class="n">attention_scores</span> <span class="o">=</span> <span class="n">attention_scores</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">norm_factor</span>
-
-                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_mask_type</span> <span class="o">==</span> <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">causal</span><span class="p">:</span>
-                    <span class="n">bias</span> <span class="o">=</span> <span class="n">causal_mask</span> <span class="k">if</span> <span class="n">bias</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">bias</span> <span class="o">+</span> <span class="n">causal_mask</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_mask_type</span> <span class="ow">in</span> <span class="p">[</span>
+                        <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span>
+                        <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">bidirectional</span>
+                <span class="p">]:</span>
+                    <span class="n">bias</span> <span class="o">=</span> <span class="n">generated_mask</span> <span class="k">if</span> <span class="n">bias</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">bias</span> <span class="o">+</span> <span class="n">generated_mask</span>
 
                 <span class="k">if</span> <span class="n">bias</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">:</span>
                     <span class="n">attention_scores</span> <span class="o">=</span> <span class="n">attention_scores</span> <span class="o">+</span> <span class="n">bias</span>
 
             <span class="n">attention_probs</span> <span class="o">=</span> <span class="n">softmax</span><span class="p">(</span><span class="n">attention_scores</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
 
+            <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">strongly_typed</span> <span class="ow">and</span> <span class="p">(</span><span class="n">attention_probs</span><span class="o">.</span><span class="n">dtype</span> <span class="o">!=</span>
+                                                 <span class="n">value</span><span class="o">.</span><span class="n">dtype</span><span class="p">):</span>
+                <span class="n">attention_probs</span> <span class="o">=</span> <span class="n">cast</span><span class="p">(</span><span class="n">attention_probs</span><span class="p">,</span> <span class="n">value</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+
             <span class="n">context</span> <span class="o">=</span> <span class="n">matmul</span><span class="p">(</span><span class="n">attention_probs</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span><span class="o">.</span><span class="n">permute</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">])</span>
             <span class="n">context</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">view</span><span class="p">(</span>
                 <span class="n">concat</span><span class="p">([</span><span class="n">shape</span><span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
                         <span class="n">shape</span><span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">]))</span>
 
-        <span class="n">context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense</span><span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="n">workspace</span><span class="p">)</span>
+        <span class="n">dense_lora_param</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">dense_lora_param</span> <span class="o">=</span> <span class="n">lora_param</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;attn_dense&quot;</span><span class="p">)</span>
+        <span class="n">context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense</span><span class="p">(</span><span class="n">context</span><span class="p">,</span>
+                             <span class="n">workspace</span><span class="p">,</span>
+                             <span class="n">lora_runtime_param</span><span class="o">=</span><span class="n">dense_lora_param</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="n">past_key_value</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">context</span></div></div>
+            <span class="k">return</span> <span class="n">context</span></div>
+</div>
 
 
-<div class="viewcode-block" id="BertAttention"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.BertAttention">[docs]</a><span class="k">class</span> <span class="nc">BertAttention</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+
+<div class="viewcode-block" id="BertAttention">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.BertAttention">[docs]</a>
+<span class="k">class</span> <span class="nc">BertAttention</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">hidden_size</span><span class="p">,</span>
                  <span class="n">num_attention_heads</span><span class="p">,</span>
-                 <span class="n">num_kv_heads</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                  <span class="n">max_position_embeddings</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span>
                  <span class="n">num_layers</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+                 <span class="n">attention_head_size</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">num_kv_heads</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                  <span class="n">q_scaling</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
                  <span class="n">apply_query_key_layer_scaling</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                  <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
@@ -617,7 +1097,7 @@
                  <span class="n">num_buckets</span><span class="o">=</span><span class="mi">0</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span> <span class="o">=</span> <span class="n">hidden_size</span> <span class="o">//</span> <span class="n">num_attention_heads</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span> <span class="o">=</span> <span class="n">hidden_size</span> <span class="o">//</span> <span class="n">num_attention_heads</span> <span class="k">if</span> <span class="n">attention_head_size</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">attention_head_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">=</span> <span class="n">num_attention_heads</span> <span class="o">//</span> <span class="n">tp_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">=</span> <span class="p">(</span>
             <span class="n">num_kv_heads</span> <span class="o">+</span> <span class="n">tp_size</span> <span class="o">-</span> <span class="mi">1</span>
@@ -641,16 +1121,20 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">relative_attention</span> <span class="o">=</span> <span class="n">relative_attention</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_distance</span> <span class="o">=</span> <span class="n">max_distance</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span> <span class="o">=</span> <span class="n">ColumnLinear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span>
-                                <span class="n">hidden_size</span> <span class="o">+</span>
-                                <span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span>
-                                 <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">),</span>
-                                <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
-                                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-                                <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
-                                <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
-                                <span class="n">gather_output</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">dense</span> <span class="o">=</span> <span class="n">RowLinear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span>
+        <span class="c1"># out dim is not necessarily hidden_size + kv specific size (in MQA/GQA), but num_heads * heads_size</span>
+        <span class="c1"># example: d_model != num_heads * head_size in Flan-T5</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span> <span class="o">=</span> <span class="n">ColumnLinear</span><span class="p">(</span>
+            <span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span> <span class="o">+</span>
+            <span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span>
+             <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">),</span>
+            <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
+            <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+            <span class="n">gather_output</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dense</span> <span class="o">=</span> <span class="n">RowLinear</span><span class="p">(</span><span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">*</span>
+                               <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">,</span>
                                <span class="n">hidden_size</span><span class="p">,</span>
                                <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
                                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
@@ -663,10 +1147,14 @@
                                                    <span class="n">tp_size</span><span class="p">,</span> <span class="n">num_buckets</span><span class="p">),</span>
                                             <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
-<div class="viewcode-block" id="BertAttention.forward"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.BertAttention.forward">[docs]</a>    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+<div class="viewcode-block" id="BertAttention.forward">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.BertAttention.forward">[docs]</a>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">input_lengths</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                <span class="n">input_lengths</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">max_input_length</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">)</span>
 
         <span class="n">qkv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
@@ -683,7 +1171,8 @@
                 <span class="n">relative_attention</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">relative_attention</span><span class="p">,</span>
                 <span class="n">max_distance</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_distance</span><span class="p">,</span>
                 <span class="n">relative_attention_bias</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rel_attn_table</span><span class="o">.</span><span class="n">value</span>
-                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">relative_attention</span> <span class="k">else</span> <span class="kc">None</span><span class="p">)</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">relative_attention</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+                <span class="n">max_input_length</span><span class="o">=</span><span class="n">max_input_length</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="c1"># plain TRT mode</span>
             <span class="k">def</span> <span class="nf">transpose_for_scores</span><span class="p">(</span><span class="n">x</span><span class="p">):</span>
@@ -713,9 +1202,11 @@
                 <span class="n">concat</span><span class="p">([</span><span class="n">shape</span><span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
                         <span class="n">shape</span><span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">]))</span>
 
-        <span class="n">context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense</span><span class="p">(</span><span class="n">context</span><span class="p">)</span>
+        <span class="n">context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense</span><span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="n">workspace</span><span class="p">)</span>
 
-        <span class="k">return</span> <span class="n">context</span></div></div>
+        <span class="k">return</span> <span class="n">context</span></div>
+</div>
+
 </pre></div>
 
            </div>
