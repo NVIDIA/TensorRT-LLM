@@ -1,25 +1,27 @@
 <!DOCTYPE html>
-<html class="writer-html5" lang="en" >
+<html class="writer-html5" lang="en" data-content_root="./">
 <head>
-  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Graph Rewriting Module &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" href="_static/pygments.css" type="text/css" />
-      <link rel="stylesheet" href="_static/css/theme.css" type="text/css" />
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=19f00094" />
+
+  
   <!--[if lt IE 9]>
     <script src="_static/js/html5shiv.min.js"></script>
   <![endif]-->
   
         <script src="_static/jquery.js?v=5d32c60e"></script>
         <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script data-url_root="./" id="documentation_options" src="_static/documentation_options.js?v=b3ba4146"></script>
+        <script src="_static/documentation_options.js?v=5929fcd5"></script>
         <script src="_static/doctools.js?v=888ff710"></script>
-        <script src="_static/sphinx_highlight.js?v=4825356b"></script>
+        <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
-    <link rel="next" title="Layers" href="python-api/tensorrt_llm.layers.html" />
+    <link rel="next" title="Memory Usage of TensorRT-LLM" href="memory.html" />
     <link rel="prev" title="How to add a new model" href="2023-05-17-how-to-add-a-new-model.html" /> 
 </head>
 
@@ -50,7 +52,6 @@
 <li class="toctree-l1"><a class="reference internal" href="gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="performance.html">Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="installation.html">Build From Sources</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Graph Rewriting Module</a><ul>
@@ -65,6 +66,7 @@
 <li class="toctree-l2"><a class="reference internal" href="#classical-workflow">Classical Workflow</a></li>
 </ul>
 </li>
+<li class="toctree-l1"><a class="reference internal" href="memory.html">Memory Usage of TensorRT-LLM</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -78,6 +80,11 @@
 <p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token.</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 </ul>
 
         </div>
@@ -105,10 +112,10 @@
            <div itemprop="articleBody">
              
   <section id="graph-rewriting-module">
-<h1>Graph Rewriting Module<a class="headerlink" href="#graph-rewriting-module" title="Permalink to this heading"></a></h1>
+<h1>Graph Rewriting Module<a class="headerlink" href="#graph-rewriting-module" title="Link to this heading"></a></h1>
 <p>TensorRT-LLM adopts a declarative approach to define a neural network. It provides a wrapper similar to PyTorch’s Module. When a user invokes the <code class="docutils literal notranslate"><span class="pre">forward</span></code> method, the layers are lowered to TensorRT’s <code class="docutils literal notranslate"><span class="pre">ILayer</span></code>s and become part of an <code class="docutils literal notranslate"><span class="pre">INetworkDefinition</span></code>. The Graph Rewriting (GW) module can be used to manipulate the network at the <code class="docutils literal notranslate"><span class="pre">ILayer</span></code>/<code class="docutils literal notranslate"><span class="pre">INetworkDefinition</span></code> level.</p>
 <section id="when-to-use-graph-rewriting">
-<h2>When to Use Graph Rewriting?<a class="headerlink" href="#when-to-use-graph-rewriting" title="Permalink to this heading"></a></h2>
+<h2>When to Use Graph Rewriting?<a class="headerlink" href="#when-to-use-graph-rewriting" title="Link to this heading"></a></h2>
 <p>For network manipulation, there are two options in TensorRT-LLM:</p>
 <ol class="arabic simple">
 <li><p><strong>Module Rewriting:</strong> This method modifies the members of <code class="docutils literal notranslate"><span class="pre">Module</span></code> instances before triggering the <code class="docutils literal notranslate"><span class="pre">forward</span></code> method(i.e. creating the TensorRT graph). It works on the highest level of the network representation and facilitates the modification of sequences of operations (like modifying the GEMM + activation for SmoothQuant),</p></li>
@@ -121,10 +128,10 @@
 </ol>
 </section>
 <section id="graph-rewriting-apis">
-<h2>Graph Rewriting APIs<a class="headerlink" href="#graph-rewriting-apis" title="Permalink to this heading"></a></h2>
+<h2>Graph Rewriting APIs<a class="headerlink" href="#graph-rewriting-apis" title="Link to this heading"></a></h2>
 <p>Several core APIs are provided for Graph Rewriting:</p>
 <section id="tensor-related-methods">
-<h3>Tensor-Related Methods<a class="headerlink" href="#tensor-related-methods" title="Permalink to this heading"></a></h3>
+<h3>Tensor-Related Methods<a class="headerlink" href="#tensor-related-methods" title="Link to this heading"></a></h3>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">Tensor.get_parent</span></code>: Get the <code class="docutils literal notranslate"><span class="pre">ILayer</span></code> that produces this tensor,</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">Tensor.get_users</span></code>: Get the consumer <code class="docutils literal notranslate"><span class="pre">ILayer</span></code>s of this tensor,</p></li>
@@ -132,7 +139,7 @@
 </ul>
 </section>
 <section id="flayerinfo-for-retrieving-high-level-information-for-a-functional">
-<h3>FLayerInfo for Retrieving High-Level Information for a Functional<a class="headerlink" href="#flayerinfo-for-retrieving-high-level-information-for-a-functional" title="Permalink to this heading"></a></h3>
+<h3>FLayerInfo for Retrieving High-Level Information for a Functional<a class="headerlink" href="#flayerinfo-for-retrieving-high-level-information-for-a-functional" title="Link to this heading"></a></h3>
 <p>For all the layers located in <code class="docutils literal notranslate"><span class="pre">functional.py</span></code>, the original input information is missing once lowered to <code class="docutils literal notranslate"><span class="pre">INetworkDefinition</span></code>, especially for TensorRT plugins, which are opaque in the Python world. <code class="docutils literal notranslate"><span class="pre">FLayerInfo</span></code> holds their original information as a high-level signature containing inputs like <code class="docutils literal notranslate"><span class="pre">Tensor</span></code>, Python attributes, and more. There is a Network-wise singleton called <code class="docutils literal notranslate"><span class="pre">FLayerInfoMemo</span></code> to map each <code class="docutils literal notranslate"><span class="pre">ILayer</span></code> to its corresponding <code class="docutils literal notranslate"><span class="pre">FLayerInfo</span></code>.</p>
 <p>For <code class="docutils literal notranslate"><span class="pre">FLayerInfo</span></code>:</p>
 <ul class="simple">
@@ -147,7 +154,7 @@
 <p><code class="docutils literal notranslate"><span class="pre">FLayerInfo</span></code> remains consistent with the actual <code class="docutils literal notranslate"><span class="pre">ILayer</span></code> during GW, making it safe to use.</p>
 </section>
 <section id="pattern-and-pattern-manager">
-<h3>Pattern and Pattern Manager<a class="headerlink" href="#pattern-and-pattern-manager" title="Permalink to this heading"></a></h3>
+<h3>Pattern and Pattern Manager<a class="headerlink" href="#pattern-and-pattern-manager" title="Link to this heading"></a></h3>
 <p>There are two kinds of patterns:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">PatternRewriter</span></code>: Used for defining a rewriting pattern, which actually alters the network.</p>
@@ -183,12 +190,12 @@
 </ul>
 </section>
 <section id="record-signature-to-decorate-functionals-requiring-flayerinfo">
-<h3>&#64;record_signature to Decorate Functionals Requiring FLayerInfo<a class="headerlink" href="#record-signature-to-decorate-functionals-requiring-flayerinfo" title="Permalink to this heading"></a></h3>
+<h3>&#64;record_signature to Decorate Functionals Requiring FLayerInfo<a class="headerlink" href="#record-signature-to-decorate-functionals-requiring-flayerinfo" title="Link to this heading"></a></h3>
 <p>The <code class="docutils literal notranslate"><span class="pre">&#64;record_signature</span></code> decorator is used to record the <code class="docutils literal notranslate"><span class="pre">FLayerInfo</span></code> for a functional. While FLayerInfo is vital for GW when analyzing or rewriting certain functionals, it is used in an “add as needed” manner. If you are adding GW patterns, ensure that the functional requires the <code class="docutils literal notranslate"><span class="pre">&#64;record_signature</span></code> decorator.</p>
 </section>
 </section>
 <section id="classical-workflow">
-<h2>Classical Workflow<a class="headerlink" href="#classical-workflow" title="Permalink to this heading"></a></h2>
+<h2>Classical Workflow<a class="headerlink" href="#classical-workflow" title="Link to this heading"></a></h2>
 <p>There are specific routines for defining a GW pattern. Let’s start with a simple example: replacing a sum layer with a subtract layer, which can also be found in the <code class="docutils literal notranslate"><span class="pre">test_graph_rewriting.py</span></code> file.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span> <span class="nc">NaivePatternRewriter_ReplaceAddWithSub</span><span class="p">(</span><span class="n">PatternRewriter</span><span class="p">):</span>
 
@@ -246,7 +253,7 @@
         <span class="n">flayer</span> <span class="o">=</span> <span class="n">FLayerInfoMemo</span><span class="o">.</span><span class="n">instance</span><span class="p">()</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
         <span class="k">assert</span> <span class="n">flayer</span>
         <span class="c1"># Although the layer is a plugin, which is a black box, we get some high-level input information from the FLayerInfo.</span>
-        <span class="n">tensor_input</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="n">flayer</span><span class="o">.</span><span class="n">get_input</span><span class="p">(</span><span class="s1">&#39;tensor&#39;</span><span class="p">)</span>
+        <span class="n">tensor_input</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="n">flayer</span><span class="o">.</span><span class="n">get_input</span><span class="p">(</span><span class="s1">&#39;qkv&#39;</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">tensor_input</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>  <span class="c1"># Already in remove-padding mode</span>
             <span class="k">return</span> <span class="kc">False</span>
 
@@ -259,11 +266,11 @@
 
             <span class="c1"># Step 1: Create new inputs and replace the original arglist.</span>
             <span class="nb">input</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
-                <span class="n">name</span><span class="o">=</span><span class="s1">&#39;tensor&#39;</span><span class="p">,</span>
+                <span class="n">name</span><span class="o">=</span><span class="s1">&#39;qkv&#39;</span><span class="p">,</span>
                 <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">float16</span><span class="p">,</span>
                 <span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">batch_size</span> <span class="o">*</span> <span class="n">in_len</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">),</span>
             <span class="p">)</span>
-            <span class="n">new_inputs</span><span class="p">[</span><span class="s1">&#39;tensor&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">input</span>
+            <span class="n">new_inputs</span><span class="p">[</span><span class="s1">&#39;qkv&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">input</span>
 
             <span class="c1"># Step 2: Create a new plugin instance.</span>
             <span class="n">new_outs</span> <span class="o">=</span> <span class="n">gpt_attention</span><span class="p">(</span><span class="o">**</span><span class="n">new_inputs</span><span class="p">)</span>
@@ -305,7 +312,7 @@
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
         <a href="2023-05-17-how-to-add-a-new-model.html" class="btn btn-neutral float-left" title="How to add a new model" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="python-api/tensorrt_llm.layers.html" class="btn btn-neutral float-right" title="Layers" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="memory.html" class="btn btn-neutral float-right" title="Memory Usage of TensorRT-LLM" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>

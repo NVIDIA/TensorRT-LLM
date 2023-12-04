@@ -1,25 +1,27 @@
 <!DOCTYPE html>
-<html class="writer-html5" lang="en" >
+<html class="writer-html5" lang="en" data-content_root="./">
 <head>
-  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Performance of TensorRT-LLM &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" href="_static/pygments.css" type="text/css" />
-      <link rel="stylesheet" href="_static/css/theme.css" type="text/css" />
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=19f00094" />
+
+  
   <!--[if lt IE 9]>
     <script src="_static/js/html5shiv.min.js"></script>
   <![endif]-->
   
         <script src="_static/jquery.js?v=5d32c60e"></script>
         <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script data-url_root="./" id="documentation_options" src="_static/documentation_options.js?v=b3ba4146"></script>
+        <script src="_static/documentation_options.js?v=5929fcd5"></script>
         <script src="_static/doctools.js?v=888ff710"></script>
-        <script src="_static/sphinx_highlight.js?v=4825356b"></script>
+        <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
-    <link rel="next" title="Build From Sources" href="installation.html" />
+    <link rel="next" title="How to debug" href="2023-05-19-how-to-debug.html" />
     <link rel="prev" title="Numerical Precision" href="precision.html" /> 
 </head>
 
@@ -67,12 +69,41 @@
 <li class="toctree-l3"><a class="reference internal" href="#fused-matmul-gated-silu-llama">Fused Matmul + Gated-SiLU (LLaMA)</a></li>
 </ul>
 </li>
+<li class="toctree-l2"><a class="reference internal" href="#reproducing-benchmarked-results">Reproducing Benchmarked Results</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#building-the-tensorrt-llm-container">Building the TensorRT-LLM Container</a></li>
 </ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="installation.html">Build From Sources</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#id4">Methodology</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#engine-building-setups">Engine Building Setups</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#running-on-a100">Running on A100</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#reproducing-first-token-latency">Reproducing First Token Latency</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#benchmarking-per-model">Benchmarking per Model</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#gpt-j-6b">GPT-J 6B</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#throughput-benchmark">Throughput Benchmark</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#first-token-latency-benchmark">First Token Latency Benchmark</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#llama2-7b">Llama2-7b</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id5">Throughput Benchmark</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id6">First Token Latency Benchmark</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#llama2-70b">Llama2-70b</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id7">Throughput Benchmark</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id8">First Token Latency Benchmark</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#falcon-180b">Falcon-180B</a></li>
+</ul>
+</li>
+</ul>
+</li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="memory.html">Memory Usage of TensorRT-LLM</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -86,6 +117,11 @@
 <p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token.</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 </ul>
 
         </div>
@@ -113,23 +149,23 @@
            <div itemprop="articleBody">
              
   <section id="performance-of-tensorrt-llm">
-<h1>Performance of TensorRT-LLM<a class="headerlink" href="#performance-of-tensorrt-llm" title="Permalink to this heading"></a></h1>
+<h1>Performance of TensorRT-LLM<a class="headerlink" href="#performance-of-tensorrt-llm" title="Link to this heading"></a></h1>
 <p>This document summarizes performance measurements of TensorRT-LLM on H100
 (Hopper), L40S (Ada) and A100 (Ampere) GPUs for a few key models.</p>
 <p>The data in the following tables is provided as a reference point to help users
 validate observed performance. It should not be considered as the peak
 performance that can be delivered by TensorRT-LLM.</p>
 <section id="methodology">
-<h2>Methodology<a class="headerlink" href="#methodology" title="Permalink to this heading"></a></h2>
+<h2>Methodology<a class="headerlink" href="#methodology" title="Link to this heading"></a></h2>
 <p>The different performance numbers below were collected using the methodology
-described in the benchmarks <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/release/0.5.0/benchmarks/">folder</a>.</p>
+described in the benchmarks <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/benchmarks/">folder</a>.</p>
 </section>
 <section id="high-throughput">
-<h2>High Throughput<a class="headerlink" href="#high-throughput" title="Permalink to this heading"></a></h2>
-<p>The below tables provide reference data at large batch sizes, representating
+<h2>High Throughput<a class="headerlink" href="#high-throughput" title="Link to this heading"></a></h2>
+<p>The below tables provide reference data at large batch sizes, representing
 high throughput tasks.</p>
 <section id="h100-gpus-fp8">
-<h3>H100 GPUs (FP8)<a class="headerlink" href="#h100-gpus-fp8" title="Permalink to this heading"></a></h3>
+<h3>H100 GPUs (FP8)<a class="headerlink" href="#h100-gpus-fp8" title="Link to this heading"></a></h3>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p>Model</p></th>
@@ -271,7 +307,7 @@ high throughput tasks.</p>
 </table>
 </section>
 <section id="l40s-gpus-fp8">
-<h3>L40S GPUs (FP8)<a class="headerlink" href="#l40s-gpus-fp8" title="Permalink to this heading"></a></h3>
+<h3>L40S GPUs (FP8)<a class="headerlink" href="#l40s-gpus-fp8" title="Link to this heading"></a></h3>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p>Model</p></th>
@@ -350,7 +386,7 @@ high throughput tasks.</p>
 </table>
 </section>
 <section id="a100-gpus-fp16">
-<h3>A100 GPUs (FP16)<a class="headerlink" href="#a100-gpus-fp16" title="Permalink to this heading"></a></h3>
+<h3>A100 GPUs (FP16)<a class="headerlink" href="#a100-gpus-fp16" title="Link to this heading"></a></h3>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p>Model</p></th>
@@ -494,12 +530,12 @@ high throughput tasks.</p>
 </section>
 </section>
 <section id="low-latency">
-<h2>Low Latency<a class="headerlink" href="#low-latency" title="Permalink to this heading"></a></h2>
+<h2>Low Latency<a class="headerlink" href="#low-latency" title="Link to this heading"></a></h2>
 <p>The below tables provide reference data at batch size 1 for first token
-latency, representating end-user’s percieved latency for online streaming
+latency, representing end-user’s perceived latency for online streaming
 tasks.</p>
 <section id="id1">
-<h3>H100 GPUs (FP8)<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h3>
+<h3>H100 GPUs (FP8)<a class="headerlink" href="#id1" title="Link to this heading"></a></h3>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p>Model</p></th>
@@ -580,7 +616,7 @@ tasks.</p>
 </table>
 </section>
 <section id="id2">
-<h3>L40S GPUs (FP8)<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h3>
+<h3>L40S GPUs (FP8)<a class="headerlink" href="#id2" title="Link to this heading"></a></h3>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p>Model</p></th>
@@ -625,7 +661,7 @@ tasks.</p>
 </table>
 </section>
 <section id="id3">
-<h3>A100 GPUs (FP16)<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h3>
+<h3>A100 GPUs (FP16)<a class="headerlink" href="#id3" title="Link to this heading"></a></h3>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p>Model</p></th>
@@ -708,15 +744,324 @@ tasks.</p>
 </section>
 </section>
 <section id="known-issues">
-<h2>Known Issues<a class="headerlink" href="#known-issues" title="Permalink to this heading"></a></h2>
+<h2>Known Issues<a class="headerlink" href="#known-issues" title="Link to this heading"></a></h2>
 <p>The following issues are being addressed to improve the efficiency of TensorRT-LLM.</p>
 <section id="fused-matmul-gated-silu-llama">
-<h3>Fused Matmul + Gated-SiLU (LLaMA)<a class="headerlink" href="#fused-matmul-gated-silu-llama" title="Permalink to this heading"></a></h3>
-<p>There are different possible implementations for Matmul followed by Gated-SiLU.
-The simplest implementation uses two Matmul operations and combines the results
-in a separate CUDA kernel. That’s the current implementation in TensorRT-LLM.
-The next release will include a more efficient implementation that runs a
-single Matmul.</p>
+<h3>Fused Matmul + Gated-SiLU (LLaMA)<a class="headerlink" href="#fused-matmul-gated-silu-llama" title="Link to this heading"></a></h3>
+<p>The current implementation combines two Matmul operations into one Matmul followed by
+a separate SwiGLU kernel (when <code class="docutils literal notranslate"><span class="pre">--use_fused_mlp</span></code> is enabled). The future release will
+include a more efficient implementation that runs single Matmul + SwiGLU fused kernel.</p>
+</section>
+</section>
+<section id="reproducing-benchmarked-results">
+<h2>Reproducing Benchmarked Results<a class="headerlink" href="#reproducing-benchmarked-results" title="Link to this heading"></a></h2>
+<section id="building-the-tensorrt-llm-container">
+<h3>Building the TensorRT-LLM Container<a class="headerlink" href="#building-the-tensorrt-llm-container" title="Link to this heading"></a></h3>
+<hr class="docutils" />
+<p>In order to benchmark TensorRT-LLM, you will need to follow the <span class="xref myst">Quick Start</span>
+build process to create a baseline container for building a wheel. Additionally, the development
+container needs a copy of the source code to build the wheel and the benchmarking script. Create the
+right build environment, use the following :</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/NVIDIA/TensorRT-LLM.git
+<span class="nb">cd</span><span class="w"> </span>TensorRT-LLM
+git<span class="w"> </span>submodule<span class="w"> </span>update<span class="w"> </span>--init<span class="w"> </span>--recursive
+git<span class="w"> </span>lfs<span class="w"> </span>install
+git<span class="w"> </span>lfs<span class="w"> </span>pull
+make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>build
+make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>run<span class="w"> </span><span class="nv">LOCAL_USER</span><span class="o">=</span><span class="m">1</span>
+</pre></div>
+</div>
+<blockquote>
+<div><p>[!WARNING]
+If you have elevated privileges on your system, then skip the <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">-C</span> <span class="pre">docker</span> <span class="pre">run</span> <span class="pre">LOCAL_USER=1</span></code>
+command above as it may make it so that you cannot access some required system libraries within the
+container because the build forces your UID and GID to match those that are set for your non-elevated
+user. There are cases where the container will be booted as root (i.e. on some SLURM systems with
+the pyxis plugin) which will cause libraries to be missing.</p>
+</div></blockquote>
+<p>If you are benchmarking in a shared environment, you need to specify the GPU indices that you would
+like the container to use, otherwise the Makefile defaults to loading the container with all GPUs on
+the system. For example, if you only have the 4 higher indices of GPUs on your system you can
+configure it using the following example:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">NV_GPU</span><span class="o">=</span><span class="m">0</span>,1,2,3
+make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>run<span class="w"> </span><span class="nv">LOCAL_USER</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">GPU_OPTS</span><span class="o">=</span><span class="s1">&#39;--gpus \&quot;device=${NV_GPU}\&quot;&#39;</span>
+</pre></div>
+</div>
+<p>Additionally, if you’d like to mount external storage to access persistent storage, or previously
+built engines, you can mount directories as follows (simply replace <code class="docutils literal notranslate"><span class="pre">source</span></code> and <code class="docutils literal notranslate"><span class="pre">destination</span></code> with
+the appropriate paths):</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>run<span class="w"> </span><span class="nv">LOCAL_USER</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">DOCKER_RUN_ARGS</span><span class="o">=</span><span class="s2">&quot;-v /source:/destination&quot;</span>
+</pre></div>
+</div>
+<p>Once the container starts, you’ll need to build the wheel and the benchmarking scripts. From the
+code root (the default directory when the container is loaded), the following commands will build
+the TensorRT-LLM wheel, install dependencies, and build the benchmark scripts:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>./scripts/build_wheel.py<span class="w"> </span>--benchmarks<span class="w"> </span>--trt_root<span class="w"> </span>/usr/local/tensorrt
+pip<span class="w"> </span>install<span class="w"> </span>./build/tensorrt_llm*.whl
+</pre></div>
+</div>
+</section>
+</section>
+<section id="id4">
+<h2>Methodology<a class="headerlink" href="#id4" title="Link to this heading"></a></h2>
+<section id="engine-building-setups">
+<h3>Engine Building Setups<a class="headerlink" href="#engine-building-setups" title="Link to this heading"></a></h3>
+<p>Each engine needs to be built before they can be benchmarked, and requires the source code for each
+of their respective build scripts. For smaller models, it is fine to build the engine on the fly in
+container; however, for larger engines it is recommended to pre-build and mount a directory with the
+engine because engine files are quite large and take time to repeatedly build. Additionally, built
+engines can be used for input lengths, output lengths, and batch sizes <em>up to</em> their build options
+meaning you can use an engine to benchmark multiple input configurations.</p>
+<p>In order to benchmark the various networks, our engine building scheme is as follows:</p>
+<ul class="simple">
+<li><p>For the GPT-J, Llama2-7b, and Llama2-70b benchmarks were ran using a single-setting engine build
+for each network configured for our maximum expected throughput.</p></li>
+<li><p>For Falcon-180B, where memory limits and model size have a higher impact for running the model,
+our benchmarks transition to a per-configuration engine build.</p></li>
+</ul>
+<p>Below we document how to benchmark each model on an H100-HBM3-80GB system and reproduce the throughput
+numbers we document on our [Performance section](#performance of-tensorrt-llm).</p>
+</section>
+<section id="running-on-a100">
+<h3>Running on A100<a class="headerlink" href="#running-on-a100" title="Link to this heading"></a></h3>
+<p>To run the benchmarks below on A100, you will need to remove the <code class="docutils literal notranslate"><span class="pre">--enable_fp8</span> <span class="pre">--fp8_kv_cache</span></code> options
+from each engine build command because FP8 computation is a feature in H100 and newer GPUs.</p>
+</section>
+<section id="reproducing-first-token-latency">
+<h3>Reproducing First Token Latency<a class="headerlink" href="#reproducing-first-token-latency" title="Link to this heading"></a></h3>
+<p>In order to test the latency to the first token, you can build the engines as specified below (or
+with the tweaks specified above on A100) – once built as described in the
+<a class="reference internal" href="#engine-building-setups"><span class="xref myst">build steps</span></a> above, you can then benchmark with a single output token in
+order to find the time to first token latency. We provide the appropriate command lines below for
+each of the benchmarked models, but you can use this same method to benchmark other models available
+in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">TensorRT-LLM</a>.</p>
+</section>
+</section>
+<section id="benchmarking-per-model">
+<h2>Benchmarking per Model<a class="headerlink" href="#benchmarking-per-model" title="Link to this heading"></a></h2>
+<section id="gpt-j-6b">
+<h3>GPT-J 6B<a class="headerlink" href="#gpt-j-6b" title="Link to this heading"></a></h3>
+<hr class="docutils" />
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>examples/gptj/build.py<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--enable_context_fmha<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--parallel_build<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--output_dir<span class="w"> </span>/tmp/engines/gptj<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--dtype<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--use_gpt_attention_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--world_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--max_batch_size<span class="w"> </span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--max_input_len<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--max_output_len<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--hidden_act<span class="w"> </span>gelu<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--enable_fp8<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--fp8_kv_cache<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--strongly_typed<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--n_layer<span class="w"> </span><span class="m">28</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--n_head<span class="w"> </span><span class="m">16</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--n_embd<span class="w"> </span><span class="m">4096</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--n_positions<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--enable_two_optimization_profiles
+</pre></div>
+</div>
+<section id="throughput-benchmark">
+<h4>Throughput Benchmark<a class="headerlink" href="#throughput-benchmark" title="Link to this heading"></a></h4>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">in_out_sizes</span><span class="o">=(</span><span class="s2">&quot;64:128,128&quot;</span><span class="w"> </span><span class="s2">&quot;64:128,2048&quot;</span><span class="w"> </span><span class="s2">&quot;64:2048,128&quot;</span><span class="w"> </span><span class="s2">&quot;64:2048,2048&quot;</span><span class="o">)</span>
+<span class="k">for</span><span class="w"> </span>in_out<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="si">${</span><span class="nv">in_out_sizes</span><span class="p">[@]</span><span class="si">}</span>
+<span class="k">do</span>
+<span class="w">	</span><span class="nv">batch_size</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$in_out</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="s1">&#39;:&#39;</span><span class="w"> </span><span class="s1">&#39;{ print $1 }&#39;</span><span class="k">)</span>
+<span class="w">	</span><span class="nv">in_out_dims</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$in_out</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="s1">&#39;:&#39;</span><span class="w"> </span><span class="s1">&#39;{ print $2 }&#39;</span><span class="k">)</span>
+<span class="w">	</span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;BS: </span><span class="nv">$batch_size</span><span class="s2">, ISL/OSL: </span><span class="nv">$in_out_dims</span><span class="s2">&quot;</span>
+
+<span class="w">	</span>./cpp/build/benchmarks/gptSessionBenchmark<span class="w"> </span>--model<span class="w"> </span>gptj<span class="w"> </span>--engine_dir<span class="w"> </span>/tmp/engines/gptj/<span class="w"> </span>--warm_up<span class="w"> </span><span class="m">1</span><span class="w"> </span>--batch_size<span class="w"> </span><span class="nv">$batch_size</span><span class="w"> </span>--duration<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num_runs<span class="w"> </span><span class="m">5</span><span class="w"> </span>--input_output_len<span class="w"> </span><span class="nv">$in_out_dims</span>
+<span class="k">done</span>
+</pre></div>
+</div>
+</section>
+<section id="first-token-latency-benchmark">
+<h4>First Token Latency Benchmark<a class="headerlink" href="#first-token-latency-benchmark" title="Link to this heading"></a></h4>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">in_out_sizes</span><span class="o">=(</span><span class="s2">&quot;64:128,1&quot;</span><span class="w"> </span><span class="s2">&quot;64:2048,1&quot;</span><span class="o">)</span>
+<span class="k">for</span><span class="w"> </span>in_out<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="si">${</span><span class="nv">in_out_sizes</span><span class="p">[@]</span><span class="si">}</span>
+<span class="k">do</span>
+<span class="w">	</span><span class="nv">batch_size</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$in_out</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="s1">&#39;:&#39;</span><span class="w"> </span><span class="s1">&#39;{ print $1 }&#39;</span><span class="k">)</span>
+<span class="w">	</span><span class="nv">in_out_dims</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$in_out</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="s1">&#39;:&#39;</span><span class="w"> </span><span class="s1">&#39;{ print $2 }&#39;</span><span class="k">)</span>
+<span class="w">	</span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;BS: </span><span class="nv">$batch_size</span><span class="s2">, ISL/OSL: </span><span class="nv">$in_out_dims</span><span class="s2">&quot;</span>
+
+<span class="w">	</span>./cpp/build/benchmarks/gptSessionBenchmark<span class="w"> </span>--model<span class="w"> </span>gptj<span class="w"> </span>--engine_dir<span class="w"> </span>/tmp/engines/gptj/<span class="w"> </span>--warm_up<span class="w"> </span><span class="m">1</span><span class="w"> </span>--batch_size<span class="w"> </span><span class="nv">$batch_size</span><span class="w"> </span>--duration<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num_runs<span class="w"> </span><span class="m">5</span><span class="w"> </span>--input_output_len<span class="w"> </span><span class="nv">$in_out_dims</span>
+<span class="k">done</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="llama2-7b">
+<h3>Llama2-7b<a class="headerlink" href="#llama2-7b" title="Link to this heading"></a></h3>
+<hr class="docutils" />
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </span>examples/llama/requirements.txt
+python<span class="w"> </span>examples/llama/build.py<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--remove_input_padding<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--enable_context_fmha<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--parallel_build<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--output_dir<span class="w"> </span>/tmp/engines/llama/7b<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--dtype<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--use_gpt_attention_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--world_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--tp_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--pp_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--max_batch_size<span class="w"> </span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--max_input_len<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--max_output_len<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--enable_fp8<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--fp8_kv_cache<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--strongly_typed<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--n_layer<span class="w"> </span><span class="m">32</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--n_head<span class="w"> </span><span class="m">32</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--n_embd<span class="w"> </span><span class="m">4096</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--inter_size<span class="w"> </span><span class="m">11008</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--vocab_size<span class="w"> </span><span class="m">32000</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--n_positions<span class="w"> </span><span class="m">4096</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--hidden_act<span class="w"> </span>silu
+</pre></div>
+</div>
+<section id="id5">
+<h4>Throughput Benchmark<a class="headerlink" href="#id5" title="Link to this heading"></a></h4>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">in_out_sizes</span><span class="o">=(</span><span class="s2">&quot;64:128,128&quot;</span><span class="w"> </span><span class="s2">&quot;64:128,2048&quot;</span><span class="w"> </span><span class="s2">&quot;64:2048,128&quot;</span><span class="w"> </span><span class="s2">&quot;32:2048,2048&quot;</span><span class="o">)</span>
+<span class="k">for</span><span class="w"> </span>in_out<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="si">${</span><span class="nv">in_out_sizes</span><span class="p">[@]</span><span class="si">}</span>
+<span class="k">do</span>
+<span class="w">	</span><span class="nv">batch_size</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$in_out</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="s1">&#39;:&#39;</span><span class="w"> </span><span class="s1">&#39;{ print $1 }&#39;</span><span class="k">)</span>
+<span class="w">	</span><span class="nv">in_out_dims</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$in_out</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="s1">&#39;:&#39;</span><span class="w"> </span><span class="s1">&#39;{ print $2 }&#39;</span><span class="k">)</span>
+<span class="w">	</span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;BS: </span><span class="nv">$batch_size</span><span class="s2">, ISL/OSL: </span><span class="nv">$in_out_dims</span><span class="s2">&quot;</span>
+
+<span class="w">	</span>./cpp/build/benchmarks/gptSessionBenchmark<span class="w"> </span>--model<span class="w"> </span>llama<span class="w"> </span>--engine_dir<span class="w"> </span>/tmp/engines/llama/7b<span class="w"> </span>--warm_up<span class="w"> </span><span class="m">1</span><span class="w"> </span>--batch_size<span class="w"> </span><span class="nv">$batch_size</span><span class="w"> </span>--duration<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num_runs<span class="w"> </span><span class="m">5</span><span class="w"> </span>--input_output_len<span class="w"> </span><span class="nv">$in_out_dims</span>
+<span class="k">done</span>
+</pre></div>
+</div>
+</section>
+<section id="id6">
+<h4>First Token Latency Benchmark<a class="headerlink" href="#id6" title="Link to this heading"></a></h4>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">in_out_sizes</span><span class="o">=(</span><span class="s2">&quot;64:128,1&quot;</span><span class="w"> </span><span class="s2">&quot;32:2048,1&quot;</span><span class="o">)</span>
+<span class="k">for</span><span class="w"> </span>in_out<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="si">${</span><span class="nv">in_out_sizes</span><span class="p">[@]</span><span class="si">}</span>
+<span class="k">do</span>
+<span class="w">	</span><span class="nv">batch_size</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$in_out</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="s1">&#39;:&#39;</span><span class="w"> </span><span class="s1">&#39;{ print $1 }&#39;</span><span class="k">)</span>
+<span class="w">	</span><span class="nv">in_out_dims</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$in_out</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="s1">&#39;:&#39;</span><span class="w"> </span><span class="s1">&#39;{ print $2 }&#39;</span><span class="k">)</span>
+<span class="w">	</span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;BS: </span><span class="nv">$batch_size</span><span class="s2">, ISL/OSL: </span><span class="nv">$in_out_dims</span><span class="s2">&quot;</span>
+
+<span class="w">	</span>./cpp/build/benchmarks/gptSessionBenchmark<span class="w"> </span>--model<span class="w"> </span>llama<span class="w"> </span>--engine_dir<span class="w"> </span>/tmp/engines/llama/7b<span class="w"> </span>--warm_up<span class="w"> </span><span class="m">1</span><span class="w"> </span>--batch_size<span class="w"> </span><span class="nv">$batch_size</span><span class="w"> </span>--duration<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num_runs<span class="w"> </span><span class="m">5</span><span class="w"> </span>--input_output_len<span class="w"> </span><span class="nv">$in_out_dims</span>
+<span class="k">done</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="llama2-70b">
+<h3>Llama2-70b<a class="headerlink" href="#llama2-70b" title="Link to this heading"></a></h3>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </span>examples/llama/requirements.txt
+python<span class="w"> </span>examples/llama/build.py<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--remove_input_padding<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--enable_context_fmha<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--parallel_build<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--output_dir<span class="w"> </span>/tmp/engines/llama/70b<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--dtype<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--use_gpt_attention_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--world_size<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--tp_size<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--pp_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--max_batch_size<span class="w"> </span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--max_input_len<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--max_output_len<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--enable_fp8<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--fp8_kv_cache<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--strongly_typed<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--n_layer<span class="w"> </span><span class="m">80</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--n_head<span class="w"> </span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--n_kv_head<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--n_embd<span class="w"> </span><span class="m">8192</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--inter_size<span class="w"> </span><span class="m">28672</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--vocab_size<span class="w"> </span><span class="m">32000</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--n_positions<span class="w"> </span><span class="m">4096</span><span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--hidden_act<span class="w"> </span>silu<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--ffn_dim_multiplier<span class="w"> </span><span class="m">1</span>.3<span class="w"> </span><span class="se">\</span>
+<span class="w">	</span>--multiple_of<span class="w"> </span><span class="m">4096</span>
+</pre></div>
+</div>
+<section id="id7">
+<h4>Throughput Benchmark<a class="headerlink" href="#id7" title="Link to this heading"></a></h4>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">in_out_sizes</span><span class="o">=(</span><span class="s2">&quot;64:128,128&quot;</span><span class="w"> </span><span class="s2">&quot;64:128,2048&quot;</span><span class="w"> </span><span class="s2">&quot;64:2048,128&quot;</span><span class="w"> </span><span class="s2">&quot;64:2048,2048&quot;</span><span class="o">)</span>
+<span class="k">for</span><span class="w"> </span>in_out<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="si">${</span><span class="nv">in_out_sizes</span><span class="p">[@]</span><span class="si">}</span>
+<span class="k">do</span>
+<span class="w">	</span><span class="nv">batch_size</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$in_out</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="s1">&#39;:&#39;</span><span class="w"> </span><span class="s1">&#39;{ print $1 }&#39;</span><span class="k">)</span>
+<span class="w">	</span><span class="nv">in_out_dims</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$in_out</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="s1">&#39;:&#39;</span><span class="w"> </span><span class="s1">&#39;{ print $2 }&#39;</span><span class="k">)</span>
+<span class="w">	</span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;BS: </span><span class="nv">$batch_size</span><span class="s2">, ISL/OSL: </span><span class="nv">$in_out_dims</span><span class="s2">&quot;</span>
+
+<span class="w">	</span>mpirun<span class="w"> </span>-n<span class="w"> </span><span class="m">4</span><span class="w"> </span>--allow-run-as-root<span class="w"> </span>--oversubscribe<span class="w"> </span>./cpp/build/benchmarks/gptSessionBenchmark<span class="w"> </span>--model<span class="w"> </span>llama<span class="w"> </span>--engine_dir<span class="w"> </span>/tmp/engines/llama/70b<span class="w"> </span>--warm_up<span class="w"> </span><span class="m">1</span><span class="w"> </span>--batch_size<span class="w"> </span><span class="nv">$batch_size</span><span class="w"> </span>--duration<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num_runs<span class="w"> </span><span class="m">5</span><span class="w"> </span>--input_output_len<span class="w"> </span><span class="nv">$in_out_dims</span>
+<span class="k">done</span>
+</pre></div>
+</div>
+</section>
+<section id="id8">
+<h4>First Token Latency Benchmark<a class="headerlink" href="#id8" title="Link to this heading"></a></h4>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">in_out_sizes</span><span class="o">=(</span><span class="s2">&quot;64:128,1&quot;</span><span class="w"> </span><span class="s2">&quot;64:128,1&quot;</span><span class="o">)</span>
+<span class="k">for</span><span class="w"> </span>in_out<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="si">${</span><span class="nv">in_out_sizes</span><span class="p">[@]</span><span class="si">}</span>
+<span class="k">do</span>
+<span class="w">	</span><span class="nv">batch_size</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$in_out</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="s1">&#39;:&#39;</span><span class="w"> </span><span class="s1">&#39;{ print $1 }&#39;</span><span class="k">)</span>
+<span class="w">	</span><span class="nv">in_out_dims</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$in_out</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="s1">&#39;:&#39;</span><span class="w"> </span><span class="s1">&#39;{ print $2 }&#39;</span><span class="k">)</span>
+<span class="w">	</span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;BS: </span><span class="nv">$batch_size</span><span class="s2">, ISL/OSL: </span><span class="nv">$in_out_dims</span><span class="s2">&quot;</span>
+
+<span class="w">	</span>mpirun<span class="w"> </span>-n<span class="w"> </span><span class="m">4</span><span class="w"> </span>--allow-run-as-root<span class="w"> </span>--oversubscribe<span class="w"> </span>./cpp/build/benchmarks/gptSessionBenchmark<span class="w"> </span>--model<span class="w"> </span>llama<span class="w"> </span>--engine_dir<span class="w"> </span>/tmp/engines/llama/70b<span class="w"> </span>--warm_up<span class="w"> </span><span class="m">1</span><span class="w"> </span>--batch_size<span class="w"> </span><span class="nv">$batch_size</span><span class="w"> </span>--duration<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num_runs<span class="w"> </span><span class="m">5</span><span class="w"> </span>--input_output_len<span class="w"> </span><span class="nv">$in_out_dims</span>
+<span class="k">done</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="falcon-180b">
+<h3>Falcon-180B<a class="headerlink" href="#falcon-180b" title="Link to this heading"></a></h3>
+<hr class="docutils" />
+<p>Benchmarking Falcon-180B requires a custom engine per batch size, input/output sequence length due
+to the large footprint of the model and the large input size of 2048. You can build and benchmark
+each engine one at a time with the following loop.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="c1"># Benchmark specific batch size:isl:osl combinations.</span>
+<span class="nv">in_out_sizes</span><span class="o">=(</span><span class="s2">&quot;96:128,128&quot;</span><span class="w"> </span><span class="s2">&quot;96:128,2048&quot;</span><span class="w"> </span><span class="s2">&quot;64:2048,128&quot;</span><span class="o">)</span>
+<span class="k">for</span><span class="w"> </span>in_out<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="si">${</span><span class="nv">in_out_sizes</span><span class="p">[@]</span><span class="si">}</span>
+<span class="k">do</span>
+<span class="w">	</span><span class="nv">batch_size</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$in_out</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="s1">&#39;:&#39;</span><span class="w"> </span><span class="s1">&#39;{ print $1 }&#39;</span><span class="k">)</span>
+<span class="w">	</span><span class="nv">in_out_dims</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$in_out</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="s1">&#39;:&#39;</span><span class="w"> </span><span class="s1">&#39;{ print $2 }&#39;</span><span class="k">)</span>
+<span class="w">	</span><span class="nv">isl</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$in_out_dims</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="s1">&#39;,&#39;</span><span class="w"> </span><span class="s1">&#39;{ print $1 }&#39;</span><span class="k">)</span>
+<span class="w">	</span><span class="nv">osl</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$in_out_dims</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="s1">&#39;,&#39;</span><span class="w"> </span><span class="s1">&#39;{ print $2 }&#39;</span><span class="k">)</span>
+<span class="w">	</span><span class="nv">engine_path</span><span class="o">=</span><span class="s2">&quot;/tmp/engines/falcon/180b/</span><span class="si">${</span><span class="nv">batch_size</span><span class="si">}</span><span class="s2">_</span><span class="si">${</span><span class="nv">isl</span><span class="si">}</span><span class="s2">_</span><span class="si">${</span><span class="nv">osl</span><span class="si">}</span><span class="s2">&quot;</span>
+<span class="w">	</span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;BS: </span><span class="nv">$batch_size</span><span class="s2">, ISL/OSL: </span><span class="si">${</span><span class="nv">isl</span><span class="si">}</span><span class="s2">,</span><span class="si">${</span><span class="nv">osl</span><span class="si">}</span><span class="s2">&quot;</span>
+
+<span class="w">	</span><span class="c1"># Build the specific engine for the BS,ISL,OSL combination</span>
+<span class="w">	</span>python<span class="w"> </span>examples/falcon/build.py<span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--use_inflight_batching<span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--paged_kv_cache<span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--remove_input_padding<span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--enable_context_fmha<span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--parallel_build<span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--output_dir<span class="w"> </span><span class="nv">$engine_path</span><span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--dtype<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--use_gemm_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--use_gpt_attention_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--world_size<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--tp<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--max_batch_size<span class="w"> </span><span class="nv">$batch_size</span><span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--max_input_len<span class="w"> </span><span class="nv">$isl</span><span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--max_output_len<span class="w"> </span><span class="nv">$osl</span><span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--enable_fp8<span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--fp8_kv_cache<span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--n_layer<span class="w"> </span><span class="m">80</span><span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--n_head<span class="w"> </span><span class="m">232</span><span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--n_kv_head<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--n_embd<span class="w"> </span><span class="m">14848</span><span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--vocab_size<span class="w"> </span><span class="m">65024</span><span class="w"> </span><span class="se">\</span>
+<span class="w">		</span>--new_decoder_architecture
+<span class="w">	</span><span class="c1"># Throughput benchmark</span>
+<span class="w">	</span>mpirun<span class="w"> </span>-n<span class="w"> </span><span class="m">8</span><span class="w"> </span>--allow-run-as-root<span class="w"> </span>--oversubscribe<span class="w"> </span>./cpp/build/benchmarks/gptSessionBenchmark<span class="w"> </span>--model<span class="w"> </span>falcon<span class="w"> </span>--engine_dir<span class="w"> </span><span class="nv">$engine_path</span><span class="w"> </span>--warm_up<span class="w"> </span><span class="m">1</span><span class="w"> </span>--batch_size<span class="w"> </span><span class="nv">$batch_size</span><span class="w"> </span>--duration<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num_runs<span class="w"> </span><span class="m">5</span><span class="w"> </span>--input_output_len<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">isl</span><span class="si">}</span><span class="s2">,</span><span class="si">${</span><span class="nv">osl</span><span class="si">}</span><span class="s2">&quot;</span>
+<span class="w">	</span><span class="c1"># Time to first token benchmark</span>
+<span class="w">	</span>mpirun<span class="w"> </span>-n<span class="w"> </span><span class="m">8</span><span class="w"> </span>--allow-run-as-root<span class="w"> </span>--oversubscribe<span class="w"> </span>./cpp/build/benchmarks/gptSessionBenchmark<span class="w"> </span>--model<span class="w"> </span>falcon<span class="w"> </span>--engine_dir<span class="w"> </span><span class="nv">$engine_path</span><span class="w"> </span>--warm_up<span class="w"> </span><span class="m">1</span><span class="w"> </span>--batch_size<span class="w"> </span><span class="nv">$batch_size</span><span class="w"> </span>--duration<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num_runs<span class="w"> </span><span class="m">5</span><span class="w"> </span>--input_output_len<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">isl</span><span class="si">}</span><span class="s2">,1&quot;</span>
+
+<span class="w">	</span><span class="c1"># The Falcon-180b engine is quite large, remove after the benchmark to free up space</span>
+<span class="w">	</span><span class="c1"># Remove this line if you&#39;d like to save the engines.</span>
+<span class="w">	</span>rm<span class="w"> </span>-r<span class="w"> </span><span class="nv">$engine_path</span>
+<span class="k">done</span>
+</pre></div>
+</div>
 </section>
 </section>
 </section>
@@ -726,7 +1071,7 @@ single Matmul.</p>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
         <a href="precision.html" class="btn btn-neutral float-left" title="Numerical Precision" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="installation.html" class="btn btn-neutral float-right" title="Build From Sources" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="2023-05-19-how-to-debug.html" class="btn btn-neutral float-right" title="How to debug" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>

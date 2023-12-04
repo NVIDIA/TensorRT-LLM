@@ -1,21 +1,23 @@
 <!DOCTYPE html>
-<html class="writer-html5" lang="en" >
+<html class="writer-html5" lang="en" data-content_root="./">
 <head>
-  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>TensorRT-LLM Architecture &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" href="_static/pygments.css" type="text/css" />
-      <link rel="stylesheet" href="_static/css/theme.css" type="text/css" />
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=19f00094" />
+
+  
   <!--[if lt IE 9]>
     <script src="_static/js/html5shiv.min.js"></script>
   <![endif]-->
   
         <script src="_static/jquery.js?v=5d32c60e"></script>
         <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script data-url_root="./" id="documentation_options" src="_static/documentation_options.js?v=b3ba4146"></script>
+        <script src="_static/documentation_options.js?v=5929fcd5"></script>
         <script src="_static/doctools.js?v=888ff710"></script>
-        <script src="_static/sphinx_highlight.js?v=4825356b"></script>
+        <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
@@ -64,10 +66,10 @@
 <li class="toctree-l1"><a class="reference internal" href="gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="performance.html">Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="installation.html">Build From Sources</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="memory.html">Memory Usage of TensorRT-LLM</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -81,6 +83,11 @@
 <p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token.</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 </ul>
 
         </div>
@@ -108,7 +115,7 @@
            <div itemprop="articleBody">
              
   <section id="tensorrt-llm-architecture">
-<h1>TensorRT-LLM Architecture<a class="headerlink" href="#tensorrt-llm-architecture" title="Permalink to this heading"></a></h1>
+<h1>TensorRT-LLM Architecture<a class="headerlink" href="#tensorrt-llm-architecture" title="Link to this heading"></a></h1>
 <p>TensorRT-LLM is a toolkit to assemble optimized solutions to perform Large
 Language Model (LLM) inference. It offers a Python API to define models and
 compile efficient <a class="reference external" href="https://developer.nvidia.com/tensorrt">TensorRT</a> engines for
@@ -141,7 +148,7 @@ Server to assemble solutions for LLM online serving. The C++ backend implements
 in-flight batching as explained in the <a class="reference internal" href="batch_manager.html"><span class="std std-doc">Batch Manager</span></a>
 documentation and is the recommended backend.</p>
 <section id="model-definition">
-<h2>Model Definition<a class="headerlink" href="#model-definition" title="Permalink to this heading"></a></h2>
+<h2>Model Definition<a class="headerlink" href="#model-definition" title="Link to this heading"></a></h2>
 <p>As mentioned above, TensorRT-LLM has a Python API that can be used to define
 Large Language Models. This API is built on top of the powerful
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/index.html#">TensorRT Python API</a>
@@ -149,7 +156,7 @@ to create graph representations of deep neural networks in TensorRT. To become
 familiar with the core concepts of the TensorRT API, refer to the
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/coreConcepts.html">Core Concepts</a>
 section of the TensorRT documentation before proceeding further.</p>
-<p>In TensorRT-LLM, the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/release/0.5.0/tensorrt_llm/builder.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder</span></code></a> class
+<p>In TensorRT-LLM, the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/tensorrt_llm/builder.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder</span></code></a> class
 contains a
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Core/Builder.html#tensorrt.Builder"><code class="docutils literal notranslate"><span class="pre">tensorrt.Builder</span></code></a>
 object. That instance is used in the <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder.create_network</span></code>
@@ -157,7 +164,7 @@ method to create an instance of the
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Network.html#tensorrt.INetworkDefinition"><code class="docutils literal notranslate"><span class="pre">tensorrt.INetworkDefinition</span></code></a>
 class. The <code class="docutils literal notranslate"><span class="pre">INetworkDefinition</span></code> object can then be populated using the free
 functions defined in the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/release/0.5.0/tensorrt_llm/functional.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.functional</span></code></a>.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/tensorrt_llm/functional.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.functional</span></code></a>.</p>
 <p>A simple example of such a free function is <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.activation</span></code> that inserts a
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Layers.html#tensorrt.IActivationLayer"><code class="docutils literal notranslate"><span class="pre">tensorrt.IActivationLayer</span></code></a>
 node in the graph of the model:</p>
@@ -193,7 +200,7 @@ class. That graph will also be optimized by TensorRT during the compilation of
 the engine, as explained in the next section.</p>
 </section>
 <section id="compilation">
-<h2>Compilation<a class="headerlink" href="#compilation" title="Permalink to this heading"></a></h2>
+<h2>Compilation<a class="headerlink" href="#compilation" title="Link to this heading"></a></h2>
 <p>Once populated, the instance of the
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Network.html#tensorrt.INetworkDefinition"><code class="docutils literal notranslate"><span class="pre">tensorrt.INetworkDefinition</span></code></a>,
 can be compiled into an efficient engine by the
@@ -208,7 +215,7 @@ object. That call, if everything works as expected, produces an instance of the
 class. That object is an optimized TensorRT engine that can be stored as a
 binary file.</p>
 <section id="weight-bindings">
-<h3>Weight Bindings<a class="headerlink" href="#weight-bindings" title="Permalink to this heading"></a></h3>
+<h3>Weight Bindings<a class="headerlink" href="#weight-bindings" title="Link to this heading"></a></h3>
 <p>TensorRT engines embed the network weights, that must be known for compilation.
 For that reason, the weights must be bound to parameters in the model
 definition before calling <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder.build_engine</span></code>. It leads to code like:</p>
@@ -230,7 +237,7 @@ TensorRT-LLM users through the <code class="docutils literal notranslate"><span 
 <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder</span></code> class.</p>
 </section>
 <section id="pattern-matching-and-fusion">
-<h3>Pattern-Matching and Fusion<a class="headerlink" href="#pattern-matching-and-fusion" title="Permalink to this heading"></a></h3>
+<h3>Pattern-Matching and Fusion<a class="headerlink" href="#pattern-matching-and-fusion" title="Link to this heading"></a></h3>
 <p>One of the key steps performed by TensorRT when it compiles the network graph
 is the fusion of operations. Fusion is a well-known technique to improve the
 efficiency when executing LLMs. It helps reduce the amount of data transferred
@@ -262,7 +269,7 @@ that can identify a lot of possible fusions. All the identified patterns are
 converted into more efficient kernels by an advanced kernel compiler.</p>
 </section>
 <section id="plugins">
-<h3>Plugins<a class="headerlink" href="#plugins" title="Permalink to this heading"></a></h3>
+<h3>Plugins<a class="headerlink" href="#plugins" title="Link to this heading"></a></h3>
 <p>The number of possible fusions is almost infinite and some useful fusions
 involve very advanced modifications of the graph. A well-known example
 is the <a class="reference external" href="https://arxiv.org/abs/2205.14135">Flash-Attention</a> technique to
@@ -281,14 +288,14 @@ limitation, TensorRT offers a powerful mechanism known as
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Plugin/pyPlugin.html">plugins</a>.</p>
 <p>The plugins are nodes inserted in the network graph definition that map to user-defined
 GPU kernels. TensorRT-LLM uses a number of such plugins. They can be found in
-the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/release/0.5.0//cpp/tensorrt_llm/plugins"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/plugins</span></code></a> directory.</p>
+the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs//cpp/tensorrt_llm/plugins"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/plugins</span></code></a> directory.</p>
 <p>Plugins are written in C++ and follow a well-defined interface described in the
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#extending">Extending TensorRT with Custom Layers</a>
 section of the TensorRT
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html">Developer Guide</a>.
 When executed within a TensorRT engine, plugins trigger the execution of
 their encapsulated GPU kernels. A fairly simple example of plugins is the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/release/0.5.0//cpp/tensorrt_llm/plugins/quantizeTensorPlugin"><code class="docutils literal notranslate"><span class="pre">QuantizeTensorPlugin</span></code></a> that
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs//cpp/tensorrt_llm/plugins/quantizeTensorPlugin"><code class="docutils literal notranslate"><span class="pre">QuantizeTensorPlugin</span></code></a> that
 triggers a CUDA kernel in the <code class="docutils literal notranslate"><span class="pre">QuantizeTensorPlugin::enqueue</span></code> member function:</p>
 <div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="c1">// In cpp/tensorrt_llm/plugins/quantizeTensorPlugin/quantizeTensorPlugin.cpp:</span>
 
@@ -315,7 +322,7 @@ the <a class="reference internal" href="gpt_attention.html"><span class="std std
 </section>
 </section>
 <section id="runtime">
-<h2>Runtime<a class="headerlink" href="#runtime" title="Permalink to this heading"></a></h2>
+<h2>Runtime<a class="headerlink" href="#runtime" title="Link to this heading"></a></h2>
 <p>TensorRT-LLM includes an API to implement Python and C++ runtimes. The role of
 the runtime components is to load the TensorRT engines and drive their
 execution. Typically, for an auto-regressive model like GPT, the runtime is in
@@ -323,7 +330,7 @@ charge of loading the engine that implements both the processing of the input
 sequence as well as the body of the generation loop. See the <a class="reference internal" href="gpt_runtime.html"><span class="std std-doc">GPT C++
 Runtime</span></a> document for details on the C++ Runtime.</p>
 <section id="multi-gpu-and-multi-node-support">
-<h3>Multi-GPU and Multi-Node Support<a class="headerlink" href="#multi-gpu-and-multi-node-support" title="Permalink to this heading"></a></h3>
+<h3>Multi-GPU and Multi-Node Support<a class="headerlink" href="#multi-gpu-and-multi-node-support" title="Link to this heading"></a></h3>
 <p>Even if TensorRT is designed for single-GPU systems, TensorRT-LLM adds the
 support for systems with multiple GPUs and nodes. It is enabled
 using TensorRT plugins that wrap communication primitives from the
@@ -331,14 +338,14 @@ using TensorRT plugins that wrap communication primitives from the
 plugin that optimize the All-Reduce primitive in the presence of All-to-all
 connections between GPUs (through NVSwitch in DGX systems).</p>
 <p>The communication plugins can be found in
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/release/0.5.0/cpp/tensorrt_llm/plugins/ncclPlugin">cpp/tensorrt_llm/plugins/ncclPlugin</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/cpp/tensorrt_llm/plugins/ncclPlugin">cpp/tensorrt_llm/plugins/ncclPlugin</a>
 and the multi-GPU functions are exposed in the TensorRT-LLM Python API
 as:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># In tensorrt_llm/functional.py:</span>
 
 <span class="c1"># Collectives.</span>
 <span class="k">def</span> <span class="nf">allreduce</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">group</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
-<span class="k">def</span> <span class="nf">allgather</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">group</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
+<span class="k">def</span> <span class="nf">allgather</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">group</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">gather_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
 
 <span class="c1"># Point-to-point communication primitives.</span>
 <span class="k">def</span> <span class="nf">send</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">tgt</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span>
@@ -348,17 +355,17 @@ as:</p>
 <p>The multi-GPU support can be enabled through two different modes of model
 parallelism: Tensor Parallelism and Pipeline Parallelism. The former mode
 splits the different layers of a model across the GPUs. Each GPU runs the
-entire network and synchronizes with its sibblings when needed. The Pipeline
+entire network and synchronizes with its siblings when needed. The Pipeline
 Parallelism distributes the different layers to the GPUs. Each GPU runs a
 subset of the entire model and communications happen at the boundary of those
 subsets of layers. Tensor Parallelism usually leads to more balanced executions
-but requires more memory bandwdith between the GPUs. Pipeline Parallelism
+but requires more memory bandwidth between the GPUs. Pipeline Parallelism
 reduces the need for high-bandwidth communication but may incur load-balancing
 issues and may be less efficient in terms of GPU utilization.</p>
 </section>
 </section>
 <section id="in-flight-batching">
-<h2>In-flight Batching<a class="headerlink" href="#in-flight-batching" title="Permalink to this heading"></a></h2>
+<h2>In-flight Batching<a class="headerlink" href="#in-flight-batching" title="Link to this heading"></a></h2>
 <p>TensorRT-LLM supports in-flight batching of requests (also known as continuous
 batching or iteration-level batching) for higher serving throughput. See the
 <a class="reference internal" href="batch_manager.html"><span class="std std-doc">Batch Manager</span></a> document for more details.</p>

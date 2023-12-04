@@ -1,20 +1,22 @@
 <!DOCTYPE html>
-<html class="writer-html5" lang="en" >
+<html class="writer-html5" lang="en" data-content_root="../../../../">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.models.bloom.model &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" href="../../../../_static/pygments.css" type="text/css" />
-      <link rel="stylesheet" href="../../../../_static/css/theme.css" type="text/css" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=19f00094" />
+
+  
   <!--[if lt IE 9]>
     <script src="../../../../_static/js/html5shiv.min.js"></script>
   <![endif]-->
   
         <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
         <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script data-url_root="../../../../" id="documentation_options" src="../../../../_static/documentation_options.js?v=b3ba4146"></script>
+        <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
         <script src="../../../../_static/doctools.js?v=888ff710"></script>
-        <script src="../../../../_static/sphinx_highlight.js?v=4825356b"></script>
+        <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../../../genindex.html" />
     <link rel="search" title="Search" href="../../../../search.html" /> 
@@ -47,10 +49,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance.html">Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../installation.html">Build From Sources</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../memory.html">Memory Usage of TensorRT-LLM</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -165,7 +167,6 @@
             <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
             <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
             <span class="n">tp_rank</span><span class="o">=</span><span class="n">tp_rank</span><span class="p">,</span>
-            <span class="n">use_int8_kv_cache</span><span class="o">=</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_int8_kv_cache</span><span class="p">(),</span>
             <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">mlp_hidden_size</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -218,7 +219,9 @@
         <span class="k">return</span> <span class="n">hidden_states</span>
 
 
-<div class="viewcode-block" id="BloomModel"><a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BloomModel">[docs]</a><span class="k">class</span> <span class="nc">BloomModel</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<div class="viewcode-block" id="BloomModel">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BloomModel">[docs]</a>
+<span class="k">class</span> <span class="nc">BloomModel</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">num_layers</span><span class="p">,</span>
@@ -267,7 +270,9 @@
 
         <span class="bp">self</span><span class="o">.</span><span class="n">ln_f</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
-<div class="viewcode-block" id="BloomModel.forward"><a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BloomModel.forward">[docs]</a>    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+<div class="viewcode-block" id="BloomModel.forward">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BloomModel.forward">[docs]</a>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">input_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -278,13 +283,14 @@
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)</span>
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ln_embed</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">past_key_value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">past_key_value</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">([</span><span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">))</span>
+        <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">fill_none_tensor_list</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">))</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="n">presents</span> <span class="o">=</span> <span class="p">[]</span>
 
-        <span class="k">for</span> <span class="n">layer</span><span class="p">,</span> <span class="n">past</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">,</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">past_key_value</span><span class="p">):</span>
+        <span class="k">for</span> <span class="n">layer</span><span class="p">,</span> <span class="n">past</span><span class="p">,</span> <span class="n">max_kv_cache_length</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">,</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">past_key_value</span><span class="p">,</span>
+                <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">host_max_kv_cache_lengths</span><span class="p">):</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">layer</span><span class="p">(</span>
                 <span class="n">hidden_states</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
@@ -293,6 +299,7 @@
                     <span class="n">past_key_value</span><span class="o">=</span><span class="p">[</span><span class="n">past</span><span class="p">],</span>
                     <span class="n">host_past_key_value_lengths</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
                     <span class="n">host_past_key_value_lengths</span><span class="p">,</span>
+                    <span class="n">host_max_kv_cache_lengths</span><span class="o">=</span><span class="n">max_kv_cache_length</span><span class="p">,</span>
                     <span class="n">cache_indirection</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span><span class="n">cache_indirection</span><span class="p">),</span>
                 <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">)</span>
 
@@ -304,10 +311,14 @@
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">presents</span><span class="p">))</span>
-        <span class="k">return</span> <span class="n">hidden_states</span></div></div>
+        <span class="k">return</span> <span class="n">hidden_states</span></div>
+</div>
 
 
-<div class="viewcode-block" id="BloomForCausalLM"><a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BloomForCausalLM">[docs]</a><span class="k">class</span> <span class="nc">BloomForCausalLM</span><span class="p">(</span><span class="n">BloomModel</span><span class="p">,</span> <span class="n">GenerationMixin</span><span class="p">):</span>
+
+<div class="viewcode-block" id="BloomForCausalLM">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BloomForCausalLM">[docs]</a>
+<span class="k">class</span> <span class="nc">BloomForCausalLM</span><span class="p">(</span><span class="n">BloomModel</span><span class="p">,</span> <span class="n">GenerationMixin</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">num_layers</span><span class="p">,</span>
@@ -344,6 +355,7 @@
         <span class="k">elif</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_kv_cache</span><span class="p">():</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_kv_dtype</span> <span class="o">=</span> <span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="s1">&#39;fp8&#39;</span><span class="p">)</span>
 
+        <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">mapping</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span> <span class="o">=</span> <span class="n">quant_mode</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_num_layers</span> <span class="o">=</span> <span class="n">num_layers</span>
@@ -371,7 +383,9 @@
                                     <span class="n">gather_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
                                     <span class="n">share_weight</span><span class="o">=</span><span class="n">share_weight</span><span class="p">)</span>
 
-<div class="viewcode-block" id="BloomForCausalLM.forward"><a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BloomForCausalLM.forward">[docs]</a>    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+<div class="viewcode-block" id="BloomForCausalLM.forward">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BloomForCausalLM.forward">[docs]</a>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">input_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -401,7 +415,10 @@
 
         <span class="k">return</span> <span class="n">lm_logits</span></div>
 
-<div class="viewcode-block" id="BloomForCausalLM.prepare_inputs"><a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BloomForCausalLM.prepare_inputs">[docs]</a>    <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+
+<div class="viewcode-block" id="BloomForCausalLM.prepare_inputs">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BloomForCausalLM.prepare_inputs">[docs]</a>
+    <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                        <span class="n">max_batch_size</span><span class="p">,</span>
                        <span class="n">max_input_len</span><span class="p">,</span>
                        <span class="n">max_new_tokens</span><span class="p">,</span>
@@ -440,6 +457,8 @@
                     <span class="n">past_key_value</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;past_key_value&#39;</span><span class="p">],</span>
                     <span class="n">host_past_key_value_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
                         <span class="s1">&#39;host_past_key_value_lengths&#39;</span><span class="p">],</span>
+                    <span class="n">host_max_kv_cache_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
+                        <span class="s1">&#39;host_max_kv_cache_lengths&#39;</span><span class="p">],</span>
                     <span class="n">cache_indirection</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;cache_indirection&#39;</span><span class="p">],</span>
                 <span class="p">),</span>
                 <span class="n">AttentionParams</span><span class="p">(</span>
@@ -447,7 +466,9 @@
                     <span class="n">context_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;context_lengths&#39;</span><span class="p">],</span>
                     <span class="n">host_context_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;host_context_lengths&#39;</span><span class="p">],</span>
                     <span class="n">max_context_length</span><span class="o">=</span><span class="n">max_input_len</span><span class="p">,</span>
-                    <span class="n">host_request_types</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;host_request_types&#39;</span><span class="p">]))</span></div></div>
+                    <span class="n">host_request_types</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;host_request_types&#39;</span><span class="p">]))</span></div>
+</div>
+
 </pre></div>
 
            </div>

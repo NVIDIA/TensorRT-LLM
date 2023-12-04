@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../../../">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>tensorrt_llm.models.chatglm.model &mdash; tensorrt_llm  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=19f00094" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
+        <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+        <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
+        <script src="../../../../_static/doctools.js?v=888ff710"></script>
+        <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../../search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../index.html" class="icon icon-home">
+            tensorrt_llm
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../architecture.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../gpt_runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance.html">Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../2023-05-19-how-to-debug.html">How to debug</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Python API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../index.html">tensorrt_llm</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../../index.html">Module code</a></li>
+      <li class="breadcrumb-item active">tensorrt_llm.models.chatglm.model</li>
+      <li class="wy-breadcrumbs-aside">
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <h1>Source code for tensorrt_llm.models.chatglm.model</h1><div class="highlight"><pre>
+<span></span><span class="c1"># SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION &amp; AFFILIATES. All rights reserved.</span>
+<span class="c1"># SPDX-License-Identifier: Apache-2.0</span>
+<span class="c1">#</span>
+<span class="c1"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="c1"># you may not use this file except in compliance with the License.</span>
+<span class="c1"># You may obtain a copy of the License at</span>
+<span class="c1">#</span>
+<span class="c1"># http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="c1">#</span>
+<span class="c1"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="c1"># distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="c1"># See the License for the specific language governing permissions and</span>
+<span class="c1"># limitations under the License.</span>
+<span class="kn">from</span> <span class="nn">copy</span> <span class="kn">import</span> <span class="n">deepcopy</span>
+<span class="kn">from</span> <span class="nn">types</span> <span class="kn">import</span> <span class="n">SimpleNamespace</span>
+
+<span class="kn">import</span> <span class="nn">tensorrt</span> <span class="k">as</span> <span class="nn">trt</span>
+
+<span class="kn">from</span> <span class="nn">tensorrt_llm.mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.quantization</span> <span class="kn">import</span> <span class="n">QuantMode</span>
+
+<span class="kn">from</span> <span class="nn">..._common</span> <span class="kn">import</span> <span class="n">default_net</span>
+<span class="kn">from</span> <span class="nn">..._utils</span> <span class="kn">import</span> <span class="n">pad_vocab_size</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span>
+<span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">concat</span><span class="p">,</span>
+                           <span class="n">gather_last_token_logits</span><span class="p">,</span> <span class="n">shape</span><span class="p">)</span>
+<span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MLP</span><span class="p">,</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span> <span class="n">AttentionParams</span><span class="p">,</span>
+                       <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span> <span class="n">KeyValueCacheParams</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">,</span>
+                       <span class="n">RmsNorm</span><span class="p">)</span>
+<span class="kn">from</span> <span class="nn">...module</span> <span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
+<span class="kn">from</span> <span class="nn">..generation_mixin</span> <span class="kn">import</span> <span class="n">GenerationMixin</span>
+
+
+<span class="k">class</span> <span class="nc">ChatGLMParams</span><span class="p">:</span>
+    <span class="n">apply_query_key_layer_scaling</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">apply_residual_connection_post_layernorm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">enable_debug_output</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">ffn_hidden_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">hidden_act</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">hidden_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">linear_bias</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">logits_dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">max_input_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">max_output_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">max_seq_length</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">model_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">norm_epsilon</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">num_heads</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">num_kv_heads</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">num_layers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">qkv_bias</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">quant_mode</span><span class="p">:</span> <span class="n">QuantMode</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">rmsnorm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">rotary_embedding_scaling</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">tokens_per_block</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">use_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">vocab_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="c1"># default values</span>
+    <span class="n">default_config</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="n">default_config</span><span class="p">[</span><span class="s2">&quot;chatglm_6b&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">SimpleNamespace</span><span class="p">(</span>
+        <span class="n">apply_query_key_layer_scaling</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">apply_residual_connection_post_layernorm</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">dtype</span><span class="o">=</span><span class="s2">&quot;float16&quot;</span><span class="p">,</span>
+        <span class="n">ffn_hidden_size</span><span class="o">=</span><span class="mi">16384</span><span class="p">,</span>
+        <span class="n">hidden_act</span><span class="o">=</span><span class="s1">&#39;gelu&#39;</span><span class="p">,</span>
+        <span class="n">hidden_size</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>
+        <span class="n">linear_bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">logits_dtype</span><span class="o">=</span><span class="s2">&quot;float16&quot;</span><span class="p">,</span>
+        <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">(),</span>
+        <span class="n">max_input_len</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span>
+        <span class="n">max_output_len</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span>
+        <span class="n">max_seq_length</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span>
+        <span class="n">norm_epsilon</span><span class="o">=</span><span class="mf">1.0e-5</span><span class="p">,</span>
+        <span class="n">num_heads</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
+        <span class="n">num_kv_heads</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
+        <span class="n">num_layers</span><span class="o">=</span><span class="mi">28</span><span class="p">,</span>
+        <span class="n">qkv_bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+        <span class="n">rmsnorm</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">rotary_embedding_scaling</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
+        <span class="n">use_cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">vocab_size</span><span class="o">=</span><span class="mi">130528</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">default_config</span><span class="p">[</span><span class="s2">&quot;chatglm2_6b&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">SimpleNamespace</span><span class="p">(</span>
+        <span class="n">apply_query_key_layer_scaling</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">apply_residual_connection_post_layernorm</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">dtype</span><span class="o">=</span><span class="s2">&quot;float16&quot;</span><span class="p">,</span>
+        <span class="n">ffn_hidden_size</span><span class="o">=</span><span class="mi">13696</span><span class="p">,</span>
+        <span class="n">hidden_act</span><span class="o">=</span><span class="s1">&#39;swiglu&#39;</span><span class="p">,</span>
+        <span class="n">hidden_size</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>
+        <span class="n">linear_bias</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">logits_dtype</span><span class="o">=</span><span class="s2">&quot;float16&quot;</span><span class="p">,</span>
+        <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">(),</span>
+        <span class="n">max_input_len</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span>
+        <span class="n">max_output_len</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span>
+        <span class="n">max_seq_length</span><span class="o">=</span><span class="mi">32768</span><span class="p">,</span>
+        <span class="n">norm_epsilon</span><span class="o">=</span><span class="mf">1.0e-5</span><span class="p">,</span>
+        <span class="n">num_heads</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
+        <span class="n">num_kv_heads</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
+        <span class="n">num_layers</span><span class="o">=</span><span class="mi">28</span><span class="p">,</span>
+        <span class="n">qkv_bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+        <span class="n">rmsnorm</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">rotary_embedding_scaling</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
+        <span class="n">use_cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">vocab_size</span><span class="o">=</span><span class="mi">65024</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">default_config</span><span class="p">[</span><span class="s2">&quot;chatglm3_6b&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">default_config</span><span class="p">[</span><span class="s2">&quot;chatglm2_6b&quot;</span><span class="p">]</span>
+    <span class="n">default_config</span><span class="p">[</span><span class="s2">&quot;chatglm2_6b_32k&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">deepcopy</span><span class="p">(</span><span class="n">default_config</span><span class="p">[</span><span class="s2">&quot;chatglm2_6b&quot;</span><span class="p">])</span>
+    <span class="n">default_config</span><span class="p">[</span><span class="s2">&quot;chatglm2_6b_32k&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">rotary_embedding_scaling</span> <span class="o">=</span> <span class="mf">50.0</span>
+    <span class="n">default_config</span><span class="p">[</span><span class="s2">&quot;chatglm3_6b_32k&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">default_config</span><span class="p">[</span><span class="s2">&quot;chatglm2_6b_32k&quot;</span><span class="p">]</span>
+    <span class="n">default_config</span><span class="p">[</span><span class="s2">&quot;glm_10b&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">SimpleNamespace</span><span class="p">(</span>
+        <span class="n">apply_query_key_layer_scaling</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">apply_residual_connection_post_layernorm</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">dtype</span><span class="o">=</span><span class="s2">&quot;float16&quot;</span><span class="p">,</span>
+        <span class="n">ffn_hidden_size</span><span class="o">=</span><span class="mi">16384</span><span class="p">,</span>
+        <span class="n">hidden_act</span><span class="o">=</span><span class="s1">&#39;gelu&#39;</span><span class="p">,</span>
+        <span class="n">hidden_size</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>
+        <span class="n">linear_bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">logits_dtype</span><span class="o">=</span><span class="s2">&quot;float16&quot;</span><span class="p">,</span>
+        <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">(),</span>
+        <span class="n">max_input_len</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span>
+        <span class="n">max_output_len</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span>
+        <span class="n">max_seq_length</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span>
+        <span class="n">norm_epsilon</span><span class="o">=</span><span class="mf">1.0e-5</span><span class="p">,</span>
+        <span class="n">num_heads</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
+        <span class="n">num_kv_heads</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
+        <span class="n">num_layers</span><span class="o">=</span><span class="mi">28</span><span class="p">,</span>
+        <span class="n">qkv_bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+        <span class="n">rmsnorm</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">rotary_embedding_scaling</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
+        <span class="n">use_cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">vocab_size</span><span class="o">=</span><span class="mi">50304</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">**</span><span class="n">args</span><span class="p">):</span>
+
+        <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">args</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">assert</span> <span class="n">key</span> <span class="ow">in</span> <span class="nb">dir</span><span class="p">(</span>
+                <span class="bp">self</span><span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2"> is not in configuration of ChatGLMHeadModel&quot;</span>
+            <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_name</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;model_name must be set for ChatGLMHeadModel&quot;</span>
+
+        <span class="c1"># fill other parameters as default values</span>
+        <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">default_config</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">model_name</span><span class="p">]</span><span class="o">.</span><span class="vm">__dict__</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="fm">__getattribute__</span><span class="p">(</span><span class="n">key</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+
+    <span class="k">def</span> <span class="nf">report</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="n">value</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+
+<span class="k">class</span> <span class="nc">ChatGLMDecoderLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer_id</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
+
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">model_name</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">model_name</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">use_cache</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">use_cache</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_base</span> <span class="o">=</span> <span class="mf">10000.0</span>
+        <span class="n">rotary_embedding_scaling</span> <span class="o">=</span> <span class="kc">None</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_name</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;chatglm_6b&quot;</span><span class="p">]:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">alpha</span> <span class="o">=</span> <span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="n">config</span><span class="o">.</span><span class="n">num_layers</span><span class="p">)</span><span class="o">**</span><span class="mf">0.5</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">norm</span> <span class="o">=</span> <span class="n">LayerNorm</span>
+            <span class="n">attention_mask_type</span> <span class="o">=</span> <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">bidirectional</span>
+            <span class="n">position_embedding_type</span> <span class="o">=</span> <span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">chatglm</span>
+        <span class="k">elif</span> <span class="n">config</span><span class="o">.</span><span class="n">model_name</span> <span class="ow">in</span> <span class="p">[</span>
+                <span class="s2">&quot;chatglm2_6b&quot;</span><span class="p">,</span> <span class="s2">&quot;chatglm2_6b_32k&quot;</span><span class="p">,</span> <span class="s2">&quot;chatglm3_6b&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;chatglm3_6b_base&quot;</span><span class="p">,</span> <span class="s2">&quot;chatglm3_6b_32k&quot;</span>
+        <span class="p">]:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">apply_residual_connection_post_layernorm</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">apply_residual_connection_post_layernorm</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">norm</span> <span class="o">=</span> <span class="n">RmsNorm</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">rmsnorm</span> <span class="k">else</span> <span class="n">LayerNorm</span>
+            <span class="n">attention_mask_type</span> <span class="o">=</span> <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">causal</span>
+            <span class="n">position_embedding_type</span> <span class="o">=</span> <span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">rope_gptj</span>
+            <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">model_name</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;chatglm2_6b_32k&quot;</span><span class="p">]:</span>
+                <span class="n">rotary_embedding_scaling</span> <span class="o">=</span> <span class="p">{</span>
+                    <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;linear&quot;</span><span class="p">,</span>
+                    <span class="s2">&quot;factor&quot;</span><span class="p">:</span> <span class="n">config</span><span class="o">.</span><span class="n">rotary_embedding_scaling</span>
+                <span class="p">}</span>
+            <span class="k">elif</span> <span class="n">config</span><span class="o">.</span><span class="n">model_name</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;chatglm3_6b_32k&quot;</span><span class="p">]:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_base</span> <span class="o">*=</span> <span class="n">config</span><span class="o">.</span><span class="n">rotary_embedding_scaling</span>
+        <span class="k">elif</span> <span class="n">config</span><span class="o">.</span><span class="n">model_name</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;glm_10b&quot;</span><span class="p">]:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">apply_residual_connection_post_layernorm</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">apply_residual_connection_post_layernorm</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">norm</span> <span class="o">=</span> <span class="n">LayerNorm</span>
+            <span class="n">attention_mask_type</span> <span class="o">=</span> <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">bidirectionalglm</span>
+            <span class="n">position_embedding_type</span> <span class="o">=</span> <span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">learned_absolute</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">pre_norm</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">norm</span><span class="p">(</span>
+            <span class="n">normalized_shape</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">eps</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">,</span>
+            <span class="n">elementwise_affine</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">attention</span> <span class="o">=</span> <span class="n">Attention</span><span class="p">(</span>
+            <span class="n">hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">num_heads</span><span class="p">,</span>
+            <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
+            <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">max_seq_length</span><span class="p">,</span>
+            <span class="n">num_layers</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">num_layers</span><span class="p">,</span>
+            <span class="n">apply_query_key_layer_scaling</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">apply_query_key_layer_scaling</span><span class="p">,</span>
+            <span class="n">attention_mask_type</span><span class="o">=</span><span class="n">attention_mask_type</span><span class="p">,</span>
+            <span class="n">bias</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">qkv_bias</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="n">position_embedding_type</span><span class="o">=</span><span class="n">position_embedding_type</span><span class="p">,</span>
+            <span class="n">rotary_embedding_base</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_base</span><span class="p">,</span>
+            <span class="n">rotary_embedding_scaling</span><span class="o">=</span><span class="n">rotary_embedding_scaling</span><span class="p">,</span>
+            <span class="n">rotary_embedding_percentage</span><span class="o">=</span><span class="mf">0.5</span><span class="p">,</span>
+            <span class="n">tp_group</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
+            <span class="n">tp_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+            <span class="n">tp_rank</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">rank</span><span class="p">,</span>
+            <span class="n">quant_mode</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">,</span>
+            <span class="n">q_scaling</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
+            <span class="n">cross_attention</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+            <span class="n">relative_attention</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+            <span class="n">max_distance</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+            <span class="n">num_buckets</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+            <span class="n">instance_id</span><span class="o">=</span><span class="n">layer_id</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span>
+            <span class="n">dense_bias</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">linear_bias</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span> <span class="o">=</span> <span class="n">MLP</span><span class="p">(</span>
+            <span class="n">hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">ffn_hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">ffn_hidden_size</span><span class="p">,</span>
+            <span class="n">hidden_act</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_act</span><span class="p">,</span>
+            <span class="n">bias</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">linear_bias</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="n">tp_group</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
+            <span class="n">tp_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+            <span class="n">quant_mode</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">,</span>
+            <span class="n">instance_id</span><span class="o">=</span><span class="n">layer_id</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">post_norm</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">norm</span><span class="p">(</span>
+            <span class="n">normalized_shape</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">eps</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">,</span>
+            <span class="n">elementwise_affine</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+        <span class="p">)</span>
+
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">position_ids</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># only used in ChatGLM-6B</span>
+        <span class="n">kv_cache_params</span><span class="p">:</span> <span class="n">KeyValueCacheParams</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">attention_params</span><span class="p">:</span> <span class="n">AttentionParams</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
+
+        <span class="n">norm_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pre_norm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+
+        <span class="n">attention_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention</span><span class="p">(</span>
+            <span class="n">hidden_states</span><span class="o">=</span><span class="n">norm_output</span><span class="p">,</span>
+            <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+            <span class="n">use_cache</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">use_cache</span><span class="p">,</span>
+            <span class="n">kv_cache_params</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="p">,</span>
+            <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">,</span>
+            <span class="n">encoder_output</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+            <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+            <span class="n">position_embedding</span><span class="o">=</span><span class="n">position_ids</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cache</span><span class="p">:</span>
+            <span class="n">attention_output</span><span class="p">,</span> <span class="n">presents</span> <span class="o">=</span> <span class="n">attention_output</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_name</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;chatglm_6b&quot;</span><span class="p">]:</span>
+            <span class="n">residual</span> <span class="o">=</span> <span class="n">norm_output</span>
+
+            <span class="n">norm_input</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">alpha</span> <span class="o">+</span> <span class="n">attention_output</span>
+
+            <span class="n">norm_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">post_norm</span><span class="p">(</span><span class="n">norm_input</span><span class="p">)</span>
+
+            <span class="n">mlp_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">norm_output</span><span class="p">)</span>
+
+            <span class="n">residual</span> <span class="o">=</span> <span class="n">norm_output</span>
+
+            <span class="n">output</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">alpha</span> <span class="o">+</span> <span class="n">mlp_output</span>
+
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_name</span> <span class="ow">in</span> <span class="p">[</span>
+                <span class="s2">&quot;chatglm2_6b&quot;</span><span class="p">,</span> <span class="s2">&quot;chatglm2_6b_32k&quot;</span><span class="p">,</span> <span class="s2">&quot;chatglm3_6b&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;chatglm3_6b_base&quot;</span><span class="p">,</span> <span class="s2">&quot;chatglm3_6b_32k&quot;</span><span class="p">,</span> <span class="s2">&quot;glm_10b&quot;</span>
+        <span class="p">]:</span>
+            <span class="n">residual</span> <span class="o">=</span> <span class="n">norm_output</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">apply_residual_connection_post_layernorm</span> <span class="k">else</span> <span class="n">hidden_states</span>
+
+            <span class="n">norm_input</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">attention_output</span>
+
+            <span class="n">norm_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">post_norm</span><span class="p">(</span><span class="n">norm_input</span><span class="p">)</span>
+
+            <span class="n">mlp_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">norm_output</span><span class="p">)</span>
+
+            <span class="n">residual</span> <span class="o">=</span> <span class="n">norm_output</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">apply_residual_connection_post_layernorm</span> <span class="k">else</span> <span class="n">norm_input</span>
+
+            <span class="n">output</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">mlp_output</span>
+
+        <span class="k">return</span> <span class="p">(</span><span class="n">output</span><span class="p">,</span> <span class="n">presents</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cache</span> <span class="k">else</span> <span class="n">output</span>
+
+
+<div class="viewcode-block" id="ChatGLMModel">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.ChatGLMModel">[docs]</a>
+<span class="k">class</span> <span class="nc">ChatGLMModel</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
+
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">model_name</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">model_name</span>
+
+        <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">model_name</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;chatglm_6b&quot;</span><span class="p">,</span> <span class="s2">&quot;glm_10b&quot;</span><span class="p">]:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">norm</span> <span class="o">=</span> <span class="n">LayerNorm</span>
+        <span class="k">elif</span> <span class="n">config</span><span class="o">.</span><span class="n">model_name</span> <span class="ow">in</span> <span class="p">[</span>
+                <span class="s2">&quot;chatglm2_6b&quot;</span><span class="p">,</span> <span class="s2">&quot;chatglm2_6b_32k&quot;</span><span class="p">,</span> <span class="s2">&quot;chatglm3_6b&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;chatglm3_6b_base&quot;</span><span class="p">,</span> <span class="s2">&quot;chatglm3_6b_32k&quot;</span>
+        <span class="p">]:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">norm</span> <span class="o">=</span> <span class="n">RmsNorm</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">use_cache</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">use_cache</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span>
+            <span class="n">num_embeddings</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
+            <span class="n">embedding_dim</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>  <span class="c1">#config.mapping.tp_size,</span>
+            <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>  <span class="c1">#config.mapping.tp_group,</span>
+            <span class="n">sharding_dim</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+            <span class="n">tp_rank</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>  <span class="c1">#config.mapping.rank,</span>
+            <span class="n">instance_id</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">num_layers</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">model_name</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;glm_10b&quot;</span><span class="p">]:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">position_embeddings</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span>
+                <span class="n">config</span><span class="o">.</span><span class="n">max_seq_length</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span>
+                <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+                <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>  <span class="c1">#config.mapping.tp_size,</span>
+                <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>  <span class="c1">#config.mapping.tp_group,</span>
+                <span class="n">sharding_dim</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+                <span class="n">tp_rank</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>  <span class="c1">#config.mapping.rank,</span>
+                <span class="n">instance_id</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">num_layers</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">block_embeddings</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span>
+                <span class="n">config</span><span class="o">.</span><span class="n">max_seq_length</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span>
+                <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+                <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>  <span class="c1">#config.mapping.tp_size,</span>
+                <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>  <span class="c1">#config.mapping.tp_group,</span>
+                <span class="n">sharding_dim</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+                <span class="n">tp_rank</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>  <span class="c1">#config.mapping.rank,</span>
+                <span class="n">instance_id</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">num_layers</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span>
+            <span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">layers</span> <span class="o">=</span> <span class="n">ModuleList</span><span class="p">(</span>
+            <span class="n">ChatGLMDecoderLayer</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="n">config</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">num_layers</span><span class="p">))</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">final_norm</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">norm</span><span class="p">(</span>
+            <span class="n">normalized_shape</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">eps</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">,</span>
+            <span class="n">elementwise_affine</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+        <span class="p">)</span>
+
+<div class="viewcode-block" id="ChatGLMModel.forward">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.ChatGLMModel.forward">[docs]</a>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">input_ids</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">position_ids</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># only used in ChatGLM-6B</span>
+        <span class="n">kv_cache_params</span><span class="p">:</span> <span class="n">KeyValueCacheParams</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">attention_params</span><span class="p">:</span> <span class="n">AttentionParams</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
+
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_name</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;glm_10b&quot;</span><span class="p">]:</span>
+            <span class="n">position_ids_list</span> <span class="o">=</span> <span class="n">position_ids</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+            <span class="n">position_embedding</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">position_embeddings</span><span class="p">(</span><span class="n">position_ids_list</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+            <span class="n">block_embedding</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_embeddings</span><span class="p">(</span><span class="n">position_ids_list</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
+            <span class="n">position_embedding</span> <span class="o">=</span> <span class="n">position_embedding</span> <span class="o">+</span> <span class="n">block_embedding</span>
+
+            <span class="n">position_embedding</span> <span class="o">=</span> <span class="n">position_embedding</span><span class="o">.</span><span class="n">view</span><span class="p">(</span>
+                <span class="n">concat</span><span class="p">([</span>
+                    <span class="n">shape</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+                    <span class="n">shape</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+                    <span class="mi">4096</span><span class="p">,</span>
+                <span class="p">]))</span>
+
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">hidden_states</span> <span class="o">+</span> <span class="n">position_embedding</span>
+
+        <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">fill_none_tensor_list</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">))</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cache</span><span class="p">:</span>
+            <span class="n">presents</span> <span class="o">=</span> <span class="p">[]</span>
+
+        <span class="k">for</span> <span class="n">layer</span><span class="p">,</span> <span class="n">past</span><span class="p">,</span> <span class="n">pointer</span><span class="p">,</span> <span class="n">host_pointer</span><span class="p">,</span> <span class="n">max_kv_cache_length</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">,</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">past_key_value</span><span class="p">,</span>
+                <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">kv_cache_block_pointers</span><span class="p">,</span>
+                <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">host_kv_cache_block_pointers</span><span class="p">,</span>
+                <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">host_max_kv_cache_lengths</span><span class="p">):</span>
+            <span class="n">layer_output</span> <span class="o">=</span> <span class="n">layer</span><span class="p">(</span>
+                <span class="n">hidden_states</span><span class="p">,</span>
+                <span class="n">position_ids</span><span class="p">,</span>
+                <span class="n">kv_cache_params</span><span class="o">=</span><span class="n">KeyValueCacheParams</span><span class="p">(</span>
+                    <span class="n">past_key_value</span><span class="o">=</span><span class="p">[</span><span class="n">past</span><span class="p">],</span>
+                    <span class="n">kv_cache_block_pointers</span><span class="o">=</span><span class="p">[</span><span class="n">pointer</span><span class="p">],</span>
+                    <span class="n">host_kv_cache_block_pointers</span><span class="o">=</span><span class="p">[</span><span class="n">host_pointer</span><span class="p">],</span>
+                    <span class="n">host_past_key_value_lengths</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
+                    <span class="n">host_past_key_value_lengths</span><span class="p">,</span>
+                    <span class="n">host_max_kv_cache_lengths</span><span class="o">=</span><span class="n">max_kv_cache_length</span><span class="p">,</span>
+                    <span class="n">cache_indirection</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span><span class="n">cache_indirection</span><span class="p">,</span>
+                <span class="p">),</span>
+                <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">,</span>
+            <span class="p">)</span>
+
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cache</span><span class="p">:</span>
+                <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">layer_output</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+                <span class="n">presents</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">layer_output</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
+
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">final_norm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
+                <span class="nb">tuple</span><span class="p">(</span><span class="n">presents</span><span class="p">))</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cache</span> <span class="k">else</span> <span class="n">hidden_states</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="ChatGLMHeadModel">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.ChatGLMHeadModel">[docs]</a>
+<span class="k">class</span> <span class="nc">ChatGLMHeadModel</span><span class="p">(</span><span class="n">ChatGLMModel</span><span class="p">,</span> <span class="n">GenerationMixin</span><span class="p">):</span>
+
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">apply_query_key_layer_scaling</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">apply_residual_connection_post_layernorm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">enable_debug_output</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">ffn_hidden_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">hidden_act</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">hidden_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">linear_bias</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">logits_dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">max_input_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">max_output_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">max_seq_length</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">model_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">norm_epsilon</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">num_heads</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">num_kv_heads</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">num_layers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">qkv_bias</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">quant_mode</span><span class="p">:</span> <span class="n">QuantMode</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">rmsnorm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">rotary_embedding_scaling</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">tokens_per_block</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">use_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">vocab_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">max_position_embeddings</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
+
+        <span class="c1"># for benchmark scripts</span>
+        <span class="k">if</span> <span class="n">max_seq_length</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">max_position_embeddings</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">max_seq_length</span> <span class="o">=</span> <span class="n">max_position_embeddings</span>
+
+        <span class="n">config</span> <span class="o">=</span> <span class="n">ChatGLMParams</span><span class="p">(</span>
+            <span class="n">apply_query_key_layer_scaling</span><span class="o">=</span><span class="n">apply_query_key_layer_scaling</span><span class="p">,</span>
+            <span class="n">apply_residual_connection_post_layernorm</span><span class="o">=</span>
+            <span class="n">apply_residual_connection_post_layernorm</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="n">enable_debug_output</span><span class="o">=</span><span class="n">enable_debug_output</span><span class="p">,</span>
+            <span class="n">ffn_hidden_size</span><span class="o">=</span><span class="n">ffn_hidden_size</span><span class="p">,</span>
+            <span class="n">hidden_act</span><span class="o">=</span><span class="n">hidden_act</span><span class="p">,</span>
+            <span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">linear_bias</span><span class="o">=</span><span class="n">linear_bias</span><span class="p">,</span>
+            <span class="n">logits_dtype</span><span class="o">=</span><span class="n">logits_dtype</span><span class="p">,</span>
+            <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span>
+            <span class="n">max_input_len</span><span class="o">=</span><span class="n">max_input_len</span><span class="p">,</span>
+            <span class="n">max_output_len</span><span class="o">=</span><span class="n">max_output_len</span><span class="p">,</span>
+            <span class="n">max_seq_length</span><span class="o">=</span><span class="n">max_seq_length</span><span class="p">,</span>
+            <span class="n">model_name</span><span class="o">=</span><span class="n">model_name</span><span class="p">,</span>
+            <span class="n">norm_epsilon</span><span class="o">=</span><span class="n">norm_epsilon</span><span class="p">,</span>
+            <span class="n">num_heads</span><span class="o">=</span><span class="n">num_heads</span><span class="p">,</span>
+            <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">num_kv_heads</span><span class="p">,</span>
+            <span class="n">num_layers</span><span class="o">=</span><span class="n">num_layers</span><span class="p">,</span>
+            <span class="n">qkv_bias</span><span class="o">=</span><span class="n">qkv_bias</span><span class="p">,</span>
+            <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">,</span>
+            <span class="n">rmsnorm</span><span class="o">=</span><span class="n">rmsnorm</span><span class="p">,</span>
+            <span class="n">rotary_embedding_scaling</span><span class="o">=</span><span class="n">rotary_embedding_scaling</span><span class="p">,</span>
+            <span class="n">tokens_per_block</span><span class="o">=</span><span class="n">tokens_per_block</span><span class="p">,</span>
+            <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
+            <span class="n">vocab_size</span><span class="o">=</span><span class="n">vocab_size</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">kv_dtype</span> <span class="o">=</span> <span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">trt</span><span class="o">.</span><span class="n">DataType</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">kv_dtype</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">dtype</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_dtype</span>
+
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">logits_dtype</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">logits_dtype</span> <span class="o">=</span> <span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">logits_dtype</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">logits_dtype</span><span class="p">,</span> <span class="n">trt</span><span class="o">.</span><span class="n">DataType</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">logits_dtype</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">logits_dtype</span>
+
+        <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_int8_kv_cache</span><span class="p">():</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">kv_dtype</span> <span class="o">=</span> <span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="s1">&#39;int8&#39;</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_kv_cache</span><span class="p">():</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">kv_dtype</span> <span class="o">=</span> <span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="s1">&#39;fp8&#39;</span><span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_num_tokens</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">max_output_len</span> <span class="o">+</span> <span class="n">config</span><span class="o">.</span><span class="n">max_input_len</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">model_name</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">model_name</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_heads</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">num_heads</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">num_kv_heads</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">num_layers</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">tokens_per_block</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">use_cache</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">use_cache</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">lm_head</span> <span class="o">=</span> <span class="n">ColumnLinear</span><span class="p">(</span>
+            <span class="n">in_features</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">out_features</span><span class="o">=</span><span class="n">pad_vocab_size</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
+                                        <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">),</span>
+            <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="n">tp_group</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
+            <span class="n">tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+            <span class="n">gather_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="p">)</span>
+
+<div class="viewcode-block" id="ChatGLMHeadModel.forward">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.ChatGLMHeadModel.forward">[docs]</a>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">input_ids</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">position_ids</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># only used in ChatGLM-6B</span>
+        <span class="n">last_token_ids</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">kv_cache_params</span><span class="p">:</span> <span class="n">KeyValueCacheParams</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">attention_params</span><span class="p">:</span> <span class="n">AttentionParams</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
+
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span>
+            <span class="n">input_ids</span><span class="p">,</span>
+            <span class="n">position_ids</span><span class="p">,</span>
+            <span class="n">kv_cache_params</span><span class="p">,</span>
+            <span class="n">attention_params</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cache</span><span class="p">:</span>
+            <span class="n">hidden_states</span><span class="p">,</span> <span class="n">presents</span> <span class="o">=</span> <span class="n">hidden_states</span>
+
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">gather_last_token_logits</span><span class="p">(</span>
+            <span class="n">hidden_states</span><span class="p">,</span> <span class="n">last_token_ids</span><span class="p">,</span>
+            <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">)</span>
+
+        <span class="n">lm_logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">lm_head</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="n">lm_logits</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="s1">&#39;logits&#39;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">logits_dtype</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cache</span> <span class="ow">and</span> <span class="n">default_net</span><span class="p">(</span>
+        <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">paged_kv_cache</span> <span class="o">==</span> <span class="kc">False</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">present</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">presents</span><span class="p">):</span>
+                <span class="n">present</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;present_key_value_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_dtype</span><span class="p">)</span>
+            <span class="k">return</span> <span class="p">(</span><span class="n">lm_logits</span><span class="p">,</span> <span class="n">presents</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">lm_logits</span></div>
+
+
+<div class="viewcode-block" id="ChatGLMHeadModel.prepare_inputs">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.ChatGLMHeadModel.prepare_inputs">[docs]</a>
+    <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">max_batch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+        <span class="n">max_input_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+        <span class="n">max_new_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+        <span class="n">use_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+        <span class="n">max_beam_width</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+    <span class="p">):</span>
+<span class="w">        </span><span class="sd">&#39;&#39;&#39;@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the</span>
+<span class="sd">            ranges of the dimensions of when using TRT dynamic shapes.</span>
+
+<span class="sd">            @return: a list contains values which can be fed into the self.forward()</span>
+<span class="sd">        &#39;&#39;&#39;</span>
+
+        <span class="n">model_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">prepare_basic_inputs</span><span class="p">(</span>
+            <span class="n">max_batch_size</span><span class="o">=</span><span class="n">max_batch_size</span><span class="p">,</span>
+            <span class="n">max_beam_width</span><span class="o">=</span><span class="n">max_beam_width</span><span class="p">,</span>
+            <span class="n">max_input_len</span><span class="o">=</span><span class="n">max_input_len</span><span class="p">,</span>
+            <span class="n">max_new_tokens</span><span class="o">=</span><span class="n">max_new_tokens</span><span class="p">,</span>
+            <span class="n">num_kv_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
+            <span class="n">head_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_heads</span><span class="p">,</span>
+            <span class="n">num_layers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span><span class="p">,</span>
+            <span class="n">kv_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_dtype</span><span class="p">,</span>
+            <span class="n">remove_input_padding</span><span class="o">=</span><span class="n">default_net</span><span class="p">(</span>
+            <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">,</span>
+            <span class="n">use_gpt_attention_plugin</span><span class="o">=</span><span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span>
+            <span class="n">gpt_attention_plugin</span><span class="p">,</span>
+            <span class="n">use_gemm_plugin</span><span class="o">=</span><span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gemm_plugin</span><span class="p">,</span>
+            <span class="n">use_custom_all_reduce</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+            <span class="n">paged_kv_cache</span><span class="o">=</span><span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">paged_kv_cache</span><span class="p">,</span>
+            <span class="n">tokens_per_block</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
+            <span class="n">gather_all_token_logits</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_dtype</span><span class="p">,</span>
+            <span class="n">num_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_heads</span><span class="p">,</span>
+            <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span>
+            <span class="n">max_num_tokens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_num_tokens</span><span class="p">,</span>
+            <span class="n">prompt_embedding_table_size</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+            <span class="n">position_encoding_2d</span><span class="o">=</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model_name</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;chatglm_6b&quot;</span><span class="p">,</span> <span class="s2">&quot;glm_10b&quot;</span><span class="p">]),</span>
+        <span class="p">)</span>
+
+        <span class="k">return</span> <span class="p">(</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;input_ids&#39;</span><span class="p">],</span> <span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;position_ids&#39;</span><span class="p">],</span>
+                <span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;last_token_ids&#39;</span><span class="p">],</span>
+                <span class="n">KeyValueCacheParams</span><span class="p">(</span>
+                    <span class="n">past_key_value</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;past_key_value&#39;</span><span class="p">],</span>
+                    <span class="n">host_past_key_value_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
+                        <span class="s1">&#39;host_past_key_value_lengths&#39;</span><span class="p">],</span>
+                    <span class="n">host_max_kv_cache_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
+                        <span class="s1">&#39;host_max_kv_cache_lengths&#39;</span><span class="p">],</span>
+                    <span class="n">kv_cache_block_pointers</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
+                        <span class="s1">&#39;kv_cache_block_pointers_list&#39;</span><span class="p">],</span>
+                    <span class="n">host_kv_cache_block_pointers</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
+                        <span class="s1">&#39;host_kv_cache_block_pointers_list&#39;</span><span class="p">],</span>
+                    <span class="n">cache_indirection</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;cache_indirection&#39;</span><span class="p">],</span>
+                <span class="p">),</span>
+                <span class="n">AttentionParams</span><span class="p">(</span>
+                    <span class="n">sequence_length</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;sequence_length&#39;</span><span class="p">],</span>
+                    <span class="n">context_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;context_lengths&#39;</span><span class="p">],</span>
+                    <span class="n">host_context_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;host_context_lengths&#39;</span><span class="p">],</span>
+                    <span class="n">max_context_length</span><span class="o">=</span><span class="n">max_input_len</span><span class="p">,</span>
+                    <span class="n">host_request_types</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;host_request_types&#39;</span><span class="p">],</span>
+                <span class="p">))</span></div>
+</div>
+
+</pre></div>
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2023, NVidia.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

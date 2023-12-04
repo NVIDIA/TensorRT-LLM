@@ -1,20 +1,22 @@
 <!DOCTYPE html>
-<html class="writer-html5" lang="en" >
+<html class="writer-html5" lang="en" data-content_root="../../../">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.layers.linear &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" href="../../../_static/pygments.css" type="text/css" />
-      <link rel="stylesheet" href="../../../_static/css/theme.css" type="text/css" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=19f00094" />
+
+  
   <!--[if lt IE 9]>
     <script src="../../../_static/js/html5shiv.min.js"></script>
   <![endif]-->
   
         <script src="../../../_static/jquery.js?v=5d32c60e"></script>
         <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script data-url_root="../../../" id="documentation_options" src="../../../_static/documentation_options.js?v=b3ba4146"></script>
+        <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
         <script src="../../../_static/doctools.js?v=888ff710"></script>
-        <script src="../../../_static/sphinx_highlight.js?v=4825356b"></script>
+        <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../../genindex.html" />
     <link rel="search" title="Search" href="../../../search.html" /> 
@@ -47,10 +49,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance.html">Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../installation.html">Build From Sources</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../memory.html">Memory Usage of TensorRT-LLM</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -109,12 +111,13 @@
 <span class="kn">import</span> <span class="nn">tensorrt</span> <span class="k">as</span> <span class="nn">trt</span>
 
 <span class="kn">from</span> <span class="nn">.._common</span> <span class="kn">import</span> <span class="n">default_net</span><span class="p">,</span> <span class="n">default_trtnet</span>
-<span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="n">int32_array</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span>
+<span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="n">str_dtype_to_trt</span>
 <span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">_create_tensor</span><span class="p">,</span> <span class="n">allgather</span><span class="p">,</span> <span class="n">allreduce</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span>
-                          <span class="n">concat</span><span class="p">,</span> <span class="n">constant</span><span class="p">,</span> <span class="n">matmul</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span> <span class="nb">slice</span><span class="p">)</span>
+                          <span class="n">matmul</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">..module</span> <span class="kn">import</span> <span class="n">Module</span>
 <span class="kn">from</span> <span class="nn">..parameter</span> <span class="kn">import</span> <span class="n">Parameter</span>
 <span class="kn">from</span> <span class="nn">..plugin</span> <span class="kn">import</span> <span class="n">TRT_LLM_PLUGIN_NAMESPACE</span>
+<span class="kn">from</span> <span class="nn">.lora</span> <span class="kn">import</span> <span class="n">Lora</span><span class="p">,</span> <span class="n">LoraRuntimeParam</span>
 
 
 <span class="k">def</span> <span class="nf">_gemm_plugin</span><span class="p">(</span><span class="nb">input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
@@ -147,7 +150,9 @@
     <span class="k">return</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
 
 
-<div class="viewcode-block" id="Linear"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.Linear">[docs]</a><span class="k">class</span> <span class="nc">Linear</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<div class="viewcode-block" id="Linear">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.Linear">[docs]</a>
+<span class="k">class</span> <span class="nc">Linear</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">in_features</span><span class="p">,</span>
@@ -178,11 +183,32 @@
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">register_parameter</span><span class="p">(</span><span class="s1">&#39;bias&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
 
-<div class="viewcode-block" id="Linear.multiply_gather"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.Linear.multiply_gather">[docs]</a>    <span class="k">def</span> <span class="nf">multiply_gather</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">gemm_plugin</span><span class="p">,</span> <span class="n">use_fp8</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">lora</span> <span class="o">=</span> <span class="n">Lora</span><span class="p">(</span>
+            <span class="n">in_hidden_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">in_features</span><span class="p">,</span>
+            <span class="n">out_hidden_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">out_features</span><span class="p">,</span>
+            <span class="n">max_low_rank</span><span class="o">=</span><span class="nb">min</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">in_features</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">out_features</span>
+            <span class="p">),</span>  <span class="c1"># Assume low rank is smaller than in/out features</span>
+        <span class="p">)</span>
+
+<div class="viewcode-block" id="Linear.multiply_gather">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.Linear.multiply_gather">[docs]</a>
+    <span class="k">def</span> <span class="nf">multiply_gather</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                        <span class="n">x</span><span class="p">,</span>
+                        <span class="n">weight</span><span class="p">,</span>
+                        <span class="n">gemm_plugin</span><span class="p">,</span>
+                        <span class="n">use_fp8</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                        <span class="n">lora_runtime_param</span><span class="p">:</span> <span class="n">LoraRuntimeParam</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="n">hidden_state</span> <span class="o">=</span> <span class="n">x</span>
         <span class="k">if</span> <span class="n">gemm_plugin</span><span class="p">:</span>
             <span class="n">x</span> <span class="o">=</span> <span class="n">_gemm_plugin</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">transb</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">use_fp8</span><span class="o">=</span><span class="n">use_fp8</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">x</span> <span class="o">=</span> <span class="n">matmul</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">transb</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">default_net</span><span class="p">(</span>
+        <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">lora_plugin</span> <span class="ow">and</span> <span class="n">lora_runtime_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora</span><span class="p">(</span><span class="n">hidden_state</span><span class="p">,</span>
+                              <span class="n">lora_runtime_param</span><span class="o">=</span><span class="n">lora_runtime_param</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">bias</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">bias</span><span class="o">.</span><span class="n">value</span><span class="o">.</span><span class="n">dtype</span><span class="p">:</span>
@@ -190,34 +216,29 @@
             <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">bias</span><span class="o">.</span><span class="n">value</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">gather_output</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_group</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="c1"># 1. [dim0, local_dim] -&gt; [dim0 * tp_size, local_dim]</span>
-            <span class="n">x</span> <span class="o">=</span> <span class="n">allgather</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_group</span><span class="p">)</span>
-
-            <span class="c1"># 2. [dim0 * tp_size, local_dim] -&gt; [dim0, local_dim * tp_size]</span>
-            <span class="c1"># 2.1 split</span>
-            <span class="n">split_size</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span>
-            <span class="n">ndim</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span>
-            <span class="n">starts</span> <span class="o">=</span> <span class="p">[</span><span class="n">constant</span><span class="p">(</span><span class="n">int32_array</span><span class="p">([</span><span class="mi">0</span><span class="p">]))</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">ndim</span><span class="p">)]</span>
-            <span class="n">sizes</span> <span class="o">=</span> <span class="p">[</span><span class="n">shape</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="n">d</span><span class="p">)</span> <span class="k">for</span> <span class="n">d</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">ndim</span><span class="p">)]</span>
-            <span class="n">sizes</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">split_size</span>
-            <span class="n">sections</span> <span class="o">=</span> <span class="p">[]</span>
-            <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span><span class="p">):</span>
-                <span class="n">starts</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">split_size</span> <span class="o">*</span> <span class="n">i</span>
-                <span class="n">sections</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">slice</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">concat</span><span class="p">(</span><span class="n">starts</span><span class="p">),</span> <span class="n">concat</span><span class="p">(</span><span class="n">sizes</span><span class="p">)))</span>
-            <span class="c1"># 2.2 concat</span>
-            <span class="n">x</span> <span class="o">=</span> <span class="n">concat</span><span class="p">(</span><span class="n">sections</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+            <span class="c1"># [dim0, local_dim] -&gt; [dim0 * tp_size, local_dim] --&gt; [dim0, local_dim * tp_size]</span>
+            <span class="n">x</span> <span class="o">=</span> <span class="n">allgather</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span> <span class="n">gather_dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="n">x</span></div>
 
-<div class="viewcode-block" id="Linear.forward"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.Linear.forward">[docs]</a>    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">):</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">multiply_gather</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
-                                    <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gemm_plugin</span><span class="p">)</span></div></div>
+
+<div class="viewcode-block" id="Linear.forward">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.Linear.forward">[docs]</a>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">lora_runtime_param</span><span class="p">:</span> <span class="n">LoraRuntimeParam</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">multiply_gather</span><span class="p">(</span><span class="n">x</span><span class="p">,</span>
+                                    <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
+                                    <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gemm_plugin</span><span class="p">,</span>
+                                    <span class="n">lora_runtime_param</span><span class="o">=</span><span class="n">lora_runtime_param</span><span class="p">)</span></div>
+</div>
+
 
 
 <span class="n">ColumnLinear</span> <span class="o">=</span> <span class="n">Linear</span>
 
 
-<div class="viewcode-block" id="RowLinear"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.RowLinear">[docs]</a><span class="k">class</span> <span class="nc">RowLinear</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<div class="viewcode-block" id="RowLinear">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.RowLinear">[docs]</a>
+<span class="k">class</span> <span class="nc">RowLinear</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">in_features</span><span class="p">,</span>
@@ -244,16 +265,33 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">=</span> <span class="n">tp_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">instance_id</span> <span class="o">=</span> <span class="n">instance_id</span>
 
-<div class="viewcode-block" id="RowLinear.multiply_reduce"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.RowLinear.multiply_reduce">[docs]</a>    <span class="k">def</span> <span class="nf">multiply_reduce</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">lora</span> <span class="o">=</span> <span class="n">Lora</span><span class="p">(</span>
+            <span class="n">in_hidden_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">in_features</span><span class="p">,</span>
+            <span class="n">out_hidden_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">out_features</span><span class="p">,</span>
+            <span class="n">max_low_rank</span><span class="o">=</span><span class="nb">min</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">in_features</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">out_features</span>
+            <span class="p">),</span>  <span class="c1"># Assume low rank is smaller than in/out features</span>
+        <span class="p">)</span>
+
+<div class="viewcode-block" id="RowLinear.multiply_reduce">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.RowLinear.multiply_reduce">[docs]</a>
+    <span class="k">def</span> <span class="nf">multiply_reduce</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                         <span class="n">x</span><span class="p">,</span>
                         <span class="n">weight</span><span class="p">,</span>
                         <span class="n">gemm_plugin</span><span class="p">,</span>
                         <span class="n">use_fp8</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                        <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                        <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                        <span class="n">lora_runtime_param</span><span class="p">:</span> <span class="n">LoraRuntimeParam</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="n">hidden_state</span> <span class="o">=</span> <span class="n">x</span>
         <span class="k">if</span> <span class="n">gemm_plugin</span><span class="p">:</span>
             <span class="n">x</span> <span class="o">=</span> <span class="n">_gemm_plugin</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">transb</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">use_fp8</span><span class="o">=</span><span class="n">use_fp8</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">x</span> <span class="o">=</span> <span class="n">matmul</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">transb</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">default_net</span><span class="p">(</span>
+        <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">lora_plugin</span> <span class="ow">and</span> <span class="n">lora_runtime_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora</span><span class="p">(</span><span class="n">hidden_state</span><span class="p">,</span>
+                              <span class="n">lora_runtime_param</span><span class="o">=</span><span class="n">lora_runtime_param</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_group</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">x</span> <span class="o">=</span> <span class="n">allreduce</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span> <span class="n">workspace</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">instance_id</span><span class="p">)</span>
@@ -266,11 +304,20 @@
 
         <span class="k">return</span> <span class="n">x</span></div>
 
-<div class="viewcode-block" id="RowLinear.forward"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.RowLinear.forward">[docs]</a>    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+
+<div class="viewcode-block" id="RowLinear.forward">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.RowLinear.forward">[docs]</a>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                <span class="n">x</span><span class="p">,</span>
+                <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">lora_runtime_param</span><span class="p">:</span> <span class="n">LoraRuntimeParam</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">multiply_reduce</span><span class="p">(</span><span class="n">x</span><span class="p">,</span>
                                     <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
                                     <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gemm_plugin</span><span class="p">,</span>
-                                    <span class="n">workspace</span><span class="o">=</span><span class="n">workspace</span><span class="p">)</span></div></div>
+                                    <span class="n">workspace</span><span class="o">=</span><span class="n">workspace</span><span class="p">,</span>
+                                    <span class="n">lora_runtime_param</span><span class="o">=</span><span class="n">lora_runtime_param</span><span class="p">)</span></div>
+</div>
+
 </pre></div>
 
            </div>

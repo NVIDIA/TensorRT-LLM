@@ -1,20 +1,22 @@
 <!DOCTYPE html>
-<html class="writer-html5" lang="en" >
+<html class="writer-html5" lang="en" data-content_root="../../../">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.layers.mlp &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" href="../../../_static/pygments.css" type="text/css" />
-      <link rel="stylesheet" href="../../../_static/css/theme.css" type="text/css" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=19f00094" />
+
+  
   <!--[if lt IE 9]>
     <script src="../../../_static/js/html5shiv.min.js"></script>
   <![endif]-->
   
         <script src="../../../_static/jquery.js?v=5d32c60e"></script>
         <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script data-url_root="../../../" id="documentation_options" src="../../../_static/documentation_options.js?v=b3ba4146"></script>
+        <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
         <script src="../../../_static/doctools.js?v=888ff710"></script>
-        <script src="../../../_static/sphinx_highlight.js?v=4825356b"></script>
+        <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../../genindex.html" />
     <link rel="search" title="Search" href="../../../search.html" /> 
@@ -47,10 +49,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance.html">Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../installation.html">Build From Sources</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../memory.html">Memory Usage of TensorRT-LLM</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -105,6 +107,9 @@
 <span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
 <span class="c1"># See the License for the specific language governing permissions and</span>
 <span class="c1"># limitations under the License.</span>
+<span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
+
+<span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="n">trt_dtype_to_np</span>
 <span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="n">ACT2FN</span>
 <span class="kn">from</span> <span class="nn">..module</span> <span class="kn">import</span> <span class="n">Module</span>
 <span class="kn">from</span> <span class="nn">..quantization</span> <span class="kn">import</span> <span class="n">QuantMode</span>
@@ -112,7 +117,9 @@
 <span class="kn">from</span> <span class="nn">.linear</span> <span class="kn">import</span> <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">RowLinear</span>
 
 
-<div class="viewcode-block" id="MLP"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.MLP">[docs]</a><span class="k">class</span> <span class="nc">MLP</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<div class="viewcode-block" id="MLP">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.MLP">[docs]</a>
+<span class="k">class</span> <span class="nc">MLP</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">hidden_size</span><span class="p">,</span>
@@ -161,17 +168,34 @@
                                   <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
                                   <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
                                   <span class="n">instance_id</span><span class="o">=</span><span class="n">instance_id</span><span class="p">)</span>
+
         <span class="bp">self</span><span class="o">.</span><span class="n">hidden_act</span> <span class="o">=</span> <span class="n">hidden_act</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">dtype</span>
 
-<div class="viewcode-block" id="MLP.forward"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.MLP.forward">[docs]</a>    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-        <span class="n">inter</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+<div class="viewcode-block" id="MLP.forward">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.MLP.forward">[docs]</a>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">lora_param</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="n">mlp_h_to_4h_param</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mlp_h_to_4h_param</span> <span class="o">=</span> <span class="n">lora_param</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;mlp_h_to_4h&quot;</span><span class="p">)</span>
+
+        <span class="n">mlp_4h_to_h_param</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mlp_4h_to_h_param</span> <span class="o">=</span> <span class="n">lora_param</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;mlp_4h_to_h&quot;</span><span class="p">)</span>
+
+        <span class="n">inter</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">mlp_h_to_4h_param</span><span class="p">)</span>
         <span class="n">inter</span> <span class="o">=</span> <span class="n">ACT2FN</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">hidden_act</span><span class="p">](</span><span class="n">inter</span><span class="p">)</span>
-        <span class="n">output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">inter</span><span class="p">,</span> <span class="n">workspace</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">output</span></div></div>
+        <span class="n">output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">inter</span><span class="p">,</span>
+                           <span class="n">workspace</span><span class="p">,</span>
+                           <span class="n">lora_runtime_param</span><span class="o">=</span><span class="n">mlp_4h_to_h_param</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">output</span></div>
+</div>
 
 
-<div class="viewcode-block" id="GatedMLP"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.GatedMLP">[docs]</a><span class="k">class</span> <span class="nc">GatedMLP</span><span class="p">(</span><span class="n">MLP</span><span class="p">):</span>
+
+<div class="viewcode-block" id="GatedMLP">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.GatedMLP">[docs]</a>
+<span class="k">class</span> <span class="nc">GatedMLP</span><span class="p">(</span><span class="n">MLP</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">hidden_size</span><span class="p">,</span>
@@ -194,6 +218,16 @@
                          <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">,</span>
                          <span class="n">instance_id</span><span class="o">=</span><span class="n">instance_id</span><span class="p">)</span>
 
+        <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">=</span> <span class="n">hidden_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">ffn_hidden_size</span> <span class="o">=</span> <span class="n">ffn_hidden_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">hidden_act</span> <span class="o">=</span> <span class="n">hidden_act</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">bias</span> <span class="o">=</span> <span class="n">bias</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tp_group</span> <span class="o">=</span> <span class="n">tp_group</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">=</span> <span class="n">tp_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span> <span class="o">=</span> <span class="n">quant_mode</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">instance_id</span> <span class="o">=</span> <span class="n">instance_id</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_fp8_qdq</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">gate</span> <span class="o">=</span> <span class="n">FP8Linear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span>
                                   <span class="n">ffn_hidden_size</span><span class="p">,</span>
@@ -211,12 +245,131 @@
                                      <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
                                      <span class="n">gather_output</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
-<div class="viewcode-block" id="GatedMLP.forward"><a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.GatedMLP.forward">[docs]</a>    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-        <span class="n">inter</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+<div class="viewcode-block" id="GatedMLP.forward">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.GatedMLP.forward">[docs]</a>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">lora_param</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+
+        <span class="n">mlp_h_to_4h_param</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mlp_h_to_4h_param</span> <span class="o">=</span> <span class="n">lora_param</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;mlp_h_to_4h&quot;</span><span class="p">)</span>
+
+        <span class="n">mlp_gate_param</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mlp_gate_param</span> <span class="o">=</span> <span class="n">lora_param</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;mlp_gate&quot;</span><span class="p">)</span>
+
+        <span class="n">mlp_4h_to_h_param</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">lora_param</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mlp_4h_to_h_param</span> <span class="o">=</span> <span class="n">lora_param</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;mlp_4h_to_h&quot;</span><span class="p">)</span>
+
+        <span class="n">inter</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">mlp_h_to_4h_param</span><span class="p">)</span>
         <span class="n">inter</span> <span class="o">=</span> <span class="n">ACT2FN</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">hidden_act</span><span class="p">](</span><span class="n">inter</span><span class="p">)</span>
-        <span class="n">gate</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">gate</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
-        <span class="n">output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">inter</span> <span class="o">*</span> <span class="n">gate</span><span class="p">,</span> <span class="n">workspace</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">output</span></div></div>
+        <span class="n">gate</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">gate</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">mlp_gate_param</span><span class="p">)</span>
+        <span class="n">intermediate</span> <span class="o">=</span> <span class="n">inter</span> <span class="o">*</span> <span class="n">gate</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">intermediate</span><span class="p">,</span>
+                           <span class="n">workspace</span><span class="p">,</span>
+                           <span class="n">lora_runtime_param</span><span class="o">=</span><span class="n">mlp_4h_to_h_param</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">output</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="FusedGatedMLP">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.FusedGatedMLP">[docs]</a>
+<span class="k">class</span> <span class="nc">FusedGatedMLP</span><span class="p">(</span><span class="n">GatedMLP</span><span class="p">):</span>
+
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                 <span class="n">hidden_size</span><span class="p">,</span>
+                 <span class="n">ffn_hidden_size</span><span class="p">,</span>
+                 <span class="n">hidden_act</span><span class="p">,</span>
+                 <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                 <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+                 <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+                 <span class="n">instance_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span>
+                         <span class="n">ffn_hidden_size</span><span class="p">,</span>
+                         <span class="n">hidden_act</span><span class="p">,</span>
+                         <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
+                         <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                         <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
+                         <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+                         <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">,</span>
+                         <span class="n">instance_id</span><span class="o">=</span><span class="n">instance_id</span><span class="p">)</span>
+
+<div class="viewcode-block" id="FusedGatedMLP.forward">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.FusedGatedMLP.forward">[docs]</a>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">workspace</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">lora_param</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="c1"># Combine the following pattern</span>
+        <span class="c1">#</span>
+        <span class="c1">#   SiLU(FC(x)) + Gate(x)</span>
+        <span class="c1">#</span>
+        <span class="c1"># into:</span>
+        <span class="c1">#</span>
+        <span class="c1">#   SwiGLU(FusedFC(x))</span>
+        <span class="c1">#</span>
+        <span class="c1"># Upside is we don&#39;t need to modify 4 different weight loading paths just to concat weights</span>
+
+        <span class="n">_np_dtype</span> <span class="o">=</span> <span class="n">trt_dtype_to_np</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="n">concat_weight</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">(</span>
+            <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">gate</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">raw_value</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">raw_value</span><span class="p">],</span>
+            <span class="n">axis</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">_np_dtype</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">bias</span><span class="p">:</span>
+            <span class="n">concat_bias</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">(</span>
+                <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">gate</span><span class="o">.</span><span class="n">bias</span><span class="o">.</span><span class="n">raw_value</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">bias</span><span class="o">.</span><span class="n">raw_value</span><span class="p">],</span>
+                <span class="n">axis</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">_np_dtype</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_fp8_qdq</span><span class="p">:</span>
+            <span class="n">gate_weights_scaling_factor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">gate</span><span class="o">.</span><span class="n">weights_scaling_factor</span><span class="o">.</span><span class="n">raw_value</span>
+            <span class="n">fc_weights_scaling_factor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">weights_scaling_factor</span><span class="o">.</span><span class="n">raw_value</span>
+            <span class="n">fc_activation_scaling_factor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">activation_scaling_factor</span><span class="o">.</span><span class="n">raw_value</span>
+            <span class="n">gate_activation_scaling_factor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">gate</span><span class="o">.</span><span class="n">activation_scaling_factor</span><span class="o">.</span><span class="n">raw_value</span>
+            <span class="k">assert</span> <span class="n">fc_activation_scaling_factor</span> <span class="o">==</span> <span class="n">gate_activation_scaling_factor</span><span class="p">,</span> <span class="s2">&quot;Activation scales should be identical&quot;</span>
+
+        <span class="c1"># Remove dangling TRT-LLM parameter references after the graph rewrite.</span>
+        <span class="k">for</span> <span class="n">param</span><span class="p">,</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gate</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">()):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">gate</span><span class="o">.</span><span class="n">_parameters</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">param</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">gate</span> <span class="o">=</span> <span class="kc">None</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_fp8_qdq</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">fc</span> <span class="o">=</span> <span class="n">FP8Linear</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                                <span class="bp">self</span><span class="o">.</span><span class="n">ffn_hidden_size</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span>
+                                <span class="n">bias</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">bias</span><span class="p">,</span>
+                                <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+                                <span class="n">tp_group</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
+                                <span class="n">tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+                                <span class="n">gather_output</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">fc</span> <span class="o">=</span> <span class="n">ColumnLinear</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                                   <span class="bp">self</span><span class="o">.</span><span class="n">ffn_hidden_size</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span>
+                                   <span class="n">bias</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">bias</span><span class="p">,</span>
+                                   <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+                                   <span class="n">tp_group</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
+                                   <span class="n">tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+                                   <span class="n">gather_output</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">value</span> <span class="o">=</span> <span class="n">concat_weight</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_fp8_qdq</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">activation_scaling_factor</span><span class="o">.</span><span class="n">value</span> <span class="o">=</span> <span class="n">fc_activation_scaling_factor</span>
+            <span class="c1"># TODO: need to align with quantization toolkit; preferably put a constraint to equalize</span>
+            <span class="c1"># fc/gate weight scaling factor to allow horizontal fusion without accuracy loss</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">weights_scaling_factor</span><span class="o">.</span><span class="n">value</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span>
+                <span class="n">gate_weights_scaling_factor</span><span class="p">,</span> <span class="n">fc_weights_scaling_factor</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">bias</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">bias</span><span class="o">.</span><span class="n">value</span> <span class="o">=</span> <span class="n">concat_bias</span>
+        <span class="n">inter</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_act</span> <span class="o">==</span> <span class="s1">&#39;silu&#39;</span><span class="p">:</span>
+            <span class="n">inter</span> <span class="o">=</span> <span class="n">ACT2FN</span><span class="p">[</span><span class="s1">&#39;swiglu&#39;</span><span class="p">](</span><span class="n">inter</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;Activation </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">hidden_act</span><span class="si">}</span><span class="s2"> not yet implemented for FusedGatedMLP&quot;</span>
+            <span class="p">)</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">inter</span><span class="p">,</span> <span class="n">workspace</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">output</span></div>
+</div>
+
 </pre></div>
 
            </div>

@@ -1,26 +1,28 @@
 <!DOCTYPE html>
-<html class="writer-html5" lang="en" >
+<html class="writer-html5" lang="en" data-content_root="./">
 <head>
-  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>How to debug &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" href="_static/pygments.css" type="text/css" />
-      <link rel="stylesheet" href="_static/css/theme.css" type="text/css" />
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=19f00094" />
+
+  
   <!--[if lt IE 9]>
     <script src="_static/js/html5shiv.min.js"></script>
   <![endif]-->
   
         <script src="_static/jquery.js?v=5d32c60e"></script>
         <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script data-url_root="./" id="documentation_options" src="_static/documentation_options.js?v=b3ba4146"></script>
+        <script src="_static/documentation_options.js?v=5929fcd5"></script>
         <script src="_static/doctools.js?v=888ff710"></script>
-        <script src="_static/sphinx_highlight.js?v=4825356b"></script>
+        <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
     <link rel="next" title="How to add a new model" href="2023-05-17-how-to-add-a-new-model.html" />
-    <link rel="prev" title="Build From Sources" href="installation.html" /> 
+    <link rel="prev" title="Performance of TensorRT-LLM" href="performance.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -50,7 +52,6 @@
 <li class="toctree-l1"><a class="reference internal" href="gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="performance.html">Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="installation.html">Build From Sources</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">How to debug</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#overview">Overview</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#debug-on-unit-tests">Debug on unit tests</a></li>
@@ -60,6 +61,7 @@
 </li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="memory.html">Memory Usage of TensorRT-LLM</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -73,6 +75,11 @@
 <p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token.</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 </ul>
 
         </div>
@@ -100,16 +107,16 @@
            <div itemprop="articleBody">
              
   <section id="how-to-debug">
-<h1>How to debug<a class="headerlink" href="#how-to-debug" title="Permalink to this heading"></a></h1>
+<h1>How to debug<a class="headerlink" href="#how-to-debug" title="Link to this heading"></a></h1>
 <p>This document describes how to debug in TensorRT-LLM.</p>
 <section id="overview">
-<h2>Overview<a class="headerlink" href="#overview" title="Permalink to this heading"></a></h2>
+<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading"></a></h2>
 <p>Usually, we want to print the intermediate tensor values when debugging a TensorRT-LLM model.
 TensorRT-LLM obeys define-and-run paradigm, we should mark the interested intermediate tensors as the network outputs.
 Then, we print the values at runtime.</p>
 </section>
 <section id="debug-on-unit-tests">
-<h2>Debug on unit tests<a class="headerlink" href="#debug-on-unit-tests" title="Permalink to this heading"></a></h2>
+<h2>Debug on unit tests<a class="headerlink" href="#debug-on-unit-tests" title="Link to this heading"></a></h2>
 <ol class="arabic simple">
 <li><p>Register the intermediate tensors as the network outputs with <code class="docutils literal notranslate"><span class="pre">register_network_output</span></code> API.</p></li>
 </ol>
@@ -157,10 +164,10 @@ Then, we print the values at runtime.</p>
 <span class="nb">print</span><span class="p">(</span><span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;inter&#39;</span><span class="p">])</span>
 </pre></div>
 </div>
-<p>Here is the <a class="reference download internal" download="" href="_downloads/29c17f8c7171976309d720e2b031e77e/test_debugging_api.py"><span class="xref download myst">full example</span></a>.</p>
+<p>Here is the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/fix/docs/tests/test_debugging_api.py">full example</a>.</p>
 </section>
 <section id="debug-on-e2e-models">
-<h2>Debug on E2E models<a class="headerlink" href="#debug-on-e2e-models" title="Permalink to this heading"></a></h2>
+<h2>Debug on E2E models<a class="headerlink" href="#debug-on-e2e-models" title="Link to this heading"></a></h2>
 <p>Here is an example to print the values of the MLP output tensor in the GPT model.</p>
 <ol class="arabic simple">
 <li><p>In <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/models/gpt/model.py</span></code>, we register the MLP output tensor:</p></li>
@@ -289,7 +296,7 @@ Output:<span class="w">  </span>chef<span class="w"> </span>before<span class="w
 </div>
 </section>
 <section id="debug-execution-errors">
-<h2>Debug execution errors<a class="headerlink" href="#debug-execution-errors" title="Permalink to this heading"></a></h2>
+<h2>Debug execution errors<a class="headerlink" href="#debug-execution-errors" title="Link to this heading"></a></h2>
 <ul class="simple">
 <li><p>If you use plugins, use can set the environment variable <code class="docutils literal notranslate"><span class="pre">CUDA_LAUNCH_BLOCKING=1</span></code> so that kernels are launch synchronously, with their return status checked immediately.</p></li>
 <li><p>If you see memory errors, make sure that the engine inputs respect the build-time shapes and that they reside <strong>on the correct device</strong> (CPU/GPU).</p></li>
@@ -301,7 +308,7 @@ Output:<span class="w">  </span>chef<span class="w"> </span>before<span class="w
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="installation.html" class="btn btn-neutral float-left" title="Build From Sources" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="performance.html" class="btn btn-neutral float-left" title="Performance of TensorRT-LLM" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
         <a href="2023-05-17-how-to-add-a-new-model.html" class="btn btn-neutral float-right" title="How to add a new model" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 

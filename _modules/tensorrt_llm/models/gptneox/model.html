@@ -1,20 +1,22 @@
 <!DOCTYPE html>
-<html class="writer-html5" lang="en" >
+<html class="writer-html5" lang="en" data-content_root="../../../../">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.models.gptneox.model &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" href="../../../../_static/pygments.css" type="text/css" />
-      <link rel="stylesheet" href="../../../../_static/css/theme.css" type="text/css" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=19f00094" />
+
+  
   <!--[if lt IE 9]>
     <script src="../../../../_static/js/html5shiv.min.js"></script>
   <![endif]-->
   
         <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
         <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script data-url_root="../../../../" id="documentation_options" src="../../../../_static/documentation_options.js?v=b3ba4146"></script>
+        <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
         <script src="../../../../_static/doctools.js?v=888ff710"></script>
-        <script src="../../../../_static/sphinx_highlight.js?v=4825356b"></script>
+        <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../../../genindex.html" />
     <link rel="search" title="Search" href="../../../../search.html" /> 
@@ -47,10 +49,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance.html">Performance of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../installation.html">Build From Sources</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../memory.html">Memory Usage of TensorRT-LLM</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -110,106 +112,12 @@
 <span class="kn">from</span> <span class="nn">..._common</span> <span class="kn">import</span> <span class="n">default_net</span>
 <span class="kn">from</span> <span class="nn">..._utils</span> <span class="kn">import</span> <span class="n">pad_vocab_size</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span>
 <span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span>
-                           <span class="n">gather_last_token_logits</span><span class="p">,</span> <span class="n">gpt_attention</span><span class="p">)</span>
-<span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MLP</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span> <span class="n">AttentionParams</span><span class="p">,</span> <span class="n">ColumnLinear</span><span class="p">,</span>
-                       <span class="n">Embedding</span><span class="p">,</span> <span class="n">KeyValueCacheParams</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">,</span> <span class="n">RowLinear</span><span class="p">)</span>
+                           <span class="n">gather_last_token_logits</span><span class="p">)</span>
+<span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MLP</span><span class="p">,</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span> <span class="n">AttentionParams</span><span class="p">,</span>
+                       <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span> <span class="n">KeyValueCacheParams</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">...mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">...module</span> <span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
-<span class="kn">from</span> <span class="nn">...parameter</span> <span class="kn">import</span> <span class="n">Parameter</span>
-<span class="kn">from</span> <span class="nn">...quantization</span> <span class="kn">import</span> <span class="n">QuantMode</span>
 <span class="kn">from</span> <span class="nn">..generation_mixin</span> <span class="kn">import</span> <span class="n">GenerationMixin</span>
-
-
-<span class="k">class</span> <span class="nc">GPTNeoXAttention</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
-
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                 <span class="n">hidden_size</span><span class="p">,</span>
-                 <span class="n">num_attention_heads</span><span class="p">,</span>
-                 <span class="n">rotary_dim</span><span class="p">,</span>
-                 <span class="n">max_position_embeddings</span><span class="p">,</span>
-                 <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">multi_block_mode</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                 <span class="n">position_embedding_type</span><span class="o">=</span><span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">rope_gpt_neox</span><span class="p">,</span>
-                 <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
-                 <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
-        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span> <span class="o">=</span> <span class="n">hidden_size</span> <span class="o">//</span> <span class="n">num_attention_heads</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">=</span> <span class="n">num_attention_heads</span> <span class="o">//</span> <span class="n">tp_size</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span> <span class="o">=</span> <span class="n">max_position_embeddings</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">rotary_dim</span> <span class="o">=</span> <span class="n">rotary_dim</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span> <span class="o">=</span> <span class="n">position_embedding_type</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">multi_block_mode</span> <span class="o">=</span> <span class="n">multi_block_mode</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">multi_query_mode</span> <span class="o">=</span> <span class="kc">False</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span> <span class="o">=</span> <span class="n">quant_mode</span>
-
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_int8_kv_cache</span><span class="p">():</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">kv_quantization_scale</span> <span class="o">=</span> <span class="n">Parameter</span><span class="p">(</span><span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">kv_dequantization_scale</span> <span class="o">=</span> <span class="n">Parameter</span><span class="p">(</span><span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="p">),</span>
-                                                     <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">register_parameter</span><span class="p">(</span><span class="s1">&#39;kv_quantization_scale&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">register_parameter</span><span class="p">(</span><span class="s1">&#39;kv_dequantization_scale&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span> <span class="o">=</span> <span class="n">ColumnLinear</span><span class="p">(</span><span class="n">in_features</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
-                                <span class="n">out_features</span><span class="o">=</span><span class="n">hidden_size</span> <span class="o">*</span> <span class="mi">3</span><span class="p">,</span>
-                                <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                                <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
-                                <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
-                                <span class="n">gather_output</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">dense</span> <span class="o">=</span> <span class="n">RowLinear</span><span class="p">(</span><span class="n">in_features</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
-                               <span class="n">out_features</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
-                               <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                               <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-                               <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
-                               <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">)</span>
-
-    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-                <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="s1">&#39;GPT-NeoX RoPE is only supported with GPTAttention plugin&#39;</span><span class="p">)</span>
-        <span class="n">qkv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
-
-        <span class="k">assert</span> <span class="n">attention_params</span><span class="o">.</span><span class="n">is_valid</span><span class="p">(</span>
-            <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span><span class="p">,</span>
-            <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">)</span>
-        <span class="k">assert</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">is_valid</span><span class="p">(</span>
-            <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span><span class="p">)</span>
-
-        <span class="n">context</span><span class="p">,</span> <span class="n">past_key_value</span> <span class="o">=</span> <span class="n">gpt_attention</span><span class="p">(</span>
-            <span class="n">tensor</span><span class="o">=</span><span class="n">qkv</span><span class="p">,</span>
-            <span class="n">past_key_value</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span><span class="n">get_first_past_key_value</span><span class="p">(),</span>
-            <span class="n">sequence_length</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">sequence_length</span><span class="p">,</span>
-            <span class="n">host_past_key_value_lengths</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
-            <span class="n">host_past_key_value_lengths</span><span class="p">,</span>
-            <span class="n">context_lengths</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">context_lengths</span><span class="p">,</span>
-            <span class="n">cache_indirection</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span><span class="n">cache_indirection</span><span class="p">,</span>
-            <span class="n">host_request_types</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">host_request_types</span><span class="p">,</span>
-            <span class="n">num_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
-            <span class="n">num_kv_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
-            <span class="n">hidden_size_per_head</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">,</span>
-            <span class="n">q_scaling</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
-            <span class="n">rotary_embedding_dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rotary_dim</span><span class="p">,</span>
-            <span class="n">position_embedding_type</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span><span class="p">,</span>
-            <span class="n">multi_block_mode</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">multi_block_mode</span><span class="p">,</span>
-            <span class="n">kv_orig_quant_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_quantization_scale</span><span class="p">,</span>
-            <span class="n">kv_quant_orig_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_dequantization_scale</span><span class="p">,</span>
-            <span class="n">kv_cache_quant_mode</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">,</span>
-            <span class="n">max_context_length</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">max_context_length</span><span class="p">,</span>
-            <span class="n">host_context_lengths</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">host_context_lengths</span><span class="p">)</span>
-
-        <span class="n">context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense</span><span class="p">(</span><span class="n">context</span><span class="p">)</span>
-
-        <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
-            <span class="k">return</span> <span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="n">past_key_value</span><span class="p">)</span>
-
-        <span class="k">return</span> <span class="n">context</span>
 
 
 <span class="k">class</span> <span class="nc">GPTNeoXDecoderLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
@@ -234,13 +142,16 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">post_attention_layernorm</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
                                                   <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">attention</span> <span class="o">=</span> <span class="n">GPTNeoXAttention</span><span class="p">(</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">attention</span> <span class="o">=</span> <span class="n">Attention</span><span class="p">(</span>
             <span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
             <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">num_attention_heads</span><span class="p">,</span>
-            <span class="n">rotary_dim</span><span class="o">=</span><span class="n">rotary_dim</span><span class="p">,</span>
+            <span class="n">rotary_embedding_percentage</span><span class="o">=</span><span class="n">rotary_dim</span> <span class="o">/</span>
+            <span class="p">(</span><span class="n">hidden_size</span> <span class="o">//</span> <span class="n">num_attention_heads</span><span class="p">),</span>
+            <span class="n">position_embedding_type</span><span class="o">=</span><span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">rope_gpt_neox</span><span class="p">,</span>
             <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">max_position_embeddings</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-            <span class="n">position_embedding_type</span><span class="o">=</span><span class="n">position_embedding_type</span><span class="p">,</span>
+            <span class="n">attention_mask_type</span><span class="o">=</span><span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span>
+            <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
             <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
             <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">)</span>
 
@@ -272,7 +183,8 @@
                                           <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
                                           <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
                                           <span class="n">kv_cache_params</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="p">,</span>
-                                          <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">)</span>
+                                          <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">,</span>
+                                          <span class="n">norm_before_bmm1</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="n">attention_output</span><span class="p">,</span> <span class="n">presents</span> <span class="o">=</span> <span class="n">attention_output</span>
@@ -284,7 +196,9 @@
         <span class="k">return</span> <span class="n">hidden_states</span>
 
 
-<div class="viewcode-block" id="GPTNeoXModel"><a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTNeoXModel">[docs]</a><span class="k">class</span> <span class="nc">GPTNeoXModel</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<div class="viewcode-block" id="GPTNeoXModel">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTNeoXModel">[docs]</a>
+<span class="k">class</span> <span class="nc">GPTNeoXModel</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">num_layers</span><span class="p">,</span>
@@ -328,7 +242,9 @@
 
         <span class="bp">self</span><span class="o">.</span><span class="n">ln_f</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
-<div class="viewcode-block" id="GPTNeoXModel.forward"><a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTNeoXModel.forward">[docs]</a>    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+<div class="viewcode-block" id="GPTNeoXModel.forward">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTNeoXModel.forward">[docs]</a>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">input_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -336,13 +252,14 @@
                 <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">past_key_value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">past_key_value</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">([</span><span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">))</span>
+        <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">fill_none_tensor_list</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">))</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="n">presents</span> <span class="o">=</span> <span class="p">[]</span>
 
-        <span class="k">for</span> <span class="n">layer</span><span class="p">,</span> <span class="n">past</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">,</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">past_key_value</span><span class="p">):</span>
+        <span class="k">for</span> <span class="n">layer</span><span class="p">,</span> <span class="n">past</span><span class="p">,</span> <span class="n">max_kv_cache_length</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">,</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">past_key_value</span><span class="p">,</span>
+                <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">host_max_kv_cache_lengths</span><span class="p">):</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">layer</span><span class="p">(</span>
                 <span class="n">hidden_states</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
@@ -350,6 +267,7 @@
                     <span class="n">past_key_value</span><span class="o">=</span><span class="p">[</span><span class="n">past</span><span class="p">],</span>
                     <span class="n">host_past_key_value_lengths</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
                     <span class="n">host_past_key_value_lengths</span><span class="p">,</span>
+                    <span class="n">host_max_kv_cache_lengths</span><span class="o">=</span><span class="n">max_kv_cache_length</span><span class="p">,</span>
                     <span class="n">cache_indirection</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span><span class="n">cache_indirection</span><span class="p">),</span>
                 <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">)</span>
 
@@ -361,10 +279,14 @@
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">presents</span><span class="p">))</span>
-        <span class="k">return</span> <span class="n">hidden_states</span></div></div>
+        <span class="k">return</span> <span class="n">hidden_states</span></div>
+</div>
 
 
-<div class="viewcode-block" id="GPTNeoXForCausalLM"><a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTNeoXForCausalLM">[docs]</a><span class="k">class</span> <span class="nc">GPTNeoXForCausalLM</span><span class="p">(</span><span class="n">GPTNeoXModel</span><span class="p">,</span> <span class="n">GenerationMixin</span><span class="p">):</span>
+
+<div class="viewcode-block" id="GPTNeoXForCausalLM">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTNeoXForCausalLM">[docs]</a>
+<span class="k">class</span> <span class="nc">GPTNeoXForCausalLM</span><span class="p">(</span><span class="n">GPTNeoXModel</span><span class="p">,</span> <span class="n">GenerationMixin</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">num_layers</span><span class="p">,</span>
@@ -417,7 +339,9 @@
                                     <span class="n">tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
                                     <span class="n">gather_output</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
-<div class="viewcode-block" id="GPTNeoXForCausalLM.forward"><a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTNeoXForCausalLM.forward">[docs]</a>    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+<div class="viewcode-block" id="GPTNeoXForCausalLM.forward">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTNeoXForCausalLM.forward">[docs]</a>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">input_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -445,7 +369,10 @@
 
         <span class="k">return</span> <span class="n">lm_logits</span></div>
 
-<div class="viewcode-block" id="GPTNeoXForCausalLM.prepare_inputs"><a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTNeoXForCausalLM.prepare_inputs">[docs]</a>    <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">max_batch_size</span><span class="p">,</span> <span class="n">max_input_len</span><span class="p">,</span> <span class="n">max_new_tokens</span><span class="p">,</span>
+
+<div class="viewcode-block" id="GPTNeoXForCausalLM.prepare_inputs">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTNeoXForCausalLM.prepare_inputs">[docs]</a>
+    <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">max_batch_size</span><span class="p">,</span> <span class="n">max_input_len</span><span class="p">,</span> <span class="n">max_new_tokens</span><span class="p">,</span>
                        <span class="n">use_cache</span><span class="p">,</span> <span class="n">max_beam_width</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the</span>
 <span class="sd">            ranges of the dimensions of when using TRT dynamic shapes.</span>
@@ -480,6 +407,8 @@
                     <span class="n">past_key_value</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;past_key_value&#39;</span><span class="p">],</span>
                     <span class="n">host_past_key_value_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
                         <span class="s1">&#39;host_past_key_value_lengths&#39;</span><span class="p">],</span>
+                    <span class="n">host_max_kv_cache_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
+                        <span class="s1">&#39;host_max_kv_cache_lengths&#39;</span><span class="p">],</span>
                     <span class="n">cache_indirection</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;cache_indirection&#39;</span><span class="p">],</span>
                 <span class="p">),</span>
                 <span class="n">AttentionParams</span><span class="p">(</span>
@@ -487,7 +416,9 @@
                     <span class="n">context_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;context_lengths&#39;</span><span class="p">],</span>
                     <span class="n">host_context_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;host_context_lengths&#39;</span><span class="p">],</span>
                     <span class="n">max_context_length</span><span class="o">=</span><span class="n">max_input_len</span><span class="p">,</span>
-                    <span class="n">host_request_types</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;host_request_types&#39;</span><span class="p">]))</span></div></div>
+                    <span class="n">host_request_types</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;host_request_types&#39;</span><span class="p">]))</span></div>
+</div>
+
 </pre></div>
 
            </div>
