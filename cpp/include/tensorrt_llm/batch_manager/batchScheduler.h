@@ -46,7 +46,7 @@ public:
     {
     }
 
-    /// @brief Takes as input a sorted list of requets and outputs a sorted lists of requests
+    /// @brief Takes as input a sorted list of requests and outputs a sorted lists of requests
     ///        to update for this current iteration, and a map of requests to terminate
     std::tuple<RequestList, RequestTable> scheduleRequests(const RequestList& requestList);
 
