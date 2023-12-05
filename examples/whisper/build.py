@@ -82,7 +82,7 @@ def parse_arguments(args, component):
     parser.add_argument('--engine_name',
                         '-n',
                         type=str,
-                        default='enc_dec',
+                        default='whisper_tiny',
                         help='TensorRT engine name prefix')
     
     parser.add_argument(
@@ -360,7 +360,6 @@ def build_rank_engine(builder: Builder,
                 args.max_output_len,
                 args.max_encoder_input_len,
             )
-
         tllm_model(*inputs)
 
         # Adding debug outputs into the network --------------------------
@@ -371,6 +370,7 @@ def build_rank_engine(builder: Builder,
 
     # Network -> Engine
     engine = builder.build_engine(network, builder_config)
+    print(engine)
     if rank == 0:
         config_path = args.output_dir / args.component / 'config.json'
         builder.save_config(builder_config, config_path)
@@ -415,6 +415,7 @@ def build(rank, args):
             cross_attention=(args.component == 'decoder'),
             has_position_embedding=args.has_position_embedding,
             has_token_type_embedding=args.has_token_type_embedding,
+            strongly_typed=args.strongly_typed,
         )
 
         engine_name = get_engine_name(args.engine_name, args.dtype,

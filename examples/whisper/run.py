@@ -82,7 +82,7 @@ def read_config(config_path: Path):
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--max_new_tokens", type=int, default=200)
+    parser.add_argument("--max_new_tokens", type=int, default=50)
     parser.add_argument('--max_kv_cache_length',
                         type=int,
                         default=None,
@@ -377,8 +377,8 @@ if __name__ == "__main__":
 
     # start_id for decoder (could add more input_ids as forced_decoder_ids)
     decoder_input_ids = torch.IntTensor([[
-        model_config.forced_decoder_ids[0][0],
-        model_config.forced_decoder_ids[0][1],
+        # model_config.forced_decoder_ids[0][0],
+        # model_config.forced_decoder_ids[0][1],
         model_config.decoder_start_token_id]]).to('cuda')
 
     # decoder_input_ids = decoder_input_ids.repeat((input_ids.shape[0], 1))
@@ -440,8 +440,7 @@ if __name__ == "__main__":
 
     if tensorrt_llm.mpi_rank() == 0:
         output_ids = tllm_output_ids[:, 0, :]
-        output_text = tokenizer.batch_decode(output_ids,
-                                             skip_special_tokens=True)
+        output_text = tokenizer.batch_decode(output_ids)
         decoder_input_lengths = (decoder_input_ids !=
                                  tokenizer.pad_token_id).sum(dim=1)
         output_gen_lengths = (output_ids != tokenizer.eos_token_id).sum(
@@ -458,7 +457,7 @@ if __name__ == "__main__":
         # only encoder test
         print("--------------------------------------")
         # print(encoder_output['encoder_output'].shape)
-        # print(encoder_output['encoder_output'][0,0,:5])
+        print(encoder_output[0,0,-5:])
         print("--------------------------------------")
 
         # simple accuracy check

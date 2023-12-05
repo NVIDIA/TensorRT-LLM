@@ -1,3 +1,4 @@
+import os
 import configparser
 
 import numpy as np
@@ -102,7 +103,7 @@ def load_whisper_from_pytorch(tllm_model,
     if not multilingual:
         model_name = model_name + ".en"
 
-    pytorch_ckpt = torch.load(pytorch_ckpt_path + f"{model_name}.ckpt")
+    pytorch_ckpt = torch.load(os.path.join(pytorch_ckpt_path, f"{model_name}.ckpt"))
     pytorch_model = {
         key: torch_to_numpy(value.to(torch_dtype))
         for key, value in pytorch_ckpt.items()
@@ -132,7 +133,7 @@ def load_whisper_from_pytorch(tllm_model,
             # if tllm_model.has_attention_qkvo_bias:
             layer.attention.qkv.bias.value = fuse_qkv(
                 pytorch_model[f'{layer_prefix}self_attn.q_proj.bias'],
-                torch.zeros(pytorch_model[f'{layer_prefix}self_attn.q_proj.bias'].shape), # no bias for k
+                np.zeros(pytorch_model[f'{layer_prefix}self_attn.q_proj.bias'].shape, dtype=dtype), # no bias for k
                 pytorch_model[f'{layer_prefix}self_attn.v_proj.bias']
             )
             layer.attention.dense.bias.value = pytorch_model[
@@ -194,8 +195,8 @@ def load_whisper_from_pytorch(tllm_model,
                 layer.self_attention.qkv.bias.value = fuse_qkv(
                     pytorch_model[
                         f'{layer_prefix}self_attn.q_proj.bias'],
-                    torch.zeros(
-                        pytorch_model[f'{layer_prefix}self_attn.q_proj.bias'].shape),
+                    np.zeros(pytorch_model[
+                        f'{layer_prefix}self_attn.q_proj.bias'].shape, dtype=np.float16),
                     pytorch_model[
                         f'{layer_prefix}self_attn.v_proj.bias']
                 )
@@ -224,8 +225,8 @@ def load_whisper_from_pytorch(tllm_model,
                 layer.cross_attention.qkv.bias.value = fuse_qkv(
                     pytorch_model[
                         f'{layer_prefix}encoder_attn.q_proj.bias'],
-                    torch.zeros(pytorch_model[
-                        f'{layer_prefix}encoder_attn.q_proj.bias'].shape),
+                    np.zeros(pytorch_model[
+                        f'{layer_prefix}encoder_attn.q_proj.bias'].shape, dtype=np.float16),
                     pytorch_model[
                         f'{layer_prefix}encoder_attn.v_proj.bias'])
                 layer.cross_attention.dense.bias.value = pytorch_model[
