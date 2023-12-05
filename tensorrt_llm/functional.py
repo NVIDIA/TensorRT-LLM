@@ -1749,6 +1749,67 @@ def concat(inputs: Sequence[Union[Tensor, int]], dim: int = 0) -> Tensor:
     return _create_tensor(layer.get_output(0), layer)
 
 
+def padding_nd(input: Tensor, pre_padding: Union[List, Tuple], post_padding: Union[List, Tuple]) -> Tensor:
+    '''
+    Add an operation to pad a tensor.
+    
+    The function creates an operation that pad the tensor 'inputs'. 
+    The padding numbers are defined in 'pre_padding' and 'post_padding'.
+    
+    The `pre_padding` and 'post_padding' must have the same length.
+
+    The shape of the output tensor is defined as:
+
+        for ii in range(input.rank()):
+            if ii < len(pre_padding):
+                output.shape[ii] = shape(input, i)
+            else:
+                jj = ii + len(pre_padding) - input.rank()
+                output.shape[ii] = shape(input, ii) + pre_padding[jj] + post_padding[jj]
+
+    For example, given a tensor [[[[-3.0, -2.0, -1.0, 10.0, -25.0], [-4.0, -9.0, -1.0, 10.0, -25.0], [0.0, 1.0, 2.0, -2.0, -1.0]]]]
+    of shape [1, 1, 3, 5], with pre_padding = [-1, 3], post_padding = [3, -2], will produce the following tensor with shape [1, 1, 5, 6].
+
+    [
+        [
+            [
+                [0.0, 0.0, 0.0, -4.0, -9.0, -1.0],
+                [0.0, 0.0, 0.0, 0.0, 1.0, 2.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ]
+        ]
+    ]
+
+    Parameters:
+        input : Tensor
+            The tensor to be padded.
+
+        pre_padding : Union[List, Tuple]
+            the amount of pre-padding to use for each dimension. If positive, the tensor is pad with zeros, otherwise, it's trimmed.
+            
+        post_padding : Union[List, Tuple]
+            the amount of post-padding to use for each dimension. If positive, the tensor is pad with zeros, otherwise, it's trimmed.
+
+    Returns:
+        A tensor that is padded.
+    '''
+    assert len(pre_padding) == len(post_padding)
+    assert input.rank() >= len(pre_padding)
+    new_shape = []
+    for i in range(input.rank()):
+        if i < len(pre_padding):
+            new_shape.append(shape(input, i))
+        else:
+            j = i + len(pre_padding) - input.rank()
+            new_dim = shape(input, i) + pre_padding[j] + post_padding[j]
+            new_shape.append(new_dim)
+
+    layer = default_trtnet().add_padding(input.trt_tensor, pre_padding, post_padding)
+    return _create_tensor(layer.get_output(0), layer).view(concat(new_shape))
+
+
 def softmax(input: Tensor, dim: Optional[int] = None) -> Tensor:
     '''
     Add an operation to compute softmax on a tensor.

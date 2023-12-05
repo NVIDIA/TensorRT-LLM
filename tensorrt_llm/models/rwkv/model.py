@@ -22,7 +22,7 @@ from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt, trt_dtype_to_np
 from ...functional import (gather_last_token_logits, recv, send, select, pow, repeat_interleave, 
                            layer_norm, group_norm, cast, matmul, slice, arange, concat,
-                           silu, sigmoid, squared_relu, constant, Tensor)
+                           silu, sigmoid, squared_relu, constant, padding_nd, Tensor)
 from ...layers import (Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
                        PositionEmbeddingType, RmsNorm, PromptTuningEmbedding)
@@ -90,26 +90,47 @@ class RwkvSelfAttentionLayer(Module):
         print(self.t_decay._value)
         print(self.t_decay._value.__class__)
         
-        kv = matmul(k.transpose(-2, -1).view((H, T, S, 1)), v.view(H, T, 1, S))
+        kv = matmul(k.transpose(-2, -1).view((H, T, S, 1)), v.view((H, T, 1, S)))
+        print("kv shape: ", kv.shape)
         w = self.t_decay.value.view((H, S, 1))
+        print("w shape: ", w.shape)
         ws = pow(w, T)
-        ind = arange(T-1, -1, self.dtype).view(1, 1, T)
+        print("ws shape: ", ws.shape)
+        ind = arange(T-1, -1, self.dtype).view((1, 1, T))
+        print("ind shape: ", ind.shape)
         w = pow(repeat_interleave(w, T, 2), ind)
+        print("w shape: ", w.shape)
         wk = w.view((H, S, T))
+        print("wk shape: ", wk.shape)
         u = self.t_first.value.view((H, S, 1))
-        w = concat([slice(w, [0, 0, 1], [w.size(0), w.size(1), w.size(2) - 1])], dim=2)
-        w = 
+        print("u shape: ", u.shape)
+        w = concat([slice(w, [0, 0, 1], [w.size(0), w.size(1), w.size(2) - 1]), u], dim=2)
+        print("w shape: ", w.shape)
+        w = padding_nd(w, [0], [T])
+        print("w shape: ", w.shape)
+        w = repeat_interleave(w, T, dim=2)
+        print("w shape: ", w.shape)
+        w = slice(w, [0, 0, 0], [w.size(0), w.size(1), 2 * T - 1]).view((H, S, T, 2 * T - 1))
+        print("w shape: ", w.shape)
+        w = slice(w, [0, 0, 0, T - 1], [w.size(0), w.size(1), w.size(2), T]).view(H, S, 1, T, T)
+        print("w shape: ", w.shape)
+        w = repeat_interleave(w, S, dim=2).view((H * S * S, T, T)).transpose(1, 2)
+        print("w shape: ", w.shape) 
         
+        kv = kv.transpose(1, 2).transpose(2, 3).view((H * S, 1, T))
+        out = matmul(kv, w).view((H * S * S, T)).transpose(0, 1).view((T, H, S, S))
+        out = matmul(r.transpose(0, 1).view(T, H, 1, S), out).view((T, H, S))
+        s = ws * s + matmul(k * wk, v)
         
-        # TODO(Rinne): this loop will impact on the performance, needs to be replaced by cuda kernel.
-        out = (r + constant_one).view((T, H, S))
-        for t in range(T):
-            rt = r[:,t:t+1,:]
-            kt = k[:,:,t:t+1]
-            vt = v[:,t:t+1,:]
-            at = matmul(kt, vt)
-            out[t] = matmul(rt, (cast(self.t_first.value, self.dtype) * at + s)).view((H, S))
-            s = at + self.t_decay.value * s
+        # # TODO(Rinne): this loop will impact on the performance, needs to be replaced by cuda kernel.
+        # out = (r + constant_one).view((T, H, S))
+        # for t in range(T):
+        #     rt = r[:,t:t+1,:]
+        #     kt = k[:,:,t:t+1]
+        #     vt = v[:,t:t+1,:]
+        #     at = matmul(kt, vt)
+        #     out[t] = matmul(rt, (cast(self.t_first.value, self.dtype) * at + s)).view((H, S))
+        #     s = at + self.t_decay.value * s
             
         out = out.view((T, H * S))
         out = group_norm(out, num_groups=H, weight=self.lx_w.value, bias=self.lx_b.value)
