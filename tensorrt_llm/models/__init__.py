@@ -23,6 +23,7 @@ from .gptneox.model import GPTNeoXForCausalLM, GPTNeoXModel
 from .internlm.model import InternLMForCausalLM, InternLMModel
 from .llama.model import LLaMAForCausalLM, LLaMAModel
 from .opt.model import OPTLMHeadModel, OPTModel
+from .rwkv.model import RwkvModel, RwkvForCausalLM
 from .quantized.quant import quantize_model  # noqa
 
 __all__ = [
@@ -48,4 +49,6 @@ __all__ = [
     'BaichuanForCausalLM',
     'InternLMForCausalLM',
     'InternLMModel',
+    'RwkvModel', 
+    'RwkvForCausalLM'
 ]

@@ -32,7 +32,7 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 
-from weight import load_from_hf_rwkv, load_from_bin, parse_config, check_embedding_share  # isort:skip
+from weight import load_from_hf_rwkv, check_embedding_share  # isort:skip
 
 MODEL_NAME = "rwkv"
 
@@ -118,8 +118,11 @@ def parse_arguments():
     parser.add_argument('--vocab_size', type=int, default=250680)
     parser.add_argument('--n_layer', type=int, default=32)
     parser.add_argument('--n_positions', type=int, default=2048)
-    parser.add_argument('--n_embd', type=int, default=4096)
+    parser.add_argument('--n_embd', type=int, default=2048)
     parser.add_argument('--n_head', type=int, default=32)
+    parser.add_argument('--dim_att', type=int, default=2048)
+    parser.add_argument('--dim_ffn', type=int, default=7168)
+    parser.add_argument('--rescale_layer', type=int, default=6)
     parser.add_argument('--mlp_hidden_size', type=int, default=None)
     parser.add_argument('--max_batch_size', type=int, default=8)
     parser.add_argument('--max_input_len', type=int, default=1024)
@@ -268,17 +271,14 @@ def parse_arguments():
     if args.model_dir is not None:
         hf_config = Rwkv5Config.from_pretrained(args.model_dir)
         args.n_embd = hf_config.hidden_size
-        args.n_head = hf_config.num_attention_heads
+        args.n_head = int(args.dim_att / hf_config.head_size)
         args.n_layer = hf_config.num_hidden_layers
         args.vocab_size = hf_config.vocab_size
+        if args.dtype == 'float16' and args.rescale_layer == 0:
+            args.rescale_layer = hf_config.rescale_every
     elif args.bin_model_dir is not None:
-        logger.info(f"Setting model configuration from {args.bin_model_dir}.")
-        n_embd, n_head, n_layer, vocab_size, _, rotary_pct, bias, inter_size, multi_query_mode, dtype, prompt_num_tasks, prompt_max_vocab_size = parse_config(
-            Path(args.bin_model_dir) / "config.ini")
-        args.n_embd = n_embd
-        args.n_head = n_head
-        args.n_layer = n_layer
-        args.vocab_size = vocab_size
+        # TODO(Rinne): implement it
+        raise NotImplementedError
 
     assert not (
         args.use_smooth_quant and args.use_weight_only
@@ -332,19 +332,22 @@ def build_rank_engine(builder: Builder,
             'Engine will share embedding and language modeling weights.')
         
     # Initialize Module
-    tensorrt_llm_rwkv = tensorrt_llm.models.RWKV5ForCausalLM(
+    tensorrt_llm_rwkv = tensorrt_llm.models.RwkvForCausalLM(
         num_layers=args.n_layer,
-        num_heads=args.n_head,
+        num_head=args.n_head,
         hidden_size=args.n_embd,
+        dim_att=args.dim_att,
+        dim_ffn=args.dim_ffn, 
+        rescale_layer=args.rescale_layer,
         vocab_size=args.vocab_size,
-        max_position_embeddings=args.n_positions,
+        # max_position_embeddings=args.n_positions,
         dtype=kv_dtype,
         mapping=Mapping(world_size=args.world_size,
                         rank=rank,
                         tp_size=args.world_size),  # TP only
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
-        share_embedding_table=share_embedding_table,
+        # share_embedding_table=share_embedding_table,
         quant_mode=args.quant_mode)
     if args.use_weight_only or args.use_smooth_quant:
         tensorrt_llm_rwkv = quantize_model(tensorrt_llm_rwkv, args.quant_mode)
@@ -356,7 +359,7 @@ def build_rank_engine(builder: Builder,
                                                     torch_dtype="auto")
         tok = time.time()
         t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-        logger.info(f'HF BLOOM loaded. Total time: {t}')
+        logger.info(f'HF RWKV loaded. Total time: {t}')
         print(hf_rwkv)
         load_from_hf_rwkv(tensorrt_llm_rwkv, 
                           hf_rwkv, 

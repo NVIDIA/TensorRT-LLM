@@ -24,10 +24,25 @@ from tensorrt_llm._utils import str_dtype_to_np
 from tensorrt_llm.models import BloomForCausalLM
 from tensorrt_llm.quantization import QuantMode
 
+
+def check_embedding_share(dir_path):
+    share_embedding_table = False
+    if Path(dir_path).exists():
+        share_embedding_table = True
+    return share_embedding_table
+
+
 def get_att_time_mix_params(config, prefix, dtype):
-    names = ['time_decay', 'time_faaaa', 'time_mix_gate', 
-             'time_mix_key', 'time_mix_value', 'time_mix_receptance']
-    return [config[prefix + name].to(dtype).detach().cpu().numpy() for name in names]
+    names = {
+        'time_decay': torch.float32,
+        'time_faaaa': torch.float32, 
+        'time_mix_gate': dtype, 
+        'time_mix_key': dtype, 
+        'time_mix_value': dtype, 
+        'time_mix_receptance': dtype
+    }
+    return [config[prefix + name].to(type).detach().cpu().numpy() for name, type in names.items()]
+
 
 def get_ffn_time_mix_params(config, prefix, dtype):
     names = ['time_mix_key', 'time_mix_receptance']
@@ -90,13 +105,13 @@ def load_from_hf_rwkv(tensorrt_llm_rwkv,
         att_g = get_weight(model_params, prefix + 'gate', dtype)
         att_o = get_weight(model_params, prefix + 'output', dtype)
         lx_weight, lx_bias = get_weight_and_bias(
-            model_params, prefix + 'ln_x', dtype)
+            model_params, prefix + 'ln_x', torch.float32)
         tensorrt_llm_rwkv.layers[l].attention.t_decay.value = time_decay
         tensorrt_llm_rwkv.layers[l].attention.t_first.value = time_first
-        tensorrt_llm_rwkv.layers[l].attention.g_mix.value = time_mix_g
-        tensorrt_llm_rwkv.layers[l].attention.k_mix.value = time_mix_k
-        tensorrt_llm_rwkv.layers[l].attention.v_mix.value = time_mix_v
-        tensorrt_llm_rwkv.layers[l].attention.r_mix.value = time_mix_r
+        tensorrt_llm_rwkv.layers[l].attention.g_mix.value = time_mix_g.squeeze()
+        tensorrt_llm_rwkv.layers[l].attention.k_mix.value = time_mix_k.squeeze()
+        tensorrt_llm_rwkv.layers[l].attention.v_mix.value = time_mix_v.squeeze()
+        tensorrt_llm_rwkv.layers[l].attention.r_mix.value = time_mix_r.squeeze()
         # TODO(Rinne): deal with tensor parallel
         tensorrt_llm_rwkv.layers[l].attention.kxw.weight.value = att_k
         tensorrt_llm_rwkv.layers[l].attention.vxw.weight.value = att_v
@@ -112,8 +127,10 @@ def load_from_hf_rwkv(tensorrt_llm_rwkv,
         ffn_k = get_weight(model_params, prefix + 'key', dtype)
         ffn_r = get_weight(model_params, prefix + 'receptance', dtype)
         ffn_v = get_weight(model_params, prefix + 'value', dtype)
-        tensorrt_llm_rwkv.layers[l].feed_forward.kxw.weight.value = ffn_k
-        tensorrt_llm_rwkv.layers[l].feed_forward.rxw.weight.value = ffn_r
+        tensorrt_llm_rwkv.layers[l].feed_forward.k_mix.value = time_mix_k.squeeze()
+        tensorrt_llm_rwkv.layers[l].feed_forward.r_mix.value = time_mix_r.squeeze()
+        tensorrt_llm_rwkv.layers[l].feed_forward.kxw.weight.value = ffn_k.squeeze()
+        tensorrt_llm_rwkv.layers[l].feed_forward.rxw.weight.value = ffn_r.squeeze()
         tensorrt_llm_rwkv.layers[l].feed_forward.vxw.weight.value = ffn_v
         
     # get weights for model output processing
@@ -130,7 +147,7 @@ def load_from_hf_rwkv(tensorrt_llm_rwkv,
         # TODO(Rinne): deal with tp
         tensorrt_llm_rwkv.lm_head.weight.value = embed_w.copy()
     
-    tensorrt_llm_rwkv.embedding.weight.value = embed_w
+    tensorrt_llm_rwkv.vocab_embedding.weight.value = embed_w
     
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
