@@ -16,6 +16,7 @@ from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 
 from build import get_engine_name  # isort:skip
 
+from wmt.weight import create_position_id
 
 def print_tensor(tensor_name, tensor, num_elements=10):
     print(
@@ -46,6 +47,7 @@ def read_config(config_path: Path):
     vocab_size = config["builder_config"]["vocab_size"]
     num_layers = config["builder_config"]["num_layers"]
     num_kv_heads = config['builder_config'].get('num_kv_heads', num_heads)
+    residual_scaling = config['builder_config']['residual_scaling']
 
     assert (num_heads % tp_size) == 0
     num_heads = num_heads // tp_size
@@ -249,6 +251,10 @@ class TRTLLMEncDecModel:
                 dtype=hidden_states_dtype('hidden_states_output'),
                 device=self.device).contiguous()
 
+        # TRT session run
+        # Note: runtime.Session's run() method will set input/output tensor address, here we only need to provide tensor shape
+        self.encoder_session.set_shapes(inputs)
+       
         # -------------------------------------------
         if debug_mode:
             engine = self.encoder_session.engine
@@ -267,9 +273,6 @@ class TRTLLMEncDecModel:
                     context.set_tensor_address(name, outputs[name].data_ptr())
         # -------------------------------------------
 
-        # TRT session run
-        # Note: runtime.Session's run() method will set input/output tensor address, here we only need to provide tensor shape
-        self.encoder_session.set_shapes(inputs)
         ok = self.encoder_session.run(inputs, outputs, self.stream)
         assert ok, "Runtime execution failed"
         torch.cuda.synchronize()
@@ -331,9 +334,16 @@ class TRTLLMEncDecModel:
         encoder_input_ids, encoder_input_lengths, encoder_max_input_length = self.process_input(
             encoder_input_ids, self.encoder_model_config.remove_input_padding,
             pad_token_id)
+        
+        if self.encoder_model_config.has_position_embedding:
+            encoder_position_ids = create_position_id(encoder_input_ids).to(self.device)
+        else:
+            encoder_position_ids = None
+        
         encoder_output = self.encoder_run(encoder_input_ids,
                                           encoder_input_lengths,
                                           encoder_max_input_length,
+                                          position_ids = encoder_position_ids,
                                           debug_mode=debug_mode)
 
         ## decoder run
@@ -377,40 +387,52 @@ if __name__ == "__main__":
     args = parse_arguments()
     logger.set_level(args.log_level)
 
-    test_remove_padding = True
-    if not test_remove_padding:
-        input_text = "translate English to German: The house is wonderful, radiating timeless charm and offering a warm, inviting interior with beautiful details and a serene backyard."
-    else:
-        input_text = [
-            "translate English to German: The house is wonderful.",
-            "summarize: I am a high-performance inference optimizer and runtime.",
-            "During its construction, the Eiffel Tower surpassed the Washington Monument to become the tallest man-made structure in the world",
-        ]
+    if args.model_name == "t5_small":
+        test_remove_padding = True
+        if not test_remove_padding:
+            input_text = "translate English to German: The house is wonderful, radiating timeless charm and offering a warm, inviting interior with beautiful details and a serene backyard."
+        else:
+            input_text = [
+                "translate English to German: The house is wonderful.",
+                "summarize: I am a high-performance inference optimizer and runtime.",
+                "During its construction, the Eiffel Tower surpassed the Washington Monument to become the tallest man-made structure in the world",
+            ]
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    tokenized_inputs = tokenizer(input_text, return_tensors="pt", padding=True)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        tokenized_inputs = tokenizer(input_text, return_tensors="pt", padding=True)
 
-    max_new_tokens = args.max_new_tokens
-    input_ids = tokenized_inputs.input_ids.type(torch.IntTensor).to(
-        'cuda')  # [batch_size, padded_length]
-    # by default int64, must cast to int32! otherwise C++ kernel will interpret as [a, 0, b, 0, c, 0, ...]
+        max_new_tokens = args.max_new_tokens
+        input_ids = tokenized_inputs.input_ids.type(torch.IntTensor).to(
+            'cuda')  # [batch_size, padded_length]
+        # by default int64, must cast to int32! otherwise C++ kernel will interpret as [a, 0, b, 0, c, 0, ...]
+        if tensorrt_llm.mpi_rank() == 0:
+            print("--------------------------------------")
+            print(
+                f"BOS={tokenizer.bos_token_id}, PAD={tokenizer.pad_token_id}, EOS={tokenizer.eos_token_id}"
+            )
+            print("input text: ", input_text)
+            print("input ids: ", input_ids)
+            print("input lengths: ", tokenized_inputs.attention_mask.sum(dim=1))
+            print("--------------------------------------")
 
-    if tensorrt_llm.mpi_rank() == 0:
-        print("--------------------------------------")
-        print(
-            f"BOS={tokenizer.bos_token_id}, PAD={tokenizer.pad_token_id}, EOS={tokenizer.eos_token_id}"
-        )
-        print("input text: ", input_text)
-        print("input ids: ", input_ids)
-        print("input lengths: ", tokenized_inputs.attention_mask.sum(dim=1))
-        print("--------------------------------------")
+        model_config = AutoConfig.from_pretrained(args.model_name)
 
-    model_config = AutoConfig.from_pretrained(args.model_name)
+        # start_id for decoder (could add more input_ids as forced_decoder_ids)
+        decoder_input_ids = torch.IntTensor([[model_config.decoder_start_token_id]
+                                            ]).to('cuda')
+        decoder_input_ids = decoder_input_ids.repeat((input_ids.shape[0], 1))
 
-    # start_id for decoder (could add more input_ids as forced_decoder_ids)
-    decoder_input_ids = torch.IntTensor([[model_config.decoder_start_token_id]
-                                         ]).to('cuda')
-    decoder_input_ids = decoder_input_ids.repeat((input_ids.shape[0], 1))
+    elif args.model_name == "wmt":
+        # Load an En-Fr Transformer model trained on WMT'14 data :
+        en2fr = torch.hub.load('pytorch/fairseq', 'transformer.wmt14.en-fr', tokenizer='moses', bpe='subword_nmt')
+        en2fr.cuda()
+        en_toks = en2fr.tokenize('Hello world!')
+        en_bpe = en2fr.apply_bpe(en_toks)
+        en_bin = en2fr.binarize(en_bpe)
+        # en_bin.tolist() == [329, 14044, 682, 812, 2]
+        input_ids = torch.tensor([en_bin.to_list()]).type(torch.IntTensor).cuda()  
+        decoder_input_ids = torch.IntTensor([[2]]).cuda()
+        decoder_input_ids = decoder_input_ids.repeat((input_ids.shape[0], 1))
 
     # simple comparison with HF on FP32
     if args.compare_hf_fp32:

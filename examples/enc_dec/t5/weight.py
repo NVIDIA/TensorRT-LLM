@@ -66,6 +66,7 @@ def parse_t5_config(config, component, args):
         args.max_distance = config.getint(component,
                                           'relative_attention_max_distance')
         args.ckpt_weight_dtype = config.get(component, 'weight_data_type')
+        args.residual_scaling = config.getfloat(component, 'residual_scaling', fallback=1.0)
 
     elif component == 'decoder':
         args.n_layer = config.getint(component, 'num_decoder_layers')
@@ -121,7 +122,9 @@ def parse_t5_config(config, component, args):
         args.encoder_num_heads = config.getint('encoder', 'num_heads')
         args.encoder_head_size = config.getint('encoder', 'd_kv')
         args.ckpt_weight_dtype = config.get(component, 'weight_data_type')
-
+        args.residual_scaling = config.getfloat(component, 'residual_scaling', fallback=1.0)
+        args.scale_before_project = config.getboolean(component, 'scale_before_project', fallback=True)
+        
     else:
         assert False, 'Unsupported component!'
 

@@ -14,7 +14,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.network import net_guard
 
 from t5.weight import parse_t5_config, load_from_hf_t5, load_from_binary_t5  # isort:skip
-
+from wmt.weight import load_from_pytorch_wmt
 
 def get_engine_name(model, dtype, tp_size, pp_size, rank):
     if pp_size == 1:
@@ -68,6 +68,10 @@ def parse_arguments(component):
                         type=str,
                         default=None,
                         help='Path to the converted weight file')
+    parser.add_argument('--config',
+                        type=str,
+                        default=None,
+                        help='Path to config.ini')
     parser.add_argument(
         '--output_dir',
         '-o',
@@ -95,10 +99,9 @@ def parse_arguments(component):
         help=
         'The path of to read timing cache from, will be ignored if the file does not exist'
     )
-
     parser.add_argument('--model_type',
                         type=str,
-                        choices=['t5', 'bart'],
+                        choices=['t5', 'bart', 'wmt'],
                         default='t5')
     parser.add_argument(
         '--dtype',
@@ -230,10 +233,15 @@ def parse_arguments(component):
     logger.set_level(args.log_level)
 
     # parse model config and add to args
-    if args.weight_dir is not None:
-        logger.info(f"Setting model configuration from {args.weight_dir}.")
+    if args.config is not None: 
+        logger.info(f"Setting model configuration from {args.config}.")
         args = parse_config(
-            Path(args.weight_dir) / "config.ini", component, args)
+            Path(args.config), component, args)
+    else: 
+        if args.weight_dir is not None:
+            logger.info(f"Setting model configuration from {args.weight_dir}.")
+            args = parse_config(
+                Path(args.weight_dir) / "config.ini", component, args)
 
     assert args.pp_size * args.tp_size == args.world_size
 
@@ -301,6 +309,7 @@ def build_rank_engine(builder: Builder,
             hidden_act=args.hidden_act,
             mlp_type=args.mlp_type,
             dtype=dtype,
+            residual_scaling=args.residual_scaling,
             use_parallel_embedding=args.use_parallel_embedding,
             embedding_sharding_dim=args.embedding_sharding_dim,
             mapping=mapping)
@@ -336,7 +345,9 @@ def build_rank_engine(builder: Builder,
             logits_dtype=args.logits_dtype,
             use_parallel_embedding=args.use_parallel_embedding,
             embedding_sharding_dim=args.embedding_sharding_dim,
-            mapping=mapping)
+            mapping=mapping,
+            residual_scaling=args.residual_scaling,
+            scale_before_project=args.scale_before_project)
 
     # No support for relative attention bias in plain TRT mode. Please use attention plugin
     # (If to add such support, need to add into
@@ -345,18 +356,22 @@ def build_rank_engine(builder: Builder,
         assert args.use_bert_attention_plugin, "Relative attention bias is only supported when using BertAttention Plugin"
         assert args.use_gpt_attention_plugin, "Relative attention bias is only supported when using GPTAttention Plugin"
 
-    if args.weight_from_pytorch_ckpt:
-        assert args.tp_size == 1, "Loading from framework model via memory is for demonstration purpose. For multi-GPU inference, please use loading from binary for better performance."
-        globals()[f'load_from_hf_{args.model_type}'](tllm_model,
-                                                     args.weight_dir,
-                                                     args.component,
-                                                     dtype=args.dtype)
+    if args.model_type == 'wmt':
+        print("Loading weight from pytorch WMT ckpt")
+        load_from_pytorch_wmt(tllm_model, args.weight_dir, args.component, args.n_positions)
     else:
-        globals()[f'load_from_binary_{args.model_type}'](tllm_model,
-                                                         args.weight_dir,
-                                                         args,
-                                                         mapping=mapping,
-                                                         dtype=args.dtype)
+        if args.weight_from_pytorch_ckpt:
+            assert args.tp_size == 1, "Loading from framework model via memory is for demonstration purpose. For multi-GPU inference, please use loading from binary for better performance."
+            globals()[f'load_from_hf_{args.model_type}'](tllm_model,
+                                                        args.weight_dir,
+                                                        args.component,
+                                                        dtype=args.dtype)
+        else:
+            globals()[f'load_from_binary_{args.model_type}'](tllm_model,
+                                                            args.weight_dir,
+                                                            args,
+                                                            mapping=mapping,
+                                                            dtype=args.dtype)
 
     # Module -> Network
     network = builder.create_network()

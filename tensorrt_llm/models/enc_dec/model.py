@@ -61,8 +61,9 @@ class EncDecEmbedding(Module):
             sharding_dim=embedding_sharding_dim,
             tp_rank=mapping.tp_rank)
 
-        self.position_embedding = None
+        
         self.max_position_embeddings = max_position_embeddings
+        # Bugfix: issue from tensorrt_llm/module.py where __setattr__ is lack of the logic to set the attribute to be None first and reset to something else.
         if has_position_embedding:
             self.position_embedding = Embedding(
                 max_position_embeddings,
@@ -72,6 +73,8 @@ class EncDecEmbedding(Module):
                 tp_group=mapping.tp_group if use_parallel_embedding else None,
                 sharding_dim=embedding_sharding_dim,
                 tp_rank=mapping.tp_rank)
+        else:
+            self.position_embedding = None
 
         self.token_type_embedding = None
         if type_vocab_size:
@@ -85,12 +88,13 @@ class EncDecEmbedding(Module):
                 tp_rank=mapping.tp_rank)
 
         # e.g. BART true, T5 false
-        self.embedding_layernorm = None
+        # Bugfix: issue from tensorrt_llm/module.py where __setattr__ is lack of the logic to set the attribute to be None first and reset to something else.
         if has_embedding_layernorm:
             self.embedding_layernorm = ln_type(normalized_shape=hidden_size,
                                                eps=layernorm_eps,
                                                dtype=dtype)
-
+        else:
+            self.embedding_layernorm = None
         # e.g. BART true, T5 false
         self.embedding_scale = 1.0
         if has_embedding_scale:
@@ -111,6 +115,8 @@ class EncDecEmbedding(Module):
         if self.embedding_layernorm:
             x = self.embedding_layernorm(x)
 
+        # output intermediate layer results. 
+        self.register_network_output('embed_layer_output', x)
         return x
 
 
@@ -547,7 +553,7 @@ class EncoderModel(Module, GenerationMixin):
                 max_input_length=max_input_length)
 
         if self.mapping.is_last_pp_rank():
-            if self.final_layernorm:
+            if self.has_final_layernorm:
                 hidden_states = self.final_layernorm(hidden_states)
             hidden_states.mark_output('encoder_output', self._dtype)
         else:
@@ -715,9 +721,11 @@ class DecoderModel(Module, GenerationMixin):
                  residual_scaling=1.0,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
-                 mapping=Mapping()):
+                 mapping=Mapping(),
+                 scale_before_project=True):
         super().__init__()
         self.mapping = mapping
+        self.scale_before_project = scale_before_project
 
         self.has_position_embedding = has_position_embedding
         self.has_token_type_embedding = type_vocab_size is not None
@@ -892,7 +900,8 @@ class DecoderModel(Module, GenerationMixin):
             # See https://github.com/huggingface/transformers/blob/0b192de1f353b0e04dad4813e02e2c672de077be/src/transformers/models/t5/modeling_t5.py#L1769-L1772
             # Note: this is specific for T5, to make it more generic, one can pass in a config:
             #   self.config.tie_word_embeddings - default to be True for T5
-            hidden_states = hidden_states * (self.hidden_size**-0.5)
+            if self.scale_before_project:
+                hidden_states = hidden_states * (self.hidden_size**-0.5)
 
             # [bs, hidden_size] -> [bs, vocab_size]
             lm_logits = self.lm_head(hidden_states)
@@ -977,6 +986,8 @@ class DecoderModel(Module, GenerationMixin):
         past_key_value = []
         sequence_length = None
         host_past_key_value_lengths = None
+        # Bug fix for building engine w/o gpt-plugin
+        host_max_kv_cache_lengths = None
         attention_mask = None
         use_gpt_attention_plugin = default_net(
         ).plugin_config.gpt_attention_plugin
