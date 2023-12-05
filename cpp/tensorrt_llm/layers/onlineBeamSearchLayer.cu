@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/beamSearchTopkKernels.h"
+#include "tensorrt_llm/layers/fillBuffers.h"
 #include "tensorrt_llm/layers/onlineBeamSearchLayer.h"
 
 using namespace tensorrt_llm::common;
@@ -30,26 +31,29 @@ static const int SMALL_TOP_K_SOFTMAX_MAX_VOC_PARTS = 128;
 static const int MAX_K = 4;
 
 template <typename T>
-__global__ void update_kernel(bool* finished, int** parent_ids_ptr, int* sequence_lengths, int** output_ids_ptr,
-    BeamHypotheses beam_hyps, const int vocab_size, const int* end_ids, const int local_batch_size,
-    const int beam_width, const int max_seq_len)
+__global__ void update_kernel(FinishedState* finished, int** parent_ids_ptr, int* sequence_lengths,
+    int** output_ids_ptr, BeamHypotheses beam_hyps, const int vocab_size, const int* end_ids,
+    const int local_batch_size, const int beam_width, const int max_seq_len)
 {
     extern __shared__ char s_buf[]; // intermediate result
     int* s_sequence_lengths = (int*) (s_buf);
 
     for (int beam_idx = threadIdx.x; beam_idx < beam_width; beam_idx += blockDim.x)
     {
-        s_sequence_lengths[beam_idx] = sequence_lengths[blockIdx.x * beam_width + beam_idx];
+        const auto batch_beam_idx = blockIdx.x * beam_width + beam_idx;
+        s_sequence_lengths[beam_idx] = sequence_lengths[batch_beam_idx];
     }
     __syncthreads();
 
     for (int beam_idx = threadIdx.x; beam_idx < beam_width; beam_idx += blockDim.x)
     {
+        const auto batch_beam_idx = blockIdx.x * beam_width + beam_idx;
         const int current_step{s_sequence_lengths[beam_idx]};
 
         // Increase the seq_len even if the request has finished.
         // On the following iteration we check if the sequence has finished before
-        if (!finished[beam_idx])
+        const auto finish_state = finished[batch_beam_idx];
+        if (!finish_state.isFinished())
         {
             s_sequence_lengths[beam_idx]++;
         }
@@ -58,8 +62,11 @@ __global__ void update_kernel(bool* finished, int** parent_ids_ptr, int* sequenc
         int new_beam_id{(new_word_id / vocab_size) % beam_width};
         new_word_id = new_word_id % vocab_size;
 
-        sequence_lengths[blockIdx.x * beam_width + beam_idx] = s_sequence_lengths[new_beam_id];
-        finished[beam_idx] = new_word_id == end_ids[blockIdx.x];
+        sequence_lengths[batch_beam_idx] = s_sequence_lengths[new_beam_id];
+        if (new_word_id == end_ids[blockIdx.x])
+        {
+            finished[batch_beam_idx].setFinishedEOS();
+        }
         parent_ids_ptr[blockIdx.x][beam_idx * max_seq_len + current_step] = new_beam_id;
         output_ids_ptr[blockIdx.x][beam_idx * max_seq_len + current_step] = new_word_id;
     }
@@ -69,13 +76,14 @@ __global__ void update_kernel(bool* finished, int** parent_ids_ptr, int* sequenc
         {
             for (int beam_idx = threadIdx.x; beam_idx < beam_width; beam_idx += blockDim.x)
             {
-                finished[blockIdx.x * beam_width + beam_idx] = true;
+                const auto batch_beam_idx = blockIdx.x * beam_width + beam_idx;
+                finished[batch_beam_idx].setFinished();
             }
         }
     }
 }
 
-void invokeUpdate(bool* finished, int** parent_ids_ptr, int* sequence_lengths, int** output_ids_ptr,
+void invokeUpdate(FinishedState* finished, int** parent_ids_ptr, int* sequence_lengths, int** output_ids_ptr,
     BeamHypotheses* beam_hyps, const int local_batch_size, const int beam_width, const int vocab_size_padded,
     const int* end_ids, const int max_seq_len, cudaStream_t stream)
 {
@@ -96,25 +104,7 @@ void OnlineBeamSearchLayer<T>::setup(size_t batch_size, SetupParams const& setup
     mDiversityRate = setupParams.beam_search_diversity_rate.value_or(std::vector<float>(0.0f));
     mLengthPenalty = setupParams.length_penalty.value_or(std::vector<float>(0.0f));
 
-    auto fillBuffers
-        = [this, &batch_size](auto const& optParam, auto const defaultValue, auto& hostBuffer, auto& deviceBuffer)
-    {
-        hostBuffer.resize(batch_size);
-        if (!optParam)
-        {
-            std::fill(std::begin(hostBuffer), std::end(hostBuffer), defaultValue);
-        }
-        else if (optParam->size() == 1)
-        {
-            std::fill(std::begin(hostBuffer), std::end(hostBuffer), optParam->front());
-        }
-        else
-        {
-            TLLM_CHECK_WITH_INFO(optParam->size() == batch_size, "Argument vector size mismatch.");
-            std::copy(optParam->begin(), optParam->end(), std::begin(hostBuffer));
-        }
-        cudaAutoCpy(deviceBuffer, hostBuffer.data(), batch_size, stream_);
-    };
+    FillBuffers const fillBuffers{batch_size, stream_};
 
     fillBuffers(setupParams.beam_search_diversity_rate, 0.0f, mDiversityRate, diversity_rates_buf_);
     fillBuffers(setupParams.length_penalty, 0.0f, mLengthPenalty, length_penalties_buf_);
@@ -136,7 +126,8 @@ void OnlineBeamSearchLayer<T>::invokeSoftMax(BeamSearchOutputParams& outputs, So
     BeamHypotheses beamHypotheses;
     auto* const end_ids = params.end_ids.template getPtr<const int>();
     float* output_log_probs = (outputs.output_log_probs) ? outputs.output_log_probs->template getPtr<float>() : nullptr;
-    auto* finished = outputs.finished->template getPtr<bool>();
+    auto* finished
+        = reinterpret_cast<FinishedState*>(outputs.finished->template getPtr<FinishedState::UnderlyingType>());
     auto* sequence_lengths = outputs.sequence_length->template getPtr<int>();
     if (outputs.beamHypotheses)
     {
@@ -153,7 +144,6 @@ void OnlineBeamSearchLayer<T>::invokeSoftMax(BeamSearchOutputParams& outputs, So
         beamHypotheses.end_ids = end_ids;
     }
 
-    output_log_probs = (outputs.output_log_probs) ? outputs.output_log_probs->template getPtr<float>() : nullptr;
     invokeTopkSoftMax(logits.template getPtr<T>(), (const T*) (nullptr), finished, sequence_lengths,
         outputs.cum_log_probs->template getPtr<float>(), output_log_probs, output_ids_ptr.getPtr<int*>(),
         topk_softmax_workspace_, topk_softmax_workspace_size_, &beamHypotheses, local_batch_size, beam_width,

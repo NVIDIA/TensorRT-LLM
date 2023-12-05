@@ -4,11 +4,14 @@ This document shows how to build and run a Falcon model in TensorRT-LLM on singl
 
 ## Overview
 
-The TensorRT-LLM Falcon implementation can be found in [tensorrt_llm/models/falcon/model.py](../../tensorrt_llm/models/falcon/model.py). The TensorRT-LLM Falcon example code is located in [`examples/falcon`](./). There are three main files in that folder:
+The TensorRT-LLM Falcon implementation can be found in [tensorrt_llm/models/falcon/model.py](../../tensorrt_llm/models/falcon/model.py). The TensorRT-LLM Falcon example code is located in [`examples/falcon`](./). There is one main file:
 
- * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Falcon model,
- * [`run.py`](./run.py) to run the inference on an input text,
- * [`summarize.py`](./summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
+* [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Falcon model.
+
+In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
+
+* [`../run.py`](../run.py) to run the inference on an input text;
+* [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
   * FP16
@@ -162,26 +165,26 @@ pip install -r requirements.txt
 ```
 
 ```bash
-python summarize.py --test_trt_llm \
-                    --hf_model_location falcon/rw-1b \
-                    --data_type float16 \
-                    --engine_dir falcon/rw-1b/trt_engines/fp16/1-gpu/
+python ../summarize.py --test_trt_llm \
+                       --hf_model_dir falcon/rw-1b \
+                       --data_type float16 \
+                       --engine_dir falcon/rw-1b/trt_engines/fp16/1-gpu/
 
-python summarize.py --test_trt_llm \
-                      --hf_model_location falcon/7b-instruct \
-                      --data_type bfloat16 \
-                      --engine_dir falcon/7b-instruct/trt_engines/bf16/1-gpu
+python ../summarize.py --test_trt_llm \
+                       --hf_model_dir falcon/7b-instruct \
+                       --data_type bfloat16 \
+                       --engine_dir falcon/7b-instruct/trt_engines/bf16/1-gpu
 
 mpirun -n 2 --allow-run-as-root --oversubscribe \
-    python summarize.py --test_trt_llm \
-                      --hf_model_location falcon/40b-instruct \
-                      --data_type bfloat16 \
-                      --engine_dir falcon/40b-instruct/trt_engines/bf16/2-gpu
+    python ../summarize.py --test_trt_llm \
+                           --hf_model_dir falcon/40b-instruct \
+                           --data_type bfloat16 \
+                           --engine_dir falcon/40b-instruct/trt_engines/bf16/2-gpu
 mpirun -n 8 --allow-run-as-root --oversubscribe \
-    python summarize.py --test_trt_llm \
-                      --hf_model_location falcon/180b \
-                      --data_type bfloat16 \
-                      --engine_dir falcon/180b/trt_engines/bf16/8-gpu
+    python ../summarize.py --test_trt_llm \
+                           --hf_model_dir falcon/180b \
+                           --data_type bfloat16 \
+                           --engine_dir falcon/180b/trt_engines/bf16/8-gpu
 ```
 
 ## Troubleshooting

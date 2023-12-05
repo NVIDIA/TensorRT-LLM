@@ -226,7 +226,8 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
 
         invokeBanRepeatNgram(logits.template getPtrWithOffset<T>(decode_vocab_size_units_offset),
             outputs.output_ids_ptr.template getPtr<const int*>(),
-            outputs.finished.value_or(Tensor{}).template getPtr<bool>(),
+            reinterpret_cast<FinishedState*>(
+                params.finished.value_or(Tensor{}).template getPtr<FinishedState::UnderlyingType>()),
             outputs.parent_ids.value_or(Tensor{}).template getPtr<const int>(), batch_size, local_batch_size,
             beam_width, no_repeat_ngram_size_buf, id_offset, vocab_size_padded_, step, stream_);
     }
@@ -321,7 +322,7 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
                 = outputs.cum_log_probs->slice({dynamic_decode_batch_size * beam_width}, dynamic_id_offset);
 
             dynamic_decode_outputs.beamHypotheses = outputs.beamHypotheses;
-            dynamic_decode_outputs.output_log_probs = outputs.output_log_probs;
+            dynamic_decode_outputs.output_log_probs = outputs.output_log_probs_tiled;
 
             // only OnlineBeamSearchLayer support beam_search_diversity_rate
             // when beamHypotheses is used
@@ -341,6 +342,7 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
             step, ite, logits_slice, end_id_slice, static_cast<std::int32_t>(max_seq_len)};
 
         decode_input_tensors.embedding_bias = params.embedding_bias;
+        decode_input_tensors.finished = params.finished;
 
         if (params.input_lengths)
         {
@@ -365,11 +367,11 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
             decode_outputs.cum_log_probs
                 = outputs.cum_log_probs->slice({local_batch_size * beam_width}, local_batch_offset);
         }
-        if (outputs.output_log_probs)
+        if (outputs.output_log_probs_tiled)
         {
             auto const generationStep = step - params.max_input_length;
             TLLM_CHECK(generationStep >= 0);
-            Tensor& output_log_probs = outputs.output_log_probs.value();
+            Tensor& output_log_probs = outputs.output_log_probs_tiled.value();
             size_t step_offset = generationStep * batch_size * beam_width;
             decode_outputs.output_log_probs
                 = output_log_probs.slice({output_log_probs.shape[0] - generationStep, local_batch_size * beam_width},
@@ -395,14 +397,16 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
             outputs.parent_ids_ptr.template getPtr<const int*>(),
             params.stop_words_list->template getPtrWithOffset<const int>(
                 ite * local_batch_size * 2 * stop_words_length),
-            outputs.finished->template getPtrWithOffset<bool>(id_offset),
-            outputs.sequence_length->template getPtr<int>(), id_offset, stop_words_length, batch_size, beam_width,
-            max_seq_len, stream_);
+            reinterpret_cast<FinishedState*>(
+                outputs.finished->template getPtrWithOffset<FinishedState::UnderlyingType>(id_offset)),
+            outputs.sequence_length->template getPtr<int>(), stop_words_length, batch_size, beam_width, max_seq_len,
+            stream_);
     }
 
     if (params.sequence_limit_length)
     {
-        invokeLengthCriterion(outputs.finished->template getPtr<bool>(),
+        invokeLengthCriterion(
+            reinterpret_cast<FinishedState*>(outputs.finished->template getPtr<FinishedState::UnderlyingType>()),
             outputs.finished_sum ? outputs.finished_sum->template getPtr<int>() : nullptr,
             params.sequence_limit_length->template getPtr<const uint32_t>(),
             outputs.sequence_length->template getPtr<int>(), batch_size, beam_width, stream_);
@@ -411,6 +415,17 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
 
     invokeCopyNextStepIds(outputs.newTokens.template getPtr<int>(), idsPtrHost,
         outputs.sequence_length->template getPtr<int>(), batch_size, beam_width, max_seq_len, stream_);
+
+    // Transpose the output log probs from [max_seq_len, bs, beam_width] to [batch_size, beam_width, max_seq_len]
+    if (outputs.output_log_probs_tiled)
+    {
+        auto logProbsMaxSeqLen = outputs.output_log_probs_tiled.value().shape[0];
+
+        invokeTransposeLogProbs(outputs.output_log_probs.value().template getPtr<float>(),
+            outputs.output_log_probs_tiled.value().template getPtr<float>(),
+            outputs.sequence_length->template getPtr<int>(), batch_size, beam_width, logProbsMaxSeqLen, stream_);
+    }
+
     sync_check_cuda_error();
 }
 

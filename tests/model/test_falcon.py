@@ -147,6 +147,18 @@ class TestFalcon(unittest.TestCase):
         tensorrt_llm.logger.set_level(log_level)
         mapping = tensorrt_llm.Mapping(world_size, rank)
         builder = Builder()
+
+        builder_config = builder.create_builder_config(
+            name=model_name,
+            precision=dtype,
+            timing_cache='model.cache',
+            tensor_parallel=world_size,
+            use_alibi=hf_config.alibi,
+            parallel_attention=hf_config.parallel_attn,
+            use_refit=use_refit,
+            strongly_typed=(dtype == "float16"),
+        )
+
         network = builder.create_network()
         if use_gpt_attengion_plugin:
             network.plugin_config.set_gpt_attention_plugin(dtype)
@@ -171,15 +183,6 @@ class TestFalcon(unittest.TestCase):
                                 tensor_parallel=world_size,
                                 rank=rank)
 
-        builder_config = builder.create_builder_config(
-            name=model_name,
-            precision=dtype,
-            timing_cache='model.cache',
-            tensor_parallel=world_size,
-            use_alibi=hf_config.alibi,
-            parallel_attention=hf_config.parallel_attn,
-            use_refit=use_refit,
-        )
         engine_buffer = builder.build_engine(network, builder_config)
         runtime = tensorrt_llm.runtime.generation._Runtime(
             engine_buffer, mapping)

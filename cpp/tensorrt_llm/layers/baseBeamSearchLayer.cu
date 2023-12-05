@@ -18,6 +18,9 @@
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/beamSearchPenaltyKernels.h"
 #include "tensorrt_llm/layers/baseBeamSearchLayer.h"
+#include "tensorrt_llm/layers/fillBuffers.h"
+
+#include <algorithm>
 
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
@@ -28,15 +31,16 @@ namespace layers
 {
 
 __global__ void update_indir_cache_kernel(int* tgt_indir_cache, const int* src_indir_cache, const int** parent_ids,
-    const bool* finished, const int* sequence_lengths, const int* input_lengths, int batch_dim, int local_batch_size,
-    int beam_width, int max_kv_cache_length, int max_seq_len)
+    const FinishedState* finished, const int* sequence_lengths, const int* input_lengths, int batch_dim,
+    int local_batch_size, int beam_width, int max_kv_cache_length, int max_seq_len)
 {
     int time_step = threadIdx.x + blockIdx.x * blockDim.x;
-    int bb_id = threadIdx.y + blockIdx.y * blockDim.y;
+    int bb_id = threadIdx.y + blockIdx.y * blockDim.y;   // should be just blockIdx.y?
     const int current_step{sequence_lengths[bb_id] - 1}; // the sequence_lengths is updated, need to minus 1
     const int batch_id = bb_id / beam_width;
     const int beam_id = bb_id % beam_width;
-    if (bb_id >= beam_width * local_batch_size || time_step < (max_seq_len - max_kv_cache_length) || finished[bb_id])
+    if (bb_id >= beam_width * local_batch_size || time_step < (max_seq_len - max_kv_cache_length)
+        || finished[bb_id].isFinished())
     {
         return;
     }
@@ -46,17 +50,17 @@ __global__ void update_indir_cache_kernel(int* tgt_indir_cache, const int* src_i
     const int src_beam = parent_ids[batch_id][beam_id * max_seq_len + current_step];
 
     // for the indir tables, we have the cyclic kv cache.
-    const uint tgt_offset
+    const uint32_t tgt_offset
         = batch_id * beam_width * max_kv_cache_length + beam_id * max_kv_cache_length + time_step_circ;
-    const uint src_offset
+    const uint32_t src_offset
         = batch_id * beam_width * max_kv_cache_length + src_beam * max_kv_cache_length + time_step_circ;
 
     tgt_indir_cache[tgt_offset] = (time_step == current_step) ? beam_id : src_indir_cache[src_offset];
 }
 
 void update_indir_cache_kernelLauncher(int* tgt_indir_cache, const int* src_indir_cache, const int** parent_ids,
-    const bool* finished, const int* sequence_lengths, const int* input_lengths, int batch_dim, int local_batch_size,
-    int beam_width, int max_seq_len, int max_kv_cache_length, cudaStream_t stream)
+    const FinishedState* finished, const int* sequence_lengths, const int* input_lengths, int batch_dim,
+    int local_batch_size, int beam_width, int max_seq_len, int max_kv_cache_length, cudaStream_t stream)
 {
     const dim3 block(32);
     // Update indirections steps [input_length[bb_id], sequence_lengths[bb_id]], included
@@ -113,7 +117,7 @@ void BaseBeamSearchLayer<T>::allocateBuffer(size_t batch_size)
     repetition_penalty_buf_ = allocator_->reMalloc(repetition_penalty_buf_, sizeof(float) * batch_size, false);
 
     is_allocate_buffer_ = true;
-    TLLM_LOG_DEBUG("% stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
@@ -122,25 +126,7 @@ void BaseBeamSearchLayer<T>::setupBase(size_t batch_size, SetupParams const& set
     allocateBuffer(batch_size);
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     // Setup penalties.
-    auto fillBuffers
-        = [this, &batch_size](auto const& optParam, auto const defaultValue, auto& hostBuffer, auto& deviceBuffer)
-    {
-        hostBuffer.resize(batch_size);
-        if (!optParam)
-        {
-            std::fill(std::begin(hostBuffer), std::end(hostBuffer), defaultValue);
-        }
-        else if (optParam->size() == 1)
-        {
-            std::fill(std::begin(hostBuffer), std::end(hostBuffer), optParam->front());
-        }
-        else
-        {
-            TLLM_CHECK_WITH_INFO(optParam->size() == batch_size, "Argument vector size mismatch.");
-            std::copy(optParam->begin(), optParam->end(), std::begin(hostBuffer));
-        }
-        cudaAutoCpy(deviceBuffer, hostBuffer.data(), batch_size, stream_);
-    };
+    FillBuffers const fillBuffers{batch_size, stream_};
 
     fillBuffers(setupParams.temperature, 1.0f, mTemperature, temperature_buf_);
     fillBuffers(setupParams.min_length, 1, mMinLength, min_lengths_buf_);
@@ -201,7 +187,9 @@ void BaseBeamSearchLayer<T>::forward(BeamSearchOutputParams& outputs, ForwardPar
     {
         update_indir_cache_kernelLauncher(outputs.tgt_cache_indirection.template getPtr<int>(),
             params.src_cache_indirection.template getPtr<const int>(),
-            outputs.parent_ids_ptr.template getPtr<const int*>(), outputs.finished->template getPtr<const bool>(),
+            outputs.parent_ids_ptr.template getPtr<const int*>(),
+            reinterpret_cast<const FinishedState*>(
+                outputs.finished->template getPtr<const FinishedState::UnderlyingType>()),
             sequence_length, input_lengths, batch_size, local_batch_size, beam_width, max_seq_len,
             params.max_kv_cache_length, stream_);
         sync_check_cuda_error();

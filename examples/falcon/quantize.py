@@ -100,7 +100,7 @@ def get_args():
     parser.add_argument("--dtype", help="Model data type.", default="float16")
     parser.add_argument("--qformat",
                         type=str,
-                        choices=['fp8'],
+                        choices=['fp8', 'int4_awq'],
                         default='fp8',
                         help='Quantization format.')
     parser.add_argument("--calib_size",

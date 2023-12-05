@@ -56,6 +56,9 @@ public:
     // beam search layer
     OptVec<FloatType> beamSearchDiversityRate;
     OptVec<FloatType> lengthPenalty;
+
+    // speculative decoding
+    OptVec<FloatType> draftAcceptanceThreshold;
 };
 
 } // namespace tensorrt_llm::runtime

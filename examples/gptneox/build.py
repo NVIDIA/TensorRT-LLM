@@ -17,9 +17,11 @@ import json
 import os
 import time
 
-import tensorrt as trt
+# isort: off
 import torch
 import torch.multiprocessing as mp
+import tensorrt as trt
+# isort: on
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, GPTNeoXConfig
 from weight import load_from_hf_gpt_neox
@@ -86,7 +88,7 @@ def serialize_engine(engine, path):
     logger.info(f'Serializing engine to {path}...')
     tik = time.time()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')
@@ -187,7 +189,7 @@ def parse_arguments():
     parser.add_argument(
         '--output_dir',
         type=str,
-        default='gpt_outputs',
+        default='engine_outputs',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
     )
@@ -366,8 +368,6 @@ def build_rank_engine(builder: Builder,
         config_path = os.path.join(args.output_dir, 'config.json')
         builder.save_config(builder_config, config_path)
 
-    tensorrt_llm.tools.cleanup(network, tensorrt_llm_gpt)
-
     return engine
 
 
@@ -400,6 +400,7 @@ def build(rank, args):
             max_position_embeddings=args.n_positions,
             apply_query_key_layer_scaling=apply_query_key_layer_scaling,
             max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
             max_input_len=args.max_input_len,
             int8=args.use_weight_only_quant_matmul_plugin
             or args.use_weight_only_groupwise_quant_matmul_plugin,

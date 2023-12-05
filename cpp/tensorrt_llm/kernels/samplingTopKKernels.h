@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include <curand_kernel.h>
 
 namespace tensorrt_llm
@@ -37,8 +38,8 @@ namespace kernels
 //! logProbs must contain **just** probabilities instead of log probabilities.
 //! \param outputIds output buffer [batchSize][maxSeqLen]. Contains pointers to rows with output tokens per request
 //! \param sequenceLength input/output buffer [batchSize]. Current sequence length of the request up to, but excluding endId token
-//! \param finishedBuf input/output buffer [batchSize]. Flag if sequence has finished (if finished || outputId == endId).
-//! If true, request exits early.
+//! \param finishedInput input buffer [batchSize]. If true, request exits early.
+//! \param finishedOutput output buffer [batchSize]. Set flag if sequence has finished (if finished || outputId == endId).
 //! \param cumLogProbs input/output buffer [batchSize]. Cumulative log probability of selected tokens. Ignored if nullptr
 //! \param outputLogProbs output buffer [batchSize]. Log probs is the probability induced by the top-k sampling.
 //! We normalize the probability 'expLogit' of the selected token by the probability 's_sum' of a set of top-k
@@ -60,34 +61,16 @@ namespace kernels
 // clang-format on
 template <typename T>
 void invokeBatchTopKSampling(void* workspace, size_t& workspaceSize, const T* logProbs, int** ids, int* sequenceLengths,
-    bool* finished, float* cumLogProbs, float* outputLogProbs, curandState_t* curandstate, const int maxTopK,
-    const int* topKs, const float topP, const float* topPs, const int vocabSizePadded, const int* endIds,
-    cudaStream_t stream, const int batchSize, const bool* skipDecode);
+    const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
+    curandState_t* curandstate, const int maxTopK, const int* topKs, const float topP, const float* topPs,
+    const int vocabSizePadded, const int* endIds, cudaStream_t stream, const int batchSize, const bool* skipDecode);
 
 //! \brief Specialization of invokeBatchTopKSampling with topPs=nullptr and topKs=nullptr
 template <typename T>
 void invokeTopKSampling(void* workspace, size_t& workspaceSize, const T* logProbs, int** outputIds, int* sequenceLength,
-    bool* finishedBuf, float* cumLogProbs, float* outputLogProbs, curandState_t* curandstate, const int topK,
-    const float topP, const int vocabSizePadded, const int* endIds, cudaStream_t stream, const int batchSize,
-    const bool* skipDecode);
-
-//! \brief Initialize batchSize curand states with given seed.
-//!
-//! \param state output buffer [batchSize]. Curand states to be initialized
-//! \param batchSize number of states to initialize
-//! \param randomSeed seed to initialize states
-//! \param stream stream
-void invokeCurandInitialize(
-    curandState_t* state, const size_t batchSize, unsigned long long randomSeed, cudaStream_t stream);
-
-//! \brief Initialize batchSize curand states with given seed per request.
-//!
-//! \param state output buffer [batchSize] of curand states to be initialized
-//! \param batchSize number of states to initialize
-//! \param randomSeeds input buffer [batchSize] with seeds
-//! \param stream stream
-void invokeCurandBatchInitialize(
-    curandState_t* states, const size_t batchSize, const unsigned long long* randomSeeds, cudaStream_t stream);
+    const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
+    curandState_t* curandstate, const int topK, const float topP, const int vocabSizePadded, const int* endIds,
+    cudaStream_t stream, const int batchSize, const bool* skipDecode);
 
 //! \brief Applies mask and bias to logits. Sets -MAX_FLT value for tokens in range [vocabSize; vocabSizePadded) to
 //! prevent them being chosen If request finished the generation, sets MAX_FLT to endId token and -MAX_FLT to all other
@@ -102,8 +85,8 @@ void invokeCurandBatchInitialize(
 //! \param vocabSizePadded padded vocab size
 //! \param stream stream
 template <typename T>
-void invokeAddBiasEndMask(T* logits, const T* bias, const int* endIds, const bool* finished, const int batchSize,
-    const int vocabSize, const int vocabSizePadded, cudaStream_t stream);
+void invokeAddBiasEndMask(T* logits, const T* bias, const int* endIds, const FinishedState* finished,
+    const int batchSize, const int vocabSize, const int vocabSizePadded, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

@@ -26,6 +26,8 @@
 #include "tensorrt_llm/plugins/layernormPlugin/layernormPlugin.h"
 #include "tensorrt_llm/plugins/layernormQuantizationPlugin/layernormQuantizationPlugin.h"
 #include "tensorrt_llm/plugins/lookupPlugin/lookupPlugin.h"
+#include "tensorrt_llm/plugins/loraPlugin/loraPlugin.h"
+#include "tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.h"
 #if ENABLE_MULTI_DEVICE
 #include "tensorrt_llm/plugins/ncclPlugin/allgatherPlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/allreducePlugin.h"
@@ -134,6 +136,7 @@ extern "C"
         static tensorrt_llm::plugins::BertAttentionPluginCreator bertAttentionPluginCreator;
         static tensorrt_llm::plugins::GPTAttentionPluginCreator gptAttentionPluginCreator;
         static tensorrt_llm::plugins::GemmPluginCreator gemmPluginCreator;
+        static tensorrt_llm::plugins::MixtureOfExpertsPluginCreator moePluginCreator;
 #if ENABLE_MULTI_DEVICE
         static tensorrt_llm::plugins::SendPluginCreator sendPluginCreator;
         static tensorrt_llm::plugins::RecvPluginCreator recvPluginCreator;
@@ -151,12 +154,14 @@ extern "C"
             weightOnlyGroupwiseQuantMatmulPluginCreator;
         static tensorrt_llm::plugins::WeightOnlyQuantMatmulPluginCreator weightOnlyQuantMatmulPluginCreator;
         static tensorrt_llm::plugins::LookupPluginCreator lookupPluginCreator;
+        static tensorrt_llm::plugins::LoraPluginCreator loraPluginCreator;
 
         static std::array pluginCreators
             = { creatorPtr(identityPluginCreator),
                   creatorPtr(bertAttentionPluginCreator),
                   creatorPtr(gptAttentionPluginCreator),
                   creatorPtr(gemmPluginCreator),
+                  creatorPtr(moePluginCreator),
 #if ENABLE_MULTI_DEVICE
                   creatorPtr(sendPluginCreator),
                   creatorPtr(recvPluginCreator),
@@ -173,6 +178,7 @@ extern "C"
                   creatorPtr(weightOnlyGroupwiseQuantMatmulPluginCreator),
                   creatorPtr(weightOnlyQuantMatmulPluginCreator),
                   creatorPtr(lookupPluginCreator),
+                  creatorPtr(loraPluginCreator),
               };
         nbCreators = pluginCreators.size();
         return pluginCreators.data();

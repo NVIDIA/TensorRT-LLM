@@ -160,6 +160,7 @@ struct Multihead_attention_params_base
     mutable int timesteps_per_block = -1;
     mutable int seq_len_tile = -1;
 
+    mutable int min_seq_len_tile = -1;
     mutable int max_seq_len_tile = -1;
     // The partial output buffer. Dimensions max_seq_len_tile x B x D. (for each timestep only seq_len_tile x B x D is
     // needed)
@@ -236,6 +237,24 @@ DECLARE_MMHA_NORMAL_AND_PAGED(__nv_bfloat16);
 #undef DECLARE_MMHA_NORMAL_AND_PAGED
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename T>
+inline int estimate_min_multi_block_count(int max_timesteps, int max_dynamic_shmem_per_block)
+{
+    const auto qk_elts = static_cast<int>((max_timesteps + 1 + 4 - 1) / 4);
+    int size_per_elts = 16;
+    const auto qk_sz = qk_elts * 16;
+    size_t logits_sz = 0;
+#ifndef MMHA_USE_FP32_ACUM_FOR_LOGITS
+    if (sizeof(T) != 4)
+    {
+        size_per_elts += 4 * sizeof(T);
+    }
+#endif
+    int elts_per_block = max_dynamic_shmem_per_block / size_per_elts;
+    int min_block_count = (qk_elts + elts_per_block - 1) / elts_per_block;
+    return std::max(1, min_block_count);
+}
 
 } // namespace kernels
 } // namespace tensorrt_llm

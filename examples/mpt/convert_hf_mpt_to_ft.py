@@ -90,10 +90,6 @@ def convert_weight_to_ft_each(out_dir: str, tensor_parallelism: int,
         for j in range(tensor_parallelism):
             save_path = os.path.join(out_dir, f'model.{tensor_name}.{j}.bin')
             split_vals[j].tofile(save_path)
-        if config['no_bias']:
-            fake_weight_path = os.path.join(out_dir, f'model.{tensor_name}.bin')
-            write_zero_bias(tensor_name, fake_weight_path, data.shape[-1],
-                            data_type)
 
     elif tensor_name.find('mlp.dense_4h_to_h.weight') != -1:
         assert data.shape == (
@@ -105,10 +101,6 @@ def convert_weight_to_ft_each(out_dir: str, tensor_parallelism: int,
         for j in range(tensor_parallelism):
             save_path = os.path.join(out_dir, f'model.{tensor_name}.{j}.bin')
             split_vals[j].tofile(save_path)
-        if config['no_bias']:
-            fake_weight_path = os.path.join(out_dir, f'model.{tensor_name}.bin')
-            write_zero_bias(tensor_name, fake_weight_path, data.shape[-1],
-                            data_type)
 
     elif tensor_name.find('mlp.dense_h_to_4h.weight') != -1:
         assert data.shape == (
@@ -121,9 +113,6 @@ def convert_weight_to_ft_each(out_dir: str, tensor_parallelism: int,
         for j in range(tensor_parallelism):
             save_path = os.path.join(out_dir, f'model.{tensor_name}.{j}.bin')
             split_vals[j].tofile(save_path)
-            if config['no_bias']:
-                write_zero_bias(tensor_name, save_path, split_vals[j].shape[-1],
-                                data_type)
 
     elif tensor_name.find('mlp.dense_h_to_4h.bias') != -1:
         assert data.shape == (
@@ -147,21 +136,38 @@ def convert_weight_to_ft_each(out_dir: str, tensor_parallelism: int,
             split_vals[j].tofile(save_path)
 
     elif tensor_name.find('attention.query_key_value.weight') != -1:
-        assert data.shape == (
-            3 * config['d_model'],
-            config['d_model']), f'unexpected dim for {tensor_name}'
-        # nn.Linear weights are transposed
-        data = data.T
-
-        data = data.reshape(config['d_model'], 3, config['d_model'])
-        split_vals = np.split(data, tensor_parallelism, axis=-1)
+        if 'kv_n_heads' in config['attn_config']:
+            # Multi-query or grouped query attention
+            head_dim = config['d_model'] // config['n_heads']
+            assert data.shape == (
+                config['d_model'] +
+                2 * config['attn_config']['kv_n_heads'] * head_dim,
+                config['d_model']), f'unexpected dim for {tensor_name}'
+            # nn.Linear weights are transposed
+            data = data.T
+            w_q, w_k, w_v = np.split(data, [
+                config['d_model'], config['d_model'] +
+                (config['attn_config']['kv_n_heads'] * head_dim)
+            ],
+                                     axis=-1)
+            w_q_split = np.split(w_q, tensor_parallelism, axis=-1)
+            w_k_split = np.split(w_k, tensor_parallelism, axis=-1)
+            w_v_split = np.split(w_v, tensor_parallelism, axis=-1)
+            split_vals = [
+                np.concatenate((w_q_split[i], w_k_split[i], w_v_split[i]),
+                               axis=-1) for i in range(tensor_parallelism)
+            ]
+        else:
+            # Multi-head attention
+            assert data.shape == (3 * config['d_model'], config['d_model'])
+            # nn.Linear weights are transposed
+            data = data.T
+            data = data.reshape(config['d_model'], 3, config['d_model'])
+            split_vals = np.split(data, tensor_parallelism, axis=-1)
 
         for j in range(tensor_parallelism):
             save_path = os.path.join(out_dir, f'model.{tensor_name}.{j}.bin')
             split_vals[j].tofile(save_path)
-            if config['no_bias']:
-                write_zero_bias(tensor_name, save_path,
-                                (3, split_vals[j].shape[-1]), data_type)
 
     else:
         raise RuntimeError(f'Tensor with name {tensor_name} is not handled')
@@ -240,6 +246,12 @@ def convert_mpt_to_ft(model_name_or_path: str,
             raise RuntimeError(
                 'qk_ln is enabled for this MPT model. This may not work as expected in FT. Use --force to force a conversion.'
             )
+        if 'kv_n_heads' in hf_config['attn_config']:
+            config['gpt']['n_kv_head'] = str(
+                hf_config['attn_config']['kv_n_heads'])
+
+        if 'no_bias' in hf_config and hf_config['no_bias']:
+            config['gpt']['bias'] = str(False)
 
         with open(os.path.join(out_dir, 'config.ini'), 'w') as configfile:
             config.write(configfile)

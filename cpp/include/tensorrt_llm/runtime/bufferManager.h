@@ -147,8 +147,32 @@ public:
     //! \brief Get the underlying cuda stream.
     [[nodiscard]] CudaStream const& getStream() const;
 
+    //! \brief The current size of the memory reserved by the memory pool.
+    [[nodiscard]] std::size_t memoryPoolReserved() const;
+
+    //! \brief The current size of the memory used by the memory pool.
+    [[nodiscard]] std::size_t memoryPoolUsed() const;
+
+    //! \brief The current size of the memory free in the memory pool.
+    [[nodiscard]] std::size_t memoryPoolFree() const;
+
+    //! \brief Try to trim the memory reserved by the pool to `size` bytes. This synchronizes implicitly with the
+    //! stream.
+    void memoryPoolTrimTo(std::size_t size);
+
 private:
     void static initMemoryPool(int device);
+
+    std::size_t static memoryPoolReserved(int device);
+
+    std::size_t static memoryPoolUsed(int device);
+
+    std::size_t static memoryPoolFree(int device)
+    {
+        return memoryPoolReserved(device) - memoryPoolUsed(device);
+    }
+
+    void static memoryPoolTrimTo(int device, std::size_t size);
 
     CudaStreamPtr mStream;
 };

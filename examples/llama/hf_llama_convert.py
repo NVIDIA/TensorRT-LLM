@@ -23,11 +23,14 @@ from pathlib import Path
 import torch
 import torch.multiprocessing as multiprocessing
 from convert import split_and_save_weight, str_to_np_dtype
+from datasets import load_dataset
 from smoothquant import (capture_activation_range, smooth_gemm,
                          smooth_gemm_fc1_gate)
 from tqdm import tqdm
 from transformers import LlamaForCausalLM, LlamaTokenizer
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+
+from tensorrt_llm.logger import logger
 
 
 def merge_qkv_scales(q_name, hf_model, scales, llama_qkv_para):
@@ -170,7 +173,14 @@ def hf_gpt_converter(args):
     saved_dir = Path(args.out_dir) / f"{infer_tp}-gpu"
     saved_dir.mkdir(parents=True, exist_ok=True)
 
-    model = LlamaForCausalLM.from_pretrained(args.in_file, device_map="auto")
+    model = LlamaForCausalLM.from_pretrained(args.in_file,
+                                             torch_dtype="auto",
+                                             device_map="auto",
+                                             trust_remote_code=True)
+    if args.load_model_on_cpu:
+        model = model.float()
+        model = model.cpu()
+        torch.cuda.empty_cache()
 
     act_range = {}
     llama_qkv_para = {}
@@ -180,9 +190,17 @@ def hf_gpt_converter(args):
     if args.smoothquant is not None or args.calibrate_kv_cache:
         os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
             "TOKENIZERS_PARALLELISM", "false")
+        if args.load_model_on_cpu:
+            logger.warning(
+                "Note that running capture_activation_range on cpu would be very small."
+            )
+        dataset = load_dataset("ccdv/cnn_dailymail",
+                               '3.0.0',
+                               cache_dir=args.dataset_cache_dir)
         act_range = capture_activation_range(
             model,
-            LlamaTokenizer.from_pretrained(args.in_file, padding_side='left'))
+            LlamaTokenizer.from_pretrained(args.in_file, padding_side='left'),
+            dataset)
         if args.smoothquant is not None:
             smooth_llama_model(model, act_range, args.smoothquant,
                                llama_qkv_para, llama_smoother)
@@ -217,6 +235,8 @@ def hf_gpt_converter(args):
             continue
         ft_name = gpt_to_ft_name(name)
 
+        if args.convert_model_on_cpu:
+            param = param.cpu()
         if name.replace(".weight", "") in llama_smoother.keys():
             smoother = llama_smoother[name.replace(".weight", "")]
             smoother = smoother.detach().cpu().numpy()
@@ -319,6 +339,12 @@ if __name__ == "__main__":
                         type=str,
                         default="fp32",
                         choices=["fp32", "fp16"])
+    parser.add_argument("--dataset-cache-dir",
+                        type=str,
+                        default=None,
+                        help="cache dir to load the hugging face dataset")
+    parser.add_argument("--load-model-on-cpu", action="store_true")
+    parser.add_argument("--convert-model-on-cpu", action="store_true")
 
     args = parser.parse_args()
     print("\n=============== Argument ===============")
@@ -328,5 +354,6 @@ if __name__ == "__main__":
 
     assert (args.calibrate_kv_cache or args.smoothquant), \
         "Either INT8 kv cache or SmoothQuant must be enabled for this script. Otherwise you can directly build engines from HuggingFace checkpoints, no need to do this FT-format conversion. "
+    logger.set_level("info")
 
     hf_gpt_converter(args)

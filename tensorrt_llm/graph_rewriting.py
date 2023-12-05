@@ -1,4 +1,5 @@
 import inspect
+import weakref
 from copy import copy
 from dataclasses import dataclass, field
 from functools import wraps
@@ -17,11 +18,15 @@ class Layer:
     '''
 
     def __init__(self, network: Network, trt_layer: trt.ILayer):
-        self.network = network
+        self._network = weakref.ref(network)
         self.trt_layer = trt_layer
 
         assert isinstance(self.network, Network)
         assert isinstance(self.trt_layer, trt.ILayer)
+
+    @property
+    def network(self):
+        return self._network()
 
     def get_inputs(self, *indices: int):
         '''
@@ -544,9 +549,10 @@ class FLayerScope:
         FLayerInfoMemo.cur_flayer = self.layer
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        assert self.layer.layer_name != "", f"FLayer {self.layer.layer_kind} without a plugin name detected"
-        FLayerInfoMemo.instance().add(self.layer.layer_name, self.layer)
         FLayerInfoMemo.cur_flayer = None
+        if exc_type is None:
+            assert self.layer.layer_name != "", f"FLayer {self.layer.layer_kind} without a plugin name detected"
+            FLayerInfoMemo.instance().add(self.layer.layer_name, self.layer)
 
 
 def record_signature(f):
@@ -625,7 +631,7 @@ class FuseAttentionWithBiasPass(PatternRewriter):
             if not self.is_attention_plugin(layer):
                 return False
             plugin_flayer = FLayerInfoMemo.instance().get(layer.name)
-            input = plugin_flayer.raw_inputs['tensor']
+            input = plugin_flayer.raw_inputs['qkv']
             if input is None or len(list(input.get_users())) != 1:
                 return False
             parent_layer = input.get_parent()
@@ -638,7 +644,7 @@ class FuseAttentionWithBiasPass(PatternRewriter):
                 return False
             if plugin_flayer.raw_inputs['qkv_bias'] is not None:
                 return False
-            plugin_flayer.raw_inputs['tensor'] = eltwise_mutable_inputs[0]
+            plugin_flayer.raw_inputs['qkv'] = eltwise_mutable_inputs[0]
             plugin_flayer.raw_inputs['qkv_bias'] = eltwise_const_inputs[0]
             from .functional import gpt_attention
             new_outputs = gpt_attention(**plugin_flayer.raw_inputs)

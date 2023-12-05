@@ -34,7 +34,7 @@ class TestBuilder(unittest.TestCase):
     def test_basic_builder_flow(self):
         tensorrt_llm.logger.set_level('verbose')
         builder = tensorrt_llm.Builder()
-        builder_config = builder.create_builder_config("test", "test")
+        builder_config = builder.create_builder_config("test", "llmTimingCache")
         builder_config.trt_builder_config.set_flag(trt.BuilderFlag.REFIT)
         model = MyAddModule()
 

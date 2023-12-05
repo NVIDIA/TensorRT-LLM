@@ -44,7 +44,9 @@ set(PLUGIN_LISTS
     rmsnormQuantizationPlugin
     weightOnlyGroupwiseQuantMatmulPlugin
     weightOnlyQuantMatmulPlugin
-    lookupPlugin)
+    lookupPlugin
+    loraPlugin
+    mixtureOfExperts)
 
 foreach(PLUGIN_ITER ${PLUGIN_LISTS})
   include_directories(${PLUGIN_ITER})

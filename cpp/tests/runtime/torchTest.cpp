@@ -57,7 +57,7 @@ void checkFilled(IBuffer& buffer, int fillValue)
 {
     if (DType == buffer.getDataType())
     {
-        EXPECT_THAT(BufferRange<typename CppDataType<DType>::type>(buffer), ::testing::Each(fillValue));
+        EXPECT_THAT(BufferRange<typename DataTypeTraits<DType>::type>(buffer), ::testing::Each(fillValue));
     }
 }
 } // namespace

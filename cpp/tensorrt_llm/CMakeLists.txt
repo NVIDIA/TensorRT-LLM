@@ -38,22 +38,22 @@ add_subdirectory(runtime)
 set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
 set(BATCH_MANAGER_TARGET_ARCH "unknown")
 
-execute_process(
-  COMMAND grep -oP "(?<=^ID=).+" /etc/os-release
-  COMMAND tr -d "\""
-  COMMAND tr -d "\n"
-  RESULT_VARIABLE _OS_ID_SUCCESS
-  OUTPUT_VARIABLE OS_ID)
-execute_process(
-  COMMAND grep -oP "(?<=^VERSION_ID=).+" /etc/os-release
-  COMMAND tr -d "\""
-  COMMAND tr -d "\n"
-  RESULT_VARIABLE _OS_VERSION_ID_SUCCESS
-  OUTPUT_VARIABLE OS_VERSION_ID)
-message(STATUS "Operating System: ${OS_ID}, ${OS_VERSION_ID}")
-
 message(STATUS "CMAKE_SYSTEM_PROCESSOR: ${CMAKE_SYSTEM_PROCESSOR}")
 if(NOT WIN32) # Linux
+  execute_process(
+    COMMAND grep -oP "(?<=^ID=).+" /etc/os-release
+    COMMAND tr -d "\""
+    COMMAND tr -d "\n"
+    RESULT_VARIABLE _OS_ID_SUCCESS
+    OUTPUT_VARIABLE OS_ID)
+  execute_process(
+    COMMAND grep -oP "(?<=^VERSION_ID=).+" /etc/os-release
+    COMMAND tr -d "\""
+    COMMAND tr -d "\n"
+    RESULT_VARIABLE _OS_VERSION_ID_SUCCESS
+    OUTPUT_VARIABLE OS_VERSION_ID)
+  message(STATUS "Operating System: ${OS_ID}, ${OS_VERSION_ID}")
+
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
     set(BATCH_MANAGER_TARGET_ARCH "x86_64-linux-gnu")
   elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")

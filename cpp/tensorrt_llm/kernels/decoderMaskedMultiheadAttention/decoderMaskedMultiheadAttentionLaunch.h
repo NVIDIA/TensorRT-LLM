@@ -101,6 +101,7 @@ inline void multi_block_grid_setup(dim3& grid, const Multihead_attention_params<
 
     params.seq_len_tile
         = mmha::divUp(params.multi_processor_count * blocks_per_sm, params.batch_size * params.num_heads);
+    params.seq_len_tile = std::max(params.min_seq_len_tile, params.seq_len_tile);
 
     const int threads_per_value = mmha::threads_per_value<T>(mmha::dh_max(Dh));
     // Make sure that each block at least processes one loop of kv (unroll size is default at 8).
@@ -226,7 +227,7 @@ void mmha_launch_kernel_ex(
     }
 
     // If blocks with larger block size already fill all SMs, then disable the multi blocks mode.
-    mmha::multi_block_grid_setup<T, Dh>(grid, params, dynamic_block_size, available_blocks, tlength, DO_MULTI_BLOCK);
+    mmha::multi_block_grid_setup<T, Dh>(grid, params, available_blocks, dynamic_block_size, tlength, DO_MULTI_BLOCK);
 
     // Launch kernels based on the valid block size.
     switch (dynamic_block_size)

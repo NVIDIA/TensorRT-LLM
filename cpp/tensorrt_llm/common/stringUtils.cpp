@@ -38,7 +38,7 @@ std::string vformat(char const* fmt, va_list args)
     std::string stringBuf(size, char{});
     auto const size2 = std::vsnprintf(&stringBuf[0], size + 1, fmt, args);
 
-    TLLM_CHECK_WITH_INFO(size2 == size, std::strerror(errno));
+    TLLM_CHECK_WITH_INFO(size2 == size, std::string(std::strerror(errno)));
 
     return stringBuf;
 }

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <algorithm> // all_of
 #include <assert.h>
 
 #include "tensorrt_llm/common/assert.h"

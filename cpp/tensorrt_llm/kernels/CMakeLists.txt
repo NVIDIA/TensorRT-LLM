@@ -18,6 +18,12 @@
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
+# skip mmha 48, 80, 96, 112, 144, 160, 192 and 224 for fast build
+if(FAST_BUILD)
+  list(FILTER SRC_CU EXCLUDE REGEX
+       "decoderMaskedMultiheadAttention(48|80|96|112|144|160|192|224).*cu$")
+endif()
+
 add_library(kernels_src OBJECT ${SRC_CPP} ${SRC_CU})
 set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)

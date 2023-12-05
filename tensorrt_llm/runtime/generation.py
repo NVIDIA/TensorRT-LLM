@@ -13,15 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import csv
 import math
 from dataclasses import dataclass, field
-from functools import wraps
-from typing import Dict, List, Optional, Sequence, Union
+from functools import reduce, wraps
+from typing import Dict, Iterable, List, Optional, Sequence, Union
 
 import numpy as np
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from cuda import cudart
 
 from .._ipc_utils import IpcMemory, set_peer_access
@@ -30,6 +34,7 @@ from ..logger import logger
 from ..mapping import Mapping
 from ..quantization import QuantMode
 from .kv_cache_manager import GenerationSequence, KVCacheManager
+from .lora_manager import LoraManager
 from .session import _scoped_stream
 
 
@@ -195,6 +200,9 @@ class _Runtime(object):
                    shape_dict: Dict[str, List[int]]):
         for i in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(i)
+            if not name in shape_dict:
+                # shape and buffer can be set by calling _set_tensors API
+                continue
             if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
                 ok = context.set_input_shape(name, shape_dict[name])
                 logger.debug(
@@ -219,6 +227,14 @@ class _Runtime(object):
             assert buffer_dict[name].is_contiguous(
             ), f"{name} is not contiguous()"
             context.set_tensor_address(name, buffer_dict[name].data_ptr())
+
+    def _set_tensors(self, context: trt.IExecutionContext,
+                     tensors: [List["RuntimeTensor"]]):
+        for t in tensors:
+            # output's shape is inference by TRT, no need to set the shape here
+            if self.engine.get_tensor_mode(t.name) == trt.TensorIOMode.INPUT:
+                context.set_input_shape(t.name, t.shape)
+            context.set_tensor_address(t.name, t.data)
 
     def _run(self,
              context: trt.IExecutionContext,
@@ -246,6 +262,7 @@ class ModelConfig:
     model_name: str = ""
     paged_kv_cache: bool = False
     cross_attention: bool = False
+    head_size: int = None
     has_position_embedding: bool = True
     has_token_type_embedding: bool = False
     tokens_per_block: int = 64
@@ -254,6 +271,8 @@ class ModelConfig:
     gather_all_token_logits: bool = False
     dtype: str = ""
     use_custom_all_reduce: bool = False
+    lora_plugin: bool = False
+    lora_target_modules: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -261,7 +280,14 @@ class SamplingConfig:
     end_id: int
     pad_id: int
 
+    max_new_tokens: int = field(default=20)
     num_beams: int = field(default=1)
+    max_kv_cache_length: Optional[int] = field(default=None)
+    output_sequence_lengths: bool = field(default=False)
+    return_dict: bool = field(default=False)
+    stop_words_list: Optional[torch.Tensor] = field(default=None)
+    bad_words_list: Optional[torch.Tensor] = field(default=None)
+
     temperature: Union[float, torch.Tensor] = field(default=1.0)
     top_k: Union[int, torch.Tensor] = field(default=1)
     top_p: Union[float, torch.Tensor] = field(default=0.0)
@@ -278,6 +304,68 @@ class SamplingConfig:
     random_seed: Union[int, torch.Tensor] = field(init=False, default=None)
     output_cum_log_probs: bool = field(init=False, default=False)
     output_log_probs: bool = field(init=False, default=False)
+
+    def update(self, **kwargs):
+        unused_kwargs = dict()
+        for key, value in kwargs.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
+            else:
+                unused_kwargs[key] = value
+        return unused_kwargs
+
+
+class RuntimeTensor:
+
+    def __init__(self):
+        self._name = ""
+        # shape is the one sent to TRT, the actual torch tensor can be larger than the shape
+        # this is useful when allocating a big KV cache tensor at the beginning and incremental seq length dim of TRT engine's input tensor
+        self._shape = None
+        self._torch_tensor = None
+
+    @staticmethod
+    def from_torch(
+            name: str,
+            data: torch.Tensor,
+            override_shape: Optional[Iterable] = None) -> 'RuntimeTensor':
+        assert (isinstance(data, torch.Tensor))
+        t = RuntimeTensor()
+        t._name = name
+        # need to hold the torch tensor for memory life time
+        t._torch_tensor = data.contiguous()
+        torch_shape = list(data.size())
+        if override_shape is not None:
+            t._shape = override_shape
+            assert isinstance(override_shape, list) or isinstance(
+                override_shape, tuple)
+            assert all([lambda x: x >= 0 for x in override_shape
+                        ]), f"Expect all dimensions >=0, got {override_shape}"
+            volumeFunc = lambda dims: reduce(lambda x, y: x * y, dims, 1)
+            assert volumeFunc(override_shape) <= volumeFunc(torch_shape), \
+                f"Override the shape to be larger than the underlying torch Tensor, got {override_shape}, torch tensor shape {torch_shape}"
+        else:
+            t._shape = torch_shape
+        return t
+
+    def to_torch(self) -> torch.Tensor:
+        return self._torch_tensor
+
+    @property
+    def shape(self) -> Iterable[int]:
+        return self._shape
+
+    @property
+    def data(self):
+        return self._torch_tensor.data_ptr()
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._torch_tensor.dtype
 
 
 class GenerationSession(object):
@@ -310,7 +398,8 @@ class GenerationSession(object):
             f'cuda:{self.runtime.runtime_rank % mapping.gpus_per_node}')
         torch.cuda.set_device(self.device)
         # dynamic_decoder currently use torch's current stream, so must let TRT enqueue use same stream here
-        if stream is None:
+        self.stream = stream
+        if self.stream is None:
             self.stream = torch.cuda.Stream(self.device)
         torch.cuda.set_stream(self.stream)
         self.debug_mode = debug_mode
@@ -368,7 +457,8 @@ class GenerationSession(object):
         if model_config.has_position_embedding and self.mapping.is_first_pp_rank(
         ):
             expected_tensor_names += ['position_ids']
-        if model_config.has_token_type_embedding:
+        if model_config.has_token_type_embedding and self.mapping.is_first_pp_rank(
+        ):
             expected_tensor_names += ['token_type_ids']
 
         expected_tensor_names += ['cache_indirection']
@@ -376,6 +466,10 @@ class GenerationSession(object):
         if self.paged_kv_cache:
             expected_tensor_names += [
                 f'kv_cache_block_pointers_{i}'
+                for i in range(self.first_layer, self.last_layer)
+            ]
+            expected_tensor_names += [
+                f'host_kv_cache_block_pointers_{i}'
                 for i in range(self.first_layer, self.last_layer)
             ]
         else:
@@ -394,7 +488,8 @@ class GenerationSession(object):
                 'host_past_key_value_lengths'
             ]
             expected_tensor_names += [
-                f'host_max_kv_cache_length_{i}' for i in range(self.num_layers)
+                f'host_max_kv_cache_length_{i}'
+                for i in range(self.first_layer, self.last_layer)
             ]
             if model_config.remove_input_padding:
                 expected_tensor_names.append('host_context_lengths')
@@ -410,10 +505,12 @@ class GenerationSession(object):
 
         if model_config.cross_attention:
             expected_tensor_names += [
-                f'cross_present_key_value_{i}' for i in range(self.num_layers)
+                f'cross_present_key_value_{i}'
+                for i in range(self.first_layer, self.last_layer)
             ]
             expected_tensor_names += [
-                f'cross_past_key_value_{i}' for i in range(self.num_layers)
+                f'cross_past_key_value_{i}'
+                for i in range(self.first_layer, self.last_layer)
             ]
             expected_tensor_names += [
                 'encoder_output', 'encoder_input_lengths',
@@ -422,6 +519,20 @@ class GenerationSession(object):
 
         if self.mapping.tp_size > 1 and model_config.use_custom_all_reduce:
             expected_tensor_names += ['all_reduce_workspace']
+
+        self.lora_target_modules = model_config.lora_target_modules
+
+        if model_config.lora_plugin:
+            for lora_module in self.lora_target_modules:
+                expected_tensor_names += [
+                    f'{lora_module}_lora_ranks_{i}'
+                    for i in range(self.first_layer, self.last_layer)
+                ]
+
+                expected_tensor_names += [
+                    f'{lora_module}_lora_weights_pointers_{i}'
+                    for i in range(self.first_layer, self.last_layer)
+                ]
 
         found_tensor_names = [
             self.runtime.engine.get_tensor_name(i)
@@ -493,7 +604,11 @@ class GenerationSession(object):
 
     @property
     def head_size(self):
-        return self.hidden_size // self.num_heads
+        return self.hidden_size // self.num_heads if self._model_config.head_size is None else self._model_config.head_size
+
+    @property
+    def max_prompt_embedding_table_size(self):
+        return self._model_config.max_prompt_embedding_table_size
 
     @property
     def quant_mode(self):
@@ -540,6 +655,10 @@ class GenerationSession(object):
     @property
     def has_token_type_embedding(self):
         return self._model_config.has_token_type_embedding
+
+    @property
+    def use_lora_plugin(self):
+        return self._model_config.lora_plugin
 
     def __setup_decoder(self, input_ids: torch.Tensor,
                         sampling_config: SamplingConfig,
@@ -606,8 +725,8 @@ class GenerationSession(object):
                                                dtype=torch.float32)
 
         assert (
-            scfg.presence_penalty == 0.0 or scfg.repetition_penalty == 0.0
-        ), f"presence_penalty({scfg.presence_penalty}) and repetition_penalty({scfg.repetition_penalty}) cannot be larger than 0.0 at the same time."
+            scfg.presence_penalty == 0.0 or scfg.repetition_penalty == 1.0
+        ), f"presence_penalty({scfg.presence_penalty}) and repetition_penalty({scfg.repetition_penalty}) cannot be non-default values at the same time."
 
         if isinstance(scfg.min_length, torch.Tensor):
             assert scfg.min_length.dtype == torch.int32, f"scfg.min_length.dtype ({scfg.min_length.dtype}) must be torch.int32"
@@ -662,6 +781,7 @@ class GenerationSession(object):
                                   device=self.device)
         max_context_length = host_context_lengths.max()
 
+        # setup output ids buffer
         if input_ids.shape[0] != host_context_lengths.shape[0]:
             # dim 0 of input_ids is not batch size, which means remove_padding is enabled
             split_ids_list = list(
@@ -680,7 +800,7 @@ class GenerationSession(object):
             tiled_input_ids = tiled_input_ids.reshape(batch_size,
                                                       scfg.num_beams,
                                                       max_context_length)
-            tiled_input_ids.permute(2, 0, 1)
+            tiled_input_ids.permute(2, 0, 1)  # TODO: delete?
             self.output_ids = torch.cat(
                 (tiled_input_ids,
                  torch.full((batch_size, scfg.num_beams,
@@ -732,7 +852,7 @@ class GenerationSession(object):
             self.log_probs = None
 
         self.finished = torch.zeros((batch_size, scfg.num_beams),
-                                    dtype=torch.bool,
+                                    dtype=torch.uint8,
                                     device=self.device)
 
         if scfg.use_beam_hyps:
@@ -787,7 +907,9 @@ class GenerationSession(object):
               max_new_tokens: int,
               beam_width: int = 1,
               max_kv_cache_length: Optional[int] = None,
-              encoder_max_input_length: Optional[int] = None):
+              encoder_max_input_length: Optional[int] = None,
+              lora_manager: LoraManager = None,
+              lora_uids: List[str] = None):
         # Store these params related to buffer size to check against
         # the input shape with the params given in decode()
         self.batch_size = batch_size
@@ -798,7 +920,7 @@ class GenerationSession(object):
         self.encoder_max_input_length = encoder_max_input_length
         if max_kv_cache_length is None:
             self.max_kv_cache_length = self.max_seq_length
-            logger.info(
+            logger.debug(
                 "The max_kv_cache_length is not set, we will use max_seq_length by default."
             )
             self.host_max_kv_cache_lengths = [
@@ -829,7 +951,8 @@ class GenerationSession(object):
                                            self.max_seq_length)
             if max_kv_cache_length.shape[0] != self.num_layers:
                 logger.error(
-                    "max_kv_cache_length tensor's size is not equal to num_layers!"
+                    "max_kv_cache_length tensor's size is not equal to num_layers! "
+                    "Note that num_layers = num_total_layers // pipeline_parallelism_size."
                 )
                 assert False
             self.host_max_kv_cache_lengths = [
@@ -840,6 +963,7 @@ class GenerationSession(object):
             ]
         else:
             assert False, "invalid max_kv_cache_length!"
+        self.lora_manager = lora_manager
 
         self.buffer = {}
         if self.mapping.is_last_pp_rank():
@@ -850,6 +974,7 @@ class GenerationSession(object):
                 dtype=self._tensor_dtype('logits'),
                 device=self.device)
         if self.cross_attention:
+            # use shape info to pass max length info in remove padding mode
             self.buffer['encoder_max_input_length'] = torch.empty(
                 (encoder_max_input_length, ),
                 dtype=self._tensor_dtype('encoder_max_input_length'),
@@ -905,10 +1030,16 @@ class GenerationSession(object):
             # They will take turns to act as input and output buffers.
             # Not applicable to cross KV buffers as it's constant
             for i in range(self.first_layer, self.last_layer):
+                trt_dtype = self.runtime.engine.get_tensor_dtype(
+                    f'present_key_value_{i}')
+                if trt_dtype == trt.fp8:
+                    # PyTorch doesn't support fp8 datatype, use int8 instead of it because int8 datatype size is same with fp8.
+                    # TODO: Remove this section when PyTorch support fp8 datatype
+                    dtype = torch.int8
+                else:
+                    dtype = self._tensor_dtype(f'present_key_value_{i}')
                 self.buffer[f'1_present_key_value_{i}'] = torch.empty(
-                    cache_shape,
-                    dtype=self._tensor_dtype(f'present_key_value_{i}'),
-                    device=self.device)
+                    cache_shape, dtype=dtype, device=self.device)
 
         if self.use_custom_all_reduce and self.mapping.tp_size > 1:
             set_peer_access(self.mapping)
@@ -927,45 +1058,87 @@ class GenerationSession(object):
                 dtype=torch.int64,
                 device="cpu")
 
+        if self.use_lora_plugin and self.lora_manager is not None:
+            assert lora_uids is not None
+            lora_weights_pointers_list = [
+                torch.zeros(size=(batch_size, 2),
+                            dtype=torch.int64).contiguous().cpu()
+                for _ in range(self.num_layers)
+            ]
+
+            for idx in range(self.num_layers):
+                layer_idx = idx + self.first_layer
+
+                for lora_module in self.lora_target_modules:
+                    self.buffer.update({
+                        f'{lora_module}_lora_ranks_{layer_idx}':
+                        torch.zeros(size=(batch_size, ),
+                                    dtype=torch.int32).contiguous().cpu()
+                    })
+
+                    self.buffer.update({
+                        f'{lora_module}_lora_weights_pointers_{layer_idx}':
+                        torch.zeros(size=(batch_size, 2),
+                                    dtype=torch.int64).contiguous().cpu()
+                    })
+                    for batch_idx in range(batch_size):
+                        lora_uid = lora_uids[batch_idx]
+                        if lora_uid is not None and lora_uid != "-1":
+                            self.buffer[f'{lora_module}_lora_ranks_{layer_idx}'][
+                                batch_idx] = self.lora_manager.uid_to_low_ranks(
+                                    lora_uid)[layer_idx][lora_module]
+
+                            self.buffer[
+                                f'{lora_module}_lora_weights_pointers_{layer_idx}'][
+                                    batch_idx][
+                                        0] = self.lora_manager.lora_weights_pointers_list[
+                                            layer_idx][lora_uid][lora_module][0]
+                            self.buffer[
+                                f'{lora_module}_lora_weights_pointers_{layer_idx}'][
+                                    batch_idx][
+                                        1] = self.lora_manager.lora_weights_pointers_list[
+                                            layer_idx][lora_uid][lora_module][1]
+                        else:
+                            self.buffer[
+                                f'{lora_module}_lora_ranks_{layer_idx}'][
+                                    batch_idx] = 0
+
         self.buffer_allocated = True
 
-    def _get_context_shape_buffer(self,
-                                  input_ids: torch.Tensor,
-                                  context_lengths: torch.Tensor,
-                                  host_context_lengths: torch.Tensor,
-                                  position_ids: torch.Tensor,
-                                  last_token_ids: torch.Tensor,
-                                  attention_mask: torch.Tensor,
-                                  cache_indirection: torch.Tensor,
-                                  kv_cache_block_pointers: List[torch.Tensor],
-                                  hidden_states_input: torch.Tensor = None,
-                                  prompt_embedding_table: torch.Tensor = None,
-                                  tasks: torch.Tensor = None,
-                                  prompt_vocab_size: torch.Tensor = None,
-                                  encoder_output: torch.Tensor = None,
-                                  encoder_input_lengths: torch.Tensor = None):
-        ctx_shape = {
-            'context_lengths': context_lengths.shape,
-            'cache_indirection': cache_indirection.shape,
-        }
-        ctx_buffer = {
-            'context_lengths': context_lengths.contiguous(),
-            'cache_indirection': cache_indirection.contiguous(),
-        }
+    def _get_context_shape_buffer(
+            self,
+            input_ids: torch.Tensor,
+            context_lengths: torch.Tensor,
+            host_context_lengths: torch.Tensor,
+            position_ids: torch.Tensor,
+            last_token_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
+            cache_indirection: torch.Tensor,
+            kv_cache_block_pointers: List[torch.Tensor],
+            host_kv_cache_block_pointers: List[torch.Tensor],
+            hidden_states_input: torch.Tensor = None,
+            prompt_embedding_table: torch.Tensor = None,
+            tasks: torch.Tensor = None,
+            prompt_vocab_size: torch.Tensor = None,
+            encoder_output: torch.Tensor = None,
+            encoder_input_lengths: torch.Tensor = None) -> List[RuntimeTensor]:
+        tensors = []
+        sym = lambda x, name: RuntimeTensor.from_torch(name, x)
+        add_tensor = lambda x, name: tensors.append(sym(x, name))
+        add_tensor_with_shape = lambda x, name, shape: tensors.append(
+            RuntimeTensor.from_torch(name, x, override_shape=shape))
+
+        add_tensor(context_lengths, 'context_lengths')
+        add_tensor(cache_indirection, 'cache_indirection')
+
         if self.has_position_embedding:
-            ctx_shape['position_ids'] = position_ids.shape
-            ctx_buffer['position_ids'] = position_ids.contiguous()
+            add_tensor(position_ids, 'position_ids')
 
         if self.cross_attention:
-            ctx_shape['encoder_output'] = encoder_output.shape
-            ctx_shape['encoder_input_lengths'] = encoder_input_lengths.shape
-            ctx_shape['encoder_max_input_length'] = self.buffer[
-                'encoder_max_input_length'].shape
-            ctx_buffer['encoder_output'] = encoder_output.contiguous()
-            ctx_buffer[
-                'encoder_input_lengths'] = encoder_input_lengths.contiguous()
-            ctx_buffer['encoder_max_input_length'] = self.buffer[
-                'encoder_max_input_length']
+            add_tensor(encoder_output, 'encoder_output')
+            add_tensor(encoder_input_lengths, 'encoder_input_lengths')
+            add_tensor(self.buffer['encoder_max_input_length'],
+                       'encoder_max_input_length')
 
         if self.mapping.has_pp():
             hidden_size = self.hidden_size * self.mapping.tp_size
@@ -973,27 +1146,20 @@ class GenerationSession(object):
                 input_ids.shape[0], input_ids.shape[1], hidden_size)
 
         if self.mapping.is_last_pp_rank():
-            ctx_buffer['logits'] = self.buffer['logits']
+            add_tensor(self.buffer['logits'], 'logits')
 
             if not self.gather_all_token_logits:
-                ctx_shape['last_token_ids'] = last_token_ids.shape
-                ctx_buffer['last_token_ids'] = last_token_ids.contiguous()
+                add_tensor(last_token_ids, 'last_token_ids')
         else:
-            ctx_shape['hidden_states_output'] = hidden_states_input.shape
-            ctx_buffer['hidden_states_output'] = hidden_states_input.contiguous(
-            )
+            add_tensor(hidden_states_input, 'hidden_states_output')
 
         if self.mapping.is_first_pp_rank():
-            ctx_shape['input_ids'] = input_ids.shape
-            ctx_buffer['input_ids'] = input_ids.contiguous()
+            add_tensor(input_ids, 'input_ids')
         else:
-            ctx_shape['hidden_states_input'] = hidden_states_input.shape
-            ctx_buffer['hidden_states_input'] = hidden_states_input.contiguous()
+            add_tensor(hidden_states_input, 'hidden_states_input')
 
         if prompt_embedding_table is not None:
-            ctx_buffer[
-                'prompt_embedding_table'] = prompt_embedding_table.contiguous()
-            ctx_shape['prompt_embedding_table'] = prompt_embedding_table.shape
+            add_tensor(prompt_embedding_table, 'prompt_embedding_table')
 
             if self.remove_input_padding:
                 tasks_generation = torch.concat([
@@ -1004,22 +1170,21 @@ class GenerationSession(object):
                 ]).unsqueeze(0).cuda()
             else:
                 tasks_generation = tasks.unsqueeze(-1)
-
-            ctx_buffer['tasks'] = tasks_generation.contiguous()
-            ctx_shape['tasks'] = tasks_generation.shape
-
-            ctx_buffer['prompt_vocab_size'] = prompt_vocab_size.contiguous()
-            ctx_shape['prompt_vocab_size'] = prompt_vocab_size.shape
+            add_tensor(tasks_generation, 'tasks')
+            add_tensor(prompt_vocab_size, 'prompt_vocab_size')
 
         if self.paged_kv_cache:
             for idx in range(self.num_layers):
                 layer_idx = idx + self.first_layer
-                ctx_buffer[
-                    f'kv_cache_block_pointers_{layer_idx}'] = kv_cache_block_pointers[
-                        idx].contiguous()
+                buffer = kv_cache_block_pointers[idx].contiguous()
                 shape = kv_cache_block_pointers[idx].shape
                 shape = [shape[0] * shape[1], *shape[2:]]
-                ctx_shape[f'kv_cache_block_pointers_{layer_idx}'] = shape
+                add_tensor_with_shape(buffer,
+                                      f'kv_cache_block_pointers_{layer_idx}',
+                                      shape)
+                add_tensor_with_shape(
+                    host_kv_cache_block_pointers[idx],
+                    f'host_kv_cache_block_pointers_{layer_idx}', shape)
 
         batch_size = context_lengths.shape[0]
         if not self.paged_kv_cache:
@@ -1031,15 +1196,12 @@ class GenerationSession(object):
                     kv_cache_buffer = torch.zeros((1, ),
                                                   dtype=torch.float32,
                                                   device=self.device)
-                    ctx_shape.update({
-                        f'past_key_value_{idx}': kv_cache_shape,
-                    })
-                    ctx_buffer.update({
-                        f'past_key_value_{idx}':
-                        kv_cache_buffer,
-                        f'present_key_value_{idx}':
-                        self.buffer[f'present_key_value_{idx}'],
-                    })
+                    add_tensor_with_shape(kv_cache_buffer,
+                                          f'past_key_value_{idx}',
+                                          kv_cache_shape)
+                    present = f'present_key_value_{idx}'
+                    add_tensor(self.buffer[present], present)
+
                     if self.cross_attention:
                         cross_kv_cache_shape = (batch_size, 2,
                                                 self.num_heads_kv, 0,
@@ -1048,102 +1210,81 @@ class GenerationSession(object):
                         cross_kv_cache_buffer = torch.zeros((1, ),
                                                             dtype=torch.float32,
                                                             device=self.device)
-                        ctx_shape.update({
-                            f'cross_past_key_value_{idx}':
-                            cross_kv_cache_shape,
-                        })
-                        ctx_buffer.update({
-                            f'cross_past_key_value_{idx}':
-                            cross_kv_cache_buffer,
-                            f'cross_present_key_value_{idx}':
-                            self.buffer[f'cross_present_key_value_{idx}'],
-                        })
+                        add_tensor_with_shape(cross_kv_cache_buffer,
+                                              f'cross_past_key_value_{idx}',
+                                              cross_kv_cache_shape)
+                        cross_present = f'cross_present_key_value_{idx}'
+                        add_tensor(self.buffer[cross_present], cross_present)
                 else:
                     key_value_cache = self.buffer[f'present_key_value_{idx}']
-                    cache_shape = key_value_cache.shape
-                    ctx_shape.update({
-                        f'past_key_value_{idx}': cache_shape,
-                    })
-                    ctx_buffer.update({
-                        f'past_key_value_{idx}':
-                        key_value_cache,
-                        f'present_key_value_{idx}':
-                        key_value_cache,
-                    })
+                    # when plugin is used, past_ket_value tensor does not need to be empty tensor
+                    # because plugin does not care, and does not use this shape.
+                    add_tensor(key_value_cache, f'past_key_value_{idx}')
+                    add_tensor(key_value_cache, f'present_key_value_{idx}')
+
                     if self.cross_attention:
-                        cross_cache_shape = self.buffer[
-                            f'cross_present_key_value_{idx}'].shape
                         cross_cache_buffer = self.buffer[
                             f'cross_present_key_value_{idx}']
-                        ctx_shape.update({
-                            f'cross_past_key_value_{idx}':
-                            cross_cache_shape,
-                        })
-                        ctx_buffer.update({
-                            f'cross_past_key_value_{idx}':
-                            cross_cache_buffer,
-                            f'cross_present_key_value_{idx}':
-                            cross_cache_buffer
-                        })
+                        add_tensor(cross_cache_buffer,
+                                   f'cross_past_key_value_{idx}')
+                        add_tensor(cross_cache_buffer,
+                                   f'cross_present_key_value_{idx}')
 
         if self.use_gpt_attention_plugin:
+            # context request
             host_request_types = torch.zeros_like(context_lengths,
                                                   device='cpu').int()
-            ctx_shape.update({
-                'sequence_length': (batch_size, ),
-                'host_past_key_value_lengths': (batch_size, ),
-                'host_request_types': host_request_types.shape,
-            })
+            self.sequence_length_buffer = context_lengths.detach().clone()
+            add_tensor_with_shape(self.sequence_length_buffer,
+                                  'sequence_length', (batch_size, ))
+
+            # field 0: past_key_value_length, field 1: is_context (deprecated). changed to [0], otherwise affects batch padded input mode
+            add_tensor_with_shape(host_context_lengths,
+                                  'host_past_key_value_lengths', (batch_size, ))
+            add_tensor(host_request_types, 'host_request_types')
             for idx in range(self.first_layer, self.last_layer):
-                ctx_shape.update({
-                    f'host_max_kv_cache_length_{idx}': (1, ),
-                })
-                ctx_buffer.update({
-                    f'host_max_kv_cache_length_{idx}':
-                    self.host_max_kv_cache_lengths[idx],
-                })
-            ctx_buffer.update({
-                'sequence_length':
-                self.sequence_length_buffer,
-                'host_past_key_value_lengths':
-                torch.tensor(
-                    [0, 1] * batch_size, dtype=torch.int32
-                ),  # field 0: past_key_value_length, field 1: is_context
-                'host_request_types':
-                host_request_types.contiguous(),
-            })
+                add_tensor_with_shape(
+                    self.host_max_kv_cache_lengths[idx - self.first_layer],
+                    f'host_max_kv_cache_length_{idx}', (1, ))
             if self.remove_input_padding:
-                ctx_buffer[
-                    'host_context_lengths'] = host_context_lengths.contiguous()
-                ctx_shape['host_context_lengths'] = host_context_lengths.shape
+                add_tensor(host_context_lengths, 'host_context_lengths')
         else:
-            ctx_shape.update({'attention_mask': attention_mask.shape})
-            ctx_buffer.update({'attention_mask': attention_mask.contiguous()})
+            add_tensor(attention_mask, 'attention_mask')
 
         if self.use_custom_all_reduce and self.mapping.tp_size > 1:
-            ctx_shape['all_reduce_workspace'] = self.all_reduce_workspace.shape
-            ctx_buffer['all_reduce_workspace'] = self.all_reduce_workspace
+            add_tensor(self.all_reduce_workspace, 'all_reduce_workspace')
 
-        return ctx_shape, ctx_buffer
+        if self.use_lora_plugin:
+            for idx in range(self.num_layers):
+                for lora_module in self.lora_target_modules:
+                    layer_idx = idx + self.first_layer
+                    lora_ranks = f'{lora_module}_lora_ranks_{layer_idx}'
+                    add_tensor(self.buffer[lora_ranks], lora_ranks)
+                    lora_weights = f'{lora_module}_lora_weights_pointers_{layer_idx}'
+                    add_tensor(self.buffer[lora_weights], lora_weights)
 
-    def _get_next_step_shape_buffer(self,
-                                    batch_size: int,
-                                    beam_width: int,
-                                    max_context_length: int,
-                                    step: int,
-                                    context_lengths: torch.Tensor,
-                                    host_context_lengths: torch.Tensor,
-                                    position_ids: torch.Tensor,
-                                    last_token_ids: torch.Tensor,
-                                    attention_mask: torch.Tensor,
-                                    cache_indirection: torch.Tensor,
-                                    kv_cache_block_pointers: List[torch.Tensor],
-                                    hidden_states_input: torch.Tensor = None,
-                                    prompt_embedding_table: torch.Tensor = None,
-                                    tasks: torch.Tensor = None,
-                                    prompt_vocab_size: torch.Tensor = None,
-                                    encoder_output: torch.Tensor = None,
-                                    encoder_input_lengths: torch.Tensor = None):
+        return tensors
+
+    def _get_next_step_shape_buffer(
+            self,
+            batch_size: int,
+            beam_width: int,
+            max_context_length: int,
+            step: int,
+            context_lengths: torch.Tensor,
+            host_context_lengths: torch.Tensor,
+            position_ids: torch.Tensor,
+            last_token_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
+            cache_indirection: torch.Tensor,
+            kv_cache_block_pointers: List[torch.Tensor],
+            host_kv_cache_block_pointers: List[torch.Tensor],
+            hidden_states_input: torch.Tensor = None,
+            prompt_embedding_table: torch.Tensor = None,
+            tasks: torch.Tensor = None,
+            prompt_vocab_size: torch.Tensor = None,
+            encoder_output: torch.Tensor = None,
+            encoder_input_lengths: torch.Tensor = None):
         next_step_shape = {
             'context_lengths': context_lengths.shape,
             'cache_indirection': cache_indirection.shape,
@@ -1192,7 +1333,11 @@ class GenerationSession(object):
             next_step_buffer['position_ids'] = position_ids.contiguous()
 
         if self.cross_attention:
-            next_step_shape['encoder_output'] = encoder_output.shape
+            # hack: disable (or minimize) cross qkv computation at generation phase
+            # TODO: enable [0,0,.] true zero tensor input; or use IfConditionalLayer
+            next_step_shape['encoder_output'] = [
+                1, 1, encoder_output.shape[-1]
+            ]  # encoder_output.shape
             next_step_shape[
                 'encoder_input_lengths'] = encoder_input_lengths.shape
             next_step_shape['encoder_max_input_length'] = self.buffer[
@@ -1209,9 +1354,14 @@ class GenerationSession(object):
                 next_step_buffer[
                     f'kv_cache_block_pointers_{layer_idx}'] = kv_cache_block_pointers[
                         idx].contiguous()
+                next_step_buffer[
+                    f'host_kv_cache_block_pointers_{layer_idx}'] = host_kv_cache_block_pointers[
+                        idx].contiguous()
                 shape = kv_cache_block_pointers[idx].shape
                 shape = [shape[0] * shape[1], *shape[2:]]
                 next_step_shape[f'kv_cache_block_pointers_{layer_idx}'] = shape
+                next_step_shape[
+                    f'host_kv_cache_block_pointers_{layer_idx}'] = shape
 
         if prompt_embedding_table is not None:
             next_step_buffer[
@@ -1276,11 +1426,19 @@ class GenerationSession(object):
                             f'cross_past_key_value_{idx}'] = cross_cache_shape
 
         if self.use_gpt_attention_plugin:
+            # generation requests
             host_request_types = torch.ones_like(context_lengths,
                                                  device='cpu').int()
+            # previous [past_kv_length, is_context] has been deprecated. only past_kv_length should be given here
+            # Note we should use max_context_length here to align to max -- but isn't this done in attn plugin's max_element() already?
+            host_past_key_value_lengths = torch.tensor(
+                [max_context_length + step] * (batch_size * beam_width),
+                dtype=torch.int32,
+                device='cpu')
             next_step_shape.update({
                 'sequence_length': (batch_size * beam_width, ),
-                'host_past_key_value_lengths': (batch_size * beam_width, ),
+                'host_past_key_value_lengths':
+                host_past_key_value_lengths.shape,
                 'host_request_types':
                 host_request_types.shape
             })
@@ -1290,19 +1448,13 @@ class GenerationSession(object):
                 })
                 next_step_buffer.update({
                     f'host_max_kv_cache_length_{idx}':
-                    self.host_max_kv_cache_lengths[idx],
+                    self.host_max_kv_cache_lengths[idx - self.first_layer],
                 })
             next_step_buffer.update({
                 # Sequence lengths are not used in the context phase actually.
-                'sequence_length':
-                self.sequence_length_buffer,
-                'host_past_key_value_lengths':
-                torch.tensor(
-                    [max_context_length + step, 0] * (batch_size * beam_width),
-                    dtype=torch.int32
-                ),  # field 0: past_key_value_length, field 1: is_context
-                'host_request_types':
-                host_request_types,
+                'sequence_length': self.sequence_length_buffer,
+                'host_past_key_value_lengths': host_past_key_value_lengths,
+                'host_request_types': host_request_types,
             })
             if self.remove_input_padding:
                 next_step_buffer[
@@ -1320,6 +1472,23 @@ class GenerationSession(object):
             next_step_shape[
                 'all_reduce_workspace'] = self.all_reduce_workspace.shape
             next_step_buffer['all_reduce_workspace'] = self.all_reduce_workspace
+
+        if self.use_lora_plugin:
+            for idx in range(self.num_layers):
+                layer_idx = idx + self.first_layer
+                for lora_module in self.lora_target_modules:
+                    next_step_shape[
+                        f'{lora_module}_lora_ranks_{layer_idx}'] = self.buffer[
+                            f'{lora_module}_lora_ranks_{layer_idx}'].shape
+                    next_step_buffer[
+                        f'{lora_module}_lora_ranks_{layer_idx}'] = self.buffer[
+                            f'{lora_module}_lora_ranks_{layer_idx}']
+                    next_step_shape[
+                        f'{lora_module}_lora_weights_pointers_{layer_idx}'] = self.buffer[
+                            f'{lora_module}_lora_weights_pointers_{layer_idx}'].shape
+                    next_step_buffer[
+                        f'{lora_module}_lora_weights_pointers_{layer_idx}'] = self.buffer[
+                            f'{lora_module}_lora_weights_pointers_{layer_idx}']
 
         return next_step_shape, next_step_buffer
 
@@ -1432,20 +1601,32 @@ class GenerationSession(object):
             self.nccl_comm.recv(final_output_ids, self.mapping.pp_group[-1])
         return final_output_ids
 
-    def finalize_decoder(self, context_lengths, batch_size, beam_width, scfg):
+    def finalize_decoder(self,
+                         context_lengths,
+                         batch_size,
+                         beam_width,
+                         scfg,
+                         streaming=False):
         final_output_ids = None
         if self.mapping.is_last_pp_rank():
             # output shape of self.gather_tree: [batch_size, beam_width, output_len]
-            final_output_ids = self.gather_tree(
-                self.sequence_length_buffer, self.output_ids, self.parent_ids,
-                self.end_ids, context_lengths, self.cum_log_probs,
+            beam_hyps_args = [
                 self.beam_hyps_output_ids_tgt,
                 self.beam_hyps_sequence_lengths_tgt,
                 self.beam_hyps_cum_log_probs, self.beam_hyps_normed_scores,
                 self.beam_hyps_log_probs, self.beam_hyps_min_normed_scores,
-                self.beam_hyps_num_beams, self.beam_hyps_is_done, self.finished,
-                self.length_penalty, batch_size, beam_width,
-                self.max_seq_length, scfg.use_beam_hyps)
+                self.beam_hyps_num_beams, self.beam_hyps_is_done
+            ]
+            if streaming:
+                # self.gather_tree modifies these args.
+                # In streaming mode, this results in incorrect decoding in the following steps.
+                beam_hyps_args = copy.deepcopy(beam_hyps_args)
+
+            final_output_ids = self.gather_tree(
+                self.sequence_length_buffer, self.output_ids, self.parent_ids,
+                self.end_ids, context_lengths, self.cum_log_probs,
+                *beam_hyps_args, self.finished, self.length_penalty, batch_size,
+                beam_width, self.max_seq_length, scfg.use_beam_hyps)
 
         # Communicate ranks in Pipeline Parallelism
         if self.mapping.has_pp():
@@ -1458,11 +1639,11 @@ class GenerationSession(object):
             self, cache_indirections: list, step: int, batch_size: int,
             max_context_length: int, beam_width: int, input_ids: torch.Tensor,
             hidden_states: torch.Tensor, scfg: SamplingConfig,
-            kv_cache_block_pointers: list, prompt_embedding_table: torch.Tensor,
-            tasks: torch.Tensor, context_lengths: torch.Tensor,
-            host_context_lengths, attention_mask: torch.Tensor,
-            prompt_vocab_size: torch.Tensor, ite: int,
-            sequence_limit_lengths: torch.Tensor,
+            kv_cache_block_pointers: list, host_kv_cache_block_pointers: list,
+            prompt_embedding_table: torch.Tensor, tasks: torch.Tensor,
+            context_lengths: torch.Tensor, host_context_lengths,
+            attention_mask: torch.Tensor, prompt_vocab_size: torch.Tensor,
+            ite: int, sequence_limit_lengths: torch.Tensor,
             sequence_lengths: torch.Tensor, next_step_buffer: dict,
             stop_words_list, bad_words_list, no_repeat_ngram_size,
             encoder_output: torch.Tensor, encoder_input_lengths: torch.Tensor):
@@ -1494,19 +1675,22 @@ class GenerationSession(object):
             attention_mask = model_inputs.get('attention_mask', None)
 
             if self.paged_kv_cache:
-                kv_cache_block_pointers = self.kv_cache_manager.get_pointer_arrays(
+                host_kv_cache_block_pointers = self.kv_cache_manager.get_pointer_arrays(
                     1)
+                kv_cache_block_pointers = [
+                    x.to('cuda') for x in host_kv_cache_block_pointers
+                ]
 
-            ctx_shape, ctx_buffer = self._get_context_shape_buffer(
+            ctx_tensors = self._get_context_shape_buffer(
                 input_ids, context_lengths, host_context_lengths, position_ids,
                 last_token_ids, attention_mask, this_src_cache_indirection,
-                kv_cache_block_pointers, hidden_states, prompt_embedding_table,
-                tasks, prompt_vocab_size, encoder_output, encoder_input_lengths)
+                kv_cache_block_pointers, host_kv_cache_block_pointers,
+                hidden_states, prompt_embedding_table, tasks, prompt_vocab_size,
+                encoder_output, encoder_input_lengths)
             context = self.runtime.ctx_context
-            self.runtime._set_shape(context, ctx_shape)
-            self.runtime._set_buffer(context, ctx_buffer)
+            self.runtime._set_tensors(context, ctx_tensors)
             if self.debug_mode:
-                self.debug_buffer = ctx_buffer
+                self.debug_buffer = {t.name: t.to_torch() for t in ctx_tensors}
             if self.cuda_graph_mode:
                 # context mode, clean cuda graph instances
                 self.runtime.cuda_graph_instances = [None for _ in range(2)]
@@ -1555,18 +1739,24 @@ class GenerationSession(object):
                             batch_size, self.vocab_size_padded)
 
         if step == 0 and beam_width > 1:
-
+            # these tiled tensors are returned by handle_per_step(), so they can relay to the next generation calls
             if not self.use_gpt_attention_plugin:
                 attention_mask = _tile_beam_width(attention_mask, beam_width)
             context_lengths = _tile_beam_width(context_lengths, beam_width)
             host_context_lengths = _tile_beam_width(host_context_lengths,
                                                     beam_width)
+            if encoder_input_lengths is not None:
+                encoder_input_lengths = _tile_beam_width(
+                    encoder_input_lengths, beam_width)
+
             if tasks is not None:
                 tasks = _tile_beam_width(tasks, beam_width)
 
             # Move tiling before logit computing of context
             if not self.paged_kv_cache:
                 for key in self.buffer.keys():
+                    # Note: this tiles both self attn cache and cross attn cache!
+                    # both names contain "present_key_value"
                     if "present_key_value" in key:
                         self.buffer[key] = _tile_beam_width(
                             self.buffer[key], beam_width)
@@ -1595,18 +1785,23 @@ class GenerationSession(object):
             attention_mask = model_inputs.get('attention_mask', None)
 
             if self.paged_kv_cache:
-                kv_cache_block_pointers = self.kv_cache_manager.get_pointer_arrays(
+                host_kv_cache_block_pointers = self.kv_cache_manager.get_pointer_arrays(
                     beam_width)
+                kv_cache_block_pointers = [
+                    x.to('cuda') for x in host_kv_cache_block_pointers
+                ]
 
             next_context = self.runtime.context_1 if step % 2 else self.runtime.context_0
             next_step_shape, next_step_buffer = self._get_next_step_shape_buffer(
                 batch_size, beam_width, max_context_length, step,
                 context_lengths, host_context_lengths, position_ids,
                 last_token_ids, attention_mask, next_src_cache_indirection,
-                kv_cache_block_pointers, hidden_states, prompt_embedding_table,
-                tasks, prompt_vocab_size, encoder_output, encoder_input_lengths)
+                kv_cache_block_pointers, host_kv_cache_block_pointers,
+                hidden_states, prompt_embedding_table, tasks, prompt_vocab_size,
+                encoder_output, encoder_input_lengths)
             self.runtime._set_shape(next_context, next_step_shape)
             self.runtime._set_buffer(next_context, next_step_buffer)
+
             if self.debug_mode:
                 self.debug_buffer = next_step_buffer
             if self.cuda_graph_mode:
@@ -1657,6 +1852,7 @@ class GenerationSession(object):
                 next_token_logits = logits.reshape(
                     (batch_size, beam_width, -1)).to(self.decoder_logits_dtype)
                 decode_step = step + max_context_length
+
                 should_stop = self.dynamic_decoder.forward(
                     next_token_logits, decode_step, max_context_length,
                     self.max_kv_cache_length, ite, batch_size, self.end_ids,
@@ -1664,9 +1860,9 @@ class GenerationSession(object):
                     sequence_limit_lengths, stop_words_list, bad_words_list,
                     no_repeat_ngram_size, this_src_cache_indirection,
                     self.output_ids, self.new_tokens, self.finished,
-                    self.sequence_length_buffer, self.cum_log_probs,
-                    self.log_probs, self.parent_ids, this_tgt_cache_indirection,
-                    self.beam_hyps_output_ids_tgt,
+                    self.finished, self.sequence_length_buffer,
+                    self.cum_log_probs, self.log_probs, self.parent_ids,
+                    this_tgt_cache_indirection, self.beam_hyps_output_ids_tgt,
                     self.beam_hyps_sequence_lengths_tgt,
                     self.beam_hyps_cum_log_probs, self.beam_hyps_normed_scores,
                     self.beam_hyps_log_probs, self.beam_hyps_min_normed_scores,
@@ -1691,7 +1887,7 @@ class GenerationSession(object):
                 # We set this to False for all sequences, since we use only length criterion to stop now
                 self.kv_cache_manager.step([False] * batch_size)
 
-        return should_stop, next_step_buffer, tasks, context_lengths, host_context_lengths, attention_mask, context_logits
+        return should_stop, next_step_buffer, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, encoder_input_lengths
 
     def decode_regular(self,
                        batch_size: int,
@@ -1715,8 +1911,10 @@ class GenerationSession(object):
                        output_sequence_lengths: bool = False,
                        return_dict: bool = False,
                        encoder_output: torch.Tensor = None,
-                       encoder_input_lengths: torch.Tensor = None):
+                       encoder_input_lengths: torch.Tensor = None,
+                       **kwargs):
         kv_cache_block_pointers = []
+        host_kv_cache_block_pointers = []
         next_step_buffer = None
         attention_mask = None
         context_logits = None
@@ -1734,23 +1932,42 @@ class GenerationSession(object):
                 outputs['generation_logits'] = generation_logits
             return outputs
 
+        benchmark_profiler = kwargs.get('benchmark_profiler', None)
+        generation_phase_step_count = 0
+
+        def profile_fn(benchmark_profiler_obj, step_count):
+            if benchmark_profiler_obj is not None:
+                benchmark_profiler_obj.record_cuda_event('last_token')
+                benchmark_profiler_obj.record_elapsed_time(
+                    'first_token', 'last_token', 'generation_time')
+                benchmark_profiler_obj.add_aux_info('generation_step_count',
+                                                    step_count)
+
         for step in range(0, self.max_new_tokens):
-            should_stop, next_step_buffer, tasks, context_lengths, host_context_lengths, attention_mask, logits = self.handle_per_step(
+            should_stop, next_step_buffer, tasks, context_lengths, host_context_lengths, attention_mask, logits, encoder_input_lengths = self.handle_per_step(
                 cache_indirections, step, batch_size, max_context_length,
                 beam_width, input_ids, hidden_states, scfg,
-                kv_cache_block_pointers, prompt_embedding_table, tasks,
-                context_lengths, host_context_lengths, attention_mask,
-                prompt_vocab_size, ite, sequence_limit_lengths,
-                sequence_lengths, next_step_buffer, stop_words_list,
-                bad_words_list, no_repeat_ngram_size, encoder_output,
-                encoder_input_lengths)
+                kv_cache_block_pointers, host_kv_cache_block_pointers,
+                prompt_embedding_table, tasks, context_lengths,
+                host_context_lengths, attention_mask, prompt_vocab_size, ite,
+                sequence_limit_lengths, sequence_lengths, next_step_buffer,
+                stop_words_list, bad_words_list, no_repeat_ngram_size,
+                encoder_output, encoder_input_lengths)
             if step == 0:
-                context_logits = logits
+                if benchmark_profiler is not None:
+                    benchmark_profiler.record_cuda_event('first_token')
+            else:
+                generation_phase_step_count = generation_phase_step_count + 1
             if self.gather_all_token_logits:
-                generation_logits.append(
-                    next_step_buffer['logits'].clone().detach())
+                if self.mapping.is_last_pp_rank():
+                    if step == 0:
+                        context_logits = logits
+                    else:
+                        generation_logits.append(
+                            next_step_buffer['logits'].clone().detach())
 
             if should_stop is not None and should_stop.item():
+                profile_fn(benchmark_profiler, generation_phase_step_count)
                 final_output_ids = self.finalize_decoder(
                     context_lengths, batch_size, beam_width, scfg)
 
@@ -1759,8 +1976,16 @@ class GenerationSession(object):
                         return get_outputs_dict(final_output_ids)
                     else:
                         return final_output_ids
+                elif self.mapping.is_last_pp_rank(
+                ) and self.gather_all_token_logits:
+                    outputs = {}
+                    outputs['context_logits'] = context_logits
+                    outputs['generation_logits'] = generation_logits
+                    return outputs
                 else:
                     return None
+
+        profile_fn(benchmark_profiler, generation_phase_step_count)
 
         final_output_ids = self.finalize_decoder(context_lengths, batch_size,
                                                  beam_width, scfg)
@@ -1770,6 +1995,11 @@ class GenerationSession(object):
                 return get_outputs_dict(final_output_ids)
             else:
                 return final_output_ids
+        elif self.mapping.is_last_pp_rank() and self.gather_all_token_logits:
+            outputs = {}
+            outputs['context_logits'] = context_logits
+            outputs['generation_logits'] = generation_logits
+            return outputs
         else:
             return None
 
@@ -1795,8 +2025,10 @@ class GenerationSession(object):
                       output_sequence_lengths: bool = False,
                       return_dict: bool = False,
                       encoder_output: torch.Tensor = None,
-                      encoder_input_lengths: torch.Tensor = None):
+                      encoder_input_lengths: torch.Tensor = None,
+                      **kwargs):
         kv_cache_block_pointers = []
+        host_kv_cache_block_pointers = []
         next_step_buffer = None
         attention_mask = None
         context_logits = None
@@ -1813,21 +2045,24 @@ class GenerationSession(object):
             return outputs
 
         for step in range(0, self.max_new_tokens):
-            should_stop, next_step_buffer, tasks, context_lengths, host_context_lengths, attention_mask, logits = self.handle_per_step(
+            should_stop, next_step_buffer, tasks, context_lengths, host_context_lengths, attention_mask, logits, encoder_input_lengths = self.handle_per_step(
                 cache_indirections, step, batch_size, max_context_length,
                 beam_width, input_ids, hidden_states, scfg,
-                kv_cache_block_pointers, prompt_embedding_table, tasks,
-                context_lengths, host_context_lengths, attention_mask,
-                prompt_vocab_size, ite, sequence_limit_lengths,
-                sequence_lengths, next_step_buffer, stop_words_list,
-                bad_words_list, no_repeat_ngram_size, encoder_output,
-                encoder_input_lengths)
+                kv_cache_block_pointers, host_kv_cache_block_pointers,
+                prompt_embedding_table, tasks, context_lengths,
+                host_context_lengths, attention_mask, prompt_vocab_size, ite,
+                sequence_limit_lengths, sequence_lengths, next_step_buffer,
+                stop_words_list, bad_words_list, no_repeat_ngram_size,
+                encoder_output, encoder_input_lengths)
             if step == 0:
                 context_logits = logits
             if should_stop is not None:
 
-                final_output_ids = self.finalize_decoder(
-                    context_lengths, batch_size, beam_width, scfg)
+                final_output_ids = self.finalize_decoder(context_lengths,
+                                                         batch_size,
+                                                         beam_width,
+                                                         scfg,
+                                                         streaming=True)
 
                 if self.mapping.is_first_pp_rank():
                     if return_dict:
@@ -1879,7 +2114,8 @@ class GenerationSession(object):
                output_sequence_lengths: bool = False,
                return_dict: bool = False,
                encoder_output: torch.Tensor = None,
-               encoder_input_lengths: torch.Tensor = None):
+               encoder_input_lengths: torch.Tensor = None,
+               **kwargs):
         scfg = sampling_config
         batch_size = context_lengths.size(0)
         beam_width = scfg.num_beams
@@ -1968,7 +2204,7 @@ class GenerationSession(object):
                 prompt_embedding_table, tasks, prompt_vocab_size, ite,
                 sequence_limit_lengths, stop_words_list, bad_words_list,
                 no_repeat_ngram_size, output_sequence_lengths, return_dict,
-                encoder_output, encoder_input_lengths)
+                encoder_output, encoder_input_lengths, **kwargs)
         else:
             return self.decode_regular(
                 batch_size, scfg, sequence_lengths, context_lengths,
@@ -1977,17 +2213,40 @@ class GenerationSession(object):
                 prompt_embedding_table, tasks, prompt_vocab_size, ite,
                 sequence_limit_lengths, stop_words_list, bad_words_list,
                 no_repeat_ngram_size, output_sequence_lengths, return_dict,
-                encoder_output, encoder_input_lengths)
+                encoder_output, encoder_input_lengths, **kwargs)
 
 
 class ChatGLMGenerationSession(GenerationSession):
+
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        engine_buffer,
+        mapping: Mapping,
+        debug_mode=False,
+        debug_tensors_to_save=None,
+        cuda_graph_mode=False,
+        stream: torch.cuda.Stream = None,
+    ):
+
+        super().__init__(
+            model_config,
+            engine_buffer,
+            mapping,
+            debug_mode,
+            debug_tensors_to_save,
+            cuda_graph_mode,
+            stream,
+        )
+
+        self.mask_index_tensor = None
 
     def _prepare_context_inputs(self, batch_size, context_lengths,
                                 use_gpt_attention_plugin, remove_input_padding,
                                 **kwargs):
 
-        last_token_ids = context_lengths.detach().clone()
         max_context_length = kwargs.pop('max_context_length')
+        last_token_ids = context_lengths.detach().clone()
 
         if remove_input_padding:
             input_lengths_acc = torch.cumsum(torch.cat(
@@ -2009,11 +2268,32 @@ class ChatGLMGenerationSession(GenerationSession):
             position_ids = torch.zeros([batch_size, 2, max_context_length],
                                        dtype=torch.int32)
             position_ids[:, 0, :] = torch.arange(max_context_length)
-            for i in range(batch_size):
-                length = context_lengths[i]
-                position_ids[i, 0, length - 1] = length - 2
-                position_ids[i, 1, length - 1] = 1
-                position_ids[i, :, length:] = 0
+
+            if kwargs["pad_id"] == 50256:  # specialization for GLM-10B
+                self.mask_index_tensor = torch.zeros([batch_size],
+                                                     dtype=torch.int32)
+                for i in range(batch_size):
+                    length = context_lengths[i]
+                    mask_index = torch.where(
+                        kwargs["input_ids"][i] == 50260)[0].int()
+                    gmask_index = torch.where(
+                        kwargs["input_ids"][i] == 50263)[0].int()
+                    smask_index = torch.where(
+                        kwargs["input_ids"][i] == 50264)[0].int()
+                    tail_index = torch.Tensor([max_context_length]).int().cuda()
+                    mask_index = torch.cat([
+                        mask_index.int(), gmask_index, smask_index, tail_index
+                    ],
+                                           dim=0).min()
+                    position_ids[i, 0, max_context_length - 1] = int(mask_index)
+                    position_ids[i, 1, max_context_length - 1] = 1
+                    self.mask_index_tensor[i] = int(mask_index)
+            else:
+                for i in range(batch_size):
+                    length = context_lengths[i]
+                    position_ids[i, 0, length - 1] = length - 2
+                    position_ids[i, 1, length - 1] = 1
+
             position_ids = position_ids.cuda()
 
         inputs = {
@@ -2043,8 +2323,13 @@ class ChatGLMGenerationSession(GenerationSession):
             last_token_ids = torch.cumsum(last_token_ids, dim=0).int().cuda()
         else:
             data = []
-            for i in range(batch_size):
-                data.append([[context_lengths[i * num_beams] - 2], [step + 2]])
+            if self.mask_index_tensor is not None:  # specialization for GLM-10B
+                for i in range(batch_size):
+                    data.append([[self.mask_index_tensor[i]], [step + 2]])
+            else:
+                for i in range(batch_size):
+                    data.append([[context_lengths[i * num_beams] - 2],
+                                 [step + 2]])
             position_ids = torch.tensor(data, dtype=torch.int32, device='cuda')
             position_ids = _tile_beam_width(position_ids, num_beams)
 
@@ -2056,3 +2341,50 @@ class ChatGLMGenerationSession(GenerationSession):
             attention_mask = torch.zeros((batch_size, 1))
             inputs['attention_mask'] = attention_mask
         return inputs
+
+
+class QWenForCausalLMGenerationSession(GenerationSession):
+
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        engine_buffer,
+        mapping: Mapping,
+        debug_mode=False,
+        debug_tensors_to_save=None,
+        cuda_graph_mode=False,
+        stream: torch.cuda.Stream = None,
+        global_max_input_length: int = 2048,
+        global_max_output_length: int = 4096,
+    ):
+        super().__init__(model_config,
+                         engine_buffer,
+                         mapping,
+                         debug_mode,
+                         debug_tensors_to_save=debug_tensors_to_save,
+                         cuda_graph_mode=cuda_graph_mode,
+                         stream=stream)
+        self.global_max_input_length = global_max_input_length
+        self.global_max_output_length = global_max_output_length
+
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        input_lengths: torch.Tensor,
+        sampling_config: SamplingConfig,
+        max_new_tokens: int,
+        runtime_rank: int = 0,
+    ):
+        max_input_length = torch.max(input_lengths).item()
+        max_new_tokens = min(max_new_tokens,
+                             self.global_max_output_length - max_input_length)
+        # setup batch_size, max_input_length, max_output_len
+        self.setup(batch_size=input_lengths.size(0),
+                   max_context_length=max_input_length,
+                   max_new_tokens=max_new_tokens)
+        output_ids = self.decode(input_ids, input_lengths, sampling_config)
+        with torch.no_grad():
+            torch.cuda.synchronize()
+            if runtime_rank == 0:
+                outputs = output_ids[:, 0, :]
+                return outputs

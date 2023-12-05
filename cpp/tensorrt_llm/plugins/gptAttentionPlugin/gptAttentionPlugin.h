@@ -18,13 +18,16 @@
 
 #include "checkMacrosPlugin.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmhaRunner.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.h"
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <set>
 #include <string>
@@ -37,20 +40,21 @@ namespace tensorrt_llm::plugins
 // num_gen_requests = number of generation requests (beam_width sequences per request).
 // Context sequences have to appear first, generation sequences after
 
-// inputs
+// inputs (see GPTAttentionPlugin::isEntryUsed for when each tensor is actually used)
 //     0.  input_tensor [batch_size, seq_len, local_hidden_size + 2 * local_num_kv_heads * head_size] or
 //                      [1, num_tokens, local_hidden_size + 2 * local_num_kv_heads * head_size] when
 //                      enable_remove_input_padding
-//     1.  sequence_length [batch_size]
-//     2.  host_past_key_value_lengths [batch_size] (int32)
+//     1.  sequence_length [batch_size] (optional)
+//     2.  host_past_key_value_lengths [batch_size] (int32) (optional)
 //     3.  host_max_kv_cache_lengths [1] (int32)
 //     4.  context_lengths [batch_size]
-//     5.  cache_indir [num_gen_requests, beam_width, memory_max_len] (required in beamsearch)
+//     5.  cache_indir [num_gen_requests, beam_width, memory_max_len] (required in beamsearch) (optional)
 //     6.  host_request_types [batch_size] int32. 0: context; 1: generation: 2: none. When not in inflight-batching
 //     mode,
 //                      all elements must be identical.
 //     6.  past_key_value_pool [batch_size, 2, local_num_kv_heads, max_seq_len, head_size] or
-//         block_pointers [batch_size, 2, max_blocks_per_seq] if paged kv cache
+//         block_pointers [batch_size, 2, max_blocks_per_seq] if paged kv cache (optional)
+//     6.1 host_block_pointers [batch_size, 2, max_blocks_per_seq] if paged kv cache (optional)
 //     7.  kv_cache_quantization_scale [1] (optional)
 //     8.  kv_cache_dequantization_scale [1] (optional)
 //     9.  alibi_slopes [num_heads] (optional for ALiBi position embedding)
@@ -73,7 +77,7 @@ public:
         tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
         bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
         int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled,
-        bool cross_attention = false, int max_distance = 0);
+        bool cross_attention = false, int max_distance = 0, bool use_paged_context_fmha = false, bool use_cache = true);
 
     GPTAttentionPlugin(const void* data, size_t length);
 
@@ -131,99 +135,34 @@ private:
 
     using IndexType = std::int32_t;
 
-    IndexType getInputTensorIdx() const
+    std::vector<size_t> mEntryIdx;
+    enum class IdxEntry : size_t
     {
-        return 0;
-    }
+        QKV_TENSOR,
+        SEQUENCE_LENGTH,
+        HOST_PAST_KEY_VALUE_LENGTHS,
+        HOST_MAX_KV_CACHE_LENGTH,
+        CONTEXT_LENGTHS,
+        CACHE_INDIR,
+        REQUEST_TYPES,
+        KV_CACHE_BLOCK_POINTERS,
+        HOST_KV_CACHE_BLOCK_POINTERS,
+        PAST_KEY_VALUE,
+        KV_CACHE_QUANTIZATION_SCALE,
+        KV_CACHE_DEQUANTIZATION_SCALE,
+        ALIBI_SLOPES,
+        RELATIVE_ATTENTION_BIAS,
+        CROSS_QKV,
+        CROSS_QKV_LENGTH,
+        ENCODER_INPUT_LENGTH,
+        HOST_CONTEXT_LENGTH,
+        QKV_BIAS_TENSOR,
+        ENUM_SIZE,
+    };
 
-    IndexType getSequenceLengthIdx() const
-    {
-        return 1;
-    }
-
-    IndexType getHostPastKeyValueLengthsIdx() const
-    {
-        return 2;
-    }
-
-    IndexType getHostMaxKvCacheLengthIdx() const
-    {
-        return 3;
-    }
-
-    IndexType getContextLengthsIdx() const
-    {
-        return 4;
-    }
-
-    IndexType getCacheIndirIdx() const
-    {
-        return 5;
-    }
-
-    IndexType getRequestTypesIdx() const
-    {
-        return 6;
-    }
-
-    IndexType getKVCacheBlockPointersIdx() const
-    {
-        // NOTE We either provide this tensor when mPagedKVCache is true or PastKeyValue otherwise
-        return 7;
-    }
-
-    IndexType getPastKeyValueIdx() const
-    {
-        // NOTE We either provide this tensor when mPagedKVCache is false or KVCacheBlockPointers otherwise
-        return 7;
-    }
-
-    IndexType getKVCacheQuantizationScaleIdx() const
-    {
-        return 8;
-    }
-
-    IndexType getKVCacheDequantizationScaleIdx() const
-    {
-        return 9;
-    }
-
-    IndexType getAlibiSlopesIdx() const
-    {
-        return (mKVCacheQuantMode.hasKvCacheQuant() ? 10 : 8);
-    }
-
-    IndexType getRelativeAttentionBiasIdx() const
-    {
-        return getAlibiSlopesIdx() + (isALiBi() ? 1 : 0);
-    }
-
-    IndexType getCrossQKVIdx() const
-    {
-        return getRelativeAttentionBiasIdx() + (isRelativePosition() ? 1 : 0);
-    }
-
-    IndexType getCrossQKVLengthIdx() const
-    {
-        return getCrossQKVIdx() + 1;
-    }
-
-    IndexType getEncoderInputLengthsIdx() const
-    {
-        return getCrossQKVLengthIdx() + 1;
-    }
-
-    IndexType getHostContextLengthsIdx() const
-    {
-        TLLM_CHECK(mRemovePadding);
-        return getCrossQKVIdx() + (isCrossAttention() ? 3 : 0);
-    }
-
-    IndexType getQKVBiasTensorIdx() const
-    {
-        TLLM_CHECK(mQKVBiasEnabled);
-        return (mKVCacheQuantMode.hasKvCacheQuant() ? 10 : 8) + (isALiBi() ? 1 : 0) + (mRemovePadding ? 1 : 0);
-    }
+    bool isEntryUsed(const IdxEntry& entry) const;
+    void initEntryIdx();
+    IndexType getIdx(const IdxEntry& entry) const;
 };
 
 class GPTAttentionPluginCreator : public GPTAttentionPluginCreatorCommon

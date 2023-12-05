@@ -8,6 +8,7 @@ multiple GPUs or multiple nodes with multiple GPUs.
 The benchmark implementation and entrypoint can be found in [`benchmarks/python/benchmark.py`](./benchmark.py). There are some other scripts in the directory:
 
 * [`benchmarks/python/allowed_configs.py`](./allowed_configs.py) to define configuration for each supported model.
+* [`benchmarks/python/build.py`](./build.py) to build supported models for benchmarking.
 * [`benchmarks/python/base_benchmark.py`](./base_benchmark.py) to implement the base class for benchmark.
 * [`benchmarks/python/gpt_benchmark.py`](./gpt_benchmark.py) to implement benchmark scripts for GPT and GPT-like(LLaMA/OPT/GPT-J/SmoothQuant-GPT) models.
 * [`benchmarks/python/bert_benchmark.py`](./bert_benchmark.py) to implement benchmark scripts for BERT models.
@@ -30,9 +31,9 @@ python benchmark.py \
 ```
 Expected outputs:
 ```
-[BENCHMARK] model_name gpt_350m world_size 1 num_heads 16 num_layers 24 hidden_size 1024 vocab_size 51200 precision float16 batch_size 1 input_length 60 output_length 20 build_time(s) 89.8 tokens_per_sec 378.12 percentile95(ms) 53.284 percentile99(ms) 53.284 latency(ms) 52.893
-[BENCHMARK] model_name gpt_350m world_size 1 num_heads 16 num_layers 24 hidden_size 1024 vocab_size 51200 precision float16 batch_size 8 input_length 60 output_length 20 build_time(s) 89.8 tokens_per_sec 361.06 percentile95(ms) 55.739 percentile99(ms) 55.739 latency(ms) 55.392
-[BENCHMARK] model_name gpt_350m world_size 1 num_heads 16 num_layers 24 hidden_size 1024 vocab_size 51200 precision float16 batch_size 64 input_length 60 output_length 20 build_time(s) 89.8 tokens_per_sec 246.03 percentile95(ms) 81.533 percentile99(ms) 81.533 latency(ms) 81.29
+[BENCHMARK] model_name gpt_350m world_size 1 num_heads 16 num_kv_heads 16 num_layers 24 hidden_size 1024 vocab_size 51200 precision float16 batch_size 1 input_length 60 output_length 20 gpu_peak_mem(gb) 4.2 build_time(s) 25.67 tokens_per_sec 483.54 percentile95(ms) 41.537 percentile99(ms) 42.102 latency(ms) 41.362 compute_cap sm80
+[BENCHMARK] model_name gpt_350m world_size 1 num_heads 16 num_kv_heads 16 num_layers 24 hidden_size 1024 vocab_size 51200 precision float16 batch_size 8 input_length 60 output_length 20 gpu_peak_mem(gb) 4.28 build_time(s) 25.67 tokens_per_sec 3477.28 percentile95(ms) 46.129 percentile99(ms) 46.276 latency(ms) 46.013 compute_cap sm80
+[BENCHMARK] model_name gpt_350m world_size 1 num_heads 16 num_kv_heads 16 num_layers 24 hidden_size 1024 vocab_size 51200 precision float16 batch_size 64 input_length 60 output_length 20 gpu_peak_mem(gb) 4.8 build_time(s) 25.67 tokens_per_sec 19698.07 percentile95(ms) 65.739 percentile99(ms) 65.906 latency(ms) 64.981 compute_cap sm80
 ...
 ```
 *Please note that the expected outputs is only for reference, specific performance numbers depend on the GPU you're using.*

@@ -115,7 +115,7 @@ TEST_F(BufferManagerTest, Pointers)
     static_assert(static_cast<nvinfer1::DataType>(trtPointerType) == BufferDataType::kTrtPointerType);
     static_assert(trtPointerType == BufferDataType::kTrtPointerType); // uses implicit type conversion
     // The C++ type corresponding to the TensorRT type for storing pointers (int64_t)
-    using cppStorageType = CppDataType<trtPointerType>::type;
+    using cppStorageType = DataTypeTraits<trtPointerType>::type;
     static_assert(sizeof(cppStorageType) == sizeof(cppPointerType));
 
     BufferManager manager(mStream);
@@ -152,4 +152,21 @@ TEST_F(BufferManagerTest, MemPoolAttributes)
     std::uint64_t threshold{0};
     TLLM_CUDA_CHECK(cudaMemPoolGetAttribute(memPool, cudaMemPoolAttrReleaseThreshold, &threshold));
     EXPECT_EQ(threshold, std::numeric_limits<std::uint64_t>::max());
+
+    manager.memoryPoolTrimTo(0);
+    auto const reserved = manager.memoryPoolReserved();
+    auto const used = manager.memoryPoolUsed();
+    auto const free = manager.memoryPoolFree();
+    EXPECT_EQ(free, reserved - used);
+    auto constexpr kBytesToReserve = 1 << 20;
+    {
+        auto const mem = manager.allocate(MemoryType::kGPU, kBytesToReserve);
+        EXPECT_EQ(mem->getSize(), kBytesToReserve);
+        EXPECT_GE(manager.memoryPoolReserved(), reserved + kBytesToReserve);
+        EXPECT_GE(manager.memoryPoolUsed(), used + kBytesToReserve);
+    }
+    EXPECT_GE(manager.memoryPoolFree(), free + kBytesToReserve);
+    manager.memoryPoolTrimTo(0);
+    EXPECT_LE(manager.memoryPoolReserved(), reserved);
+    EXPECT_LE(manager.memoryPoolFree(), free);
 }

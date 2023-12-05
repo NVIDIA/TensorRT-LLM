@@ -13,21 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+import weakref
 from collections import OrderedDict
 from enum import IntEnum
 from functools import partial
 from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
+from packaging import version
 
 from . import graph_rewriting as gw
 from ._common import default_net, default_trtnet, precision
 from ._utils import (bf16_array, dim_resolve_negative, dim_to_trt_axes,
                      fp16_array, fp32_array, int32_array, np_dtype_to_trt,
                      str_dtype_to_np, str_dtype_to_trt, torch_to_numpy,
-                     trt_dtype_to_torch)
+                     trt_dtype_to_torch, trt_version)
 from .logger import logger
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE
 from .quantization import QuantMode
@@ -185,12 +190,14 @@ class Tensor(object):
             self.is_tensor_wrapper = True
             assert network is not None
             self.trt_tensor = trt_tensor
-            self.network = network
+            self._network = weakref.ref(network)
             assert not is_network_input, "is_network_input should be False when trt_tensor is not None"
             return
 
-        # defining an input placeholder for the network
-        self.network = default_net()
+        # be cautious here, the weakref is critical to avoid circular referencing before Network and Tensor
+        # using strong reference will likely cause significant peak memory increase, since Network objects
+        # holds the weights data.
+        self._network = weakref.ref(default_net())
         if is_network_input:
             if dim_range is not None:
                 assert isinstance(dim_range, OrderedDict)
@@ -221,6 +228,10 @@ class Tensor(object):
             self.dtype = dtype
             self.shape = shape
             self.location = location
+
+    @property
+    def network(self):
+        return self._network()
 
     @property
     def name(self):
@@ -599,6 +610,7 @@ class AttentionMaskType(IntEnum):
     padding = 0
     causal = 1
     bidirectional = 2
+    bidirectionalglm = 3  # TODO: merge this mask into bidirectional
 
 
 class LayerNormType(IntEnum):
@@ -610,6 +622,12 @@ class LayerNormType(IntEnum):
 class LayerNormPositionType(IntEnum):
     pre_layernorm = 0
     post_layernorm = 1
+
+
+class MLPType(IntEnum):
+    MLP = 0
+    GatedMLP = 1
+    FusedGatedMLP = 2
 
 
 def activation(input: Tensor, act_type: trt.ActivationType) -> Tensor:
@@ -864,11 +882,15 @@ def interpolate(input: Tensor,
         ]
     layer.shape = updated_shape
 
+    if version.parse(trt_version()) >= version.parse("10.0.0"):
+        mode_enum = trt.InterpolationMode
+    else:
+        mode_enum = trt.ResizeMode
     if mode in ['nearest', 'nearest-exact'] or mode is None:
-        layer.resize_mode = trt.ResizeMode.NEAREST
+        layer.resize_mode = mode_enum.NEAREST
         layer.coordinate_transformation = trt.ResizeCoordinateTransformation.ASYMMETRIC
     elif mode in ['linear', 'bilinear', 'trilinear']:
-        layer.resize_mode = trt.ResizeMode.LINEAR
+        layer.resize_mode = mode_enum.LINEAR
         if align_corners:
             layer.coordinate_transformation = trt.ResizeCoordinateTransformation.ALIGN_CORNERS
         else:
@@ -878,12 +900,12 @@ def interpolate(input: Tensor,
             layer.coordinate_transformation = trt.ResizeCoordinateTransformation.HALF_PIXEL
 
     elif mode in ['bicubic']:
-        layer.resize_mode = trt.ResizeMode.CUBIC
+        layer.resize_mode = mode_enum.CUBIC
 
         layer.coordinate_transformation = trt.ResizeCoordinateTransformation.HALF_PIXEL
 
     else:
-        layer.resize_mode = trt.ResizeMode.NEAREST
+        layer.resize_mode = mode_enum.NEAREST
         layer.coordinate_transformation = trt.ResizeCoordinateTransformation.ASYMMETRIC
 
     return _create_tensor(layer.get_output(0), layer)
@@ -925,7 +947,6 @@ def matmul(input: Tensor,
         else trt.MatrixOperation.NONE
     layer = default_trtnet().add_matrix_multiply(input.trt_tensor, op0,
                                                  mat2.trt_tensor, op1)
-
     return _create_tensor(layer.get_output(0), layer)
 
 
@@ -1911,22 +1932,9 @@ def embedding(input: Tensor,
                                                 input.trt_tensor, 0)
             x = _create_tensor(layer.get_output(0), layer)
 
-            # 1. [dim0, local_dim] -> [dim0 * tp_size, local_dim]
-            x = allgather(x, tp_group)
+            # [dim0, local_dim] -> [dim0 * tp_size, local_dim] --> [dim0, local_dim * tp_size]
+            x = allgather(x, tp_group, gather_dim=-1)
 
-            # 2. [dim0 * tp_size, local_dim] -> [dim0, local_dim * tp_size]
-            # 2.1 split
-            split_size = shape(x, dim=0) / tp_size
-            ndim = x.ndim()
-            starts = [constant(int32_array([0])) for _ in range(ndim)]
-            sizes = [shape(x, dim=d) for d in range(ndim)]
-            sizes[0] = split_size
-            sections = []
-            for i in range(tp_size):
-                starts[0] = split_size * i
-                sections.append(slice(x, concat(starts), concat(sizes)))
-            # 2.2 concat
-            x = concat(sections, dim=(x.ndim() - 1))
         else:
             raise ValueError(
                 'Tensor Parallelism only support splitting Embedding lookup along hidden (sharding_dim==1) and vocab (sharding_dim==0) dimensionis'
@@ -2455,7 +2463,9 @@ def avg_pool2d(input: Tensor,
     layer = default_trtnet().add_pooling(input.trt_tensor,
                                          trt.PoolingType.AVERAGE, kernel_size)
     if stride is None:
-        layer.stride = kernel_size
+        stride = kernel_size
+    if version.parse(trt_version()) >= version.parse("10.0.0"):
+        layer.stride_nd = stride
     else:
         layer.stride = stride
 
@@ -2477,7 +2487,6 @@ def conv2d(input: Tensor,
            padding: Tuple[int, int] = (0, 0),
            dilation: Tuple[int, int] = (1, 1),
            groups: int = 1) -> Tensor:
-
     ##
     ## TODO: Document that function!
     ##
@@ -2504,8 +2513,11 @@ def conv2d(input: Tensor,
                                                 kernel_size, weight, bias)
     layer.stride_nd = stride
     layer.padding_nd = padding
-    layer.dilation = dilation
     layer.num_groups = groups
+    if version.parse(trt_version()) >= version.parse("10.0.0"):
+        layer.dilation_nd = dilation
+    else:
+        layer.dilation = dilation
 
     if not is_weight_constant:
         layer.set_input(1, weight.trt_tensor)
@@ -2794,21 +2806,23 @@ def allreduce(tensor: Tensor,
     return _create_tensor(layer.get_output(0), layer)
 
 
-def allgather(tensor: Tensor, group: List[int]) -> Tensor:
+def allgather(tensor: Tensor, group: List[int], gather_dim: int = 0) -> Tensor:
     '''
     Add an operation that performs a collective all-gather.
 
-    Let's define 'world_size' as the length of the 'group' list. That functions
-    creates a layer to gather 'world_size' tensors distributed
-    amongst the 'world_size' participating ranks (one GPU per rank).
+    Let's define 'group_size' as the length of the 'group' list. That functions
+    creates a layer to gather 'group_size' tensors distributed
+    amongst the 'group_size' participating ranks (one GPU per rank).
 
     The list 'group' contains the identifiers of the ranks participating into
     the collective operation.
 
+    Note that 'group' here can be either TP group or PP group, because allgather communication is not limited to a specific split pattern. Therefore 'group_size' does not need to equal MPI 'world_size'.
+
     The tensors in the different ranks must be 1D tensors (or views) and the
     output tensor will have that same shape.
 
-    Given the 'section_size = input.shape[0] / world_size', each rank
+    Given the 'section_size = input.shape[0] / group_size', each rank
     contributes a section of its input tensor that correspond to
     'rank*section_size:(rank+1)*section_size'.
 
@@ -2824,6 +2838,9 @@ def allgather(tensor: Tensor, group: List[int]) -> Tensor:
         group : List[int]
             The ranks participating into the all-gather operation.
 
+        gather_dim: int = 0
+            Gather along given dimension. By default 0, i.e. treated as 1D tensor.
+
     Returns:
         The tensor produced by that layer.
     '''
@@ -2831,6 +2848,7 @@ def allgather(tensor: Tensor, group: List[int]) -> Tensor:
         'AllGather', '1', TRT_LLM_PLUGIN_NAMESPACE)
     assert allgather_plg_creator is not None
 
+    group_size = len(group)
     group = trt.PluginField("group", np.array(group, dtype=np.int32),
                             trt.PluginFieldType.INT32)
 
@@ -2844,7 +2862,34 @@ def allgather(tensor: Tensor, group: List[int]) -> Tensor:
     plug_inputs = [tensor.trt_tensor]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, allgather)
-    return _create_tensor(layer.get_output(0), layer)
+
+    x = _create_tensor(layer.get_output(0), layer)
+
+    # gather along a given dimension other than dim0
+    if gather_dim != 0:
+        # also support -1 type of dim representation
+        if gather_dim < 0:
+            gather_dim = x.ndim() + gather_dim
+
+        # plugin above gathers as 1D flattened tensor
+        # 1. [dim0, ...dimi, ...dimN] -> [group_size * dim0, ...dimi, ...dimN]
+
+        # now we need to gather-by-dim via split-concat
+        # 2. [group_size * dim0, ...dimi, ...dimN] -> [dim0, ...group_size * dimi, ...dimN]
+        # 2.1 split
+        split_size = shape(x, dim=0) / group_size
+        ndim = x.ndim()
+        starts = [constant(int32_array([0])) for _ in range(ndim)]
+        sizes = [shape(x, dim=d) for d in range(ndim)]
+        sizes[0] = split_size
+        sections = []
+        for i in range(group_size):
+            starts[0] = split_size * i
+            sections.append(slice(x, concat(starts), concat(sizes)))
+        # 2.2 concat
+        x = concat(sections, dim=gather_dim)
+
+    return x
 
 
 def send(tensor: Tensor, tgt: int) -> Tensor:
@@ -2939,7 +2984,8 @@ def bert_attention(tensor: Tensor,
                    q_scaling: float,
                    relative_attention: bool = False,
                    relative_attention_bias: Tensor = None,
-                   max_distance: int = 0) -> Tuple[Tensor]:
+                   max_distance: int = 0,
+                   max_input_length: Tensor = None) -> Tuple[Tensor]:
     '''
     Add an operation that performs the multi-head attention in BERT.
 
@@ -2990,6 +3036,9 @@ def bert_attention(tensor: Tensor,
             Implicit mode is only enabled when passing in non-zero positive max_distance value.
             See relative attention bias in docs/gpt_attention.md
 
+        max_input_length: Tensor = None
+            The maximum input sequence length represented by Tensor shape. Requires for remove_input_padding to pre-define plugin workspace size.
+
     Returns:
         The tensor produced by that layer.
     '''
@@ -3025,14 +3074,22 @@ def bert_attention(tensor: Tensor,
     max_distance = trt.PluginField("max_distance",
                                    np.array(max_distance, dtype=np.int32),
                                    trt.PluginFieldType.INT32)
+    remove_padding = trt.PluginField(
+        "remove_padding",
+        np.array(np.int8(default_net().plugin_config.remove_input_padding),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
     pfc = trt.PluginFieldCollection([
         nheads, head_size, q_scaling, enable_qk_half_accum, context_fmha_type,
-        pf_type, do_relative_attention, max_distance
+        pf_type, do_relative_attention, max_distance, remove_padding
     ])
 
     attn_plug = attn_plg_creator.create_plugin("padding_attn", pfc)
     plug_inputs = [tensor, input_lengths]
+    if max_input_length is not None:
+        # for remove padding mode
+        plug_inputs += [max_input_length]
     if relative_attention_bias is not None:
+        # for relative attention mode
         plug_inputs += [relative_attention_bias]
 
     plug_inputs = [i.trt_tensor for i in plug_inputs]
@@ -3047,42 +3104,45 @@ def bert_attention(tensor: Tensor,
 
 @gw.record_signature
 def gpt_attention(
-        tensor: Tensor,
-        past_key_value: Tensor,
-        sequence_length: Tensor,
-        host_past_key_value_lengths: Tensor,
-        host_max_kv_cache_lengths: Tensor,
-        context_lengths: Tensor,
-        cache_indirection: Tensor,
-        host_request_types: Tensor,
-        num_heads: int,
-        num_kv_heads: int,
-        hidden_size_per_head: int,
-        q_scaling: float,
-        rotary_embedding_dim: int,
-        rotary_embedding_base: float = 10000.0,
-        rotary_embedding_scale_type: RotaryScalingType = RotaryScalingType.none,
-        rotary_embedding_scale: float = 1.0,
-        rotary_embedding_max_positions: int = 1024,
-        position_embedding_type: PositionEmbeddingType = PositionEmbeddingType.
+    qkv: Tensor,
+    past_key_value: Tensor,
+    sequence_length: Tensor,
+    host_past_key_value_lengths: Optional[Tensor],
+    host_max_kv_cache_lengths: Tensor,
+    context_lengths: Optional[Tensor],
+    cache_indirection: Optional[Tensor],
+    host_request_types: Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    hidden_size_per_head: int,
+    q_scaling: float,
+    rotary_embedding_dim: int = 0,
+    rotary_embedding_base: float = 10000.0,
+    rotary_embedding_scale_type: RotaryScalingType = RotaryScalingType.none,
+    rotary_embedding_scale: float = 1.0,
+    rotary_embedding_max_positions: int = 1024,
+    position_embedding_type: PositionEmbeddingType = PositionEmbeddingType.
     learned_absolute,
-        kv_orig_quant_scale: Tensor = None,
-        kv_quant_orig_scale: Tensor = None,
-        kv_cache_quant_mode: QuantMode = None,
-        max_context_length: int = None,
-        mask_type: AttentionMaskType = AttentionMaskType.causal,
-        alibi_slopes: Tensor = None,
-        tp_size: int = 1,
-        tp_rank: int = 0,
-        kv_cache_block_pointers: Tensor = None,
-        do_cross_attention: bool = False,
-        cross_qkv: Tensor = None,  # for cross attention
-        cross_qkv_length: Tensor = None,  # for cross attention
-        encoder_input_lengths: Tensor = None,  # for cross attention
-        relative_attention_bias: Tensor = None,  # for relative attention
-        max_distance: int = 0,  # for relative attention
-        host_context_lengths: Tensor = None,  # for pad-free input mode
-        qkv_bias: Tensor = None) -> Tuple[Tensor]:
+    kv_orig_quant_scale: Optional[Tensor] = None,
+    kv_quant_orig_scale: Optional[Tensor] = None,
+    kv_cache_quant_mode: QuantMode = QuantMode(0),
+    max_context_length: Optional[int] = None,
+    mask_type: AttentionMaskType = AttentionMaskType.causal,
+    alibi_slopes: Optional[Tensor] = None,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    kv_cache_block_pointers: Optional[Tensor] = None,
+    host_kv_cache_block_pointers: Tensor = None,
+    do_cross_attention: bool = False,
+    cross_qkv: Optional[Tensor] = None,  # for cross attention
+    cross_qkv_length: Optional[Tensor] = None,  # for cross attention
+    encoder_input_lengths: Optional[Tensor] = None,  # for cross attention
+    relative_attention_bias: Optional[Tensor] = None,  # for relative attention
+    max_distance: int = 0,  # for relative attention
+    host_context_lengths: Optional[Tensor] = None,  # for pad-free input mode
+    qkv_bias: Optional[Tensor] = None,
+    use_cache: bool = True,
+) -> Tuple[Tensor, Optional[Tensor]]:
     '''
     Add an operation that performs the multi-head attention in GPT-like models.
 
@@ -3095,40 +3155,40 @@ def gpt_attention(
     See docs/gpt_attention.md for the documentation of that function.
 
     Parameters:
-        tensor: Tensor
-            The input QKV tensor. Its shape is [batch_beam_size, max_seqlen, 3
-            * hidden_dim] in padded mode and [1, num_tokens, 3 * hidden_dim] in
-            packed mode. See QKV Input in docs/gpt_attention.md.
+        qkv: Tensor (On GPU)
+            The input QKV tensor. Its shape is [batch_beam_size, max_seqlen, qkv_dim] in padded mode and [1, num_tokens, qkv_dim] in
+            packed mode. Where qkv_dim depends on using MQA, GQA, or MHA. See QKV Input in docs/gpt_attention.md,
 
-        past_key_value: Tensor
+        past_key_value: Tensor (On GPU)
             The tensor that stores KV cache data. Its shape is
-            [max_batch_size * max_beam_width, 2, num_heads, max_seqlen, hidden_dim_per_head]
+            [max_batch_size * max_beam_width, 2, num_kv_heads, max_seqlen, hidden_dim_per_head]
             in contiguous mode and
-            [max_blocks, 2, num_heads, num_tokens_per_block, hidden_dim_per_head]
+            [max_blocks, 2, num_kv_heads, num_tokens_per_block, hidden_dim_per_head]
             in paged mode. See KV Cache in docs/gpt_attention.md,
 
-        sequence_lengths: Tensor
+        sequence_lengths: Tensor (On GPU)
             The tensor that stores the length of each sequence. Its shape is
             [batch_size]. See QKV Input in docs/gpt_attention.md,
 
-        host past_key_value_length: Tensor
-            An INT32 tensor of shape [batch_size].
+        host_past_key_value_lengths: Tensor (On CPU)
+            An INT32 tensor of shape [batch_size],
 
-        host max_kv_cache_lengths: Tensor
+        host_max_kv_cache_lengths: Tensor (On CPU)
             An INT32 tensor of shape [1].
             by default, the max_kv_cache_length is determined by the shape of cache_indir_table.
-            And we support flexible max_kv_cache_length (or max_past_length) for each layer.
+            And we support independent max_kv_cache_length (or max_past_length) for each layer.
+            May be used to implement window attention,
 
-        context_lengths: Tensor
+        context_lengths: Tensor (On GPU)
             The tensor that stores the context-phase sequence length of each request. Its shape
             is [batch_size]. See QKV Input in doc/functional.py,
 
-        cache_indirection: Tensor
+        cache_indirection: Tensor (On GPU)
             The tensor to reconstruct the paths when using beam-search. Its
             shape is [batch_size, beam_width, max_seqlen]. See Beam-Search in
             docs/gpt_attention.md,
 
-        host_request_types: Tensor = None
+        host_request_types: Tensor = None (On CPU)
             The tensor on the host that indicates if a request is in context or
             generation phase. Its shape is [batch_size]. See Inflight Batching
             in docs/gpt_attention.md,
@@ -3198,6 +3258,7 @@ def gpt_attention(
                 * tensorrt_llm.layers.AttentionMaskType.padding for BERT,
                 * tensorrt_llm.layers.AttentionMaskType.causal for GPT,
                 * tensorrt_llm.layers.AttentionMaskType.bidirectional for ChatGLM-6B,
+                * tensorrt_llm.layers.AttentionMaskType.bidirectionalglm for GLM-10B,
 
         alibi_slopes: Tensor
             The ALiBi slopes. The ALiBi bias is computed on-the-fly in the kernel
@@ -3212,7 +3273,10 @@ def gpt_attention(
         kv_cache_block_pointers:
             The tensor of block pointers for the KV cache. Its shape is
             [max_batch_size, max_beam_width, 2, max_blocks_per_sequence * 2]
-            See KV cache section in docs/gpt_attention.md,
+            See KV cache section in docs/gpt_attention.md, on gpu
+
+        host_kv_cache_block_pointers:
+            The same as kv_cache_block_pointers, but on cpu,
 
         do_cross_attention: bool = False
             Do we use this as cross attention instead of self attention,
@@ -3237,7 +3301,7 @@ def gpt_attention(
             Implicit mode is only enabled when passing in non-zero positive max_distance value.
             See relative attention bias in docs/gpt_attention.md
 
-        host_context_lengths: Tensor = None
+        host_context_lengths: Tensor = None (On CPU)
             A host tensor that contains the lengths of the different inputs,
 
         qkv_bias: Tensor = None,
@@ -3346,6 +3410,13 @@ def gpt_attention(
     max_distance = trt.PluginField("max_distance",
                                    np.array(max_distance, dtype=np.int32),
                                    trt.PluginFieldType.INT32)
+    use_paged_context_fmha_field = trt.PluginField(
+        "use_paged_context_fmha",
+        np.array(np.int8(default_net().plugin_config.use_paged_context_fmha),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    use_cache_pf = trt.PluginField("use_cache",
+                                   np.array([use_cache], dtype=np.int32),
+                                   trt.PluginFieldType.INT32)
 
     pfc = trt.PluginFieldCollection([
         nheads, num_kv_heads, head_size, unidirectional, q_scaling,
@@ -3355,26 +3426,38 @@ def gpt_attention(
         multi_block_mode, kv_cache_quant_mode_field, remove_input_padding,
         mask_type, paged_kv_cache, tokens_per_block, pf_type,
         max_context_length, qkv_bias_enabled, do_cross_attention_field,
-        max_distance
+        max_distance, use_paged_context_fmha_field, use_cache_pf
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
-    plug_inputs = [
-        tensor,
-        sequence_length,
-        host_past_key_value_lengths,
-        host_max_kv_cache_lengths,
-        context_lengths,
-        cache_indirection,
-        host_request_types,
-    ]
-
-    if paged_kv_cache_flag:
-        plug_inputs += [kv_cache_block_pointers]
+    plug_inputs = []
+    if use_cache:
+        plug_inputs = [
+            qkv,
+            sequence_length,
+            host_past_key_value_lengths,
+            host_max_kv_cache_lengths,
+            context_lengths,
+            cache_indirection,
+            host_request_types,
+        ]
     else:
-        plug_inputs += [past_key_value]
+        plug_inputs = [
+            qkv,
+            host_max_kv_cache_lengths,
+            context_lengths,
+            host_request_types,
+        ]
 
-    if kv_cache_quant_mode.has_kv_cache_quant():
+    if use_cache:
+        if paged_kv_cache_flag:
+            plug_inputs += [
+                kv_cache_block_pointers, host_kv_cache_block_pointers
+            ]
+        else:
+            plug_inputs += [past_key_value]
+
+    if use_cache and kv_cache_quant_mode.has_kv_cache_quant():
         plug_inputs += [kv_orig_quant_scale, kv_quant_orig_scale]
 
     if alibi_slopes is not None:
@@ -3396,7 +3479,7 @@ def gpt_attention(
     layer = default_trtnet().add_plugin_v2(plug_inputs, attn_plug)
     output = _create_tensor(layer.get_output(0), layer)
     present_key_value = None
-    if not paged_kv_cache_flag:
+    if use_cache and not paged_kv_cache_flag:
         present_key_value = _create_tensor(layer.get_output(1), layer)
         assert present_key_value is not None
         expected_outputs = 2
@@ -3874,3 +3957,109 @@ def non_gated_version(activation):
     if is_gated_activation(activation):
         return GATED_ACT_2_ACT[activation]
     return activation
+
+
+def lora_plugin(
+    input: Tensor = None,
+    in_hidden_size: int = 0,
+    out_hidden_size: int = 0,
+    host_request_types: Tensor = None,
+    transa: bool = False,
+    transb: bool = False,
+    host_context_lengths: Tensor = None,  # for pad-free input mode
+    max_context_length: int = 0,
+    max_low_rank: int = 0,
+    lora_ranks: Tensor = None,
+    lora_weights_pointers: Tensor = None,
+):
+    '''
+    Parameters:
+        lora_ids : cpu Tensor = None
+            A tensor that contains the lora ids of different inputs.
+
+        in_hidden_size/out_hidden_size : int
+            the lora computation workflow is
+            [M, in_hidden_size] -> [M, low_rank] -> [M, out_hidden_size]
+
+        host_request_types : Tensor = None
+            The tensor on the host that indicates if a request is in context or
+            generation phase. Its shape is [batch_size]. See Inflight Batching
+            in docs/gpt_attention.md,
+
+        transa : bool
+            Is the first input transposed? Set to 'True' if you want the first
+            input to be transposed, 'False' otherwise.
+
+        transb : bool
+            Is the second input transposed? Set to 'True' if you want the
+            second input to be transposed, 'False' otherwise.
+
+        host_context_lengths: cpu Tensor = None
+            A host tensor that contains the lengths of the different inputs,
+
+        max_context_length : int
+            Maximum length during context phase, used to determine the workspace size.
+
+        max_low_rank : int
+            Maximum low_rank, used to determine the workspace size.
+
+        lora_ranks : cpu Tensor with shape [batch_size]
+            The low_rank of each request
+
+        lora_weights_pointers : cpu int64 Tensor with shape [batch_size, 2]
+            The weights pointers of each request. Consist of in_pointer and out_pointer.
+
+    Return:
+        The tensor produced by that layer.
+
+    '''
+    assert host_context_lengths is not None or not default_net(
+    ).plugin_config.remove_input_padding
+
+    trt.get_plugin_registry().plugin_creator_list
+    in_hidden_size = trt.PluginField("in_hidden_size",
+                                     np.array(in_hidden_size, dtype=np.int32),
+                                     trt.PluginFieldType.INT32)
+    out_hidden_size = trt.PluginField("out_hidden_size",
+                                      np.array(out_hidden_size, dtype=np.int32),
+                                      trt.PluginFieldType.INT32)
+    transa = 1 if transa else 0
+    transa = trt.PluginField("transa", np.array(transa, dtype=np.int32),
+                             trt.PluginFieldType.INT32)
+    transb = 1 if transb else 0
+    transb = trt.PluginField("transb", np.array(transb, dtype=np.int32),
+                             trt.PluginFieldType.INT32)
+
+    plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'Lora', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+
+    p_dtype = default_net().plugin_config.lora_plugin
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    remove_input_padding = trt.PluginField(
+        "remove_input_padding",
+        np.array(np.int8(default_net().plugin_config.remove_input_padding),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    max_context_length_filed = trt.PluginField(
+        "max_context_length", np.array(max_context_length, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+    max_low_rank_filed = trt.PluginField("max_low_rank",
+                                         np.array(max_low_rank, dtype=np.int32),
+                                         trt.PluginFieldType.INT32)
+
+    pfc = trt.PluginFieldCollection([
+        in_hidden_size, out_hidden_size, transa, transb, pf_type,
+        remove_input_padding, max_context_length_filed, max_low_rank_filed
+    ])
+    lora_plug = plg_creator.create_plugin("lora", pfc)
+
+    plug_inputs = [input, host_request_types, lora_ranks, lora_weights_pointers]
+    if default_net().plugin_config.remove_input_padding:
+        plug_inputs += [host_context_lengths]
+
+    plug_inputs = [i.trt_tensor for i in plug_inputs]
+    layer = default_trtnet().add_plugin_v2(plug_inputs, lora_plug)
+
+    return _create_tensor(layer.get_output(0), layer)

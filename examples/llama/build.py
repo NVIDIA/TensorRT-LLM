@@ -14,19 +14,23 @@
 # limitations under the License.
 import argparse
 import json
+import math
 import os
 import time
 from pathlib import Path
 
-import tensorrt as trt
+# isort: off
 import torch
 import torch.multiprocessing as mp
+import tensorrt as trt
+# isort: on
 from transformers import LlamaConfig, LlamaForCausalLM
 from weight import (get_scaling_factors, load_from_awq_llama, load_from_binary,
-                    load_from_gptq_llama, load_from_hf_llama,
-                    load_from_meta_llama)
+                    load_from_gptq_llama, load_from_hf_checkpoint,
+                    load_from_hf_llama, load_from_meta_llama)
 
 import tensorrt_llm
+from tensorrt_llm import profiler
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.layers.attention import PositionEmbeddingType
@@ -35,8 +39,8 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import quantize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
-from tensorrt_llm.profiler import check_gpt_mem_usage
 from tensorrt_llm.quantization import QuantMode
+from tensorrt_llm.runtime.lora_manager import LoraConfig
 
 from weight import parse_ft_config  # isort:skip
 
@@ -116,7 +120,7 @@ def serialize_engine(engine, path):
     logger.info(f'Serializing engine to {path}...')
     tik = time.time()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')
@@ -178,6 +182,7 @@ def parse_arguments():
                         type=str,
                         default=False,
                         choices=['float16', 'float32', 'bfloat16'])
+
     parser.add_argument('--parallel_build', default=False, action='store_true')
     parser.add_argument('--enable_context_fmha',
                         default=False,
@@ -194,6 +199,9 @@ def parse_arguments():
                         It is beneifical when batchxnum_heads cannot fully utilize GPU.'
     )
     parser.add_argument('--visualize', default=False, action='store_true')
+    parser.add_argument('--load_by_shard',
+                        action='store_true',
+                        help='Load a pretrained model shard-by-shard.')
     parser.add_argument('--enable_debug_output',
                         default=False,
                         action='store_true')
@@ -202,7 +210,7 @@ def parse_arguments():
     parser.add_argument(
         '--output_dir',
         type=str,
-        default='llama_outputs',
+        default='engine_outputs',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
     )
@@ -304,6 +312,14 @@ def parse_arguments():
         help='Quantize weights for the various GEMMs to INT4/INT8.'
         'See --weight_only_precision to set the precision')
     parser.add_argument(
+        '--disable_weight_only_quant_plugin',
+        default=False,
+        action="store_true",
+        help=
+        'By default, using plugin implementation for weight quantization. Enabling disable_weight_only_quant_plugin flag will use ootb implementation instead of plugin.'
+        'You must also use --use_weight_only for that argument to have an impact.'
+    )
+    parser.add_argument(
         '--weight_only_precision',
         const='int8',
         type=str,
@@ -328,7 +344,7 @@ def parse_arguments():
     )
     parser.add_argument('--tokens_per_block',
                         type=int,
-                        default=64,
+                        default=128,
                         help='Number of tokens per block in paged KV cache')
     parser.add_argument(
         '--max_num_tokens',
@@ -352,9 +368,20 @@ def parse_arguments():
         type=int,
         default=0,
         help='Setting to a value > 0 enables support for prompt tuning.')
+    parser.add_argument('--gather_all_token_logits',
+                        action='store_true',
+                        default=False)
+    parser.add_argument(
+        '--use_lora_plugin',
+        nargs='?',
+        const=None,
+        default=False,
+        choices=['float16', 'float32', 'bfloat16'],
+        help="Activates the lora plugin which enables embedding sharing.")
+    parser.add_argument('--hf_lora_dir', type=str, default=None)
 
     args = parser.parse_args()
-    tensorrt_llm.logger.set_level(args.log_level)
+    logger.set_level(args.log_level)
 
     assert not (
         args.use_smooth_quant and args.use_weight_only
@@ -390,7 +417,7 @@ def parse_arguments():
             per_token=False,
             per_channel=False,
             per_group=args.per_group,
-            use_int4_weights=args.weight_only_precision == "int4")
+            use_int4_weights="int4" in args.weight_only_precision)
     else:
         args.quant_mode = QuantMode(0)
 
@@ -420,7 +447,7 @@ def parse_arguments():
             args.n_kv_head = hf_config.num_key_value_heads
         args.n_layer = hf_config.num_hidden_layers
         args.n_positions = hf_config.max_position_embeddings
-        args.vocab_size = hf_config.vocab_size if args.vocab_size is None else args.vocab_size
+        args.vocab_size = hf_config.vocab_size if hf_config.vocab_size is not None else args.vocab_size
         args.hidden_act = hf_config.hidden_act
         args.rms_norm_eps = hf_config.rms_norm_eps
     elif args.meta_ckpt_dir is not None:
@@ -459,10 +486,39 @@ def parse_arguments():
             "MQA/GQA requires either the number of K/V heads to be divisible by the tensor parallelism size OR " \
             "the tensor parallelism size to be divisible by the number of K/V heads."
 
+    hf_modules_to_trtllm_modules = {
+        "q_proj": "attn_q",
+        "v_proj": "attn_k",
+        "k_proj": "attn_v",
+        "o_proj": "attn_dense",
+        "gate_proj": "mlp_h_to_4h",
+        "down_proj": "mlp_4h_to_h",
+        "up_proj": "mlp_gate"
+    }  # lora modules on llama
+
+    lora_config = LoraConfig.from_hf(args.hf_lora_dir,
+                                     hf_modules_to_trtllm_modules)
+
+    if lora_config.is_valid:
+        args.vocab_size = lora_config.vocab_size
+
+    args.lora_config = lora_config
+
+    if args.weight_only_precision == 'int4_awq':
+        if args.vocab_size % 64 != 0:
+            args.vocab_size = int((args.vocab_size + 63) / 64) * 64
+            logger.info("To use awq we pad it to {}.".format(args.vocab_size))
+
     assert args.pp_size * args.tp_size == args.world_size
 
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha
+
+    assert (math.log2(args.tokens_per_block).is_integer()
+            ), "tokens_per_block must be power of 2"
+    if args.enable_context_fmha or args.enable_context_fmha_fp32_acc:
+        assert (args.tokens_per_block >=
+                128), "Context fMHA requires >= 128 tokens per block"
 
     if args.inter_size is None:
         # this should not be need when loading a real model
@@ -494,6 +550,7 @@ def build_rank_engine(builder: Builder,
     assert args.n_layer % args.pp_size == 0, \
         f"num_layers {args.n_layer} must be a multiple of pipeline parallelism size {args.pp_size}"
 
+    profiler.print_memory_usage(f'Rank {rank} Engine build starts')
     # Initialize Module
     tensorrt_llm_llama = tensorrt_llm.models.LLaMAForCausalLM(
         num_layers=args.n_layer,
@@ -553,27 +610,40 @@ def build_rank_engine(builder: Builder,
     elif args.model_dir is not None:
         logger.info(f'Loading HF LLaMA ... from {args.model_dir}')
         tik = time.time()
-        hf_llama = LlamaForCausalLM.from_pretrained(
-            args.model_dir,
-            device_map={
-                "model": "cpu",
-                "lm_head": "cpu"
-            },  # Load to CPU memory
-            torch_dtype="auto")
+        if not args.load_by_shard:
+            hf_llama = LlamaForCausalLM.from_pretrained(
+                args.model_dir,
+                device_map={
+                    "model": "cpu",
+                    "lm_head": "cpu"
+                },  # Load to CPU memory
+                torch_dtype='auto',
+            )
+            use_gemm_woq_plugin = not args.disable_weight_only_quant_plugin
+            load_from_hf_llama(tensorrt_llm_llama,
+                               hf_llama,
+                               mapping=mapping,
+                               dtype=args.dtype,
+                               use_gemm_woq_plugin=use_gemm_woq_plugin,
+                               lora_config=args.lora_config)
+            del hf_llama
+        else:
+            load_from_hf_checkpoint(tensorrt_llm_llama,
+                                    args.model_dir,
+                                    mapping,
+                                    dtype=args.dtype,
+                                    lora_config=args.lora_config)
         tok = time.time()
         t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
         logger.info(f'HF LLaMA loaded. Total time: {t}')
-        load_from_hf_llama(tensorrt_llm_llama,
-                           hf_llama,
-                           mapping=mapping,
-                           dtype=args.dtype)
-        del hf_llama
+
     elif args.ft_model_dir is not None:
         load_from_binary(tensorrt_llm_llama,
                          args.ft_model_dir,
                          mapping,
                          fp16=(args.dtype == 'float16'),
                          multi_query_mode=(args.n_kv_head != args.n_head))
+    profiler.print_memory_usage(f'Rank {rank} model weight loaded.')
 
     # Module -> Network
     network = builder.create_network()
@@ -589,6 +659,8 @@ def build_rank_engine(builder: Builder,
                 "Gemm plugin does not support FP8. Disabled Gemm plugin.")
     if args.use_rmsnorm_plugin:
         network.plugin_config.set_rmsnorm_plugin(dtype=args.use_rmsnorm_plugin)
+    if args.use_lora_plugin:
+        network.plugin_config.set_lora_plugin(dtype=args.use_lora_plugin)
 
     # Quantization plugins.
     if args.use_smooth_quant:
@@ -604,7 +676,8 @@ def build_rank_engine(builder: Builder,
             ContextFMHAType.enabled_with_fp32_acc)
     if args.multi_block_mode:
         network.plugin_config.enable_mmha_multi_block_mode()
-    if args.use_weight_only:
+
+    if args.use_weight_only and not args.disable_weight_only_quant_plugin:
         if args.per_group:
             network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
                 dtype='float16')
@@ -632,7 +705,8 @@ def build_rank_engine(builder: Builder,
             args.max_beam_width,
             args.max_num_tokens,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size,
-        )
+            gather_all_token_logits=args.gather_all_token_logits,
+            lora_target_modules=args.lora_config.lora_target_modules)
         tensorrt_llm_llama(*inputs)
         if args.enable_debug_output:
             # mark intermediate nodes' outputs
@@ -655,8 +729,6 @@ def build_rank_engine(builder: Builder,
         config_path = os.path.join(args.output_dir, 'config.json')
         builder.save_config(builder_config, config_path)
 
-    tensorrt_llm.tools.cleanup(network, tensorrt_llm_llama)
-
     return engine
 
 
@@ -668,12 +740,13 @@ def build(rank, args):
 
     # when doing serializing build, all ranks share one engine
     builder = Builder()
-
     cache = None
     for cur_rank in range(args.world_size):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
+        tik = time.time()
+
         # NOTE: when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
         int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
             not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
@@ -692,6 +765,7 @@ def build(rank, args):
             hidden_act=args.hidden_act,
             max_position_embeddings=args.n_positions,
             max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,
@@ -701,6 +775,8 @@ def build(rank, args):
             opt_level=args.builder_opt,
             max_prompt_embedding_table_size=args.
             max_prompt_embedding_table_size,
+            gather_all_token_logits=args.gather_all_token_logits,
+            lora_target_modules=args.lora_config.lora_target_modules,
         )
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.tp_size,
                                       args.pp_size, cur_rank)
@@ -715,7 +791,7 @@ def build(rank, args):
             kv_dtype = str_dtype_to_trt('int8')
         elif args.quant_mode.has_fp8_kv_cache():
             kv_dtype = str_dtype_to_trt('fp8')
-        check_gpt_mem_usage(
+        profiler.check_gpt_mem_usage(
             engine=engine,
             kv_dtype=kv_dtype,
             use_gpt_attention_plugin=args.use_gpt_attention_plugin,
@@ -735,6 +811,12 @@ def build(rank, args):
 
         serialize_engine(engine, os.path.join(args.output_dir, engine_name))
         del engine
+        profiler.print_memory_usage(f'Rank {cur_rank} Engine serialized')
+
+        tok = time.time()
+        t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
+        logger.info(
+            f'Rank {cur_rank} Engine build time: {t} - {tok - tik} (sec)')
 
     if rank == 0:
         ok = builder.save_timing_cache(

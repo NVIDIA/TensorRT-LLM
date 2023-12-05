@@ -50,6 +50,8 @@ public:
     TensorPtr endIds; // [batchSize * beamWidth], on gpu
 
     // optional parameters
+    TensorPtr finished;            // [batchSize, beamWidth], finished states at current iteration.
+                                   // If true for some request, the decoding step of it is skipped, on gpu
     TensorPtr sequenceLimitLength; // [batchSize], on gpu
     TensorPtr embeddingBias;       // [vocabSizePadded], on gpu
     TensorPtr lengths;             // [batchSize, beamWidth], on gpu

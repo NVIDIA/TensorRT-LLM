@@ -144,7 +144,8 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
     th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
     th::optional<th::Tensor> src_cache_indirection_opt,
     // Outputs
-    th::Tensor& output_token_ids, th::Tensor& newTokens, th::Tensor& should_stop, th::optional<th::Tensor> finished_opt,
+    th::Tensor& output_token_ids, th::Tensor& newTokens, th::Tensor& should_stop,
+    th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
     th::optional<th::Tensor> sequence_lengths_opt, th::optional<th::Tensor> cum_log_probs_opt,
     th::optional<th::Tensor> output_log_probs_opt, th::optional<th::Tensor> parent_ids_opt,
     th::optional<th::Tensor> tgt_cache_indirection_opt, th::optional<th::Tensor> beam_hyps_output_ids_tgt_opt,
@@ -166,12 +167,13 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
     safeUpdate<int>(bad_words_list_opt, forwardParams.bad_words_list);
     safeUpdate<int>(stop_words_list_opt, forwardParams.stop_words_list);
     safeUpdate<int>(no_repeat_ngram_size_opt, forwardParams.no_repeat_ngram_size);
+    safeUpdate<uint8_t>(finished_input, forwardParams.finished);
 
     auto const& output_ids_converted = convert_tensor<int>(output_token_ids);
     typename tensorrt_llm::layers::DynamicDecodeLayer<T>::OutputParams outputParams{output_ids_converted};
     outputParams.newTokens = std::move(convert_tensor<int>(newTokens));
 
-    safeUpdate<bool>(finished_opt, outputParams.finished);
+    safeUpdate<uint8_t>(finished_output, outputParams.finished);
     std::int32_t* finished_sum_host = nullptr;
     if (forwardParams.sequence_limit_length && outputParams.finished.has_value())
     {
@@ -280,7 +282,8 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
     th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
     th::optional<th::Tensor> src_cache_indirection_opt,
     // output buffers.
-    th::Tensor output_token_ids, th::Tensor newTokens, th::optional<th::Tensor> finished_opt,
+    th::Tensor output_token_ids, th::Tensor newTokens, th::optional<th::Tensor> finished_input,
+    th::optional<th::Tensor> finished_output,
     th::optional<th::Tensor> seuqence_lengths_opt, // length of the current sequences.
     th::optional<th::Tensor> cum_log_probs_opt, th::optional<th::Tensor> output_log_probs_opt,
     th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,
@@ -310,14 +313,11 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
 
     CHECK_INPUT(logits, scalar_type_);
     TLLM_CHECK_WITH_INFO(logits.dim() == 3,
-        tensorrt_llm::common::fmtstr("logits is of shape (batch_size, beam_width, vocab_size_padded), "
-                                     "but got dim=%d shape=%s",
-            (int) logits.dim(), tensorrt_llm::common::vec2str(convert_shape(logits)).c_str())
-            .c_str());
+        "logits is of shape (batch_size, beam_width, vocab_size_padded), but got dim=%d shape=%s", (int) logits.dim(),
+        tensorrt_llm::common::vec2str(convert_shape(logits)).c_str());
     TLLM_CHECK_WITH_INFO(static_cast<size_t>(logits.size(2)) == vocab_size_padded_,
-        tensorrt_llm::common::fmtstr("logits is of shape (batch_size, beam_width, "
-                                     "vocab_size(%ld)), but got the last dim=%ld.",
-            vocab_size_padded_, static_cast<size_t>(logits.size(2))));
+        "logits is of shape (batch_size, beam_width, vocab_size(%ld)), but got the last dim=%ld.", vocab_size_padded_,
+        static_cast<size_t>(logits.size(2)));
 
     CHECK_INPUT(end_id, torch::kInt32);
 
@@ -329,7 +329,8 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
     CHECK_OPTIONAL_INPUT(src_cache_indirection_opt, torch::kInt32);
 
     CHECK_INPUT(output_token_ids, torch::kInt32);
-    CHECK_OPTIONAL_INPUT(finished_opt, torch::kBool);
+    CHECK_OPTIONAL_INPUT(finished_input, torch::kUInt8);
+    CHECK_OPTIONAL_INPUT(finished_output, torch::kUInt8);
     CHECK_OPTIONAL_INPUT(seuqence_lengths_opt, torch::kInt32);
     CHECK_OPTIONAL_INPUT(cum_log_probs_opt, torch::kFloat32);
     CHECK_OPTIONAL_INPUT(output_log_probs_opt, torch::kFloat32);
@@ -345,11 +346,11 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
         sequence_limit_length_opt, stop_words_list_opt, bad_words_list_opt, no_repeat_ngram_size_opt,
         src_cache_indirection_opt,
         // Outputs
-        output_token_ids, newTokens, should_stop, finished_opt, seuqence_lengths_opt, cum_log_probs_opt,
-        output_log_probs_opt, parent_ids_opt, tgt_cache_indirection_opt, beam_hyps_output_ids_tgt_opt,
-        beam_hyps_sequence_lengths_tgt_opt, beam_hyps_cum_log_probs_opt, beam_hyps_normed_scores_opt,
-        beam_hyps_log_probs_opt, beam_hyps_min_normed_scores_opt, beam_hyps_num_beams_opt, beam_hyps_is_done_opt,
-        use_beam_hyps);
+        output_token_ids, newTokens, should_stop, finished_input, finished_output, seuqence_lengths_opt,
+        cum_log_probs_opt, output_log_probs_opt, parent_ids_opt, tgt_cache_indirection_opt,
+        beam_hyps_output_ids_tgt_opt, beam_hyps_sequence_lengths_tgt_opt, beam_hyps_cum_log_probs_opt,
+        beam_hyps_normed_scores_opt, beam_hyps_log_probs_opt, beam_hyps_min_normed_scores_opt, beam_hyps_num_beams_opt,
+        beam_hyps_is_done_opt, use_beam_hyps);
 
     return should_stop;
 }

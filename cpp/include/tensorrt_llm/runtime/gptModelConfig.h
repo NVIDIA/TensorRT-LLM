@@ -50,9 +50,11 @@ public:
         , mMaxOutputLen(0)
         , mMaxNumTokens(std::nullopt)
         , mComputeContextLogits(false)
+        , mComputeGenerationLogits(false)
         , mModelVariant(ModelVariant::kGpt)
         , mUseCustomAllReduce(false)
         , mMaxPromptEmbeddingTableSize(0)
+        , mMaxDraftLen(0)
     {
     }
 
@@ -222,6 +224,16 @@ public:
         mComputeContextLogits = computeContextLogits;
     }
 
+    [[nodiscard]] bool constexpr computeGenerationLogits() const noexcept
+    {
+        return mComputeGenerationLogits;
+    }
+
+    void constexpr computeGenerationLogits(bool computeGenerationLogits) noexcept
+    {
+        mComputeGenerationLogits = computeGenerationLogits;
+    }
+
     [[nodiscard]] ModelVariant getModelVariant() const
     {
         return mModelVariant;
@@ -242,6 +254,16 @@ public:
         mUseCustomAllReduce = customAllReduce;
     }
 
+    void constexpr setMaxDraftLen(SizeType maxDraftLen) noexcept
+    {
+        mMaxDraftLen = maxDraftLen;
+    }
+
+    [[nodiscard]] SizeType constexpr getMaxTokensPerStep() const noexcept
+    {
+        return mMaxDraftLen + 1;
+    }
+
 private:
     SizeType mVocabSize;
     SizeType mNbLayers;
@@ -260,10 +282,12 @@ private:
     std::optional<SizeType> mMaxNumTokens;
 
     bool mComputeContextLogits;
+    bool mComputeGenerationLogits;
     ModelVariant mModelVariant;
     bool mUseCustomAllReduce;
 
     SizeType mMaxPromptEmbeddingTableSize;
+    SizeType mMaxDraftLen;
 };
 
 } // namespace tensorrt_llm::runtime

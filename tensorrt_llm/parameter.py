@@ -16,8 +16,11 @@ import math
 from typing import Optional, Sequence, Union
 
 import numpy as np
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 
 from ._utils import str_dtype_to_trt, torch_to_numpy, trt_dtype_to_torch
 from .functional import Tensor, constant
@@ -47,8 +50,9 @@ class Parameter:
                 v_range = 0.1
 
             if dtype == trt.DataType.INT8:
-                value = torch.randint(int(-128 * v_range),
-                                      int(128 * v_range), (shape),
+                upper = math.ceil(128 * v_range)
+                value = torch.randint(-upper,
+                                      upper, (shape),
                                       dtype=trt_dtype_to_torch(dtype),
                                       device='cuda')
                 # value ~ U[int(-128 * v_range), int(128 * v_range)]

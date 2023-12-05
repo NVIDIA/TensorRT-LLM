@@ -287,6 +287,16 @@ inline int getMultiProcessorCount()
     return multi_processor_count;
 }
 
+inline int getMaxSharedMemoryPerBlockOptin()
+{
+    int device_id;
+    int max_shared_memory_per_block;
+    check_cuda_error(cudaGetDevice(&device_id));
+    check_cuda_error(
+        cudaDeviceGetAttribute(&max_shared_memory_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id));
+    return max_shared_memory_per_block;
+}
+
 inline int divUp(int a, int n)
 {
     return (a + n - 1) / n;

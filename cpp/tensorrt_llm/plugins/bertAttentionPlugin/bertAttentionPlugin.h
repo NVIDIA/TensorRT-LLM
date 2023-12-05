@@ -36,7 +36,7 @@ public:
 
     BertAttentionPlugin(int num_heads, int head_size, float q_scaling, bool qk_half_accum,
         tensorrt_llm::kernels::ContextFMHAType context_fmha_type, nvinfer1::DataType type,
-        bool do_relative_attention = false, int max_distance = 0);
+        bool do_relative_attention = false, int max_distance = 0, bool remove_padding = false);
 
     BertAttentionPlugin(const void* data, size_t length);
 
@@ -78,11 +78,11 @@ private:
 
     int mNumHeads;
     int mHeadSize;
-    int mMaxInputLength;
     float mQScaling;
     nvinfer1::DataType mType;
     bool mRelativeAttention = false;
     int mMaxDistance = 0;
+    bool mRemovePadding = false;
 
     // unfused mha
     bool mQKHalfAccum = false;

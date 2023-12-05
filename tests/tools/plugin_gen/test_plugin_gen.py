@@ -1,4 +1,5 @@
 import os
+from importlib.metadata import version
 
 import pytest
 
@@ -20,6 +21,10 @@ WORKSPACE = './tmp/'
 
 
 def is_triton_installed() -> bool:
+    # the triton detection does not work in PyTorch NGC 23.10 container
+    if version('triton') != "2.1.0+440fd1b":
+        return False
+
     return os.path.exists(TRITON_COMPILE_BIN)
 
 

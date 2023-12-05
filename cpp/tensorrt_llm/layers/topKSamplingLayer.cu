@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
@@ -93,7 +94,7 @@ void TopKSamplingLayer<T>::allocateBuffer(size_t const batch_size, std::vector<u
         max_top_k = 1;
     }
     invokeTopKSampling<T>(nullptr, sampling_workspace_size_, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-        nullptr, max_top_k, 1.0f, vocab_size_padded_, nullptr, stream_, batch_size, skip_decode_buf_);
+        nullptr, nullptr, max_top_k, 1.0f, vocab_size_padded_, nullptr, stream_, batch_size, skip_decode_buf_);
     sampling_workspace_ = allocator_->reMalloc(sampling_workspace_, sampling_workspace_size_, false);
     runtime_top_k_buf_ = allocator_->reMalloc(runtime_top_k_buf_, sizeof(uint32_t) * batch_size, false);
     runtime_top_p_buf_ = allocator_->reMalloc(runtime_top_p_buf_, sizeof(float) * batch_size, false);
@@ -171,9 +172,14 @@ void TopKSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingPa
     auto* logits = !skip_any_ ? params.logits.template getPtr<T>() : runtime_logits_buf_;
     auto* end_ids = params.end_ids.template getPtr<const int>();
 
-    bool* finished = (outputs.finished) ? outputs.finished->template getPtr<bool>() : nullptr;
+    FinishedState* finished_input = (params.finished)
+        ? reinterpret_cast<FinishedState*>(params.finished->template getPtr<FinishedState::UnderlyingType>())
+        : nullptr;
+    FinishedState* finished_output = (outputs.finished)
+        ? reinterpret_cast<FinishedState*>(outputs.finished->template getPtr<FinishedState::UnderlyingType>())
+        : nullptr;
     invokeAddBiasEndMask(
-        logits, (T*) (nullptr), end_ids, finished, local_batch_size, vocab_size_, vocab_size_padded_, stream_);
+        logits, (T*) (nullptr), end_ids, finished_input, local_batch_size, vocab_size_, vocab_size_padded_, stream_);
     sync_check_cuda_error();
 
     float* cum_log_probs = (outputs.cum_log_probs) ? outputs.cum_log_probs->template getPtr<float>() : nullptr;
@@ -181,16 +187,16 @@ void TopKSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingPa
 
     if (cum_log_probs != nullptr || output_log_probs != nullptr)
     {
-        invokeAddBiasSoftMax(
-            logits, (T*) (nullptr), end_ids, finished, local_batch_size, vocab_size_, vocab_size_padded_, stream_);
+        invokeAddBiasSoftMax(logits, logits, (T*) (nullptr), end_ids, finished_input, local_batch_size, vocab_size_,
+            vocab_size_padded_, stream_);
         sync_check_cuda_error();
     }
 
     int* sequence_length = (outputs.sequence_length) ? outputs.sequence_length->template getPtr<int>() : nullptr;
 
     invokeBatchTopKSampling(sampling_workspace_, sampling_workspace_size_, logits,
-        outputs.output_ids_ptr.template getPtr<int*>(), sequence_length, finished, cum_log_probs, output_log_probs,
-        curandstate_buf_ + ite * local_batch_size,
+        outputs.output_ids_ptr.template getPtr<int*>(), sequence_length, finished_input, finished_output, cum_log_probs,
+        output_log_probs, curandstate_buf_ + ite * local_batch_size,
         (int) runtime_max_top_k_, // useless because runtime_top_k_buf_ is never
                                   // nullptr. Keep for legacy.
         (int*) (runtime_top_k_buf_ + ite * local_batch_size),

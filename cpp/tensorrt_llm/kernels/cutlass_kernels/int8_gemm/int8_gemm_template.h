@@ -22,12 +22,13 @@
 // clang-format off
 #include <cutlass/gemm/device/default_gemm_configuration.h>
 #include <cutlass/gemm/device/gemm.h>
-#include <cutlass/gemm/device/gemm_universal_base.h>
+#include <cutlass_extensions/gemm/device/gemm_universal_base_compat.h>
 #include <cutlass/gemm/kernel/default_gemm.h>
 #include <cutlass/epilogue/threadblock/epilogue_with_visitor.h>
 // clang-format on
 
 #include "cutlass_extensions/compute_occupancy.h"
+#include "cutlass_extensions/epilogue/threadblock/epilogue_per_row_per_col_scale.h"
 #include "cutlass_extensions/epilogue/threadblock/epilogue_tensor_op_int32.h"
 #include "cutlass_extensions/epilogue_helpers.h"
 #include "cutlass_extensions/gemm_configs.h"
@@ -123,7 +124,7 @@ void genericInt8GemmKernelLauncher(const int8_t* A, const int8_t* B, tk::QuantMo
         return;
     }
 
-    using Gemm = cutlass::gemm::device::GemmUniversalBase<GemmKernel>;
+    using Gemm = cutlass::gemm::device::GemmUniversalBaseCompat<GemmKernel>;
 
     typename EpilogueOp::Params linearScalingParams; // TODO: right now it's unused (scaling is done in
                                                      // visitor, no activation needed)

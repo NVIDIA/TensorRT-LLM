@@ -269,7 +269,7 @@ class KernelMetaData:
         if yaml_path:
             with open(yaml_path, "r") as f:
                 yaml_str = f.read()
-        yaml_data = yaml.load(yaml_str, Loader=yaml.SafeLoader)
+        yaml_data = yaml.safe_load(yaml_str)
 
         kernel_name = yaml_data["name"]
         ios = []
@@ -316,7 +316,14 @@ class KernelMetaData:
         logger.info(f"load {self.num_outputs} outputs")
         logger.info(f"load {self.num_constexprs} constexprs")
 
-        return yaml.dump(ret)
+        yaml.add_representer(
+            data_type=OrderedDict,
+            representer=lambda dumper, data: dumper.represent_mapping(
+                yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+                data.items(),
+            ),
+            Dumper=yaml.SafeDumper)
+        return yaml.safe_dump(ret)
 
     def to_triton_signatures(self) -> List[str]:
         '''

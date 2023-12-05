@@ -2226,6 +2226,8 @@ inline __device__ Float8_ mul(uint4 a, int64_t b)
     fc.y = mul<float2, uint32_t, float2>(a.y, make_float2(int8[2], int8[3]));
     fc.z = mul<float2, uint32_t, float2>(a.z, make_float2(int8[4], int8[5]));
     fc.w = mul<float2, uint32_t, float2>(a.w, make_float2(int8[6], int8[7]));
+
+    return fc;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2247,6 +2249,8 @@ inline __device__ Float8_ mul(Float8_ fa, int64_t b)
     fc.y = mul<float2, float2, float2>(fa.y, make_float2(int8[2], int8[3]));
     fc.z = mul<float2, float2, float2>(fa.z, make_float2(int8[4], int8[5]));
     fc.w = mul<float2, float2, float2>(fa.w, make_float2(int8[6], int8[7]));
+
+    return fc;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2323,6 +2327,8 @@ inline __device__ Float8_ mul(bf16_8_t a, int64_t b)
     fc.y = mul<float2, __nv_bfloat162, float2>(a.y, make_float2(int8[2], int8[3]));
     fc.z = mul<float2, __nv_bfloat162, float2>(a.z, make_float2(int8[4], int8[5]));
     fc.w = mul<float2, __nv_bfloat162, float2>(a.w, make_float2(int8[6], int8[7]));
+
+    return fc;
 }
 
 #endif // ENABLE_BF16

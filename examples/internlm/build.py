@@ -14,13 +14,16 @@
 # limitations under the License.
 import argparse
 import json
+import math
 import os
 import time
 from pathlib import Path
 
-import tensorrt as trt
+# isort: off
 import torch
 import torch.multiprocessing as mp
+import tensorrt as trt
+# isort: on
 from transformers import AutoConfig, AutoModelForCausalLM
 from weight import (get_scaling_factors, load_from_awq_internlm,
                     load_from_binary, load_from_gptq_internlm,
@@ -115,7 +118,7 @@ def serialize_engine(engine, path):
     logger.info(f'Serializing engine to {path}...')
     tik = time.time()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')
@@ -201,7 +204,7 @@ def parse_arguments():
     parser.add_argument(
         '--output_dir',
         type=str,
-        default='internlm_outputs',
+        default='engine_outputs',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
     )
@@ -318,7 +321,7 @@ def parse_arguments():
     )
     parser.add_argument('--tokens_per_block',
                         type=int,
-                        default=64,
+                        default=128,
                         help='Number of tokens per block in paged KV cache')
     parser.add_argument(
         '--max_num_tokens',
@@ -465,6 +468,12 @@ def parse_arguments():
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha
 
+    assert (math.log2(args.tokens_per_block).is_integer()
+            ), "tokens_per_block must be power of 2"
+    if args.enable_context_fmha or args.enable_context_fmha_fp32_acc:
+        assert (args.tokens_per_block >=
+                128), "Context fMHA requires >= 128 tokens per block"
+
     if args.inter_size is None:
         # this should not be need when loading a real model
         # but it is helpful when creating a dummy model without loading any real weights
@@ -494,16 +503,14 @@ def build_rank_engine(builder: Builder,
 
     assert args.n_layer % args.pp_size == 0, \
         f"num_layers {args.n_layer} must be a multiple of pipeline parallelism size {args.pp_size}"
-
     # Initialize Module
-    tensorrt_llm_internlm = tensorrt_llm.models.InternLMForCausalLM(
+    tensorrt_llm_internlm = tensorrt_llm.models.LLaMAForCausalLM(
         num_layers=args.n_layer,
         num_heads=args.n_head,
         num_kv_heads=args.n_kv_head,
         hidden_size=args.n_embd,
         vocab_size=args.vocab_size,
         hidden_act=args.hidden_act,
-        attn_bias=args.attn_bias,
         max_position_embeddings=args.n_positions,
         dtype=dtype,
         mlp_hidden_size=args.inter_size,
@@ -513,6 +520,8 @@ def build_rank_engine(builder: Builder,
         rotary_scaling=args.rotary_scaling,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
+        use_fused_mlp=False,
+        attn_bias=args.attn_bias,
         quant_mode=args.quant_mode,
         rms_norm_eps=args.rms_norm_eps)
     if args.use_smooth_quant:
@@ -688,6 +697,7 @@ def build(rank, args):
             hidden_act=args.hidden_act,
             max_position_embeddings=args.n_positions,
             max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,

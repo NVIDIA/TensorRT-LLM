@@ -16,15 +16,17 @@ from .baichuan.model import BaichuanForCausalLM
 from .bert.model import BertForQuestionAnswering, BertModel
 from .bloom.model import BloomForCausalLM, BloomModel
 from .chatglm.model import ChatGLMHeadModel, ChatGLMModel
+from .enc_dec.model import DecoderModel, EncoderModel
 from .falcon.model import FalconForCausalLM, FalconModel
 from .gpt.model import GPTLMHeadModel, GPTModel
 from .gptj.model import GPTJForCausalLM, GPTJModel
 from .gptneox.model import GPTNeoXForCausalLM, GPTNeoXModel
-from .internlm.model import InternLMForCausalLM, InternLMModel
 from .llama.model import LLaMAForCausalLM, LLaMAModel
 from .opt.model import OPTLMHeadModel, OPTModel
+from .qwen.model import QWenForCausalLM
 from .rwkv.model import RwkvModel, RwkvForCausalLM
-from .quantized.quant import quantize_model  # noqa
+
+from .quantized.quant import quantize_model  # noqa # isort:skip
 
 __all__ = [
     'BertModel',
@@ -49,6 +51,10 @@ __all__ = [
     'BaichuanForCausalLM',
     'InternLMForCausalLM',
     'InternLMModel',
-    'RwkvModel', 
     'RwkvForCausalLM'
+    'QWenForCausalLM',
+    'RwkvModel', 
+    'RwkvForCausalLM', 
+    'EncoderModel',
+    'DecoderModel',
 ]

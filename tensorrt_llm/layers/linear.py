@@ -16,12 +16,13 @@ import numpy as np
 import tensorrt as trt
 
 from .._common import default_net, default_trtnet
-from .._utils import int32_array, str_dtype_to_trt
+from .._utils import str_dtype_to_trt
 from ..functional import (Tensor, _create_tensor, allgather, allreduce, cast,
-                          concat, constant, matmul, shape, slice)
+                          matmul)
 from ..module import Module
 from ..parameter import Parameter
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
+from .lora import Lora, LoraRuntimeParam
 
 
 def _gemm_plugin(input: Tensor,
@@ -85,11 +86,30 @@ class Linear(Module):
         else:
             self.register_parameter('bias', None)
 
-    def multiply_gather(self, x, weight, gemm_plugin, use_fp8=False):
+        self.lora = Lora(
+            in_hidden_size=self.in_features,
+            out_hidden_size=self.out_features,
+            max_low_rank=min(
+                self.in_features, self.out_features
+            ),  # Assume low rank is smaller than in/out features
+        )
+
+    def multiply_gather(self,
+                        x,
+                        weight,
+                        gemm_plugin,
+                        use_fp8=False,
+                        lora_runtime_param: LoraRuntimeParam = None):
+        hidden_state = x
         if gemm_plugin:
             x = _gemm_plugin(x, weight, transb=True, use_fp8=use_fp8)
         else:
             x = matmul(x, weight, transb=True)
+
+        if default_net(
+        ).plugin_config.lora_plugin and lora_runtime_param is not None:
+            x = x + self.lora(hidden_state,
+                              lora_runtime_param=lora_runtime_param)
 
         if self.bias is not None:
             if x.dtype != self.bias.value.dtype:
@@ -97,28 +117,16 @@ class Linear(Module):
             x = x + self.bias.value
 
         if self.gather_output and self.tp_size > 1 and self.tp_group is not None:
-            # 1. [dim0, local_dim] -> [dim0 * tp_size, local_dim]
-            x = allgather(x, self.tp_group)
-
-            # 2. [dim0 * tp_size, local_dim] -> [dim0, local_dim * tp_size]
-            # 2.1 split
-            split_size = shape(x, dim=0) / self.tp_size
-            ndim = x.ndim()
-            starts = [constant(int32_array([0])) for _ in range(ndim)]
-            sizes = [shape(x, dim=d) for d in range(ndim)]
-            sizes[0] = split_size
-            sections = []
-            for i in range(self.tp_size):
-                starts[0] = split_size * i
-                sections.append(slice(x, concat(starts), concat(sizes)))
-            # 2.2 concat
-            x = concat(sections, dim=1)
+            # [dim0, local_dim] -> [dim0 * tp_size, local_dim] --> [dim0, local_dim * tp_size]
+            x = allgather(x, self.tp_group, gather_dim=1)
 
         return x
 
-    def forward(self, x):
-        return self.multiply_gather(x, self.weight.value,
-                                    default_net().plugin_config.gemm_plugin)
+    def forward(self, x, lora_runtime_param: LoraRuntimeParam = None):
+        return self.multiply_gather(x,
+                                    self.weight.value,
+                                    default_net().plugin_config.gemm_plugin,
+                                    lora_runtime_param=lora_runtime_param)
 
 
 ColumnLinear = Linear
@@ -151,16 +159,31 @@ class RowLinear(Module):
         self.tp_size = tp_size
         self.instance_id = instance_id
 
+        self.lora = Lora(
+            in_hidden_size=self.in_features,
+            out_hidden_size=self.out_features,
+            max_low_rank=min(
+                self.in_features, self.out_features
+            ),  # Assume low rank is smaller than in/out features
+        )
+
     def multiply_reduce(self,
                         x,
                         weight,
                         gemm_plugin,
                         use_fp8=False,
-                        workspace=None):
+                        workspace=None,
+                        lora_runtime_param: LoraRuntimeParam = None):
+        hidden_state = x
         if gemm_plugin:
             x = _gemm_plugin(x, weight, transb=True, use_fp8=use_fp8)
         else:
             x = matmul(x, weight, transb=True)
+
+        if default_net(
+        ).plugin_config.lora_plugin and lora_runtime_param is not None:
+            x = x + self.lora(hidden_state,
+                              lora_runtime_param=lora_runtime_param)
 
         if self.tp_size > 1 and self.tp_group is not None:
             x = allreduce(x, self.tp_group, workspace, self.instance_id)
@@ -173,8 +196,12 @@ class RowLinear(Module):
 
         return x
 
-    def forward(self, x, workspace=None):
+    def forward(self,
+                x,
+                workspace=None,
+                lora_runtime_param: LoraRuntimeParam = None):
         return self.multiply_reduce(x,
                                     self.weight.value,
                                     default_net().plugin_config.gemm_plugin,
-                                    workspace=workspace)
+                                    workspace=workspace,
+                                    lora_runtime_param=lora_runtime_param)

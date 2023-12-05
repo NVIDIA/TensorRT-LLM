@@ -14,13 +14,16 @@
 # limitations under the License.
 import argparse
 import json
+import math
 import os
 import time
 from pathlib import Path
 
-import tensorrt as trt
+# isort: off
 import torch
 import torch.multiprocessing as mp
+import tensorrt as trt
+# isort: on
 from transformers import AutoModelForCausalLM
 from weight import (get_scaling_factors, load_from_awq_gpt_j,
                     load_from_bin_gpt_j, load_from_hf_gpt_j, parse_config)
@@ -49,7 +52,7 @@ def serialize_engine(engine, path):
     logger.info(f'Serializing engine to {path}...')
     tik = time.time()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')
@@ -137,7 +140,7 @@ def parse_arguments(args):
     parser.add_argument(
         '--output_dir',
         type=str,
-        default='gpt_outputs',
+        default='engine_outputs',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
     )
@@ -178,7 +181,7 @@ def parse_arguments(args):
     )
     parser.add_argument('--tokens_per_block',
                         type=int,
-                        default=64,
+                        default=128,
                         help='Number of tokens per block in paged KV cache')
     parser.add_argument(
         '--max_num_tokens',
@@ -315,6 +318,12 @@ def parse_arguments(args):
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha
 
+    assert (math.log2(args.tokens_per_block).is_integer()
+            ), "tokens_per_block must be power of 2"
+    if args.enable_context_fmha or args.enable_context_fmha_fp32_acc:
+        assert (args.tokens_per_block >=
+                128), "Context fMHA requires >= 128 tokens per block"
+
     return args
 
 
@@ -443,7 +452,6 @@ def build_rank_engine(builder: Builder,
         config_path = os.path.join(args.output_dir, 'config.json')
         builder.save_config(builder_config, config_path)
 
-    tensorrt_llm.tools.cleanup(network, tensorrt_llm_gpt)
     return engine
 
 
@@ -462,7 +470,7 @@ def build(rank, args):
         if args.parallel_build and cur_rank != rank:
             continue
         # NOTE(nkorobov): when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
-        int8_trt_flag = args.quant_mode.has_act_and_weight_quant() or (
+        int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
             not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
 
         builder_config = builder.create_builder_config(
@@ -478,10 +486,10 @@ def build(rank, args):
             hidden_act=args.hidden_act,
             max_position_embeddings=args.n_positions,
             max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,
-            fp8=args.enable_fp8,
             int8=int8_trt_flag,
             quant_mode=args.quant_mode,
             strongly_typed=args.strongly_typed)

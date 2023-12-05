@@ -167,6 +167,48 @@ class TestFunctional(unittest.TestCase):
                         "factor": 2.0
                     },
                 ]))
+        # for XQA test
+        test_cases += list(
+            product(
+                ['llama_attention'],
+                [ContextFMHAType.enabled],
+                ['float16'],
+                [None],
+                [1, 4],
+                [165, 1025, 2543, 6030],
+                [16],
+                [128],
+                [2],
+                [False, True],
+                [False],
+                [1],
+                [False],
+                [False],
+                [10000.0],  # rope base
+                [  # rope scaling
+                    None,
+                ]))
+        # for XQA multi batch split logic test
+        test_cases += list(
+            product(
+                ['llama_attention'],
+                [ContextFMHAType.enabled],
+                ['float16'],
+                [None],
+                [150],
+                [500],
+                [32],
+                [128],
+                [4],
+                [False, True],
+                [False],
+                [1],
+                [False],
+                [False],
+                [10000.0],  # rope base
+                [  # rope scaling
+                    None,
+                ]))
 
         return test_cases
 
@@ -237,16 +279,19 @@ class TestFunctional(unittest.TestCase):
                 "Beam search and paged kv cache are not supported in this test yet"
             )
 
-        tokens_per_block = 16 if paged_kv_cache else -1
+        tokens_per_block = 128 if paged_kv_cache else -1
 
         def _construct_execution(
                 session, input_tensor, weight, bias, past_key_value,
-                pointer_array, sequence_length, host_past_key_value_lengths,
-                host_max_kv_cache_lengths, context_lengths,
-                host_context_lengths, cache_indirection, host_request_types,
-                num_heads, hidden_size, num_kv_heads, output, dtype,
-                max_context_length, shape_dict, kv_int8_quant_scale,
-                kv_int8_dequant_scale, configuration):
+                host_pointer_array, sequence_length,
+                host_past_key_value_lengths, host_max_kv_cache_lengths,
+                context_lengths, host_context_lengths, cache_indirection,
+                host_request_types, num_heads, hidden_size, num_kv_heads,
+                output, dtype, max_context_length, shape_dict,
+                kv_int8_quant_scale, kv_int8_dequant_scale, configuration):
+            pointer_array = None
+            if paged_kv_cache:
+                pointer_array = host_pointer_array.to('cuda')
             head_size = hidden_size // num_heads
             # construct trt network
             builder = tensorrt_llm.Builder()
@@ -296,9 +341,14 @@ class TestFunctional(unittest.TestCase):
 
                 past_key_value_tensor = None
                 pointer_array_tensor = None
+                host_pointer_array_tensor = None
                 if paged_kv_cache:
                     pointer_array_tensor = Tensor(
                         name='kv_cache_block_pointers',
+                        shape=tuple(pointer_array.shape),
+                        dtype=tensorrt_llm.str_dtype_to_trt('int64'))
+                    host_pointer_array_tensor = Tensor(
+                        name='host_kv_cache_block_pointers',
                         shape=tuple(pointer_array.shape),
                         dtype=tensorrt_llm.str_dtype_to_trt('int64'))
                 else:
@@ -368,7 +418,7 @@ class TestFunctional(unittest.TestCase):
                         }[configuration.rope_scaling["type"]]
                         rope_scale = configuration.rope_scaling["factor"]
                 outputs = tensorrt_llm.functional.gpt_attention(
-                    tensor=qkv,
+                    qkv=qkv,
                     past_key_value=past_key_value_tensor,
                     sequence_length=sequence_length_tensor,
                     host_past_key_value_lengths=
@@ -395,6 +445,7 @@ class TestFunctional(unittest.TestCase):
                         use_int8_kv_cache=use_int8_kv_cache,
                         use_fp8_kv_cache=use_fp8_kv_cache),
                     kv_cache_block_pointers=pointer_array_tensor,
+                    host_kv_cache_block_pointers=host_pointer_array_tensor,
                     max_context_length=max_context_length,
                     qkv_bias=qkv_bias)
 
@@ -418,6 +469,7 @@ class TestFunctional(unittest.TestCase):
             }
             if paged_kv_cache:
                 inputs['kv_cache_block_pointers'] = pointer_array
+                inputs['host_kv_cache_block_pointers'] = host_pointer_array
             else:
                 inputs['past_key_value'] = past_key_value
 
@@ -467,8 +519,7 @@ class TestFunctional(unittest.TestCase):
         out_len = 8
         max_seq_len = in_len + 24
         max_blocks_per_seq = math.ceil(max_seq_len / tokens_per_block)
-        blocks = math.ceil(
-            (batch_size * beam_width * max_seq_len) / tokens_per_block)
+        blocks = batch_size * beam_width * max_blocks_per_seq
         shape_dict = {
             'weight': (hidden_size, qkv_hidden_size),
             'bias': (qkv_hidden_size, ),

@@ -253,6 +253,7 @@ class BloomForCausalLM(BloomModel, GenerationMixin):
         elif quant_mode.has_fp8_kv_cache():
             self._kv_dtype = str_dtype_to_trt('fp8')
 
+        self.mapping = mapping
         self.quant_mode = quant_mode
 
         self._num_layers = num_layers

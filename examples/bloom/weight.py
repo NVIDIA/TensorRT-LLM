@@ -15,12 +15,14 @@
 import configparser
 import time
 from pathlib import Path
+from typing import Union
 
 import numpy as np
 import torch
 
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_np
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models import BloomForCausalLM
 from tensorrt_llm.quantization import QuantMode
 
@@ -195,8 +197,17 @@ def load_from_hf_bloom(tensorrt_llm_bloom,
 
     embed_w = get_weight(model_params, 'transformer.word_embeddings', dtype)
     if not share_embedding_table:
+        vocab_size = embed_w.shape[0]
+        lm_head_weight = embed_w.copy()
+        if vocab_size % tensor_parallel != 0:
+            # padding
+            vocab_size_padded = tensorrt_llm_bloom.lm_head.out_features * tensor_parallel
+            pad_width = vocab_size_padded - vocab_size
+            lm_head_weight = np.pad(lm_head_weight, ((pad_width, 0), (0, 0)),
+                                    'constant',
+                                    constant_values=0)
         tensorrt_llm_bloom.lm_head.weight.value = split_matrix_tp(
-            embed_w.copy(), tensor_parallel, rank, dim=0)
+            lm_head_weight, tensor_parallel, rank, dim=0)
 
     if not use_parallel_embedding:
         tensorrt_llm_bloom.embedding.weight.value = embed_w
@@ -214,6 +225,108 @@ def load_from_hf_bloom(tensorrt_llm_bloom,
                                          dtype)
     tensorrt_llm_bloom.ln_f.weight.value = ln_f_w
     tensorrt_llm_bloom.ln_f.bias.value = ln_f_b
+
+    tok = time.time()
+    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
+    tensorrt_llm.logger.info(f'Weights loaded. Total time: {t}')
+
+
+def load_from_hf_checkpoint(
+    tensorrt_llm_bloom: tensorrt_llm.models.BloomForCausalLM,
+    model_dir: Union[str, Path],
+    dtype: Union[str, torch.dtype] = torch.float32,
+    use_parallel_embedding: bool = False,
+    sharding_dim: int = 0,
+    share_embedding_table: bool = False,
+):
+    tensorrt_llm.logger.info('Loading weights from HF BLOOM...')
+    tik = time.time()
+
+    quant_mode = getattr(tensorrt_llm_bloom, 'quant_mode', QuantMode(0))
+    mapping = tensorrt_llm_bloom.mapping
+    tp_size = mapping.tp_size
+    tp_rank = mapping.tp_rank
+
+    if isinstance(dtype, str):
+        dtype = tensorrt_llm._utils.str_dtype_to_torch(dtype)
+
+    def is_bias(_name):
+        return 'bias' in _name
+
+    # Load examples/common/utils.py
+    import sys
+    sys.path.append(str(Path(__file__).parent.parent))
+    from common import utils
+
+    for model_file in utils.iterate_shard_files(model_dir, mapping.tp_rank):
+        logger.debug(f'Loading file {str(model_file)}...')
+        model_params = utils.load_state_dict(model_file, dtype=dtype)
+        for name, param in model_params.items():
+            logger.debug(f'Converting weight {name}...')
+            i = utils.retrieved_layer_index_from_name(name)
+            layer = tensorrt_llm_bloom.layers[i] if i is not None else None
+            param = param.detach().cpu().numpy()
+            if 'self_attention.query_key_value' in name:
+                if not is_bias(name):
+                    split_v = split_qkv_tp(tensorrt_llm_bloom, param, tp_size,
+                                           tp_rank)
+                    set_layer_weight(layer.attention.qkv, split_v, quant_mode)
+                else:
+                    layer.attention.qkv.bias.value = split_qkv_bias_tp(
+                        tensorrt_llm_bloom, param, tp_size, tp_rank)
+            elif 'self_attention.dense' in name:
+                if not is_bias(name):
+                    split_v = split_matrix_tp(param, tp_size, tp_rank, dim=1)
+                    set_layer_weight(layer.attention.dense, split_v, quant_mode)
+                else:
+                    layer.attention.dense.bias.value = param
+
+            elif 'mlp.dense_h_to_4h' in name:
+                if not is_bias(name):
+                    split_v = split_matrix_tp(param, tp_size, tp_rank, dim=0)
+                    set_layer_weight(layer.mlp.fc, split_v, quant_mode)
+                else:
+                    layer.mlp.fc.bias.value = split_matrix_tp(param,
+                                                              tp_size,
+                                                              tp_rank,
+                                                              dim=0)
+            elif 'mlp.dense_4h_to_h' in name:
+                if not is_bias(name):
+                    split_v = split_matrix_tp(param, tp_size, tp_rank, dim=1)
+                    set_layer_weight(layer.mlp.proj, split_v, quant_mode)
+                else:
+                    layer.mlp.proj.bias.value = param
+            elif 'input_layernorm' in name:
+                if not is_bias(name):
+                    layer.input_layernorm.weight.value = param
+                else:
+                    layer.input_layernorm.bias.value = param
+            elif 'post_attention_layernorm' in name:
+                if not is_bias(name):
+                    layer.post_layernorm.weight.value = param
+                else:
+                    layer.post_layernorm.bias.value = param
+            elif 'word_embeddings.' in name:
+                if not share_embedding_table:
+                    tensorrt_llm_bloom.lm_head.weight.value = split_matrix_tp(
+                        param, tp_size, tp_rank, dim=0)
+                if not use_parallel_embedding:
+                    tensorrt_llm_bloom.embedding.weight.value = param
+                else:
+                    assert tensorrt_llm_bloom._vocab_size % tp_size == 0
+                    tensorrt_llm_bloom.embedding.weight.value = split_matrix_tp(
+                        param, tp_size, tp_rank, dim=sharding_dim)
+            elif 'word_embeddings_layernorm.' in name:
+                if not is_bias(name):
+                    tensorrt_llm_bloom.ln_embed.weight.value = param
+                else:
+                    tensorrt_llm_bloom.ln_embed.bias.value = param
+            elif 'ln_f.' in name:
+                if not is_bias(name):
+                    tensorrt_llm_bloom.ln_f.weight.value = param
+                else:
+                    tensorrt_llm_bloom.ln_f.bias.value = param
+        del model_params
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
