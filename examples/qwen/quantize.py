@@ -88,6 +88,10 @@ def get_calib_dataloader(data="ccdv/cnn_dailymail",
     batch_encoded = batch_encoded.cuda()
     calib_dataloader = DataLoader(batch_encoded,
                                   batch_size=batch_size,
+    calib_dataloader = DataLoader(batch_encoded,
+                                  batch_size=batch_size,
+                                  pin_memory=True,
+                                  num_workers=num_workers,
                                   shuffle=False)
 
     return calib_dataloader
