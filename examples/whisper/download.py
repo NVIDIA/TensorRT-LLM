@@ -24,10 +24,6 @@ def download(args):
     for k, v in model.state_dict().items():
         dict_layers[k] = v.shape
 
-    import json
-    with open('decoder.json', 'w') as fp:
-        json.dump(dict_layers, fp, indent=4)
-
     # write config
     config = configparser.ConfigParser()
     config["encoder"] = {}
