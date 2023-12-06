@@ -26,27 +26,60 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-// TODO Add half2 implementation
-template <typename T>
-__global__ void applyTemperaturePenalty(T* logits, const T* bias, const float temperatureInverse, const int m,
-    const int vocabSize, const int vocabSizePadded)
-{
-    const bool IS_FP16 = std::is_same<T, half>::value;
-    const T MAX_T_VAL = (IS_FP16) ? 65504.F : FLT_MAX;
-    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < m * vocabSizePadded;
-         index += blockDim.x * gridDim.x)
+    template <typename T>
+    __device__ T getMaxValue();
+
+    template <>
+    __device__ half getMaxValue<half>() {
+        return __float2half(65504.F);
+    }
+
+    template <>
+    __device__ float getMaxValue<float>() {
+        return FLT_MAX;
+    }
+
+    template <typename T>
+    __global__ void applyTemperaturePenalty(T* logits, const T* bias, const float temperature_inverse, const int m,
+        const int vocab_size, const int vocab_size_padd)
     {
-        T biasVal = bias == nullptr ? (T) (0.0f) : bias[index % vocabSizePadded];
-        if (index % vocabSizePadded < vocabSize)
+        const bool IS_FP16 = std::is_same<T, half>::value;
+        const T MAX_T_VAL = getMaxValue<T>();
+
+        for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < m * vocab_size_padd / (IS_FP16 ? 2 : 1);
+            index += blockDim.x * gridDim.x)
         {
-            logits[index] = (logits[index] + biasVal) * (T) temperatureInverse;
-        }
-        else
-        {
-            logits[index] = -MAX_T_VAL;
+            int actual_index = index * (IS_FP16 ? 2 : 1);
+
+            if (IS_FP16 && actual_index % vocab_size_padd < vocab_size)
+            {
+                half2* logits_half2 = reinterpret_cast<half2*>(logits);
+                const half2* bias_half2 = reinterpret_cast<const half2*>(bias);
+
+                half2 bias_val_half2 = (bias == nullptr) ? __float2half2_rn(0.0f) : bias_half2[index];
+
+                half2 temperature_inverse_half2 = __float2half2_rn(temperature_inverse);
+                logits_half2[index] = __hmul2(__hadd2(logits_half2[index], bias_val_half2), temperature_inverse_half2);
+            }
+            else if (!IS_FP16 && actual_index % vocab_size_padd < vocab_size)
+            {
+                T bias_val = (bias == nullptr) ? T(0.0f) : bias[actual_index];
+                logits[actual_index] = (logits[actual_index] + bias_val) * (T)temperature_inverse;
+            }
+            else
+            {
+                if (IS_FP16)
+                {
+                    half2* logits_half2 = reinterpret_cast<half2*>(logits);
+                    logits_half2[index] = __float2half2_rn(-65504.F);
+                }
+                else
+                {
+                    logits[actual_index] = -MAX_T_VAL;
+                }
+            }
         }
     }
-}
 
 template <>
 __global__ void applyTemperaturePenalty(half2* logits, const half2* bias, const float temperatureInverse,
