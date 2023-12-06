@@ -420,15 +420,15 @@ class AudioEncoder(Module):
         print(self.position_emb.shape, type(self.position_emb))
         
     def forward(self, x):
+        # expand dims for 2d conv
+        x = view(x, [*x.shape, 1])
         x = self.conv1(x)
-
         x = ACT2FN[self.hidden_act](x)
         
         x = self.conv2(x)
-        
         x = ACT2FN[self.hidden_act](x)
-
         x = view(x, [1, self.n_state, self.n_ctx])
+
         x = permute(x, [0, 2, 1])
 
         # add positional embeddings
@@ -436,17 +436,12 @@ class AudioEncoder(Module):
         
         hidden_states = add(x, position_embedding)
 
-        print(hidden_states.dtype, "after position embed")
-
         # attention blocks
         for layer_idx, block in enumerate(self.blocks):
             hidden_states = block(hidden_states=hidden_states, layer_idx=layer_idx)
             
-
         hidden_states = self.ln_post(hidden_states)
-
         hidden_states.mark_output('encoder_output', self._dtype)
-        
         return hidden_states
 
     def prepare_inputs(self, max_batch_size=4):
@@ -459,9 +454,9 @@ class AudioEncoder(Module):
         input_features = Tensor(
             name="input_features",
             dtype=self._dtype,
-            shape=[1,80,3000, 1],
+            shape=[1,80,3000],
             dim_range=OrderedDict([
-                ('batch_size', [1]), ('n_mels', [80]), ('input_length', [3000]), ('conv_unsqueeze', [1])
+                ('batch_size', [1]), ('n_mels', [80]), ('input_length', [3000])
             ])
         )
         return [input_features]

@@ -366,7 +366,7 @@ if __name__ == "__main__":
     audio = whisper.pad_or_trim(audio)
 
     # make log-Mel spectrogram and move to the same device as the model
-    input_features = whisper.log_mel_spectrogram(audio).cuda().unsqueeze(dim=0).unsqueeze(dim=-1)
+    input_features = whisper.log_mel_spectrogram(audio).cuda().unsqueeze(dim=0).half()
 
     if tensorrt_llm.mpi_rank() == 0:
         print("--------------------------------------")
@@ -423,24 +423,27 @@ if __name__ == "__main__":
     tllm_model = TRTLLMEncDecModel.from_engine(args.engine_name,
                                                args.engine_dir,
                                                debug_mode=args.debug_mode)
-    tik = time.time()
-    encoder_output, tllm_output_ids = tllm_model.generate(
-        input_features=input_features,
-        decoder_input_ids=decoder_input_ids,
-        max_new_tokens=max_new_tokens,
-        num_beams=args.num_beams,
-        bos_token_id=tokenizer.bos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        debug_mode=args.debug_mode,
-    )
-    tok = time.time()
+    for i in range(10):
+        tik = time.time()
+        encoder_output, tllm_output_ids = tllm_model.generate(
+            input_features=input_features,
+            decoder_input_ids=decoder_input_ids,
+            max_new_tokens=max_new_tokens,
+            num_beams=args.num_beams,
+            bos_token_id=tokenizer.bos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            debug_mode=args.debug_mode,
+        )
+        output_ids = tllm_output_ids[:, 0, :]
+        output_text = tokenizer.batch_decode(output_ids)
+        tok = time.time()
+        print(tok - tik)
 
     inference_dtype = tllm_model.encoder_model_config.dtype
 
     if tensorrt_llm.mpi_rank() == 0:
-        output_ids = tllm_output_ids[:, 0, :]
-        output_text = tokenizer.batch_decode(output_ids)
+        
         decoder_input_lengths = (decoder_input_ids !=
                                  tokenizer.pad_token_id).sum(dim=1)
         output_gen_lengths = (output_ids != tokenizer.eos_token_id).sum(

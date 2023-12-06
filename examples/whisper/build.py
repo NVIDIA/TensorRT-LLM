@@ -360,6 +360,7 @@ def build_rank_engine(builder: Builder,
                 args.max_output_len,
                 args.max_encoder_input_len,
             )
+            
         tllm_model(*inputs)
 
         # Adding debug outputs into the network --------------------------
