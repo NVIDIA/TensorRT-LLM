@@ -44,13 +44,17 @@ def generate_output(engine: str,
 
     output_name += '_tp' + str(tp_size) + '_pp' + str(pp_size)
 
-    run.generate(engine_dir=str(engine_dir),
-                 hf_model_location=str(hf_dir),
-                 input_file=str(input_file),
-                 output_npy=str(output_dir / (output_name + '.npy')),
-                 output_csv=str(output_dir / (output_name + '.csv')),
-                 max_output_len=max_output_len,
-                 num_beams=num_beams)
+    args = run.parse_arguments([
+        '--engine_dir',
+        str(engine_dir), '--input_file',
+        str(input_file), '--tokenizer_dir',
+        str(hf_dir), '--output_npy',
+        str(output_dir / (output_name + '.npy')), '--output_csv',
+        str(output_dir / (output_name + '.csv')), '--max_output_len',
+        str(max_output_len), '--num_beams',
+        str(num_beams)
+    ])
+    run.main(args)
 
 
 def generate_outputs(only_fp8, num_beams):

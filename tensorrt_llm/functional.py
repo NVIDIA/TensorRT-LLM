@@ -2487,7 +2487,6 @@ def conv2d(input: Tensor,
            padding: Tuple[int, int] = (0, 0),
            dilation: Tuple[int, int] = (1, 1),
            groups: int = 1) -> Tensor:
-
     ##
     ## TODO: Document that function!
     ##
@@ -3105,42 +3104,45 @@ def bert_attention(tensor: Tensor,
 
 @gw.record_signature
 def gpt_attention(
-        tensor: Tensor,
-        past_key_value: Tensor,
-        sequence_length: Tensor,
-        host_past_key_value_lengths: Tensor,
-        host_max_kv_cache_lengths: Tensor,
-        context_lengths: Tensor,
-        cache_indirection: Tensor,
-        host_request_types: Tensor,
-        num_heads: int,
-        num_kv_heads: int,
-        hidden_size_per_head: int,
-        q_scaling: float,
-        rotary_embedding_dim: int,
-        rotary_embedding_base: float = 10000.0,
-        rotary_embedding_scale_type: RotaryScalingType = RotaryScalingType.none,
-        rotary_embedding_scale: float = 1.0,
-        rotary_embedding_max_positions: int = 1024,
-        position_embedding_type: PositionEmbeddingType = PositionEmbeddingType.
+    qkv: Tensor,
+    past_key_value: Tensor,
+    sequence_length: Tensor,
+    host_past_key_value_lengths: Optional[Tensor],
+    host_max_kv_cache_lengths: Tensor,
+    context_lengths: Optional[Tensor],
+    cache_indirection: Optional[Tensor],
+    host_request_types: Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    hidden_size_per_head: int,
+    q_scaling: float,
+    rotary_embedding_dim: int = 0,
+    rotary_embedding_base: float = 10000.0,
+    rotary_embedding_scale_type: RotaryScalingType = RotaryScalingType.none,
+    rotary_embedding_scale: float = 1.0,
+    rotary_embedding_max_positions: int = 1024,
+    position_embedding_type: PositionEmbeddingType = PositionEmbeddingType.
     learned_absolute,
-        kv_orig_quant_scale: Tensor = None,
-        kv_quant_orig_scale: Tensor = None,
-        kv_cache_quant_mode: QuantMode = None,
-        max_context_length: int = None,
-        mask_type: AttentionMaskType = AttentionMaskType.causal,
-        alibi_slopes: Tensor = None,
-        tp_size: int = 1,
-        tp_rank: int = 0,
-        kv_cache_block_pointers: Tensor = None,
-        do_cross_attention: bool = False,
-        cross_qkv: Tensor = None,  # for cross attention
-        cross_qkv_length: Tensor = None,  # for cross attention
-        encoder_input_lengths: Tensor = None,  # for cross attention
-        relative_attention_bias: Tensor = None,  # for relative attention
-        max_distance: int = 0,  # for relative attention
-        host_context_lengths: Tensor = None,  # for pad-free input mode
-        qkv_bias: Tensor = None) -> Tuple[Tensor]:
+    kv_orig_quant_scale: Optional[Tensor] = None,
+    kv_quant_orig_scale: Optional[Tensor] = None,
+    kv_cache_quant_mode: QuantMode = QuantMode(0),
+    max_context_length: Optional[int] = None,
+    mask_type: AttentionMaskType = AttentionMaskType.causal,
+    alibi_slopes: Optional[Tensor] = None,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    kv_cache_block_pointers: Optional[Tensor] = None,
+    host_kv_cache_block_pointers: Tensor = None,
+    do_cross_attention: bool = False,
+    cross_qkv: Optional[Tensor] = None,  # for cross attention
+    cross_qkv_length: Optional[Tensor] = None,  # for cross attention
+    encoder_input_lengths: Optional[Tensor] = None,  # for cross attention
+    relative_attention_bias: Optional[Tensor] = None,  # for relative attention
+    max_distance: int = 0,  # for relative attention
+    host_context_lengths: Optional[Tensor] = None,  # for pad-free input mode
+    qkv_bias: Optional[Tensor] = None,
+    use_cache: bool = True,
+) -> Tuple[Tensor, Optional[Tensor]]:
     '''
     Add an operation that performs the multi-head attention in GPT-like models.
 
@@ -3153,40 +3155,40 @@ def gpt_attention(
     See docs/gpt_attention.md for the documentation of that function.
 
     Parameters:
-        tensor: Tensor
-            The input QKV tensor. Its shape is [batch_beam_size, max_seqlen, 3
-            * hidden_dim] in padded mode and [1, num_tokens, 3 * hidden_dim] in
-            packed mode. See QKV Input in docs/gpt_attention.md.
+        qkv: Tensor (On GPU)
+            The input QKV tensor. Its shape is [batch_beam_size, max_seqlen, qkv_dim] in padded mode and [1, num_tokens, qkv_dim] in
+            packed mode. Where qkv_dim depends on using MQA, GQA, or MHA. See QKV Input in docs/gpt_attention.md,
 
-        past_key_value: Tensor
+        past_key_value: Tensor (On GPU)
             The tensor that stores KV cache data. Its shape is
-            [max_batch_size * max_beam_width, 2, num_heads, max_seqlen, hidden_dim_per_head]
+            [max_batch_size * max_beam_width, 2, num_kv_heads, max_seqlen, hidden_dim_per_head]
             in contiguous mode and
-            [max_blocks, 2, num_heads, num_tokens_per_block, hidden_dim_per_head]
+            [max_blocks, 2, num_kv_heads, num_tokens_per_block, hidden_dim_per_head]
             in paged mode. See KV Cache in docs/gpt_attention.md,
 
-        sequence_lengths: Tensor
+        sequence_lengths: Tensor (On GPU)
             The tensor that stores the length of each sequence. Its shape is
             [batch_size]. See QKV Input in docs/gpt_attention.md,
 
-        host past_key_value_length: Tensor
-            An INT32 tensor of shape [batch_size].
+        host_past_key_value_lengths: Tensor (On CPU)
+            An INT32 tensor of shape [batch_size],
 
-        host max_kv_cache_lengths: Tensor
+        host_max_kv_cache_lengths: Tensor (On CPU)
             An INT32 tensor of shape [1].
             by default, the max_kv_cache_length is determined by the shape of cache_indir_table.
-            And we support flexible max_kv_cache_length (or max_past_length) for each layer.
+            And we support independent max_kv_cache_length (or max_past_length) for each layer.
+            May be used to implement window attention,
 
-        context_lengths: Tensor
+        context_lengths: Tensor (On GPU)
             The tensor that stores the context-phase sequence length of each request. Its shape
             is [batch_size]. See QKV Input in doc/functional.py,
 
-        cache_indirection: Tensor
+        cache_indirection: Tensor (On GPU)
             The tensor to reconstruct the paths when using beam-search. Its
             shape is [batch_size, beam_width, max_seqlen]. See Beam-Search in
             docs/gpt_attention.md,
 
-        host_request_types: Tensor = None
+        host_request_types: Tensor = None (On CPU)
             The tensor on the host that indicates if a request is in context or
             generation phase. Its shape is [batch_size]. See Inflight Batching
             in docs/gpt_attention.md,
@@ -3271,7 +3273,10 @@ def gpt_attention(
         kv_cache_block_pointers:
             The tensor of block pointers for the KV cache. Its shape is
             [max_batch_size, max_beam_width, 2, max_blocks_per_sequence * 2]
-            See KV cache section in docs/gpt_attention.md,
+            See KV cache section in docs/gpt_attention.md, on gpu
+
+        host_kv_cache_block_pointers:
+            The same as kv_cache_block_pointers, but on cpu,
 
         do_cross_attention: bool = False
             Do we use this as cross attention instead of self attention,
@@ -3296,7 +3301,7 @@ def gpt_attention(
             Implicit mode is only enabled when passing in non-zero positive max_distance value.
             See relative attention bias in docs/gpt_attention.md
 
-        host_context_lengths: Tensor = None
+        host_context_lengths: Tensor = None (On CPU)
             A host tensor that contains the lengths of the different inputs,
 
         qkv_bias: Tensor = None,
@@ -3405,6 +3410,13 @@ def gpt_attention(
     max_distance = trt.PluginField("max_distance",
                                    np.array(max_distance, dtype=np.int32),
                                    trt.PluginFieldType.INT32)
+    use_paged_context_fmha_field = trt.PluginField(
+        "use_paged_context_fmha",
+        np.array(np.int8(default_net().plugin_config.use_paged_context_fmha),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    use_cache_pf = trt.PluginField("use_cache",
+                                   np.array([use_cache], dtype=np.int32),
+                                   trt.PluginFieldType.INT32)
 
     pfc = trt.PluginFieldCollection([
         nheads, num_kv_heads, head_size, unidirectional, q_scaling,
@@ -3414,26 +3426,38 @@ def gpt_attention(
         multi_block_mode, kv_cache_quant_mode_field, remove_input_padding,
         mask_type, paged_kv_cache, tokens_per_block, pf_type,
         max_context_length, qkv_bias_enabled, do_cross_attention_field,
-        max_distance
+        max_distance, use_paged_context_fmha_field, use_cache_pf
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
-    plug_inputs = [
-        tensor,
-        sequence_length,
-        host_past_key_value_lengths,
-        host_max_kv_cache_lengths,
-        context_lengths,
-        cache_indirection,
-        host_request_types,
-    ]
-
-    if paged_kv_cache_flag:
-        plug_inputs += [kv_cache_block_pointers]
+    plug_inputs = []
+    if use_cache:
+        plug_inputs = [
+            qkv,
+            sequence_length,
+            host_past_key_value_lengths,
+            host_max_kv_cache_lengths,
+            context_lengths,
+            cache_indirection,
+            host_request_types,
+        ]
     else:
-        plug_inputs += [past_key_value]
+        plug_inputs = [
+            qkv,
+            host_max_kv_cache_lengths,
+            context_lengths,
+            host_request_types,
+        ]
 
-    if kv_cache_quant_mode.has_kv_cache_quant():
+    if use_cache:
+        if paged_kv_cache_flag:
+            plug_inputs += [
+                kv_cache_block_pointers, host_kv_cache_block_pointers
+            ]
+        else:
+            plug_inputs += [past_key_value]
+
+    if use_cache and kv_cache_quant_mode.has_kv_cache_quant():
         plug_inputs += [kv_orig_quant_scale, kv_quant_orig_scale]
 
     if alibi_slopes is not None:
@@ -3455,7 +3479,7 @@ def gpt_attention(
     layer = default_trtnet().add_plugin_v2(plug_inputs, attn_plug)
     output = _create_tensor(layer.get_output(0), layer)
     present_key_value = None
-    if not paged_kv_cache_flag:
+    if use_cache and not paged_kv_cache_flag:
         present_key_value = _create_tensor(layer.get_output(1), layer)
         assert present_key_value is not None
         expected_outputs = 2

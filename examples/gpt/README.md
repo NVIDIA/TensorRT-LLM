@@ -5,12 +5,16 @@ multiple GPUs or multiple nodes with multiple GPUs.
 
 ## Overview
 
-The TensorRT-LLM GPT implementation can be found in [`tensorrt_llm/models/gpt/model.py`](../../tensorrt_llm/models/gpt/model.py). The TensorRT-LLM GPT example code is located in [`examples/gpt`](./). There are three main files:
+The TensorRT-LLM GPT implementation can be found in [`tensorrt_llm/models/gpt/model.py`](../../tensorrt_llm/models/gpt/model.py). The TensorRT-LLM GPT example code is located in [`examples/gpt`](./). There are two main files:
 
- * [`hf_gpt_convert.py`](./hf_gpt_convert.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers)
+* [`hf_gpt_convert.py`](./hf_gpt_convert.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers)
     format to the [FasterTransformer (FT)](https://github.com/NVIDIA/FasterTransformer) format,
- * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the GPT model,
- * [`run.py`](./run.py) to run the inference on an input text.
+* [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the GPT model.
+
+In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
+
+* [`../run.py`](../run.py) to run the inference on an input text;
+* [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
   * FP16
@@ -127,7 +131,7 @@ To run a TensorRT-LLM GPT model on a single GPU, you can use `python3`:
 
 ```bash
 # Run the GPT-350M model on a single GPU.
-python3 run.py --max_output_len=8
+python3 ../run.py --max_output_len=8 --no_add_special_tokens
 ```
 
 #### Single node, multiple GPUs
@@ -136,7 +140,7 @@ To run a model using multiple GPUs on a single node, you can use `mpirun` as:
 
 ```bash
 # Run the GPT-175B model on a single node using multiple GPUs.
-mpirun -np 8 python3 run.py --max_output_len=8 --engine_dir=gpt_175b
+mpirun -np 8 python3 ../run.py --max_output_len=8 --engine_dir=gpt_175b --no_add_special_tokens
 ```
 
 #### Multiple nodes, multiple GPUs using [Slurm](https://slurm.schedmd.com)
@@ -165,7 +169,7 @@ srun --mpi=pmix \
      --container-mounts <path>:<path> \
      --container-workdir <path> \
      --output logs/tensorrt_llm_%t.out \
-     --error logs/tensorrt_llm_%t.error python3 -u run.py --max_output_len=8 --engine_dir <engine_dir>
+     --error logs/tensorrt_llm_%t.error python3 -u ../run.py --max_output_len=8 --engine_dir <engine_dir> --no_add_special_tokens
 ```
 
 Then, submit the job using:
@@ -182,7 +186,7 @@ The SantaCoder extends the existing GPT model with multi-query attention mechani
 
 The main differences in this example are:
 1. In model conversion `hf_gpt_convert.py` where extra option `--model santacoder` is required to allow converting checkpoint correctly
-2. In engine execution `run.py` where `--tokenizer ./santacoder` needs to be specified to decode the output ids correctly.
+2. In engine execution `../run.py` where `--tokenizer_dir ./santacoder` needs to be specified to decode the output ids correctly.
 
 ```bash
 git clone https://huggingface.co/bigcode/santacoder
@@ -199,7 +203,7 @@ python3 build.py \
     --output_dir santacoder_outputs_tp4 \
     --world_size 4
 
-mpirun -np 4 python3 run.py --engine_dir santacoder_outputs_tp4 --tokenizer ./santacoder --input_text "def print_hello_world():" --max_output_len 20
+mpirun -np 4 python3 ../run.py --engine_dir santacoder_outputs_tp4 --tokenizer_dir ./santacoder --input_text "def print_hello_world():" --max_output_len 20 --no_add_special_tokens
 ```
 
 ## GPT Variant - StarCoder
@@ -221,7 +225,7 @@ python3 build.py \
     --output_dir starcoder_outputs_tp4 \
     --world_size 4
 
-mpirun -np 4 python3 run.py --engine_dir starcoder_outputs_tp4 --tokenizer ./starcoder  --input_text "def print_hello_world():" --max_output_len 20
+mpirun -np 4 python3 ../run.py --engine_dir starcoder_outputs_tp4 --tokenizer_dir ./starcoder  --input_text "def print_hello_world():" --max_output_len 20 --no_add_special_tokens
 ```
 
 ## Summarization using the GPT model
@@ -460,7 +464,9 @@ python3 build.py --vocab_size=256000 \
 
 ```bash
 # Run the GPT-Next model on a single GPU. Use custom tokenizer.
-python3 run.py --max_output_len=8 --vocab_file=./c-model/gpt-next-2B/1-gpu/tokenizer.model
+python3 ../run.py --max_output_len=8 \
+                  --vocab_file=./c-model/gpt-next-2B/1-gpu/tokenizer.model \
+                  --no_add_special_tokens
 ```
 
 ## Prompt-tuning
@@ -483,7 +489,7 @@ It'll give you a summary of the different tasks in the table, that you can speci
 
 Finally, you can run inference on pre-defined tokens:
 ```bash
-python3 run.py --input_tokens input.csv --prompt_table email_composition.npy --tasks 0 --max_output_len=8 --vocab_file=./c-model/gpt-next-8B/1-gpu/tokenizer.model
+python3 ../run.py --input_file input.csv --prompt_table email_composition.npy --tasks 0 --max_output_len=8 --vocab_file=./c-model/gpt-next-8B/1-gpu/tokenizer.model --no_add_special_tokens
 ```
 
 ## Tensor Parallelism for Embedding Lookup Table.
@@ -534,4 +540,46 @@ python3 hf_gpt_convert.py -i gpt2 -o ./c-model/gpt2 --tensor-parallelism 2 --sto
 python3 build.py --model_dir=./c-model/gpt2/2-gpu --dtype bfloat16 --world_size=2 --remove_input_padding --use_gpt_attention_plugin --use_gemm_plugin --parallel_build --max_input_len 1000 --use_parallel_embedding --embedding_sharding_dim 0 --use_lookup_plugin --use_embedding_sharing --output_dir=trt_engine/gpt2/bfloat16/2-gpu
 
 mpirun -np 2 python3 ../summarize.py --engine_dir trt_engine/gpt2/bfloat16/2-gpu --hf_model_dir gpt2 --batch_size 10 --test_trt_llm --check_accuracy --tensorrt_llm_rouge1_threshold=14 --dataset_path ./dataset --no_add_special_tokens
+```
+
+### Run LoRA with the Nemo checkpoint
+
+```bash
+git clone https://huggingface.co/nvidia/GPT-2B-001
+python3 nemo_ckpt_convert.py -i GPT-2B-001/GPT-2B-001_bf16_tp1.nemo -o /tmp/c-model/gpt-next-2B --tensor-parallelism 1 --storage-type bfloat16
+
+python3 build.py --model_dir=/tmp/c-model/gpt-next-2B/1-gpu/ \
+                 --dtype bfloat16 \
+                 --remove_input_padding \
+                 --use_gpt_attention_plugin \
+                 --output_dir /tmp/gpt-next-2B/ \
+                 --use_lora_plugin \
+                 --max_batch_size 4 \
+                 --max_input_len 512 \
+                 --max_output_len 50 \
+                 --lora_target_modules "attn_qkv"
+
+python3 nemo_lora_convert.py  -i tmp_nemo_ckpt/gpt2b_lora-900.nemo -o /tmp/gpt-next-2B/ -t bf16  # Assume lora weights are in tmp_nemo_ckpt/gpt2b_lora-900.nemo
+
+python3 ../run.py --max_output_len=20 \
+                  --vocab_file=/tmp/c-model/gpt-next-2B/1-gpu/tokenizer.model \
+                  --engine_dir /tmp/gpt-next-2B/ \
+                  --lora_dir /tmp/gpt-next-2B/ \
+                  --lora_task_uids "lora" \
+                  --no_add_special_tokens \
+                  --input_text "After Washington had returned to Williamsburg, Dinwiddie ordered him to lead a larger force to assist Trent in his work. While en route, Washington learned of Trent's retreat. Since Tanaghrisson had promised support to the British, Washington continued toward Fort Duquesne and met with the Mingo leader. Learning of a French scouting party in the area, Washington, with Tanaghrisson and his party, surprised the Canadians on May 28 in what became known as the Battle of Jumonville Glen. They killed many of the Canadians, including their commanding officer, Joseph Coulon de Jumonville, whose head was reportedly split open by Tanaghrisson with a tomahawk. The historian Fred Anderson suggests that Tanaghrisson was acting to gain the support of the British and regain authority over his own people. They had been inclined to support the French, with whom they had long trading relationships. One of Tanaghrisson's men told Contrecoeur that Jumonville had been killed by British musket fire. Question: Upon learning of a French scounting party in the area, what did Washington do? Answer:"
+```
+
+Users who want to skip LoRA module may pass uid -1 with `--lora_task_uids -1`.
+In that case, the model will not run the LoRA module and the results will be
+different.
+
+```bash
+python3 ../run.py --max_output_len=20 \
+                  --vocab_file=/tmp/c-model/gpt-next-2B/1-gpu/tokenizer.model \
+                  --engine_dir /tmp/gpt-next-2B/ \
+                  --lora_dir /tmp/gpt-next-2B/ \
+                  --lora_task_uids "-1" \
+                  --no_add_special_tokens \
+                  --input_text "After Washington had returned to Williamsburg, Dinwiddie ordered him to lead a larger force to assist Trent in his work. While en route, Washington learned of Trent's retreat. Since Tanaghrisson had promised support to the British, Washington continued toward Fort Duquesne and met with the Mingo leader. Learning of a French scouting party in the area, Washington, with Tanaghrisson and his party, surprised the Canadians on May 28 in what became known as the Battle of Jumonville Glen. They killed many of the Canadians, including their commanding officer, Joseph Coulon de Jumonville, whose head was reportedly split open by Tanaghrisson with a tomahawk. The historian Fred Anderson suggests that Tanaghrisson was acting to gain the support of the British and regain authority over his own people. They had been inclined to support the French, with whom they had long trading relationships. One of Tanaghrisson's men told Contrecoeur that Jumonville had been killed by British musket fire. Question: Upon learning of a French scounting party in the area, what did Washington do? Answer:"
 ```

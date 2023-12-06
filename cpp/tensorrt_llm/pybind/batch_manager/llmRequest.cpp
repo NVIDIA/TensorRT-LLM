@@ -46,9 +46,10 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
     auto badWordsList = from_torch(mBadWordsList);
     auto stopWordsList = from_torch(mStopWordsList);
     auto promptEmbeddingTable = from_torch(mPromptEmbeddingTable);
+    auto draftLogits = from_torch(mDraftLogits);
 
     return std::make_shared<tb::LlmRequest>(mRequestId, mMaxNewTokens,
         std::make_shared<std::vector<TokenIdType>>(mTokens.at(0)), mSamplingConfig, mIsStreaming, mEndId, mPadId,
         embeddingBias, badWordsList, stopWordsList, promptEmbeddingTable, mPromptVocabSize, mReturnLogProbs,
-        mDraftTokens);
+        mDraftTokens, draftLogits);
 }

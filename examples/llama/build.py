@@ -14,6 +14,7 @@
 # limitations under the License.
 import argparse
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -39,6 +40,7 @@ from tensorrt_llm.models import quantize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
+from tensorrt_llm.runtime.lora_manager import LoraConfig
 
 from weight import parse_ft_config  # isort:skip
 
@@ -118,7 +120,7 @@ def serialize_engine(engine, path):
     logger.info(f'Serializing engine to {path}...')
     tik = time.time()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')
@@ -208,7 +210,7 @@ def parse_arguments():
     parser.add_argument(
         '--output_dir',
         type=str,
-        default='llama_outputs',
+        default='engine_outputs',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
     )
@@ -342,7 +344,7 @@ def parse_arguments():
     )
     parser.add_argument('--tokens_per_block',
                         type=int,
-                        default=64,
+                        default=128,
                         help='Number of tokens per block in paged KV cache')
     parser.add_argument(
         '--max_num_tokens',
@@ -369,6 +371,14 @@ def parse_arguments():
     parser.add_argument('--gather_all_token_logits',
                         action='store_true',
                         default=False)
+    parser.add_argument(
+        '--use_lora_plugin',
+        nargs='?',
+        const=None,
+        default=False,
+        choices=['float16', 'float32', 'bfloat16'],
+        help="Activates the lora plugin which enables embedding sharing.")
+    parser.add_argument('--hf_lora_dir', type=str, default=None)
 
     args = parser.parse_args()
     logger.set_level(args.log_level)
@@ -437,7 +447,7 @@ def parse_arguments():
             args.n_kv_head = hf_config.num_key_value_heads
         args.n_layer = hf_config.num_hidden_layers
         args.n_positions = hf_config.max_position_embeddings
-        args.vocab_size = hf_config.vocab_size if args.vocab_size is None else args.vocab_size
+        args.vocab_size = hf_config.vocab_size if hf_config.vocab_size is not None else args.vocab_size
         args.hidden_act = hf_config.hidden_act
         args.rms_norm_eps = hf_config.rms_norm_eps
     elif args.meta_ckpt_dir is not None:
@@ -476,6 +486,24 @@ def parse_arguments():
             "MQA/GQA requires either the number of K/V heads to be divisible by the tensor parallelism size OR " \
             "the tensor parallelism size to be divisible by the number of K/V heads."
 
+    hf_modules_to_trtllm_modules = {
+        "q_proj": "attn_q",
+        "v_proj": "attn_k",
+        "k_proj": "attn_v",
+        "o_proj": "attn_dense",
+        "gate_proj": "mlp_h_to_4h",
+        "down_proj": "mlp_4h_to_h",
+        "up_proj": "mlp_gate"
+    }  # lora modules on llama
+
+    lora_config = LoraConfig.from_hf(args.hf_lora_dir,
+                                     hf_modules_to_trtllm_modules)
+
+    if lora_config.is_valid:
+        args.vocab_size = lora_config.vocab_size
+
+    args.lora_config = lora_config
+
     if args.weight_only_precision == 'int4_awq':
         if args.vocab_size % 64 != 0:
             args.vocab_size = int((args.vocab_size + 63) / 64) * 64
@@ -485,6 +513,12 @@ def parse_arguments():
 
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha
+
+    assert (math.log2(args.tokens_per_block).is_integer()
+            ), "tokens_per_block must be power of 2"
+    if args.enable_context_fmha or args.enable_context_fmha_fp32_acc:
+        assert (args.tokens_per_block >=
+                128), "Context fMHA requires >= 128 tokens per block"
 
     if args.inter_size is None:
         # this should not be need when loading a real model
@@ -590,13 +624,15 @@ def build_rank_engine(builder: Builder,
                                hf_llama,
                                mapping=mapping,
                                dtype=args.dtype,
-                               use_gemm_woq_plugin=use_gemm_woq_plugin)
+                               use_gemm_woq_plugin=use_gemm_woq_plugin,
+                               lora_config=args.lora_config)
             del hf_llama
         else:
             load_from_hf_checkpoint(tensorrt_llm_llama,
                                     args.model_dir,
                                     mapping,
-                                    dtype=args.dtype)
+                                    dtype=args.dtype,
+                                    lora_config=args.lora_config)
         tok = time.time()
         t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
         logger.info(f'HF LLaMA loaded. Total time: {t}')
@@ -623,6 +659,9 @@ def build_rank_engine(builder: Builder,
                 "Gemm plugin does not support FP8. Disabled Gemm plugin.")
     if args.use_rmsnorm_plugin:
         network.plugin_config.set_rmsnorm_plugin(dtype=args.use_rmsnorm_plugin)
+    if args.use_lora_plugin:
+        network.plugin_config.set_lora_plugin(dtype=args.use_lora_plugin)
+
     # Quantization plugins.
     if args.use_smooth_quant:
         network.plugin_config.set_smooth_quant_gemm_plugin(dtype=args.dtype)
@@ -666,7 +705,8 @@ def build_rank_engine(builder: Builder,
             args.max_beam_width,
             args.max_num_tokens,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size,
-            gather_all_token_logits=args.gather_all_token_logits)
+            gather_all_token_logits=args.gather_all_token_logits,
+            lora_target_modules=args.lora_config.lora_target_modules)
         tensorrt_llm_llama(*inputs)
         if args.enable_debug_output:
             # mark intermediate nodes' outputs
@@ -700,7 +740,6 @@ def build(rank, args):
 
     # when doing serializing build, all ranks share one engine
     builder = Builder()
-
     cache = None
     for cur_rank in range(args.world_size):
         # skip other ranks if parallel_build is enabled
@@ -737,6 +776,7 @@ def build(rank, args):
             max_prompt_embedding_table_size=args.
             max_prompt_embedding_table_size,
             gather_all_token_logits=args.gather_all_token_logits,
+            lora_target_modules=args.lora_config.lora_target_modules,
         )
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.tp_size,
                                       args.pp_size, cur_rank)

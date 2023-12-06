@@ -756,8 +756,8 @@ template void invokeTileEncoderResults(__nv_bfloat16* tiled_output, int* tiled_s
     const size_t mem_max_seq_len, const size_t d_model, cudaStream_t stream);
 #endif
 
-__global__ void insertUnfinishedPath(BeamHypotheses beam_hyps, const bool* finished, const float* cum_log_probs,
-    const int batch_size, const int beam_width)
+__global__ void insertUnfinishedPath(BeamHypotheses beam_hyps, const FinishedState* finished,
+    const float* cum_log_probs, const int batch_size, const int beam_width)
 {
     const int bid = blockIdx.x;
     const int tgt_start_idx = beam_hyps.num_beams[bid];
@@ -802,7 +802,7 @@ __global__ void insertUnfinishedPath(BeamHypotheses beam_hyps, const bool* finis
             // TODO huggingface uses total length to normalize the scores, instead of number of generated tokens.
             // Check that is it reasonable or not.
             beam_hyps.normed_scores[tgt_beam_idx] = apply_length_penalty(cum_log_probs[src_beam_idx],
-                finished[src_beam_idx] ? last_token_idx + 1 : last_token_idx, length_penalty);
+                finished[src_beam_idx].isFinished() ? last_token_idx + 1 : last_token_idx, length_penalty);
             beam_hyps.cum_log_probs[tgt_beam_idx] = cum_log_probs[src_beam_idx];
 
             beam_hyps.num_beams[bid]++;
@@ -810,7 +810,7 @@ __global__ void insertUnfinishedPath(BeamHypotheses beam_hyps, const bool* finis
     }
 }
 
-void invokeInsertUnfinishedPath(BeamHypotheses beam_hyps, const bool* finished, const float* cum_log_probs,
+void invokeInsertUnfinishedPath(BeamHypotheses beam_hyps, const FinishedState* finished, const float* cum_log_probs,
     const int batch_size, const int beam_width, cudaStream_t stream)
 {
     insertUnfinishedPath<<<batch_size, 256, 0, stream>>>(beam_hyps, finished, cum_log_probs, batch_size, beam_width);

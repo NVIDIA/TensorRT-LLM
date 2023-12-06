@@ -71,13 +71,24 @@ class MLP(Module):
                                   tp_group=tp_group,
                                   tp_size=tp_size,
                                   instance_id=instance_id)
+
         self.hidden_act = hidden_act
         self.dtype = dtype
 
-    def forward(self, hidden_states, workspace=None):
-        inter = self.fc(hidden_states)
+    def forward(self, hidden_states, workspace=None, lora_param=None):
+        mlp_h_to_4h_param = None
+        if lora_param is not None:
+            mlp_h_to_4h_param = lora_param.get_runtime_params(0, "mlp_h_to_4h")
+
+        mlp_4h_to_h_param = None
+        if lora_param is not None:
+            mlp_4h_to_h_param = lora_param.get_runtime_params(0, "mlp_4h_to_h")
+
+        inter = self.fc(hidden_states, mlp_h_to_4h_param)
         inter = ACT2FN[self.hidden_act](inter)
-        output = self.proj(inter, workspace)
+        output = self.proj(inter,
+                           workspace,
+                           lora_runtime_param=mlp_4h_to_h_param)
         return output
 
 
@@ -131,11 +142,27 @@ class GatedMLP(MLP):
                                      tp_size=tp_size,
                                      gather_output=False)
 
-    def forward(self, hidden_states, workspace=None):
-        inter = self.fc(hidden_states)
+    def forward(self, hidden_states, workspace=None, lora_param=None):
+
+        mlp_h_to_4h_param = None
+        if lora_param is not None:
+            mlp_h_to_4h_param = lora_param.get_runtime_params(0, "mlp_h_to_4h")
+
+        mlp_gate_param = None
+        if lora_param is not None:
+            mlp_gate_param = lora_param.get_runtime_params(0, "mlp_gate")
+
+        mlp_4h_to_h_param = None
+        if lora_param is not None:
+            mlp_4h_to_h_param = lora_param.get_runtime_params(0, "mlp_4h_to_h")
+
+        inter = self.fc(hidden_states, mlp_h_to_4h_param)
         inter = ACT2FN[self.hidden_act](inter)
-        gate = self.gate(hidden_states)
-        output = self.proj(inter * gate, workspace)
+        gate = self.gate(hidden_states, mlp_gate_param)
+        intermediate = inter * gate
+        output = self.proj(intermediate,
+                           workspace,
+                           lora_runtime_param=mlp_4h_to_h_param)
         return output
 
 
@@ -161,7 +188,7 @@ class FusedGatedMLP(GatedMLP):
                          quant_mode=quant_mode,
                          instance_id=instance_id)
 
-    def forward(self, hidden_states, workspace=None):
+    def forward(self, hidden_states, workspace=None, lora_param=None):
         # Combine the following pattern
         #
         #   SiLU(FC(x)) + Gate(x)

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/onlineSoftmaxBeamsearchKernels.h"
 #include "tensorrt_llm/layers/baseBeamSearchLayer.h"
 

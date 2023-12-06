@@ -15,7 +15,7 @@ repos:
     rev: v4.1.0
     hooks:
     -   id: check-added-large-files
-        exclude: 'cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin'
+        exclude: 'cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/'
     -   id: check-merge-conflict
     -   id: check-symlinks
     -   id: detect-private-key
@@ -33,9 +33,7 @@ repos:
     -   id: clang-format
         types_or: [c++, c, cuda]
         exclude: |
-            (?x)^(
-                cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin/.*
-            )$
+            (?x)^(.*cubin.cpp$ | .*fmha_cubin.h)$
 -   repo: https://github.com/cheshirekow/cmake-format-precommit
     rev: v0.6.10
     hooks:

@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/int8_gemm/int8_gemm.h"
+#include "tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.h"
 
 namespace tensorrt_llm::plugins
 {
@@ -126,6 +127,7 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileT
     {
         if (mProfileMap->count(m) == 0)
         {
+            initTmpData(m, n, k, mWorkspaceTmp, mTmpWorkspaceSizeInBytes, cudaStreamDefault);
             const auto tactics = this->getTactics(m, n, k);
             // Profile different tactics for particular m and insert best config to the map
             mProfileMap->insert({m, this->profileTacticsForProblem(m, n, k, tactics)});
@@ -134,6 +136,7 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileT
 
     // Allocate tmp data to run GEMMs
     allocateTmpData();
+
     const int startMinMRounded = nextPowerOfTwo(dims.minM);
     for (int m = startMinMRounded; m < maxM; m *= 2)
     {
@@ -278,5 +281,9 @@ template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmC
 
 template class GemmPluginProfiler<cublasLtMatmulHeuristicResult_t,
     std::shared_ptr<tensorrt_llm::common::CublasMMWrapper>, GemmIdCublas, GemmIdCublasHash>;
+
+// TODO I dont like the dependency on the MOE plugin here, but MOE needs the full context to run profiles
+template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig, MixtureOfExpertsPlugin*,
+    GemmIDMoe, GemmIDMoeHash>;
 
 } // namespace tensorrt_llm::plugins

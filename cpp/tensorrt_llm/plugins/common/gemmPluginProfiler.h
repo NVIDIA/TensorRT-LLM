@@ -249,6 +249,8 @@ protected:
 
     virtual std::vector<Config> getTactics(int m, int n, int k) const = 0;
 
+    virtual void initTmpData(int m, int n, int k, char* workspace, size_t size, cudaStream_t stream){};
+
 private:
     void allocateTmpData();
 

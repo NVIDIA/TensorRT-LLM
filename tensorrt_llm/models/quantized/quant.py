@@ -472,9 +472,8 @@ def _default_fp8_quantize(model: Union[GPTLMHeadModel, LLaMAForCausalLM,
 
 
 def _fp8_quantize(model, quant_mode: QuantMode, quant_scales: dict = None):
-    if isinstance(
-            model,
-        (FalconForCausalLM, GPTJForCausalLM, GPTLMHeadModel, LLaMAForCausalLM)):
+    if isinstance(model, (FalconForCausalLM, GPTJForCausalLM, GPTLMHeadModel,
+                          LLaMAForCausalLM, BaichuanForCausalLM)):
         return _default_fp8_quantize(model, quant_mode, quant_scales)
     raise NotImplementedError(
         f"Model {model} is not implemented by fp8_quantize yet")

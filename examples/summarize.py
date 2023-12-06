@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import argparse
-import json
 from pathlib import Path
 
 import evaluate
@@ -23,49 +22,16 @@ import torch
 from datasets import load_dataset
 from qwen.utils.utils import make_context
 from transformers import (AutoModel, AutoModelForCausalLM,
-                          AutoModelForSeq2SeqLM, AutoTokenizer,
-                          GenerationConfig, T5Tokenizer)
+                          AutoModelForSeq2SeqLM, GenerationConfig)
+from utils import (DEFAULT_HF_MODEL_DIRS, load_tokenizer,
+                   read_model_name_from_config)
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
+from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime import ModelRunner
 from tensorrt_llm.tools.ppl import ppl
-
-DEFAULT_HF_MODEL_DIRS = {
-    'baichuan': 'baichuan-inc/Baichuan-13B-Chat',
-    'bloom': 'bigscience/bloom-560m',
-    'chatglm_6b': 'THUDM/chatglm-6b',
-    'chatglm2_6b': 'THUDM/chatglm2-6b',
-    'chatglm2_6b_32k': 'THUDM/chatglm2-6b-32k',
-    'chatglm3_6b': 'THUDM/chatglm3-6b',
-    'chatglm3_6b_base': 'THUDM/chatglm3-6b-base',
-    'chatglm3_6b_32k': 'THUDM/chatglm3-6b-32k',
-    'falcon': 'tiiuae/falcon-rw-1b',
-    'glm_10b': 'THUDM/glm-10b',
-    'gpt': 'gpt2-medium',
-    'gptj': 'EleutherAI/gpt-j-6b',
-    'gptneox': 'EleutherAI/gpt-neox-20b',
-    'internlm': 'internlm/internlm-chat-7b',
-    'llama': 'meta-llama/Llama-2-7b-hf',
-    'opt': 'facebook/opt-350m',
-    'qwen': 'Qwen/Qwen-7B',
-}
-
-DTYPE_STR_MAPPING = {
-    'fp32': torch.float32,
-    'fp16': torch.float16,
-    'bf16': torch.bfloat16,
-    'float32': torch.float32,
-    'float16': torch.float16,
-    'bfloat16': torch.bfloat16,
-}
-
-
-def read_model_name_from_config(config_path: Path):
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-    return config['builder_config']['name']
 
 
 def main(args):
@@ -82,58 +48,38 @@ def main(args):
     test_hf = args.test_hf and runtime_rank == 0  # only run hf on rank 0
     test_trt_llm = args.test_trt_llm
     profiler.start('load tokenizer')
-    if args.vocab_file is None:
-        # Should set both padding_side and truncation_side to be 'left'
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_dir,
-                                                  legacy=False,
-                                                  padding_side='left',
-                                                  truncation_side='left',
-                                                  trust_remote_code=True)
-    else:
-        # From gpt-next
-        tokenizer = T5Tokenizer(vocab_file=args.vocab_file,
-                                padding_side='left',
-                                truncation_side='left')
+    tokenizer, pad_id, end_id = load_tokenizer(
+        tokenizer_dir=args.tokenizer_dir,
+        vocab_file=args.vocab_file,
+        model_name=model_name,
+    )
     profiler.stop('load tokenizer')
     logger.info(
         f'Load tokenizer takes: {profiler.elapsed_time_in_sec("load tokenizer")} sec'
     )
-
-    # TODO: The below lines are used to be compatible with the original code; may need fix
-    if model_name.startswith('chatglm'):
-        pass
-    elif model_name == 'falcon' and tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    elif model_name == 'qwen':
-        tokenizer.pad_token_id = tokenizer.im_end_id
-    else:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    if model_name == 'falcon':
-        pad_id = tokenizer.pad_token_id
-        end_id = tokenizer.eos_token_id
-    elif model_name == 'qwen':
-        pad_id = tokenizer.pad_token_id
-        end_id = tokenizer.im_end_id
-    else:
-        pad_id = tokenizer.encode(tokenizer.pad_token,
-                                  add_special_tokens=False)[0]
-        end_id = tokenizer.encode(tokenizer.eos_token,
-                                  add_special_tokens=False)[0]
 
     if args.eval_task == 'code_completion':
         dataset_name = "openai_humaneval"
         dataset_revision = None
         dataset_input_key = 'prompt'
         dataset_output_key = 'canonical_solution'
+        dataset_split = 'test'
     elif args.eval_task == 'summarize':
         dataset_name = "ccdv/cnn_dailymail"
         dataset_revision = "3.0.0"
         dataset_input_key = 'article'
         dataset_output_key = 'highlights'
+        dataset_split = 'test'
+    elif args.eval_task == 'summarize_long':
+        dataset_name = "tau/zero_scrolls"
+        dataset_revision = 'squality'
+        dataset_input_key = 'input'
+        dataset_output_key = 'output'
+        dataset_split = 'validation'  # only this split contains reference strings
     dataset = load_dataset(dataset_name,
                            dataset_revision,
-                           cache_dir=args.dataset_path)
+                           cache_dir=args.dataset_path,
+                           split=dataset_split)
 
     max_batch_size = args.batch_size
 
@@ -143,7 +89,7 @@ def main(args):
     output_len = args.output_len
     test_token_num = args.max_input_length
     # random_seed = 5
-    temperature = 1
+    temperature = args.temperature
     num_beams = args.num_beams
     length_penalty = args.length_penalty
     repetition_penalty = args.repetition_penalty
@@ -157,7 +103,12 @@ def main(args):
 
     if test_hf:
         profiler.start('load HF model')
-        torch_dtype = DTYPE_STR_MAPPING[args.data_type]
+        dtype_alias_mapping = {
+            'fp32': 'float32',
+            'fp16': 'float16',
+            'bf16': 'bfloat16'
+        }
+        args.data_type = dtype_alias_mapping.get(args.data_type, args.data_type)
         if model_name.startswith('chatglm'):
             auto_model_cls = AutoModel
         elif model_name.startswith('glm'):
@@ -167,8 +118,9 @@ def main(args):
         model = auto_model_cls.from_pretrained(
             args.hf_model_dir,
             trust_remote_code=True,
-            torch_dtype=torch_dtype,
+            torch_dtype=str_dtype_to_torch(args.data_type),
             device_map='auto' if args.hf_device_map_auto else None)
+        model.to_bettertransformer()
         if not args.hf_device_map_auto:
             model.cuda()
         if model_name == 'qwen':
@@ -244,6 +196,7 @@ def main(args):
                 max_kv_cache_length=args.max_kv_cache_length,
                 end_id=end_id,
                 pad_id=pad_id,
+                temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
                 num_beams=num_beams,
@@ -326,8 +279,8 @@ def main(args):
                                      max_new_tokens=output_len,
                                      top_k=top_k,
                                      temperature=temperature,
-                                     eos_token_id=tokenizer.eos_token_id,
-                                     pad_token_id=tokenizer.pad_token_id,
+                                     eos_token_id=end_id,
+                                     pad_token_id=pad_id,
                                      num_beams=num_beams,
                                      num_return_sequences=num_beams,
                                      early_stopping=True,
@@ -378,7 +331,7 @@ def main(args):
         return output_lines_list, tokens_list, ppls
 
     if test_trt_llm:
-        datapoint = dataset['test'][0:1]
+        datapoint = dataset[0:1]
         output, *_ = eval_trt_llm(datapoint,
                                   eval_task=args.eval_task,
                                   eval_ppl=args.eval_ppl,
@@ -394,7 +347,7 @@ def main(args):
                 "---------------------------------------------------------")
 
     if test_hf:
-        datapoint = dataset['test'][0:1]
+        datapoint = dataset[0:1]
         output, *_ = eval_hf(datapoint,
                              eval_task=args.eval_task,
                              eval_ppl=args.eval_ppl,
@@ -416,14 +369,12 @@ def main(args):
 
     ite_count = 0
     data_point_idx = 0
-    while (data_point_idx < len(dataset['test'])) and (ite_count <
-                                                       args.max_ite):
+    while (data_point_idx < len(dataset)) and (ite_count < args.max_ite):
         if runtime_rank == 0:
             logger.debug(
                 f"run data_point {data_point_idx} ~ {data_point_idx + max_batch_size}"
             )
-        datapoint = dataset['test'][data_point_idx:(data_point_idx +
-                                                    max_batch_size)]
+        datapoint = dataset[data_point_idx:(data_point_idx + max_batch_size)]
 
         if test_trt_llm:
             profiler.start('tensorrt_llm')
@@ -525,7 +476,7 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--hf_model_dir', type=str, default=None)
+    parser.add_argument('--hf_model_dir', '--model_dir', type=str, default=None)
     parser.add_argument(
         '--tokenizer_dir',
         default=None,
@@ -539,10 +490,11 @@ if __name__ == '__main__':
         choices=['fp32', 'fp16', 'bf16', 'float32', 'float16', 'bfloat16'],
         default='fp16')
     parser.add_argument('--engine_dir', type=str, default='engine_outputs')
-    parser.add_argument('--eval_task',
-                        type=str,
-                        default='summarize',
-                        choices=['summarize', 'code_completion'])
+    parser.add_argument(
+        '--eval_task',
+        type=str,
+        default='summarize',
+        choices=['summarize', 'summarize_long', 'code_completion'])
     parser.add_argument('--eval_ppl', action='store_true')
     parser.add_argument('--check_accuracy', action='store_true')
     parser.add_argument('--tensorrt_llm_rouge1_threshold',
@@ -561,6 +513,7 @@ if __name__ == '__main__':
               If the final sequence length exceeds the kv cache length, we will enable cyclic kv cache. \
               If it is set to None, we will use the max sequence length.')
     parser.add_argument('--num_beams', type=int, default=1)
+    parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--top_k', type=int, default=1)
     parser.add_argument('--top_p', type=float, default=0.0)
     parser.add_argument('--length_penalty', type=float, default=1.0)

@@ -25,13 +25,28 @@ namespace tr = tensorrt_llm::runtime;
 
 using namespace tensorrt_llm::pybind::batch_manager;
 
+namespace
+{
+
+void copy_tensor(NamedTensor const& src, tb::NamedTensor& dst)
+{
+    TLLM_CHECK_WITH_INFO(src.name == dst.name, "names do not match: %s != %s", src.name.c_str(), dst.name.c_str());
+    if (src.tensor.has_value())
+    {
+        dst.tensor = tr::TorchView::of(src.tensor.value());
+    }
+}
+} // namespace
+
 std::shared_ptr<tb::InferenceRequest> InferenceRequest::toTrtLlm() const
 {
-    tb::InferenceRequest::TensorMap trtTensors;
-    for (const auto& torchTensorItem : mInputTensors)
+    tb::InferenceRequest::TensorMap tensorMap;
+    for (auto const& [name, tensor] : mInputTensors)
     {
-        trtTensors.insert({torchTensorItem.first, tr::TorchView::of(torchTensorItem.second)});
+        if (tensor.has_value())
+        {
+            tensorMap[name] = tr::TorchView::of(tensor.value());
+        }
     }
-
-    return std::make_shared<tb::InferenceRequest>(trtTensors, mRequestId);
+    return std::make_shared<tb::InferenceRequest>(tensorMap, mRequestId);
 }

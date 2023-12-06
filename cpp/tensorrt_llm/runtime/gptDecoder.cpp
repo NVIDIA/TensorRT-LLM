@@ -49,6 +49,8 @@ GptDecoder<T>::GptDecoder(size_t vocabSize, size_t vocabSizePadded, CudaStreamPt
 template <typename T>
 void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType maxSequenceLength)
 {
+    mSamplingConfig = samplingConfig;
+
     typename layers::DynamicDecodeLayer<T>::SetupParams setupParams;
 
     setupParams.random_seed = samplingConfig.randomSeed;
@@ -325,7 +327,9 @@ void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& de
     beamHypotheses.input_lengths = bufferCast<SizeType>(*decodingInput.lengths);
 
     // This is where transpose is done
-    tensorrt_llm::kernels::invokeInsertUnfinishedPath(beamHypotheses, bufferCast<bool>(*decodingOutput.finished),
+    tensorrt_llm::kernels::invokeInsertUnfinishedPath(beamHypotheses,
+        reinterpret_cast<const tensorrt_llm::kernels::FinishedState*>(
+            bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*decodingOutput.finished)),
         bufferCast<float>(*decodingOutput.cumLogProbs), batchSize, beamWidth, stream.get());
     sync_check_cuda_error();
 
@@ -340,7 +344,13 @@ void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& de
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-void IGptDecoder::acceptTokens(const ITensor& targetTokenIds, const ITensor& draftTokenIds,
+namespace tensorrt_llm::runtime
+{
+template class GptDecoder<float>;
+template class GptDecoder<half>;
+} // namespace tensorrt_llm::runtime
+
+void IGptDecoder::acceptDraftTokensByIds(const ITensor& targetTokenIds, const ITensor& draftTokenIds,
     const ITensor& contextLengths, const ITensor& numDraftTokens, ITensor& sequenceLengths, const ITensor& finishedVec,
     ITensor& finishedFinal, ITensor& finishedSum, BufferManager::CudaStreamPtr const& stream)
 {
@@ -371,9 +381,13 @@ void IGptDecoder::acceptTokens(const ITensor& targetTokenIds, const ITensor& dra
         common::fmtstr("Sequence length batch size (%d) is not equal to batch size (%d)",
             sequenceLengths.getShape().d[0], batchSize));
 
-    tensorrt_llm::kernels::invokeAcceptTokens(bufferCast<SizeType>(draftTokenIds), bufferCast<SizeType>(targetTokenIds),
-        bufferCast<SizeType>(contextLengths), bufferCast<SizeType>(numDraftTokens),
-        bufferCast<SizeType>(sequenceLengths), bufferCast<bool>(finishedVec), bufferCast<bool>(finishedFinal),
+    tensorrt_llm::kernels::invokeAcceptDraftTokensByIds(bufferCast<SizeType>(draftTokenIds),
+        bufferCast<SizeType>(targetTokenIds), bufferCast<SizeType>(contextLengths),
+        bufferCast<SizeType>(numDraftTokens), bufferCast<SizeType>(sequenceLengths),
+        reinterpret_cast<const tensorrt_llm::kernels::FinishedState*>(
+            bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(finishedVec)),
+        reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
+            bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(finishedFinal)),
         bufferCast<int>(finishedSum), batchSize, beamWidth, maxSeqLength, maxDraftTokens, stream->get());
 
     sync_check_cuda_error();
@@ -381,8 +395,49 @@ void IGptDecoder::acceptTokens(const ITensor& targetTokenIds, const ITensor& dra
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-namespace tensorrt_llm::runtime
+void IGptDecoder::acceptDraftTokensByLogits(ITensor& draftLogits, const ITensor& targetLogits, ITensor& draftProbs,
+    ITensor& targetProbs, const ITensor& numDraftTokens, ITensor& finished, SizeType vocabSize,
+    SizeType vocabSizePadded, bool useRandomAcceptThreshold, float randomAcceptThreshold, curandState_t* curandState,
+    BufferManager::CudaStreamPtr const& stream)
 {
-template class GptDecoder<float>;
-template class GptDecoder<half>;
-} // namespace tensorrt_llm::runtime
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+
+    auto const draftLogitsShape = draftLogits.getShape();
+    auto const maxDraftTokens = draftLogitsShape.d[0];
+    auto const batchSize = draftLogitsShape.d[1];
+    auto const beamWidth = draftLogitsShape.d[2];
+
+    TLLM_CHECK_WITH_INFO(
+        beamWidth == 1, common::fmtstr("Beam width (%d) > 1 is not supported for the speculative decoding", beamWidth));
+
+    TLLM_CHECK(draftLogitsShape.d[3] == vocabSize);
+
+    if (draftLogits.getDataType() == nvinfer1::DataType::kFLOAT)
+    {
+        tensorrt_llm::kernels::acceptDraftTokensByLogits(bufferCast<float>(draftLogits),
+            const_cast<float*>(bufferCast<float>(targetLogits)), bufferCast<float>(draftProbs),
+            bufferCast<float>(targetProbs), bufferCast<SizeType>(numDraftTokens),
+            reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
+                bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(finished)),
+            curandState, batchSize, beamWidth, vocabSize, vocabSizePadded, maxDraftTokens, useRandomAcceptThreshold,
+            randomAcceptThreshold, stream->get());
+    }
+    else if (draftLogits.getDataType() == nvinfer1::DataType::kHALF)
+    {
+        tensorrt_llm::kernels::acceptDraftTokensByLogits(bufferCast<half>(draftLogits),
+            const_cast<half*>(bufferCast<half>(targetLogits)), bufferCast<half>(draftProbs),
+            bufferCast<half>(targetProbs), bufferCast<SizeType>(numDraftTokens),
+            reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
+                bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(finished)),
+            curandState, batchSize, beamWidth, vocabSize, vocabSizePadded, maxDraftTokens, useRandomAcceptThreshold,
+            randomAcceptThreshold, stream->get());
+    }
+    else
+    {
+        TLLM_THROW("Incorrect logits dtype. Only float32 and float16 are supported");
+    }
+
+    sync_check_cuda_error();
+
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+}

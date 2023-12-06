@@ -71,9 +71,7 @@ public:
                                          // Vector of views on newTokensSteps for each token. Elements are on gpu.
 
     // optional parameters
-    TensorPtr finishedSteps; // [maxTokensPerStep, batchSize, beamWidth] finished states at each generated token of
-                             // maxTokensPerStep, on gpu
-    TensorPtr finished;      // [batchSize, beamWidth], usually a view of finishedSteps for current token.
+    TensorPtr finished; // [batchSize, beamWidth],
                         // Set to true by decoding if any of the stop conditions are met or if DecodingInput.finished is
                         // true. In beam search and to determine whether to stop according to
                         // DecodingInput.sequenceLimitLength, on gpu

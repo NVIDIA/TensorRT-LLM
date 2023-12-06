@@ -300,11 +300,10 @@ class TestGPTNeoX(unittest.TestCase):
             ctx_buffer[f'host_max_kv_cache_length_{i}'] = torch.tensor(
                 [total_seq_len], dtype=torch.int32)
             ctx_shape[f'host_max_kv_cache_length_{i}'] = (1, )
-        sequence_length_buffer = torch.add(sequence_length_buffer, step)
         ctx_buffer['sequence_length'] = sequence_length_buffer
+        sequence_length_buffer = torch.add(sequence_length_buffer, step)
         ctx_shape['sequence_length'] = ctx_buffer['sequence_length'].shape
-        ctx_buffer['host_past_key_value_lengths'] = torch.tensor(
-            [0] * batch_size, dtype=torch.int32)
+        ctx_buffer['host_past_key_value_lengths'] = ctx_context_lengths.cpu()
         ctx_shape['host_past_key_value_lengths'] = ctx_buffer[
             'host_past_key_value_lengths'].shape
 

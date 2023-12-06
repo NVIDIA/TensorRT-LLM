@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 
 import tensorrt_llm
@@ -25,7 +26,9 @@ import tensorrt_llm.profiler as profiler
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import (ChatGLMGenerationSession, GenerationSession,
-                                  ModelConfig, SamplingConfig)
+                                  LoraManager, ModelConfig,
+                                  QWenForCausalLMGenerationSession,
+                                  SamplingConfig)
 
 
 def get_engine_name(model: str, dtype: str, tp_size: int, pp_size: int,
@@ -88,6 +91,8 @@ def read_config(config_path: Path) -> Tuple[ModelConfig, dict]:
         logger.warning(
             "`multi_query_mode` config is deprecated. Please rebuild the engine."
         )
+    # num_kv_heads, if exists in config, should override multi_query_mode
+    if multi_query_mode and ('num_kv_heads' not in builder_config):
         num_kv_heads = 1
     num_heads = num_heads // tp_size
     num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
@@ -105,6 +110,7 @@ def read_config(config_path: Path) -> Tuple[ModelConfig, dict]:
     max_prompt_embedding_table_size = builder_config.get(
         'max_prompt_embedding_table_size', 0)
     quant_mode = QuantMode(builder_config.get('quant_mode', 0))
+    lora_target_modules = builder_config.get('lora_target_modules')
 
     plugin_config = config['plugin_config']
     use_gpt_attention_plugin = bool(plugin_config['gpt_attention_plugin'])
@@ -112,6 +118,7 @@ def read_config(config_path: Path) -> Tuple[ModelConfig, dict]:
     paged_kv_cache = plugin_config['paged_kv_cache']
     tokens_per_block = plugin_config['tokens_per_block']
     use_custom_all_reduce = plugin_config.get('use_custom_all_reduce', False)
+    lora_plugin = plugin_config.get('lora_plugin')
 
     model_config = ModelConfig(
         vocab_size=vocab_size,
@@ -131,7 +138,9 @@ def read_config(config_path: Path) -> Tuple[ModelConfig, dict]:
         quant_mode=quant_mode,
         gather_all_token_logits=gather_all_token_logits,
         dtype=dtype,
-        use_custom_all_reduce=use_custom_all_reduce)
+        use_custom_all_reduce=use_custom_all_reduce,
+        lora_plugin=lora_plugin,
+        lora_target_modules=lora_target_modules)
 
     other_config = {
         'world_size': world_size,
@@ -148,8 +157,11 @@ class ModelRunner:
     An interface class that wraps GenerationSession and provides generation methods.
     """
 
-    def __init__(self, session: GenerationSession, max_batch_size: int,
-                 max_input_len: int) -> None:
+    def __init__(self,
+                 session: GenerationSession,
+                 max_batch_size: int,
+                 max_input_len: int,
+                 lora_manager: Optional[LoraManager] = None) -> None:
         """
         Create a ModelRunner instance.
         You are recommended to use the from_dir method to load the engine and create a ModelRunner instance.
@@ -161,14 +173,18 @@ class ModelRunner:
                 The maximum batch size allowed for the input.
             max_input_len (int):
                 The maximum input length allowed for the input.
+            lora_manager (LoraManager):
+                The LoRA manager to handle LoRA weights.
         """
         self.session = session
         self.max_batch_size = max_batch_size
         self.max_input_len = max_input_len
+        self.lora_manager = lora_manager
 
     @classmethod
     def from_dir(cls,
                  engine_dir: str,
+                 lora_dir: Optional[str] = None,
                  rank: int = 0,
                  debug_mode: bool = False) -> 'ModelRunner':
         """
@@ -177,6 +193,8 @@ class ModelRunner:
         Args:
             engine_dir (str):
                 The directory that contains the serialized engine files and config files.
+            lora_dir (str):
+                The directory that contains LoRA weights.
             rank (int):
                 The runtime rank id.
             debug_mode (int):
@@ -208,6 +226,8 @@ class ModelRunner:
 
         if model_config.model_name in ('chatglm_6b', 'glm_10b'):
             session_cls = ChatGLMGenerationSession
+        elif model_config.model_name == 'qwen':
+            session_cls = QWenForCausalLMGenerationSession
         else:
             session_cls = GenerationSession
         session = session_cls(model_config,
@@ -218,11 +238,29 @@ class ModelRunner:
         loading_time = profiler.elapsed_time_in_sec("load tensorrt_llm engine")
         logger.info(f'Load engine takes: {loading_time} sec')
 
-        return cls(session, **other_config)
+        if session.use_lora_plugin:
+            assert lora_dir is not None, \
+                "lora_dir should not be None for engine built with lora_plugin enabled."
+            lora_manager = LoraManager()
+            lora_manager.load_from_hf(model_dir=lora_dir,
+                                      model_config=model_config,
+                                      runtime_mapping=runtime_mapping)
+        else:
+            lora_manager = None
+
+        return cls(session, lora_manager=lora_manager, **other_config)
 
     @property
     def remove_input_padding(self) -> bool:
         return self.session.remove_input_padding
+
+    @property
+    def use_lora_plugin(self) -> bool:
+        return self.session.use_lora_plugin
+
+    @property
+    def max_prompt_embedding_table_size(self) -> int:
+        return self.session.max_prompt_embedding_table_size
 
     def _prepare_inputs(self, batch_input_ids: List[torch.Tensor],
                         pad_id: int) -> Tuple[torch.Tensor]:
@@ -282,6 +320,10 @@ class ModelRunner:
     def generate(self,
                  batch_input_ids: List[torch.Tensor],
                  sampling_config: Optional[SamplingConfig] = None,
+                 prompt_table_path: Optional[str] = None,
+                 prompt_tasks: Optional[str] = None,
+                 lora_uids: Optional[list] = None,
+                 streaming: bool = False,
                  **kwargs) -> Union[torch.Tensor, dict]:
         """
         Generates sequences of token ids.
@@ -295,6 +337,12 @@ class ModelRunner:
                 The sampling configuration to be used as base parametrization for the generation call.
                 The passed **kwargs matching the sampling_config's attributes will override them.
                 If the sampling_config is not provided, a default will be used.
+            prompt_table_path (str):
+                The file path of prompt table (.npy format, exported by nemo_prompt_convert.py).
+            prompt_tasks (str):
+                The prompt tuning task ids for the input batch, in format of comma-separated list (e.g., 0,3,1,0).
+            lora_uids (list):
+                The uids of LoRA weights for the input batch. Use -1 to disable the LoRA module.
             kwargs (Dict[str, Any]:
                 Ad hoc parametrization of sampling_config.
                 The passed **kwargs matching the sampling_config's attributes will override them.
@@ -316,21 +364,66 @@ class ModelRunner:
         batch_input_ids, input_lengths = self._prepare_inputs(
             batch_input_ids, sampling_config.pad_id)
 
+        if self.use_lora_plugin:
+            assert lora_uids is not None, \
+                "lora_uids should not be None for engine built with lora_plugin enabled."
+
         self.session.setup(
             batch_size=batch_size,
             max_context_length=input_lengths.max().item(),
             max_new_tokens=sampling_config.max_new_tokens,
             beam_width=sampling_config.num_beams,
-            max_kv_cache_length=sampling_config.max_kv_cache_length)
+            max_kv_cache_length=sampling_config.max_kv_cache_length,
+            lora_manager=self.lora_manager,
+            lora_uids=lora_uids)
 
         batch_input_ids = batch_input_ids.cuda()
         input_lengths = input_lengths.cuda()
+        ptuning_kwargs = self._prepare_ptuning(prompt_table_path, prompt_tasks,
+                                               batch_size)
         outputs = self.session.decode(
             batch_input_ids,
             input_lengths,
             sampling_config,
+            stop_words_list=sampling_config.stop_words_list,
+            bad_words_list=sampling_config.bad_words_list,
             output_sequence_lengths=sampling_config.output_sequence_lengths,
-            return_dict=sampling_config.return_dict)
+            return_dict=sampling_config.return_dict,
+            streaming=streaming,
+            **ptuning_kwargs)
         if sampling_config.return_dict:
-            outputs = self._prepare_outputs(outputs, input_lengths)
+            if streaming:
+                outputs = (self._prepare_outputs(curr_outputs, input_lengths)
+                           for curr_outputs in outputs)
+            else:
+                outputs = self._prepare_outputs(outputs, input_lengths)
         return outputs
+
+    def _prepare_ptuning(self, prompt_table_path: str, tasks: str,
+                         batch_size: int):
+        if self.max_prompt_embedding_table_size == 0:
+            return {}
+
+        if prompt_table_path is not None:
+            prompt_table = torch.from_numpy(np.load(prompt_table_path))
+            _, task_vocab_size, hidden_size = prompt_table.size()
+            task_vocab_size = torch.tensor([task_vocab_size], dtype=torch.int32)
+            prompt_table = prompt_table.view(-1, hidden_size)
+            prompt_table = prompt_table.to(dtype=self.session.dtype)
+        else:
+            prompt_table = torch.empty([1, self.session.hidden_size])
+            task_vocab_size = torch.zeros([1])
+
+        if tasks is not None:
+            tasks = torch.tensor([int(t) for t in tasks.split(',')],
+                                 dtype=torch.int32)
+            assert tasks.size(0) == batch_size, \
+                f"Number of supplied tasks ({tasks.size(0)}) must match input batch size ({batch_size})"
+        else:
+            tasks = torch.zeros([batch_size])
+
+        return {
+            'prompt_embedding_table': prompt_table.cuda(),
+            'tasks': tasks.cuda(),
+            'prompt_vocab_size': task_vocab_size.cuda()
+        }

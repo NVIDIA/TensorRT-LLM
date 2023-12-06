@@ -631,7 +631,7 @@ class FuseAttentionWithBiasPass(PatternRewriter):
             if not self.is_attention_plugin(layer):
                 return False
             plugin_flayer = FLayerInfoMemo.instance().get(layer.name)
-            input = plugin_flayer.raw_inputs['tensor']
+            input = plugin_flayer.raw_inputs['qkv']
             if input is None or len(list(input.get_users())) != 1:
                 return False
             parent_layer = input.get_parent()
@@ -644,7 +644,7 @@ class FuseAttentionWithBiasPass(PatternRewriter):
                 return False
             if plugin_flayer.raw_inputs['qkv_bias'] is not None:
                 return False
-            plugin_flayer.raw_inputs['tensor'] = eltwise_mutable_inputs[0]
+            plugin_flayer.raw_inputs['qkv'] = eltwise_mutable_inputs[0]
             plugin_flayer.raw_inputs['qkv_bias'] = eltwise_const_inputs[0]
             from .functional import gpt_attention
             new_outputs = gpt_attention(**plugin_flayer.raw_inputs)

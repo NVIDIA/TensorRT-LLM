@@ -47,12 +47,13 @@ public:
         std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType> promptVocabSize = std::nullopt, bool returnLogProbs = false,
-        std::optional<VecTokens> draftTokens = std::nullopt)
+        std::optional<VecTokens> draftTokens = std::nullopt, std::optional<TensorPtr> draftLogits = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, embeddingBias, badWordsList, stopWordsList, promptEmbeddingTable,
             promptVocabSize, returnLogProbs,
             draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))
-                                    : std::make_shared<VecTokens>())
+                                    : std::make_shared<VecTokens>(),
+            draftLogits)
     {
     }
 

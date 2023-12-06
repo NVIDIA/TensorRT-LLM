@@ -45,11 +45,13 @@ extern bool CHECK_DEBUG_ENABLED;
                                             : tensorrt_llm::common::throwRuntimeError(__FILE__, __LINE__, #val);       \
     } while (0)
 
-#define TLLM_CHECK_WITH_INFO(val, info)                                                                                \
+#define TLLM_CHECK_WITH_INFO(val, info, ...)                                                                           \
     do                                                                                                                 \
     {                                                                                                                  \
-        TLLM_LIKELY(static_cast<bool>(val)) ? ((void) 0)                                                               \
-                                            : tensorrt_llm::common::throwRuntimeError(__FILE__, __LINE__, info);       \
+        TLLM_LIKELY(static_cast<bool>(val))                                                                            \
+        ? ((void) 0)                                                                                                   \
+        : tensorrt_llm::common::throwRuntimeError(                                                                     \
+            __FILE__, __LINE__, tensorrt_llm::common::fmtstr(info, ##__VA_ARGS__));                                    \
     } while (0)
 
 #define TLLM_CHECK_DEBUG(val)                                                                                          \

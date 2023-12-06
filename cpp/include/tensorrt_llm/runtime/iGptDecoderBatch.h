@@ -65,6 +65,8 @@ public:
     std::optional<SizeType> maxNewTokens; // maximum number of tokens to generate for this request
     std::optional<SizeType> endId;        // end token id
     BufferPtr draftTokens;   // [generatedTokensPerStep - 1], on gpu, draft tokens from speculative decoding
+    std::optional<TensorPtr>
+        draftLogits;         // [generatedTokensPerStep - 1, vocabSize], on gpu, draft tokens from speculative decoding
     TensorPtr embeddingBias; // [vocabSizePadded], on gpu
     TensorPtr badWordsList;  // [2, badWordsLength], on gpu
     TensorPtr stopWordsList; // [2, stopWordsLength], on gpu

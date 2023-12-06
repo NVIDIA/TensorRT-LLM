@@ -15,11 +15,14 @@
  * limitations under the License.
  */
 #include "tensorrt_llm/batch_manager/GptManager.h"
-#include "tensorrt_llm/batch_manager/NamedTensor.h"
+
 #include "tensorrt_llm/batch_manager/inferenceRequest.h"
+#include "tensorrt_llm/batch_manager/namedTensor.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/mpiUtils.h"
+#include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
@@ -42,9 +45,9 @@ namespace trt = nvinfer1;
 class WorkItem
 {
 public:
-    WorkItem(std::shared_ptr<InferenceRequest> ir, uint64_t RequestId)
+    WorkItem(std::shared_ptr<InferenceRequest> ir, uint64_t requestId)
         : mInferenceRequest(ir)
-        , mRequestId(RequestId)
+        , mRequestId(requestId)
     {
     }
 
@@ -100,18 +103,12 @@ public:
     void push(std::shared_ptr<InferenceRequest> request, uint64_t requestId)
     {
         std::lock_guard<std::mutex> lk(mMutex);
-        if (hasInProgressReqId(requestId) || hasPendingReqId(requestId))
-        {
-            std::string errStr
-                = "requestId " + std::to_string(requestId) + " is already in progress, request is ignored.";
-            throw std::runtime_error(errStr);
-        }
-        else
-        {
-            auto workItem = std::make_shared<WorkItem>(request, requestId);
-            mPendingWorkItems.push_back(workItem);
-            mPendingWorkItemsReqIds.insert(workItem->requestId());
-        }
+        TLLM_CHECK_WITH_INFO(!hasInProgressReqId(requestId) && !hasPendingReqId(requestId),
+            "requestId %lu is already in progress, request is ignored.", requestId);
+
+        auto workItem = std::make_shared<WorkItem>(request, requestId);
+        mPendingWorkItems.push_back(workItem);
+        mPendingWorkItemsReqIds.insert(workItem->requestId());
     }
 
     /// @brief Get a new work item from the queue, and move it to the list of
@@ -208,12 +205,12 @@ public:
 
     void recordStart(std::shared_ptr<InferenceRequest> request, uint64_t requestId)
     {
-        const auto& input_ids_tensor = request->getInputTensor("input_ids");
-        std::vector<int64_t> tensorShape(input_ids_tensor->getShape().nbDims);
-        auto const inputLength = tensorShape[1];
-        auto const [specified, outputLength]
-            = request->getScalarValueFromTensor<int>("request_output_len", {1, 1}, false);
-        assert(specified);
+        auto const inputLength = request->getInputIds()->getSize();
+        auto const maxNewTokens = request->getMaxNewTokensNamed();
+        auto const& outputLengthTensor = maxNewTokens.tensor;
+        TLLM_CHECK_WITH_INFO(outputLengthTensor != nullptr && outputLengthTensor->getSize() > 0,
+            "Undefined scalar vector for %s", maxNewTokens.name.c_str());
+        auto const outputLength = *bufferCast<SizeType>(*outputLengthTensor);
         auto const start = std::chrono::steady_clock::now();
         mRequestBenchInfos[requestId] = BenchInfo(inputLength, outputLength, start);
     }
@@ -286,20 +283,15 @@ public:
         mWorkItemsQueue.clear();
     }
 
-    void enqueue(std::vector<NamedTensor> tensors, uint64_t requestId, bool streaming)
+    void enqueue(std::shared_ptr<InferenceRequest> const& request)
     {
-        // Create InferenceRequest from a set of tensors
-        auto request = std::make_shared<InferenceRequest>(requestId);
+        TLLM_CHECK(request != nullptr);
+        auto const requestId = request->getRequestId();
         if (requestId == mTerminateReqId)
         {
             mWorkItemsQueue.push(request, requestId);
             return;
         }
-        for (auto t : tensors)
-        {
-            request->emplaceInputTensor(t.name, std::move(t.tensor));
-        }
-        request->setIsStreaming(streaming);
 
         // Enqueue
         try
@@ -307,11 +299,14 @@ public:
             mRecorder->recordStart(request, requestId);
             mWorkItemsQueue.push(request, requestId);
         }
+        catch (const tc::TllmException& e)
+        {
+            throw;
+        }
         catch (const std::exception& e)
         {
-            throw std::runtime_error(e.what());
+            TLLM_THROW("%s", e.what());
         }
-        return;
     }
 
     void waitForEmpty() const
@@ -357,8 +352,8 @@ public:
                         }
                         else
                         {
-                            std::string warnStr = std::string("request Id ") + std::to_string(workItem->requestId())
-                                + std::string(" has been stopped. Request is ignored.");
+                            auto warnStr = tc::fmtstr(
+                                "request Id %lu has been stopped. Request is ignored.", workItem->requestId());
                             TLLM_LOG_WARNING(warnStr);
                             sendResponse(workItem->requestId(), {}, true, warnStr);
                         }
@@ -366,7 +361,7 @@ public:
                     if (world_size > 1)
                     {
                         std::vector<int64_t> packed;
-                        for (auto ir : rval)
+                        for (auto const& ir : rval)
                         {
                             auto vpacked = ir->serialize();
                             packed.push_back(static_cast<int64_t>(vpacked.size()));
@@ -400,10 +395,9 @@ public:
         return rval;
     }
 
-    void sendResponse(uint64_t requestId, std::list<NamedTensor> const& response_tensors, bool final_response,
-        const std::string& errMsg)
+    void sendResponse(uint64_t requestId, [[maybe_unused]] std::list<NamedTensor> const& response_tensors,
+        bool final_response, [[maybe_unused]] const std::string& errMsg)
     {
-        std::string errStr = std::string("Failed to send response for requestId: ") + std::to_string(requestId);
         try
         {
             if (final_response)
@@ -414,7 +408,7 @@ public:
         }
         catch (const std::exception& e)
         {
-            TLLM_LOG_ERROR(errStr);
+            TLLM_LOG_ERROR("Failed to send response for requestId: %ul\n%s", requestId, e.what());
         }
     }
 
@@ -434,24 +428,43 @@ std::pair<std::vector<std::vector<int32_t>>, std::vector<int32_t>> parseDataset(
 {
     auto constexpr allowExceptions = true;
     auto constexpr ingoreComments = true;
-    TLLM_CHECK_WITH_INFO(
-        std::filesystem::exists(datasetPath), std::string("File does not exist: ") + datasetPath.string());
+    TLLM_CHECK_WITH_INFO(std::filesystem::exists(datasetPath), "File does not exist: %s", datasetPath.string().c_str());
     std::ifstream jsonStream(datasetPath);
     auto json = nlohmann::json::parse(jsonStream, nullptr, allowExceptions, ingoreComments);
 
-    std::vector<std::vector<int32_t>> input_ids_list;
-    std::vector<int32_t> output_ids_list;
+    std::vector<std::vector<int32_t>> inputIds;
+    std::vector<int32_t> outputIds;
     for (auto& sample : json)
     {
-        input_ids_list.push_back(sample["input_ids"]);
-        output_ids_list.push_back(sample["output_len"]);
+        inputIds.push_back(sample["input_ids"]);
+        outputIds.push_back(sample["output_len"]);
     }
-    return std::make_pair(input_ids_list, output_ids_list);
+    return std::make_pair(inputIds, outputIds);
 }
 
-void benchmarkGptManager(std::string const& modelName, std::filesystem::path const& engineDir, std::string const& type,
-    std::string const& datasetPath, int beamWidth, int warmUp, std::shared_ptr<nvinfer1::ILogger> const& logger,
-    TrtGptModelOptionalParams const& optionalParams, batch_scheduler::SchedulerPolicy schedulerPolicy)
+std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId,
+    std::pair<std::vector<std::vector<int32_t>>, std::vector<int32_t>> const& dataset, std::size_t sample_idx,
+    ITensor::SharedPtr const& beamWidthTensor, ITensor::SharedPtr const& eosId, ITensor::SharedPtr const& padId,
+    BufferManager const& bufferManager)
+{
+    auto request = std::make_shared<InferenceRequest>(reqId);
+    auto const& inputIds = dataset.first[sample_idx];
+    request->setInputIds(bufferManager.copyFrom(
+        inputIds, ITensor::makeShape({1, static_cast<SizeType>(inputIds.size())}), MemoryType::kPINNED));
+    auto const request_output_len = dataset.second[sample_idx];
+    request->setMaxNewTokens(
+        bufferManager.copyFrom(&request_output_len, ITensor::makeShape({1, 1}), MemoryType::kPINNED));
+    request->setBeamWidth(beamWidthTensor);
+    request->setEndId(eosId);
+    request->setPadId(padId);
+    return request;
+}
+
+void benchmarkGptManager([[maybe_unused]] std::string const& modelName, std::filesystem::path const& engineDir,
+    std::string const& type, std::string const& datasetPath, int beamWidth, int warmUp,
+    const std::optional<int32_t>& eosId, const std::optional<int32_t>& padId,
+    std::shared_ptr<nvinfer1::ILogger> const& logger, TrtGptModelOptionalParams const& optionalParams,
+    batch_scheduler::SchedulerPolicy schedulerPolicy)
 {
     auto const worldConfig = WorldConfig::mpi(*logger);
 
@@ -466,57 +479,49 @@ void benchmarkGptManager(std::string const& modelName, std::filesystem::path con
     }
     else
     {
-        const std::string errStr = std::string("Unexpected batching type: ") + type;
-        TLLM_LOG_ERROR(errStr);
+        TLLM_LOG_ERROR("Unexpected batching type: %s", type.c_str());
     }
 
-    ITensor::SharedPtr beamWidthBuffer = BufferManager::cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
-    auto beamWidthBufferPtr = bufferCast<SizeType>(*beamWidthBuffer);
-    *beamWidthBufferPtr = beamWidth;
-    auto beamWidthTensor = NamedTensor(beamWidthBuffer, "beam_width");
+    BufferManager bufferManager{std::make_shared<CudaStream>()}; // the stream is not used
+
+    ITensor::SharedPtr beamWidthTensor{
+        bufferManager.copyFrom(&beamWidth, ITensor::makeShape({1}), MemoryType::kPINNED)};
 
     // Load dataset
     auto dataset = parseDataset(datasetPath);
-    std::vector<std::vector<NamedTensor>> tensors_list;
-    const auto num_samples = dataset.first.size();
-    for (int i = 0; i < num_samples; ++i)
-    {
-        const auto input_ids = dataset.first[i];
-        const auto request_output_len = dataset.second[i];
-        std::vector<int64_t> input_ids_shape = {1, static_cast<int64_t>(input_ids.size())};
-        auto input_ids_tensor = NamedTensor(nvinfer1::DataType::kINT32, input_ids_shape, "input_ids", input_ids.data());
-        auto request_output_len_tensor
-            = NamedTensor(nvinfer1::DataType::kINT32, {1, 1}, "request_output_len", &request_output_len);
-        std::vector<NamedTensor> tensors
-            = {std::move(input_ids_tensor), std::move(request_output_len_tensor), beamWidthTensor};
-        tensors_list.emplace_back(std::move(tensors));
-    }
+    const auto numSamples = dataset.first.size();
 
     const int maxBeamWidth = beamWidth;
     auto recorder = std::make_shared<Recorder>();
-    uint64_t terminateReqId = num_samples + 1;
+    uint64_t terminateReqId = numSamples + 1;
     auto gptServer = std::make_shared<GptServer>(
         engineDir, modelType, maxBeamWidth, schedulerPolicy, optionalParams, recorder, terminateReqId);
+
+    ITensor::SharedPtr eosIdTensor{
+        eosId ? bufferManager.copyFrom(&eosId.value(), ITensor::makeShape({1}), MemoryType::kPINNED) : nullptr};
+    ITensor::SharedPtr padIdTensor{
+        padId ? bufferManager.copyFrom(&padId.value(), ITensor::makeShape({1}), MemoryType::kPINNED) : nullptr};
 
     if (worldConfig.getRank() == 0)
     {
         // Warm up
-        for (auto i = 1; i < warmUp + 1; ++i)
+        SizeType reqId = 0;
+        for (auto i = 0; i < warmUp; ++i)
         {
-            // skip terminateReqId
+            ++reqId;
             if (i == terminateReqId)
-            {
-                i += 1;
-            }
-            gptServer->enqueue(tensors_list[0], i, false);
+                ++reqId;
+            auto request = makeRequest(reqId, dataset, 0, beamWidthTensor, eosIdTensor, padIdTensor, bufferManager);
+            gptServer->enqueue(request);
         }
         gptServer->waitForEmpty();
 
         // Benchmark
         recorder->initialize();
-        for (int i = 0; i < tensors_list.size(); ++i)
+        for (std::size_t i = 0; i < numSamples; ++i)
         {
-            gptServer->enqueue(tensors_list[i], 1 + i, false);
+            auto request = makeRequest(i + 1, dataset, i, beamWidthTensor, eosIdTensor, padIdTensor, bufferManager);
+            gptServer->enqueue(request);
         }
         gptServer->waitForEmpty();
         recorder->finalize();
@@ -524,7 +529,7 @@ void benchmarkGptManager(std::string const& modelName, std::filesystem::path con
         recorder->report();
         // Send terminateReqId to terminate servers on all ranks
         // Sever on rank 0 will broadcast the terminate signal to other servers on multi-GPU cases
-        gptServer->enqueue({}, terminateReqId, false);
+        gptServer->enqueue(std::make_shared<InferenceRequest>(terminateReqId));
     }
     // Wait until benchmarking is done and batch manager is terminated
     gptServer->waitBatchManager();
@@ -548,7 +553,8 @@ int main(int argc, char* argv[])
         "beam_width", "Specify beam width you want to benchmark.", cxxopts::value<int>()->default_value("1"));
     options.add_options()(
         "warm_up", "Specify warm up iterations before benchmark starts.", cxxopts::value<int>()->default_value("2"));
-
+    options.add_options()("eos_id", "Specify the end-of-sequence token id.", cxxopts::value<int>());
+    options.add_options()("pad_id", "Specify the padding token id.", cxxopts::value<int>());
     options.add_options()("max_num_sequences", "Max number of Sequences.", cxxopts::value<int>());
     options.add_options()("max_tokens_in_paged_kvcache", "Max tokens in paged K-V Cache.", cxxopts::value<int>());
     options.add_options()(
@@ -609,6 +615,20 @@ int main(int argc, char* argv[])
         optionalParams.enableTrtOverlap = result["enable_trt_overlap"].as<bool>();
     }
 
+    std::optional<int32_t> padId;
+    // Argument: Padding token id
+    if (result.count("pad_id"))
+    {
+        padId = result["pad_id"].as<int>();
+    }
+
+    std::optional<int32_t> eosId;
+    // Argument: End-of-sentence token id
+    if (result.count("eos_id"))
+    {
+        eosId = result["eos_id"].as<int>();
+    }
+
     // Argument: Scheduler policy
     batch_scheduler::SchedulerPolicy schedulerPolicy;
     auto const schedulerPolicyArg = result["scheduler_policy"].as<std::string>();
@@ -660,7 +680,7 @@ int main(int argc, char* argv[])
     try
     {
         benchmarkGptManager(result["model"].as<std::string>(), result["engine_dir"].as<std::string>(), type,
-            datasetPath, beamWidth, result["warm_up"].as<int>(), logger, optionalParams, schedulerPolicy);
+            datasetPath, beamWidth, result["warm_up"].as<int>(), eosId, padId, logger, optionalParams, schedulerPolicy);
     }
     catch (const std::exception& e)
     {

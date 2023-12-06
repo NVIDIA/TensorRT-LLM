@@ -30,18 +30,17 @@ class BuildConfig(BaseModel, extra=Extra.allow):
     max_input_len: int
     num_kv_heads: Optional[int] = None
     max_output_len: Optional[int] = None
+    max_beam_width: int = 1
     # TRT builder_optimization_level from 0 to 5
     builder_opt: Optional[int] = None
     inter_size: Optional[int] = None
     rotary_dim: Optional[int] = None
     type_vocab_size: Optional[int] = None
-    use_smooth_quant: bool = False
-    per_token: bool = False
-    per_channel: bool = False
     pre_norm: Optional[bool] = None
     do_layer_norm_before: Optional[bool] = None
     enable_qk_half_accum: bool = False
     enable_context_fmha: bool = True
+    enable_multi_block_mode: bool = False
     # None means using the model family's default value defined in the ctor
     position_embedding_type: Optional[PositionEmbeddingType] = None
     # Only when position embedding is RoPE, this value makes sense, make
@@ -49,6 +48,10 @@ class BuildConfig(BaseModel, extra=Extra.allow):
     rotary_pct: Optional[float] = None
     bias: bool = True
     quantization: Optional[str] = None
+    # use_custom_all_reduce gives better performance with NVLink
+    use_custom_all_reduce: bool = True
+    moe_num_experts: int = None
+    moe_top_k: int = None
 
 
 class ModelConfig(BaseModel):
@@ -106,6 +109,24 @@ _allowed_configs = {
                     max_input_len=512,
                     max_output_len=200,
                     builder_opt=None,
+                )),
+    "gpt_350m_moe":
+    ModelConfig(name="gpt_350m_moe",
+                family="gpt",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=24,
+                    num_heads=16,
+                    hidden_size=1024,
+                    vocab_size=51200,
+                    hidden_act='gelu',
+                    n_positions=1024,
+                    max_batch_size=256,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                    moe_num_experts=8,
+                    moe_top_k=1,
                 )),
     "gpt_350m_sq_per_tensor":
     ModelConfig(name="gpt_350m_sq_per_tensor",
@@ -301,6 +322,40 @@ _allowed_configs = {
                     max_output_len=200,
                     builder_opt=None,
                 )),
+    "llama_70b_long_context":
+    ModelConfig(name="llama_70b_long_context",
+                family="llama",
+                benchmark_type="gpt",
+                build_config=BuildConfig(num_layers=80,
+                                         num_heads=64,
+                                         num_kv_heads=8,
+                                         hidden_size=8192,
+                                         vocab_size=32000,
+                                         hidden_act='silu',
+                                         n_positions=2048,
+                                         inter_size=28672,
+                                         max_batch_size=16,
+                                         max_input_len=8000,
+                                         max_output_len=200,
+                                         builder_opt=None,
+                                         enable_multi_block_mode=True)),
+    "llama_70b_long_generation":
+    ModelConfig(name="llama_70b_long_generation",
+                family="llama",
+                benchmark_type="gpt",
+                build_config=BuildConfig(num_layers=80,
+                                         num_heads=64,
+                                         num_kv_heads=8,
+                                         hidden_size=8192,
+                                         vocab_size=32000,
+                                         hidden_act='silu',
+                                         n_positions=2048,
+                                         inter_size=28672,
+                                         max_batch_size=64,
+                                         max_input_len=200,
+                                         max_output_len=16384,
+                                         builder_opt=None,
+                                         enable_multi_block_mode=True)),
     "llama_70b_sq_per_tensor":
     ModelConfig(name="llama_70b_sq_per_tensor",
                 family="llama",

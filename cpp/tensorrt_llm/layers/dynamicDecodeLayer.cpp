@@ -226,7 +226,8 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
 
         invokeBanRepeatNgram(logits.template getPtrWithOffset<T>(decode_vocab_size_units_offset),
             outputs.output_ids_ptr.template getPtr<const int*>(),
-            params.finished.value_or(Tensor{}).template getPtr<bool>(),
+            reinterpret_cast<FinishedState*>(
+                params.finished.value_or(Tensor{}).template getPtr<FinishedState::UnderlyingType>()),
             outputs.parent_ids.value_or(Tensor{}).template getPtr<const int>(), batch_size, local_batch_size,
             beam_width, no_repeat_ngram_size_buf, id_offset, vocab_size_padded_, step, stream_);
     }
@@ -396,14 +397,16 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
             outputs.parent_ids_ptr.template getPtr<const int*>(),
             params.stop_words_list->template getPtrWithOffset<const int>(
                 ite * local_batch_size * 2 * stop_words_length),
-            outputs.finished->template getPtrWithOffset<bool>(id_offset),
-            outputs.sequence_length->template getPtr<int>(), id_offset, stop_words_length, batch_size, beam_width,
-            max_seq_len, stream_);
+            reinterpret_cast<FinishedState*>(
+                outputs.finished->template getPtrWithOffset<FinishedState::UnderlyingType>(id_offset)),
+            outputs.sequence_length->template getPtr<int>(), stop_words_length, batch_size, beam_width, max_seq_len,
+            stream_);
     }
 
     if (params.sequence_limit_length)
     {
-        invokeLengthCriterion(outputs.finished->template getPtr<bool>(),
+        invokeLengthCriterion(
+            reinterpret_cast<FinishedState*>(outputs.finished->template getPtr<FinishedState::UnderlyingType>()),
             outputs.finished_sum ? outputs.finished_sum->template getPtr<int>() : nullptr,
             params.sequence_limit_length->template getPtr<const uint32_t>(),
             outputs.sequence_length->template getPtr<int>(), batch_size, beam_width, stream_);

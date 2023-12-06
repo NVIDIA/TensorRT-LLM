@@ -118,7 +118,7 @@ def parse_arguments():
         type=str,
         default=None,
         help=
-        'If this option is specified, TensorRT engines will be saved to engine_dir.'
+        'If this option is specified, TensorRT engines will be saved to the specified path.'
     )
     parser.add_argument(
         '--engine_dir',
@@ -128,37 +128,33 @@ def parse_arguments():
         ('If this option is specified, instead of building engines on-air before benchmarking, '
          'the engines contained in the engine_dir will be used.'))
     parser.add_argument(
-        '--n_positions',
+        '--max_beam_width',
         type=int,
         default=None,
         help=
-        ('If this option is specified, it will override the n_positions of TRT engines to the specified value instead of using pre-defined one'
-         'By default when this option is not used, it will use pre-defined n_positions'
-         ))
+        ('If this option is specified, it will override the max beam width of '
+         'TRT engines to the specified value instead of using pre-defined one'))
     parser.add_argument(
         '--max_input_len',
         type=int,
         default=None,
         help=
-        ('If this option is specified, it will override the max input len of TRT engines to the specified value instead of using pre-defined one'
-         'By default when this option is not used, it will use pre-defined max input len'
-         ))
+        ('If this option is specified, it will override the max input len of '
+         'TRT engines to the specified value instead of using pre-defined one'))
     parser.add_argument(
         '--max_output_len',
         type=int,
         default=None,
         help=
-        ('If this option is specified, it will override the max output len of TRT engines to the specified value instead of using pre-defined one'
-         'By default when this option is not used, it will use pre-defined max output len'
-         ))
+        ('If this option is specified, it will override the max output len of '
+         'TRT engines to the specified value instead of using pre-defined one'))
     parser.add_argument(
         '--max_batch_size',
         type=int,
         default=None,
         help=
-        ('If this option is specified, it will override the max batch size of TRT engines to the specified value instead of using pre-defined one'
-         'By default when this option is not used, it will use pre-defined max batch size'
-         ))
+        ('If this option is specified, it will override the max batch size of '
+         'TRT engines to the specified value instead of using pre-defined one'))
     parser.add_argument(
         '--force_num_layer_1',
         default=False,
@@ -175,20 +171,6 @@ def parse_arguments():
                         default=False,
                         action='store_true',
                         help='Execute GPT session with CUDA graph.')
-    parser.add_argument(
-        '--enable_custom_all_reduce',
-        default=False,
-        action='store_true',
-        help=
-        'Use latency-optimized all-reduce for tensor parallelism. Gives better performance with NVLink.'
-    )
-    parser.add_argument(
-        '--strongly_typed',
-        default=False,
-        action='store_true',
-        help=
-        'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
-    )
     parser.add_argument(
         '--quantization',
         type=str,
@@ -209,6 +191,7 @@ def main(args):
     # the start method `spawn` of Python multiprocessing,
     # so we set the start method first, then initialize MPI.
     from allowed_configs import get_allowed_models
+    from benchmark_profiler import BenchmarkProfiler
     from bert_benchmark import BERTBenchmark
     from gpt_benchmark import GPTBenchmark
     from mem_monitor import MemoryMonitor
@@ -228,47 +211,19 @@ def main(args):
     in_out_len_options = [[int(i) for i in io.split(',')]
                           for io in in_out_len_options]
 
+    benchmark_profiler = None
     if args.model in get_allowed_models(benchmark_type="gpt"):
-        benchmarker = GPTBenchmark(
-            args.engine_dir,
-            args.model,
-            args.mode,
-            batch_size_options,
-            in_out_len_options,
-            args.dtype,
-            args.refit,
-            args.num_beams,
-            args.top_k,
-            args.top_p,
-            args.output_dir,
-            args.n_positions,
-            args.max_input_len,
-            args.max_output_len,
-            args.max_batch_size,
-            force_num_layer_1=args.force_num_layer_1,
-            enable_cuda_graph=args.enable_cuda_graph,
-            enable_custom_all_reduce=args.enable_custom_all_reduce,
-            strongly_typed=args.strongly_typed,
-            quantization=args.quantization)
+        benchmark_profiler = BenchmarkProfiler()
+        benchmarker = GPTBenchmark(args, batch_size_options, in_out_len_options)
     elif args.model in get_allowed_models(benchmark_type="bert"):
-        benchmarker = BERTBenchmark(args.engine_dir,
-                                    args.model,
-                                    args.mode,
-                                    batch_size_options,
-                                    input_len_options,
-                                    args.dtype,
-                                    args.output_dir,
-                                    args.n_positions,
-                                    args.max_input_len,
-                                    args.max_output_len,
-                                    args.max_batch_size,
-                                    force_num_layer_1=args.force_num_layer_1)
+        benchmarker = BERTBenchmark(args, batch_size_options, input_len_options)
     else:
         raise Exception(f'Unexpected model: {args.model}')
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    benchmarker.print_report_header(args.csv)
+    benchmarker.print_report_header(args.csv,
+                                    benchmark_profiler=benchmark_profiler)
     for config in benchmarker.get_config():
         try:
             inputs = benchmarker.prepare_inputs(config)
@@ -290,12 +245,16 @@ def main(args):
             for _ in range(args.warm_up):
                 benchmarker.run(inputs, config)
             logger.info('Warm up done. Start benchmarking.')
-
+            if benchmark_profiler is not None:
+                benchmark_profiler.clean()
+                benchmark_profiler.start()
             cur_duration = 0
             start_time = time()
             while iter_idx < args.num_runs or cur_duration < args.duration:
                 start.record()
-                benchmarker.run(inputs, config)
+                benchmarker.run(inputs,
+                                config,
+                                benchmark_profiler=benchmark_profiler)
                 end.record()
 
                 torch.cuda.synchronize()
@@ -315,6 +274,9 @@ def main(args):
         memory_monitor.stop()
         _, peak_gpu_used = memory_monitor.get_peak_memory_usage("GiB")
         peak_gpu_used = round(peak_gpu_used, 3)
+        if benchmark_profiler is not None:
+            benchmark_profiler.add_aux_info('iter_count', iter_idx)
+            benchmark_profiler.stop()
 
         latency = round(sum(latencies) / iter_idx, 3)
         latencies.sort()
@@ -325,7 +287,8 @@ def main(args):
                            percentile95,
                            percentile99,
                            peak_gpu_used,
-                           csv=args.csv)
+                           csv=args.csv,
+                           benchmark_profiler=benchmark_profiler)
 
 
 if __name__ == '__main__':
