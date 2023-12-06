@@ -28,6 +28,7 @@ assert len(fr_bin) == 5
 
 # Convert one of the samples to a string and detokenize
 fr_sample = fr_bin[0]['tokens']
+print(fr_sample)
 fr_bpe = en2fr.string(fr_sample)
 fr_toks = en2fr.remove_bpe(fr_bpe)
 fr = en2fr.detokenize(fr_toks)

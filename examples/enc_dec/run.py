@@ -47,7 +47,6 @@ def read_config(config_path: Path):
     vocab_size = config["builder_config"]["vocab_size"]
     num_layers = config["builder_config"]["num_layers"]
     num_kv_heads = config['builder_config'].get('num_kv_heads', num_heads)
-    residual_scaling = config['builder_config']['residual_scaling']
 
     assert (num_heads % tp_size) == 0
     num_heads = num_heads // tp_size
@@ -387,7 +386,7 @@ if __name__ == "__main__":
     args = parse_arguments()
     logger.set_level(args.log_level)
 
-    if args.model_name == "t5_small":
+    if args.model_name == "t5-small":
         test_remove_padding = True
         if not test_remove_padding:
             input_text = "translate English to German: The house is wonderful, radiating timeless charm and offering a warm, inviting interior with beautiful details and a serene backyard."
@@ -421,19 +420,25 @@ if __name__ == "__main__":
         decoder_input_ids = torch.IntTensor([[model_config.decoder_start_token_id]
                                             ]).to('cuda')
         decoder_input_ids = decoder_input_ids.repeat((input_ids.shape[0], 1))
+        bos_token_id=tokenizer.bos_token_id
+        pad_token_id=tokenizer.pad_token_id
+        eos_token_id=tokenizer.eos_token_id
 
     elif args.model_name == "wmt":
+        print("model type wmt")
+        max_new_tokens = args.max_new_tokens
         # Load an En-Fr Transformer model trained on WMT'14 data :
-        en2fr = torch.hub.load('pytorch/fairseq', 'transformer.wmt14.en-fr', tokenizer='moses', bpe='subword_nmt')
-        en2fr.cuda()
-        en_toks = en2fr.tokenize('Hello world!')
-        en_bpe = en2fr.apply_bpe(en_toks)
-        en_bin = en2fr.binarize(en_bpe)
-        # en_bin.tolist() == [329, 14044, 682, 812, 2]
-        input_ids = torch.tensor([en_bin.to_list()]).type(torch.IntTensor).cuda()  
+        # en2fr = torch.hub.load('pytorch/fairseq', 'transformer.wmt14.en-fr', tokenizer='moses', bpe='subword_nmt')
+        # en_toks = en2fr.tokenize('Hello world!')
+        # en_bpe = en2fr.apply_bpe(en_toks)
+        en_bin = [329, 14044, 682, 812, 2]
+        input_ids = torch.tensor([en_bin]).type(torch.IntTensor).cuda()  
         decoder_input_ids = torch.IntTensor([[2]]).cuda()
         decoder_input_ids = decoder_input_ids.repeat((input_ids.shape[0], 1))
-
+        print("input ids: ", input_ids)
+        bos_token_id=2
+        pad_token_id=0
+        eos_token_id=2
     # simple comparison with HF on FP32
     if args.compare_hf_fp32:
         if tensorrt_llm.mpi_rank() == 0:
@@ -480,9 +485,9 @@ if __name__ == "__main__":
         decoder_input_ids=decoder_input_ids,
         max_new_tokens=max_new_tokens,
         num_beams=args.num_beams,
-        bos_token_id=tokenizer.bos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
+        bos_token_id=bos_token_id,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
         debug_mode=args.debug_mode,
     )
     tok = time.time()
@@ -491,20 +496,26 @@ if __name__ == "__main__":
 
     if tensorrt_llm.mpi_rank() == 0:
         output_ids = tllm_output_ids[:, 0, :]
-        output_text = tokenizer.batch_decode(output_ids,
-                                             skip_special_tokens=True)
-        decoder_input_lengths = (decoder_input_ids !=
-                                 tokenizer.pad_token_id).sum(dim=1)
-        output_gen_lengths = (output_ids != tokenizer.eos_token_id).sum(
-            dim=1) - decoder_input_lengths
-        print("--------------------------------------")
-        print("TRT-LLM output_ids: ", output_ids)
-        print("TRT-LLM output text: ", output_text)
-        print("TRT-LLM output generated lengths: ", output_gen_lengths)
-        print(f"TRT-LLM E2E time {(tok-tik)*1000}ms")
-        print("Precision:", inference_dtype)
-        print("--------------------------------------")
-
+        if args.model_name == 't5-small':
+            output_text = tokenizer.batch_decode(output_ids,
+                                                skip_special_tokens=True)
+            decoder_input_lengths = (decoder_input_ids !=
+                                    tokenizer.pad_token_id).sum(dim=1)
+            output_gen_lengths = (output_ids != tokenizer.eos_token_id).sum(
+                dim=1) - decoder_input_lengths
+        
+            print("--------------------------------------")
+            print("TRT-LLM output_ids: ", output_ids)
+            print("TRT-LLM output text: ", output_text)
+            print("TRT-LLM output generated lengths: ", output_gen_lengths)
+            print(f"TRT-LLM E2E time {(tok-tik)*1000}ms")
+            print("Precision:", inference_dtype)
+            print("--------------------------------------")
+        
+        elif args.model_name == "wmt":
+            print(output_ids)
+        else:
+            print("not recognized model name")
         # simple accuracy check
         if args.compare_hf_fp32:
             from difflib import SequenceMatcher

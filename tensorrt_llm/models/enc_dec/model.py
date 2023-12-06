@@ -116,7 +116,7 @@ class EncDecEmbedding(Module):
             x = self.embedding_layernorm(x)
 
         # output intermediate layer results. 
-        self.register_network_output('embed_layer_output', x)
+        # self.register_network_output('embed_layer_output', x)
         return x
 
 
@@ -553,7 +553,7 @@ class EncoderModel(Module, GenerationMixin):
                 max_input_length=max_input_length)
 
         if self.mapping.is_last_pp_rank():
-            if self.has_final_layernorm:
+            if self.has_model_final_layernorm:
                 hidden_states = self.final_layernorm(hidden_states)
             hidden_states.mark_output('encoder_output', self._dtype)
         else:
@@ -888,7 +888,8 @@ class DecoderModel(Module, GenerationMixin):
                 hidden_states = hidden_states[0]
 
         if self.mapping.is_last_pp_rank():
-            if self.final_layernorm:
+            #
+            if self.has_model_final_layernorm:
                 hidden_states = self.final_layernorm(hidden_states)
 
             # [bs, seq, hidden_size] or [1, num_tokens, hidden_size] -> [bs, hidden_size]

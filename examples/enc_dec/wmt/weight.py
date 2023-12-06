@@ -5,6 +5,10 @@ import numpy
 fairseq_wmt_ckpt_path = "/data/wmt"
 fairseq_wmt_ckpt = "model.pt"
 
+def create_position_id(input_ids, position_id_offset=2):
+    position_ids = [list(range(position_id_offset, len(input_id) + position_id_offset)) for input_id in input_ids]
+    return torch.tensor(position_ids).type(torch.IntTensor)
+
 def generate_position_embedding(num_embeddings: int, embedding_dim: int):
     '''
     https://github.com/facebookresearch/fairseq/blob/main/fairseq/modules/sinusoidal_positional_embedding.py
