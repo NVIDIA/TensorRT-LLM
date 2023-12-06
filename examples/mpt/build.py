@@ -20,6 +20,7 @@ from typing import List
 
 import torch
 import torch.multiprocessing as mp
+import transformers
 
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_trt
@@ -32,9 +33,9 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 
-from weight import get_scaling_factors, load_from_ft, parse_ft_config, check_embedding_share  # isort:skip
+from weight import get_scaling_factors, load_from_hf, parse_hf_config, check_embedding_share  # isort:skip
 
-MODEL_NAME = "gpt"
+MODEL_NAME = "mpt"
 
 
 def get_engine_name(model, dtype, tp_size, rank):
@@ -308,9 +309,9 @@ def parse_arguments(args):
 
     if args.model_dir is not None:
         logger.info(f"Setting model configuration from {args.model_dir}.")
-
-        n_embd, n_head, n_layer, n_positions, vocab_size, _, hidden_act, rotary_pct, bias, inter_size, n_kv_head, dtype, prompt_num_tasks, prompt_max_vocab_size, position_embedding_type = parse_ft_config(
-            Path(args.model_dir) / "config.ini")
+        hf_config = transformers.AutoConfig.from_pretrained(args.model_dir, trust_remote_code=True)
+        n_embd, n_head, n_layer, n_positions, vocab_size, _, hidden_act, rotary_pct, bias, inter_size, n_kv_head, dtype, prompt_num_tasks, prompt_max_vocab_size, position_embedding_type = parse_hf_config(
+            hf_config)
         args.n_embd = n_embd
         args.n_head = n_head
         args.n_layer = n_layer
@@ -319,7 +320,7 @@ def parse_arguments(args):
         args.hidden_act = hidden_act
         args.rotary_pct = rotary_pct
         args.bias = bias
-        args.dtype = dtype
+        # args.dtype = dtype
         args.inter_size = inter_size
         args.n_kv_head = n_kv_head
         args.position_embedding_type = position_embedding_type
@@ -456,7 +457,7 @@ def build_rank_engine(builder: Builder,
                                       **quantize_kwargs)
 
     if args.model_dir is not None:
-        load_from_ft(tensorrt_llm_gpt, args.model_dir, rank, args.world_size,
+        load_from_hf(tensorrt_llm_gpt, args.model_dir, rank, args.world_size,
                      args.dtype, args.use_parallel_embedding,
                      args.embedding_sharding_dim, share_embedding_table)
 

@@ -5,9 +5,10 @@ from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
+import transformers
 
 import tensorrt_llm
-from tensorrt_llm._utils import pad_vocab_size, str_dtype_to_np
+from tensorrt_llm._utils import pad_vocab_size, str_dtype_to_np, str_dtype_to_torch, torch_to_numpy
 from tensorrt_llm.functional import is_gated_activation
 from tensorrt_llm.models import GPTLMHeadModel
 from tensorrt_llm.models.quantized.quant import get_dummy_quant_scales
@@ -118,7 +119,7 @@ def split(v, tp_size, idx, dim=0):
         return v
     if len(v.shape) == 1:
         return np.ascontiguousarray(np.split(v, tp_size)[idx].copy())
-    elif len(v.shape) == 2:
+    elif len(v.shape) >= 2:
         return np.ascontiguousarray(np.split(v, tp_size, axis=dim)[idx].copy())
     return None
 
@@ -161,6 +162,28 @@ def parse_ft_config(ini_file):
                                         fallback='alibi')
     return n_embd, n_head, n_layer, n_positions, vocab_size, do_layer_norm_before, hidden_act, rotary_pct, bias, inter_size, n_kv_head, dtype, prompt_num_tasks, prompt_max_vocab_size, pos_embedding_type
 
+def parse_hf_config(hf_config):
+    # hf_config = transformers.AutoConfig.from_pretrained(ini_file, trust_remote_code=True)
+    print(hf_config)
+    n_embd = hf_config.d_model
+    n_head = hf_config.n_heads
+    n_layer = hf_config.n_layers
+    n_positions = hf_config.max_seq_len
+    vocab_size = hf_config.vocab_size
+    do_layer_norm_before = True
+    hidden_act = 'gelu'
+    rotary_pct = 0.0
+    bias = not hf_config.no_bias
+    inter_size = int(hf_config.expansion_ratio * hf_config.d_model)
+    if "kv_n_heads" in hf_config.attn_config:
+        n_kv_head = hf_config.attn_config["kv_n_heads"]
+    else:
+        n_kv_head = n_head
+    dtype = hf_config.torch_dtype
+    prompt_num_tasks = 0
+    prompt_max_vocab_size = 0
+    pos_embedding_type = 'alibi'
+    return n_embd, n_head, n_layer, n_positions, vocab_size, do_layer_norm_before, hidden_act, rotary_pct, bias, inter_size, n_kv_head, dtype, prompt_num_tasks, prompt_max_vocab_size, pos_embedding_type
 
 def check_embedding_share(dir_path):
     share_embedding_table = False
@@ -478,3 +501,171 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     tensorrt_llm.logger.info(f'Weights loaded. Total time: {t}')
+
+def load_from_hf(tensorrt_llm_gpt: GPTLMHeadModel,
+                 model_dir,
+                 tp_rank=0,
+                 tp_size=1,
+                 dtype='float32',
+                 use_parallel_embedding=False,
+                 sharding_dim=0,
+                 share_embedding_table=False):
+    tensorrt_llm.logger.info('Loading weights from HF...')
+    
+    # do conversion on cpu
+    torch_device = 'cpu'
+
+    torch_data_type = str_dtype_to_torch(dtype)
+    hf_config = transformers.AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+    hf_config.init_device = 'cuda'
+    model = transformers.AutoModelForCausalLM.from_pretrained(
+        model_dir, trust_remote_code=True,
+        torch_dtype=torch_data_type, config=hf_config) #.to(torch_device)
+
+    # hf_config = vars(model.config)
+    # print(hf_config)
+    
+    n_embd, n_head, n_layer, n_positions, vocab_size, do_layer_norm_before, hidden_act, rotary_pct, bias, inter_size, n_kv_head, _, prompt_num_tasks, prompt_max_vocab_size, pos_embedding_type = parse_hf_config(hf_config)
+    mha_mode = (n_kv_head == n_head)
+    np_dtype = str_dtype_to_np(dtype)
+    
+    # Determine the quantization mode.
+    quant_mode = getattr(tensorrt_llm_gpt, "quant_mode", QuantMode(0))
+    
+    if quant_mode.is_int8_weight_only():
+        plugin_weight_only_quant_type = torch.int8
+    elif quant_mode.is_int4_weight_only():
+        plugin_weight_only_quant_type = torch.quint4x2
+        
+    # Do we use SmoothQuant?
+    use_smooth_quant = quant_mode.has_act_and_weight_quant()
+    # Do we use quantization per token?
+    quant_per_token_dyn = quant_mode.has_per_token_dynamic_scaling()
+    # Do we use quantization per channel?
+    quant_per_channel = quant_mode.has_per_channel_scaling()
+
+    # Do we use INT4/INT8 weight-only?
+    use_weight_only = quant_mode.is_weight_only()
+
+    # Int8 KV cache
+    use_int8_kv_cache = quant_mode.has_int8_kv_cache()
+
+    # Debug
+    suffix = gen_suffix(tp_rank, use_smooth_quant, quant_per_channel)
+    # The type of weights.
+    w_type = np_dtype if not use_smooth_quant else np.int8
+
+    model_params = dict(model.named_parameters())
+    
+    tik = time.time()
+    for k, v in model_params.items():
+        print(k, v.shape)
+        if isinstance(v, list):
+            v = [torch_to_numpy(vv.to(torch_data_type).detach().cpu()) for vv in v]
+        else:
+            v = torch_to_numpy(v.to(torch_data_type).detach().cpu())
+        if 'wte.weight' in k:
+            if use_parallel_embedding:
+                v = split(v, tp_size, tp_rank,
+                          tensorrt_llm_gpt.embedding_sharding_dim)
+            tensorrt_llm_gpt.embedding.vocab_embedding.weight.value = np.ascontiguousarray(v)
+            tensorrt_llm_gpt.lm_head.weight.value = np.ascontiguousarray(split(v, tp_size, tp_rank,
+                          dim=0))
+        elif 'norm_f.weight' in k:
+            tensorrt_llm_gpt.ln_f.weight.value = np.ascontiguousarray(v)
+            dst = tensorrt_llm_gpt.ln_f.bias
+            dst.value = np.ascontiguousarray(np.zeros(v.shape[-1], dtype=np_dtype))
+        elif 'lm_head.weight' in k:
+            # share input embedding
+            tensorrt_llm_gpt.lm_head.weight.value = np.ascontiguousarray(split(v, tp_size, tp_rank))
+                    
+        else:
+            layer_idx = extract_layer_idx(k)
+            if layer_idx is None:
+                continue
+            idx = int(layer_idx)
+            if idx >= tensorrt_llm_gpt._num_layers:
+                continue
+            if 'norm_1.weight' in k:
+                tensorrt_llm_gpt.layers[idx].input_layernorm.weight.value = v
+                dst = tensorrt_llm_gpt.layers[idx].input_layernorm.bias
+                dst.value = np.ascontiguousarray(np.zeros(v.shape[-1], dtype=np_dtype))
+            elif 'norm_2.weight' in k:
+                dst = tensorrt_llm_gpt.layers[idx].post_layernorm.weight
+                dst.value = v
+                dst = tensorrt_llm_gpt.layers[idx].post_layernorm.bias
+                dst.value = np.ascontiguousarray(np.zeros(v.shape[-1], dtype=np_dtype))
+            elif 'attn.Wqkv.weight' in k:
+                dst = tensorrt_llm_gpt.layers[idx].attention.qkv.weight
+                if not mha_mode:
+                    head_dim = n_embd // n_head
+                    v = np.split(v, [n_embd, n_embd + (n_kv_head * head_dim)])
+                    assert isinstance(v, list) and len(v) == 3
+                    wq = split(v[0], tp_size, tp_rank)
+                    wk = split(v[1], tp_size, tp_rank)
+                    wv = split(v[2], tp_size, tp_rank)
+                    split_v = np.ascontiguousarray(np.concatenate((wq, wk, wv)))
+                else:
+                    q_emb = v.shape[0] // 3
+                    model_emb = v.shape[1]
+                    v = v.reshape(3, q_emb, model_emb)
+                    split_v = split(v, tp_size, tp_rank, dim=1)
+                    print(tp_rank, v.shape, split_v)
+                    split_v = split_v.reshape(3 * (q_emb // tp_size),
+                                              model_emb)
+                if use_weight_only:
+                    v = np.ascontiguousarray(split_v.transpose())
+                    processed_torch_weights, torch_weight_scales = \
+                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.tensor(v), plugin_weight_only_quant_type)
+                    # workaround for trt not supporting int8 inputs in plugins currently
+                    dst.value = processed_torch_weights.view(
+                        dtype=torch.float32).numpy()
+                    scales = tensorrt_llm_gpt.layers[
+                        idx].attention.qkv.per_channel_scale
+                    scales.value = torch_weight_scales.numpy()
+                else:
+                    dst.value = np.ascontiguousarray(split_v)
+            elif 'attn.out_proj.weight' in k:
+                dst = tensorrt_llm_gpt.layers[idx].attention.dense.weight
+                split_v = split(v, tp_size, tp_rank, dim=1)
+                if use_weight_only:
+                    v = np.ascontiguousarray(split_v.transpose())
+                    processed_torch_weights, torch_weight_scales = \
+                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.tensor(v), plugin_weight_only_quant_type)
+                    # workaround for trt not supporting int8 inputs in plugins currently
+                    dst.value = processed_torch_weights.view(
+                        dtype=torch.float32).numpy()
+                    scales = tensorrt_llm_gpt.layers[
+                        idx].attention.dense.per_channel_scale
+                    scales.value = torch_weight_scales.numpy()
+                else:
+                    dst.value = np.ascontiguousarray(split_v)
+            elif 'ffn.up_proj.weight' in k:
+                dst = tensorrt_llm_gpt.layers[idx].mlp.fc.weight
+                split_v = split(v, tp_size, tp_rank, dim=0)
+                dst.value = np.ascontiguousarray(split_v)
+            elif 'ffn.down_proj.weight' in k:
+                dst = tensorrt_llm_gpt.layers[idx].mlp.proj.weight
+                split_v = split(v, tp_size, tp_rank, dim=1)
+                dst.value = np.ascontiguousarray(split_v)
+            elif 'ffn.router.layer.weight' in k:
+                dst = tensorrt_llm_gpt.layers[idx].moe.router.fc.weight
+                split_v = split(v, tp_size, tp_rank, dim=0)
+                dst.value = np.ascontiguousarray(split_v)
+            elif 'ffn.mlp.w1' in k:
+                dst = tensorrt_llm_gpt.layers[idx].moe.w1
+                split_v = split(v, tp_size, tp_rank, dim=0)
+                dst.value = np.ascontiguousarray(split_v)
+
+            elif 'ffn.mlp.w2' in k:
+                dst = tensorrt_llm_gpt.layers[idx].moe.w2
+                split_v = split(v, tp_size, tp_rank, dim=0)
+                dst.value = np.ascontiguousarray(split_v)
+
+
+    tok = time.time()
+    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
+    tensorrt_llm.logger.info(f'Weights loaded. Total time: {t}')
+    return
