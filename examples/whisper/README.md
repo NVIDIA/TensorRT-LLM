@@ -53,7 +53,7 @@ python3 build.py --weight_dir models \
 # Example 1: inference w/ single GPU, FP32, greedy search, compare results with HuggingFace FP32
 python3 run.py --engine_dir trt_engines/whisper-tiny-en/float32/ --engine_name whisper-tiny.en --model_name openai/whisper-tiny.en --max_new_token=64 --num_beams=1 --compare_hf_fp32
 
-# Example 1: inference w/ single GPU, FP32, greedy search, compare results with HuggingFace FP16
+# Example 1: inference w/ single GPU, FP16, greedy search, compare results with HuggingFace FP32
 python3 run.py --engine_dir trt_engines/whisper-tiny-en/float16/ --engine_name whisper-tiny.en --model_name openai/whisper-tiny.en --max_new_token=64 --num_beams=1 --compare_hf_fp32
 ```
 
