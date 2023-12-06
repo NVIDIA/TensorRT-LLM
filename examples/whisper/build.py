@@ -246,7 +246,6 @@ def parse_arguments(args, component):
 
     if args.dtype == 'bfloat16':
         assert args.use_gemm_plugin, "Please use gemm plugin when dtype is bfloat16"
-    print(args)
     return args
 
 
@@ -273,11 +272,31 @@ def build_rank_engine(builder: Builder,
     # Initialize Module
     if args.component == 'encoder':
         tllm_model = AudioEncoder(
-            args.hidden_size,
-            args.n_layer,
-            args.n_ctx,
-            args.n_head,
-            dtype=dtype)
+            num_layers=args.n_layer,
+            num_heads=args.n_head,
+            hidden_size=args.hidden_size,
+            dtype=dtype,
+            head_size=args.head_size,
+            max_position_embeddings=args.n_positions,
+            relative_attention=False,
+            max_distance=0,
+            num_buckets=0,
+            has_embedding_layernorm=args.has_embedding_layernorm,
+            has_embedding_scale=args.has_embedding_scale,
+            q_scaling=args.q_scaling,
+            has_attention_qkvo_bias=args.has_attention_qkvo_bias,
+            has_mlp_bias=args.has_mlp_bias,
+            has_model_final_layernorm=args.has_model_final_layernorm,
+            layernorm_eps=args.layernorm_eps,
+            layernorm_position=args.layernorm_position,
+            layernorm_type=args.layernorm_type,
+            hidden_act=args.hidden_act,
+            mlp_type=args.mlp_type,
+            use_parallel_embedding=args.use_parallel_embedding,
+            embedding_sharding_dim=args.embedding_sharding_dim,
+            mapping=mapping,
+            n_mels=args.n_mels
+            )
     elif args.component == 'decoder':
         tllm_model = tensorrt_llm.models.DecoderModel(
             num_layers=args.n_layer,
@@ -371,7 +390,6 @@ def build_rank_engine(builder: Builder,
 
     # Network -> Engine
     engine = builder.build_engine(network, builder_config)
-    print(engine)
     if rank == 0:
         config_path = args.output_dir / args.component / 'config.json'
         builder.save_config(builder_config, config_path)

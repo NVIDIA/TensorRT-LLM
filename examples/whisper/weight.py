@@ -20,6 +20,7 @@ def parse_config(ini_file, component, args):
         args.hidden_size = config.getint(component, 'd_model')
         args.n_ctx = config.getint(component, 'max_source_positions')
         args.ffn_hidden_size = config.getint(component, 'encoder_ffn_dim')
+        args.n_mels = config.getint(component, 'num_mel_bins')
         args.vocab_size = config.getint(component, 'vocab_size')
         args.n_positions = config.getint(component, 'max_source_positions')
         args.has_position_embedding = config.getboolean(
@@ -35,6 +36,8 @@ def parse_config(ini_file, component, args):
         args.has_attention_qkvo_bias = True
         args.has_mlp_bias = True
         args.has_model_final_layernorm = True
+        args.mlp_type = 'MLP'
+        args.gated_act = False
         args.layernorm_eps = config.getfloat(component,
                                              'layernorm_eps',
                                              fallback=1e-5)
@@ -130,44 +133,45 @@ def load_whisper_from_pytorch(tllm_model,
             layer.attention.dense.weight.value = pytorch_model[
                 f'{layer_prefix}self_attn.out_proj.weight']
 
-            # if tllm_model.has_attention_qkvo_bias:
-            layer.attention.qkv.bias.value = fuse_qkv(
-                pytorch_model[f'{layer_prefix}self_attn.q_proj.bias'],
-                np.zeros(pytorch_model[f'{layer_prefix}self_attn.q_proj.bias'].shape, dtype=dtype), # no bias for k
-                pytorch_model[f'{layer_prefix}self_attn.v_proj.bias']
-            )
-            layer.attention.dense.bias.value = pytorch_model[
-                f'{layer_prefix}self_attn.out_proj.bias']
+            if tllm_model.has_attention_qkvo_bias:
+                layer.attention.qkv.bias.value = fuse_qkv(
+                    pytorch_model[f'{layer_prefix}self_attn.q_proj.bias'],
+                    np.zeros(pytorch_model[f'{layer_prefix}self_attn.q_proj.bias'].shape, dtype=dtype), # no bias for k
+                    pytorch_model[f'{layer_prefix}self_attn.v_proj.bias']
+                )
+                layer.attention.dense.bias.value = pytorch_model[
+                    f'{layer_prefix}self_attn.out_proj.bias']
 
             layer.attention_layernorm.weight.value = pytorch_model[
                 f'{layer_prefix}self_attn_layer_norm.weight']
-            # if tllm_model.layernorm_type != LayerNormType.RmsNorm:
-            layer.attention_layernorm.bias.value = pytorch_model[
-                f'{layer_prefix}self_attn_layer_norm.bias']
+            
+            if tllm_model.layernorm_type != LayerNormType.RmsNorm:
+                layer.attention_layernorm.bias.value = pytorch_model[
+                    f'{layer_prefix}self_attn_layer_norm.bias']
 
             layer.mlp.fc.weight.value = pytorch_model[
                 f'{layer_prefix}fc1.weight']
             layer.mlp.proj.weight.value = pytorch_model[
                 f'{layer_prefix}fc2.weight']
 
-            # if tllm_model.has_mlp_bias:
-            layer.mlp.fc.bias.value = pytorch_model[
-                f'{layer_prefix}fc1.bias']
-            layer.mlp.proj.bias.value = pytorch_model[
-                f'{layer_prefix}fc2.bias']
+            if tllm_model.has_mlp_bias:
+                layer.mlp.fc.bias.value = pytorch_model[
+                    f'{layer_prefix}fc1.bias']
+                layer.mlp.proj.bias.value = pytorch_model[
+                    f'{layer_prefix}fc2.bias']
 
             layer.mlp_layernorm.weight.value = pytorch_model[
                 f'{layer_prefix}final_layer_norm.weight']
-            # if tllm_model.layernorm_type != LayerNormType.RmsNorm:
-            layer.mlp_layernorm.bias.value = pytorch_model[
-                f'{layer_prefix}final_layer_norm.bias']
+            if tllm_model.layernorm_type != LayerNormType.RmsNorm:
+                layer.mlp_layernorm.bias.value = pytorch_model[
+                    f'{layer_prefix}final_layer_norm.bias']
 
-        # if tllm_model.final_layernorm:
-        tllm_model.ln_post.weight.value = pytorch_model[
-            'model.encoder.layer_norm.weight']
-        # if tllm_model.layernorm_type != LayerNormType.RmsNorm:
-        tllm_model.ln_post.bias.value = pytorch_model[
-            'model.encoder.layer_norm.bias']
+        if tllm_model.final_layernorm:
+            tllm_model.final_layernorm.weight.value = pytorch_model[
+                'model.encoder.layer_norm.weight']
+        if tllm_model.layernorm_type != LayerNormType.RmsNorm:
+            tllm_model.final_layernorm.bias.value = pytorch_model[
+                'model.encoder.layer_norm.bias']
 
     if component == "decoder":
         tllm_model.embedding.vocab_embedding.weight.value = pytorch_model[

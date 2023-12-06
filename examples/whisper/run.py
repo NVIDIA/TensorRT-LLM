@@ -7,7 +7,9 @@ from pathlib import Path
 import torch
 import tensorrt as trt
 # isort: on
-from transformers import AutoConfig, AutoTokenizer, WhisperForConditionalGeneration
+from transformers import (AutoConfig, AutoTokenizer, \
+                          WhisperForConditionalGeneration, \
+                          WhisperProcessor)
 
 import tensorrt_llm
 from tensorrt_llm import logger
@@ -16,7 +18,8 @@ from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 
 from build import get_engine_name  # isort:skip
 
-import whisper
+# import whisper
+from datasets import load_dataset
 
 
 def print_tensor(tensor_name, tensor, num_elements=10):
@@ -138,20 +141,18 @@ class TRTLLMEncDecModel:
                                                    pp_size=pp_size,
                                                    gpus_per_node=gpus_per_node)
 
-            # load engine
-            print(engine_name, dtype, tp_size, pp_size, runtime_rank)
-        
+            # load engine        
             engine_fname = get_engine_name(engine_name, dtype, tp_size, pp_size, runtime_rank)
             with open(engine_dir / component / engine_fname, "rb") as f:
                 engine_buffer = f.read()
 
-            return model_config, runtime_mapping, engine_buffer
+            return model_config, runtime_mapping, engine_buffer, dtype
 
         # Note: encoder and decoder doesn't necessarily have the same TP & PP config
-        self.encoder_model_config, self.encoder_runtime_mapping, encoder_engine_buffer = engine_setup(
+        self.encoder_model_config, self.encoder_runtime_mapping, encoder_engine_buffer, self.dtype = engine_setup(
             component='encoder')
 
-        self.decoder_model_config, self.decoder_runtime_mapping, decoder_engine_buffer = engine_setup(
+        self.decoder_model_config, self.decoder_runtime_mapping, decoder_engine_buffer, _ = engine_setup(
             component='decoder')
 
         # for Pipeline Parallelism in encoder
@@ -311,6 +312,7 @@ class TRTLLMEncDecModel:
 
         ## encoder run
         logger.info(f"Rank {self.runtime_rank} Running encoder engine ...")
+        
         encoder_output = self.encoder_run(input_features, debug_mode=debug_mode)
 
         ## decoder run
@@ -318,7 +320,7 @@ class TRTLLMEncDecModel:
         decoder_input_ids, decoder_input_lengths, decoder_max_input_length = self.process_input(
             decoder_input_ids, self.decoder_model_config.remove_input_padding,
             pad_token_id)
-
+                
         # generation config
         sampling_config = SamplingConfig(end_id=eos_token_id,
                                          pad_id=pad_token_id,
@@ -345,7 +347,7 @@ class TRTLLMEncDecModel:
         )
         torch.cuda.synchronize()
 
-        return encoder_output, output_ids
+        return output_ids
         # return encoder_output
 
 
@@ -356,17 +358,26 @@ if __name__ == "__main__":
     args = parse_arguments()
     logger.set_level(args.log_level)
 
-    
+    # TRT-LLM runtime
+    tllm_model = TRTLLMEncDecModel.from_engine(args.engine_name,
+                                               args.engine_dir,
+                                               debug_mode=args.debug_mode)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    processor = WhisperProcessor.from_pretrained(args.model_name)
 
     max_new_tokens = args.max_new_tokens
-    # encoder_input = torch.ones(1,80,3000, 1).float().cuda()
-    audio = whisper.load_audio("0.wav")
-    audio = whisper.pad_or_trim(audio)
+    
+    ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
+    sample = ds[0]["audio"]
+    input_features = processor(
+        sample["array"],
+        sampling_rate=sample["sampling_rate"],
+        return_tensors="pt"
+    ).input_features.cuda()
 
-    # make log-Mel spectrogram and move to the same device as the model
-    input_features = whisper.log_mel_spectrogram(audio).cuda().unsqueeze(dim=0).half()
+    if tllm_model.dtype == 'float16':
+        input_features = input_features.half()
 
     if tensorrt_llm.mpi_rank() == 0:
         print("--------------------------------------")
@@ -376,38 +387,26 @@ if __name__ == "__main__":
     model_config = AutoConfig.from_pretrained(args.model_name)
 
     # start_id for decoder (could add more input_ids as forced_decoder_ids)
-    decoder_input_ids = torch.IntTensor([[
-        # model_config.forced_decoder_ids[0][0],
-        # model_config.forced_decoder_ids[0][1],
-        model_config.decoder_start_token_id]]).to('cuda')
+    decoder_input_ids = torch.IntTensor([[model_config.decoder_start_token_id]]).to('cuda')
 
     # decoder_input_ids = decoder_input_ids.repeat((input_ids.shape[0], 1))
 
     # simple comparison with HF on FP32
     if args.compare_hf_fp32:
         if tensorrt_llm.mpi_rank() == 0:
-            if "t5" in args.model_name:
+            if "whisper" in args.model_name:
                 hf_model = WhisperForConditionalGeneration.from_pretrained(
                     args.model_name).to('cuda')
             else:
                 pass
-
-            tik = time.time()
-            hf_output_ids = hf_model.generate(
-                input_ids=input_ids,
-                decoder_input_ids=decoder_input_ids,
-                max_new_tokens=max_new_tokens,
-                num_beams=args.num_beams,
-                bos_token_id=tokenizer.bos_token_id,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                use_cache=True)
-            torch.cuda.synchronize()
-            tok = time.time()
+            for i in range(10):
+                tik = time.time()
+                hf_output_ids = hf_model.generate(input_features=input_features.float())
+                torch.cuda.synchronize()
+                tok = time.time()
 
             output_ids = hf_output_ids.squeeze(dim=1)
-            hf_output_text = tokenizer.batch_decode(output_ids,
-                                                    skip_special_tokens=True)
+            hf_output_text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
             decoder_input_lengths = (decoder_input_ids !=
                                      tokenizer.pad_token_id).sum(dim=1)
             output_gen_lengths = (output_ids != tokenizer.eos_token_id).sum(
@@ -419,13 +418,9 @@ if __name__ == "__main__":
             print(f"HF E2E time {(tok-tik)*1000}ms")
             print("--------------------------------------")
 
-    # TRT-LLM runtime
-    tllm_model = TRTLLMEncDecModel.from_engine(args.engine_name,
-                                               args.engine_dir,
-                                               debug_mode=args.debug_mode)
     for i in range(10):
         tik = time.time()
-        encoder_output, tllm_output_ids = tllm_model.generate(
+        tllm_output_ids = tllm_model.generate(
             input_features=input_features,
             decoder_input_ids=decoder_input_ids,
             max_new_tokens=max_new_tokens,
@@ -436,9 +431,8 @@ if __name__ == "__main__":
             debug_mode=args.debug_mode,
         )
         output_ids = tllm_output_ids[:, 0, :]
-        output_text = tokenizer.batch_decode(output_ids)
+        output_text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
         tok = time.time()
-        print(tok - tik)
 
     inference_dtype = tllm_model.encoder_model_config.dtype
 
@@ -454,13 +448,6 @@ if __name__ == "__main__":
         print("TRT-LLM output generated lengths: ", output_gen_lengths)
         print(f"TRT-LLM E2E time {(tok-tik)*1000}ms")
         print("Precision:", inference_dtype)
-        print("--------------------------------------")
-
-
-        # only encoder test
-        print("--------------------------------------")
-        # print(encoder_output['encoder_output'].shape)
-        print(encoder_output[0,0,-5:])
         print("--------------------------------------")
 
         # simple accuracy check
