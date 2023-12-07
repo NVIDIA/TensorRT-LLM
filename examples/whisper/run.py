@@ -337,7 +337,7 @@ class TRTLLMEncDecModel:
             encoder_max_input_length=1500)
         torch.cuda.synchronize()
 
-        encoder_input_lengths = torch.IntTensor([1500]).to('cuda:0')
+        encoder_input_lengths = torch.IntTensor([1500]*input_features.shape[0]).to('cuda:0')
         output_ids = self.decoder_session.decode(
             decoder_input_ids,
             decoder_input_lengths,
@@ -348,7 +348,6 @@ class TRTLLMEncDecModel:
         torch.cuda.synchronize()
 
         return output_ids
-        # return encoder_output
 
 
 if __name__ == "__main__":
@@ -389,7 +388,7 @@ if __name__ == "__main__":
     # start_id for decoder (could add more input_ids as forced_decoder_ids)
     decoder_input_ids = torch.IntTensor([[model_config.decoder_start_token_id]]).to('cuda')
 
-    # decoder_input_ids = decoder_input_ids.repeat((input_ids.shape[0], 1))
+    decoder_input_ids = decoder_input_ids.repeat((input_features.shape[0], 1))
 
     # simple comparison with HF on FP32
     if args.compare_hf_fp32:

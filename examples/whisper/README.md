@@ -35,7 +35,8 @@ python3 build.py --weight_dir models \
                  --use_gpt_attention_plugin \
                  --dtype float32 \
                  --max_beam_width 1 \
-                 --engine_name whisper-tiny.en
+                 --engine_name whisper-tiny.en \
+                 --max_batch_size 1
 
 # Example 1: build whisper-tiny using a single GPU, FP16, running gready search
 python3 build.py --weight_dir models \
@@ -44,7 +45,8 @@ python3 build.py --weight_dir models \
                  --use_gpt_attention_plugin \
                  --dtype float16 \
                  --max_beam_width 1 \
-                 --engine_name whisper-tiny.en
+                 --engine_name whisper-tiny.en \
+                 --max_batch_size 1
 ```
 
 

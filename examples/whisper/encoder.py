@@ -264,7 +264,7 @@ class AudioEncoder(Module, GenerationMixin):
         
         x = self.conv2(x)
         x = ACT2FN[self.hidden_act](x)
-        x = view(x, [1, self.hidden_size, self.n_ctx])
+        x = view(x, [x.shape[0], self.hidden_size, self.n_ctx])
 
         x = permute(x, [0, 2, 1])
 
@@ -288,13 +288,13 @@ class AudioEncoder(Module, GenerationMixin):
 
         @return: a list contains values which can be fed into the self.forward()
         """
-        # bs_range = [1, (max_batch_size + 1) // 2, max_batch_size]
+        bs_range = [1, (max_batch_size + 1) // 2, max_batch_size]
         input_features = Tensor(
             name="input_features",
             dtype=self._dtype,
-            shape=[1,self.n_mels,3000],
+            shape=[-1, self.n_mels, 3000],
             dim_range=OrderedDict([
-                ('batch_size', [1]), ('n_mels', [self.n_mels]), ('input_length', [3000])
+                ('batch_size', [bs_range]), ('n_mels', [self.n_mels]), ('input_length', [3000])
             ])
         )
 
