@@ -336,7 +336,7 @@ pip install nvidia_ammo-0.3.0-cp310-cp310-linux_x86_64.whl
 from tensorrt_llm.models.quantized.ammo import quantize_and_export
 ```
 - Then control + left mouse button, click the `quantize_and_export` function to view its internal implementation.
-- In the if judgment below, add the following question code to support Qwen
+- Find "model_lookup" , add the following question code to support Qwen
 ```bash
     ("qwen", ): "qwen",
 ```
