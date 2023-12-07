@@ -83,7 +83,7 @@ high throughput tasks.
 ## Low Latency
 
 The below tables provide reference data at batch size 1 for first token
-latency, representating end-user's percieved latency for online streaming
+latency, representating end-user's perceived latency for online streaming
 tasks.
 
 ### H100 GPUs (FP8)
