@@ -4,58 +4,53 @@ This document explains how to build the [MPT](https://huggingface.co/mosaicml/mp
 
 ## Overview
 Currently we use `tensorrt_llm.models.GPTLMHeadModel` to build TRT engine for MPT models.
-Support for float16, float32 and bfloat16 conversion. Just change `data_type` flags to any.
+Support for float16, float32 and bfloat16 conversion. Just change `dtype` flags to any.
 
 ## Support Matrix
   * FP16
-  * FP8
-  * INT8 & INT4 Weight-Only
-  * FP8 KV CACHE
   * Tensor Parallel
   * MHA, MQA & GQA
-  * STRONGLY TYPED
 
 #### MPT 7B
 
-### 1. Convert weights from HF Transformers to FT format
-
-The [`convert_hf_mpt_to_ft.py`](./convert_hf_mpt_to_ft.py) script allows you to convert weights from HF Transformers format to FT format.
-
-```bash
-python convert_hf_mpt_to_ft.py -i mosaicml/mpt-7b -o ./ft_ckpts/mpt-7b/fp16/ -t float16
-
-python convert_hf_mpt_to_ft.py -i mosaicml/mpt-7b -o ./ft_ckpts/mpt-7b/fp32/ --tensor_parallelism 4 -t float32
-```
-
-`--infer_gpu_num 4` is used to convert to FT format with 4-way tensor parallelism
-
-
-### 2. Build TensorRT engine(s)
+### 1. Build TensorRT engine(s) from HF
 
 Examples of build invocations:
 
 ```bash
-# Build a single-GPU float16 engine using FT weights.
-python3 build.py --model_dir=./ft_ckpts/mpt-7b/fp16/1-gpu \
-                 --max_batch_size 64 \
+# Build a single-GPU float16 engine using HF weights.
+# If you have your own model code and not the code from transformers library, then set trust_remote_code flag
+# set the data type for conversion using dtype flag
+python3 build.py --model_dir=/hf-model/mpt-7b \
+                 --max_batch_size 16 \
+                 --use_gpt_attention_plugin \
+                 --use_gemm_plugin \
+                 --dtype float16 \
+                 --output_dir ./trt_engines/mpt-7b/fp16/1-gpu \
+                 --trust_remote_code
+
+# If you want to use model code from transformers library, then remove trust_remote_code flag and just send mosaicml/mpt-<> in the model_dir as shown below
+python3 build.py --model_dir=mosaicml/mpt-7b \
+                 --max_batch_size 16 \
                  --use_gpt_attention_plugin \
                  --use_gemm_plugin \
                  --output_dir ./trt_engines/mpt-7b/fp16/1-gpu
 
 # Build 4-GPU MPT-7B float32 engines
-# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
+# Enable several TensorRT-LLM plugins (gpt attention and gemm) to increase runtime performance. It also helps with build time.
 python3 build.py --world_size=4 \
+                 --dtype float32 \
                  --parallel_build \
                  --max_batch_size 64 \
                  --max_input_len 512 \
                  --max_output_len 64 \
                  --use_gpt_attention_plugin \
                  --use_gemm_plugin \
-                 --model_dir ./ft_ckpts/mpt-7b/fp32/4-gpu \
+                 --model_dir /hf-model/mpt-7b \
                  --output_dir=./trt_engines/mpt-7b/fp32/4-gpu
 ```
 
-### 3. Run TRT engine to check if the build was correct
+### 2. Run TRT engine to check if the build was correct
 
 ```bash
 python ../run.py --max_output_len 10 \
@@ -73,36 +68,25 @@ mpirun -n 4 --allow-run-as-root \
 
 Same commands can be changed to convert MPT 30B to TRT LLM format. Below is an example to build MPT30B fp16 4-way tensor parallelized TRT engine
 
-### 1. Convert weights from HF Transformers to FT format
-
-The [`convert_hf_mpt_to_ft.py`](./convert_hf_mpt_to_ft.py) script allows you to convert weights from HF Transformers format to FT format.
-
-
-```bash
-python convert_hf_mpt_to_ft.py -i mosaicml/mpt-30b -o ./ft_ckpts/mpt-7b/fp16/ --tensor_parallelism 4 -t float16
-```
-
-`--infer_gpu_num 4` is used to convert to FT format with 4-way tensor parallelism
-
-
-### 2. Build TensorRT engine(s)
+### 1. Build TensorRT engine(s)
 
 Examples of build invocations:
 
 ```bash
 # Build 4-GPU MPT-30B float16 engines
 python3 build.py --world_size=4 \
+                 --dtype bfloat16 \
                  --parallel_build \
                  --max_batch_size 64 \
                  --max_input_len 512 \
                  --max_output_len 64 \
                  --use_gpt_attention_plugin \
                  --use_gemm_plugin \
-                 --model_dir ./ft_ckpts/mpt-30b/fp16/4-gpu \
+                 --model_dir mosaicml/mpt-30b \
                  --output_dir=./trt_engines/mpt-30b/fp16/4-gpu
 ```
 
-### 3. Run TRT engine to check if the build was correct
+### 2. Run TRT engine to check if the build was correct
 
 ```bash
 # Run 4-GPU MPT7B TRT engine on a sample input prompt
@@ -115,19 +99,7 @@ mpirun -n 4 --allow-run-as-root \
 #### Replit Code V-1.5 3B
 Same commands can be changed to convert [Replit Code V-1.5 3B](https://huggingface.co/replit/replit-code-v1_5-3b) to TRT LLM format. Below is an example to build Replit Code V-1.5 3B fp16 2-way tensor parallelized TRT engine.
 
-### 1. Convert weights from HF Transformers to FT format
-
-The [`convert_hf_mpt_to_ft.py`](./convert_hf_mpt_to_ft.py) script allows you to convert weights from HF Transformers format to FT format.
-
-
-```bash
-python convert_hf_mpt_to_ft.py -i ./replit-code-v1_5-3b -o ./ft_ckpts/replit-code-v1_5-3b/bf16/ --tensor_parallelism 2 -t bfloat16
-```
-
-`--infer_gpu_num 2` is used to convert to FT format with 2-way tensor parallelism
-
-
-### 2. Build TensorRT engine(s)
+### 1. Build TensorRT engine(s)
 
 Examples of build invocations:
 
@@ -140,7 +112,7 @@ python3 build.py --world_size=2 \
                  --max_output_len 64 \
                  --use_gpt_attention_plugin \
                  --use_gemm_plugin \
-                 --model_dir ./ft_ckpts/replit-code-v1_5-3b/bf16/2-gpu \
+                 --model_dir ./replit-code-v1_5-3b \
                  --output_dir=./trt_engines/replit-code-v1_5-3b/bf16/2-gpu
 ```
 Here is the partial output of above command.
@@ -183,30 +155,4 @@ Output: "(n):
         return fibonacci(n-1) + fibonacci(n-2)
 
 print(fibonacci(10))"
-```
-#### FP8 Post-Training Quantization
-
-The example below uses the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
-
-First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
-
-After successfully running the script, the output should be in .npz format, e.g. `quantized_fp8/llama_tp_1_rank0.npz`,
-where FP8 scaling factors are stored.
-
-```bash
-# Quantize MPT 7B into FP8 and export a single-rank checkpoint
-python examples/quantization/quantize.py --model_dir .mosaicml/mpt-7b \
-                                         --dtype float16 \
-                                         --qformat fp8 \
-                                         --export_path ./quantized_fp8
-
-# Build MPT 7B TP using binary checkpoint + PTQ scaling factors from the single-rank checkpoint
-python build.py --model_dir ft_ckpts/mpt-7b/fp16 \
-                --quantized_fp8_model_path ./quantized_fp8/mpt_tp1_rank0.npz \
-                --use_gpt_attention_plugin \
-                --use_gemm_plugin \
-                --output_dir trt_engines/mpt-7b/fp8/1-gpu/ \
-                --remove_input_padding \
-                --enable_fp8 \
-                --fp8_kv_cache
 ```

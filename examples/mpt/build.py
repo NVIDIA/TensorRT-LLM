@@ -33,7 +33,7 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 
-from weight import get_scaling_factors, load_from_hf, parse_hf_config, check_embedding_share  # isort:skip
+from weight import get_scaling_factors, load_from_hf, parse_hf_config  # isort:skip
 
 MODEL_NAME = "mpt"
 
@@ -300,6 +300,7 @@ def parse_arguments(args):
         type=str,
         default=None,
         help='Path of a quantized model checkpoint in .npz format')
+    
     args = parser.parse_args(args)
     logger.set_level(args.log_level)
 
@@ -310,7 +311,7 @@ def parse_arguments(args):
     if args.model_dir is not None:
         logger.info(f"Setting model configuration from {args.model_dir}.")
         hf_config = transformers.AutoConfig.from_pretrained(args.model_dir, trust_remote_code=True)
-        n_embd, n_head, n_layer, n_positions, vocab_size, _, hidden_act, rotary_pct, bias, inter_size, n_kv_head, dtype, prompt_num_tasks, prompt_max_vocab_size, position_embedding_type = parse_hf_config(
+        n_embd, n_head, n_layer, n_positions, vocab_size, do_layer_norm_before, hidden_act, rotary_pct, bias, inter_size, n_kv_head, dtype, prompt_num_tasks, prompt_max_vocab_size, position_embedding_type = parse_hf_config(
             hf_config)
         args.n_embd = n_embd
         args.n_head = n_head
@@ -404,18 +405,9 @@ def build_rank_engine(builder: Builder,
     # 2) For multiple-processes, use_parallel_embedding=True and embedding_sharding_dim == 0.
     # Besides, for TensorRT 9.0, we can observe the engine size reduction when the lookup and gemm plugin are enabled.
     share_embedding_table = False
-    if args.use_embedding_sharing:
-        if args.world_size > 1:
-            if args.model_dir is not None and args.embedding_sharding_dim == 0 and args.use_parallel_embedding:
-                share_embedding_table = check_embedding_share(args.model_dir)
-        else:
-            if args.model_dir is not None:
-                share_embedding_table = check_embedding_share(args.model_dir)
-
-        if not share_embedding_table:
-            logger.warning(f'Cannot share the embedding lookup table.')
-
-    if share_embedding_table:
+    if not share_embedding_table:
+        logger.warning(f'Cannot share the embedding lookup table.')
+    else:
         logger.info(
             'Engine will share embedding and language modeling weights.')
 
