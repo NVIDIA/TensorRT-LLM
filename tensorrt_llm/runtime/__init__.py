@@ -16,6 +16,10 @@ from .generation import SamplingConfig  # autoflake: skip
 from .generation import (ChatGLMGenerationSession, GenerationSession,
                          ModelConfig, QWenForCausalLMGenerationSession,
                          to_word_list_format)
+from .generation import (LogitsProcessorList, LogitsProcessor, 
+                         DebugLogitsProcessor, SelectTokensAtBeginLogitsProcessor, 
+                         StoppingCriteriaList, StoppingCriteria, 
+                         DebugStoppingCriteria, AccurateStopWordsCriteria)
 from .kv_cache_manager import GenerationSequence, KVCacheManager
 from .lora_manager import LoraManager  # autoflake: skip
 from .model_runner import ModelRunner
@@ -33,5 +37,13 @@ __all__ = [
     'ChatGLMGenerationSession',
     'QWenForCausalLMGenerationSession',
     'to_word_list_format',
+    'LogitsProcessorList',
+    'LogitsProcessor',
+    'DebugLogitsProcessor',
+    'SelectTokensAtBeginLogitsProcessor',
+    'StoppingCriteriaList',
+    'StoppingCriteria',
+    'DebugStoppingCriteria',
+    'AccurateStopWordsCriteria'
     'ModelRunner',
 ]

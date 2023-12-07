@@ -18,7 +18,7 @@ import csv
 import math
 from dataclasses import dataclass, field
 from functools import reduce, wraps
-from typing import Dict, Iterable, List, Optional, Sequence, Union
+from typing import Dict, Iterable, List, Set, Optional, Sequence, Union
 
 import numpy as np
 
@@ -313,6 +313,79 @@ class SamplingConfig:
             else:
                 unused_kwargs[key] = value
         return unused_kwargs
+
+
+class LogitsProcessor:
+    def __call__(self, step: int, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        raise NotImplementedError(
+            f"{self.__class__} is an abstract class. Only classes inheriting this class can be called."
+        )
+
+
+class LogitsProcessorList(list, LogitsProcessor):
+    def __call__(self, step: int, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        for processor in self:
+            scores = processor(step, input_ids, scores)
+        return scores
+
+
+class DebugLogitsProcessor(LogitsProcessor):
+    def __call__(self, step: int, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        logger.info("[DebugLogitsProcessor]\nstep: %d\ninput_ids:\n%s\nscores:\n%s" % (step, str(input_ids), str(scores)))
+        return scores
+
+
+class SelectTokensAtBeginLogitsProcessor(LogitsProcessor):
+    def __init__(self, begin_selected_tokens: List[Set[int]], context_lengths: torch.Tensor):
+        self.begin_selected_tokens = begin_selected_tokens
+        self.batch_size = len(begin_selected_tokens)
+        self.context_lengths = context_lengths
+        self.have_processed = False
+
+    def __call__(self, step: int, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        if self.have_processed:
+            return scores
+        beam_width = scores.size(0) // self.batch_size
+        all_tokens = set(range(scores.size(-1)))
+        for batch_idx in range(self.batch_size):
+            if self.begin_selected_tokens[batch_idx] is not None:
+                selected_tokens = self.begin_selected_tokens[batch_idx]
+                scores[beam_width * batch_idx: beam_width * (batch_idx + 1), 
+                        list(all_tokens - selected_tokens)] = -float("inf")
+        self.have_processed = True
+        return scores
+
+
+class StoppingCriteria:
+    def __call__(self, step: int, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        raise NotImplementedError("StoppingCriteria needs to be subclassed")
+
+
+class StoppingCriteriaList(list, StoppingCriteria):
+    def __call__(self, step: int, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        return any(criteria(step, input_ids, scores) for criteria in self)
+
+
+class DebugStoppingCriteria(StoppingCriteria):
+    def __call__(self, step: int, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        logger.info("[DebugStoppingCriteria]\nstep: %d\ninput_ids:\n%s\nscores:\n%s" % (step, str(input_ids), str(scores)))
+        return False
+
+
+class AccurateStopWordsCriteria(StoppingCriteria):
+    def __init__(self, prompts: List[str], stop_words_list: List[List[str]], decode_fn) -> None:
+        self.stop_words_list = stop_words_list
+        self.prompts = prompts
+        self.decode_fn = decode_fn
+
+    def __call__(self, step: int, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        beam_width = input_ids.size(0) // len(self.prompts)
+        stop_words_list = [self.stop_words_list[idx // beam_width] for idx in range(input_ids.size(0))]
+        prompts = [self.prompts[idx // beam_width] for idx in range(input_ids.size(0))]
+        return all(
+            any(stop_word in self.decode_fn(ids)[len(prompt): ] 
+                for stop_word in stop_words) 
+            for ids, prompt, stop_words in zip(input_ids, prompts, stop_words_list))
 
 
 class RuntimeTensor:
@@ -1646,7 +1719,8 @@ class GenerationSession(object):
             ite: int, sequence_limit_lengths: torch.Tensor,
             sequence_lengths: torch.Tensor, next_step_buffer: dict,
             stop_words_list, bad_words_list, no_repeat_ngram_size,
-            encoder_output: torch.Tensor, encoder_input_lengths: torch.Tensor):
+            encoder_output: torch.Tensor, encoder_input_lengths: torch.Tensor,
+            stopping_criteria: StoppingCriteria, logits_processor: LogitsProcessor):
         if step % 2:
             context = self.runtime.context_0
             this_src_cache_indirection = cache_indirections[1]
@@ -1848,6 +1922,13 @@ class GenerationSession(object):
                     fname = "".join(c for c in k if (c.isalnum() or c in "._-"))
                     np.savetxt(f"{fname}-step{step}.txt", t.cpu().detach())
             if logits is not None:
+                if logits_processor is not None:
+                    final_output_ids = self.finalize_decoder(
+                        context_lengths, batch_size, beam_width, scfg)
+                    # keep the shape as same as huggingface stopping_criteria
+                    final_output_ids_ = final_output_ids.reshape(-1, final_output_ids.size(-1))
+                    logits = logits_processor(step, final_output_ids_, logits)
+                    self.buffer['logits'] = logits
                 # [batch_size x beam_width, vocab_size_padded] -> [batch_size, beam_width, vocab_size_padded]
                 next_token_logits = logits.reshape(
                     (batch_size, beam_width, -1)).to(self.decoder_logits_dtype)
@@ -1868,6 +1949,12 @@ class GenerationSession(object):
                     self.beam_hyps_log_probs, self.beam_hyps_min_normed_scores,
                     self.beam_hyps_num_beams, self.beam_hyps_is_done,
                     scfg.use_beam_hyps)
+                if stopping_criteria is not None and not should_stop.item():
+                    final_output_ids = self.finalize_decoder(
+                        context_lengths, batch_size, beam_width, scfg)
+                    # keep the shape as same as huggingface stopping_criteria
+                    final_output_ids_ = final_output_ids.reshape(-1, final_output_ids.size(-1))
+                    should_stop[0] = stopping_criteria(step, final_output_ids_, logits)
 
         if self.mapping.has_pp():
             should_stop = self.pp_communicate_new_tokens(
@@ -1912,6 +1999,8 @@ class GenerationSession(object):
                        return_dict: bool = False,
                        encoder_output: torch.Tensor = None,
                        encoder_input_lengths: torch.Tensor = None,
+                       stopping_criteria: StoppingCriteria = None,
+                       logits_processor: LogitsProcessor = None,
                        **kwargs):
         kv_cache_block_pointers = []
         host_kv_cache_block_pointers = []
@@ -1952,7 +2041,7 @@ class GenerationSession(object):
                 host_context_lengths, attention_mask, prompt_vocab_size, ite,
                 sequence_limit_lengths, sequence_lengths, next_step_buffer,
                 stop_words_list, bad_words_list, no_repeat_ngram_size,
-                encoder_output, encoder_input_lengths)
+                encoder_output, encoder_input_lengths, stopping_criteria, logits_processor)
             if step == 0:
                 if benchmark_profiler is not None:
                     benchmark_profiler.record_cuda_event('first_token')
@@ -2026,6 +2115,8 @@ class GenerationSession(object):
                       return_dict: bool = False,
                       encoder_output: torch.Tensor = None,
                       encoder_input_lengths: torch.Tensor = None,
+                      stopping_criteria: StoppingCriteria = None,
+                      logits_processor: LogitsProcessor = None,
                       **kwargs):
         kv_cache_block_pointers = []
         host_kv_cache_block_pointers = []
@@ -2053,7 +2144,7 @@ class GenerationSession(object):
                 host_context_lengths, attention_mask, prompt_vocab_size, ite,
                 sequence_limit_lengths, sequence_lengths, next_step_buffer,
                 stop_words_list, bad_words_list, no_repeat_ngram_size,
-                encoder_output, encoder_input_lengths)
+                encoder_output, encoder_input_lengths, stopping_criteria, logits_processor)
             if step == 0:
                 context_logits = logits
             if should_stop is not None:
@@ -2115,6 +2206,8 @@ class GenerationSession(object):
                return_dict: bool = False,
                encoder_output: torch.Tensor = None,
                encoder_input_lengths: torch.Tensor = None,
+               stopping_criteria: StoppingCriteria = None,
+               logits_processor: LogitsProcessor = None,
                **kwargs):
         scfg = sampling_config
         batch_size = context_lengths.size(0)
@@ -2204,7 +2297,8 @@ class GenerationSession(object):
                 prompt_embedding_table, tasks, prompt_vocab_size, ite,
                 sequence_limit_lengths, stop_words_list, bad_words_list,
                 no_repeat_ngram_size, output_sequence_lengths, return_dict,
-                encoder_output, encoder_input_lengths, **kwargs)
+                encoder_output, encoder_input_lengths,
+                stopping_criteria, logits_processor, **kwargs)
         else:
             return self.decode_regular(
                 batch_size, scfg, sequence_lengths, context_lengths,
@@ -2213,7 +2307,8 @@ class GenerationSession(object):
                 prompt_embedding_table, tasks, prompt_vocab_size, ite,
                 sequence_limit_lengths, stop_words_list, bad_words_list,
                 no_repeat_ngram_size, output_sequence_lengths, return_dict,
-                encoder_output, encoder_input_lengths, **kwargs)
+                encoder_output, encoder_input_lengths,
+                stopping_criteria, logits_processor, **kwargs)
 
 
 class ChatGLMGenerationSession(GenerationSession):

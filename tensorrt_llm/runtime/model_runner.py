@@ -28,7 +28,8 @@ from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import (ChatGLMGenerationSession, GenerationSession,
                                   LoraManager, ModelConfig,
                                   QWenForCausalLMGenerationSession,
-                                  SamplingConfig)
+                                  SamplingConfig, 
+                                  StoppingCriteria, LogitsProcessor)
 
 
 def get_engine_name(model: str, dtype: str, tp_size: int, pp_size: int,
@@ -324,6 +325,8 @@ class ModelRunner:
                  prompt_tasks: Optional[str] = None,
                  lora_uids: Optional[list] = None,
                  streaming: bool = False,
+                 stopping_criteria: StoppingCriteria = None,
+                 logits_processor: LogitsProcessor = None,
                  **kwargs) -> Union[torch.Tensor, dict]:
         """
         Generates sequences of token ids.
@@ -390,6 +393,8 @@ class ModelRunner:
             output_sequence_lengths=sampling_config.output_sequence_lengths,
             return_dict=sampling_config.return_dict,
             streaming=streaming,
+            stopping_criteria=stopping_criteria,
+            logits_processor=logits_processor,
             **ptuning_kwargs)
         if sampling_config.return_dict:
             if streaming:
