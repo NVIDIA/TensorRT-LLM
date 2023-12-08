@@ -15,11 +15,13 @@ Welcome to TensorRT-LLM's documentation!
    batch_manager.md
    gpt_attention.md
    precision.md
+   installation.md
    performance.md
    2023-05-19-how-to-debug.md
    2023-05-17-how-to-add-a-new-model.md
    graph-rewriting.md
    memory.md
+   new_workflow.md
 
 Python API
 ----------
@@ -65,3 +67,15 @@ Indices and tables
 * :ref:`genindex`
 * :ref:`modindex`
 * :ref:`search`
+
+
+Blogs
+----------
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Blogs
+   :hidden:
+
+   blogs/H100vsA100.md
+   blogs/H200launch.md

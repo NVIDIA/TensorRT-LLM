@@ -87,3 +87,10 @@ class Mapping(object):
         if p >= self.world_size:
             p = p - self.world_size
         return p
+
+    def pp_layers(self, num_layers):
+        layers_per_pipeline_stage = num_layers // self.pp_size
+        layers_range = list(
+            range(self.pp_rank * layers_per_pipeline_stage,
+                  (self.pp_rank + 1) * layers_per_pipeline_stage, 1))
+        return layers_range

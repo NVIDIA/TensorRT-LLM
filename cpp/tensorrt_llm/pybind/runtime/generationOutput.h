@@ -20,6 +20,7 @@
 
 #include <ATen/ATen.h>
 #include <optional>
+#include <pybind11/pybind11.h>
 
 namespace tensorrt_llm::pybind::runtime
 {
@@ -36,6 +37,7 @@ public:
     }
 
     [[nodiscard]] std::shared_ptr<tensorrt_llm::runtime::GenerationOutput> toTrtLlm() const;
+    static void initBindings(pybind11::module_& m);
 };
 
 } // namespace tensorrt_llm::pybind::runtime

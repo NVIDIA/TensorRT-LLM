@@ -25,30 +25,31 @@
 #include <ATen/ops/tensor.h>
 #include <functional>
 
-namespace py = pybind11;
-namespace tb = tensorrt_llm::batch_manager;
-
 namespace tensorrt_llm::pybind::batch_manager
 {
 
 using GetInferenceRequestsCallback = std::function<std::list<InferenceRequest>(int32_t)>;
 using SendResponseCallback = std::function<void(uint64_t, std::list<NamedTensor> const&, bool, const std::string&)>;
 
-tb::GetInferenceRequestsCallback callbackAdapter(GetInferenceRequestsCallback callback);
-tb::SendResponseCallback callbackAdapter(SendResponseCallback callback);
+tensorrt_llm::batch_manager::GetInferenceRequestsCallback callbackAdapter(GetInferenceRequestsCallback callback);
+tensorrt_llm::batch_manager::SendResponseCallback callbackAdapter(SendResponseCallback callback);
 
-class GptManager : tb::GptManager
+class GptManager : tensorrt_llm::batch_manager::GptManager
 {
 public:
-    GptManager(std::filesystem::path const& trtEnginePath, tb::TrtGptModelType modelType, int32_t maxBeamWidth,
-        tb::batch_scheduler::SchedulerPolicy schedulerPolicy, GetInferenceRequestsCallback getInferenceRequestsCb,
-        SendResponseCallback sendResponseCb, tb::PollStopSignalCallback pollStopSignalCb = nullptr,
-        tb::ReturnBatchManagerStatsCallback returnBatchManagerStatsCb = nullptr,
-        const tb::TrtGptModelOptionalParams& optionalParams = tb::TrtGptModelOptionalParams(),
+    GptManager(std::filesystem::path const& trtEnginePath, tensorrt_llm::batch_manager::TrtGptModelType modelType,
+        int32_t maxBeamWidth, tensorrt_llm::batch_manager::batch_scheduler::SchedulerPolicy schedulerPolicy,
+        GetInferenceRequestsCallback getInferenceRequestsCb, SendResponseCallback sendResponseCb,
+        tensorrt_llm::batch_manager::PollStopSignalCallback pollStopSignalCb = nullptr,
+        tensorrt_llm::batch_manager::ReturnBatchManagerStatsCallback returnBatchManagerStatsCb = nullptr,
+        const tensorrt_llm::batch_manager::TrtGptModelOptionalParams& optionalParams
+        = tensorrt_llm::batch_manager::TrtGptModelOptionalParams(),
         std::optional<uint64_t> terminateReqId = std::nullopt);
 
-    py::object enter();
-    void exit(py::handle type, py::handle value, py::handle traceback);
+    pybind11::object enter();
+    void exit(pybind11::handle type, pybind11::handle value, pybind11::handle traceback);
+
+    static void initBindings(pybind11::module_& m);
 };
 
 } // namespace tensorrt_llm::pybind::batch_manager

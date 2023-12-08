@@ -87,12 +87,12 @@ protected:
         T const* qkv_bias;
         int32_t input_seq_length; // padded input length
         int32_t max_past_kv_len;
-        // By default, max_kv_cache_length == cyclic_kv_cache_length
+        // By default, max_attention_window == cyclic_attention_window_size
         // unless each layer has different cyclic kv cache length.
         // Max cache capacity (used to allocate KV cache)
-        int32_t max_kv_cache_length;
+        int32_t max_attention_window;
         // Cyclic kv cache capacity (used to get the cyclic kv cache position for new tokens)
-        int32_t cyclic_kv_cache_length;
+        int32_t cyclic_attention_window_size;
         int32_t const* q_seq_lengths;
         int32_t const* kv_seq_lengths;
         float const* kv_scale_orig_quant;
@@ -134,12 +134,12 @@ protected:
         T* context_buf;
         void* key_value_cache;
         void* block_pointers;
-        // By default, max_kv_cache_length == cyclic_kv_cache_length
+        // By default, max_attention_window == cyclic_attention_window_size
         // unless each layer has different cyclic kv cache length.
         // Max cache capacity (used to allocate KV cache)
-        int32_t max_kv_cache_length;
+        int32_t max_attention_window;
         // Cyclic kv cache capacity (used to get the cyclic kv cache position for new tokens)
-        int32_t cyclic_kv_cache_length;
+        int32_t cyclic_attention_window_size;
         int32_t num_requests;
         int32_t max_blocks_per_sequence;
         int32_t const* cache_indir;
@@ -150,6 +150,7 @@ protected:
         int relative_attention_bias_stride = 0;
         // optional when cross attention
         int32_t const* encoder_input_lengths = nullptr;
+        int32_t const* host_context_lengths = nullptr;
     };
 
     template <typename T, typename KVCacheBuffer>

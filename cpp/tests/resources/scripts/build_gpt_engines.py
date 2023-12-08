@@ -98,7 +98,10 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
         run_command(["git", "lfs", "pull", "--include", model_file_name],
                     cwd=hf_dir)
 
-    (hf_dir / "model.safetensors").unlink(missing_ok=True)
+    safetensor_file = hf_dir / "model.safetensors"
+    has_safetensor = safetensor_file.exists()
+    if has_safetensor:
+        safetensor_file.rename(str(safetensor_file) + ".bak")
 
     assert (hf_dir / model_file_name).is_file()
 
@@ -157,6 +160,9 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
     build_engine(fp16_weight_dir_x_gpu,
                  engine_dir / 'fp16-plugin-packed-paged-gather' / tp_pp_dir,
                  tp_size, '--gather_all_token_logits', *ifb_args)
+
+    if has_safetensor:
+        _pl.Path(str(safetensor_file) + ".bak").rename(safetensor_file)
 
     print("Done.")
 

@@ -211,7 +211,7 @@ class _Runtime(object):
                 if not ok:
                     raise ValueError(
                         f"Couldn't assign {name} with shape {shape_dict[name]}, "
-                        f"engine supports [min, opt, max] = {self.engine.get_profile_shape(context.active_optimization_profile, name)}"
+                        f"engine supports [min, opt, max] = {self.engine.get_tensor_profile_shape(name, self.engine.active_optimization_profile)}"
                     )
 
     def _set_buffer(self, context: trt.IExecutionContext,
@@ -229,8 +229,24 @@ class _Runtime(object):
             context.set_tensor_address(name, buffer_dict[name].data_ptr())
 
     def _set_tensors(self, context: trt.IExecutionContext,
-                     tensors: [List["RuntimeTensor"]]):
-        for t in tensors:
+                     tensors: Dict[str, "RuntimeTensor"]):
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            # it's allowed to call set_tensors multi times with different tensors
+            # each time only set some of the engine tensors, so it is valid to skip the ones not in the current given tensors dict
+            if not name in tensors:
+                if self.engine.get_tensor_mode(
+                        t.name) == trt.TensorIOMode.OUTPUT:
+                    dtype = self.engine.get_tensor_dtype(name)
+                    shape = context.get_tensor_shape(name)
+                    tensors[name] = RuntimeTensor.from_torch(
+                        name,
+                        torch.zeros(tuple(shape),
+                                    dtype=trt_dtype_to_torch(dtype),
+                                    device='cuda'))
+                else:
+                    continue
+            t = tensors[name]
             # output's shape is inference by TRT, no need to set the shape here
             if self.engine.get_tensor_mode(t.name) == trt.TensorIOMode.INPUT:
                 context.set_input_shape(t.name, t.shape)
@@ -282,7 +298,7 @@ class SamplingConfig:
 
     max_new_tokens: int = field(default=20)
     num_beams: int = field(default=1)
-    max_kv_cache_length: Optional[int] = field(default=None)
+    max_attention_window_size: Optional[int] = field(default=None)
     output_sequence_lengths: bool = field(default=False)
     return_dict: bool = field(default=False)
     stop_words_list: Optional[torch.Tensor] = field(default=None)
@@ -291,6 +307,10 @@ class SamplingConfig:
     temperature: Union[float, torch.Tensor] = field(default=1.0)
     top_k: Union[int, torch.Tensor] = field(default=1)
     top_p: Union[float, torch.Tensor] = field(default=0.0)
+    top_p_decay: Optional[float] = field(default=None)
+    top_p_min: Optional[float] = field(default=None)
+    top_p_reset_ids: Optional[int] = field(default=None)
+
     length_penalty: Union[float, torch.Tensor] = field(default=1.0)
     repetition_penalty: Union[float, torch.Tensor] = field(default=1.0)
     min_length: Union[int, torch.Tensor] = field(default=1)
@@ -313,6 +333,44 @@ class SamplingConfig:
             else:
                 unused_kwargs[key] = value
         return unused_kwargs
+
+
+class LogitsProcessor:
+    """
+    Base class for all logit processors that can be applied during generation.
+    """
+
+    def __call__(self, step: int, input_ids: torch.Tensor,
+                 scores: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError(
+            f"{self.__class__} is an abstract class. Only classes inheriting this class can be called."
+        )
+
+
+class LogitsProcessorList(list, LogitsProcessor):
+
+    def __call__(self, step: int, input_ids: torch.Tensor,
+                 scores: torch.Tensor) -> torch.Tensor:
+        for processor in self:
+            scores = processor(step, input_ids, scores)
+        return scores
+
+
+class StoppingCriteria:
+    """
+    Base class for all stopping criteria that can be applied during generation.
+    """
+
+    def __call__(self, step: int, input_ids: torch.Tensor,
+                 scores: torch.Tensor) -> bool:
+        raise NotImplementedError("StoppingCriteria needs to be subclassed")
+
+
+class StoppingCriteriaList(list, StoppingCriteria):
+
+    def __call__(self, step: int, input_ids: torch.Tensor,
+                 scores: torch.Tensor) -> bool:
+        return any(criteria(step, input_ids, scores) for criteria in self)
 
 
 class RuntimeTensor:
@@ -488,7 +546,7 @@ class GenerationSession(object):
                 'host_past_key_value_lengths'
             ]
             expected_tensor_names += [
-                f'host_max_kv_cache_length_{i}'
+                f'host_max_attention_window_size_{i}'
                 for i in range(self.first_layer, self.last_layer)
             ]
             if model_config.remove_input_padding:
@@ -819,7 +877,7 @@ class GenerationSession(object):
                      device=padded_input_ids.device)),
                 axis=-1)
 
-        # Note: we still allocate max_seq_length size of parent ids (not max_kv_cache_length).
+        # Note: we still allocate max_seq_length size of parent ids (not max_attention_window_size).
         self.parent_ids = torch.zeros(
             (batch_size, scfg.num_beams, self.max_seq_length),
             dtype=torch.int32,
@@ -906,7 +964,7 @@ class GenerationSession(object):
               max_context_length: int,
               max_new_tokens: int,
               beam_width: int = 1,
-              max_kv_cache_length: Optional[int] = None,
+              max_attention_window_size: Optional[int] = None,
               encoder_max_input_length: Optional[int] = None,
               lora_manager: LoraManager = None,
               lora_uids: List[str] = None):
@@ -918,51 +976,53 @@ class GenerationSession(object):
         self.max_seq_length = max_context_length + max_new_tokens
         self.beam_width = beam_width
         self.encoder_max_input_length = encoder_max_input_length
-        if max_kv_cache_length is None:
-            self.max_kv_cache_length = self.max_seq_length
+        if max_attention_window_size is None:
+            self.max_attention_window_size = self.max_seq_length
             logger.debug(
-                "The max_kv_cache_length is not set, we will use max_seq_length by default."
+                "The max_attention_window_size is not set, we will use max_seq_length by default."
             )
-            self.host_max_kv_cache_lengths = [
-                torch.ones((1, ), dtype=torch.int32) * self.max_kv_cache_length
+            self.host_max_attention_window_sizes = [
+                torch.ones(
+                    (1, ), dtype=torch.int32) * self.max_attention_window_size
                 for i in range(self.num_layers)
             ]
-        elif isinstance(max_kv_cache_length, int):
-            if max_kv_cache_length > self.max_seq_length:
+        elif isinstance(max_attention_window_size, int):
+            if max_attention_window_size > self.max_seq_length:
                 logger.warning(
-                    "The value of max_kv_cache_length should ideally not exceed max_seq_length. "
+                    "The value of max_attention_window_size should ideally not exceed max_seq_length. "
                     "Therefore, it has been adjusted to match the value of max_seq_length."
                 )
-            self.max_kv_cache_length = min(max_kv_cache_length,
-                                           self.max_seq_length)
-            self.host_max_kv_cache_lengths = [
-                torch.ones((1, ), dtype=torch.int32) * self.max_kv_cache_length
+            self.max_attention_window_size = min(max_attention_window_size,
+                                                 self.max_seq_length)
+            self.host_max_attention_window_sizes = [
+                torch.ones(
+                    (1, ), dtype=torch.int32) * self.max_attention_window_size
                 for i in range(self.num_layers)
             ]
-        elif isinstance(max_kv_cache_length, torch.Tensor):
-            self.max_kv_cache_length = int(
-                torch.max(max_kv_cache_length).item())
-            if self.max_kv_cache_length > self.max_seq_length:
+        elif isinstance(max_attention_window_size, torch.Tensor):
+            self.max_attention_window_size = int(
+                torch.max(max_attention_window_size).item())
+            if self.max_attention_window_size > self.max_seq_length:
                 logger.warning(
-                    "The value of max_kv_cache_length should ideally not exceed max_seq_length. "
+                    "The value of max_attention_window_size should ideally not exceed max_seq_length. "
                     "Therefore, it has been adjusted to match the value of max_seq_length."
                 )
-            self.max_kv_cache_length = min(self.max_kv_cache_length,
-                                           self.max_seq_length)
-            if max_kv_cache_length.shape[0] != self.num_layers:
+            self.max_attention_window_size = min(self.max_attention_window_size,
+                                                 self.max_seq_length)
+            if max_attention_window_size.shape[0] != self.num_layers:
                 logger.error(
-                    "max_kv_cache_length tensor's size is not equal to num_layers! "
+                    "max_attention_window_size tensor's size is not equal to num_layers! "
                     "Note that num_layers = num_total_layers // pipeline_parallelism_size."
                 )
                 assert False
-            self.host_max_kv_cache_lengths = [
+            self.host_max_attention_window_sizes = [
                 torch.minimum(
-                    max_kv_cache_length.to(torch.int32)[i],
+                    max_attention_window_size.to(torch.int32)[i],
                     torch.IntTensor([self.max_seq_length]))
                 for i in range(self.num_layers)
             ]
         else:
-            assert False, "invalid max_kv_cache_length!"
+            assert False, "invalid max_attention_window_size!"
         self.lora_manager = lora_manager
 
         self.buffer = {}
@@ -982,7 +1042,7 @@ class GenerationSession(object):
 
         if self.paged_kv_cache:
             blocks = batch_size * beam_width * math.ceil(
-                self.max_kv_cache_length / self.tokens_per_block)
+                self.max_attention_window_size / self.tokens_per_block)
             cache_shape = (
                 blocks,
                 2,
@@ -995,7 +1055,7 @@ class GenerationSession(object):
                 batch_size,
                 2,
                 self.num_heads_kv,
-                self.max_kv_cache_length,
+                self.max_attention_window_size,
                 self.head_size,
             )
             if self.cross_attention:
@@ -1122,13 +1182,13 @@ class GenerationSession(object):
             prompt_vocab_size: torch.Tensor = None,
             encoder_output: torch.Tensor = None,
             encoder_input_lengths: torch.Tensor = None) -> List[RuntimeTensor]:
-        tensors = []
+        tensors = {}
         sym = lambda x, name: RuntimeTensor.from_torch(name, x)
-        add_tensor = lambda x, name: tensors.append(sym(x, name))
-        add_tensor_with_shape = lambda x, name, shape: tensors.append(
-            RuntimeTensor.from_torch(name, x, override_shape=shape))
-
-        add_tensor(context_lengths, 'context_lengths')
+        add_tensor = lambda x, name: tensors.update({name: sym(x, name)})
+        add_tensor_with_shape = lambda x, name, shape: tensors.update(
+            {name: RuntimeTensor.from_torch(name, x, override_shape=shape)})
+        if self.use_gpt_attention_plugin:
+            add_tensor(context_lengths, 'context_lengths')
         add_tensor(cache_indirection, 'cache_indirection')
 
         if self.has_position_embedding:
@@ -1244,8 +1304,9 @@ class GenerationSession(object):
             add_tensor(host_request_types, 'host_request_types')
             for idx in range(self.first_layer, self.last_layer):
                 add_tensor_with_shape(
-                    self.host_max_kv_cache_lengths[idx - self.first_layer],
-                    f'host_max_kv_cache_length_{idx}', (1, ))
+                    self.host_max_attention_window_sizes[idx -
+                                                         self.first_layer],
+                    f'host_max_attention_window_size_{idx}', (1, ))
             if self.remove_input_padding:
                 add_tensor(host_context_lengths, 'host_context_lengths')
         else:
@@ -1285,14 +1346,14 @@ class GenerationSession(object):
             prompt_vocab_size: torch.Tensor = None,
             encoder_output: torch.Tensor = None,
             encoder_input_lengths: torch.Tensor = None):
-        next_step_shape = {
-            'context_lengths': context_lengths.shape,
-            'cache_indirection': cache_indirection.shape,
-        }
-        next_step_buffer = {
-            'context_lengths': context_lengths.contiguous(),
-            'cache_indirection': cache_indirection.contiguous(),
-        }
+        tensors = {}  # Dict[str, RuntimeTensor]
+        sym = lambda x, name: RuntimeTensor.from_torch(name, x)
+        add_tensor = lambda x, name: tensors.update({name: sym(x, name)})
+        add_tensor_with_shape = lambda x, name, shape: tensors.update(
+            {name: RuntimeTensor.from_torch(name, x, override_shape=shape)})
+        if self.use_gpt_attention_plugin:
+            add_tensor(context_lengths, 'context_lengths')
+        add_tensor(cache_indirection, 'cache_indirection')
 
         if self.mapping.has_pp():
             hidden_size = self.hidden_size * self.mapping.tp_size
@@ -1302,128 +1363,89 @@ class GenerationSession(object):
             hidden_states_input = hidden_states_input.resize_(*shape)
 
         if self.mapping.is_last_pp_rank():
-            next_step_buffer['logits'] = self.buffer['logits']
+            add_tensor(self.buffer['logits'], 'logits')
 
             if not self.gather_all_token_logits:
-                next_step_shape['last_token_ids'] = last_token_ids.shape
-                next_step_buffer['last_token_ids'] = last_token_ids.contiguous()
+                add_tensor(last_token_ids, 'last_token_ids')
         else:
-            next_step_shape['hidden_states_output'] = hidden_states_input.shape
-            next_step_buffer[
-                'hidden_states_output'] = hidden_states_input.contiguous()
+            add_tensor(hidden_states_input, 'hidden_states_output')
 
         if self.mapping.is_first_pp_rank():
-            next_step_shape['input_ids'] = (
-                1, batch_size *
-                beam_width) if self.remove_input_padding else (batch_size *
-                                                               beam_width, 1)
-            next_step_buffer['input_ids'] = self.new_tokens
+            input_ids_shape = (1, batch_size *
+                               beam_width) if self.remove_input_padding else (
+                                   batch_size * beam_width, 1)
+            add_tensor_with_shape(self.new_tokens, 'input_ids', input_ids_shape)
         else:
-            next_step_shape['hidden_states_input'] = hidden_states_input.shape
-            next_step_buffer[
-                'hidden_states_input'] = hidden_states_input.contiguous()
+            add_tensor(hidden_states_input, 'hidden_states_input')
 
         if self.remove_input_padding:
-            next_step_shape['host_context_lengths'] = host_context_lengths.shape
-            next_step_buffer[
-                'host_context_lengths'] = host_context_lengths.contiguous()
+            add_tensor(host_context_lengths, 'host_context_lengths')
 
         if self.has_position_embedding:
-            next_step_shape['position_ids'] = position_ids.shape
-            next_step_buffer['position_ids'] = position_ids.contiguous()
+            add_tensor(position_ids, 'position_ids')
 
         if self.cross_attention:
             # hack: disable (or minimize) cross qkv computation at generation phase
             # TODO: enable [0,0,.] true zero tensor input; or use IfConditionalLayer
-            next_step_shape['encoder_output'] = [
-                1, 1, encoder_output.shape[-1]
-            ]  # encoder_output.shape
-            next_step_shape[
-                'encoder_input_lengths'] = encoder_input_lengths.shape
-            next_step_shape['encoder_max_input_length'] = self.buffer[
-                'encoder_max_input_length'].shape
-            next_step_buffer['encoder_output'] = encoder_output.contiguous()
-            next_step_buffer[
-                'encoder_input_lengths'] = encoder_input_lengths.contiguous()
-            next_step_buffer['encoder_max_input_length'] = self.buffer[
-                'encoder_max_input_length']
+            encoder_output_shape = [1, 1, encoder_output.shape[-1]
+                                    ]  # encoder_output.shape
+            add_tensor_with_shape(encoder_output, 'encoder_output',
+                                  encoder_output_shape)
+            add_tensor(encoder_input_lengths, 'encoder_input_lengths')
+            add_tensor(self.buffer['encoder_max_input_length'],
+                       'encoder_max_input_length')
 
         if self.paged_kv_cache:
             for idx in range(self.num_layers):
                 layer_idx = idx + self.first_layer
-                next_step_buffer[
-                    f'kv_cache_block_pointers_{layer_idx}'] = kv_cache_block_pointers[
-                        idx].contiguous()
-                next_step_buffer[
-                    f'host_kv_cache_block_pointers_{layer_idx}'] = host_kv_cache_block_pointers[
-                        idx].contiguous()
                 shape = kv_cache_block_pointers[idx].shape
                 shape = [shape[0] * shape[1], *shape[2:]]
-                next_step_shape[f'kv_cache_block_pointers_{layer_idx}'] = shape
-                next_step_shape[
-                    f'host_kv_cache_block_pointers_{layer_idx}'] = shape
+                add_tensor_with_shape(kv_cache_block_pointers[idx],
+                                      f'kv_cache_block_pointers_{layer_idx}',
+                                      shape)
+                add_tensor_with_shape(
+                    host_kv_cache_block_pointers[idx],
+                    f'host_kv_cache_block_pointers_{layer_idx}', shape)
 
         if prompt_embedding_table is not None:
-            next_step_buffer[
-                'prompt_embedding_table'] = prompt_embedding_table.contiguous()
-            next_step_shape[
-                'prompt_embedding_table'] = prompt_embedding_table.shape
+            add_tensor(prompt_embedding_table, 'prompt_embedding_table')
 
             if self.remove_input_padding:
                 gen_tasks = tasks.unsqueeze(0)
             else:
                 gen_tasks = tasks.unsqueeze(-1)
-
-            next_step_buffer['tasks'] = gen_tasks.contiguous()
-            next_step_shape['tasks'] = gen_tasks.shape
-
-            next_step_buffer[
-                'prompt_vocab_size'] = prompt_vocab_size.contiguous()
-            next_step_shape['prompt_vocab_size'] = prompt_vocab_size.shape
+            add_tensor(gen_tasks, 'tasks')
+            add_tensor(prompt_vocab_size, 'prompt_vocab_size')
 
         if not self.paged_kv_cache:
             for idx in range(self.first_layer, self.last_layer):
                 if not self.use_gpt_attention_plugin:
-                    if step % 2:
-                        next_step_buffer.update({
-                            f'past_key_value_{idx}':
-                            self.buffer[f'1_present_key_value_{idx}'],
-                            f'present_key_value_{idx}':
-                            self.buffer[f'present_key_value_{idx}'],
-                        })
-                    else:
-                        next_step_buffer.update({
-                            f'past_key_value_{idx}':
-                            self.buffer[f'present_key_value_{idx}'],
-                            f'present_key_value_{idx}':
-                            self.buffer[f'1_present_key_value_{idx}'],
-                        })
                     next_shape = (batch_size * beam_width, 2, self.num_heads_kv,
                                   max_context_length + step, self.head_size)
-                    next_step_shape[f'past_key_value_{idx}'] = next_shape
+                    if step % 2:
+                        add_tensor_with_shape(
+                            self.buffer[f'1_present_key_value_{idx}'],
+                            f'past_key_value_{idx}', next_shape)
+                        add_tensor(self.buffer[f'present_key_value_{idx}'],
+                                   f'present_key_value_{idx}')
+                    else:
+                        add_tensor_with_shape(
+                            self.buffer[f'present_key_value_{idx}'],
+                            f'past_key_value_{idx}', next_shape)
+                        add_tensor(self.buffer[f'1_present_key_value_{idx}'],
+                                   f'present_key_value_{idx}')
                 else:
                     key_value_cache = self.buffer[f'present_key_value_{idx}']
-                    cache_shape = key_value_cache.shape
-                    next_step_buffer.update({
-                        f'past_key_value_{idx}':
-                        key_value_cache,
-                        f'present_key_value_{idx}':
-                        key_value_cache,
-                    })
-                    next_step_shape[f'past_key_value_{idx}'] = cache_shape
+                    add_tensor(key_value_cache, f'past_key_value_{idx}')
+                    add_tensor(key_value_cache, f'present_key_value_{idx}')
+
                     if self.cross_attention:
-                        cross_cache_shape = self.buffer[
-                            f'cross_present_key_value_{idx}'].shape
                         cross_cache_buffer = self.buffer[
                             f'cross_present_key_value_{idx}']
-                        next_step_buffer.update({
-                            f'cross_past_key_value_{idx}':
-                            cross_cache_buffer,
-                            f'cross_present_key_value_{idx}':
-                            cross_cache_buffer,
-                        })
-                        next_step_shape[
-                            f'cross_past_key_value_{idx}'] = cross_cache_shape
+                        add_tensor(cross_cache_buffer,
+                                   f'cross_past_key_value_{idx}')
+                        add_tensor(cross_cache_buffer,
+                                   f'cross_present_key_value_{idx}')
 
         if self.use_gpt_attention_plugin:
             # generation requests
@@ -1435,62 +1457,37 @@ class GenerationSession(object):
                 [max_context_length + step] * (batch_size * beam_width),
                 dtype=torch.int32,
                 device='cpu')
-            next_step_shape.update({
-                'sequence_length': (batch_size * beam_width, ),
-                'host_past_key_value_lengths':
-                host_past_key_value_lengths.shape,
-                'host_request_types':
-                host_request_types.shape
-            })
+            add_tensor(host_past_key_value_lengths,
+                       'host_past_key_value_lengths')
+            add_tensor(host_request_types, 'host_request_types')
+            # Sequence lengths are not used in the context phase actually.
+            add_tensor_with_shape(self.sequence_length_buffer,
+                                  'sequence_length',
+                                  (batch_size * beam_width, ))
+
             for idx in range(self.first_layer, self.last_layer):
-                next_step_shape.update({
-                    f'host_max_kv_cache_length_{idx}': (1, ),
-                })
-                next_step_buffer.update({
-                    f'host_max_kv_cache_length_{idx}':
-                    self.host_max_kv_cache_lengths[idx - self.first_layer],
-                })
-            next_step_buffer.update({
-                # Sequence lengths are not used in the context phase actually.
-                'sequence_length': self.sequence_length_buffer,
-                'host_past_key_value_lengths': host_past_key_value_lengths,
-                'host_request_types': host_request_types,
-            })
+                add_tensor_with_shape(
+                    self.host_max_attention_window_sizes[idx -
+                                                         self.first_layer],
+                    f'host_max_attention_window_size_{idx}', (1, ))
             if self.remove_input_padding:
-                next_step_buffer[
-                    'host_context_lengths'] = host_context_lengths.contiguous()
-                next_step_shape[
-                    'host_context_lengths'] = host_context_lengths.shape
+                add_tensor(host_context_lengths, 'host_context_lengths')
         else:
-            next_step_shape.update({'attention_mask': attention_mask.shape})
-            next_step_buffer.update({
-                'attention_mask':
-                attention_mask.contiguous(),
-            })
+            add_tensor(attention_mask, 'attention_mask')
 
         if self.use_custom_all_reduce and self.mapping.tp_size > 1:
-            next_step_shape[
-                'all_reduce_workspace'] = self.all_reduce_workspace.shape
-            next_step_buffer['all_reduce_workspace'] = self.all_reduce_workspace
+            add_tensor(self.all_reduce_workspace, 'all_reduce_workspace')
 
         if self.use_lora_plugin:
             for idx in range(self.num_layers):
                 layer_idx = idx + self.first_layer
                 for lora_module in self.lora_target_modules:
-                    next_step_shape[
-                        f'{lora_module}_lora_ranks_{layer_idx}'] = self.buffer[
-                            f'{lora_module}_lora_ranks_{layer_idx}'].shape
-                    next_step_buffer[
-                        f'{lora_module}_lora_ranks_{layer_idx}'] = self.buffer[
-                            f'{lora_module}_lora_ranks_{layer_idx}']
-                    next_step_shape[
-                        f'{lora_module}_lora_weights_pointers_{layer_idx}'] = self.buffer[
-                            f'{lora_module}_lora_weights_pointers_{layer_idx}'].shape
-                    next_step_buffer[
-                        f'{lora_module}_lora_weights_pointers_{layer_idx}'] = self.buffer[
-                            f'{lora_module}_lora_weights_pointers_{layer_idx}']
+                    lora_ranks = f'{lora_module}_lora_ranks_{layer_idx}'
+                    add_tensor(self.buffer[lora_ranks], lora_ranks)
+                    lora_module = f'{lora_module}_lora_weights_pointers_{layer_idx}'
+                    add_tensor(self.buffer[lora_module], lora_module)
 
-        return next_step_shape, next_step_buffer
+        return tensors
 
     def _prepare_context_inputs(self, batch_size, context_lengths,
                                 host_context_lengths, use_gpt_attention_plugin,
@@ -1606,7 +1603,7 @@ class GenerationSession(object):
                          batch_size,
                          beam_width,
                          scfg,
-                         streaming=False):
+                         in_progress=False):
         final_output_ids = None
         if self.mapping.is_last_pp_rank():
             # output shape of self.gather_tree: [batch_size, beam_width, output_len]
@@ -1617,7 +1614,7 @@ class GenerationSession(object):
                 self.beam_hyps_log_probs, self.beam_hyps_min_normed_scores,
                 self.beam_hyps_num_beams, self.beam_hyps_is_done
             ]
-            if streaming:
+            if scfg.use_beam_hyps and in_progress:
                 # self.gather_tree modifies these args.
                 # In streaming mode, this results in incorrect decoding in the following steps.
                 beam_hyps_args = copy.deepcopy(beam_hyps_args)
@@ -1644,9 +1641,12 @@ class GenerationSession(object):
             context_lengths: torch.Tensor, host_context_lengths,
             attention_mask: torch.Tensor, prompt_vocab_size: torch.Tensor,
             ite: int, sequence_limit_lengths: torch.Tensor,
-            sequence_lengths: torch.Tensor, next_step_buffer: dict,
-            stop_words_list, bad_words_list, no_repeat_ngram_size,
-            encoder_output: torch.Tensor, encoder_input_lengths: torch.Tensor):
+            sequence_lengths: torch.Tensor,
+            next_step_tensors: Dict[str, RuntimeTensor], stop_words_list,
+            bad_words_list, no_repeat_ngram_size, encoder_output: torch.Tensor,
+            encoder_input_lengths: torch.Tensor,
+            stopping_criteria: StoppingCriteria,
+            logits_processor: LogitsProcessor):
         if step % 2:
             context = self.runtime.context_0
             this_src_cache_indirection = cache_indirections[1]
@@ -1690,7 +1690,10 @@ class GenerationSession(object):
             context = self.runtime.ctx_context
             self.runtime._set_tensors(context, ctx_tensors)
             if self.debug_mode:
-                self.debug_buffer = {t.name: t.to_torch() for t in ctx_tensors}
+                self.debug_buffer = {
+                    name: tensor.to_torch()
+                    for name, tensor in ctx_tensors.items()
+                }
             if self.cuda_graph_mode:
                 # context mode, clean cuda graph instances
                 self.runtime.cuda_graph_instances = [None for _ in range(2)]
@@ -1784,7 +1787,13 @@ class GenerationSession(object):
             last_token_ids = model_inputs.get('last_token_ids')
             attention_mask = model_inputs.get('attention_mask', None)
 
+            # Prepare for the next step, and always allocate 1 token slot.
             if self.paged_kv_cache:
+                # Iterate to the next step in KV cache manager.
+                # Increase number of tokens for all unfinished sequences.
+                # And allocate new blocks if needed.
+                # We set this to False for all sequences, since we use only length criterion to stop now
+                self.kv_cache_manager.step([False] * batch_size)
                 host_kv_cache_block_pointers = self.kv_cache_manager.get_pointer_arrays(
                     beam_width)
                 kv_cache_block_pointers = [
@@ -1792,18 +1801,24 @@ class GenerationSession(object):
                 ]
 
             next_context = self.runtime.context_1 if step % 2 else self.runtime.context_0
-            next_step_shape, next_step_buffer = self._get_next_step_shape_buffer(
+            next_step_tensors = self._get_next_step_shape_buffer(
                 batch_size, beam_width, max_context_length, step,
                 context_lengths, host_context_lengths, position_ids,
                 last_token_ids, attention_mask, next_src_cache_indirection,
                 kv_cache_block_pointers, host_kv_cache_block_pointers,
                 hidden_states, prompt_embedding_table, tasks, prompt_vocab_size,
                 encoder_output, encoder_input_lengths)
-            self.runtime._set_shape(next_context, next_step_shape)
-            self.runtime._set_buffer(next_context, next_step_buffer)
+            # there are some tensors created inside the _get_next_step_shape_buffer, not owned by any object
+            # needs to pro-long the life time of the tensors inside the next_step_tensors array
+            # otherwise, it maybe released before the next step actually enqueued
+            # one way to prolong it is to return the list, and destroy it in next step by assigning new values
+            self.runtime._set_tensors(next_context, next_step_tensors)
 
             if self.debug_mode:
-                self.debug_buffer = next_step_buffer
+                self.debug_buffer = {
+                    name: tensor.to_torch()
+                    for name, tensor in next_step_tensors.items()
+                }
             if self.cuda_graph_mode:
                 # capture cuda graph
                 CUASSERT(
@@ -1848,6 +1863,17 @@ class GenerationSession(object):
                     fname = "".join(c for c in k if (c.isalnum() or c in "._-"))
                     np.savetxt(f"{fname}-step{step}.txt", t.cpu().detach())
             if logits is not None:
+                if logits_processor is not None:
+                    final_output_ids = self.finalize_decoder(context_lengths,
+                                                             batch_size,
+                                                             beam_width,
+                                                             scfg,
+                                                             in_progress=True)
+                    # keep the shape as same as huggingface stopping_criteria
+                    final_output_ids_ = final_output_ids.reshape(
+                        -1, final_output_ids.size(-1))
+                    logits = logits_processor(step, final_output_ids_, logits)
+                    self.buffer['logits'] = logits
                 # [batch_size x beam_width, vocab_size_padded] -> [batch_size, beam_width, vocab_size_padded]
                 next_token_logits = logits.reshape(
                     (batch_size, beam_width, -1)).to(self.decoder_logits_dtype)
@@ -1855,8 +1881,8 @@ class GenerationSession(object):
 
                 should_stop = self.dynamic_decoder.forward(
                     next_token_logits, decode_step, max_context_length,
-                    self.max_kv_cache_length, ite, batch_size, self.end_ids,
-                    self.embedding_bias_opt, context_lengths,
+                    self.max_attention_window_size, ite, batch_size,
+                    self.end_ids, self.embedding_bias_opt, context_lengths,
                     sequence_limit_lengths, stop_words_list, bad_words_list,
                     no_repeat_ngram_size, this_src_cache_indirection,
                     self.output_ids, self.new_tokens, self.finished,
@@ -1868,6 +1894,17 @@ class GenerationSession(object):
                     self.beam_hyps_log_probs, self.beam_hyps_min_normed_scores,
                     self.beam_hyps_num_beams, self.beam_hyps_is_done,
                     scfg.use_beam_hyps)
+                if stopping_criteria is not None and not should_stop.item():
+                    final_output_ids = self.finalize_decoder(context_lengths,
+                                                             batch_size,
+                                                             beam_width,
+                                                             scfg,
+                                                             in_progress=True)
+                    # keep the shape as same as huggingface stopping_criteria
+                    final_output_ids_ = final_output_ids.reshape(
+                        -1, final_output_ids.size(-1))
+                    should_stop[0] = stopping_criteria(step, final_output_ids_,
+                                                       logits)
 
         if self.mapping.has_pp():
             should_stop = self.pp_communicate_new_tokens(
@@ -1880,14 +1917,8 @@ class GenerationSession(object):
                 # Free all blocks in all sequences.
                 # With in-flight batching and while loop we'll free some sequences, when they are done
                 self.kv_cache_manager.step([True] * batch_size)
-            else:
-                # Iterate to the next step in KV cache manager.
-                # Increase number of tokens for all unfinished sequences.
-                # And allocate new blocks if needed.
-                # We set this to False for all sequences, since we use only length criterion to stop now
-                self.kv_cache_manager.step([False] * batch_size)
 
-        return should_stop, next_step_buffer, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, encoder_input_lengths
+        return should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, encoder_input_lengths
 
     def decode_regular(self,
                        batch_size: int,
@@ -1912,10 +1943,11 @@ class GenerationSession(object):
                        return_dict: bool = False,
                        encoder_output: torch.Tensor = None,
                        encoder_input_lengths: torch.Tensor = None,
+                       stopping_criteria: StoppingCriteria = None,
+                       logits_processor: LogitsProcessor = None,
                        **kwargs):
         kv_cache_block_pointers = []
         host_kv_cache_block_pointers = []
-        next_step_buffer = None
         attention_mask = None
         context_logits = None
         generation_logits = []
@@ -1943,16 +1975,18 @@ class GenerationSession(object):
                 benchmark_profiler_obj.add_aux_info('generation_step_count',
                                                     step_count)
 
+        next_step_tensors = None
         for step in range(0, self.max_new_tokens):
-            should_stop, next_step_buffer, tasks, context_lengths, host_context_lengths, attention_mask, logits, encoder_input_lengths = self.handle_per_step(
+            should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, logits, encoder_input_lengths = self.handle_per_step(
                 cache_indirections, step, batch_size, max_context_length,
                 beam_width, input_ids, hidden_states, scfg,
                 kv_cache_block_pointers, host_kv_cache_block_pointers,
                 prompt_embedding_table, tasks, context_lengths,
                 host_context_lengths, attention_mask, prompt_vocab_size, ite,
-                sequence_limit_lengths, sequence_lengths, next_step_buffer,
+                sequence_limit_lengths, sequence_lengths, next_step_tensors,
                 stop_words_list, bad_words_list, no_repeat_ngram_size,
-                encoder_output, encoder_input_lengths)
+                encoder_output, encoder_input_lengths, stopping_criteria,
+                logits_processor)
             if step == 0:
                 if benchmark_profiler is not None:
                     benchmark_profiler.record_cuda_event('first_token')
@@ -1963,8 +1997,8 @@ class GenerationSession(object):
                     if step == 0:
                         context_logits = logits
                     else:
-                        generation_logits.append(
-                            next_step_buffer['logits'].clone().detach())
+                        l = next_step_tensors['logits'].to_torch()
+                        generation_logits.append(l.clone().detach())
 
             if should_stop is not None and should_stop.item():
                 profile_fn(benchmark_profiler, generation_phase_step_count)
@@ -2026,10 +2060,11 @@ class GenerationSession(object):
                       return_dict: bool = False,
                       encoder_output: torch.Tensor = None,
                       encoder_input_lengths: torch.Tensor = None,
+                      stopping_criteria: StoppingCriteria = None,
+                      logits_processor: LogitsProcessor = None,
                       **kwargs):
         kv_cache_block_pointers = []
         host_kv_cache_block_pointers = []
-        next_step_buffer = None
         attention_mask = None
         context_logits = None
 
@@ -2044,16 +2079,18 @@ class GenerationSession(object):
                 outputs['context_logits'] = context_logits
             return outputs
 
+        next_step_tensors = None
         for step in range(0, self.max_new_tokens):
-            should_stop, next_step_buffer, tasks, context_lengths, host_context_lengths, attention_mask, logits, encoder_input_lengths = self.handle_per_step(
+            should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, logits, encoder_input_lengths = self.handle_per_step(
                 cache_indirections, step, batch_size, max_context_length,
                 beam_width, input_ids, hidden_states, scfg,
                 kv_cache_block_pointers, host_kv_cache_block_pointers,
                 prompt_embedding_table, tasks, context_lengths,
                 host_context_lengths, attention_mask, prompt_vocab_size, ite,
-                sequence_limit_lengths, sequence_lengths, next_step_buffer,
+                sequence_limit_lengths, sequence_lengths, next_step_tensors,
                 stop_words_list, bad_words_list, no_repeat_ngram_size,
-                encoder_output, encoder_input_lengths)
+                encoder_output, encoder_input_lengths, stopping_criteria,
+                logits_processor)
             if step == 0:
                 context_logits = logits
             if should_stop is not None:
@@ -2062,7 +2099,7 @@ class GenerationSession(object):
                                                          batch_size,
                                                          beam_width,
                                                          scfg,
-                                                         streaming=True)
+                                                         in_progress=True)
 
                 if self.mapping.is_first_pp_rank():
                     if return_dict:
@@ -2115,6 +2152,8 @@ class GenerationSession(object):
                return_dict: bool = False,
                encoder_output: torch.Tensor = None,
                encoder_input_lengths: torch.Tensor = None,
+               stopping_criteria: StoppingCriteria = None,
+               logits_processor: LogitsProcessor = None,
                **kwargs):
         scfg = sampling_config
         batch_size = context_lengths.size(0)
@@ -2151,7 +2190,7 @@ class GenerationSession(object):
             torch.full((
                 batch_size,
                 beam_width,
-                self.max_kv_cache_length,
+                self.max_attention_window_size,
             ),
                        0,
                        dtype=torch.int32,
@@ -2159,7 +2198,7 @@ class GenerationSession(object):
             torch.full((
                 batch_size,
                 beam_width,
-                self.max_kv_cache_length,
+                self.max_attention_window_size,
             ),
                        0,
                        dtype=torch.int32,
@@ -2175,18 +2214,16 @@ class GenerationSession(object):
 
         # Init KV cache block manager
         if self.paged_kv_cache:
-            max_blocks_per_seq = math.ceil(self.max_kv_cache_length /
+            max_blocks_per_seq = math.ceil(self.max_attention_window_size /
                                            self.tokens_per_block)
             blocks = batch_size * beam_width * max_blocks_per_seq
             memory_pools = [
                 self.buffer[f'present_key_value_{i}']
                 for i in range(self.first_layer, self.last_layer)
             ]
-            self.kv_cache_manager = KVCacheManager(memory_pools, blocks,
-                                                   self.tokens_per_block,
-                                                   max_blocks_per_seq,
-                                                   self.max_kv_cache_length,
-                                                   beam_width)
+            self.kv_cache_manager = KVCacheManager(
+                memory_pools, blocks, self.tokens_per_block, max_blocks_per_seq,
+                self.max_attention_window_size, beam_width)
 
             # Add sequences to the manager
             for bi in range(batch_size):
@@ -2204,7 +2241,8 @@ class GenerationSession(object):
                 prompt_embedding_table, tasks, prompt_vocab_size, ite,
                 sequence_limit_lengths, stop_words_list, bad_words_list,
                 no_repeat_ngram_size, output_sequence_lengths, return_dict,
-                encoder_output, encoder_input_lengths, **kwargs)
+                encoder_output, encoder_input_lengths, stopping_criteria,
+                logits_processor, **kwargs)
         else:
             return self.decode_regular(
                 batch_size, scfg, sequence_lengths, context_lengths,
@@ -2213,7 +2251,8 @@ class GenerationSession(object):
                 prompt_embedding_table, tasks, prompt_vocab_size, ite,
                 sequence_limit_lengths, stop_words_list, bad_words_list,
                 no_repeat_ngram_size, output_sequence_lengths, return_dict,
-                encoder_output, encoder_input_lengths, **kwargs)
+                encoder_output, encoder_input_lengths, stopping_criteria,
+                logits_processor, **kwargs)
 
 
 class ChatGLMGenerationSession(GenerationSession):

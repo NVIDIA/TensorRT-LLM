@@ -16,9 +16,14 @@
  */
 #include "namedTensor.h"
 
-#include "tensorrt_llm/batch_manager/inferenceRequest.h"
 #include "tensorrt_llm/runtime/torch.h"
 
+#include <pybind11/functional.h>
+#include <pybind11/operators.h>
+#include <pybind11/stl.h>
+#include <torch/extension.h>
+
+namespace py = pybind11;
 namespace tb = tensorrt_llm::batch_manager;
 
 namespace tensorrt_llm::pybind::batch_manager
@@ -27,6 +32,14 @@ namespace tensorrt_llm::pybind::batch_manager
 NamedTensor::NamedTensor(const tb::NamedTensor& cppNamedTensor)
     : Base(runtime::Torch::tensor(cppNamedTensor.tensor), cppNamedTensor.name)
 {
+}
+
+void NamedTensor::initBindings(py::module_& m)
+{
+    py::class_<NamedTensor>(m, "NamedTensor")
+        .def(py::init<NamedTensor::TensorPtr, std::string>(), py::arg("tensor"), py::arg("name"))
+        .def_readwrite("tensor", &NamedTensor::tensor)
+        .def_readonly("name", &NamedTensor::name);
 }
 
 } // namespace tensorrt_llm::pybind::batch_manager

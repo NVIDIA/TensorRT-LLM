@@ -44,7 +44,7 @@ public:
 
     LoraPlugin(const void* data, size_t length, const PluginProfilerPtr& profiler);
 
-    ~LoraPlugin() override = default;
+    ~LoraPlugin(); // override = default;
 
     // IPluginV2DynamicExt Methods
     nvinfer1::IPluginV2DynamicExt* clone() const noexcept override;
@@ -132,6 +132,9 @@ private:
     GemmIdCublas mGemmId{};
 
     PluginProfilerPtr mPluginProfiler;
+
+    bool graphCreated = false;
+    cudaGraphExec_t instance;
 };
 
 class LoraPluginCreator : public BaseCreator

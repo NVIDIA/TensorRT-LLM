@@ -20,25 +20,32 @@ from pathlib import Path
 import numpy as np
 import torch
 from utils import (DEFAULT_HF_MODEL_DIRS, DEFAULT_PROMPT_TEMPLATES,
-                   load_tokenizer, read_model_name_from_config,
-                   throttle_generator)
+                   load_tokenizer, read_model_name, throttle_generator)
 
 import tensorrt_llm
 from tensorrt_llm.logger import logger
-from tensorrt_llm.runtime import ModelRunner
+from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
+
+if PYTHON_BINDINGS:
+    from tensorrt_llm.runtime import ModelRunnerCpp
 
 
 def parse_arguments(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--max_output_len', type=int, required=True)
-    parser.add_argument('--max_kv_cache_length',
-                        type=int,
-                        default=None,
-                        help='The max kv cache length. \
-              If the final sequence length exceeds the kv cache length, we will enable cyclic kv cache. \
-              If it is set to None, we will use the max sequence length.')
+    parser.add_argument(
+        '--max_attention_window_size',
+        type=int,
+        default=None,
+        help=
+        'The attention window size that controls the sliding window attention / cyclic kv cache behaviour'
+    )
     parser.add_argument('--log_level', type=str, default='error')
     parser.add_argument('--engine_dir', type=str, default='engine_outputs')
+    parser.add_argument('--use_py_session',
+                        default=False,
+                        action='store_true',
+                        help="Whether or not to use Python runtime session")
     parser.add_argument(
         '--input_text',
         type=str,
@@ -118,6 +125,14 @@ def parse_arguments(args=None):
         nargs="+",
         help="The list of LoRA task uids; use -1 to disable the LoRA module")
 
+    parser.add_argument(
+        '--num_prepend_vtokens',
+        nargs="+",
+        type=int,
+        help="Number of (default) virtual tokens to prepend to each sentence."
+        " For example, '--num_prepend_vtokens=10' will prepend the tokens"
+        " [vocab_size, vocab_size + 1, ..., vocab_size + 9] to the sentence.")
+
     return parser.parse_args(args=args)
 
 
@@ -127,7 +142,8 @@ def parse_input(tokenizer,
                 input_file=None,
                 add_special_tokens=True,
                 max_input_length=923,
-                pad_id=None):
+                pad_id=None,
+                num_prepend_vtokens=[]):
     if pad_id is None:
         pad_id = tokenizer.pad_token_id
 
@@ -166,6 +182,15 @@ def parse_input(tokenizer,
         else:
             print('Input file format not supported.')
             raise SystemExit
+
+    if num_prepend_vtokens:
+        assert len(num_prepend_vtokens) == len(batch_input_ids)
+        base_vocab_size = tokenizer.vocab_size - len(
+            tokenizer.special_tokens_map.get('additional_special_tokens', []))
+        for i, length in enumerate(num_prepend_vtokens):
+            batch_input_ids[i] = list(
+                range(base_vocab_size,
+                      base_vocab_size + length)) + batch_input_ids[i]
 
     batch_input_ids = [
         torch.tensor(x, dtype=torch.int32).unsqueeze(0) for x in batch_input_ids
@@ -217,8 +242,7 @@ def print_output(tokenizer,
     if generation_logits is not None and output_logits_npy is not None and num_beams == 1:
         input_lengths = torch.Tensor(input_lengths)
         context_logits = torch.cat(context_logits, axis=0)
-        generation_logits = [logit.unsqueeze(1) for logit in generation_logits]
-        generation_logits = torch.cat(generation_logits, axis=1)
+        generation_logits = generation_logits.squeeze(1)
         last_token_ids = torch.cumsum(input_lengths, dim=0).int().cuda()
         batch_size = input_lengths.size(0)
         vocab_size_padded = context_logits.shape[-1]
@@ -239,8 +263,7 @@ def main(args):
     runtime_rank = tensorrt_llm.mpi_rank()
     logger.set_level(args.log_level)
 
-    model_name = read_model_name_from_config(
-        Path(args.engine_dir) / "config.json")
+    model_name = read_model_name(args.engine_dir)
     if args.tokenizer_dir is None:
         args.tokenizer_dir = DEFAULT_HF_MODEL_DIRS[model_name]
 
@@ -249,11 +272,6 @@ def main(args):
         vocab_file=args.vocab_file,
         model_name=model_name,
     )
-
-    runner = ModelRunner.from_dir(engine_dir=args.engine_dir,
-                                  lora_dir=args.lora_dir,
-                                  rank=runtime_rank,
-                                  debug_mode=args.debug_mode)
 
     # # An example to stop generation when the model generate " London" on first sentence, " eventually became" on second sentence
     # stop_words_list = [[" London"], ["eventually became"]]
@@ -267,39 +285,59 @@ def main(args):
     # bad_words_list = torch.Tensor(bad_words_list).to(torch.int32).to("cuda").contiguous()
     bad_words_list = None
 
+    prompt_template = None
     if args.use_prompt_template and model_name in DEFAULT_PROMPT_TEMPLATES:
         prompt_template = DEFAULT_PROMPT_TEMPLATES[model_name]
-    else:
-        prompt_template = None
     batch_input_ids = parse_input(tokenizer=tokenizer,
                                   input_text=args.input_text,
                                   prompt_template=prompt_template,
                                   input_file=args.input_file,
                                   add_special_tokens=args.add_special_tokens,
                                   max_input_length=args.max_input_length,
-                                  pad_id=pad_id)
+                                  pad_id=pad_id,
+                                  num_prepend_vtokens=args.num_prepend_vtokens)
     input_lengths = [x.size(1) for x in batch_input_ids]
 
+    if not PYTHON_BINDINGS and not args.use_py_session:
+        logger.warning(
+            "Python bindings of C++ session is unavailable, fallback to Python session."
+        )
+        args.use_py_session = True
+    runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
+    runner_kwargs = dict(engine_dir=args.engine_dir,
+                         lora_dir=args.lora_dir,
+                         rank=runtime_rank,
+                         debug_mode=args.debug_mode)
+    if not args.use_py_session:
+        runner_kwargs.update(
+            max_batch_size=len(batch_input_ids),
+            max_input_len=max(input_lengths),
+            max_output_len=args.max_output_len,
+            max_beam_width=args.num_beams,
+            max_attention_window_size=args.max_attention_window_size)
+    runner = runner_cls.from_dir(**runner_kwargs)
+
     with torch.no_grad():
-        outputs = runner.generate(batch_input_ids,
-                                  max_new_tokens=args.max_output_len,
-                                  max_kv_cache_length=args.max_kv_cache_length,
-                                  end_id=end_id,
-                                  pad_id=pad_id,
-                                  temperature=args.temperature,
-                                  top_k=args.top_k,
-                                  top_p=args.top_p,
-                                  num_beams=args.num_beams,
-                                  length_penalty=args.length_penalty,
-                                  repetition_penalty=args.repetition_penalty,
-                                  stop_words_list=stop_words_list,
-                                  bad_words_list=bad_words_list,
-                                  lora_uids=args.lora_task_uids,
-                                  prompt_table_path=args.prompt_table_path,
-                                  prompt_tasks=args.prompt_tasks,
-                                  streaming=args.streaming,
-                                  output_sequence_lengths=True,
-                                  return_dict=True)
+        outputs = runner.generate(
+            batch_input_ids,
+            max_new_tokens=args.max_output_len,
+            max_attention_window_size=args.max_attention_window_size,
+            end_id=end_id,
+            pad_id=pad_id,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            num_beams=args.num_beams,
+            length_penalty=args.length_penalty,
+            repetition_penalty=args.repetition_penalty,
+            stop_words_list=stop_words_list,
+            bad_words_list=bad_words_list,
+            lora_uids=args.lora_task_uids,
+            prompt_table_path=args.prompt_table_path,
+            prompt_tasks=args.prompt_tasks,
+            streaming=args.streaming,
+            output_sequence_lengths=True,
+            return_dict=True)
         torch.cuda.synchronize()
 
     if runtime_rank == 0:
@@ -319,7 +357,7 @@ def main(args):
             sequence_lengths = outputs['sequence_lengths']
             context_logits = None
             generation_logits = None
-            if runner.session.gather_all_token_logits:
+            if runner.gather_all_token_logits:
                 context_logits = outputs['context_logits']
                 generation_logits = outputs['generation_logits']
             print_output(tokenizer,

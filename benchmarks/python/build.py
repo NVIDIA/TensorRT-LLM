@@ -15,6 +15,7 @@
 import argparse
 import multiprocessing as mp
 import os
+import time
 from collections import OrderedDict
 
 import tensorrt as trt
@@ -28,7 +29,7 @@ from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.layers import PositionEmbeddingType
 from tensorrt_llm.logger import logger
-from tensorrt_llm.models import quantize_model
+from tensorrt_llm.models import PretrainedConfig, quantize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
@@ -117,6 +118,25 @@ def parse_arguments():
                         default=False,
                         action='store_true',
                         help='Quick sanity check with num_layer=1.')
+    parser.add_argument('--serial_build',
+                        default=False,
+                        action='store_true',
+                        help="Build engines serially")
+
+    parser.add_argument(
+        '--rank',
+        type=int,
+        default=None,
+        help=
+        "The rank of the model to be built, only used when --serial_build is specified"
+    )
+    parser.add_argument(
+        '--world_size',
+        type=int,
+        default=None,
+        help=
+        "The number of gpus to be used for inference, only used when --serial_build is specified"
+    )
 
     return parser.parse_args()
 
@@ -194,9 +214,15 @@ def build_gpt(args):
         build_config['num_layers'] = 1
 
     # More parameters
-    world_size = tensorrt_llm.mpi_world_size()
-    runtime_rank = tensorrt_llm.mpi_rank()
-    torch.cuda.set_device(runtime_rank)
+    if args.serial_build and args.rank is not None and args.world_size is not None:
+        runtime_rank = args.rank
+        world_size = args.world_size
+    else:
+        runtime_rank = tensorrt_llm.mpi_rank()
+        world_size = tensorrt_llm.mpi_world_size()
+    if not args.serial_build:
+        torch.cuda.set_device(runtime_rank)
+
     num_kv_heads = build_config['num_heads'] \
         if build_config['num_kv_heads'] is None else build_config['num_kv_heads']
     apply_query_key_layer_scaling = False
@@ -265,18 +291,26 @@ def build_gpt(args):
             moe_layer_config=tensorrt_llm.moe_config.MoeLayerConfig(
                 build_config["moe_num_experts"], build_config["moe_top_k"]))
     elif family == "opt":
-        tensorrt_llm_model = tensorrt_llm.models.OPTLMHeadModel(
-            num_layers=build_config['num_layers'],
-            num_heads=build_config['num_heads'],
-            hidden_size=build_config['hidden_size'],
-            vocab_size=build_config['vocab_size'],
-            hidden_act=build_config['hidden_act'],
-            max_position_embeddings=build_config['n_positions'],
-            dtype=kv_dtype,
-            mapping=tensorrt_llm.Mapping(world_size=world_size,
-                                         tp_size=world_size),  # TP only
-            pre_norm=build_config['pre_norm'],
-            do_layer_norm_before=build_config['do_layer_norm_before'])
+        config = {
+            'architecture': 'OPTForCausalLM',
+            'dtype': args.dtype,
+            'vocab_size': build_config['vocab_size'],
+            'hidden_size': build_config['hidden_size'],
+            'num_hidden_layers': build_config['num_layers'],
+            'num_attention_heads': build_config['num_heads'],
+            'hidden_act': build_config['hidden_act'],
+            'max_position_embeddings': build_config['n_positions'],
+            'mapping': {
+                'world_size': world_size,
+                'tp_size': world_size
+            },
+            'use_parallel_embedding': False,
+            'share_embedding_table': False,
+            'embedding_sharding_dim': 0,
+            'do_layer_norm_before': build_config['do_layer_norm_before']
+        }
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.OPTForCausalLM(config)
     elif family == "llama":
         tensorrt_llm_model = tensorrt_llm.models.LLaMAForCausalLM(
             num_layers=build_config['num_layers'],
@@ -467,8 +501,10 @@ def build_gpt(args):
         tensorrt_llm.graph_rewriting.optimize(network)
 
     # Network -> Engine
+    start = time.time()
     engine = builder.build_engine(network, builder_config)
     assert engine is not None, f'Failed to build engine for rank {runtime_rank}'
+    build_time = round(time.time() - start, 2)
 
     if args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -478,7 +514,7 @@ def build_gpt(args):
             config_path = os.path.join(args.output_dir, 'config.json')
             builder_config.plugin_config = network.plugin_config
             builder.save_config(builder_config, config_path)
-    return engine
+    return engine, build_time
 
 
 def build_bert(args):
@@ -487,9 +523,15 @@ def build_bert(args):
         build_config['num_layers'] = 1
 
     # More parameters
-    world_size = tensorrt_llm.mpi_world_size()
-    runtime_rank = tensorrt_llm.mpi_rank()
-    torch.cuda.set_device(runtime_rank)
+    if args.serial_build and args.rank is not None and args.world_size is not None:
+        runtime_rank = args.rank
+        world_size = args.world_size
+    else:
+        runtime_rank = tensorrt_llm.mpi_rank()
+        world_size = tensorrt_llm.mpi_world_size()
+    if not args.serial_build:
+        torch.cuda.set_device(runtime_rank)
+
     num_kv_heads = build_config['num_heads'] \
         if build_config['num_kv_heads'] is None else build_config['num_kv_heads']
     max_batch_size = build_config['max_batch_size'] \
@@ -575,8 +617,10 @@ def build_bert(args):
         hidden_states.mark_output('hidden_states', hidden_states_dtype)
 
     # Network -> Engine
+    start = time.time()
     engine = builder.build_engine(network, builder_config)
     assert engine is not None, f'Failed to build engine for rank {runtime_rank}'
+    build_time = round(time.time() - start, 2)
 
     if args.output_dir is not None:
         if not os.path.exists(args.output_dir):
@@ -587,7 +631,7 @@ def build_bert(args):
             config_path = os.path.join(args.output_dir, 'config.json')
             builder_config.plugin_config = network.plugin_config
             builder.save_config(builder_config, config_path)
-    return engine
+    return engine, build_time
 
 
 def main(args):

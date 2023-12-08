@@ -110,11 +110,11 @@ public:
     const void* qkv;
 #ifdef USE_KV_SCALE
     const float* kv_scale_orig_quant = nullptr;
-    const float* kv_scale_quant_orig = nullptr;
 #endif
     // Max 3K size
     KVCache<HasBeam> cacheList[kMaxBatchSizePerWave];
     int batch_size;
+    const float* kv_scale_quant_orig = nullptr;
     void* scratch = nullptr;
 };
 
@@ -144,21 +144,42 @@ int buildXQALaunchParams(XQALaunchParam<HasBeam>& launchParams, const XQAParams&
     launchParams.num_k_heads = params.num_kv_heads;
 #ifdef USE_KV_SCALE
     launchParams.kv_scale_orig_quant = params.kv_scale_orig_quant;
-    launchParams.kv_scale_quant_orig = params.kv_scale_quant_orig;
 #endif
+    launchParams.kv_scale_quant_orig = params.kv_scale_quant_orig;
     launchParams.batch_size = micro_batch_size;
     launchParams.scratch = params.workspaces;
+
+    int max_context_length = 0;
+    int max_past_kv_length = 0;
+    if (params.host_context_lengths)
+    {
+        // TODO: remove this logic, maybe use xqaParams.sequence_lengths inside kernel.
+        max_context_length
+            = *std::max_element(params.host_context_lengths, params.host_context_lengths + params.batch_size);
+        max_past_kv_length = *std::max_element(
+            params.host_past_key_value_lengths, params.host_past_key_value_lengths + params.batch_size);
+    }
     for (int i = 0; i < micro_batch_size; i++)
     {
         int batch_idx = start_batch_idx + i;
         launchParams.cacheList[i].data = kv_linear_buffer.getKBlockPtr(batch_idx * params.beam_width, 0);
-        // the kernel_mha use KV from KVCache, so need plus 1 here.
-        launchParams.cacheList[i].size = params.host_past_key_value_lengths[batch_idx] + 1;
-        launchParams.cacheList[i].capacity = params.max_kv_cache_length;
+        int current_len = 0;
+        // TODO: remove this logic, maybe use xqaParams.sequence_lengths inside kernel.
+        if (params.host_context_lengths)
+        {
+            // the kernel_mha use KV from KVCache, so need plus 1 here.
+            current_len = params.host_context_lengths[batch_idx] + max_past_kv_length - max_context_length + 1;
+        }
+        else
+        {
+            current_len = params.host_past_key_value_lengths[batch_idx] + 1;
+        }
+        launchParams.cacheList[i].size = current_len;
+        launchParams.cacheList[i].capacity = params.max_attention_window_size;
         if constexpr (HasBeam)
         {
             launchParams.cacheList[i].cacheInDir
-                = params.cache_indir + batch_idx * params.beam_width * params.max_kv_cache_length;
+                = params.cache_indir + batch_idx * params.beam_width * params.max_attention_window_size;
         }
     }
     return micro_batch_size;
@@ -175,6 +196,14 @@ public:
         , mKernelMeta(&sXqaKernelMetaInfo[0])
         , mSM(sm)
     {
+        const char* enable_xqa_env_var = getenv("TRTLLM_FORCE_XQA");
+        if (enable_xqa_env_var != nullptr)
+        {
+            if (enable_xqa_env_var[0] == '1' && enable_xqa_env_var[1] == '\0')
+            {
+                mForceXQA = true;
+            }
+        }
     }
 
     void loadXQAKernels()
@@ -238,8 +267,12 @@ public:
         return findIter != mFunctions.end();
     }
 
-    static bool mayHavePerfGain(const XQAParams& xqaParams, int multiprocessor_count)
+    bool mayHavePerfGain(const XQAParams& xqaParams, int multiprocessor_count) const
     {
+        if (mForceXQA)
+        {
+            return true;
+        }
         int num_kv_heads = xqaParams.num_kv_heads;
         int batch_size = static_cast<int>(xqaParams.batch_size);
         int multi_block_count = 1;
@@ -270,7 +303,7 @@ public:
 
         invokeApplyBiasRopeUpdateKVCache<T, KVLinearBuffer, true>(static_cast<T*>(const_cast<void*>(xqaParams.qkv)),
             nullptr, kv_linear_buffer, static_cast<const T*>(xqaParams.qkv_bias), xqaParams.sequence_lengths, nullptr,
-            nullptr, xqaParams.batch_size, 1, xqaParams.cyclic_kv_cache_length, xqaParams.batch_size * beam_width,
+            nullptr, xqaParams.batch_size, 1, xqaParams.cyclic_attention_window_size, xqaParams.batch_size * beam_width,
             xqaParams.num_q_heads, xqaParams.num_kv_heads, xqaParams.head_size, xqaParams.rotary_embedding_dim,
             xqaParams.rotary_embedding_base, xqaParams.rotary_embedding_scale_type, xqaParams.rotary_embedding_scale,
             xqaParams.rotary_embedding_max_positions, xqaParams.position_embedding_type, (float*) nullptr, 0,
@@ -291,8 +324,9 @@ public:
             XQALaunchParam<HAS_BEAM> launchParams;
             int micro_batch_size = buildXQALaunchParams(
                 launchParams, xqaParams, kv_linear_buffer, start_batch_idx, multiprocessor_count);
-            void* kernelParams[] = {&launchParams.num_k_heads, &launchParams.output, &launchParams.qkv,
-                &launchParams.cacheList, &launchParams.batch_size, &launchParams.scratch, nullptr};
+            void* kernelParams[]
+                = {&launchParams.num_k_heads, &launchParams.output, &launchParams.qkv, &launchParams.cacheList,
+                    &launchParams.batch_size, &launchParams.kv_scale_quant_orig, &launchParams.scratch, nullptr};
             int multi_block = 1;
             if (xqaParams.multi_block_mode)
             {
@@ -351,6 +385,8 @@ protected:
     unsigned int mKernelMetaCount;
     unsigned int mSM;
     std::unordered_map<const unsigned long long*, CUmodule> mModules;
+
+    bool mForceXQA = false;
 
     struct XQAKernelFuncInfo
     {
@@ -420,7 +456,7 @@ public:
 
     bool shouldUse(const XQAParams& xqaParams)
     {
-        return xqaKernel->supportConfig(xqaParams) && XQAKernelList::mayHavePerfGain(xqaParams, mMultiProcessorCount);
+        return xqaKernel->supportConfig(xqaParams) && xqaKernel->mayHavePerfGain(xqaParams, mMultiProcessorCount);
     }
 
     void run(const XQAParams& xqa_params, KVLinearBuffer& kv_linear_buffer, const cudaStream_t& stream,

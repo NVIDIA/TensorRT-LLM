@@ -483,7 +483,8 @@ class TestFunctional(unittest.TestCase):
             config=CreateConfig(fp16=(dtype == trt.float16),
                                 bf16=(dtype == trt.bfloat16),
                                 int8=(weight_dtype == trt.int8),
-                                precision_constraints='obey'))
+                                precision_constraints='obey',
+                                builder_optimization_level=4))
         assert build_engine is not None
         with TrtRunner(build_engine) as runner:
             feed_dict = {

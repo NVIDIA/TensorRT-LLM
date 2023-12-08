@@ -185,7 +185,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> con
     SizeType constexpr tensorParallelism{1};
     SizeType constexpr pipelineParallelism{1};
     SizeType constexpr localRank{0};
-    WorldConfig constexpr worldConfig{tensorParallelism, pipelineParallelism, localRank};
+    WorldConfig const worldConfig{tensorParallelism, pipelineParallelism, localRank};
 
     SizeType constexpr vocabSize{51200};
     SizeType constexpr nbLayers{2};
@@ -238,12 +238,12 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> con
         samplingConfigs, generatedTokensPerSteps, manager);
     auto outputs = prepareDecoderOutputs(batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths, manager);
 
-    // We set maxKvCacheLength = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
-    auto const maxKvCacheLength = maxSeqLength;
+    // We set maxAttentionWindow = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
+    auto const maxAttentionWindow = maxSeqLength;
 
     // set up decoder
     auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr);
-    decoder.setup(batchSize, maxBeamWidth, maxSeqLength, maxKvCacheLength, maxGeneratedTokensPerStep, dataType);
+    decoder.setup(batchSize, maxBeamWidth, maxSeqLength, maxAttentionWindow, maxGeneratedTokensPerStep, dataType);
 
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
@@ -295,7 +295,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     SizeType constexpr tensorParallelism{1};
     SizeType constexpr pipelineParallelism{1};
     SizeType constexpr localRank{0};
-    WorldConfig constexpr worldConfig{tensorParallelism, pipelineParallelism, localRank};
+    WorldConfig const worldConfig{tensorParallelism, pipelineParallelism, localRank};
 
     SizeType constexpr vocabSize{51200};
     SizeType constexpr nbLayers{2};
@@ -348,12 +348,12 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
         samplingConfigs, generatedTokensPerSteps, manager);
     auto outputs = prepareDecoderOutputs(batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths, manager);
 
-    // We set maxKvCacheLength = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
-    auto const maxKvCacheLength = maxSeqLength;
+    // We set maxAttentionWindow = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
+    auto const maxAttentionWindow = maxSeqLength;
 
     // set up decoder
     auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr);
-    decoder.setup(batchSize, maxBeamWidth, maxSeqLength, maxKvCacheLength, maxGeneratedTokensPerStep, dataType);
+    decoder.setup(batchSize, maxBeamWidth, maxSeqLength, maxAttentionWindow, maxGeneratedTokensPerStep, dataType);
 
     std::vector<SizeType> expectedSteps(batchSize, 0);
     auto expectedLengths = tiledInputLengths;
@@ -410,7 +410,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     SizeType constexpr tensorParallelism{1};
     SizeType constexpr pipelineParallelism{1};
     SizeType constexpr localRank{0};
-    WorldConfig constexpr worldConfig{tensorParallelism, pipelineParallelism, localRank};
+    WorldConfig const worldConfig{tensorParallelism, pipelineParallelism, localRank};
 
     SizeType constexpr vocabSize{51200};
     SizeType constexpr nbLayers{2};
@@ -457,12 +457,12 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
         samplingConfigs, generatedTokensPerSteps, manager);
     auto outputs = prepareDecoderOutputs(batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths, manager);
 
-    // We set maxKvCacheLength = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
-    auto const maxKvCacheLength = maxSeqLength;
+    // We set maxAttentionWindow = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
+    auto const maxAttentionWindow = maxSeqLength;
 
     // set up decoder
     auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr);
-    decoder.setup(batchSize, maxBeamWidth, maxSeqLength, maxKvCacheLength, maxGeneratedTokensPerStep, dataType);
+    decoder.setup(batchSize, maxBeamWidth, maxSeqLength, maxAttentionWindow, maxGeneratedTokensPerStep, dataType);
 
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {

@@ -57,11 +57,12 @@ struct XQAParams
     const float* kv_scale_orig_quant = nullptr;
     const float* kv_scale_quant_orig = nullptr;
     const int32_t* host_past_key_value_lengths = nullptr;
+    const int32_t* host_context_lengths = nullptr;
     void* workspaces = nullptr;
     uint32_t batch_size = 0;
     int32_t beam_width = 0;
-    int32_t max_kv_cache_length = 0;
-    int32_t cyclic_kv_cache_length = 0;
+    int32_t max_attention_window_size = 0;
+    int32_t cyclic_attention_window_size = 0;
     int timestep = 0;
     const void* qkv_bias;
     const int32_t* sequence_lengths; //
@@ -128,21 +129,10 @@ public:
             SUPPORT_RETURN_FALSE("rotary_embedding_base");
         if (xqaParams.rotary_embedding_scale_type != tensorrt_llm::kernels::RotaryScalingType::kNONE)
             SUPPORT_RETURN_FALSE("rotary_embedding_scale_type");
-        if (xqaParams.rotary_embedding_scale != 1.0f)
-            SUPPORT_RETURN_FALSE("rotary_embedding_scale");
-        if (xqaParams.position_embedding_type != tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPT_NEOX)
-            SUPPORT_RETURN_FALSE("position_embedding_type");
-        // xqaParams.remove_padding
         if (xqaParams.mask_type != tensorrt_llm::kernels::AttentionMaskType::CAUSAL)
             SUPPORT_RETURN_FALSE("mask_type");
         if (xqaParams.paged_kv_cache)
             SUPPORT_RETURN_FALSE("paged_kv_cache");
-        if (xqaParams.kv_cache_quant_mode != tensorrt_llm::common::QuantMode::int8KvCache()
-            && xqaParams.kv_cache_quant_mode != tensorrt_llm::common::QuantMode::fp8KvCache()
-            && xqaParams.kv_cache_quant_mode != tensorrt_llm::common::QuantMode::none())
-            SUPPORT_RETURN_FALSE("kv_cache_quant_mode");
-        if (xqaParams.kv_cache_quant_mode != tensorrt_llm::common::QuantMode::none())
-            SUPPORT_RETURN_FALSE("kv_cache_quant_mode");
         if (xqaParams.qkv_bias_enabled)
             SUPPORT_RETURN_FALSE("qkv_bias_enabled");
         if (xqaParams.cross_attention)
@@ -152,8 +142,8 @@ public:
             SUPPORT_RETURN_FALSE("host_past_key_value_lengths");
         if (xqaParams.beam_width != 1)
             SUPPORT_RETURN_FALSE("beam_width");
-        if (xqaParams.cyclic_kv_cache_length != xqaParams.max_kv_cache_length)
-            SUPPORT_RETURN_FALSE("cyclic_kv_cache_length != max_kv_cache_length");
+        if (xqaParams.cyclic_attention_window_size != xqaParams.max_attention_window_size)
+            SUPPORT_RETURN_FALSE("cyclic_attention_window_size != max_attention_window_size");
         return shouldUseImpl(xqaParams);
     }
 

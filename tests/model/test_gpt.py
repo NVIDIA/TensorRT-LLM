@@ -148,7 +148,6 @@ class TestGPT(unittest.TestCase):
                 network.plugin_config.set_gpt_attention_plugin(dtype)
             if fast_building:
                 network.plugin_config.set_gemm_plugin(dtype)
-                network.plugin_config.set_layernorm_plugin(dtype)
             network.plugin_config.set_context_fmha(context_fmha_type)
             if enable_remove_input_padding:
                 network.plugin_config.enable_remove_input_padding()
@@ -513,6 +512,9 @@ class TestGPT(unittest.TestCase):
                                                          batch_idx=bi)
                 kv_cache_manager.add_sequence(generation_sequence, seq_len)
 
+            # Pre allocate the kv cache for the generated tokens.
+            kv_cache_manager.step([False] * batch_size)
+
         def run_engine(context,
                        input_ids,
                        context_lengths,
@@ -521,7 +523,7 @@ class TestGPT(unittest.TestCase):
                        last_token_ids,
                        cache_indirection,
                        host_past_key_value_lengths,
-                       host_max_kv_cache_lengths,
+                       host_max_attention_window_sizes,
                        sequence_length=None,
                        host_context_lengths=None):
 
@@ -560,7 +562,7 @@ class TestGPT(unittest.TestCase):
                         f'host_kv_cache_block_pointers_{idx}'] = host_kv_cache_block_pointers[
                             idx].reshape(shape).contiguous()
                     ctx_buffer[
-                        f'host_max_kv_cache_length_{idx}'] = host_max_kv_cache_lengths
+                        f'host_max_attention_window_size_{idx}'] = host_max_attention_window_sizes
             else:
                 for i in range(gpt_config.n_layer):
                     ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[
@@ -568,7 +570,7 @@ class TestGPT(unittest.TestCase):
                     ctx_buffer[
                         f'present_key_value_{i}'] = key_value_cache_buffers[i]
                     ctx_buffer[
-                        f'host_max_kv_cache_length_{i}'] = host_max_kv_cache_lengths
+                        f'host_max_attention_window_size_{i}'] = host_max_attention_window_sizes
 
             ctx_shape = {
                 key: buffer.shape
@@ -617,8 +619,8 @@ class TestGPT(unittest.TestCase):
                 ctx_last_token_ids = torch.cumsum(ctx_last_token_ids,
                                                   dim=0).int()
 
-            host_max_kv_cache_lengths = torch.tensor([total_length],
-                                                     dtype=torch.int32)
+            host_max_attention_window_sizes = torch.tensor([total_length],
+                                                           dtype=torch.int32)
 
             host_context_lengths = ctx_context_lengths.cpu(
             ) if enable_remove_input_padding else None
@@ -627,7 +629,6 @@ class TestGPT(unittest.TestCase):
 
             host_past_key_value_lengths = ctx_context_lengths.detach().clone(
             ).cpu()
-
             # We need sequence_lengths start as context_lengths for step 0 (context),
             # and it will be added one after each step.
             sequence_length = ctx_context_lengths.detach().clone()
@@ -640,7 +641,7 @@ class TestGPT(unittest.TestCase):
                 last_token_ids=ctx_last_token_ids,
                 cache_indirection=cache_indirections[0],
                 host_past_key_value_lengths=host_past_key_value_lengths,
-                host_max_kv_cache_lengths=host_max_kv_cache_lengths,
+                host_max_attention_window_sizes=host_max_attention_window_sizes,
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types)
@@ -691,8 +692,8 @@ class TestGPT(unittest.TestCase):
             host_past_key_value_lengths = torch.tensor([seq_len + step - 1] *
                                                        batch_size,
                                                        dtype=torch.int32)
-            host_max_kv_cache_lengths = torch.tensor([seq_len + step],
-                                                     dtype=torch.int32)
+            host_max_attention_window_sizes = torch.tensor([seq_len + step],
+                                                           dtype=torch.int32)
 
             host_context_lengths = gen_context_lengths.cpu(
             ) if enable_remove_input_padding else None
@@ -710,7 +711,7 @@ class TestGPT(unittest.TestCase):
                 last_token_ids=gen_last_token_ids,
                 cache_indirection=cache_indirections[1],
                 host_past_key_value_lengths=host_past_key_value_lengths,
-                host_max_kv_cache_lengths=host_max_kv_cache_lengths,
+                host_max_attention_window_sizes=host_max_attention_window_sizes,
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types)
@@ -766,8 +767,8 @@ class TestGPT(unittest.TestCase):
                 [0] * num_context_input + [seq_len] * num_generation_input,
                 dtype=torch.int32)
 
-            host_max_kv_cache_lengths = torch.tensor([total_length],
-                                                     dtype=torch.int32)
+            host_max_attention_window_sizes = torch.tensor([total_length],
+                                                           dtype=torch.int32)
 
             context_lengths = torch.tensor([seq_len] * batch_size,
                                            dtype=torch.int32).cuda()
@@ -791,7 +792,7 @@ class TestGPT(unittest.TestCase):
                 last_token_ids=gen_last_token_ids,
                 cache_indirection=cache_indirections[0],
                 host_past_key_value_lengths=host_past_key_value_lengths,
-                host_max_kv_cache_lengths=host_max_kv_cache_lengths,
+                host_max_attention_window_sizes=host_max_attention_window_sizes,
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types,

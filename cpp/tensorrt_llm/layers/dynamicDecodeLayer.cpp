@@ -296,7 +296,7 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
             auto const end_id_offset
                 = end_ids.slice({dynamic_decode_batch_size}, dynamic_ite * dynamic_decode_batch_size);
             typename BaseBeamSearchLayer<T>::ForwardParams dynamic_decode_input_tensors{step, ite, logits_offset,
-                end_id_offset, *params.src_cache_indirection, static_cast<std::int32_t>(params.max_kv_cache_length),
+                end_id_offset, *params.src_cache_indirection, static_cast<std::int32_t>(params.max_attention_window),
                 static_cast<std::int32_t>(max_seq_len)};
 
             dynamic_decode_input_tensors.embedding_bias = params.embedding_bias;

@@ -19,6 +19,8 @@ from typing import Optional
 
 from transformers import AutoTokenizer, T5Tokenizer
 
+import tensorrt_llm
+
 DEFAULT_HF_MODEL_DIRS = {
     'baichuan': 'baichuan-inc/Baichuan-13B-Chat',
     'bloom': 'bigscience/bloom-560m',
@@ -48,10 +50,16 @@ DEFAULT_PROMPT_TEMPLATES = {
 }
 
 
-def read_model_name_from_config(config_path: Path):
-    with open(config_path, 'r') as f:
+def read_model_name(engine_dir: str):
+    engine_version = tensorrt_llm.builder.get_engine_version(engine_dir)
+
+    with open(Path(engine_dir) / "config.json", 'r') as f:
         config = json.load(f)
-    return config['builder_config']['name']
+
+    if engine_version is None:
+        return config['builder_config']['name']
+
+    return config['pretrained_config']['architecture']
 
 
 def throttle_generator(generator, stream_interval):

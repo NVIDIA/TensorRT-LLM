@@ -84,8 +84,8 @@ struct FusedQKVMaskedAttentionDispatchParams
     float rotary_embedding_scale;
     int rotary_embedding_max_positions;
     PositionEmbeddingType position_embedding_type;
-    int max_kv_cache_length;
-    int cyclic_kv_cache_length;
+    int max_attention_window;
+    int cyclic_attention_window_size;
     const int* input_lengths;
     int step;
     float q_scaling;
@@ -182,11 +182,12 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(
     xqaParams.kv_scale_orig_quant = generationsParams.kv_scale_orig_quant;
     xqaParams.kv_scale_quant_orig = generationsParams.kv_scale_quant_orig;
     xqaParams.host_past_key_value_lengths = generationsParams.host_past_key_value_lengths;
+    xqaParams.host_context_lengths = generationsParams.host_context_lengths;
     xqaParams.workspaces = generationsParams.workspace;
     xqaParams.batch_size = generationsParams.num_requests;
     xqaParams.beam_width = generationsParams.beam_width;
-    xqaParams.max_kv_cache_length = generationsParams.max_kv_cache_length;
-    xqaParams.cyclic_kv_cache_length = generationsParams.cyclic_kv_cache_length;
+    xqaParams.max_attention_window_size = generationsParams.max_attention_window;
+    xqaParams.cyclic_attention_window_size = generationsParams.cyclic_attention_window_size;
     xqaParams.timestep = generationsParams.past_kv_length;
     xqaParams.qkv_bias = generationsParams.qkv_bias;
     xqaParams.sequence_lengths = generationsParams.sequence_lengths;
@@ -241,8 +242,8 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     params.cache_indir = input_params.cache_indir;
     params.batch_size = input_params.inference_batch_size;
     params.beam_width = input_params.beam_width;
-    params.max_kv_cache_length = input_params.max_kv_cache_length;
-    params.cyclic_kv_cache_length = input_params.cyclic_kv_cache_length;
+    params.max_attention_window_size = input_params.max_attention_window;
+    params.cyclic_attention_window_size = input_params.cyclic_attention_window_size;
     params.length_per_sample = input_params.sequence_lengths; // max_input_length + current output length
     // timestep for shared memory size calculation and rotary embedding computation
     params.timestep = input_params.step - 1;
@@ -550,7 +551,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
     {
         using BufferDataType = typename KVCacheBufferDataType<KVCacheBuffer>::Type;
         kv_cache_buffer = KVCacheBuffer(params.batch_size, 1,
-            isCrossAttention() ? params.cross_qkv_length : params.max_kv_cache_length,
+            isCrossAttention() ? params.cross_qkv_length : params.max_attention_window,
             num_kv_heads * head_size * elem_size);
         kv_cache_buffer.data = reinterpret_cast<BufferDataType*>(params.key_value_cache);
     }
@@ -651,7 +652,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
     decoder_params.seqKVLengths = isCrossAttention() ? params.encoder_input_lengths : params.kv_seq_lengths;
     decoder_params.batchSize = params.batch_size;
     decoder_params.maxSeqLength = isCrossAttention() ? params.cross_qkv_length : params.input_seq_length;
-    decoder_params.maxKvCacheLength = params.cyclic_kv_cache_length;
+    decoder_params.attentionWindowSize = params.cyclic_attention_window_size;
     decoder_params.numTokens = params.num_tokens;
     decoder_params.attentionMaskType = mMaskType;
     invokeBuildDecoderInfo(decoder_params, stream);
@@ -712,7 +713,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
         invokeApplyBiasRopeUpdateKVCache(const_cast<T*>(params.attention_input), q_buf_2_, kv_cache_buffer,
             const_cast<T*>(params.qkv_bias), params.q_seq_lengths, params.kv_seq_lengths,
             mRemovePadding ? padding_offset : nullptr, params.batch_size, params.input_seq_length,
-            params.cyclic_kv_cache_length, params.num_tokens, mNumHeads, mNumKVHeads, getHeadSize(),
+            params.cyclic_attention_window_size, params.num_tokens, mNumHeads, mNumKVHeads, getHeadSize(),
             mRotaryEmbeddingDim, mRotaryEmbeddingBase, mRotaryEmbeddingScaleType, mRotaryEmbeddingScale,
             mRotaryEmbeddingMaxPositions, position_embedding_type, (float*) nullptr, 0, cache_type,
             params.kv_scale_orig_quant, enablePagedKVContextFMHA, stream);
@@ -733,9 +734,9 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
             //    - cu_kv_seqlens: the cumulative kv sequence lengths, needed for variable sequence length.
 
             // the token will pay attention to previous tokens while starting from max(0, rowIdx -
-            // cyclic_kv_cache_length);
+            // cyclic_attention_window_size);
             mFMHARunner->setup_paged_kv(params.batch_size, params.input_seq_length, params.max_past_kv_len,
-                blocks_per_context_sequence, mTokensPerBlock, params.cyclic_kv_cache_length, params.num_tokens,
+                blocks_per_context_sequence, mTokensPerBlock, params.cyclic_attention_window_size, params.num_tokens,
                 isALiBi(), isAliBiWithScale(), mTpSize, mTpRank);
             mFMHARunner->run_paged_kv(q_buf_2_, paged_kv_tma_desc, host_kv_cache_block_ptrs,
                 reinterpret_cast<KVBlockArray&>(kv_cache_buffer), cu_q_seqlens, cu_kv_seqlens, params.context_buf,
@@ -744,8 +745,8 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
         else
         {
             // the token will pay attention to previous tokens while starting from max(0, rowIdx -
-            // cyclic_kv_cache_length);
-            mFMHARunner->setup(params.batch_size, params.input_seq_length, params.cyclic_kv_cache_length,
+            // cyclic_attention_window_size);
+            mFMHARunner->setup(params.batch_size, params.input_seq_length, params.cyclic_attention_window_size,
                 params.num_tokens, isALiBi(), isAliBiWithScale(), mTpSize, mTpRank);
             mFMHARunner->run(const_cast<T*>(params.attention_input), cu_q_seqlens, params.context_buf, stream);
         }
@@ -795,7 +796,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
         {
             invokeTranspose4dBatchMajor(k_buf_2_, v_buf_2_, kv_cache_buffer, params.batch_size,
                 isCrossAttention() ? params.cross_qkv_length : params.input_seq_length,
-                isCrossAttention() ? params.cross_qkv_length : params.cyclic_kv_cache_length, getHeadSize(),
+                isCrossAttention() ? params.cross_qkv_length : params.cyclic_attention_window_size, getHeadSize(),
                 mNumKVHeads, cache_type, params.kv_scale_orig_quant,
                 isCrossAttention() ? params.encoder_input_lengths : params.q_seq_lengths, stream);
         }
@@ -891,7 +892,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
                 // [num_heads, num_buckets], with necessary params (max_distance, num_buckets) passed at the end
                 invokeAddRelativeAttentionBiasUnaligned(qk_buf_float_, relative_attention_bias, params.batch_size,
                     mNumHeads, attention_seq_len_1,
-                    isCrossAttention() ? params.cross_qkv_length : params.cyclic_kv_cache_length, stream,
+                    isCrossAttention() ? params.cross_qkv_length : params.cyclic_attention_window_size, stream,
                     max_distance > 0, relative_attention_bias_stride, max_distance, true /* bidirectional */);
             }
 
@@ -918,8 +919,9 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
                 // already max_output_len + 1. In implicit mode, relative_attention_bias is relative_attention_table
                 // [num_heads, num_buckets], with necessary params (max_distance, num_buckets) passed at the end
                 invokeAddRelativeAttentionBiasUnaligned(qk_buf_, relative_attention_bias, params.batch_size, mNumHeads,
-                    attention_seq_len_1, isCrossAttention() ? params.cross_qkv_length : params.cyclic_kv_cache_length,
-                    stream, max_distance > 0, relative_attention_bias_stride, max_distance, true /* bidirectional */);
+                    attention_seq_len_1,
+                    isCrossAttention() ? params.cross_qkv_length : params.cyclic_attention_window_size, stream,
+                    max_distance > 0, relative_attention_bias_stride, max_distance, true /* bidirectional */);
             }
 
             MaskedSoftmaxParam<T, T> param;
@@ -1078,7 +1080,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(
         {
             using BufferDataType = typename KVCacheBufferDataType<KVCacheBuffer>::Type;
             kv_cache_buffer
-                = KVCacheBuffer(batch_beam, 1, params.max_kv_cache_length, num_kv_heads * head_size * elem_size);
+                = KVCacheBuffer(batch_beam, 1, params.max_attention_window, num_kv_heads * head_size * elem_size);
             kv_cache_buffer.data = reinterpret_cast<BufferDataType*>(params.key_value_cache);
         }
     }
@@ -1098,8 +1100,8 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     }
 
     int timestep = params.past_kv_length;
-    const int max_timesteps
-        = mCrossAttention ? params.cyclic_kv_cache_length : std::min(timestep, params.cyclic_kv_cache_length);
+    const int max_timesteps = mCrossAttention ? params.cyclic_attention_window_size
+                                              : std::min(timestep, params.cyclic_attention_window_size);
     int estimated_min_multi_block_count
         = estimate_min_multi_block_count<T>(max_timesteps, mMaxSharedMemoryPerBlockOptin - 2048);
 
@@ -1157,8 +1159,8 @@ int GPTAttentionPluginCommon::enqueueGeneration(
     dispatch_params.size_per_head = getHeadSize();
     dispatch_params.rotary_embedding_dim = mRotaryEmbeddingDim;
     dispatch_params.position_embedding_type = mPositionEmbeddingType;
-    dispatch_params.max_kv_cache_length = params.max_kv_cache_length;
-    dispatch_params.cyclic_kv_cache_length = params.cyclic_kv_cache_length;
+    dispatch_params.max_attention_window = params.max_attention_window;
+    dispatch_params.cyclic_attention_window_size = params.cyclic_attention_window_size;
     dispatch_params.input_lengths = params.context_lengths;
     dispatch_params.step = step;
     dispatch_params.q_scaling = q_scaling;

@@ -82,7 +82,7 @@ struct BuildDecoderInfoParams
     int maxSeqLength;
     // The kv cache capacity.
     // We will apply the limited_length_causal mask when there are not enough kv cache.
-    int maxKvCacheLength;
+    int attentionWindowSize;
     // The number of tokens in total. It's \sum_{ii=0}^{batchSize} seqLengths[ii].
     int numTokens;
     // The type of attention.
