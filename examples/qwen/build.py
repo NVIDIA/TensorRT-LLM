@@ -159,7 +159,7 @@ def parse_arguments():
     parser.add_argument('--max_input_len', type=int, default=2048)
     parser.add_argument('--max_output_len', type=int, default=2048)
     parser.add_argument('--max_beam_width', type=int, default=1)
-    parser.add_argument('--rotary_base', type=float, default=10000.0)
+    parser.add_argument('--rotary_emb_base', type=float, default=10000.0)
     parser.add_argument('--rotary_scaling', nargs=2, type=str, default=None)
     parser.add_argument('--use_gpt_attention_plugin',
                         nargs='?',
@@ -420,7 +420,7 @@ def build_rank_engine(builder: Builder,
         mlp_hidden_size=args.inter_size,
         neox_rotary_style=True,
         mapping=mapping,
-        rotary_base=args.rotary_base,
+        rotary_emb_base=args.rotary_emb_base,
         rotary_scaling=args.rotary_scaling,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
