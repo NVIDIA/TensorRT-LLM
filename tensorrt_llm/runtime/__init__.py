@@ -14,12 +14,19 @@
 # limitations under the License.
 from .generation import SamplingConfig  # autoflake: skip
 from .generation import (ChatGLMGenerationSession, GenerationSession,
-                         ModelConfig, QWenForCausalLMGenerationSession,
-                         to_word_list_format)
+                         LogitsProcessor, LogitsProcessorList, ModelConfig,
+                         QWenForCausalLMGenerationSession, StoppingCriteria,
+                         StoppingCriteriaList, to_word_list_format)
 from .kv_cache_manager import GenerationSequence, KVCacheManager
 from .lora_manager import LoraManager  # autoflake: skip
 from .model_runner import ModelRunner
 from .session import Session, TensorInfo
+
+try:
+    from .model_runner_cpp import ModelRunnerCpp
+    PYTHON_BINDINGS = True
+except ImportError:
+    PYTHON_BINDINGS = False
 
 __all__ = [
     'ModelConfig',
@@ -33,5 +40,11 @@ __all__ = [
     'ChatGLMGenerationSession',
     'QWenForCausalLMGenerationSession',
     'to_word_list_format',
+    'LogitsProcessorList',
+    'LogitsProcessor',
+    'StoppingCriteriaList',
+    'StoppingCriteria',
     'ModelRunner',
+    'ModelRunnerCpp',
+    'PYTHON_BINDINGS',
 ]

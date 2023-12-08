@@ -68,7 +68,7 @@ def build_trt_llm(python_exe: str,
         python_exe, "scripts/build_wheel.py", "--cuda_architectures",
         cuda_architectures, "--build_dir",
         str(build_dir), "--dist_dir",
-        str(dist_dir)
+        str(dist_dir), "--python_bindings"
     ]
     if trt_root is not None:
         build_wheel += ["--trt_root", str(trt_root)]

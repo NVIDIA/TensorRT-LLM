@@ -75,9 +75,9 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
                 name='host_past_key_value_lengths',
                 shape=shape_dict['host_past_key_value_lengths'],
                 dtype=tensorrt_llm.str_dtype_to_trt('int32'))
-            host_max_kv_cache_lengths_tensor = Tensor(
-                name='host_max_kv_cache_lengths',
-                shape=shape_dict['host_max_kv_cache_lengths'],
+            host_max_attention_window_sizes_tensor = Tensor(
+                name='host_max_attention_window_sizes',
+                shape=shape_dict['host_max_attention_window_sizes'],
                 dtype=tensorrt_llm.str_dtype_to_trt('int32'))
             context_lengths_tensor = Tensor(
                 name='context_lengths',
@@ -126,7 +126,8 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
                 past_key_value=past_key_value_tensor,
                 sequence_length=sequence_length_tensor,
                 host_past_key_value_lengths=host_past_key_value_lengths_tensor,
-                host_max_kv_cache_lengths=host_max_kv_cache_lengths_tensor,
+                host_max_attention_window_sizes=
+                host_max_attention_window_sizes_tensor,
                 context_lengths=context_lengths_tensor,
                 cache_indirection=cache_indirection_tensor,
                 host_request_types=host_request_types_tensor,
@@ -177,7 +178,7 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
         'input': (batch_size, in_len, hidden_size),
         'output': (batch_size, in_len, hidden_size),
         'host_past_key_value_lengths': (batch_size, ),
-        'host_max_kv_cache_lengths': (1, )
+        'host_max_attention_window_sizes': (1, )
     }
 
     weight = torch.randn(shape_dict['weight'],

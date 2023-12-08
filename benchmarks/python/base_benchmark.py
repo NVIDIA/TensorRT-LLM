@@ -59,12 +59,18 @@ def serialize_engine(engine, path):
 
 class BaseBenchmark(object):
 
-    def __init__(self, engine_dir, model_name, dtype):
+    def __init__(self,
+                 engine_dir,
+                 model_name,
+                 dtype,
+                 rank,
+                 world_size,
+                 serial_build: bool = False):
         self.engine_dir = engine_dir
         self.model_name = model_name
         self.dtype = dtype
-        self.runtime_rank = tensorrt_llm.mpi_rank()
-        self.world_size = tensorrt_llm.mpi_world_size()
+        self.runtime_rank = rank
+        self.world_size = world_size
         self.engine_model_name = model_name
         self.quant_mode = QuantMode(0)
         self.enable_fp8 = False
@@ -100,8 +106,9 @@ class BaseBenchmark(object):
         self.runtime_mapping = tensorrt_llm.Mapping(world_size=self.world_size,
                                                     rank=self.runtime_rank,
                                                     tp_size=self.world_size)
-        torch.cuda.set_device(self.runtime_rank %
-                              self.runtime_mapping.gpus_per_node)
+        if not serial_build:
+            torch.cuda.set_device(self.runtime_rank %
+                                  self.runtime_mapping.gpus_per_node)
 
         self.csv_filename = ""  # lazy init
 

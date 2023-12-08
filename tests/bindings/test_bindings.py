@@ -286,6 +286,7 @@ def test_gpt_json_config():
     gpt_model_config = _tb.GptModelConfig(**model_config)
     json_config = {
         "name": "gpt",
+        "version": "none",
         "precision": "float32",
         "tensor_parallelism": 1,
         "pipeline_parallelism": 1,
@@ -383,7 +384,7 @@ def test_llm_request():
     assert llm_request.is_streaming
     assert llm_request.pad_id == 99
     assert llm_request.end_id == 100
-    assert llm_request.batch_slot == -1  # batch_slot is still uninitialized
+    assert llm_request.seq_slot == -1  # seq_slot is still uninitialized
     assert torch.equal(llm_request.prompt_embedding_table,
                        kwargs["prompt_embedding_table"])
     assert llm_request.prompt_vocab_size == 2
@@ -533,7 +534,7 @@ def test_inference_request():
 def test_trt_gpt_model_optional_params():
     opt_params = _tb.TrtGptModelOptionalParams()
 
-    kv_cache_config = _tb.KvCacheConfig(10, 10, 0.5)
+    kv_cache_config = _tb.KvCacheConfig(10, 10, 0.5, False)
     opt_params.kv_cache_config = kv_cache_config
     assert opt_params.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
 
@@ -542,3 +543,6 @@ def test_trt_gpt_model_optional_params():
 
     opt_params.enable_trt_overlap = True
     assert opt_params.enable_trt_overlap
+
+    opt_params.use_context_fmha_for_generation = True
+    assert opt_params.use_context_fmha_for_generation

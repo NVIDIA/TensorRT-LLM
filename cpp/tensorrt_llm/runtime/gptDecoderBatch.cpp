@@ -114,7 +114,7 @@ GptDecoderBatch::GptDecoderBatch(
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatch::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxKvCacheLength,
+void GptDecoderBatch::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow,
     SizeType maxSequenceLength, SizeType maxTokensPerStep, nvinfer1::DataType dtype)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
@@ -125,7 +125,7 @@ void GptDecoderBatch::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeTy
     mActualBatchSize = maxBatchSize;
     mGeneratedTokensPerStep.resize(maxBatchSize);
     mMaxSequenceLength = maxSequenceLength;
-    mMaxKvCacheLength = maxKvCacheLength;
+    mMaxAttentionWindow = maxAttentionWindow;
     mMaxTokensPerStep = maxTokensPerStep;
 
     auto const maxBatchSizeShape = ITensor::makeShape({maxBatchSize});
@@ -248,7 +248,7 @@ void GptDecoderBatch::newRequest(
     TensorPtr endIdTensorPtr{ITensor::slice(constPointerCast(dJointInput.endIds), batchIdx, localBatchSize)};
     kernels::invokeFill(*endIdTensorPtr, endId, *stream);
     dInput = std::make_unique<DecodingInput>(
-        inputLength, mMaxKvCacheLength, localBatchSize, dJointInput.logits, endIdTensorPtr);
+        inputLength, mMaxAttentionWindow, localBatchSize, dJointInput.logits, endIdTensorPtr);
 
     // Here, we need to add leading 1 dimension since decoderInput expects batchSize as leading dim
     // and decoder_batch::Request doesn't have batch dimension

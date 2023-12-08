@@ -71,7 +71,6 @@ class BaichuanDecoderLayer(Module):
             tp_group=tp_group,
             tp_size=tp_size,
             tp_rank=tp_rank,
-            use_int8_kv_cache=quant_mode.has_int8_kv_cache(),
             quant_mode=quant_mode)
         if not mlp_hidden_size:
             self.mlp_hidden_size = hidden_size * 4
@@ -169,11 +168,11 @@ class BaichuanModel(Module):
         if use_cache:
             presents = []
 
-        for layer, past, pointer, host_pointer, max_kv_cache_length in zip(
+        for layer, past, pointer, host_pointer, max_attention_window_size in zip(
                 self.layers, kv_cache_params.past_key_value,
                 kv_cache_params.kv_cache_block_pointers,
                 kv_cache_params.host_kv_cache_block_pointers,
-                kv_cache_params.host_max_kv_cache_lengths):
+                kv_cache_params.host_max_attention_window_sizes):
             hidden_states = layer(
                 hidden_states,
                 use_cache=use_cache,
@@ -182,7 +181,7 @@ class BaichuanModel(Module):
                     past_key_value=[past],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
-                    host_max_kv_cache_lengths=max_kv_cache_length,
+                    host_max_attention_window_sizes=max_attention_window_size,
                     kv_cache_block_pointers=[pointer],
                     host_kv_cache_block_pointers=[host_pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
@@ -334,8 +333,8 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
                     past_key_value=model_inputs['past_key_value'],
                     host_past_key_value_lengths=model_inputs[
                         'host_past_key_value_lengths'],
-                    host_max_kv_cache_lengths=model_inputs[
-                        'host_max_kv_cache_lengths'],
+                    host_max_attention_window_sizes=model_inputs[
+                        'host_max_attention_window_sizes'],
                     kv_cache_block_pointers=model_inputs[
                         'kv_cache_block_pointers_list'],
                     host_kv_cache_block_pointers=model_inputs[

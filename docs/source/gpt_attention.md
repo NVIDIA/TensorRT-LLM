@@ -175,26 +175,25 @@ tensor scaling).
 
 TensorRT-LLM has a feature called `Cyclic KV Cache`, which treats the kv cache
 as a circular buffer. This means that it only stores the kv cache for the last N
-tokens, where N is determined by the `max_kv_cache_length` parameter in
+tokens, where N is determined by the `max_attention_window_size` parameter in
 `GenerationSession.setup`. You can see examples of this in the `run.py` or
 `summarize.py` files. When the cache is full, new tokens’ kv cache will
 overwrite the "least recently used" caches.
 
-In the context phase, if the input length surpasses the `max_kv_cache_length`,
+In the context phase, if the input length surpasses the `max_attention_window_size`,
 `Sliding Window Attention` will be activated. This serves the same function as
 the `sliding window_size`.
 
 This feature helps to reduce the memory footprint of the kv cache when
 dealing with very long sequences.
 
-_Note that when using beam search, cyclic kv cache may not perform as well as
-full kv cache when the current step exceeds `max_kv_cache_length`.
-This issue will be addressed in future releases._
+_Note that the cyclic kv cache feature doesn't work with beam searching currently as
+the context kv cache are shared across beams.
 
-_The experimental feature, which allows different `max_kv_cache_length` values
+_The experimental feature, which allows different `max_attention_window_size` values
 for each layer, is also supported. To utilize this feature, simply provide an
 `int32 torch.Tensor` with a shape of `[num_layers]` to the `GenerationSession.setup`.
-This tensor will serve as the buffer for `max_kv_cache_length`,
+This tensor will serve as the buffer for `max_attention_window_size`,
 setting unique values for each layer. However, it’s important to note that the
 memory allocation for the kv cache still relies on the buffer’s maximum value._
 

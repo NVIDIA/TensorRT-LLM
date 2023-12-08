@@ -42,12 +42,13 @@ def parse_args():
     parser.add_argument('--dataset_path',
                         type=str,
                         default='/code/tensorrt_llm/data')
-    parser.add_argument('--max_kv_cache_length',
-                        type=int,
-                        default=4096,
-                        help='The max kv cache length. \
-              If the final sequence length exceeds the kv cache length, we will enable cyclic kv cache. \
-              If it is set to None, we will use the max sequence length.')
+    parser.add_argument(
+        '--max_attention_window_size',
+        type=int,
+        default=4096,
+        help=
+        'The attention window size that controls the sliding window attention / cyclic kv cache behaviour'
+    )
     parser.add_argument(
         '--max_input_len',
         type=int,
@@ -147,7 +148,7 @@ def get_long_texts(dataset_openweb):
     for datapoint in dataset_openweb["train"]:
         text = datapoint["text"]
         approximate_tokens = len(text.split())
-        if (approximate_tokens > args.max_kv_cache_length) and (
+        if (approximate_tokens > args.max_attention_window_size) and (
                 approximate_tokens < args.max_input_len):
             yield text
 
@@ -228,17 +229,19 @@ def summarize_tensorrt_llm(datapoint, tokenizer, tensorrt_llm_llama, args):
         num_beams=args.num_beams)
 
     with torch.no_grad():
-        tensorrt_llm_llama.setup(batch_size=args.batch_size,
-                                 max_context_length=max_length,
-                                 max_new_tokens=args.output_len,
-                                 beam_width=args.num_beams,
-                                 max_kv_cache_length=args.max_kv_cache_length)
+        tensorrt_llm_llama.setup(
+            batch_size=args.batch_size,
+            max_context_length=max_length,
+            max_new_tokens=args.output_len,
+            beam_width=args.num_beams,
+            max_attention_window_size=args.max_attention_window_size)
         logger.info(f"Generation session set up with the parameters: \
             batch_size: {tensorrt_llm_llama.batch_size}, \
             max_context_length: {tensorrt_llm_llama.max_context_length}, \
             max_new_tokens: {tensorrt_llm_llama.max_new_tokens}, \
             beam_width: {tensorrt_llm_llama.beam_width}, \
-            max_kv_cache_length: {tensorrt_llm_llama.max_kv_cache_length}")
+            max_attention_window_size: {tensorrt_llm_llama.max_attention_window_size}"
+                    )
 
         if tensorrt_llm_llama.remove_input_padding:
             output_ids = tensorrt_llm_llama.decode_batch(
@@ -290,7 +293,7 @@ def main(args):
         ]
     except StopIteration:
         logger.warning(
-            f"No test data of sufficient length ({args.max_kv_cache_length}). Try decreasing the max_kv_cache_length parameter"
+            f"No test data of sufficient length ({args.max_attention_window_size}). Try decreasing the max_attention_window_size parameter"
         )
         return
 

@@ -173,8 +173,9 @@ def hf_gpt_converter(args):
     saved_dir = Path(args.out_dir) / f"{infer_tp}-gpu"
     saved_dir.mkdir(parents=True, exist_ok=True)
 
+    torch_dtype = torch.float16 if args.storage_type == 'fp16' else torch.float32
     model = LlamaForCausalLM.from_pretrained(args.in_file,
-                                             torch_dtype="auto",
+                                             torch_dtype=torch_dtype,
                                              device_map="auto",
                                              trust_remote_code=True)
     if args.load_model_on_cpu:

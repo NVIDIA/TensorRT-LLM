@@ -104,7 +104,6 @@ class Layer:
     # list of TRT layers.
     TRT_LAYER_TYPE_TO_LAYER = {
         trt.LayerType.CONVOLUTION: trt.IConvolutionLayer,
-        trt.LayerType.FULLY_CONNECTED: trt.IFullyConnectedLayer,
         trt.LayerType.ACTIVATION: trt.IActivationLayer,
         trt.LayerType.POOLING: trt.IPoolingLayer,
         trt.LayerType.LRN: trt.ILRNLayer,
@@ -122,7 +121,6 @@ class Layer:
         trt.LayerType.MATRIX_MULTIPLY: trt.IMatrixMultiplyLayer,
         trt.LayerType.RAGGED_SOFTMAX: trt.IRaggedSoftMaxLayer,
         trt.LayerType.CONSTANT: trt.IConstantLayer,
-        trt.LayerType.RNN_V2: trt.IRNNv2Layer,
         trt.LayerType.IDENTITY: trt.IIdentityLayer,
         trt.LayerType.PLUGIN_V2: trt.IPluginV2Layer,
         trt.LayerType.SLICE: trt.ISliceLayer,

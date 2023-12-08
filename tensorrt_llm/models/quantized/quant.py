@@ -23,13 +23,14 @@ from ...models import (BaichuanForCausalLM, BloomForCausalLM, FalconForCausalLM,
 from ...module import Module
 from ...quantization import QuantMode
 from ...quantization.layers import FP8Linear, FP8RowLinear
+from ...quantization.quantize import weight_only_quantize
 
 # isort: off
-from ...quantization.layers import (
-    SmoothQuantAttention, SmoothQuantGatedMLP, SmoothQuantLayerNorm,
-    SmoothQuantMLP, SmoothQuantRmsNorm, WeightOnlyGroupwiseQuantColumnLinear,
-    WeightOnlyGroupwiseQuantRowLinear, WeightOnlyQuantColumnLinear,
-    WeightOnlyQuantRowLinear)
+from ...quantization.layers import (SmoothQuantAttention, SmoothQuantGatedMLP,
+                                    SmoothQuantLayerNorm, SmoothQuantMLP,
+                                    SmoothQuantRmsNorm,
+                                    WeightOnlyGroupwiseQuantColumnLinear,
+                                    WeightOnlyGroupwiseQuantRowLinear)
 # isort: on
 
 
@@ -92,6 +93,7 @@ def _smooth_quantize_llama(model, quant_mode):
             dtype=layer.dtype,
             attention_mask_type=layer.attention_mask_type,
             position_embedding_type=layer.position_embedding_type,
+            rotary_embedding_base=layer.attention.rotary_embedding_base,
             tp_group=layer.tp_group,
             tp_size=layer.tp_size,
             quant_mode=quant_mode,
@@ -270,53 +272,6 @@ def _smooth_quantize(model, quant_mode):
         assert False, f"Model {type(model).__name__} is not supported by SmoothQuant yet"
 
 
-def _weight_only_quantize(model,
-                          quant_mode,
-                          exclude_modules=None,
-                          current_key_name=None):
-    assert quant_mode.is_weight_only()
-
-    exclude_modules = ['lm_head'
-                       ] if exclude_modules is None else exclude_modules
-
-    for name, module in model.named_children():
-        if current_key_name is None:
-            current_key_name = []
-        current_key_name.append(name)
-
-        if len(list(module.children())) > 0:
-            _weight_only_quantize(module, quant_mode, exclude_modules,
-                                  current_key_name)
-
-        if isinstance(module, ColumnLinear) and name not in exclude_modules:
-            if not any(key in '.'.join(current_key_name)
-                       for key in exclude_modules):
-                model._modules[name] = WeightOnlyQuantColumnLinear(
-                    in_features=module.in_features,
-                    out_features=module.out_features * module.tp_size,
-                    bias=module.bias is not None,
-                    dtype=module.dtype,
-                    tp_group=module.tp_group,
-                    tp_size=module.tp_size,
-                    gather_output=module.gather_output,
-                    quant_mode=quant_mode)
-        elif isinstance(module, RowLinear) and name not in exclude_modules:
-            if not any(key in '.'.join(current_key_name)
-                       for key in exclude_modules):
-                model._modules[name] = WeightOnlyQuantRowLinear(
-                    in_features=module.in_features * module.tp_size,
-                    out_features=module.out_features,
-                    bias=module.bias is not None,
-                    dtype=module.dtype,
-                    tp_group=module.tp_group,
-                    tp_size=module.tp_size,
-                    quant_mode=quant_mode)
-
-        current_key_name.pop(-1)
-
-    return model
-
-
 def _weight_only_groupwise_quantize(model,
                                     quant_mode,
                                     group_size=128,
@@ -379,7 +334,7 @@ def quantize_model(model: Module, quant_mode: QuantMode, **kwargs: Any):
         if quant_mode.has_per_group_scaling():
             model = _weight_only_groupwise_quantize(model, quant_mode, **kwargs)
         else:
-            model = _weight_only_quantize(model, quant_mode, **kwargs)
+            model = weight_only_quantize(model, quant_mode, **kwargs)
 
     setattr(model, "quant_mode", quant_mode)
     return model

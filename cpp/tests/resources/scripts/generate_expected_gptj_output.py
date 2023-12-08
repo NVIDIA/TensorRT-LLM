@@ -52,7 +52,7 @@ def generate_output(engine: str,
         str(output_dir / (output_name + '.npy')), '--output_csv',
         str(output_dir / (output_name + '.csv')), '--max_output_len',
         str(max_output_len), '--num_beams',
-        str(num_beams)
+        str(num_beams), '--use_py_session'
     ])
     run.main(args)
 

@@ -105,7 +105,7 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, const 
 
 template <typename T, typename KVCacheBuffer>
 void invokeTranspose4dBatchMajor(const T* k_src, const T* v_src, KVCacheBuffer& kvTable, const int local_batch_size,
-    const int seq_len, const int max_kv_cache_len, const int size_per_head, const int local_head_num,
+    const int seq_len, const int max_attention_window_size, const int size_per_head, const int local_head_num,
     const KvCacheDataType cache_type, const float* kvScaleOrigQuant, const int* sequence_lengths, cudaStream_t stream);
 
 // NOTE: this kernel is in-place, QKV will be modified, if other kernels need that, may need copy or use before it.

@@ -128,11 +128,26 @@ TEST_F(TorchTest, Aten)
             EXPECT_LT(tensorView->getSize(), tensorTllm->getSize());
             EXPECT_EQ(tensorView->getSize(), tensorAten.numel());
             EXPECT_EQ(tensorView->data(), tensorTllm->data());
-            EXPECT_THROW(tensorView->reshape(shapeLarge), std::runtime_error);
+            EXPECT_THROW(tensorView->reshape(shapeLarge), tc::TllmException);
 
             tensorView->release();
             EXPECT_EQ(tensorView->data(), nullptr);
             EXPECT_EQ(tensorView->getSize(), 0);
         }
+    }
+}
+
+TEST_F(TorchTest, Resize)
+{
+    auto devices = {at::Device{at::kCUDA, 0}, at::Device{at::kCPU}};
+    for (auto device : devices)
+    {
+        auto tensorAten = at::randn({1, 2, 3, 4}).to(device);
+        auto tensorView = TorchView::of(tensorAten);
+        auto size = tensorView->getSize();
+        EXPECT_NO_THROW(tensorView->resize(size / 2));
+        EXPECT_EQ(tensorView->getSize(), size / 2);
+        EXPECT_NO_THROW(tensorView->resize(size * 2));
+        EXPECT_EQ(tensorView->getSize(), size * 2);
     }
 }

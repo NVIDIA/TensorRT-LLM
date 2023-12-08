@@ -19,12 +19,16 @@
 #include "namedTensor.h"
 #include "tensorrt_llm/batch_manager/GptManager.h"
 #include "tensorrt_llm/batch_manager/callbacks.h"
-#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/pybind/utils/pathCaster.h"
+
+#include <pybind11/functional.h>
+#include <pybind11/operators.h>
+#include <pybind11/stl.h>
+#include <torch/extension.h>
 
 #include <ATen/ATen.h>
 
 #include <ATen/ops/tensor.h>
-#include <functional>
 #include <memory>
 #include <optional>
 
@@ -51,8 +55,8 @@ py::object GptManager::enter()
 void GptManager::exit(py::handle type, py::handle value, py::handle traceback)
 {
     // NOTE: we must release the GIL here. GptManager has spawned a thread for the execution loop. That thread must be
-    // able to do forward progress for the shutdown process to succeed. For that, we must manually release the GIL while
-    // waiting in `process.join()`.
+    // able to do forward progress for the shutdown process to succeed. It takes the GIL during its callbacks, so
+    // we release it now. Note that we shouldn't do anything related to python objects after that.
     py::gil_scoped_release release;
     shutdown();
 }
@@ -85,4 +89,21 @@ tb::SendResponseCallback callbackAdapter(SendResponseCallback callback)
         callback(id, pythonList, isOk, errMsg);
     };
 }
+
+void GptManager::initBindings(py::module_& m)
+{
+    py::class_<GptManager>(m, "GptManager")
+        .def(py::init<std::filesystem::path const&, tb::TrtGptModelType, int32_t, tb::batch_scheduler::SchedulerPolicy,
+                 GetInferenceRequestsCallback, SendResponseCallback, tb::PollStopSignalCallback,
+                 tb::ReturnBatchManagerStatsCallback, const tb::TrtGptModelOptionalParams&, std::optional<uint64_t>>(),
+            py::arg("trt_engine_path"), py::arg("model_type"), py::arg("max_beam_width"), py::arg("scheduler_policy"),
+            py::arg("get_inference_requests_cb"), py::arg("send_response_cb"), py::arg("poll_stop_signal_cb") = nullptr,
+            py::arg("return_batch_manager_stats_cb") = nullptr,
+            py::arg_v("optional_params", tb::TrtGptModelOptionalParams(), "TrtGptModelOptionalParams"),
+            py::arg("terminate_req_id") = std::nullopt)
+        .def("shutdown", &GptManager::exit)
+        .def("__enter__", &GptManager::enter)
+        .def("__exit__", &GptManager::exit);
+}
+
 } // namespace tensorrt_llm::pybind::batch_manager

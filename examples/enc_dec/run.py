@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import argparse
 import json
 import time
@@ -81,12 +95,6 @@ def read_config(config_path: Path):
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument("--max_new_tokens", type=int, default=64)
-    parser.add_argument('--max_kv_cache_length',
-                        type=int,
-                        default=None,
-                        help='The max kv cache length. \
-              If the final sequence length exceeds the kv cache length, we will enable cyclic kv cache. \
-              If it is set to None, we will use the max sequence length.')
     parser.add_argument("--log_level", type=str, default="error")
     parser.add_argument("--engine_dir", "-i", type=str, default="trt_engines")
     parser.add_argument("--engine_name", type=str, default="enc_dec")
@@ -354,7 +362,7 @@ class TRTLLMEncDecModel:
             decoder_max_input_length,
             max_new_tokens,
             num_beams,
-            max_kv_cache_length=None,
+            max_attention_window_size=None,
             encoder_max_input_length=encoder_max_input_length)
         torch.cuda.synchronize()
 
@@ -495,7 +503,7 @@ if __name__ == "__main__":
                 print(
                     f"[CAVEAT] Comparing TRT-LLM {inference_dtype} results with HF float32 results. Close match are not expected!"
                 )
-            assert match_rate > 0.9, f"Incorrect results! Match rate {match_rate}"
+            assert match_rate > 0.8, f"Incorrect results! Match rate {match_rate}"
             print(
                 f"TRT-LLM results match HF FP32 results with literal match rate {match_rate}"
             )

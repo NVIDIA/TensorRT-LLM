@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import math
 from collections import OrderedDict
 from typing import Optional
@@ -8,15 +22,17 @@ from tensorrt_llm._common import default_net
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType, PositionEmbeddingType, Tensor,
-                                     assertion, gather_last_token_logits, recv,
-                                     send, shape)
+                                     assertion, gather_last_token_logits, gelu,
+                                     recv, send, shape, transpose)
 from tensorrt_llm.layers import (MLP, Attention, AttentionMaskType,
                                  AttentionParams, BertAttention, ColumnLinear,
-                                 Embedding, FusedGatedMLP, GatedMLP, GroupNorm,
-                                 KeyValueCacheParams, LayerNorm, RmsNorm)
+                                 Conv1d, Embedding, FusedGatedMLP, GatedMLP,
+                                 GroupNorm, KeyValueCacheParams, LayerNorm,
+                                 RmsNorm)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.generation_mixin import GenerationMixin
 from tensorrt_llm.module import Module, ModuleList
+from tensorrt_llm.parameter import Parameter
 
 layernorm_map = {
     LayerNormType.LayerNorm: LayerNorm,
@@ -513,8 +529,8 @@ class EncoderModel(Module, GenerationMixin):
                          residual_scaling=residual_scaling,
                          relative_attention=relative_attention,
                          max_distance=max_distance,
-                         num_buckets=num_buckets) for _ in
-            self.get_transformer_layers(self.mapping, self.total_num_layers)
+                         num_buckets=num_buckets)
+            for _ in self.mapping.pp_layers(self.total_num_layers)
         ])
 
         if self.mapping.is_last_pp_rank():
@@ -711,6 +727,7 @@ class DecoderModel(Module, GenerationMixin):
                  layernorm_type=LayerNormType.LayerNorm,
                  hidden_act="relu",
                  mlp_type=MLPType.MLP,
+                 rescale_before_lm_head=True,
                  has_lm_head_bias=False,
                  residual_scaling=1.0,
                  use_parallel_embedding=False,
@@ -767,6 +784,7 @@ class DecoderModel(Module, GenerationMixin):
 
         self.has_position_embedding = has_position_embedding
         self.has_token_type_embedding = type_vocab_size is not None
+        self.rescale_before_lm_head = rescale_before_lm_head
 
         if self.mapping.is_first_pp_rank():
             self.embedding = EncDecEmbedding(
@@ -804,8 +822,8 @@ class DecoderModel(Module, GenerationMixin):
                          residual_scaling=residual_scaling,
                          relative_attention=relative_attention,
                          max_distance=max_distance,
-                         num_buckets=num_buckets) for _ in
-            self.get_transformer_layers(self.mapping, self.total_num_layers)
+                         num_buckets=num_buckets)
+            for _ in self.mapping.pp_layers(self.total_num_layers)
         ])
 
         if self.mapping.is_last_pp_rank():
@@ -856,9 +874,9 @@ class DecoderModel(Module, GenerationMixin):
         if use_cache:
             presents = []
 
-        for decoder_layer, past, max_kv_cache_length in zip(
+        for decoder_layer, past, max_attention_window_size in zip(
                 self.decoder_layers, kv_cache_params.past_key_value,
-                kv_cache_params.host_max_kv_cache_lengths):
+                kv_cache_params.host_max_attention_window_sizes):
             hidden_states = decoder_layer(
                 hidden_states,
                 encoder_output=encoder_output,
@@ -868,7 +886,7 @@ class DecoderModel(Module, GenerationMixin):
                     past_key_value=past,
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
-                    host_max_kv_cache_lengths=max_kv_cache_length,
+                    host_max_attention_window_sizes=max_attention_window_size,
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
                 all_reduce_workspace=all_reduce_workspace)
@@ -892,7 +910,9 @@ class DecoderModel(Module, GenerationMixin):
             # See https://github.com/huggingface/transformers/blob/0b192de1f353b0e04dad4813e02e2c672de077be/src/transformers/models/t5/modeling_t5.py#L1769-L1772
             # Note: this is specific for T5, to make it more generic, one can pass in a config:
             #   self.config.tie_word_embeddings - default to be True for T5
-            hidden_states = hidden_states * (self.hidden_size**-0.5)
+            # openai whisper model didn't use this rescale
+            if self.rescale_before_lm_head:
+                hidden_states = hidden_states * (self.hidden_size**-0.5)
 
             # [bs, hidden_size] -> [bs, vocab_size]
             lm_logits = self.lm_head(hidden_states)
@@ -902,10 +922,8 @@ class DecoderModel(Module, GenerationMixin):
             hidden_states.mark_output('hidden_states_output', self._dtype)
 
         if use_cache and default_net().plugin_config.paged_kv_cache == False:
-            for i, present in zip(
-                    self.get_transformer_layers(self.mapping,
-                                                self.total_num_layers),
-                    presents):
+            for i, present in zip(self.mapping.pp_layers(self.total_num_layers),
+                                  presents):
                 present[0].mark_output(f'present_key_value_{i}', self._kv_dtype)
                 present[1].mark_output(f'cross_present_key_value_{i}',
                                        self._kv_dtype)
@@ -1092,7 +1110,7 @@ class DecoderModel(Module, GenerationMixin):
                 dtype=self._dtype,
                 shape=[-1, -1, self.encoder_hidden_size],
                 dim_range=OrderedDict([
-                    ("batch_size", [bs_range]),
+                    ("batch_size_beam_width_encoder", [bb_range]),
                     ("encoder_input_len", [encoder_input_len_range]),
                     ("encoder_hidden_size", [self.encoder_hidden_size]),
                 ]),
@@ -1184,18 +1202,18 @@ class DecoderModel(Module, GenerationMixin):
                                                [workspace_size])
                                           ]))
 
-        layers_range = self.get_transformer_layers(self.mapping,
-                                                   self.total_num_layers)
+        layers_range = self.mapping.pp_layers(self.total_num_layers)
 
         if use_gpt_attention_plugin:
-            host_max_kv_cache_lengths = []
+            host_max_attention_window_sizes = []
             for i in layers_range:
-                host_kv_cache_length_tensor = Tensor(
-                    name=f'host_max_kv_cache_length_{i}',
+                host_attention_window_size_tensor = Tensor(
+                    name=f'host_max_attention_window_size_{i}',
                     dtype=trt.int32,
                     shape=[1],
                     dim_range=OrderedDict([('scalar', [1])]))
-                host_max_kv_cache_lengths.append(host_kv_cache_length_tensor)
+                host_max_attention_window_sizes.append(
+                    host_attention_window_size_tensor)
 
         for i in layers_range:
             kv_dim_range = OrderedDict([
@@ -1234,7 +1252,7 @@ class DecoderModel(Module, GenerationMixin):
             kv_cache_params = KeyValueCacheParams(
                 past_key_value=past_key_value,
                 host_past_key_value_lengths=host_past_key_value_lengths,
-                host_max_kv_cache_lengths=host_max_kv_cache_lengths,
+                host_max_attention_window_sizes=host_max_attention_window_sizes,
                 cache_indirection=cache_indirection)
 
             attention_params = AttentionParams(
@@ -1250,3 +1268,68 @@ class DecoderModel(Module, GenerationMixin):
         return (input_ids, encoder_output, position_ids, token_type_ids, True,
                 attention_mask, last_token_ids, kv_cache_params,
                 attention_params, hidden_states, all_reduce_workspace)
+
+
+class WhisperEncoder(Module):
+
+    def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int,
+                 n_layer: int, dtype):
+        super().__init__()
+        self.n_mels = n_mels
+        self.conv1 = Conv1d(n_mels, n_state, kernel_size=3, padding=1)
+        self.conv2 = Conv1d(n_state,
+                            n_state,
+                            kernel_size=3,
+                            stride=2,
+                            padding=1)
+        self.positional_embedding = Parameter(shape=(n_ctx, n_state),
+                                              dtype=dtype)
+        self.encoder_layers = ModuleList([
+            EncoderLayer(hidden_size=n_state,
+                         ffn_hidden_size=n_state * 4,
+                         num_attention_heads=n_head,
+                         num_kv_heads=n_head,
+                         head_size=n_state // n_head,
+                         max_position_embeddings=3000,
+                         q_scaling=1.0,
+                         has_attention_qkvo_bias=True,
+                         has_mlp_bias=True,
+                         hidden_act='gelu',
+                         dtype=dtype) for _ in range(n_layer)
+        ])
+
+        self.ln_post = LayerNorm(n_state)
+        self._dtype = dtype
+
+    def forward(self, x: Tensor):
+
+        x = self.conv1(x)
+        x = gelu(x)
+        x = self.conv2(x)
+        x = gelu(x)
+        x = transpose(x, 2, 1)
+        x = x + self.positional_embedding.value
+
+        hidden_states = x
+
+        for encoder_layer in self.encoder_layers:
+            hidden_states = encoder_layer(hidden_states)
+
+        x = hidden_states
+        x = self.ln_post(x)
+        x.mark_output('output', self._dtype)
+        return x
+
+    def prepare_inputs(self, max_batch_size=16):
+
+        bs_range = [1, (max_batch_size + 1) // 2, max_batch_size]
+
+        x = Tensor(name="x",
+                   dtype=self._dtype,
+                   shape=[-1, self.n_mels, 3000],
+                   dim_range=OrderedDict([
+                       ("batch_size", [bs_range]),
+                       ("feature_dim", [self.n_mels]),
+                       ("feature_len_range", [3000]),
+                   ]))
+        return (x)

@@ -25,14 +25,13 @@ import numpy as np
 import torch
 import tensorrt as trt
 # isort: on
-from packaging import version
 
 from . import graph_rewriting as gw
 from ._common import default_net, default_trtnet, precision
 from ._utils import (bf16_array, dim_resolve_negative, dim_to_trt_axes,
                      fp16_array, fp32_array, int32_array, np_dtype_to_trt,
                      str_dtype_to_np, str_dtype_to_trt, torch_to_numpy,
-                     trt_dtype_to_torch, trt_version)
+                     trt_dtype_to_torch)
 from .logger import logger
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE
 from .quantization import QuantMode
@@ -302,6 +301,11 @@ class Tensor(object):
         allocating buffers to store the output tensors when preparing the
         execution of the TensorRT engine.
         '''
+        if isinstance(dtype, str):
+            dtype = str_dtype_to_trt(dtype)
+        else:
+            assert isinstance(dtype, trt.DataType)
+
         default_net()._mark_output(self, name, dtype)
 
     def __add__(self, b):
@@ -605,6 +609,16 @@ class PositionEmbeddingType(IntEnum):
     def choices() -> List[str]:
         return [embedding.name for embedding in PositionEmbeddingType]
 
+    def __str__(self):
+        return self.name
+
+    @staticmethod
+    def from_string(s):
+        try:
+            return PositionEmbeddingType[s]
+        except KeyError:
+            raise ValueError(f'Unsupported position embedding type: {s}')
+
 
 class AttentionMaskType(IntEnum):
     padding = 0
@@ -882,15 +896,11 @@ def interpolate(input: Tensor,
         ]
     layer.shape = updated_shape
 
-    if version.parse(trt_version()) >= version.parse("10.0.0"):
-        mode_enum = trt.InterpolationMode
-    else:
-        mode_enum = trt.ResizeMode
     if mode in ['nearest', 'nearest-exact'] or mode is None:
-        layer.resize_mode = mode_enum.NEAREST
+        layer.resize_mode = trt.InterpolationMode.NEAREST
         layer.coordinate_transformation = trt.ResizeCoordinateTransformation.ASYMMETRIC
     elif mode in ['linear', 'bilinear', 'trilinear']:
-        layer.resize_mode = mode_enum.LINEAR
+        layer.resize_mode = trt.InterpolationMode.LINEAR
         if align_corners:
             layer.coordinate_transformation = trt.ResizeCoordinateTransformation.ALIGN_CORNERS
         else:
@@ -900,12 +910,12 @@ def interpolate(input: Tensor,
             layer.coordinate_transformation = trt.ResizeCoordinateTransformation.HALF_PIXEL
 
     elif mode in ['bicubic']:
-        layer.resize_mode = mode_enum.CUBIC
+        layer.resize_mode = trt.InterpolationMode.CUBIC
 
         layer.coordinate_transformation = trt.ResizeCoordinateTransformation.HALF_PIXEL
 
     else:
-        layer.resize_mode = mode_enum.NEAREST
+        layer.resize_mode = trt.InterpolationMode.NEAREST
         layer.coordinate_transformation = trt.ResizeCoordinateTransformation.ASYMMETRIC
 
     return _create_tensor(layer.get_output(0), layer)
@@ -940,6 +950,16 @@ def matmul(input: Tensor,
     Returns:
         The tensor produced by the inserted layer.
     '''
+
+    # MatMul with fp32 accumulation in strongly typed mode will cause engine building failed.
+    # Will be fixed it in TRT 10.0.
+    matmul_fp32_acc = False
+    if (input.dtype == trt.DataType.HALF or mat2.dtype
+            == trt.DataType.HALF) and not default_net()._strongly_typed:
+        input = cast(input, 'float32')
+        mat2 = cast(mat2, 'float32')
+        matmul_fp32_acc = True
+
     input, mat2 = broadcast_helper(input, mat2)
     op0 = trt.MatrixOperation.TRANSPOSE if transa \
         else trt.MatrixOperation.NONE
@@ -947,6 +967,9 @@ def matmul(input: Tensor,
         else trt.MatrixOperation.NONE
     layer = default_trtnet().add_matrix_multiply(input.trt_tensor, op0,
                                                  mat2.trt_tensor, op1)
+    if matmul_fp32_acc:
+        return cast(_create_tensor(layer.get_output(0), layer), 'float16')
+
     return _create_tensor(layer.get_output(0), layer)
 
 
@@ -1021,7 +1044,7 @@ def slice(input: Tensor,
     size = end-start.
 
     TensorRT supports different slice modes but that function restricts that
-    choice to `mode == tensorrt.SliceMode.STRICT_BOUNDS`.
+    choice to `mode == tensorrt.SampleMode.STRICT_BOUNDS`.
 
     Parameters:
         input : Tensor
@@ -2460,14 +2483,12 @@ def avg_pool2d(input: Tensor,
     if ndim == 3:
         input = expand_dims(input, 0)
 
-    layer = default_trtnet().add_pooling(input.trt_tensor,
-                                         trt.PoolingType.AVERAGE, kernel_size)
+    layer = default_trtnet().add_pooling_nd(input.trt_tensor,
+                                            trt.PoolingType.AVERAGE,
+                                            kernel_size)
     if stride is None:
         stride = kernel_size
-    if version.parse(trt_version()) >= version.parse("10.0.0"):
-        layer.stride_nd = stride
-    else:
-        layer.stride = stride
+    layer.stride_nd = stride
 
     output = _create_tensor(layer.get_output(0), layer)
 
@@ -2478,6 +2499,57 @@ def avg_pool2d(input: Tensor,
                     output.size(3)]))
 
     return output
+
+
+def conv1d(input: Tensor,
+           weight: Tensor,
+           bias: Optional[Tensor] = None,
+           stride: int = 1,
+           padding: int = 0,
+           dilation: int = 1,
+           groups: int = 1) -> Tensor:
+
+    noutput = weight.size()[0]
+    kernel_size = weight.size()[-2]
+    is_weight_constant = (weight.producer is not None
+                          and weight.producer.type == trt.LayerType.CONSTANT)
+    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+
+    if bias is not None:
+        is_bias_constant = (bias.producer is not None
+                            and bias.producer.type == trt.LayerType.CONSTANT)
+        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+
+    input_shuffle_layer = default_trtnet().add_shuffle(input.trt_tensor)
+    input_shuffle_layer.reshape_dims = trt.Dims([*(input.size()), 1])
+    input_shuffled = _create_tensor(input_shuffle_layer.get_output(0),
+                                    input_shuffle_layer)
+
+    kernel_size = trt.Dims([kernel_size, 1])
+
+    layer = default_trtnet().add_convolution_nd(input_shuffled.trt_tensor,
+                                                noutput, kernel_size, weight,
+                                                bias)
+    layer.stride_nd = (stride, 2)
+    layer.padding_nd = (padding, 0)
+    layer.dilation = (dilation, 2)
+    layer.num_groups = groups
+
+    if not is_weight_constant:
+        layer.set_input(1, weight.trt_tensor)
+    if bias is not None and not is_bias_constant:
+        layer.set_input(2, bias.trt_tensor)
+
+    output_2d = _create_tensor(layer.get_output(0), layer)
+    output_2d_shuffle_layer = default_trtnet().add_shuffle(output_2d.trt_tensor)
+    output_2d_shuffle_layer.reshape_dims = trt.Dims(
+        [output_2d.size()[0],
+         output_2d.size()[1],
+         output_2d.size()[2]])
+    output_1d = _create_tensor(output_2d_shuffle_layer.get_output(0),
+                               output_2d_shuffle_layer)
+
+    return output_1d
 
 
 def conv2d(input: Tensor,
@@ -2513,11 +2585,9 @@ def conv2d(input: Tensor,
                                                 kernel_size, weight, bias)
     layer.stride_nd = stride
     layer.padding_nd = padding
+    layer.dilation_nd = dilation
     layer.num_groups = groups
-    if version.parse(trt_version()) >= version.parse("10.0.0"):
-        layer.dilation_nd = dilation
-    else:
-        layer.dilation = dilation
+    layer.dilation_nd = dilation
 
     if not is_weight_constant:
         layer.set_input(1, weight.trt_tensor)
@@ -3108,7 +3178,7 @@ def gpt_attention(
     past_key_value: Tensor,
     sequence_length: Tensor,
     host_past_key_value_lengths: Optional[Tensor],
-    host_max_kv_cache_lengths: Tensor,
+    host_max_attention_window_sizes: Tensor,
     context_lengths: Optional[Tensor],
     cache_indirection: Optional[Tensor],
     host_request_types: Tensor,
@@ -3173,11 +3243,11 @@ def gpt_attention(
         host_past_key_value_lengths: Tensor (On CPU)
             An INT32 tensor of shape [batch_size],
 
-        host_max_kv_cache_lengths: Tensor (On CPU)
+        host_max_attention_window_sizes: Tensor (On CPU)
             An INT32 tensor of shape [1].
-            by default, the max_kv_cache_length is determined by the shape of cache_indir_table.
-            And we support independent max_kv_cache_length (or max_past_length) for each layer.
-            May be used to implement window attention,
+            by default, the max_attention_window_size is determined by the shape of cache_indir_table.
+            And we support independent max_attention_window_size for each layer.
+            This controls the sliding-window-attention/cyclic-kv-cache features.
 
         context_lengths: Tensor (On GPU)
             The tensor that stores the context-phase sequence length of each request. Its shape
@@ -3317,7 +3387,7 @@ def gpt_attention(
     assert host_context_lengths is not None or not default_net(
     ).plugin_config.remove_input_padding
     assert isinstance(max_context_length, int)
-    assert host_max_kv_cache_lengths is not None
+    assert host_max_attention_window_sizes is not None
 
     paged_kv_cache_flag = default_net().plugin_config.paged_kv_cache
 
@@ -3436,7 +3506,7 @@ def gpt_attention(
             qkv,
             sequence_length,
             host_past_key_value_lengths,
-            host_max_kv_cache_lengths,
+            host_max_attention_window_sizes,
             context_lengths,
             cache_indirection,
             host_request_types,
@@ -3444,7 +3514,7 @@ def gpt_attention(
     else:
         plug_inputs = [
             qkv,
-            host_max_kv_cache_lengths,
+            host_max_attention_window_sizes,
             context_lengths,
             host_request_types,
         ]
@@ -3568,6 +3638,8 @@ def layer_norm(input: Tensor,
         layer.epsilon = eps
         return _create_tensor(layer.get_output(0), layer)
     else:
+        logger.warning("Layernorm plugin is going to be deprecated, "
+                       "disable it for better performance.")
         plg_creator = trt.get_plugin_registry().get_plugin_creator(
             'Layernorm', '1', TRT_LLM_PLUGIN_NAMESPACE)
         assert plg_creator is not None
@@ -3661,8 +3733,8 @@ def rms_norm(input: Tensor,
 
         return y
     else:
-        # TODO remove the plugin version if rmsnorm operation can be offloaded
-        # to Myelin.
+        logger.warning("RMSnorm plugin is going to be deprecated, "
+                       "disable it for better performance.")
         plg_creator = trt.get_plugin_registry().get_plugin_creator(
             'Rmsnorm', '1', TRT_LLM_PLUGIN_NAMESPACE)
         assert plg_creator is not None

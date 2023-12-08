@@ -257,7 +257,7 @@ The list of supported models is:
 * [InternLM](examples/internlm)
 * [LLaMA](examples/llama)
 * [LLaMA-v2](examples/llama)
-* [Mistral](examples/llama)
+* [Mistral](examples/llama#mistral-v01)
 * [MPT](examples/mpt)
 * [mT5](examples/enc_dec)
 * [OPT](examples/opt)
@@ -266,9 +266,10 @@ The list of supported models is:
 * [SantaCoder](examples/gpt)
 * [StarCoder](examples/gpt)
 * [T5](examples/enc_dec)
+* [Whisper](examples/whisper)
 
 Note: [Encoder-Decoder](examples/enc_dec/) provides general encoder-decoder
-support that contains many encoder-decoder models such as T5, Flan-T5, etc. We
+functionality that supports many encoder-decoder models such as T5 family, BART family, Whisper family, etc. We
 unroll the exact model names in the list above to let users find specific
 models easier.
 
@@ -372,7 +373,7 @@ For example: `mpirun -n 1 python3 examples/gpt/build.py ...`
 
 ### Change Log
 
-#### Version 0.6.0
+#### Version 0.6.1
 
   * Models
       * ChatGLM3

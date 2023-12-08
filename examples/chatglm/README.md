@@ -109,8 +109,6 @@ python3 build.py -m glm_10b --output_dir trt_engines/glm_10b/fp16/1-gpu
 
 * Use `--use_gpt_attention_plugin <DataType>` to configure GPT Attention plugin (default as float16)
 * Use `--use_gemm_plugin <DataType>` to configure GEMM plugin (default as float16)
-* Use `--use_layernorm_plugin <DataType>` (for ChatGLM-6B and GLM-10B models) to configure layernorm normolization plugin (default as float16)
-* Use `--use_rmsnorm_plugin <DataType>` (for ChatGLM2-6B\* and ChatGLM3-6B\* models) to configure RMS normolization plugin (default as float16)
 
 #### Fused MultiHead Attention (FMHA)
 

@@ -82,7 +82,6 @@ class LLaMADecoderLayer(Module):
             rotary_embedding_scaling=rotary_scaling,
             tp_group=tp_group,
             tp_size=tp_size,
-            use_int8_kv_cache=quant_mode.has_int8_kv_cache(),
             quant_mode=quant_mode,
             instance_id=2 * layer_id,
         )
@@ -208,7 +207,7 @@ class LLaMAModel(Module):
                               attn_bias=attn_bias,
                               mlp_bias=mlp_bias,
                               use_fused_mlp=use_fused_mlp)
-            for i in self.get_transformer_layers(self.mapping, num_layers)
+            for i in self.mapping.pp_layers(num_layers)
         ])
 
         if self.mapping.is_last_pp_rank():
@@ -247,12 +246,13 @@ class LLaMAModel(Module):
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
         self.register_network_output(f"embd", hidden_states)
 
-        for layer_idx, (layer, past, pointer, host_pointer,
-                        max_kv_cache_length) in enumerate(
-                            zip(self.layers, kv_cache_params.past_key_value,
-                                kv_cache_params.kv_cache_block_pointers,
-                                kv_cache_params.host_kv_cache_block_pointers,
-                                kv_cache_params.host_max_kv_cache_lengths)):
+        for layer_idx, (
+                layer, past, pointer, host_pointer,
+                max_attention_window_size) in enumerate(
+                    zip(self.layers, kv_cache_params.past_key_value,
+                        kv_cache_params.kv_cache_block_pointers,
+                        kv_cache_params.host_kv_cache_block_pointers,
+                        kv_cache_params.host_max_attention_window_sizes)):
             lora_param = None
             if lora_params.lora_ranks is not None:
                 lora_param = lora_params.get_layer_params(layer_idx)
@@ -265,7 +265,7 @@ class LLaMAModel(Module):
                     past_key_value=[past],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
-                    host_max_kv_cache_lengths=max_kv_cache_length,
+                    host_max_attention_window_sizes=max_attention_window_size,
                     kv_cache_block_pointers=[pointer],
                     host_kv_cache_block_pointers=[host_pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
@@ -398,9 +398,8 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
             hidden_states.mark_output('hidden_states_output', self.dtype)
 
         if use_cache and default_net().plugin_config.paged_kv_cache == False:
-            for i, present in zip(
-                    self.get_transformer_layers(self.mapping, self.num_layers),
-                    presents):
+            for i, present in zip(self.mapping.pp_layers(self.num_layers),
+                                  presents):
                 present.mark_output(f'present_key_value_{i}', self.kv_dtype)
             if self.mapping.is_last_pp_rank():
                 return (lm_logits, presents)
@@ -472,8 +471,8 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                 past_key_value=model_inputs['past_key_value'],
                 host_past_key_value_lengths=model_inputs[
                     'host_past_key_value_lengths'],
-                host_max_kv_cache_lengths=model_inputs[
-                    'host_max_kv_cache_lengths'],
+                host_max_attention_window_sizes=model_inputs[
+                    'host_max_attention_window_sizes'],
                 kv_cache_block_pointers=model_inputs[
                     'kv_cache_block_pointers_list'],
                 host_kv_cache_block_pointers=model_inputs[

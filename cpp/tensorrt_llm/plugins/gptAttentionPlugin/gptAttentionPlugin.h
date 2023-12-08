@@ -46,7 +46,7 @@ namespace tensorrt_llm::plugins
 //                      enable_remove_input_padding
 //     1.  sequence_length [batch_size] (optional)
 //     2.  host_past_key_value_lengths [batch_size] (int32) (optional)
-//     3.  host_max_kv_cache_lengths [1] (int32)
+//     3.  host_max_attention_window_sizes [1] (int32)
 //     4.  context_lengths [batch_size]
 //     5.  cache_indir [num_gen_requests, beam_width, memory_max_len] (required in beamsearch) (optional)
 //     6.  host_request_types [batch_size] int32. 0: context; 1: generation: 2: none. When not in inflight-batching
@@ -141,7 +141,7 @@ private:
         QKV_TENSOR,
         SEQUENCE_LENGTH,
         HOST_PAST_KEY_VALUE_LENGTHS,
-        HOST_MAX_KV_CACHE_LENGTH,
+        HOST_MAX_ATTENTION_WINDOW,
         CONTEXT_LENGTHS,
         CACHE_INDIR,
         REQUEST_TYPES,

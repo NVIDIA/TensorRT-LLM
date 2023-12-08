@@ -66,7 +66,7 @@ bool GPTAttentionPlugin::isEntryUsed(const IdxEntry& entry) const
     case IdxEntry::QKV_TENSOR: return true;
     case IdxEntry::SEQUENCE_LENGTH: return useKVCache();
     case IdxEntry::HOST_PAST_KEY_VALUE_LENGTHS: return useKVCache();
-    case IdxEntry::HOST_MAX_KV_CACHE_LENGTH: return true;
+    case IdxEntry::HOST_MAX_ATTENTION_WINDOW: return true;
     case IdxEntry::CONTEXT_LENGTHS: return true;
     case IdxEntry::CACHE_INDIR: return useKVCache();
     case IdxEntry::REQUEST_TYPES: return true;
@@ -132,7 +132,7 @@ bool GPTAttentionPlugin::supportsFormatCombination(
     int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
 {
     if (pos == getIdx(IdxEntry::CONTEXT_LENGTHS) || pos == getIdx(IdxEntry::REQUEST_TYPES)
-        || pos == getIdx(IdxEntry::HOST_MAX_KV_CACHE_LENGTH))
+        || pos == getIdx(IdxEntry::HOST_MAX_ATTENTION_WINDOW))
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32;
     }
@@ -319,17 +319,17 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
     const int beamWidth = useKVCache() ? inputDesc[getIdx(IdxEntry::CACHE_INDIR)].dims.d[1] : 1;
 
-    // Commonly, cyclic kv cache length, and max kv cache length will be the same
-    // unless each layer has different max kv cache length.
+    // Commonly, cyclic_attention_window_size, and max_attention_window_size will be the same
+    // unless each layer has different attention window sizes.
     // the kv_cache capacity.
-    const int max_kv_cache_length = isCrossAttention()
+    const int max_attention_window_size = isCrossAttention()
         ? max_encoder_context_len
         : (useKVCache() ? inputDesc[getIdx(IdxEntry::CACHE_INDIR)].dims.d[2] : 0);
-    // The cyclic_kv_cache_length will determine the cyclic kv cache position of new tokens.
-    // Note that this cyclic_kv_cache_length might be smaller than the actual kv cache capactity (max_kv_cache_length).
-    const int cyclic_kv_cache_length = isCrossAttention()
+    // The cyclic_attention_window_size will determine the cyclic kv cache position of new tokens.
+    // Note that this cyclic_attention_window_size might be smaller than the actual kv cache capactity.
+    const int cyclic_attention_window_size = isCrossAttention()
         ? max_encoder_context_len
-        : reinterpret_cast<const int*>(inputs[getIdx(IdxEntry::HOST_MAX_KV_CACHE_LENGTH)])[0];
+        : reinterpret_cast<const int*>(inputs[getIdx(IdxEntry::HOST_MAX_ATTENTION_WINDOW)])[0];
 
     const float* kv_scale_orig_quant = nullptr;
     const float* kv_scale_quant_orig = nullptr;
@@ -395,9 +395,9 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         }
 
         EnqueueContextParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, max_context_q_len,
-            max_context_kv_len, max_kv_cache_length, cyclic_kv_cache_length, context_q_lengths, sequence_kv_length,
-            kv_scale_orig_quant, kv_scale_quant_orig, alibi_slopes, context_buf_, key_value_cache, block_pointers,
-            host_block_pointers, batch_size, localNbTokens, max_blocks_per_sequence, workspace};
+            max_context_kv_len, max_attention_window_size, cyclic_attention_window_size, context_q_lengths,
+            sequence_kv_length, kv_scale_orig_quant, kv_scale_quant_orig, alibi_slopes, context_buf_, key_value_cache,
+            block_pointers, host_block_pointers, batch_size, localNbTokens, max_blocks_per_sequence, workspace};
         if (isRelativePosition())
         {
             enqueue_params.relative_attention_bias
@@ -425,11 +425,14 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
         const int* cache_indir
             = beamWidth == 1 ? nullptr : reinterpret_cast<const int*>(inputs[getIdx(IdxEntry::CACHE_INDIR)]);
+        const int* host_context_lengths
+            = mRemovePadding ? reinterpret_cast<const int*>(inputs[getIdx(IdxEntry::HOST_CONTEXT_LENGTH)]) : nullptr;
 
         EnqueueGenerationParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, sequence_kv_length,
             max_context_kv_len, beamWidth, context_q_lengths, kv_scale_orig_quant, kv_scale_quant_orig, alibi_slopes,
-            context_buf_, key_value_cache, block_pointers, max_kv_cache_length, cyclic_kv_cache_length, num_requests,
-            max_blocks_per_sequence, cache_indir, workspace, max_context_kv_len_list};
+            context_buf_, key_value_cache, block_pointers, max_attention_window_size, cyclic_attention_window_size,
+            num_requests, max_blocks_per_sequence, cache_indir, workspace, max_context_kv_len_list};
+        enqueue_params.host_context_lengths = host_context_lengths;
         if (isRelativePosition())
         {
             enqueue_params.relative_attention_bias
