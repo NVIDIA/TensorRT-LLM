@@ -350,6 +350,7 @@ model_lookup = {
     ("mpt", ): "mpt",
     ("gpt2", ): "gpt2",
     ("chatglm", ): "chatglm",
+    ("qwen", ): "qwen",
 }
 ```
 - Second, change save code
