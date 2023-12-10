@@ -250,12 +250,12 @@ class Pipeline:
                  model,
                  pad_id,
                  end_id,
-                 max_kv_cache_length=2048):
+                 max_attention_window_size=2048):
         self.tokenizer = tokenizer
         self.model = model
         self.pad_id = pad_id
         self.end_id = end_id
-        self.max_kv_cache_length = max_kv_cache_length
+        self.max_attention_window_size = max_attention_window_size
 
     def __call__(self, prompt):
         # Run the model in batch size 1 and beam size 1
@@ -294,7 +294,7 @@ class Pipeline:
                 outputs = self.model.generate(
                     batch_input_ids,
                     max_new_tokens=output_len,
-                    max_kv_cache_length=self.max_kv_cache_length,
+                    max_attention_window_size=self.max_attention_window_size,
                     end_id=self.end_id,
                     pad_id=self.pad_id,
                     top_k=top_k,
@@ -306,7 +306,7 @@ class Pipeline:
         return self.tokenizer.decode(output_ids, skip_special_tokens=True)
 
     def check_valid_length(self, prompt):
-        return len(self.tokenizer.encode(prompt)) <= 512
+        return len(self.tokenizer.encode(prompt)) <= self.model.max_input_len
 
 
 def parse_args():
@@ -341,13 +341,12 @@ def parse_args():
     )
     parser.add_argument("--max_input_length", type=int, default=2048)
     parser.add_argument(
-        "--max_kv_cache_length",
+        '--max_attention_window_size',
         type=int,
         default=None,
-        help="The max kv cache length. "
-        "If the final sequence length exceeds the kv cache length, "
-        "we will enable cyclic kv cache. "
-        "If it is set to None, we will use the max sequence length.")
+        help=
+        'The attention window size that controls the sliding window attention / cyclic kv cache behaviour'
+    )
 
     parser.add_argument("--test_trt_llm", action="store_true")
     parser.add_argument("--test_hf", action="store_true")

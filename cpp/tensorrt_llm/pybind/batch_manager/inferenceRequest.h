@@ -19,9 +19,9 @@
 
 #include "tensorrt_llm/batch_manager/inferenceRequest.h"
 #include "tensorrt_llm/pybind/batch_manager/namedTensor.h"
-#include "tensorrt_llm/runtime/common.h"
 
 #include <ATen/ATen.h>
+#include <pybind11/pybind11.h>
 
 #include <memory>
 #include <optional>
@@ -53,6 +53,7 @@ public:
     }
 
     [[nodiscard]] std::shared_ptr<tensorrt_llm::batch_manager::InferenceRequest> toTrtLlm() const;
+    static void initBindings(pybind11::module_& m);
 };
 
 } // namespace tensorrt_llm::pybind::batch_manager

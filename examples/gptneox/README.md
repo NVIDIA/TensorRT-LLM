@@ -39,7 +39,6 @@ python3 build.py --dtype=float16                    \
                  --log_level=verbose                \
                  --use_gpt_attention_plugin float16 \
                  --use_gemm_plugin float16          \
-                 --use_layernorm_plugin float16     \
                  --max_batch_size=16                \
                  --max_input_len=1024               \
                  --max_output_len=1024              \
@@ -53,7 +52,6 @@ python3 build.py --dtype=float16                    \
                  --log_level=verbose                \
                  --use_gpt_attention_plugin float16 \
                  --use_gemm_plugin float16          \
-                 --use_layernorm_plugin float16     \
                  --max_batch_size=16                \
                  --max_input_len=1024               \
                  --max_output_len=1024              \
@@ -65,7 +63,6 @@ python3 build.py --dtype=float16                    \
                  --log_level=verbose                \
                  --use_gpt_attention_plugin float16 \
                  --use_gemm_plugin float16          \
-                 --use_layernorm_plugin float16     \
                  --max_batch_size=16                \
                  --max_input_len=1024               \
                  --max_output_len=1024              \
@@ -163,7 +160,6 @@ python3 build.py --dtype=float16                                                
                  --log_level=verbose                                                                 \
                  --use_gpt_attention_plugin float16                                                  \
                  --use_gemm_plugin float16                                                           \
-                 --use_layernorm_plugin float16                                                      \
                  --use_weight_only_groupwise_quant_matmul_plugin float16                             \
                  --groupwise_quant_safetensors_path=gptneox_model/gptneox-20b-4bit-gs128.safetensors \
                  --max_batch_size=16                                                                 \
@@ -179,7 +175,6 @@ python3 build.py --dtype=float16                                                
                  --log_level=verbose                                                                 \
                  --use_gpt_attention_plugin float16                                                  \
                  --use_gemm_plugin float16                                                           \
-                 --use_layernorm_plugin float16                                                      \
                  --use_weight_only_groupwise_quant_matmul_plugin float16                             \
                  --groupwise_quant_safetensors_path=gptneox_model/gptneox-20b-4bit-gs128.safetensors \
                  --max_batch_size=16                                                                 \

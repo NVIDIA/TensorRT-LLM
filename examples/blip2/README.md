@@ -22,30 +22,27 @@
     cd ../opt
     git-lfs clone https://huggingface.co/facebook/opt-2.7b
     ```
-- Convert original checkpoint to FT format (same as original OPT-2.7B)
+- Convert original checkpoint to TRT-LLM checkpoint format (same as original OPT-2.7B)
     ```bash
     # OPT-2.7B
-    python3 hf_opt_convert.py -i opt-2.7b -o c-model/opt-2.7b/fp16 -i_g 1 -weight_data_type fp16
+    python3 convert_checkpoint.py --model_dir ./opt-2.7b \
+                --dtype float16 \
+                --output_dir ./opt/2.7B/trt_ckpt/fp16/1-gpu/ \
+                --use_prompt_tuning
     ```
-- Build TRT-LLM engines from FT-format model (only need to add --max_prompt_embedding_table_size)
+- Build TRT-LLM engines from TRT-LLM checkpoint (only need to add --max_prompt_embedding_table_size)
 
     **NOTE:** `max_prompt_embedding_table_size = query_token_num * max_batch_size`, so if you changes the max_batch_size, prompt table size must be reset accordingly.
     ```bash
     # OPT-2.7B
-    python build.py --model_dir=./c-model/opt-2.7b/fp16/1-gpu \
+    trtllm-build --checkpoint_dir=./opt/2.7B/trt_ckpt/fp16/1-gpu/ \
                     --max_batch_size 8 \
-                    --dtype float16 \
                     --use_gpt_attention_plugin float16 \
                     --use_gemm_plugin float16 \
-                    --use_layernorm_plugin float16 \
                     --max_input_len 924 \
                     --max_output_len 100 \
                     --max_beam_width 5 \
-                    --world_size 1 \
                     --output_dir ../blip2/trt_engine/blip-2-opt-2.7b/fp16/1-gpu \
-                    --do_layer_norm_before \
-                    --pre_norm \
-                    --hidden_act relu \
                     --max_prompt_embedding_table_size 256 # 256 = 32 (query_token number) * 8 (max_batch_size)
     ```
     The built OPT engines lie in `./trt_engine/blip-2-opt-2.7b/fp16/1-gpu`.
@@ -53,22 +50,21 @@
     **UPDATE[2023-09-21]**: We have newly added INT8/INT4 weight-only support for OPT. So you can enable it using commands as follows (take `INT4` as an example, while `INT8` is the default precision for weight-only quantization):
     ```bash
     # OPT-2.7B
-    python build.py --model_dir=./c-model/opt-2.7b/fp16/1-gpu \
+    python3 convert_checkpoint.py --model_dir ./opt-2.7b \
+                --dtype float16 \
+                --output_dir ./opt/2.7B/trt_ckpt/int4_weightonly/1-gpu/
+                --use_prompt_tuning \
+                --use_weight_only \
+                --weight_only_precision int4
+
+    trtllm-build --checkpoint_dir=./opt/2.7B/trt_ckpt/int4_weightonly/1-gpu/ \
                     --max_batch_size 8 \
-                    --dtype float16 \
                     --use_gpt_attention_plugin float16 \
                     --use_gemm_plugin float16 \
-                    --use_layernorm_plugin float16 \
                     --max_input_len 924 \
                     --max_output_len 100 \
                     --max_beam_width 5 \
-                    --world_size 1 \
                     --output_dir ../blip2/trt_engine/blip-2-opt-2.7b/int4_weightonly/1-gpu \
-                    --do_layer_norm_before \
-                    --pre_norm \
-                    --hidden_act relu \
-                    --use_weight_only \
-                    --weight_only_precision int4 \
                     --max_prompt_embedding_table_size 256 # 256 = 32 (query_token number) * 8 (max_batch_size)
     ```
     The built OPT engines lie in `./trt_engine/blip-2-opt-2.7b/int4_weightonly/1-gpu`.

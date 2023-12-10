@@ -12,6 +12,7 @@ The benchmark implementation and entrypoint can be found in [`benchmarks/python/
 * [`benchmarks/python/base_benchmark.py`](./base_benchmark.py) to implement the base class for benchmark.
 * [`benchmarks/python/gpt_benchmark.py`](./gpt_benchmark.py) to implement benchmark scripts for GPT and GPT-like(LLaMA/OPT/GPT-J/SmoothQuant-GPT) models.
 * [`benchmarks/python/bert_benchmark.py`](./bert_benchmark.py) to implement benchmark scripts for BERT models.
+* [`benchmarks/python/enc_dec_benchmark.py`](./enc_dec_benchmark.py) to implement benchmark scripts for Encoder-Decoder models.
 
 ## Usage
 

@@ -29,12 +29,13 @@ class WorldConfig
 public:
     static SizeType constexpr kDefaultGpusPerNode = 8;
 
-    constexpr explicit WorldConfig(SizeType tensorParallelism = 1, SizeType pipelineParallelism = 1, SizeType rank = 0,
-        SizeType gpusPerNode = kDefaultGpusPerNode)
+    explicit WorldConfig(SizeType tensorParallelism = 1, SizeType pipelineParallelism = 1, SizeType rank = 0,
+        SizeType gpusPerNode = kDefaultGpusPerNode, std::vector<SizeType> deviceIds = {})
         : mTensorParallelism{tensorParallelism}
         , mPipelineParallelism{pipelineParallelism}
         , mRank{rank}
         , mGpusPerNode{gpusPerNode}
+        , mDeviceIds{deviceIds}
     {
     }
 
@@ -73,8 +74,12 @@ public:
         return mGpusPerNode;
     }
 
-    [[nodiscard]] SizeType constexpr getDevice() const noexcept
+    [[nodiscard]] SizeType getDevice() const noexcept
     {
+        if (mDeviceIds.size())
+        {
+            return mDeviceIds[mRank % mGpusPerNode];
+        }
         return mRank % mGpusPerNode;
     }
 
@@ -110,17 +115,20 @@ public:
 
     static WorldConfig mpi(nvinfer1::ILogger& logger, SizeType gpusPerNode = kDefaultGpusPerNode,
         std::optional<SizeType> tensorParallelism = std::nullopt,
-        std::optional<SizeType> pipelineParallelism = std::nullopt);
+        std::optional<SizeType> pipelineParallelism = std::nullopt,
+        std::optional<std::vector<SizeType>> userSpecifiedDeviceIds = std::nullopt);
 
     static WorldConfig mpi(SizeType gpusPerNode = kDefaultGpusPerNode,
         std::optional<SizeType> tensorParallelism = std::nullopt,
-        std::optional<SizeType> pipelineParallelism = std::nullopt);
+        std::optional<SizeType> pipelineParallelism = std::nullopt,
+        std::optional<std::vector<SizeType>> userSpecifiedDeviceIds = std::nullopt);
 
 private:
     SizeType mTensorParallelism;
     SizeType mPipelineParallelism;
     SizeType mRank;
     SizeType mGpusPerNode;
+    std::vector<SizeType> mDeviceIds;
 };
 
 } // namespace tensorrt_llm::runtime

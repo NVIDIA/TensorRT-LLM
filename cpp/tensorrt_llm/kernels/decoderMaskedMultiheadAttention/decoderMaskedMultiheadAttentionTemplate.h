@@ -1273,9 +1273,9 @@ __global__ void masked_multihead_attention_kernel(
 
     // The maximum sequence length in the cyclic kv_cache, i.e., an upper bound on L.
     // Note that the maximum sequence length supported by the model might be greater than this.
-    // Note max_kv_cache_length is maximum of cyclic_kv_cache_length among all layers.
+    // Note max_attention_window_size is maximum of cyclic_attention_window_size among all layers.
     // By default, you can assume that they are the same.
-    const auto cyclic_kv_cache_len = static_cast<unsigned>(params.cyclic_kv_cache_length);
+    const auto cyclic_kv_cache_len = static_cast<unsigned>(params.cyclic_attention_window_size);
     // The current timestep (including paddings).
     // It is only used to calculate the smem stride.
     const auto timestep = static_cast<unsigned>(DO_MULTI_BLOCK ? params.timesteps_per_block : params.timestep);
@@ -1796,11 +1796,12 @@ __global__ void masked_multihead_attention_kernel(
         : divUp(static_cast<unsigned>(kv_loop_length), K_PER_WARP) * K_PER_WARP;
 
     // Iterate over the keys/timesteps to compute the various (Q*K^T)_{ti} values.
-    // Note max_kv_cache_length is maximum of cyclic_kv_cache_length among all layers.
+    // Note max_attention_window_size is maximum of cyclic_attention_window_size among all layers.
     // By default, you can assume that they are the same.
-    const auto bi_seq_len_offset = static_cast<std::size_t>(batch_beam_idx) * params.max_kv_cache_length;
-    // Beam indices are based on the max_kv_cache_length while each layer may have different cyclic_kv_cache_length
-    // So we need to rebuild the beam_indices if max_kv_cache_length is not equal to cyclic_kv_cache_length.
+    const auto bi_seq_len_offset = static_cast<std::size_t>(batch_beam_idx) * params.max_attention_window_size;
+    // Beam indices are based on the max_attention_window_size while each layer may have different
+    // cyclic_attention_window_size So we need to rebuild the beam_indices if max_attention_window_size is not equal to
+    // cyclic_attention_window_size.
     const int* beam_indices = HAS_BEAMS ? &params.cache_indir[bi_seq_len_offset] : nullptr;
 
     const auto c_tile_times_timesteps_per_block = c_tile * timesteps_per_block; // 0 if !MULTI_BLOCK_FLAG
@@ -2596,39 +2597,38 @@ __global__ void masked_multihead_attention_kernel(
             T* out_oi_smem = reinterpret_cast<T*>(smem_);
 
             const auto o_idx = chunk_index<T, V_vec_k, THREADS_PER_VALUE>(tidx);
-            // The partial output region this thread takes care of
-            const auto oo = o_idx.x;
+
+            // Init partial out for accumulation.
+            V_vec_k zero_k;
+            zero(zero_k);
+            V_vec_k thread_accumulated_out = zero_k;
+
             // The hidden dimensions computed by this particular thread. (refer to vi)
             const auto oi = o_idx.y;
 
-            // Within the bound.
-            const bool within_bound = oo < gridDim.z;
+            // The partial output region this thread takes care of
+            const auto oo = o_idx.x;
 
-            // Load partial output
-            int thread_partial_out_offset = oo * params.batch_size * num_heads * params.hidden_size_per_head;
-            // Load partial max (different to thread_partial_max since the threadIdx rule changes here)
-            float thread_partial_max_for_out = within_bound ? params.partial_max[bhi_seq_len_tile + oo] : final_max;
-
-            // Load the partial outputs.
-            V_vec_k zero_k;
-            zero(zero_k);
-            V_vec_k thread_partial_out = within_bound
-                ? *reinterpret_cast<const V_vec_k*>(&params.partial_out[thread_partial_out_offset + bhi * Dh + oi])
-                : zero_k;
-
-            Tk factor_compute;
-            convert_from_float(&factor_compute, __expf(thread_partial_max_for_out - final_max));
-            thread_partial_out = mul<V_vec_k, Tk, V_vec_k>(factor_compute, thread_partial_out);
-
-            // Make sure we can start writing to shared memory.
-            __syncthreads();
-
-            // The reduction iteration should start with a number which is a power of 2
-            const auto reduction_iteration = static_cast<int>(cuda::std::bit_ceil(gridDim.z));
+            // Each thread may handle more than one partial output.
+            for (int tile_idx = o_idx.x; tile_idx < gridDim.z; tile_idx += V_PER_ITER)
+            {
+                // Load partial output
+                int thread_partial_out_offset = tile_idx * params.batch_size * num_heads * params.hidden_size_per_head;
+                // Load partial max (different to thread_partial_max since the threadIdx rule changes here)
+                float thread_partial_max_for_out = params.partial_max[bhi_seq_len_tile + tile_idx];
+                // Load the partial outputs.
+                V_vec_k thread_partial_out
+                    = *reinterpret_cast<const V_vec_k*>(&params.partial_out[thread_partial_out_offset + bhi * Dh + oi]);
+                // Apply the correction factor.
+                Tk factor_compute;
+                convert_from_float(&factor_compute, __expf(thread_partial_max_for_out - final_max));
+                thread_partial_out = mul<V_vec_k, Tk, V_vec_k>(factor_compute, thread_partial_out);
+                thread_accumulated_out = add(thread_partial_out, thread_accumulated_out);
+            }
 
             // Run the final reduction amongst the different groups computing different partial outputs.
 #pragma unroll
-            for (int active_groups = reduction_iteration; active_groups >= 2; active_groups /= 2)
+            for (int active_groups = V_PER_ITER; active_groups >= 2; active_groups /= 2)
             {
 
                 // The midpoint in the number of active groups.
@@ -2637,15 +2637,15 @@ __global__ void masked_multihead_attention_kernel(
                 // The upper part of active threads store to shared memory.
                 if (oo >= midpoint && oo < active_groups && (Dh == Dh_MAX || oi < Dh))
                 {
-                    *reinterpret_cast<V_vec_k*>(&out_oi_smem[(oo - midpoint) * Dh + oi]) = thread_partial_out;
+                    *reinterpret_cast<V_vec_k*>(&out_oi_smem[(oo - midpoint) * Dh + oi]) = thread_accumulated_out;
                 }
                 __syncthreads();
 
                 // The bottom warps update their values.
                 if (oo < midpoint && (Dh == Dh_MAX || oi < Dh))
                 {
-                    thread_partial_out
-                        = add(thread_partial_out, *reinterpret_cast<const V_vec_k*>(&out_oi_smem[oo * Dh + oi]));
+                    thread_accumulated_out
+                        = add(thread_accumulated_out, *reinterpret_cast<const V_vec_k*>(&out_oi_smem[oo * Dh + oi]));
                 }
                 __syncthreads();
             }
@@ -2661,8 +2661,8 @@ __global__ void masked_multihead_attention_kernel(
                 Tk inv_sum_compute;
                 convert_from_float(&inv_sum_compute, inv_sum);
 
-                thread_partial_out = mul<V_vec_k, Tk, V_vec_k>(inv_sum_compute, thread_partial_out);
-                *reinterpret_cast<V_vec_k*>(&params.out[bhi * Dh + oi]) = thread_partial_out;
+                thread_accumulated_out = mul<V_vec_k, Tk, V_vec_k>(inv_sum_compute, thread_accumulated_out);
+                *reinterpret_cast<V_vec_k*>(&params.out[bhi * Dh + oi]) = thread_accumulated_out;
             }
 
             // Reset qk_current_smem and block_counter for the next timestep

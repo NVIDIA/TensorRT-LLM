@@ -15,8 +15,15 @@
  * limitations under the License.
  */
 #include "loraPlugin.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/kernels/groupGemm.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
+
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cublasMMWrapper.h"
+#include "tensorrt_llm/common/cublasVersionCheck.h"
+#include <algorithm>
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::common;
@@ -30,6 +37,10 @@ static const char* LORA_PLUGIN_VERSION{"1"};
 static const char* LORA_PLUGIN_NAME{"Lora"};
 PluginFieldCollection LoraPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> LoraPluginCreator::mPluginAttributes;
+
+// TODO should be managed by better way
+static std::vector<cublasHandle_t> cublas_handles;
+static std::vector<cudaStream_t> streams;
 
 // TODO should reuse the function in gemmPlugin
 void _getProblemParams(cublasOperation_t& transa, cublasOperation_t& transb, int& m, int& n, int& k, int& lda, int& ldb,
@@ -283,6 +294,34 @@ void LoraPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, in
     mGemmId.k = K;
 }
 
+size_t getLowRankWorkSpaceSize(int nbReq, int maxContextLength, int maxLowRank, int typeSize)
+{
+    return (size_t) divUp(nbReq * maxContextLength * maxLowRank * typeSize, 16) * 16;
+}
+
+size_t getCutlassWorkSpaceSize(int nbReq)
+{
+    auto gemm_coord_size = divUp(nbReq * sizeof(cutlass::gemm::GemmCoord), 16) * 16;
+    auto ptr_size = 4 * divUp(nbReq * sizeof(half*), 16) * 16;
+    auto ldd_size = 4 * divUp(nbReq * sizeof(int64_t), 16) * 16;
+
+    return gemm_coord_size + ptr_size + ldd_size;
+}
+
+LoraPlugin::~LoraPlugin()
+{
+    for (int i = 0; i < streams.size(); i++)
+    {
+        if (i != 0)
+        {
+            cudaStreamDestroy(streams.at(i));
+        }
+        cublasDestroy(cublas_handles.at(i));
+    }
+    streams.clear();
+    cublas_handles.clear();
+}
+
 size_t LoraPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
     const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept
 {
@@ -291,15 +330,30 @@ size_t LoraPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, in
     auto const type = inputs[getInputTensorIdx()].type;
     auto const typeSize = tensorrt_llm::runtime::BufferDataType(type).getSize();
 
-    size_t const lowRankWorkSpaceSize = nbReq * mMaxContextLength * mMaxLowRank * typeSize;
+    return CUBLAS_WORKSPACE_SIZE + getLowRankWorkSpaceSize(nbReq, mMaxContextLength, mMaxLowRank, typeSize)
+        + getCutlassWorkSpaceSize(nbReq);
+}
 
-    return CUBLAS_WORKSPACE_SIZE + lowRankWorkSpaceSize;
+void runCublasGemmEx(const int M, const int N, const int K, const bool transA, const bool transB, const void* act,
+    const void* weight, void* output, cublasHandle_t cublas_handle)
+{
+    float a = 1.0f;
+    float b = 0.0f;
+    void* alpha = &a;
+    void* beta = &b;
+    cublasOperation_t transa, transb;
+    int m, n, k;
+    int lda, ldb, ldc;
+    _getProblemParams(transa, transb, m, n, k, lda, ldb, ldc, transA, transB, M, N, K);
+
+    tensorrt_llm::common::check_cuda_error(cublasGemmEx(cublas_handle, transa, transb, m, n, k, alpha, weight,
+        CUDA_R_16F, lda, act, CUDA_R_16F, ldb, beta, output, CUDA_R_16F, ldc, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));
 }
 
 int LoraPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
     const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
-    TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     // inputs
     //     input [-1, K] (view as 2D)
     //     host_request_type [batch_size] on cpu
@@ -309,10 +363,9 @@ int LoraPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinf
     // outputs
     //     output [-1, N] (view as 2D)
 
-    auto const typeSize = tensorrt_llm::runtime::BufferDataType(mType).getSize();
-    void* cublasWorkSpace = workspace;
-    void* lowRankWorkSpace = static_cast<char*>(cublasWorkSpace) + CUBLAS_WORKSPACE_SIZE;
+    TLLM_CHECK(mType == DataType::kHALF); // Only support on half now, will extend to more data type in near future.
 
+    auto const typeSize = tensorrt_llm::runtime::BufferDataType(mType).getSize();
     setGemmConfig();
     auto const batch_size = inputDesc[getLoraRanksIdx()].dims.d[0];
     auto const lora_ranks = static_cast<int32_t const*>(inputs[getLoraRanksIdx()]);
@@ -321,55 +374,230 @@ int LoraPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinf
         = mRemoveInputPadding ? static_cast<int32_t const*>(inputs[getHostContextLengthsIdx()]) : nullptr;
     RequestType const* reqTypes = static_cast<RequestType const*>(inputs[getHostRequestTypesIdx()]);
 
+    void* cublasWorkSpace = workspace;
+    void* lowRankWorkSpace = static_cast<char*>(cublasWorkSpace) + CUBLAS_WORKSPACE_SIZE;
+    void* cutlassWorkSpace = static_cast<char*>(lowRankWorkSpace)
+        + getLowRankWorkSpaceSize(batch_size, mMaxContextLength, mMaxLowRank, typeSize);
+    size_t cutlassWorkSpaceSize = getCutlassWorkSpaceSize(batch_size);
     size_t handled_token_num = 0;
+
+    // TODO only initialize output buffer when the lora rank is -1
+    const int nbDimsA = inputDesc[0].dims.nbDims;
+
+    bool useUnifyGemm = false;
     for (int batchIdx = 0; batchIdx < batch_size; batchIdx++)
     {
-        const RequestType reqType = reqTypes[batchIdx];
-        const auto M = (reqType != RequestType::kCONTEXT)
-            ? 1
-            : (mRemoveInputPadding ? host_context_lengths[batchIdx] : inputDesc[0].dims.d[1]);
-        const auto lora_rank = lora_ranks[batchIdx];
-
-        if (lora_rank <= 0)
+        if (lora_weights_ptr[2 * batchIdx] != lora_weights_ptr[0]
+            || lora_weights_ptr[2 * batchIdx + 1] != lora_weights_ptr[1] || lora_ranks[batchIdx] == 0)
         {
-            const auto N = outputDesc[0].dims.d[outputDesc[0].dims.nbDims - 1];
-            void* output = static_cast<void*>(static_cast<char*>(outputs[0]) + handled_token_num * N * typeSize);
-            if (typeSize == 2)
-            {
-                deviceFill((half*) output, M * N, (half) 0.0f, stream);
-            }
-            else
-            {
-                deviceFill((float*) output, M * N, 0.0f, stream);
-            }
+            useUnifyGemm = false;
         }
-        else
-        {
-            // the input shape should be [1, token_num, K] under remove_input_padding,
-            // [batch, seqlen, K] under non-remove_input_padding
-            auto bestTactic = mPluginProfiler->getBestConfig(M, mGemmId);
+    }
 
-            const int nbDimsA = inputDesc[0].dims.nbDims;
+    bool UseGroupedGemm = true;
+    if (useUnifyGemm)
+    {
+        const RequestType reqType = reqTypes[0];
+        int M = 0;
+        for (int batchIdx = 0; batchIdx < batch_size; batchIdx++)
+        {
+            M += (reqType != RequestType::kCONTEXT)
+                ? 1
+                : (mRemoveInputPadding ? host_context_lengths[batchIdx] : inputDesc[0].dims.d[1]);
+        }
+        const auto lora_rank = lora_ranks[0];
+        auto bestTactic = mPluginProfiler->getBestConfig(M, mGemmId);
+
+        const auto N = lora_rank;
+
+        TLLM_CHECK_WITH_INFO(N <= mMaxLowRank,
+            fmtstr("Invalid low_rank (%d). low_rank must be smaller than mMaxLowRank (%d)", N, mMaxLowRank));
+        const auto K = mTransA ? inputDesc[0].dims.d[0] : inputDesc[0].dims.d[nbDimsA - 1]; // input hidden size
+        const auto N2 = outputDesc[0].dims.d[nbDimsA - 1];
+        // [M, K] -> [M, N] -> [M, N2]
+
+        void* lora_in_weight = reinterpret_cast<void*>(lora_weights_ptr[0]);
+        void* lora_out_weight = reinterpret_cast<void*>(lora_weights_ptr[1]);
+        const void* input = inputs[0];
+        void* output = outputs[0];
+
+        _runGemm(M, N, K, mTransA, mTransB, mType, mCublasWrapper, input, lora_in_weight, lowRankWorkSpace, bestTactic,
+            cublasWorkSpace, stream);
+
+        _runGemm(M, N2, N, mTransA, mTransB, mType, mCublasWrapper, lowRankWorkSpace, lora_out_weight, output,
+            bestTactic, cublasWorkSpace, stream);
+    }
+    else if (UseGroupedGemm)
+    {
+        int handled_token_num = 0;
+        std::vector<cutlass::gemm::GemmCoord> problem_sizes;
+        problem_sizes.reserve(batch_size);
+        std::vector<void*> ptrA;
+        ptrA.reserve(batch_size);
+        std::vector<void*> ptrB;
+        ptrB.reserve(batch_size);
+        std::vector<void*> ptrC;
+        ptrC.reserve(batch_size);
+        std::vector<void*> ptrD;
+        ptrD.reserve(batch_size);
+
+        std::vector<cutlass::gemm::GemmCoord> problem_sizes_2;
+        problem_sizes_2.reserve(batch_size);
+        std::vector<void*> ptrA_2;
+        ptrA_2.reserve(batch_size);
+        std::vector<void*> ptrB_2;
+        ptrB_2.reserve(batch_size);
+        std::vector<void*> ptrC_2;
+        ptrC_2.reserve(batch_size);
+        std::vector<void*> ptrD_2;
+        ptrD_2.reserve(batch_size);
+        for (int batchIdx = 0; batchIdx < batch_size; batchIdx++)
+        {
+            const RequestType reqType = reqTypes[batchIdx];
+            const auto M = (reqType != RequestType::kCONTEXT)
+                ? 1
+                : (mRemoveInputPadding ? host_context_lengths[batchIdx] : inputDesc[0].dims.d[1]);
+            const auto lora_rank = lora_ranks[batchIdx];
             const auto N = lora_rank;
+            if (N > 0)
+            {
+                TLLM_CHECK_WITH_INFO(N <= mMaxLowRank,
+                    fmtstr("Invalid low_rank (%d). low_rank must be smaller than mMaxLowRank (%d)", N, mMaxLowRank));
+                const auto K = mTransA ? inputDesc[0].dims.d[0] : inputDesc[0].dims.d[nbDimsA - 1]; // input hidden size
 
-            TLLM_CHECK_WITH_INFO(N <= mMaxLowRank,
-                fmtstr("Invalid low_rank (%d). low_rank must be smaller than mMaxLowRank (%d)", N, mMaxLowRank));
-            const auto K = mTransA ? inputDesc[0].dims.d[0] : inputDesc[0].dims.d[nbDimsA - 1]; // input hidden size
-            const auto N2 = outputDesc[0].dims.d[nbDimsA - 1];
-            // [M, K] -> [M, N] -> [M, N2]
+                cutlass::gemm::GemmCoord problem(M, N, K);
+                problem_sizes.push_back(problem);
 
-            void* lora_in_weight = reinterpret_cast<void*>(lora_weights_ptr[batchIdx * 2 + 0]);
-            void* lora_out_weight = reinterpret_cast<void*>(lora_weights_ptr[batchIdx * 2 + 1]);
-            const void* input
-                = static_cast<const void*>(static_cast<const char*>(inputs[0]) + handled_token_num * K * typeSize);
-            void* output = static_cast<void*>(static_cast<char*>(outputs[0]) + handled_token_num * N2 * typeSize);
-            _runGemm(M, N, K, mTransA, mTransB, mType, mCublasWrapper, input, lora_in_weight, lowRankWorkSpace,
-                bestTactic, cublasWorkSpace, stream);
+                ptrA.push_back(static_cast<void*>(
+                    static_cast<char*>(const_cast<void*>(inputs[0])) + handled_token_num * K * typeSize));
+                ptrB.push_back(reinterpret_cast<void*>(lora_weights_ptr[batchIdx * 2 + 0]));
+                ptrC.push_back(static_cast<void*>(
+                    static_cast<char*>(lowRankWorkSpace) + handled_token_num * mMaxLowRank * typeSize));
+                ptrD.push_back(static_cast<void*>(
+                    static_cast<char*>(lowRankWorkSpace) + handled_token_num * mMaxLowRank * typeSize));
 
-            _runGemm(M, N2, N, mTransA, mTransB, mType, mCublasWrapper, lowRankWorkSpace, lora_out_weight, output,
-                bestTactic, cublasWorkSpace, stream);
+                const auto N2 = outputDesc[0].dims.d[nbDimsA - 1];
+                cutlass::gemm::GemmCoord problem_2(M, N2, N);
+                problem_sizes_2.push_back(problem_2);
+                ptrA_2.push_back(static_cast<void*>(
+                    static_cast<char*>(lowRankWorkSpace) + handled_token_num * mMaxLowRank * typeSize));
+                ptrB_2.push_back(reinterpret_cast<void*>(lora_weights_ptr[batchIdx * 2 + 1]));
+                ptrC_2.push_back(
+                    static_cast<void*>(static_cast<char*>(outputs[0]) + handled_token_num * N2 * typeSize));
+                ptrD_2.push_back(
+                    static_cast<void*>(static_cast<char*>(outputs[0]) + handled_token_num * N2 * typeSize));
+            }
+            handled_token_num += M;
         }
-        handled_token_num += M;
+        tensorrt_llm::kernels::run_cutlass_1(problem_sizes, ptrA, ptrB, ptrC, ptrD, cutlassWorkSpace,
+            cutlassWorkSpaceSize, cublasWorkSpace, CUBLAS_WORKSPACE_SIZE, stream);
+        sync_check_cuda_error();
+        tensorrt_llm::kernels::run_cutlass_2(problem_sizes_2, ptrA_2, ptrB_2, ptrC_2, ptrD_2, cutlassWorkSpace,
+            cutlassWorkSpaceSize, cublasWorkSpace, CUBLAS_WORKSPACE_SIZE, stream);
+        sync_check_cuda_error();
+    }
+    else
+    {
+        if (streams.size() != batch_size)
+        {
+            for (int i = 0; i < batch_size; i++)
+            {
+                // TLLM_LOG_INFO("allocate %d stream and handle", i);
+                cudaStream_t stream_;
+                cublasHandle_t handle;
+                if (i == 0)
+                {
+                    stream_ = stream;
+                }
+                else
+                {
+                    cudaStreamCreate(&stream_);
+                }
+                cublasCreate(&handle);
+                cublasSetStream(handle, stream_);
+                cublas_handles.push_back(handle);
+                streams.push_back(stream_);
+                cudaStreamSynchronize(stream_);
+            }
+        }
+
+        if (!graphCreated)
+        {
+            cudaGraph_t graph;
+            cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+            std::vector<cudaEvent_t> events;
+            events.reserve(batch_size);
+
+            for (int batchIdx = 0; batchIdx < batch_size; batchIdx++)
+            {
+                cublasSetStream(cublas_handles[batchIdx], streams[batchIdx]);
+                cudaEventCreate(&events[batchIdx]);
+
+                const RequestType reqType = reqTypes[batchIdx];
+                const auto M = (reqType != RequestType::kCONTEXT)
+                    ? 1
+                    : (mRemoveInputPadding ? host_context_lengths[batchIdx] : inputDesc[0].dims.d[1]);
+                const auto lora_rank = lora_ranks[batchIdx];
+
+                if (lora_rank <= 0)
+                {
+                    const auto N = outputDesc[0].dims.d[outputDesc[0].dims.nbDims - 1];
+                    void* output
+                        = static_cast<void*>(static_cast<char*>(outputs[0]) + handled_token_num * N * typeSize);
+                    if (typeSize == 2)
+                    {
+                        deviceFill((half*) output, M * N, (half) 0.0f, streams[batchIdx]);
+                    }
+                    else
+                    {
+                        deviceFill((float*) output, M * N, 0.0f, streams[batchIdx]);
+                    }
+                }
+                else
+                {
+                    // the input shape should be [1, token_num, K] under remove_input_padding,
+                    // [batch, seqlen, K] under non-remove_input_padding
+                    auto bestTactic = mPluginProfiler->getBestConfig(M, mGemmId);
+
+                    const auto N = lora_rank;
+
+                    TLLM_CHECK_WITH_INFO(N <= mMaxLowRank,
+                        fmtstr(
+                            "Invalid low_rank (%d). low_rank must be smaller than mMaxLowRank (%d)", N, mMaxLowRank));
+                    const auto K
+                        = mTransA ? inputDesc[0].dims.d[0] : inputDesc[0].dims.d[nbDimsA - 1]; // input hidden size
+                    const auto N2 = outputDesc[0].dims.d[nbDimsA - 1];
+                    // [M, K] -> [M, N] -> [M, N2]
+
+                    void* lora_in_weight = reinterpret_cast<void*>(lora_weights_ptr[batchIdx * 2 + 0]);
+                    void* lora_out_weight = reinterpret_cast<void*>(lora_weights_ptr[batchIdx * 2 + 1]);
+                    const void* input = static_cast<const void*>(
+                        static_cast<const char*>(inputs[0]) + handled_token_num * K * typeSize);
+                    void* output
+                        = static_cast<void*>(static_cast<char*>(outputs[0]) + handled_token_num * N2 * typeSize);
+
+                    if (batchIdx > 0)
+                    {
+                        cudaStreamWaitEvent(streams[batchIdx], events[0]);
+                    }
+
+                    runCublasGemmEx(
+                        M, N, K, mTransA, mTransB, input, lora_in_weight, lowRankWorkSpace, cublas_handles[batchIdx]);
+                    runCublasGemmEx(M, N2, N, mTransA, mTransB, lowRankWorkSpace, lora_out_weight, output,
+                        cublas_handles[batchIdx]);
+
+                    cudaEventRecord(events[batchIdx], streams[batchIdx]);
+                }
+                handled_token_num += M;
+
+                cudaStreamWaitEvent(stream, events[batchIdx], 0);
+            }
+
+            cudaStreamEndCapture(stream, &graph);
+            cudaGraphInstantiate(&instance, graph, NULL, NULL, 0);
+            graphCreated = true;
+        }
+        cudaGraphLaunch(instance, stream);
     }
     return 0;
 }

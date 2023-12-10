@@ -70,7 +70,6 @@ python build.py --model_type t5 \
                 --use_bert_attention_plugin \
                 --use_gpt_attention_plugin \
                 --use_gemm_plugin \
-                --use_rmsnorm_plugin \
                 --dtype float32 \
                 --max_beam_width 1
 
@@ -86,7 +85,6 @@ python build.py --model_type t5 \
                 --use_bert_attention_plugin \
                 --use_gpt_attention_plugin \
                 --use_gemm_plugin \
-                --use_rmsnorm_plugin \
                 --dtype bfloat16 \
                 --max_beam_width 3
 
@@ -103,7 +101,6 @@ python build.py --model_type t5 \
                 --use_bert_attention_plugin \
                 --use_gpt_attention_plugin \
                 --use_gemm_plugin \
-                --use_rmsnorm_plugin \
                 --dtype bfloat16 \
                 --max_beam_width 3
 ```
@@ -122,6 +119,63 @@ mpirun --allow-run-as-root -np 4 python3 run.py --engine_dir tmp/trt_engines/t5-
 
 # Example 3: inference w/ 4 GPUs (2-way TP and 2-way PP, as configured during the engine building step), BF16, greedy search
 mpirun --allow-run-as-root -np 4 python3 run.py --engine_dir tmp/trt_engines/flan-t5-small/4-gpu/bfloat16/tp2 --engine_name flan-t5-small --model_name google/flan-t5-small --max_new_token=64 --num_beams=1
+```
+
+### Benchmark
+
+The benchmark implementation and entrypoint can be found in [`benchmarks/python/benchmark.py`](../../benchmarks/python/benchmark.py). Specifically, [`benchmarks/python/enc_dec_benchmark.py`](../../benchmarks/python/enc_dec_benchmark.py) is the benchmark script for Encoder-Decoder models.
+
+Step 1: In `examples/enc_dec/`:
+
+After downloading the models and converting/splitting the weights, build the engine **without** the `--remove_input_padding` flag and **without** pipeline parallelism.
+
+```bash
+# Example 1: build t5-small using a single GPU, FP32, running gready search
+python build.py --model_type t5 \
+                --weight_dir tmp/trt_models/t5-small/tp1 \
+                -o tmp/trt_engines/t5-small/1-gpu \
+                --engine_name t5-small \
+                --use_bert_attention_plugin \
+                --use_gpt_attention_plugin \
+                --use_gemm_plugin \
+                --dtype float32 \
+                --max_beam_width 1
+
+# Example 2: build t5-small using 4-way tensor parallelism on a node with 8 GPUs, BF16, enabling beam search up to width=3
+python build.py --model_type t5 \
+                --world_size 4 \
+                --tp_size 4 \
+                --gpus_per_node 4 \
+                --weight_dir tmp/trt_models/t5-small/tp4 \
+                -o tmp/trt_engines/t5-small/4-gpu \
+                --engine_name t5-small \
+                --use_bert_attention_plugin \
+                --use_gpt_attention_plugin \
+                --use_gemm_plugin \
+                --dtype bfloat16 \
+                --max_beam_width 3
+```
+
+Step 2: In `benchmarks/python/`:
+
+```bash
+# Example 1: Single-GPU benchmark
+python benchmark.py \
+    -m t5_small \
+    --batch_size "1;8" \
+    --input_output_len "60,20;128,20" \
+    --dtype float32 \
+    --engine_dir ../../examples/enc_dec/tmp/trt_engines/t5-small/1-gpu/float32/tp1 \
+    --csv # optional
+
+# Example 2: Multi-GPU benchmark
+mpirun --allow-run-as-root -np 4 python benchmark.py \
+    -m t5_small \
+    --batch_size "1;8" \
+    --input_output_len "60,20;128,20" \
+    --dtype bfloat16 \
+    --engine_dir ../../examples/enc_dec/tmp/trt_engines/t5-small/4-gpu/bfloat16/tp4 \
+    --csv # optional
 ```
 
 ### Reminders

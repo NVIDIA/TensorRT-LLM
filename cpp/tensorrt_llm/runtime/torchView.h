@@ -70,11 +70,6 @@ public:
         return mTensor.is_cuda() ? MemoryType::kGPU : mTensor.is_pinned() ? MemoryType::kPINNED : MemoryType::kCPU;
     }
 
-    void resize(std::size_t newSize) override
-    {
-        ITensor::resize(newSize);
-    }
-
     void release() override
     {
         resize(0);
@@ -87,9 +82,19 @@ public:
 
     void reshape(Shape const& dims) override
     {
-        TLLM_CHECK(volumeNonNegative(dims) <= getCapacity());
-        mTensor.resize_(TorchUtils::shape(dims));
+        try
+        {
+            mTensor.resize_(TorchUtils::shape(dims));
+        }
+        catch (c10::Error const& e)
+        {
+            TLLM_THROW("%s", e.what_without_backtrace());
+        }
         mDims = dims;
+        if (auto const newSize = volumeNonNegative(dims); mCapacity < newSize)
+        {
+            mCapacity = newSize;
+        }
     }
 
 private:

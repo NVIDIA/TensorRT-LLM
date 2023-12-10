@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-import time
 from math import ceil
 
 import torch
@@ -27,8 +26,9 @@ from build import build_gpt, get_quant_mode  # isort:skip
 
 class GPTBenchmark(BaseBenchmark):
 
-    def __init__(self, args, batch_sizes, in_out_lens):
-        super().__init__(args.engine_dir, args.model, args.dtype)
+    def __init__(self, args, batch_sizes, in_out_lens, rank, world_size):
+        super().__init__(args.engine_dir, args.model, args.dtype, rank,
+                         world_size, args.serial_build)
         self.batch_sizes = batch_sizes
         self.in_out_lens = in_out_lens
         self.num_beams = args.num_beams
@@ -49,6 +49,13 @@ class GPTBenchmark(BaseBenchmark):
                 setattr(self, key, value)
             if args.force_num_layer_1:
                 self.num_layers = 1
+            if args.max_batch_size is not None:
+                self.max_batch_size = args.max_batch_size
+            if args.max_input_len is not None:
+                self.max_input_len = args.max_input_len
+            if args.max_output_len is not None:
+                self.max_output_len = args.max_output_len
+
             self.quant_mode, _, _, _ = get_quant_mode(args.quantization)
             self.enable_fp8 = self.quant_mode.has_fp8_qdq()
             self.fp8_kv_cache = self.quant_mode.has_fp8_kv_cache()
@@ -62,11 +69,12 @@ class GPTBenchmark(BaseBenchmark):
             elif args.mode == 'ootb-except-mha':
                 self.use_gpt_attention_plugin = True
 
-            start = time.time()
-            engine_buffer = build_gpt(args)
-            self.build_time = round(time.time() - start, 2)
+            engine_buffer, build_time = build_gpt(args)
+            self.build_time = build_time
 
         assert engine_buffer is not None
+        if args.build_only:
+            return
 
         if not hasattr(self, 'num_kv_heads') or self.num_kv_heads is None:
             self.num_kv_heads = self.num_heads
@@ -194,7 +202,8 @@ class GPTBenchmark(BaseBenchmark):
                 'generation_step_count')
             token_per_step = batch_size * self.num_beams
             total_tokens = generation_step_count * token_per_step
-            report_dict["generation_time(ms)"] = generation_time_ms / iter_count
+            report_dict["generation_time(ms)"] = round(
+                generation_time_ms / iter_count, 3)
             report_dict["total_generated_tokens"] = total_tokens / iter_count
             tokens_per_second = round(
                 total_tokens * 1000.0 / generation_time_ms, 3)

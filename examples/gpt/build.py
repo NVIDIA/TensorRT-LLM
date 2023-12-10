@@ -61,6 +61,28 @@ def serialize_engine(engine, path):
     logger.info(f'Engine serialized. Total time: {t}')
 
 
+def override_args_from_model_dir(args: argparse.Namespace) -> None:
+    if args.model_dir is not None:
+        logger.info(f"Setting model configuration from {args.model_dir}.")
+        parsed_params = parse_ft_config(Path(args.model_dir) / "config.ini")
+        args.n_embd = parsed_params["n_embd"]
+        args.n_head = parsed_params["n_head"]
+        args.n_layer = parsed_params["n_layer"]
+        args.n_positions = parsed_params["n_positions"]
+        args.vocab_size = parsed_params["vocab_size"]
+        args.hidden_act = parsed_params["hidden_act"]
+        if parsed_params["rotary_pct"] is not None:
+            args.rotary_pct = parsed_params["rotary_pct"]
+        if parsed_params["rotary_base"] is not None:
+            args.rotary_base = parsed_params["rotary_base"]
+        if parsed_params["rotary_scaling"] is not None:
+            args.rotary_scaling = parsed_params["rotary_scaling"]
+        args.bias = parsed_params["bias"]
+        args.dtype = parsed_params["dtype"]
+        args.inter_size = parsed_params["inter_size"]
+        args.multi_query_mode = parsed_params["multi_query_mode"]
+
+
 def parse_arguments(args):
     parser = argparse.ArgumentParser()
     parser.add_argument('--world_size',
@@ -360,21 +382,7 @@ def parse_arguments(args):
     if args.inter_size is None:
         args.inter_size = 4 * args.n_embd
 
-    if args.model_dir is not None:
-        logger.info(f"Setting model configuration from {args.model_dir}.")
-        n_embd, n_head, n_layer, n_positions, vocab_size, _, hidden_act, rotary_pct, bias, inter_size, multi_query_mode, dtype, prompt_num_tasks, prompt_max_vocab_size = parse_ft_config(
-            Path(args.model_dir) / "config.ini")
-        args.n_embd = n_embd
-        args.n_head = n_head
-        args.n_layer = n_layer
-        args.n_positions = n_positions
-        args.vocab_size = vocab_size
-        args.hidden_act = hidden_act
-        args.rotary_pct = rotary_pct
-        args.bias = bias
-        args.dtype = dtype
-        args.inter_size = inter_size
-        args.multi_query_mode = multi_query_mode
+    override_args_from_model_dir(args)
     plugins_args = [
         'use_gpt_attention_plugin', 'use_gemm_plugin', 'use_layernorm_plugin',
         'use_lookup_plugin', 'use_lora_plugin'

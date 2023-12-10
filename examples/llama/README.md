@@ -496,7 +496,7 @@ mpirun -n 2 --allow-run-as-root \
 #### Mistral v0.1
 Mistral v0.1 is compatible with LLaMA interface and can be built and run using the same instructions.
 Setting `--max_input_len`, corresponding to the `max_position_embeddings` in the original Mistral config explicitly regulates context size.
-The `--max_kv_cache_length` parameter is set to the `sliding_window` value in the config and regulates both sliding window attention in the context phase and rolling buffer cache in the generation phase.
+The `--max_attention_window_size` parameter is set to the `sliding_window` value in the config and regulates both sliding window attention in the context phase and rolling buffer cache in the generation phase.
 
 ```bash
 # Build Mistral 7B with max input length 32256
@@ -510,10 +510,10 @@ python build.py --model_dir ./tmp/mistral/7B/ \
                 --max_input_len 32256
 
 # Run Mistral 7B fp16 inference with sliding window/cache size 4096
-python3 ../run.py --max_output_len=50 \
-                  --tokenizer_dir ./tmp/llama/7B/ \
-                  --engine_dir=./tmp/llama/7B/trt_engines/fp16/1-gpu/ \
-                  --max_kv_cache_length=4096
+python3 run.py --max_output_len=50 \
+               --tokenizer_dir ./tmp/llama/7B/ \
+               --engine_dir=./tmp/llama/7B/trt_engines/fp16/1-gpu/ \
+               --max_attention_window_size=4096
 ```
 
 Note that if you are comparing TRT-LLM with Huggingface,
@@ -537,7 +537,7 @@ python build.py --meta_ckpt_dir ./CodeLlama-7b-Instruct/ --dtype float16 \
 Use the following command to build `CodeLlama-34b-Instruct` for 4 GPUs (TP=4):
 ```
 python build.py --meta_ckpt_dir ./CodeLlama-34b-Instruct/ --dtype float16 \
-    --remove_input_padding --use_gpt_attention_plugin float16 --use_gemm_plugin float16 --use_rmsnorm_plugin float16 \
+    --remove_input_padding --use_gpt_attention_plugin float16 --use_gemm_plugin float16 \
     --enable_context_fmha --output_dir codellama_34b --rotary_base 1000000 --vocab_size 32000 --world_size 4 --tp_size 4
 ```
 
@@ -547,7 +547,7 @@ To build the engine for running similarly long input/output, you need to specify
 Use `--max_input_len` and `--max_output_len` (which defaults to `2048` and `512`, respectively) according to your use case, e.g.:
 ```
 python build.py --meta_ckpt_dir ./CodeLlama-34b-Instruct/ --dtype float16 \
-    --remove_input_padding --use_gpt_attention_plugin float16 --use_gemm_plugin float16 --use_rmsnorm_plugin float16 \
+    --remove_input_padding --use_gpt_attention_plugin float16 --use_gemm_plugin float16 \
     --output_dir codellama_34b --rotary_base 1000000 --vocab_size 32000 --world_size 8 --tp_size 8 --parallel_build \
     --enable_context_fmha --use_parallel_embedding --max_input_len 15360 --max_output_len 1024 --max_batch_size 4
 ```

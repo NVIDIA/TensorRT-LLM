@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
+import json
 import os
 import time
 from functools import wraps
@@ -21,11 +23,15 @@ from typing import Optional, Union
 import tensorrt as trt
 from packaging import version
 
-from tensorrt_llm.quantization import QuantMode
-
 from ._utils import to_dict, to_json_file, trt_version
+from .graph_rewriting import optimize
 from .logger import logger
-from .network import Network
+from .models import MODEL_MAP, PretrainedConfig, PretrainedModel
+from .network import Network, net_guard
+from .plugin import PluginConfig
+from .plugin.plugin import ContextFMHAType
+from .quantization import QuantMode
+from .version import __version__
 
 
 class _BuildingFlag:
@@ -82,17 +88,22 @@ class Builder():
         return self._trt_builder
 
     def create_network(self) -> Network:
+        explicit_batch_flag = 0
+        if version.parse(trt_version()).major <= 9:
+            # Explicit batch flag is deprecated, only use for TRT major version <= 9
+            explicit_batch_flag = 1 << int(
+                trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+
         if version.parse(trt_version()) >= version.parse(
                 "9.1.0") and self.strongly_typed:
             return Network()._init(
                 self.trt_builder.create_network(
-                    (1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+                    explicit_batch_flag
                     | (1 << int(
                         trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED))))
         else:
             return Network()._init(
-                self.trt_builder.create_network(
-                    1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)))
+                self.trt_builder.create_network(explicit_batch_flag))
 
     def create_builder_config(self,
                               precision: str,
@@ -343,3 +354,256 @@ class Builder():
         config['plugin_config'] = to_dict(builder_config.plugin_config)
         to_json_file(config, config_path)
         logger.info(f'Config saved to {config_path}.')
+
+
+class BuildConfig:
+
+    def __init__(self, max_input_len, max_output_len, max_batch_size,
+                 max_beam_width, max_num_tokens,
+                 max_prompt_embedding_table_size, plugin_config):
+        self.max_input_len = max_input_len
+        self.max_output_len = max_output_len
+        self.max_batch_size = max_batch_size
+        self.max_beam_width = max_beam_width
+        self.max_num_tokens = max_num_tokens
+        self.max_prompt_embedding_table_size = max_prompt_embedding_table_size
+        self.plugin_config = plugin_config
+
+    @classmethod
+    def from_dict(cls, config):
+        max_input_len = config.pop('max_input_len')
+        max_output_len = config.pop('max_output_len')
+        max_batch_size = config.pop('max_batch_size')
+        max_beam_width = config.pop('max_beam_width')
+        max_num_tokens = config.pop('max_num_tokens')
+        max_prompt_embedding_table_size = config.pop(
+            'max_prompt_embedding_table_size', 0)
+
+        plugin_config = PluginConfig()
+        if 'plugin_config' not in config:
+            return cls(
+                max_input_len=max_input_len,
+                max_output_len=max_output_len,
+                max_batch_size=max_batch_size,
+                max_beam_width=max_beam_width,
+                max_num_tokens=max_num_tokens,
+                max_prompt_embedding_table_size=max_prompt_embedding_table_size,
+                plugin_config=plugin_config)
+
+        config = config['plugin_config']
+        gpt_attention_plugin = config.pop('gpt_attention_plugin', False)
+        if gpt_attention_plugin:
+            plugin_config.set_gpt_attention_plugin(dtype=gpt_attention_plugin)
+
+        gemm_plugin = config.pop('gemm_plugin', False)
+        if gemm_plugin:
+            plugin_config.set_gemm_plugin(dtype=gemm_plugin)
+
+        lookup_plugin = config.pop('lookup_plugin', False)
+        if lookup_plugin:
+            plugin_config.set_lookup_plugin(dtype=lookup_plugin)
+
+        enable_context_fmha = config.pop('enable_context_fmha', False)
+        enable_context_fmha_fp32_acc = config.pop(
+            'enable_context_fmha_fp32_acc', False)
+        assert not (enable_context_fmha and enable_context_fmha_fp32_acc)
+        if enable_context_fmha:
+            plugin_config.set_context_fmha(ContextFMHAType.enabled)
+        if enable_context_fmha_fp32_acc:
+            plugin_config.set_context_fmha(
+                ContextFMHAType.enabled_with_fp32_acc)
+
+        remove_input_padding = config.pop('remove_input_padding', False)
+        if remove_input_padding:
+            plugin_config.enable_remove_input_padding()
+
+        paged_kv_cache = config.pop('paged_kv_cache', False)
+        tokens_per_block = config.pop('tokens_per_block', 64)
+        if paged_kv_cache:
+            plugin_config.enable_paged_kv_cache(tokens_per_block)
+
+        return cls(
+            max_input_len=max_input_len,
+            max_output_len=max_output_len,
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_num_tokens=max_num_tokens,
+            max_prompt_embedding_table_size=max_prompt_embedding_table_size,
+            plugin_config=plugin_config)
+
+    @classmethod
+    def from_json_file(cls, config_file):
+        with open(config_file) as f:
+            config = json.load(f)
+            return BuildConfig.from_dict(config)
+
+    def to_dict(self):
+        output = copy.deepcopy(self.__dict__)
+        plugin_config = output.pop('plugin_config')
+        plugin_config_dict = copy.deepcopy(plugin_config.__dict__)
+        output['plugin_config'] = plugin_config_dict
+        return output
+
+
+def serialize_engine(engine, path):
+    logger.info(f'Serializing engine to {path}...')
+    tik = time.time()
+    with open(path, 'wb') as f:
+        f.write(bytearray(engine))
+    tok = time.time()
+    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
+    logger.info(f'Engine serialized. Total time: {t}')
+
+
+class EngineConfig:
+
+    def __init__(self, pretrained_config: PretrainedConfig,
+                 build_config: BuildConfig, version: str):
+        self.pretrained_config = pretrained_config
+        self.build_config = build_config
+        self.version = version
+
+    @classmethod
+    def from_json_file(cls, config_file):
+        with open(config_file) as f:
+            config = json.load(f)
+            return cls(PretrainedConfig.from_dict(config['pretrained_config']),
+                       BuildConfig.from_dict(config['build_config']),
+                       config['version'])
+
+    def to_dict(self):
+        return {
+            'version': self.version,
+            'pretrained_config': self.pretrained_config.to_dict(),
+            'build_config': self.build_config.to_dict(),
+        }
+
+
+class Engine:
+
+    def __init__(self, config: EngineConfig, engine: trt.IHostMemory):
+        self.config = config
+        self.engine = engine
+
+    def save(self, engine_dir: str):
+        if self.config.pretrained_config.mapping.rank == 0:
+            with open(os.path.join(engine_dir, 'config.json'),
+                      "w",
+                      encoding="utf-8") as f:
+                json.dump(self.config.to_dict(), f, indent=4)
+        serialize_engine(
+            self.engine,
+            os.path.join(
+                engine_dir,
+                f'rank{self.config.pretrained_config.mapping.rank}.engine'))
+
+    @classmethod
+    def from_dir(cls, engine_dir: str, rank: int = 0):
+        with open(os.path.join(engine_dir, f'rank{rank}.engine'), 'rb') as f:
+            engine_buffer = f.read()
+
+        config = EngineConfig.from_json_file(
+            os.path.join(engine_dir, 'config.json'))
+        config.pretrained_config.set_rank(rank)
+
+        return cls(config, engine_buffer)
+
+
+def get_engine_version(engine_dir: str) -> Union[None, str]:
+    engine_dir = Path(engine_dir)
+    config_path = engine_dir / "config.json"
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    if 'version' not in config:
+        return None
+
+    return config['version']
+
+
+def build_shard_model(model: PretrainedModel,
+                      build_config: BuildConfig) -> Engine:
+    builder = Builder()
+    network = builder.create_network()
+    network._plugin_config = build_config.plugin_config
+
+    use_weight_only = model.config.quant_mode.is_weight_only()
+    per_group = model.config.quant_mode.has_per_group_scaling()
+    use_smooth_quant = model.config.quant_mode.has_act_and_weight_quant()
+    if use_weight_only:
+        if per_group:
+            network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
+                dtype='float16')
+        else:
+            network.plugin_config.set_weight_only_quant_matmul_plugin(
+                dtype='float16')
+    if use_smooth_quant:
+        network.plugin_config.set_smooth_quant_gemm_plugin(dtype='float16')
+        network.plugin_config.set_rmsnorm_quantization_plugin(dtype='float16')
+        network.plugin_config.set_quantize_tensor_plugin()
+        network.plugin_config.set_quantize_per_token_plugin()
+    nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else False
+    if nccl_plugin:
+        network.plugin_config.set_nccl_plugin(nccl_plugin)
+
+    with net_guard(network):
+        # Prepare
+        network.set_named_parameters(model.named_parameters())
+
+        # Forward
+        inputs = model.prepare_inputs(
+            build_config.max_batch_size, build_config.max_input_len,
+            build_config.max_output_len, True, build_config.max_beam_width,
+            build_config.max_num_tokens,
+            build_config.max_prompt_embedding_table_size)
+        model(*inputs)
+
+    optimize(network)
+
+    builder_config = builder.create_builder_config(
+        precision=model.config.dtype,
+        int8=model.config.quant_mode.has_act_or_weight_quant())
+
+    # Network -> Engine
+    engine = builder.build_engine(network, builder_config)
+    engine_config = EngineConfig(model.config, build_config, __version__)
+
+    return Engine(engine_config, engine)
+
+
+def build(ckpt_dir_or_model_config: Union[str, PretrainedConfig],
+          build_config: Union[str, BuildConfig],
+          rank: int = 0,
+          model_cls=None) -> Engine:
+    is_ckpt_dir = False
+    if isinstance(ckpt_dir_or_model_config, PretrainedConfig):
+        model_config = ckpt_dir_or_model_config
+    else:
+        if ckpt_dir_or_model_config.lower().endswith('.json'):
+            model_config = PretrainedConfig.from_json_file(
+                ckpt_dir_or_model_config)
+        else:
+            model_config = PretrainedConfig.from_json_file(
+                os.path.join(ckpt_dir_or_model_config, 'config.json'))
+            is_ckpt_dir = True
+
+    if isinstance(build_config, str):
+        build_config = BuildConfig.from_json_file(build_config)
+
+    assert rank < model_config.mapping.world_size
+    architecture = model_config.architecture
+
+    if model_cls is None:
+        if architecture not in MODEL_MAP:
+            raise RuntimeError(
+                f'Unsupported model architecture: {architecture}')
+        model_cls = MODEL_MAP[architecture]
+
+    if not is_ckpt_dir:
+        rank_config = copy.deepcopy(model_config)
+        rank_config.set_rank(rank)
+        model = model_cls.from_config(rank_config)
+    else:
+        model = model_cls.from_checkpoint(ckpt_dir_or_model_config, rank=rank)
+
+    return build_shard_model(model, build_config)

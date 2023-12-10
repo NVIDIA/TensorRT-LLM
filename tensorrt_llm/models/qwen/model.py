@@ -52,7 +52,6 @@ class QWenAttention(Module):
         rotary_embedding_base=10000.0,
         rotary_embedding_scaling=None,
         neox_rotary_style=False,
-        use_int8_kv_cache=False,
         rotary_embedding_percentage=1.0,
         tp_group=None,
         tp_size=1,
@@ -112,12 +111,8 @@ class QWenAttention(Module):
 
         self.dtype = dtype
         self.quant_mode = quant_mode
-        if use_int8_kv_cache:
-            # TODO: remove use_int8_kv_cache as can be replaced by quant_mode.has_kv_cache_quant()
-            # Merge int8 setting into quant_mode
-            self.quant_mode = self.quant_mode.set_int8_kv_cache()
 
-        self.use_int8_kv_cache = use_int8_kv_cache
+        self.use_int8_kv_cache = self.quant_mode.has_int8_kv_cache()
         if self.use_int8_kv_cache:
             self.kv_orig_quant_scale = Parameter(shape=(1, ), dtype='float32')
             self.kv_quant_orig_scale = Parameter(shape=(1, ), dtype='float32')
@@ -193,7 +188,8 @@ class QWenAttention(Module):
             sequence_length=attention_params.sequence_length,
             host_past_key_value_lengths=kv_cache_params.
             host_past_key_value_lengths,
-            host_max_kv_cache_lengths=kv_cache_params.host_max_kv_cache_lengths,
+            host_max_attention_window_sizes=kv_cache_params.
+            host_max_attention_window_sizes,
             context_lengths=attention_params.context_lengths,
             cache_indirection=kv_cache_params.cache_indirection,
             host_request_types=attention_params.host_request_types,
@@ -286,7 +282,7 @@ class QWenBlock(Module):
             neox_rotary_style=neox_rotary_style,
             tp_group=self.tp_group,
             tp_size=self.tp_size,
-            use_int8_kv_cache=quant_mode.has_int8_kv_cache(),
+            quant_mode=quant_mode,
         )
         if not mlp_hidden_size:
             mlp_hidden_size = hidden_size * 4
@@ -393,7 +389,7 @@ class QWenModel(Module):
                       tp_group=mapping.tp_group,
                       tp_size=mapping.tp_size,
                       rms_norm_eps=rms_norm_eps)
-            for i in self.get_transformer_layers(self.mapping, num_layers)
+            for i in self.mapping.pp_layers(num_layers)
         ])
 
         self.ln_f = RmsNorm(normalized_shape=hidden_size,
@@ -423,11 +419,11 @@ class QWenModel(Module):
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
         self.register_network_output(f"embd", hidden_states)
 
-        for layer, past, pointer, host_pointer, max_kv_cache_length in zip(
+        for layer, past, pointer, host_pointer, max_attention_window_size in zip(
                 self.layers, kv_cache_params.past_key_value,
                 kv_cache_params.kv_cache_block_pointers,
                 kv_cache_params.host_kv_cache_block_pointers,
-                kv_cache_params.host_max_kv_cache_lengths):
+                kv_cache_params.host_max_attention_window_sizes):
             hidden_states = layer(
                 hidden_states,
                 use_cache=use_cache,
@@ -435,7 +431,7 @@ class QWenModel(Module):
                     past_key_value=[past],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
-                    host_max_kv_cache_lengths=max_kv_cache_length,
+                    host_max_attention_window_sizes=max_attention_window_size,
                     kv_cache_block_pointers=[pointer],
                     host_kv_cache_block_pointers=[host_pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
@@ -563,9 +559,8 @@ class QWenForCausalLM(QWenModel, GenerationMixin):
             hidden_states.mark_output('hidden_states_output', self.dtype)
 
         if use_cache and default_net().plugin_config.paged_kv_cache == False:
-            for i, present in zip(
-                    self.get_transformer_layers(self.mapping, self.num_layers),
-                    presents):
+            for i, present in zip(self.mapping.pp_layers(self.num_layers),
+                                  presents):
                 present.mark_output(f'present_key_value_{i}', self.kv_dtype)
             if self.mapping.is_last_pp_rank():
                 return (lm_logits, presents)
@@ -628,8 +623,8 @@ class QWenForCausalLM(QWenModel, GenerationMixin):
                     past_key_value=model_inputs['past_key_value'],
                     host_past_key_value_lengths=model_inputs[
                         'host_past_key_value_lengths'],
-                    host_max_kv_cache_lengths=model_inputs[
-                        'host_max_kv_cache_lengths'],
+                    host_max_attention_window_sizes=model_inputs[
+                        'host_max_attention_window_sizes'],
                     kv_cache_block_pointers=model_inputs[
                         'kv_cache_block_pointers_list'],
                     host_kv_cache_block_pointers=model_inputs[

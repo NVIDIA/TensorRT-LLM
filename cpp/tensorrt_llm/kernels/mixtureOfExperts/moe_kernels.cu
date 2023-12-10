@@ -411,7 +411,7 @@ template <typename T, int EXPERTS, int WARPS_PER_TB>
 void topkGatingSoftmaxLauncherHelper(const T* input, const bool* finished, T* output, int* indices, int* source_row,
     const int num_rows, const int k, const int start_expert, const int end_expert, cudaStream_t stream)
 {
-    static constexpr unsigned long MAX_BYTES_PER_LDG = 16;
+    static constexpr std::size_t MAX_BYTES_PER_LDG = 16;
 
     static constexpr int BYTES_PER_LDG = std::min(MAX_BYTES_PER_LDG, sizeof(T) * EXPERTS);
     using Constants = detail::TopkConstants<T, EXPERTS, BYTES_PER_LDG>;

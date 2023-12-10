@@ -251,7 +251,3 @@ python3 ../summarize.py --engine_dir gptj_engine \
                         --data_type fp16 \
                         --check_accuracy
 ```
-
-## Known issues
-
-- You must enable the LayerNorm plugin to build the engine for GPT-J when using TensorRT 8.6, this constraint is removed in TensorRT 9.0. To enable LayerNorm plugin, you should add `--use_layernorm_plugin <float16 or float32>` in the build.py, see build.py commands example above.

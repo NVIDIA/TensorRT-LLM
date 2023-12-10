@@ -49,11 +49,11 @@ public:
         GenerationConfig() = default;
 
         explicit GenerationConfig(SizeType batchSize, SizeType beamWidth, SizeType maxInputLength,
-            SizeType maxKvCacheLength, SizeType maxSeqLength, SizeType inputLengthSum = SizeType(0))
+            SizeType maxAttentionWindow, SizeType maxSeqLength, SizeType inputLengthSum = SizeType(0))
             : batchSize{batchSize}
             , beamWidth{beamWidth}
             , maxInputLength{maxInputLength}
-            , maxKvCacheLength{maxKvCacheLength}
+            , maxAttentionWindow{maxAttentionWindow}
             , maxSeqLength{maxSeqLength}
             , inputLengthSum{inputLengthSum}
         {
@@ -62,12 +62,12 @@ public:
         SizeType batchSize{};
         SizeType beamWidth{};
         SizeType maxInputLength{};
-        SizeType maxKvCacheLength{};
+        SizeType maxAttentionWindow{};
         SizeType maxSeqLength{};
         SizeType inputLengthSum{}; // Initialized only if inputPacked is set to true in fromInput.
 
         static GenerationConfig fromInput(ITensor const& inputIds, ITensor const& inputLengths, bool inputPacked,
-            SizeType beamWidth, SizeType maxKvCacheLength, SizeType maxSequenceLength);
+            SizeType beamWidth, SizeType maxAttentionWindow, SizeType maxSequenceLength);
     };
 
 public:
@@ -89,10 +89,10 @@ public:
     TensorPtr requestTypes; // with attention plugin. Host tensor
 
     std::vector<TensorPtr> presentKeysVals;
-    std::vector<TensorPtr> presentKeysValsAlt; // without attention plugin
-    std::vector<TensorPtr> maxKvCacheLengths;  // with attention plugin, host tensor
-    TensorPtr kvCacheBlockPointersHost;        // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
-    TensorPtr kvCacheBlockPointersDevice;      // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
+    std::vector<TensorPtr> presentKeysValsAlt;  // without attention plugin
+    std::vector<TensorPtr> maxAttentionWindows; // with attention plugin, host tensor
+    TensorPtr kvCacheBlockPointersHost;         // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
+    TensorPtr kvCacheBlockPointersDevice;       // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
 
     // References to tmp buffers
     TensorPtr newTokens;
@@ -126,7 +126,7 @@ public:
     void create(TllmRuntime& runtime, GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void initFromInput(ITensor const& inputIds, TensorPtr const& inputLengths, bool inputPacked, SizeType beamWidth,
-        SizeType maxKvCacheLength, SizeType maxSequenceLength, BufferManager& manager);
+        SizeType maxAttentionWindow, SizeType maxSequenceLength, BufferManager& manager);
 
     //! \brief Reshape buffers based on current GenerationConfig
     void reshape(GptModelConfig const& modelConfig, WorldConfig const& worldConfig);

@@ -24,13 +24,6 @@ from ..mapping import Mapping
 
 class GenerationMixin:
 
-    def get_transformer_layers(self, mapping, num_layers):
-        layers_per_pipeline_stage = num_layers // mapping.pp_size
-        layers_range = list(
-            range(mapping.pp_rank * layers_per_pipeline_stage,
-                  (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
-        return layers_range
-
     @staticmethod
     def has_two_optimization_profiles(use_gpt_attention_plugin: bool,
                                       use_gemm_plugin: bool,
@@ -99,7 +92,7 @@ class GenerationMixin:
             kv_cache_range = [_kv_cache_range_gen]
 
         num_kv_heads = (num_kv_heads + mapping.tp_size - 1) // mapping.tp_size
-        layers_range = self.get_transformer_layers(mapping, num_layers)
+        layers_range = mapping.pp_layers(num_layers)
         past_key_value = []
         kv_cache_block_pointers_list = []
         host_kv_cache_block_pointers_list = []
@@ -203,14 +196,14 @@ class GenerationMixin:
                             ('max_blocks_per_seq', max_blocks_per_seq_range),
                         ]))
                     host_kv_cache_block_pointers_list.append(
-                        kv_cache_block_pointers)
+                        host_kv_cache_block_pointers)
                     past_key_value.append(None)
 
         sequence_length = None
         context_lengths = None
         host_context_lengths = None
         host_past_key_value_lengths = None
-        host_max_kv_cache_lengths = None
+        host_max_attention_window_sizes = None
         attention_mask = None
         cache_indirection = None
         host_request_types = None
@@ -265,17 +258,18 @@ class GenerationMixin:
             )
 
         if use_gpt_attention_plugin:
-            host_max_kv_cache_lengths = []
+            host_max_attention_window_sizes = []
             for i in layers_range:
-                host_kv_cache_length_tensor = Tensor(
-                    name=f'host_max_kv_cache_length_{i}',
+                host_max_attention_window_tensor = Tensor(
+                    name=f'host_max_attention_window_size_{i}',
                     dtype=trt.int32,
                     shape=[1],
                     dim_range=OrderedDict([
                         ('scalar',
                          [1, 1] if enable_two_optimization_profiles else [1])
                     ]))
-                host_max_kv_cache_lengths.append(host_kv_cache_length_tensor)
+                host_max_attention_window_sizes.append(
+                    host_max_attention_window_tensor)
 
         if use_cache:
             cache_indirection = Tensor(
@@ -293,7 +287,7 @@ class GenerationMixin:
             'attention_mask': attention_mask,
             'sequence_length': sequence_length,
             'host_past_key_value_lengths': host_past_key_value_lengths,
-            'host_max_kv_cache_lengths': host_max_kv_cache_lengths,
+            'host_max_attention_window_sizes': host_max_attention_window_sizes,
             'past_key_value': past_key_value,
             'cache_indirection': cache_indirection,
             'kv_cache_block_pointers_list': kv_cache_block_pointers_list,
@@ -492,6 +486,7 @@ class GenerationMixin:
         tasks = None
         prompt_vocab_size = None
         if prompt_embedding_table_size > 0:
+            assert num_heads is not None
             hidden_size = num_heads * head_size
             _p_embedding_range = [
                 1, prompt_embedding_table_size // 2, prompt_embedding_table_size
@@ -544,7 +539,7 @@ class GenerationMixin:
         if use_lora_plugin:
             lora_weights_pointers = []
             lora_ranks = []
-
+            layers_range = mapping.pp_layers(num_layers)
             for i in layers_range:
                 lora_weight_pointer_dict = {}
                 lora_rank_dict = {}

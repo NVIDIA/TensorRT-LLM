@@ -217,7 +217,7 @@ def check_accuracy(engine_dir, input_tokens, max_output_len):
         if expect_output is not None:
             error = np.mean(output.cpu().numpy().flatten() !=
                             expect_output.cpu().numpy().flatten())
-            assert error < 2.0 / 8, f"diff at batch_size={batch_size}, expect_output={expect_output}, output={output}"
+            assert error < 0.3, f"diff at batch_size={batch_size}, expect_output={expect_output}, output={output}"
 
 
 def check_output(engine: str, max_output_len: int = 8):

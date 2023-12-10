@@ -419,8 +419,7 @@ def load_from_hf_checkpoint(
     sys.path.append(str(Path(__file__).parent.parent))
     from common import utils
 
-    layers_range = tensorrt_llm_llama.get_transformer_layers(
-        mapping, tensorrt_llm_llama.num_layers)
+    layers_range = mapping.pp_layers(tensorrt_llm_llama.num_layers)
 
     def _is_qkv_weight(name):
         for k in ['q_proj', 'k_proj', 'v_proj']:
@@ -1129,7 +1128,7 @@ def load_from_gptq_llama(tensorrt_llm_llama,
         w_unpacked[:, 1::2] = w_packed_int4x2 // 16
         return w_unpacked.contiguous()
 
-    def process_and_assign_weight(mOp, v, tp_dim=0):
+    def process_and_assign_weight(mOp, v, tp_dim=-1):
         if tp_dim == -1:
             qweight_int32, qzeros_int32, scales_fp16 = [
                 item.cpu() for item in v
