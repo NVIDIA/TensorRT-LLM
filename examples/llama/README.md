@@ -92,7 +92,7 @@ python build.py --model_dir ./tmp/llama/7B/ \
                 --use_gpt_attention_plugin float16 \
                 --enable_context_fmha \
                 --use_gemm_plugin float16 \
-                --output_dir ./tmp/llama/7B/trt_engines/fp16/2-gpu/ \
+                --output_dir ./tmp/llama/7B/trt_engines/fp16/4-gpu/ \
                 --world_size 4 \
                 --tp_size 2 \
                 --pp_size 2
