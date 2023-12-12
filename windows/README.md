@@ -133,7 +133,7 @@ Build TensorRT-LLM
 python .\scripts\build_wheel.py -a "89-real" --trt_root C:\workspace\TensorRT-9.2.0.5\
 ```
 
-The above command will generate `build\tensorrt_llm-0.6.0-py3-none-any.whl`. Copy or move this into your mounted folder so it can be accessed on your host machine. If you intend to use the C++ runtime, you'll also need to gather various DLLs from the build into your mounted folder. Complete information about these files can be found below in [Extra Steps for C++ Runtime Usage](#extra-steps-for-c-runtime-usage).
+The above command will generate `build\tensorrt_llm-0.6.1-py3-none-any.whl`. Copy or move this into your mounted folder so it can be accessed on your host machine. If you intend to use the C++ runtime, you'll also need to gather various DLLs from the build into your mounted folder. Complete information about these files can be found below in [Extra Steps for C++ Runtime Usage](#extra-steps-for-c-runtime-usage).
 
 Once you've gathered your files into the mounted folder, you may exit the container and continue on to [Installation](#installation).
 
@@ -212,7 +212,7 @@ The `-a` flag specifies the device architecture. `"89-real"` supports GeForce 40
 
 Note that the flag `-D "ENABLE_MULTI_DEVICE=0"`, while not specified here, is implied on Windows. Multi-device inference is supported on Linux, but not on Windows.
 
-The above command will generate `build\tensorrt_llm-0.6.0-py3-none-any.whl`.
+The above command will generate `build\tensorrt_llm-0.6.1-py3-none-any.whl`.
 
 ## Installation
 
@@ -223,7 +223,7 @@ pip install tensorrt_llm --extra-index-url https://pypi.nvidia.com --extra-index
 
 Alternatively, if you built the wheel from source, locate your wheel (either in `build\` or in the folder you mounted to your Docker contailer) and run:
 ```
-pip install tensorrt_llm-0.6.0-py3-none-any.whl
+pip install tensorrt_llm-0.6.1-py3-none-any.whl
 ```
 
 You may run the following command to verify that your TensorRT-LLM installation is working properly:

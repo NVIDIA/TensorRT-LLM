@@ -142,6 +142,24 @@ def parse_arguments():
         ('If this option is specified, it will override the max input len of '
          'TRT engines to the specified value instead of using pre-defined one'))
     parser.add_argument(
+        '--max_encoder_input_len',
+        type=int,
+        default=None,
+        help=
+        ('This argument is only for encoder-decoder models'
+         'If this option is specified, it will override the max encoder input len of TRT engines to the specified value instead of using pre-defined one'
+         'By default when this option is not used, it will use pre-defined max encoder input len'
+         ))
+    parser.add_argument(
+        '--max_decoder_input_len',
+        type=int,
+        default=None,
+        help=
+        ('This argument is only for encoder-decoder models'
+         'If this option is specified, it will override the max decoder input len of TRT engines to the specified value instead of using pre-defined one'
+         'By default when this option is not used, it will use pre-defined max decoder input len'
+         ))
+    parser.add_argument(
         '--max_output_len',
         type=int,
         default=None,
@@ -181,6 +199,33 @@ def parse_arguments():
             'int4_weight_only_awq', 'int4_weight_only_gptq'
         ],
         help="Optimize the model with specified quantization recipe")
+    parser.add_argument(
+        '--build_only',
+        default=False,
+        action='store_true',
+        help=
+        "Build engine only and skip inference, this can help to benchmark the build time on single gpu node for multi GPU model, where the inference is not possible"
+    )
+
+    parser.add_argument('--serial_build',
+                        default=False,
+                        action='store_true',
+                        help="Build engines serially")
+
+    parser.add_argument(
+        '--rank',
+        type=int,
+        default=None,
+        help=
+        "The rank of the model to be built, only used when --build_only and --serial_build is specified"
+    )
+    parser.add_argument(
+        '--world_size',
+        type=int,
+        default=None,
+        help=
+        "The number of gpus to be used for inference, only used when --build_only and --serial_build is specified"
+    )
 
     return parser.parse_args()
 
@@ -193,9 +238,11 @@ def main(args):
     from allowed_configs import get_allowed_models
     from benchmark_profiler import BenchmarkProfiler
     from bert_benchmark import BERTBenchmark
+    from enc_dec_benchmark import EncDecBenchmark
     from gpt_benchmark import GPTBenchmark
     from mem_monitor import MemoryMonitor
 
+    import tensorrt_llm
     from tensorrt_llm.logger import logger
 
     logger.set_level(args.log_level)
@@ -206,19 +253,39 @@ def main(args):
     # Input length (for BERT-like models)
     input_len_options = args.input_len.split(';')
     input_len_options = [int(i) for i in input_len_options]
-    # Input-output length combination (for GPT-like models)
+    # Input-output length combination (for GPT-like models and enc_dec models)
     in_out_len_options = args.input_output_len.split(';')
     in_out_len_options = [[int(i) for i in io.split(',')]
                           for io in in_out_len_options]
 
+    if args.serial_build and not args.build_only:
+        raise Exception(
+            f"--serial_build must be used with --build_only, always need to parallel build to do inference in the same process"
+        )
+
+    if args.build_only and args.serial_build and args.rank is not None and args.world_size is not None:
+        rank = args.rank
+        world_size = args.world_size
+    else:
+        rank = tensorrt_llm.mpi_rank()
+        world_size = tensorrt_llm.mpi_world_size()
+
     benchmark_profiler = None
     if args.model in get_allowed_models(benchmark_type="gpt"):
         benchmark_profiler = BenchmarkProfiler()
-        benchmarker = GPTBenchmark(args, batch_size_options, in_out_len_options)
+        benchmarker = GPTBenchmark(args, batch_size_options, in_out_len_options,
+                                   rank, world_size)
     elif args.model in get_allowed_models(benchmark_type="bert"):
-        benchmarker = BERTBenchmark(args, batch_size_options, input_len_options)
+        benchmarker = BERTBenchmark(args, batch_size_options, input_len_options,
+                                    rank, world_size)
+    elif args.model in get_allowed_models(benchmark_type="enc_dec"):
+        benchmarker = EncDecBenchmark(args, batch_size_options,
+                                      in_out_len_options, rank, world_size)
     else:
         raise Exception(f'Unexpected model: {args.model}')
+
+    if args.build_only:
+        return
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)

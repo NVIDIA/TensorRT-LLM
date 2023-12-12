@@ -93,6 +93,9 @@ setup(
             'bindings.*.so',
         ]) + ['bindings/*.pyi', 'tools/plugin_gen/templates/*'],
     },
+    entry_points={
+        'console_scripts': ['trtllm-build=tensorrt_llm.commands.build:main'],
+    },
     python_requires=">=3.7, <4",
     distclass=BinaryDistribution,
     extras_require={"devel": devel_deps},

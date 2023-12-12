@@ -18,7 +18,7 @@ from parameterized import parameterized
 
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_np
-from tensorrt_llm.models import GPTLMHeadModel, OPTLMHeadModel
+from tensorrt_llm.models import GPTLMHeadModel
 
 
 class TestModelDtype(unittest.TestCase):
@@ -28,8 +28,7 @@ class TestModelDtype(unittest.TestCase):
 
     @parameterized.expand([(GPTLMHeadModel, 'float32'),
                            (GPTLMHeadModel, 'bfloat16'),
-                           (GPTLMHeadModel, 'float16'),
-                           (OPTLMHeadModel, 'float16')])
+                           (GPTLMHeadModel, 'float16')])
     def test_model_dtype(self, model_cls, dtype):
         ''' Every parameter in the model should have the same dtype as the model initialized to
         '''

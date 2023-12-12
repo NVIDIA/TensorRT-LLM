@@ -292,8 +292,9 @@ float compare(void* _pa, void* _pb, int size, float scale)
 #if defined(ENABLE_BF16)
     if constexpr (std::is_same_v<T, __nv_bfloat16>)
     {
-        // bfloat16 has fewer mantissa digits than float16, so the cumulative error will be larger.
-        diff_thres *= 2.f;
+        // bfloat16 has fewer mantissa digits than float16(10 bits for fp16 but only 7 bits for bf16), so the cumulative
+        // error will be larger.
+        diff_thres *= 3.f;
     }
     else
 #endif
@@ -308,8 +309,7 @@ float compare(void* _pa, void* _pb, int size, float scale)
 template <typename T1, typename T2>
 void random_fill(std::vector<T1>& vec, T2 minv, T2 maxv)
 {
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen(20231205);
     std::uniform_real_distribution<float> dis(static_cast<float>(minv), static_cast<float>(maxv));
     for (auto& v : vec)
     {

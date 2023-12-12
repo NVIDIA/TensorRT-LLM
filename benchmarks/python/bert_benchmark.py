@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-import time
 
 # isort: off
 import torch
@@ -30,8 +29,9 @@ from tensorrt_llm.runtime import TensorInfo
 
 class BERTBenchmark(BaseBenchmark):
 
-    def __init__(self, args, batch_sizes, in_lens):
-        super().__init__(args.engine_dir, args.model, args.dtype)
+    def __init__(self, args, batch_sizes, in_lens, rank, world_size):
+        super().__init__(args.engine_dir, args.model, args.dtype, rank,
+                         world_size, args.serial_build)
         self.batch_sizes = batch_sizes
         self.in_lens = in_lens
         self.build_time = 0
@@ -49,12 +49,17 @@ class BERTBenchmark(BaseBenchmark):
                 setattr(self, key, value)
             if args.force_num_layer_1:
                 self.num_layers = 1
+            if args.max_batch_size is not None:
+                self.max_batch_size = args.max_batch_size
+            if args.max_input_len is not None:
+                self.max_input_len = args.max_input_len
 
-            start = time.time()
-            engine_buffer = build_bert(args)
-            self.build_time = round(time.time() - start, 2)
+            engine_buffer, build_time = build_bert(args)
+            self.build_time = build_time
 
         assert engine_buffer is not None
+        if args.build_only:
+            return
 
         self.session = tensorrt_llm.runtime.Session.from_serialized_engine(
             engine_buffer)

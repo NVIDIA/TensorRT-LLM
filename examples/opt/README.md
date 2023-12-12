@@ -5,10 +5,9 @@ multiple GPUs or multiple nodes with multiple GPUs.
 
 ## Overview
 
-The TensorRT-LLM OPT implementation can be found in [`tensorrt_llm/models/opt/model.py`](../../tensorrt_llm/models/opt/model.py). The TensorRT-LLM OPT example code is located in [`examples/opt`](./). There are two main files:
+The TensorRT-LLM OPT implementation can be found in [`tensorrt_llm/models/opt/model.py`](../../tensorrt_llm/models/opt/model.py). The TensorRT-LLM OPT example code is located in [`examples/opt`](./). There is one file:
 
-* [`hf_opt_convert.py`](./hf_opt_convert.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the [FasterTransformer (FT)](https://github.com/NVIDIA/FasterTransformer) format;
-* [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the OPT model.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format
 
 In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
 
@@ -23,11 +22,7 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 ## Usage
 
 The next two sections describe how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers)
-format to the FT format. You can skip those two sections if you already have weights in the
-FT format.
-
-Note, also, that if your weights are neither in HF Transformers nor in FT formats, you will need to convert to the FT format. The script like
-[`hf_opt_convert.py`](./hf_opt_convert.py) can serve as a starting point.
+format to the TensorRT-LLM format.
 
 ### 1. Download weights from HuggingFace Transformers
 
@@ -53,95 +48,71 @@ git-lfs clone https://huggingface.co/facebook/opt-2.7b
 git-lfs clone https://huggingface.co/facebook/opt-66b
 ```
 
-### 2. Convert weights from HF Transformers to FT format
-
-TensorRT-LLM can directly load weights from FT. The [`hf_opt_convert.py`](./hf_opt_convert.py) script allows you to convert weights from HF Transformers
-format to FT format.
+### 2. Convert weights from HF Transformers to TensorRT-LLM format
 
 ```bash
 # OPT-125M
-python3 hf_opt_convert.py -i opt-125m -o ./c-model/opt-125m/fp16 -i_g 1 -weight_data_type fp16
+python3 convert_checkpoint.py --model_dir ./opt-125m \
+                --dtype float16 \
+                --output_dir ./opt/125M/trt_ckpt/fp16/1-gpu/
 
 # OPT-350M
-python3 hf_opt_convert.py -i opt-350m -o ./c-model/opt-350m/fp16 -i_g 1 -weight_data_type fp16
+python3 convert_checkpoint.py --model_dir ./opt-350m \
+                --dtype float16 \
+                --output_dir ./opt/350M/trt_ckpt/fp16/1-gpu/
 
 # OPT-2.7B
-python3 hf_opt_convert.py -i opt-2.7b -o ./c-model/opt-2.7b/fp16 -i_g 1 -weight_data_type fp16
+python3 convert_checkpoint.py --model_dir ./opt-2.7b \
+                --dtype float16 \
+                --output_dir ./opt/2.7B/trt_ckpt/fp16/1-gpu/
 
 # OPT-66B
-python3 hf_opt_convert.py -i opt-66b  -o ./c-model/opt-66b/fp16  -i_g 4 -weight_data_type fp16
+python3 convert_checkpoint.py --model_dir ./opt-66b \
+                --dtype float16 \
+                --world_size 4 \
+                --output_dir ./opt/66B/trt_ckpt/fp16/4-gpu/ \
+                --workers 2
 ```
 
 ### 3. Build TensorRT engine(s)
 
-TensorRT-LLM builds TensorRT engine(s) using a checkpoint in FT format. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) using
-dummy weights. Note that the number of TensorRT engines depends on the number of GPUs that will be used to run inference.
-
-The [`build.py`](./build.py) script requires a single GPU to build the TensorRT engine(s). However, if you have more than one GPU in your system (of the same
-model), you can enable parallel builds to accelerate the engine building process. For that, add the `--parallel_build` argument to the build command. We use that option for the 66B model that we split across four different GPUs.
-
-Examples of build invocations:
-
 ```bash
 # OPT-125M
-python3 build.py --model_dir=./c-model/opt-125m/fp16/1-gpu \
-                 --max_batch_size 8 \
-                 --dtype float16 \
-                 --use_gpt_attention_plugin float16 \
-                 --use_gemm_plugin float16 \
-                 --use_layernorm_plugin float16 \
-                 --max_input_len 924 \
-                 --max_output_len 100 \
-                 --world_size 1 \
-                 --output_dir trt_engine/opt-125m/fp16/1-gpu \
-                 --do_layer_norm_before \
-                 --pre_norm \
-                 --hidden_act relu
+trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/1-gpu/ \
+                --use_gemm_plugin float16 \
+                --use_gpt_attention_plugin float16 \
+                --max_batch_size 8 \
+                --max_input_len 924 \
+                --max_output_len 100 \
+                --output_dir ./opt/125M/trt_engines/fp16/1-gpu/
 
 # OPT-350M
-python3 build.py --model_dir=./c-model/opt-350m/fp16/1-gpu \
-                 --max_batch_size 8 \
-                 --dtype float16 \
-                 --use_gpt_attention_plugin float16 \
-                 --use_gemm_plugin float16 \
-                 --use_layernorm_plugin float16 \
-                 --max_input_len 924 \
-                 --max_output_len 100 \
-                 --world_size 1 \
-                 --output_dir trt_engine/opt-350m/fp16/1-gpu \
-                 --post_norm \
-                 --hidden_act relu
+trtllm-build --checkpoint_dir ./opt/350M/trt_ckpt/fp16/1-gpu/ \
+                --use_gemm_plugin float16 \
+                --use_gpt_attention_plugin float16 \
+                --max_batch_size 8 \
+                --max_input_len 924 \
+                --max_output_len 100 \
+                --output_dir ./opt/350M/trt_engines/fp16/1-gpu/
 
 # OPT-2.7B
-python3 build.py --model_dir=./c-model/opt-2.7b/fp16/1-gpu \
-                 --max_batch_size 8 \
-                 --dtype float16 \
-                 --use_gpt_attention_plugin float16 \
-                 --use_gemm_plugin float16 \
-                 --use_layernorm_plugin float16 \
-                 --max_input_len 924 \
-                 --max_output_len 100 \
-                 --world_size 1 \
-                 --output_dir trt_engine/opt-2.7b/fp16/1-gpu \
-                 --do_layer_norm_before \
-                 --pre_norm \
-                 --hidden_act relu
+trtllm-build --checkpoint_dir ./opt/2.7B/trt_ckpt/fp16/1-gpu/ \
+                --use_gemm_plugin float16 \
+                --use_gpt_attention_plugin float16 \
+                --max_batch_size 8 \
+                --max_input_len 924 \
+                --max_output_len 100 \
+                --output_dir ./opt/2.7B/trt_engines/fp16/1-gpu/
 
 # OPT-66B
-python3 build.py --model_dir=./c-model/opt-66b/fp16/4-gpu \
-                 --max_batch_size 8 \
-                 --dtype float16 \
-                 --use_gpt_attention_plugin float16 \
-                 --use_gemm_plugin float16 \
-                 --use_layernorm_plugin float16 \
-                 --max_input_len 924 \
-                 --max_output_len 100 \
-                 --world_size 4 \
-                 --output_dir trt_engines/opt-66b/fp16/4-gpu \
-                 --do_layer_norm_before \
-                 --pre_norm \
-                 --hidden_act relu \
-                 --parallel_build
+trtllm-build --checkpoint_dir ./opt/66B/trt_ckpt/fp16/4-gpu/ \
+                --use_gemm_plugin float16 \
+                --use_gpt_attention_plugin float16 \
+                --max_batch_size 8 \
+                --max_input_len 924 \
+                --max_output_len 100 \
+                --output_dir ./opt/66B/trt_engines/fp16/4-gpu/ \
+                --workers 2
 ```
 
 ### 4. Summarization using the OPT model
@@ -153,7 +124,7 @@ The script can also perform the same summarization using the HF OPT model.
 
 ```bash
 # OPT-125M
-python3 ../summarize.py --engine_dir trt_engine/opt-125m/fp16/1-gpu \
+python3 ../summarize.py --engine_dir ./opt/125M/trt_engines/fp16/1-gpu/ \
                         --test_hf \
                         --batch_size 1 \
                         --test_trt_llm \
@@ -163,7 +134,7 @@ python3 ../summarize.py --engine_dir trt_engine/opt-125m/fp16/1-gpu \
                         --tensorrt_llm_rouge1_threshold=14
 
 # OPT-350M
-python3 ../summarize.py --engine_dir trt_engine/opt-350m/fp16/1-gpu \
+python3 ../summarize.py --engine_dir ./opt/350M/trt_engines/fp16/1-gpu/ \
                         --test_hf \
                         --batch_size 1 \
                         --test_trt_llm \
@@ -173,7 +144,7 @@ python3 ../summarize.py --engine_dir trt_engine/opt-350m/fp16/1-gpu \
                         --tensorrt_llm_rouge1_threshold=20
 
 # OPT-2.7B
-python3 ../summarize.py --engine_dir trt_engine/opt-2.7b/fp16/1-gpu \
+python3 ../summarize.py --engine_dir ./opt/2.7B/trt_engines/fp16/1-gpu/ \
                         --test_hf \
                         --batch_size 1 \
                         --test_trt_llm \
@@ -184,7 +155,7 @@ python3 ../summarize.py --engine_dir trt_engine/opt-2.7b/fp16/1-gpu \
 
 # OPT-66B
 mpirun -n 4 --allow-run-as-root \
-    python3 ../summarize.py --engine_dir trt_engines/opt-66b/fp16/4-gpu \
+    python3 ../summarize.py --engine_dir ./opt/66B/trt_engines/fp16/4-gpu/ \
                             --batch_size 1 \
                             --test_trt_llm \
                             --hf_model_dir opt-66b \
@@ -195,7 +166,7 @@ mpirun -n 4 --allow-run-as-root \
 
 #### Fused MultiHead Attention (FMHA)
 
-You can enable the FMHA kernels for OPT by adding `--enable_context_fmha` to the invocation of `build.py`. Note that it is disabled by default because of possible accuracy issues due to the use of Flash Attention.
+You can enable the FMHA kernels for OPT by adding `--enable_context_fmha` to the invocation of `trtllm-build`. Note that it is disabled by default because of possible accuracy issues due to the use of Flash Attention.
 
 If you find that the default fp16 accumulation (`--enable_context_fmha`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--enable_context_fmha_fp32_acc`. However, it is expected to see performance drop.
 
@@ -214,9 +185,12 @@ Assume the size of embedding lookup table is (vocab\_size \* hidden\_size), we c
 2.1 To shard the embedding lookup table along the hidden\_size dimension, set the flag `--use_parallel_embedding --embedding_sharding_dim 1`. Here is an example:
 
 ```Bash
-python3 build.py --model_dir=./c-model/opt-125m/fp16/2-gpu --max_batch_size 8 --dtype float16 --use_gpt_attention_plugin float16 --use_gemm_plugin float16 --use_layernorm_plugin float16 \
-                  --max_input_len 924 --max_output_len 100 --world_size 2 --output_dir trt_engine/opt-125m/fp16/2-gpu --do_layer_norm_before --pre_norm --hidden_act relu \
-                  --use_parallel_embedding --embedding_sharding_dim 1
+python3 convert_checkpoint.py --model_dir ./opt-125m \
+                --dtype float16 \
+                --output_dir ./opt/125M/trt_ckpt/fp16/2-gpu/ \
+                --world_size 2 \
+                --use_parallel_embedding \
+                --embedding_sharding_dim 1
 ```
 2.2 To shard the embedding lookup table along the vocab\_size dimension, set the flag `--use_parallel_embedding --embedding_sharding_dim 0`.
 
@@ -225,13 +199,42 @@ Meanwhile, we provide a lookup plugin to support tensor parallelism on vocab\_si
 - An example of sharing along vocab\_size dimension with lookup plugin:
 
 ```Bash
-python3 build.py --model_dir=./c-model/opt-125m/fp16/2-gpu --max_batch_size 8 --dtype float16 --use_gpt_attention_plugin float16 --use_gemm_plugin float16 --use_layernorm_plugin float16 \
-                  --max_input_len 924 --max_output_len 100 --world_size 2 --output_dir trt_engine/opt-125m/fp16/2-gpu --do_layer_norm_before --pre_norm --hidden_act relu \
-                  --use_parallel_embedding --embedding_sharding_dim 0 --use_lookup_plugin
+python3 convert_checkpoint.py --model_dir ./opt-125m \
+                --dtype float16 \
+                --output_dir ./opt/125M/trt_ckpt/fp16/2-gpu/ \
+                --world_size 2 \
+                --use_parallel_embedding \
+                --embedding_sharding_dim 0
+
+trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/2-gpu/ \
+                --use_gemm_plugin float16 \
+                --use_gpt_attention_plugin float16 \
+                --use_lookup_plugin float16 \
+                --max_batch_size 8 \
+                --max_input_len 924 \
+                --max_output_len 100 \
+                --output_dir ./opt/125M/trt_engines/fp16/2-gpu/ \
+                --workers 2
+
+mpirun -n 2 --allow-run-as-root \
+      python3 ../summarize.py --engine_dir ./opt/125M/trt_engines/fp16/2-gpu/ \
+                        --batch_size 1 \
+                        --test_trt_llm \
+                        --hf_model_dir opt-125m \
+                        --data_type fp16 \
+                        --check_accuracy \
+                        --tensorrt_llm_rouge1_threshold=14
 ```
+
 - An example of sharing along vocab\_size dimension without lookup plugin:
+
 ```Bash
-python3 build.py --model_dir=./c-model/opt-125m/fp16/2-gpu --max_batch_size 8 --dtype float16 --use_gpt_attention_plugin float16 --use_gemm_plugin float16 --use_layernorm_plugin float16 \
-                  --max_input_len 924 --max_output_len 100 --world_size 2 --output_dir trt_engine/opt-125m/fp16/2-gpu --do_layer_norm_before --pre_norm --hidden_act relu \
-                  --use_parallel_embedding --embedding_sharding_dim 0
+trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/2-gpu/ \
+                --use_gemm_plugin float16 \
+                --use_gpt_attention_plugin float16 \
+                --max_batch_size 8 \
+                --max_input_len 924 \
+                --max_output_len 100 \
+                --output_dir ./opt/125M/trt_engines/fp16/2-gpu/ \
+                --workers 2
 ```

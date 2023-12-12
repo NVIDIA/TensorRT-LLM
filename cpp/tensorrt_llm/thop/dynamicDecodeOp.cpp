@@ -138,7 +138,7 @@ void FtDynamicDecode<T>::setup(size_t batch_size, size_t beam_width, th::optiona
 
 template <typename T>
 void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width, hidden_size)
-    int step, int max_input_length, int max_kv_cache_length, uint64_t ite, int local_batch_size, th::Tensor end_id,
+    int step, int max_input_length, int max_attention_window, uint64_t ite, int local_batch_size, th::Tensor end_id,
     th::optional<th::Tensor> embedding_bias_opt, th::optional<th::Tensor> input_lengths_opt,
     th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
     th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
@@ -158,7 +158,7 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
     auto const& logits_converted = convert_tensor<float>(logits);
     auto const& end_ids_converted = convert_tensor<int>(end_id);
     typename tensorrt_llm::layers::DynamicDecodeLayer<T>::ForwardParams forwardParams{step, static_cast<int>(ite),
-        max_input_length, max_kv_cache_length, local_batch_size, logits_converted, end_ids_converted};
+        max_input_length, max_attention_window, local_batch_size, logits_converted, end_ids_converted};
 
     safeUpdate<int>(src_cache_indirection_opt, forwardParams.src_cache_indirection);
     safeUpdate<int>(sequence_limit_length_opt, forwardParams.sequence_limit_length);
@@ -275,7 +275,7 @@ void DynamicDecodeOp::setup(int64_t batch_size, int64_t beam_width, th::optional
 }
 
 th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max_input_length,
-    int64_t max_kv_cache_length, int64_t ite, int64_t local_batch_size, th::Tensor end_id,
+    int64_t max_attention_window, int64_t ite, int64_t local_batch_size, th::Tensor end_id,
     th::optional<th::Tensor> embedding_bias_opt,
     th::optional<th::Tensor> input_lengths_opt, // length of input contexts.
     th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
@@ -341,7 +341,7 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
 
     dynamic_decode_->forward(
         // Inputs
-        logits, static_cast<int>(step), static_cast<int>(max_input_length), static_cast<int>(max_kv_cache_length),
+        logits, static_cast<int>(step), static_cast<int>(max_input_length), static_cast<int>(max_attention_window),
         static_cast<uint32_t>(ite), static_cast<int>(local_batch_size), end_id, embedding_bias_opt, input_lengths_opt,
         sequence_limit_length_opt, stop_words_list_opt, bad_words_list_opt, no_repeat_ngram_size_opt,
         src_cache_indirection_opt,

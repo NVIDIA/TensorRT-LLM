@@ -8,16 +8,16 @@ import tensorrt_llm.bindings as _tb
 
 
 @pytest.mark.parametrize(
-    "variant, results_file",
+    "variant, results_file, load_bytearray",
     [
-        ("fp32-default", "output_tokens_fp32_tp1_pp1.npy"),
-        ("fp32-plugin", "output_tokens_fp32_plugin_tp1_pp1.npy"),
-        ("fp16-default", "output_tokens_fp16_tp1_pp1.npy"),
-        ("fp16-plugin", "output_tokens_fp16_plugin_tp1_pp1.npy"),
+        ("fp32-default", "output_tokens_fp32_tp1_pp1.npy", True),
+        ("fp32-plugin", "output_tokens_fp32_plugin_tp1_pp1.npy", False),
+        ("fp16-default", "output_tokens_fp16_tp1_pp1.npy", True),
+        ("fp16-plugin", "output_tokens_fp16_plugin_tp1_pp1.npy", False),
         # ("fp16-plugin-packed", "output_tokens_fp16_plugin_packed_tp1_pp1.npy"),
         # ("fp16-plugin-packed-paged", "output_tokens_fp16_plugin_packed_paged_tp1_pp1.npy"),
     ])
-def test_gpt_session(variant, results_file, llm_root: _pl.Path,
+def test_gpt_session(variant, results_file, load_bytearray, llm_root: _pl.Path,
                      resource_path: _pl.Path, engine_path: _pl.Path,
                      data_path: _pl.Path, llm_model_root):
     model_dir = "gpt2"
@@ -66,7 +66,7 @@ def test_gpt_session(variant, results_file, llm_root: _pl.Path,
     model_path = engine_path / model_dir / variant / gpu_size_path
     assert model_path.is_dir()
     config_path = model_path / "config.json"
-    config_json = _tb.GptJsonConfig.parse_file(str(config_path))
+    config_json = _tb.GptJsonConfig.parse_file(config_path)
     assert config_json.tensor_parallelism == tp_size
     assert config_json.pipeline_parallelism == pp_size
     world_config = _tb.WorldConfig.mpi(tensor_parallelism=tp_size,
@@ -77,8 +77,16 @@ def test_gpt_session(variant, results_file, llm_root: _pl.Path,
                                           max_seq_length)
 
     model_config = config_json.model_config
-    session = _tb.GptSession(session_config, model_config, world_config,
-                             str(model_path / engine_filename))
+    full_engine_path = str(model_path / engine_filename)
+    if load_bytearray:
+        with open(full_engine_path, "rb") as f:
+            engine_data = bytearray(f.read())
+        session = _tb.GptSession(session_config, model_config, world_config,
+                                 engine_data)
+    else:
+        session = _tb.GptSession(session_config, model_config, world_config,
+                                 full_engine_path)
+
     assert isinstance(session, _tb.GptSession)
     assert isinstance(session.model_config, _tb.GptModelConfig)
     assert isinstance(session.world_config, _tb.WorldConfig)
@@ -106,12 +114,8 @@ def test_gpt_session(variant, results_file, llm_root: _pl.Path,
     generation_input.max_new_tokens = max_new_tokens
 
     for r in range(repetitions):
-        output_ids = _tor.empty((max_batch_size, max_seq_length),
-                                dtype=_tor.int32,
-                                device=cuda_device)
-        output_lengths = _tor.empty((max_batch_size, ),
-                                    dtype=_tor.int32,
-                                    device=cuda_device)
+        output_ids = _tor.empty(0, dtype=_tor.int32, device=cuda_device)
+        output_lengths = _tor.empty(0, dtype=_tor.int32, device=cuda_device)
         generation_output = _tb.GenerationOutput(output_ids, output_lengths)
         num_steps = 0
 

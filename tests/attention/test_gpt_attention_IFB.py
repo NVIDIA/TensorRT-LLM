@@ -195,13 +195,15 @@ class TestFunctional(unittest.TestCase):
 
         remove_input_padding = True
 
-        def _construct_execution(
-                session, input_tensor, weight, bias, host_pointer_array,
-                sequence_length, host_past_key_value_lengths,
-                host_max_kv_cache_lengths, context_lengths, max_context_length,
-                cache_indirection, num_heads, hidden_size, num_kv_heads, output,
-                dtype, kv_int8_quant_scale, kv_int8_dequant_scale,
-                host_context_lengths, host_request_types):
+        def _construct_execution(session, input_tensor, weight, bias,
+                                 host_pointer_array, sequence_length,
+                                 host_past_key_value_lengths,
+                                 host_max_attention_window_sizes,
+                                 context_lengths, max_context_length,
+                                 cache_indirection, num_heads, hidden_size,
+                                 num_kv_heads, output, dtype,
+                                 kv_int8_quant_scale, kv_int8_dequant_scale,
+                                 host_context_lengths, host_request_types):
             pointer_array = host_pointer_array.to('cuda')
             head_size = hidden_size // num_heads
             # construct trt network
@@ -226,9 +228,9 @@ class TestFunctional(unittest.TestCase):
                     name='host_past_key_value_lengths',
                     shape=tuple(host_past_key_value_lengths.shape),
                     dtype=tensorrt_llm.str_dtype_to_trt('int32'))
-                host_max_kv_cache_lengths_tensor = Tensor(
-                    name='host_max_kv_cache_lengths',
-                    shape=tuple(host_max_kv_cache_lengths.shape),
+                host_max_attention_window_sizes_tensor = Tensor(
+                    name='host_max_attention_window_sizes',
+                    shape=tuple(host_max_attention_window_sizes.shape),
                     dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                 input_lengths_tensor = Tensor(
                     name='context_lengths',
@@ -322,7 +324,8 @@ class TestFunctional(unittest.TestCase):
                     sequence_length=sequence_length_tensor,
                     host_past_key_value_lengths=
                     host_past_key_value_lengths_tensor,
-                    host_max_kv_cache_lengths=host_max_kv_cache_lengths_tensor,
+                    host_max_attention_window_sizes=
+                    host_max_attention_window_sizes_tensor,
                     context_lengths=input_lengths_tensor,
                     cache_indirection=cache_indirection_tensor,
                     host_request_types=host_request_types_tensor,
@@ -355,7 +358,8 @@ class TestFunctional(unittest.TestCase):
                 'input': input_tensor,
                 'sequence_length': sequence_length,
                 'host_past_key_value_lengths': host_past_key_value_lengths,
-                'host_max_kv_cache_lengths': host_max_kv_cache_lengths,
+                'host_max_attention_window_sizes':
+                host_max_attention_window_sizes,
                 'context_lengths': context_lengths,
                 'cache_indirection': cache_indirection,
                 'host_request_types': host_request_types,
@@ -403,8 +407,7 @@ class TestFunctional(unittest.TestCase):
         num_req = batch_size
         in_lens = torch.randint(1, in_len + 1, (num_req, ))
         max_blocks_per_seq = math.ceil(max_seq_len / tokens_per_block)
-        blocks = math.ceil(
-            (num_req * beam_width * max_seq_len) / tokens_per_block)
+        blocks = num_req * beam_width * max_blocks_per_seq
         shape_dict = {
             'weight': (hidden_size, qkv_hidden_size),
             'bias': (qkv_hidden_size, ),
@@ -776,9 +779,9 @@ class TestFunctional(unittest.TestCase):
                 host_past_key_value_length_list,
                 dtype=torch.int32,
                 device='cpu').reshape(-1)
-            host_max_kv_cache_lengths = torch.tensor([max_seq_len],
-                                                     dtype=torch.int32,
-                                                     device='cpu')
+            host_max_attention_window_sizes = torch.tensor([max_seq_len],
+                                                           dtype=torch.int32,
+                                                           device='cpu')
             total_num_tokens = int(sum(host_input_lengths))
             max_context_length = in_len
             context_lengths = host_context_lengths.cuda()
@@ -819,7 +822,7 @@ class TestFunctional(unittest.TestCase):
             session, output = _construct_execution(
                 session, input_tensor, weight_plugin, bias_plugin,
                 dense_pointer_arrays, sequence_lengths,
-                host_past_key_value_lengths, host_max_kv_cache_lengths,
+                host_past_key_value_lengths, host_max_attention_window_sizes,
                 context_lengths, max_context_length, cache_indirection,
                 num_heads, hidden_size, num_kv_heads, output, dtype,
                 kv_int8_quant_scale, kv_int8_dequant_scale,

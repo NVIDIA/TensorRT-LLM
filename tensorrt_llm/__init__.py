@@ -21,7 +21,8 @@ import tensorrt_llm.tools as tools
 from ._common import _init, default_net, default_trtnet, precision
 # Disable flake8 on the line below because mpi_rank is not used in tensorrt_llm project
 # but may be called in dependencies (such as examples)
-from ._utils import mpi_rank, mpi_world_size, str_dtype_to_trt  # NOQA
+from ._utils import mpi_rank  # NOQA
+from ._utils import mpi_world_size, str_dtype_to_torch, str_dtype_to_trt  # NOQA
 from .builder import Builder, BuilderConfig
 from .functional import Tensor, constant
 from .logger import logger

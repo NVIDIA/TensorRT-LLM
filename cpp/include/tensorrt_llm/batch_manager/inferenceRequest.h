@@ -17,7 +17,6 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/namedTensor.h"
-#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
@@ -56,6 +55,9 @@ auto constexpr kRandomSeedTensorName = "random_seed";
 auto constexpr kReturnLogProbsTensorName = "return_log_probs";
 auto constexpr kPromptEmbeddingTableName = "prompt_embedding_table";
 auto constexpr kPromptVocabSizeName = "prompt_vocab_size";
+
+// Obsolete names for backward compatibility
+auto constexpr kInputLengthsTensorName = "input_lengths";
 
 // Output tensors
 auto constexpr kOutputIdsTensorName = "output_ids";
@@ -131,6 +133,8 @@ public:
         inference_request::kReturnLogProbsTensorName,
         inference_request::kPromptEmbeddingTableName,
         inference_request::kPromptVocabSizeName,
+        // obsolete names for backward compatibility
+        inference_request::kInputLengthsTensorName,
     };
 
 #define TENSOR_GETTER_SETTER(funcName, tensorName)                                                                     \
@@ -191,11 +195,8 @@ public:
 protected:
     static void validateTensorName(std::string const& tensorName)
     {
-        // TODO (martinma): Throw an exception if the tensor name is not valid.
-        if (std::find(kTensorNames.begin(), kTensorNames.end(), tensorName) == kTensorNames.end())
-        {
-            TLLM_LOG_WARNING("Invalid tensor name in InferenceRequest: %s", tensorName.c_str());
-        }
+        TLLM_CHECK_WITH_INFO(std::find(kTensorNames.begin(), kTensorNames.end(), tensorName) != kTensorNames.end(),
+            "Invalid tensor name: %s", tensorName.c_str());
     }
 
     uint64_t mRequestId;

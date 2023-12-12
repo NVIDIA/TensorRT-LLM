@@ -91,7 +91,8 @@ class TestPluginNoCache(unittest.TestCase):
 
             sequence_length = inputs['sequence_length']
             host_context_lengths = inputs['host_context_lengths']
-            host_max_kv_cache_lengths = inputs['host_max_kv_cache_lengths'][0]
+            host_max_attention_window_sizes = inputs[
+                'host_max_attention_window_sizes'][0]
             context_lengths = inputs['context_lengths']
             host_request_types = inputs['host_request_types']
 
@@ -106,7 +107,7 @@ class TestPluginNoCache(unittest.TestCase):
                 past_key_value=past_key_value,
                 sequence_length=sequence_length,
                 host_past_key_value_lengths=host_past_key_value_lengths,
-                host_max_kv_cache_lengths=host_max_kv_cache_lengths,
+                host_max_attention_window_sizes=host_max_attention_window_sizes,
                 context_lengths=context_lengths,
                 cache_indirection=cache_indirection,
                 host_request_types=host_request_types,
@@ -165,8 +166,8 @@ class TestPluginNoCache(unittest.TestCase):
                                      dtype=torch.int32).cuda()
         host_past_key_value_lengths = torch.zeros([max_batch_size],
                                                   dtype=torch.int32).cpu()
-        host_max_kv_cache_lengths = torch.tensor([max_input_len],
-                                                 dtype=torch.int32).cpu()
+        host_max_attention_window_sizes = torch.tensor([max_input_len],
+                                                       dtype=torch.int32).cpu()
         context_lengths = torch.full([max_batch_size],
                                      max_input_len,
                                      dtype=torch.int32).cuda()
@@ -206,7 +207,7 @@ class TestPluginNoCache(unittest.TestCase):
         session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
         inputs = {
             'qkv': qkv,
-            'host_max_kv_cache_length_0': host_max_kv_cache_lengths,
+            'host_max_attention_window_size_0': host_max_attention_window_sizes,
             'context_lengths': context_lengths,
             'host_request_types': host_request_types,
         }
@@ -236,7 +237,7 @@ class TestPluginNoCache(unittest.TestCase):
             'qkv': qkv,
             'sequence_length': sequence_length,
             'host_past_key_value_lengths': host_past_key_value_lengths,
-            'host_max_kv_cache_length_0': host_max_kv_cache_lengths,
+            'host_max_attention_window_size_0': host_max_attention_window_sizes,
             'context_lengths': context_lengths,
             'cache_indirection': cache_indirection,
             'host_request_types': host_request_types,

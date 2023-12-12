@@ -48,11 +48,10 @@ public:
     using BeamTokens = std::vector<VecTokens>;
     using TensorPtr = TTensor;
 
-    GenericLlmRequest(RequestIdType requestId, SizeType maxNewTokens,
-        std::shared_ptr<std::vector<TokenIdType>> inputTokens, runtime::SamplingConfig samplingConfig, bool isStreaming,
-        std::optional<SizeType> endId = std::nullopt, std::optional<SizeType> padId = std::nullopt,
-        std::optional<TensorPtr> embeddingBias = std::nullopt, std::optional<TensorPtr> badWordsList = std::nullopt,
-        std::optional<TensorPtr> stopWordsList = std::nullopt,
+    GenericLlmRequest(RequestIdType requestId, SizeType maxNewTokens, std::shared_ptr<VecTokens> inputTokens,
+        runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType> endId = std::nullopt,
+        std::optional<SizeType> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
+        std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType> promptVocabSize = std::nullopt, bool returnLogProbs = false,
         std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
@@ -65,7 +64,7 @@ public:
         , mIsStreaming(isStreaming)
         , mEndId(endId)
         , mPadId(padId)
-        , mBatchSlot(-1)
+        , mSeqSlot(-1)
         , mOrigPromptLen(inputTokens->size())
         , mEmbeddingBias(embeddingBias)
         , mBadWordsList(badWordsList)
@@ -132,14 +131,21 @@ public:
     /// @brief Get the tokens at a given beam index
     /// @param beam The beam index
     /// @return A vector of tokens for this beam index, includes the prompt
-    std::vector<TokenIdType> const& getTokens(SizeType beam) const
+    VecTokens const& getTokens(SizeType beam) const
     {
         return mTokens.at(beam);
     }
 
+    /// @brief Get all tokens (input+output) for all beams
+    /// @return A vector of vector of tokens.
+    BeamTokens const& getTokens() const
+    {
+        return mTokens;
+    }
+
     /// @brief Get the draft tokens
     /// @return shared_ptr to vector of draft tokens
-    std::shared_ptr<std::vector<TokenIdType>> const& getDraftTokens() const
+    std::shared_ptr<VecTokens> const& getDraftTokens() const
     {
         return mDraftTokens;
     }
@@ -176,7 +182,7 @@ public:
     /// @brief Add new generated tokens to the vector of tokens
     /// @param beamTokens A vector containing the tokens to add for each beam index
     ///                   beamTokens is expected to be of size beamWidth
-    void addNewTokens(const std::vector<TokenIdType>& beamTokens)
+    void addNewTokens(VecTokens const& beamTokens)
     {
         assert(static_cast<size_t>(mSamplingConfig.beamWidth) == beamTokens.size());
         for (std::size_t beam = 0; beam < beamTokens.size(); ++beam)
@@ -236,7 +242,7 @@ public:
             mPromptLen = newPromptLen;
         }
         mState = REQUEST_STATE_CONTEXT_INIT;
-        mBatchSlot = -1;
+        mSeqSlot = -1;
     }
 
     /// @brief Get the maximum position of the tokens returned to the client. Use to ensure we don't return to
@@ -335,7 +341,7 @@ public:
     bool mIsStreaming;
     std::optional<SizeType> mEndId;
     std::optional<SizeType> mPadId;
-    SizeType mBatchSlot;
+    SizeType mSeqSlot;
 
 protected:
     SizeType mOrigPromptLen;
@@ -369,7 +375,7 @@ public:
     using BeamTokens = Base::BeamTokens;
     using VecTokens = Base::VecTokens;
 
-    LlmRequest(RequestIdType requestId, SizeType maxNewTokens, std::shared_ptr<std::vector<TokenIdType>> inputTokens,
+    LlmRequest(RequestIdType requestId, SizeType maxNewTokens, std::shared_ptr<VecTokens> inputTokens,
         runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType> endId = std::nullopt,
         std::optional<SizeType> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
         std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,

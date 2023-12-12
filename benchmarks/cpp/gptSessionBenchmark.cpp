@@ -257,6 +257,7 @@ int main(int argc, char* argv[])
 
     options.add_options()("ctx_micro_batch_size", "Batch size for context phase.", cxxopts::value<int>());
     options.add_options()("gen_micro_batch_size", "Batch size for generation phase.", cxxopts::value<int>());
+    options.add_options()("max_attention_window", "Max kv cache length per sequence.", cxxopts::value<int>());
     options.add_options()("max_tokens_in_paged_kvcache", "Max tokens in paged K-V Cache.", cxxopts::value<int>());
     options.add_options()(
         "kv_cache_free_gpu_mem_fraction", "K-V Cache Free Gpu Mem Fraction.", cxxopts::value<float>());
@@ -351,6 +352,11 @@ int main(int argc, char* argv[])
     if (result.count("max_tokens_in_paged_kvcache"))
     {
         sessionConfig.kvCacheConfig.maxTokens = result["max_tokens_in_paged_kvcache"].as<int>();
+    }
+    // Argument: Max KV Cache Length
+    if (result.count("max_attention_window"))
+    {
+        sessionConfig.kvCacheConfig.maxAttentionWindow = result["max_attention_window"].as<int>();
     }
     // Argument: K-V Cache Free Gpu Mem Fraction
     if (result.count("kv_cache_free_gpu_mem_fraction"))

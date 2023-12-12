@@ -102,12 +102,12 @@ struct Multihead_attention_params_base
     int batch_size = 0;
     // The beam width
     int beam_width = 0;
-    // By default, max_kv_cache_length == cyclic_kv_cache_length
+    // By default, max_attention_window_size == cyclic_attention_window_size
     // unless each layer has different cyclic kv cache length.
     // Max cache capacity (used to allocate KV cache)
-    int max_kv_cache_length = 0;
+    int max_attention_window_size = 0;
     // Cyclic kv cache capacity (used to get the cyclic kv cache position for new tokens)
-    int cyclic_kv_cache_length = 0;
+    int cyclic_attention_window_size = 0;
     // The number of heads (H).
     int num_heads = 0;
     // Controls MHA/MQA/GQA

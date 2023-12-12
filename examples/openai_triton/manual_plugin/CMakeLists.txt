@@ -25,7 +25,7 @@ project(${TARGET_NAME})
 set(CMAKE_VERBOSE_MAKEFILE 1)
 
 # Compile options
-set(CMAKE_C_FLAGS "-Wall -pthread ")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -pthread ")
 set(CMAKE_C_FLAGS_DEBUG "-g -O0")
 set(CMAKE_C_FLAGS_RELEASE "-O2")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -lstdc++")

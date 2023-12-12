@@ -135,7 +135,6 @@ python build.py --bin_model_dir=./c-model/bloom/int8_kv_cache/560M/1-gpu \
                 --dtype float16 \
                 --use_gpt_attention_plugin float16 \
                 --use_gemm_plugin float16 \
-                --use_layernorm_plugin \
                 --int8_kv_cache \
                 --use_weight_only
 ```

@@ -75,8 +75,8 @@ The Python runtime allocates KV cache tensors based on the parameters of the `Ge
 
 ## Memory pool
 
-TensorRT-LLM C++ runtime is using stream-ordered memory allocator to allocate and free buffers, see [BufferManager::initMemoryPool](cpp/tensorrt_llm/runtime/bufferManager.cpp), which uses the default memory pool managed by the CUDA driver. When a `GptSession` object is destroyed, memory is returned to the memory pool and can be reused by the next instance of a `GptSession` object. Memory will be released from the pool if it is required for other memory allocations.
-However, `nvidia-smi` may still show high memory occupation after memory is returned to the CUDA driver's memory pool. This should not be a concern and is intended behavior. The amount of reserved and free memory in the pool can be inspected by [BufferManager::memoryPoolReserved())](cpp/tensorrt_llm/runtime/bufferManager.cpp) and [BufferManager::memoryPoolFree())](cpp/tensorrt_llm/runtime/bufferManager.cpp), respectively.
+TensorRT-LLM C++ runtime is using stream-ordered memory allocator to allocate and free buffers, see [BufferManager::initMemoryPool](source:cpp/tensorrt_llm/runtime/bufferManager.cpp), which uses the default memory pool managed by the CUDA driver. When a `GptSession` object is destroyed, memory is returned to the memory pool and can be reused by the next instance of a `GptSession` object. Memory will be released from the pool if it is required for other memory allocations.
+However, `nvidia-smi` may still show high memory occupation after memory is returned to the CUDA driver's memory pool. This should not be a concern and is intended behavior. The amount of reserved and free memory in the pool can be inspected by [BufferManager::memoryPoolReserved())](source:cpp/tensorrt_llm/runtime/bufferManager.cpp) and [BufferManager::memoryPoolFree())](source:cpp/tensorrt_llm/runtime/bufferManager.cpp), respectively.
 
 ## Known Issues
 

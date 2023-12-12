@@ -286,14 +286,14 @@ class KeyValueCacheParams:
     def __init__(self,
                  past_key_value: List[Tensor] = None,
                  host_past_key_value_lengths: Tensor = None,
-                 host_max_kv_cache_lengths: List[Tensor] = None,
+                 host_max_attention_window_sizes: List[Tensor] = None,
                  kv_cache_block_pointers: List[Tensor] = None,
                  host_kv_cache_block_pointers: List[Tensor] = None,
                  cache_indirection: Tensor = None,
                  past_key_value_length: Tensor = None):
         self.past_key_value = past_key_value
         self.host_past_key_value_lengths = host_past_key_value_lengths
-        self.host_max_kv_cache_lengths = host_max_kv_cache_lengths
+        self.host_max_attention_window_sizes = host_max_attention_window_sizes
         self.kv_cache_block_pointers = kv_cache_block_pointers
         self.host_kv_cache_block_pointers = host_kv_cache_block_pointers
         self.cache_indirection = cache_indirection
@@ -317,14 +317,14 @@ class KeyValueCacheParams:
     def fill_none_tensor_list(self, list_size):
         if self.past_key_value is None:
             self.past_key_value = tuple([None] * list_size)
-        if self.host_max_kv_cache_lengths is None:
-            self.host_max_kv_cache_lengths = tuple([None] * list_size)
+        if self.host_max_attention_window_sizes is None:
+            self.host_max_attention_window_sizes = tuple([None] * list_size)
 
     def is_valid(self, gpt_attention_plugin):
         if gpt_attention_plugin:
             if self.host_past_key_value_lengths is None:
                 return False
-            if self.host_max_kv_cache_lengths is None:
+            if self.host_max_attention_window_sizes is None:
                 return False
             if self.cache_indirection is None:
                 return False
@@ -349,7 +349,6 @@ class Attention(Module):
         position_embedding_type=PositionEmbeddingType.learned_absolute,
         rotary_embedding_base=10000.0,
         rotary_embedding_scaling=None,
-        use_int8_kv_cache=False,
         rotary_embedding_percentage=1.0,
         tp_group=None,
         tp_size=1,
@@ -376,6 +375,7 @@ class Attention(Module):
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
         self.hidden_size = hidden_size // tp_size
         self.max_position_embeddings = max_position_embeddings
+        self.bias = bias
         self.tp_size = tp_size
         self.tp_rank = tp_rank
         self.dtype = dtype
@@ -421,11 +421,7 @@ class Attention(Module):
             )
 
         self.quant_mode = quant_mode
-        if use_int8_kv_cache:
-            # TODO: remove use_int8_kv_cache as can be replaced by quant_mode.has_kv_cache_quant()
-            # Merge int8 setting into quant_mode
-            self.quant_mode = self.quant_mode.set_int8_kv_cache()
-        self.use_int8_kv_cache = use_int8_kv_cache
+        self.use_int8_kv_cache = self.quant_mode.has_int8_kv_cache()
         if self.quant_mode.has_kv_cache_quant():
             self.kv_orig_quant_scale = Parameter(shape=(1, ), dtype='float32')
             self.kv_quant_orig_scale = Parameter(shape=(1, ), dtype='float32')
@@ -615,8 +611,8 @@ class Attention(Module):
                 sequence_length=attention_params.sequence_length,
                 host_past_key_value_lengths=kv_cache_params.
                 host_past_key_value_lengths,
-                host_max_kv_cache_lengths=kv_cache_params.
-                host_max_kv_cache_lengths,
+                host_max_attention_window_sizes=kv_cache_params.
+                host_max_attention_window_sizes,
                 context_lengths=attention_params.context_lengths,
                 cache_indirection=kv_cache_params.cache_indirection,
                 host_request_types=attention_params.host_request_types,

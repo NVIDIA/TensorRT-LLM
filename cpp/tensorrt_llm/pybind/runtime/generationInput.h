@@ -17,15 +17,14 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/generationInput.h"
 
 #include <ATen/ATen.h>
-
 #include <ATen/ops/tensor.h>
 #include <memory>
 #include <optional>
+#include <pybind11/pybind11.h>
 
 namespace tensorrt_llm::pybind::runtime
 {
@@ -46,6 +45,7 @@ public:
     }
 
     [[nodiscard]] std::shared_ptr<tensorrt_llm::runtime::PromptTuningParams> toTrtLlm() const;
+    static void initBindings(pybind11::module_& m);
 };
 
 class GenerationInput
@@ -62,5 +62,6 @@ public:
     }
 
     [[nodiscard]] std::shared_ptr<tensorrt_llm::runtime::GenerationInput> toTrtLlm() const;
+    static void initBindings(pybind11::module_& m);
 };
 } // namespace tensorrt_llm::pybind::runtime

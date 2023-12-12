@@ -46,6 +46,7 @@ public:
         , mTokensPerBlock{64}
         , mQuantMode{common::QuantMode::none()}
         , mMaxBatchSize(0)
+        , mMaxBeamWidth(0)
         , mMaxInputLen(0)
         , mMaxOutputLen(0)
         , mMaxNumTokens(std::nullopt)
@@ -169,6 +170,16 @@ public:
         mMaxBatchSize = maxBatchSize;
     }
 
+    [[nodiscard]] SizeType constexpr getMaxBeamWidth() const noexcept
+    {
+        return mMaxBeamWidth;
+    }
+
+    void constexpr setMaxBeamWidth(SizeType maxBeamWidth) noexcept
+    {
+        mMaxBeamWidth = maxBeamWidth;
+    }
+
     [[nodiscard]] SizeType constexpr getMaxInputLen() const noexcept
     {
         return mMaxInputLen;
@@ -259,6 +270,11 @@ public:
         mMaxDraftLen = maxDraftLen;
     }
 
+    [[nodiscard]] SizeType getMaxDraftLen() const
+    {
+        return mMaxDraftLen;
+    }
+
     [[nodiscard]] SizeType constexpr getMaxTokensPerStep() const noexcept
     {
         return mMaxDraftLen + 1;
@@ -277,6 +293,7 @@ private:
     SizeType mTokensPerBlock;
     common::QuantMode mQuantMode;
     SizeType mMaxBatchSize;
+    SizeType mMaxBeamWidth;
     SizeType mMaxInputLen;
     SizeType mMaxOutputLen;
     std::optional<SizeType> mMaxNumTokens;

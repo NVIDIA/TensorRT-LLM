@@ -10,7 +10,7 @@ performance that can be delivered by TensorRT-LLM.
 ## Methodology
 
 The different performance numbers below were collected using the methodology
-described in the benchmarks [folder](../../benchmarks/).
+described in the benchmarks [folder](source:benchmarks/).
 
 ## Peak Throughput
 
@@ -151,6 +151,7 @@ include a more efficient implementation that runs single Matmul + SwiGLU fused k
 ## Reproducing Benchmarked Results
 
 ### Building the TensorRT-LLM Container
+
 ---
 In order to benchmark TensorRT-LLM, you will need to follow the [Quick Start](../../README.md#quick-start)
 build process to create a baseline container for building a wheel. Additionally, the development
@@ -237,7 +238,8 @@ in [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM).
 
 ## Benchmarking per Model
 
-#### GPT-J 6B
+### GPT-J 6B
+
 ---
 ```shell
 python examples/gptj/build.py \
@@ -261,7 +263,7 @@ python examples/gptj/build.py \
 	--enable_two_optimization_profiles
 ```
 
-##### Throughput Benchmark
+#### Throughput Benchmark
 
 ```shell
 in_out_sizes=("64:128,128" "64:128,2048" "64:2048,128" "64:2048,2048")
@@ -275,7 +277,7 @@ do
 done
 ```
 
-##### First Token Latency Benchmark
+#### First Token Latency Benchmark
 
 ```shell
 in_out_sizes=("64:128,1" "64:2048,1")
@@ -291,6 +293,7 @@ done
 
 
 ### Llama2-7b
+
 ---
 ```shell
 pip install -r examples/llama/requirements.txt
@@ -319,7 +322,7 @@ python examples/llama/build.py \
 	--hidden_act silu
 ```
 
-##### Throughput Benchmark
+#### Throughput Benchmark
 
 ```shell
 in_out_sizes=("64:128,128" "64:128,2048" "64:2048,128" "32:2048,2048")
@@ -332,7 +335,7 @@ do
 	./cpp/build/benchmarks/gptSessionBenchmark --model llama --engine_dir /tmp/engines/llama/7b --warm_up 1 --batch_size $batch_size --duration 0 --num_runs 5 --input_output_len $in_out_dims
 done
 ```
-##### First Token Latency Benchmark
+#### First Token Latency Benchmark
 
 ```shell
 in_out_sizes=("64:128,1" "32:2048,1")
@@ -378,7 +381,7 @@ python examples/llama/build.py \
 	--multiple_of 4096
 ```
 
-##### Throughput Benchmark
+#### Throughput Benchmark
 
 ```shell
 in_out_sizes=("64:128,128" "64:128,2048" "64:2048,128" "64:2048,2048")
@@ -392,7 +395,7 @@ do
 done
 ```
 
-##### First Token Latency Benchmark
+#### First Token Latency Benchmark
 
 ```shell
 in_out_sizes=("64:128,1" "64:128,1")
@@ -408,6 +411,7 @@ done
 
 
 ### Falcon-180B
+
 ---
 
 Benchmarking Falcon-180B requires a custom engine per batch size, input/output sequence length due

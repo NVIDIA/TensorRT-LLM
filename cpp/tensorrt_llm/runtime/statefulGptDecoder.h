@@ -39,7 +39,7 @@ public:
     StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabSizePadded, CudaStreamPtr stream);
 
     //! Setup the decoder before calling `forward()`
-    void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxKvCacheLength, SizeType maxSequenceLength,
+    void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow, SizeType maxSequenceLength,
         SizeType maxTokensPerStep, nvinfer1::DataType dtype) override;
 
     //! @brief Initialize the decoder with new batch of inputs.
@@ -98,7 +98,8 @@ public:
     }
 
 private:
-    void reshapeBuffers(SizeType batchSize, SizeType beamWidth, SizeType mMaxKvCacheLength, SizeType maxSequenceLength);
+    void reshapeBuffers(
+        SizeType batchSize, SizeType beamWidth, SizeType mMaxAttentionWindow, SizeType maxSequenceLength);
 
 private:
     std::size_t const mVocabSize;
@@ -116,6 +117,6 @@ private:
 
     SizeType mNbSteps;
     SizeType mMaxSequenceLength{};
-    SizeType mMaxKvCacheLength{};
+    SizeType mMaxAttentionWindow{};
 };
 } // namespace tensorrt_llm::runtime
