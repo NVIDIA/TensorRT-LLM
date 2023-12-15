@@ -36,7 +36,7 @@ install_ubuntu_requirements() {
 
     apt-get update
     if [[ $(apt list --installed | grep libcudnn8) ]]; then
-      apt-get remove --purge -y libcudnn8*
+      apt-get remove --purge -y --allow-change-held-packages libcudnn8*
     fi
     if [[ $(apt list --installed | grep libnccl) ]]; then
       apt-get remove --purge -y --allow-change-held-packages libnccl*
