@@ -375,7 +375,10 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
         int32_t* weight_ptr = const_cast<int32_t*>(reinterpret_cast<const int32_t*>(inputs[mWeightInputIdx]));
 
         const auto& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
-        TLLM_CHECK_WITH_INFO(bestTactic, "No valid weight only groupwise GEMM tactic");
+        TLLM_CHECK_WITH_INFO(bestTactic,
+            "No valid weight only groupwise GEMM tactic(It is usually caused by the failure to execute all candidate "
+            "configurations of the CUTLASS kernel, please pay attention to the warning information when building the "
+            "engine.)");
         m_weightOnlyGroupwiseGemmRunner->gemm(act_ptr, weight_ptr, inputs[mScalesInputIdx], zeros_ptr, biases_ptr,
             outputs[0], m, real_n, k, mGroupSize, *bestTactic,
             reinterpret_cast<char*>(workspace) + m * k * sizeof(half), ws_bytes, stream);

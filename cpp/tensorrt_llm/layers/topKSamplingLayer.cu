@@ -85,7 +85,7 @@ __global__ void setup_topk_runtime_args(int batch_size, uint32_t top_k, uint32_t
 template <typename T>
 void TopKSamplingLayer<T>::allocateBuffer(size_t const batch_size, std::vector<uint32_t> const& top_k)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     uint32_t max_top_k = (top_k.size() > 0) ? *std::max_element(std::begin(top_k), std::end(top_k)) : 1;
     if (max_top_k == 0)
     {
@@ -104,7 +104,7 @@ void TopKSamplingLayer<T>::allocateBuffer(size_t const batch_size, std::vector<u
 template <typename T>
 void TopKSamplingLayer<T>::freeBuffer()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     if (is_allocate_buffer_)
     {
         allocator_->free((void**) (&sampling_workspace_));
@@ -118,7 +118,7 @@ void TopKSamplingLayer<T>::freeBuffer()
 template <typename T>
 void TopKSamplingLayer<T>::setup(size_t const batch_size, SetupParams const& setupParams)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     BaseSamplingLayer<T>::setupBase(batch_size, setupParams);
 
     uint32_t const default_top_k = 0;
@@ -162,7 +162,7 @@ void TopKSamplingLayer<T>::setup(size_t const batch_size, SetupParams const& set
 template <typename T>
 void TopKSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingParams const& params)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const batch_size = outputs.output_ids_ptr.shape[0];
     auto const local_batch_size = params.logits.shape[0];
@@ -223,7 +223,7 @@ TopKSamplingLayer<T>::TopKSamplingLayer(TopKSamplingLayer<T> const& top_k_sampli
 template <typename T>
 TopKSamplingLayer<T>::~TopKSamplingLayer()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     freeBuffer();
 }
 

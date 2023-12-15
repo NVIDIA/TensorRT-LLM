@@ -254,7 +254,7 @@ public:
     void startScheduling();
 
     //! \brief Assign blocks for new sequence. Try to reuse blocks.
-    void addSequence(GenerationRequest& sequence, std::shared_ptr<LlmRequest> const& llmRequest);
+    void addSequence(GenerationRequest& sequence, SizeType inputLength, std::shared_ptr<LlmRequest> const& llmRequest);
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
     void addSequence(GenerationRequest& sequence, SizeType inputLength, bool enableCyclicKvCache);
@@ -448,6 +448,17 @@ public:
     [[nodiscard]] static SizeType getMaxNumTokens(KvCacheConfig const& config, nvinfer1::DataType dtype,
         tensorrt_llm::runtime::GptModelConfig const& modelConfig, tensorrt_llm::runtime::WorldConfig const& worldConfig,
         runtime::BufferManager const& bufferManager);
+
+    [[nodiscard]] SizeType getNumPrepopulatedTokens(SizeType batchSlotIdx, SizeType beamIdx) const
+    {
+        auto const& prepopulatedTokens = mSequences.at(batchSlotIdx)->getNumPrepopulatedTokens();
+        return prepopulatedTokens.size() > 0 ? prepopulatedTokens.at(beamIdx) : 0;
+    }
+
+    [[nodiscard]] bool isEnableBlockReuse() const
+    {
+        return mEnableBlockReuse;
+    }
 
 private:
     void resetBlockPointers(SizeType seqSlotIdx, SizeType beamWidth);

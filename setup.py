@@ -58,11 +58,9 @@ def get_version():
 
 
 class BinaryDistribution(Distribution):
+    """Distribution which always forces a binary package with platform name"""
 
     def has_ext_modules(self):
-        return False
-
-    def is_pure(self):
         return True
 
 
@@ -73,21 +71,32 @@ devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
 
+# https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(
     name='tensorrt_llm',
     version=get_version(),
     description='TensorRT-LLM: A TensorRT Toolbox for Large Language Models',
-    install_requires=required_deps,
-    dependency_links=extra_URLs,
-    zip_safe=True,
-    license="Apache License 2.0",
+    long_description=
+    'TensorRT-LLM: A TensorRT Toolbox for Large Language Models',
+    author="NVIDIA Corporation",
+    url="https://github.com/NVIDIA/TensorRT-LLM",
+    download_url="https://github.com/NVIDIA/TensorRT-LLM/tags",
     packages=find_packages(),
     # TODO Add windows support for python bindings.
+    classifiers=[
+        "Development Status :: 4 - Beta",
+        "License :: Apache License 2.0",
+        "Intended Audience :: Developers",
+        "Programming Language :: Python :: 3.10",
+    ],
+    distclass=BinaryDistribution,
+    license="Apache License 2.0",
+    keywords="nvidia tensorrt deeplearning inference",
     package_data={
         'tensorrt_llm': ([
             'libs/th_common.dll', 'libs/nvinfer_plugin_tensorrt_llm.dll',
             'bindings.*.pyd'
-        ] if platform.system() == "Windows" else [
+        ] if on_windows else [
             'libs/libth_common.so',
             'libs/libnvinfer_plugin_tensorrt_llm.so',
             'bindings.*.so',
@@ -96,7 +105,9 @@ setup(
     entry_points={
         'console_scripts': ['trtllm-build=tensorrt_llm.commands.build:main'],
     },
-    python_requires=">=3.7, <4",
-    distclass=BinaryDistribution,
     extras_require={"devel": devel_deps},
-)
+    zip_safe=True,
+    install_requires=required_deps,
+    dependency_links=
+    extra_URLs,  # Warning: Dependency links support has been dropped by pip 19.0
+    python_requires=">=3.7, <4")

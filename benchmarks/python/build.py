@@ -27,7 +27,7 @@ from base_benchmark import get_engine_name, serialize_engine
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
-from tensorrt_llm.layers import PositionEmbeddingType
+from tensorrt_llm.layers import MoeConfig, PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models import PretrainedConfig, quantize_model
 from tensorrt_llm.network import net_guard
@@ -284,12 +284,12 @@ def build_gpt(args):
             apply_query_key_layer_scaling,
             position_embedding_type=PositionEmbeddingType.learned_absolute
             if build_config['position_embedding_type'] is None else
-            build_config['position_embedding_type'],
+            PositionEmbeddingType[build_config['position_embedding_type']],
             rotary_embedding_percentage=build_config['rotary_pct'],
             quant_mode=quant_mode,
             bias=build_config['bias'],
-            moe_layer_config=tensorrt_llm.moe_config.MoeLayerConfig(
-                build_config["moe_num_experts"], build_config["moe_top_k"]))
+            moe_config=MoeConfig(build_config["moe_num_experts"],
+                                 build_config["moe_top_k"]))
     elif family == "opt":
         config = {
             'architecture': 'OPTForCausalLM',
@@ -307,7 +307,29 @@ def build_gpt(args):
             'use_parallel_embedding': False,
             'share_embedding_table': False,
             'embedding_sharding_dim': 0,
-            'do_layer_norm_before': build_config['do_layer_norm_before']
+            'do_layer_norm_before': build_config['do_layer_norm_before'],
+            'quantization': {
+                'use_smooth_quant':
+                quant_mode.has_act_and_weight_quant(),
+                'per_channel':
+                quant_mode.has_per_channel_scaling(),
+                'per_token':
+                quant_mode.has_per_token_dynamic_scaling(),
+                'per_group':
+                quant_mode.has_per_group_scaling(),
+                'group_size':
+                128,
+                'int8_kv_cache':
+                quant_mode.has_int8_kv_cache(),
+                'enable_fp8':
+                quant_mode.has_fp8_qdq(),
+                'fp8_kv_cache':
+                quant_mode.has_fp8_kv_cache(),
+                'use_weight_only':
+                quant_mode.is_weight_only(),
+                'weight_only_precision':
+                'int8' if quant_mode.is_int8_weight_only() else 'int4',
+            }
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.OPTForCausalLM(config)
@@ -325,7 +347,9 @@ def build_gpt(args):
             mapping=tensorrt_llm.Mapping(world_size=world_size,
                                          tp_size=world_size),  # TP only
             quant_mode=quant_mode,
-            use_fused_mlp=True)
+            use_fused_mlp=True,
+            moe_config=MoeConfig(build_config["moe_num_experts"],
+                                 build_config["moe_top_k"]))
     elif family == "gptj":
         tensorrt_llm_model = tensorrt_llm.models.GPTJForCausalLM(
             num_layers=build_config['num_layers'],
@@ -402,17 +426,47 @@ def build_gpt(args):
             model_name="chatglm3_6b")
 
     elif family == "bloom":
-        tensorrt_llm_model = tensorrt_llm.models.BloomForCausalLM(
-            num_layers=build_config['num_layers'],
-            num_heads=build_config['num_heads'],
-            hidden_size=build_config['hidden_size'],
-            vocab_size=build_config['vocab_size'],
-            max_position_embeddings=build_config['n_positions'],
-            dtype=kv_dtype,
-            mapping=tensorrt_llm.Mapping(world_size=world_size,
-                                         tp_size=world_size),  # TP only
-            quant_mode=quant_mode,
-            use_parallel_embedding=(args.model == 'bloom_176b'))
+        config = {
+            'architecture': 'BloomForCausalLM',
+            'dtype': args.dtype,
+            'vocab_size': build_config['vocab_size'],
+            'hidden_size': build_config['hidden_size'],
+            'num_hidden_layers': build_config['num_layers'],
+            'num_attention_heads': build_config['num_heads'],
+            'hidden_act': build_config['hidden_act'],
+            'max_position_embeddings': build_config['n_positions'],
+            'mapping': {
+                'world_size': world_size,
+                'tp_size': world_size
+            },
+            'use_parallel_embedding': (args.model == 'bloom_176b'),
+            'share_embedding_table': False,
+            'embedding_sharding_dim': 0,
+            'quantization': {
+                'use_smooth_quant':
+                quant_mode.has_act_and_weight_quant(),
+                'per_channel':
+                quant_mode.has_per_channel_scaling(),
+                'per_token':
+                quant_mode.has_per_token_dynamic_scaling(),
+                'per_group':
+                quant_mode.has_per_group_scaling(),
+                'group_size':
+                128,
+                'int8_kv_cache':
+                quant_mode.has_int8_kv_cache(),
+                'enable_fp8':
+                quant_mode.has_fp8_qdq(),
+                'fp8_kv_cache':
+                quant_mode.has_fp8_kv_cache(),
+                'use_weight_only':
+                quant_mode.is_weight_only(),
+                'weight_only_precision':
+                'int8' if quant_mode.is_int8_weight_only() else 'int4',
+            }
+        }
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.BloomForCausalLM(config)
     elif family == "falcon":
         tensorrt_llm_model = tensorrt_llm.models.FalconForCausalLM(
             num_layers=build_config['num_layers'],
@@ -447,8 +501,9 @@ def build_gpt(args):
                 "zero": True,
                 "pre_quant_scale": False,
             }
-    tensorrt_llm_model = quantize_model(tensorrt_llm_model, quant_mode,
-                                        **quant_kwargs)
+    if family not in ['opt', 'bloom']:
+        tensorrt_llm_model = quantize_model(tensorrt_llm_model, quant_mode,
+                                            **quant_kwargs)
 
     # Module -> Network
     network = builder.create_network()
@@ -495,7 +550,10 @@ def build_gpt(args):
                                                    max_input_len,
                                                    max_output_len, True,
                                                    max_beam_width)
-        tensorrt_llm_model(*inputs)
+        if family in ['opt', 'bloom']:
+            tensorrt_llm_model(**inputs)
+        else:
+            tensorrt_llm_model(*inputs)
 
     if args.mode == 'plugin':
         tensorrt_llm.graph_rewriting.optimize(network)

@@ -65,6 +65,9 @@ def iterate_shard_files(model_dir: Union[Path, str],
     if not shard_files:
         # The model checkpoint is stored in .bin file.
         shard_files = list(model_dir.glob('*.bin'))
+    if not shard_files:
+        raise RuntimeError(
+            f"Could not find any .safetensors or .bin files in {model_dir}")
 
     try:
         import tqdm

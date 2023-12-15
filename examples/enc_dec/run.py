@@ -21,17 +21,22 @@ from pathlib import Path
 import torch
 import tensorrt as trt
 # isort: on
-from transformers import AutoConfig, AutoTokenizer, T5ForConditionalGeneration
+from transformers import (AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer,
+                          BartForConditionalGeneration,
+                          MBartForConditionalGeneration,
+                          T5ForConditionalGeneration)
 
 import tensorrt_llm
 from tensorrt_llm import logger
-from tensorrt_llm._utils import trt_dtype_to_torch
+from tensorrt_llm._utils import torch_to_numpy, trt_dtype_to_torch
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 
 from build import get_engine_name  # isort:skip
 
 
 def print_tensor(tensor_name, tensor, num_elements=10):
+    if tensor.dtype in (torch.int32, torch.int64):
+        tensor = tensor.to(dtype=float)
     print(
         f'{tensor_name}: mean={tensor.abs().mean().item():.3f}, sum={tensor.abs().sum().item():.3f}, max={tensor.abs().max().item():.3f}'
     )
@@ -46,33 +51,37 @@ def print_tensor(tensor_name, tensor, num_elements=10):
 def read_config(config_path: Path):
     with open(config_path, "r") as f:
         config = json.load(f)
-    use_gpt_attention_plugin = config["plugin_config"]["gpt_attention_plugin"]
-    remove_input_padding = config["plugin_config"]["remove_input_padding"]
-    tp_size = config['builder_config']['tensor_parallel']
-    pp_size = config['builder_config']['pipeline_parallel']
-    gpus_per_node = config['builder_config']['gpus_per_node']
+
+    builder_config = config['builder_config']
+    plugin_config = config['plugin_config']
+    use_gpt_attention_plugin = plugin_config["gpt_attention_plugin"]
+    remove_input_padding = plugin_config["remove_input_padding"]
+    tp_size = builder_config['tensor_parallel']
+    pp_size = builder_config['pipeline_parallel']
+    gpus_per_node = builder_config['gpus_per_node']
     world_size = tp_size * pp_size
     assert world_size == tensorrt_llm.mpi_world_size(), \
         f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
-    num_heads = config["builder_config"]["num_heads"]
-    hidden_size = config["builder_config"]["hidden_size"]
-    head_size = config["builder_config"]["head_size"]
-    vocab_size = config["builder_config"]["vocab_size"]
-    num_layers = config["builder_config"]["num_layers"]
-    num_kv_heads = config['builder_config'].get('num_kv_heads', num_heads)
+    num_heads = builder_config["num_heads"]
+    hidden_size = builder_config["hidden_size"]
+    head_size = builder_config["head_size"]
+    vocab_size = builder_config["vocab_size"]
+    num_layers = builder_config["num_layers"]
+    num_kv_heads = builder_config.get('num_kv_heads', num_heads)
 
     assert (num_heads % tp_size) == 0
     num_heads = num_heads // tp_size
     hidden_size = hidden_size // tp_size
     num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
 
-    cross_attention = config["builder_config"]["cross_attention"]
-    has_position_embedding = config["builder_config"]["has_position_embedding"]
-    has_token_type_embedding = config["builder_config"][
-        "has_token_type_embedding"]
+    cross_attention = builder_config["cross_attention"]
+    has_position_embedding = builder_config["has_position_embedding"]
+    has_token_type_embedding = builder_config["has_token_type_embedding"]
     use_custom_all_reduce = config['plugin_config'].get('use_custom_all_reduce',
                                                         False)
-    dtype = config["builder_config"]["precision"]
+    dtype = builder_config["precision"]
+    gather_all_token_logits = builder_config.get('gather_all_token_logits',
+                                                 False)
 
     model_config = ModelConfig(
         num_heads=num_heads,
@@ -87,7 +96,8 @@ def read_config(config_path: Path):
         has_position_embedding=has_position_embedding,
         has_token_type_embedding=has_token_type_embedding,
         use_custom_all_reduce=use_custom_all_reduce,
-        dtype=dtype)
+        dtype=dtype,
+        gather_all_token_logits=gather_all_token_logits)
 
     return model_config, tp_size, pp_size, gpus_per_node, dtype
 
@@ -100,7 +110,7 @@ def parse_arguments():
     parser.add_argument("--engine_name", type=str, default="enc_dec")
     parser.add_argument("--model_name",
                         type=str,
-                        help="HuggingFace model name",
+                        help="HuggingFace model name or FairSeq model path",
                         default="t5-small")
     parser.add_argument("--num_beams",
                         type=int,
@@ -228,6 +238,21 @@ class TRTLLMEncDecModel:
         if self.encoder_runtime_mapping.is_first_pp_rank():
             inputs['input_ids'] = input_ids.contiguous()
             if self.encoder_model_config.has_position_embedding:
+                if position_ids is None:
+                    if self.encoder_model_config.remove_input_padding:
+                        position_ids = [
+                            torch.arange(sample_length,
+                                         dtype=torch.int32,
+                                         device=input_ids.device)
+                            for sample_length in torch_to_numpy(input_lengths)
+                        ]
+                        position_ids = torch.cat(position_ids)
+                        position_ids = torch.unsqueeze(position_ids, dim=0)
+                    else:
+                        bsz, seq_len = input_ids.shape[:2]
+                        position_ids = torch.arange(
+                            seq_len, dtype=torch.int32,
+                            device=input_ids.device).expand(bsz, -1)
                 inputs['position_ids'] = position_ids.contiguous()
             if self.encoder_model_config.has_token_type_embedding:
                 inputs['token_type_ids'] = token_type_ids.contiguous()
@@ -243,6 +268,9 @@ class TRTLLMEncDecModel:
             (max_input_length, ),
             dtype=hidden_states_dtype('max_input_length'),
             device=self.device).contiguous()
+
+        # Note: runtime.Session's run() method will set input/output tensor address, here we only need to provide tensor shape
+        self.encoder_session.set_shapes(inputs)
 
         # output tensors. only last PP rank final encoder output, others are intermediate hidden_states output. Need broadcast later
         outputs = {}
@@ -276,9 +304,8 @@ class TRTLLMEncDecModel:
         # -------------------------------------------
 
         # TRT session run
-        # Note: runtime.Session's run() method will set input/output tensor address, here we only need to provide tensor shape
-        self.encoder_session.set_shapes(inputs)
         ok = self.encoder_session.run(inputs, outputs, self.stream)
+
         assert ok, "Runtime execution failed"
         torch.cuda.synchronize()
 
@@ -306,13 +333,15 @@ class TRTLLMEncDecModel:
             encoder_output = outputs['encoder_output']
 
         # -------------------------------------------
-        if debug_mode:
+        if debug_mode and self.encoder_runtime_mapping.tp_rank == 0:  # only tp_rank 0 print encoder output
             torch.cuda.synchronize()
             # use print_tensor() to print the tensors registered in the encoder network
             print("--------------------------------------")
             print("Debug output for Encoder")
             print("--------------------------------------")
             print("Registered output tensors are: ", outputs.keys())
+            for k, v in outputs.items():
+                print_tensor(k, v, num_elements=30)
             print_tensor('encoder_output', encoder_output)
             print("--------------------------------------")
         # -------------------------------------------
@@ -329,6 +358,7 @@ class TRTLLMEncDecModel:
         eos_token_id=None,
         bos_token_id=None,
         debug_mode=False,
+        return_dict=False,
     ):
         ## ensure all externally provided tensors are on the correct device.
         encoder_input_ids = encoder_input_ids.to(self.device)
@@ -372,10 +402,83 @@ class TRTLLMEncDecModel:
             sampling_config,
             encoder_output=encoder_output,
             encoder_input_lengths=encoder_input_lengths,
-        )
+            return_dict=return_dict)
         torch.cuda.synchronize()
 
         return output_ids
+
+
+def test_fairseq_models(args):
+    ## Note: NMT is the only FairSeq model. Adding FairSeq dependency is too heavy for the CI workflow, hence we used fixed input/output ids for correctness check and leave FairSeq code in comments. Users can follow Encoder-Decoder's README to install FairSeq and test locally.
+    '''
+        from fairseq.models.transformer import TransformerModel
+
+        fairseq_model = TransformerModel.from_pretrained(model_name_or_path=args.model_name, data_name_or_path=args.model_name, bpe='subword_nmt', tokenizer='moses').cuda()
+
+        input_text = "Good Morning! How are you doing today?"
+        input_ids = fairseq_model.encode(input_text)
+
+        tik = time.time()
+        # Note: FairSeq sampling=True results are not deterministic, disable during accuracy check
+        fairseq_output_ids = fairseq_model.generate(input_ids, beam=1, sampling=False) #
+        tik = time.time()
+
+        fairseq_output_ids = fairseq_output_ids[0]['tokens']
+        fairseq_output_text = fairseq_model.decode(fairseq_output_ids)
+
+        print("--------------------------------------")
+        print("input text: ", input_text)
+        print("input ids: ", input_ids) # [9938, 5384, 9328, 812, 3619, 53, 181, 3829, 1735, 171, 2]
+        print("fairseq_output ids: ", fairseq_output_ids) # [9804, 391, 4, 4625, 167, 25, 1003, 5123, 17, 167, 1466, 1234, 171, 2]
+        print("fairseq_output text: ", fairseq_output_text) # "Bonjour, Comment vous en tirez-vous aujourd'hui ?"
+        print(f"FairSeq E2E time {(tok-tik)*1000}ms")
+        print("--------------------------------------")
+        '''
+
+    max_new_tokens = args.max_new_tokens
+    bos_token_id = 2
+    pad_token_id = 0
+    eos_token_id = 2
+    decoder_start_token_id = bos_token_id
+
+    input_ids = torch.tensor(
+        [9938, 5384, 9328, 812, 3619, 53, 181, 3829, 1735, 171, 2])
+    fairseq_output_ids = torch.tensor(
+        [9804, 391, 4, 4625, 167, 25, 1003, 5123, 17, 167, 1466, 1234, 171, 2])
+    input_ids = torch.tensor([input_ids.tolist()]).type(torch.IntTensor).cuda()
+    decoder_input_ids = torch.IntTensor([[decoder_start_token_id]]).cuda()
+    decoder_input_ids = decoder_input_ids.repeat((input_ids.shape[0], 1))
+
+    tllm_model = TRTLLMEncDecModel.from_engine(args.engine_name,
+                                               args.engine_dir,
+                                               debug_mode=args.debug_mode)
+
+    inference_dtype = tllm_model.encoder_model_config.dtype
+
+    tik = time.time()
+    tllm_output_ids = tllm_model.generate(
+        encoder_input_ids=input_ids,
+        decoder_input_ids=decoder_input_ids,
+        max_new_tokens=max_new_tokens,
+        num_beams=args.num_beams,
+        bos_token_id=bos_token_id,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        debug_mode=args.debug_mode,
+    )
+    tok = time.time()
+    output_ids = tllm_output_ids[:, 0, :]
+    output_ids = output_ids[output_ids != eos_token_id]
+    fairseq_output_ids = fairseq_output_ids[fairseq_output_ids != eos_token_id]
+
+    print("--------------------------------------")
+    print("TRT-LLM output_ids: ", output_ids)
+    print(f"TRT-LLM E2E time {(tok-tik)*1000}ms")
+    print("Precision:", inference_dtype)
+    print("--------------------------------------")
+
+    assert output_ids.tolist() == fairseq_output_ids.tolist(
+    ), f"TRT-LLM output ids {output_ids} does not match Fairseq ids {fairseq_output_ids}"
 
 
 if __name__ == "__main__":
@@ -385,9 +488,20 @@ if __name__ == "__main__":
     args = parse_arguments()
     logger.set_level(args.log_level)
 
+    # FairSeq NMT test logic is different from HuggingFace models
+    if 'wmt' in args.model_name:
+        test_fairseq_models(args)
+        exit()
+
     test_remove_padding = True
     if not test_remove_padding:
-        input_text = "translate English to German: The house is wonderful, radiating timeless charm and offering a warm, inviting interior with beautiful details and a serene backyard."
+        if 't5' in args.model_name:
+            input_text = "translate English to German: The house is wonderful, radiating timeless charm and offering a warm, inviting interior with beautiful details and a serene backyard."
+        elif 'bart' in args.model_name:
+            input_text = "The tower is 324 metres (1,063 ft) tall, about the same height as an 81-storey building, and the tallest structure in Paris. Its base is square, measuring 125 metres (410 ft) on each side. During its construction, the Eiffel Tower surpassed the Washington Monument to become the tallest man-made structure in the world, a title it held for 41 years until the Chrysler Building in New York City was finished in 1930. It was the first structure to reach a height of 300 metres. Due to the addition of a broadcasting aerial at the top of the tower in 1957, it is now taller than the Chrysler Building by 5.2 metres (17 ft). Excluding transmitters, the Eiffel Tower is the second tallest free-standing structure in France after the Millau Viaduct."
+        else:
+            raise RuntimeError('Unsupported model type!')
+
     else:
         input_text = [
             "translate English to German: The house is wonderful.",
@@ -395,7 +509,8 @@ if __name__ == "__main__":
             "During its construction, the Eiffel Tower surpassed the Washington Monument to become the tallest man-made structure in the world",
         ]
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name)  # TODO: use model path instead
     tokenized_inputs = tokenizer(input_text, return_tensors="pt", padding=True)
 
     max_new_tokens = args.max_new_tokens
@@ -423,14 +538,17 @@ if __name__ == "__main__":
     # simple comparison with HF on FP32
     if args.compare_hf_fp32:
         if tensorrt_llm.mpi_rank() == 0:
-            if "t5" in args.model_name:
-                hf_model = T5ForConditionalGeneration.from_pretrained(
-                    args.model_name).to('cuda')
-            else:
-                pass
+            hf_model = AutoModelForSeq2SeqLM.from_pretrained(
+                args.model_name,  # TODO: use model path instead
+                # torch_dtype=torch.float16 if '16' in dtype else torch.float32,  # TODO: use matched torch dtype
+            ).to('cuda').eval()  # TODO: create config model path instead
+            assert type(hf_model) in (
+                T5ForConditionalGeneration, BartForConditionalGeneration,
+                MBartForConditionalGeneration), 'Unsupported model!'
 
             tik = time.time()
-            hf_output_ids = hf_model.generate(
+            # breakpoint()
+            hf_gen_output = hf_model.generate(
                 input_ids=input_ids,
                 decoder_input_ids=decoder_input_ids,
                 max_new_tokens=max_new_tokens,
@@ -438,7 +556,19 @@ if __name__ == "__main__":
                 bos_token_id=tokenizer.bos_token_id,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
-                use_cache=True)
+                use_cache=True,
+                # control logits processors
+                no_repeat_ngram_size=0,  # disable no repeat post-processor
+                forced_bos_token_id=None,  # disable forced first/last token
+                forced_eos_token_id=None,
+                min_length=0,
+                # for debug
+                output_scores=True,
+                output_hidden_states=True,
+                return_dict_in_generate=True)
+            # get hf output scores
+            hf_output_ids = hf_gen_output.sequences
+            # convert to logits
             torch.cuda.synchronize()
             tok = time.time()
 
@@ -470,6 +600,7 @@ if __name__ == "__main__":
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
         debug_mode=args.debug_mode,
+        return_dict=False,  # when set return_dict=True, get outputs by key
     )
     tok = time.time()
 

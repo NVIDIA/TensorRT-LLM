@@ -414,8 +414,6 @@ class FLayerInfo:
             if default_net().strongly_typed:
                 if new.trt_tensor.dtype != deprecated.trt_tensor.dtype:
                     new = cast(new, deprecated.trt_tensor.dtype)
-            else:
-                new.trt_tensor.dtype = deprecated.trt_tensor.dtype
             new.trt_tensor.name = name
 
         def _reset_network_output_tensors(network, out, new_out):
@@ -424,16 +422,18 @@ class FLayerInfo:
             need_to_mark = False
             for i in range(num_outputs):
                 net_outputs.append(network._trt_network.get_output(i))
-                if out.trt_tensor is net_outputs[i]: need_to_mark = True
-            if need_to_mark is False: return
+                if out.trt_tensor is net_outputs[i]:
+                    need_to_mark = True
+            if need_to_mark is False:
+                return
             for output in net_outputs:
                 network.trt_network.unmark_output(output)
             for i in range(num_outputs):
-                network.trt_network.mark_output(
-                    new_out.trt_tensor
-                ) if net_outputs[
-                    i] is out.trt_tensor else network.trt_network.mark_output(
-                        net_outputs[i])
+                if net_outputs[i] is out.trt_tensor:
+                    network.trt_network.mark_output(new_out.trt_tensor)
+                    new_out.trt_tensor.dtype = out.trt_tensor.dtype
+                else:
+                    network.trt_network.mark_output(net_outputs[i])
 
         def replace_all_uses_with(out, new_out):
             if isinstance(out, Tensor):

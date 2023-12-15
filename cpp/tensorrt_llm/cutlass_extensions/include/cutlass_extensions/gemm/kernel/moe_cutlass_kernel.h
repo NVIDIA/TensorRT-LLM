@@ -507,6 +507,10 @@ public:
 #elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)
         static constexpr bool compile_needed = platform::is_same<KernelArch, arch::Sm80>::value;
         KernelRunner<compile_needed>::run_kernel(params, shared_storage);
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+        // TODO Update the arch to Sm90 once CUTLASS hopper specialisations are available
+        static constexpr bool compile_needed = platform::is_same<KernelArch, arch::Sm80>::value;
+        KernelRunner<compile_needed>::run_kernel(params, shared_storage);
 #else
         CUTLASS_NOT_IMPLEMENTED();
 #endif

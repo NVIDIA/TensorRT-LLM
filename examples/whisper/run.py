@@ -381,8 +381,7 @@ if __name__ == '__main__':
     s += f"total_duration: {total_duration:.3f} seconds\n"
     s += f"({total_duration/3600:.2f} hours)\n"
     s += f"processing time: {elapsed:.3f} seconds " f"({elapsed/3600:.2f} hours)\n"
-    if not args.input_file:
-        s += f"batch size: {args.batch_size}\n"
+    s += f"batch size: {args.batch_size}\n"
     s += f"num_beams: {args.num_beams}\n"
     print(s)
 

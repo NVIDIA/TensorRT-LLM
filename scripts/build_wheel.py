@@ -196,8 +196,7 @@ def main(build_type: str = "Release",
         def get_pybind_lib():
             pybind_build_dir = (build_dir / "tensorrt_llm" / "pybind")
             if platform.system() == "Windows":
-                pybind_lib = list(
-                    (pybind_build_dir / str(build_type)).glob("bindings.*.pyd"))
+                pybind_lib = list(pybind_build_dir.glob("bindings.*.pyd"))
             else:
                 pybind_lib = list(pybind_build_dir.glob("bindings.*.so"))
 

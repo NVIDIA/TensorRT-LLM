@@ -297,9 +297,12 @@ inline int getMaxSharedMemoryPerBlockOptin()
     return max_shared_memory_per_block;
 }
 
-inline int divUp(int a, int n)
+template <typename T1, typename T2>
+inline size_t divUp(const T1& a, const T2& n)
 {
-    return (a + n - 1) / n;
+    size_t tmp_a = static_cast<size_t>(a);
+    size_t tmp_n = static_cast<size_t>(n);
+    return (tmp_a + tmp_n - 1) / tmp_n;
 }
 
 template <typename T, typename U, typename = std::enable_if_t<std::is_integral<T>::value>,

@@ -71,6 +71,30 @@ void simple_assert(bool flag)
     }
 }
 
+template <typename T>
+std::vector<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> get_configs(T& runner, int k)
+{
+    auto configs = runner.getConfigs();
+    std::vector<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> rets;
+    for (auto config : configs)
+    {
+        if (config.stages >= 5)
+        {
+            continue;
+        }
+        if (config.split_k_style != tensorrt_llm::cutlass_extensions::SplitKStyle::NO_SPLIT_K)
+        {
+            int k_size = (k + config.split_k_factor - 1) / config.split_k_factor;
+            if (k_size % 64)
+            {
+                continue;
+            }
+        }
+        rets.push_back(config);
+    }
+    return rets;
+}
+
 template <typename KernelFlag, WeightOnlyActivationType AFlag, WeightOnlyQuantType BFlag>
 float benchmark_perchannel(void* act, void* weight, void* scales, void* zeros, void* bias, void* out, int m, int n,
     int k, int group_size, int warmup, int iter)
@@ -100,7 +124,7 @@ float benchmark_perchannel(void* act, void* weight, void* scales, void* zeros, v
         tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<typename AType<AFlag>::CutlassKernelAType,
             typename BType<BFlag>::CutlassKernelBType, cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY>
             gemm;
-        auto configs = gemm.getConfigs();
+        auto configs = get_configs(gemm, k);
         int ws_bytes = gemm.getWorkspaceSize(m, n, k);
         char* ws_ptr = nullptr;
         if (ws_bytes)
@@ -181,7 +205,7 @@ float benchmark_groupwise(void* act, void* weight, void* scales, void* zeros, vo
         tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<typename AType<AFlag>::CutlassKernelAType,
             typename BType<BFlag>::CutlassKernelBType, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS>
             gemm;
-        auto configs = gemm.getConfigs();
+        auto configs = get_configs(gemm, k);
         int ws_bytes = gemm.getWorkspaceSize(m, n, k);
         char* ws_ptr = nullptr;
         if (ws_bytes)

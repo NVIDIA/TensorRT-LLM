@@ -45,14 +45,10 @@ protected:
     static int mDeviceCount;
 
     std::vector<BufferManager::IBufferPtr> managed_buffers;
-    DataType* mInputProbabilities{};
+    float* mInputProbabilities{};
     DataType* mInputTensor{};
-    DataType* mExpertStates{};
-    int* mExpertOffsets{};
 
-    int* mSeqLens{};
     int mMaxSeqLen = 0;
-    int mNumSequences{};
 
     int mHiddenSize{};
     int mNumExperts{};
@@ -132,7 +128,7 @@ protected:
     MOEExpertScaleNormalizationMode mNormMode = MOEExpertScaleNormalizationMode::NONE;
 
     int mExpertWDiag1 = 1;
-    int mExpertWDiag2 = 1;
+    int mExpertWDiag2 = 2;
 
     template <class T>
     T* allocBuffer(size_t size)
@@ -143,7 +139,7 @@ protected:
     }
 
     void initBuffersPermute(std::vector<std::vector<DataType>> h_hidden_states,
-        std::vector<std::vector<DataType>> h_router_results, int hidden_size, int num_experts, int k,
+        std::vector<std::vector<float>> h_router_results, int hidden_size, int num_experts, int k,
         std::vector<uint8_t> finished, MOEParallelismConfig parallelism_config)
     {
         managed_buffers.clear();
@@ -152,7 +148,6 @@ protected:
         mInterSize = hidden_size * 4;
         mNumExperts = num_experts;
         mK = k;
-        mNumSequences = h_hidden_states.size();
 
         mTotalTokens = 0;
         std::vector<int> h_seq_lens;
@@ -212,7 +207,7 @@ protected:
             mActiveRows = std::count(finished.begin(), finished.end(), 0);
         }
 
-        mInputProbabilities = allocBuffer<DataType>(mTotalTokens * mNumExperts);
+        mInputProbabilities = allocBuffer<float>(mTotalTokens * mNumExperts);
         mScaleProbs = allocBuffer<DataType>(mTotalTokens * mK);
         mInputTensor = allocBuffer<DataType>(mTotalTokens * mHiddenSize);
         mFinalOutput = allocBuffer<DataType>(mTotalTokens * mHiddenSize);
@@ -224,7 +219,7 @@ protected:
         for (auto& sequence : h_router_results)
         {
             check_cuda_error(cudaMemcpyAsync(
-                input_probs_ptr, sequence.data(), sequence.size() * sizeof(DataType), cudaMemcpyHostToDevice, stream));
+                input_probs_ptr, sequence.data(), sequence.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
             input_probs_ptr += sequence.size();
         }
 
@@ -237,8 +232,8 @@ protected:
         }
 
         // Init the diagonals of our matrix, this will set to the scalar value * expert_id
-        initWeights(mExpertWeight1, mInterSize, mHiddenSize, mExpertWDiag1);
-        initWeights(mExpertWeight2, mHiddenSize, mInterSize, mExpertWDiag2);
+        initWeights(mExpertWeight1, mHiddenSize, mInterSize, mExpertWDiag1);
+        initWeights(mExpertWeight2, mInterSize, mHiddenSize, mExpertWDiag2);
 
         if (mUseBias)
         {
@@ -266,7 +261,7 @@ protected:
     }
 
     void runMoEPermute(std::vector<std::vector<DataType>> h_hidden_states,
-        std::vector<std::vector<DataType>> h_router_results, int hidden_size, int num_experts, int k,
+        std::vector<std::vector<float>> h_router_results, int hidden_size, int num_experts, int k,
         std::vector<uint8_t> finished = {}, MOEParallelismConfig parallelism_config = {})
     {
         initBuffersPermute(std::move(h_hidden_states), std::move(h_router_results), hidden_size, num_experts, k,
@@ -288,17 +283,17 @@ protected:
             auto* bias_1 = mUseBias ? weight_2 + mNumExperts * matrix_size : nullptr;
 
             // 2D memcpy just the slices we care about
-            const size_t row_size_1 = mInterSize / tp_size * sizeof(DataType);
+            const size_t row_size_1 = matrix_size * sizeof(DataType);
             check_cuda_error(cudaMemcpy2DAsync(weight_1, row_size_1, (uint8_t*) mExpertWeight1 + row_size_1 * tp_rank,
-                row_size_1 * tp_size, row_size_1, mNumExperts * mHiddenSize, cudaMemcpyDeviceToDevice, mStream->get()));
+                row_size_1 * tp_size, row_size_1, mNumExperts, cudaMemcpyDeviceToDevice, mStream->get()));
 
-            const size_t row_size_2 = matrix_size * sizeof(DataType);
+            const size_t row_size_2 = mInterSize / tp_size * sizeof(DataType);
             check_cuda_error(cudaMemcpy2DAsync(weight_2, row_size_2, (uint8_t*) mExpertWeight2 + row_size_2 * tp_rank,
-                row_size_2 * tp_size, row_size_2, mNumExperts, cudaMemcpyDeviceToDevice, mStream->get()));
+                row_size_2 * tp_size, row_size_2, mNumExperts * mHiddenSize, cudaMemcpyDeviceToDevice, mStream->get()));
 
             if (mUseBias)
             {
-                const size_t row_size_bias = row_size_1; // Same as row size of the fc1 weight matrix
+                const size_t row_size_bias = mInterSize / tp_size * sizeof(DataType);
                 check_cuda_error(
                     cudaMemcpy2DAsync(bias_1, row_size_bias, (uint8_t*) mExpertBias1 + row_size_bias * tp_rank,
                         row_size_bias * tp_size, row_size_bias, mNumExperts, cudaMemcpyDeviceToDevice, mStream->get()));
@@ -562,7 +557,7 @@ void MixtureOfExpertsTest::BasicPermuteTest(int k)
     std::vector<DataType> hidden_states(hidden_size * num_tokens, 0);
     std::iota(hidden_states.begin(), hidden_states.end(), 0.0f);
 
-    std::vector<DataType> probs = {
+    std::vector<float> probs = {
         0.5, 0.1, 0.25, 0.15,   //
         0.03, 0.2, 0.07, 0.7,   //
         0.25, 0.21, 0.35, 0.19, //
@@ -634,7 +629,7 @@ TEST_F(MixtureOfExpertsTest, Finished)
     std::vector<DataType> hidden_states(hidden_size * num_tokens, 0);
     std::iota(hidden_states.begin(), hidden_states.end(), 0.0f);
 
-    std::vector<DataType> probs = {
+    std::vector<float> probs = {
         0.5, 0.1, 0.25, 0.15, //
         0.05, 0.2, 0.05, 0.7, //
         0.25, 0.2, 0.35, 0.2, //
@@ -690,7 +685,7 @@ void MixtureOfExpertsTest::ExpertParallelTest(int k)
     std::vector<DataType> hidden_states(hidden_size * num_tokens, 0);
     std::iota(hidden_states.begin(), hidden_states.end(), 0.0f);
 
-    std::vector<DataType> probs = {
+    std::vector<float> probs = {
         0.5, 0.1, 0.25, 0.15,   //
         0.03, 0.2, 0.07, 0.7,   //
         0.25, 0.21, 0.35, 0.19, //
@@ -772,7 +767,7 @@ void MixtureOfExpertsTest::TensorParallelTest(int k)
     std::vector<DataType> hidden_states(hidden_size * num_tokens, 0);
     std::iota(hidden_states.begin(), hidden_states.end(), 0.0f);
 
-    std::vector<DataType> probs = {
+    std::vector<float> probs = {
         0.5, 0.1, 0.25, 0.15,   //
         0.03, 0.2, 0.07, 0.7,   //
         0.25, 0.21, 0.35, 0.19, //

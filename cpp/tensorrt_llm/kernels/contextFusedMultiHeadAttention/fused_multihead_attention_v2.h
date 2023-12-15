@@ -232,20 +232,21 @@ public:
     }
 
     inline uint64_t hashID(unsigned int s, unsigned int d, bool interleaved, bool unroll, bool force_fp32_acc,
-        bool flash_attention, int attention_mask_type, bool tiled) const
+        bool flash_attention, bool is_alibi_supported, int attention_mask_type, bool tiled) const
     {
         s = flash_attention ? 0 : s;
         // D <= 2048
-        return (uint64_t) s << 32 | d << 16 | (attention_mask_type << 5) | (tiled ? 16ull : 0ull)
-            | (force_fp32_acc ? 8ull : 0ull) | (flash_attention ? 4ull : 0ull) | (interleaved ? 2ull : 0ull)
-            | (unroll ? 1ull : 0ull);
+        return (uint64_t) s << 32 | d << 16 | (attention_mask_type << 6) | (is_alibi_supported ? 32ull : 0ull)
+            | (tiled ? 16ull : 0ull) | (force_fp32_acc ? 8ull : 0ull) | (flash_attention ? 4ull : 0ull)
+            | (interleaved ? 2ull : 0ull) | (unroll ? 1ull : 0ull);
     }
 
     virtual uint64_t hashID(const KernelMeta& kernelMeta) const
     {
 
         return hashID(kernelMeta.mS, kernelMeta.mD, kernelMeta.mInterleaved, kernelMeta.mUnrollStep,
-            kernelMeta.mFP32Accumulation, kernelMeta.mFlashAttention, kernelMeta.mAttentionMaskType, kernelMeta.mTiled);
+            kernelMeta.mFP32Accumulation, kernelMeta.mFlashAttention, kernelMeta.mAlibiSupported,
+            kernelMeta.mAttentionMaskType, kernelMeta.mTiled);
     }
 
     virtual void run(
@@ -288,10 +289,17 @@ public:
             }
         }
 
-        const auto findIter = mFunctions.find(hashID(launch_params.kernel_s, params.d, launch_params.interleaved,
-            forceUnroll, launch_params.force_fp32_acc, launch_params.flash_attention,
-            static_cast<int>(launch_params.attention_mask_type), launch_params.granular_tiling));
-        TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(), "FMHA kernels are not found");
+        const auto findIter
+            = mFunctions.find(hashID(launch_params.kernel_s, params.d, launch_params.interleaved, forceUnroll,
+                launch_params.force_fp32_acc, launch_params.flash_attention, !launch_params.useKernelWithoutAlibi,
+                static_cast<int>(launch_params.attention_mask_type), launch_params.granular_tiling));
+
+        // Add debug info when kernels are not found.
+        TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(),
+            "FMHA kernels are not found (kernel meta info: %d %d %d %d %d %d %d %d %d) !", launch_params.kernel_s,
+            params.d, launch_params.interleaved, forceUnroll, launch_params.force_fp32_acc,
+            launch_params.flash_attention, !launch_params.useKernelWithoutAlibi,
+            static_cast<int>(launch_params.attention_mask_type), launch_params.granular_tiling);
 
         const auto& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
         const CUfunction func = findIter->second.mDeviceFunction;
@@ -383,31 +391,39 @@ public:
     }
 
     inline uint64_t hashID(unsigned int s, unsigned int d, bool interleaved, bool unroll, bool force_fp32_acc,
-        bool flash_attention, bool warp_specialization, int attention_mask_type, bool tiled) const
+        bool flash_attention, bool warp_specialization, bool is_alibi_supported, int attention_mask_type,
+        bool tiled) const
     {
         s = flash_attention ? 0 : s;
         // D <= 2048
-        return (uint64_t) s << 32 | d << 16 | (attention_mask_type << 6) | (warp_specialization ? 16ull : 0ull)
-            | (tiled ? 16ull : 0ull) | (force_fp32_acc ? 8ull : 0ull) | (flash_attention ? 4ull : 0ull)
-            | (interleaved ? 2ull : 0ull) | (unroll ? 1ull : 0ull);
+        return (uint64_t) s << 32 | d << 16 | (attention_mask_type << 7) | (is_alibi_supported ? 64ull : 0ull)
+            | (warp_specialization ? 32ull : 0ull) | (tiled ? 16ull : 0ull) | (force_fp32_acc ? 8ull : 0ull)
+            | (flash_attention ? 4ull : 0ull) | (interleaved ? 2ull : 0ull) | (unroll ? 1ull : 0ull);
     }
 
     virtual uint64_t hashID(const KernelMeta& kernelMeta) const
     {
         return hashID(kernelMeta.mS, kernelMeta.mD, kernelMeta.mInterleaved, kernelMeta.mUnrollStep,
             kernelMeta.mFP32Accumulation, kernelMeta.mFlashAttention, kernelMeta.mWarpSpecialization,
-            kernelMeta.mAttentionMaskType, kernelMeta.mTiled);
+            kernelMeta.mAlibiSupported, kernelMeta.mAttentionMaskType, kernelMeta.mTiled);
     }
 
     virtual void run(
         Fused_multihead_attention_paged_kv_params_v2& params, Launch_params& launch_params, cudaStream_t stream) const
     {
 
-        const auto findIter = mFunctions.find(
-            hashID(launch_params.kernel_s, params.d, launch_params.interleaved, launch_params.force_unroll,
-                launch_params.force_fp32_acc, launch_params.flash_attention, launch_params.warp_specialization,
-                static_cast<int>(launch_params.attention_mask_type), launch_params.granular_tiling));
-        TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(), "FMHA kernels are not found");
+        const auto findIter = mFunctions.find(hashID(launch_params.kernel_s, params.d, launch_params.interleaved,
+            launch_params.force_unroll, launch_params.force_fp32_acc, launch_params.flash_attention,
+            launch_params.warp_specialization, !launch_params.useKernelWithoutAlibi,
+            static_cast<int>(launch_params.attention_mask_type), launch_params.granular_tiling));
+
+        // Add debug info when kernels are not found.
+        TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(),
+            "Paged KV FMHA kernels are not found (kernel meta info: %d %d %d %d %d %d %d %d %d %d) !",
+            launch_params.kernel_s, params.d, launch_params.interleaved, launch_params.force_unroll,
+            launch_params.force_fp32_acc, launch_params.flash_attention, launch_params.warp_specialization,
+            !launch_params.useKernelWithoutAlibi, static_cast<int>(launch_params.attention_mask_type),
+            launch_params.granular_tiling);
 
         const auto& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
         const CUfunction func = findIter->second.mDeviceFunction;

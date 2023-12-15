@@ -527,6 +527,9 @@ class Tensor(object):
         else:
             return id(None)
 
+    def __repr__(self):
+        return f"TensorRT-LLM Tensor: {self.name=} {self.dtype=} {self.shape=}"
+
 
 def _create_tensor(trt_tensor: trt.ITensor,
                    producer: trt.ILayer = None) -> Tensor:
@@ -4034,15 +4037,15 @@ def non_gated_version(activation):
 def lora_plugin(
     input: Tensor = None,
     in_hidden_size: int = 0,
-    out_hidden_size: int = 0,
+    out_hidden_sizes: List[int] = [0],
     host_request_types: Tensor = None,
     transa: bool = False,
     transb: bool = False,
     host_context_lengths: Tensor = None,  # for pad-free input mode
     max_context_length: int = 0,
     max_low_rank: int = 0,
-    lora_ranks: Tensor = None,
-    lora_weights_pointers: Tensor = None,
+    lora_ranks: List[Tensor] = None,
+    lora_weights_pointers: List[Tensor] = None,
 ):
     '''
     Parameters:
@@ -4089,12 +4092,14 @@ def lora_plugin(
     ).plugin_config.remove_input_padding
 
     trt.get_plugin_registry().plugin_creator_list
-    in_hidden_size = trt.PluginField("in_hidden_size",
-                                     np.array(in_hidden_size, dtype=np.int32),
-                                     trt.PluginFieldType.INT32)
-    out_hidden_size = trt.PluginField("out_hidden_size",
-                                      np.array(out_hidden_size, dtype=np.int32),
-                                      trt.PluginFieldType.INT32)
+    in_hidden_size_field = trt.PluginField(
+        "in_hidden_size", np.array(in_hidden_size, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+    out_hidden_size_field_list = [
+        trt.PluginField(f"out_hidden_size_{i}", np.array(o, dtype=np.int32),
+                        trt.PluginFieldType.INT32)
+        for i, o in enumerate(out_hidden_sizes)
+    ]
     transa = 1 if transa else 0
     transa = trt.PluginField("transa", np.array(transa, dtype=np.int32),
                              trt.PluginFieldType.INT32)
@@ -4114,24 +4119,36 @@ def lora_plugin(
         "remove_input_padding",
         np.array(np.int8(default_net().plugin_config.remove_input_padding),
                  dtype=np.int8), trt.PluginFieldType.INT8)
-    max_context_length_filed = trt.PluginField(
+    max_context_length_field = trt.PluginField(
         "max_context_length", np.array(max_context_length, dtype=np.int32),
         trt.PluginFieldType.INT32)
-    max_low_rank_filed = trt.PluginField("max_low_rank",
+    max_low_rank_field = trt.PluginField("max_low_rank",
                                          np.array(max_low_rank, dtype=np.int32),
                                          trt.PluginFieldType.INT32)
+    num_lora_modules = len(out_hidden_sizes)
+    num_lora_modules_field = trt.PluginField(
+        "num_lora_modules", np.array(num_lora_modules, dtype=np.int32),
+        trt.PluginFieldType.INT32)
 
     pfc = trt.PluginFieldCollection([
-        in_hidden_size, out_hidden_size, transa, transb, pf_type,
-        remove_input_padding, max_context_length_filed, max_low_rank_filed
-    ])
+        in_hidden_size_field, transa, transb, num_lora_modules_field, pf_type,
+        remove_input_padding, max_context_length_field, max_low_rank_field
+    ] + out_hidden_size_field_list)
     lora_plug = plg_creator.create_plugin("lora", pfc)
 
-    plug_inputs = [input, host_request_types, lora_ranks, lora_weights_pointers]
+    plug_inputs = [input, host_request_types
+                   ] + lora_ranks + lora_weights_pointers
+
     if default_net().plugin_config.remove_input_padding:
         plug_inputs += [host_context_lengths]
 
     plug_inputs = [i.trt_tensor for i in plug_inputs]
     layer = default_trtnet().add_plugin_v2(plug_inputs, lora_plug)
 
-    return _create_tensor(layer.get_output(0), layer)
+    if num_lora_modules == 1:
+        return _create_tensor(layer.get_output(0), layer)
+    else:
+        return [
+            _create_tensor(layer.get_output(i), layer)
+            for i in range(num_lora_modules)
+        ]

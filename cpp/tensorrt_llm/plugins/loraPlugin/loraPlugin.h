@@ -38,13 +38,13 @@ public:
 
     LoraPlugin() = delete;
 
-    LoraPlugin(int in_hidden_size, int out_hidden_size, int transA, int transB, int lora_module_number,
+    LoraPlugin(int in_hidden_size, std::vector<int> out_hidden_sizes, int transA, int transB, int num_lora_modules,
         nvinfer1::DataType type, const PluginProfilerPtr& profiler, bool remove_input_padding, int max_context_length,
         int max_low_rank);
 
     LoraPlugin(const void* data, size_t length, const PluginProfilerPtr& profiler);
 
-    ~LoraPlugin(); // override = default;
+    ~LoraPlugin() override = default;
 
     // IPluginV2DynamicExt Methods
     nvinfer1::IPluginV2DynamicExt* clone() const noexcept override;
@@ -97,13 +97,13 @@ private:
 
     IndexType getLoraWeightsPtrsIdx() const
     {
-        return 3;
+        return 2 + mNumLoraModules;
     }
 
     IndexType getHostContextLengthsIdx() const
     {
         TLLM_CHECK(mRemoveInputPadding);
-        return 4;
+        return 2 + mNumLoraModules + mNumLoraModules;
     }
 
     enum class RequestType : int32_t
@@ -116,13 +116,14 @@ private:
     const std::string mLayerName;
 
     int mInHiddenSize;
-    int mOutHiddenSize;
+    std::vector<int> mOutHiddenSizes;
     int mTransA;
     int mTransB;
     nvinfer1::DataType mType;
     bool mRemoveInputPadding;
     int mMaxContextLength;
     int mMaxLowRank;
+    int mNumLoraModules;
 
     // @fixme: seems this is shared across multiple clones.
     // If we deep copy the wrapper inside clone(), then we may avoid the mutex inside the wrapper?
@@ -132,9 +133,6 @@ private:
     GemmIdCublas mGemmId{};
 
     PluginProfilerPtr mPluginProfiler;
-
-    bool graphCreated = false;
-    cudaGraphExec_t instance;
 };
 
 class LoraPluginCreator : public BaseCreator

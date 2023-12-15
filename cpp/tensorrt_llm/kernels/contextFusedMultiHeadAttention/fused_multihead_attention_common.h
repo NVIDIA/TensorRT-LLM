@@ -301,9 +301,26 @@ struct Launch_params
     bool granular_tiling = false;
     // mask type: padding, causal, sliding_window_causal
     ContextAttentionMaskType attention_mask_type = ContextAttentionMaskType::PADDING;
+    // use specialized kernels without alibi support.
+    bool useKernelWithoutAlibi = false;
     // harward properties to determine how to launch blocks
     int multi_processor_count = 0;
     int device_l2_cache_size = 0;
+
+    void set_default_kernel_selection_params()
+    {
+        kernel_s = 0;
+        kernel_kv_s = 0;
+        force_unroll = false;
+        use_tma = false;
+        flash_attention = false;
+        warp_specialization = false;
+        granular_tiling = false;
+        attention_mask_type = (attention_mask_type == ContextAttentionMaskType::PADDING)
+            ? ContextAttentionMaskType::PADDING
+            : ContextAttentionMaskType::CAUSAL;
+        useKernelWithoutAlibi = false;
+    }
 };
 
 } // namespace kernels

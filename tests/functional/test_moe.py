@@ -27,7 +27,7 @@ from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 import tensorrt_llm
 from tensorrt_llm import Tensor
 from tensorrt_llm._utils import torch_to_numpy, trt_dtype_to_torch
-from tensorrt_llm.layers.moe import MOEExpertScaleNormalizationMode
+from tensorrt_llm.layers.moe import MoeConfig
 from tensorrt_llm.quantization import QuantMode
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -45,7 +45,7 @@ def make_tuple(num_experts=4,
                bias=True,
                dtype='float32',
                weight_dtype=None,
-               norm_mode=MOEExpertScaleNormalizationMode.NONE):
+               norm_mode=MoeConfig.ExpertScaleNormalizationMode.NONE):
     if weight_dtype is None:
         weight_dtype = dtype
     return (num_experts, topk, hidden_size, num_sequences, sequence_length,
@@ -56,12 +56,20 @@ def gen_uniform_weights(*args, **kwargs):
     return (torch.rand(*args, **kwargs) * 2 - 1).contiguous()
 
 
-def quant_dequant(weights, weight_dtype):
-    if weight_dtype != trt.int8:
+def quant_dequant(weights, quant_mode):
+    if not quant_mode.is_weight_only():
         return weights
     # use the test version `_symmetric_...` to get the non-interleaved weights
+    type = torch.quint4x2 if quant_mode.is_int4_weight_only() else torch.int8
     quant_weights, _, torch_weight_scales = torch.ops.fastertransformer._symmetric_quantize_last_axis_of_batched_matrix(
-        weights.T.cpu().contiguous(), trt_dtype_to_torch(weight_dtype))
+        weights.T.cpu().contiguous(), type)
+
+    # Unpack the int4s int int8s
+    if quant_mode.is_int4_weight_only():
+        upper = (quant_weights >> 4)
+        lower = (quant_weights << 4) >> 4  # Arithmetic right shift sign extends
+        quant_weights = torch.stack((lower, upper), dim=2).view(weights.T.shape)
+
     quant_weights = quant_weights.to(dtype=weights.dtype)
     result = torch.multiply(quant_weights,
                             torch_weight_scales.unsqueeze(0)).T.contiguous()
@@ -155,19 +163,20 @@ class TestFunctional(unittest.TestCase):
             ]
 
         # Add some cases for quantized dtype
-        params += [
-            make_tuple(dtype='float16', hidden_size=64, weight_dtype='int8'),
-            make_tuple(dtype='float16',
-                       hidden_size=64,
-                       num_experts=5,
-                       weight_dtype='int8'),
-        ]
-        if getSMVersion() >= 80:
+        for dtype in ('int8', 'int4'):
             params += [
-                make_tuple(dtype='bfloat16',
+                make_tuple(dtype='float16', hidden_size=64, weight_dtype=dtype),
+                make_tuple(dtype='float16',
                            hidden_size=64,
-                           weight_dtype='int8')
+                           num_experts=5,
+                           weight_dtype=dtype),
             ]
+            if getSMVersion() >= 80:
+                params += [
+                    make_tuple(dtype='bfloat16',
+                               hidden_size=64,
+                               weight_dtype=dtype)
+                ]
 
         # Test all activation functions with float16
         for actfn in ('relu', 'silu', 'gelu', 'swiglu', 'geglu', 'identity'):
@@ -189,6 +198,12 @@ class TestFunctional(unittest.TestCase):
             if getSMVersion() >= 80:
                 params += [make_tuple(actfn=actfn, dtype='bfloat16')]
 
+        # Test different k values for gated activations
+        params += [
+            make_tuple(actfn='geglu', topk=2, dtype='float16'),
+            make_tuple(actfn='geglu', topk=2, bias=False, dtype='float16')
+        ]
+
         # Test no bias
         params += [
             make_tuple(bias=False, dtype='float32'),
@@ -196,34 +211,48 @@ class TestFunctional(unittest.TestCase):
             make_tuple(dtype='float16',
                        hidden_size=64,
                        weight_dtype='int8',
+                       bias=False),
+            make_tuple(dtype='float16',
+                       hidden_size=64,
+                       weight_dtype='int4',
                        bias=False)
         ]
 
         # Test renormalization
         params += [
-            make_tuple(topk=2,
-                       dtype='float32',
-                       norm_mode=MOEExpertScaleNormalizationMode.RENORMALIZE),
-            make_tuple(topk=2,
-                       dtype='float16',
-                       norm_mode=MOEExpertScaleNormalizationMode.RENORMALIZE),
-            make_tuple(dtype='float16',
-                       topk=2,
-                       hidden_size=64,
-                       weight_dtype='int8',
-                       norm_mode=MOEExpertScaleNormalizationMode.RENORMALIZE),
+            make_tuple(
+                topk=2,
+                dtype='float32',
+                norm_mode=MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE),
+            make_tuple(
+                topk=2,
+                dtype='float16',
+                norm_mode=MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE),
+            make_tuple(
+                dtype='float16',
+                topk=2,
+                hidden_size=64,
+                weight_dtype='int8',
+                norm_mode=MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE),
+            make_tuple(
+                dtype='float16',
+                topk=2,
+                hidden_size=128,
+                weight_dtype='int4',
+                norm_mode=MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE),
             # Renorm affects the final accumulate, so sanity check with no bias too
-            make_tuple(norm_mode=MOEExpertScaleNormalizationMode.RENORMALIZE,
-                       topk=2,
-                       dtype='float16',
-                       bias=False),
+            make_tuple(
+                norm_mode=MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE,
+                topk=2,
+                dtype='float16',
+                bias=False),
         ]
         if getSMVersion() >= 80:
             params += [
-                make_tuple(
-                    dtype='bfloat16',
-                    topk=2,
-                    norm_mode=MOEExpertScaleNormalizationMode.RENORMALIZE)
+                make_tuple(dtype='bfloat16',
+                           topk=2,
+                           norm_mode=MoeConfig.ExpertScaleNormalizationMode.
+                           RENORMALIZE)
             ]
 
         return params
@@ -266,7 +295,14 @@ class TestFunctional(unittest.TestCase):
                                 dtype_str, weight_dtype_str, norm_mode):
         """ This test compares the MOE plugin result to a simple reference implementation using torch """
         dtype = tensorrt_llm.str_dtype_to_trt(dtype_str)
-        weight_dtype = tensorrt_llm.str_dtype_to_trt(weight_dtype_str)
+        use_int4_weights = weight_dtype_str == 'int4'
+        weight_dtype = trt.int8 if use_int4_weights else tensorrt_llm.str_dtype_to_trt(
+            weight_dtype_str)
+
+        quant_mode = QuantMode(0)
+        if weight_dtype != dtype:
+            quant_mode = QuantMode.use_weight_only(
+                use_int4_weights=use_int4_weights)
 
         ffn_hidden_size = 4 * hidden_size
         self.create_weights(num_experts,
@@ -291,16 +327,18 @@ class TestFunctional(unittest.TestCase):
                                bias,
                                dtype,
                                weight_dtype=weight_dtype,
+                               quant_mode=quant_mode,
                                norm_mode=norm_mode)['output'].float()
 
         ref = self.referenceImpl(input_data, top_k, actfn, weight_dtype,
-                                 norm_mode).cpu().float()
+                                 quant_mode, norm_mode).cpu().float()
 
         tolerances = {
             'float32': 1e-2,
             'float16': 5e-2,
             'bfloat16': 5e-2,
             'int8': 2e-1,
+            'int4': 2e-1,
         }
         # NOTE: There is a known issue where similar routing values result in selecting a different expert to the reference
         #   This shouldn't cause issues in production, but will cause large deviations in the test results
@@ -314,7 +352,7 @@ class TestFunctional(unittest.TestCase):
         params = []
         for actfn in ('gelu', 'geglu'):
             params += [('float32', actfn), ('float16', actfn),
-                       ('bfloat16', actfn), ('int8', actfn)]
+                       ('bfloat16', actfn), ('int8', actfn), ('int4', actfn)]
         return params
 
     @parameterized.expand(get_mlp_params(), name_func=custom_name_func)
@@ -322,13 +360,19 @@ class TestFunctional(unittest.TestCase):
         """ This test uses one expert and compares the result to a plain MLP """
         if getSMVersion() < 80 and dtype_str == 'bfloat16':
             pytest.skip("Skip bf16 tests on arch < sm80")
-        dtype = tensorrt_llm.str_dtype_to_trt(dtype_str)
-        weight_dtype = dtype
 
+        use_int4_weights = dtype_str == 'int4'
+        weight_dtype = trt.int8 if use_int4_weights else tensorrt_llm.str_dtype_to_trt(
+            dtype_str)
+
+        dtype = weight_dtype
+        quant_mode = QuantMode(0)
         hidden_size = 8
-        if dtype_str == 'int8':
+        if dtype_str == 'int8' or dtype_str == 'int4':
             dtype = tensorrt_llm.str_dtype_to_trt("float16")
             hidden_size = 64
+            quant_mode = QuantMode.use_weight_only(
+                use_int4_weights=use_int4_weights)
 
         num_sequences = 5
         sequence_lengths = 4
@@ -355,9 +399,10 @@ class TestFunctional(unittest.TestCase):
                            ffn_hidden_size=ffn_hidden_size,
                            hidden_act=gated2act(actfn),
                            bias=bias,
+                           quant_mode=quant_mode,
                            dtype=dtype)
             # Quantize the weights manually so the results are comparable
-            fc1_qd = quant_dequant(self.fc1_weights[0].cpu(), weight_dtype)
+            fc1_qd = quant_dequant(self.fc1_weights[0].cpu(), quant_mode)
             if is_gated_activation(actfn):
                 # Note that the MLP uses the opposite convention to the GLU paper for naming,
                 #  the gate is the matrix the activations are NOT applied to
@@ -366,7 +411,7 @@ class TestFunctional(unittest.TestCase):
                     torch_to_numpy(gate))
 
             mlp.fc.weight.value = np.ascontiguousarray(torch_to_numpy(fc1_qd))
-            fc2_qd = quant_dequant(self.fc2_weights[0].cpu(), weight_dtype)
+            fc2_qd = quant_dequant(self.fc2_weights[0].cpu(), quant_mode)
             mlp.proj.weight.value = np.ascontiguousarray(torch_to_numpy(fc2_qd))
             if bias:
                 fc1_bias = self.fc1_bias[0].cpu()
@@ -395,6 +440,7 @@ class TestFunctional(unittest.TestCase):
                            bias,
                            dtype,
                            weight_dtype=weight_dtype,
+                           quant_mode=quant_mode,
                            custom_network=MLP)
 
         tolerances = {
@@ -403,25 +449,28 @@ class TestFunctional(unittest.TestCase):
             if getSMVersion() >= 75 else 1e-1,  # Some issues for geglu on volta
             'bfloat16': 1e-1,
             'int8': 2e-1,
+            'int4': 2e-1,
         }
         np.testing.assert_allclose(res['output'].float(),
                                    res['mlp_output'].float(),
                                    rtol=tolerances[dtype_str],
                                    atol=tolerances[dtype_str])
 
-    def set_weight_layer(self, input_weights, weight, scale,
-                         weight_dtype: trt.DataType):
-        torch_transpose = torch.transpose(input_weights, 1,
-                                          2).contiguous().cpu()
-        if weight_dtype == trt.int8:
+    def set_weight_layer(self, input_weights, weight, scale, quant_mode):
+        if quant_mode.is_weight_only():
+            torch_transpose = torch.transpose(input_weights, 1,
+                                              2).contiguous().cpu()
+            type = torch.quint4x2 if quant_mode.is_int4_weight_only(
+            ) else torch.int8
             processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
-                torch_transpose, trt_dtype_to_torch(weight_dtype))
+                torch_transpose, type)
+            # Change the shape to what moe expects without touching the underlying format
             weight.value = np.ascontiguousarray(
                 torch_to_numpy(processed_torch_weights))
             scale.value = np.ascontiguousarray(
                 torch_to_numpy(torch_weight_scales))
         else:
-            weight.value = np.ascontiguousarray(torch_to_numpy(torch_transpose))
+            weight.value = np.ascontiguousarray(torch_to_numpy(input_weights))
 
     def trtImpl(self,
                 input_data,
@@ -433,7 +482,8 @@ class TestFunctional(unittest.TestCase):
                 bias,
                 dtype: trt.DataType,
                 weight_dtype: trt.DataType = None,
-                norm_mode=MOEExpertScaleNormalizationMode.NONE,
+                quant_mode=QuantMode(0),
+                norm_mode=MoeConfig.ExpertScaleNormalizationMode.NONE,
                 finished=None,
                 custom_network=None):
         builder = tensorrt_llm.Builder()
@@ -448,23 +498,21 @@ class TestFunctional(unittest.TestCase):
                                   dtype=tensorrt_llm.str_dtype_to_trt(
                                       'bool')) if finished is not None else None
 
-            quant_mode = QuantMode(0)
-            if weight_dtype == trt.int8:
-                quant_mode = QuantMode.use_weight_only(use_int4_weights=False)
-            moe = tensorrt_llm.layers.MOE(num_experts=num_experts,
+            moe = tensorrt_llm.layers.MOE(moe_config=MoeConfig(
+                num_experts=num_experts,
+                top_k=top_k,
+                normalization_mode=norm_mode),
                                           hidden_size=hidden_size,
                                           ffn_hidden_size=ffn_hidden_size,
                                           hidden_act=actfn,
-                                          top_k=top_k,
                                           bias=bias,
                                           dtype=dtype,
-                                          quant_mode=quant_mode,
-                                          normalization_mode=norm_mode)
+                                          quant_mode=quant_mode)
             moe.router.weight.value = torch_to_numpy(self.router_weights.cpu())
             self.set_weight_layer(self.fc1_weights, moe.experts_weight_1,
-                                  moe.experts_scale_1, weight_dtype)
+                                  moe.experts_scale_1, quant_mode)
             self.set_weight_layer(self.fc2_weights, moe.experts_weight_2,
-                                  moe.experts_scale_2, weight_dtype)
+                                  moe.experts_scale_2, quant_mode)
             if bias:
                 moe.experts_bias_1.value = torch_to_numpy(self.fc1_bias.cpu())
                 moe.experts_bias_2.value = torch_to_numpy(self.fc2_bias.cpu())
@@ -495,7 +543,8 @@ class TestFunctional(unittest.TestCase):
             outputs = runner.infer(feed_dict=feed_dict)
         return outputs
 
-    def referenceImpl(self, inputs, k, actfn, weight_dtype, norm_mode):
+    def referenceImpl(self, inputs, k, actfn, weight_dtype, quant_mode,
+                      norm_mode):
         # Always run the ref implementation at full precision TODO is this a good choice?
         inputs = inputs.cuda().float()
         inputs_merged = inputs.view(-1, inputs.shape[-1])
@@ -509,11 +558,11 @@ class TestFunctional(unittest.TestCase):
         assert topk.indices.shape == (router_probs.shape[0], k)
         results = torch.zeros_like(inputs_merged)
         for i, (scales, experts) in enumerate(zip(topk.values, topk.indices)):
-            if norm_mode == MOEExpertScaleNormalizationMode.RENORMALIZE:
+            if norm_mode == MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE:
                 scales /= sum(scales)
             input = inputs_merged[i, :]
             for scale, expert in zip(scales, experts):
-                fc1_qd = quant_dequant(self.fc1_weights[expert], weight_dtype)
+                fc1_qd = quant_dequant(self.fc1_weights[expert], quant_mode)
                 if is_gated_activation(actfn):
                     fc1 = gated_matmul(input, fc1_qd.float(),
                                        self.fc1_bias[expert].float(), actfn)
@@ -522,7 +571,7 @@ class TestFunctional(unittest.TestCase):
                         input,
                         fc1_qd.T.float()) + self.fc1_bias[expert].float()
                     fc1 = doact(fc1, actfn)
-                fc2_qd = quant_dequant(self.fc2_weights[expert], weight_dtype)
+                fc2_qd = quant_dequant(self.fc2_weights[expert], quant_mode)
                 final = torch.matmul(
                     fc1, fc2_qd.T.float()) + self.fc2_bias[expert].float()
                 assert final.shape == (inputs.shape[-1], )

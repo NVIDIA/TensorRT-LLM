@@ -90,7 +90,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
               skip_gptj=False,
               skip_llama=False,
               skip_chatglm=False,
-              only_fp8=False,
+              run_fp8=False,
               only_multi_gpu=False,
               trt_root: _tp.Optional[str] = None,
               build_only=False) -> None:
@@ -120,7 +120,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                                 skip_gptj=skip_gptj,
                                 skip_llama=skip_llama,
                                 skip_chatglm=skip_chatglm,
-                                only_fp8=only_fp8)
+                                run_fp8=run_fp8)
 
         if build_only:
             return
@@ -130,7 +130,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                          skip_gptj=skip_gptj,
                          skip_llama=skip_llama,
                          skip_chatglm=skip_chatglm,
-                         only_fp8=only_fp8)
+                         run_fp8=run_fp8)
 
         if not skip_gpt:
             run_benchmarks(python_exe=python_exe,
@@ -160,9 +160,9 @@ def prepare_all_model_tests(python_exe: str,
                             skip_gptj=False,
                             skip_llama=False,
                             skip_chatglm=False,
-                            only_fp8=False):
+                            run_fp8=False):
     model_cache_arg = ["--model_cache", model_cache] if model_cache else []
-    only_fp8_arg = ["--only_fp8"] if only_fp8 else []
+    only_fp8_arg = ["--only_fp8"]
 
     if not skip_gpt:
         prepare_model_tests(model_name="gpt",
@@ -178,8 +178,14 @@ def prepare_all_model_tests(python_exe: str,
                             python_exe=python_exe,
                             root_dir=root_dir,
                             resources_dir=resources_dir,
-                            model_cache_arg=model_cache_arg,
-                            only_fp8_arg=only_fp8_arg)
+                            model_cache_arg=model_cache_arg)
+        if run_fp8:
+            prepare_model_tests(model_name="gptj",
+                                python_exe=python_exe,
+                                root_dir=root_dir,
+                                resources_dir=resources_dir,
+                                model_cache_arg=model_cache_arg,
+                                only_fp8_arg=only_fp8_arg)
     else:
         _log.info("Skipping GPT-J tests")
 
@@ -248,7 +254,7 @@ def prepare_model_tests(model_name: str,
 
 
 def run_google_tests(build_dir: _pl.Path, skip_gpt, skip_gptj, skip_llama,
-                     skip_chatglm, only_fp8):
+                     skip_chatglm, run_fp8):
     make_google_tests = [
         "cmake", "--build", ".", "--config", "Release", "-j", "--target",
         "google-tests"
@@ -268,9 +274,7 @@ def run_google_tests(build_dir: _pl.Path, skip_gpt, skip_gptj, skip_llama,
         excluded_tests.append(".*Llama.*")
     if skip_chatglm:
         excluded_tests.append(".*ChatGlm.*")
-    if only_fp8:
-        ctest.extend(["-R", ".*FP8.*"])
-    else:
+    if not run_fp8:
         excluded_tests.append(".*FP8.*")
     if excluded_tests:
         ctest.extend(["-E", "|".join(excluded_tests)])
@@ -391,9 +395,9 @@ if __name__ == "__main__":
                         action="store_true",
                         help="Skip the tests for ChatGLM")
     parser.add_argument(
-        "--only_fp8",
+        "--run_fp8",
         action="store_true",
-        help="Run only FP8 tests. Implemented for H100 runners.")
+        help="Additionally run FP8 tests. Implemented for H100 runners.")
     parser.add_argument(
         "--only_multi_gpu",
         action="store_true",

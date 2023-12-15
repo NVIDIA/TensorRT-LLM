@@ -82,6 +82,11 @@ def parse_arguments(args=None):
     parser.add_argument('--tokenizer_dir',
                         help="HF tokenizer config path",
                         default='gpt2')
+    parser.add_argument(
+        '--tokenizer_type',
+        help=
+        'Specify that argument when providing a .model file as the tokenizer_dir. '
+        'It allows AutoTokenizer to instantiate the correct tokenizer type.')
     parser.add_argument('--vocab_file',
                         help="Used for sentencepiece tokenizers")
     parser.add_argument('--num_beams',
@@ -124,6 +129,11 @@ def parse_arguments(args=None):
         default=None,
         nargs="+",
         help="The list of LoRA task uids; use -1 to disable the LoRA module")
+    parser.add_argument('--lora_ckpt_source',
+                        type=str,
+                        default="hf",
+                        choices=["hf", "nemo"],
+                        help="The source of lora checkpoint.")
 
     parser.add_argument(
         '--num_prepend_vtokens',
@@ -271,6 +281,7 @@ def main(args):
         tokenizer_dir=args.tokenizer_dir,
         vocab_file=args.vocab_file,
         model_name=model_name,
+        tokenizer_type=args.tokenizer_type,
     )
 
     # # An example to stop generation when the model generate " London" on first sentence, " eventually became" on second sentence
@@ -307,7 +318,8 @@ def main(args):
     runner_kwargs = dict(engine_dir=args.engine_dir,
                          lora_dir=args.lora_dir,
                          rank=runtime_rank,
-                         debug_mode=args.debug_mode)
+                         debug_mode=args.debug_mode,
+                         lora_ckpt_source=args.lora_ckpt_source)
     if not args.use_py_session:
         runner_kwargs.update(
             max_batch_size=len(batch_input_ids),

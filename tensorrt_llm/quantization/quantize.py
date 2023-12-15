@@ -85,6 +85,7 @@ def smooth_quantize(model, quant_mode):
             position_embedding_type=layer.attention.position_embedding_type,
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
+            tp_rank=config.mapping.tp_rank,
             quant_mode=quant_mode,
             bias=layer.attention.bias)
 
@@ -96,12 +97,12 @@ def smooth_quantize(model, quant_mode):
         elif isinstance(layer.mlp, MLP):
             mlp_norm_cls = SmoothQuantMLP
 
-        layer.mlp = mlp_norm_cls(hidden_size=layer.mlp.hidden_size,
-                                 ffn_hidden_size=layer.mlp.ffn_hidden_size,
-                                 hidden_act=layer.mlp.hidden_act,
-                                 dtype=layer.mlp.dtype,
-                                 tp_group=layer.mlp.tp_group,
-                                 tp_size=layer.mlp.tp_size,
+        layer.mlp = mlp_norm_cls(hidden_size=config.hidden_size,
+                                 ffn_hidden_size=config.intermediate_size,
+                                 hidden_act=config.hidden_act,
+                                 dtype=config.dtype,
+                                 tp_group=config.mapping.tp_group,
+                                 tp_size=config.mapping.tp_size,
                                  quant_mode=quant_mode,
                                  bias=layer.mlp.bias)
         assert hasattr(
@@ -141,7 +142,7 @@ def quantize_kv_cache(model, quant_mode):
 def quantize(model, quant_mode):
     quantize_kv_cache(model, quant_mode)
 
-    if quant_mode.is_weight_only():
-        weight_only_quantize(model, quant_mode)
-    elif quant_mode.has_act_and_weight_quant():
+    if quant_mode.has_act_and_weight_quant():
         smooth_quantize(model, quant_mode)
+    elif quant_mode.is_weight_only():
+        weight_only_quantize(model, quant_mode)

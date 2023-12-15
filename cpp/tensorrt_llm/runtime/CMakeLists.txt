@@ -55,7 +55,7 @@ add_library(runtime_src OBJECT ${SRCS})
 set_property(TARGET runtime_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
-target_include_directories(runtime_src PRIVATE ${MPI_INCLUDE_PATH})
+target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
 
 if(ENABLE_MULTI_DEVICE EQUAL 1)
   target_link_libraries(runtime_src PUBLIC ${NCCL_LIB})

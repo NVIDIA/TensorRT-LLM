@@ -73,14 +73,20 @@ def throttle_generator(generator, stream_interval):
 
 def load_tokenizer(tokenizer_dir: Optional[str] = None,
                    vocab_file: Optional[str] = None,
-                   model_name: str = 'gpt'):
+                   model_name: str = 'gpt',
+                   tokenizer_type: Optional[str] = None):
     if vocab_file is None:
+        use_fast = True
+        if tokenizer_type is not None and tokenizer_type == "llama":
+            use_fast = False
         # Should set both padding_side and truncation_side to be 'left'
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir,
                                                   legacy=False,
                                                   padding_side='left',
                                                   truncation_side='left',
-                                                  trust_remote_code=True)
+                                                  trust_remote_code=True,
+                                                  tokenizer_type=tokenizer_type,
+                                                  use_fast=use_fast)
     else:
         # For gpt-next, directly load from tokenizer.model
         assert model_name == 'gpt'

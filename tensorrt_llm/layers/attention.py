@@ -32,7 +32,7 @@ from ..quantization import QuantMode
 from ..quantization.functional import dequantize, quantize
 from ..quantization.layers import FP8Linear, FP8RowLinear
 from .linear import ColumnLinear, RowLinear
-from .lora import Lora
+from .lora import Lora, LoraRuntimeParams
 
 
 class RopeEmbeddingUtils:
@@ -481,29 +481,16 @@ class Attention(Module):
                                                    tp_size, num_buckets),
                                             dtype=dtype)
 
-        self.q_lora = Lora(
+        self.qkv_lora = Lora(
             in_hidden_size=hidden_size,
-            out_hidden_size=self.num_attention_heads * self.attention_head_size,
+            out_hidden_sizes=[
+                self.num_attention_heads * self.attention_head_size,
+                self.num_attention_kv_heads * self.attention_head_size,
+                self.num_attention_kv_heads * self.attention_head_size
+            ],
             max_low_rank=min(
                 hidden_size,
-                self.num_attention_heads * self.attention_head_size),
-        )
-
-        self.k_lora = Lora(
-            in_hidden_size=hidden_size,
-            out_hidden_size=self.num_attention_kv_heads *
-            self.attention_head_size,
-            max_low_rank=min(
-                hidden_size,
-                self.num_attention_kv_heads * self.attention_head_size),
-        )
-
-        self.v_lora = Lora(
-            in_hidden_size=hidden_size,
-            out_hidden_size=self.num_attention_kv_heads *
-            self.attention_head_size,
-            max_low_rank=min(
-                hidden_size,
+                self.num_attention_heads * self.attention_head_size,
                 self.num_attention_kv_heads * self.attention_head_size),
         )
 
@@ -517,7 +504,7 @@ class Attention(Module):
                 workspace=None,
                 position_embedding=None,
                 norm_before_bmm1=False,
-                lora_param=None):
+                lora_layer_params=None):
 
         assert isinstance(hidden_states, Tensor)
 
@@ -534,26 +521,39 @@ class Attention(Module):
                                                  tp_rank=self.tp_rank,
                                                  alibi_scale=alibi_scale)
 
-        qkv_lora_param = None
-        if lora_param is not None:
-            qkv_lora_param = lora_param.get_runtime_params(0, "attn_qkv")
-        qkv = self.qkv(hidden_states, qkv_lora_param)
+        qkv_lora_params = None
+        if lora_layer_params is not None:
+            qkv_lora_params = lora_layer_params.get_runtime_params(
+                0, "attn_qkv")
 
-        if default_net().plugin_config.lora_plugin and lora_param is not None:
-            q_lora_param = lora_param.get_runtime_params(0, "attn_q")
-            k_lora_param = lora_param.get_runtime_params(0, "attn_k")
-            v_lora_param = lora_param.get_runtime_params(0, "attn_v")
+        qkv = self.qkv(hidden_states, qkv_lora_params)
 
-            assert (q_lora_param is not None and k_lora_param is not None and v_lora_param is not None) or \
-                (q_lora_param is None and k_lora_param is None and v_lora_param is None), "q_lora_param, k_lora_param and v_lora_param should be all enabled or all disabled at the same time."
-            if q_lora_param is not None and k_lora_param is not None and v_lora_param is not None:
-                assert qkv_lora_param is None, "Cannot enable qkv_lora_param and split q_lora_parm, k_lora_param, v_lora_param at the same time."
-                q_lora = self.q_lora(hidden_states,
-                                     lora_runtime_param=q_lora_param)
-                k_lora = self.k_lora(hidden_states,
-                                     lora_runtime_param=k_lora_param)
-                v_lora = self.v_lora(hidden_states,
-                                     lora_runtime_param=v_lora_param)
+        if default_net(
+        ).plugin_config.lora_plugin and qkv_lora_params is None and lora_layer_params is not None:
+            q_lora_params = lora_layer_params.get_runtime_params(0, "attn_q")
+            k_lora_params = lora_layer_params.get_runtime_params(0, "attn_k")
+            v_lora_params = lora_layer_params.get_runtime_params(0, "attn_v")
+
+            assert (q_lora_params is not None and k_lora_params is not None and v_lora_params is not None) or \
+                (q_lora_params is None and k_lora_params is None and v_lora_params is None), "q_lora_params, k_lora_params and v_lora_params should be all enabled or all disabled at the same time."
+
+            if q_lora_params is not None and k_lora_params is not None and v_lora_params is not None:
+                qkv_lora_params = LoraRuntimeParams(
+                    lora_ranks=[
+                        q_lora_params.lora_ranks[0],
+                        k_lora_params.lora_ranks[0], v_lora_params.lora_ranks[0]
+                    ],
+                    lora_weights_pointers=[
+                        q_lora_params.lora_weights_pointers[0],
+                        k_lora_params.lora_weights_pointers[0],
+                        v_lora_params.lora_weights_pointers[0]
+                    ],
+                    host_request_types=q_lora_params.host_request_types,
+                    host_context_lengths=q_lora_params.host_context_lengths,
+                    max_context_length=q_lora_params.max_context_length)
+
+                q_lora, k_lora, v_lora = self.qkv_lora(hidden_states,
+                                                       qkv_lora_params)
                 qkv_lora = concat([q_lora, k_lora, v_lora], dim=2)
                 qkv = qkv + qkv_lora
 
@@ -916,12 +916,13 @@ class Attention(Module):
                 concat([shape(context, 0),
                         shape(context, 1), self.hidden_size]))
 
-        dense_lora_param = None
-        if lora_param is not None:
-            dense_lora_param = lora_param.get_runtime_params(0, "attn_dense")
+        dense_lora_params = None
+        if lora_layer_params is not None:
+            dense_lora_params = lora_layer_params.get_runtime_params(
+                0, "attn_dense")
         context = self.dense(context,
                              workspace,
-                             lora_runtime_param=dense_lora_param)
+                             lora_runtime_params=dense_lora_params)
 
         if use_cache:
             return (context, past_key_value)

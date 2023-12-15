@@ -89,8 +89,9 @@ class Builder():
 
     def create_network(self) -> Network:
         explicit_batch_flag = 0
-        if version.parse(trt_version()).major <= 9:
-            # Explicit batch flag is deprecated, only use for TRT major version <= 9
+        if "EXPLICIT_BATCH" in trt.NetworkDefinitionCreationFlag.__members__.keys(
+        ):
+            # Explicit batch flag will be deprecated in TRT 10
             explicit_batch_flag = 1 << int(
                 trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
 
@@ -360,13 +361,15 @@ class BuildConfig:
 
     def __init__(self, max_input_len, max_output_len, max_batch_size,
                  max_beam_width, max_num_tokens,
-                 max_prompt_embedding_table_size, plugin_config):
+                 max_prompt_embedding_table_size, gather_all_token_logits,
+                 plugin_config):
         self.max_input_len = max_input_len
         self.max_output_len = max_output_len
         self.max_batch_size = max_batch_size
         self.max_beam_width = max_beam_width
         self.max_num_tokens = max_num_tokens
         self.max_prompt_embedding_table_size = max_prompt_embedding_table_size
+        self.gather_all_token_logits = gather_all_token_logits
         self.plugin_config = plugin_config
 
     @classmethod
@@ -378,6 +381,7 @@ class BuildConfig:
         max_num_tokens = config.pop('max_num_tokens')
         max_prompt_embedding_table_size = config.pop(
             'max_prompt_embedding_table_size', 0)
+        gather_all_token_logits = config.pop('gather_all_token_logits', False)
 
         plugin_config = PluginConfig()
         if 'plugin_config' not in config:
@@ -388,6 +392,7 @@ class BuildConfig:
                 max_beam_width=max_beam_width,
                 max_num_tokens=max_num_tokens,
                 max_prompt_embedding_table_size=max_prompt_embedding_table_size,
+                gather_all_token_logits=gather_all_token_logits,
                 plugin_config=plugin_config)
 
         config = config['plugin_config']
@@ -422,6 +427,9 @@ class BuildConfig:
         if paged_kv_cache:
             plugin_config.enable_paged_kv_cache(tokens_per_block)
 
+        use_custom_all_reduce = config.pop('use_custom_all_reduce', False)
+        plugin_config.use_custom_all_reduce = use_custom_all_reduce
+
         return cls(
             max_input_len=max_input_len,
             max_output_len=max_output_len,
@@ -429,6 +437,7 @@ class BuildConfig:
             max_beam_width=max_beam_width,
             max_num_tokens=max_num_tokens,
             max_prompt_embedding_table_size=max_prompt_embedding_table_size,
+            gather_all_token_logits=gather_all_token_logits,
             plugin_config=plugin_config)
 
     @classmethod
@@ -540,11 +549,13 @@ def build_shard_model(model: PretrainedModel,
     if use_smooth_quant:
         network.plugin_config.set_smooth_quant_gemm_plugin(dtype='float16')
         network.plugin_config.set_rmsnorm_quantization_plugin(dtype='float16')
+        network.plugin_config.set_layernorm_quantization_plugin(dtype='float16')
         network.plugin_config.set_quantize_tensor_plugin()
         network.plugin_config.set_quantize_per_token_plugin()
     nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else False
     if nccl_plugin:
-        network.plugin_config.set_nccl_plugin(nccl_plugin)
+        network.plugin_config.set_nccl_plugin(
+            nccl_plugin, network.plugin_config.use_custom_all_reduce)
 
     with net_guard(network):
         # Prepare
@@ -556,7 +567,7 @@ def build_shard_model(model: PretrainedModel,
             build_config.max_output_len, True, build_config.max_beam_width,
             build_config.max_num_tokens,
             build_config.max_prompt_embedding_table_size)
-        model(*inputs)
+        model(**inputs)
 
     optimize(network)
 
@@ -571,21 +582,21 @@ def build_shard_model(model: PretrainedModel,
     return Engine(engine_config, engine)
 
 
-def build(ckpt_dir_or_model_config: Union[str, PretrainedConfig],
-          build_config: Union[str, BuildConfig],
+def build(build_config: Union[str, BuildConfig],
           rank: int = 0,
+          ckpt_dir: str = None,
+          model_config: Union[str, PretrainedConfig] = None,
+          weights=None,
           model_cls=None) -> Engine:
-    is_ckpt_dir = False
-    if isinstance(ckpt_dir_or_model_config, PretrainedConfig):
-        model_config = ckpt_dir_or_model_config
+    if ckpt_dir is not None:
+        model_config = PretrainedConfig.from_json_file(
+            os.path.join(ckpt_dir, 'config.json'))
     else:
-        if ckpt_dir_or_model_config.lower().endswith('.json'):
-            model_config = PretrainedConfig.from_json_file(
-                ckpt_dir_or_model_config)
+        assert model_config is not None
+        if isinstance(model_config, PretrainedConfig):
+            model_config = model_config
         else:
-            model_config = PretrainedConfig.from_json_file(
-                os.path.join(ckpt_dir_or_model_config, 'config.json'))
-            is_ckpt_dir = True
+            model_config = PretrainedConfig.from_json_file(model_config)
 
     if isinstance(build_config, str):
         build_config = BuildConfig.from_json_file(build_config)
@@ -599,11 +610,12 @@ def build(ckpt_dir_or_model_config: Union[str, PretrainedConfig],
                 f'Unsupported model architecture: {architecture}')
         model_cls = MODEL_MAP[architecture]
 
-    if not is_ckpt_dir:
+    if ckpt_dir is not None:
+        model = model_cls.from_checkpoint(ckpt_dir, rank=rank)
+    else:
         rank_config = copy.deepcopy(model_config)
         rank_config.set_rank(rank)
         model = model_cls.from_config(rank_config)
-    else:
-        model = model_cls.from_checkpoint(ckpt_dir_or_model_config, rank=rank)
-
+        if weights is not None:
+            model.load(weights)
     return build_shard_model(model, build_config)

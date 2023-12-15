@@ -122,6 +122,9 @@ GptJsonConfig parseJson(InputType&& i)
         auto const useGptAttentionPlugin = !gptAttentionPlugin.is_boolean() || gptAttentionPlugin.template get<bool>();
         auto const removeInputPadding = pluginConfig.at("remove_input_padding").template get<bool>();
         auto const useCustomAllReduce = pluginConfig.at("use_custom_all_reduce").template get<bool>();
+        auto const useContextFMHAForGeneration
+            = pluginConfig.at("use_context_fmha_for_generation").template get<bool>();
+        auto const pagedContextFMHA = pluginConfig.at("use_paged_context_fmha").template get<bool>();
 
         auto modelConfig = GptModelConfig{vocabSize, numLayers, numHeads, hiddenSize, dataType};
         modelConfig.useGptAttentionPlugin(useGptAttentionPlugin);
@@ -133,6 +136,8 @@ GptJsonConfig parseJson(InputType&& i)
         modelConfig.setNbKvHeads(numKvHeads);
         modelConfig.computeContextLogits(computeContextLogits);
         modelConfig.computeGenerationLogits(computeGenerationLogits);
+        modelConfig.setUseContextFMHAForGeneration(useContextFMHAForGeneration);
+        modelConfig.setPagedContextFMHA(pagedContextFMHA);
 
         modelConfig.setMaxBatchSize(maxBatchSize);
         modelConfig.setMaxBeamWidth(maxBeamWidth);
@@ -229,6 +234,8 @@ GptJsonConfig parseJson(InputType&& i)
         auto const useGptAttentionPlugin = !gptAttentionPlugin.is_boolean() || gptAttentionPlugin.template get<bool>();
         auto const removeInputPadding = pluginConfig.at("remove_input_padding").template get<bool>();
         auto const useCustomAllReduce = pluginConfig.at("use_custom_all_reduce").template get<bool>();
+        auto const useContextFMHAForGeneration
+            = pluginConfig.at("use_context_fmha_for_generation").template get<bool>();
 
         auto modelConfig = GptModelConfig{vocabSize, numHiddenLayers, numAttentionHeads, hiddenSize, dataType};
         modelConfig.useGptAttentionPlugin(useGptAttentionPlugin);
@@ -240,6 +247,7 @@ GptJsonConfig parseJson(InputType&& i)
         modelConfig.setNbKvHeads(numKeyValueHeads);
         modelConfig.computeContextLogits(computeContextLogits);
         modelConfig.computeGenerationLogits(computeGenerationLogits);
+        modelConfig.setUseContextFMHAForGeneration(useContextFMHAForGeneration);
 
         modelConfig.setMaxBatchSize(maxBatchSize);
         modelConfig.setMaxBeamWidth(maxBeamWidth);

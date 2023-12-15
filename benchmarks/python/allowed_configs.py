@@ -12,14 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Literal, Optional
+from dataclasses import asdict, dataclass
+from typing import Optional
 
-from pydantic import BaseModel, Extra
+try:
+    from typing import Literal
+except ImportError:
+    from typing_extensions import Literal
 
-from tensorrt_llm.functional import PositionEmbeddingType
 
-
-class BuildConfig(BaseModel, extra=Extra.allow):
+@dataclass
+class BuildConfig:
     num_layers: int
     num_heads: int
     hidden_size: int
@@ -41,20 +44,33 @@ class BuildConfig(BaseModel, extra=Extra.allow):
     enable_qk_half_accum: bool = False
     enable_context_fmha: bool = True
     enable_multi_block_mode: bool = False
+    # The enum name of PositionEmbeddingType
     # None means using the model family's default value defined in the ctor
-    position_embedding_type: Optional[PositionEmbeddingType] = None
+    position_embedding_type: str = None
     # Only when position embedding is RoPE, this value makes sense, make
-    # default value to be None, not 0 or 1 to prevent misuse
+    # default value to be None, not the others to prevent misuse
     rotary_pct: Optional[float] = None
     bias: bool = True
     quantization: Optional[str] = None
     # use_custom_all_reduce gives better performance with NVLink
     use_custom_all_reduce: bool = True
-    moe_num_experts: int = None
-    moe_top_k: int = None
+    moe_num_experts: int = 0
+    moe_top_k: int = 0
+    use_alibi: bool = None
+    remove_input_padding: bool = None
+    parallel_attention: bool = None
+    new_decoder_architecture: bool = None
 
 
-class EncDecBuildConfig(BuildConfig, extra=Extra.allow):
+@dataclass
+class EncDecBuildConfig:
+    num_layers: int
+    num_heads: int
+    hidden_size: int
+    vocab_size: int
+    hidden_act: Optional[str]
+    n_positions: int
+    max_batch_size: int
     num_decoder_layers: Optional[int] = None
     head_size: Optional[int] = None
     ffn_hidden_size: Optional[int] = None
@@ -62,6 +78,8 @@ class EncDecBuildConfig(BuildConfig, extra=Extra.allow):
     max_distance: Optional[int] = None
     max_encoder_input_len: Optional[int] = None
     max_decoder_input_len: Optional[int] = None
+    max_output_len: Optional[int] = None
+    builder_opt: Optional[int] = None
 
     def __post_init__(self) -> None:
         assert self.head_size is not None
@@ -69,7 +87,8 @@ class EncDecBuildConfig(BuildConfig, extra=Extra.allow):
         assert self.num_buckets is not None
 
 
-class ModelConfig(BaseModel):
+@dataclass
+class ModelConfig:
     name: str
     family: str
     benchmark_type: Literal["gpt", "bert", "enc_dec"]
@@ -192,7 +211,7 @@ _allowed_configs = {
                     max_input_len=512,
                     max_output_len=200,
                     builder_opt=None,
-                    position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
+                    position_embedding_type='rope_gpt_neox',
                     rotary_pct=0.5,
                     bias=False,
                 )),
@@ -284,6 +303,25 @@ _allowed_configs = {
                     max_input_len=512,
                     max_output_len=200,
                     builder_opt=None,
+                )),
+    "llama_7b_moe":
+    ModelConfig(name="llama_7b_moe",
+                family="llama",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=32,
+                    num_heads=32,
+                    hidden_size=4096,
+                    vocab_size=32000,
+                    hidden_act='silu',
+                    n_positions=2048,
+                    inter_size=11008,
+                    max_batch_size=128,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                    moe_num_experts=4,
+                    moe_top_k=1,
                 )),
     "llama_13b":
     ModelConfig(name="llama_13b",
@@ -849,7 +887,7 @@ def get_allowed_models(benchmark_type=None):
 
 def get_build_config(model_name):
     if model_name in _allowed_configs:
-        return dict(_allowed_configs[model_name].build_config)
+        return asdict(_allowed_configs[model_name].build_config)
     else:
         raise KeyError(f'Unexpected model: {model_name}. Please add the model '
                        'to allowed_configs.py')
@@ -858,6 +896,14 @@ def get_build_config(model_name):
 def get_model_family(model_name):
     if model_name in _allowed_configs:
         return _allowed_configs[model_name].family
+    else:
+        raise KeyError(f'Unexpected model: {model_name}. Please add the model '
+                       'to allowed_configs.py')
+
+
+def get_benchmark_type(model_name):
+    if model_name in _allowed_configs:
+        return _allowed_configs[model_name].benchmark_type
     else:
         raise KeyError(f'Unexpected model: {model_name}. Please add the model '
                        'to allowed_configs.py')

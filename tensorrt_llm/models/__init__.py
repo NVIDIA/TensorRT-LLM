@@ -59,4 +59,5 @@ __all__ = [
 
 MODEL_MAP = {
     'OPTForCausalLM': OPTForCausalLM,
+    'BloomForCausalLM': BloomForCausalLM,
 }

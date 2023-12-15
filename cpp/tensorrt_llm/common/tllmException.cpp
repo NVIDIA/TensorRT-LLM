@@ -50,7 +50,7 @@ TllmException::TllmException(char const* file, std::size_t line, const std::stri
 }
 #endif
 
-TllmException::~TllmException() = default;
+TllmException::~TllmException() noexcept = default;
 
 std::string TllmException::getTrace() const
 {

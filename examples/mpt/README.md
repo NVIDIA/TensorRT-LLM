@@ -10,6 +10,7 @@ Support for float16, float32 and bfloat16 conversion. Just change `data_type` fl
   * FP16
   * FP8
   * INT8 & INT4 Weight-Only
+  * INT4 AWQ
   * FP8 KV CACHE
   * Tensor Parallel
   * MHA, MQA & GQA
@@ -30,7 +31,7 @@ python convert_hf_mpt_to_ft.py -i mosaicml/mpt-7b -o ./ft_ckpts/mpt-7b/fp32/ --t
 `--infer_gpu_num 4` is used to convert to FT format with 4-way tensor parallelism
 
 
-### 2. Build TensorRT engine(s)
+### 2.1 Build TensorRT engine(s)
 
 Examples of build invocations:
 
@@ -53,6 +54,78 @@ python3 build.py --world_size=4 \
                  --use_gemm_plugin \
                  --model_dir ./ft_ckpts/mpt-7b/fp32/4-gpu \
                  --output_dir=./trt_engines/mpt-7b/fp32/4-gpu
+```
+
+### 2.2 Build Smoothquant engine(s)
+```bash
+# Generate Smoothquantied weights and scaling factors.
+python convert_hf_mpt_to_ft.py -i mosaicml/mpt-7b -o ./ft_ckpts/mpt-7b/sq/ -sq 0.5
+
+# Build smoothquant engine.
+python3 build.py --max_batch_size 64 \
+                 --max_input_len 512 \
+                 --max_output_len 64 \
+                 --remove_input_padding \
+                 --enable_context_fmha \
+                 --use_gpt_attention_plugin \
+                 --use_gemm_plugin \
+                 --model_dir ./ft_ckpts/mpt-7b/sq/1-gpu \
+                 --output_dir=./trt_engines/mpt-7b/sq/1-gpu-engine \
+                 --use_smooth_quant \
+                 --per_channel \
+                 --per_token
+```
+
+### 2.3 Use Weight-only per-channel quantization
+Examples of build invocations:
+
+```bash
+# Build INT8 weight-only engine.
+python3 build.py --model_dir=./ft_ckpts/mpt-7b/fp16/1-gpu \
+                 --max_batch_size 64 \
+                 --use_weight_only \
+                 --use_gpt_attention_plugin \
+                 --use_gemm_plugin \
+                 --output_dir ./trt_engines/mpt-7b/int8_weight_only/1-gpu
+
+# Build INT4 weight-only engine.
+python3 build.py --model_dir=./ft_ckpts/mpt-7b/fp16/1-gpu \
+                 --max_batch_size 64 \
+                 --use_weight_only \
+                 --weight_only_precision int4 \
+                 --use_gpt_attention_plugin \
+                 --use_gemm_plugin \
+                 --output_dir ./trt_engines/mpt-7b/int4_weight_only/1-gpu
+```
+
+### 2.4 Use AMMO quantization and AWQ-INT4
+
+First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+
+
+```bash
+# RUN ammo
+python3 ../quantization/quantize.py --model_dir=./ft_ckpts/mpt-7b/fp16/1-gpu \
+                                    --qformat int4_awq \
+                                    --calib_size 32 \
+                                    --export_path ./
+```
+
+After quantization, `mpt_tp1_rank0.npz` file will be generated under export path, then We use `--quant_ckpt_path` pass it to build stage.
+
+```bash
+# Build INT4 AWQ engine
+python3 build.py --model_dir=./ft_ckpts/mpt-7b/fp16/1-gpu \
+                 --max_batch_size 64 \
+                 --use_weight_only \
+                 --weight_only_precision int4 \
+                 --use_gpt_attention_plugin \
+                 --use_gemm_plugin \
+                 --output_dir ./trt_engines/mpt-7b/int4_awq/1-gpu \
+                 --use_weight_only \
+                 --weight_only_precision int4_awq \
+                 --per_group \
+                 --quant_ckpt_path ./mpt_tp1_rank0.npz
 ```
 
 ### 3. Run TRT engine to check if the build was correct

@@ -209,8 +209,11 @@ __global__ void batchApplyRepetitionPenalty(T* logits, const float* penalties, c
     {
         // outputIds shape: (batchSize, input_len + output_len)
         int penaltyIndex = outputIds[batchIdx][blockIdx.y * maxSeqLen + index];
-        assert(penaltyIndex < vocabSize);
         penaltyIndices[index] = penaltyIndex;
+        if (penaltyIndex >= vocabSize)
+        {
+            continue;
+        }
         float logit = (float) logits[penaltyIndex];
         if (penaltyType == RepetitionPenaltyType::Additive)
         {
@@ -239,6 +242,10 @@ __global__ void batchApplyRepetitionPenalty(T* logits, const float* penalties, c
     // Phase 2. Replace a logit value by the penalized one.
     for (int index = threadIdx.x; index < currentStep; index += blockDim.x)
     {
+        if (penaltyIndices[index] >= vocabSize)
+        {
+            continue;
+        }
         logits[penaltyIndices[index]] = penaltyLogits[index];
     }
 }

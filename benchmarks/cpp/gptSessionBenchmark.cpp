@@ -96,7 +96,12 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
 
                 // copy inputs and wrap into shared_ptr
                 GenerationInput::TensorPtr inputIds;
-                std::vector<int32_t> inputsHost(batchSize * maxInputLength, padId);
+                std::vector<int32_t> inputsHost(batchSize * maxInputLength);
+                srand(time(0));
+                for (int i = 0; i < inputsHost.size(); i++)
+                {
+                    inputsHost[i] = rand() % modelConfig.getVocabSizePadded(worldConfig.getSize());
+                }
 
                 if (inputPacked)
                 {

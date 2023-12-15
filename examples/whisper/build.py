@@ -143,6 +143,7 @@ def parse_arguments():
         help=
         'By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV'
     )
+    parser.add_argument('--debug_mode', action='store_true')
     args = parser.parse_args()
     logger.set_level(args.log_level)
 
@@ -233,8 +234,9 @@ def build_encoder(model, args):
 
         tensorrt_llm_whisper_encoder(inputs)
 
-        for k, v in tensorrt_llm_whisper_encoder.named_network_outputs():
-            network._mark_output(v, k, str_dtype_to_trt(args.dtype))
+        if args.debug_mode:
+            for k, v in tensorrt_llm_whisper_encoder.named_network_outputs():
+                network._mark_output(v, k, str_dtype_to_trt(args.dtype))
 
     engine = None
     engine_name = get_engine_name(MODEL_ENCODER_NAME, args.dtype, 1, 0)
@@ -345,8 +347,9 @@ def build_decoder(model, args):
 
         tensorrt_llm_whisper_decoder(*inputs)
 
-        for k, v in tensorrt_llm_whisper_decoder.named_network_outputs():
-            network._mark_output(v, k, str_dtype_to_trt(args.dtype))
+        if args.debug_mode:
+            for k, v in tensorrt_llm_whisper_decoder.named_network_outputs():
+                network._mark_output(v, k, str_dtype_to_trt(args.dtype))
 
     engine = None
     engine_name = get_engine_name(MODEL_DECODER_NAME, args.dtype, 1, 0)

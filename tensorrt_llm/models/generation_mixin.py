@@ -131,19 +131,6 @@ class GenerationMixin:
                             math.ceil(kv_cache_range[1][2] / tokens_per_block)
                         ]
                     ]
-                    blocks_range = [
-                        [
-                            bb_range[0][0] * max_blocks_per_seq_range[0][0],
-                            bb_range[0][1] * max_blocks_per_seq_range[0][1],
-                            bb_range[0][2] * max_blocks_per_seq_range[0][2]
-                        ],
-                        [
-                            bb_range[1][0] * max_blocks_per_seq_range[1][0],
-                            bb_range[1][1] * max_blocks_per_seq_range[1][1],
-                            bb_range[1][2] * max_blocks_per_seq_range[1][2]
-                        ],
-                    ]
-
                     max_blocks_per_seq_range = [[
                         x for x in max_blocks_per_seq_range[0]
                     ], [x for x in max_blocks_per_seq_range[1]]]
@@ -153,26 +140,10 @@ class GenerationMixin:
                         math.ceil(kv_cache_range[0][1] / tokens_per_block),
                         math.ceil(kv_cache_range[0][2] / tokens_per_block)
                     ]]
-                    blocks_range = [[
-                        bb_range[0][0] * max_blocks_per_seq_range[0][0],
-                        bb_range[0][1] * max_blocks_per_seq_range[0][1],
-                        bb_range[0][2] * max_blocks_per_seq_range[0][2]
-                    ]]
-
                     max_blocks_per_seq_range = [[
                         x for x in max_blocks_per_seq_range[0]
                     ]]
 
-                kv_dim_range = OrderedDict([
-                    ('blocks', blocks_range),
-                    ('kv', [2, 2] if enable_two_optimization_profiles else [2]),
-                    ('num_heads', [num_kv_heads, num_kv_heads]
-                     if enable_two_optimization_profiles else [num_kv_heads]),
-                    ('tokens_per_block', [tokens_per_block, tokens_per_block] if
-                     enable_two_optimization_profiles else [tokens_per_block]),
-                    ('head_size', [head_size, head_size]
-                     if enable_two_optimization_profiles else [head_size]),
-                ])
                 for i in layers_range:
                     kv_cache_block_pointers = Tensor(
                         name=f'kv_cache_block_pointers_{i}',

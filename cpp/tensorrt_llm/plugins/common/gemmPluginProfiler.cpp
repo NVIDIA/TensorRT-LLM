@@ -207,7 +207,8 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
         {
             std::ostringstream msg;
             msg << "Cannot profile configuration " << ii << " (for"
-                << " m=" << m << ", n=" << n << ", k=" << k << "). Skipped";
+                << " m=" << m << ", n=" << n << ", k=" << k << ")"
+                << ", reason: \"" << e.what() << "\". Skipped";
             TLLM_LOG_WARNING(msg.str());
             continue;
         }

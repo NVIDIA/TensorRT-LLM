@@ -66,13 +66,12 @@ class TestFunctional(unittest.TestCase):
                     [False], [False, True], [1], [False], [False]))
 
         # Test cases for fused context MHAs
-        # TODO: add the tests back
-        # test_cases += list(
-        #     product(['llama_attention'], [
-        #         ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
-        #     ], ['float16', 'bfloat16'], [None], [2], [90, 1024], [4],
-        #             [32, 64, 80, 112, 128], [0], [False], [False, True], [1],
-        #             [False], [False]))
+        test_cases += list(
+            product(['llama_attention'], [
+                ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
+            ], ['float16', 'bfloat16'], [None], [2], [90, 1024], [4],
+                    [32, 64, 80, 112, 128], [0], [False], [False, True], [1],
+                    [False], [False]))
 
         # Test cases of float32 d=256 case (for testing MMHA key loops).
         test_cases += list(
@@ -239,6 +238,11 @@ class TestFunctional(unittest.TestCase):
                     None,
                 ]))
 
+        # split test cases into two partitions
+        test_cases = [("partition0", ) + case if i % 2 == 0 else
+                      ("partition1", ) + case
+                      for i, case in enumerate(test_cases)]
+
         return test_cases
 
     def custom_name_func(testcase_func, param_num, param):
@@ -249,6 +253,7 @@ class TestFunctional(unittest.TestCase):
 
     @parameterized.expand(load_test_cases, name_func=custom_name_func)
     def test_gpt_attention(self,
+                           test_partition,
                            attention_type,
                            context_fmha_type,
                            dtype,

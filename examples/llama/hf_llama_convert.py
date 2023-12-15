@@ -126,15 +126,15 @@ def smooth_llama_model(model, scales, alpha, llama_qkv_para, llama_smoother):
             dim=1)[0]
 
 
-def gpt_to_ft_name(orig_name):
-    global_ft_weights = {
+def gpt_to_bin_name(orig_name):
+    global_bin_weights = {
         "model.embed_tokens.weight": 'vocab_embedding.weight',
         "model.norm.weight": 'ln_f.weight',
         "lm_head.weight": 'lm_head.weight',
     }
 
-    if orig_name in global_ft_weights:
-        return global_ft_weights[orig_name]
+    if orig_name in global_bin_weights:
+        return global_bin_weights[orig_name]
 
     _, _, layer_id, *weight_name = orig_name.split(".")
 
@@ -220,7 +220,7 @@ def hf_gpt_converter(args):
 
     storage_type = str_to_np_dtype(args.storage_type)
 
-    global_ft_weights = [
+    global_bin_weights = [
         'vocab_embedding.weight', 'ln_f.weight', 'lm_head.weight'
     ]
 
@@ -234,33 +234,33 @@ def hf_gpt_converter(args):
     for name, param in model.named_parameters():
         if "weight" not in name and "bias" not in name:
             continue
-        ft_name = gpt_to_ft_name(name)
+        bin_name = gpt_to_bin_name(name)
 
         if args.convert_model_on_cpu:
             param = param.cpu()
         if name.replace(".weight", "") in llama_smoother.keys():
             smoother = llama_smoother[name.replace(".weight", "")]
             smoother = smoother.detach().cpu().numpy()
-            starmap_args.append(
-                (0, saved_dir, infer_tp,
-                 f"{ft_name}.smoother".replace(".weight", ""), smoother, None, {
-                     "int8_outputs": int8_outputs,
-                     "multi_query_mode": args.multi_query_mode,
-                     "local_dim": None,
-                 }))
+            starmap_args.append((0, saved_dir, infer_tp,
+                                 f"{bin_name}.smoother".replace(".weight", ""),
+                                 smoother, None, {
+                                     "int8_outputs": int8_outputs,
+                                     "multi_query_mode": args.multi_query_mode,
+                                     "local_dim": None,
+                                 }))
 
         param = transpose_weights(name, param)
 
         param = param.detach().cpu().numpy().astype(storage_type)
 
-        if ft_name in global_ft_weights:
-            param.tofile(saved_dir / f"{ft_name}.bin")
-        elif ft_name.split('.')[-2] == 'query_key_value':
+        if bin_name in global_bin_weights:
+            param.tofile(saved_dir / f"{bin_name}.bin")
+        elif bin_name.split('.')[-2] == 'query_key_value':
             # Is there other ways to get local_dim? local_dim = hidden_size in llama2
             local_dim = model.config.hidden_size if args.multi_query_mode else None
             if args.smoothquant is None:
                 merge_qkv_scales(name, model, act_range, llama_qkv_para)
-            qkv = (0, saved_dir, infer_tp, ft_name,
+            qkv = (0, saved_dir, infer_tp, bin_name,
                    llama_qkv_para.get(
                        name.replace(".weight", "").replace(
                            ".q_proj",
@@ -274,10 +274,10 @@ def hf_gpt_converter(args):
                                         "local_dim": local_dim,
                                     })
             starmap_args.append(qkv)
-        elif ft_name.split('.')[-2] == 'kv':
+        elif bin_name.split('.')[-2] == 'kv':
             continue
         else:
-            starmap_args.append((0, saved_dir, infer_tp, ft_name, param,
+            starmap_args.append((0, saved_dir, infer_tp, bin_name, param,
                                  act_range.get(name.replace(".weight", "")), {
                                      "int8_outputs": int8_outputs,
                                      "multi_query_mode": args.multi_query_mode,
@@ -354,7 +354,7 @@ if __name__ == "__main__":
     print("========================================")
 
     assert (args.calibrate_kv_cache or args.smoothquant), \
-        "Either INT8 kv cache or SmoothQuant must be enabled for this script. Otherwise you can directly build engines from HuggingFace checkpoints, no need to do this FT-format conversion. "
+        "Either INT8 kv cache or SmoothQuant must be enabled for this script. Otherwise you can directly build engines from HuggingFace checkpoints, no need to do this binary format conversion. "
     logger.set_level("info")
 
     hf_gpt_converter(args)

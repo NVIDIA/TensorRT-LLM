@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import List
 
 
 class Mapping(object):
@@ -88,9 +89,14 @@ class Mapping(object):
             p = p - self.world_size
         return p
 
-    def pp_layers(self, num_layers):
+    def pp_layers(self, num_layers: int) -> List[int]:
         layers_per_pipeline_stage = num_layers // self.pp_size
-        layers_range = list(
-            range(self.pp_rank * layers_per_pipeline_stage,
-                  (self.pp_rank + 1) * layers_per_pipeline_stage, 1))
-        return layers_range
+        layers_range = range(self.pp_rank * layers_per_pipeline_stage,
+                             (self.pp_rank + 1) * layers_per_pipeline_stage)
+        return list(layers_range)
+
+    def ep_experts(self, num_experts: int) -> List[int]:
+        experts_per_rank = num_experts // self.tp_size
+        experts_range = range(self.tp_rank * experts_per_rank,
+                              (self.tp_rank + 1) * experts_per_rank)
+        return list(experts_range)

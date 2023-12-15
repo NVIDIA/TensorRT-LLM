@@ -16,6 +16,7 @@
  */
 #include "gptAttentionCommon.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
@@ -470,7 +471,7 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
     workspaces[9] = qk_buf_float_size;
     workspaces[10] = padding_offset_size;
     workspaces[11] = paged_kv_tma_desc_size;
-    context_workspace_size = tensorrt_llm::plugins::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
+    context_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
     return context_workspace_size;
 }
 
@@ -486,7 +487,8 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForGeneration(
     size_t generation_workspace_size = 0;
 
     const int batch_beam = total_num_seq;
-    int32_t const maxSeqLenTile = std::max(kReservedMaxSeqLenTilePerSeq, tc::divUp(mMultiProcessorCount, mNumHeads));
+    int32_t const maxSeqLenTile
+        = std::max(getMaxNumSeqLenTile(batch_beam), (int) tc::divUp(mMultiProcessorCount, mNumHeads));
 
     const size_t partial_out_size = size * batch_beam * mNumHeads * mHeadSize * maxSeqLenTile;
     const size_t partial_sum_size = sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile;
@@ -499,14 +501,14 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForGeneration(
     workspaces[1] = partial_sum_size;
     workspaces[2] = partial_max_size;
     workspaces[3] = block_counter_size;
-    generation_workspace_size = tensorrt_llm::plugins::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
+    generation_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 
     size_t mqa_workspace_size = 0;
     if (mDecoderXQARunner.get())
     {
         size_t mqa_workspaces[1];
         mqa_workspaces[0] = mDecoderXQARunner->getWorkspaceSize();
-        mqa_workspace_size = tensorrt_llm::plugins::calculateTotalWorkspaceSize(mqa_workspaces, 1);
+        mqa_workspace_size = tc::calculateTotalWorkspaceSize(mqa_workspaces, 1);
     }
 
     return std::max(generation_workspace_size, mqa_workspace_size);
@@ -518,7 +520,8 @@ int GPTAttentionPluginCommon::getMaxNumSeqLenTile(int batch_beam_size) const
     {
         // And we allocate the buffer based on the maximum number of blocks per sequence (batch_beam_size = 1).
         // Assume we can only have 1 block (large block size like 1024) in SM, and we only want one wave of blocks.
-        return tc::divUp(mMultiProcessorCount, batch_beam_size * mNumHeads);
+        return tc::getEnvMmhaMultiblockDebug() ? std::max(kReservedMaxSeqLenTilePerSeq, getEnvMmhaBlocksPerSequence())
+                                               : tc::divUp(mMultiProcessorCount, batch_beam_size * mNumHeads);
     }
     return 0;
 }
@@ -1233,6 +1236,10 @@ int GPTAttentionPluginCommon::initialize() noexcept
 {
     auto cublasHandle = getCublasHandle();
     auto cublasLtHandle = getCublasLtHandle();
+
+    // Pre-warm getting environment variables
+    getEnvMmhaMultiblockDebug();
+    getEnvMmhaBlocksPerSequence();
 
     mCublasWrapper.reset(new tc::CublasMMWrapper(cublasHandle, cublasLtHandle, nullptr, nullptr));
     if (mEnableContextFMHA)

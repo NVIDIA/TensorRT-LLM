@@ -100,6 +100,7 @@ def quantize_and_export(model: torch.nn.Module,
         ("mpt", ): "mpt",
         ("gpt2", ): "gpt2",
         ("chatglm", ): "chatglm",
+        ("qwen", ): "qwen",
     }
     for templates, model_type_target in model_lookup.items():
         if any(t in model_cls_name.lower() for t in templates):
@@ -115,12 +116,15 @@ def quantize_and_export(model: torch.nn.Module,
 
     if export_path:
         with torch.inference_mode():
-            export_model_config(
-                model,
-                model_type,
-                torch.float16,
-                export_dir=export_path,
-                inference_tensor_parallel=tensor_parallel_size,
-            )
+            if qformat == "int4_awq" and model_type == "qwen":
+                torch.save(model.state_dict(), export_path)
+            else:
+                export_model_config(
+                    model,
+                    model_type,
+                    torch.float16,
+                    export_dir=export_path,
+                    inference_tensor_parallel=tensor_parallel_size,
+                )
         logger.info(f"Quantized model exported to :{export_path}")
     return model

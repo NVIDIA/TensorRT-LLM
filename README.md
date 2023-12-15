@@ -150,10 +150,13 @@ mkdir -p ./bloom/560M && git clone https://huggingface.co/bigscience/bloom-560m 
 ```
 ***2. Build the engine***
 
-```python
+```bash
 # Single GPU on BLOOM 560M
-python build.py --model_dir ./bloom/560M/ \
+python convert_checkpoint.py --model_dir ./bloom/560M/ \
                 --dtype float16 \
+                --output_dir ./bloom/560M/trt_ckpt/fp16/1-gpu/
+# May need to add trtllm-build to PATH, export PATH=/usr/local/bin:$PATH
+trtllm-build --checkpoint_dir ./bloom/560M/trt_ckpt/fp16/1-gpu/ \
                 --use_gemm_plugin float16 \
                 --use_gpt_attention_plugin float16 \
                 --output_dir ./bloom/560M/trt_engines/fp16/1-gpu/
@@ -166,7 +169,7 @@ See the BLOOM [example](examples/bloom) for more details and options regarding t
 The `../summarize.py` script can be used to perform the summarization of articles
 from the CNN Daily dataset:
 
-```python
+```bash
 python ../summarize.py --test_trt_llm \
                        --hf_model_dir ./bloom/560M/ \
                        --data_type fp16 \
@@ -244,10 +247,12 @@ the models listed in the [examples](examples/.) folder.
 The list of supported models is:
 
 * [Baichuan](examples/baichuan)
+* [BART](examples/enc_dec)
 * [Bert](examples/bert)
 * [Blip2](examples/blip2)
 * [BLOOM](examples/bloom)
 * [ChatGLM](examples/chatglm)
+* [FairSeq NMT](examples/nmt)
 * [Falcon](examples/falcon)
 * [Flan-T5](examples/enc_dec)
 * [GPT](examples/gpt)
@@ -257,6 +262,7 @@ The list of supported models is:
 * [InternLM](examples/internlm)
 * [LLaMA](examples/llama)
 * [LLaMA-v2](examples/llama)
+* [mBART](examples/enc_dec)
 * [Mistral](examples/llama#mistral-v01)
 * [MPT](examples/mpt)
 * [mT5](examples/enc_dec)
@@ -269,7 +275,7 @@ The list of supported models is:
 * [Whisper](examples/whisper)
 
 Note: [Encoder-Decoder](examples/enc_dec/) provides general encoder-decoder
-functionality that supports many encoder-decoder models such as T5 family, BART family, Whisper family, etc. We
+functionality that supports many encoder-decoder models such as T5 family, BART family, Whisper family, NMT family, etc. We
 unroll the exact model names in the list above to let users find specific
 models easier.
 

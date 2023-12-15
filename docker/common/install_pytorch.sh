@@ -35,19 +35,19 @@ install_from_source() {
     export _GLIBCXX_USE_CXX11_ABI=$1
     export TORCH_CUDA_ARCH_LIST="8.0;9.0"
 
-    pip uninstall -y torch
+    pip3 uninstall -y torch
     cd /tmp
     git clone --depth 1 --branch v$TORCH_VERSION https://github.com/pytorch/pytorch
     cd pytorch
     git submodule sync && git submodule update --init --recursive
-    pip install -r requirements.txt
-    python setup.py install
+    pip3 install -r requirements.txt
+    python3 setup.py install
     cd /tmp && rm -rf /tmp/pytorch
     restore_environment $1
 }
 
 install_from_pypi() {
-    pip install torch==${TORCH_VERSION}
+    pip3 install torch==${TORCH_VERSION}
 }
 
 case "$1" in

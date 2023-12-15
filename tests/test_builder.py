@@ -72,5 +72,14 @@ class TestBuilder(unittest.TestCase):
         print(x)  # to avoid the delete of x
 
 
+class TestSubprocess(unittest.TestCase):
+
+    def import_using_popen(self):
+        import tensorrt_llm  # isort: skip
+        from subprocess import Popen
+
+        Popen(["python3", "-c", "import tensorrt_llm"])
+
+
 if __name__ == '__main__':
     unittest.main()
