@@ -17,10 +17,12 @@
 
 #include "decoderMaskedMultiheadAttentionTemplate.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 
+#include <algorithm>
 #include <cuda_runtime_api.h>
 #ifdef ENABLE_FP8
 #include <cuda_fp8.h>
@@ -91,24 +93,35 @@ inline size_t smem_size_in_bytes(const Multihead_attention_params<T, DO_CROSS_AT
 
 template <typename T, int Dh, bool DO_CROSS_ATTENTION>
 inline void multi_block_grid_setup(dim3& grid, const Multihead_attention_params<T, DO_CROSS_ATTENTION>& params,
-    int blocks_per_sm, int block_size, int tlength, bool do_multi_block)
+    int blocks_per_sm, int block_size, int tlength)
 {
-    if (!do_multi_block)
+    if (!params.multi_block_mode)
     {
-        params.multi_block_mode = false;
         return;
     }
 
-    params.seq_len_tile
+    int balanced_seq_len_tile
         = mmha::divUp(params.multi_processor_count * blocks_per_sm, params.batch_size * params.num_heads);
-    params.seq_len_tile = std::max(params.min_seq_len_tile, params.seq_len_tile);
 
     const int threads_per_value = mmha::threads_per_value<T>(mmha::dh_max(Dh));
     // Make sure that each block at least processes one loop of kv (unroll size is default at 8).
     const int seq_len_per_kv_loop = mmha::divUp(block_size, threads_per_value) * 8;
-    const int max_seq_len_tile = std::min(mmha::divUp(tlength + 1, seq_len_per_kv_loop), params.max_seq_len_tile);
+    int max_seq_len_tile = params.max_seq_len_tile;
 
-    params.seq_len_tile = std::min(params.seq_len_tile, max_seq_len_tile);
+    const bool multi_block_debug_flag = getEnvMmhaMultiblockDebug();
+
+    // User defined number of blocks.
+    if (multi_block_debug_flag)
+    {
+        const int env_seq_len_tile = getEnvMmhaBlocksPerSequence();
+        balanced_seq_len_tile = env_seq_len_tile > 0 ? env_seq_len_tile : balanced_seq_len_tile;
+    }
+    else
+    {
+        max_seq_len_tile = std::min(mmha::divUp(tlength + 1, seq_len_per_kv_loop), max_seq_len_tile);
+    }
+
+    params.seq_len_tile = std::clamp(balanced_seq_len_tile, params.min_seq_len_tile, max_seq_len_tile);
 
     TLLM_CHECK_WITH_INFO(
         params.seq_len_tile <= block_size, "The number of blocks per sequence may not exceed the thread block size.");
@@ -117,6 +130,14 @@ inline void multi_block_grid_setup(dim3& grid, const Multihead_attention_params<
     params.timesteps_per_block = mmha::divUp(tlength + 1, params.seq_len_tile);
 
     params.multi_block_mode = (params.seq_len_tile > 1);
+
+    static bool debug_flag_printed_once = false;
+    if (multi_block_debug_flag && !debug_flag_printed_once)
+    {
+        TLLM_LOG_INFO("MMHA kernel info: threads per block(%d), launched_blocks_per_sequence(%d), sequence_length(%d).",
+            block_size, params.seq_len_tile, tlength + 1);
+        debug_flag_printed_once = true;
+    }
 
     grid.z = params.seq_len_tile;
 }
@@ -230,7 +251,7 @@ void mmha_launch_kernel_ex(
     }
 
     // If blocks with larger block size already fill all SMs, then disable the multi blocks mode.
-    mmha::multi_block_grid_setup<T, Dh>(grid, params, available_blocks, dynamic_block_size, tlength, DO_MULTI_BLOCK);
+    mmha::multi_block_grid_setup<T, Dh>(grid, params, available_blocks, dynamic_block_size, tlength);
 
     // Launch kernels based on the valid block size.
     switch (dynamic_block_size)

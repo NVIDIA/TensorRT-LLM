@@ -17,7 +17,7 @@ import tensorrt as trt
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
-from ...functional import (PositionEmbeddingType, Tensor,
+from ...functional import (PositionEmbeddingType, Tensor, allreduce,
                            gather_last_token_logits)
 from ...layers import (MLP, Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, KeyValueCacheParams, LayerNorm)
@@ -62,7 +62,7 @@ class GPTJDecoderLayer(Module):
             dtype=dtype,
             attention_mask_type=AttentionMaskType.causal,
             bias=False,
-            tp_group=tp_group,
+            tp_group=None,
             tp_size=tp_size,
             quant_mode=quant_mode)
 
@@ -70,7 +70,7 @@ class GPTJDecoderLayer(Module):
                        ffn_hidden_size=hidden_size * 4,
                        hidden_act=hidden_act,
                        dtype=dtype,
-                       tp_group=tp_group,
+                       tp_group=None,
                        tp_size=tp_size,
                        quant_mode=quant_mode)
 
@@ -100,7 +100,11 @@ class GPTJDecoderLayer(Module):
         attention_output = attention_output
 
         feed_forward_hidden_states = self.mlp(hidden_states)
-        hidden_states = attention_output + feed_forward_hidden_states + residual
+        hidden_states = attention_output + feed_forward_hidden_states
+        if self.tp_size > 1:
+            hidden_states = allreduce(hidden_states, self.tp_group)
+        hidden_states = hidden_states + residual
+
         if use_cache:
             return (hidden_states, presents)
         return hidden_states

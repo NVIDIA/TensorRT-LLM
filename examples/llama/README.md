@@ -239,7 +239,7 @@ python3 hf_llama_convert.py -i /llama-models/llama-7b-hf -o /llama/smooth_llama_
 
 [`build.py`](./build.py) add new options for the support of INT8 KV cache.
 
-`--int8_kv_cache` is the command-line option to enable INT8 KV cache, and `--ft_model_dir` should contain the directory where the INT8 KV cache scales lie in.
+`--int8_kv_cache` is the command-line option to enable INT8 KV cache, and `--bin_model_dir` is the directory where the INT8 KV cache scales are located.
 
 **INT8 KV cache + per-channel weight-only quantization**
 
@@ -249,7 +249,7 @@ Examples of INT8 weight-only quantization + INT8 KV cache
 
 ```bash
 # Build model with both INT8 weight-only and INT8 KV cache enabled
-python build.py --ft_model_dir=/llama/smooth_llama_7B/int8_kv_cache/1-gpu/ \
+python build.py --bin_model_dir=/llama/smooth_llama_7B/int8_kv_cache/1-gpu/ \
                 --dtype float16 \
                 --use_gpt_attention_plugin float16 \
                 --use_gemm_plugin float16 \
@@ -272,7 +272,7 @@ python ../summarize.py --test_trt_llm \
 
 In addition, you can enable INT8 KV cache together with AWQ (per-group INT4 weight-only quantization)like the following command.
 
-**NOTE**: AWQ checkpoint is passed through `--model_dir`, and the INT8 scales of KV cache is through `--ft_model_dir`.
+**NOTE**: AWQ checkpoint is passed through `--quant_ckpt_path`, and the INT8 scales for the KV cache are expected to be in the directory pointed by `--bin_model_dir`.
 
 ```bash
 python build.py --model_dir ./tmp/llama/7B/ \
@@ -287,7 +287,7 @@ python build.py --model_dir ./tmp/llama/7B/ \
                 --per_group \
                 --output_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_int4_AWQ/1-gpu/
                 --int8_kv_cache \ # Turn on INT8 KV cache
-                --ft_model_dir /llama/smooth_llama_7B/int8_kv_cache/1-gpu/ # Directory to look for INT8 scale of KV cache
+                --bin_model_dir /llama/smooth_llama_7B/int8_kv_cache/1-gpu/ # Directory to look for INT8 scale of KV cache
 ```
 
 Test with `../summarize.py`:
@@ -320,17 +320,17 @@ Examples of build invocations:
 
 ```bash
 # Build model for SmoothQuant in the _per_tensor_ mode.
-python3 build.py --ft_model_dir=/llama/smooth_llama_7B/sq0.8/1-gpu/ \
+python3 build.py --bin_model_dir=/llama/smooth_llama_7B/sq0.8/1-gpu/ \
                  --use_smooth_quant
 
 # Build model for SmoothQuant in the _per_token_ + _per_channel_ mode
-python3 build.py --ft_model_dir=/llama/smooth_llama_7B/sq0.8/1-gpu/ \
+python3 build.py --bin_model_dir=/llama/smooth_llama_7B/sq0.8/1-gpu/ \
                  --use_smooth_quant \
                  --per_token \
                  --per_channel
 ```
 
-Note we use `--ft_model_dir` instead of `--model_dir` and `--meta_ckpt_dir` since SmoothQuant model needs INT8 weights and various scales from the binary files.
+Note we use `--bin_model_dir` instead of `--model_dir` and `--meta_ckpt_dir` since SmoothQuant model needs INT8 weights and various scales from the binary files.
 
 #### FP8 Post-Training Quantization
 
@@ -390,7 +390,7 @@ AWQ/GPTQ examples below involves 2 steps:
                     --export_path ./quantized_int4-awq \
                     --calib_size 32
     ```
-    The quantized model checkpoint is saved to path `./llama-7b-4bit-gs128-awq.pt` for future TRT-LLM engine build.
+    The quantized model checkpoint is saved to `./quantized_int4-awq/llama_tp1_rank0.npz` for future TRT-LLM engine build.
 
 2. Build TRT-LLM engine:
 
@@ -588,7 +588,7 @@ python build.py --model_dir llama-v2-13b-hf/ \
                 --max_output_len 50 \
                 --use_lora_plugin float16 \
                 --hf_lora_dir "chinese-llama-2-lora-13b/" \
-                --world_size 2 --tp_size 2
+                --world_size 2 --tp_size 2 --use_fused_mlp
 
 ```
 
@@ -601,7 +601,8 @@ mpirun -n 2 python ../run.py --engine_dir "/tmp/new_lora_13b/trt_engines/fp16/2-
               --input_text "今天天气很好，我到公园的时后，" \
               --lora_dir "chinese-llama-2-lora-13b/" \
               --lora_task_uids 0 \
-              --no_add_special_tokens
+              --no_add_special_tokens \
+              --use_py_session
 
  Input: "今天天气很好，我到公园的时后，"
 Output: "发现那里有很多小朋友们都在玩。他们都在玩跳绳，跳绳的花样都很多，我看他们玩的很开心。我看他们玩的的时候，我也想跟着他们一起玩，于是我也买了一个跳绳，跟着他们一起玩。我们玩的很开心"
@@ -616,7 +617,8 @@ mpirun -n 2 python ../run.py --engine_dir "/tmp/new_lora_13b/trt_engines/fp16/2-
               --input_text "今天天气很好，我到公园的时后，" \
               --lora_dir "chinese-llama-2-lora-13b/" \
               --lora_task_uids -1 \
-              --no_add_special_tokens
+              --no_add_special_tokens \
+              --use_py_session
 
  Input: "今天天气很好，我到公园的时后，"
 Output: "我看见一个人坐在那边边看书书，我看起来还挺像你，可是我走过过去问了一下他说你是你吗，他说没有，然后我就说你看我看看你像你，他说说你看我像你，我说你是你，他说你是你，"

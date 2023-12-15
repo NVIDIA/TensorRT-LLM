@@ -19,10 +19,10 @@ import tensorrt as trt
 from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
 from ...functional import Tensor, gather_last_token_logits, recv, send
-from ...layers import (Attention, AttentionMaskType, AttentionParams,
+from ...layers import (MOE, Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, FusedGatedMLP, GatedMLP,
-                       KeyValueCacheParams, LoraParams, PositionEmbeddingType,
-                       PromptTuningEmbedding, RmsNorm)
+                       KeyValueCacheParams, LoraParams, MoeConfig,
+                       PositionEmbeddingType, PromptTuningEmbedding, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
 from ...quantization import QuantMode
@@ -46,11 +46,13 @@ class LLaMADecoderLayer(Module):
                  mlp_hidden_size=None,
                  tp_group=None,
                  tp_size=1,
+                 tp_rank=0,
                  quant_mode=QuantMode(0),
                  rms_norm_eps=1e-06,
                  attn_bias=False,
                  mlp_bias=False,
-                 use_fused_mlp=False):
+                 use_fused_mlp=False,
+                 moe_config: MoeConfig = MoeConfig()):
         super().__init__()
         self._layer_id = layer_id  # useful for debugging
         # used for quantizing model
@@ -87,7 +89,17 @@ class LLaMADecoderLayer(Module):
         )
         if not mlp_hidden_size:
             self.mlp_hidden_size = hidden_size * 4
-        ClsMLP = FusedGatedMLP if use_fused_mlp is True else GatedMLP
+
+        ClsMLP = GatedMLP
+        mlp_kwargs = {}
+        if moe_config.has_moe():
+            ClsMLP = MOE
+            mlp_kwargs = {
+                "moe_config": moe_config,
+                "tp_rank": tp_rank,
+            }
+        elif use_fused_mlp:
+            ClsMLP = FusedGatedMLP
         self.mlp = ClsMLP(hidden_size=hidden_size,
                           ffn_hidden_size=self.mlp_hidden_size,
                           hidden_act=hidden_act,
@@ -96,7 +108,8 @@ class LLaMADecoderLayer(Module):
                           tp_group=tp_group,
                           tp_size=tp_size,
                           quant_mode=quant_mode,
-                          instance_id=2 * layer_id + 1)
+                          instance_id=2 * layer_id + 1,
+                          **mlp_kwargs)
         self.post_layernorm = RmsNorm(normalized_shape=hidden_size,
                                       eps=rms_norm_eps,
                                       dtype=dtype)
@@ -108,7 +121,7 @@ class LLaMADecoderLayer(Module):
                 kv_cache_params=None,
                 attention_params=None,
                 all_reduce_workspace=None,
-                lora_param=None):
+                lora_layer_params=None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         if self._layer_id == 0:
@@ -120,7 +133,7 @@ class LLaMADecoderLayer(Module):
                                           kv_cache_params=kv_cache_params,
                                           attention_params=attention_params,
                                           workspace=all_reduce_workspace,
-                                          lora_param=lora_param)
+                                          lora_layer_params=lora_layer_params)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -136,7 +149,7 @@ class LLaMADecoderLayer(Module):
 
         hidden_states = self.mlp(hidden_states,
                                  all_reduce_workspace,
-                                 lora_param=lora_param)
+                                 lora_layer_params=lora_layer_params)
         if self._layer_id == 0:
             self.register_network_output(f"mlp", hidden_states)
 
@@ -169,6 +182,7 @@ class LLaMAModel(Module):
                  use_fused_mlp=False,
                  attn_bias=False,
                  mlp_bias=False,
+                 moe_config: MoeConfig = MoeConfig(),
                  use_prompt_tuning: bool = False):
         super().__init__()
         self.mapping = mapping
@@ -189,25 +203,28 @@ class LLaMAModel(Module):
             )
 
         self.layers = ModuleList([
-            LLaMADecoderLayer(layer_id=i,
-                              hidden_size=hidden_size,
-                              num_attention_heads=num_heads,
-                              num_kv_heads=num_kv_heads,
-                              max_position_embeddings=max_position_embeddings,
-                              dtype=dtype,
-                              hidden_act=hidden_act,
-                              mlp_hidden_size=mlp_hidden_size,
-                              position_embedding_type=position_embedding_type,
-                              rotary_base=rotary_base,
-                              rotary_scaling=rotary_scaling,
-                              tp_group=mapping.tp_group,
-                              tp_size=mapping.tp_size,
-                              quant_mode=quant_mode,
-                              rms_norm_eps=rms_norm_eps,
-                              attn_bias=attn_bias,
-                              mlp_bias=mlp_bias,
-                              use_fused_mlp=use_fused_mlp)
-            for i in self.mapping.pp_layers(num_layers)
+            LLaMADecoderLayer(
+                layer_id=i,
+                hidden_size=hidden_size,
+                num_attention_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                max_position_embeddings=max_position_embeddings,
+                dtype=dtype,
+                hidden_act=hidden_act,
+                mlp_hidden_size=mlp_hidden_size,
+                position_embedding_type=position_embedding_type,
+                rotary_base=rotary_base,
+                rotary_scaling=rotary_scaling,
+                tp_group=mapping.tp_group,
+                tp_size=mapping.tp_size,
+                tp_rank=mapping.tp_rank,
+                quant_mode=quant_mode,
+                rms_norm_eps=rms_norm_eps,
+                attn_bias=attn_bias,
+                mlp_bias=mlp_bias,
+                use_fused_mlp=use_fused_mlp,
+                moe_config=moe_config,
+            ) for i in self.mapping.pp_layers(num_layers)
         ])
 
         if self.mapping.is_last_pp_rank():
@@ -253,9 +270,9 @@ class LLaMAModel(Module):
                         kv_cache_params.kv_cache_block_pointers,
                         kv_cache_params.host_kv_cache_block_pointers,
                         kv_cache_params.host_max_attention_window_sizes)):
-            lora_param = None
+            lora_layer_params = None
             if lora_params.lora_ranks is not None:
-                lora_param = lora_params.get_layer_params(layer_idx)
+                lora_layer_params = lora_params.get_layer_params(layer_idx)
 
             hidden_states = layer(
                 hidden_states,
@@ -271,7 +288,7 @@ class LLaMAModel(Module):
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
                 all_reduce_workspace=all_reduce_workspace,
-                lora_param=lora_param)
+                lora_layer_params=lora_layer_params)
 
             if use_cache:
                 presents.append(hidden_states[1])
@@ -311,6 +328,7 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                  use_fused_mlp=False,
                  attn_bias=False,
                  mlp_bias=False,
+                 moe_config=MoeConfig(),
                  use_prompt_tuning: bool = False):
 
         if isinstance(dtype, str):
@@ -343,6 +361,7 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
         self.quant_mode = quant_mode
         self.use_parallel_embedding = use_parallel_embedding
         self.embedding_sharding_dim = embedding_sharding_dim
+        self.moe_config = moe_config
 
         super().__init__(num_layers, num_heads, num_kv_heads, hidden_size,
                          vocab_size, hidden_act, max_position_embeddings, dtype,
@@ -350,7 +369,7 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                          rotary_scaling, mapping, quant_mode,
                          use_parallel_embedding, embedding_sharding_dim,
                          rms_norm_eps, use_fused_mlp, attn_bias, mlp_bias,
-                         use_prompt_tuning)
+                         moe_config, use_prompt_tuning)
 
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
         if self.mapping.is_last_pp_rank():

@@ -56,6 +56,8 @@ public:
         , mUseCustomAllReduce(false)
         , mMaxPromptEmbeddingTableSize(0)
         , mMaxDraftLen(0)
+        , mUseContextFMHAForGeneration(false)
+        , mPagedContextFMHA(false)
     {
     }
 
@@ -280,6 +282,26 @@ public:
         return mMaxDraftLen + 1;
     }
 
+    void constexpr setUseContextFMHAForGeneration(bool useContextFMHAForGeneration) noexcept
+    {
+        mUseContextFMHAForGeneration = useContextFMHAForGeneration;
+    }
+
+    [[nodiscard]] bool constexpr getContextFMHAForGeneration() const noexcept
+    {
+        return mUseContextFMHAForGeneration;
+    }
+
+    void constexpr setPagedContextFMHA(bool pagedContextFMHA) noexcept
+    {
+        mPagedContextFMHA = pagedContextFMHA;
+    }
+
+    [[nodiscard]] bool constexpr getPagedContextFMHA() const noexcept
+    {
+        return mPagedContextFMHA;
+    }
+
 private:
     SizeType mVocabSize;
     SizeType mNbLayers;
@@ -305,6 +327,9 @@ private:
 
     SizeType mMaxPromptEmbeddingTableSize;
     SizeType mMaxDraftLen;
+
+    bool mUseContextFMHAForGeneration;
+    bool mPagedContextFMHA;
 };
 
 } // namespace tensorrt_llm::runtime

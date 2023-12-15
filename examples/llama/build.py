@@ -25,6 +25,11 @@ import torch.multiprocessing as mp
 import tensorrt as trt
 # isort: on
 from transformers import LlamaConfig, LlamaForCausalLM
+
+try:
+    from transformers import MixtralForCausalLM
+except ImportError:
+    MixtralForCausalLM = None
 from weight import (get_scaling_factors, load_from_awq_llama, load_from_binary,
                     load_from_gptq_llama, load_from_hf_checkpoint,
                     load_from_hf_llama, load_from_meta_llama)
@@ -33,6 +38,7 @@ import tensorrt_llm
 from tensorrt_llm import profiler
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
+from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.layers.attention import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -42,7 +48,7 @@ from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime.lora_manager import LoraConfig
 
-from weight import parse_ft_config  # isort:skip
+from weight import parse_bin_config  # isort:skip
 
 MODEL_NAME = "llama"
 
@@ -132,7 +138,7 @@ def parse_arguments():
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument('--model_dir', type=str, default=None)
-    parser.add_argument('--ft_model_dir', type=str, default=None)
+    parser.add_argument('--bin_model_dir', type=str, default=None)
     parser.add_argument('--meta_ckpt_dir', type=str, default=None)
     parser.add_argument('--quant_ckpt_path', type=str, default=None)
     parser.add_argument('--dtype',
@@ -379,6 +385,32 @@ def parse_arguments():
         choices=['float16', 'float32', 'bfloat16'],
         help="Activates the lora plugin which enables embedding sharing.")
     parser.add_argument('--hf_lora_dir', type=str, default=None)
+    parser.add_argument(
+        '--moe_num_experts',
+        default=0,
+        type=int,
+        help='Specify the number of experts to use for MOE layers')
+    parser.add_argument(
+        '--moe_top_k',
+        default=0,
+        type=int,
+        help=
+        'Specify the top_k value to use for MOE layers. Default to 1 if --moe_num_experts is set'
+    )
+    parser.add_argument(
+        '--moe_tp_mode',
+        default=MoeConfig.ParallelismMode.TENSOR_PARALLEL,
+        type=int,
+        help=
+        'Controls how to distribute experts in TP. Check layers/moe.py for accepted values',
+    )
+    parser.add_argument(
+        '--moe_renorm_mode',
+        default=MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE,
+        type=int,
+        help=
+        'Controls renormalization after gate logits. Check layers/moe.py for accepted values',
+    )
 
     args = parser.parse_args()
     logger.set_level(args.log_level)
@@ -450,6 +482,18 @@ def parse_arguments():
         args.vocab_size = hf_config.vocab_size if hf_config.vocab_size is not None else args.vocab_size
         args.hidden_act = hf_config.hidden_act
         args.rms_norm_eps = hf_config.rms_norm_eps
+        # These attributes only exists with Mixtral, for the moment
+        args.moe_num_experts = getattr(hf_config, "num_local_experts",
+                                       args.moe_num_experts)
+        args.moe_top_k = getattr(hf_config, "num_experts_per_tok",
+                                 args.moe_top_k)
+        args.rotary_base = getattr(hf_config, "rope_theta", args.rotary_base)
+        args.model_type = hf_config.model_type
+        if hf_config.model_type == "mixtral":
+            # HF LLaMA-type models are implicitly using gated activation.
+            # With our MoE implementation, we must make it explicit
+            args.hidden_act = "swiglu"
+
     elif args.meta_ckpt_dir is not None:
         with open(Path(args.meta_ckpt_dir, "params.json")) as fp:
             meta_config: dict = json.load(fp)
@@ -457,16 +501,22 @@ def parse_arguments():
         args.n_head = meta_config["n_heads"]
         args.n_layer = meta_config["n_layers"]
         args.n_kv_head = meta_config.get("n_kv_heads", args.n_head)
-        args.multiple_of = meta_config["multiple_of"]
-        args.ffn_dim_multiplier = meta_config.get("ffn_dim_multiplier", 1)
-        n_embd = int(4 * args.n_embd * 2 / 3)
-        args.inter_size = args.multiple_of * (
-            (int(n_embd * args.ffn_dim_multiplier) + args.multiple_of - 1) //
-            args.multiple_of)
+        if "hidden_dim" in meta_config:
+            args.inter_size = meta_config["hidden_dim"]
+        else:
+            args.multiple_of = meta_config.get("multiple_of", 1)
+            n_embd = int(4 * args.n_embd * 2 / 3)
+            args.ffn_dim_multiplier = meta_config.get("ffn_dim_multiplier", 1)
+            args.inter_size = args.multiple_of * (
+                (int(n_embd * args.ffn_dim_multiplier) + args.multiple_of - 1)
+                // args.multiple_of)
         args.rms_norm_eps = meta_config["norm_eps"]
-    elif args.ft_model_dir is not None:
-        n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, n_kv_head = parse_ft_config(
-            Path(args.ft_model_dir) / "config.ini")
+        args.moe_num_experts = meta_config.get("moe", {}).get("num_experts", 0)
+        args.moe_top_k = meta_config.get("moe", {}).get("num_experts_per_tok",
+                                                        0)
+    elif args.bin_model_dir is not None:
+        n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, n_kv_head = parse_bin_config(
+            Path(args.bin_model_dir) / "config.ini")
         args.inter_size = inter_size  # override the inter_size for LLaMA
         args.n_kv_head = n_kv_head
         args.n_embd = n_embd
@@ -529,6 +579,12 @@ def parse_arguments():
             args.multiple_of)
         logger.info(f"Setting inter_size to {args.inter_size}.")
 
+    if args.moe_num_experts and args.moe_top_k == 0:
+        args.moe_top_k = 1
+    args.moe_config = MoeConfig(args.moe_num_experts, args.moe_top_k,
+                                args.moe_tp_mode,
+                                args.moe_renorm_mode).validate()
+
     return args
 
 
@@ -572,7 +628,7 @@ def build_rank_engine(builder: Builder,
         rms_norm_eps=args.rms_norm_eps,
         use_fused_mlp=args.use_fused_mlp,
         use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
-    )
+        moe_config=args.moe_config)
     quantize_kwargs = {}
     if args.use_smooth_quant or args.use_weight_only:
         if args.weight_only_precision == 'int4_awq':
@@ -595,6 +651,13 @@ def build_rank_engine(builder: Builder,
                                            num_layers=args.n_layer,
                                            quant_mode=args.quant_mode)
         quantize_kwargs = {"quant_scales": quant_scales}
+
+    if args.use_weight_only and args.moe_config.has_moe():
+        if 'exclude_modules' in quantize_kwargs:
+            quantize_kwargs['exclude_modules'].append('router')
+        else:
+            quantize_kwargs['exclude_modules'] = ['lm_head', 'router']
+
     tensorrt_llm_llama = quantize_model(tensorrt_llm_llama, args.quant_mode,
                                         **quantize_kwargs)
     if args.per_group:
@@ -603,7 +666,7 @@ def build_rank_engine(builder: Builder,
                   quant_ckpt_path=args.quant_ckpt_path,
                   mapping=mapping,
                   dtype=args.dtype,
-                  ft_model_dir=args.ft_model_dir)
+                  bin_model_dir=args.bin_model_dir)
     elif args.meta_ckpt_dir is not None:
         load_from_meta_llama(tensorrt_llm_llama, args.meta_ckpt_dir, mapping,
                              args.dtype)
@@ -611,11 +674,15 @@ def build_rank_engine(builder: Builder,
         logger.info(f'Loading HF LLaMA ... from {args.model_dir}')
         tik = time.time()
         if not args.load_by_shard:
-            hf_llama = LlamaForCausalLM.from_pretrained(
+            hf_model = LlamaForCausalLM if args.model_type != "mixtral" else MixtralForCausalLM
+            hf_llama = hf_model.from_pretrained(
                 args.model_dir,
                 device_map={
                     "model": "cpu",
-                    "lm_head": "cpu"
+                    "lm_head": "cpu",
+                    "embed_tokens": "cpu",
+                    "layers": "cpu",
+                    "norm": "cpu",
                 },  # Load to CPU memory
                 torch_dtype='auto',
             )
@@ -637,9 +704,9 @@ def build_rank_engine(builder: Builder,
         t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
         logger.info(f'HF LLaMA loaded. Total time: {t}')
 
-    elif args.ft_model_dir is not None:
+    elif args.bin_model_dir is not None:
         load_from_binary(tensorrt_llm_llama,
-                         args.ft_model_dir,
+                         args.bin_model_dir,
                          mapping,
                          fp16=(args.dtype == 'float16'),
                          multi_query_mode=(args.n_kv_head != args.n_head))

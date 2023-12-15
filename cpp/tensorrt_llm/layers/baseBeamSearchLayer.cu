@@ -37,10 +37,14 @@ __global__ void update_indir_cache_kernel(int* tgt_indir_cache, const int* src_i
     int time_step = threadIdx.x + blockIdx.x * blockDim.x;
     int bb_id = threadIdx.y + blockIdx.y * blockDim.y;   // should be just blockIdx.y?
     const int current_step{sequence_lengths[bb_id] - 1}; // the sequence_lengths is updated, need to minus 1
+    const int input_length{input_lengths == nullptr ? 0 : input_lengths[bb_id]};
     const int batch_id = bb_id / beam_width;
     const int beam_id = bb_id % beam_width;
-    if (bb_id >= beam_width * local_batch_size || time_step < (max_seq_len - max_attention_window)
-        || finished[bb_id].isFinished())
+    // Exit when the batch_beam or timestep is out of the bound.
+    // Assume that KV Cache is shared and fixed for context part,
+    //  so we don't need to update the indices for context part.
+    if (bb_id >= beam_width * local_batch_size || time_step >= max_seq_len || time_step < input_length
+        || time_step < (max_seq_len - max_attention_window) || finished[bb_id].isFinished())
     {
         return;
     }
@@ -90,14 +94,14 @@ BaseBeamSearchLayer<T>::BaseBeamSearchLayer(BaseBeamSearchLayer<T> const& beam_s
 template <typename T>
 BaseBeamSearchLayer<T>::~BaseBeamSearchLayer()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     freeBuffer();
 }
 
 template <typename T>
 void BaseBeamSearchLayer<T>::freeBuffer()
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     if (is_allocate_buffer_)
     {
         allocator_->free((void**) (&temperature_buf_));
@@ -105,26 +109,26 @@ void BaseBeamSearchLayer<T>::freeBuffer()
         allocator_->free((void**) (&repetition_penalty_buf_));
         is_allocate_buffer_ = false;
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
 void BaseBeamSearchLayer<T>::allocateBuffer(size_t batch_size)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     temperature_buf_ = allocator_->reMalloc(temperature_buf_, sizeof(float) * batch_size, false);
     min_lengths_buf_ = allocator_->reMalloc(min_lengths_buf_, sizeof(int) * batch_size, false);
     repetition_penalty_buf_ = allocator_->reMalloc(repetition_penalty_buf_, sizeof(float) * batch_size, false);
 
     is_allocate_buffer_ = true;
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
 void BaseBeamSearchLayer<T>::setupBase(size_t batch_size, SetupParams const& setupParams)
 {
     allocateBuffer(batch_size);
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     // Setup penalties.
     FillBuffers const fillBuffers{batch_size, stream_};
 
@@ -149,13 +153,13 @@ void BaseBeamSearchLayer<T>::setupBase(size_t batch_size, SetupParams const& set
             fillBuffers(setupParams.presence_penalty, 1.0f, mRepetitionPenalty, repetition_penalty_buf_);
         }
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
 void BaseBeamSearchLayer<T>::forward(BeamSearchOutputParams& outputs, ForwardParams const& params)
 {
-    TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s", __PRETTY_FUNCTION__);
     Tensor& output_ids_ptr = outputs.output_ids_ptr;
 
     const auto batch_size = static_cast<std::int32_t>(output_ids_ptr.shape[0]);

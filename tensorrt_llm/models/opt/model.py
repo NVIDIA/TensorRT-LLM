@@ -174,7 +174,7 @@ class OPTForCausalLM(DecoderModelForCausalLM):
             if (not use_parallel_embedding) or (use_parallel_embedding and
                                                 embedding_sharding_dim == 1):
                 raise NotImplementedError(
-                    'For multiple-processes cases, sharing the embedding table must set use_parallel_embedding=True and embedding_sharding_dim = 0'
+                    'For multiple-processes cases, sharing the embedding table must set use_parallel_embedding=True and embedding_sharding_dim=0'
                 )
 
         transformer = OPTModel(config)
@@ -195,3 +195,9 @@ class OPTForCausalLM(DecoderModelForCausalLM):
                                share_weight=share_weight)
 
         super().__init__(config, transformer, lm_head)
+
+    def check_config(self):
+        self.config.set_if_not_exist('use_parallel_embedding', False)
+        self.config.set_if_not_exist('embedding_sharding_dim', 0)
+        self.config.set_if_not_exist('share_embedding_table', False)
+        self.config.set_if_not_exist('do_layer_norm_before', False)

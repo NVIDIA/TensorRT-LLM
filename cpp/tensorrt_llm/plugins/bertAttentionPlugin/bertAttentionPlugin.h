@@ -90,7 +90,7 @@ private:
     // fmha runner (disable by default)
     bool mEnableContextFMHA = false;
     bool mFMHAForceFP32Acc = false;
-    bool mSM = tensorrt_llm::common::getSMVersion();
+    int mSM = tensorrt_llm::common::getSMVersion();
 
     // The default copy constructor will leave them as nullptr. clone() shall initialize it.
     UniqPtrWNullCopy<tensorrt_llm::kernels::FusedMHARunnerV2> mFMHARunner;

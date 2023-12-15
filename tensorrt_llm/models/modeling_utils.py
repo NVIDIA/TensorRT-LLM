@@ -1,13 +1,14 @@
 import copy
 import json
 import os
+from typing import List, Optional
 
 import safetensors
 
 from .._common import default_net
 from .._utils import str_dtype_to_trt
 from ..functional import PositionEmbeddingType, Tensor, gather_last_token_logits
-from ..layers import AttentionParams, KeyValueCacheParams
+from ..layers import AttentionParams, KeyValueCacheParams, LoraParams
 from ..mapping import Mapping
 from ..module import Module, ModuleList
 from ..quantization import QuantMode
@@ -57,6 +58,10 @@ class PretrainedConfig:
                 setattr(self, key, value)
             except AttributeError as err:
                 raise err
+
+    def set_if_not_exist(self, key, value):
+        if not hasattr(self, key):
+            setattr(self, key, value)
 
     @classmethod
     def from_dict(cls, config):
@@ -201,22 +206,31 @@ class DecoderLayerList(ModuleList):
                 use_cache=False,
                 attention_mask=None,
                 kv_cache_params=None,
-                attention_params=None):
-        if kv_cache_params.past_key_value is None:
-            kv_cache_params.past_key_value = tuple([None] *
-                                                   len(self.layer_list))
-        if kv_cache_params.host_max_attention_window_sizes is None:
-            kv_cache_params.host_max_attention_window_sizes = tuple(
-                [None] * len(self.layer_list))
+                attention_params=None,
+                all_reduce_workspace=None,
+                lora_params=None):
+        kv_cache_params.fill_none_tensor_list(len(self.layer_list))
 
         if use_cache:
             presents = []
 
-        for layer, past, pointer, host_pointer, max_attention_window_size in zip(
-                self, kv_cache_params.past_key_value,
-                kv_cache_params.kv_cache_block_pointers,
-                kv_cache_params.host_kv_cache_block_pointers,
-                kv_cache_params.host_max_attention_window_sizes):
+        for layer_idx, (
+                layer, past, pointer, host_pointer,
+                max_attention_window_size) in enumerate(
+                    zip(self, kv_cache_params.past_key_value,
+                        kv_cache_params.kv_cache_block_pointers,
+                        kv_cache_params.host_kv_cache_block_pointers,
+                        kv_cache_params.host_max_attention_window_sizes)):
+
+            lora_param = None
+            if lora_params is not None and lora_params.lora_ranks is not None:
+                lora_param = lora_params.get_layer_params(layer_idx)
+
+            kwargs = {}
+            if all_reduce_workspace is not None:
+                kwargs['all_reduce_workspace'] = all_reduce_workspace
+            if lora_param is not None:
+                kwargs['lora_param'] = lora_param
             hidden_states = layer(
                 hidden_states,
                 use_cache=use_cache,
@@ -229,7 +243,8 @@ class DecoderLayerList(ModuleList):
                     kv_cache_block_pointers=[pointer],
                     host_kv_cache_block_pointers=[host_pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
-                attention_params=attention_params)
+                attention_params=attention_params,
+                **kwargs)
 
             if use_cache:
                 presents.append(hidden_states[1])
@@ -255,7 +270,13 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
         self.config = config
 
     def __post_init__(self):
+        self.check_config()
         quantize(self, self.config.quant_mode)
+
+    def check_config(self):
+        raise NotImplementedError(
+            f"{self.__class__} is an abstract class. Only classes inheriting this class can be called."
+        )
 
     @classmethod
     def from_config(cls, config: PretrainedConfig):
@@ -293,7 +314,9 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
                        use_cache,
                        max_beam_width: int = 1,
                        max_num_tokens: int = None,
-                       prompt_embedding_table_size: int = 0):
+                       prompt_embedding_table_size: int = 0,
+                       gather_all_token_logits: bool = False,
+                       lora_target_modules: List[str] = None):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -308,6 +331,9 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
         use_gemm_plugin = default_net().plugin_config.gemm_plugin
         paged_kv_cache = default_net().plugin_config.paged_kv_cache
         tokens_per_block = default_net().plugin_config.tokens_per_block
+        use_custom_all_reduce = default_net(
+        ).plugin_config.use_custom_all_reduce
+        use_lora_plugin = default_net().plugin_config.lora_plugin
 
         model_inputs = self.prepare_basic_inputs(
             max_batch_size=max_batch_size,
@@ -327,30 +353,64 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
             max_num_tokens=max_num_tokens,
             dtype=str_dtype_to_trt(self.config.dtype),
             prompt_embedding_table_size=prompt_embedding_table_size,
-            mapping=self.config.mapping)
+            mapping=self.config.mapping,
+            gather_all_token_logits=gather_all_token_logits,
+            use_custom_all_reduce=use_custom_all_reduce,
+            use_lora_plugin=use_lora_plugin,
+            lora_target_modules=lora_target_modules)
 
-        return (model_inputs['input_ids'], model_inputs['position_ids'], True,
-                model_inputs['last_token_ids'], model_inputs['attention_mask'],
-                KeyValueCacheParams(
-                    past_key_value=model_inputs['past_key_value'],
-                    host_past_key_value_lengths=model_inputs[
-                        'host_past_key_value_lengths'],
-                    host_max_attention_window_sizes=model_inputs[
-                        'host_max_attention_window_sizes'],
-                    kv_cache_block_pointers=model_inputs[
-                        'kv_cache_block_pointers_list'],
-                    host_kv_cache_block_pointers=model_inputs[
-                        'host_kv_cache_block_pointers_list'],
-                    cache_indirection=model_inputs['cache_indirection'],
-                ),
-                AttentionParams(
-                    sequence_length=model_inputs['sequence_length'],
-                    context_lengths=model_inputs['context_lengths'],
-                    host_context_lengths=model_inputs['host_context_lengths'],
-                    max_context_length=max_input_len,
-                    host_request_types=model_inputs['host_request_types']),
-                model_inputs['prompt_embedding_table'], model_inputs['tasks'],
-                model_inputs['prompt_vocab_size'])
+        result = {
+            'input_ids':
+            model_inputs['input_ids'],
+            'position_ids':
+            model_inputs['position_ids'],
+            'use_cache':
+            True,
+            'last_token_ids':
+            model_inputs['last_token_ids'],
+            'attention_mask':
+            model_inputs['attention_mask'],
+            'kv_cache_params':
+            KeyValueCacheParams(
+                past_key_value=model_inputs['past_key_value'],
+                host_past_key_value_lengths=model_inputs[
+                    'host_past_key_value_lengths'],
+                host_max_attention_window_sizes=model_inputs[
+                    'host_max_attention_window_sizes'],
+                kv_cache_block_pointers=model_inputs[
+                    'kv_cache_block_pointers_list'],
+                host_kv_cache_block_pointers=model_inputs[
+                    'host_kv_cache_block_pointers_list'],
+                cache_indirection=model_inputs['cache_indirection'],
+            ),
+            'attention_params':
+            AttentionParams(
+                sequence_length=model_inputs['sequence_length'],
+                context_lengths=model_inputs['context_lengths'],
+                host_context_lengths=model_inputs['host_context_lengths'],
+                max_context_length=max_input_len,
+                host_request_types=model_inputs['host_request_types'])
+        }
+
+        if prompt_embedding_table_size > 0:
+            result['prompt_embedding_table'] = model_inputs[
+                'prompt_embedding_table']
+            result['tasks'] = model_inputs['tasks']
+            result['prompt_vocab_size'] = model_inputs['prompt_vocab_size']
+        if model_inputs['hidden_states_input'] is not None:
+            result['hidden_states_input'] = model_inputs['hidden_states_input']
+        if model_inputs['all_reduce_workspace'] is not None:
+            result['all_reduce_workspace'] = model_inputs[
+                'all_reduce_workspace']
+        if use_lora_plugin:
+            result['lora_params'] = LoraParams(
+                model_inputs['lora_ranks'],
+                model_inputs['lora_weights_pointers'],
+                host_context_lengths=model_inputs['host_context_lengths'],
+                max_context_length=max_input_len,
+                host_request_types=model_inputs['host_request_types'])
+
+        return result
 
 
 class DecoderModelForCausalLM(PretrainedModel):
@@ -368,29 +428,59 @@ class DecoderModelForCausalLM(PretrainedModel):
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
-                prompt_embedding_table=None,
-                prompt_tasks=None,
-                prompt_vocab_size=None):
-        hidden_states = self.transformer.forward(
-            input_ids, position_ids, use_cache, attention_mask, kv_cache_params,
-            attention_params, prompt_embedding_table, prompt_tasks,
-            prompt_vocab_size)
+                hidden_states=None,
+                all_reduce_workspace=None,
+                prompt_embedding_table: Optional[Tensor] = None,
+                prompt_tasks: Optional[Tensor] = None,
+                prompt_vocab_size: Optional[Tensor] = None,
+                lora_params=None):
+        kwargs = {
+            'input_ids': input_ids,
+            'position_ids': position_ids,
+            'use_cache': use_cache,
+            'attention_mask': attention_mask,
+            'kv_cache_params': kv_cache_params,
+            'attention_params': attention_params,
+        }
+        if all_reduce_workspace is not None:
+            kwargs['all_reduce_workspace'] = all_reduce_workspace
+        if lora_params is not None:
+            kwargs['lora_params'] = lora_params
+        if hidden_states is not None:
+            kwargs['hidden_states'] = hidden_states
+        if prompt_embedding_table is not None:
+            kwargs['prompt_embedding_table'] = prompt_embedding_table
+        if prompt_tasks is not None:
+            kwargs['prompt_tasks'] = prompt_tasks
+        if prompt_vocab_size is not None:
+            kwargs['prompt_vocab_size'] = prompt_vocab_size
+
+        hidden_states = self.transformer.forward(**kwargs)
 
         if use_cache:
             hidden_states, presents = hidden_states
 
-        hidden_states = gather_last_token_logits(
-            hidden_states, last_token_ids,
-            default_net().plugin_config.remove_input_padding)
+        if self.config.mapping.is_last_pp_rank():
+            hidden_states = gather_last_token_logits(
+                hidden_states, last_token_ids,
+                default_net().plugin_config.remove_input_padding)
 
-        # [batch_size, hidden_size] -> [batch_size, vocab_size]
-        lm_logits = self.lm_head(hidden_states)
-        lm_logits.mark_output('logits', self.config.logits_dtype)
+            # [batch_size, hidden_size] -> [batch_size, vocab_size]
+            lm_logits = self.lm_head(hidden_states)
+            lm_logits.mark_output('logits', self.config.logits_dtype)
+        else:
+            hidden_states.mark_output('hidden_states_output', self.dtype)
 
         if use_cache and default_net().plugin_config.paged_kv_cache == False:
-            for i, present in enumerate(presents):
+            for i, present in zip(
+                    self.config.mapping.pp_layers(
+                        self.config.num_hidden_layers), presents):
                 present.mark_output(f'present_key_value_{i}',
                                     self.config.kv_dtype)
-            return (lm_logits, presents)
-
-        return lm_logits
+            if self.config.mapping.is_last_pp_rank():
+                return (lm_logits, presents)
+            return (hidden_states, presents)
+        else:
+            if self.config.mapping.is_last_pp_rank():
+                return lm_logits
+            return hidden_states

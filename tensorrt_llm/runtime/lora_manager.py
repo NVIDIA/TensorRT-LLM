@@ -1,10 +1,12 @@
 import json
 import os
+from pathlib import Path
 
 import numpy as np
 import torch
 
-from .._utils import _str_to_np_dict, fromfile, numpy_to_torch
+from .._utils import (_str_to_np_dict, fromfile, numpy_to_torch,
+                      str_dtype_to_torch)
 
 
 class LoraConfig(object):
@@ -57,12 +59,14 @@ class LoraConfig(object):
         if os.path.exists(f"{hf_lora_dir}/adapter_model.bin"):
             lora_weight = torch.load(f"{hf_lora_dir}/adapter_model.bin")
 
-            if "lm_head" in adapter_config["modules_to_save"]:
-                lm_head_weight = lora_weight["base_model.model.lm_head.weight"]
+            if adapter_config["modules_to_save"] is not None:
+                if "lm_head" in adapter_config["modules_to_save"]:
+                    lm_head_weight = lora_weight[
+                        "base_model.model.lm_head.weight"]
 
-            if "embed_tokens" in adapter_config["modules_to_save"]:
-                embedding_weight = lora_weight[
-                    "base_model.model.model.embed_tokens.weight"]
+                if "embed_tokens" in adapter_config["modules_to_save"]:
+                    embedding_weight = lora_weight[
+                        "base_model.model.model.embed_tokens.weight"]
 
         return cls(hf_lora_dir, adapter_config, tokenizer_config,
                    lora_target_modules, is_valid, lm_head_weight,
@@ -108,11 +112,21 @@ class LoraManager(object):
         self._lora_weights = []
         self._lora_weights_pointers_list = []
 
-    def load_from_nemo(self, model_dir, model_config):
+    def load_from_ckpt(self, model_dir, model_config, runtime_mapping,
+                       ckpt_source):
+        if ckpt_source == "hf":
+            self.load_from_hf(model_dir, model_config, runtime_mapping)
+        elif ckpt_source == "nemo":
+            self.load_from_nemo(model_dir, model_config, runtime_mapping)
+        else:
+            assert False, f"LoraManager does not support source {ckpt_source}"
+
+    def load_from_nemo(self, model_dir, model_config, runtime_mapping):
         '''
         Load lora modules, could be move to client side
         '''
         self._model_config = model_config
+        model_dir = Path(model_dir)
 
         with open(model_dir / "lora_weights.json", 'r') as f:
             config = json.load(f)
@@ -122,6 +136,7 @@ class LoraManager(object):
                                   ['key']] = key
 
         lora_target_modules = model_config.lora_target_modules
+        dtype = model_config.dtype
 
         for layer_idx in range(model_config.num_layers):
             self._lora_weights_pointers_list.append({})
@@ -155,6 +170,8 @@ class LoraManager(object):
                                      _str_to_np_dict['bfloat16']).transpose(
                                          1, 0))).cuda(
                                          )  # t_in: [hidden_size * 3, low_rank]
+                    t_in = t_in.float().to(str_dtype_to_torch(dtype))
+                    t_out = t_out.float().to(str_dtype_to_torch(dtype))
 
                     self._lora_weights_pointers_list[layer_idx][uid].update({
                         lora_module: [
@@ -228,7 +245,7 @@ class LoraManager(object):
             hf_config = json.load(f)
 
         lora_target_modules = model_config.lora_target_modules
-        self._model_config = model_config
+        dtype = model_config.dtype
 
         ranks = [0, hf_config["r"]]
         uids = ["-1", "0"]  # TODO should be lora from some config
@@ -309,6 +326,8 @@ class LoraManager(object):
 
                     t_in = t_in.cuda().contiguous()
                     t_out = t_out.cuda().contiguous()
+                    t_in = t_in.float().to(str_dtype_to_torch(dtype))
+                    t_out = t_out.float().to(str_dtype_to_torch(dtype))
                     self._lora_weights_pointers_list[layer_idx][uid].update(
                         {lora_module: [t_in.data_ptr(),
                                        t_out.data_ptr()]})

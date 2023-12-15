@@ -24,11 +24,11 @@ set(STATIC_TARGET
 set(API_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
 
 find_package(MPI REQUIRED)
-message(STATUS "Using MPI_CXX_INCLUDE_DIRS: ${MPI_CXX_INCLUDE_DIRS}")
-message(STATUS "Using MPI_CXX_LIBRARIES: ${MPI_CXX_LIBRARIES}")
+message(STATUS "Using MPI_C_INCLUDE_DIRS: ${MPI_C_INCLUDE_DIRS}")
+message(STATUS "Using MPI_C_LIBRARIES: ${MPI_C_LIBRARIES}")
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cutlass_extensions/include
-                    ${API_INCLUDE_DIR} ${MPI_INCLUDE_PATH})
+                    ${API_INCLUDE_DIR} ${MPI_C_INCLUDE_DIRS})
 
 add_subdirectory(common)
 add_subdirectory(kernels)
@@ -114,7 +114,7 @@ set(TRTLLM_LINK_LIBS
     ${CUBLASLT_LIB}
     ${CUDNN_LIB}
     ${CMAKE_DL_LIBS}
-    ${MPI_CXX_LIBRARIES}
+    ${MPI_C_LIBRARIES}
     ${NCCL_LIB}
     ${TRT_LIB}
     common_src

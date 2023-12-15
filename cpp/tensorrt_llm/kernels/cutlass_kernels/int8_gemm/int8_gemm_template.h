@@ -368,7 +368,7 @@ std::vector<tkc::CutlassGemmConfig> CutlassInt8GemmRunner<T>::getConfigs() const
     static constexpr bool isWeightOnly = false;
     std::vector<tkc::CutlassGemmConfig> candidateConfigs
         = get_candidate_configs(mSm, isWeightOnly, mSm <= 70, /* SIMT configs */
-            true);                                            /* INT8 configs */
+            true, SPLIT_K_LIMIT);                             /* INT8 configs */
     return candidateConfigs;
 }
 

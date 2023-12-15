@@ -285,9 +285,7 @@ int WeightOnlyQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDesc* input
     const int n = inputDesc[1].dims.d[1];
     const int k = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
 
-    const int ws_size = m_weightOnlyGemmRunner->getWorkspaceSize(m, n, k);
-    const auto& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
-    TLLM_CHECK_WITH_INFO(bestTactic, "No valid weight only groupwise GEMM tactic");
+    const bool use_cuda_kernel = m < SMALL_M_FAST_PATH && mCudaKernelEnabled;
 #if defined(ENABLE_BF16)
     TLLM_CHECK_WITH_INFO(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16,
         "No valid weightOnlyQuantMatmul configuration");
@@ -316,7 +314,7 @@ int WeightOnlyQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDesc* input
         weight_only_quant_type = tensorrt_llm::kernels::WeightOnlyQuantType::Int4b;
         real_n = n * INT8_INT4_RATIO;
     }
-    if (m < SMALL_M_FAST_PATH && mCudaKernelEnabled)
+    if (use_cuda_kernel)
     {
         // Use CUDA kernels for small batch size
         // The CUDA kernel is designed for ColumnMajorTileInterleave weight layout used in fpAIntB cutlass
@@ -329,6 +327,14 @@ int WeightOnlyQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDesc* input
     }
     else
     {
+        const int ws_size = m_weightOnlyGemmRunner->getWorkspaceSize(m, real_n, k);
+
+        const auto& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
+        TLLM_CHECK_WITH_INFO(bestTactic,
+            "No valid weight only per-channel GEMM tactic(It is usually caused by the failure to execute all candidate "
+            "configurations of the CUTLASS kernel, please pay attention to the warning information when building the "
+            "engine.)");
+
         m_weightOnlyGemmRunner->gemm(inputs[0], inputs[1], inputs[2], outputs[0], m, real_n, k, *bestTactic,
             reinterpret_cast<char*>(workspace), ws_size, stream);
     }

@@ -369,7 +369,8 @@ void GptDecoderBatch::newRequest(
     mGeneratedTokensPerStep[batchIdx] = generatedTokensPerStep;
 
     // copy the request ids into outputIds
-    auto inputIdsView = ITensor::view(requestIds, ITensor::makeShape({localBatchSize, inputLength}));
+    auto const requestIdsShape = requestIds->getShape();
+    auto inputIdsView = ITensor::view(requestIds, ITensor::makeShape({localBatchSize, requestIdsShape.d[0]}));
     auto outputIdsView = ITensor::view(outputIds, ITensor::makeShape({beamWidth, mMaxSequenceLength}));
     kernels::invokeFill(*outputIdsView, endId, *stream);
     kernels::tileTensor(*outputIdsView, *inputIdsView, beamWidth, *stream);

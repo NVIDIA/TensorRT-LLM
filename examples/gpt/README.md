@@ -549,11 +549,13 @@ git clone https://huggingface.co/nvidia/GPT-2B-001
 python3 nemo_ckpt_convert.py -i GPT-2B-001/GPT-2B-001_bf16_tp1.nemo -o /tmp/c-model/gpt-next-2B --tensor-parallelism 1 --storage-type bfloat16
 
 python3 build.py --model_dir=/tmp/c-model/gpt-next-2B/1-gpu/ \
+                 --use_gemm_plugin bfloat16 \
                  --dtype bfloat16 \
                  --remove_input_padding \
                  --use_gpt_attention_plugin \
                  --output_dir /tmp/gpt-next-2B/ \
                  --use_lora_plugin \
+                 --enable_context_fmha \
                  --max_batch_size 4 \
                  --max_input_len 512 \
                  --max_output_len 50 \
@@ -566,6 +568,7 @@ python3 ../run.py --max_output_len=20 \
                   --engine_dir /tmp/gpt-next-2B/ \
                   --lora_dir /tmp/gpt-next-2B/ \
                   --lora_task_uids "lora" \
+                  --lora_ckpt_source "nemo" \
                   --no_add_special_tokens \
                   --input_text "After Washington had returned to Williamsburg, Dinwiddie ordered him to lead a larger force to assist Trent in his work. While en route, Washington learned of Trent's retreat. Since Tanaghrisson had promised support to the British, Washington continued toward Fort Duquesne and met with the Mingo leader. Learning of a French scouting party in the area, Washington, with Tanaghrisson and his party, surprised the Canadians on May 28 in what became known as the Battle of Jumonville Glen. They killed many of the Canadians, including their commanding officer, Joseph Coulon de Jumonville, whose head was reportedly split open by Tanaghrisson with a tomahawk. The historian Fred Anderson suggests that Tanaghrisson was acting to gain the support of the British and regain authority over his own people. They had been inclined to support the French, with whom they had long trading relationships. One of Tanaghrisson's men told Contrecoeur that Jumonville had been killed by British musket fire. Question: Upon learning of a French scounting party in the area, what did Washington do? Answer:"
 ```
@@ -580,6 +583,7 @@ python3 ../run.py --max_output_len=20 \
                   --engine_dir /tmp/gpt-next-2B/ \
                   --lora_dir /tmp/gpt-next-2B/ \
                   --lora_task_uids "-1" \
+                  --lora_ckpt_source "nemo" \
                   --no_add_special_tokens \
                   --input_text "After Washington had returned to Williamsburg, Dinwiddie ordered him to lead a larger force to assist Trent in his work. While en route, Washington learned of Trent's retreat. Since Tanaghrisson had promised support to the British, Washington continued toward Fort Duquesne and met with the Mingo leader. Learning of a French scouting party in the area, Washington, with Tanaghrisson and his party, surprised the Canadians on May 28 in what became known as the Battle of Jumonville Glen. They killed many of the Canadians, including their commanding officer, Joseph Coulon de Jumonville, whose head was reportedly split open by Tanaghrisson with a tomahawk. The historian Fred Anderson suggests that Tanaghrisson was acting to gain the support of the British and regain authority over his own people. They had been inclined to support the French, with whom they had long trading relationships. One of Tanaghrisson's men told Contrecoeur that Jumonville had been killed by British musket fire. Question: Upon learning of a French scounting party in the area, what did Washington do? Answer:"
 ```

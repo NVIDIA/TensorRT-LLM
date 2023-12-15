@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/workspace.h"
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <math.h>
@@ -58,8 +59,9 @@ static constexpr int WARP_SIZE = 32;
 // ====================== Softmax things ===============================
 // We have our own implementation of softmax here so we can support transposing the output
 // in the softmax kernel when we extend this module to support expert-choice routing.
-template <typename T, int TPB>
-__launch_bounds__(TPB) __global__ void moeSoftmax(const T* input, const bool* finished, T* output, const int num_cols)
+template <int TPB>
+__launch_bounds__(TPB) __global__
+    void moeSoftmax(const float* input, const bool* finished, float* output, const int num_cols)
 {
     using BlockReduce = cub::BlockReduce<float, TPB>;
     __shared__ typename BlockReduce::TempStorage tmpStorage;
@@ -81,7 +83,7 @@ __launch_bounds__(TPB) __global__ void moeSoftmax(const T* input, const bool* fi
     for (int ii = threadIdx.x; ii < num_cols; ii += TPB)
     {
         const int idx = thread_row_offset + ii;
-        threadData = max(static_cast<float>(input[idx]), threadData);
+        threadData = max(input[idx], threadData);
     }
 
     const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, cub::Max());
@@ -111,16 +113,16 @@ __launch_bounds__(TPB) __global__ void moeSoftmax(const T* input, const bool* fi
     {
         const int idx = thread_row_offset + ii;
         const float val = exp((static_cast<float>(input[idx]) - float_max)) * normalizing_factor;
-        output[idx] = T(val);
+        output[idx] = val;
     }
 }
 
-template <typename T, int TPB>
-__launch_bounds__(TPB) __global__ void moeTopK(const T* inputs_after_softmax, const bool* finished, T* output,
+template <int TPB>
+__launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax, const bool* finished, float* output,
     int* indices, int* source_rows, const int num_experts, const int k, const int start_expert, const int end_expert)
 {
 
-    using cub_kvp = cub::KeyValuePair<int, T>;
+    using cub_kvp = cub::KeyValuePair<int, float>;
     using BlockReduce = cub::BlockReduce<cub_kvp, TPB>;
     __shared__ typename BlockReduce::TempStorage tmpStorage;
 
@@ -135,7 +137,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(const T* inputs_after_softmax, co
     for (int k_idx = 0; k_idx < k; ++k_idx)
     {
         thread_kvp.key = 0;
-        thread_kvp.value = T(-1.f); // This is OK because inputs are probabilities
+        thread_kvp.value = -1.f; // This is OK because inputs are probabilities
 
         cub_kvp inp_kvp;
         for (int expert = threadIdx.x; expert < num_experts; expert += TPB)
@@ -189,9 +191,9 @@ __launch_bounds__(TPB) __global__ void moeTopK(const T* inputs_after_softmax, co
   2) This implementation assumes k is small, but will work for any k.
 */
 
-template <typename T, int VPT, int NUM_EXPERTS, int WARPS_PER_CTA, int BYTES_PER_LDG>
+template <int VPT, int NUM_EXPERTS, int WARPS_PER_CTA, int BYTES_PER_LDG>
 __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
-    void topkGatingSoftmax(const T* input, const bool* finished, T* output, const int num_rows, int* indices,
+    void topkGatingSoftmax(const float* input, const bool* finished, float* output, const int num_rows, int* indices,
         int* source_rows, const int k, const int start_expert, const int end_expert)
 {
     // We begin by enforcing compile time assertions and setting up compile time constants.
@@ -201,7 +203,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
     static_assert(BYTES_PER_LDG <= 16, "BYTES_PER_LDG must be leq 16");
 
     // Number of bytes each thread pulls in per load
-    static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T);
+    static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(float);
     static constexpr int ELTS_PER_ROW = NUM_EXPERTS;
     static constexpr int THREADS_PER_ROW = ELTS_PER_ROW / VPT;
     static constexpr int LDG_PER_THREAD = VPT / ELTS_PER_LDG;
@@ -243,20 +245,20 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
 
     // We finally start setting up the read pointers for each thread. First, each thread jumps to the start of the
     // row it will read.
-    const T* thread_row_ptr = input + thread_row * ELTS_PER_ROW;
+    const float* thread_row_ptr = input + thread_row * ELTS_PER_ROW;
 
     // Now, we compute the group each thread belong to in order to determine the first column to start loads.
     const int thread_group_idx = threadIdx.x % THREADS_PER_ROW;
     const int first_elt_read_by_thread = thread_group_idx * ELTS_PER_LDG;
-    const T* thread_read_ptr = thread_row_ptr + first_elt_read_by_thread;
+    const float* thread_read_ptr = thread_row_ptr + first_elt_read_by_thread;
 
     // Determine the pointer type to use to read in the data depending on the BYTES_PER_LDG template param. In theory,
     // this can support all powers of 2 up to 16.
-    using AccessType = cutlass::AlignedArray<T, ELTS_PER_LDG>;
+    using AccessType = cutlass::AlignedArray<float, ELTS_PER_LDG>;
 
     // Finally, we pull in the data from global mem
-    cutlass::Array<T, VPT> row_chunk_input;
-    AccessType* row_chunk_vec_ptr = reinterpret_cast<AccessType*>(&row_chunk_input);
+    cutlass::Array<float, VPT> row_chunk;
+    AccessType* row_chunk_vec_ptr = reinterpret_cast<AccessType*>(&row_chunk);
     const AccessType* vec_thread_read_ptr = reinterpret_cast<const AccessType*>(thread_read_ptr);
 #pragma unroll
     for (int ii = 0; ii < LDG_PER_THREAD; ++ii)
@@ -264,14 +266,9 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
         row_chunk_vec_ptr[ii] = vec_thread_read_ptr[ii * THREADS_PER_ROW];
     }
 
-    using ComputeType = float;
-    using Converter = cutlass::NumericArrayConverter<ComputeType, T, VPT>;
-    Converter compute_type_converter;
-    cutlass::Array<ComputeType, VPT> row_chunk = compute_type_converter(row_chunk_input);
-
     // First, we perform a max reduce within the thread. We can do the max in fp16 safely (I think) and just
     // convert to float afterwards for the exp + sum reduction.
-    ComputeType thread_max = row_chunk[0];
+    float thread_max = row_chunk[0];
 #pragma unroll
     for (int ii = 1; ii < VPT; ++ii)
     {
@@ -370,7 +367,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
             // The lead thread from each sub-group will write out the final results to global memory. (This will be a
             // single) thread per row of the input/output matrices.
             const int idx = k * thread_row + k_idx;
-            output[idx] = T(max_val);
+            output[idx] = max_val;
             indices[idx] = should_process_row ? (expert - start_expert) : NUM_EXPERTS;
             source_rows[idx] = k_idx * num_rows + thread_row;
         }
@@ -386,7 +383,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
             {
                 const int offset_for_expert = expert % ELTS_PER_LDG;
                 // Safe to set to any negative value since row_chunk values must be between 0 and 1.
-                row_chunk[ldg_group_for_expert * ELTS_PER_LDG + offset_for_expert] = ComputeType(-10000.f);
+                row_chunk[ldg_group_for_expert * ELTS_PER_LDG + offset_for_expert] = -10000.f;
             }
         }
     }
@@ -395,10 +392,10 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
 namespace detail
 {
 // Constructs some constants needed to partition the work across threads at compile time.
-template <typename T, int EXPERTS, int BYTES_PER_LDG>
+template <int EXPERTS, int BYTES_PER_LDG>
 struct TopkConstants
 {
-    static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T);
+    static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(float);
     static_assert(EXPERTS / (ELTS_PER_LDG * WARP_SIZE) == 0 || EXPERTS % (ELTS_PER_LDG * WARP_SIZE) == 0, "");
     static constexpr int VECs_PER_THREAD = std::max(1, EXPERTS / (ELTS_PER_LDG * WARP_SIZE));
     static constexpr int VPT = VECs_PER_THREAD * ELTS_PER_LDG;
@@ -407,28 +404,27 @@ struct TopkConstants
 };
 } // namespace detail
 
-template <typename T, int EXPERTS, int WARPS_PER_TB>
-void topkGatingSoftmaxLauncherHelper(const T* input, const bool* finished, T* output, int* indices, int* source_row,
-    const int num_rows, const int k, const int start_expert, const int end_expert, cudaStream_t stream)
+template <int EXPERTS, int WARPS_PER_TB>
+void topkGatingSoftmaxLauncherHelper(const float* input, const bool* finished, float* output, int* indices,
+    int* source_row, const int num_rows, const int k, const int start_expert, const int end_expert, cudaStream_t stream)
 {
     static constexpr std::size_t MAX_BYTES_PER_LDG = 16;
 
-    static constexpr int BYTES_PER_LDG = std::min(MAX_BYTES_PER_LDG, sizeof(T) * EXPERTS);
-    using Constants = detail::TopkConstants<T, EXPERTS, BYTES_PER_LDG>;
+    static constexpr int BYTES_PER_LDG = std::min(MAX_BYTES_PER_LDG, sizeof(float) * EXPERTS);
+    using Constants = detail::TopkConstants<EXPERTS, BYTES_PER_LDG>;
     static constexpr int VPT = Constants::VPT;
     static constexpr int ROWS_PER_WARP = Constants::ROWS_PER_WARP;
     const int num_warps = (num_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
     const int num_blocks = (num_warps + WARPS_PER_TB - 1) / WARPS_PER_TB;
 
     dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
-    topkGatingSoftmax<T, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG><<<num_blocks, block_dim, 0, stream>>>(
+    topkGatingSoftmax<VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG><<<num_blocks, block_dim, 0, stream>>>(
         input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert);
 }
 
-template <typename T>
-void topkGatingSoftmaxKernelLauncher(const T* input, const bool* finished, T* output, T* softmax_temp_output,
-    int* indices, int* source_row, const int num_rows, const int num_experts, const int k, const int start_expert,
-    const int end_expert, cudaStream_t stream)
+void topkGatingSoftmaxKernelLauncher(const float* input, const bool* finished, float* output,
+    float* softmax_temp_output, int* indices, int* source_row, const int num_rows, const int num_experts, const int k,
+    const int start_expert, const int end_expert, cudaStream_t stream)
 {
     static constexpr int WARPS_PER_TB = 4;
 
@@ -436,55 +432,55 @@ void topkGatingSoftmaxKernelLauncher(const T* input, const bool* finished, T* ou
     {
     case 1:
     {
-        topkGatingSoftmaxLauncherHelper<T, 1, WARPS_PER_TB>(
+        topkGatingSoftmaxLauncherHelper<1, WARPS_PER_TB>(
             input, finished, output, indices, source_row, num_rows, k, start_expert, end_expert, stream);
         break;
     }
     case 2:
     {
-        topkGatingSoftmaxLauncherHelper<T, 2, WARPS_PER_TB>(
+        topkGatingSoftmaxLauncherHelper<2, WARPS_PER_TB>(
             input, finished, output, indices, source_row, num_rows, k, start_expert, end_expert, stream);
         break;
     }
     case 4:
     {
-        topkGatingSoftmaxLauncherHelper<T, 4, WARPS_PER_TB>(
+        topkGatingSoftmaxLauncherHelper<4, WARPS_PER_TB>(
             input, finished, output, indices, source_row, num_rows, k, start_expert, end_expert, stream);
         break;
     }
     case 8:
     {
-        topkGatingSoftmaxLauncherHelper<T, 8, WARPS_PER_TB>(
+        topkGatingSoftmaxLauncherHelper<8, WARPS_PER_TB>(
             input, finished, output, indices, source_row, num_rows, k, start_expert, end_expert, stream);
         break;
     }
     case 16:
     {
-        topkGatingSoftmaxLauncherHelper<T, 16, WARPS_PER_TB>(
+        topkGatingSoftmaxLauncherHelper<16, WARPS_PER_TB>(
             input, finished, output, indices, source_row, num_rows, k, start_expert, end_expert, stream);
         break;
     }
     case 32:
     {
-        topkGatingSoftmaxLauncherHelper<T, 32, WARPS_PER_TB>(
+        topkGatingSoftmaxLauncherHelper<32, WARPS_PER_TB>(
             input, finished, output, indices, source_row, num_rows, k, start_expert, end_expert, stream);
         break;
     }
     case 64:
     {
-        topkGatingSoftmaxLauncherHelper<T, 64, WARPS_PER_TB>(
+        topkGatingSoftmaxLauncherHelper<64, WARPS_PER_TB>(
             input, finished, output, indices, source_row, num_rows, k, start_expert, end_expert, stream);
         break;
     }
     case 128:
     {
-        topkGatingSoftmaxLauncherHelper<T, 128, WARPS_PER_TB>(
+        topkGatingSoftmaxLauncherHelper<128, WARPS_PER_TB>(
             input, finished, output, indices, source_row, num_rows, k, start_expert, end_expert, stream);
         break;
     }
     case 256:
     {
-        topkGatingSoftmaxLauncherHelper<T, 256, WARPS_PER_TB>(
+        topkGatingSoftmaxLauncherHelper<256, WARPS_PER_TB>(
             input, finished, output, indices, source_row, num_rows, k, start_expert, end_expert, stream);
         break;
     }
@@ -492,8 +488,8 @@ void topkGatingSoftmaxKernelLauncher(const T* input, const bool* finished, T* ou
     {
         static constexpr int TPB = 256;
         TLLM_CHECK(softmax_temp_output != nullptr);
-        moeSoftmax<T, TPB><<<num_rows, TPB, 0, stream>>>(input, finished, softmax_temp_output, num_experts);
-        moeTopK<T, TPB><<<num_rows, TPB, 0, stream>>>(
+        moeSoftmax<TPB><<<num_rows, TPB, 0, stream>>>(input, finished, softmax_temp_output, num_experts);
+        moeTopK<TPB><<<num_rows, TPB, 0, stream>>>(
             softmax_temp_output, finished, output, indices, source_row, num_experts, k, start_expert, end_expert);
     }
     }
@@ -649,7 +645,7 @@ enum class ScaleMode : int
 // This kernel unpermutes the original data, does the k-way reduction and performs the final skip connection.
 template <typename T, int RESIDUAL_NUM, bool HAS_BIAS, ScaleMode SCALE_MODE, bool CHECK_SKIPPED>
 __global__ void finalizeMoeRoutingKernel(const T* expanded_permuted_rows, T* reduced_unpermuted_output, const T* skip_1,
-    const T* skip_2, const T* bias, const T* scales, const int* expanded_source_row_to_expanded_dest_row,
+    const T* skip_2, const T* bias, const float* scales, const int* expanded_source_row_to_expanded_dest_row,
     const int* expert_for_source_row, const int cols, const int k, const int64_t* num_valid_ptr)
 {
     const int original_row = blockIdx.x;
@@ -672,14 +668,14 @@ __global__ void finalizeMoeRoutingKernel(const T* expanded_permuted_rows, T* red
     for (int tid = threadIdx.x; tid < cols; tid += blockDim.x)
     {
         T thread_output{0.f};
-        T row_rescale{0.f};
+        float row_rescale{0.f};
         for (int k_idx = 0; k_idx < k; ++k_idx)
         {
             const int expanded_original_row = original_row + k_idx * num_rows;
             const int expanded_permuted_row = expanded_source_row_to_expanded_dest_row[expanded_original_row];
 
             const int64_t k_offset = original_row * k + k_idx;
-            const T row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? T(1.f) : scales[k_offset];
+            const float row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
             if constexpr (SCALE_MODE == ScaleMode::RENORM_SCALE)
             {
                 row_rescale = row_rescale + row_scale;
@@ -698,13 +694,14 @@ __global__ void finalizeMoeRoutingKernel(const T* expanded_permuted_rows, T* red
             const T* bias_ptr = bias + expert_idx * cols;
             const T bias_value = HAS_BIAS ? bias_ptr[tid] : T(0.f);
 
-            thread_output = thread_output + row_scale * (expanded_permuted_rows_row_ptr[tid] + bias_value);
+            thread_output = static_cast<float>(thread_output)
+                + row_scale * static_cast<float>(expanded_permuted_rows_row_ptr[tid] + bias_value);
         }
 
         if (SCALE_MODE == ScaleMode::RENORM_SCALE && (!CHECK_SKIPPED || thread_output))
         {
-            assert(row_rescale != T(0.f));
-            thread_output = thread_output / row_rescale;
+            assert(row_rescale != 0.f);
+            thread_output = static_cast<float>(thread_output) / row_rescale;
         }
 
         if (RESIDUAL_NUM == 1)
@@ -721,7 +718,7 @@ __global__ void finalizeMoeRoutingKernel(const T* expanded_permuted_rows, T* red
 
 template <typename T, int RESIDUAL_NUM>
 void finalizeMoeRoutingKernelLauncherSelectBias(const T* expanded_permuted_rows, T* reduced_unpermuted_output,
-    const T* skip_1, const T* skip_2, const T* bias, const T* scales,
+    const T* skip_1, const T* skip_2, const T* bias, const float* scales,
     const int* expanded_source_row_to_expanded_dest_row, const int* expert_for_source_row, const int num_rows,
     const int cols, const int k, const int64_t* num_valid_ptr, MOEParallelismConfig parallelism_config,
     MOEExpertScaleNormalizationMode normalization_mode, cudaStream_t stream)
@@ -766,7 +763,7 @@ void finalizeMoeRoutingKernelLauncherSelectBias(const T* expanded_permuted_rows,
 
 template <typename T>
 void finalizeMoeRoutingKernelLauncher(const T* expanded_permuted_rows, T* reduced_unpermuted_output, const T* skip_1,
-    const T* skip_2, const T* bias, const T* scales, const int* expanded_source_row_to_expanded_dest_row,
+    const T* skip_2, const T* bias, const float* scales, const int* expanded_source_row_to_expanded_dest_row,
     const int* expert_for_source_row, const int num_rows, const int cols, const int k, const int64_t* num_valid_ptr,
     MOEParallelismConfig parallelism_config, MOEExpertScaleNormalizationMode normalization_mode, cudaStream_t stream)
 {
@@ -835,44 +832,56 @@ void doGatedActivation(T* output, const T* gemm_result, const int64_t* num_valid
 }
 
 template <typename T, typename WeightType, typename Enable>
+std::vector<size_t> CutlassMoeFCRunner<T, WeightType, Enable>::getWorkspaceBufferSizes(const int num_rows,
+    const int hidden_size, const int inter_size, const int num_experts, const int num_experts_per_node, const int k,
+    ActivationType activation_type) const
+{
+    const size_t num_moe_inputs = k * num_rows;
+    const size_t buf_size = num_moe_inputs * hidden_size;
+    const size_t interbuf_elems = num_moe_inputs * inter_size;
+    const size_t glu_inter_elems = isGatedActivation(activation_type) ? (interbuf_elems * 2) : 0;
+    int num_softmax_outs = 0;
+
+    const bool is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
+    if (!is_pow_2 || num_experts > 256)
+    {
+        num_softmax_outs = num_rows * num_experts;
+    }
+
+    size_t source_rows_size = num_moe_inputs * sizeof(int);
+    size_t permuted_rows_size = num_moe_inputs * sizeof(int);
+    size_t permuted_experts_size = num_moe_inputs * sizeof(int);
+    size_t permuted_data_size = buf_size * sizeof(T);
+    size_t total_rows_before_expert_size = num_experts_per_node * sizeof(int64_t);
+    size_t softmax_out_size = num_softmax_outs * sizeof(float);
+    size_t glu_inter_size = glu_inter_elems * sizeof(T);
+    size_t fc1_result_size = interbuf_elems * sizeof(T);
+    size_t sorter_size = CubKeyValueSorter::getWorkspaceSize(num_rows, num_experts);
+
+    std::vector<size_t> workspace{
+        source_rows_size,
+        permuted_rows_size,
+        permuted_experts_size,
+        permuted_data_size,
+        total_rows_before_expert_size,
+        softmax_out_size,
+        glu_inter_size,
+        // These pointers reuse the same memory
+        std::max(fc1_result_size, sorter_size),
+    };
+    return workspace;
+}
+
+template <typename T, typename WeightType, typename Enable>
 size_t CutlassMoeFCRunner<T, WeightType, Enable>::getWorkspaceSize(const int num_rows, const int hidden_size,
     const int inter_size, const int num_experts, const int k, ActivationType activation_type,
     MOEParallelismConfig parallelism_config) const
 {
     const int ep_size = parallelism_config.ep_size;
     TLLM_CHECK_WITH_INFO(num_experts % ep_size == 0, "Number of experts must be a multiple of tp size");
-    const int buf_size = pad_to_multiple_of_16(k * num_rows * hidden_size);
-    const int glu_inter_size
-        = isGatedActivation(activation_type) ? pad_to_multiple_of_16(k * num_rows * inter_size * 2) : 0;
-    const int interbuf_size = pad_to_multiple_of_16(k * num_rows * inter_size) + glu_inter_size;
-    const int padded_experts = pad_to_multiple_of_16(num_experts / ep_size);
-    const int num_moe_inputs = pad_to_multiple_of_16(k * num_rows);
-    int num_softmax_outs = 0;
-
-    const bool is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
-    if (!is_pow_2 || num_experts > 256)
-    {
-        num_softmax_outs = pad_to_multiple_of_16(num_rows * num_experts);
-    }
-
-    // softmax output, permuted_rows and permuted_experts have moved to outside of moe kernel, allocate them
-    // in Encoder or Decoder before invoking FfnLayer forward.
-    size_t total_ws_bytes = 3 * num_moe_inputs * sizeof(int); // source_rows_, permuted_rows_, permuted_experts_
-    total_ws_bytes += buf_size * sizeof(T);                   // permuted_data
-    total_ws_bytes += padded_experts * sizeof(int64_t);       // Hold total_rows_before_expert_
-    total_ws_bytes += num_softmax_outs * sizeof(T);
-    const int bytes_for_fc1_result = interbuf_size * sizeof(T);
-    const int sorter_ws_size_bytes = pad_to_multiple_of_16(CubKeyValueSorter::getWorkspaceSize(num_rows, num_experts));
-
-    int bytes_for_intermediate_and_sorting = bytes_for_fc1_result;
-    if (sorter_ws_size_bytes > bytes_for_fc1_result)
-    {
-        int remaining_bytes = pad_to_multiple_of_16(sorter_ws_size_bytes - bytes_for_fc1_result);
-        bytes_for_intermediate_and_sorting += remaining_bytes;
-    }
-
-    total_ws_bytes += bytes_for_intermediate_and_sorting; // intermediate (fc1) output + cub sorting workspace
-    return total_ws_bytes;
+    auto workspace = getWorkspaceBufferSizes(
+        num_rows, hidden_size, inter_size, num_experts, num_experts / ep_size, k, activation_type);
+    return tensorrt_llm::common::calculateTotalWorkspaceSize(workspace.data(), workspace.size());
 }
 
 template <typename T, typename WeightType, typename Enable>
@@ -880,45 +889,43 @@ void CutlassMoeFCRunner<T, WeightType, Enable>::configureWsPtrs(char* ws_ptr, co
     const int inter_size, const int num_experts, const int num_experts_per_node, const int k,
     ActivationType activation_type)
 {
-    const int buf_size = pad_to_multiple_of_16(k * num_rows * hidden_size);
-    const int glu_inter_size
-        = isGatedActivation(activation_type) ? pad_to_multiple_of_16(k * num_rows * inter_size * 2) : 0;
-    const int interbuf_size = pad_to_multiple_of_16(k * num_rows * inter_size) + glu_inter_size;
-    const int sorter_ws_size_bytes = pad_to_multiple_of_16(CubKeyValueSorter::getWorkspaceSize(num_rows, num_experts));
-    const size_t interbuf_sorter_size_bytes = std::max(interbuf_size * sizeof(T), (size_t) sorter_ws_size_bytes);
-    const int padded_experts = pad_to_multiple_of_16(num_experts_per_node);
-    const int num_moe_inputs = pad_to_multiple_of_16(k * num_rows);
+    auto workspace = getWorkspaceBufferSizes(
+        num_rows, hidden_size, inter_size, num_experts, num_experts_per_node, k, activation_type);
 
-    source_rows_ = (int*) ws_ptr;
-    permuted_rows_ = source_rows_ + num_moe_inputs;
-    permuted_experts_ = permuted_rows_ + num_moe_inputs;
-    permuted_data_ = (T*) (permuted_experts_ + num_moe_inputs);
+    std::vector<int8_t*> ws_sliced{(int8_t*) ws_ptr};
+    for (auto size : workspace)
+    {
+        ws_sliced.push_back(nextWorkspacePtr(ws_sliced.back(), size));
+    }
 
-    total_rows_before_expert_ = (int64_t*) (permuted_data_ + buf_size);
+    source_rows_ = (int*) ws_sliced[0];
+    permuted_rows_ = (int*) ws_sliced[1];
+    permuted_experts_ = (int*) ws_sliced[2];
+    permuted_data_ = (T*) ws_sliced[3];
 
-    // These pointers are aliased. Since the sort ws can be overwritten after it is finished
-    glu_inter_result_ = (T*) (total_rows_before_expert_ + padded_experts);
-    fc1_result_ = glu_inter_result_ + glu_inter_size;
-    sorter_ws_ = (char*) glu_inter_result_;
+    total_rows_before_expert_ = (int64_t*) ws_sliced[4];
 
+    softmax_out_ = nullptr;
     const bool is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
     if (!is_pow_2 || num_experts > 256)
     {
-        softmax_out_ = (T*) (sorter_ws_ + interbuf_sorter_size_bytes);
+        softmax_out_ = (float*) ws_sliced[5];
     }
-    else
-    {
-        softmax_out_ = nullptr;
-    }
+
+    glu_inter_result_ = (T*) ws_sliced[6];
+
+    // These pointers are aliased. Since the sort ws can be overwritten after it is finished
+    sorter_ws_ = (char*) ws_sliced[7];
+    fc1_result_ = (T*) ws_sliced[7];
 }
 
 template <typename T, typename WeightType, typename Enable>
-void CutlassMoeFCRunner<T, WeightType, Enable>::runMoe(const void* input_activations_void,
-    const void* gating_output_void, const void* fc1_expert_weights_void, const void* fc1_scales_void,
-    const void* fc1_expert_biases_void, ActivationType fc1_activation_type, const void* fc2_expert_weights_void,
-    const void* fc2_scales_void, const void* fc2_expert_biases_void, const int num_rows, const int hidden_size,
-    const int inter_size, const int num_experts, const int k, char* workspace_ptr, void* final_output_void,
-    void* fc2_result_void, const bool* finished, const int active_rows, void* expert_scales_void,
+void CutlassMoeFCRunner<T, WeightType, Enable>::runMoe(const void* input_activations_void, const float* gating_output,
+    const void* fc1_expert_weights_void, const void* fc1_scales_void, const void* fc1_expert_biases_void,
+    ActivationType fc1_activation_type, const void* fc2_expert_weights_void, const void* fc2_scales_void,
+    const void* fc2_expert_biases_void, const int num_rows, const int hidden_size, const int inter_size,
+    const int num_experts, const int k, char* workspace_ptr, void* final_output_void, void* fc2_result_void,
+    const bool* finished, const int active_rows, void* expert_scales_void,
     int* expanded_source_row_to_expanded_dest_row, int* expert_for_source_row, MOEParallelismConfig parallelism_config,
     MOEExpertScaleNormalizationMode normalization_mode, cudaStream_t stream)
 {
@@ -926,7 +933,6 @@ void CutlassMoeFCRunner<T, WeightType, Enable>::runMoe(const void* input_activat
         = std::is_same<WeightType, uint8_t>::value || std::is_same<WeightType, cutlass::uint4b_t>::value;
 
     auto* input_activations = static_cast<const T*>(input_activations_void);
-    auto* gating_output = static_cast<const T*>(gating_output_void);
     auto* fc1_expert_weights = static_cast<const WeightType*>(fc1_expert_weights_void);
     auto* fc1_scales = static_cast<const T*>(fc1_scales_void);
     auto* fc1_expert_biases = static_cast<const T*>(fc1_expert_biases_void);
@@ -935,7 +941,7 @@ void CutlassMoeFCRunner<T, WeightType, Enable>::runMoe(const void* input_activat
     auto* fc2_expert_biases = static_cast<const T*>(fc2_expert_biases_void);
     auto* final_output = static_cast<T*>(final_output_void);
     auto* fc2_result = static_cast<T*>(fc2_result_void);
-    auto* expert_scales = static_cast<T*>(expert_scales_void);
+    auto* expert_scales = static_cast<float*>(expert_scales_void);
 
     TLLM_CHECK(input_activations);
     TLLM_CHECK(gating_output);
@@ -965,7 +971,7 @@ void CutlassMoeFCRunner<T, WeightType, Enable>::runMoe(const void* input_activat
 
     configureWsPtrs(
         workspace_ptr, num_rows, hidden_size, inter_size, num_experts, num_experts_per_node, k, fc1_activation_type);
-    topkGatingSoftmaxKernelLauncher<T>(gating_output, finished, expert_scales, softmax_out_, expert_for_source_row,
+    topkGatingSoftmaxKernelLauncher(gating_output, finished, expert_scales, softmax_out_, expert_for_source_row,
         source_rows_, num_rows, num_experts, k, start_expert, end_expert, stream);
 
     sync_check_cuda_error();
@@ -1008,8 +1014,8 @@ void CutlassMoeFCRunner<T, WeightType, Enable>::runMoe(const void* input_activat
 
         sync_check_cuda_error();
 
-        doGatedActivation<T>(
-            fc1_result_, glu_inter_result_, num_valid_tokens_ptr, inter_size, num_rows, fc1_activation_type, stream);
+        doGatedActivation<T>(fc1_result_, glu_inter_result_, num_valid_tokens_ptr, inter_size, num_rows * k,
+            fc1_activation_type, stream);
     }
 
     sync_check_cuda_error();

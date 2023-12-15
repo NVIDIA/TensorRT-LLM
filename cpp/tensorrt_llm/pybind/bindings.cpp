@@ -175,9 +175,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
             py::overload_cast<bool>(&tr::GptModelConfig::useCustomAllReduce));
 
     py::class_<tr::WorldConfig>(m, "WorldConfig")
-        .def(py::init<SizeType, SizeType, SizeType, SizeType>(), py::arg("tensor_parallelism") = 1,
-            py::arg("pipeline_parallelism") = 1, py::arg("rank") = 0,
-            py::arg("gpus_per_node") = tr::WorldConfig::kDefaultGpusPerNode)
+        .def(py::init<SizeType, SizeType, SizeType, SizeType, std::optional<std::vector<SizeType>> const&>(),
+            py::arg("tensor_parallelism") = 1, py::arg("pipeline_parallelism") = 1, py::arg("rank") = 0,
+            py::arg("gpus_per_node") = tr::WorldConfig::kDefaultGpusPerNode, py::arg("device_ids") = py::none())
         .def_property_readonly("size", &tr::WorldConfig::getSize)
         .def_property_readonly("tensor_parallelism", &tr::WorldConfig::getTensorParallelism)
         .def_property_readonly("pipeline_parallelism", &tr::WorldConfig::getPipelineParallelism)
@@ -185,14 +185,15 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("is_pipeline_parallel", &tr::WorldConfig::isPipelineParallel)
         .def_property_readonly("rank", &tr::WorldConfig::getRank)
         .def_property_readonly("gpus_per_node", &tr::WorldConfig::getGpusPerNode)
+        .def_property_readonly("gpus_per_group", &tr::WorldConfig::getGpusPerGroup)
         .def_property_readonly("device", &tr::WorldConfig::getDevice)
         .def_property_readonly("pipeline_parallel_rank", &tr::WorldConfig::getPipelineParallelRank)
         .def_property_readonly("tensor_parallel_rank", &tr::WorldConfig::getTensorParallelRank)
         .def_static("mpi",
             py::overload_cast<SizeType, std::optional<SizeType>, std::optional<SizeType>,
-                std::optional<std::vector<SizeType>>>(&tr::WorldConfig::mpi),
+                std::optional<std::vector<SizeType>> const&>(&tr::WorldConfig::mpi),
             py::arg("gpus_per_node") = tr::WorldConfig::kDefaultGpusPerNode, py::arg("tensor_parallelism") = py::none(),
-            py::arg("pipeline_parallelism") = py::none(), py::arg("user_specified_device_ids") = py::none());
+            py::arg("pipeline_parallelism") = py::none(), py::arg("device_ids") = py::none());
 
     py::class_<tr::SamplingConfig>(m, "SamplingConfig")
         .def(py::init<SizeType>(), py::arg("beam_width") = 1)
@@ -304,14 +305,13 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .value("GUARANTEED_NO_EVICT", tbb::SchedulerPolicy::GUARANTEED_NO_EVICT);
 
     py::class_<tb::TrtGptModelOptionalParams>(m, "TrtGptModelOptionalParams")
-        .def(py::init<tbk::KvCacheConfig, std::optional<SizeType>, bool, bool>(),
-            py::arg_v("kv_cache_config", tbk::KvCacheConfig{}, "KvCacheConfig()"),
-            py::arg("max_num_sequences") = py::none(), py::arg("enable_trt_overlap") = true,
-            py::arg("use_context_fmha_for_generation") = false)
+        .def(py::init<tbk::KvCacheConfig, std::optional<SizeType>, bool>(),
+            py::arg("kv_cache_config") = tbk::KvCacheConfig{}, py::arg("max_num_sequences") = py::none(),
+            py::arg("enable_trt_overlap") = true)
         .def_readwrite("kv_cache_config", &tb::TrtGptModelOptionalParams::kvCacheConfig)
         .def_readwrite("max_num_sequences", &tb::TrtGptModelOptionalParams::maxNumSequences)
         .def_readwrite("enable_trt_overlap", &tb::TrtGptModelOptionalParams::enableTrtOverlap)
-        .def_readwrite("use_context_fmha_for_generation", &tb::TrtGptModelOptionalParams::useContextFMHAForGeneration);
+        .def_readwrite("device_ids", &tb::TrtGptModelOptionalParams::deviceIds);
 
     tpb::GptManager::initBindings(m);
 }

@@ -42,7 +42,7 @@ def parse_t5_config(config, component, args):
         args.hidden_size = config.getint(component, 'd_model')
         args.ffn_hidden_size = config.getint(component, 'd_ff')
         args.vocab_size = config.getint(component, 'vocab_size')
-        args.n_positions = config.getint(component, 'n_positions')
+        args.n_positions = config.getint(component, 'n_positions', fallback=512)
         args.has_position_embedding = config.getboolean(
             component, 'has_position_embedding',
             fallback=False)  # TODO: hardcoded here
@@ -88,7 +88,7 @@ def parse_t5_config(config, component, args):
         args.hidden_size = config.getint(component, 'd_model')
         args.ffn_hidden_size = config.getint(component, 'd_ff')
         args.vocab_size = config.getint(component, 'vocab_size')
-        args.n_positions = config.getint(component, 'n_positions')
+        args.n_positions = config.getint(component, 'n_positions', fallback=512)
         args.has_position_embedding = config.getboolean(
             component, 'has_position_embedding',
             fallback=False)  # TODO: hardcoded here
@@ -131,6 +131,9 @@ def parse_t5_config(config, component, args):
         args.logits_dtype = config.get(component,
                                        'logits_dtype',
                                        fallback='float32')
+        args.rescale_before_lm_head = config.getboolean(
+            component, 'tie_word_embeddings'
+        )  # default is True (for T5), but False for Flan-T5
         args.encoder_hidden_size = config.getint('encoder', 'd_model')
         args.encoder_num_heads = config.getint('encoder', 'num_heads')
         args.encoder_head_size = config.getint('encoder', 'd_kv')
@@ -336,7 +339,7 @@ def load_from_hf_t5(tllm_model, pytorch_ckpt_path, component, dtype="float32"):
 def load_from_binary_t5(tllm_model: Union[EncoderModel, DecoderModel],
                         dir_path,
                         args,
-                        mapping=Mapping(),
+                        mapping: Optional[Mapping] = None,
                         dtype='float32',
                         use_parallel_embedding=False,
                         sharding_dim=0,
@@ -344,6 +347,9 @@ def load_from_binary_t5(tllm_model: Union[EncoderModel, DecoderModel],
                         scaling_factors=None):
     logger.info('Loading weights from binary...')
     tik = time.time()
+
+    if mapping is None:
+        mapping = Mapping()
 
     ckpt_np_dtype = str_dtype_to_np(args.ckpt_weight_dtype)
 

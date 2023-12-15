@@ -76,7 +76,7 @@ add_library(${PLUGIN_SHARED_TARGET} SHARED ${PLUGIN_SOURCES})
 
 target_include_directories(
   ${PLUGIN_SHARED_TARGET}
-  PUBLIC ${CUDA_INSTALL_DIR}/include ${MPI_INCLUDE_PATH}
+  PUBLIC ${CUDA_INSTALL_DIR}/include ${MPI_C_INCLUDE_DIRS}
   PRIVATE ${TARGET_DIR})
 
 if(CUDA_VERSION VERSION_LESS 11.0)
@@ -119,6 +119,6 @@ target_link_libraries(
   nvinfer
   ${CUDA_DRV_LIB}
   ${CMAKE_DL_LIBS}
-  ${MPI_LIBRARIES}
+  ${MPI_C_LIBRARIES}
   ${NCCL_LIB}
   ${STATIC_TARGET})

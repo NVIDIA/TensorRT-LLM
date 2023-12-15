@@ -297,9 +297,6 @@ def quantize(input: Tensor,
 
     output = _create_tensor(layer.get_output(0), layer)
 
-    if not default_net().strongly_typed:
-        layer.get_output(0).dtype = str_dtype_to_trt(dtype)
-
     return output
 
 
@@ -349,9 +346,7 @@ def quantize_per_token(x: Tensor) -> Tuple[Tensor]:
         layer.get_output(0).set_dynamic_range(-127, 127)
 
         quantized = _create_tensor(layer.get_output(0), layer)
-        quantized.trt_tensor.dtype = str_dtype_to_trt("int8")
         scales = _create_tensor(layer.get_output(1), layer)
-        scales.trt_tensor.dtype = str_dtype_to_trt("float32")
 
         return quantized, scales
 
@@ -375,5 +370,4 @@ def quantize_tensor(x, scale):
         layer.get_output(0).set_dynamic_range(-127, 127)
 
         quantized = _create_tensor(layer.get_output(0), layer)
-        quantized.trt_tensor.dtype = str_dtype_to_trt("int8")
     return quantized

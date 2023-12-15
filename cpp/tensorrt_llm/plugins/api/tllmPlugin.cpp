@@ -32,6 +32,7 @@
 #include "tensorrt_llm/plugins/ncclPlugin/allgatherPlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/allreducePlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/recvPlugin.h"
+#include "tensorrt_llm/plugins/ncclPlugin/reduceScatterPlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/sendPlugin.h"
 #endif // ENABLE_MULTI_DEVICE
 #include "tensorrt_llm/plugins/quantizePerTokenPlugin/quantizePerTokenPlugin.h"
@@ -142,6 +143,7 @@ extern "C"
         static tensorrt_llm::plugins::RecvPluginCreator recvPluginCreator;
         static tensorrt_llm::plugins::AllreducePluginCreator allreducePluginCreator;
         static tensorrt_llm::plugins::AllgatherPluginCreator allgatherPluginCreator;
+        static tensorrt_llm::plugins::ReduceScatterPluginCreator reduceScatterPluginCreator;
 #endif // ENABLE_MULTI_DEVICE
         static tensorrt_llm::plugins::LayernormPluginCreator layernormPluginCreator;
         static tensorrt_llm::plugins::RmsnormPluginCreator rmsnormPluginCreator;
@@ -167,6 +169,7 @@ extern "C"
                   creatorPtr(recvPluginCreator),
                   creatorPtr(allreducePluginCreator),
                   creatorPtr(allgatherPluginCreator),
+                  creatorPtr(reduceScatterPluginCreator),
 #endif // ENABLE_MULTI_DEVICE
                   creatorPtr(layernormPluginCreator),
                   creatorPtr(rmsnormPluginCreator),

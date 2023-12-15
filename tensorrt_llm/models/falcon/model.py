@@ -18,7 +18,8 @@ import tensorrt as trt
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
-from ...functional import Tensor, gather_last_token_logits, recv, send
+from ...functional import (Tensor, allreduce, gather_last_token_logits, recv,
+                           send)
 from ...layers import (MLP, Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, KeyValueCacheParams, LayerNorm,
                        PositionEmbeddingType)
@@ -69,6 +70,12 @@ class FalconDecoderLayer(Module):
         else:
             position_embedding_type = PositionEmbeddingType.rope_gpt_neox
 
+        self.new_decoder_architecture = new_decoder_architecture
+        self.parallel_attn = parallel_attention
+        if self.is_parallel_attention:
+            # Not to apply allreduce inside the Attention/MLP layers.
+            # allreduce applies after those layer.
+            tp_group = None
         self.attention = Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -88,9 +95,6 @@ class FalconDecoderLayer(Module):
         if mlp_hidden_size is None:
             mlp_hidden_size = hidden_size * 4
 
-        self.new_decoder_architecture = new_decoder_architecture
-        self.parallel_attn = parallel_attention
-
         if self.new_decoder_architecture:
             # Layernorm before MLP.
             self.mlp_layernorm = LayerNorm(normalized_shape=hidden_size,
@@ -109,11 +113,15 @@ class FalconDecoderLayer(Module):
             quant_mode=quant_mode,
             instance_id=2 * layer_id + 1,
         )
-        if self.new_decoder_architecture or self.parallel_attn:
+        if self.is_parallel_attention:
             self.post_layernorm = None
         else:
             self.post_layernorm = LayerNorm(normalized_shape=hidden_size,
                                             dtype=dtype)
+
+    @property
+    def is_parallel_attention(self):
+        return self.new_decoder_architecture or self.parallel_attn
 
     def forward(self,
                 hidden_states: Tensor,
@@ -152,8 +160,11 @@ class FalconDecoderLayer(Module):
 
         hidden_states = self.mlp(hidden_states, all_reduce_workspace)
 
-        if self.new_decoder_architecture or self.parallel_attn:
+        if self.is_parallel_attention:
             hidden_states = hidden_states + attention_output
+            if self.tp_size > 1:
+                hidden_states = allreduce(hidden_states, self.tp_group,
+                                          all_reduce_workspace, self._layer_id)
 
         hidden_states = residual + hidden_states
         if use_cache:

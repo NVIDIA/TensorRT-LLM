@@ -121,6 +121,8 @@ def read_config(config_path: Path) -> Tuple[ModelConfig, dict]:
     tokens_per_block = plugin_config['tokens_per_block']
     use_custom_all_reduce = plugin_config.get('use_custom_all_reduce', False)
     lora_plugin = plugin_config.get('lora_plugin')
+    use_context_fmha_for_generation = plugin_config.get(
+        'use_context_fmha_for_generation')
 
     model_config = ModelConfig(
         vocab_size=vocab_size,
@@ -142,7 +144,8 @@ def read_config(config_path: Path) -> Tuple[ModelConfig, dict]:
         dtype=dtype,
         use_custom_all_reduce=use_custom_all_reduce,
         lora_plugin=lora_plugin,
-        lora_target_modules=lora_target_modules)
+        lora_target_modules=lora_target_modules,
+        use_context_fmha_for_generation=use_context_fmha_for_generation)
 
     other_config = {
         'world_size': world_size,
@@ -249,8 +252,7 @@ class ModelRunnerMixin:
             task_vocab_size = torch.tensor([task_vocab_size], dtype=torch.int32)
             prompt_table = prompt_table.view(-1, hidden_size)
         else:
-            prompt_table = torch.empty([1, self.session.hidden_size],
-                                       dtype=self.dtype)
+            prompt_table = torch.empty([1, self.hidden_size], dtype=self.dtype)
             task_vocab_size = torch.zeros([1], dtype=torch.int32)
 
         if tasks is not None:
@@ -317,7 +319,8 @@ class ModelRunner(ModelRunnerMixin):
                  engine_dir: str,
                  lora_dir: Optional[str] = None,
                  rank: int = 0,
-                 debug_mode: bool = False) -> 'ModelRunner':
+                 debug_mode: bool = False,
+                 lora_ckpt_source: str = "hf") -> 'ModelRunner':
         """
         Create a ModelRunner instance from an engine directory.
 
@@ -415,9 +418,10 @@ class ModelRunner(ModelRunnerMixin):
             assert lora_dir is not None, \
                 "lora_dir should not be None for engine built with lora_plugin enabled."
             lora_manager = LoraManager()
-            lora_manager.load_from_hf(model_dir=lora_dir,
-                                      model_config=model_config,
-                                      runtime_mapping=runtime_mapping)
+            lora_manager.load_from_ckpt(model_dir=lora_dir,
+                                        model_config=model_config,
+                                        runtime_mapping=runtime_mapping,
+                                        ckpt_source=lora_ckpt_source)
         else:
             lora_manager = None
 
@@ -431,6 +435,30 @@ class ModelRunner(ModelRunnerMixin):
     @property
     def dtype(self) -> torch.dtype:
         return self.session.dtype
+
+    @property
+    def vocab_size(self) -> int:
+        return self.session.vocab_size
+
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.session.vocab_size_padded
+
+    @property
+    def hidden_size(self) -> int:
+        return self.session.hidden_size
+
+    @property
+    def num_heads(self) -> int:
+        return self.session.num_heads
+
+    @property
+    def num_layers(self) -> int:
+        return self.session.num_layers
+
+    @property
+    def max_sequence_length(self) -> int:
+        return self.max_input_len + self.max_output_len
 
     @property
     def remove_input_padding(self) -> bool:
@@ -498,7 +526,7 @@ class ModelRunner(ModelRunnerMixin):
                 If return_dict=False, the method returns generated output_ids.
                 If return_dict=True, the method returns a dict of output_ids,
                 sequence_lengths (if sampling_config.output_sequence_lengths=True),
-                context_logits and generation_logits (if self.session.gather_all_token_logits=True).
+                context_logits and generation_logits (if self.gather_all_token_logits=True).
         """
         # Use sampling_config like HF's generation_config
         if sampling_config is None:

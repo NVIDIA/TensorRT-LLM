@@ -3,7 +3,6 @@ import sys
 from time import time
 
 import tensorrt as trt
-import version
 
 iModelID = int(
     sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else -1
@@ -30,8 +29,7 @@ def build(iPart, minBS=1, optBS=2, maxBS=4):
     builder = trt.Builder(logger)
 
     network_creation_flags = 0
-    if version.parse(trt.__version__).major <= 9:
-        # Explicit batch flag is deprecated, only use for TRT major version <= 9
+    if "EXPLICIT_BATCH" in trt.NetworkDefinitionCreationFlag.__members__.keys():
         network_creation_flags = 1 << int(
             trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
 

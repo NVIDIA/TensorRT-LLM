@@ -2549,7 +2549,7 @@ __global__ void masked_multihead_attention_kernel(
 
             float final_max = -FLT_MAX;
             float thread_partial_max = -FLT_MAX;
-            thread_partial_max = params.partial_max[bhi_seq_len_tile + min(tidx, gridDim.x - 1)];
+            thread_partial_max = params.partial_max[bhi_seq_len_tile + min(tidx, gridDim.z - 1)];
 
             // Make sure we can start writing to shared memory.
             __syncthreads();

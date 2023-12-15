@@ -89,7 +89,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                  max_output_len: Optional[int] = None,
                  max_beam_width: Optional[int] = None,
                  max_attention_window_size: Optional[int] = None,
-                 debug_mode: bool = False) -> 'ModelRunnerCpp':
+                 debug_mode: bool = False,
+                 lora_ckpt_source: str = "hf") -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
 
@@ -120,6 +121,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 The attention window size that controls the sliding window attention / cyclic kv cache behaviour.
             debug_mode (bool):
                 Whether or not to turn on the debug mode.
+            lora_ckpt_source (str):
+                Source of checkpoint. Should be one of ['hf', 'nemo'].
         Returns:
             ModelRunnerCpp: An instance of ModelRunnerCpp.
         """
@@ -182,6 +185,28 @@ class ModelRunnerCpp(ModelRunnerMixin):
     def dtype(self) -> torch.dtype:
         bindings_dtype = self.session.model_config.data_type
         return _bindings_dtype_to_torch_dtype_dict[bindings_dtype]
+
+    @property
+    def vocab_size(self) -> int:
+        return self.session.model_config.vocab_size
+
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.session.model_config.vocab_size_padded(
+            self.session.world_config.size)
+
+    @property
+    def hidden_size(self) -> int:
+        return self.session.model_config.hidden_size
+
+    @property
+    def num_heads(self) -> int:
+        return self.session.model_config.num_heads
+
+    @property
+    def num_layers(self) -> int:
+        return self.session.model_config.num_layers(
+            self.session.world_config.pipeline_parallelism)
 
     @property
     def max_sequence_length(self) -> int:
@@ -249,7 +274,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 If return_dict=False, the method returns generated output_ids.
                 If return_dict=True, the method returns a dict of output_ids,
                 sequence_lengths (if sampling_config.output_sequence_lengths=True),
-                context_logits and generation_logits (if self.session.gather_all_token_logits=True).
+                context_logits and generation_logits (if self.gather_all_token_logits=True).
         """
         if sampling_config is None:
             sampling_config = SamplingConfig(end_id=None, pad_id=None)
@@ -273,13 +298,12 @@ class ModelRunnerCpp(ModelRunnerMixin):
         batch_input_ids, input_lengths = self._prepare_inputs(
             batch_input_ids, sampling_config.pad_id)
 
-        packed_input = self.session.model_config.use_packed_input
         batch_input_ids = batch_input_ids.cuda()
         input_lengths = input_lengths.cuda()
         generation_input = GenerationInput(sampling_config.end_id,
                                            sampling_config.pad_id,
                                            batch_input_ids, input_lengths,
-                                           packed_input)
+                                           self.remove_input_padding)
         generation_input.max_new_tokens = sampling_config.max_new_tokens
         generation_input.bad_words_list = sampling_config.bad_words_list
         generation_input.stop_words_list = sampling_config.stop_words_list
@@ -289,7 +313,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                                    prompt_tasks, batch_size)
             generation_input.prompt_tuning_params = PromptTuningParams(
                 **ptuning_kwargs)
-            generation_input.prompt_tuning_params.prompt_tuning_enabled = [True]
+            generation_input.prompt_tuning_params.prompt_tuning_enabled = [
+                True
+            ] * batch_size
 
         cuda_device = torch.device(self.session.device)
         output_ids = torch.empty(
@@ -301,14 +327,12 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                      device=cuda_device)
         generation_output = GenerationOutput(output_ids, output_lengths)
         if self.gather_all_token_logits:
-            vocab_size_padded = self.session.model_config.vocab_size_padded(
-                self.session.world_config.size)
             generation_output.context_logits = torch.empty(
-                (batch_size, self.max_input_len, vocab_size_padded),
+                (batch_size, self.max_input_len, self.vocab_size_padded),
                 device=cuda_device)
             generation_output.generation_logits = torch.zeros(
                 (batch_size, sampling_config.num_beams,
-                 sampling_config.max_new_tokens - 1, vocab_size_padded),
+                 sampling_config.max_new_tokens - 1, self.vocab_size_padded),
                 device=cuda_device)
 
         self.session.generate(generation_output, generation_input,

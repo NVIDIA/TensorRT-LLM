@@ -137,7 +137,7 @@ public:
     virtual void setTactic(std::optional<cutlass_extensions::CutlassGemmConfig> gemm_config) = 0;
     virtual std::vector<cutlass_extensions::CutlassGemmConfig> getTactics() = 0;
 
-    virtual void runMoe(const void* input_activations, const void* gating_output, const void* fc1_expert_weights,
+    virtual void runMoe(const void* input_activations, const float* gating_output, const void* fc1_expert_weights,
         const void* fc1_scales, const void* fc1_expert_biases, ActivationType fc1_activation_type,
         const void* fc2_expert_weights, const void* fc2_scales, const void* fc2_expert_biases, const int num_rows,
         const int hidden_size, const int inter_size, const int num_experts, const int k, char* workspace_ptr,
@@ -173,7 +173,7 @@ public:
         return moe_gemm_runner_.getConfigs();
     }
 
-    void runMoe(const void* input_activations, const void* gating_output, const void* fc1_expert_weights,
+    void runMoe(const void* input_activations, const float* gating_output, const void* fc1_expert_weights,
         const void* fc1_scales, const void* fc1_expert_biases, ActivationType fc1_activation_type,
         const void* fc2_expert_weights, const void* fc2_scales, const void* fc2_expert_biases, const int num_rows,
         const int hidden_size, const int inter_size, const int num_experts, const int k, char* workspace_ptr,
@@ -185,6 +185,8 @@ public:
 private:
     void computeTotalRowsBeforeExpert(const int* sorted_indices, const int total_indices, const int num_experts,
         int64_t* total_rows_before_expert, cudaStream_t stream);
+    std::vector<size_t> getWorkspaceBufferSizes(const int num_rows, const int hidden_size, const int inter_size,
+        const int num_experts, const int num_experts_per_node, const int k, ActivationType activation_type) const;
     void configureWsPtrs(char* ws_ptr, const int num_rows, const int hidden_size, const int inter_size,
         const int num_experts, const int num_experts_per_node, const int k, ActivationType activation_type);
 
@@ -198,7 +200,7 @@ private:
     int* permuted_experts_;
     char* sorter_ws_;
     T* permuted_data_;
-    T* softmax_out_;
+    float* softmax_out_;
 
     int64_t* total_rows_before_expert_;
 
@@ -224,7 +226,7 @@ public:
         return;
     }
 
-    void runMoe(const void* input_activations, const void* gating_output, const void* fc1_expert_weights,
+    void runMoe(const void* input_activations, const float* gating_output, const void* fc1_expert_weights,
         const void* fc1_scales, const void* fc1_expert_biases, ActivationType fc1_activation_type,
         const void* fc2_expert_weights, const void* fc2_scales, const void* fc2_expert_biases, const int num_rows,
         const int hidden_size, const int inter_size, const int num_experts, const int k, char* workspace_ptr,

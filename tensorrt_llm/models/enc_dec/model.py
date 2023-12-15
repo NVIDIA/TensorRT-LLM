@@ -120,10 +120,16 @@ class EncDecEmbedding(Module):
         # and should not be formulated determinisitically
 
         x = self.vocab_embedding(input_ids) * self.embedding_scale
+
+        self.register_network_output('word_embeddings', x)
+
         if self.position_embedding:
-            x = x + self.position_embedding(position_ids)
+            pos_emb = self.position_embedding(position_ids)
+            self.register_network_output('position_embeddings', pos_emb)
+            x = x + pos_emb
         if self.token_type_embedding:
             x = x + self.token_type_embedding(token_type_ids)
+
         if self.embedding_layernorm:
             x = self.embedding_layernorm(x)
 
@@ -224,6 +230,8 @@ class EncoderLayer(Module):
                                           workspace=all_reduce_workspace,
                                           max_input_length=max_input_length)
 
+        self.register_network_output('attention_output', attention_output)
+
         hidden_states = residual + attention_output
 
         if self.layernorm_position == LayerNormPositionType.post_layernorm:
@@ -236,6 +244,8 @@ class EncoderLayer(Module):
             hidden_states = self.mlp_layernorm(hidden_states)
 
         hidden_states = self.mlp(hidden_states, workspace=all_reduce_workspace)
+
+        self.register_network_output('mlp_output', hidden_states)
 
         hidden_states = residual + hidden_states
 
@@ -382,6 +392,8 @@ class DecoderLayer(Module):
         if use_cache:
             attention_output, presents_self = attention_output
 
+        self.register_network_output('self_attention_output', attention_output)
+
         hidden_states = residual + attention_output
 
         if self.layernorm_position == LayerNormPositionType.post_layernorm:
@@ -405,6 +417,8 @@ class DecoderLayer(Module):
         if use_cache:
             attention_output, presents_cross = attention_output
 
+        self.register_network_output('cross_attention_output', attention_output)
+
         hidden_states = residual + attention_output
 
         if self.layernorm_position == LayerNormPositionType.post_layernorm:
@@ -417,6 +431,7 @@ class DecoderLayer(Module):
             hidden_states = self.mlp_layernorm(hidden_states)
 
         hidden_states = self.mlp(hidden_states, workspace=all_reduce_workspace)
+        self.register_network_output('mlp_output', hidden_states)
 
         hidden_states = residual + hidden_states
 
@@ -552,6 +567,8 @@ class EncoderModel(Module, GenerationMixin):
         if self.mapping.is_first_pp_rank():
             hidden_states = self.embedding(input_ids, position_ids,
                                            token_type_ids)
+            self.register_network_output('embedding_layer_output',
+                                         hidden_states)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
@@ -563,7 +580,7 @@ class EncoderModel(Module, GenerationMixin):
                 max_input_length=max_input_length)
 
         if self.mapping.is_last_pp_rank():
-            if self.final_layernorm:
+            if self.has_model_final_layernorm:
                 hidden_states = self.final_layernorm(hidden_states)
             hidden_states.mark_output('encoder_output', self._dtype)
         else:
@@ -727,7 +744,7 @@ class DecoderModel(Module, GenerationMixin):
                  layernorm_type=LayerNormType.LayerNorm,
                  hidden_act="relu",
                  mlp_type=MLPType.MLP,
-                 rescale_before_lm_head=True,
+                 rescale_before_lm_head=False,
                  has_lm_head_bias=False,
                  residual_scaling=1.0,
                  use_parallel_embedding=False,
@@ -736,8 +753,9 @@ class DecoderModel(Module, GenerationMixin):
         super().__init__()
         self.mapping = mapping
 
-        self.has_position_embedding = has_position_embedding
+        self.has_position_embedding = has_position_embedding  # TODO: remove dup codes
         self.has_token_type_embedding = type_vocab_size is not None
+        self.rescale_before_lm_head = rescale_before_lm_head
 
         # e.g. BART regular, T5 RMS
         self.layernorm_type = layernorm_type
@@ -859,13 +877,12 @@ class DecoderModel(Module, GenerationMixin):
         else:
             assert isinstance(hidden_states, Tensor)
 
-        if self.mapping.is_last_pp_rank():
-            assert last_token_ids is not None, "Expecting last token ids to be not None"
-
         # In PP, layer 0 has ids as inputs, all other layers have hidden_states as inputs
         if self.mapping.is_first_pp_rank():
             hidden_states = self.embedding(decoder_input_ids, position_ids,
                                            token_type_ids)
+            self.register_network_output('embedding_layer_output',
+                                         hidden_states)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
@@ -874,9 +891,9 @@ class DecoderModel(Module, GenerationMixin):
         if use_cache:
             presents = []
 
-        for decoder_layer, past, max_attention_window_size in zip(
-                self.decoder_layers, kv_cache_params.past_key_value,
-                kv_cache_params.host_max_attention_window_sizes):
+        for i, (decoder_layer, past, max_attention_window_size) in enumerate(
+                zip(self.decoder_layers, kv_cache_params.past_key_value,
+                    kv_cache_params.host_max_attention_window_sizes)):
             hidden_states = decoder_layer(
                 hidden_states,
                 encoder_output=encoder_output,
@@ -896,15 +913,18 @@ class DecoderModel(Module, GenerationMixin):
                     2]
                 presents.append((presents_self, presents_cross))
                 hidden_states = hidden_states[0]
+            self.register_network_output(f'decoder_layer_{i}_output',
+                                         hidden_states)
 
         if self.mapping.is_last_pp_rank():
-            if self.final_layernorm:
+            if self.has_model_final_layernorm:
                 hidden_states = self.final_layernorm(hidden_states)
 
             # [bs, seq, hidden_size] or [1, num_tokens, hidden_size] -> [bs, hidden_size]
             hidden_states = gather_last_token_logits(
                 hidden_states, last_token_ids,
                 default_net().plugin_config.remove_input_padding)
+            self.register_network_output('logits_before_lmhead', hidden_states)
 
             # Rescale output before projecting on vocab (for T5)
             # See https://github.com/huggingface/transformers/blob/0b192de1f353b0e04dad4813e02e2c672de077be/src/transformers/models/t5/modeling_t5.py#L1769-L1772
@@ -942,6 +962,7 @@ class DecoderModel(Module, GenerationMixin):
         max_decoder_input_len,
         max_new_tokens,
         max_encoder_input_len,
+        gather_all_token_logits: bool = False,
     ):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
@@ -1159,7 +1180,7 @@ class DecoderModel(Module, GenerationMixin):
                                         ]))
 
         last_token_ids = None
-        if self.mapping.is_last_pp_rank():
+        if self.mapping.is_last_pp_rank() and not gather_all_token_logits:
             last_token_ids = Tensor(
                 name="last_token_ids",
                 dtype=trt.int32,

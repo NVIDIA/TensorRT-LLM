@@ -18,6 +18,7 @@
 #define TRT_MIXTURE_OF_EXPERTS_PLUGIN_H
 
 #include "NvInferPlugin.h"
+#include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include <cassert>
@@ -40,19 +41,21 @@ struct GemmIDMoe
     tensorrt_llm::ActivationType actfn{};
     nvinfer1::DataType dtype{};
     nvinfer1::DataType wdtype{};
+    tensorrt_llm::common::QuantMode quant_mode;
     tensorrt_llm::kernels::MOEParallelismMode parallelism_mode{};
 
     bool operator==(const GemmIDMoe& id) const
     {
         return id.num_experts == num_experts && id.moe_k == moe_k && id.hidden == hidden && id.inter == inter
-            && id.actfn == actfn && id.dtype == dtype && id.wdtype == wdtype && id.parallelism_mode == parallelism_mode;
+            && id.actfn == actfn && id.dtype == dtype && id.wdtype == wdtype && id.quant_mode == quant_mode
+            && id.parallelism_mode == parallelism_mode;
     }
 
     friend std::ostream& operator<<(std::ostream& out, const GemmIDMoe& id)
     {
         out << "experts, k, hidden, inter, actfn, dtype, weight type, parallelism mode=" << id.num_experts << ","
             << id.moe_k << "," << id.hidden << "," << id.inter << "," << static_cast<int>(id.actfn) << ","
-            << static_cast<int>(id.dtype) << "," << static_cast<int>(id.wdtype) << ","
+            << static_cast<int>(id.dtype) << "," << static_cast<int>(id.wdtype) << "," << id.quant_mode.value() << ","
             << static_cast<int>(id.parallelism_mode);
         return out;
     }
@@ -63,13 +66,14 @@ struct GemmIDMoeHash
 {
     std::size_t operator()(const GemmIDMoe& id) const
     {
-        int hash = std::hash<int>{}(id.num_experts);
+        size_t hash = std::hash<int>{}(id.num_experts);
         hash ^= std::hash<int>{}(id.moe_k);
         hash ^= std::hash<int>{}(id.hidden);
         hash ^= std::hash<int>{}(id.inter);
         hash ^= std::hash<int>{}(static_cast<int>(id.actfn));
         hash ^= std::hash<int>{}(static_cast<int>(id.dtype));
         hash ^= std::hash<int>{}(static_cast<int>(id.wdtype));
+        hash ^= std::hash<int>{}(static_cast<int>(id.quant_mode.value()));
         hash ^= std::hash<int>{}(static_cast<int>(id.parallelism_mode));
         return hash;
     }
@@ -84,8 +88,9 @@ public:
     MixtureOfExpertsPlugin() = delete;
     MixtureOfExpertsPlugin(int number_of_experts, int top_k, int expert_hidden_size, int expert_inter_size,
         tensorrt_llm::ActivationType activation_type, nvinfer1::DataType type, nvinfer1::DataType weight_type,
-        bool use_finished, bool use_bias, int tp_size, int tp_rank, MOEParallelismMode parallelism_mode,
-        MOEExpertScaleNormalizationMode normalization_mode, MixtureOfExpertsPluginProfilerPtr plugin_profiler_ptr);
+        tensorrt_llm::common::QuantMode quant_mode, bool use_finished, bool use_bias, int tp_size, int tp_rank,
+        MOEParallelismMode parallelism_mode, MOEExpertScaleNormalizationMode normalization_mode,
+        MixtureOfExpertsPluginProfilerPtr plugin_profiler_ptr);
     MixtureOfExpertsPlugin(const void* data, size_t length, MixtureOfExpertsPluginProfilerPtr plugin_profiler_ptr);
     MixtureOfExpertsPlugin(const MixtureOfExpertsPlugin&);
 
@@ -137,10 +142,11 @@ private:
     tensorrt_llm::ActivationType mActivationType;
     nvinfer1::DataType mType{};
     nvinfer1::DataType mWeightType{};
+    tensorrt_llm::common::QuantMode mQuantMode;
     bool mUseFinished{};
     bool mUseBias{};
-    int mWorldSize{};
-    int mWorldRank{};
+    int mTPSize{};
+    int mTPRank{};
     MOEParallelismMode mParallelismMode{};
     MOEExpertScaleNormalizationMode mNormalizationMode{};
 
@@ -205,7 +211,7 @@ private:
 
     bool hasExpertQuantScales() const
     {
-        return mType != mWeightType;
+        return mQuantMode.hasInt4Weights() || mQuantMode.hasInt8Weights();
     }
 
     IndexType getExpertBias1Index() const
@@ -242,6 +248,32 @@ private:
     constexpr static IndexType getOutputTensorIndex()
     {
         return 0;
+    }
+
+    /**
+     * Get the index of the expert shape tuple that represents the inner dimension
+     */
+    int getGemmShapeInnerDimIndex() const
+    {
+        // In weight only mode the shape is transposed
+        return hasExpertQuantScales() ? 1 : 2;
+    }
+
+    /**
+     * Get the index of the expert shape tuple that represents the outer dimension
+     */
+    int getGemmShapeOuterDimIndex() const
+    {
+        // In weight only mode the shape is transposed
+        return hasExpertQuantScales() ? 2 : 1;
+    }
+
+    /**
+     * Get quantization dimension scaling factor
+     */
+    int getWeightPackedElements() const
+    {
+        return mQuantMode.hasInt4Weights() ? 2 : 1;
     }
 };
 

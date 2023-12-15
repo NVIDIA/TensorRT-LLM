@@ -466,7 +466,8 @@ template <typename T, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp>
 std::vector<tkc::CutlassGemmConfig> CutlassFpAIntBGemmRunner<T, WeightType, QuantOp>::getConfigs() const
 {
     static constexpr bool is_weight_only = !std::is_same<T, WeightType>::value;
-    std::vector<tkc::CutlassGemmConfig> candidateConfigs = get_candidate_configs(sm_, is_weight_only, false);
+    std::vector<tkc::CutlassGemmConfig> candidateConfigs
+        = get_candidate_configs(sm_, is_weight_only, false, false, SPLIT_K_LIMIT);
     return candidateConfigs;
 }
 

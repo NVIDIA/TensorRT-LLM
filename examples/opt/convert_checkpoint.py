@@ -286,6 +286,10 @@ if __name__ == '__main__':
     hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
                                                     torch_dtype="auto")
     hf_config = hf_model.config
+    if hf_config.hidden_size != hf_config.word_embed_proj_dim:
+        args.use_embedding_sharing = False
+        args.use_parallel_embedding = False
+
     config = {
         'architecture': hf_config.architectures[0],
         'dtype': args.dtype,

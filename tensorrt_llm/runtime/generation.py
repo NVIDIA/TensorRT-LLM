@@ -235,8 +235,7 @@ class _Runtime(object):
             # it's allowed to call set_tensors multi times with different tensors
             # each time only set some of the engine tensors, so it is valid to skip the ones not in the current given tensors dict
             if not name in tensors:
-                if self.engine.get_tensor_mode(
-                        t.name) == trt.TensorIOMode.OUTPUT:
+                if self.engine.get_tensor_mode(name) == trt.TensorIOMode.OUTPUT:
                     dtype = self.engine.get_tensor_dtype(name)
                     shape = context.get_tensor_shape(name)
                     tensors[name] = RuntimeTensor.from_torch(
@@ -263,7 +262,10 @@ class _Runtime(object):
         return ok
 
     def __del__(self):
-        cudart.cudaFree(self.address)
+        try:
+            cudart.cudaFree(self.address)  # FIXME: cudaFree is None??
+        except TypeError:
+            pass
 
 
 @dataclass
@@ -289,6 +291,7 @@ class ModelConfig:
     use_custom_all_reduce: bool = False
     lora_plugin: bool = False
     lora_target_modules: List[str] = field(default_factory=list)
+    use_context_fmha_for_generation: bool = False
 
 
 @dataclass
@@ -496,6 +499,10 @@ class GenerationSession(object):
             self.dynamic_decoder = torch.classes.FasterTransformer.DynamicDecodeOp(
                 self.vocab_size, self.vocab_size_padded, self.mapping.tp_size,
                 self.mapping.pp_size, self.decoder_logits_dtype)
+
+        if model_config.use_context_fmha_for_generation:
+            logger.warning(
+                "Context FMHA is used for generation. Use it only for testing")
 
         self.gather_tree = torch.ops.tensorrt_llm.gather_tree
 
@@ -717,6 +724,10 @@ class GenerationSession(object):
     @property
     def use_lora_plugin(self):
         return self._model_config.lora_plugin
+
+    @property
+    def use_context_fmha_for_generation(self):
+        return self._model_config.use_context_fmha_for_generation
 
     def __setup_decoder(self, input_ids: torch.Tensor,
                         sampling_config: SamplingConfig,
@@ -1351,8 +1362,15 @@ class GenerationSession(object):
         add_tensor = lambda x, name: tensors.update({name: sym(x, name)})
         add_tensor_with_shape = lambda x, name, shape: tensors.update(
             {name: RuntimeTensor.from_torch(name, x, override_shape=shape)})
+        context_lengths_local = context_lengths.clone()
+        host_context_lengths_local = host_context_lengths.clone()
+        if self.use_context_fmha_for_generation:
+            context_lengths_local = torch.ones_like(context_lengths,
+                                                    device='cuda').int()
+            host_context_lengths_local = torch.ones_like(context_lengths,
+                                                         device='cpu').int()
         if self.use_gpt_attention_plugin:
-            add_tensor(context_lengths, 'context_lengths')
+            add_tensor(context_lengths_local, 'context_lengths')
         add_tensor(cache_indirection, 'cache_indirection')
 
         if self.mapping.has_pp():
@@ -1379,7 +1397,7 @@ class GenerationSession(object):
             add_tensor(hidden_states_input, 'hidden_states_input')
 
         if self.remove_input_padding:
-            add_tensor(host_context_lengths, 'host_context_lengths')
+            add_tensor(host_context_lengths_local, 'host_context_lengths')
 
         if self.has_position_embedding:
             add_tensor(position_ids, 'position_ids')
@@ -1451,6 +1469,9 @@ class GenerationSession(object):
             # generation requests
             host_request_types = torch.ones_like(context_lengths,
                                                  device='cpu').int()
+            if self.use_context_fmha_for_generation:
+                host_request_types = torch.zeros_like(context_lengths,
+                                                      device='cpu').int()
             # previous [past_kv_length, is_context] has been deprecated. only past_kv_length should be given here
             # Note we should use max_context_length here to align to max -- but isn't this done in attn plugin's max_element() already?
             host_past_key_value_lengths = torch.tensor(
@@ -1461,8 +1482,11 @@ class GenerationSession(object):
                        'host_past_key_value_lengths')
             add_tensor(host_request_types, 'host_request_types')
             # Sequence lengths are not used in the context phase actually.
-            add_tensor_with_shape(self.sequence_length_buffer,
-                                  'sequence_length',
+            sequence_length = self.sequence_length_buffer
+            if self.use_context_fmha_for_generation:
+                sequence_length = self.sequence_length_buffer.clone()
+                sequence_length += 1
+            add_tensor_with_shape(sequence_length, 'sequence_length',
                                   (batch_size * beam_width, ))
 
             for idx in range(self.first_layer, self.last_layer):
@@ -1471,7 +1495,7 @@ class GenerationSession(object):
                                                          self.first_layer],
                     f'host_max_attention_window_size_{idx}', (1, ))
             if self.remove_input_padding:
-                add_tensor(host_context_lengths, 'host_context_lengths')
+                add_tensor(host_context_lengths_local, 'host_context_lengths')
         else:
             add_tensor(attention_mask, 'attention_mask')
 

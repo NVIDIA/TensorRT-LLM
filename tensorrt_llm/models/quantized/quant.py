@@ -47,19 +47,25 @@ def _smooth_quantize_gpt(model, quant_mode):
         layer.attention = SmoothQuantAttention(
             layer.hidden_size,
             num_attention_heads=layer.num_attention_heads,
+            num_kv_heads=layer.attention.num_attention_kv_heads * layer.tp_size,
             max_position_embeddings=layer.max_position_embeddings,
             num_layers=layer.num_layers,
             apply_query_key_layer_scaling=layer.apply_query_key_layer_scaling,
             dtype=layer.dtype,
             attention_mask_type=layer.attention_mask_type,
+            bias=(layer.attention.dense.bias != None),
+            qkv_bias_only=(layer.attention.qkv.bias != None
+                           and layer.attention.dense.bias == None),
             position_embedding_type=layer.position_embedding_type,
             tp_group=layer.tp_group,
             tp_size=layer.tp_size,
+            tp_rank=layer.attention.tp_rank,
             quant_mode=quant_mode)
         assert hasattr(layer, "mlp"), "The layer has no mlp"
         layer.mlp = SmoothQuantMLP(hidden_size=layer.hidden_size,
                                    ffn_hidden_size=layer.hidden_size * 4,
                                    hidden_act=layer.hidden_act,
+                                   bias=(layer.mlp.fc.bias != None),
                                    dtype=layer.dtype,
                                    tp_group=layer.tp_group,
                                    tp_size=layer.tp_size,
@@ -100,6 +106,8 @@ def _smooth_quantize_llama(model, quant_mode):
             bias=False)
 
         assert hasattr(layer, "mlp"), "The layer has no mlp"
+        assert not model.moe_config.has_moe(
+        ), "MOE does not support smooth quant"
         layer.mlp = SmoothQuantGatedMLP(hidden_size=model.hidden_size,
                                         ffn_hidden_size=layer.mlp_hidden_size,
                                         hidden_act=layer.hidden_act,

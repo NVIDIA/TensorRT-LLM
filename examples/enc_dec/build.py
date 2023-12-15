@@ -28,6 +28,8 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.network import net_guard
 
 from t5.weight import parse_t5_config, load_from_hf_t5, load_from_binary_t5  # isort:skip
+from bart.weight import parse_bart_config, load_from_binary_bart  # isort:skip
+from nmt.weight import parse_nmt_config, load_from_binary_nmt  # isort:skip
 
 
 def get_engine_name(model, dtype, tp_size, pp_size, rank):
@@ -51,6 +53,7 @@ def parse_config(ini_file, component, args):
     config = configparser.ConfigParser()
     config.read(ini_file)
     model_type = config.get('structure', 'model_type')
+    args.model_type = model_type
     args = globals()[f'parse_{model_type}_config'](config, component, args)
     return args
 
@@ -102,6 +105,7 @@ def parse_arguments(component):
                         type=str,
                         default='enc_dec',
                         help='TensorRT engine name prefix')
+    parser.add_argument('--debug_mode', action='store_true')
     parser.add_argument(
         '--timing_cache',
         type=str,
@@ -112,7 +116,7 @@ def parse_arguments(component):
 
     parser.add_argument('--model_type',
                         type=str,
-                        choices=['t5', 'bart'],
+                        choices=['t5', 'bart', 'nmt'],
                         default='t5')
     parser.add_argument(
         '--dtype',
@@ -238,6 +242,9 @@ def parse_arguments(component):
         help=
         'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
     )
+    parser.add_argument('--gather_all_token_logits',
+                        action='store_true',
+                        default=False)
 
     # parse cmdline args
     args = parser.parse_args()
@@ -346,11 +353,12 @@ def build_rank_engine(builder: Builder,
             layernorm_type=args.layernorm_type,
             hidden_act=args.hidden_act,
             mlp_type=args.mlp_type,
-            dtype=dtype,
-            logits_dtype=args.logits_dtype,
             use_parallel_embedding=args.use_parallel_embedding,
             embedding_sharding_dim=args.embedding_sharding_dim,
-            mapping=mapping)
+            mapping=mapping,
+            rescale_before_lm_head=args.rescale_before_lm_head,
+            dtype=dtype,
+            logits_dtype=args.logits_dtype)
 
     # No support for relative attention bias in plain TRT mode. Please use attention plugin
     # (If to add such support, need to add into
@@ -416,14 +424,16 @@ def build_rank_engine(builder: Builder,
                 args.max_decoder_input_len,
                 args.max_output_len,
                 args.max_encoder_input_len,
+                gather_all_token_logits=args.gather_all_token_logits,
             )
 
         tllm_model(*inputs)
 
         # Adding debug outputs into the network --------------------------
-        for k, v in tllm_model.named_network_outputs():
-            network._mark_output(v, k,
-                                 tensorrt_llm.str_dtype_to_trt(args.dtype))
+        if args.debug_mode:
+            for k, v in tllm_model.named_network_outputs():
+                network._mark_output(v, k,
+                                     tensorrt_llm.str_dtype_to_trt(args.dtype))
         # ----------------------------------------------------------------
 
     # Network -> Engine
@@ -472,7 +482,8 @@ def build(rank, args):
             cross_attention=(args.component == 'decoder'),
             has_position_embedding=args.has_position_embedding,
             has_token_type_embedding=args.has_token_type_embedding,
-            strongly_typed=args.strongly_typed)
+            strongly_typed=args.strongly_typed,
+            gather_all_token_logits=args.gather_all_token_logits)
 
         engine_name = get_engine_name(args.engine_name, args.dtype,
                                       args.tp_size, args.pp_size, cur_rank)

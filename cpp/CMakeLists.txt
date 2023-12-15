@@ -137,7 +137,7 @@ endif()
 
 message(STATUS "GPU architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
-enable_language(CUDA)
+enable_language(C CXX CUDA)
 
 find_package(CUDAToolkit REQUIRED)
 

@@ -81,6 +81,7 @@ class PluginConfig(object):
         self.lookup_plugin = False
         self.lora_plugin = False
         self.use_paged_context_fmha = False
+        self.use_context_fmha_for_generation = False
 
     def enable_qk_half_accum(self):
         self.attention_qk_half_accumulation = True
@@ -184,4 +185,8 @@ class PluginConfig(object):
 
     def set_paged_context_fmha(self):
         self.use_paged_context_fmha = True
+        return self
+
+    def set_context_fmha_for_generation(self):
+        self.use_context_fmha_for_generation = True
         return self

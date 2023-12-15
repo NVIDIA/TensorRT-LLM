@@ -37,7 +37,7 @@ namespace layers
 template <typename T>
 void DynamicDecodeLayer<T>::initialize()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     mOnlineBeamsearchDecode = std::make_unique<OnlineBeamSearchLayer<T>>(
         vocab_size_, vocab_size_padded_, stream_, allocator_, is_free_buffer_after_forward_);
 
@@ -58,14 +58,14 @@ DynamicDecodeLayer<T>::DynamicDecodeLayer(size_t vocab_size, size_t vocab_size_p
     , vocab_size_padded_(vocab_size_padded)
     , cuda_device_prop_(cuda_device_prop)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     initialize();
 }
 
 template <typename T>
 DynamicDecodeLayer<T>::~DynamicDecodeLayer()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     freeBuffer();
 }
 
@@ -76,7 +76,7 @@ DynamicDecodeLayer<T>::DynamicDecodeLayer(DynamicDecodeLayer const& dynamic_deco
     , vocab_size_padded_(dynamic_decode_layer.vocab_size_padded_)
     , cuda_device_prop_(dynamic_decode_layer.cuda_device_prop_)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     initialize();
 }
 
@@ -117,7 +117,7 @@ bool hasDiffRuntimeArgs(DecodingSetupParams const& params)
 template <typename T>
 void DynamicDecodeLayer<T>::setup(size_t batch_size, size_t beam_width, SetupParams const& setupParams)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
 
     if (beam_width == 1)
     { // sampling layers
@@ -159,7 +159,7 @@ void DynamicDecodeLayer<T>::setup(size_t batch_size, size_t beam_width, SetupPar
 template <typename T>
 void DynamicDecodeLayer<T>::allocateBuffer(size_t batch_size, size_t beam_width, size_t max_seq_len)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     mIdsPtrHost->resize(2 * batch_size);
     zero_parent_ids = allocator_->reMalloc(zero_parent_ids, sizeof(int*) * 2 * batch_size, false);
 }
@@ -167,14 +167,14 @@ void DynamicDecodeLayer<T>::allocateBuffer(size_t batch_size, size_t beam_width,
 template <typename T>
 void DynamicDecodeLayer<T>::freeBuffer()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     allocator_->free((void**) &zero_parent_ids);
 }
 
 template <typename T>
 void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& params)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
 
     const auto ite = params.ite;
     const auto step = params.step;

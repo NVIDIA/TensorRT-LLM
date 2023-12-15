@@ -20,9 +20,9 @@ from .cast import Cast
 from .conv import Conv1d, Conv2d, ConvTranspose2d
 from .embedding import Embedding, PromptTuningEmbedding
 from .linear import ColumnLinear, Linear, RowLinear
-from .lora import Lora, LoraParams, LoraRuntimeParam
+from .lora import Lora, LoraParams, LoraRuntimeParams
 from .mlp import MLP, FusedGatedMLP, GatedMLP
-from .moe import MOE
+from .moe import MOE, MoeConfig
 from .normalization import GroupNorm, LayerNorm, RmsNorm
 from .pooling import AvgPool2d
 
@@ -52,6 +52,7 @@ __all__ = [
     'KeyValueCacheParams',
     'Lora',
     'LoraParams',
-    'LoraRuntimeParam',
+    'LoraRuntimeParams',
     'MOE',
+    'MoeConfig',
 ]

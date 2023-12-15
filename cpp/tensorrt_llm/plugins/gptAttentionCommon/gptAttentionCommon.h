@@ -193,7 +193,7 @@ protected:
     }
 
 protected:
-    static constexpr int kReservedMaxSeqLenTilePerSeq = 8;
+    static constexpr int kReservedMaxSeqLenTilePerSeq = 64;
 
     const std::string mLayerName;
 

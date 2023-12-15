@@ -109,17 +109,29 @@ def parse_arguments():
                         type=int,
                         default=64,
                         help='Number of tokens per block in paged KV cache')
+    parser.add_argument(
+        '--use_custom_all_reduce',
+        action='store_true',
+        help=
+        'Activates latency-optimized algorithm for all-reduce instead of NCCL.')
+    parser.add_argument('--gather_all_token_logits',
+                        action='store_true',
+                        default=False)
 
     args = parser.parse_args()
 
     return args
 
 
-def build_and_save_shard(rank, gpu_id, ckpt_dir_or_model_config, build_config,
-                         model_cls, log_level, output_dir):
+def build_and_save_shard(rank, gpu_id, ckpt_dir, build_config, output_dir,
+                         log_level, model_config, model_cls):
     torch.cuda.set_device(gpu_id)
     logger.set_level(log_level)
-    engine = build(ckpt_dir_or_model_config, build_config, rank, model_cls)
+    engine = build(build_config,
+                   rank,
+                   ckpt_dir,
+                   model_config,
+                   model_cls=model_cls)
     engine.save(output_dir)
 
 
@@ -129,24 +141,25 @@ def build_and_save(ckpt_dir_or_model_config: str,
                    workers: int = 1,
                    log_level: str = 'info',
                    model_cls=None):
-
+    ckpt_dir = ckpt_dir_or_model_config
     if ckpt_dir_or_model_config.lower().endswith('.json'):
         model_config = PretrainedConfig.from_json_file(ckpt_dir_or_model_config)
+        ckpt_dir = None
     else:
         model_config = PretrainedConfig.from_json_file(
             os.path.join(ckpt_dir_or_model_config, 'config.json'))
 
     if workers == 1:
         for rank in range(model_config.mapping.world_size):
-            build_and_save_shard(rank, rank % workers, ckpt_dir_or_model_config,
-                                 build_config, model_cls, log_level, output_dir)
+            build_and_save_shard(rank, rank % workers, ckpt_dir, build_config,
+                                 output_dir, log_level, model_config, model_cls)
     else:
         with ProcessPoolExecutor(mp_context=get_context('spawn'),
                                  max_workers=workers) as p:
             futures = [
-                p.submit(build_and_save_shard, rank, rank % workers,
-                         ckpt_dir_or_model_config, build_config, model_cls,
-                         log_level, output_dir)
+                p.submit(build_and_save_shard, rank, rank % workers, ckpt_dir,
+                         build_config, output_dir, log_level, model_config,
+                         model_cls)
                 for rank in range(model_config.mapping.world_size)
             ]
             wait(futures)
@@ -184,6 +197,8 @@ def main():
             args.max_num_tokens,
             'max_prompt_embedding_table_size':
             args.max_prompt_embedding_table_size,
+            'gather_all_token_logits':
+            args.gather_all_token_logits,
             'plugin_config': {
                 'gpt_attention_plugin': args.use_gpt_attention_plugin,
                 'gemm_plugin': args.use_gemm_plugin,
@@ -194,15 +209,13 @@ def main():
                 'paged_kv_cache': args.paged_kv_cache,
                 'tokens_per_block': args.tokens_per_block,
                 'lookup_plugin': args.use_lookup_plugin,
+                'use_custom_all_reduce': args.use_custom_all_reduce,
             }
         })
 
-    if args.checkpoint_dir is not None:
-        build_and_save(args.checkpoint_dir, build_config, args.output_dir,
-                       workers, args.log_level, model_cls)
-    else:
-        build_and_save(args.model_config, build_config, args.output_dir,
-                       workers, args.log_level, model_cls)
+    source = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_config
+    build_and_save(source, build_config, args.output_dir, workers,
+                   args.log_level, model_cls)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

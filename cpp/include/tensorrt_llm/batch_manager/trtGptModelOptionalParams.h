@@ -34,21 +34,18 @@ public:
 
     explicit TrtGptModelOptionalParams(KvCacheConfig const& kvCacheConfig = KvCacheConfig{},
         std::optional<SizeType> maxNumSequences = std::nullopt, bool enableTrtOverlap = true,
-        bool useContextFMHAForGeneration = false,
-        std::optional<std::vector<SizeType>> userSpecifiedDeviceIds = std::nullopt)
+        std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt)
         : kvCacheConfig{kvCacheConfig}
         , maxNumSequences{maxNumSequences}
         , enableTrtOverlap{enableTrtOverlap}
-        , useContextFMHAForGeneration(useContextFMHAForGeneration)
-        , userSpecifiedDeviceIds(userSpecifiedDeviceIds)
+        , deviceIds(deviceIds)
     {
     }
 
     KvCacheConfig kvCacheConfig;
     std::optional<SizeType> maxNumSequences;
     bool enableTrtOverlap;
-    bool useContextFMHAForGeneration;
-    std::optional<std::vector<SizeType>> userSpecifiedDeviceIds;
+    std::optional<std::vector<SizeType>> deviceIds;
 };
 
 } // namespace tensorrt_llm::batch_manager

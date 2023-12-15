@@ -24,7 +24,7 @@ import torch.multiprocessing as mp
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
-from tensorrt_llm.layers import PositionEmbeddingType
+from tensorrt_llm.layers import MoeConfig, PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import quantize_model
@@ -343,6 +343,18 @@ def parse_arguments(args):
         'Maximum lengths of draft tokens for speculative decoding target model.'
     )
     parser.add_argument(
+        '--use_paged_context_fmha',
+        action='store_true',
+        help=
+        'Activates paged context FMHA. This mode of the context FMHA is required for chunked context, speculative decoding and reuse of KV cache blocks. Context FMHA performance is worse when this mode is on.'
+    )
+    parser.add_argument(
+        '--use_context_fmha_for_generation',
+        action='store_true',
+        help=
+        'Activates context FMHA for generation phase instead of MMHA. Use only for testing and debug.'
+    )
+    parser.add_argument(
         '--lora_target_modules',
         nargs='+',
         default=None,
@@ -359,15 +371,29 @@ def parse_arguments(args):
 
     parser.add_argument(
         '--moe_num_experts',
-        default=None,
+        default=0,
         type=int,
         help='Specify the number of experts to use for MOE layers')
     parser.add_argument(
         '--moe_top_k',
-        default=None,
+        default=0,
         type=int,
         help=
         'Specify the top_k value to use for MOE layers. Default to 1 if --moe_num_experts is set'
+    )
+    parser.add_argument(
+        '--moe_tp_mode',
+        default=MoeConfig.ParallelismMode.TENSOR_PARALLEL,
+        type=int,
+        help=
+        'Controls how to distribute experts in TP. Check layers/moe.py for accepted values',
+    )
+    parser.add_argument(
+        '--moe_renorm_mode',
+        default=MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE,
+        type=int,
+        help=
+        'Controls renormalization after gate logits. Check layers/moe.py for accepted values',
     )
     args = parser.parse_args(args)
     logger.set_level(args.log_level)
@@ -451,8 +477,11 @@ def parse_arguments(args):
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha or args.enable_context_fmha_fp32_acc
 
-    if args.moe_num_experts and args.moe_top_k is None:
+    if args.moe_num_experts and args.moe_top_k == 0:
         args.moe_top_k = 1
+    args.moe_config = MoeConfig(args.moe_num_experts, args.moe_top_k,
+                                args.moe_tp_mode,
+                                args.moe_renorm_mode).validate()
 
     return args
 
@@ -516,8 +545,8 @@ def build_rank_engine(builder: Builder,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
         share_embedding_table=share_embedding_table,
-        moe_layer_config=tensorrt_llm.moe_config.MoeLayerConfig(
-            args.moe_num_experts, args.moe_top_k))
+        moe_config=args.moe_config,
+    )
 
     if args.use_smooth_quant or args.use_weight_only:
         tensorrt_llm_gpt = quantize_model(tensorrt_llm_gpt, args.quant_mode)
@@ -596,8 +625,16 @@ def build_rank_engine(builder: Builder,
         # Use the plugin for the embedding parallelism and sharing
         network.plugin_config.set_lookup_plugin(dtype=args.dtype)
 
-    if args.max_draft_len > 0:
+    if args.use_paged_context_fmha or args.max_draft_len > 0:
+        assert args.enable_context_fmha or args.enable_context_fmha_fp32_acc, "context fmha must be enabled"
         network.plugin_config.set_paged_context_fmha()
+
+    if args.use_context_fmha_for_generation:
+        logger.warning(
+            f'use_context_fmha_for_generation is set. This flag must be used only for testing'
+        )
+        assert args.use_gpt_attention_plugin and args.paged_kv_cache and args.use_paged_context_fmha, "use_context_fmha_for_generation must be used with paged KV cache and attention."
+        network.plugin_config.set_context_fmha_for_generation()
 
     with net_guard(network):
         # Prepare

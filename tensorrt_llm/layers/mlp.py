@@ -15,11 +15,12 @@
 import numpy as np
 
 from .._utils import trt_dtype_to_np
-from ..functional import ACT2FN
+from ..functional import ACT2FN, concat
 from ..module import Module
 from ..quantization import QuantMode
 from ..quantization.layers import FP8Linear, FP8RowLinear
 from .linear import ColumnLinear, RowLinear
+from .lora import Lora, LoraRuntimeParams
 
 
 class MLP(Module):
@@ -74,21 +75,24 @@ class MLP(Module):
 
         self.hidden_act = hidden_act
         self.dtype = dtype
+        self.bias = bias
 
-    def forward(self, hidden_states, workspace=None, lora_param=None):
-        mlp_h_to_4h_param = None
-        if lora_param is not None:
-            mlp_h_to_4h_param = lora_param.get_runtime_params(0, "mlp_h_to_4h")
+    def forward(self, hidden_states, workspace=None, lora_layer_params=None):
+        mlp_fc_lora_params = None
+        if lora_layer_params is not None:
+            mlp_fc_lora_params = lora_layer_params.get_runtime_params(
+                0, "mlp_h_to_4h")
 
-        mlp_4h_to_h_param = None
-        if lora_param is not None:
-            mlp_4h_to_h_param = lora_param.get_runtime_params(0, "mlp_4h_to_h")
+        mlp_proj_lora_params = None
+        if lora_layer_params is not None:
+            mlp_proj_lora_params = lora_layer_params.get_runtime_params(
+                0, "mlp_4h_to_h")
 
-        inter = self.fc(hidden_states, mlp_h_to_4h_param)
+        inter = self.fc(hidden_states, mlp_fc_lora_params)
         inter = ACT2FN[self.hidden_act](inter)
         output = self.proj(inter,
                            workspace,
-                           lora_runtime_param=mlp_4h_to_h_param)
+                           lora_runtime_params=mlp_proj_lora_params)
         return output
 
 
@@ -142,27 +146,30 @@ class GatedMLP(MLP):
                                      tp_size=tp_size,
                                      gather_output=False)
 
-    def forward(self, hidden_states, workspace=None, lora_param=None):
+    def forward(self, hidden_states, workspace=None, lora_layer_params=None):
 
-        mlp_h_to_4h_param = None
-        if lora_param is not None:
-            mlp_h_to_4h_param = lora_param.get_runtime_params(0, "mlp_h_to_4h")
+        mlp_fc_lora_params = None
+        if lora_layer_params is not None:
+            mlp_fc_lora_params = lora_layer_params.get_runtime_params(
+                0, "mlp_h_to_4h")
 
-        mlp_gate_param = None
-        if lora_param is not None:
-            mlp_gate_param = lora_param.get_runtime_params(0, "mlp_gate")
+        mlp_gate_lora_params = None
+        if lora_layer_params is not None:
+            mlp_gate_lora_params = lora_layer_params.get_runtime_params(
+                0, "mlp_gate")
 
-        mlp_4h_to_h_param = None
-        if lora_param is not None:
-            mlp_4h_to_h_param = lora_param.get_runtime_params(0, "mlp_4h_to_h")
+        mlp_proj_lora_params = None
+        if lora_layer_params is not None:
+            mlp_proj_lora_params = lora_layer_params.get_runtime_params(
+                0, "mlp_4h_to_h")
 
-        inter = self.fc(hidden_states, mlp_h_to_4h_param)
+        inter = self.fc(hidden_states, mlp_fc_lora_params)
         inter = ACT2FN[self.hidden_act](inter)
-        gate = self.gate(hidden_states, mlp_gate_param)
+        gate = self.gate(hidden_states, mlp_gate_lora_params)
         intermediate = inter * gate
         output = self.proj(intermediate,
                            workspace,
-                           lora_runtime_param=mlp_4h_to_h_param)
+                           lora_runtime_params=mlp_proj_lora_params)
         return output
 
 
@@ -188,7 +195,15 @@ class FusedGatedMLP(GatedMLP):
                          quant_mode=quant_mode,
                          instance_id=instance_id)
 
-    def forward(self, hidden_states, workspace=None, lora_param=None):
+        self.mlp_in_lora = Lora(
+            in_hidden_size=hidden_size,
+            out_hidden_sizes=[
+                ffn_hidden_size // tp_size, ffn_hidden_size // tp_size
+            ],
+            max_low_rank=min(hidden_size, ffn_hidden_size // tp_size),
+        )
+
+    def forward(self, hidden_states, workspace=None, lora_layer_params=None):
         # Combine the following pattern
         #
         #   SiLU(FC(x)) + Gate(x)
@@ -249,6 +264,33 @@ class FusedGatedMLP(GatedMLP):
         if self.bias:
             self.fc.bias.value = concat_bias
         inter = self.fc(hidden_states)
+
+        if lora_layer_params is not None:
+            mlp_fc_lora_params = lora_layer_params.get_runtime_params(
+                0, "mlp_h_to_4h")
+            mlp_gate_lora_params = lora_layer_params.get_runtime_params(
+                0, "mlp_gate")
+
+            if mlp_fc_lora_params is not None and mlp_gate_lora_params is not None:
+                mlp_in_lora_params = LoraRuntimeParams(
+                    lora_ranks=[
+                        mlp_fc_lora_params.lora_ranks[0],
+                        mlp_gate_lora_params.lora_ranks[0]
+                    ],
+                    lora_weights_pointers=[
+                        mlp_fc_lora_params.lora_weights_pointers[0],
+                        mlp_gate_lora_params.lora_weights_pointers[0]
+                    ],
+                    host_request_types=mlp_fc_lora_params.host_request_types,
+                    host_context_lengths=mlp_fc_lora_params.
+                    host_context_lengths,
+                    max_context_length=mlp_fc_lora_params.max_context_length)
+
+                mlp_fc_lora, mlp_gate_lora = self.mlp_in_lora(
+                    hidden_states, mlp_in_lora_params)
+                mlp_in_result = concat([mlp_gate_lora, mlp_fc_lora], dim=2)
+                inter = inter + mlp_in_result
+
         if self.hidden_act == 'silu':
             inter = ACT2FN['swiglu'](inter)
         else:

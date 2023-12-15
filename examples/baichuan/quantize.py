@@ -53,14 +53,13 @@ def get_calib_dataloader(data="cnn_dailymail",
     else:
         raise NotImplementedError
 
-    batch_encoded = tokenizer.batch_encode_plus(dataset,
-                                                return_tensors="pt",
-                                                padding=True,
-                                                max_length=block_size)
-    batch_encoded = batch_encoded["input_ids"]
-    batch_encoded = batch_encoded.cuda()
+    dataset_input_ids = tokenizer(dataset,
+                                  return_tensors="pt",
+                                  padding=True,
+                                  truncation=True,
+                                  max_length=block_size).input_ids.cuda()
 
-    calib_dataloader = DataLoader(batch_encoded,
+    calib_dataloader = DataLoader(dataset_input_ids,
                                   batch_size=batch_size,
                                   shuffle=False)
 

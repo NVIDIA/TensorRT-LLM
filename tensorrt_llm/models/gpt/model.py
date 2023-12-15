@@ -23,11 +23,10 @@ from ...functional import (Tensor, gather_last_token_logits,
                            is_gated_activation, non_gated_version)
 from ...layers import (MLP, MOE, Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
-                       LayerNorm, LoraParams, PositionEmbeddingType,
+                       LayerNorm, LoraParams, MoeConfig, PositionEmbeddingType,
                        PromptTuningEmbedding)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
-from ...moe_config import MoeLayerConfig
 from ...quantization import QuantMode
 from ..generation_mixin import GenerationMixin
 
@@ -37,19 +36,17 @@ def MLPFactory(hidden_size,
                hidden_act,
                bias=True,
                dtype=None,
-               num_experts=0,
-               top_k=0,
+               moe_config: MoeConfig = MoeConfig(),
                tp_group=None,
                tp_size=1,
                tp_rank=0,
                quant_mode=QuantMode(0),
                instance_id: int = 0):
-    if num_experts > 0 and top_k > 0:
-        return MOE(num_experts,
+    if moe_config.has_moe():
+        return MOE(moe_config,
                    hidden_size,
                    ffn_hidden_size,
                    hidden_act,
-                   top_k,
                    bias,
                    dtype,
                    tp_group,
@@ -132,8 +129,7 @@ class GPTDecoderLayer(Module):
                  inter_size=None,
                  bias=True,
                  num_kv_heads=None,
-                 num_experts=0,
-                 top_k=0,
+                 moe_config: MoeConfig = MoeConfig(),
                  tp_group=None,
                  tp_size=1,
                  tp_rank=0,
@@ -181,8 +177,7 @@ class GPTDecoderLayer(Module):
                               hidden_act=hidden_act,
                               dtype=dtype,
                               bias=bias,
-                              num_experts=num_experts,
-                              top_k=top_k,
+                              moe_config=moe_config,
                               tp_group=tp_group,
                               tp_size=tp_size,
                               tp_rank=tp_rank,
@@ -198,7 +193,7 @@ class GPTDecoderLayer(Module):
                 kv_cache_params=None,
                 attention_params=None,
                 workspace=None,
-                lora_param=None):
+                lora_layer_params=None):
 
         assert isinstance(hidden_states, Tensor)
 
@@ -212,7 +207,7 @@ class GPTDecoderLayer(Module):
                                           kv_cache_params=kv_cache_params,
                                           attention_params=attention_params,
                                           workspace=workspace,
-                                          lora_param=lora_param)
+                                          lora_layer_params=lora_layer_params)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -254,7 +249,7 @@ class GPTModel(Module):
                  use_prompt_tuning=False,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
-                 moe_layer_config=MoeLayerConfig()):
+                 moe_config=MoeConfig()):
         super().__init__()
         self.mapping = mapping
 
@@ -295,8 +290,7 @@ class GPTModel(Module):
                 bias=bias,
                 quant_mode=quant_mode,
                 instance_id=i,
-                num_experts=moe_layer_config.num_experts(i),
-                top_k=moe_layer_config.top_k(i),
+                moe_config=moe_config,
             ) for i in range(num_layers)
         ])
 
@@ -334,10 +328,9 @@ class GPTModel(Module):
                         kv_cache_params.kv_cache_block_pointers,
                         kv_cache_params.host_kv_cache_block_pointers,
                         kv_cache_params.host_max_attention_window_sizes)):
-            lora_param = None
+            lora_layer_params = None
             if lora_params.lora_ranks is not None:
-                if lora_params.lora_ranks is not None:
-                    lora_param = lora_params.get_layer_params(layer_idx)
+                lora_layer_params = lora_params.get_layer_params(layer_idx)
 
             hidden_states = layer(
                 hidden_states,
@@ -353,7 +346,7 @@ class GPTModel(Module):
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
                 workspace=workspace,
-                lora_param=lora_param)
+                lora_layer_params=lora_layer_params)
 
             if use_cache:
                 presents.append(hidden_states[1])
@@ -390,7 +383,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                  use_prompt_tuning=False,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
-                 moe_layer_config=MoeLayerConfig(),
+                 moe_config=MoeConfig(),
                  share_embedding_table=False):
 
         if isinstance(dtype, str):
@@ -447,7 +440,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             use_prompt_tuning=use_prompt_tuning,
             use_parallel_embedding=use_parallel_embedding,
             embedding_sharding_dim=embedding_sharding_dim,
-            moe_layer_config=moe_layer_config,
+            moe_config=moe_config,
         )
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
 

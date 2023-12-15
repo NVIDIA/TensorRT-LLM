@@ -142,9 +142,17 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
     {
     case CutlassGemmType::Simt: return {CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8};
     case CutlassGemmType::WeightOnly:
-        return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
-            CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
-            CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64};
+        if (sm >= 75)
+        {
+            return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
+                CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
+                CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64};
+        }
+        else
+        {
+            return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
+                CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64};
+        }
     case CutlassGemmType::Int8:
         return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
             CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
@@ -156,8 +164,8 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
     }
 }
 
-std::vector<CutlassGemmConfig> get_candidate_configs(
-    int sm, const bool is_weight_only, const bool simt_configs_only, const bool int8_configs_only)
+std::vector<CutlassGemmConfig> get_candidate_configs(int sm, const bool is_weight_only, const bool simt_configs_only,
+    const bool int8_configs_only, const int max_split_k)
 {
     std::vector<CutlassTileConfig> tiles
         = get_candidate_tiles(sm, is_weight_only, simt_configs_only, int8_configs_only);
@@ -165,13 +173,20 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
     std::vector<CutlassGemmConfig> candidate_configs;
     const int min_stages = int8_configs_only ? 3 : 2;
     const int max_stages = int8_configs_only ? 6 : (sm >= 80 ? 4 : 2);
-
     for (const auto& tile_config : tiles)
     {
         for (int stages = min_stages; stages <= max_stages; ++stages)
         {
             CutlassGemmConfig config{tile_config, SplitKStyle::NO_SPLIT_K, 1, stages};
             candidate_configs.push_back(config);
+            if (sm >= 75)
+            {
+                for (int split_k_factor = 2; split_k_factor <= max_split_k; ++split_k_factor)
+                {
+                    auto config = CutlassGemmConfig{tile_config, SplitKStyle::SPLIT_K_SERIAL, split_k_factor, stages};
+                    candidate_configs.push_back(config);
+                }
+            }
         }
     }
 

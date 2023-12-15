@@ -235,6 +235,7 @@ def test_world_config():
     assert world_config.pipeline_parallelism == pipeline_parallelism
     assert world_config.rank == rank
     assert world_config.gpus_per_node == gpus_per_node
+    assert world_config.gpus_per_group == gpus_per_node
     assert world_config.size == tensor_parallelism * pipeline_parallelism
     assert world_config.is_pipeline_parallel
     assert world_config.is_tensor_parallel
@@ -247,6 +248,17 @@ def test_world_config():
     assert world_config.pipeline_parallelism == 1
     assert world_config.gpus_per_node == gpus_per_node
     assert world_config.rank == 0
+
+    gpus_per_group = gpus_per_node // 2
+    device_ids = list(gpus_per_group + x for x in range(gpus_per_group))
+    assert max(device_ids) < gpus_per_node
+    world_config = _tb.WorldConfig(rank=rank,
+                                   gpus_per_node=gpus_per_node,
+                                   device_ids=device_ids)
+    assert world_config.gpus_per_node == gpus_per_node
+    assert world_config.gpus_per_group == gpus_per_group
+    assert world_config.rank == rank
+    assert world_config.device == rank + gpus_per_group
 
 
 def test_sampling_config():
@@ -326,6 +338,8 @@ def test_gpt_json_config():
             "gpt_attention_plugin": False,
             "remove_input_padding": False,
             "use_custom_all_reduce": False,
+            "use_context_fmha_for_generation": False,
+            "use_paged_context_fmha": False,
         }
     }
 
@@ -544,5 +558,6 @@ def test_trt_gpt_model_optional_params():
     opt_params.enable_trt_overlap = True
     assert opt_params.enable_trt_overlap
 
-    opt_params.use_context_fmha_for_generation = True
-    assert opt_params.use_context_fmha_for_generation
+    assert opt_params.device_ids is None
+    opt_params.device_ids = [0, 1]
+    assert opt_params.device_ids == [0, 1]
