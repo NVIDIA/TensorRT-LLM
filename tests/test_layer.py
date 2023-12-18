@@ -17,8 +17,11 @@ from itertools import product
 
 import numpy as np
 import pytest
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from functional.torch_ref import attention_qkvpacked_ref
 from parameterized import parameterized
 from polygraphy.backend.trt import (CreateConfig, EngineFromNetwork, Profile,
@@ -693,8 +696,8 @@ class TestLayer(unittest.TestCase):
 
             # the max kv cache length for each layer.
             # single tensor since we only have 1 layer here.
-            host_max_kv_cache_lengths = torch.tensor([max_seq_len],
-                                                     dtype=torch.int32)
+            host_max_attention_window_sizes = torch.tensor([max_seq_len],
+                                                           dtype=torch.int32)
 
             sequence_length = torch.full([batch_size],
                                          seq_len,
@@ -767,9 +770,9 @@ class TestLayer(unittest.TestCase):
                     name='host_past_key_value_lengths',
                     shape=tuple(host_past_key_value_lengths.shape),
                     dtype=tensorrt_llm.str_dtype_to_trt('int32'))
-                host_max_kv_cache_lengths_tensor = Tensor(
-                    name='host_max_kv_cache_lengths',
-                    shape=tuple(host_max_kv_cache_lengths.shape),
+                host_max_attention_window_sizes_tensor = Tensor(
+                    name='host_max_attention_window_sizes',
+                    shape=tuple(host_max_attention_window_sizes.shape),
                     dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                 cache_indirection_tensor = Tensor(
                     name='cache_indirection',
@@ -801,8 +804,8 @@ class TestLayer(unittest.TestCase):
                         past_key_value=[past_key_value_tensor],
                         host_past_key_value_lengths=
                         host_past_key_value_lengths_tensor,
-                        host_max_kv_cache_lengths=
-                        host_max_kv_cache_lengths_tensor,
+                        host_max_attention_window_sizes=
+                        host_max_attention_window_sizes_tensor,
                         cache_indirection=cache_indirection_tensor),
                     attention_params=AttentionParams(
                         sequence_length=sequence_length_tensor,
@@ -831,7 +834,8 @@ class TestLayer(unittest.TestCase):
                 'past_key_value': past_key_value,
                 'sequence_length': sequence_length,
                 'host_past_key_value_lengths': host_past_key_value_lengths,
-                'host_max_kv_cache_lengths': host_max_kv_cache_lengths,
+                'host_max_attention_window_sizes':
+                host_max_attention_window_sizes,
                 'context_lengths': context_lengths,
                 'host_request_types': host_request_types,
                 'cache_indirection': cache_indirection

@@ -238,7 +238,7 @@ class KVCacheManager(object):
                  blocks: int,
                  tokens_per_block: int,
                  max_blocks_per_seq: int,
-                 max_kv_cache_len: int,
+                 max_attention_window_size: int,
                  beam_width: int = 1):
 
         self.blocks_manager = BlocksManager(
@@ -248,7 +248,7 @@ class KVCacheManager(object):
             beam_width=beam_width)
         self.num_pools = len(memory_pools)
         self.tokens_per_block = tokens_per_block
-        self.max_kv_cache_len = max_kv_cache_len
+        self.max_attention_window_size = max_attention_window_size
         self.beam_width = beam_width
 
         self.lens = []
@@ -261,11 +261,11 @@ class KVCacheManager(object):
         """
         for seq in self.sequences:
             batch_idx = seq.get_batch_idx()
-            # Enable cyclic kv cache when it exceeds the max_kv_cache_len
-            if self.lens[batch_idx] == self.max_kv_cache_len:
+            # Enable cyclic kv cache when it exceeds the max_attention_window_size
+            if self.lens[batch_idx] == self.max_attention_window_size:
                 continue
             if not finished[batch_idx] and self.lens[
-                    batch_idx] % self.tokens_per_block == self.tokens_per_block - 1:
+                    batch_idx] % self.tokens_per_block == 0:
                 self.blocks_manager.allocate(seq)
 
             self.lens[batch_idx] += 1
@@ -290,29 +290,30 @@ class KVCacheManager(object):
         """
         Add sequence to the manager and allocate minimum amount of blocks for context
         """
-        self.lens.append(min(context_len, self.max_kv_cache_len))
+        seq_len = min(context_len, self.max_attention_window_size)
+        self.lens.append(seq_len)
         self.sequences.append(sequence)
 
         # With beam_width > 1 we share context blocks between beams.
 
         # First get number of blocks that can be shared across different beams.
         # This is only possible for complete blocks -> round down.
-        context_blocks = context_len // self.tokens_per_block
+        context_blocks = seq_len // self.tokens_per_block
         for _ in range(context_blocks):
             # Share context stage blocks within beam
             self.blocks_manager.allocate(sequence, share_across_beam=True)
-        # Get one extra block for each beam. This is always one extra block
-        # because we need space for context_len + 1 tokens.
-        if context_len < self.max_kv_cache_len or context_len % self.tokens_per_block > 0:
+
+        # allocate one more block if there are tokens that can't be shared across beams.
+        if seq_len % self.tokens_per_block > 0:
             self.blocks_manager.allocate(sequence, share_across_beam=False)
 
     def get_pointer_arrays(self, beam_width: int) -> List[torch.Tensor]:
         """
-        Returns arrays of pointers for all memory pools copied to GPU
+        Returns arrays of pointers for all memory pools
         """
         pointer_arrays = []
         for pool in range(self.num_pools):
             pointer_arrays.append(
                 self.blocks_manager.get_pointer_array(
-                    pool, beam_width).to('cuda').view(dtype=torch.int64))
+                    pool, beam_width).view(dtype=torch.int64))
         return pointer_arrays

@@ -33,7 +33,7 @@ namespace layers
 template <typename T>
 void BaseSamplingLayer<T>::allocateBuffer(size_t batch_size)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     curandstate_buf_ = allocator_->reMalloc(curandstate_buf_, sizeof(curandState_t) * batch_size, false);
     random_seeds_buf_ = allocator_->reMalloc(random_seeds_buf_, sizeof(unsigned long long) * batch_size, false);
     temperature_buf_ = allocator_->reMalloc(temperature_buf_, sizeof(float) * batch_size, false);
@@ -52,7 +52,7 @@ void BaseSamplingLayer<T>::allocateBuffer(size_t batch_size)
 template <typename T>
 void BaseSamplingLayer<T>::freeBuffer()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     if (is_allocate_buffer_)
     {
         allocator_->free((void**) (&curandstate_buf_));
@@ -93,7 +93,7 @@ BaseSamplingLayer<T>::~BaseSamplingLayer()
 template <typename T>
 void BaseSamplingLayer<T>::setupBase(const size_t batch_size, SetupParams const& setupParams)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     allocateBuffer(batch_size);
 
     // If runtime argument has single random seed, using this random seed to
@@ -170,7 +170,7 @@ void BaseSamplingLayer<T>::setupBase(const size_t batch_size, SetupParams const&
 template <typename T>
 void BaseSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams const& params)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const batch_size = outputs.output_ids_ptr.shape[0];
     auto const local_batch_size = params.logits.shape[0];
@@ -234,7 +234,7 @@ void BaseSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams 
         freeBuffer();
     }
     sync_check_cuda_error();
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template class BaseSamplingLayer<float>;

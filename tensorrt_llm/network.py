@@ -15,9 +15,9 @@
 import collections
 import contextlib
 import hashlib
+import weakref
 from collections import defaultdict
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, OrderedDict, Set
 
 import numpy as np
@@ -165,6 +165,12 @@ class Network(object):
             layer.get_output(idx).name = f"{layer.name}_output_{idx}"
 
     def register_ndarray(self, ndarray: np.ndarray) -> None:
+        ''' When the functional APIs need to create local numpy array and use as weights for constant or other layers,
+            they need to register the ndarray objects to the TRT-LLM Network to prolong the lifetime of the ndarray, such that weights are
+            still valid when functional API returned.
+            All the weights referenced by the trt Network are weak referenced, it's TRT-LLM's responsibility to keep the weights alive
+            during the TRT network construction and TRT engine building process.
+        '''
         self._registered_ndarrays.append(ndarray)
 
     def get_inputs(self):
@@ -370,7 +376,7 @@ class Network(object):
         '''
         return self._get_graph_impl(self._get_network_hash())
 
-    @lru_cache(maxsize=1)
+    #TODO: tali, using one LRU cache here can cause the Network object to be leaked, need a way to speed this function w/o using global lru cache.
     def _get_graph_impl(self, network_hash: bytes) -> "Network._GraphState":
         graph = Network._GraphState()
         graph.build(self)
@@ -459,7 +465,7 @@ def net_guard(network):
 
 class _TrtLlmModuleCallStack(object):
     call_stack = []
-    module_name_map = {}
+    module_name_map = weakref.WeakKeyDictionary()
 
     def __init__(self):
         super().__init__()

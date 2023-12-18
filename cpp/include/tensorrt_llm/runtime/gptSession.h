@@ -143,9 +143,9 @@ private:
 
     void createContexts(SizeType numBatchesCtx, SizeType numBatchesGen, bool useCudaGraphs);
     void createBuffers(SizeType numMicroBatches);
-    void createDecoders(SizeType batchSize, SizeType beamWidth, SizeType maxKvCacheLength, SizeType maxSequenceLength,
+    void createDecoders(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow, SizeType maxSequenceLength,
         nvinfer1::DataType logitsType, bool decoderPerRequest, SizeType numMicroBatches);
-    void createKvCacheManager(SizeType batchSize, SizeType beamWidth, SizeType maxKvCacheLength,
+    void createKvCacheManager(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow,
         SizeType maxSequenceLength, KvCacheConfig const& config);
     void createCustomAllReduceWorkspace(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength);
 
@@ -261,7 +261,7 @@ private:
     std::vector<std::shared_ptr<IpcMemory>> mIpcMemoryHandles;
 
     SizeType mDecoderMaxSequenceLength{};
-    SizeType mDecoderMaxKvCacheLength{};
+    SizeType mDecoderMaxAttentionWindow{};
 
     LoggerPtr mLogger;
     std::shared_ptr<TllmRuntime> mRuntime;

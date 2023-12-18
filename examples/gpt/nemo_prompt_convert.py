@@ -39,8 +39,23 @@ def prompt_convert(out_file, prompt_config, prompt_weights):
     vtokens_len = []
 
     if nemo_type == "peft_tuning":
-        prompt_task_weights = prompt_weights[
-            "model.embedding.adapter_layer.ptuning_adapter.inference_table"]
+        ptuning_key = "model.embedding.adapter_layer.ptuning_adapter.inference_table"
+        if ptuning_key not in prompt_weights:
+            key_match = "adapter_layer.ptuning_adapter"
+            for k in prompt_weights.keys():
+                if key_match in k:
+                    ptuning_key = k
+                    break
+            else:
+                raise ValueError(
+                    "Could not find a suitable ptuning key in Nemo dict."
+                    f" Tried {ptuning_key} or any key matching *{key_match}*")
+        prompt_task_weights = prompt_weights[ptuning_key]
+
+        if 'hidden_size' in prompt_config:
+            assert prompt_config['hidden_size'] == prompt_task_weights.shape[
+                1], "P-Tuning hidden size does not match the model's."
+
         vtokens_embeddings.append(prompt_task_weights)
         vtokens_len.append(prompt_task_weights.shape[0])
     else:

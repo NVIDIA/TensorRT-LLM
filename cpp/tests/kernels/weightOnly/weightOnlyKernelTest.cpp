@@ -71,6 +71,30 @@ void simple_assert(bool flag)
     }
 }
 
+template <typename T>
+std::vector<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> get_configs(T& runner, int k)
+{
+    auto configs = runner.getConfigs();
+    std::vector<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> rets;
+    for (auto config : configs)
+    {
+        if (config.stages >= 5)
+        {
+            continue;
+        }
+        if (config.split_k_style != tensorrt_llm::cutlass_extensions::SplitKStyle::NO_SPLIT_K)
+        {
+            int k_size = (k + config.split_k_factor - 1) / config.split_k_factor;
+            if (k_size % 64)
+            {
+                continue;
+            }
+        }
+        rets.push_back(config);
+    }
+    return rets;
+}
+
 template <typename KernelFlag, WeightOnlyActivationType AFlag, WeightOnlyQuantType BFlag>
 float benchmark_perchannel(void* act, void* weight, void* scales, void* zeros, void* bias, void* out, int m, int n,
     int k, int group_size, int warmup, int iter)
@@ -83,8 +107,8 @@ float benchmark_perchannel(void* act, void* weight, void* scales, void* zeros, v
     cudaEventCreate(&end);
     if constexpr (std::is_same_v<KernelFlag, CudaKernel>)
     {
-        WeightOnlyParams params{reinterpret_cast<uint8_t*>(weight), scales, zeros, act, bias, out, m, n, k, group_size,
-            BFlag, WeightOnlyType::PerChannel, WeightOnlyActivationFunctionType::Identity, AFlag};
+        WeightOnlyParams params{reinterpret_cast<uint8_t*>(weight), scales, zeros, act, nullptr, bias, out, m, n, k,
+            group_size, BFlag, WeightOnlyType::PerChannel, WeightOnlyActivationFunctionType::Identity, AFlag};
         for (int i = 0; i < warmup; ++i)
         {
             tensorrt_llm::kernels::weight_only_batched_gemv_launcher(params, s);
@@ -100,7 +124,7 @@ float benchmark_perchannel(void* act, void* weight, void* scales, void* zeros, v
         tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<typename AType<AFlag>::CutlassKernelAType,
             typename BType<BFlag>::CutlassKernelBType, cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY>
             gemm;
-        auto configs = gemm.getConfigs();
+        auto configs = get_configs(gemm, k);
         int ws_bytes = gemm.getWorkspaceSize(m, n, k);
         char* ws_ptr = nullptr;
         if (ws_bytes)
@@ -164,8 +188,8 @@ float benchmark_groupwise(void* act, void* weight, void* scales, void* zeros, vo
     cudaEventCreate(&end);
     if constexpr (std::is_same_v<KernelFlag, CudaKernel>)
     {
-        WeightOnlyParams params{reinterpret_cast<uint8_t*>(weight), scales, zeros, act, bias, out, m, n, k, group_size,
-            BFlag, WeightOnlyType::GroupWise, WeightOnlyActivationFunctionType::Identity, AFlag};
+        WeightOnlyParams params{reinterpret_cast<uint8_t*>(weight), scales, zeros, act, nullptr, bias, out, m, n, k,
+            group_size, BFlag, WeightOnlyType::GroupWise, WeightOnlyActivationFunctionType::Identity, AFlag};
         for (int i = 0; i < warmup; ++i)
         {
             tensorrt_llm::kernels::weight_only_batched_gemv_launcher(params, s);
@@ -181,7 +205,7 @@ float benchmark_groupwise(void* act, void* weight, void* scales, void* zeros, vo
         tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<typename AType<AFlag>::CutlassKernelAType,
             typename BType<BFlag>::CutlassKernelBType, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS>
             gemm;
-        auto configs = gemm.getConfigs();
+        auto configs = get_configs(gemm, k);
         int ws_bytes = gemm.getWorkspaceSize(m, n, k);
         char* ws_ptr = nullptr;
         if (ws_bytes)
@@ -292,8 +316,9 @@ float compare(void* _pa, void* _pb, int size, float scale)
 #if defined(ENABLE_BF16)
     if constexpr (std::is_same_v<T, __nv_bfloat16>)
     {
-        // bfloat16 has fewer mantissa digits than float16, so the cumulative error will be larger.
-        diff_thres *= 2.f;
+        // bfloat16 has fewer mantissa digits than float16(10 bits for fp16 but only 7 bits for bf16), so the cumulative
+        // error will be larger.
+        diff_thres *= 3.f;
     }
     else
 #endif
@@ -308,8 +333,7 @@ float compare(void* _pa, void* _pb, int size, float scale)
 template <typename T1, typename T2>
 void random_fill(std::vector<T1>& vec, T2 minv, T2 maxv)
 {
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen(20231205);
     std::uniform_real_distribution<float> dis(static_cast<float>(minv), static_cast<float>(maxv));
     for (auto& v : vec)
     {

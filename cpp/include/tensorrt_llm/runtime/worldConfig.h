@@ -29,14 +29,9 @@ class WorldConfig
 public:
     static SizeType constexpr kDefaultGpusPerNode = 8;
 
-    constexpr explicit WorldConfig(SizeType tensorParallelism = 1, SizeType pipelineParallelism = 1, SizeType rank = 0,
-        SizeType gpusPerNode = kDefaultGpusPerNode)
-        : mTensorParallelism{tensorParallelism}
-        , mPipelineParallelism{pipelineParallelism}
-        , mRank{rank}
-        , mGpusPerNode{gpusPerNode}
-    {
-    }
+    explicit WorldConfig(SizeType tensorParallelism = 1, SizeType pipelineParallelism = 1, SizeType rank = 0,
+        SizeType gpusPerNode = kDefaultGpusPerNode,
+        std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt);
 
     [[nodiscard]] SizeType constexpr getSize() const noexcept
     {
@@ -73,9 +68,14 @@ public:
         return mGpusPerNode;
     }
 
-    [[nodiscard]] SizeType constexpr getDevice() const noexcept
+    [[nodiscard]] SizeType getGpusPerGroup() const noexcept
     {
-        return mRank % mGpusPerNode;
+        return static_cast<SizeType>(mDeviceIds.size());
+    }
+
+    [[nodiscard]] SizeType getDevice() const noexcept
+    {
+        return mDeviceIds[mRank % getGpusPerGroup()];
     }
 
     [[nodiscard]] SizeType constexpr getPipelineParallelRank() const noexcept
@@ -110,17 +110,20 @@ public:
 
     static WorldConfig mpi(nvinfer1::ILogger& logger, SizeType gpusPerNode = kDefaultGpusPerNode,
         std::optional<SizeType> tensorParallelism = std::nullopt,
-        std::optional<SizeType> pipelineParallelism = std::nullopt);
+        std::optional<SizeType> pipelineParallelism = std::nullopt,
+        std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt);
 
     static WorldConfig mpi(SizeType gpusPerNode = kDefaultGpusPerNode,
         std::optional<SizeType> tensorParallelism = std::nullopt,
-        std::optional<SizeType> pipelineParallelism = std::nullopt);
+        std::optional<SizeType> pipelineParallelism = std::nullopt,
+        std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt);
 
 private:
     SizeType mTensorParallelism;
     SizeType mPipelineParallelism;
     SizeType mRank;
     SizeType mGpusPerNode;
+    std::vector<SizeType> mDeviceIds;
 };
 
 } // namespace tensorrt_llm::runtime

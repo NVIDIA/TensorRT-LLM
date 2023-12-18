@@ -40,14 +40,8 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
     std::shared_ptr<nvinfer1::ILogger> const& logger, int warmUp, int numRuns, int duration,
     GptSession::Config& sessionConfig, bool cudaGraphMode, bool printAllLogits)
 {
-
     std::string modelNameHyphen = modelName;
     std::filesystem::path jsonFileName = dataPath / "config.json";
-    if (tc::strStartsWith(modelName, "chatglm"))
-    {
-        std::replace(modelNameHyphen.begin(), modelNameHyphen.end(), '_', '-');
-        jsonFileName = dataPath / (modelNameHyphen + std::string("-config.json"));
-    }
     auto const json = GptJsonConfig::parse(jsonFileName);
     auto const modelConfig = json.getModelConfig();
     auto const inputPacked = modelConfig.usePackedInput();
@@ -102,7 +96,12 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
 
                 // copy inputs and wrap into shared_ptr
                 GenerationInput::TensorPtr inputIds;
-                std::vector<int32_t> inputsHost(batchSize * maxInputLength, padId);
+                std::vector<int32_t> inputsHost(batchSize * maxInputLength);
+                srand(time(0));
+                for (int i = 0; i < inputsHost.size(); i++)
+                {
+                    inputsHost[i] = rand() % modelConfig.getVocabSizePadded(worldConfig.getSize());
+                }
 
                 if (inputPacked)
                 {
@@ -263,6 +262,7 @@ int main(int argc, char* argv[])
 
     options.add_options()("ctx_micro_batch_size", "Batch size for context phase.", cxxopts::value<int>());
     options.add_options()("gen_micro_batch_size", "Batch size for generation phase.", cxxopts::value<int>());
+    options.add_options()("max_attention_window", "Max kv cache length per sequence.", cxxopts::value<int>());
     options.add_options()("max_tokens_in_paged_kvcache", "Max tokens in paged K-V Cache.", cxxopts::value<int>());
     options.add_options()(
         "kv_cache_free_gpu_mem_fraction", "K-V Cache Free Gpu Mem Fraction.", cxxopts::value<float>());
@@ -357,6 +357,11 @@ int main(int argc, char* argv[])
     if (result.count("max_tokens_in_paged_kvcache"))
     {
         sessionConfig.kvCacheConfig.maxTokens = result["max_tokens_in_paged_kvcache"].as<int>();
+    }
+    // Argument: Max KV Cache Length
+    if (result.count("max_attention_window"))
+    {
+        sessionConfig.kvCacheConfig.maxAttentionWindow = result["max_attention_window"].as<int>();
     }
     // Argument: K-V Cache Free Gpu Mem Fraction
     if (result.count("kv_cache_free_gpu_mem_fraction"))

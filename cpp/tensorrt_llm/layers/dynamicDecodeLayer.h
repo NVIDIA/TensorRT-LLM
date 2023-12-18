@@ -79,12 +79,12 @@ public:
     class ForwardParams
     {
     public:
-        ForwardParams(int step, int ite, int maxInputLength, int maxKvCacheLength, int localBatchSize,
+        ForwardParams(int step, int ite, int maxInputLength, int maxAttentionWindow, int localBatchSize,
             tc::Tensor logits, tc::Tensor endIds)
             : step{step}
             , ite{ite}
             , max_input_length{maxInputLength}
-            , max_kv_cache_length{maxKvCacheLength}
+            , max_attention_window{maxAttentionWindow}
             , local_batch_size{localBatchSize}
             , logits{std::move(logits)}
             , end_ids{std::move(endIds)}
@@ -95,12 +95,13 @@ public:
         int step;
         int ite;
         int max_input_length;
-        int max_kv_cache_length;
+        int max_attention_window;
         int local_batch_size;
         tc::Tensor logits;  // [batch_size, beam_width, vocab_size_padded], on gpu
         tc::Tensor end_ids; // [batch_size], on gpu
 
         // optional parameters
+        std::optional<tc::Tensor> finished;              // [batch_size * beam_width], optional
         std::optional<tc::Tensor> src_cache_indirection; // [local_batch_size, beam_width, max_seq_len] - the k/v cache
                                                          // index for beam search, mandatory for beam search, on gpu
         std::optional<tc::Tensor> sequence_limit_length; // [batch_size], on gpu

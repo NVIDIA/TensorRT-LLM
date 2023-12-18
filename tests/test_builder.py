@@ -34,7 +34,7 @@ class TestBuilder(unittest.TestCase):
     def test_basic_builder_flow(self):
         tensorrt_llm.logger.set_level('verbose')
         builder = tensorrt_llm.Builder()
-        builder_config = builder.create_builder_config("test", "test")
+        builder_config = builder.create_builder_config("test", "llmTimingCache")
         builder_config.trt_builder_config.set_flag(trt.BuilderFlag.REFIT)
         model = MyAddModule()
 
@@ -70,6 +70,15 @@ class TestBuilder(unittest.TestCase):
         x = tensorrt_llm.functional.assertion
         x = tensorrt_llm.functional.einsum
         print(x)  # to avoid the delete of x
+
+
+class TestSubprocess(unittest.TestCase):
+
+    def import_using_popen(self):
+        import tensorrt_llm  # isort: skip
+        from subprocess import Popen
+
+        Popen(["python3", "-c", "import tensorrt_llm"])
 
 
 if __name__ == '__main__':

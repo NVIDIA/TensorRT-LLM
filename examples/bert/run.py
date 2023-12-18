@@ -16,8 +16,10 @@ import argparse
 import json
 import os
 
-import tensorrt as trt
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 
 import tensorrt_llm
 from tensorrt_llm import logger

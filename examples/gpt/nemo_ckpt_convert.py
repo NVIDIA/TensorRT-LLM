@@ -14,25 +14,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
-import configparser
 import datetime
 import logging
 import multiprocessing
-import shutil
 import sys
 import tempfile
-import typing
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import torch
 from tqdm import tqdm
-from transformers import GPT2Tokenizer, T5Tokenizer
 from utils.convert import (cpu_map_location, gpu_map_location,
                            split_and_save_weight)
-from utils.nemo import (UnpackedNemoCheckpointDir, extract_layers_with_prefix,
-                        nemo_to_gpt_config, unpack_nemo_ckpt)
+from utils.nemo import (UnpackedNemoCheckpointDir, copy_tokenizer_files,
+                        extract_layers_with_prefix,
+                        get_eos_bos_ids_from_tokenizer_config,
+                        nemo_config_to_ini_config, unpack_nemo_ckpt,
+                        update_tokenizer_paths)
 
 from tensorrt_llm._utils import str_dtype_to_torch, torch_to_numpy
 
@@ -164,21 +163,17 @@ def convert_checkpoint(unpacked_checkpoints_dir: UnpackedNemoCheckpointDir,
         model_level_weights[key] = np.concatenate(values, axis=0)
         model_level_weights[key].tofile(out_dir / key)
     vocab_size = model_level_weights["model.wte.bin"].shape[0]
-
-    tokenizer_config = update_tokenizer_paths(nemo_model_config["tokenizer"],
-                                              unpacked_checkpoints_dir)
+    tokenizer_config = update_tokenizer_paths(
+        nemo_model_config["tokenizer"],
+        unpacked_checkpoints_dir.get_all_tokenizer_file_paths())
     copy_tokenizer_files(tokenizer_config, out_dir)
-    tokenizer = build_tokenizer(tokenizer_config)
-    gpt_model_config = nemo_to_gpt_config(nemo_model_config, vocab_size,
-                                          tokenizer.eos_token_id,
-                                          tokenizer.bos_token_id)
-
-    config = configparser.ConfigParser()
-    config["gpt"] = {k: str(v) for k, v in vars(gpt_model_config).items()}
-    config["gpt"]["storage_dtype"] = args.storage_type
+    ini_config = nemo_config_to_ini_config(
+        nemo_model_config,
+        *get_eos_bos_ids_from_tokenizer_config(tokenizer_config), vocab_size,
+        args.storage_type)
     config_path = out_dir / "config.ini"
     with config_path.open("w") as config_file:
-        config.write(config_file)
+        ini_config.write(config_file)
 
 
 def create_out_dir(args):
@@ -186,70 +181,6 @@ def create_out_dir(args):
     if not out_dir.exists():
         out_dir.mkdir(parents=True)
     return out_dir
-
-
-def update_tokenizer_paths(tokenizer_config: typing.Dict,
-                           unpacked_checkpoints_dir):
-
-    def _update_config_entry(key, file_pattern):
-        old_path = tokenizer_config[key]
-        if old_path is None:
-            return
-        old_path = Path(old_path)
-        new_path = unpacked_checkpoints_dir.get_tokenizer_file_path(
-            "tokenizer", key, file_pattern)
-        if new_path:
-            LOGGER.debug(f"Update tokenizer {key} {old_path} -> {new_path}")
-            tokenizer_config[key] = new_path.as_posix()
-        elif not old_path.exists():
-            LOGGER.warning(
-                f"Tokenizer {key}'s path {old_path} does not exists: set it to None"
-            )
-            tokenizer_config[key] = None
-
-    _update_config_entry("model", "*.model")
-    _update_config_entry("vocab_file", "*vocab*")
-    _update_config_entry("merge_file", "*merge*.txt")
-
-    return tokenizer_config
-
-
-def copy_tokenizer_files(config, out_dir):
-    basenames = {
-        "model": "tokenizer",
-        "vocab_file": "vocab",
-        "merge_file": "merges",
-    }
-
-    for key in basenames.keys():
-        if config[key] is None:
-            continue
-        path = Path(config[key])
-        if not path.exists():
-            LOGGER.debug(f"Tokenizer {key}: {path} file not found")
-            continue
-
-        dst_path = out_dir / f"{basenames[key]}{path.suffix}"
-        LOGGER.debug(f"Copy tokenizer {key}: {path}->{dst_path}")
-        shutil.copy(path.as_posix(), dst_path.as_posix())
-
-
-def build_tokenizer(tokenizer_config: typing.Dict):
-    if tokenizer_config["library"] == "sentencepiece":
-        tokenizer = T5Tokenizer(tokenizer_config["model"], extra_ids=0)
-    elif "GPT2" in tokenizer_config["type"]:
-        tokenizer = GPT2Tokenizer(tokenizer_config["vocab_file"],
-                                  tokenizer_config["merge_file"])
-    else:
-        raise ValueError(
-            f'Tokenizer type {tokenizer_config["library"]} not handled')
-
-    if tokenizer.bos_token_id is None:
-        tokenizer.add_special_tokens({"bos_token": "<s>"})
-    if tokenizer.eos_token_id is None:
-        tokenizer.add_special_tokens({"eos_token": "</s>"})
-
-    return tokenizer
 
 
 def main():

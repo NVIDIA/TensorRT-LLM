@@ -2,6 +2,24 @@
 
 set -ex
 
+TRT_VER="9.2.0.5"
+CUDA_VER="12.2"
+CUDNN_VER="8.9.4.25-1+cuda12.2"
+NCCL_VER="2.18.3-1+cuda12.2"
+CUBLAS_VER="12.2.5.6-1"
+
+for i in "$@"; do
+    case $i in
+        --TRT_VER=?*) TRT_VER="${i#*=}";;
+        --CUDA_VER=?*) CUDA_VER="${i#*=}";;
+        --CUDNN_VER=?*) CUDNN_VER="${i#*=}";;
+        --NCCL_VER=?*) NCCL_VER="${i#*=}";;
+        --CUBLAS_VER=?*) CUBLAS_VER="${i#*=}";;
+        *) ;;
+    esac
+    shift
+done
+
 NVCC_VERSION_OUTPUT=$(nvcc --version)
 if [[ $(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1) != ${CUDA_VER} ]]; then
   echo "The version of pre-installed CUDA is not equal to ${CUDA_VER}."
@@ -46,7 +64,7 @@ install_centos_requirements() {
 }
 
 install_tensorrt() {
-    PY_VERSION=$(python -c 'import sys; print(".".join(map(str, sys.version_info[0:2])))')
+    PY_VERSION=$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[0:2])))')
     PARSED_PY_VERSION=$(echo "${PY_VERSION//./}")
     TRT_CUDA_VERSION="12.2"
 
@@ -56,15 +74,15 @@ install_tensorrt() {
         if [ "$ARCH" = "arm64" ];then ARCH="aarch64";fi
         if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
         if [ "$ARCH" = "x86_64" ];then DIR_NAME="x64-agnostic"; else DIR_NAME=${ARCH};fi
-        if [ "$ARCH" = "aarch64" ];then OS="ubuntu-22.04"; else OS="linux";fi
-        RELEASE_URL_TRT=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/secure/9.1.0/tars/tensorrt-${TRT_VER}.${OS}.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz;
+        if [ "$ARCH" = "aarch64" ];then OS1="Ubuntu22_04" && OS2="Ubuntu-22.04" && OS="ubuntu-22.04"; else OS1="Linux" && OS2="Linux" && OS="linux";fi
+        RELEASE_URL_TRT=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/9.2.0/tensorrt-${TRT_VER}.${OS}.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz;
     fi
     wget --no-verbose ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
     tar -xf /tmp/TensorRT.tar -C /usr/local/
     mv /usr/local/TensorRT-${TRT_VER} /usr/local/tensorrt
-    pip install /usr/local/tensorrt/python/tensorrt-*-cp${PARSED_PY_VERSION}-*.whl
+    pip3 install /usr/local/tensorrt/python/tensorrt-*-cp${PARSED_PY_VERSION}-*.whl
     rm -rf /tmp/TensorRT.tar
-    echo 'export LD_LIBRARY_PATH=/usr/local/tensorrt/lib:$LD_LIBRARY_PATH' >> "${ENV}"
+    echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/tensorrt/lib' >> "${ENV}"
 }
 
 # Install base packages depending on the base OS

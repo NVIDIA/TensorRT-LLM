@@ -28,8 +28,7 @@ resources_dir = _pl.Path(
     __file__).parent.parent.parent.parent.parent / "examples/chatglm"
 sys.path.insert(0, str(resources_dir))
 
-engine_target_path = _pl.Path(
-    __file__).parent.parent / "models/rt_engine/chatglm"
+engine_target_path = _pl.Path(__file__).parent.parent / "models/rt_engine"
 
 import build as _ecb
 
@@ -67,7 +66,10 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
 
     model_name_list = ["chatglm_6b", "chatglm2_6b", "chatglm3_6b"]
     hf_dir_list = [resources_dir / model_name for model_name in model_name_list]
-    trt_dir = resources_dir / "trtModel"
+    trt_dir_list = [
+        resources_dir / ("output_" + model_name)
+        for model_name in model_name_list
+    ]
 
     run_command(
         ["pip", "install", "-r",
@@ -89,14 +91,17 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
             )
 
     print("\nBuilding engines")
-    for model_name, hf_dir in zip(model_name_list, hf_dir_list):
+    for model_name, hf_dir, trt_dir in zip(model_name_list, hf_dir_list,
+                                           trt_dir_list):
         print("Building %s" % model_name)
         build_engine(model_name, hf_dir, trt_dir, world_size)
 
     if not _Path(engine_target_path).exists():
         _Path(engine_target_path).mkdir(parents=True, exist_ok=True)
-    for file in _Path(trt_dir).glob("*"):
-        _shutil.move(file, engine_target_path)
+    for model_name in model_name_list:
+        _shutil.move(
+            _Path(resources_dir) / ("output_" + model_name),
+            engine_target_path / model_name)
 
     print("Done.")
 

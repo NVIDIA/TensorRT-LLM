@@ -30,17 +30,19 @@ public:
     using SizeType = tensorrt_llm::runtime::SizeType;
 
     explicit KvCacheConfig(std::optional<SizeType> maxTokens = std::nullopt,
-        std::optional<SizeType> maxKvCacheLength = std::nullopt,
-        std::optional<float> freeGpuMemoryFraction = std::nullopt)
+        std::optional<SizeType> maxAttentionWindow = std::nullopt,
+        std::optional<float> freeGpuMemoryFraction = std::nullopt, bool enableBlockReuse = false)
         : maxTokens{maxTokens}
-        , maxKvCacheLength{maxKvCacheLength}
+        , maxAttentionWindow{maxAttentionWindow}
         , freeGpuMemoryFraction{freeGpuMemoryFraction}
+        , enableBlockReuse(enableBlockReuse)
     {
     }
 
     std::optional<SizeType> maxTokens;
-    std::optional<SizeType> maxKvCacheLength;
+    std::optional<SizeType> maxAttentionWindow;
     std::optional<float> freeGpuMemoryFraction;
+    bool enableBlockReuse;
 
     static constexpr auto kDefaultGpuMemFraction = 0.85f;
 };

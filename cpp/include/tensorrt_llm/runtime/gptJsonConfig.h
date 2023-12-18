@@ -32,9 +32,10 @@ namespace tensorrt_llm::runtime
 class GptJsonConfig
 {
 public:
-    GptJsonConfig(std::string name, std::string precision, SizeType tensorParallelism, SizeType pipelineParallelism,
-        GptModelConfig const& modelConfig)
+    GptJsonConfig(std::string name, std::string version, std::string precision, SizeType tensorParallelism,
+        SizeType pipelineParallelism, GptModelConfig const& modelConfig)
         : mName(std::move(name))
+        , mVersion(std::move(version))
         , mPrecision(std::move(precision))
         , mTensorParallelism{tensorParallelism}
         , mPipelineParallelism{pipelineParallelism}
@@ -56,6 +57,11 @@ public:
     [[nodiscard]] std::string const& getName() const
     {
         return mName;
+    }
+
+    [[nodiscard]] std::string const& getVersion() const
+    {
+        return mVersion;
     }
 
     [[nodiscard]] std::string const& getPrecision() const
@@ -87,6 +93,7 @@ public:
 
 private:
     std::string const mName;
+    std::string const mVersion;
     std::string const mPrecision;
     SizeType const mTensorParallelism;
     SizeType const mPipelineParallelism;

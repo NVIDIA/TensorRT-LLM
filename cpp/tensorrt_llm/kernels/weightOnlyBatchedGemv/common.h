@@ -69,6 +69,7 @@ struct WeightOnlyParams
     const ActType* scales;
     const ActType* zeros;
     const ActType* in;
+    const ActType* act_scale;
     const ActType* bias;
     ActType* out;
     const int m;
@@ -81,13 +82,14 @@ struct WeightOnlyParams
     WeightOnlyActivationType act_type;
 
     WeightOnlyParams(const uint8_t* _qweight, const ActType* _scales, const ActType* _zeros, const ActType* _in,
-        const ActType* _bias, ActType* _out, const int _m, const int _n, const int _k, const int _group_size,
-        const WeightOnlyQuantType _quant_type, const WeightOnlyType _weight_only_type,
+        const ActType* _act_scale, const ActType* _bias, ActType* _out, const int _m, const int _n, const int _k,
+        const int _group_size, const WeightOnlyQuantType _quant_type, const WeightOnlyType _weight_only_type,
         const WeightOnlyActivationFunctionType _act_func_type, const WeightOnlyActivationType _act_type)
         : qweight(_qweight)
         , scales(_scales)
         , zeros(_zeros)
         , in(_in)
+        , act_scale(_act_scale)
         , bias(_bias)
         , out(_out)
         , m(_m)

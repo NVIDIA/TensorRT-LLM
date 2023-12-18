@@ -23,6 +23,7 @@
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/core/DeviceType.h>
 #include <cuda_runtime.h>
 #include <torch/types.h>
 
@@ -108,6 +109,17 @@ public:
         case at::ScalarType::Bits8: return IBuffer::DataType::kFP8;
         case at::ScalarType::BFloat16: return IBuffer::DataType::kBF16;
         default: TLLM_THROW("unsupported data type");
+        }
+    }
+
+    static at::DeviceType deviceType(runtime::MemoryType memoryType)
+    {
+        switch (memoryType)
+        {
+        case runtime::MemoryType::kGPU: return c10::kCUDA;
+        case runtime::MemoryType::kCPU: [[fallthrough]];
+        case runtime::MemoryType::kPINNED: [[fallthrough]];
+        default: return c10::kCPU;
         }
     }
 

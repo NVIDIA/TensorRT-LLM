@@ -18,7 +18,8 @@ import tensorrt as trt
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
-from ...functional import Tensor, gather_last_token_logits, recv, send
+from ...functional import (Tensor, allreduce, gather_last_token_logits, recv,
+                           send)
 from ...layers import (MLP, Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, KeyValueCacheParams, LayerNorm,
                        PositionEmbeddingType)
@@ -69,6 +70,12 @@ class FalconDecoderLayer(Module):
         else:
             position_embedding_type = PositionEmbeddingType.rope_gpt_neox
 
+        self.new_decoder_architecture = new_decoder_architecture
+        self.parallel_attn = parallel_attention
+        if self.is_parallel_attention:
+            # Not to apply allreduce inside the Attention/MLP layers.
+            # allreduce applies after those layer.
+            tp_group = None
         self.attention = Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -81,16 +88,12 @@ class FalconDecoderLayer(Module):
             tp_group=tp_group,
             tp_size=tp_size,
             tp_rank=tp_rank,
-            use_int8_kv_cache=quant_mode.has_int8_kv_cache(),
             quant_mode=quant_mode,
             instance_id=2 * layer_id,
         )
 
         if mlp_hidden_size is None:
             mlp_hidden_size = hidden_size * 4
-
-        self.new_decoder_architecture = new_decoder_architecture
-        self.parallel_attn = parallel_attention
 
         if self.new_decoder_architecture:
             # Layernorm before MLP.
@@ -110,11 +113,15 @@ class FalconDecoderLayer(Module):
             quant_mode=quant_mode,
             instance_id=2 * layer_id + 1,
         )
-        if self.new_decoder_architecture or self.parallel_attn:
+        if self.is_parallel_attention:
             self.post_layernorm = None
         else:
             self.post_layernorm = LayerNorm(normalized_shape=hidden_size,
                                             dtype=dtype)
+
+    @property
+    def is_parallel_attention(self):
+        return self.new_decoder_architecture or self.parallel_attn
 
     def forward(self,
                 hidden_states: Tensor,
@@ -153,8 +160,11 @@ class FalconDecoderLayer(Module):
 
         hidden_states = self.mlp(hidden_states, all_reduce_workspace)
 
-        if self.new_decoder_architecture or self.parallel_attn:
+        if self.is_parallel_attention:
             hidden_states = hidden_states + attention_output
+            if self.tp_size > 1:
+                hidden_states = allreduce(hidden_states, self.tp_group,
+                                          all_reduce_workspace, self._layer_id)
 
         hidden_states = residual + hidden_states
         if use_cache:
@@ -228,7 +238,7 @@ class FalconModel(Module):
                 tp_size=mapping.tp_size,
                 tp_rank=mapping.tp_rank,
                 layer_id=i,
-            ) for i in self.get_transformer_layers(self.mapping, num_layers)
+            ) for i in self.mapping.pp_layers(num_layers)
         ])
 
         if self.mapping.is_last_pp_rank():
@@ -254,10 +264,11 @@ class FalconModel(Module):
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
-        for layer, past, pointer, max_kv_cache_length in zip(
+        for layer, past, pointer, host_pointer, max_attention_window_size in zip(
                 self.layers, kv_cache_params.past_key_value,
                 kv_cache_params.kv_cache_block_pointers,
-                kv_cache_params.host_max_kv_cache_lengths):
+                kv_cache_params.host_kv_cache_block_pointers,
+                kv_cache_params.host_max_attention_window_sizes):
             hidden_states = layer(
                 hidden_states,
                 use_cache=use_cache,
@@ -266,8 +277,9 @@ class FalconModel(Module):
                     past_key_value=[past],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
-                    host_max_kv_cache_lengths=max_kv_cache_length,
+                    host_max_attention_window_sizes=max_attention_window_size,
                     kv_cache_block_pointers=[pointer],
+                    host_kv_cache_block_pointers=[host_pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
                 all_reduce_workspace=all_reduce_workspace)
@@ -379,9 +391,8 @@ class FalconForCausalLM(FalconModel, GenerationMixin):
             hidden_states.mark_output('hidden_states_output', self.dtype)
 
         if use_cache and default_net().plugin_config.paged_kv_cache == False:
-            for i, present in zip(
-                    self.get_transformer_layers(self.mapping, self.num_layers),
-                    presents):
+            for i, present in zip(self.mapping.pp_layers(self.num_layers),
+                                  presents):
                 present.mark_output(f'present_key_value_{i}', self.kv_dtype)
             if self.mapping.is_last_pp_rank():
                 return lm_logits, presents
@@ -449,10 +460,12 @@ class FalconForCausalLM(FalconModel, GenerationMixin):
                 past_key_value=model_inputs['past_key_value'],
                 host_past_key_value_lengths=model_inputs[
                     'host_past_key_value_lengths'],
-                host_max_kv_cache_lengths=model_inputs[
-                    'host_max_kv_cache_lengths'],
+                host_max_attention_window_sizes=model_inputs[
+                    'host_max_attention_window_sizes'],
                 kv_cache_block_pointers=model_inputs[
                     'kv_cache_block_pointers_list'],
+                host_kv_cache_block_pointers=model_inputs[
+                    'host_kv_cache_block_pointers_list'],
                 cache_indirection=model_inputs['cache_indirection']),
             AttentionParams(
                 sequence_length=model_inputs['sequence_length'],

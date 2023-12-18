@@ -12,23 +12,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Optional
+
 import numpy as np
 import tensorrt as trt
 
 from .._common import default_net, default_trtnet
-from .._utils import int32_array, str_dtype_to_trt
+from .._utils import str_dtype_to_trt
 from ..functional import (Tensor, _create_tensor, allgather, allreduce, cast,
-                          concat, constant, matmul, shape, slice)
+                          matmul)
 from ..module import Module
 from ..parameter import Parameter
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
+from .lora import Lora, LoraRuntimeParams
 
 
 def _gemm_plugin(input: Tensor,
                  mat2: Tensor,
                  transa: bool = False,
                  transb: bool = False,
-                 use_fp8: bool = False) -> Tensor:
+                 use_fp8: bool = False,
+                 strict_dtype: Optional[str] = None) -> Tensor:
     plg_creator = trt.get_plugin_registry().get_plugin_creator(
         'Gemm', '1', TRT_LLM_PLUGIN_NAMESPACE)
     assert plg_creator is not None
@@ -43,10 +47,12 @@ def _gemm_plugin(input: Tensor,
     use_fp8 = trt.PluginField("use_fp8", np.array(use_fp8, dtype=np.int32),
                               trt.PluginFieldType.INT32)
 
-    p_dtype = default_net().plugin_config.gemm_plugin
-    pf_type = trt.PluginField(
-        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
-        trt.PluginFieldType.INT32)
+    if strict_dtype is not None:
+        p_dtype = strict_dtype
+    else:
+        p_dtype = str_dtype_to_trt(default_net().plugin_config.gemm_plugin)
+    pf_type = trt.PluginField("type_id", np.array([int(p_dtype)], np.int32),
+                              trt.PluginFieldType.INT32)
     pfc = trt.PluginFieldCollection([transa, transb, pf_type, use_fp8])
     gemm_plug = plg_creator.create_plugin("gemm", pfc)
     plug_inputs = [input.trt_tensor, mat2.trt_tensor]
@@ -64,7 +70,8 @@ class Linear(Module):
                  tp_group=None,
                  tp_size=1,
                  gather_output=True,
-                 share_weight=None):
+                 share_weight=None,
+                 strict_dtype=False):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features // tp_size
@@ -79,17 +86,41 @@ class Linear(Module):
         self.tp_size = tp_size
         self.tp_group = tp_group
         self.gather_output = gather_output
+        self.strict_dtype = self.dtype if strict_dtype else None
 
         if bias:
             self.bias = Parameter(shape=(self.out_features, ), dtype=dtype)
         else:
             self.register_parameter('bias', None)
 
-    def multiply_gather(self, x, weight, gemm_plugin, use_fp8=False):
+        self.lora = Lora(
+            in_hidden_size=self.in_features,
+            out_hidden_sizes=[self.out_features],
+            max_low_rank=min(
+                self.in_features, self.out_features
+            ),  # Assume low rank is smaller than in/out features
+        )
+
+    def multiply_gather(self,
+                        x,
+                        weight,
+                        gemm_plugin,
+                        use_fp8=False,
+                        lora_runtime_params: LoraRuntimeParams = None):
+        hidden_state = x
         if gemm_plugin:
-            x = _gemm_plugin(x, weight, transb=True, use_fp8=use_fp8)
+            x = _gemm_plugin(x,
+                             weight,
+                             transb=True,
+                             use_fp8=use_fp8,
+                             strict_dtype=self.strict_dtype)
         else:
             x = matmul(x, weight, transb=True)
+
+        if default_net(
+        ).plugin_config.lora_plugin and lora_runtime_params is not None:
+            x = x + self.lora(hidden_state,
+                              lora_runtime_params=lora_runtime_params)
 
         if self.bias is not None:
             if x.dtype != self.bias.value.dtype:
@@ -97,28 +128,16 @@ class Linear(Module):
             x = x + self.bias.value
 
         if self.gather_output and self.tp_size > 1 and self.tp_group is not None:
-            # 1. [dim0, local_dim] -> [dim0 * tp_size, local_dim]
-            x = allgather(x, self.tp_group)
-
-            # 2. [dim0 * tp_size, local_dim] -> [dim0, local_dim * tp_size]
-            # 2.1 split
-            split_size = shape(x, dim=0) / self.tp_size
-            ndim = x.ndim()
-            starts = [constant(int32_array([0])) for _ in range(ndim)]
-            sizes = [shape(x, dim=d) for d in range(ndim)]
-            sizes[0] = split_size
-            sections = []
-            for i in range(self.tp_size):
-                starts[0] = split_size * i
-                sections.append(slice(x, concat(starts), concat(sizes)))
-            # 2.2 concat
-            x = concat(sections, dim=1)
+            # [dim0, local_dim] -> [dim0 * tp_size, local_dim] --> [dim0, local_dim * tp_size]
+            x = allgather(x, self.tp_group, gather_dim=-1)
 
         return x
 
-    def forward(self, x):
-        return self.multiply_gather(x, self.weight.value,
-                                    default_net().plugin_config.gemm_plugin)
+    def forward(self, x, lora_runtime_params: LoraRuntimeParams = None):
+        return self.multiply_gather(x,
+                                    self.weight.value,
+                                    default_net().plugin_config.gemm_plugin,
+                                    lora_runtime_params=lora_runtime_params)
 
 
 ColumnLinear = Linear
@@ -133,7 +152,8 @@ class RowLinear(Module):
                  dtype=None,
                  tp_group=None,
                  tp_size=1,
-                 instance_id: int = 0):
+                 instance_id: int = 0,
+                 strict_dtype: bool = False):
         super().__init__()
         self.in_features = in_features // tp_size
         self.out_features = out_features
@@ -151,16 +171,36 @@ class RowLinear(Module):
         self.tp_size = tp_size
         self.instance_id = instance_id
 
+        self.lora = Lora(
+            in_hidden_size=self.in_features,
+            out_hidden_sizes=[self.out_features],
+            max_low_rank=min(
+                self.in_features, self.out_features
+            ),  # Assume low rank is smaller than in/out features
+        )
+        self.strict_dtype = self.dtype if strict_dtype else None
+
     def multiply_reduce(self,
                         x,
                         weight,
                         gemm_plugin,
                         use_fp8=False,
-                        workspace=None):
+                        workspace=None,
+                        lora_runtime_params: LoraRuntimeParams = None):
+        hidden_state = x
         if gemm_plugin:
-            x = _gemm_plugin(x, weight, transb=True, use_fp8=use_fp8)
+            x = _gemm_plugin(x,
+                             weight,
+                             transb=True,
+                             use_fp8=use_fp8,
+                             strict_dtype=self.strict_dtype)
         else:
             x = matmul(x, weight, transb=True)
+
+        if default_net(
+        ).plugin_config.lora_plugin and lora_runtime_params is not None:
+            x = x + self.lora(hidden_state,
+                              lora_runtime_params=lora_runtime_params)
 
         if self.tp_size > 1 and self.tp_group is not None:
             x = allreduce(x, self.tp_group, workspace, self.instance_id)
@@ -173,8 +213,12 @@ class RowLinear(Module):
 
         return x
 
-    def forward(self, x, workspace=None):
+    def forward(self,
+                x,
+                workspace=None,
+                lora_runtime_params: LoraRuntimeParams = None):
         return self.multiply_reduce(x,
                                     self.weight.value,
                                     default_net().plugin_config.gemm_plugin,
-                                    workspace=workspace)
+                                    workspace=workspace,
+                                    lora_runtime_params=lora_runtime_params)

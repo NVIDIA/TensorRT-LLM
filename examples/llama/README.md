@@ -4,11 +4,14 @@ This document shows how to build and run a LLaMA model in TensorRT-LLM on both s
 
 ## Overview
 
-The TensorRT-LLM LLaMA implementation can be found in [tensorrt_llm/models/llama/model.py](../../tensorrt_llm/models/llama/model.py). The TensorRT-LLM LLaMA example code is located in [`examples/llama`](./). There are three main files:
+The TensorRT-LLM LLaMA implementation can be found in [tensorrt_llm/models/llama/model.py](../../tensorrt_llm/models/llama/model.py). The TensorRT-LLM LLaMA example code is located in [`examples/llama`](./). There is one main file:
 
- * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the LLaMA model,
- * [`run.py`](./run.py) to run the inference on an input text,
- * and a shared [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset using the model.
+* [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the LLaMA model.
+
+In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
+
+* [`../run.py`](../run.py) to run the inference on an input text;
+* [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
   * FP16
@@ -192,13 +195,13 @@ python build.py --model_dir ./tmp/LongAlpaca-70B/ \
 wget https://www.gutenberg.org/cache/epub/64317/pg64317.txt
 
 # Run with 8 GPUs
-# Notice, `--input_tokens_limit <n>` is a convenience option to limit the input length for the data.
+# Notice, `--max_input_length <n>` is a convenience option to limit the input length for the data.
 # It should be set to the maximum context length the model supports. Here the limit is set to 32K.
 mpirun -n 8 --allow-run-as-root \
-    python run.py \
+    python ../run.py \
     --max_output_len 128 \
-    --input_tokens_limit 32768 \
-    --input_tokens pg64317.txt \
+    --max_input_length 32768 \
+    --input_file pg64317.txt \
     --engine_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
     --tokenizer_dir ./tmp/LongAlpaca-70B/
 ```
@@ -236,7 +239,7 @@ python3 hf_llama_convert.py -i /llama-models/llama-7b-hf -o /llama/smooth_llama_
 
 [`build.py`](./build.py) add new options for the support of INT8 KV cache.
 
-`--int8_kv_cache` is the command-line option to enable INT8 KV cache, and `--ft_model_dir` should contain the directory where the INT8 KV cache scales lie in.
+`--int8_kv_cache` is the command-line option to enable INT8 KV cache, and `--bin_model_dir` is the directory where the INT8 KV cache scales are located.
 
 **INT8 KV cache + per-channel weight-only quantization**
 
@@ -246,7 +249,7 @@ Examples of INT8 weight-only quantization + INT8 KV cache
 
 ```bash
 # Build model with both INT8 weight-only and INT8 KV cache enabled
-python build.py --ft_model_dir=/llama/smooth_llama_7B/int8_kv_cache/1-gpu/ \
+python build.py --bin_model_dir=/llama/smooth_llama_7B/int8_kv_cache/1-gpu/ \
                 --dtype float16 \
                 --use_gpt_attention_plugin float16 \
                 --use_gemm_plugin float16 \
@@ -269,7 +272,7 @@ python ../summarize.py --test_trt_llm \
 
 In addition, you can enable INT8 KV cache together with AWQ (per-group INT4 weight-only quantization)like the following command.
 
-**NOTE**: AWQ checkpoint is passed through `--model_dir`, and the INT8 scales of KV cache is through `--ft_model_dir`.
+**NOTE**: AWQ checkpoint is passed through `--quant_ckpt_path`, and the INT8 scales for the KV cache are expected to be in the directory pointed by `--bin_model_dir`.
 
 ```bash
 python build.py --model_dir ./tmp/llama/7B/ \
@@ -284,7 +287,7 @@ python build.py --model_dir ./tmp/llama/7B/ \
                 --per_group \
                 --output_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_int4_AWQ/1-gpu/
                 --int8_kv_cache \ # Turn on INT8 KV cache
-                --ft_model_dir /llama/smooth_llama_7B/int8_kv_cache/1-gpu/ # Directory to look for INT8 scale of KV cache
+                --bin_model_dir /llama/smooth_llama_7B/int8_kv_cache/1-gpu/ # Directory to look for INT8 scale of KV cache
 ```
 
 Test with `../summarize.py`:
@@ -317,17 +320,17 @@ Examples of build invocations:
 
 ```bash
 # Build model for SmoothQuant in the _per_tensor_ mode.
-python3 build.py --ft_model_dir=/llama/smooth_llama_7B/sq0.8/1-gpu/ \
+python3 build.py --bin_model_dir=/llama/smooth_llama_7B/sq0.8/1-gpu/ \
                  --use_smooth_quant
 
 # Build model for SmoothQuant in the _per_token_ + _per_channel_ mode
-python3 build.py --ft_model_dir=/llama/smooth_llama_7B/sq0.8/1-gpu/ \
+python3 build.py --bin_model_dir=/llama/smooth_llama_7B/sq0.8/1-gpu/ \
                  --use_smooth_quant \
                  --per_token \
                  --per_channel
 ```
 
-Note we use `--ft_model_dir` instead of `--model_dir` and `--meta_ckpt_dir` since SmoothQuant model needs INT8 weights and various scales from the binary files.
+Note we use `--bin_model_dir` instead of `--model_dir` and `--meta_ckpt_dir` since SmoothQuant model needs INT8 weights and various scales from the binary files.
 
 #### FP8 Post-Training Quantization
 
@@ -384,16 +387,16 @@ AWQ/GPTQ examples below involves 2 steps:
     python quantize.py --model_dir ./tmp/llama/7B \
                     --dtype float16 \
                     --qformat int4_awq \
-                    --export_path ./llama-7b-4bit-gs128-awq.pt \
+                    --export_path ./quantized_int4-awq \
                     --calib_size 32
     ```
-    The quantized model checkpoint is saved to path `./llama-7b-4bit-gs128-awq.pt` for future TRT-LLM engine build.
+    The quantized model checkpoint is saved to `./quantized_int4-awq/llama_tp1_rank0.npz` for future TRT-LLM engine build.
 
 2. Build TRT-LLM engine:
 
     ```bash
     python build.py --model_dir ./tmp/llama/7B/ \
-                    --quant_ckpt_path ./llama-7b-4bit-gs128-awq.pt \
+                    --quant_ckpt_path ./quantized_int4-awq/llama_tp1_rank0.npz \
                     --dtype float16 \
                     --remove_input_padding \
                     --use_gpt_attention_plugin float16 \
@@ -450,14 +453,14 @@ To run a TensorRT-LLM LLaMA model using the engines generated by build.py
 
 ```bash
 # With fp16 inference
-python3 run.py --max_output_len=50 \
-               --tokenizer_dir ./tmp/llama/7B/ \
-               --engine_dir=./tmp/llama/7B/trt_engines/fp16/1-gpu/
+python3 ../run.py --max_output_len=50 \
+                  --tokenizer_dir ./tmp/llama/7B/ \
+                  --engine_dir=./tmp/llama/7B/trt_engines/fp16/1-gpu/
 
 # With bf16 inference
-python3 run.py --max_output_len=50 \
-               --tokenizer_dir ./tmp/llama/7B/ \
-               --engine_dir=./tmp/llama/7B/trt_engines/bf16/1-gpu/
+python3 ../run.py --max_output_len=50 \
+                  --tokenizer_dir ./tmp/llama/7B/ \
+                  --engine_dir=./tmp/llama/7B/trt_engines/bf16/1-gpu/
 ```
 
 ### Summarization using the LLaMA model
@@ -493,7 +496,7 @@ mpirun -n 2 --allow-run-as-root \
 #### Mistral v0.1
 Mistral v0.1 is compatible with LLaMA interface and can be built and run using the same instructions.
 Setting `--max_input_len`, corresponding to the `max_position_embeddings` in the original Mistral config explicitly regulates context size.
-The `--max_kv_cache_len` parameter is set to the `sliding_window` value in the config and regulates both sliding window attention in the context phase and rolling buffer cache in the generation phase.
+The `--max_attention_window_size` parameter is set to the `sliding_window` value in the config and regulates both sliding window attention in the context phase and rolling buffer cache in the generation phase.
 
 ```bash
 # Build Mistral 7B with max input length 32256
@@ -510,11 +513,11 @@ python build.py --model_dir ./tmp/mistral/7B/ \
 python3 run.py --max_output_len=50 \
                --tokenizer_dir ./tmp/llama/7B/ \
                --engine_dir=./tmp/llama/7B/trt_engines/fp16/1-gpu/ \
-               --max_kv_cache_len=4096
+               --max_attention_window_size=4096
 ```
 
 Note that if you are comparing TRT-LLM with Huggingface,
-you should install `transformers` with version >= 3.34.1 in order to have Mistral model supported.
+you should install `transformers` with version >= 4.34.1 in order to have Mistral model supported.
 And upgrade `flash-attn` package by `pip install --upgrade flash-attn` or you may see wrong results generated by the huggingface implementation.
 
 ## Running CodeLlama
@@ -534,7 +537,7 @@ python build.py --meta_ckpt_dir ./CodeLlama-7b-Instruct/ --dtype float16 \
 Use the following command to build `CodeLlama-34b-Instruct` for 4 GPUs (TP=4):
 ```
 python build.py --meta_ckpt_dir ./CodeLlama-34b-Instruct/ --dtype float16 \
-    --remove_input_padding --use_gpt_attention_plugin float16 --use_gemm_plugin float16 --use_rmsnorm_plugin float16 \
+    --remove_input_padding --use_gpt_attention_plugin float16 --use_gemm_plugin float16 \
     --enable_context_fmha --output_dir codellama_34b --rotary_base 1000000 --vocab_size 32000 --world_size 4 --tp_size 4
 ```
 
@@ -544,7 +547,7 @@ To build the engine for running similarly long input/output, you need to specify
 Use `--max_input_len` and `--max_output_len` (which defaults to `2048` and `512`, respectively) according to your use case, e.g.:
 ```
 python build.py --meta_ckpt_dir ./CodeLlama-34b-Instruct/ --dtype float16 \
-    --remove_input_padding --use_gpt_attention_plugin float16 --use_gemm_plugin float16 --use_rmsnorm_plugin float16 \
+    --remove_input_padding --use_gpt_attention_plugin float16 --use_gemm_plugin float16 \
     --output_dir codellama_34b --rotary_base 1000000 --vocab_size 32000 --world_size 8 --tp_size 8 --parallel_build \
     --enable_context_fmha --use_parallel_embedding --max_input_len 15360 --max_output_len 1024 --max_batch_size 4
 ```
@@ -552,11 +555,71 @@ python build.py --meta_ckpt_dir ./CodeLlama-34b-Instruct/ --dtype float16 \
 ### Run
 Use the following command to run the 7b engine from above:
 ```
-python run.py --max_output_len=40 --tokenizer_dir . --engine_dir codellama_7b --input_text "In Bash, how do I list all text files?"
+python ../run.py --max_output_len=40 --tokenizer_dir . --engine_dir codellama_7b --input_text "In Bash, how do I list all text files?"
 ```
 Use the following command to run the 34b engine with long input/output from above:
 ```
 mpirun -n 8 --allow-run-as-root \
-    python run.py --max_output_len=160 --tokenizer_dir ./CodeLlama-34b-Instruct \
+    python ../run.py --max_output_len=160 --tokenizer_dir ./CodeLlama-34b-Instruct \
     --engine_dir codellama_34b --input_text "In python, write a function for binary searching an element in an integer array."
+```
+
+## Run LLaMa with LoRA
+
+* download the base model and lora model from HF
+
+```bash
+git-lfs clone https://huggingface.co/meta-llama/Llama-2-13b-hf
+git-lfs clone https://huggingface.co/hfl/chinese-llama-2-lora-13b
+```
+
+* Build engine, setting `--use_lora_plugin` and `--hf_lora_dir`. If lora has separate lm_head and embedding, they will replace lm_head and embedding of base model.
+
+```bash
+python build.py --model_dir llama-v2-13b-hf/ \
+                --dtype float16 \
+                --remove_input_padding \
+                --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
+                --use_gemm_plugin float16 \
+                --output_dir "/tmp/new_lora_13b/trt_engines/fp16/2-gpu/" \
+                --max_batch_size 1 \
+                --max_input_len 512 \
+                --max_output_len 50 \
+                --use_lora_plugin float16 \
+                --hf_lora_dir "chinese-llama-2-lora-13b/" \
+                --world_size 2 --tp_size 2 --use_fused_mlp
+
+```
+
+* Run inference. Need to setup the `lora_dir`. Remember to use lora tokenizer because lora model has larger vocab size.
+
+```bash
+mpirun -n 2 python ../run.py --engine_dir "/tmp/new_lora_13b/trt_engines/fp16/2-gpu/" \
+              --max_output_len 50 \
+              --tokenizer_dir "chinese-llama-2-lora-13b/" \
+              --input_text "今天天气很好，我到公园的时后，" \
+              --lora_dir "chinese-llama-2-lora-13b/" \
+              --lora_task_uids 0 \
+              --no_add_special_tokens \
+              --use_py_session
+
+ Input: "今天天气很好，我到公园的时后，"
+Output: "发现那里有很多小朋友们都在玩。他们都在玩跳绳，跳绳的花样都很多，我看他们玩的很开心。我看他们玩的的时候，我也想跟着他们一起玩，于是我也买了一个跳绳，跟着他们一起玩。我们玩的很开心"
+```
+
+If users don't want to skip lora module, please pass uid -1 like `--lora_task_uids -1`, then the model would not run lora module and the results would be little different.
+
+```bash
+mpirun -n 2 python ../run.py --engine_dir "/tmp/new_lora_13b/trt_engines/fp16/2-gpu/" \
+              --max_output_len 50 \
+              --tokenizer_dir "chinese-llama-2-lora-13b/" \
+              --input_text "今天天气很好，我到公园的时后，" \
+              --lora_dir "chinese-llama-2-lora-13b/" \
+              --lora_task_uids -1 \
+              --no_add_special_tokens \
+              --use_py_session
+
+ Input: "今天天气很好，我到公园的时后，"
+Output: "我看见一个人坐在那边边看书书，我看起来还挺像你，可是我走过过去问了一下他说你是你吗，他说没有，然后我就说你看我看看你像你，他说说你看我像你，我说你是你，他说你是你，"
 ```

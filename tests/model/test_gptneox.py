@@ -20,8 +20,11 @@ from itertools import product
 
 import numpy as np
 import pytest
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from parameterized import parameterized
 from transformers import GPTNeoXConfig, GPTNeoXForCausalLM
 
@@ -135,12 +138,19 @@ class TestGPTNeoX(unittest.TestCase):
         fp16 = (dtype == 'float16')
 
         with tempfile.TemporaryDirectory() as tmpdirname:
+            builder_config = builder.create_builder_config(
+                name='gptneox',
+                precision=dtype,
+                timing_cache='model.cache',
+                tensor_parallel=world_size,  # TP only
+                use_refit=use_refit,
+                strongly_typed=fp16,
+            )
             network = builder.create_network()
             if use_attention_plugin:
                 network.plugin_config.set_gpt_attention_plugin(dtype)
             if use_ln_gemm_plugin:
                 network.plugin_config.set_gemm_plugin(dtype)
-                network.plugin_config.set_layernorm_plugin(dtype)
             if enable_remove_input_padding:
                 network.plugin_config.enable_remove_input_padding()
             network.plugin_config.set_context_fmha(context_fmha_flag)
@@ -152,13 +162,6 @@ class TestGPTNeoX(unittest.TestCase):
                                            world_size,
                                            apply_query_key_layer_scaling)
 
-            builder_config = builder.create_builder_config(
-                name='gptneox',
-                precision=dtype,
-                timing_cache='model.cache',
-                tensor_parallel=world_size,  # TP only
-                use_refit=use_refit,
-            )
             engine_buffer = builder.build_engine(network, builder_config)
             runtime = tensorrt_llm.runtime.generation._Runtime(
                 engine_buffer, mapping)
@@ -293,14 +296,13 @@ class TestGPTNeoX(unittest.TestCase):
             ctx_shape[f'past_key_value_{i}'] = shape
             ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             ctx_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
-            ctx_buffer[f'host_max_kv_cache_length_{i}'] = torch.tensor(
+            ctx_buffer[f'host_max_attention_window_size_{i}'] = torch.tensor(
                 [total_seq_len], dtype=torch.int32)
-            ctx_shape[f'host_max_kv_cache_length_{i}'] = (1, )
-        sequence_length_buffer = torch.add(sequence_length_buffer, step)
+            ctx_shape[f'host_max_attention_window_size_{i}'] = (1, )
         ctx_buffer['sequence_length'] = sequence_length_buffer
+        sequence_length_buffer = torch.add(sequence_length_buffer, step)
         ctx_shape['sequence_length'] = ctx_buffer['sequence_length'].shape
-        ctx_buffer['host_past_key_value_lengths'] = torch.tensor(
-            [0] * batch_size, dtype=torch.int32)
+        ctx_buffer['host_past_key_value_lengths'] = ctx_context_lengths.cpu()
         ctx_shape['host_past_key_value_lengths'] = ctx_buffer[
             'host_past_key_value_lengths'].shape
 
@@ -387,13 +389,13 @@ class TestGPTNeoX(unittest.TestCase):
         step1_shape = {k: v.shape for k, v in step1_buffer.items()}
         for i in range(gpt_config.num_hidden_layers):
             step1_shape[f'past_key_value_{i}'] = shape
-            step1_shape[f'host_max_kv_cache_length_{i}'] = (1, )
+            step1_shape[f'host_max_attention_window_size_{i}'] = (1, )
         step1_shape['sequence_length'] = (batch_size, )
         step1_shape['host_past_key_value_lengths'] = (batch_size, )
         for i in range(gpt_config.num_hidden_layers):
             step1_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             step1_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
-            step1_buffer[f'host_max_kv_cache_length_{i}'] = torch.tensor(
+            step1_buffer[f'host_max_attention_window_size_{i}'] = torch.tensor(
                 [total_seq_len], dtype=torch.int32)
         # For step 1, the sequence_lengths = context_lengths + 1.
         sequence_length_buffer = torch.add(sequence_length_buffer, step)

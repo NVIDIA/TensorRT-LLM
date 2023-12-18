@@ -126,7 +126,7 @@ __global__ void computePaddingOffsets(int* paddingOffsets, const int* seqOffsets
     // Iterate over the tokens to update the number of padded elements.
     for (int tokenIdx = threadIdx.x; tokenIdx < seqLength; tokenIdx += blockDim.x)
     {
-        paddingOffsets[seqBegin + tokenIdx] = paddingOffset + max(0, tokenIdx - seqLength);
+        paddingOffsets[seqBegin + tokenIdx] = paddingOffset;
     }
 }
 
@@ -134,7 +134,7 @@ __global__ void computePaddingOffsets(int* paddingOffsets, const int* seqOffsets
 
 template <typename AttentionMaskDataType>
 __global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, const int* seqOffsets, int maxSeqLength,
-    int maxKvCacheLength, AttentionMaskType attentionMaskType)
+    int attentionWindowSize, AttentionMaskType attentionMaskType)
 {
     // The index of the sequence in the batch.
     int batchIdx = blockIdx.y;
@@ -152,7 +152,7 @@ __global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, const
     int seqLength = seqEnd - seqBegin;
 
     // Iterate over the tokens to update the number of padded elements.
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < maskSize; idx += blockDim.x)
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < maskSize; idx += gridDim.x * blockDim.x)
     {
         // The position in the matrix.
         int rowIdx = idx / maxSeqLength;
@@ -174,7 +174,7 @@ __global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, const
         case AttentionMaskType::CAUSAL:
             isValid = rowIdx < seqLength && colIdx < seqLength && colIdx <= rowIdx;
             // Sliding_window_causal when there are not enough kv cache.
-            isValid = isValid && colIdx >= max(0, rowIdx - maxKvCacheLength);
+            isValid = isValid && colIdx >= max(0, rowIdx - attentionWindowSize);
             // seq_length==4, max_seq_len==5
             // 1 0 0 0 0
             // 1 1 0 0 0
@@ -182,7 +182,7 @@ __global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, const
             // 1 1 1 1 0
             // 0 0 0 0 0
 
-            // seq_length==6, max_seq_len==6, max_kv_cache_length = 2
+            // seq_length==6, max_seq_len==6, max_attention_window_size = 2
             // 1 0 0 0 0 0
             // 1 1 0 0 0 0
             // 1 1 1 0 0 0
@@ -226,25 +226,29 @@ void invokeBuildDecoderInfo(const BuildDecoderInfoParams<T>& params, cudaStream_
     // Compute the sequence offsets.
     const int THREADS_PER_BLOCK = 256;
     computeSeqOffsets<THREADS_PER_BLOCK>
-        <<<1, THREADS_PER_BLOCK, 0, stream>>>(params.seqOffsets, params.seqLengths, params.batchSize);
+        <<<1, THREADS_PER_BLOCK, 0, stream>>>(params.seqQOffsets, params.seqQLengths, params.batchSize);
+    if (params.seqKVLengths)
+    {
+        computeSeqOffsets<THREADS_PER_BLOCK>
+            <<<1, THREADS_PER_BLOCK, 0, stream>>>(params.seqKVOffsets, params.seqKVLengths, params.batchSize);
+    }
 
     // Compute the padding offsets.
     computePaddingOffsets<<<params.batchSize, THREADS_PER_BLOCK, 0, stream>>>(
-        params.paddingOffsets, params.seqOffsets, params.maxSeqLength);
+        params.paddingOffsets, params.seqQOffsets, params.maxSeqLength);
 
     // Compute the attention mask, if needed.
     if (params.attentionMask != nullptr)
     {
-        // large value like 512 hurts kernel perf at long sequence length. Keep small for now.
-        const int MIN_BLOCKS = 16;
+        const int MIN_BLOCKS = 512;
         int blocksPerSeq = 16;
         while (blocksPerSeq * params.batchSize < MIN_BLOCKS)
         {
             blocksPerSeq *= 2;
         }
         dim3 grid(blocksPerSeq, params.batchSize);
-        computeAttentionMask<<<grid, THREADS_PER_BLOCK, 0, stream>>>(params.attentionMask, params.seqOffsets,
-            params.maxSeqLength, params.maxKvCacheLength, params.attentionMaskType);
+        computeAttentionMask<<<grid, THREADS_PER_BLOCK, 0, stream>>>(params.attentionMask, params.seqQOffsets,
+            params.maxSeqLength, params.attentionWindowSize, params.attentionMaskType);
     }
 }
 

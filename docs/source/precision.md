@@ -123,7 +123,7 @@ This release of TensorRT-LLM contains the following examples:
 | ChatGLM    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | ChatGLM-v2 |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | ChatGLM-v3 |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| Falcon     |   Y   |   Y   |   Y   |   Y   |    .    |   .   |   .   |     Y     |     .      |
+| Falcon     |   Y   |   Y   |   Y   |   Y   |    .    |   .   |   .   |     .     |     .      |
 | Flan-T5    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | GPT        |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     .     |     .      |
 | GPT-J      |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
@@ -133,7 +133,7 @@ This release of TensorRT-LLM contains the following examples:
 | LLaMA      |   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     Y     |     Y      |
 | LLaMA-v2   |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
 | Mistral    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| MPT        |   Y   |   Y   |   Y   |   Y   |    .    |   .   |   .   |     .     |     .      |
+| MPT        |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
 | OPT        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Replit Code|   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | SantaCoder |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |

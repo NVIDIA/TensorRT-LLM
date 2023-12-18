@@ -257,7 +257,7 @@ as:
 
 # Collectives.
 def allreduce(tensor: Tensor, group: List[int]) -> Tensor
-def allgather(tensor: Tensor, group: List[int]) -> Tensor
+def allgather(tensor: Tensor, group: List[int], gather_dim: int = 0) -> Tensor
 
 # Point-to-point communication primitives.
 def send(tensor: Tensor, tgt: int) -> Tensor
@@ -267,7 +267,7 @@ def recv(tensor: Tensor, src: int) -> Tensor
 The multi-GPU support can be enabled through two different modes of model
 parallelism: Tensor Parallelism and Pipeline Parallelism. The former mode
 splits the different layers of a model across the GPUs. Each GPU runs the
-entire network and synchronizes with its sibblings when needed. The Pipeline
+entire network and synchronizes with its siblings when needed. The Pipeline
 Parallelism distributes the different layers to the GPUs. Each GPU runs a
 subset of the entire model and communications happen at the boundary of those
 subsets of layers. Tensor Parallelism usually leads to more balanced executions

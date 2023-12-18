@@ -44,7 +44,7 @@ struct MixedGemmArchTraits<float, float, arch>
     static constexpr int Stages = 2;
     using OperatorClass = cutlass::arch::OpClassSimt;
     using AccType = float;
-    using LayoutB = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
 
     static constexpr int ElementsPerAccessA = 1;
     static constexpr int ElementsPerAccessB = 1;

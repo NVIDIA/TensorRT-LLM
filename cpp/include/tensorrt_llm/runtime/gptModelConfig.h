@@ -46,6 +46,7 @@ public:
         , mTokensPerBlock{64}
         , mQuantMode{common::QuantMode::none()}
         , mMaxBatchSize(0)
+        , mMaxBeamWidth(0)
         , mMaxInputLen(0)
         , mMaxOutputLen(0)
         , mMaxNumTokens(std::nullopt)
@@ -54,6 +55,9 @@ public:
         , mModelVariant(ModelVariant::kGpt)
         , mUseCustomAllReduce(false)
         , mMaxPromptEmbeddingTableSize(0)
+        , mMaxDraftLen(0)
+        , mUseContextFMHAForGeneration(false)
+        , mPagedContextFMHA(false)
     {
     }
 
@@ -168,6 +172,16 @@ public:
         mMaxBatchSize = maxBatchSize;
     }
 
+    [[nodiscard]] SizeType constexpr getMaxBeamWidth() const noexcept
+    {
+        return mMaxBeamWidth;
+    }
+
+    void constexpr setMaxBeamWidth(SizeType maxBeamWidth) noexcept
+    {
+        mMaxBeamWidth = maxBeamWidth;
+    }
+
     [[nodiscard]] SizeType constexpr getMaxInputLen() const noexcept
     {
         return mMaxInputLen;
@@ -253,6 +267,41 @@ public:
         mUseCustomAllReduce = customAllReduce;
     }
 
+    void constexpr setMaxDraftLen(SizeType maxDraftLen) noexcept
+    {
+        mMaxDraftLen = maxDraftLen;
+    }
+
+    [[nodiscard]] SizeType getMaxDraftLen() const
+    {
+        return mMaxDraftLen;
+    }
+
+    [[nodiscard]] SizeType constexpr getMaxTokensPerStep() const noexcept
+    {
+        return mMaxDraftLen + 1;
+    }
+
+    void constexpr setUseContextFMHAForGeneration(bool useContextFMHAForGeneration) noexcept
+    {
+        mUseContextFMHAForGeneration = useContextFMHAForGeneration;
+    }
+
+    [[nodiscard]] bool constexpr getContextFMHAForGeneration() const noexcept
+    {
+        return mUseContextFMHAForGeneration;
+    }
+
+    void constexpr setPagedContextFMHA(bool pagedContextFMHA) noexcept
+    {
+        mPagedContextFMHA = pagedContextFMHA;
+    }
+
+    [[nodiscard]] bool constexpr getPagedContextFMHA() const noexcept
+    {
+        return mPagedContextFMHA;
+    }
+
 private:
     SizeType mVocabSize;
     SizeType mNbLayers;
@@ -266,6 +315,7 @@ private:
     SizeType mTokensPerBlock;
     common::QuantMode mQuantMode;
     SizeType mMaxBatchSize;
+    SizeType mMaxBeamWidth;
     SizeType mMaxInputLen;
     SizeType mMaxOutputLen;
     std::optional<SizeType> mMaxNumTokens;
@@ -276,6 +326,10 @@ private:
     bool mUseCustomAllReduce;
 
     SizeType mMaxPromptEmbeddingTableSize;
+    SizeType mMaxDraftLen;
+
+    bool mUseContextFMHAForGeneration;
+    bool mPagedContextFMHA;
 };
 
 } // namespace tensorrt_llm::runtime

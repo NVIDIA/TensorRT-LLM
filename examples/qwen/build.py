@@ -13,14 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import math
 import os
 import time
 
-import tensorrt as trt
+# isort: off
 import torch
 import torch.multiprocessing as mp
+import tensorrt as trt
+# isort: on
 from transformers import AutoConfig, AutoModelForCausalLM
-from weight import load_from_ft, load_from_hf_qwen
+from weight import (load_from_awq_qwen, load_from_ft, load_from_gptq_qwen,
+                    load_from_hf_qwen)
 
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_trt
@@ -107,7 +111,7 @@ def serialize_engine(engine, path):
     logger.info(f'Serializing engine to {path}...')
     tik = time.time()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')
@@ -123,6 +127,7 @@ def parse_arguments():
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument('--hf_model_dir', type=str, default=None)
     parser.add_argument('--ft_dir_path', type=str, default=None)
+    parser.add_argument("--quant_ckpt_path", type=str, default=None)
     parser.add_argument('--dtype',
                         type=str,
                         default='float16',
@@ -184,7 +189,7 @@ def parse_arguments():
     parser.add_argument(
         '--output_dir',
         type=str,
-        default='qwen_outputs',
+        default='engine_outputs',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
     )
@@ -225,6 +230,12 @@ def parse_arguments():
         'By default, we use a single static scaling factor to scale weights in the int4 range. '
         'per_group chooses at run time, and for each group, a custom scaling factor. '
         'The flag is built for GPTQ/AWQ quantization.')
+    parser.add_argument(
+        "--group_size",
+        type=int,
+        default=128,
+        help="group size used in gptq/awq quantization.",
+    )
 
     parser.add_argument(
         '--use_weight_only',
@@ -239,7 +250,7 @@ def parse_arguments():
         type=str,
         nargs='?',
         default='int8',
-        choices=['int8', 'int4'],
+        choices=['int8', 'int4', 'int4_awq', 'int4_gptq'],
         help=
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
@@ -258,7 +269,7 @@ def parse_arguments():
     )
     parser.add_argument('--tokens_per_block',
                         type=int,
-                        default=64,
+                        default=128,
                         help='Number of tokens per block in paged KV cache')
 
     parser.add_argument(
@@ -379,6 +390,12 @@ def parse_arguments():
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha
 
+    assert (math.log2(args.tokens_per_block).is_integer()
+            ), "tokens_per_block must be power of 2"
+    if args.enable_context_fmha or args.enable_context_fmha_fp32_acc:
+        assert (args.tokens_per_block >=
+                128), "Context fMHA requires >= 128 tokens per block"
+
     return args
 
 
@@ -435,7 +452,13 @@ def build_rank_engine(builder: Builder,
     tensorrt_llm_qwen = quantize_model(tensorrt_llm_qwen, args.quant_mode,
                                        **quantize_kwargs)
     ft_dir_path = args.ft_dir_path
-    if args.hf_model_dir is not None and \
+    if args.per_group:
+        load_func = load_from_awq_qwen if args.weight_only_precision == 'int4_awq' else load_from_gptq_qwen
+        load_func(tensorrt_llm_qwen=tensorrt_llm_qwen,
+                  quant_ckpt_path=args.quant_ckpt_path,
+                  mapping=mapping,
+                  dtype=args.dtype)
+    elif args.hf_model_dir is not None and \
         (ft_dir_path is None or not os.path.exists(ft_dir_path)):
         logger.info(f'Loading HF QWen ... from {args.hf_model_dir}')
         tik = time.time()
