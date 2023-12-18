@@ -16,6 +16,7 @@
  */
 
 #include <cstdio>
+#include <unistd.h>
 
 #include "lookupPlugin.h"
 #include "tensorrt_llm/kernels/lookupKernels.h"
@@ -26,6 +27,10 @@ using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
 using tensorrt_llm::plugins::LookupPluginCreator;
 using tensorrt_llm::plugins::LookupPlugin;
+
+#ifdef USE_DGTRT
+#include "storage.h"
+#endif
 
 static const char* LOOKUP_PLUGIN_VERSION{"1"};
 static const char* LOOKUP_PLUGIN_NAME{"Lookup"};
@@ -110,7 +115,7 @@ size_t LookupPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, 
     return 0;
 }
 
-int LookupPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
+int LookupPlugin::enqueue_old(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
     const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
     // inputs
@@ -150,6 +155,112 @@ int LookupPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvi
         invokeLookUp<__nv_bfloat16, int>(output, input, weight, batchSize, offset, localVocabSize, hidden, stream);
     }
 
+    return 0;
+}
+int LookupPlugin::enqueue_with_storage(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
+    const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
+{
+    // inputs
+    //     input  [batchSize]
+    //     weight [localVocabSize, hidden]
+    // outputs
+    //     embedding [batchSize, hidden]
+
+    int batchSize = 1;
+    for (int i = 0; i < inputDesc[0].dims.nbDims; ++i)
+    {
+        batchSize *= inputDesc[0].dims.d[i];
+        // printf("dim %d: %d\n", i, inputDesc[0].dims.d[i]);
+    }
+
+    const int localVocabSize = inputDesc[1].dims.d[0];
+    const int hidden = inputDesc[1].dims.d[inputDesc[1].dims.nbDims - 1];
+    // printf("batch %d voc sz %d hidden %d\n", batchSize, localVocabSize, hidden);
+    const int* input = reinterpret_cast<const int*>(inputs[0]);
+
+    int offset = mRank * localVocabSize;
+
+    if (mType == DataType::kHALF)
+    {
+        const half* weight = reinterpret_cast<const half*>(inputs[1]);
+        half* output = reinterpret_cast<half*>(outputs[0]);
+        invokeLookUp<half, int>(output, input, weight, batchSize, offset, localVocabSize, hidden, stream);
+    }
+    else if (mType == DataType::kFLOAT)
+    {
+        const float* weight = reinterpret_cast<const float*>(inputs[1]);
+        float* output = reinterpret_cast<float*>(outputs[0]);
+        invokeLookUp<float, int>(output, input, weight, batchSize, offset, localVocabSize, hidden, stream);
+    }
+    else if (mType == DataType::kBF16)
+    {
+        const __nv_bfloat16* weight = reinterpret_cast<const __nv_bfloat16*>(inputs[1]);
+        __nv_bfloat16* output = reinterpret_cast<__nv_bfloat16*>(outputs[0]);
+        invokeLookUp<__nv_bfloat16, int>(output, input, weight, batchSize, offset, localVocabSize, hidden, stream);
+    }
+
+    return 0;
+}
+int LookupPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
+    const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
+{
+    enqueue_old(inputDesc, outputDesc, inputs, outputs, workspace, stream);
+    #if USE_DGTRT
+    if (dg::is_request_storage_enabled()) {
+        // printf("storage enabled @ %d\n", (int)getpid());
+        int batchSize = 1;
+        for (int i = 0; i < inputDesc[0].dims.nbDims; ++i)
+        {
+            batchSize *= inputDesc[0].dims.d[i];
+        }
+        // image feature is a big thing
+        if (batchSize < 500) {
+            return 0;
+        }
+        const int hidden = inputDesc[1].dims.d[inputDesc[1].dims.nbDims - 1];
+        const int* input = reinterpret_cast<const int*>(inputs[0]);
+        uint8_t* output = reinterpret_cast<uint8_t*>(outputs[0]);
+        // input carries input ids from multi batches, and there are some blocks with nagtive
+        // ids inside, those blocks are images and each block follows the rule of:
+        // [-200 -size-of-block -id-for-storage]
+        
+        auto data = std::shared_ptr<int>(new int[batchSize]);
+        auto cpu = data.get();
+        memset(cpu, 0, sizeof(int) * batchSize);
+        cudaMemcpyAsync(cpu, input, sizeof(int) * batchSize, cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+
+        int itemSize = sizeof(float);
+        if (mType == DataType::kHALF)
+        {
+            itemSize = sizeof(half);
+        }
+        else if (mType == DataType::kBF16)
+        {
+            itemSize = sizeof(__nv_bfloat16);
+        }
+
+        auto hiddenSize = itemSize * hidden;
+        int idx = 0;
+        while (idx < batchSize - 100) {
+            if (cpu[idx] == -200) {
+                auto szBlock = cpu[idx+1];
+                auto id = cpu[idx+2];
+                auto ptr = dg::get_request_storage(id);
+                if (ptr == nullptr) {
+                    printf("request storage data not found: %d\n", id);
+                } else {
+                    cudaMemcpyAsync(output + idx * hiddenSize, ptr, szBlock * hiddenSize, cudaMemcpyHostToDevice, stream);
+                }
+                idx += szBlock;
+            } else {
+                idx++;
+            }
+        }
+    } else {
+        // printf("storage not enabled @ %d\n", (int)getpid());
+    }
+    #endif
     return 0;
 }
 

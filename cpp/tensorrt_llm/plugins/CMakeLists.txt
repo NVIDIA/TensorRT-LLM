@@ -26,6 +26,27 @@ if(${CMAKE_BUILD_TYPE} MATCHES "Debug")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
 endif()
 
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} "-c"
+          "import dgtrt as dg; print(dg.get_cmake_linking(),end='');"
+  RESULT_VARIABLE DGTRT_SO_PATH_RET
+  OUTPUT_VARIABLE DGTRT_SO_PATH)
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} "-c"
+          "import dgtrt as dg; print(dg.get_include_dir(),end='');"
+  RESULT_VARIABLE DGTRT_INCLUDE_PATH_RET
+  OUTPUT_VARIABLE DGTRT_INCLUDE_PATH)
+
+set(DG_LIBS)
+if((${DGTRT_SO_PATH_RET} MATCHES 0) AND (${DGTRT_INCLUDE_PATH_RET} MATCHES 0))
+  include_directories(${DGTRT_INCLUDE_PATH})
+  set(DG_LIBS "${DGTRT_SO_PATH}")
+  add_definitions(-DUSE_DGTRT)
+  message(STATUS "Found dgtrt ${DGTRT_INCLUDE_PATH} ${DGTRT_SO_PATH}")
+else()
+  message(ERROR "DGTRT not found.")
+endif()
+
 set(PLUGIN_SOURCES)
 set(PLUGIN_CU_SOURCES)
 
@@ -120,4 +141,5 @@ target_link_libraries(
   ${CMAKE_DL_LIBS}
   ${MPI_LIBRARIES}
   ${NCCL_LIB}
-  ${STATIC_TARGET})
+  ${STATIC_TARGET}
+  ${DG_LIBS})

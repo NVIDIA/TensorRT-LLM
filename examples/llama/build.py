@@ -329,6 +329,11 @@ def parse_arguments():
         help=
         'By default we use contiguous KV cache. By setting this flag you enable paged KV cache'
     )
+    parser.add_argument(
+        '--use_lookup_plugin',
+        action="store_true",
+        default=False,
+        help="Activates the lookup plugin which enables embedding sharing.")
     parser.add_argument('--tokens_per_block',
                         type=int,
                         default=64,
@@ -633,6 +638,9 @@ def build_rank_engine(builder: Builder,
         network.plugin_config.enable_remove_input_padding()
     if args.paged_kv_cache:
         network.plugin_config.enable_paged_kv_cache(args.tokens_per_block)
+
+    if args.use_lookup_plugin:
+        network.plugin_config.set_lookup_plugin(dtype=args.dtype)
 
     with net_guard(network):
         # Prepare
