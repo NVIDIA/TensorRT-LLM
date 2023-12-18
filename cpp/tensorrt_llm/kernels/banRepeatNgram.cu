@@ -27,7 +27,7 @@ namespace kernels
 template <typename T>
 __global__ void ban_repeat_ngram(T* logits, const int** output_ids_buf, const FinishedState* finished_buf,
     const int* parent_ids_buf, int batch_size, int beam_width, const int* no_repeat_ngram_size_buf, int id_offset,
-    int vocab_size_padded, size_t step)
+    int vocab_size_padded, size_t step, int max_seq_len)
 {
     /**
      * Find subsequences that match the last (ngram_size - 1) generated tokens. The next-tokens of those matching
@@ -86,21 +86,20 @@ __global__ void ban_repeat_ngram(T* logits, const int** output_ids_buf, const Fi
         {
             if (last_token_idx >= 0)
             {
-                last_tokens[last_token_idx--] = output_ids_buf[blockIdx.y][curr_idx * batch_size * beam_width
-                    + id_offset + local_batch_idx * beam_width + parent_id];
+                last_tokens[last_token_idx--] = output_ids_buf[local_batch_idx][parent_id * max_seq_len
+                    + id_offset + curr_idx];
             }
 
             // before reaching the part of current block, traverse only; after that, record the tokens
             if (curr_idx < start_record_idx)
             {
-                shared_tokens[shared_token_idx--] = output_ids_buf[blockIdx.y][curr_idx * batch_size * beam_width
-                    + id_offset + local_batch_idx * beam_width + parent_id];
+                shared_tokens[shared_token_idx--] = output_ids_buf[local_batch_idx][parent_id * max_seq_len
+                    + id_offset + curr_idx];
             }
 
             if (beam_search)
             {
-                parent_id = parent_ids_buf[curr_idx * batch_size * beam_width + id_offset + local_batch_idx * beam_width
-                    + parent_id];
+                parent_id = parent_ids_buf[parent_id * max_seq_len + id_offset + curr_idx];
             }
         }
     }
@@ -136,7 +135,7 @@ __global__ void ban_repeat_ngram(T* logits, const int** output_ids_buf, const Fi
 template <typename T>
 void invokeBanRepeatNgram(T* logits, const int** output_ids_buf, const FinishedState* finished_buf,
     const int* parent_ids_buf, int batch_size, int local_batch_size, int beam_width,
-    const int* no_repeat_ngram_size_buf, int id_offset, int vocab_size_padded, size_t step, cudaStream_t stream)
+    const int* no_repeat_ngram_size_buf, int id_offset, int vocab_size_padded, size_t step, int max_seq_len, cudaStream_t stream)
 {
     // each input in the local batch can have different no_repeat_ngram_size. Use max for shmem allocation
     // getting the max of current batch and allocate shmem as needed is ideal. But here the ngram_buf is on GPU, while
@@ -155,14 +154,14 @@ void invokeBanRepeatNgram(T* logits, const int** output_ids_buf, const FinishedS
     // token's ngram and for most recent tokens
     ban_repeat_ngram<<<grid, block, (block.x + 2 * (max_no_repeat_ngram_size - 1)) * sizeof(int), stream>>>(logits,
         output_ids_buf, finished_buf, parent_ids_buf, batch_size, beam_width, no_repeat_ngram_size_buf, id_offset,
-        vocab_size_padded, step);
+        vocab_size_padded, step, max_seq_len);
     sync_check_cuda_error();
 }
 
 #define INVOKE_BAN_REPEAT_NGRAM(T)                                                                                     \
     template void invokeBanRepeatNgram(T* logits, const int** output_ids_buf, const FinishedState* finished_buf,       \
         const int* parent_ids_buf, int batch_size, int local_batch_size, int beam_width,                               \
-        const int* no_repeat_ngram_size_buf, int id_offset, int vocab_size_padded, size_t step, cudaStream_t stream);
+        const int* no_repeat_ngram_size_buf, int id_offset, int vocab_size_padded, size_t step, int max_seq_len, cudaStream_t stream);
 
 INVOKE_BAN_REPEAT_NGRAM(float)
 INVOKE_BAN_REPEAT_NGRAM(half)

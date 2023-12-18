@@ -229,7 +229,7 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
             reinterpret_cast<FinishedState*>(
                 params.finished.value_or(Tensor{}).template getPtr<FinishedState::UnderlyingType>()),
             outputs.parent_ids.value_or(Tensor{}).template getPtr<const int>(), batch_size, local_batch_size,
-            beam_width, no_repeat_ngram_size_buf, id_offset, vocab_size_padded_, step, stream_);
+            beam_width, no_repeat_ngram_size_buf, id_offset, vocab_size_padded_, step, max_seq_len, stream_);
     }
 
     if (params.bad_words_list)
