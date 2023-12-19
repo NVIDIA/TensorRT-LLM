@@ -54,7 +54,8 @@ def main(build_type: str = "Release",
          install: bool = False,
          skip_building_wheel: bool = False,
          python_bindings: bool = False,
-         benchmarks: bool = False):
+         benchmarks: bool = False,
+         always_build: bool = False):
     project_dir = Path(__file__).parent.resolve().parent
     os.chdir(project_dir)
     build_run = partial(run, shell=True, check=True)
@@ -138,6 +139,7 @@ def main(build_type: str = "Release",
     else:
         build_dir = Path(build_dir)
     first_build = not build_dir.exists()
+    first_build = True
 
     if clean and build_dir.exists():
         rmtree(build_dir)
@@ -267,6 +269,10 @@ if __name__ == "__main__":
         "-l",
         action="store_true",
         help="Only build the C++ library without Python dependencies")
+    parser.add_argument(
+        "--always_build",
+        action="store_true",
+        help="Always build library")
     parser.add_argument(
         "--extra-cmake-vars",
         "-D",

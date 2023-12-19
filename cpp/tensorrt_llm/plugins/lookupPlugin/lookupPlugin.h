@@ -50,8 +50,6 @@ public:
         const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
     int enqueue_old(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
         const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept;
-    int enqueue_with_storage(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
-        const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept;
 
     // IPluginV2Ext Methods
     nvinfer1::DataType getOutputDataType(

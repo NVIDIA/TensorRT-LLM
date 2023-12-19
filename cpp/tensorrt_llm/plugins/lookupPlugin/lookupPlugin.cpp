@@ -30,6 +30,7 @@ using tensorrt_llm::plugins::LookupPlugin;
 
 #ifdef USE_DGTRT
 #include "storage.h"
+#define DGTRT_DBG 0
 #endif
 
 static const char* LOOKUP_PLUGIN_VERSION{"1"};
@@ -157,62 +158,32 @@ int LookupPlugin::enqueue_old(const nvinfer1::PluginTensorDesc* inputDesc, const
 
     return 0;
 }
-int LookupPlugin::enqueue_with_storage(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
-    const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
-{
-    // inputs
-    //     input  [batchSize]
-    //     weight [localVocabSize, hidden]
-    // outputs
-    //     embedding [batchSize, hidden]
-
-    int batchSize = 1;
-    for (int i = 0; i < inputDesc[0].dims.nbDims; ++i)
-    {
-        batchSize *= inputDesc[0].dims.d[i];
-        // printf("dim %d: %d\n", i, inputDesc[0].dims.d[i]);
-    }
-
-    const int localVocabSize = inputDesc[1].dims.d[0];
-    const int hidden = inputDesc[1].dims.d[inputDesc[1].dims.nbDims - 1];
-    // printf("batch %d voc sz %d hidden %d\n", batchSize, localVocabSize, hidden);
-    const int* input = reinterpret_cast<const int*>(inputs[0]);
-
-    int offset = mRank * localVocabSize;
-
-    if (mType == DataType::kHALF)
-    {
-        const half* weight = reinterpret_cast<const half*>(inputs[1]);
-        half* output = reinterpret_cast<half*>(outputs[0]);
-        invokeLookUp<half, int>(output, input, weight, batchSize, offset, localVocabSize, hidden, stream);
-    }
-    else if (mType == DataType::kFLOAT)
-    {
-        const float* weight = reinterpret_cast<const float*>(inputs[1]);
-        float* output = reinterpret_cast<float*>(outputs[0]);
-        invokeLookUp<float, int>(output, input, weight, batchSize, offset, localVocabSize, hidden, stream);
-    }
-    else if (mType == DataType::kBF16)
-    {
-        const __nv_bfloat16* weight = reinterpret_cast<const __nv_bfloat16*>(inputs[1]);
-        __nv_bfloat16* output = reinterpret_cast<__nv_bfloat16*>(outputs[0]);
-        invokeLookUp<__nv_bfloat16, int>(output, input, weight, batchSize, offset, localVocabSize, hidden, stream);
-    }
-
-    return 0;
-}
 int LookupPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
     const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
     enqueue_old(inputDesc, outputDesc, inputs, outputs, workspace, stream);
-    #if USE_DGTRT
+    int device = -1;
+    cudaGetDevice(&device);
+
+#if USE_DGTRT
     if (dg::is_request_storage_enabled()) {
-        // printf("storage enabled @ %d\n", (int)getpid());
+#if DGTRT_DBG
+        printf("storage enabled @ %d\n", (int)getpid());
+#endif
         int batchSize = 1;
         for (int i = 0; i < inputDesc[0].dims.nbDims; ++i)
         {
             batchSize *= inputDesc[0].dims.d[i];
+#if DGTRT_DBG
+            printf("in dim %d: %d\n", i, inputDesc[0].dims.d[i]);
+#endif
         }
+#if DGTRT_DBG
+        for (int i = 0; i < outputDesc[0].dims.nbDims; ++i)
+        {
+            printf("out dim %d: %d\n", i, outputDesc[0].dims.d[i]);
+        }
+#endif
         // image feature is a big thing
         if (batchSize < 500) {
             return 0;
@@ -241,6 +212,9 @@ int LookupPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvi
         }
 
         auto hiddenSize = itemSize * hidden;
+#if DGTRT_DBG
+        printf("item sz %d hidden %d bhidden %d\n", itemSize, hidden, hiddenSize);
+#endif
         int idx = 0;
         while (idx < batchSize - 100) {
             if (cpu[idx] == -200) {
@@ -258,7 +232,9 @@ int LookupPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvi
             }
         }
     } else {
-        // printf("storage not enabled @ %d\n", (int)getpid());
+#if DGTRT_DBG
+        printf("storage not enabled @ %d\n", (int)getpid());
+#endif
     }
     #endif
     return 0;
