@@ -148,8 +148,8 @@ struct FastInterleavedAndBiasedNumericArrayConverter<bfloat16_t, uint8_t, 4>
         // Construct FP32s, bfloat does not have enough mantissa for IADD trick
         uint32_t* fp32_intermediates_casted = reinterpret_cast<uint32_t*>(fp32_intermediates);
         fp32_intermediates_casted[0] = __byte_perm(i8s, fp32_base, 0x7650);
-        fp32_intermediates_casted[1] = __byte_perm(i8s, fp32_base, 0x7652);
-        fp32_intermediates_casted[2] = __byte_perm(i8s, fp32_base, 0x7651);
+        fp32_intermediates_casted[1] = __byte_perm(i8s, fp32_base, 0x7651);
+        fp32_intermediates_casted[2] = __byte_perm(i8s, fp32_base, 0x7652);
         fp32_intermediates_casted[3] = __byte_perm(i8s, fp32_base, 0x7653);
 
         // Subtract out fp32_base + 128 to make the unsigned integer signed.
