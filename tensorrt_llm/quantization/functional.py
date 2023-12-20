@@ -19,7 +19,8 @@ import tensorrt as trt
 
 from .._common import default_net, default_trtnet
 from .._utils import str_dtype_to_np, str_dtype_to_trt
-from ..functional import Tensor, _create_tensor, cast, clip, constant, round
+from ..functional import (Tensor, _create_tensor, cast, clip, constant, matmul,
+                          repeat_interleave, round)
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
 
 
@@ -63,11 +64,22 @@ def smooth_quant_gemm(input: Tensor, weights: Tensor, scales_a: Tensor,
         return _create_tensor(layer.get_output(0), layer)
 
 
-def weight_only_quant_matmul(input: Tensor, weights: Tensor, scales: Tensor,
-                             weightTypeId: int) -> Tensor:
+def weight_only_quant_matmul(input: Tensor,
+                             weights: Tensor,
+                             scales: Tensor,
+                             weightTypeId: int,
+                             dtype: str = 'float16') -> Tensor:
+
     if not default_net().plugin_config.weight_only_quant_matmul_plugin:
-        raise TypeError(
-            "Weight Only Qunat MatMul is only supported with plugin")
+        if weights.dtype != trt.int8:
+            # Q->DQ
+            weights = quantize(weights, scales, dtype='int8', axis=1)
+            weights = dequantize(weights, scales, 1, input.dtype)
+        else:
+            weights = dequantize(weights, scales, 1, input.dtype)
+
+        res = matmul(input, weights)
+        return cast(res, dtype)
     else:
         plg_creator = trt.get_plugin_registry().get_plugin_creator(
             'WeightOnlyQuantMatmul', '1', TRT_LLM_PLUGIN_NAMESPACE)
@@ -90,15 +102,35 @@ def weight_only_quant_matmul(input: Tensor, weights: Tensor, scales: Tensor,
         return _create_tensor(layer.get_output(0), layer)
 
 
-def weight_only_groupwise_quant_matmul(input: Tensor, pre_quant_scale: Tensor,
-                                       weights: Tensor, scales: Tensor,
-                                       zeros: Tensor, biases: Tensor,
+def weight_only_groupwise_quant_matmul(input: Tensor,
+                                       pre_quant_scale: Tensor,
+                                       weights: Tensor,
+                                       scales: Tensor,
+                                       zeros: Tensor,
+                                       biases: Tensor,
                                        quant_algo: int,
-                                       group_size: int) -> Tensor:
+                                       group_size: int,
+                                       dtype: str = 'float16') -> Tensor:
+
     if not default_net(
     ).plugin_config.weight_only_groupwise_quant_matmul_plugin:
-        raise TypeError(
-            "Weight Only Groupwise Quant MatMul is only supported with plugin")
+        scales = repeat_interleave(scales, group_size, 0)
+        weights = quantize(weights, scales, dtype='int8', axis=1)
+        weights = dequantize(weights, scales, 1, input.dtype)
+
+        if quant_algo & 4:
+            # pre quant
+            input = input * pre_quant_scale
+        elif quant_algo & 2:
+            # zero
+            zeros = repeat_interleave(zeros, group_size, 0)
+            weights += zeros
+        res = matmul(input, weights)
+        if quant_algo & 1:
+            # bias
+            res += biases
+
+        return cast(res, dtype)
     else:
         plg_creator = trt.get_plugin_registry().get_plugin_creator(
             'WeightOnlyGroupwiseQuantMatmul', '1', TRT_LLM_PLUGIN_NAMESPACE)

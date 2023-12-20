@@ -48,7 +48,7 @@ ReallocType CudaAllocator::reallocType(void const* ptr, size_t size) const
 
 void* CudaAllocator::malloc(std::size_t size, bool const setZero)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     auto bufferPtr = mBufferManager.gpu(size);
     if (setZero)
     {
@@ -62,7 +62,7 @@ void* CudaAllocator::malloc(std::size_t size, bool const setZero)
 
 void CudaAllocator::free(void** ptr)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     mPointerMapping.erase(*ptr);
     *ptr = nullptr;
 }

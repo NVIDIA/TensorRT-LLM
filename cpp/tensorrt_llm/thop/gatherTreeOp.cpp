@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/kernels/beamSearchTopkKernels.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -60,7 +61,9 @@ th::Tensor gatherTree(th::Tensor& sequence_lengths, th::Tensor& output_ids, th::
         beamHypotheses.is_done = get_ptr<bool>(beam_hyps_is_done.value());
         beamHypotheses.input_lengths = get_ptr<int32_t>(tiled_input_lengths);
 
-        tl::kernels::invokeInsertUnfinishedPath(beamHypotheses, get_ptr<bool>(finished.value()),
+        tl::kernels::invokeInsertUnfinishedPath(beamHypotheses,
+            reinterpret_cast<tl::kernels::FinishedState*>(
+                get_ptr<tl::kernels::FinishedState::UnderlyingType>(finished.value())),
             get_ptr<float>(cum_log_probs_opt.value()), batch_size, beam_width, stream);
         sync_check_cuda_error();
 
@@ -81,24 +84,24 @@ th::Tensor gatherTree(th::Tensor& sequence_lengths, th::Tensor& output_ids, th::
         tl::kernels::gatherTreeParam param;
         param.beams = get_ptr<int32_t>(workspace);
         // Remove prompt length if possible
-        param.sequence_lengths = get_ptr<int32_t>(sequence_lengths);
+        param.sequenceLengths = get_ptr<int32_t>(sequence_lengths);
         // add sequence_length 1 here because the sequence_length of time step t is t - 1
-        param.max_sequence_length_final_step = 1;
+        param.maxSequenceLengthFinalStep = 1;
         // response input lengths (used to slice the ids during postprocessing), used in interactive generation
         // This feature is not supported yet, setting it to nullptr temporarily.
-        param.response_input_lengths = nullptr;
-        param.max_seq_len = max_seq_len;
-        param.batch_size = batch_size;
-        param.beam_width = beam_width;
-        param.step_ids = get_ptr<int32_t>(output_ids);
-        param.parent_ids = beam_width == 1 ? nullptr : get_ptr<int32_t>(parent_ids);
-        param.end_tokens = get_ptr<int32_t>(end_ids);
-        param.input_lengths = get_ptr<int32_t>(tiled_input_lengths);
+        param.responseInputLengths = nullptr;
+        param.maxSeqLen = max_seq_len;
+        param.batchSize = batch_size;
+        param.beamWidth = beam_width;
+        param.stepIds = get_ptr<int32_t>(output_ids);
+        param.parentIds = beam_width == 1 ? nullptr : get_ptr<int32_t>(parent_ids);
+        param.endTokens = get_ptr<int32_t>(end_ids);
+        param.inputLengths = get_ptr<int32_t>(tiled_input_lengths);
 
         param.stream = stream;
-        param.output_ids = get_ptr<int32_t>(final_output_ids);
-        param.cum_log_probs = cum_log_probs_opt.has_value() ? get_ptr<float>(cum_log_probs_opt.value()) : nullptr;
-        param.length_penalty = get_val<float>(length_penalty, 0);
+        param.outputIds = get_ptr<int32_t>(final_output_ids);
+        param.cumLogProbs = cum_log_probs_opt.has_value() ? get_ptr<float>(cum_log_probs_opt.value()) : nullptr;
+        param.lengthPenalty = get_val<float>(length_penalty, 0);
 
         // NOTE: need to remove all prompt virtual tokens
         tl::kernels::invokeGatherTree(param);

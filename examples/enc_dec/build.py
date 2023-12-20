@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import argparse
 import configparser
 import time
@@ -14,6 +28,8 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.network import net_guard
 
 from t5.weight import parse_t5_config, load_from_hf_t5, load_from_binary_t5  # isort:skip
+from bart.weight import parse_bart_config, load_from_binary_bart  # isort:skip
+from nmt.weight import parse_nmt_config, load_from_binary_nmt  # isort:skip
 
 
 def get_engine_name(model, dtype, tp_size, pp_size, rank):
@@ -27,7 +43,7 @@ def serialize_engine(engine, path):
     logger.info(f'Serializing engine to {path}...')
     tik = time.time()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')
@@ -37,6 +53,7 @@ def parse_config(ini_file, component, args):
     config = configparser.ConfigParser()
     config.read(ini_file)
     model_type = config.get('structure', 'model_type')
+    args.model_type = model_type
     args = globals()[f'parse_{model_type}_config'](config, component, args)
     return args
 
@@ -88,6 +105,7 @@ def parse_arguments(component):
                         type=str,
                         default='enc_dec',
                         help='TensorRT engine name prefix')
+    parser.add_argument('--debug_mode', action='store_true')
     parser.add_argument(
         '--timing_cache',
         type=str,
@@ -98,7 +116,7 @@ def parse_arguments(component):
 
     parser.add_argument('--model_type',
                         type=str,
-                        choices=['t5', 'bart'],
+                        choices=['t5', 'bart', 'nmt'],
                         default='t5')
     parser.add_argument(
         '--dtype',
@@ -332,11 +350,12 @@ def build_rank_engine(builder: Builder,
             layernorm_type=args.layernorm_type,
             hidden_act=args.hidden_act,
             mlp_type=args.mlp_type,
-            dtype=dtype,
-            logits_dtype=args.logits_dtype,
             use_parallel_embedding=args.use_parallel_embedding,
             embedding_sharding_dim=args.embedding_sharding_dim,
-            mapping=mapping)
+            mapping=mapping,
+            rescale_before_lm_head=args.rescale_before_lm_head,
+            dtype=dtype,
+            logits_dtype=args.logits_dtype)
 
     # No support for relative attention bias in plain TRT mode. Please use attention plugin
     # (If to add such support, need to add into
@@ -407,9 +426,10 @@ def build_rank_engine(builder: Builder,
         tllm_model(*inputs)
 
         # Adding debug outputs into the network --------------------------
-        for k, v in tllm_model.named_network_outputs():
-            network._mark_output(v, k,
-                                 tensorrt_llm.str_dtype_to_trt(args.dtype))
+        if args.debug_mode:
+            for k, v in tllm_model.named_network_outputs():
+                network._mark_output(v, k,
+                                     tensorrt_llm.str_dtype_to_trt(args.dtype))
         # ----------------------------------------------------------------
 
     # Network -> Engine

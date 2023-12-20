@@ -138,7 +138,7 @@ void FtDynamicDecode<T>::setup(size_t batch_size, size_t beam_width, th::optiona
 
 template <typename T>
 void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width, hidden_size)
-    int step, int max_input_length, int max_kv_cache_length, uint64_t ite, int local_batch_size, th::Tensor end_id,
+    int step, int max_input_length, int max_attention_window, uint64_t ite, int local_batch_size, th::Tensor end_id,
     th::optional<th::Tensor> embedding_bias_opt, th::optional<th::Tensor> input_lengths_opt,
     th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
     th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
@@ -158,7 +158,7 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
     auto const& logits_converted = convert_tensor<float>(logits);
     auto const& end_ids_converted = convert_tensor<int>(end_id);
     typename tensorrt_llm::layers::DynamicDecodeLayer<T>::ForwardParams forwardParams{step, static_cast<int>(ite),
-        max_input_length, max_kv_cache_length, local_batch_size, logits_converted, end_ids_converted};
+        max_input_length, max_attention_window, local_batch_size, logits_converted, end_ids_converted};
 
     safeUpdate<int>(src_cache_indirection_opt, forwardParams.src_cache_indirection);
     safeUpdate<int>(sequence_limit_length_opt, forwardParams.sequence_limit_length);
@@ -167,13 +167,13 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
     safeUpdate<int>(bad_words_list_opt, forwardParams.bad_words_list);
     safeUpdate<int>(stop_words_list_opt, forwardParams.stop_words_list);
     safeUpdate<int>(no_repeat_ngram_size_opt, forwardParams.no_repeat_ngram_size);
-    safeUpdate<int>(finished_input, forwardParams.finished);
+    safeUpdate<uint8_t>(finished_input, forwardParams.finished);
 
     auto const& output_ids_converted = convert_tensor<int>(output_token_ids);
     typename tensorrt_llm::layers::DynamicDecodeLayer<T>::OutputParams outputParams{output_ids_converted};
     outputParams.newTokens = std::move(convert_tensor<int>(newTokens));
 
-    safeUpdate<bool>(finished_output, outputParams.finished);
+    safeUpdate<uint8_t>(finished_output, outputParams.finished);
     std::int32_t* finished_sum_host = nullptr;
     if (forwardParams.sequence_limit_length && outputParams.finished.has_value())
     {
@@ -275,7 +275,7 @@ void DynamicDecodeOp::setup(int64_t batch_size, int64_t beam_width, th::optional
 }
 
 th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max_input_length,
-    int64_t max_kv_cache_length, int64_t ite, int64_t local_batch_size, th::Tensor end_id,
+    int64_t max_attention_window, int64_t ite, int64_t local_batch_size, th::Tensor end_id,
     th::optional<th::Tensor> embedding_bias_opt,
     th::optional<th::Tensor> input_lengths_opt, // length of input contexts.
     th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
@@ -313,14 +313,11 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
 
     CHECK_INPUT(logits, scalar_type_);
     TLLM_CHECK_WITH_INFO(logits.dim() == 3,
-        tensorrt_llm::common::fmtstr("logits is of shape (batch_size, beam_width, vocab_size_padded), "
-                                     "but got dim=%d shape=%s",
-            (int) logits.dim(), tensorrt_llm::common::vec2str(convert_shape(logits)).c_str())
-            .c_str());
+        "logits is of shape (batch_size, beam_width, vocab_size_padded), but got dim=%d shape=%s", (int) logits.dim(),
+        tensorrt_llm::common::vec2str(convert_shape(logits)).c_str());
     TLLM_CHECK_WITH_INFO(static_cast<size_t>(logits.size(2)) == vocab_size_padded_,
-        tensorrt_llm::common::fmtstr("logits is of shape (batch_size, beam_width, "
-                                     "vocab_size(%ld)), but got the last dim=%ld.",
-            vocab_size_padded_, static_cast<size_t>(logits.size(2))));
+        "logits is of shape (batch_size, beam_width, vocab_size(%ld)), but got the last dim=%ld.", vocab_size_padded_,
+        static_cast<size_t>(logits.size(2)));
 
     CHECK_INPUT(end_id, torch::kInt32);
 
@@ -332,8 +329,8 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
     CHECK_OPTIONAL_INPUT(src_cache_indirection_opt, torch::kInt32);
 
     CHECK_INPUT(output_token_ids, torch::kInt32);
-    CHECK_OPTIONAL_INPUT(finished_input, torch::kBool);
-    CHECK_OPTIONAL_INPUT(finished_output, torch::kBool);
+    CHECK_OPTIONAL_INPUT(finished_input, torch::kUInt8);
+    CHECK_OPTIONAL_INPUT(finished_output, torch::kUInt8);
     CHECK_OPTIONAL_INPUT(seuqence_lengths_opt, torch::kInt32);
     CHECK_OPTIONAL_INPUT(cum_log_probs_opt, torch::kFloat32);
     CHECK_OPTIONAL_INPUT(output_log_probs_opt, torch::kFloat32);
@@ -344,7 +341,7 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
 
     dynamic_decode_->forward(
         // Inputs
-        logits, static_cast<int>(step), static_cast<int>(max_input_length), static_cast<int>(max_kv_cache_length),
+        logits, static_cast<int>(step), static_cast<int>(max_input_length), static_cast<int>(max_attention_window),
         static_cast<uint32_t>(ite), static_cast<int>(local_batch_size), end_id, embedding_bias_opt, input_lengths_opt,
         sequence_limit_length_opt, stop_words_list_opt, bad_words_list_opt, no_repeat_ngram_size_opt,
         src_cache_indirection_opt,

@@ -282,7 +282,7 @@ class TestKVCacheManager(unittest.TestCase):
         manager = KVCacheManager(memory_pools=[memory_pool_1, memory_pool_2],
                                  blocks=blocks,
                                  tokens_per_block=tokens_per_block,
-                                 max_kv_cache_len=max_blocks_per_seq *
+                                 max_attention_window_size=max_blocks_per_seq *
                                  tokens_per_block,
                                  max_blocks_per_seq=max_blocks_per_seq)
         manager.add_sequence(GenerationSequence(seq_idx=0, batch_idx=0), 30)

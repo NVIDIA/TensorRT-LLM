@@ -1,0 +1,4 @@
+tiktoken
+datasets
+kaldialign
+openai-whisper

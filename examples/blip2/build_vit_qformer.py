@@ -27,8 +27,13 @@ def build(iPart, minBS=1, optBS=2, maxBS=4):
     planFile = planFileList[iPart]
 
     builder = trt.Builder(logger)
-    network = builder.create_network(
-        1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+
+    network_creation_flags = 0
+    if "EXPLICIT_BATCH" in trt.NetworkDefinitionCreationFlag.__members__.keys():
+        network_creation_flags = 1 << int(
+            trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+
+    network = builder.create_network(network_creation_flags)
     profile = builder.create_optimization_profile()
     config = builder.create_builder_config()
     config.set_flag(trt.BuilderFlag.FP16)

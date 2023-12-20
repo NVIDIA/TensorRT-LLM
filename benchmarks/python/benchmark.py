@@ -14,11 +14,9 @@
 # limitations under the License.
 import argparse
 import multiprocessing as mp
-from multiprocessing import Process, Queue
 from time import time
 
 import torch
-from mem_monitor import mem_monitor
 
 
 def parse_arguments():
@@ -120,7 +118,7 @@ def parse_arguments():
         type=str,
         default=None,
         help=
-        'If this option is specified, TensorRT engines will be saved to engine_dir.'
+        'If this option is specified, TensorRT engines will be saved to the specified path.'
     )
     parser.add_argument(
         '--engine_dir',
@@ -130,37 +128,51 @@ def parse_arguments():
         ('If this option is specified, instead of building engines on-air before benchmarking, '
          'the engines contained in the engine_dir will be used.'))
     parser.add_argument(
-        '--n_positions',
+        '--max_beam_width',
         type=int,
         default=None,
         help=
-        ('If this option is specified, it will override the n_positions of TRT engines to the specified value instead of using pre-defined one'
-         'By default when this option is not used, it will use pre-defined n_positions'
-         ))
+        ('If this option is specified, it will override the max beam width of '
+         'TRT engines to the specified value instead of using pre-defined one'))
     parser.add_argument(
         '--max_input_len',
         type=int,
         default=None,
         help=
-        ('If this option is specified, it will override the max input len of TRT engines to the specified value instead of using pre-defined one'
-         'By default when this option is not used, it will use pre-defined max input len'
+        ('If this option is specified, it will override the max input len of '
+         'TRT engines to the specified value instead of using pre-defined one'))
+    parser.add_argument(
+        '--max_encoder_input_len',
+        type=int,
+        default=None,
+        help=
+        ('This argument is only for encoder-decoder models'
+         'If this option is specified, it will override the max encoder input len of TRT engines to the specified value instead of using pre-defined one'
+         'By default when this option is not used, it will use pre-defined max encoder input len'
+         ))
+    parser.add_argument(
+        '--max_decoder_input_len',
+        type=int,
+        default=None,
+        help=
+        ('This argument is only for encoder-decoder models'
+         'If this option is specified, it will override the max decoder input len of TRT engines to the specified value instead of using pre-defined one'
+         'By default when this option is not used, it will use pre-defined max decoder input len'
          ))
     parser.add_argument(
         '--max_output_len',
         type=int,
         default=None,
         help=
-        ('If this option is specified, it will override the max output len of TRT engines to the specified value instead of using pre-defined one'
-         'By default when this option is not used, it will use pre-defined max output len'
-         ))
+        ('If this option is specified, it will override the max output len of '
+         'TRT engines to the specified value instead of using pre-defined one'))
     parser.add_argument(
         '--max_batch_size',
         type=int,
         default=None,
         help=
-        ('If this option is specified, it will override the max batch size of TRT engines to the specified value instead of using pre-defined one'
-         'By default when this option is not used, it will use pre-defined max batch size'
-         ))
+        ('If this option is specified, it will override the max batch size of '
+         'TRT engines to the specified value instead of using pre-defined one'))
     parser.add_argument(
         '--force_num_layer_1',
         default=False,
@@ -178,20 +190,6 @@ def parse_arguments():
                         action='store_true',
                         help='Execute GPT session with CUDA graph.')
     parser.add_argument(
-        '--enable_custom_all_reduce',
-        default=False,
-        action='store_true',
-        help=
-        'Use latency-optimized all-reduce for tensor parallelism. Gives better performance with NVLink.'
-    )
-    parser.add_argument(
-        '--strongly_typed',
-        default=False,
-        action='store_true',
-        help=
-        'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
-    )
-    parser.add_argument(
         '--quantization',
         type=str,
         default=None,
@@ -201,6 +199,33 @@ def parse_arguments():
             'int4_weight_only_awq', 'int4_weight_only_gptq'
         ],
         help="Optimize the model with specified quantization recipe")
+    parser.add_argument(
+        '--build_only',
+        default=False,
+        action='store_true',
+        help=
+        "Build engine only and skip inference, this can help to benchmark the build time on single gpu node for multi GPU model, where the inference is not possible"
+    )
+
+    parser.add_argument('--serial_build',
+                        default=False,
+                        action='store_true',
+                        help="Build engines serially")
+
+    parser.add_argument(
+        '--rank',
+        type=int,
+        default=None,
+        help=
+        "The rank of the model to be built, only used when --build_only and --serial_build is specified"
+    )
+    parser.add_argument(
+        '--world_size',
+        type=int,
+        default=None,
+        help=
+        "The number of gpus to be used for inference, only used when --build_only and --serial_build is specified"
+    )
 
     return parser.parse_args()
 
@@ -211,9 +236,13 @@ def main(args):
     # the start method `spawn` of Python multiprocessing,
     # so we set the start method first, then initialize MPI.
     from allowed_configs import get_allowed_models
+    from benchmark_profiler import BenchmarkProfiler
     from bert_benchmark import BERTBenchmark
+    from enc_dec_benchmark import EncDecBenchmark
     from gpt_benchmark import GPTBenchmark
+    from mem_monitor import MemoryMonitor
 
+    import tensorrt_llm
     from tensorrt_llm.logger import logger
 
     logger.set_level(args.log_level)
@@ -224,52 +253,44 @@ def main(args):
     # Input length (for BERT-like models)
     input_len_options = args.input_len.split(';')
     input_len_options = [int(i) for i in input_len_options]
-    # Input-output length combination (for GPT-like models)
+    # Input-output length combination (for GPT-like models and enc_dec models)
     in_out_len_options = args.input_output_len.split(';')
     in_out_len_options = [[int(i) for i in io.split(',')]
                           for io in in_out_len_options]
 
+    if args.serial_build and not args.build_only:
+        raise Exception(
+            f"--serial_build must be used with --build_only, always need to parallel build to do inference in the same process"
+        )
+
+    if args.build_only and args.serial_build and args.rank is not None and args.world_size is not None:
+        rank = args.rank
+        world_size = args.world_size
+    else:
+        rank = tensorrt_llm.mpi_rank()
+        world_size = tensorrt_llm.mpi_world_size()
+
+    benchmark_profiler = None
     if args.model in get_allowed_models(benchmark_type="gpt"):
-        benchmarker = GPTBenchmark(
-            args.engine_dir,
-            args.model,
-            args.mode,
-            batch_size_options,
-            in_out_len_options,
-            args.dtype,
-            args.refit,
-            args.num_beams,
-            args.top_k,
-            args.top_p,
-            args.output_dir,
-            args.n_positions,
-            args.max_input_len,
-            args.max_output_len,
-            args.max_batch_size,
-            force_num_layer_1=args.force_num_layer_1,
-            enable_cuda_graph=args.enable_cuda_graph,
-            enable_custom_all_reduce=args.enable_custom_all_reduce,
-            strongly_typed=args.strongly_typed,
-            quantization=args.quantization)
+        benchmark_profiler = BenchmarkProfiler()
+        benchmarker = GPTBenchmark(args, batch_size_options, in_out_len_options,
+                                   rank, world_size)
     elif args.model in get_allowed_models(benchmark_type="bert"):
-        benchmarker = BERTBenchmark(args.engine_dir,
-                                    args.model,
-                                    args.mode,
-                                    batch_size_options,
-                                    input_len_options,
-                                    args.dtype,
-                                    args.output_dir,
-                                    args.n_positions,
-                                    args.max_input_len,
-                                    args.max_output_len,
-                                    args.max_batch_size,
-                                    force_num_layer_1=args.force_num_layer_1)
+        benchmarker = BERTBenchmark(args, batch_size_options, input_len_options,
+                                    rank, world_size)
+    elif args.model in get_allowed_models(benchmark_type="enc_dec"):
+        benchmarker = EncDecBenchmark(args, batch_size_options,
+                                      in_out_len_options, rank, world_size)
     else:
         raise Exception(f'Unexpected model: {args.model}')
 
+    if args.build_only:
+        return
+
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    benchmarker.print_report_header(args.csv)
+    benchmarker.print_report_header(args.csv,
+                                    benchmark_profiler=benchmark_profiler)
     for config in benchmarker.get_config():
         try:
             inputs = benchmarker.prepare_inputs(config)
@@ -282,11 +303,8 @@ def main(args):
         torch.cuda.empty_cache()
         latencies = []
 
-        # Launch a subprocess to monitor memory usage
-        q1 = Queue()  # q1 is used for sending signal to subprocess
-        q2 = Queue()  # q2 is used for receiving results from subprocess
-        mem_monitor_process = Process(target=mem_monitor, args=(q1, q2))
-        mem_monitor_process.start()
+        memory_monitor = MemoryMonitor()
+        memory_monitor.start()
 
         iter_idx = 0
         try:
@@ -294,12 +312,16 @@ def main(args):
             for _ in range(args.warm_up):
                 benchmarker.run(inputs, config)
             logger.info('Warm up done. Start benchmarking.')
-
+            if benchmark_profiler is not None:
+                benchmark_profiler.clean()
+                benchmark_profiler.start()
             cur_duration = 0
             start_time = time()
             while iter_idx < args.num_runs or cur_duration < args.duration:
                 start.record()
-                benchmarker.run(inputs, config)
+                benchmarker.run(inputs,
+                                config,
+                                benchmark_profiler=benchmark_profiler)
                 end.record()
 
                 torch.cuda.synchronize()
@@ -313,15 +335,15 @@ def main(args):
 
         except Exception as e:
             print("Found exception during benchmarking", e.with_traceback())
-            mem_monitor_process.kill()
+            memory_monitor.kill()
             raise e
-        logger.debug("Sending signal to mem monitor process, start")
-        q1.put(1)
-        logger.debug("Sending signal to mem monitor process, done")
-        peak_gpu_used = q2.get()
-        logger.debug("Get peak gpu memory usage from mem monitor process, done")
-        mem_monitor_process.join()
-        logger.debug("Memory monitor process joined")
+
+        memory_monitor.stop()
+        _, peak_gpu_used = memory_monitor.get_peak_memory_usage("GiB")
+        peak_gpu_used = round(peak_gpu_used, 3)
+        if benchmark_profiler is not None:
+            benchmark_profiler.add_aux_info('iter_count', iter_idx)
+            benchmark_profiler.stop()
 
         latency = round(sum(latencies) / iter_idx, 3)
         latencies.sort()
@@ -332,7 +354,8 @@ def main(args):
                            percentile95,
                            percentile99,
                            peak_gpu_used,
-                           csv=args.csv)
+                           csv=args.csv,
+                           benchmark_profiler=benchmark_profiler)
 
 
 if __name__ == '__main__':

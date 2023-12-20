@@ -42,6 +42,16 @@ static inline std::basic_ostream<char>& operator<<(std::basic_ostream<char>& str
     return stream;
 }
 
+inline std::string fmtstr(std::string const& s)
+{
+    return s;
+}
+
+inline std::string fmtstr(std::string&& s)
+{
+    return s;
+}
+
 #if defined(_MSC_VER)
 std::string fmtstr(char const* format, ...);
 #else

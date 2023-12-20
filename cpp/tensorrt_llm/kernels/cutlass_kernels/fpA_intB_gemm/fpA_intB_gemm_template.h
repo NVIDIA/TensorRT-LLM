@@ -453,7 +453,7 @@ void CutlassFpAIntBGemmRunner<T, WeightType, QuantOp>::gemm(const void* A, const
 
     if constexpr (QuantOp == cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY)
     {
-        dispatch_to_arch<tkc::EpilogueOpNoBias>((const T*) A, (const WeightType*) B, (const T*) weight_scales, nullptr,
+        dispatch_to_arch<tkc::EpilogueOpDefault>((const T*) A, (const WeightType*) B, (const T*) weight_scales, nullptr,
             nullptr, (T*) C, m, n, k, k, gemmConfig, workspace_ptr, workspace_bytes, stream, nullptr);
     }
     else
@@ -466,7 +466,8 @@ template <typename T, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp>
 std::vector<tkc::CutlassGemmConfig> CutlassFpAIntBGemmRunner<T, WeightType, QuantOp>::getConfigs() const
 {
     static constexpr bool is_weight_only = !std::is_same<T, WeightType>::value;
-    std::vector<tkc::CutlassGemmConfig> candidateConfigs = get_candidate_configs(sm_, is_weight_only, false);
+    std::vector<tkc::CutlassGemmConfig> candidateConfigs
+        = get_candidate_configs(sm_, is_weight_only, false, false, SPLIT_K_LIMIT);
     return candidateConfigs;
 }
 

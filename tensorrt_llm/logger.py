@@ -17,8 +17,6 @@ import os
 
 import tensorrt as trt
 
-from ._utils import mpi_rank, mpi_world_size
-
 try:
     from polygraphy.logger import G_LOGGER
 except ImportError:
@@ -63,8 +61,6 @@ class Logger(metaclass=Singleton):
             self._polygraphy_logger.module_severity = severity_map[
                 min_severity][2]
 
-        self.mpi_rank = mpi_rank()
-        self.mpi_size = mpi_world_size()
         if invalid_severity:
             self.warning(
                 f"Requested log level {environ_severity} is invalid. Using 'warning' instead"
@@ -89,10 +85,7 @@ class Logger(metaclass=Singleton):
         return self._trt_logger
 
     def log(self, severity, msg):
-        if self.mpi_size > 1:
-            msg = f'[TRT-LLM] [MPI_Rank {self.mpi_rank}] {severity} ' + msg
-        else:
-            msg = f'[TRT-LLM] {severity} ' + msg
+        msg = f'[TRT-LLM] {severity} ' + msg
         self._func_wrapper(severity)(msg)
 
     def critical(self, msg):

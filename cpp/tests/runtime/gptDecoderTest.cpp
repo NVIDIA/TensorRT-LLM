@@ -34,7 +34,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     SizeType constexpr tensorParallelism{1};
     SizeType constexpr pipelineParallelism{1};
     SizeType constexpr localRank{0};
-    WorldConfig constexpr worldConfig{tensorParallelism, pipelineParallelism, localRank};
+    WorldConfig const worldConfig{tensorParallelism, pipelineParallelism, localRank};
 
     SizeType constexpr vocabSize{51200};
     SizeType constexpr nbLayers{2};

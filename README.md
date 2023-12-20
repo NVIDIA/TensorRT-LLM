@@ -17,24 +17,29 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
-* [2023/11/13] [**H200** achieves nearly **12,000 tok/sec on Llama2-13B**](./docs/source/blogs/H200launch.md)
+* [2023/12/04] [**Falcon-180B** on a **single H200** GPU with INT4 AWQ, and **6.7x faster Llama-70B** over A100](./docs/source/blogs/Falcon180B-H200.md)
 
-<img src="./docs/source/blogs/media/H200launch_tps.png" alt="H200 TPS" width="500" height="auto">
+<img src="./docs/source/blogs/media/Falcon180B-H200_H200vA100.png" alt="H200 TPS" width="400" height="auto">
 
-H200 FP8 achieves 11,819 tok/s on Llama2-13B on a single GPU, and is up to 1.9x faster than H100.
+H200 with INT4 AWQ, runs Falcon-180B on a _single_ GPU.
 
+H200 is now 2.4x faster on Llama-70B with recent improvements to TensorRT-LLM GQA; up to 6.7x faster than A100.
 
-* [2023/11/03] [TensorRT-LLM is up to **4.6x faster on H100 than A100**, achieving **10,000 tok/s at 100ms to first token.**](./docs/source/blogs/H100vsA100.md)
+* [2023/11/27] [SageMaker LMI now supports TensorRT-LLM - improves throughput by 60%, compared to previous version](https://aws.amazon.com/blogs/machine-learning/boost-inference-performance-for-llms-with-new-amazon-sagemaker-containers/)
+* [2023/11/13] [H200 achieves nearly 12,000 tok/sec on Llama2-13B](./docs/source/blogs/H200launch.md)
 * [2023/10/22] [🚀 RAG on Windows using TensorRT-LLM and LlamaIndex 🦙](https://github.com/NVIDIA/trt-llm-rag-windows#readme)
 * [2023/10/19] Getting Started Guide - [Optimizing Inference on Large Language Models with NVIDIA TensorRT-LLM, Now Publicly Available
 ](https://developer.nvidia.com/blog/optimizing-inference-on-llms-with-tensorrt-llm-now-publicly-available/)
 * [2023/10/17] [Large Language Models up to 4x Faster on RTX With TensorRT-LLM for Windows
 ](https://blogs.nvidia.com/blog/2023/10/17/tensorrt-llm-windows-stable-diffusion-rtx/)
-* [2023/9/9] [NVIDIA TensorRT-LLM Supercharges Large Language Model Inference on NVIDIA H100 GPUs](https://developer.nvidia.com/blog/nvidia-tensorrt-llm-supercharges-large-language-model-inference-on-nvidia-h100-gpus/)
 
-[2023/10/31 - Phind](https://www.phind.com/blog/phind-model-beats-gpt4-fast) ; [2023/10/12 - Databricks (MosaicML)](https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices) ;
-[2023/10/4 - Perplexity](https://blog.perplexity.ai/blog/introducing-pplx-api) ;
-[2023/9/27 - CloudFlare](https://www.cloudflare.com/press-releases/2023/cloudflare-powers-hyper-local-ai-inference-with-nvidia/);
+
+[2023/11/27 - Amazon Sagemaker](https://aws.amazon.com/blogs/machine-learning/boost-inference-performance-for-llms-with-new-amazon-sagemaker-containers/)
+[2023/11/17 - Perplexity](https://blog.perplexity.ai/blog/turbocharging-llama-2-70b-with-nvidia-h100) ;
+[2023/10/31 - Phind](https://www.phind.com/blog/phind-model-beats-gpt4-fast) ;
+[2023/10/12 - Databricks (MosaicML)](https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices) ;
+[2023/10/04 - Perplexity](https://blog.perplexity.ai/blog/introducing-pplx-api) ;
+[2023/09/27 - CloudFlare](https://www.cloudflare.com/press-releases/2023/cloudflare-powers-hyper-local-ai-inference-with-nvidia/);
 
 ## Table of Contents
 
@@ -145,10 +150,13 @@ mkdir -p ./bloom/560M && git clone https://huggingface.co/bigscience/bloom-560m 
 ```
 ***2. Build the engine***
 
-```python
+```bash
 # Single GPU on BLOOM 560M
-python build.py --model_dir ./bloom/560M/ \
+python convert_checkpoint.py --model_dir ./bloom/560M/ \
                 --dtype float16 \
+                --output_dir ./bloom/560M/trt_ckpt/fp16/1-gpu/
+# May need to add trtllm-build to PATH, export PATH=/usr/local/bin:$PATH
+trtllm-build --checkpoint_dir ./bloom/560M/trt_ckpt/fp16/1-gpu/ \
                 --use_gemm_plugin float16 \
                 --use_gpt_attention_plugin float16 \
                 --output_dir ./bloom/560M/trt_engines/fp16/1-gpu/
@@ -161,7 +169,7 @@ See the BLOOM [example](examples/bloom) for more details and options regarding t
 The `../summarize.py` script can be used to perform the summarization of articles
 from the CNN Daily dataset:
 
-```python
+```bash
 python ../summarize.py --test_trt_llm \
                        --hf_model_dir ./bloom/560M/ \
                        --data_type fp16 \
@@ -239,10 +247,12 @@ the models listed in the [examples](examples/.) folder.
 The list of supported models is:
 
 * [Baichuan](examples/baichuan)
+* [BART](examples/enc_dec)
 * [Bert](examples/bert)
 * [Blip2](examples/blip2)
 * [BLOOM](examples/bloom)
 * [ChatGLM](examples/chatglm)
+* [FairSeq NMT](examples/nmt)
 * [Falcon](examples/falcon)
 * [Flan-T5](examples/enc_dec)
 * [GPT](examples/gpt)
@@ -252,7 +262,8 @@ The list of supported models is:
 * [InternLM](examples/internlm)
 * [LLaMA](examples/llama)
 * [LLaMA-v2](examples/llama)
-* [Mistral](examples/llama)
+* [mBART](examples/enc_dec)
+* [Mistral](examples/llama#mistral-v01)
 * [MPT](examples/mpt)
 * [mT5](examples/enc_dec)
 * [OPT](examples/opt)
@@ -261,9 +272,10 @@ The list of supported models is:
 * [SantaCoder](examples/gpt)
 * [StarCoder](examples/gpt)
 * [T5](examples/enc_dec)
+* [Whisper](examples/whisper)
 
 Note: [Encoder-Decoder](examples/enc_dec/) provides general encoder-decoder
-support that contains many encoder-decoder models such as T5, Flan-T5, etc. We
+functionality that supports many encoder-decoder models such as T5 family, BART family, Whisper family, NMT family, etc. We
 unroll the exact model names in the list above to let users find specific
 models easier.
 
@@ -367,7 +379,7 @@ For example: `mpirun -n 1 python3 examples/gpt/build.py ...`
 
 ### Change Log
 
-#### Versions 0.6.0 / 0.6.1
+#### Version 0.6.1
 
   * Models
       * ChatGLM3

@@ -213,7 +213,6 @@ class ChatGLMDecoderLayer(Module):
             position_embedding_type=position_embedding_type,
             rotary_embedding_base=self.rotary_embedding_base,
             rotary_embedding_scaling=rotary_embedding_scaling,
-            use_int8_kv_cache=config.quant_mode.has_int8_kv_cache(),
             rotary_embedding_percentage=0.5,
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
@@ -393,19 +392,21 @@ class ChatGLMModel(Module):
         if self.use_cache:
             presents = []
 
-        for layer, past, pointer, max_kv_cache_length in zip(
+        for layer, past, pointer, host_pointer, max_attention_window_size in zip(
                 self.layers, kv_cache_params.past_key_value,
                 kv_cache_params.kv_cache_block_pointers,
-                kv_cache_params.host_max_kv_cache_lengths):
+                kv_cache_params.host_kv_cache_block_pointers,
+                kv_cache_params.host_max_attention_window_sizes):
             layer_output = layer(
                 hidden_states,
                 position_ids,
                 kv_cache_params=KeyValueCacheParams(
                     past_key_value=[past],
                     kv_cache_block_pointers=[pointer],
+                    host_kv_cache_block_pointers=[host_pointer],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
-                    host_max_kv_cache_lengths=max_kv_cache_length,
+                    host_max_attention_window_sizes=max_attention_window_size,
                     cache_indirection=kv_cache_params.cache_indirection,
                 ),
                 attention_params=attention_params,
@@ -607,10 +608,12 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
                     past_key_value=model_inputs['past_key_value'],
                     host_past_key_value_lengths=model_inputs[
                         'host_past_key_value_lengths'],
-                    host_max_kv_cache_lengths=model_inputs[
-                        'host_max_kv_cache_lengths'],
+                    host_max_attention_window_sizes=model_inputs[
+                        'host_max_attention_window_sizes'],
                     kv_cache_block_pointers=model_inputs[
                         'kv_cache_block_pointers_list'],
+                    host_kv_cache_block_pointers=model_inputs[
+                        'host_kv_cache_block_pointers_list'],
                     cache_indirection=model_inputs['cache_indirection'],
                 ),
                 AttentionParams(

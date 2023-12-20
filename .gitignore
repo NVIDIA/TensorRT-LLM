@@ -21,6 +21,7 @@ cpp/cmake-build-*
 cpp/.ccache/
 tensorrt_llm/libs
 tensorrt_llm/bindings.pyi
+tensorrt_llm/bindings/*.pyi
 
 # Testing
 .coverage.*

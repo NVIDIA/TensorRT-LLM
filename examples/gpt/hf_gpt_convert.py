@@ -195,6 +195,7 @@ def hf_gpt_converter(args: ProgArgs):
 
     # load position_embedding from rank 0
     model = AutoModelForCausalLM.from_pretrained(args.in_file,
+                                                 torch_dtype="auto",
                                                  device_map="auto",
                                                  trust_remote_code=True)
     if args.load_model_on_cpu:

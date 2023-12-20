@@ -17,11 +17,12 @@ from .attention import (Attention, AttentionMaskType, AttentionParams,
                         BertAttention, KeyValueCacheParams,
                         PositionEmbeddingType)
 from .cast import Cast
-from .conv import Conv2d, ConvTranspose2d
+from .conv import Conv1d, Conv2d, ConvTranspose2d
 from .embedding import Embedding, PromptTuningEmbedding
 from .linear import ColumnLinear, Linear, RowLinear
-from .lora import Lora, LoraParams
+from .lora import Lora, LoraParams, LoraRuntimeParams
 from .mlp import MLP, FusedGatedMLP, GatedMLP
+from .moe import MOE, MoeConfig
 from .normalization import GroupNorm, LayerNorm, RmsNorm
 from .pooling import AvgPool2d
 
@@ -40,6 +41,7 @@ __all__ = [
     'PromptTuningEmbedding',
     'Conv2d',
     'ConvTranspose2d',
+    'Conv1d',
     'AvgPool2d',
     'Mish',
     'MLP',
@@ -50,4 +52,7 @@ __all__ = [
     'KeyValueCacheParams',
     'Lora',
     'LoraParams',
+    'LoraRuntimeParams',
+    'MOE',
+    'MoeConfig',
 ]

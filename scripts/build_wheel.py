@@ -62,8 +62,8 @@ def main(build_type: str = "Release",
     if not (project_dir / "3rdparty/cutlass/.git").exists():
         build_run('git submodule update --init --recursive')
 
-    requirements_filename = "requirements-windows.txt" if platform.system(
-    ) == "Windows" else "requirements.txt"
+    requirements_filename = "requirements-dev-windows.txt" if platform.system(
+    ) == "Windows" else "requirements-dev.txt"
     build_run(
         f"\"{sys.executable}\" -m pip install -r {requirements_filename} --extra-index-url https://pypi.ngc.nvidia.com"
     )
@@ -241,7 +241,7 @@ def main(build_type: str = "Release",
         )
 
     if install:
-        build_run(f"\"{sys.executable}\" -m pip install -e .")
+        build_run(f"\"{sys.executable}\" -m pip install -e .[devel]")
 
 
 if __name__ == "__main__":

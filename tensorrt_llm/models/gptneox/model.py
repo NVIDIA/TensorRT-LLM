@@ -158,9 +158,9 @@ class GPTNeoXModel(Module):
         if use_cache:
             presents = []
 
-        for layer, past, max_kv_cache_length in zip(
+        for layer, past, max_attention_window_size in zip(
                 self.layers, kv_cache_params.past_key_value,
-                kv_cache_params.host_max_kv_cache_lengths):
+                kv_cache_params.host_max_attention_window_sizes):
             hidden_states = layer(
                 hidden_states,
                 use_cache=use_cache,
@@ -168,7 +168,7 @@ class GPTNeoXModel(Module):
                     past_key_value=[past],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
-                    host_max_kv_cache_lengths=max_kv_cache_length,
+                    host_max_attention_window_sizes=max_attention_window_size,
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params)
 
@@ -299,8 +299,8 @@ class GPTNeoXForCausalLM(GPTNeoXModel, GenerationMixin):
                     past_key_value=model_inputs['past_key_value'],
                     host_past_key_value_lengths=model_inputs[
                         'host_past_key_value_lengths'],
-                    host_max_kv_cache_lengths=model_inputs[
-                        'host_max_kv_cache_lengths'],
+                    host_max_attention_window_sizes=model_inputs[
+                        'host_max_attention_window_sizes'],
                     cache_indirection=model_inputs['cache_indirection'],
                 ),
                 AttentionParams(

@@ -287,7 +287,7 @@ int WeightOnlyQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDesc* input
 
     const int ws_size = m_weightOnlyGemmRunner->getWorkspaceSize(m, n, k);
     const auto& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
-    TLLM_CHECK_WITH_INFO(bestTactic, "No valid weight only groupwise GEMM tactic");
+    TLLM_CHECK_WITH_INFO(bestTactic, "No valid weight only GEMM tactic");
 #if defined(ENABLE_BF16)
     TLLM_CHECK_WITH_INFO(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16,
         "No valid weightOnlyQuantMatmul configuration");
@@ -322,7 +322,7 @@ int WeightOnlyQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDesc* input
         // The CUDA kernel is designed for ColumnMajorTileInterleave weight layout used in fpAIntB cutlass
         // kernel when sm >= 75 and the preprocessing of cutlass on sm70 does not interleave the weights.
         tensorrt_llm::kernels::WeightOnlyParams params{reinterpret_cast<const uint8_t*>(inputs[1]), inputs[2], nullptr,
-            inputs[0], nullptr, outputs[0], m, real_n, k, 0, weight_only_quant_type,
+            inputs[0], nullptr, nullptr, outputs[0], m, real_n, k, 0, weight_only_quant_type,
             tensorrt_llm::kernels::WeightOnlyType::PerChannel,
             tensorrt_llm::kernels::WeightOnlyActivationFunctionType::Identity, weight_only_act_type};
         tensorrt_llm::kernels::weight_only_batched_gemv_launcher(params, stream);

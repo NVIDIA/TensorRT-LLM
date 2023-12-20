@@ -33,6 +33,8 @@
 #include <typeinfo>
 #include <vector>
 
+#include "tensorrt_llm/common/dataType.h"
+
 namespace tensorrt_llm::runtime
 {
 
@@ -213,19 +215,7 @@ public:
 
     [[nodiscard]] constexpr std::size_t getSize() const noexcept
     {
-        switch (static_cast<nvinfer1::DataType>(*this))
-        {
-        case nvinfer1::DataType::kINT64: return 8;
-        case nvinfer1::DataType::kINT32: [[fallthrough]];
-        case nvinfer1::DataType::kFLOAT: return 4;
-        case nvinfer1::DataType::kBF16: [[fallthrough]];
-        case nvinfer1::DataType::kHALF: return 2;
-        case nvinfer1::DataType::kBOOL: [[fallthrough]];
-        case nvinfer1::DataType::kUINT8: [[fallthrough]];
-        case nvinfer1::DataType::kINT8: [[fallthrough]];
-        case nvinfer1::DataType::kFP8: return 1;
-        }
-        return 0;
+        return tensorrt_llm::common::getDTypeSize(static_cast<nvinfer1::DataType>(*this));
     }
 
 private:

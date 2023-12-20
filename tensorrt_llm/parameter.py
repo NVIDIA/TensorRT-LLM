@@ -84,6 +84,10 @@ class Parameter:
         assert v.shape == self._value.shape, \
             f'The value updated is not the same shape as the original. ' \
             f'Updated: {v.shape}, original: {self._value.shape}'
+        if self._value.dtype != v.dtype:
+            logger.warning(
+                f"Parameter was initialized as {self._value.dtype} but set to {v.dtype}"
+            )
         self._value = v
 
     def _get_weights(self) -> trt.Weights:

@@ -47,8 +47,10 @@ void SamplingKernelTest<T>::allocateBuffers(int32_t batchSize, int32_t vocabSize
     mSeqLengthsHost = mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
     mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
 
-    mFinishedHost = mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kBOOL);
-    mFinishedDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), nvinfer1::DataType::kBOOL);
+    mFinishedHost = mBufferManager->pinned(
+        ITensor::makeShape({batchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
+    mFinishedDevice
+        = mBufferManager->gpu(ITensor::makeShape({batchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
 
     mOutputIdsHost = mBufferManager->pinned(ITensor::makeShape({batchSize, maxSeqLen}), nvinfer1::DataType::kINT32);
     mOutputIdsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize, maxSeqLen}), nvinfer1::DataType::kINT32);
@@ -102,7 +104,7 @@ void SamplingKernelTest<T>::setupBuffers(int32_t batchSize, int32_t vocabSize, i
 
     // Init by zero.
     trk::invokeFill(*mSeqLengthsDevice, int32_t{0}, *mStream);
-    trk::invokeFill(*mFinishedDevice, false, *mStream);
+    trk::invokeFill(*mFinishedDevice, uint8_t{0}, *mStream);
     trk::invokeFill(*mCumLogProbsDevice, float{0.0f}, *mStream);
     trk::invokeFill(*mOutputLogProbsDevice, float{0.0f}, *mStream);
     trk::invokeFill(*mZeroParentIdsDevice, int32_t{0}, *mStream);
@@ -145,12 +147,13 @@ void SamplingKernelTest<T>::setupBuffers(int32_t batchSize, int32_t vocabSize, i
 
 template <typename T>
 void SamplingKernelTest<T>::verifyCurrentStep(int32_t batchSize, int32_t vocabSize, int32_t maxSeqLen, int32_t step,
-    bool greedySearch, bool useSkipDecode, bool hasDiffRuntimeArgs, std::vector<bool>& refFinished,
-    std::vector<int32_t>& refSeqLength, const std::vector<bool>& finishedCurrentStep)
+    bool greedySearch, bool useSkipDecode, bool hasDiffRuntimeArgs, std::vector<tk::FinishedState>& refFinished,
+    std::vector<int32_t>& refSeqLength, const std::vector<tk::FinishedState>& finishedCurrentStep)
 {
     const auto outputIdsHostPtr = bufferCast<int32_t>(*mOutputIdsHost);
     const auto seqLengthsHostPtr = bufferCast<int32_t>(*mSeqLengthsHost);
-    const auto finishedHostPtr = bufferCast<bool>(*mFinishedHost);
+    const auto finishedHostPtr
+        = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinishedHost));
     const auto logProbsHostPtr = bufferCast<T>(*mLogProbsHost);
     const auto endIdsHostPtr = bufferCast<int32_t>(*mEndIdsHost);
     const auto skipDecodeHostPtr = bufferCast<bool>(*mSkipDecodeHost);
@@ -159,10 +162,11 @@ void SamplingKernelTest<T>::verifyCurrentStep(int32_t batchSize, int32_t vocabSi
     for (SizeType bi = 0; bi < batchSize; ++bi)
     {
         // Set reference finished state to true if we finished before or at current step
-        bool finishedThisStep = finishedCurrentStep[bi] || outputIdsHostPtr[bi * maxSeqLen + step] == endIdsHostPtr[bi];
-        refFinished[bi] = refFinished[bi] || finishedThisStep;
+        const bool generatedEOS = outputIdsHostPtr[bi * maxSeqLen + step] == endIdsHostPtr[bi];
+        bool finishedThisStep = finishedCurrentStep[bi].isFinished() || generatedEOS;
+        refFinished[bi] = generatedEOS ? tk::FinishedState::finishedEOS() : refFinished[bi];
 
-        if (refFinished[bi] == false)
+        if (!refFinished[bi].isFinished())
         {
             // Increase reference seq len excluding the EOS token
             refSeqLength[bi]++;
@@ -176,7 +180,7 @@ void SamplingKernelTest<T>::verifyCurrentStep(int32_t batchSize, int32_t vocabSi
             // Only in greedy search we can guarantee the selected token and stop by condition
             if (greedySearch)
             {
-                EXPECT_EQ(finishedHostPtr[bi], refFinished[bi]);
+                EXPECT_EQ(finishedHostPtr[bi].isFinished(), refFinished[bi].isFinished());
             }
 
             int idx = bi * vocabSize + outputIdsHostPtr[bi * maxSeqLen + step];
@@ -184,7 +188,7 @@ void SamplingKernelTest<T>::verifyCurrentStep(int32_t batchSize, int32_t vocabSi
             expectedCumLogProbsHostPtr[bi]
                 += step < refSeqLength[bi] || finishedThisStep ? (float) logProbsHostPtr[idx] : 0.0f;
             // If sequence has just finished at this step
-            if (finishedHostPtr[bi] && step < seqLengthsHostPtr[bi])
+            if (finishedHostPtr[bi].isFinished() && step < seqLengthsHostPtr[bi])
             {
                 // Check that finished tokens is endId
                 EXPECT_EQ(outputIdsHostPtr[bi * maxSeqLen + step], endIdsHostPtr[bi])
@@ -223,7 +227,7 @@ void SamplingKernelTest<T>::runTest(const SamplingKernelTestParam& param, bool h
 
     // Allocate internal state holders for reference
     std::vector<int32_t> refSeqLength(batchSize);
-    std::vector<bool> refFinished(batchSize);
+    std::vector<tk::FinishedState> refFinished(batchSize, tk::FinishedState::empty());
 
     // retrieve the workspace size of the sampling kernel.
     const auto workspaceSize = getWorkspaceSize(param);
@@ -237,15 +241,18 @@ void SamplingKernelTest<T>::runTest(const SamplingKernelTestParam& param, bool h
         auto endIdsHostPtr = bufferCast<int32_t>(*mEndIdsHost);
         initRandom(logitsHostPtr, batchSize * vocabSize, -3.0f, 3.0f);
 
-        std::vector<bool> finishedCurrentStep(batchSize);
+        std::vector<tk::FinishedState> finishedCurrentStep(batchSize, tk::FinishedState::empty());
         // Only in greedy search we can guarantee the selected token and stop by condition
         if (greedySearch)
         {
             for (SizeType bi = 0; bi < batchSize; ++bi)
             {
                 // Randomly decide if the sequence finishes at current step
-                finishedCurrentStep[bi] = refFinished[bi] == false ? finishedDist(gen) < 0.1 : false;
-                if (finishedCurrentStep[bi])
+                finishedCurrentStep[bi] = (refFinished[bi].isFinished() == false && finishedDist(gen) < 0.1)
+                    ? tk::FinishedState::finishedEOS()
+                    : tk::FinishedState::empty();
+
+                if (finishedCurrentStep[bi].isFinished())
                 {
                     // Set logit of the endId for the finished request to the value above others
                     // NOTE that we can guarantee finish only in greedy search

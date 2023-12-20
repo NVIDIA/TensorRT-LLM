@@ -25,11 +25,11 @@ namespace kernels
 {
 
 template <typename T, int MAX_K>
-void topK_softMax_kernelLauncher(const T* log_probs, const T* bias, const bool* finished, const int* sequence_lengths,
-    float* cum_log_probs, float* output_log_probs, int** output_ids_ptr, void* temp_storage,
-    const int temp_storage_size, BeamHypotheses* beam_hyps, const int batch_size, const int beam_width,
-    const int vocab_size, const int* end_ids, const float* diversity_rates, const float* length_penalties,
-    cudaStream_t stream);
+void topK_softMax_kernelLauncher(const T* log_probs, const T* bias, const FinishedState* finished,
+    const int* sequence_lengths, float* cum_log_probs, float* output_log_probs, int** output_ids_ptr,
+    void* temp_storage, const int temp_storage_size, BeamHypotheses* beam_hyps, const int batch_size,
+    const int beam_width, const int vocab_size, const int* end_ids, const float* diversity_rates,
+    const float* length_penalties, cudaStream_t stream);
 
 #define CASE_K(MAX_K)                                                                                                  \
     topK_softMax_kernelLauncher<T, MAX_K>(log_probs, bias, finished, sequence_lengths, cum_log_probs,                  \
@@ -38,7 +38,7 @@ void topK_softMax_kernelLauncher(const T* log_probs, const T* bias, const bool* 
     break;
 
 template <typename T>
-void invokeTopkSoftMax(const T* log_probs, const T* bias, const bool* finished, const int* sequence_lengths,
+void invokeTopkSoftMax(const T* log_probs, const T* bias, const FinishedState* finished, const int* sequence_lengths,
     float* cum_log_probs, float* output_log_probs, int** output_ids_ptr, void* temp_storage,
     const int temp_storage_size, BeamHypotheses* beam_hyps, const int batch_size, const int beam_width,
     const int vocab_size, const int* end_ids, const float* diversity_rates, const float* length_penalties,
@@ -73,13 +73,13 @@ void invokeTopkSoftMax(const T* log_probs, const T* bias, const bool* finished, 
 
 #undef CASE_K
 
-template void invokeTopkSoftMax<float>(const float* log_probs, const float* bias, const bool* finished,
+template void invokeTopkSoftMax<float>(const float* log_probs, const float* bias, const FinishedState* finished,
     const int* sequence_lengths, float* cum_log_probs, float* output_log_probs, int** output_ids_ptr, void* tmp_storage,
     const int temp_storage_size, BeamHypotheses* beam_hyps, const int batch_size, const int beam_width,
     const int vocab_size, const int* end_ids, const float* diversity_rates, const float* length_penalties,
     cudaStream_t stream);
 
-template void invokeTopkSoftMax<half>(const half* log_probs, const half* bias, const bool* finished,
+template void invokeTopkSoftMax<half>(const half* log_probs, const half* bias, const FinishedState* finished,
     const int* sequence_lengths, float* cum_log_probs, float* output_log_probs, int** output_ids_ptr, void* tmp_storage,
     const int temp_storage_size, BeamHypotheses* beam_hyps, const int batch_size, const int beam_width,
     const int vocab_size, const int* end_ids, const float* diversity_rates, const float* length_penalties,
