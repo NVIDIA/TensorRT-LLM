@@ -68,7 +68,7 @@ def build_trt_llm(python_exe: str,
         python_exe, "scripts/build_wheel.py", "--cuda_architectures",
         cuda_architectures, "--build_dir",
         str(build_dir), "--dist_dir",
-        str(dist_dir)
+        str(dist_dir), "--python_bindings"
     ]
     if trt_root is not None:
         build_wheel += ["--trt_root", str(trt_root)]
@@ -232,6 +232,7 @@ def prepare_model_tests(model_name: str,
     ] + model_cache_arg + only_fp8_arg + only_multi_gpu_arg
     run_command(build_engines, cwd=root_dir, env=model_env)
 
+    model_env["PYTHONPATH"] = "examples"
     generate_expected_output = [
         python_exe,
         str(scripts_dir / f"generate_expected_{model_name}_output.py")

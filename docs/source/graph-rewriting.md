@@ -137,7 +137,7 @@ class GPTAttentionPluginRemovePaddingRewritePass(PatternRewriter):
         flayer = FLayerInfoMemo.instance().get(layer.name)
         assert flayer
         # Although the layer is a plugin, which is a black box, we get some high-level input information from the FLayerInfo.
-        tensor_input: Tensor = flayer.get_input('tensor')
+        tensor_input: Tensor = flayer.get_input('qkv')
         if tensor_input.shape[0] == 1:  # Already in remove-padding mode
             return False
 
@@ -150,11 +150,11 @@ class GPTAttentionPluginRemovePaddingRewritePass(PatternRewriter):
 
             # Step 1: Create new inputs and replace the original arglist.
             input = Tensor(
-                name='tensor',
+                name='qkv',
                 dtype=trt.float16,
                 shape=(1, batch_size * in_len, hidden_size),
             )
-            new_inputs['tensor'] = input
+            new_inputs['qkv'] = input
 
             # Step 2: Create a new plugin instance.
             new_outs = gpt_attention(**new_inputs)

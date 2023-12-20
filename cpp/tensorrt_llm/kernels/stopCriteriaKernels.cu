@@ -24,128 +24,133 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-__global__ void stop_words_criterion(const int** output_ids, const int** parent_ids, const int* stop_words,
-    bool* finished, const int* sequence_lengths, size_t id_offset, size_t stop_words_len, int batch_size,
-    int beam_width, int max_seq_len)
+__global__ void stopWordsCriterion(const int** outputIds, const int** parentIds, const int* stopWords,
+    FinishedState* finished, const int* sequenceLengths, size_t stopWordsLen, int batchSize, int beamWidth,
+    int maxSeqLen)
 {
     const int id = blockIdx.x * blockDim.x + threadIdx.x;
-    const int batch_idx = blockIdx.y / beam_width;
-    const int beam_idx = blockIdx.y % beam_width;
+    const int batchIdx = blockIdx.y / beamWidth;
+    const int beamIdx = blockIdx.y % beamWidth;
 
-    const int* base_stop_words = stop_words + batch_idx * 2 * stop_words_len;
-    const int* base_offsets = base_stop_words + stop_words_len;
+    const int* baseStopWords = stopWords + batchIdx * 2 * stopWordsLen;
+    const int* baseOffsets = baseStopWords + stopWordsLen;
 
-    if (id >= stop_words_len || base_offsets[id] < 0)
+    if (id >= stopWordsLen || baseOffsets[id] < 0)
     {
         return;
     }
 
-    const int item_end = base_offsets[id];
-    const int item_start = (id > 0) ? base_offsets[id - 1] : 0;
-    const int item_size = item_end - item_start;
+    const int itemEnd = baseOffsets[id];
+    const int itemStart = (id > 0) ? baseOffsets[id - 1] : 0;
+    const int itemSize = itemEnd - itemStart;
 
-    /* The single-token case unconditionally bans the token */
-    bool should_stop = false;
+    // The single-token case unconditionally bans the token
+    bool shouldStop = false;
 
-    const int current_step
-        = sequence_lengths[blockIdx.y] - 1; // need to minus 1 because the sequence_lengths is updated in this step
-    /* Enough previously generated tokens to look for a match */
-    if (current_step + 1 >= item_size)
+    // Need to minus 1 because the sequenceLengths is updated in this step
+    const int currentStep = sequenceLengths[blockIdx.y] - 1;
+    // Enough previously generated tokens to look for a match
+    if (currentStep + 1 >= itemSize)
     {
-        should_stop = true;
-        int parent_id = beam_idx;
-        const bool gather_beam = beam_width > 1;
+        shouldStop = true;
+        int parentId = beamIdx;
+        const bool gatherBeam = beamWidth > 1;
 
-        for (int token_idx = item_size - 1; token_idx >= 0; token_idx--)
+        for (int tokenIdx = itemSize - 1; tokenIdx >= 0; tokenIdx--)
         {
-            const int previous_token
-                = output_ids[batch_idx][parent_id * max_seq_len + current_step - (item_size - 1) + token_idx];
-            if (previous_token != base_stop_words[item_start + token_idx])
+            const int previousToken
+                = outputIds[batchIdx][parentId * maxSeqLen + currentStep - (itemSize - 1) + tokenIdx];
+            if (previousToken != baseStopWords[itemStart + tokenIdx])
             {
-                should_stop = false;
+                shouldStop = false;
                 break;
             }
-            if (gather_beam)
+            if (gatherBeam)
             {
-                parent_id = parent_ids == nullptr
+                parentId = parentIds == nullptr
                     ? 0
-                    : parent_ids[batch_idx][parent_id * max_seq_len + current_step - (item_size - 1) + token_idx];
+                    : parentIds[batchIdx][parentId * maxSeqLen + currentStep - (itemSize - 1) + tokenIdx];
 
-                if (parent_id < 0 || parent_id >= beam_width)
+                if (parentId < 0 || parentId >= beamWidth)
                 {
-                    should_stop = false;
+                    shouldStop = false;
                     break;
                 }
             }
         }
     }
 
-    if (should_stop)
+    if (shouldStop)
     {
-        finished[batch_idx * beam_width + beam_idx] = true;
+        finished[batchIdx * beamWidth + beamIdx].setFinishedStopWords();
     }
 }
 
-void invokeStopWordsCriterion(const int** output_ids, const int** parent_ids, const int* stop_words, bool* finished,
-    const int* sequence_lengths, size_t id_offset, size_t stop_words_len, int batch_size, int beam_width,
-    int max_seq_len, cudaStream_t stream)
+void invokeStopWordsCriterion(const int** outputIds, const int** parentIds, const int* stopWords,
+    FinishedState* finished, const int* sequenceLengths, size_t stopWordsLen, int batchSize, int beamWidth,
+    int maxSeqLen, cudaStream_t stream)
 {
-    // Check if we have sampled a word from the stop_words list. If so, stop the
-    // sequence.
+    // Check if we have sampled a word from the stopWords list. If so, stop the sequence.
     dim3 block, grid;
-    constexpr size_t max_block_size{256};
-    block.x = min(((stop_words_len + 32 - 1) / 32) * 32, max_block_size);
-    grid.x = (stop_words_len + block.x - 1) / block.x;
-    grid.y = batch_size * beam_width;
+    constexpr size_t maxBlockSize{256};
+    block.x = min(((stopWordsLen + 32 - 1) / 32) * 32, maxBlockSize);
+    grid.x = (stopWordsLen + block.x - 1) / block.x;
+    grid.y = batchSize * beamWidth;
 
-    stop_words_criterion<<<grid, block, 0, stream>>>(output_ids, parent_ids, stop_words, finished, sequence_lengths,
-        id_offset, stop_words_len, batch_size, beam_width, max_seq_len);
+    stopWordsCriterion<<<grid, block, 0, stream>>>(
+        outputIds, parentIds, stopWords, finished, sequenceLengths, stopWordsLen, batchSize, beamWidth, maxSeqLen);
     sync_check_cuda_error();
 }
 
-__global__ void length_criterion(bool* finished, int* finished_sum, const uint32_t* sequence_limit_length,
-    const int* sequence_lengths, int batch_size, int beam_width)
+__global__ void lengthCriterion(FinishedState* finished, int* finishedSum, const uint32_t* sequenceLimitLength,
+    const int* sequenceLengths, int batchSize, int beamWidth)
 {
-    int thread_finished_count = 0;
-    for (int index = threadIdx.x; index < batch_size * beam_width; index += blockDim.x)
+    int threadFinishedCount = 0;
+    for (int index = threadIdx.x; index < batchSize * beamWidth; index += blockDim.x)
     {
-        const int batch_idx = index / beam_width;
+        const int batchIdx = index / beamWidth;
 
-        finished[index] |= sequence_lengths[index] >= sequence_limit_length[batch_idx];
-        thread_finished_count += finished[index] ? 1 : 0;
+        auto finishState = finished[index];
+
+        if (sequenceLengths[index] >= sequenceLimitLength[batchIdx])
+        {
+            finishState.setFinishedMaxLength();
+        }
+        threadFinishedCount += finishState.isFinished() ? 1 : 0;
+        finished[index] = finishState;
     }
 
-    if (finished_sum)
+    if (finishedSum)
     {
-        int block_finished_count = 0;
+        int blockFinishedCount = 0;
         if (blockDim.x <= 32)
         {
-            block_finished_count = warpReduceSum(thread_finished_count);
+            blockFinishedCount = warpReduceSum(threadFinishedCount);
         }
         else
         {
-            block_finished_count = blockReduceSum(thread_finished_count);
+            blockFinishedCount = blockReduceSum(threadFinishedCount);
         }
         __syncthreads();
 
         if (threadIdx.x == 0)
         {
-            finished_sum[0] = block_finished_count;
+            finishedSum[0] = blockFinishedCount;
         }
     }
 }
 
-void invokeLengthCriterion(bool* finished, int* finished_sum, const uint32_t* sequence_limit_length,
-    const int* sequence_lengths, int batch_size, int beam_width, cudaStream_t stream)
+void invokeLengthCriterion(FinishedState* finished, int* finishedSum, const uint32_t* sequenceLimitLength,
+    const int* sequenceLengths, int batchSize, int beamWidth, cudaStream_t stream)
 {
     // Check if we have attained the sequence length limit. If so, stop the
     // sequence. In addition, check if all sequences are stopped and return the
-    // result in should_stop
-    dim3 block{min(512, uint32_t(batch_size * beam_width))};
+    // result in shouldStop
+    dim3 block{min(512, uint32_t(batchSize * beamWidth))};
     dim3 grid{1};
 
-    length_criterion<<<grid, block, 0, stream>>>(
-        finished, finished_sum, sequence_limit_length, sequence_lengths, batch_size, beam_width);
+    lengthCriterion<<<grid, block, 0, stream>>>(
+        finished, finishedSum, sequenceLimitLength, sequenceLengths, batchSize, beamWidth);
     sync_check_cuda_error();
 }
 

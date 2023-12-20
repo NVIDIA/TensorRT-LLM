@@ -1,91 +1,23 @@
-import logging as _log
-import os as _os
 import pathlib as _pl
-import subprocess as _sp
-import sys as _sys
-import typing as _tp
 
 import numpy as _np
-import pytest
 import torch as _tor
+from binding_test_utils import *
 
 import tensorrt_llm.bindings as _tb
 
 
-@pytest.fixture(scope="module")
-def llm_root() -> _pl.Path:
-    environ_root = _os.environ.get("LLM_ROOT", None)
-    return _pl.Path(environ_root) if environ_root is not None else _pl.Path(
-        __file__).parent.parent.parent
-
-
-@pytest.fixture(scope="module")
-def llm_model_root() -> _pl.Path | None:
-    return _os.environ.get("LLM_MODEL_ROOT", None)
-
-
-@pytest.fixture(scope="module")
-def resource_path(llm_root: _pl.Path) -> _pl.Path:
-    return llm_root / "cpp" / "tests" / "resources"
-
-
-@pytest.fixture(scope="module")
-def engine_path(resource_path: _pl.Path) -> _pl.Path:
-    return resource_path / "models" / "rt_engine"
-
-
-@pytest.fixture(scope="module")
-def data_path(resource_path: _pl.Path) -> _pl.Path:
-    return resource_path / "data"
-
-
-def run_command(command: _tp.Sequence[str],
-                cwd: _pl.Path,
-                *,
-                shell=False,
-                env=None) -> None:
-    _log.info("Running: cd %s && %s", str(cwd), " ".join(command))
-    _sp.check_call(command, cwd=cwd, shell=shell, env=env)
-
-
-def prepare_model_tests(
-    llm_root: _pl.Path,
-    resource_path: _pl.Path,
-    model_name: str,
-    model_cache_arg=[],
-):
-    scripts_dir = resource_path / "scripts"
-    python_exe = _sys.executable
-    model_env = {**_os.environ, "PYTHONPATH": f"examples/{model_name}"}
-    build_engines = [
-        python_exe,
-        str(scripts_dir / f"build_{model_name}_engines.py")
-    ] + model_cache_arg
-    run_command(build_engines, cwd=llm_root, env=model_env)
-
-    generate_expected_output = [
-        python_exe,
-        str(scripts_dir / f"generate_expected_{model_name}_output.py")
-    ]
-    run_command(generate_expected_output, cwd=llm_root, env=model_env)
-
-
-def sequence_lengths(sequences: _np.ndarray, pad_id: int) -> _np.ndarray:
-    return _np.apply_along_axis(lambda x: _np.searchsorted(x, True), 1,
-                                sequences == pad_id).astype("int32")
-
-
 @pytest.mark.parametrize(
-    "variant, results_file",
+    "variant, results_file, load_bytearray",
     [
-        ("fp32-default", "output_tokens_fp32_tp1_pp1.npy"),
-        ("fp32-plugin", "output_tokens_fp32_plugin_tp1_pp1.npy"),
-        ("fp16-default", "output_tokens_fp16_tp1_pp1.npy"),
-        ("fp16-plugin", "output_tokens_fp16_plugin_tp1_pp1.npy"),
+        ("fp32-default", "output_tokens_fp32_tp1_pp1.npy", True),
+        ("fp32-plugin", "output_tokens_fp32_plugin_tp1_pp1.npy", False),
+        ("fp16-default", "output_tokens_fp16_tp1_pp1.npy", True),
+        ("fp16-plugin", "output_tokens_fp16_plugin_tp1_pp1.npy", False),
         # ("fp16-plugin-packed", "output_tokens_fp16_plugin_packed_tp1_pp1.npy"),
         # ("fp16-plugin-packed-paged", "output_tokens_fp16_plugin_packed_paged_tp1_pp1.npy"),
     ])
-def test_gpt_session(variant, results_file, llm_root: _pl.Path,
+def test_gpt_session(variant, results_file, load_bytearray, llm_root: _pl.Path,
                      resource_path: _pl.Path, engine_path: _pl.Path,
                      data_path: _pl.Path, llm_model_root):
     model_dir = "gpt2"
@@ -134,7 +66,7 @@ def test_gpt_session(variant, results_file, llm_root: _pl.Path,
     model_path = engine_path / model_dir / variant / gpu_size_path
     assert model_path.is_dir()
     config_path = model_path / "config.json"
-    config_json = _tb.GptJsonConfig.parse_file(str(config_path))
+    config_json = _tb.GptJsonConfig.parse_file(config_path)
     assert config_json.tensor_parallelism == tp_size
     assert config_json.pipeline_parallelism == pp_size
     world_config = _tb.WorldConfig.mpi(tensor_parallelism=tp_size,
@@ -145,8 +77,16 @@ def test_gpt_session(variant, results_file, llm_root: _pl.Path,
                                           max_seq_length)
 
     model_config = config_json.model_config
-    session = _tb.GptSession(session_config, model_config, world_config,
-                             str(model_path / engine_filename))
+    full_engine_path = str(model_path / engine_filename)
+    if load_bytearray:
+        with open(full_engine_path, "rb") as f:
+            engine_data = bytearray(f.read())
+        session = _tb.GptSession(session_config, model_config, world_config,
+                                 engine_data)
+    else:
+        session = _tb.GptSession(session_config, model_config, world_config,
+                                 full_engine_path)
+
     assert isinstance(session, _tb.GptSession)
     assert isinstance(session.model_config, _tb.GptModelConfig)
     assert isinstance(session.world_config, _tb.WorldConfig)
@@ -174,12 +114,8 @@ def test_gpt_session(variant, results_file, llm_root: _pl.Path,
     generation_input.max_new_tokens = max_new_tokens
 
     for r in range(repetitions):
-        output_ids = _tor.empty((max_batch_size, max_seq_length),
-                                dtype=_tor.int32,
-                                device=cuda_device)
-        output_lengths = _tor.empty((max_batch_size, ),
-                                    dtype=_tor.int32,
-                                    device=cuda_device)
+        output_ids = _tor.empty(0, dtype=_tor.int32, device=cuda_device)
+        output_lengths = _tor.empty(0, dtype=_tor.int32, device=cuda_device)
         generation_output = _tb.GenerationOutput(output_ids, output_lengths)
         num_steps = 0
 

@@ -54,6 +54,8 @@ public:
 
     CUresult cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod, const char* name) const;
 
+    CUresult cuModuleGetGlobal(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, const char* name) const;
+
     CUresult cuLinkAddFile(CUlinkState state, CUjitInputType type, const char* path, unsigned int numOptions,
         CUjit_option* options, void** optionValues) const;
 
@@ -78,6 +80,7 @@ private:
     CUresult (*_cuLinkCreate)(unsigned int, CUjit_option*, void**, CUlinkState*);
     CUresult (*_cuModuleLoadData)(CUmodule*, const void*);
     CUresult (*_cuModuleGetFunction)(CUfunction*, CUmodule, const char*);
+    CUresult (*_cuModuleGetGlobal)(CUdeviceptr*, size_t*, CUmodule, const char*);
     CUresult (*_cuLinkAddFile)(CUlinkState, CUjitInputType, const char*, unsigned int, CUjit_option*, void**);
     CUresult (*_cuLinkAddData)(
         CUlinkState, CUjitInputType, void*, size_t, const char*, unsigned int, CUjit_option*, void**);

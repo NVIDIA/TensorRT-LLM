@@ -97,7 +97,7 @@ def serialize_engine(engine, path):
     if isinstance(engine, trt.ICudaEngine):
         engine = engine.serialize()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')

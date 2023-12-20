@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/plugins/common/checkMacrosPlugin.h"
 
@@ -103,21 +104,6 @@ inline cudaDataType_t trtToCublasDtype(nvinfer1::DataType type)
     default: TLLM_THROW("Not supported data type for cuBLAS");
     }
 }
-
-std::uintptr_t constexpr kCudaMemAlign = 128;
-
-int8_t* alignPtr(int8_t* ptr, uintptr_t to);
-
-int8_t* nextWorkspacePtrCommon(int8_t* ptr, uintptr_t previousWorkspaceSize, const uintptr_t alignment);
-
-int8_t* nextWorkspacePtr(
-    int8_t* const base, uintptr_t& offset, const uintptr_t size, const uintptr_t alignment = kCudaMemAlign);
-
-int8_t* nextWorkspacePtr(int8_t* ptr, uintptr_t previousWorkspaceSize);
-
-int8_t* nextWorkspacePtrWithAlignment(int8_t* ptr, uintptr_t previousWorkspaceSize, const uintptr_t alignment);
-
-size_t calculateTotalWorkspaceSize(size_t* workspaces, int count, const uintptr_t alignment = kCudaMemAlign);
 
 // Like std::unique_ptr, but does not prevent generation of default copy constructor when used as class members.
 // The copy constructor produces nullptr. So the plugin default copy constructor will not really copy this, and

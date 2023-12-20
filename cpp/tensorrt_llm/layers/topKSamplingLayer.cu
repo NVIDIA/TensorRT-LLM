@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
@@ -84,7 +85,7 @@ __global__ void setup_topk_runtime_args(int batch_size, uint32_t top_k, uint32_t
 template <typename T>
 void TopKSamplingLayer<T>::allocateBuffer(size_t const batch_size, std::vector<uint32_t> const& top_k)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     uint32_t max_top_k = (top_k.size() > 0) ? *std::max_element(std::begin(top_k), std::end(top_k)) : 1;
     if (max_top_k == 0)
     {
@@ -103,7 +104,7 @@ void TopKSamplingLayer<T>::allocateBuffer(size_t const batch_size, std::vector<u
 template <typename T>
 void TopKSamplingLayer<T>::freeBuffer()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     if (is_allocate_buffer_)
     {
         allocator_->free((void**) (&sampling_workspace_));
@@ -117,7 +118,7 @@ void TopKSamplingLayer<T>::freeBuffer()
 template <typename T>
 void TopKSamplingLayer<T>::setup(size_t const batch_size, SetupParams const& setupParams)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     BaseSamplingLayer<T>::setupBase(batch_size, setupParams);
 
     uint32_t const default_top_k = 0;
@@ -161,7 +162,7 @@ void TopKSamplingLayer<T>::setup(size_t const batch_size, SetupParams const& set
 template <typename T>
 void TopKSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingParams const& params)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const batch_size = outputs.output_ids_ptr.shape[0];
     auto const local_batch_size = params.logits.shape[0];
@@ -171,8 +172,12 @@ void TopKSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingPa
     auto* logits = !skip_any_ ? params.logits.template getPtr<T>() : runtime_logits_buf_;
     auto* end_ids = params.end_ids.template getPtr<const int>();
 
-    bool* finished_input = (params.finished) ? params.finished->template getPtr<bool>() : nullptr;
-    bool* finished_output = (outputs.finished) ? outputs.finished->template getPtr<bool>() : nullptr;
+    FinishedState* finished_input = (params.finished)
+        ? reinterpret_cast<FinishedState*>(params.finished->template getPtr<FinishedState::UnderlyingType>())
+        : nullptr;
+    FinishedState* finished_output = (outputs.finished)
+        ? reinterpret_cast<FinishedState*>(outputs.finished->template getPtr<FinishedState::UnderlyingType>())
+        : nullptr;
     invokeAddBiasEndMask(
         logits, (T*) (nullptr), end_ids, finished_input, local_batch_size, vocab_size_, vocab_size_padded_, stream_);
     sync_check_cuda_error();
@@ -182,7 +187,7 @@ void TopKSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingPa
 
     if (cum_log_probs != nullptr || output_log_probs != nullptr)
     {
-        invokeAddBiasSoftMax(logits, (T*) (nullptr), end_ids, finished_input, local_batch_size, vocab_size_,
+        invokeAddBiasSoftMax(logits, logits, (T*) (nullptr), end_ids, finished_input, local_batch_size, vocab_size_,
             vocab_size_padded_, stream_);
         sync_check_cuda_error();
     }
@@ -218,7 +223,7 @@ TopKSamplingLayer<T>::TopKSamplingLayer(TopKSamplingLayer<T> const& top_k_sampli
 template <typename T>
 TopKSamplingLayer<T>::~TopKSamplingLayer()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     freeBuffer();
 }
 

@@ -45,7 +45,7 @@ public:
     GptDecoderBatch(std::size_t vocabSize, std::size_t vocabSizePadded, CudaStreamPtr stream);
 
     //! Setup the decoder before calling `forward()`
-    void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxKvCacheLength, SizeType maxSequenceLength,
+    void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow, SizeType maxSequenceLength,
         SizeType maxTokensPerStep, nvinfer1::DataType dtype) override;
 
     //! @brief Initialize the decoder at `batchIdx` with a new `request`.
@@ -181,7 +181,10 @@ private:
     DecodingOutputPtr mJointDecodingOutput;
 
     std::vector<TensorPtr> mDraftTokenIds;
+    std::vector<TensorPtr> mDraftLogits;
+    std::vector<bool> mAcceptByLogits;
     TensorPtr mNumDraftTokens;
+    TensorPtr mCurandStates;
 
     std::vector<SizeType> mNbSteps;
     std::vector<bool> mFinished;
@@ -189,8 +192,15 @@ private:
     std::vector<SizeType> mMaxNewTokens;
     std::vector<SizeType> mBeamWidths;
     std::vector<SizeType> mGeneratedTokensPerStep;
+
+    TensorPtr mFinishedSteps; // [maxTokensPerStep, batchSize, beamWidth] finished states of type FinishedState
+                              // for each generated token of maxTokensPerStep, on gpu
+    TensorPtr mDraftProbs;    // [batchSize, maxDraftTokens, beamWidth, vocabPadded], temporary data for speculative
+                              // decoding accept by logits kernel, on gpu
+    TensorPtr mTargetProbs;   // [batchSize, maxDraftTokens+1, beamWidth, vocabPadded], temporary data for speculative
+                              // decoding accept by logits kernel, on gpu
     SizeType mMaxSequenceLength{};
-    SizeType mMaxKvCacheLength{};
+    SizeType mMaxAttentionWindow{};
     SizeType mActualBatchSize{};
     SizeType mMaxTokensPerStep{};
 };

@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/tensor.h"
 #include "tensorrt_llm/kernels/beamSearchTopkKernels.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/penaltyTypes.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
@@ -55,16 +56,16 @@ public:
     {
     public:
         ForwardParams(int step, int ite, tc::Tensor logits, tc::Tensor endIds, tc::Tensor src_cache_indirection,
-            int max_kv_cache_length, int max_seq_len)
+            int max_attention_window, int max_seq_len)
             : SoftmaxParams(step, ite, std::move(logits), std::move(endIds))
             , src_cache_indirection{std::move(src_cache_indirection)}
-            , max_kv_cache_length{max_kv_cache_length}
+            , max_attention_window{max_attention_window}
             , max_seq_len{max_seq_len}
         {
         }
 
         // mandatory parameters
-        int max_kv_cache_length;
+        int max_attention_window;
         int max_seq_len;
         tc::Tensor src_cache_indirection; // [local_batch_size, beam_width, max_seq_len]
 
@@ -121,7 +122,8 @@ private:
 };
 
 void update_indir_cache_kernelLauncher(int* tgt_indir_cache, const int* src_indir_cache, const int* beam_ids,
-    const bool* finished, int batch_dim, int beam_width, int max_seq_len, int ite, cudaStream_t stream);
+    const tensorrt_llm::kernels::FinishedState* finished, int batch_dim, int beam_width, int max_seq_len, int ite,
+    cudaStream_t stream);
 
 } // namespace layers
 } // namespace tensorrt_llm

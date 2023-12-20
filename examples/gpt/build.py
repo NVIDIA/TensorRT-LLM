@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import math
 import time
 from pathlib import Path
 from typing import List
@@ -23,7 +24,7 @@ import torch.multiprocessing as mp
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
-from tensorrt_llm.layers import PositionEmbeddingType
+from tensorrt_llm.layers import MoeConfig, PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import quantize_model
@@ -54,10 +55,32 @@ def serialize_engine(engine, path):
     logger.info(f'Serializing engine to {path}...')
     tik = time.time()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')
+
+
+def override_args_from_model_dir(args: argparse.Namespace) -> None:
+    if args.model_dir is not None:
+        logger.info(f"Setting model configuration from {args.model_dir}.")
+        parsed_params = parse_ft_config(Path(args.model_dir) / "config.ini")
+        args.n_embd = parsed_params["n_embd"]
+        args.n_head = parsed_params["n_head"]
+        args.n_layer = parsed_params["n_layer"]
+        args.n_positions = parsed_params["n_positions"]
+        args.vocab_size = parsed_params["vocab_size"]
+        args.hidden_act = parsed_params["hidden_act"]
+        if parsed_params["rotary_pct"] is not None:
+            args.rotary_pct = parsed_params["rotary_pct"]
+        if parsed_params["rotary_base"] is not None:
+            args.rotary_base = parsed_params["rotary_base"]
+        if parsed_params["rotary_scaling"] is not None:
+            args.rotary_scaling = parsed_params["rotary_scaling"]
+        args.bias = parsed_params["bias"]
+        args.dtype = parsed_params["dtype"]
+        args.inter_size = parsed_params["inter_size"]
+        args.multi_query_mode = parsed_params["multi_query_mode"]
 
 
 def parse_arguments(args):
@@ -152,7 +175,7 @@ def parse_arguments(args):
     parser.add_argument(
         '--output_dir',
         type=Path,
-        default='gpt_outputs',
+        default='engine_outputs',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
     )
@@ -232,7 +255,7 @@ def parse_arguments(args):
     )
     parser.add_argument('--tokens_per_block',
                         type=int,
-                        default=64,
+                        default=128,
                         help='Number of tokens per block in paged KV cache')
     parser.add_argument(
         '--max_prompt_embedding_table_size',
@@ -319,6 +342,59 @@ def parse_arguments(args):
         help=
         'Maximum lengths of draft tokens for speculative decoding target model.'
     )
+    parser.add_argument(
+        '--use_paged_context_fmha',
+        action='store_true',
+        help=
+        'Activates paged context FMHA. This mode of the context FMHA is required for chunked context, speculative decoding and reuse of KV cache blocks. Context FMHA performance is worse when this mode is on.'
+    )
+    parser.add_argument(
+        '--use_context_fmha_for_generation',
+        action='store_true',
+        help=
+        'Activates context FMHA for generation phase instead of MMHA. Use only for testing and debug.'
+    )
+    parser.add_argument(
+        '--lora_target_modules',
+        nargs='+',
+        default=None,
+        choices=[
+            "attn_qkv",
+            "attn_dense",
+            "mlp_h_to_4h",
+            "mlp_gate",
+            "mlp_4h_to_h",
+        ],
+        help=
+        "Add lora in which modules. Only be activated when use_lora_plugin is enabled."
+    )
+
+    parser.add_argument(
+        '--moe_num_experts',
+        default=0,
+        type=int,
+        help='Specify the number of experts to use for MOE layers')
+    parser.add_argument(
+        '--moe_top_k',
+        default=0,
+        type=int,
+        help=
+        'Specify the top_k value to use for MOE layers. Default to 1 if --moe_num_experts is set'
+    )
+    parser.add_argument(
+        '--moe_tp_mode',
+        default=MoeConfig.ParallelismMode.TENSOR_PARALLEL,
+        type=int,
+        help=
+        'Controls how to distribute experts in TP. Check layers/moe.py for accepted values',
+    )
+    parser.add_argument(
+        '--moe_renorm_mode',
+        default=MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE,
+        type=int,
+        help=
+        'Controls renormalization after gate logits. Check layers/moe.py for accepted values',
+    )
     args = parser.parse_args(args)
     logger.set_level(args.log_level)
 
@@ -332,21 +408,7 @@ def parse_arguments(args):
     if args.inter_size is None:
         args.inter_size = 4 * args.n_embd
 
-    if args.model_dir is not None:
-        logger.info(f"Setting model configuration from {args.model_dir}.")
-        n_embd, n_head, n_layer, n_positions, vocab_size, _, hidden_act, rotary_pct, bias, inter_size, multi_query_mode, dtype, prompt_num_tasks, prompt_max_vocab_size = parse_ft_config(
-            Path(args.model_dir) / "config.ini")
-        args.n_embd = n_embd
-        args.n_head = n_head
-        args.n_layer = n_layer
-        args.n_positions = n_positions
-        args.vocab_size = vocab_size
-        args.hidden_act = hidden_act
-        args.rotary_pct = rotary_pct
-        args.bias = bias
-        args.dtype = dtype
-        args.inter_size = inter_size
-        args.multi_query_mode = multi_query_mode
+    override_args_from_model_dir(args)
     plugins_args = [
         'use_gpt_attention_plugin', 'use_gemm_plugin', 'use_layernorm_plugin',
         'use_lookup_plugin', 'use_lora_plugin'
@@ -375,6 +437,12 @@ def parse_arguments(args):
         if not args.paged_kv_cache:
             args.paged_kv_cache = True
             logger.info("Using paged KV cache for inflight batching mode.")
+
+    assert (math.log2(args.tokens_per_block).is_integer()
+            ), "tokens_per_block must be power of 2"
+    if args.enable_context_fmha or args.enable_context_fmha_fp32_acc:
+        assert (args.tokens_per_block >=
+                128), "Context fMHA requires >= 128 tokens per block"
 
     if args.use_smooth_quant:
         args.quant_mode = QuantMode.use_smooth_quant(args.per_token,
@@ -408,6 +476,12 @@ def parse_arguments(args):
 
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha or args.enable_context_fmha_fp32_acc
+
+    if args.moe_num_experts and args.moe_top_k == 0:
+        args.moe_top_k = 1
+    args.moe_config = MoeConfig(args.moe_num_experts, args.moe_top_k,
+                                args.moe_tp_mode,
+                                args.moe_renorm_mode).validate()
 
     return args
 
@@ -470,7 +544,9 @@ def build_rank_engine(builder: Builder,
         use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
-        share_embedding_table=share_embedding_table)
+        share_embedding_table=share_embedding_table,
+        moe_config=args.moe_config,
+    )
 
     if args.use_smooth_quant or args.use_weight_only:
         tensorrt_llm_gpt = quantize_model(tensorrt_llm_gpt, args.quant_mode)
@@ -549,6 +625,17 @@ def build_rank_engine(builder: Builder,
         # Use the plugin for the embedding parallelism and sharing
         network.plugin_config.set_lookup_plugin(dtype=args.dtype)
 
+    if args.use_paged_context_fmha or args.max_draft_len > 0:
+        assert args.enable_context_fmha or args.enable_context_fmha_fp32_acc, "context fmha must be enabled"
+        network.plugin_config.set_paged_context_fmha()
+
+    if args.use_context_fmha_for_generation:
+        logger.warning(
+            f'use_context_fmha_for_generation is set. This flag must be used only for testing'
+        )
+        assert args.use_gpt_attention_plugin and args.paged_kv_cache and args.use_paged_context_fmha, "use_context_fmha_for_generation must be used with paged KV cache and attention."
+        network.plugin_config.set_context_fmha_for_generation()
+
     with net_guard(network):
         # Prepare
         network.set_named_parameters(tensorrt_llm_gpt.named_parameters())
@@ -563,7 +650,8 @@ def build_rank_engine(builder: Builder,
             args.max_num_tokens,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size,
             gather_all_token_logits=args.gather_all_token_logits,
-            max_draft_len=args.max_draft_len)
+            max_draft_len=args.max_draft_len,
+            lora_target_modules=args.lora_target_modules)
         tensorrt_llm_gpt(*inputs)
 
     tensorrt_llm.graph_rewriting.optimize(network)
@@ -624,7 +712,9 @@ def build(rank, args):
             max_prompt_embedding_table_size,
             gather_all_token_logits=args.gather_all_token_logits,
             quant_mode=args.quant_mode,
-            use_parallel_embedding=args.use_parallel_embedding)
+            use_parallel_embedding=args.use_parallel_embedding,
+            lora_target_modules=args.lora_target_modules,
+        )
 
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.world_size,
                                       cur_rank)

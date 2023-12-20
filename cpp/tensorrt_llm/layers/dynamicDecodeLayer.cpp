@@ -37,7 +37,7 @@ namespace layers
 template <typename T>
 void DynamicDecodeLayer<T>::initialize()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     mOnlineBeamsearchDecode = std::make_unique<OnlineBeamSearchLayer<T>>(
         vocab_size_, vocab_size_padded_, stream_, allocator_, is_free_buffer_after_forward_);
 
@@ -58,14 +58,14 @@ DynamicDecodeLayer<T>::DynamicDecodeLayer(size_t vocab_size, size_t vocab_size_p
     , vocab_size_padded_(vocab_size_padded)
     , cuda_device_prop_(cuda_device_prop)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     initialize();
 }
 
 template <typename T>
 DynamicDecodeLayer<T>::~DynamicDecodeLayer()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     freeBuffer();
 }
 
@@ -76,7 +76,7 @@ DynamicDecodeLayer<T>::DynamicDecodeLayer(DynamicDecodeLayer const& dynamic_deco
     , vocab_size_padded_(dynamic_decode_layer.vocab_size_padded_)
     , cuda_device_prop_(dynamic_decode_layer.cuda_device_prop_)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     initialize();
 }
 
@@ -117,7 +117,7 @@ bool hasDiffRuntimeArgs(DecodingSetupParams const& params)
 template <typename T>
 void DynamicDecodeLayer<T>::setup(size_t batch_size, size_t beam_width, SetupParams const& setupParams)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
 
     if (beam_width == 1)
     { // sampling layers
@@ -159,7 +159,7 @@ void DynamicDecodeLayer<T>::setup(size_t batch_size, size_t beam_width, SetupPar
 template <typename T>
 void DynamicDecodeLayer<T>::allocateBuffer(size_t batch_size, size_t beam_width, size_t max_seq_len)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     mIdsPtrHost->resize(2 * batch_size);
     zero_parent_ids = allocator_->reMalloc(zero_parent_ids, sizeof(int*) * 2 * batch_size, false);
 }
@@ -167,14 +167,14 @@ void DynamicDecodeLayer<T>::allocateBuffer(size_t batch_size, size_t beam_width,
 template <typename T>
 void DynamicDecodeLayer<T>::freeBuffer()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     allocator_->free((void**) &zero_parent_ids);
 }
 
 template <typename T>
 void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& params)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
 
     const auto ite = params.ite;
     const auto step = params.step;
@@ -226,7 +226,8 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
 
         invokeBanRepeatNgram(logits.template getPtrWithOffset<T>(decode_vocab_size_units_offset),
             outputs.output_ids_ptr.template getPtr<const int*>(),
-            params.finished.value_or(Tensor{}).template getPtr<bool>(),
+            reinterpret_cast<FinishedState*>(
+                params.finished.value_or(Tensor{}).template getPtr<FinishedState::UnderlyingType>()),
             outputs.parent_ids.value_or(Tensor{}).template getPtr<const int>(), batch_size, local_batch_size,
             beam_width, no_repeat_ngram_size_buf, id_offset, vocab_size_padded_, step, stream_);
     }
@@ -295,7 +296,7 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
             auto const end_id_offset
                 = end_ids.slice({dynamic_decode_batch_size}, dynamic_ite * dynamic_decode_batch_size);
             typename BaseBeamSearchLayer<T>::ForwardParams dynamic_decode_input_tensors{step, ite, logits_offset,
-                end_id_offset, *params.src_cache_indirection, static_cast<std::int32_t>(params.max_kv_cache_length),
+                end_id_offset, *params.src_cache_indirection, static_cast<std::int32_t>(params.max_attention_window),
                 static_cast<std::int32_t>(max_seq_len)};
 
             dynamic_decode_input_tensors.embedding_bias = params.embedding_bias;
@@ -396,14 +397,16 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
             outputs.parent_ids_ptr.template getPtr<const int*>(),
             params.stop_words_list->template getPtrWithOffset<const int>(
                 ite * local_batch_size * 2 * stop_words_length),
-            outputs.finished->template getPtrWithOffset<bool>(id_offset),
-            outputs.sequence_length->template getPtr<int>(), id_offset, stop_words_length, batch_size, beam_width,
-            max_seq_len, stream_);
+            reinterpret_cast<FinishedState*>(
+                outputs.finished->template getPtrWithOffset<FinishedState::UnderlyingType>(id_offset)),
+            outputs.sequence_length->template getPtr<int>(), stop_words_length, batch_size, beam_width, max_seq_len,
+            stream_);
     }
 
     if (params.sequence_limit_length)
     {
-        invokeLengthCriterion(outputs.finished->template getPtr<bool>(),
+        invokeLengthCriterion(
+            reinterpret_cast<FinishedState*>(outputs.finished->template getPtr<FinishedState::UnderlyingType>()),
             outputs.finished_sum ? outputs.finished_sum->template getPtr<int>() : nullptr,
             params.sequence_limit_length->template getPtr<const uint32_t>(),
             outputs.sequence_length->template getPtr<int>(), batch_size, beam_width, stream_);

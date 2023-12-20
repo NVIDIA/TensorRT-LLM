@@ -21,6 +21,7 @@ Welcome to TensorRT-LLM's documentation!
    2023-05-17-how-to-add-a-new-model.md
    graph-rewriting.md
    memory.md
+   new_workflow.md
 
 Python API
 ----------

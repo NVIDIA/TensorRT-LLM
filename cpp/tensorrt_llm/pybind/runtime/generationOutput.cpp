@@ -19,6 +19,11 @@
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
 
+#include <pybind11/functional.h>
+#include <pybind11/operators.h>
+#include <pybind11/stl.h>
+#include <torch/extension.h>
+
 namespace tr = tensorrt_llm::runtime;
 
 using namespace tensorrt_llm::pybind::runtime;
@@ -35,6 +40,10 @@ std::shared_ptr<tr::GenerationOutput> GenerationOutput::toTrtLlm() const
     {
         output->contextLogits = tr::TorchView::of(contextLogits.value());
     }
+    if (generationLogits)
+    {
+        output->generationLogits = tr::TorchView::of(generationLogits.value());
+    }
 
     if (onTokenGenerated)
     {
@@ -43,4 +52,16 @@ std::shared_ptr<tr::GenerationOutput> GenerationOutput::toTrtLlm() const
         { delegate(tr::Torch::tensor(ids), step, finished); };
     }
     return output;
+}
+
+void GenerationOutput::initBindings(py::module_& m)
+{
+    py::class_<GenerationOutput>(m, "GenerationOutput")
+        .def(py::init<GenerationOutput::TensorPtr, GenerationOutput::TensorPtr>(), py::arg("ids"), py::arg("lengths"))
+        .def_readwrite("ids", &GenerationOutput::ids)
+        .def_readwrite("lengths", &GenerationOutput::lengths)
+        .def_readwrite("log_probs", &GenerationOutput::logProbs)
+        .def_readwrite("context_logits", &GenerationOutput::contextLogits)
+        .def_readwrite("generation_logits", &GenerationOutput::generationLogits)
+        .def_readwrite("on_token_generated", &GenerationOutput::onTokenGenerated);
 }

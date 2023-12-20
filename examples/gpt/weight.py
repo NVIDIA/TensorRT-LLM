@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import configparser
+import logging
 import time
 from pathlib import Path
 
@@ -26,6 +27,8 @@ from tensorrt_llm._utils import (numpy_to_torch, pad_vocab_size,
 from tensorrt_llm.functional import is_gated_activation
 from tensorrt_llm.models import GPTLMHeadModel
 from tensorrt_llm.quantization import QuantMode
+
+LOGGER = logging.getLogger(__name__)
 
 
 def gen_suffix(rank, use_smooth_quant, quant_per_channel):
@@ -68,7 +71,29 @@ def parse_ft_config(ini_file):
     do_layer_norm_before = gpt_config.getboolean('gpt',
                                                  'do_layer_norm_before',
                                                  fallback=True)
-    rotary_pct = gpt_config.getfloat('gpt', 'rotary_pct', fallback=0.0)
+    rotary_base = gpt_config.getfloat('gpt', 'rotary_base', fallback=None)
+    rotary_scaling_type = gpt_config.get('gpt',
+                                         'rotary_scaling_type',
+                                         fallback=None)
+    rotary_scaling_factor = gpt_config.get('gpt',
+                                           'rotary_scaling_factor',
+                                           fallback=None)
+    if rotary_scaling_type is None:
+        if rotary_scaling_factor is not None:
+            raise ValueError(
+                f"'rotary_scaling_factor={rotary_scaling_factor}' is found in ini "
+                f"config file {ini_file}, whereas 'rotary_scaling_type' is missing "
+                f"in the config. The 'rotary_scaling_factor' will be ignored and "
+                f"rotary scaling will not be used.")
+        rotary_scaling = None
+    else:
+        if rotary_scaling_factor is None:
+            raise ValueError(
+                f"'rotary_scaling_factor={rotary_scaling_factor}' was not found "
+                f"in ini config file {ini_file}, whereas 'rotary_scaling_type' is "
+                f"provided  and equals {repr(rotary_scaling_type)}.")
+        rotary_scaling = [rotary_scaling_type, rotary_scaling_factor]
+    rotary_pct = gpt_config.getfloat('gpt', 'rotary_pct', fallback=None)
     hidden_act = gpt_config.get('gpt', 'activation_function')
     bias = gpt_config.getboolean('gpt', 'bias', fallback=True)
     inter_size = gpt_config.getint('gpt', 'intermediate_size', fallback=None)
@@ -84,7 +109,24 @@ def parse_ft_config(ini_file):
     prompt_max_vocab_size = gpt_config.getint('gpt',
                                               'prompt_max_vocab_size',
                                               fallback=0)
-    return n_embd, n_head, n_layer, n_positions, vocab_size, do_layer_norm_before, hidden_act, rotary_pct, bias, inter_size, multi_query_mode, dtype, prompt_num_tasks, prompt_max_vocab_size
+    return {
+        "n_embd": n_embd,
+        "n_head": n_head,
+        "n_layer": n_layer,
+        "n_positions": n_positions,
+        "vocab_size": vocab_size,
+        "do_layer_norm_before": do_layer_norm_before,
+        "hidden_act": hidden_act,
+        "rotary_pct": rotary_pct,
+        "rotary_base": rotary_base,
+        "rotary_scaling": rotary_scaling,
+        "bias": bias,
+        "inter_size": inter_size,
+        "multi_query_mode": multi_query_mode,
+        "dtype": dtype,
+        "prompt_num_tasks": prompt_num_tasks,
+        "prompt_max_vocab_size": prompt_max_vocab_size
+    }
 
 
 def check_embedding_share(dir_path):
@@ -112,8 +154,18 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
         plugin_weight_only_quant_type = torch.int8
     elif quant_mode.is_int4_weight_only():
         plugin_weight_only_quant_type = torch.quint4x2
-    n_embd, n_head, n_layer, n_positions, vocab_size, do_layer_norm_before, hidden_act, rotary_pct, bias, inter_size, multi_query_mode, *_ = parse_ft_config(
-        Path(dir_path) / 'config.ini')
+    _parsed_params = parse_ft_config(Path(dir_path) / 'config.ini')
+    n_embd = _parsed_params["n_embd"]
+    n_head = _parsed_params["n_head"]
+    n_layer = _parsed_params["n_layer"]
+    n_positions = _parsed_params["n_positions"]
+    vocab_size = _parsed_params["vocab_size"]
+    do_layer_norm_before = _parsed_params["do_layer_norm_before"]
+    hidden_act = _parsed_params["hidden_act"]
+    bias = _parsed_params["bias"]
+    inter_size = _parsed_params["inter_size"]
+    multi_query_mode = _parsed_params["multi_query_mode"]
+
     np_dtype = str_dtype_to_np(dtype)
 
     def fromfile(dir_path, name, shape=None, dtype=None):

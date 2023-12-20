@@ -179,8 +179,7 @@ def load_from_hf_falcon(trtllm_falcon: tensorrt_llm.models.FalconForCausalLM,
         dtype = tensorrt_llm._utils.str_dtype_to_torch(dtype)
     num_kv_heads = trtllm_falcon.num_kv_heads
 
-    layers_range = trtllm_falcon.get_transformer_layers(
-        trtllm_falcon.mapping, trtllm_falcon.num_layers)
+    layers_range = trtllm_falcon.mapping.pp_layers(trtllm_falcon.num_layers)
     for i in layers_range:
         prefix = f'transformer.h.{i}'
         layer = trtllm_falcon.layers[i - layers_range[0]]
@@ -348,8 +347,7 @@ def load_from_hf_checkpoint(
     def is_bias(_name):
         return 'bias' in _name
 
-    layers_range = trtllm_falcon.get_transformer_layers(
-        trtllm_falcon.mapping, trtllm_falcon.num_layers)
+    layers_range = trtllm_falcon.mapping.pp_layers(trtllm_falcon.num_layers)
     for model_file in iterate_shard_files(model_dir, mapping.tp_rank):
         logger.debug(f'Loading file {str(model_file)}...')
         state_dict = load_state_dict(model_file, dtype)

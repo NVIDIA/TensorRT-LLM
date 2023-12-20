@@ -12,29 +12,57 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import time
+from multiprocessing import Event, Process, Queue
 
-import pynvml
-
-
-def get_memory_info(handle):
-    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle,
-                                              version=pynvml.nvmlMemory_v2)
-    total = round(mem_info.total / 1024 / 1024 / 1024, 2)
-    used = round(mem_info.used / 1024 / 1024 / 1024, 2)
-    free = round(mem_info.free / 1024 / 1024 / 1024, 2)
-    return total, used, free
+from tensorrt_llm.logger import logger
+from tensorrt_llm.profiler import (MemUnitType, bytes_to_target_unit,
+                                   device_memory_info)
 
 
-def mem_monitor(q1, q2):
-    pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+class MemoryMonitor:
 
-    peak_used = 0
-    while q1.empty():
-        _, used, _ = get_memory_info(handle)
-        peak_used = max(used, peak_used)
-        time.sleep(0.1)
+    def __init__(self, query_interval=0.1):
+        self.query_interval = query_interval  # second(s)
+        self.mem_monitor_process = None
+        # bytes
+        self._peak_host_memory = 0
+        self._peak_device_memory = 0
 
-    pynvml.nvmlShutdown()
-    q2.put(peak_used)
+        self.device_handles = {}
+
+        self.signal_event = Event()  # Sending signal to subprocess
+        self.peak_mem_queue = Queue()  # Receiving results from subprocess
+
+    def start(self):
+        self.mem_monitor_process = Process(target=self._upd_peak_memory_usage,
+                                           args=(self.signal_event,
+                                                 self.peak_mem_queue))
+        self.mem_monitor_process.start()
+        logger.debug("Launched memory monitor subprocess.")
+
+    def kill(self):
+        if self.mem_monitor_process is not None:
+            self.mem_monitor_process.kill()
+            logger.debug("Memory monitor subprocess is killed.")
+
+    def stop(self):
+        self.signal_event.set()
+        logger.debug("Sent signal to stop memory monitor subprocess.")
+
+        self._peak_device_memory = max(self._peak_device_memory,
+                                       self.peak_mem_queue.get())
+
+        self.mem_monitor_process.join()
+        self.mem_monitor_process = None
+        logger.debug("Memory monitor subprocess joined.")
+
+    def _upd_peak_memory_usage(self, signal_event, peak_mem_queue):
+        peak_used, _, _ = device_memory_info()
+        while not signal_event.is_set():
+            used, _, _ = device_memory_info()
+            peak_used = max(used, peak_used)
+        peak_mem_queue.put(peak_used)
+
+    def get_peak_memory_usage(self, unit: MemUnitType = 'GiB'):
+        return bytes_to_target_unit(self._peak_host_memory, unit), \
+            bytes_to_target_unit(self._peak_device_memory, unit)

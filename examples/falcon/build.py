@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import math
 import os
 import time
 from pathlib import Path
@@ -110,7 +111,7 @@ def serialize_engine(engine, path):
     logger.info(f'Serializing engine to {path}...')
     tik = time.time()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')
@@ -242,7 +243,7 @@ def parse_arguments():
     parser.add_argument(
         '--output_dir',
         type=str,
-        default='falcon_outputs',
+        default='engine_outputs',
         help='The path to save the serialized engine files, timing cache '
         'file and model configs')
     parser.add_argument('--remove_input_padding',
@@ -286,7 +287,7 @@ def parse_arguments():
     )
     parser.add_argument('--tokens_per_block',
                         type=int,
-                        default=64,
+                        default=128,
                         help='Number of tokens per block in paged KV cache')
     parser.add_argument(
         '--max_num_tokens',
@@ -353,9 +354,15 @@ def parse_arguments():
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha
 
+    assert (math.log2(args.tokens_per_block).is_integer()
+            ), "tokens_per_block must be power of 2"
+    if args.enable_context_fmha or args.enable_context_fmha_fp32_acc:
+        assert (args.tokens_per_block >=
+                128), "Context fMHA requires >= 128 tokens per block"
+
     args.quant_mode = QuantMode(0)
     if args.use_weight_only:
-        assert args.enable_fp8, "FP8 and Weight-only cannot be activated simultaneously!"
+        assert args.enable_fp8 is False, "FP8 and Weight-only cannot be activated simultaneously!"
         if args.weight_only_precision == 'int4_awq':
             args.quant_mode = QuantMode.from_description(
                 quantize_weights=True,
@@ -470,7 +477,7 @@ def build_rank_engine(builder: Builder,
     tensorrt_llm_falcon = quantize_model(tensorrt_llm_falcon, args.quant_mode,
                                          **quantize_kwargs)
 
-    if args.per_group:
+    if args.quant_ckpt_path:
         load_from_awq_falcon(tensorrt_llm_falcon=tensorrt_llm_falcon,
                              quant_ckpt_path=args.quant_ckpt_path,
                              mapping=mapping,

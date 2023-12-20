@@ -14,6 +14,7 @@
 # limitations under the License.
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 from typing import List
@@ -58,7 +59,7 @@ def serialize_engine(engine, path):
     logger.info(f'Serializing engine to {path}...')
     tik = time.time()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')
@@ -100,13 +101,14 @@ def parse_arguments(args):
     )
     parser.add_argument(
         '--world_size',
+        '-ws',
         type=int,
         default=1,
         help='world size, only support tensor parallelism now',
     )
-    parser.add_argument('--tp_size', type=int, default=1)
-    parser.add_argument('--pp_size', type=int, default=1)
-    parser.add_argument('--model_dir', type=Path, default=None)
+    parser.add_argument('--tp_size', '-tp', type=int, default=1)
+    parser.add_argument('--pp_size', '-pp', type=int, default=1)
+    parser.add_argument('--model_dir', type=str, default=None)
     parser.add_argument('--quant_ckpt_path', type=str, default="awq/")
     parser.add_argument(
         '--dtype',
@@ -209,7 +211,7 @@ def parse_arguments(args):
     parser.add_argument(
         '--output_dir',
         type=Path,
-        default=None,
+        default='engine_outputs',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
     )
@@ -316,7 +318,7 @@ def parse_arguments(args):
     parser.add_argument(
         '--tokens_per_block',
         type=int,
-        default=64,
+        default=128,
         help='Number of tokens per block in paged KV cache',
     )
 
@@ -365,14 +367,15 @@ def parse_arguments(args):
     assert args.world_size == args.tp_size * args.pp_size  # only TP is supported now
 
     if args.model_dir is None:
-        args.model_dir = Path(args.model_name)
-    if args.output_dir is None:
-        args.output_dir = Path("output_" + args.model_name)
-    with open(args.model_dir / "config.json", "r") as f:
+        args.model_dir = args.model_name
+    with open(Path(args.model_dir) / "config.json", "r") as f:
         js = json.loads(f.read())
 
     if args.model_name in ["chatglm_6b", "glm_10b"]:
         assert args.max_input_len < js["max_sequence_length"]
+
+    if args.output_dir is None:
+        args.output_dir = Path("output_" + args.model_name)
 
     if args.model_name in ["chatglm_6b"]:
         args.apply_query_key_layer_scaling = False
@@ -386,6 +389,7 @@ def parse_arguments(args):
             args.max_output_len,
             js["max_sequence_length"],
         )
+        args.multi_block_mode = False
         args.multi_query_mode = False
         args.norm_epsilon = js["layernorm_epsilon"]
         args.num_heads = js["num_attention_heads"]
@@ -415,7 +419,8 @@ def parse_arguments(args):
             args.max_output_len,
             js["seq_length"],
         )
-        args.multi_query_mode = js["multi_query_attention"]
+        args.multi_block_mode = False
+        args.multi_query_mode = False  # regardless of config.json
         args.norm_epsilon = js["layernorm_epsilon"]
         args.num_heads = js["num_attention_heads"]
         args.num_kv_heads = js["multi_query_group_num"]
@@ -441,6 +446,7 @@ def parse_arguments(args):
             js["max_sequence_length"],
             True,
         )
+        args.multi_block_mode = False
         args.multi_query_mode = False
         args.norm_epsilon = 1.0e-5
         args.num_heads = js["num_attention_heads"]
@@ -489,6 +495,12 @@ def parse_arguments(args):
 
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha
+
+    assert (math.log2(args.tokens_per_block).is_integer()
+            ), "tokens_per_block must be power of 2"
+    if args.enable_context_fmha or args.enable_context_fmha_fp32_acc:
+        assert (args.tokens_per_block >=
+                128), "Context fMHA requires >= 128 tokens per block"
 
     logger.info(' Build Arguments '.center(100, '='))
     for k, v in vars(args).items():
@@ -653,7 +665,7 @@ def build(rank, args):
     torch.cuda.set_device(rank % args.gpus_per_node)
     logger.set_level(args.log_level)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    timing_cache_file = args.output_dir / "model.cache"
+    timing_cache_file = args.timing_cache
     timing_cache = timing_cache_file
 
     builder = Builder()

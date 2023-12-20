@@ -18,6 +18,9 @@ RUN bash ./install_base.sh && rm install_base.sh
 COPY docker/common/install_cmake.sh install_cmake.sh
 RUN bash ./install_cmake.sh && rm install_cmake.sh
 
+COPY docker/common/install_ccache.sh install_ccache.sh
+RUN bash ./install_ccache.sh && rm install_ccache.sh
+
 # Download & install internal TRT release
 ARG TRT_VER CUDA_VER CUDNN_VER NCCL_VER CUBLAS_VER
 COPY docker/common/install_tensorrt.sh install_tensorrt.sh
@@ -50,7 +53,7 @@ COPY benchmarks benchmarks
 COPY scripts scripts
 COPY tensorrt_llm tensorrt_llm
 COPY 3rdparty 3rdparty
-COPY setup.py requirements.txt ./
+COPY setup.py requirements.txt requirements-dev.txt ./
 
 ARG BUILD_WHEEL_ARGS="--clean --trt_root /usr/local/tensorrt"
 RUN python3 scripts/build_wheel.py ${BUILD_WHEEL_ARGS}

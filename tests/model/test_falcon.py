@@ -140,20 +140,29 @@ class TestFalcon(unittest.TestCase):
                                 use_refit=False,
                                 use_gpt_attengion_plugin=False,
                                 use_gemm_plugin=False,
-                                use_layernorm_plugin=False,
                                 enable_remove_input_padding=False,
                                 context_fmha_type=ContextFMHAType.disabled,
                                 log_level: str = 'error'):
         tensorrt_llm.logger.set_level(log_level)
         mapping = tensorrt_llm.Mapping(world_size, rank)
         builder = Builder()
+
+        builder_config = builder.create_builder_config(
+            name=model_name,
+            precision=dtype,
+            timing_cache='model.cache',
+            tensor_parallel=world_size,
+            use_alibi=hf_config.alibi,
+            parallel_attention=hf_config.parallel_attn,
+            use_refit=use_refit,
+            strongly_typed=(dtype == "float16"),
+        )
+
         network = builder.create_network()
         if use_gpt_attengion_plugin:
             network.plugin_config.set_gpt_attention_plugin(dtype)
         if use_gemm_plugin:
             network.plugin_config.set_gemm_plugin(dtype)
-        if use_layernorm_plugin:
-            network.plugin_config.set_layernorm_plugin(dtype)
         if enable_remove_input_padding:
             network.plugin_config.enable_remove_input_padding()
         if world_size > 1:
@@ -171,15 +180,6 @@ class TestFalcon(unittest.TestCase):
                                 tensor_parallel=world_size,
                                 rank=rank)
 
-        builder_config = builder.create_builder_config(
-            name=model_name,
-            precision=dtype,
-            timing_cache='model.cache',
-            tensor_parallel=world_size,
-            use_alibi=hf_config.alibi,
-            parallel_attention=hf_config.parallel_attn,
-            use_refit=use_refit,
-        )
         engine_buffer = builder.build_engine(network, builder_config)
         runtime = tensorrt_llm.runtime.generation._Runtime(
             engine_buffer, mapping)
@@ -347,8 +347,8 @@ class TestFalcon(unittest.TestCase):
         # past kv length: (length, is_context)
         host_past_key_value_lengths = torch.tensor([0] * batch_size,
                                                    dtype=torch.int32)
-        host_max_kv_cache_lengths = torch.tensor([total_length],
-                                                 dtype=torch.int32)
+        host_max_attention_window_sizes = torch.tensor([total_length],
+                                                       dtype=torch.int32)
 
         ctx_buffer = {
             'input_ids': ctx_input_ids.contiguous(),
@@ -376,7 +376,7 @@ class TestFalcon(unittest.TestCase):
                                 head_dim)
         for i in range(hf_config.num_hidden_layers):
             ctx_shape[f'past_key_value_{i}'] = past_kv_shape
-            ctx_shape[f'host_max_kv_cache_length_{i}'] = (1, )
+            ctx_shape[f'host_max_attention_window_size_{i}'] = (1, )
             ctx_buffer[f'present_key_value_{i}'] = torch.zeros(
                 present_kv_shape,
                 dtype=str_dtype_to_torch(kv_dtype),
@@ -385,7 +385,7 @@ class TestFalcon(unittest.TestCase):
                 ctx_buffer[f'past_key_value_{i}'] = ctx_buffer[
                     f'present_key_value_{i}']
                 ctx_buffer[
-                    f'host_max_kv_cache_length_{i}'] = host_max_kv_cache_lengths
+                    f'host_max_attention_window_size_{i}'] = host_max_attention_window_sizes
             else:
                 ctx_buffer[f'past_key_value_{i}'] = torch.zeros(
                     (1, ), dtype=str_dtype_to_torch(kv_dtype), device=device)
@@ -456,7 +456,7 @@ class TestFalcon(unittest.TestCase):
                 # gpt_attention_plugin shares past/present cache.
                 step1_buffer[f'present_key_value_{i}'] = kv_cache
                 step1_buffer[
-                    f'host_max_kv_cache_length_{i}'] = host_max_kv_cache_lengths
+                    f'host_max_attention_window_size_{i}'] = host_max_attention_window_sizes
         step1_shape = {k: v.shape for k, v in step1_buffer.items()}
 
         context = runtime.context_1

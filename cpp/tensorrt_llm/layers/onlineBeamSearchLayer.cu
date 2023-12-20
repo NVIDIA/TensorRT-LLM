@@ -31,26 +31,29 @@ static const int SMALL_TOP_K_SOFTMAX_MAX_VOC_PARTS = 128;
 static const int MAX_K = 4;
 
 template <typename T>
-__global__ void update_kernel(bool* finished, int** parent_ids_ptr, int* sequence_lengths, int** output_ids_ptr,
-    BeamHypotheses beam_hyps, const int vocab_size, const int* end_ids, const int local_batch_size,
-    const int beam_width, const int max_seq_len)
+__global__ void update_kernel(FinishedState* finished, int** parent_ids_ptr, int* sequence_lengths,
+    int** output_ids_ptr, BeamHypotheses beam_hyps, const int vocab_size, const int* end_ids,
+    const int local_batch_size, const int beam_width, const int max_seq_len)
 {
     extern __shared__ char s_buf[]; // intermediate result
     int* s_sequence_lengths = (int*) (s_buf);
 
     for (int beam_idx = threadIdx.x; beam_idx < beam_width; beam_idx += blockDim.x)
     {
-        s_sequence_lengths[beam_idx] = sequence_lengths[blockIdx.x * beam_width + beam_idx];
+        const auto batch_beam_idx = blockIdx.x * beam_width + beam_idx;
+        s_sequence_lengths[beam_idx] = sequence_lengths[batch_beam_idx];
     }
     __syncthreads();
 
     for (int beam_idx = threadIdx.x; beam_idx < beam_width; beam_idx += blockDim.x)
     {
+        const auto batch_beam_idx = blockIdx.x * beam_width + beam_idx;
         const int current_step{s_sequence_lengths[beam_idx]};
 
         // Increase the seq_len even if the request has finished.
         // On the following iteration we check if the sequence has finished before
-        if (!finished[blockIdx.x * beam_width + beam_idx])
+        const auto finish_state = finished[batch_beam_idx];
+        if (!finish_state.isFinished())
         {
             s_sequence_lengths[beam_idx]++;
         }
@@ -59,8 +62,11 @@ __global__ void update_kernel(bool* finished, int** parent_ids_ptr, int* sequenc
         int new_beam_id{(new_word_id / vocab_size) % beam_width};
         new_word_id = new_word_id % vocab_size;
 
-        sequence_lengths[blockIdx.x * beam_width + beam_idx] = s_sequence_lengths[new_beam_id];
-        finished[beam_idx] = new_word_id == end_ids[blockIdx.x];
+        sequence_lengths[batch_beam_idx] = s_sequence_lengths[new_beam_id];
+        if (new_word_id == end_ids[blockIdx.x])
+        {
+            finished[batch_beam_idx].setFinishedEOS();
+        }
         parent_ids_ptr[blockIdx.x][beam_idx * max_seq_len + current_step] = new_beam_id;
         output_ids_ptr[blockIdx.x][beam_idx * max_seq_len + current_step] = new_word_id;
     }
@@ -70,13 +76,14 @@ __global__ void update_kernel(bool* finished, int** parent_ids_ptr, int* sequenc
         {
             for (int beam_idx = threadIdx.x; beam_idx < beam_width; beam_idx += blockDim.x)
             {
-                finished[blockIdx.x * beam_width + beam_idx] = true;
+                const auto batch_beam_idx = blockIdx.x * beam_width + beam_idx;
+                finished[batch_beam_idx].setFinished();
             }
         }
     }
 }
 
-void invokeUpdate(bool* finished, int** parent_ids_ptr, int* sequence_lengths, int** output_ids_ptr,
+void invokeUpdate(FinishedState* finished, int** parent_ids_ptr, int* sequence_lengths, int** output_ids_ptr,
     BeamHypotheses* beam_hyps, const int local_batch_size, const int beam_width, const int vocab_size_padded,
     const int* end_ids, const int max_seq_len, cudaStream_t stream)
 {
@@ -90,7 +97,7 @@ void invokeUpdate(bool* finished, int** parent_ids_ptr, int* sequence_lengths, i
 template <typename T>
 void OnlineBeamSearchLayer<T>::setup(size_t batch_size, SetupParams const& setupParams)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     BaseBeamSearchLayer<T>::setupBase(batch_size, setupParams);
     allocateBuffer(batch_size);
 
@@ -101,13 +108,13 @@ void OnlineBeamSearchLayer<T>::setup(size_t batch_size, SetupParams const& setup
 
     fillBuffers(setupParams.beam_search_diversity_rate, 0.0f, mDiversityRate, diversity_rates_buf_);
     fillBuffers(setupParams.length_penalty, 0.0f, mLengthPenalty, length_penalties_buf_);
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
 void OnlineBeamSearchLayer<T>::invokeSoftMax(BeamSearchOutputParams& outputs, SoftmaxParams const& params)
 {
-    TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s", __PRETTY_FUNCTION__);
     Tensor const& output_ids_ptr = outputs.output_ids_ptr;
     const auto batch_size = static_cast<std::int32_t>(output_ids_ptr.shape[0]);
     const auto beam_width = static_cast<std::int32_t>(output_ids_ptr.shape[1]);
@@ -119,7 +126,8 @@ void OnlineBeamSearchLayer<T>::invokeSoftMax(BeamSearchOutputParams& outputs, So
     BeamHypotheses beamHypotheses;
     auto* const end_ids = params.end_ids.template getPtr<const int>();
     float* output_log_probs = (outputs.output_log_probs) ? outputs.output_log_probs->template getPtr<float>() : nullptr;
-    auto* finished = outputs.finished->template getPtr<bool>();
+    auto* finished
+        = reinterpret_cast<FinishedState*>(outputs.finished->template getPtr<FinishedState::UnderlyingType>());
     auto* sequence_lengths = outputs.sequence_length->template getPtr<int>();
     if (outputs.beamHypotheses)
     {
@@ -151,7 +159,7 @@ void OnlineBeamSearchLayer<T>::invokeSoftMax(BeamSearchOutputParams& outputs, So
 template <typename T>
 void OnlineBeamSearchLayer<T>::allocateBuffer(size_t batch_size)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     // we need to check 2 * beam_width candidates each time
     // 64 is the max beam width we support now.
     topk_softmax_workspace_size_ = (size_t) (ceil(batch_size * 64 * (64 * 2) / 4.) * 4 * 2
@@ -163,13 +171,13 @@ void OnlineBeamSearchLayer<T>::allocateBuffer(size_t batch_size)
     length_penalties_buf_ = allocator_->reMalloc(length_penalties_buf_, sizeof(float) * batch_size, false);
 
     is_allocate_buffer_ = true;
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
 void OnlineBeamSearchLayer<T>::freeBuffer()
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     if (is_allocate_buffer_)
     {
         allocator_->free((void**) (&topk_softmax_workspace_));
@@ -177,7 +185,7 @@ void OnlineBeamSearchLayer<T>::freeBuffer()
         allocator_->free((void**) (&length_penalties_buf_));
         is_allocate_buffer_ = false;
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
@@ -191,13 +199,13 @@ template <typename T>
 OnlineBeamSearchLayer<T>::OnlineBeamSearchLayer(OnlineBeamSearchLayer<T> const& beam_search_layer)
     : BaseBeamSearchLayer<T>(beam_search_layer)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
 }
 
 template <typename T>
 OnlineBeamSearchLayer<T>::~OnlineBeamSearchLayer()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
 }
 
 template class OnlineBeamSearchLayer<float>;

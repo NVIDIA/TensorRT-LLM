@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "identityPlugin.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
 
 using namespace nvinfer1;
 using tensorrt_llm::plugins::IdentityPluginCreator;
@@ -56,13 +57,7 @@ bool IdentityPlugin::supportsFormatCombination(
     const PluginTensorDesc& output = inOut[1];
     switch (pos)
     {
-    case 0:
-        return (input.type == DataType::kHALF || input.type == DataType::kFLOAT
-#ifdef ENABLE_BF16
-                   || input.type == DataType::kBF16
-#endif
-                   )
-            && input.format == nvinfer1::TensorFormat::kLINEAR;
+    case 0: return input.format == nvinfer1::TensorFormat::kLINEAR;
     case 1: return output.type == input.type && output.format == nvinfer1::TensorFormat::kLINEAR;
     }
     return false;
@@ -87,20 +82,7 @@ int IdentityPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const n
     {
         count *= inputDesc[0].dims.d[i];
     }
-    if (inputDesc[0].type == DataType::kHALF)
-    {
-        count *= sizeof(half);
-    }
-    else if (inputDesc[0].type == DataType::kFLOAT)
-    {
-        count *= sizeof(float);
-    }
-#ifdef ENABLE_BF16
-    else if (inputDesc[0].type == DataType::kBF16)
-    {
-        count *= sizeof(__nv_bfloat16);
-    }
-#endif
+    count *= tensorrt_llm::runtime::BufferDataType(inputDesc[0].type).getSize();
 
     cudaMemcpyAsync(outputs[0], inputs[0], count, cudaMemcpyDeviceToDevice, stream);
 

@@ -14,6 +14,7 @@
 # limitations under the License.
 import argparse
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -51,7 +52,7 @@ def serialize_engine(engine, path):
     logger.info(f'Serializing engine to {path}...')
     tik = time.time()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')
@@ -139,7 +140,7 @@ def parse_arguments(args):
     parser.add_argument(
         '--output_dir',
         type=str,
-        default='gpt_outputs',
+        default='engine_outputs',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
     )
@@ -180,7 +181,7 @@ def parse_arguments(args):
     )
     parser.add_argument('--tokens_per_block',
                         type=int,
-                        default=64,
+                        default=128,
                         help='Number of tokens per block in paged KV cache')
     parser.add_argument(
         '--max_num_tokens',
@@ -316,6 +317,12 @@ def parse_arguments(args):
 
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha
+
+    assert (math.log2(args.tokens_per_block).is_integer()
+            ), "tokens_per_block must be power of 2"
+    if args.enable_context_fmha or args.enable_context_fmha_fp32_acc:
+        assert (args.tokens_per_block >=
+                128), "Context fMHA requires >= 128 tokens per block"
 
     return args
 
