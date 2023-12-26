@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>New Workflow &mdash; tensorrt_llm  documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=19f00094" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script src="_static/jquery.js?v=5d32c60e"></script>
+        <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+        <script src="_static/documentation_options.js?v=5929fcd5"></script>
+        <script src="_static/doctools.js?v=888ff710"></script>
+        <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Layers" href="python-api/tensorrt_llm.layers.html" />
+    <link rel="prev" title="Memory Usage of TensorRT-LLM" href="memory.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            tensorrt_llm
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="architecture.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gpt_runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">TensorRT-LLM Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="performance.html">Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="2023-05-19-how-to-debug.html">How to debug</a></li>
+<li class="toctree-l1"><a class="reference internal" href="2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
+<li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">New Workflow</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#prepare-tensorrt-llm-checkpoint">Prepare TensorRT-LLM Checkpoint</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#config">Config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#rank-weights">Rank Weights</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#example">Example</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#build-checkpoint-into-tensorrt-engine">Build Checkpoint into TensorRT Engine</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#make-evaluation">Make Evaluation</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Python API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">tensorrt_llm</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">New Workflow</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/new_workflow.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="new-workflow">
+<h1>New Workflow<a class="headerlink" href="#new-workflow" title="Link to this heading"></a></h1>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading"></a></h2>
+<p>There are 3 steps in the new workflow:</p>
+<ol class="arabic simple">
+<li><p>convert weights from different source frameworks into TensorRT-LLM checkpoint</p></li>
+<li><p>build the TensorRT-LLM checkpoint into TensorRT engine(s) with a unified build command</p></li>
+<li><p>load the engine(s) to TensorRT-LLM model runner and make evaluation with different evaluation tasks</p></li>
+</ol>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">NeMo</span> <span class="o">-------------</span>
+                  <span class="o">|</span>
+<span class="n">HuggingFace</span> <span class="o">------</span>
+                  <span class="o">|</span>   <span class="n">convert</span>                       <span class="n">build</span>                <span class="n">load</span>
+<span class="n">AMMO</span> <span class="o">-------------</span>  <span class="o">----------&gt;</span> <span class="n">TRT</span><span class="o">-</span><span class="n">LLM</span> <span class="n">Checkpoint</span> <span class="o">--------&gt;</span> <span class="n">TRT</span> <span class="n">Engine</span> <span class="o">------&gt;</span> <span class="n">TRT</span><span class="o">-</span><span class="n">LLM</span> <span class="n">ModelRunner</span>
+                  <span class="o">|</span>
+<span class="n">JAX</span> <span class="o">--------------</span>
+                  <span class="o">|</span>
+<span class="n">DeepSpeed</span> <span class="o">--------</span>
+</pre></div>
+</div>
+</section>
+<section id="prepare-tensorrt-llm-checkpoint">
+<h2>Prepare TensorRT-LLM Checkpoint<a class="headerlink" href="#prepare-tensorrt-llm-checkpoint" title="Link to this heading"></a></h2>
+<p>There are different kinds of sources we want to support:</p>
+<ol class="arabic simple">
+<li><p>trained models from NeMo/DeepSpeed/JAX</p></li>
+<li><p>quantized models from AMMO</p></li>
+<li><p>popular models from HuggingFace</p></li>
+</ol>
+<p>TensorRT-LLM defines its own checkpoint format. A checkpoint directory include:</p>
+<ol class="arabic simple">
+<li><p>One config json file, which contains several model hyper-parameters</p></li>
+<li><p>One or several rank weights files, each rank file contains a dictionary of tensors(weights)</p></li>
+</ol>
+<section id="config">
+<h3>Config<a class="headerlink" href="#config" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Field</p></th>
+<th class="head text-left"><p>Type</p></th>
+<th class="head text-left"><p>Default Value</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>architecture</p></td>
+<td class="text-left"><p>string</p></td>
+<td class="text-left"><p>mandatory</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>dtype</p></td>
+<td class="text-left"><p>string</p></td>
+<td class="text-left"><p>mandatory</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>logits_dtype</p></td>
+<td class="text-left"><p>string</p></td>
+<td class="text-left"><p>‘float32’</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>vocab_size</p></td>
+<td class="text-left"><p>int</p></td>
+<td class="text-left"><p>mandatory</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>max_position_embeddings</p></td>
+<td class="text-left"><p>int</p></td>
+<td class="text-left"><p>null</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>hidden_size</p></td>
+<td class="text-left"><p>int</p></td>
+<td class="text-left"><p>mandatory</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>num_hidden_layers</p></td>
+<td class="text-left"><p>int</p></td>
+<td class="text-left"><p>mandatory</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>num_attention_heads</p></td>
+<td class="text-left"><p>int</p></td>
+<td class="text-left"><p>mandatory</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>num_key_value_heads</p></td>
+<td class="text-left"><p>int</p></td>
+<td class="text-left"><p>num_attention_heads</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>hidden_act</p></td>
+<td class="text-left"><p>string</p></td>
+<td class="text-left"><p>mandatory</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>intermediate_size</p></td>
+<td class="text-left"><p>int</p></td>
+<td class="text-left"><p>null</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>norm_epsilon</p></td>
+<td class="text-left"><p>float</p></td>
+<td class="text-left"><p>1e-5</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>position_embedding_type</p></td>
+<td class="text-left"><p>string</p></td>
+<td class="text-left"><p>‘learned_absolute’</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>use_prompt_tuning</p></td>
+<td class="text-left"><p>bool</p></td>
+<td class="text-left"><p>false</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>mapping.world_size</p></td>
+<td class="text-left"><p>int</p></td>
+<td class="text-left"><p>1</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>mapping.tp_size</p></td>
+<td class="text-left"><p>int</p></td>
+<td class="text-left"><p>1</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>mapping.pp_size</p></td>
+<td class="text-left"><p>int</p></td>
+<td class="text-left"><p>1</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>quantization.use_smooth_quant</p></td>
+<td class="text-left"><p>bool</p></td>
+<td class="text-left"><p>false</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>quantization.per_channel</p></td>
+<td class="text-left"><p>bool</p></td>
+<td class="text-left"><p>false</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>quantization.per_token</p></td>
+<td class="text-left"><p>bool</p></td>
+<td class="text-left"><p>false</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>quantization.per_group</p></td>
+<td class="text-left"><p>bool</p></td>
+<td class="text-left"><p>false</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>quantization.group_size</p></td>
+<td class="text-left"><p>int</p></td>
+<td class="text-left"><p>64</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>quantization.int8_kv_cache</p></td>
+<td class="text-left"><p>bool</p></td>
+<td class="text-left"><p>false</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>quantization.enable_fp8</p></td>
+<td class="text-left"><p>bool</p></td>
+<td class="text-left"><p>false</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>quantization.fp8_kv_cache</p></td>
+<td class="text-left"><p>bool</p></td>
+<td class="text-left"><p>false</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>quantization.use_weight_only</p></td>
+<td class="text-left"><p>bool</p></td>
+<td class="text-left"><p>false</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>quantization.weight_only_precision</p></td>
+<td class="text-left"><p>string</p></td>
+<td class="text-left"><p>‘int8’</p></td>
+</tr>
+</tbody>
+</table>
+<p>The config field is extensible, a model could add its own specific config fields.
+For example, OPT model has a <code class="docutils literal notranslate"><span class="pre">do_layer_norm_before</span></code> field.</p>
+</section>
+<section id="rank-weights">
+<h3>Rank Weights<a class="headerlink" href="#rank-weights" title="Link to this heading"></a></h3>
+<p>Like PyTorch, the tensor(weight) name is a string containing hierarchical information,
+which is uniquely mapped to a certain parameter of a TensorRT-LLM model.</p>
+<p>For example, the <code class="docutils literal notranslate"><span class="pre">Attention</span></code> layer contains 2 <code class="docutils literal notranslate"><span class="pre">Linear</span></code> layer, qkv and dense.
+Each linear layer contains one weight and one bias.
+So, there are 4 tensors(weights) in total, whose names are:</p>
+<ul class="simple">
+<li><p>“xxx.qkv.weight”</p></li>
+<li><p>“xxx.qkv.bias”</p></li>
+<li><p>“xxx.dense.weight”</p></li>
+<li><p>“xxx.dense.bias”</p></li>
+</ul>
+<p><code class="docutils literal notranslate"><span class="pre">xxx</span></code> is the prefix name. If we quantize the KV cache, we will have extra 2 scaling factors:</p>
+<ul class="simple">
+<li><p>“xxx.kv_orig_quant_scale”</p></li>
+<li><p>“xxx.kv_quant_orig_scale”</p></li>
+</ul>
+<p>If we do FP8 quantize, we will have extra 4 scaling factors:</p>
+<ul class="simple">
+<li><p>“xxx.qkv.activation_scaling_factor”</p></li>
+<li><p>“xxx.qkv.weights_scaling_factor”</p></li>
+<li><p>“xxx.dense.activation_scaling_factor”</p></li>
+<li><p>“xxx.dense.weights_scaling_factor”</p></li>
+</ul>
+</section>
+<section id="example">
+<h3>Example<a class="headerlink" href="#example" title="Link to this heading"></a></h3>
+<p>Let’s take OPT as an example, say we want to deploy the model with tensor parallelism 2:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>examples/opt
+python3<span class="w"> </span>convert_checkpoint.py<span class="w"> </span>--model_dir<span class="w"> </span>./opt-125m<span class="w"> </span><span class="se">\</span>
+<span class="w">                </span>--dtype<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
+<span class="w">                </span>--world_size<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
+<span class="w">                </span>--output_dir<span class="w"> </span>./opt/125M/trt_ckpt/fp16/2-gpu/
+</pre></div>
+</div>
+<p>Here is the checkpoint directory:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="o">./</span><span class="n">opt</span><span class="o">/</span><span class="mi">125</span><span class="n">M</span><span class="o">/</span><span class="n">trt_ckpt</span><span class="o">/</span><span class="n">fp16</span><span class="o">/</span><span class="mi">1</span><span class="o">-</span><span class="n">gpu</span><span class="o">/</span>
+    <span class="n">config</span><span class="o">.</span><span class="n">json</span>
+    <span class="n">rank0</span><span class="o">.</span><span class="n">safetensors</span>
+    <span class="n">rank1</span><span class="o">.</span><span class="n">safetensors</span>
+</pre></div>
+</div>
+<p>Here is the <code class="docutils literal notranslate"><span class="pre">config.json</span></code>:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;architecture&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;OPTForCausalLM&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float16&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;logits_dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float32&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;num_hidden_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">12</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;num_attention_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">12</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;hidden_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">768</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;vocab_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">50272</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;position_embedding_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;learned_absolute&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;max_position_embeddings&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;hidden_act&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;relu&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;quantization&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;use_weight_only&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;weight_only_precision&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;int8&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="nt">&quot;mapping&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;world_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;tp_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="nt">&quot;use_parallel_embedding&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;embedding_sharding_dim&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;share_embedding_table&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;do_layer_norm_before&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;use_prompt_tuning&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="build-checkpoint-into-tensorrt-engine">
+<h2>Build Checkpoint into TensorRT Engine<a class="headerlink" href="#build-checkpoint-into-tensorrt-engine" title="Link to this heading"></a></h2>
+<p>TensorRT-LLM provides a unified build command: <code class="docutils literal notranslate"><span class="pre">trtllm-llm</span></code>. Before using it,
+you may need to add it to the <code class="docutils literal notranslate"><span class="pre">PATH</span></code></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">PATH</span><span class="o">=</span>/usr/local/bin:<span class="nv">$PATH</span>
+
+trtllm-build<span class="w"> </span>--checkpoint_dir<span class="w"> </span>./opt/125M/trt_ckpt/fp16/2-gpu/<span class="w"> </span><span class="se">\</span>
+<span class="w">                </span>--use_gemm_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
+<span class="w">                </span>--use_gpt_attention_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
+<span class="w">                </span>--max_batch_size<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">                </span>--max_input_len<span class="w"> </span><span class="m">924</span><span class="w"> </span><span class="se">\</span>
+<span class="w">                </span>--max_output_len<span class="w"> </span><span class="m">100</span><span class="w"> </span><span class="se">\</span>
+<span class="w">                </span>--output_dir<span class="w"> </span>./opt/125M/trt_engines/fp16/2-gpu/
+</pre></div>
+</div>
+</section>
+<section id="make-evaluation">
+<h2>Make Evaluation<a class="headerlink" href="#make-evaluation" title="Link to this heading"></a></h2>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mpirun<span class="w"> </span>-n<span class="w"> </span><span class="m">2</span><span class="w"> </span>--allow-run-as-root<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>python3<span class="w"> </span>../summarize.py<span class="w"> </span>--engine_dir<span class="w"> </span>./opt/125M/trt_engines/fp16/2-gpu/<span class="w"> </span><span class="se">\</span>
+<span class="w">                        </span>--batch_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">                        </span>--test_trt_llm<span class="w"> </span><span class="se">\</span>
+<span class="w">                        </span>--hf_model_dir<span class="w"> </span>opt-125m<span class="w"> </span><span class="se">\</span>
+<span class="w">                        </span>--data_type<span class="w"> </span>fp16<span class="w"> </span><span class="se">\</span>
+<span class="w">                        </span>--check_accuracy<span class="w"> </span><span class="se">\</span>
+<span class="w">                        </span>--tensorrt_llm_rouge1_threshold<span class="o">=</span><span class="m">14</span>
+</pre></div>
+</div>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="memory.html" class="btn btn-neutral float-left" title="Memory Usage of TensorRT-LLM" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="python-api/tensorrt_llm.layers.html" class="btn btn-neutral float-right" title="Layers" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2023, NVidia.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

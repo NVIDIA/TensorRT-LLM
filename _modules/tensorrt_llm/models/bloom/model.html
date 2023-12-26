@@ -48,12 +48,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../precision.html">Numerical Precision</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../installation.html">Build TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation.html">TensorRT-LLM Installation</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance.html">Performance of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../new_workflow.html">New Workflow</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -72,6 +73,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
 </ul>
 
         </div>
@@ -113,80 +115,55 @@
 <span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
 <span class="c1"># See the License for the specific language governing permissions and</span>
 <span class="c1"># limitations under the License.</span>
-<span class="kn">import</span> <span class="nn">tensorrt</span> <span class="k">as</span> <span class="nn">trt</span>
 
-<span class="kn">from</span> <span class="nn">..._common</span> <span class="kn">import</span> <span class="n">default_net</span>
-<span class="kn">from</span> <span class="nn">..._utils</span> <span class="kn">import</span> <span class="n">pad_vocab_size</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span>
-<span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">gather_last_token_logits</span>
-<span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MLP</span><span class="p">,</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span> <span class="n">AttentionParams</span><span class="p">,</span>
-                       <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span> <span class="n">KeyValueCacheParams</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">,</span>
-                       <span class="n">PositionEmbeddingType</span><span class="p">)</span>
-<span class="kn">from</span> <span class="nn">...mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
-<span class="kn">from</span> <span class="nn">...module</span> <span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
-<span class="kn">from</span> <span class="nn">...quantization</span> <span class="kn">import</span> <span class="n">QuantMode</span>
-<span class="kn">from</span> <span class="nn">..generation_mixin</span> <span class="kn">import</span> <span class="n">GenerationMixin</span>
+<span class="kn">from</span> <span class="nn">..._utils</span> <span class="kn">import</span> <span class="n">pad_vocab_size</span>
+<span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="n">Tensor</span>
+<span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MLP</span><span class="p">,</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span> <span class="n">ColumnLinear</span><span class="p">,</span>
+                       <span class="n">Embedding</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">,</span> <span class="n">PositionEmbeddingType</span><span class="p">)</span>
+<span class="kn">from</span> <span class="nn">...module</span> <span class="kn">import</span> <span class="n">Module</span>
+<span class="kn">from</span> <span class="nn">..modeling_utils</span> <span class="kn">import</span> <span class="n">DecoderLayerList</span><span class="p">,</span> <span class="n">DecoderModelForCausalLM</span>
 
 
 <span class="k">class</span> <span class="nc">BloomDecoderLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                 <span class="n">hidden_size</span><span class="p">,</span>
-                 <span class="n">num_attention_heads</span><span class="p">,</span>
-                 <span class="n">max_position_embeddings</span><span class="p">,</span>
-                 <span class="n">num_layers</span><span class="p">,</span>
-                 <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">attention_mask_type</span><span class="o">=</span><span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span>
-                 <span class="n">hidden_act</span><span class="o">=</span><span class="s1">&#39;gelu&#39;</span><span class="p">,</span>
-                 <span class="n">position_embedding_type</span><span class="o">=</span><span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">alibi</span><span class="p">,</span>
-                 <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
-                 <span class="n">mlp_hidden_size</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                 <span class="n">multi_query_mode</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                 <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
-                 <span class="n">tp_rank</span><span class="o">=</span><span class="mi">0</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">=</span> <span class="n">hidden_size</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">=</span> <span class="n">num_attention_heads</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span> <span class="o">=</span> <span class="n">max_position_embeddings</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span> <span class="o">=</span> <span class="n">num_layers</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">dtype</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">attention_mask_type</span> <span class="o">=</span> <span class="n">attention_mask_type</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">hidden_act</span> <span class="o">=</span> <span class="n">hidden_act</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span> <span class="o">=</span> <span class="n">position_embedding_type</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">tp_group</span> <span class="o">=</span> <span class="n">tp_group</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">=</span> <span class="n">tp_size</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">tp_rank</span> <span class="o">=</span> <span class="n">tp_rank</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">layer_idx</span> <span class="o">=</span> <span class="n">layer_idx</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
+
+        <span class="n">hidden_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span>
+        <span class="n">dtype</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">dtype</span>
+        <span class="n">tp_group</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span>
+        <span class="n">tp_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
+        <span class="n">tp_rank</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">input_layernorm</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
                                          <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">attention</span> <span class="o">=</span> <span class="n">Attention</span><span class="p">(</span>
             <span class="n">hidden_size</span><span class="p">,</span>
-            <span class="n">num_attention_heads</span><span class="p">,</span>
-            <span class="mi">1</span> <span class="k">if</span> <span class="n">multi_query_mode</span> <span class="k">else</span> <span class="n">num_attention_heads</span><span class="p">,</span>
-            <span class="n">max_position_embeddings</span><span class="p">,</span>
-            <span class="n">num_layers</span><span class="p">,</span>
+            <span class="n">config</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
+            <span class="n">config</span><span class="o">.</span><span class="n">num_key_value_heads</span><span class="p">,</span>
+            <span class="n">max_position_embeddings</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span>
+            <span class="n">num_layers</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
             <span class="n">attention_mask_type</span><span class="o">=</span><span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span>
-            <span class="n">position_embedding_type</span><span class="o">=</span><span class="n">position_embedding_type</span><span class="p">,</span>
-            <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
+            <span class="n">position_embedding_type</span><span class="o">=</span><span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">alibi</span><span class="p">,</span>
+            <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
             <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
             <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
             <span class="n">tp_rank</span><span class="o">=</span><span class="n">tp_rank</span><span class="p">,</span>
-            <span class="n">use_int8_kv_cache</span><span class="o">=</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_int8_kv_cache</span><span class="p">(),</span>
-            <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">)</span>
+            <span class="n">quant_mode</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="n">mlp_hidden_size</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">mlp_hidden_size</span> <span class="o">=</span> <span class="n">hidden_size</span> <span class="o">*</span> <span class="mi">4</span>
+        <span class="n">mlp_hidden_size</span> <span class="o">=</span> <span class="n">hidden_size</span> <span class="o">*</span> <span class="mi">4</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">intermediate_size</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">config</span><span class="o">.</span><span class="n">intermediate_size</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span> <span class="o">=</span> <span class="n">MLP</span><span class="p">(</span><span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
                        <span class="n">ffn_hidden_size</span><span class="o">=</span><span class="n">mlp_hidden_size</span><span class="p">,</span>
-                       <span class="n">hidden_act</span><span class="o">=</span><span class="n">hidden_act</span><span class="p">,</span>
+                       <span class="n">hidden_act</span><span class="o">=</span><span class="s1">&#39;gelu&#39;</span><span class="p">,</span>
                        <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-                       <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
+                       <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
                        <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
                        <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
-                       <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">)</span>
+                       <span class="n">quant_mode</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">post_layernorm</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
                                         <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
@@ -230,52 +207,29 @@
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BloomModel">[docs]</a>
 <span class="k">class</span> <span class="nc">BloomModel</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                 <span class="n">num_layers</span><span class="p">,</span>
-                 <span class="n">num_heads</span><span class="p">,</span>
-                 <span class="n">hidden_size</span><span class="p">,</span>
-                 <span class="n">vocab_size</span><span class="p">,</span>
-                 <span class="n">hidden_act</span><span class="p">,</span>
-                 <span class="n">max_position_embeddings</span><span class="p">,</span>
-                 <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">(),</span>
-                 <span class="n">mlp_hidden_size</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                 <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
-                 <span class="n">multi_query_mode</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                 <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                 <span class="n">embedding_sharding_dim</span><span class="o">=</span><span class="mi">0</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
-        <span class="k">if</span> <span class="n">use_parallel_embedding</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span><span class="n">vocab_size</span><span class="p">,</span>
-                                       <span class="n">hidden_size</span><span class="p">,</span>
-                                       <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-                                       <span class="n">tp_group</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
-                                       <span class="n">tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
-                                       <span class="n">sharding_dim</span><span class="o">=</span><span class="n">embedding_sharding_dim</span><span class="p">,</span>
-                                       <span class="n">tp_rank</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span><span class="p">)</span>
+        <span class="n">dtype</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">dtype</span>
+        <span class="n">tp_group</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span>
+        <span class="n">tp_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
+        <span class="n">tp_rank</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span>
+        <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">use_parallel_embedding</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span>
+                <span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
+                <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
+                <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+                <span class="n">sharding_dim</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">embedding_sharding_dim</span><span class="p">,</span>
+                <span class="n">tp_rank</span><span class="o">=</span><span class="n">tp_rank</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span><span class="n">vocab_size</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">ln_embed</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">layers</span> <span class="o">=</span> <span class="n">ModuleList</span><span class="p">([</span>
-            <span class="n">BloomDecoderLayer</span><span class="p">(</span><span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
-                              <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">num_heads</span><span class="p">,</span>
-                              <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">max_position_embeddings</span><span class="p">,</span>
-                              <span class="n">num_layers</span><span class="o">=</span><span class="n">num_layers</span><span class="p">,</span>
-                              <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-                              <span class="n">attention_mask_type</span><span class="o">=</span><span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span>
-                              <span class="n">hidden_act</span><span class="o">=</span><span class="n">hidden_act</span><span class="p">,</span>
-                              <span class="n">multi_query_mode</span><span class="o">=</span><span class="n">multi_query_mode</span><span class="p">,</span>
-                              <span class="n">tp_group</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
-                              <span class="n">tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
-                              <span class="n">tp_rank</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span><span class="p">,</span>
-                              <span class="n">mlp_hidden_size</span><span class="o">=</span><span class="n">mlp_hidden_size</span><span class="p">,</span>
-                              <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
-                              <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_layers</span><span class="p">)</span>
-        <span class="p">])</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">ln_f</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
+                                       <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                                       <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">ln_embed</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                                  <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">layers</span> <span class="o">=</span> <span class="n">DecoderLayerList</span><span class="p">(</span><span class="n">BloomDecoderLayer</span><span class="p">,</span> <span class="n">config</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">ln_f</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
 <div class="viewcode-block" id="BloomModel.forward">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BloomModel.forward">[docs]</a>
@@ -285,34 +239,22 @@
                 <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                 <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">prompt_embedding_table</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">prompt_tasks</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">prompt_vocab_size</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)</span>
+
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ln_embed</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
 
-        <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">fill_none_tensor_list</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">))</span>
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
+                                    <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
+                                    <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
+                                    <span class="n">kv_cache_params</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="p">,</span>
+                                    <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
-            <span class="n">presents</span> <span class="o">=</span> <span class="p">[]</span>
-
-        <span class="k">for</span> <span class="n">layer</span><span class="p">,</span> <span class="n">past</span><span class="p">,</span> <span class="n">max_kv_cache_length</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">,</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">past_key_value</span><span class="p">,</span>
-                <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">host_max_kv_cache_lengths</span><span class="p">):</span>
-            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">layer</span><span class="p">(</span>
-                <span class="n">hidden_states</span><span class="p">,</span>
-                <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
-                <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
-                <span class="n">kv_cache_params</span><span class="o">=</span><span class="n">KeyValueCacheParams</span><span class="p">(</span>
-                    <span class="n">past_key_value</span><span class="o">=</span><span class="p">[</span><span class="n">past</span><span class="p">],</span>
-                    <span class="n">host_past_key_value_lengths</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
-                    <span class="n">host_past_key_value_lengths</span><span class="p">,</span>
-                    <span class="n">host_max_kv_cache_lengths</span><span class="o">=</span><span class="n">max_kv_cache_length</span><span class="p">,</span>
-                    <span class="n">cache_indirection</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span><span class="n">cache_indirection</span><span class="p">),</span>
-                <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">)</span>
-
-            <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
-                <span class="n">presents</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
-                <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">hidden_states</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">hidden_states</span><span class="p">,</span> <span class="n">presents</span> <span class="o">=</span> <span class="n">hidden_states</span>
 
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ln_f</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
 
@@ -325,155 +267,44 @@
 
 <div class="viewcode-block" id="BloomForCausalLM">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BloomForCausalLM">[docs]</a>
-<span class="k">class</span> <span class="nc">BloomForCausalLM</span><span class="p">(</span><span class="n">BloomModel</span><span class="p">,</span> <span class="n">GenerationMixin</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">BloomForCausalLM</span><span class="p">(</span><span class="n">DecoderModelForCausalLM</span><span class="p">):</span>
 
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                 <span class="n">num_layers</span><span class="p">,</span>
-                 <span class="n">num_heads</span><span class="p">,</span>
-                 <span class="n">hidden_size</span><span class="p">,</span>
-                 <span class="n">vocab_size</span><span class="p">,</span>
-                 <span class="n">max_position_embeddings</span><span class="p">,</span>
-                 <span class="n">hidden_act</span><span class="o">=</span><span class="s1">&#39;gelu&#39;</span><span class="p">,</span>
-                 <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">(),</span>
-                 <span class="n">mlp_hidden_size</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                 <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
-                 <span class="n">multi_query_mode</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                 <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                 <span class="n">embedding_sharding_dim</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
-                 <span class="n">share_embedding_table</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
-        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">dtype</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_kv_dtype</span> <span class="o">=</span> <span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">dtype</span><span class="p">,</span> <span class="n">trt</span><span class="o">.</span><span class="n">DataType</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_kv_dtype</span> <span class="o">=</span> <span class="n">dtype</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
+        <span class="n">use_parallel_embedding</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">use_parallel_embedding</span>
+        <span class="n">embedding_sharding_dim</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">embedding_sharding_dim</span>
 
-        <span class="k">if</span> <span class="n">share_embedding_table</span> <span class="ow">and</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">share_embedding_table</span> <span class="ow">and</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
             <span class="k">if</span> <span class="p">(</span><span class="ow">not</span> <span class="n">use_parallel_embedding</span><span class="p">)</span> <span class="ow">or</span> <span class="p">(</span><span class="n">use_parallel_embedding</span> <span class="ow">and</span>
                                                 <span class="n">embedding_sharding_dim</span> <span class="o">==</span> <span class="mi">1</span><span class="p">):</span>
                 <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
-                    <span class="s1">&#39;For multiple-processes cases, sharing the embedding table must set use_parallel_embedding=True and embedding_sharding_dim = 0&#39;</span>
+                    <span class="s1">&#39;For multiple-processes cases, sharing the embedding table must set use_parallel_embedding=True and embedding_sharding_dim=0&#39;</span>
                 <span class="p">)</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_dtype</span>
-        <span class="k">if</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_int8_kv_cache</span><span class="p">():</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_kv_dtype</span> <span class="o">=</span> <span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="s1">&#39;int8&#39;</span><span class="p">)</span>
-        <span class="k">elif</span> <span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_kv_cache</span><span class="p">():</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_kv_dtype</span> <span class="o">=</span> <span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="s1">&#39;fp8&#39;</span><span class="p">)</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">mapping</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span> <span class="o">=</span> <span class="n">quant_mode</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">_num_layers</span> <span class="o">=</span> <span class="n">num_layers</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_num_heads</span> <span class="o">=</span> <span class="n">num_heads</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_hidden_size</span> <span class="o">=</span> <span class="n">hidden_size</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_vocab_size</span> <span class="o">=</span> <span class="n">vocab_size</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_tp_size</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_multi_query_mode</span> <span class="o">=</span> <span class="n">multi_query_mode</span>
-        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">num_layers</span><span class="p">,</span> <span class="n">num_heads</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">vocab_size</span><span class="p">,</span>
-                         <span class="n">hidden_act</span><span class="p">,</span> <span class="n">max_position_embeddings</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">mapping</span><span class="p">,</span>
-                         <span class="n">mlp_hidden_size</span><span class="p">,</span> <span class="n">bias</span><span class="p">,</span> <span class="n">quant_mode</span><span class="p">,</span> <span class="n">multi_query_mode</span><span class="p">,</span>
-                         <span class="n">use_parallel_embedding</span><span class="p">,</span> <span class="n">embedding_sharding_dim</span><span class="p">)</span>
-        <span class="n">vocab_size_padded</span> <span class="o">=</span> <span class="n">pad_vocab_size</span><span class="p">(</span><span class="n">vocab_size</span><span class="p">,</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">)</span>
+        <span class="n">transformer</span> <span class="o">=</span> <span class="n">BloomModel</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+        <span class="n">vocab_size_padded</span> <span class="o">=</span> <span class="n">pad_vocab_size</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
+                                           <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">)</span>
 
         <span class="n">share_weight</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="n">share_embedding_table</span><span class="p">:</span>
-            <span class="n">share_weight</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span><span class="o">.</span><span class="n">weight</span>
+        <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">share_embedding_table</span><span class="p">:</span>
+            <span class="n">share_weight</span> <span class="o">=</span> <span class="n">transformer</span><span class="o">.</span><span class="n">embedding</span><span class="o">.</span><span class="n">weight</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">lm_head</span> <span class="o">=</span> <span class="n">ColumnLinear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span>
-                                    <span class="n">vocab_size_padded</span><span class="p">,</span>
-                                    <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                                    <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-                                    <span class="n">tp_group</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
-                                    <span class="n">tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
-                                    <span class="n">gather_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                                    <span class="n">share_weight</span><span class="o">=</span><span class="n">share_weight</span><span class="p">)</span>
+        <span class="n">lm_head</span> <span class="o">=</span> <span class="n">ColumnLinear</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                               <span class="n">vocab_size_padded</span><span class="p">,</span>
+                               <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                               <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+                               <span class="n">tp_group</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
+                               <span class="n">tp_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+                               <span class="n">gather_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                               <span class="n">share_weight</span><span class="o">=</span><span class="n">share_weight</span><span class="p">)</span>
 
-<div class="viewcode-block" id="BloomForCausalLM.forward">
-<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BloomForCausalLM.forward">[docs]</a>
-    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                <span class="n">input_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-                <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                <span class="n">last_token_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-        <span class="n">hidden_states</span> <span class="o">=</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">,</span> <span class="n">use_cache</span><span class="p">,</span>
-                                        <span class="n">attention_mask</span><span class="p">,</span> <span class="n">kv_cache_params</span><span class="p">,</span>
-                                        <span class="n">attention_params</span><span class="p">)</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">transformer</span><span class="p">,</span> <span class="n">lm_head</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
-            <span class="n">hidden_states</span><span class="p">,</span> <span class="n">presents</span> <span class="o">=</span> <span class="n">hidden_states</span>
-
-        <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">gather_last_token_logits</span><span class="p">(</span>
-            <span class="n">hidden_states</span><span class="p">,</span> <span class="n">last_token_ids</span><span class="p">,</span>
-            <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">)</span>
-
-        <span class="c1"># [batch_size, hidden_size] -&gt; [batch_size, vocab_size]</span>
-        <span class="n">lm_logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">lm_head</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
-        <span class="n">lm_logits</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="s1">&#39;logits&#39;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">)</span>
-
-        <span class="k">if</span> <span class="n">use_cache</span> <span class="ow">and</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">paged_kv_cache</span> <span class="o">==</span> <span class="kc">False</span><span class="p">:</span>
-            <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">present</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">presents</span><span class="p">):</span>
-                <span class="n">present</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;present_key_value_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_dtype</span><span class="p">)</span>
-            <span class="k">return</span> <span class="p">(</span><span class="n">lm_logits</span><span class="p">,</span> <span class="n">presents</span><span class="p">)</span>
-
-        <span class="k">return</span> <span class="n">lm_logits</span></div>
-
-
-<div class="viewcode-block" id="BloomForCausalLM.prepare_inputs">
-<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BloomForCausalLM.prepare_inputs">[docs]</a>
-    <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                       <span class="n">max_batch_size</span><span class="p">,</span>
-                       <span class="n">max_input_len</span><span class="p">,</span>
-                       <span class="n">max_new_tokens</span><span class="p">,</span>
-                       <span class="n">use_cache</span><span class="p">,</span>
-                       <span class="n">max_beam_width</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">&#39;&#39;&#39;@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the</span>
-<span class="sd">            ranges of the dimensions of when using TRT dynamic shapes.</span>
-
-<span class="sd">            @return: a list contains values which can be fed into the self.forward()</span>
-<span class="sd">        &#39;&#39;&#39;</span>
-
-        <span class="c1"># Prepare inputs</span>
-        <span class="n">head_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hidden_size</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_heads</span>
-        <span class="n">num_heads</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_heads</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tp_size</span>
-        <span class="n">remove_input_padding</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span>
-        <span class="n">use_gpt_attention_plugin</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">(</span>
-        <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span>
-        <span class="n">use_gemm_plugin</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gemm_plugin</span>
-
-        <span class="n">model_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">prepare_basic_inputs</span><span class="p">(</span>
-            <span class="n">max_batch_size</span><span class="p">,</span>
-            <span class="n">max_beam_width</span><span class="p">,</span>
-            <span class="n">max_input_len</span><span class="p">,</span>
-            <span class="n">max_new_tokens</span><span class="p">,</span>
-            <span class="n">num_heads</span><span class="p">,</span>
-            <span class="n">head_size</span><span class="p">,</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_num_layers</span><span class="p">,</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_kv_dtype</span><span class="p">,</span>
-            <span class="n">remove_input_padding</span><span class="p">,</span>
-            <span class="n">use_gpt_attention_plugin</span><span class="p">,</span>
-            <span class="n">use_gemm_plugin</span><span class="o">=</span><span class="n">use_gemm_plugin</span><span class="p">)</span>
-
-        <span class="k">return</span> <span class="p">(</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;input_ids&#39;</span><span class="p">],</span> <span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;position_ids&#39;</span><span class="p">],</span> <span class="kc">True</span><span class="p">,</span>
-                <span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;last_token_ids&#39;</span><span class="p">],</span> <span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;attention_mask&#39;</span><span class="p">],</span>
-                <span class="n">KeyValueCacheParams</span><span class="p">(</span>
-                    <span class="n">past_key_value</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;past_key_value&#39;</span><span class="p">],</span>
-                    <span class="n">host_past_key_value_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
-                        <span class="s1">&#39;host_past_key_value_lengths&#39;</span><span class="p">],</span>
-                    <span class="n">host_max_kv_cache_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
-                        <span class="s1">&#39;host_max_kv_cache_lengths&#39;</span><span class="p">],</span>
-                    <span class="n">cache_indirection</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;cache_indirection&#39;</span><span class="p">],</span>
-                <span class="p">),</span>
-                <span class="n">AttentionParams</span><span class="p">(</span>
-                    <span class="n">sequence_length</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;sequence_length&#39;</span><span class="p">],</span>
-                    <span class="n">context_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;context_lengths&#39;</span><span class="p">],</span>
-                    <span class="n">host_context_lengths</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;host_context_lengths&#39;</span><span class="p">],</span>
-                    <span class="n">max_context_length</span><span class="o">=</span><span class="n">max_input_len</span><span class="p">,</span>
-                    <span class="n">host_request_types</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;host_request_types&#39;</span><span class="p">]))</span></div>
+<div class="viewcode-block" id="BloomForCausalLM.check_config">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BloomForCausalLM.check_config">[docs]</a>
+    <span class="k">def</span> <span class="nf">check_config</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;use_parallel_embedding&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;embedding_sharding_dim&#39;</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;share_embedding_table&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span></div>
 </div>
 
 </pre></div>

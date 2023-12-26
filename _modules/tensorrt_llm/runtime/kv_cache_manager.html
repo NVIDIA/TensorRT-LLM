@@ -48,12 +48,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../batch_manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../gpt_attention.html">Multi-head, Multi-query and Group-query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../precision.html">Numerical Precision</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../installation.html">Build TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation.html">TensorRT-LLM Installation</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance.html">Performance of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../new_workflow.html">New Workflow</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -72,6 +73,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
 </ul>
 
         </div>
@@ -350,7 +352,7 @@
                  <span class="n">blocks</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                  <span class="n">tokens_per_block</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                  <span class="n">max_blocks_per_seq</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-                 <span class="n">max_kv_cache_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                 <span class="n">max_attention_window_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                  <span class="n">beam_width</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">):</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">blocks_manager</span> <span class="o">=</span> <span class="n">BlocksManager</span><span class="p">(</span>
@@ -360,7 +362,7 @@
             <span class="n">beam_width</span><span class="o">=</span><span class="n">beam_width</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">num_pools</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">memory_pools</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">=</span> <span class="n">tokens_per_block</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">max_kv_cache_len</span> <span class="o">=</span> <span class="n">max_kv_cache_len</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window_size</span> <span class="o">=</span> <span class="n">max_attention_window_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">beam_width</span> <span class="o">=</span> <span class="n">beam_width</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">lens</span> <span class="o">=</span> <span class="p">[]</span>
@@ -375,11 +377,11 @@
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">for</span> <span class="n">seq</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">sequences</span><span class="p">:</span>
             <span class="n">batch_idx</span> <span class="o">=</span> <span class="n">seq</span><span class="o">.</span><span class="n">get_batch_idx</span><span class="p">()</span>
-            <span class="c1"># Enable cyclic kv cache when it exceeds the max_kv_cache_len</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">lens</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">]</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_kv_cache_len</span><span class="p">:</span>
+            <span class="c1"># Enable cyclic kv cache when it exceeds the max_attention_window_size</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">lens</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">]</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window_size</span><span class="p">:</span>
                 <span class="k">continue</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="n">finished</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">]</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">lens</span><span class="p">[</span>
-                    <span class="n">batch_idx</span><span class="p">]</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">-</span> <span class="mi">1</span><span class="p">:</span>
+                    <span class="n">batch_idx</span><span class="p">]</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">blocks_manager</span><span class="o">.</span><span class="n">allocate</span><span class="p">(</span><span class="n">seq</span><span class="p">)</span>
 
             <span class="bp">self</span><span class="o">.</span><span class="n">lens</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span>
@@ -407,20 +409,21 @@
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Add sequence to the manager and allocate minimum amount of blocks for context</span>
 <span class="sd">        &quot;&quot;&quot;</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">lens</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">min</span><span class="p">(</span><span class="n">context_len</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_kv_cache_len</span><span class="p">))</span>
+        <span class="n">seq_len</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">context_len</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window_size</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">lens</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">seq_len</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">sequences</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">sequence</span><span class="p">)</span>
 
         <span class="c1"># With beam_width &gt; 1 we share context blocks between beams.</span>
 
         <span class="c1"># First get number of blocks that can be shared across different beams.</span>
         <span class="c1"># This is only possible for complete blocks -&gt; round down.</span>
-        <span class="n">context_blocks</span> <span class="o">=</span> <span class="n">context_len</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span>
+        <span class="n">context_blocks</span> <span class="o">=</span> <span class="n">seq_len</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span>
         <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">context_blocks</span><span class="p">):</span>
             <span class="c1"># Share context stage blocks within beam</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">blocks_manager</span><span class="o">.</span><span class="n">allocate</span><span class="p">(</span><span class="n">sequence</span><span class="p">,</span> <span class="n">share_across_beam</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-        <span class="c1"># Get one extra block for each beam. This is always one extra block</span>
-        <span class="c1"># because we need space for context_len + 1 tokens.</span>
-        <span class="k">if</span> <span class="n">context_len</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_kv_cache_len</span> <span class="ow">or</span> <span class="n">context_len</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+
+        <span class="c1"># allocate one more block if there are tokens that can&#39;t be shared across beams.</span>
+        <span class="k">if</span> <span class="n">seq_len</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">blocks_manager</span><span class="o">.</span><span class="n">allocate</span><span class="p">(</span><span class="n">sequence</span><span class="p">,</span> <span class="n">share_across_beam</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span></div>
 
 
@@ -428,13 +431,13 @@
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.KVCacheManager.get_pointer_arrays">[docs]</a>
     <span class="k">def</span> <span class="nf">get_pointer_arrays</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">beam_width</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        Returns arrays of pointers for all memory pools copied to GPU</span>
+<span class="sd">        Returns arrays of pointers for all memory pools</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="n">pointer_arrays</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">pool</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_pools</span><span class="p">):</span>
             <span class="n">pointer_arrays</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">blocks_manager</span><span class="o">.</span><span class="n">get_pointer_array</span><span class="p">(</span>
-                    <span class="n">pool</span><span class="p">,</span> <span class="n">beam_width</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s1">&#39;cuda&#39;</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">))</span>
+                    <span class="n">pool</span><span class="p">,</span> <span class="n">beam_width</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">))</span>
         <span class="k">return</span> <span class="n">pointer_arrays</span></div>
 </div>
 
