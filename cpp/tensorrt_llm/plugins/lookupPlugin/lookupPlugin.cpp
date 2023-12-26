@@ -162,8 +162,6 @@ int LookupPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvi
     const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
     enqueue_old(inputDesc, outputDesc, inputs, outputs, workspace, stream);
-    int device = -1;
-    cudaGetDevice(&device);
 
 #if USE_DGTRT
     if (dg::is_request_storage_enabled()) {
@@ -226,7 +224,7 @@ int LookupPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvi
                 } else {
                     cudaMemcpyAsync(output + idx * hiddenSize, ptr, szBlock * hiddenSize, cudaMemcpyHostToDevice, stream);
                 }
-                idx += szBlock;
+                idx += szBlock-2;
             } else {
                 idx++;
             }
