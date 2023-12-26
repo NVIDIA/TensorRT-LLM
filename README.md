@@ -108,15 +108,15 @@ concepts used in TensorRT-LLM, we recommend you to read the following
 
 ## Installation
 
-*For Windows installation, see [`Windows`](windows/README.md).*
-
-TensorRT-LLM must be built from source, instructions can be found
+The documentation for installing TensorRT-LLM can be found
 [here](./docs/source/installation.md). An image of a Docker container with
 TensorRT-LLM and its Triton Inference Server Backend will be made available
 soon.
 
 The remaining commands in that document must be executed from the TensorRT-LLM
 container.
+
+*For Windows installation, see [`Windows`](windows/README.md).*
 
 ## Quick Start
 

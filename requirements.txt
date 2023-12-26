@@ -17,4 +17,3 @@ transformers==4.33.1
 wheel
 optimum
 evaluate
-nvidia-ammo~=0.5.0

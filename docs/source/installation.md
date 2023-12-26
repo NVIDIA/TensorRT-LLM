@@ -22,9 +22,8 @@ for the NVIDIA platform can be found
 
 ## Install From the Wheel Package
 
-Please try installing using the wheel package first to save effort.
-
-After installing CUDA 12.2 according to the [instructions](https://developer.nvidia.com/cuda-toolkit), please execute the following commands to install TensorRT-LLM.
+After installing CUDA 12.2 according to the [instructions](https://developer.nvidia.com/cuda-toolkit),
+please execute the following commands to install TensorRT-LLM.
 
 ```bash
 # Install dependencies, TensorRT-LLM requires Python 3.10
@@ -35,7 +34,7 @@ pip3 install tensorrt_llm -U --extra-index-url https://pypi.nvidia.com
 python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"
 ```
 
-Note that users who have debugging needs or use the C++11 ABI need to compile TensorRT-LLM from source.
+Note that users who have debugging needs or use the GNU C++11 ABI need to compile TensorRT-LLM from source.
 
 ## Fetch the Sources
 
