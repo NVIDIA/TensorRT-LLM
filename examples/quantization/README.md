@@ -21,11 +21,7 @@ docker run --gpus all --ipc=host --ulimit memlock=-1 --shm-size=20g -it <the doc
 
 ```bash
 # Obtain the python version from the system.
-python_version=$(python3 --version 2>&1 | awk '{print $2}' | awk -F. '{print $1$2}')
-# Download and install the AMMO package from the DevZone.
-wget https://developer.nvidia.com/downloads/assets/cuda/files/nvidia-ammo/nvidia_ammo-0.5.0.tar.gz
-tar -xzf nvidia_ammo-0.5.0.tar.gz
-pip install nvidia_ammo-0.5.0/nvidia_ammo-0.5.0-cp$python_version-cp$python_version-linux_x86_64.whl
+pip install --no-cache-dir --extra-index-url https://pypi.nvidia.com nvidia-ammo~=0.5.0
 # Install the additional requirements
 cd <this example folder>
 pip install -r requirements.txt

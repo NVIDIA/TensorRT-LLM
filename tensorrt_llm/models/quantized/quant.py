@@ -106,8 +106,9 @@ def _smooth_quantize_llama(model, quant_mode):
             bias=False)
 
         assert hasattr(layer, "mlp"), "The layer has no mlp"
-        assert not model.moe_config.has_moe(
-        ), "MOE does not support smooth quant"
+        if hasattr(model, "moe_config"):
+            assert not model.moe_config.has_moe(
+            ), "MOE does not support smooth quant"
         layer.mlp = SmoothQuantGatedMLP(hidden_size=model.hidden_size,
                                         ffn_hidden_size=layer.mlp_hidden_size,
                                         hidden_act=layer.hidden_act,

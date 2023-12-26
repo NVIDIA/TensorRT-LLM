@@ -1,6 +1,7 @@
-# Build TensorRT-LLM
+# TensorRT-LLM Installation
 
 - [Overview](#overview)
+- [Install From the Wheel Package](#install-from-the-wheel-package)
 - [Fetch the Sources](#fetch-the-sources)
 - [Build TensorRT-LLM in One Step](#build-tensorrt-llm-in-one-step)
 - [Build Step-by-step](#build-step-by-step)
@@ -13,15 +14,28 @@
 
 ## Overview
 
-This document contains instructions to build TensorRT-LLM from sources. TensorRT-LLM depends on the latest versions of
-TensorRT and
-[Polygraphy](https://github.com/NVIDIA/TensorRT/tree/main/tools/Polygraphy)
-which are distributed separately, and should be copied into this repository.
-
+This document contains instructions to install TensorRT-LLM.
 We recommend the use of [Docker](https://www.docker.com) to build and run
 TensorRT-LLM. Instructions to install an environment to run Docker containers
 for the NVIDIA platform can be found
 [here](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
+
+## Install From the Wheel Package
+
+Please try installing using the wheel package first to save effort.
+
+After installing CUDA 12.2 according to the [instructions](https://developer.nvidia.com/cuda-toolkit), please execute the following commands to install TensorRT-LLM.
+
+```bash
+# Install dependencies, TensorRT-LLM requires Python 3.10
+apt-get update && apt-get -y install python3.10 python3-pip openmpi-bin libopenmpi-dev
+# Install the latest version of TensorRT-LLM
+pip3 install tensorrt_llm -U --extra-index-url https://pypi.nvidia.com
+# Check installation
+python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"
+```
+
+Note that users who have debugging needs or use the C++11 ABI need to compile TensorRT-LLM from source.
 
 ## Fetch the Sources
 

@@ -232,6 +232,7 @@ _allowed_configs = {
                     builder_opt=None,
                     pre_norm=False,
                     do_layer_norm_before=False,
+                    use_custom_all_reduce=False,
                 )),
     "opt_2.7b":
     ModelConfig(name="opt_2.7b",
@@ -250,6 +251,7 @@ _allowed_configs = {
                     builder_opt=None,
                     pre_norm=False,
                     do_layer_norm_before=True,
+                    use_custom_all_reduce=False,
                 )),
     "opt_6.7b":
     ModelConfig(name="opt_6.7b",
@@ -268,6 +270,7 @@ _allowed_configs = {
                     builder_opt=None,
                     pre_norm=False,
                     do_layer_norm_before=True,
+                    use_custom_all_reduce=False,
                 )),
     "opt_66b":
     ModelConfig(name="opt_66b",
@@ -286,6 +289,7 @@ _allowed_configs = {
                     builder_opt=None,
                     pre_norm=True,
                     do_layer_norm_before=True,
+                    use_custom_all_reduce=False,
                 )),
     "llama_7b":
     ModelConfig(name="llama_7b",
@@ -512,6 +516,7 @@ _allowed_configs = {
                     max_output_len=200,
                     builder_opt=None,
                     remove_input_padding=False,
+                    use_custom_all_reduce=False,
                 )),
     "bloom_560m":
     ModelConfig(name="bloom_560m",
@@ -528,6 +533,7 @@ _allowed_configs = {
                     max_input_len=1024,
                     max_output_len=1024,
                     builder_opt=None,
+                    use_custom_all_reduce=False,
                 )),
     "bloom_176b":
     ModelConfig(name="bloom_176b",
@@ -544,6 +550,7 @@ _allowed_configs = {
                     max_input_len=1024,
                     max_output_len=1024,
                     builder_opt=None,
+                    use_custom_all_reduce=False,
                 )),
     "bert_base":
     ModelConfig(name="bert_base",
