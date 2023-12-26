@@ -78,12 +78,13 @@
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="precision.html">Numerical Precision</a></li>
-<li class="toctree-l1"><a class="reference internal" href="installation.html">Build TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">TensorRT-LLM Installation</a></li>
 <li class="toctree-l1"><a class="reference internal" href="performance.html">Performance of TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-19-how-to-debug.html">How to debug</a></li>
 <li class="toctree-l1"><a class="reference internal" href="2023-05-17-how-to-add-a-new-model.html">How to add a new model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="new_workflow.html">New Workflow</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
 <ul>
@@ -102,6 +103,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
 </ul>
 
         </div>
@@ -215,6 +217,11 @@ minimum number of tokens (input + generated) that are required for the
 multi-block version to become more efficient than the “vanilla” implementation
 that uses a single CUDA thread-block per head. It is controlled by an internal
 heuristic.</em></p>
+<p>Another note is that as the masked MHA kernels use shared memory size
+proportional to sequence length, so there can be some cases that GPU’s shared
+memory is not enough when multi-block mode is not enabled. To get masked MHA
+kernel work in these cases, multi-block mode is forced on and a warning log is
+printed.</p>
 </section>
 </section>
 <section id="inflight-batching">
@@ -286,22 +293,21 @@ tensor scaling).</p>
 <h2>Sliding Window Attention, Cyclic (Rolling Buffer) KV Cache<a class="headerlink" href="#sliding-window-attention-cyclic-rolling-buffer-kv-cache" title="Link to this heading"></a></h2>
 <p>TensorRT-LLM has a feature called <code class="docutils literal notranslate"><span class="pre">Cyclic</span> <span class="pre">KV</span> <span class="pre">Cache</span></code>, which treats the kv cache
 as a circular buffer. This means that it only stores the kv cache for the last N
-tokens, where N is determined by the <code class="docutils literal notranslate"><span class="pre">max_kv_cache_length</span></code> parameter in
+tokens, where N is determined by the <code class="docutils literal notranslate"><span class="pre">max_attention_window_size</span></code> parameter in
 <code class="docutils literal notranslate"><span class="pre">GenerationSession.setup</span></code>. You can see examples of this in the <code class="docutils literal notranslate"><span class="pre">run.py</span></code> or
 <code class="docutils literal notranslate"><span class="pre">summarize.py</span></code> files. When the cache is full, new tokens’ kv cache will
 overwrite the “least recently used” caches.</p>
-<p>In the context phase, if the input length surpasses the <code class="docutils literal notranslate"><span class="pre">max_kv_cache_length</span></code>,
+<p>In the context phase, if the input length surpasses the <code class="docutils literal notranslate"><span class="pre">max_attention_window_size</span></code>,
 <code class="docutils literal notranslate"><span class="pre">Sliding</span> <span class="pre">Window</span> <span class="pre">Attention</span></code> will be activated. This serves the same function as
 the <code class="docutils literal notranslate"><span class="pre">sliding</span> <span class="pre">window_size</span></code>.</p>
 <p>This feature helps to reduce the memory footprint of the kv cache when
 dealing with very long sequences.</p>
-<p><em>Note that when using beam search, cyclic kv cache may not perform as well as
-full kv cache when the current step exceeds <code class="docutils literal notranslate"><span class="pre">max_kv_cache_length</span></code>.
-This issue will be addressed in future releases.</em></p>
-<p><em>The experimental feature, which allows different <code class="docutils literal notranslate"><span class="pre">max_kv_cache_length</span></code> values
+<p>_Note that the cyclic kv cache feature doesn’t work with beam searching currently as
+the context kv cache are shared across beams.</p>
+<p><em>The experimental feature, which allows different <code class="docutils literal notranslate"><span class="pre">max_attention_window_size</span></code> values
 for each layer, is also supported. To utilize this feature, simply provide an
 <code class="docutils literal notranslate"><span class="pre">int32</span> <span class="pre">torch.Tensor</span></code> with a shape of <code class="docutils literal notranslate"><span class="pre">[num_layers]</span></code> to the <code class="docutils literal notranslate"><span class="pre">GenerationSession.setup</span></code>.
-This tensor will serve as the buffer for <code class="docutils literal notranslate"><span class="pre">max_kv_cache_length</span></code>,
+This tensor will serve as the buffer for <code class="docutils literal notranslate"><span class="pre">max_attention_window_size</span></code>,
 setting unique values for each layer. However, it’s important to note that the
 memory allocation for the kv cache still relies on the buffer’s maximum value.</em></p>
 </section>
