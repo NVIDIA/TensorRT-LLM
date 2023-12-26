@@ -121,7 +121,8 @@ public:
         if (mLaunchParams.useKernelWithoutAlibi)
         {
             // The kernel adopts the log2f optimziation.
-            set_alpha(params.scale_bmm1, scale_bmm1 * float(M_LOG2E), DATA_TYPE_FP32);
+            constexpr float kLog2e = 1.4426950408889634074; // log_2(e) = M_LOG2E
+            set_alpha(params.scale_bmm1, scale_bmm1 * float(kLog2e), DATA_TYPE_FP32);
         }
         else
         {

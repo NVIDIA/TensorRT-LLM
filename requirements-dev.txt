@@ -12,5 +12,4 @@ pytest-cov
 pytest-forked
 pytest-xdist
 rouge_score
-# tensorrt>=8.6.0
 typing-extensions==4.8.0

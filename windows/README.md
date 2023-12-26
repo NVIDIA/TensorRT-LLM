@@ -60,7 +60,7 @@ It may be useful to create a single folder for holding TensorRT-LLM and its depe
 
 Clone TensorRT-LLM:
 ```
-git clone https://github.com/NVIDIA/TensorRT-LLM.git
+git clone --branch rel https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
 git submodule update --init --recursive
 ```
