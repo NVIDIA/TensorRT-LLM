@@ -16,11 +16,7 @@
  */
 #pragma once
 
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
-#include <cassert>
-#include <mpi.h>
-#include <nccl.h>
 #include <string>
 #include <vector>
 

@@ -46,7 +46,7 @@ public:
     // In GenerationInput, tasks expected shape is [batchSize]
     // For context requests with non-packed inputs, expected shape is [batchSize, 1]
     // For generation requests with non-packed inputs, expected shape is [batchSize*beamWidth] for generation requests.
-    // For packed inputs, expected shape is [1, packedLength] (note that ifb currently doesn't support non-packed
+    // For packed inputs, expected shape is [packedLength] (note that ifb currently doesn't support non-packed
     // inputs)
     TensorPtr tasks;
     TensorPtr vocabSize; // [1], on gpu

@@ -165,18 +165,10 @@ own instance of `GptSession` using its own `WorldConfig`. A typical example
 is:
 
 ```cpp
-#include <mpi.h>
-
-// Initialize the MPI library.
-MPI_Init(&argc, &argv);
-
-// Get the number of ranks (size of the world).
-int worldSize;
-MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
+#include "tensorrt_llm/common/mpiUtils.h"
 
 // Get the unique identifier for each rank.
-int rank;
-MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+auto const rank = COMM_SESSION.getRank();
 
 // Create the TensorRT-LLM Runtime WorldConfig.
 tensorrt_llm::runtime::WorldConfig worldConfig(tensorParallelism, pipelineParallelism, rank);
@@ -316,7 +308,7 @@ batchSize, beamWidth]`_.
    shape of the output `ids` tensor,
  * `contextLogits`, is a tensor of values on the GPU (same datatype as the
    computation type) to store the logits for the context. Its shape is
-   `[batchSize, maxSequenceLength, vocabSizePadded]`. This buffer will only be
+   `[batchSize, maxSequenceLength, vocabSizePadded]`. If use `remove_input_padding`, its shape is `[packedSize, vocabSizePadded]`. This buffer will only be
    filled in if the TensorRT engine was built with the
    `gather_all_token_logits` parameter enabled. It is important to point out
    that enabling that computation may have an impact on performance (the final
@@ -324,7 +316,7 @@ batchSize, beamWidth]`_.
    instead of a just the last one),
  * `generationLogits`, is a tensor of values on the GPU (same datatype as the
    computation type) to store the logits for the generation. Its shape is
-   `[batchSize, beamWidth, maxOutputLen-1, vocabSizePadded]`. This buffer will only be
+   `[batchSize, beamWidth, maxOutputLen, vocabSizePadded]`. This buffer will only be
    filled in if the TensorRT engine was built with the
    `gather_all_token_logits` parameter enabled.
  * `onTokenGenerated`, is a callback function invoked in the generation loop to
@@ -350,17 +342,18 @@ value for a given parameter, the vector can be limited to a single element
  * `temperature`, a vector of floating-point numbers to control the
    modulation of logits when sampling new tokens. The default value is `1.0f`,
  * `minLength`, a vector of integers to set a lower-bound on the number of tokens
-   generated. The default value is 1,
+   generated. The default value is 0,
  * `repetitionPenalty`, a vector of float-point numbers to penalize tokens
    based on how often they appear in the sequence. The default value is `0.f`,
  * `presencePenalty`, a vector of float-point numbers to penalize tokens
    already present in the sequence (irrespective of the number of appearances).
    The default value is `0.f`,
+ * `frequencyPenalty`, a vector of float-point numbers to penalize tokens
+   already present in the sequence (dependent on the number of appearances).
+   The default value is `0.f`,
 
-The parameters `repetitionPenalty` and `presencePenalty` are mutually
-exclusive. In this release, it means that a user can only set, at most, one of
-those two optional fields.  In a future release, we might adopt a finer-grained
-method based on checking the values.
+The parameters `repetitionPenalty`, `presencePenalty`, and `frequencyPenalty` are not mutually
+exclusive.
 
 ***Sampling***
 

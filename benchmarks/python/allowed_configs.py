@@ -84,7 +84,6 @@ class EncDecBuildConfig:
     def __post_init__(self) -> None:
         assert self.head_size is not None
         assert self.ffn_hidden_size is not None
-        assert self.num_buckets is not None
 
 
 @dataclass
@@ -232,6 +231,7 @@ _allowed_configs = {
                     builder_opt=None,
                     pre_norm=False,
                     do_layer_norm_before=False,
+                    use_custom_all_reduce=False,
                 )),
     "opt_2.7b":
     ModelConfig(name="opt_2.7b",
@@ -250,6 +250,7 @@ _allowed_configs = {
                     builder_opt=None,
                     pre_norm=False,
                     do_layer_norm_before=True,
+                    use_custom_all_reduce=False,
                 )),
     "opt_6.7b":
     ModelConfig(name="opt_6.7b",
@@ -268,6 +269,7 @@ _allowed_configs = {
                     builder_opt=None,
                     pre_norm=False,
                     do_layer_norm_before=True,
+                    use_custom_all_reduce=False,
                 )),
     "opt_66b":
     ModelConfig(name="opt_66b",
@@ -286,6 +288,7 @@ _allowed_configs = {
                     builder_opt=None,
                     pre_norm=True,
                     do_layer_norm_before=True,
+                    use_custom_all_reduce=False,
                 )),
     "llama_7b":
     ModelConfig(name="llama_7b",
@@ -512,6 +515,7 @@ _allowed_configs = {
                     max_output_len=200,
                     builder_opt=None,
                     remove_input_padding=False,
+                    use_custom_all_reduce=False,
                 )),
     "bloom_560m":
     ModelConfig(name="bloom_560m",
@@ -528,6 +532,7 @@ _allowed_configs = {
                     max_input_len=1024,
                     max_output_len=1024,
                     builder_opt=None,
+                    use_custom_all_reduce=False,
                 )),
     "bloom_176b":
     ModelConfig(name="bloom_176b",
@@ -544,6 +549,7 @@ _allowed_configs = {
                     max_input_len=1024,
                     max_output_len=1024,
                     builder_opt=None,
+                    use_custom_all_reduce=False,
                 )),
     "bert_base":
     ModelConfig(name="bert_base",
@@ -868,6 +874,47 @@ _allowed_configs = {
                     n_positions=0,
                     num_buckets=32,
                     max_distance=128,
+                    max_batch_size=8,
+                    max_encoder_input_len=1024,
+                    max_decoder_input_len=1,
+                    max_output_len=200,
+                    builder_opt=None,
+                )),
+    "bart_large_cnn":
+    ModelConfig(name="bart_large_cnn",
+                family="bart",
+                benchmark_type="enc_dec",
+                build_config=EncDecBuildConfig(
+                    num_layers=12,
+                    num_decoder_layers=12,
+                    num_heads=16,
+                    head_size=64,
+                    ffn_hidden_size=4096,
+                    hidden_size=1024,
+                    vocab_size=50265,
+                    hidden_act="gelu",
+                    n_positions=1024,
+                    num_buckets=32,
+                    max_batch_size=8,
+                    max_encoder_input_len=1024,
+                    max_decoder_input_len=1,
+                    max_output_len=200,
+                    builder_opt=None,
+                )),
+    "mbart_large_50_many_to_one_mmt":
+    ModelConfig(name="mbart_large_50_many_to_one_mmt",
+                family="bart",
+                benchmark_type="enc_dec",
+                build_config=EncDecBuildConfig(
+                    num_layers=12,
+                    num_decoder_layers=12,
+                    num_heads=16,
+                    head_size=64,
+                    ffn_hidden_size=4096,
+                    hidden_size=1024,
+                    vocab_size=250054,
+                    hidden_act="relu",
+                    n_positions=1024,
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,

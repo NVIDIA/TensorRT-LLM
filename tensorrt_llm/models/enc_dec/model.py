@@ -168,9 +168,7 @@ class EncoderLayer(Module):
         # e.g. BART post, T5 pre
         self.layernorm_position = layernorm_position
 
-        # Note: q_scaling convention in TRT-LLM plugin is 1.f / (q_scaling * sqrt(head_size))
-        # if don't want q_scaling, use 1/sqrt(head_size) to cancel
-        # e.g. BART false, T5 false
+        # e.g. BART q_scaling = 1.f, T5 q_scaling = 1.f/sqrt(head_size)
         self.attention = BertAttention(
             hidden_size,
             num_attention_heads,
@@ -287,9 +285,7 @@ class DecoderLayer(Module):
         # e.g. BART post, T5 pre
         self.layernorm_position = layernorm_position
 
-        # Note: q_scaling convention in TRT-LLM plugin is 1.f / (q_scaling * sqrt(head_size))
-        # if don't want q_scaling, use 1/sqrt(head_size) to cancel
-        # e.g. BART false, T5 false
+        # e.g. BART q_scaling = 1.f, T5 q_scaling = 1.f/sqrt(head_size)
         self.self_attention = Attention(
             hidden_size,
             num_attention_heads,
@@ -314,11 +310,13 @@ class DecoderLayer(Module):
                                                 eps=layernorm_eps,
                                                 dtype=dtype)
 
-        # self attn uses MMHA, mask is always causal triangular
+        # Note: self attn uses MMHA, mask is always causal triangular
         # cross attn has two scenarios:
         # - in context phase, all ones mask, same as padding type
         # - in generation phase, same causal triangular mask as MMHA
         # - context phase special handling is done in plugin by resetting mask type
+        #
+        # e.g. BART q_scaling = 1.f, T5 q_scaling = 1.f/sqrt(head_size)
         self.cross_attention = Attention(
             hidden_size,
             num_attention_heads,
@@ -616,34 +614,30 @@ class EncoderModel(Module, GenerationMixin):
                 input_ids = Tensor(
                     name="input_ids",
                     dtype=trt.int32,
-                    shape=[1, -1],
-                    dim_range=OrderedDict([('batch_size_fake', [1]),
-                                           ("num_tokens", [num_tokens_range])]),
+                    shape=[-1],
+                    dim_range=OrderedDict([("num_tokens", [num_tokens_range])]),
                 )
                 if self.has_position_embedding:
                     position_ids = Tensor(
                         name='position_ids',
                         dtype=trt.int32,
-                        shape=[1, -1],
-                        dim_range=OrderedDict([('batch_size_fake', [1]),
-                                               ('num_tokens',
+                        shape=[-1],
+                        dim_range=OrderedDict([('num_tokens',
                                                 [num_tokens_range])]),
                     )
                 if self.has_token_type_embedding:
                     token_type_ids = Tensor(
                         name='token_type_ids',
                         dtype=trt.int32,
-                        shape=[1, -1],
-                        dim_range=OrderedDict([('batch_size_fake', [1]),
-                                               ('num_tokens',
+                        shape=[-1],
+                        dim_range=OrderedDict([('num_tokens',
                                                 [num_tokens_range])]),
                     )
             else:
                 hidden_states = Tensor(name='hidden_states_input',
                                        dtype=self._dtype,
-                                       shape=[1, -1, hidden_size],
+                                       shape=[-1, hidden_size],
                                        dim_range=OrderedDict([
-                                           ('batch_size_fake', [1]),
                                            ('num_tokens', [num_tokens_range]),
                                            ('hidden_size', [hidden_size]),
                                        ]))
@@ -920,7 +914,7 @@ class DecoderModel(Module, GenerationMixin):
             if self.has_model_final_layernorm:
                 hidden_states = self.final_layernorm(hidden_states)
 
-            # [bs, seq, hidden_size] or [1, num_tokens, hidden_size] -> [bs, hidden_size]
+            # [bs, seq, hidden_size] or [num_tokens, hidden_size] -> [bs, hidden_size]
             hidden_states = gather_last_token_logits(
                 hidden_states, last_token_ids,
                 default_net().plugin_config.remove_input_padding)
@@ -1028,18 +1022,16 @@ class DecoderModel(Module, GenerationMixin):
             if self.mapping.is_first_pp_rank():
                 input_ids = Tensor(name='input_ids',
                                    dtype=trt.int32,
-                                   shape=[1, -1],
+                                   shape=[-1],
                                    dim_range=OrderedDict([
-                                       ('batch_size_fake', [1]),
                                        ('decoder_num_tokens',
                                         [decoder_num_tokens_range]),
                                    ]))
                 if self.has_position_embedding:
                     position_ids = Tensor(name='position_ids',
                                           dtype=trt.int32,
-                                          shape=[1, -1],
+                                          shape=[-1],
                                           dim_range=OrderedDict([
-                                              ('batch_size_fake', [1]),
                                               ('decoder_num_tokens',
                                                [decoder_num_tokens_range]),
                                           ]))
@@ -1047,17 +1039,15 @@ class DecoderModel(Module, GenerationMixin):
                     token_type_ids = Tensor(
                         name='token_type_ids',
                         dtype=trt.int32,
-                        shape=[1, -1],
-                        dim_range=OrderedDict([('batch_size_fake', [1]),
-                                               ('decoder_num_tokens',
+                        shape=[-1],
+                        dim_range=OrderedDict([('decoder_num_tokens',
                                                 [decoder_num_tokens_range])]),
                     )
             else:
                 hidden_states = Tensor(name='hidden_states_input',
                                        dtype=self._dtype,
-                                       shape=[1, -1, self.hidden_size],
+                                       shape=[-1, self.hidden_size],
                                        dim_range=OrderedDict([
-                                           ('batch_size_fake', [1]),
                                            ('decoder_num_tokens',
                                             [decoder_num_tokens_range]),
                                            ('hidden_size', [self.hidden_size]),
@@ -1118,9 +1108,8 @@ class DecoderModel(Module, GenerationMixin):
             encoder_output = Tensor(
                 name="encoder_output",
                 dtype=self._dtype,
-                shape=[-1, -1, self.encoder_hidden_size],
+                shape=[-1, self.encoder_hidden_size],
                 dim_range=OrderedDict([
-                    ("batch_size_fake", [1]),
                     ("encoder_num_tokens", [encoder_num_tokens_range]),
                     ("encoder_hidden_size", [self.encoder_hidden_size]),
                 ]),

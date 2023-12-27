@@ -574,8 +574,9 @@ class SmoothQuantMLP(Module):
         if hidden_act not in ACT2FN:
             raise ValueError(
                 'unsupported activation function: {}'.format(hidden_act))
+        fc_output_size = 2 * ffn_hidden_size if hidden_act == 'swiglu' else ffn_hidden_size
         self.fc = SmoothQuantColumnLinear(hidden_size,
-                                          ffn_hidden_size,
+                                          fc_output_size,
                                           bias=bias,
                                           dtype=dtype,
                                           tp_group=tp_group,
@@ -1062,14 +1063,19 @@ class SmoothQuantAttention(Module):
 
         self.use_lora = False
 
-    def forward(self,
-                hidden_states: Tensor,
-                attention_mask=None,
-                use_cache=False,
-                kv_cache_params=None,
-                attention_params=None,
-                workspace=None,
-                lora_layer_params=None):
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask=None,
+        use_cache=False,
+        kv_cache_params=None,
+        attention_params=None,
+        encoder_output=None,
+        workspace=None,
+        position_embedding=None,
+        norm_before_bmm1=False,
+        lora_layer_params=None,
+    ):
         assert lora_layer_params is None, "lora is not supported on SmoothQuantAttention now"
         # TODO add in-flight batching to SmoothQuant
         if default_net().plugin_config.smooth_quant_gemm_plugin:

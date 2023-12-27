@@ -98,8 +98,6 @@ public:
 
 private:
     BufferManager mManager;
-
-    common::CudaAllocator mAllocator;
     std::shared_ptr<tensorrt_llm::layers::DynamicDecodeLayer<T>> mDynamicDecodeLayer;
 
     TensorPtr mLogProbsTiled; // Buffer used to store the transpose of the logProbs. Needed because the kernels have

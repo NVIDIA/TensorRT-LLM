@@ -29,7 +29,9 @@ void invokeAddBiasApplyPenalties(T* logits, const int** output_ids_ptr, const in
     const int* input_lengths, const int* sequence_lengths, const T* bias, const int ite, const int local_batch_size,
     const int batch_size, const int beam_width, const int vocab_size, const int vocab_size_padded, const int* end_ids,
     const float* temperatures, const std::vector<float>& h_temperatures, const float* repetition_penalties,
-    const std::vector<float>& h_repetition_penalties, const RepetitionPenaltyType repetition_penalty_type,
+    const float* presence_penalties, const float* frequency_penalties, const std::vector<float>& h_repetition_penalties,
+    const std::vector<float>& h_presence_penalties, const std::vector<float>& h_frequency_penalties,
+    const bool use_repetition_penalty, const bool use_presence_penalty, const bool use_frequency_penalty,
     const int* min_lengths, int max_seq_len, cudaStream_t stream);
 
 } // namespace kernels

@@ -26,26 +26,26 @@ namespace kernels
 {
 
 //! \brief Applies penalty to logits of the tokens that were generated.
-//! There are 3 types of penalty:
-//! - RepetitionPenaltyType::Additive logit' = logit - penalty
-//! - RepetitionPenaltyType::Multiplicative logit' = logit < 0.0f ? logit * penalty : logit / penalty
-//! - RepetitionPenaltyType::None logit' = logit
 //!
 //! \param logits input/output buffer [batchSize, vocabSizePadded]. Logits to be modified by inplace.
-//! \param penalties input buffer [batchSize]. Penalties per request
+//! \param repetition_penalties input buffer [batchSize]. Repetition penalties per request
+//! \param presence_penalties input buffer [batchSize]. Presence penalties per request
+//! \param frequency_penalties input buffer [batchSize]. Frequency penalties per request
 //! \param outputIds input buffer [batchSize][maxSeqLen]. Contains pointers to rows [1, maxSeqLen]
 //! with output tokens per request
 //! \param sequenceLengths input buffer [batchSize]. Current sequence lengths of the request tokens.
 //! \param batchSize batch size
 //! \param vocabSize padded vocab size
-//! \param penaltyType One of {RepetitionPenaltyType::Additive,
-//! RepetitionPenaltyType::Multiplicative, RepetitionPenaltyType::None}
 //! \param maxSeqLen maximum sequence length
 //! \param stream stream
+//! \param use_repetition whether using the repetition penalty
+//! \param use_presence whether using the presence penalty
+//! \param use_frequency whether using the frequency penalty
 template <typename T>
-void invokeBatchApplyRepetitionPenalty(T* logits, const float* penalties, const int** outputIds,
-    const int* sequenceLengths, const int batchSize, const int vocabSize, const RepetitionPenaltyType penaltyType,
-    int maxSeqLen, cudaStream_t stream);
+void invokeBatchApplyRepetitionPenalty(T* logits, const float* repetition_penalties, const float* presence_penalties,
+    const float* frequency_penalties, const bool use_repetition, const bool use_presence, const bool use_frequency,
+    const int** outputIds, const int* sequenceLengths, const int batchSize, const int vocabSize, int maxSeqLen,
+    cudaStream_t stream);
 
 //! \brief Applies temperature penalty logits' = (logit + bias) / temperature. Sets -MAX_FLOAT to padded logits
 //!

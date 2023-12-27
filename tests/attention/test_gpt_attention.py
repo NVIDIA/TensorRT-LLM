@@ -813,8 +813,7 @@ class TestFunctional(unittest.TestCase):
             for b in range(batch_size):
                 tmp.append(tensor[b, :in_len // 2, :])
             return torch.cat(tmp,
-                             dim=1).cuda().reshape(1,
-                                                   batch_size * (in_len // 2),
+                             dim=1).cuda().reshape(batch_size * (in_len // 2),
                                                    -1)
 
         cache_indirection = torch.full((
@@ -967,7 +966,7 @@ class TestFunctional(unittest.TestCase):
                 torch.cuda.synchronize()
 
                 if enable_remove_input_padding:
-                    shape_dict['input'] = (1, batch_size * (in_len // 2),
+                    shape_dict['input'] = (batch_size * (in_len // 2),
                                            hidden_size)
                     input_tensor = remove_input_padding(input_tensor)
 
@@ -1105,7 +1104,7 @@ class TestFunctional(unittest.TestCase):
                                                         beam_width)
 
                 if enable_remove_input_padding:
-                    shape_dict['input'] = (1, batch_size, hidden_size)
+                    shape_dict['input'] = (batch_size, hidden_size)
                     input_tensor = input_tensor.view(shape_dict['input'])
 
                 # TRT LLM execution

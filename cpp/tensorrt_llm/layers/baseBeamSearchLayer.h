@@ -43,8 +43,8 @@ class BaseBeamSearchLayer : public BaseLayer
 public:
     using SetupParams = DecodingSetupParams;
 
-    BaseBeamSearchLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream, tc::IAllocator* allocator,
-        bool is_free_buffer_after_forward);
+    BaseBeamSearchLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
+        std::shared_ptr<tc::IAllocator> allocator, bool is_free_buffer_after_forward);
 
     BaseBeamSearchLayer(BaseBeamSearchLayer<T> const& beam_search_layer);
 
@@ -107,10 +107,16 @@ protected:
     std::vector<float> mTemperature;
     std::vector<int> mMinLength;
     std::vector<float> mRepetitionPenalty;
+    std::vector<float> mPresencePenalty;
+    std::vector<float> mFrequencyPenalty;
     float* temperature_buf_;
     int* min_lengths_buf_;
     float* repetition_penalty_buf_;
-    tensorrt_llm::kernels::RepetitionPenaltyType mRepetitionPenaltyType;
+    float* presence_penalty_buf_;
+    float* frequency_penalty_buf_;
+    bool use_repetition_penalty_ = false;
+    bool use_presence_penalty_ = false;
+    bool use_frequency_penalty_ = false;
 
     virtual void invokeSoftMax(BeamSearchOutputParams& outputs, SoftmaxParams const& params) = 0;
 

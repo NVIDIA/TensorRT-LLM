@@ -123,8 +123,7 @@ def generate(model_name, batch_size, beam_width):
         max_input_len_real += 1
 
     if remove_input_padding:
-        input_ids_no_padding = torch.zeros(1,
-                                           torch.sum(input_lengths),
+        input_ids_no_padding = torch.zeros(torch.sum(input_lengths),
                                            dtype=torch.int32)
         lengths_acc = torch.cumsum(
             torch.cat([torch.IntTensor([0]), input_lengths]),
@@ -132,7 +131,7 @@ def generate(model_name, batch_size, beam_width):
         )
         for i in range(len(input_ids)):
             input_ids_no_padding[
-                0, lengths_acc[i]:lengths_acc[i + 1]] = torch.IntTensor(
+                lengths_acc[i]:lengths_acc[i + 1]] = torch.IntTensor(
                     input_ids[i,
                               max_input_len - input_lengths[i]:max_input_len])
 

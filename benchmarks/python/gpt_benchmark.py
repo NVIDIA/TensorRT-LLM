@@ -108,9 +108,14 @@ class GPTBenchmark(BaseBenchmark):
             self.decoder = tensorrt_llm.runtime.GenerationSession(
                 model_config, engine_buffer, self.runtime_mapping)
         else:
+            end_id = 50256
+            pad_id = 50256
+            if "llama" in args.model:
+                end_id = 2
+                pad_id = 0
             self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
-                end_id=50256,
-                pad_id=50256,
+                end_id=end_id,
+                pad_id=pad_id,
                 num_beams=self.num_beams,
                 top_k=args.top_k,
                 top_p=args.top_p)

@@ -119,7 +119,7 @@ void genericMoeGemmKernelLauncher(const T* A, const WeightType* B, const T* weig
         return;
     }
     int occupancy = std::min(2, GemmGrouped::maximum_active_blocks());
-    TLLM_CHECK_WITH_INFO(occupancy != 0, "GPU lacks the shared memory resources to run GroupedGEMM kernel");
+    TLLM_CHECK_WITH_INFO(occupancy > 0, "GPU lacks the shared memory resources to run GroupedGEMM kernel");
     const int threadblock_count = multi_processor_count * occupancy;
 
     typename EpilogueOp::Params epilogue_op(

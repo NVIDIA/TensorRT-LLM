@@ -33,6 +33,7 @@ from ._utils import (bf16_array, dim_resolve_negative, dim_to_trt_axes,
                      str_dtype_to_np, str_dtype_to_trt, torch_to_numpy,
                      trt_dtype_to_torch)
 from .logger import logger
+from .network import PluginInfo, set_np_weight, set_plugin_info
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE
 from .quantization import QuantMode
 
@@ -575,8 +576,8 @@ def _create_tensor(trt_tensor: trt.ITensor,
     default_net()._set_layer_name(producer)
     if default_net().dtype is not None and not default_net().strongly_typed:
         if producer.type not in [
-                trt.LayerType.CONSTANT, trt.LayerType.GATHER,
-                trt.LayerType.CONCATENATION
+                trt.LayerType.SHAPE, trt.LayerType.CONSTANT,
+                trt.LayerType.GATHER, trt.LayerType.CONCATENATION
         ]:
             producer.precision = default_net().dtype
     assert tensor is not None
@@ -585,6 +586,12 @@ def _create_tensor(trt_tensor: trt.ITensor,
         gw.FLayerInfoMemo.instance().cur_flayer.layer_name = producer.name
 
     return tensor
+
+
+def _add_plugin_info(layer, plugin_creator: trt.IPluginCreator,
+                     plugin_name: str, pfc: trt.PluginFieldCollection) -> None:
+    plugin_info = PluginInfo(plugin_creator, plugin_name, pfc)
+    set_plugin_info(default_net().trt_network, layer.name, plugin_info)
 
 
 class RotaryScalingType(IntEnum):
@@ -999,7 +1006,10 @@ def constant(ndarray: np.ndarray) -> Tensor:
     layer = default_trtnet().add_constant(trt.Dims(ndarray.shape), weights)
     if not default_net()._strongly_typed:
         layer.set_output_type(0, np_dtype_to_trt(ndarray.dtype))
-    return _create_tensor(layer.get_output(0), layer)
+    tensor = _create_tensor(layer.get_output(0), layer)
+    # TODO: remove this WAR after https://nvbugs/4359151 fixed.
+    set_np_weight(default_trtnet(), layer.name, ndarray)
+    return tensor
 
 
 # TODO: TensorRT uses sizes of the output dimensions.
@@ -1007,7 +1017,8 @@ def constant(ndarray: np.ndarray) -> Tensor:
 def slice(input: Tensor,
           starts: Union[Tensor, Sequence[int]],
           sizes: Union[Tensor, Sequence[int]],
-          strides: Union[Tensor, Sequence[int]] = None) -> Tensor:
+          strides: Union[Tensor, Sequence[int]] = None,
+          mode: trt.SampleMode = None) -> Tensor:
     '''
     Add an operation to extract a slice from a tensor.
 
@@ -1062,6 +1073,9 @@ def slice(input: Tensor,
         strides : Union[Tensor, Sequence[int]]
             The step be taken from start, in input tensor.
 
+        mode : trt.SampleMode
+            The mode that controls how the slice operation handles out of bounds coordinates.
+
     Returns:
         The tensor produced by the slice layer.
     '''
@@ -1083,6 +1097,8 @@ def slice(input: Tensor,
                                        start=trt_starts,
                                        shape=trt_sizes,
                                        stride=trt_strides)
+    if mode is not None:
+        layer.mode = mode
 
     if isinstance(starts, Tensor):
         layer.set_input(1, starts.trt_tensor)
@@ -1144,11 +1160,15 @@ def arange(start: Union[Tensor, int], end: Union[Tensor, int],
     num = end - start
     num = num.view([1])
 
-    layer = default_trtnet().add_fill([0], trt.FillOperation.LINSPACE)
+    layer = default_trtnet().add_fill([0], trt.FillOperation.LINSPACE,
+                                      trt.int32)
     layer.set_input(0, num.trt_tensor)  # rank = 1
     layer.set_input(1, start.trt_tensor)  # rank = 0
     layer.set_input(2, step.trt_tensor)  # rank = 1
-    return _create_tensor(layer.get_output(0), layer)
+    tensor = _create_tensor(layer.get_output(0), layer)
+    if tensor.dtype != str_dtype_to_trt(dtype):
+        tensor = tensor.cast(dtype)
+    return tensor
 
 
 def expand(input: Tensor, expand_shape: Tensor) -> Tensor:
@@ -1846,6 +1866,7 @@ def _lookup_plugin(input: Tensor, weight: Tensor, rank: int) -> Tensor:
     lookup_plug = plg_creator.create_plugin("lookup", pfc)
     plug_inputs = [input.trt_tensor, weight.trt_tensor]
     layer = default_trtnet().add_plugin_v2(plug_inputs, lookup_plug)
+    _add_plugin_info(layer, plg_creator, "lookup", pfc)
     return _create_tensor(layer.get_output(0), layer)
 
 
@@ -2282,6 +2303,7 @@ def identity(input: Tensor) -> Tensor:
         id_plug = plg_creator.create_plugin("identity", pfc)
         plug_inputs = [input.trt_tensor]
         layer = default_trtnet().add_plugin_v2(plug_inputs, id_plug)
+        _add_plugin_info(layer, plg_creator, "identity", pfc)
     return _create_tensor(layer.get_output(0), layer)
 
 
@@ -2535,7 +2557,7 @@ def conv1d(input: Tensor,
                                                 bias)
     layer.stride_nd = (stride, 2)
     layer.padding_nd = (padding, 0)
-    layer.dilation = (dilation, 2)
+    layer.dilation_nd = (dilation, 2)
     layer.num_groups = groups
 
     if not is_weight_constant:
@@ -2876,6 +2898,7 @@ def allreduce(tensor: Tensor,
         plug_inputs.append(workspace.trt_tensor)
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, ar_plug)
+    _add_plugin_info(layer, allreduce_plg_creator, "allreduce", pfc)
     return _create_tensor(layer.get_output(0), layer)
 
 
@@ -2935,6 +2958,7 @@ def allgather(tensor: Tensor, group: List[int], gather_dim: int = 0) -> Tensor:
     plug_inputs = [tensor.trt_tensor]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, allgather)
+    _add_plugin_info(layer, allgather_plg_creator, "allgather", pfc)
 
     x = _create_tensor(layer.get_output(0), layer)
 
@@ -3005,6 +3029,7 @@ def send(tensor: Tensor, tgt: int) -> Tensor:
     plug_inputs = [tensor.trt_tensor]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, send_plug)
+    _add_plugin_info(layer, send_plg_creator, "send", pfc)
     return _create_tensor(layer.get_output(0), layer)
 
 
@@ -3047,6 +3072,7 @@ def recv(tensor: Tensor, src: int) -> Tensor:
     plug_inputs = [tensor.trt_tensor]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, recv_plug)
+    _add_plugin_info(layer, recv_plg_creator, "recv", pfc)
     return _create_tensor(layer.get_output(0), layer)
 
 
@@ -3168,6 +3194,7 @@ def bert_attention(tensor: Tensor,
     plug_inputs = [i.trt_tensor for i in plug_inputs]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, attn_plug)
+    _add_plugin_info(layer, attn_plg_creator, "padding_attn", pfc)
     assert layer.num_outputs == 1, \
         f"Plugin outputs number mismatch with expected, got {layer.num_outputs}, expected 1"
     output = _create_tensor(layer.get_output(0), layer)
@@ -3393,6 +3420,13 @@ def gpt_attention(
     assert host_max_attention_window_sizes is not None
 
     paged_kv_cache_flag = default_net().plugin_config.paged_kv_cache
+    if isinstance(qkv, list):
+        is_unfuse_qkv_gemm = 1
+    else:
+        is_unfuse_qkv_gemm = 0
+    unfuse_qkv_gemm = trt.PluginField(
+        "unfuse_qkv_gemm", np.array(np.int8(is_unfuse_qkv_gemm), dtype=np.int8),
+        trt.PluginFieldType.INT8)
 
     nheads = trt.PluginField("num_heads", np.array(num_heads, dtype=np.int32),
                              trt.PluginFieldType.INT32)
@@ -3495,18 +3529,17 @@ def gpt_attention(
         nheads, num_kv_heads, head_size, unidirectional, q_scaling,
         position_embedding_type, rotary_embedding_dim, rotary_embedding_base,
         rotary_embedding_scale_type, rotary_embedding_scale,
-        rotary_embedding_max_positions, tp_size, tp_rank, context_fmha_type,
-        multi_block_mode, kv_cache_quant_mode_field, remove_input_padding,
-        mask_type, paged_kv_cache, tokens_per_block, pf_type,
-        max_context_length, qkv_bias_enabled, do_cross_attention_field,
+        rotary_embedding_max_positions, tp_size, tp_rank, unfuse_qkv_gemm,
+        context_fmha_type, multi_block_mode, kv_cache_quant_mode_field,
+        remove_input_padding, mask_type, paged_kv_cache, tokens_per_block,
+        pf_type, max_context_length, qkv_bias_enabled, do_cross_attention_field,
         max_distance, use_paged_context_fmha_field, use_cache_pf
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
-    plug_inputs = []
+    plug_inputs = [*qkv] if is_unfuse_qkv_gemm else [qkv]
     if use_cache:
-        plug_inputs = [
-            qkv,
+        plug_inputs += [
             sequence_length,
             host_past_key_value_lengths,
             host_max_attention_window_sizes,
@@ -3515,8 +3548,7 @@ def gpt_attention(
             host_request_types,
         ]
     else:
-        plug_inputs = [
-            qkv,
+        plug_inputs += [
             host_max_attention_window_sizes,
             context_lengths,
             host_request_types,
@@ -3550,6 +3582,7 @@ def gpt_attention(
 
     plug_inputs = [i.trt_tensor for i in plug_inputs]
     layer = default_trtnet().add_plugin_v2(plug_inputs, attn_plug)
+    _add_plugin_info(layer, attn_plg_creator, "causal_attn", pfc)
     output = _create_tensor(layer.get_output(0), layer)
     present_key_value = None
     if use_cache and not paged_kv_cache_flag:
@@ -3671,6 +3704,7 @@ def layer_norm(input: Tensor,
 
         plug_inputs = [input.trt_tensor, weight.trt_tensor, bias.trt_tensor]
         layer = default_trtnet().add_plugin_v2(plug_inputs, layernorm_plug)
+        _add_plugin_info(layer, plg_creator, "layernorm", pfc)
         return _create_tensor(layer.get_output(0), layer)
 
 
@@ -3759,6 +3793,7 @@ def rms_norm(input: Tensor,
 
         plug_inputs = [input.trt_tensor, weight.trt_tensor]
         layer = default_trtnet().add_plugin_v2(plug_inputs, rmsnorm_plug)
+        _add_plugin_info(layer, plg_creator, "rmsnorm", pfc)
         return _create_tensor(layer.get_output(0), layer)
 
 
@@ -3870,7 +3905,6 @@ def generate_alibi_biases(slopes: Tensor, key_length: Tensor) -> Tensor:
     arange_shape = concat([1, 1, 1, key_length])
 
     arange_tensor = arange(trt_0, key_length, "float32").view(arange_shape)
-    arange_tensor = cast(arange_tensor, "float32")
     return slopes * arange_tensor
 
 
@@ -3953,12 +3987,12 @@ def gather_last_token_logits(hidden_states: Tensor, last_token_ids: Tensor,
         return hidden_states
 
     if remove_input_padding:
-        hidden_states = index_select(hidden_states, 1,
-                                     last_token_ids - 1)  # [1, seq_len, hidden]
+        hidden_states = index_select(hidden_states, 0,
+                                     last_token_ids - 1)  # [seq_len, hidden]
 
         hidden_states = hidden_states.view(
             concat([shape(last_token_ids, 0),
-                    shape(hidden_states, 2)]))
+                    shape(hidden_states, 1)]))
     else:
         # only calculate logits for the last token
         # [batch_size, seqlen, hidden_size] -> [batch_size, hidden_size]

@@ -42,7 +42,7 @@ namespace tensorrt_llm::plugins
 
 // inputs (see GPTAttentionPlugin::isEntryUsed for when each tensor is actually used)
 //     0.  input_tensor [batch_size, seq_len, local_hidden_size + 2 * local_num_kv_heads * head_size] or
-//                      [1, num_tokens, local_hidden_size + 2 * local_num_kv_heads * head_size] when
+//                      [num_tokens, local_hidden_size + 2 * local_num_kv_heads * head_size] when
 //                      enable_remove_input_padding
 //     1.  sequence_length [batch_size] (optional)
 //     2.  host_past_key_value_lengths [batch_size] (int32) (optional)
@@ -74,6 +74,7 @@ public:
         int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
+        bool unfuse_qkv_gemm,                                                                       // for AutoPP
         tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
         bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
         int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled,
@@ -139,6 +140,8 @@ private:
     enum class IdxEntry : size_t
     {
         QKV_TENSOR,
+        K_TENSOR,
+        V_TENSOR,
         SEQUENCE_LENGTH,
         HOST_PAST_KEY_VALUE_LENGTHS,
         HOST_MAX_ATTENTION_WINDOW,

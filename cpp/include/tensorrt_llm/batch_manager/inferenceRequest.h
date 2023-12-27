@@ -51,6 +51,7 @@ auto constexpr kLengthPenaltyTensorName = "len_penalty";
 auto constexpr kRepetitionPenaltyTensorName = "repetition_penalty";
 auto constexpr kMinLengthTensorName = "min_length";
 auto constexpr kPresencePenaltyTensorName = "presence_penalty";
+auto constexpr kFrequencyPenaltyTensorName = "frequency_penalty";
 auto constexpr kRandomSeedTensorName = "random_seed";
 auto constexpr kReturnLogProbsTensorName = "return_log_probs";
 auto constexpr kPromptEmbeddingTableName = "prompt_embedding_table";
@@ -64,6 +65,9 @@ auto constexpr kOutputIdsTensorName = "output_ids";
 auto constexpr kSequenceLengthTensorName = "sequence_length";
 auto constexpr kLogProbsTensorName = "output_log_probs";
 auto constexpr kCumLogProbsTensorName = "cum_log_probs";
+auto constexpr kContextLogitsName = "context_logits";
+auto constexpr kGenerationLogitsName = "generation_logits";
+
 } // namespace inference_request
 
 template <typename TTensor, typename TNamedTensor>
@@ -129,6 +133,7 @@ public:
         inference_request::kRepetitionPenaltyTensorName,
         inference_request::kMinLengthTensorName,
         inference_request::kPresencePenaltyTensorName,
+        inference_request::kFrequencyPenaltyTensorName,
         inference_request::kRandomSeedTensorName,
         inference_request::kReturnLogProbsTensorName,
         inference_request::kPromptEmbeddingTableName,
@@ -185,6 +190,7 @@ public:
     TENSOR_GETTER_SETTER(RepetitionPenalty, inference_request::kRepetitionPenaltyTensorName)
     TENSOR_GETTER_SETTER(MinLength, inference_request::kMinLengthTensorName)
     TENSOR_GETTER_SETTER(PresencePenalty, inference_request::kPresencePenaltyTensorName)
+    TENSOR_GETTER_SETTER(FrequencyPenalty, inference_request::kFrequencyPenaltyTensorName)
     TENSOR_GETTER_SETTER(RandomSeed, inference_request::kRandomSeedTensorName)
     TENSOR_GETTER_SETTER(ReturnLogProbs, inference_request::kReturnLogProbsTensorName)
     TENSOR_GETTER_SETTER(PromptEmbeddingTable, inference_request::kPromptEmbeddingTableName)

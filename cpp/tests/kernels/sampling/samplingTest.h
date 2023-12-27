@@ -192,6 +192,7 @@ struct SamplingKernelTestParam
     uint32_t topK;
     float topP;
     int32_t outputLen;
+    bool normalizeLogProbs = false;
 
     SamplingKernelTestParam& setBatchSize(int32_t bs)
     {

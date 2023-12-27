@@ -29,11 +29,11 @@ namespace tensorrt_llm::layers
 class DecodingSetupParams
 {
 public:
-    std::optional<std::vector<float>> temperature;       // [1] or [batch_size] on cpu
-    std::optional<std::vector<std::int32_t>> min_length; // [1] or [batch_size] on cpu
-    // repetition_penalty and presence_penalty are mutually exclusive.
+    std::optional<std::vector<float>> temperature;        // [1] or [batch_size] on cpu
+    std::optional<std::vector<std::int32_t>> min_length;  // [1] or [batch_size] on cpu
     std::optional<std::vector<float>> repetition_penalty; // [1] or [batch_size] on cpu
     std::optional<std::vector<float>> presence_penalty;   // [1] or [batch_size] on cpu
+    std::optional<std::vector<float>> frequency_penalty;  // [1] or [batch_size] on cpu
 };
 
 class DecodingParams

@@ -319,12 +319,11 @@ Then, you can add any combination of `--per-token` and `--per-channel` to get th
 Examples of build invocations:
 
 ```bash
-# Build model for SmoothQuant in the _per_tensor_ mode.
-python3 build.py --bin_model_dir=/llama/smooth_llama_7B/sq0.8/1-gpu/ \
-                 --use_smooth_quant
-
 # Build model for SmoothQuant in the _per_token_ + _per_channel_ mode
 python3 build.py --bin_model_dir=/llama/smooth_llama_7B/sq0.8/1-gpu/ \
+                 --use_gpt_attention_plugin float16 \
+                 --remove_input_padding \
+                 --enable_context_fmha \
                  --use_smooth_quant \
                  --per_token \
                  --per_channel

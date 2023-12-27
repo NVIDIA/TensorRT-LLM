@@ -33,14 +33,15 @@ using namespace tensorrt_llm::runtime;
 template <typename T>
 GptDecoder<T>::GptDecoder(size_t vocabSize, size_t vocabSizePadded, CudaStreamPtr const& stream)
     : mManager{stream}
-    , mAllocator{mManager}
 {
     bool isFreeBufferAfterForward{false};
     cudaDeviceProp prop;
     tc::check_cuda_error(cudaGetDeviceProperties(&prop, 0));
 
+    auto allocator = std::make_shared<common::CudaAllocator>(mManager);
+
     mDynamicDecodeLayer = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(
-        vocabSize, vocabSizePadded, stream->get(), &mAllocator, isFreeBufferAfterForward, &prop);
+        vocabSize, vocabSizePadded, stream->get(), std::move(allocator), isFreeBufferAfterForward, &prop);
 
     auto constexpr nvFloatType = TRTDataType<float>::value;
     mLogProbsTiled = mManager.emptyTensor(MemoryType::kGPU, nvFloatType);
@@ -53,12 +54,14 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
 
     typename layers::DynamicDecodeLayer<T>::SetupParams setupParams;
 
-    setupParams.random_seed = samplingConfig.randomSeed;
+    setupParams.randomSeed = samplingConfig.randomSeed;
 
     setupParams.repetition_penalty = samplingConfig.repetitionPenalty;
     setupParams.presence_penalty = samplingConfig.presencePenalty;
+    setupParams.frequency_penalty = samplingConfig.frequencyPenalty;
     setupParams.temperature = samplingConfig.temperature;
     setupParams.min_length = samplingConfig.minLength;
+    setupParams.normalize_log_probs = samplingConfig.normalizeLogProbs;
 
     // signed to unsigned
     if (samplingConfig.topK)

@@ -31,6 +31,9 @@ from tensorrt_llm.models.quantized.quant import get_dummy_quant_scales
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime.lora_manager import LoraConfig
 
+from .utils import (iterate_shard_files, load_state_dict,
+                    retrieved_layer_index_from_name)
+
 
 def get_scaling_factors(
     model_path: Union[str, Path],
@@ -549,23 +552,18 @@ def load_from_hf_checkpoint(
         plugin_weight_only_quant_type = torch.quint4x2
     use_weight_only = quant_mode.is_weight_only()
 
-    # Load examples/common/utils.py
-    import sys
-    sys.path.append(str(Path(__file__).parent.parent))
-    from common import utils
-
     layers_range = mapping.pp_layers(tensorrt_llm_llama.num_layers)
 
     qkv_weight_helper = QkvWeightHelper(tensorrt_llm_llama)
 
-    for model_file in utils.iterate_shard_files(model_dir,
-                                                rank=mapping.tp_rank,
-                                                progress_bar=False):
+    for model_file in iterate_shard_files(model_dir,
+                                          rank=mapping.tp_rank,
+                                          progress_bar=False):
         logger.debug(f'Loading file {str(model_file)}...')
-        model_params = utils.load_state_dict(model_file, dtype=dtype)
+        model_params = load_state_dict(model_file, dtype=dtype)
         for name, param in model_params.items():
             logger.debug(f'Converting weight {name}...')
-            i = utils.retrieved_layer_index_from_name(name)
+            i = retrieved_layer_index_from_name(name)
             if i is None:
                 layer = None
             else:

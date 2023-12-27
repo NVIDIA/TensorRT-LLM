@@ -127,6 +127,8 @@ public:
         return mDevice;
     }
 
+    [[nodiscard]] nvinfer1::DataType getLogitDataType() const;
+
     void generate(GenerationOutput& outputs, GenerationInput const& inputs, SamplingConfig const& samplingConfig);
 
 private:
@@ -141,7 +143,7 @@ private:
 
     void setup(Config const& sessionConfig);
 
-    void createContexts(SizeType numBatchesCtx, SizeType numBatchesGen, bool useCudaGraphs);
+    void createContexts();
     void createBuffers(SizeType numMicroBatches);
     void createDecoders(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow, SizeType maxSequenceLength,
         nvinfer1::DataType logitsType, bool decoderPerRequest, SizeType numMicroBatches);
@@ -149,8 +151,9 @@ private:
         SizeType maxSequenceLength, KvCacheConfig const& config);
     void createCustomAllReduceWorkspace(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength);
 
-    void executeContextStep(std::vector<GenerationInput> const& microBatches,
-        std::vector<SizeType> const& microBatchOffsets, KvCacheManager const* kvCacheManager);
+    void executeContextStep(std::vector<GenerationInput> const& microBatchesInputs,
+        std::vector<GenerationOutput>& microBatchesOutputs, std::vector<SizeType> const& microBatchOffsets,
+        KvCacheManager const* kvCacheManager);
     SizeType executeGenerationStep(SizeType step, std::vector<GenerationInput> const& microBatchesInputs,
         std::vector<GenerationOutput>& microBatchesOutputs, std::vector<SizeType> const& microBatchOffsets,
         KvCacheManager* kvCacheManager, std::vector<bool>& microBatchesFinished);
@@ -226,16 +229,8 @@ private:
             return numCtxBatches / numGenBatches;
         }
 
-        //! @details First 2 * numGenBatches contexts are for generation phase, next numCtxBatches are for context
-        //!          phase. Use numCtxPerGen() contexts for the context batches of each generation batch.
-        constexpr SizeType getCtxContextId(SizeType generationBatchId, SizeType contextBatchId) const
-        {
-            return 2 * numGenBatches + generationBatchId * numCtxPerGen() + contextBatchId;
-        }
-
-        //! @details First 2 * numGenBatches contexts are for generation phase, flip-flop between 2 of them for each
-        //!          generation batch.
-        constexpr SizeType getGenContextId(SizeType flipFlopId, SizeType generationBatchId) const
+        //! @details flip-flop between 2 graph instances for each generation batch.
+        constexpr SizeType getGenGraphId(SizeType flipFlopId, SizeType generationBatchId) const
         {
             return flipFlopId * numGenBatches + generationBatchId;
         }

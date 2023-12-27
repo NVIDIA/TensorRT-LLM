@@ -51,6 +51,7 @@ def serialize_engine(engine, path):
 
 def parse_config(ini_file, component, args):
     config = configparser.ConfigParser()
+    assert ini_file.exists(), f"Missing config file {ini_file}"
     config.read(ini_file)
     model_type = config.get('structure', 'model_type')
     args.model_type = model_type

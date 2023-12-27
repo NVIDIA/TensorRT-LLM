@@ -150,15 +150,16 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
         '--dtype=float16', '--use_gpt_attention_plugin=float16',
         '--remove_input_padding', '--paged_kv_cache',
         '--enable_context_fmha_fp32_acc', '--max_num_tokens=10000',
-        '--use_paged_context_fmha', '--max_draft_len=5'
+        '--use_paged_context_fmha'
     ]
     build_engine(fp16_weight_dir_x_gpu,
                  engine_dir / 'fp16-plugin-packed-paged' / tp_pp_dir, tp_size,
-                 *ifb_args)
+                 '--max_draft_len=5', *ifb_args)
+
     # We build almost the same engine twice. But this engine has gather_all_token_logits
     # to extract logits from python runtime and uses context FMHA for generation to match draft model executions,
     # which uses context FMHA for draft tokens prediction.
-    # gather_all_token_logits is not supported in C++ runtime yet.
+    # Currently the gather_all_token_logits is not supported with target model of speculative decoding
     build_engine(fp16_weight_dir_x_gpu,
                  engine_dir / 'fp16-plugin-packed-paged-gather' / tp_pp_dir,
                  tp_size, '--gather_all_token_logits',
@@ -166,7 +167,7 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
     build_engine(
         fp16_weight_dir_x_gpu, engine_dir /
         'fp16-plugin-packed-paged-context-fmha-for-gen' / tp_pp_dir, tp_size,
-        '--use_context_fmha_for_generation', *ifb_args)
+        '--use_context_fmha_for_generation', '--max_draft_len=5', *ifb_args)
 
     if has_safetensor:
         _pl.Path(str(safetensor_file) + ".bak").rename(safetensor_file)

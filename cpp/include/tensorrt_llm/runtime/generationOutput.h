@@ -39,6 +39,8 @@ public:
     {
         TLLM_CHECK_WITH_INFO(static_cast<bool>(this->ids), "Invalid ids tensor");
         TLLM_CHECK_WITH_INFO(static_cast<bool>(this->lengths), "Invalid lengths tensor");
+
+        generationLogitsFragments = std::make_shared<std::vector<TensorPtr>>();
     }
 
     // mandatory parameters
@@ -48,8 +50,14 @@ public:
     // optional parameters
     TensorPtr cumLogProbs;      // [batchSize, beamWidth], must be float*, on gpu
     TensorPtr logProbs;         // [batchSize, beamWidth, maxInputLength + maxNewTokens], must be float*, on gpu
-    TensorPtr contextLogits;    // [batch_size, max_input_length, vocab_size_padded]
-    TensorPtr generationLogits; // [batch_size, beam_width, max_output_length-1, vocab_size_padded]
+    TensorPtr contextLogits;    // [batch_size, max_input_length, vocab_size_padded], if packed, the shape will be
+                                // [packed_size, vocab_size_padded]
+    TensorPtr generationLogits; // [batch_size, beam_width, max_output_length, vocab_size_padded]
+    // generation logit pointer list
+    std::shared_ptr<std::vector<TensorPtr>> generationLogitsFragments;
+
+    TensorPtr contextLogitsHost;
+    TensorPtr generationLogitsHost;
 
     // callbacks
     Callback onTokenGenerated;

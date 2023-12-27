@@ -96,6 +96,8 @@ def main(args):
     num_beams = args.num_beams
     length_penalty = args.length_penalty
     repetition_penalty = args.repetition_penalty
+    presence_penalty = args.presence_penalty
+    frequency_penalty = args.frequency_penalty
 
     if test_trt_llm:
         if not PYTHON_BINDINGS and not args.use_py_session:
@@ -137,7 +139,12 @@ def main(args):
             trust_remote_code=True,
             torch_dtype=str_dtype_to_torch(args.data_type),
             device_map='auto' if args.hf_device_map_auto else None)
-        model.to_bettertransformer()
+        try:
+            model.to_bettertransformer()
+        except ValueError as e:
+            logger.warning(
+                f'Fail to call model.to_bettertransformer(), exception:\n{str(e)}'
+            )
         if not args.hf_device_map_auto:
             model.cuda()
         if model_name == 'qwen':
@@ -172,8 +179,9 @@ def main(args):
 
             # TODO: The below lines are used to be compatible with the original code; may need fix
             if model_name.startswith(('chatglm2', 'chatglm3')):
-                input_ids = tokenizer.encode(curr_text, return_tensors='pt')
-                input_ids = input_ids[:, :test_token_num]
+                input_ids = tokenizer.encode(curr_text,
+                                             return_tensors='pt').squeeze(0)
+                input_ids = input_ids[:test_token_num]
             elif model_name == 'qwen':
                 # use make_content to generate prompt
                 system_prompt = "You are a useful assistant, please directly output the corresponding summary according to the article entered by the user."
@@ -184,14 +192,14 @@ def main(args):
                     system=system_prompt,
                     max_input_length=test_token_num,
                 )
-                input_ids = torch.tensor(input_id_list).unsqueeze(0)
+                input_ids = torch.tensor(input_id_list)
             else:
                 input_ids = tokenizer.encode(
                     curr_text,
                     return_tensors='pt',
                     add_special_tokens=add_special_tokens,
                     truncation=True,
-                    max_length=test_token_num)
+                    max_length=test_token_num).squeeze(0)
 
             batch_input_ids.append(input_ids)
         return batch_input_ids
@@ -204,7 +212,7 @@ def main(args):
         batch_input_ids = _prepare_inputs(datapoint[dataset_input_key],
                                           eval_task=eval_task,
                                           add_special_tokens=add_special_tokens)
-        input_lengths = [x.size(1) for x in batch_input_ids]
+        input_lengths = [x.size(0) for x in batch_input_ids]
 
         with torch.no_grad():
             outputs = runner.generate(
@@ -219,6 +227,8 @@ def main(args):
                 num_beams=num_beams,
                 length_penalty=length_penalty,
                 repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
                 output_sequence_lengths=True,
                 return_dict=True)
             torch.cuda.synchronize()
@@ -277,7 +287,7 @@ def main(args):
         batch_input_ids = _prepare_inputs(datapoint[dataset_input_key],
                                           eval_task=eval_task,
                                           add_special_tokens=add_special_tokens)
-        input_lengths = [x.size(1) for x in batch_input_ids]
+        input_lengths = [x.size(0) for x in batch_input_ids]
         # Left padding for HF
         max_length = max(input_lengths)
         paddings = [
@@ -285,8 +295,7 @@ def main(args):
             for l in input_lengths
         ]
         batch_input_ids = [
-            torch.cat([pad, x.squeeze(0)])
-            for x, pad in zip(batch_input_ids, paddings)
+            torch.cat([pad, x]) for x, pad in zip(batch_input_ids, paddings)
         ]
         batch_input_ids = torch.stack(batch_input_ids)
         batch_input_ids = batch_input_ids.cuda()
@@ -552,6 +561,8 @@ if __name__ == '__main__':
     parser.add_argument('--top_p', type=float, default=0.0)
     parser.add_argument('--length_penalty', type=float, default=1.0)
     parser.add_argument('--repetition_penalty', type=float, default=1.0)
+    parser.add_argument('--presence_penalty', type=float, default=0.0)
+    parser.add_argument('--frequency_penalty', type=float, default=0.0)
     parser.add_argument('--debug_mode',
                         default=False,
                         action='store_true',

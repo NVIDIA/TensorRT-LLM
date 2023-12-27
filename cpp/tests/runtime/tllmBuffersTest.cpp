@@ -160,6 +160,9 @@ void testBuffer(IBuffer& buffer, std::int32_t typeSize)
     EXPECT_EQ(bufferWrapped->getMemoryType(), buffer.getMemoryType());
     EXPECT_NO_THROW(bufferWrapped->resize(buffer.getCapacity() / 2));
     EXPECT_THROW(bufferWrapped->resize(buffer.getCapacity() * 2), std::bad_alloc);
+    auto byteBuffer = IBuffer::wrap(static_cast<std::uint8_t*>(buffer.data()), buffer.getSizeInBytes());
+    EXPECT_EQ(byteBuffer->getSizeInBytes(), buffer.getSizeInBytes());
+    EXPECT_EQ(byteBuffer->getCapacity(), buffer.getSizeInBytes());
     auto tensorWrapped = ITensor::wrap(buffer.data(), buffer.getDataType(),
         ITensor::makeShape({static_cast<SizeType>(buffer.getSize())}), buffer.getCapacity());
     EXPECT_EQ(tensorWrapped->getSize(), buffer.getSize());

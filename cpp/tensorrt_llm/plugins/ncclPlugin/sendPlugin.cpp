@@ -16,6 +16,11 @@
  */
 #include "sendPlugin.h"
 
+#include "tensorrt_llm/common/mpiUtils.h"
+
+#include <cassert>
+#include <nccl.h>
+
 using namespace nvinfer1;
 using tensorrt_llm::plugins::SendPluginCreator;
 using tensorrt_llm::plugins::SendPlugin;
@@ -119,13 +124,10 @@ int SendPlugin::initialize() noexcept
     {
         return 0;
     }
-    int myRank, nRanks;
-    MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &myRank));
-    MPICHECK(MPI_Comm_size(MPI_COMM_WORLD, &nRanks));
 
     ncclUniqueId id;
     ncclGetUniqueId(&id);
-    MPICHECK(MPI_Send(&id, sizeof(id), MPI_BYTE, mTgtRank, 0, MPI_COMM_WORLD));
+    COMM_SESSION.send(id, mTgtRank, 0);
     NCCLCHECK(ncclCommInitRank(&mComm, 2, id, 0));
     return 0;
 }

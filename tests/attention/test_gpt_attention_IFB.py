@@ -794,8 +794,8 @@ class TestFunctional(unittest.TestCase):
                                             device='cuda').reshape(-1)
 
             local_shape_dict = {
-                'input': (1, total_num_tokens, hidden_size),
-                'output': (1, total_num_tokens, hidden_size),
+                'input': (total_num_tokens, hidden_size),
+                'output': (total_num_tokens, hidden_size),
                 'past_key_value':
                 (blocks, 2, num_kv_heads, tokens_per_block, head_size),
                 'sequence_length': (num_seq, ),
@@ -867,16 +867,21 @@ class TestFunctional(unittest.TestCase):
                 input_length = input_length_list[i][0]
                 local_beam_width = beam_width if step != 0 else 1
                 offset_next = offset + input_length * local_beam_width
-                torch_in = input_tensor[:, offset:offset_next, :].reshape(
-                    (local_beam_width, input_length, hidden_size))
+                if remove_input_padding:
+                    torch_in = input_tensor[offset:offset_next, :].reshape(
+                        (local_beam_width, input_length, hidden_size))
+                else:
+                    torch_in = input_tensor[:, offset:offset_next, :].reshape(
+                        (local_beam_width, input_length, hidden_size))
                 torch_out, torch_cache_list[req_idx] = torch_exec(
                     step, torch_in, ctx_attention_mask_list[req_idx], req_idx,
                     torch_cache_list[req_idx])
 
                 np.testing.assert_allclose(
-                    output[:, offset:offset_next, :].reshape(
-                        (local_beam_width, input_length,
-                         hidden_size)).cpu().numpy(),
+                    (output[offset:offset_next, :] if remove_input_padding else
+                     output[:, offset:offset_next, :]).reshape(
+                         (local_beam_width, input_length,
+                          hidden_size)).cpu().numpy(),
                     torch_out.cpu().numpy(),
                     atol=1e-3 if step == 0 else 2E-3)
                 offset = offset_next

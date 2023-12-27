@@ -73,7 +73,10 @@ def read_config(config_path: Path) -> Tuple[ModelConfig, dict]:
     """
     with open(config_path, 'r') as f:
         config = json.load(f)
+        return _builder_to_model_config(config)
 
+
+def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     builder_config = config['builder_config']
     model_name = builder_config['name']
     dtype = builder_config['precision']
@@ -168,7 +171,7 @@ class ModelRunnerMixin:
             raise RuntimeError(
                 f"Input batch size ({batch_size}) exceeds the engine or specified limit ({self.max_batch_size})"
             )
-        input_lengths = [x.size(1) for x in batch_input_ids]
+        input_lengths = [x.size(0) for x in batch_input_ids]
         max_length = max(input_lengths)
         if max_length > self.max_input_len:
             raise RuntimeError(
@@ -185,15 +188,13 @@ class ModelRunnerMixin:
 
     def _prepare_inputs(self, batch_input_ids: List[torch.Tensor],
                         pad_id: int) -> Tuple[torch.Tensor]:
-        # Remove potential additional dim, cast to int32
-        batch_input_ids = [
-            x.flatten().type(torch.int32) for x in batch_input_ids
-        ]
+        # Cast to int32
+        batch_input_ids = [x.type(torch.int32) for x in batch_input_ids]
         input_lengths = [x.size(0) for x in batch_input_ids]
         max_length = max(input_lengths)
 
         if self.remove_input_padding:
-            batch_input_ids = torch.concat(batch_input_ids).unsqueeze(0)
+            batch_input_ids = torch.concat(batch_input_ids)
         else:
             # Right padding for trt-llm
             paddings = [

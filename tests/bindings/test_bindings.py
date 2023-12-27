@@ -277,6 +277,7 @@ def test_sampling_config():
     check_empty_then_set("min_length", size_t_array)
     check_empty_then_set("repetition_penalty", float_array)
     check_empty_then_set("presence_penalty", float_array)
+    check_empty_then_set("frequency_penalty", float_array)
     check_empty_then_set("top_k", size_t_array)
     check_empty_then_set("top_p", float_array)
     check_empty_then_set("random_seed", size_t_array)
@@ -507,6 +508,10 @@ def test_inference_request():
     assert ir.presence_penalty is None
     ir.presence_penalty = data_tensor
     assert torch.equal(ir.presence_penalty, data_tensor)
+
+    assert ir.frequency_penalty is None
+    ir.frequency_penalty = data_tensor
+    assert torch.equal(ir.frequency_penalty, data_tensor)
 
     assert ir.prompt_embedding_table is None
     ir.prompt_embedding_table = data_tensor

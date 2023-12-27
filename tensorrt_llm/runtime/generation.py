@@ -85,7 +85,7 @@ def to_word_list_format(word_dict: List[List[str]],
 
 def _prepare_input_ids(tensors: Sequence[torch.Tensor]):
     tensors = [torch.flatten(t) for t in tensors]
-    data = torch.unsqueeze(torch.concat(tensors), 0)
+    data = torch.concat(tensors)
     row_lengths = [t.size(0) for t in tensors]
     row_lengths = torch.tensor(row_lengths,
                                dtype=torch.int32,
@@ -318,6 +318,7 @@ class SamplingConfig:
     repetition_penalty: Union[float, torch.Tensor] = field(default=1.0)
     min_length: Union[int, torch.Tensor] = field(default=1)
     presence_penalty: Union[float, torch.Tensor] = field(default=0.0)
+    frequency_penalty: Union[float, torch.Tensor] = field(default=0.0)
     use_beam_hyps: bool = field(default=True)
 
     ## None here means user didn't set it, and dynamicDecodeOp.cpp take optional value
@@ -793,9 +794,17 @@ class GenerationSession(object):
                                                scfg.presence_penalty,
                                                dtype=torch.float32)
 
-        assert (
-            scfg.presence_penalty == 0.0 or scfg.repetition_penalty == 1.0
-        ), f"presence_penalty({scfg.presence_penalty}) and repetition_penalty({scfg.repetition_penalty}) cannot be non-default values at the same time."
+        if isinstance(scfg.frequency_penalty, torch.Tensor):
+            assert scfg.frequency_penalty.dtype == torch.float32, f"scfg.frequency_penalty.dtype ({scfg.frequency_penalty.dtype}) must be torch.float32"
+            assert scfg.frequency_penalty.shape[
+                0] == batch_size, f"scfg.frequency_penalty.shape[0] ({scfg.frequency_penalty.shape[0]}) must equal to batch_size ({batch_size})"
+            self.frequency_penalty = scfg.frequency_penalty
+        elif scfg.frequency_penalty == 0.0:
+            self.frequency_penalty = None
+        else:
+            self.frequency_penalty = torch.full([batch_size],
+                                                scfg.frequency_penalty,
+                                                dtype=torch.float32)
 
         if isinstance(scfg.min_length, torch.Tensor):
             assert scfg.min_length.dtype == torch.int32, f"scfg.min_length.dtype ({scfg.min_length.dtype}) must be torch.int32"
@@ -833,14 +842,13 @@ class GenerationSession(object):
             self.random_seed = None
 
         if self.mapping.is_last_pp_rank():
-            self.dynamic_decoder.setup(batch_size, scfg.num_beams, self.top_k,
-                                       self.top_p, self.temperature,
-                                       self.repetition_penalty,
-                                       self.presence_penalty, self.min_length,
-                                       self.host_length_penalty,
-                                       self.beam_search_diversity_rate,
-                                       self.random_seed, self.top_p_decay,
-                                       self.top_p_min, self.top_p_reset_ids)
+            self.dynamic_decoder.setup(
+                batch_size, scfg.num_beams, self.top_k, self.top_p,
+                self.temperature, self.repetition_penalty,
+                self.presence_penalty, self.frequency_penalty, self.min_length,
+                self.host_length_penalty, self.beam_search_diversity_rate,
+                self.random_seed, self.top_p_decay, self.top_p_min,
+                self.top_p_reset_ids)
 
         assert scfg.end_id is not None, "end_id cannot be none"
         assert scfg.pad_id is not None, 'pad_id cannot be none'
@@ -851,10 +859,10 @@ class GenerationSession(object):
         max_context_length = host_context_lengths.max()
 
         # setup output ids buffer
-        if input_ids.shape[0] != host_context_lengths.shape[0]:
-            # dim 0 of input_ids is not batch size, which means remove_padding is enabled
+        if input_ids.dim() == 1:
+            # input_ids only have one dimension, which means remove_padding is enabled
             split_ids_list = list(
-                torch.split(input_ids,
+                torch.split(input_ids.unsqueeze(0),
                             host_context_lengths.numpy().tolist(),
                             dim=1))
             padded_input_ids = torch.nested.to_padded_tensor(
@@ -1213,8 +1221,12 @@ class GenerationSession(object):
 
         if self.mapping.has_pp():
             hidden_size = self.hidden_size * self.mapping.tp_size
-            hidden_states_input = hidden_states_input.resize_(
-                input_ids.shape[0], input_ids.shape[1], hidden_size)
+            if input_ids.dim() == 2:
+                hidden_states_input = hidden_states_input.resize_(
+                    input_ids.shape[0], input_ids.shape[1], hidden_size)
+            else:
+                hidden_states_input = hidden_states_input.resize_(
+                    input_ids.shape[0], hidden_size)
 
         if self.mapping.is_last_pp_rank():
             add_tensor(self.buffer['logits'], 'logits')
@@ -1238,7 +1250,7 @@ class GenerationSession(object):
                                tasks[b].item(),
                                dtype=torch.int32)
                     for b in range(context_lengths.size(0))
-                ]).unsqueeze(0).cuda()
+                ]).cuda()
             else:
                 tasks_generation = tasks.unsqueeze(-1)
             add_tensor(tasks_generation, 'tasks')
@@ -1375,7 +1387,7 @@ class GenerationSession(object):
 
         if self.mapping.has_pp():
             hidden_size = self.hidden_size * self.mapping.tp_size
-            shape = (1, batch_size * beam_width,
+            shape = (batch_size * beam_width,
                      hidden_size) if self.remove_input_padding else (
                          batch_size * beam_width, 1, hidden_size)
             hidden_states_input = hidden_states_input.resize_(*shape)
@@ -1389,8 +1401,8 @@ class GenerationSession(object):
             add_tensor(hidden_states_input, 'hidden_states_output')
 
         if self.mapping.is_first_pp_rank():
-            input_ids_shape = (1, batch_size *
-                               beam_width) if self.remove_input_padding else (
+            input_ids_shape = (batch_size *
+                               beam_width, ) if self.remove_input_padding else (
                                    batch_size * beam_width, 1)
             add_tensor_with_shape(self.new_tokens, 'input_ids', input_ids_shape)
         else:
@@ -1405,7 +1417,9 @@ class GenerationSession(object):
         if self.cross_attention:
             # hack: disable (or minimize) cross qkv computation at generation phase
             # TODO: enable [0,0,.] true zero tensor input; or use IfConditionalLayer
-            encoder_output_shape = [1, 1, encoder_output.shape[-1]
+            encoder_output_shape = [1, encoder_output.shape[-1]
+                                    ] if self.remove_input_padding else [
+                                        1, 1, encoder_output.shape[-1]
                                     ]  # encoder_output.shape
             add_tensor_with_shape(encoder_output, 'encoder_output',
                                   encoder_output_shape)
@@ -1429,7 +1443,7 @@ class GenerationSession(object):
             add_tensor(prompt_embedding_table, 'prompt_embedding_table')
 
             if self.remove_input_padding:
-                gen_tasks = tasks.unsqueeze(0)
+                gen_tasks = tasks
             else:
                 gen_tasks = tasks.unsqueeze(-1)
             add_tensor(gen_tasks, 'tasks')
@@ -1521,13 +1535,12 @@ class GenerationSession(object):
         if use_gpt_attention_plugin:
             max_context_length = kwargs.pop('max_context_length')
             if remove_input_padding:
-                position_ids = torch.unsqueeze(
-                    torch.concat([
-                        torch.arange(0,
-                                     host_context_lengths[i],
-                                     dtype=torch.int32,
-                                     device='cuda') for i in range(batch_size)
-                    ]), 0)
+                position_ids = torch.concat([
+                    torch.arange(0,
+                                 host_context_lengths[i],
+                                 dtype=torch.int32,
+                                 device='cuda') for i in range(batch_size)
+                ])
                 last_token_ids = torch.cumsum(last_token_ids, dim=0).int()
             else:
                 position_ids = torch.tensor(range(max_context_length),
@@ -1562,7 +1575,6 @@ class GenerationSession(object):
             step = kwargs.pop('step')
             position_ids = context_lengths + step
             if remove_input_padding:
-                position_ids = torch.unsqueeze(position_ids, 0)
                 last_token_ids = torch.cumsum(last_token_ids, dim=0).int()
             else:
                 position_ids = torch.unsqueeze(position_ids, 1)
@@ -2195,6 +2207,11 @@ class GenerationSession(object):
             "rerun the setup function with the new beam width to avoid buffer overflow."
         ite = 0  # index of local batches, will always be 0 if pp_size = 1
 
+        if self.remove_input_padding and input_ids.dim() == 2:
+            assert input_ids.shape[
+                0] == 1, "Packed 2D input must have shape [1, <sum of input lengths>]"
+            input_ids = input_ids.squeeze(0)
+
         self.__setup_decoder(input_ids, scfg, host_context_lengths)
         if not self.buffer_allocated:
             raise RuntimeError('Buffer not allocated, please call setup first!')
@@ -2381,7 +2398,7 @@ class ChatGLMGenerationSession(GenerationSession):
             for i in range(batch_size):
                 position_ids[0, 0, i] = context_lengths[i * num_beams] - 2
                 position_ids[0, 1, i] = step + 2
-            position_ids = _tile_beam_width(position_ids, num_beams)
+            position_ids = torch.tile(position_ids, [1, 1, num_beams])
             position_ids = position_ids.int().cuda()
             last_token_ids = torch.cumsum(last_token_ids, dim=0).int().cuda()
         else:

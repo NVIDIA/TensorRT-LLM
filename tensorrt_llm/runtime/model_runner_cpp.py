@@ -359,8 +359,9 @@ def _populate_sampling_config(
     ]
     gpt_sampling_config.length_penalty = [sampling_config.length_penalty]
     gpt_sampling_config.min_length = [sampling_config.min_length]
-    # TODO: cannot set presence_penalty?
+    # TODO: cannot set presence_penalty and frequency_penalty?
     # gpt_sampling_config.presence_penalty = [sampling_config.presence_penalty]
+    # gpt_sampling_config.frequency_penalty = [sampling_config.frequency_penalty]
     if sampling_config.random_seed is not None:
         gpt_sampling_config.random_seed = [sampling_config.random_seed]
     gpt_sampling_config.repetition_penalty = [

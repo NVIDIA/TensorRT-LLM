@@ -34,11 +34,12 @@ public:
 
     explicit TrtGptModelOptionalParams(KvCacheConfig const& kvCacheConfig = KvCacheConfig{},
         std::optional<SizeType> maxNumSequences = std::nullopt, bool enableTrtOverlap = true,
-        std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt)
+        std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt, bool normalizeLogProbs = true)
         : kvCacheConfig{kvCacheConfig}
         , maxNumSequences{maxNumSequences}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(deviceIds)
+        , normalizeLogProbs{normalizeLogProbs}
     {
     }
 
@@ -46,6 +47,7 @@ public:
     std::optional<SizeType> maxNumSequences;
     bool enableTrtOverlap;
     std::optional<std::vector<SizeType>> deviceIds;
+    bool normalizeLogProbs;
 };
 
 } // namespace tensorrt_llm::batch_manager

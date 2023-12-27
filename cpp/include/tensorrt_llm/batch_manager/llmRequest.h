@@ -332,6 +332,46 @@ public:
         mDraftLogits = draftLogits;
     }
 
+    TensorPtr const& getContextLogitsHost() const
+    {
+        return mContextLogitsHost;
+    }
+
+    void setContextLogitsHost(TensorPtr contextLogitsHost)
+    {
+        mContextLogitsHost = std::move(contextLogitsHost);
+    }
+
+    TensorPtr const& getGenerationLogitsHost() const
+    {
+        return mGenerationLogitsHost;
+    }
+
+    void setGenerationLogitsHost(TensorPtr generationLogitsHost)
+    {
+        mGenerationLogitsHost = std::move(generationLogitsHost);
+    }
+
+    std::vector<TensorPtr> const& getGenerationLogitsFragments() const
+    {
+        return mGenerationLogitsFragments;
+    }
+
+    void addGenerationFragments(TensorPtr& genLogits)
+    {
+        mGenerationLogitsFragments.push_back(genLogits);
+    }
+
+    SizeType getGenerationLogitsFragmentsSize()
+    {
+        return mGenerationLogitsFragments.size();
+    }
+
+    void clearGenerationLogitsFragments()
+    {
+        mGenerationLogitsFragments.clear();
+    }
+
     RequestIdType mRequestId;
     SizeType mPromptLen;
     SizeType mMaxNewTokens;
@@ -361,6 +401,13 @@ protected:
     VecLogProbs mCumLogProbs;           // [beamSize]
     std::shared_ptr<VecTokens> mDraftTokens;
     std::optional<TensorPtr> mDraftLogits;
+
+    // Save logits
+    TensorPtr mContextLogits;    // [mPromptLen, vocab_size_padded]
+    TensorPtr mContextLogitsHost;
+    TensorPtr mGenerationLogits; // [beam_size, mMaxNewTokens, vocab_size_padded]
+    TensorPtr mGenerationLogitsHost;
+    std::vector<TensorPtr> mGenerationLogitsFragments;
 };
 
 class LlmRequest : public GenericLlmRequest<runtime::ITensor::SharedPtr>

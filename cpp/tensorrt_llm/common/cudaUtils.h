@@ -305,6 +305,11 @@ inline size_t divUp(const T1& a, const T2& n)
     return (tmp_a + tmp_n - 1) / tmp_n;
 }
 
+inline int roundUp(int a, int n)
+{
+    return divUp(a, n) * n;
+}
+
 template <typename T, typename U, typename = std::enable_if_t<std::is_integral<T>::value>,
     typename = std::enable_if_t<std::is_integral<U>::value>>
 auto constexpr ceilDiv(T numerator, U denominator)

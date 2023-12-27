@@ -1103,7 +1103,7 @@ INSTANTIATE_TRANSPOSE_ATTENTION_OUT_REMOVE_PADDING(__nv_bfloat16);
 #endif
 #undef INSTANTIATE_TRANSPOSE_ATTENTION_OUT_REMOVE_PADDING
 
-template <typename T, bool ADD_BIAS, bool USING_CONTEXT_FMHA>
+template <typename T, bool ADD_BIAS>
 __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf, T* QKV, const T* __restrict qkv_bias,
     const int* seq_lens, const int* padding_offset, const int batch_size, const int seq_len, const int token_num,
     const int head_num, const int kv_head_num, const int size_per_head, const float* scale, const int int8_mode)
@@ -1182,33 +1182,17 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
             {
                 val = val + ldg(&qkv_bias[bias_id]);
             }
-
-            if (USING_CONTEXT_FMHA)
-            {
-                if (int8_mode == 2)
-                {
-                    // TODO: add support for int8 BMM with FusedAtt
-                }
-                else
-                {
-                    QKV[index] = val;
-                }
-            }
         }
         // Write to split QKV buffer
         if (head_num == kv_head_num || qkv_id == 0) // QKV or Q when MQA/GQA
         {
-            // if context FMHA is used, q_buf is not used, so no need to write to it
-            if (!(USING_CONTEXT_FMHA && qkv_id == 0))
-            {
-                const int target_batch_stride = head_num * seq_len * size_per_head;
-                const int target_head_stride = seq_len * size_per_head;
-                const int target_seq_stride = size_per_head;
-                if (qkv_ptr[qkv_id])
-                    qkv_ptr[qkv_id][target_batch_id * target_batch_stride + head_id * target_head_stride
-                        + seq_id * target_seq_stride + size_id]
-                        = val;
-            }
+            const int target_batch_stride = head_num * seq_len * size_per_head;
+            const int target_head_stride = seq_len * size_per_head;
+            const int target_seq_stride = size_per_head;
+            if (qkv_ptr[qkv_id])
+                qkv_ptr[qkv_id][target_batch_id * target_batch_stride + head_id * target_head_stride
+                    + seq_id * target_seq_stride + size_id]
+                    = val;
         }
         else if (head_num != kv_head_num && qkv_id > 0) // KV when MQA/GQA
         {
@@ -1252,7 +1236,7 @@ struct Vec_t<__nv_bfloat16>
 };
 #endif
 
-template <typename T, bool ADD_BIAS, bool USING_CONTEXT_FMHA>
+template <typename T, bool ADD_BIAS>
 __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf, T* QKV, const T* __restrict qkv_bias,
     const int* seq_lens, const int* padding_offset, const int batch_size, const int seq_len, const int head_num,
     const int kv_head_num, const int size_per_head, const int rotary_embedding_dim, float rotary_embedding_base,
@@ -1413,22 +1397,12 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     }
     if (!is_masked)
     {
-        if (USING_CONTEXT_FMHA)
-        {
-            *reinterpret_cast<Vec_t*>(&QKV[src_q_idx]) = q;
-        }
-        else
-        {
-            if (q_buf)
-                *reinterpret_cast<Vec_t*>(&q_buf[dest_q_idx]) = q;
-        }
+
+        if (q_buf)
+            *reinterpret_cast<Vec_t*>(&q_buf[dest_q_idx]) = q;
+
         if ((head_num == kv_head_num) || (head_idx == (kv_head_idx * qheads_per_kv_head)))
         {
-            if (USING_CONTEXT_FMHA)
-            {
-                *reinterpret_cast<Vec_t*>(&QKV[src_k_idx]) = k;
-                *reinterpret_cast<Vec_t*>(&QKV[src_v_idx]) = v;
-            }
             // we always need the following writes for KV cache
             if (k_buf)
                 *reinterpret_cast<Vec_t*>(&k_buf[dest_kv_idx]) = k;
@@ -1439,22 +1413,11 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     else if (is_seq_masked && !is_head_size_masked)
     {
         // Set padding to zero in case of potential nan generated.
-        if (USING_CONTEXT_FMHA)
-        {
-            *reinterpret_cast<Vec_t*>(&QKV[src_q_idx]) = zero;
-        }
-        else
-        {
-            if (q_buf)
-                *reinterpret_cast<Vec_t*>(&q_buf[dest_q_idx]) = zero;
-        }
+        if (q_buf)
+            *reinterpret_cast<Vec_t*>(&q_buf[dest_q_idx]) = zero;
+
         if ((head_num == kv_head_num) || (head_idx == (kv_head_idx * qheads_per_kv_head)))
         {
-            if (USING_CONTEXT_FMHA)
-            {
-                *reinterpret_cast<Vec_t*>(&QKV[src_k_idx]) = zero;
-                *reinterpret_cast<Vec_t*>(&QKV[src_v_idx]) = zero;
-            }
             // we always need the following writes for KV cache
             if (k_buf)
                 *reinterpret_cast<Vec_t*>(&k_buf[dest_kv_idx]) = zero;
@@ -1464,22 +1427,22 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     }
 }
 
-#define FUSED_QKV_BIAS_TRANSPOSE_LAUNCH(T, ADD_BIAS, USING_CONTEXT_FMHA)                                               \
-    add_fusedQKV_bias_transpose_kernel<T, ADD_BIAS, USING_CONTEXT_FMHA><<<grid, block, 0, stream>>>(q_buf, k_buf,      \
-        v_buf, QKV, qkv_bias, seq_lens, padding_offset, batch_size, seq_len, token_num, head_num, kv_head_num,         \
-        size_per_head, scale, int8_mode);
+#define FUSED_QKV_BIAS_TRANSPOSE_LAUNCH(T, ADD_BIAS)                                                                   \
+    add_fusedQKV_bias_transpose_kernel<T, ADD_BIAS><<<grid, block, 0, stream>>>(q_buf, k_buf, v_buf, QKV, qkv_bias,    \
+        seq_lens, padding_offset, batch_size, seq_len, token_num, head_num, kv_head_num, size_per_head, scale,         \
+        int8_mode);
 
-#define FUSED_QKV_BIAS_ROTARY_TRANSPOSE_LAUNCH(T, ADD_BIAS, USING_CONTEXT_FMHA)                                        \
-    add_fusedQKV_bias_transpose_kernel<T, ADD_BIAS, USING_CONTEXT_FMHA><<<grid, block, smem_size, stream>>>(q_buf,     \
-        k_buf, v_buf, QKV, qkv_bias, seq_lens, padding_offset, batch_size, seq_len, head_num, kv_head_num,             \
-        size_per_head, rotary_embedding_dim, rotary_embedding_base, rotary_scale_type, rotary_embedding_scale,         \
+#define FUSED_QKV_BIAS_ROTARY_TRANSPOSE_LAUNCH(T, ADD_BIAS)                                                            \
+    add_fusedQKV_bias_transpose_kernel<T, ADD_BIAS><<<grid, block, smem_size, stream>>>(q_buf, k_buf, v_buf, QKV,      \
+        qkv_bias, seq_lens, padding_offset, batch_size, seq_len, head_num, kv_head_num, size_per_head,                 \
+        rotary_embedding_dim, rotary_embedding_base, rotary_scale_type, rotary_embedding_scale,                        \
         rotary_embedding_max_positions, position_embedding_type);
 
 template <typename T>
 void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, const T* qkv_bias, const int* seq_lens,
     const int* padding_offset, const int batch_size, const int seq_len, const int token_num, const int head_num,
-    const int kv_head_num, const int size_per_head, const bool using_context_fmha, const int rotary_embedding_dim,
-    const float rotary_embedding_base, const RotaryScalingType rotary_scale_type, const float rotary_embedding_scale,
+    const int kv_head_num, const int size_per_head, const int rotary_embedding_dim, const float rotary_embedding_base,
+    const RotaryScalingType rotary_scale_type, const float rotary_embedding_scale,
     const int rotary_embedding_max_positions, const PositionEmbeddingType position_embedding_type, const float* scale,
     const int int8_mode, cudaStream_t stream)
 {
@@ -1493,25 +1456,11 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, const 
 
         if (qkv_bias != nullptr)
         {
-            if (using_context_fmha)
-            {
-                FUSED_QKV_BIAS_TRANSPOSE_LAUNCH(T, true, true);
-            }
-            else
-            {
-                FUSED_QKV_BIAS_TRANSPOSE_LAUNCH(T, true, false);
-            }
+            FUSED_QKV_BIAS_TRANSPOSE_LAUNCH(T, true);
         }
         else
         {
-            if (using_context_fmha)
-            {
-                FUSED_QKV_BIAS_TRANSPOSE_LAUNCH(T, false, true);
-            }
-            else
-            {
-                FUSED_QKV_BIAS_TRANSPOSE_LAUNCH(T, false, false);
-            }
+            FUSED_QKV_BIAS_TRANSPOSE_LAUNCH(T, false);
         }
     }
     else
@@ -1526,25 +1475,11 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, const 
         // NOTE: add offset for rotary embedding
         if (qkv_bias != nullptr)
         {
-            if (using_context_fmha)
-            {
-                FUSED_QKV_BIAS_ROTARY_TRANSPOSE_LAUNCH(T, true, true);
-            }
-            else
-            {
-                FUSED_QKV_BIAS_ROTARY_TRANSPOSE_LAUNCH(T, true, false);
-            }
+            FUSED_QKV_BIAS_ROTARY_TRANSPOSE_LAUNCH(T, true);
         }
         else
         {
-            if (using_context_fmha)
-            {
-                FUSED_QKV_BIAS_ROTARY_TRANSPOSE_LAUNCH(T, false, true);
-            }
-            else
-            {
-                FUSED_QKV_BIAS_ROTARY_TRANSPOSE_LAUNCH(T, false, false);
-            }
+            FUSED_QKV_BIAS_ROTARY_TRANSPOSE_LAUNCH(T, false);
         }
     }
 }
@@ -1552,8 +1487,8 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, const 
 #define INSTANTIATE_ADDFUSEDQKVBIAS_TRANSPOSE(T)                                                                       \
     template void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, const T* qkv_bias,              \
         const int* seq_lens, const int* padding_offset, const int batch_size, const int seq_len, const int token_num,  \
-        const int head_num, const int kv_head_num, const int size_per_head, const bool using_context_fmha,             \
-        const int rotary_embedding_dim, const float rotary_embedding_base, const RotaryScalingType rotary_scale_type,  \
+        const int head_num, const int kv_head_num, const int size_per_head, const int rotary_embedding_dim,            \
+        const float rotary_embedding_base, const RotaryScalingType rotary_scale_type,                                  \
         const float rotary_embedding_scale, const int rotary_embedding_max_poisitions,                                 \
         const PositionEmbeddingType position_embedding_type, const float* scale, const int int8_mode,                  \
         cudaStream_t stream)

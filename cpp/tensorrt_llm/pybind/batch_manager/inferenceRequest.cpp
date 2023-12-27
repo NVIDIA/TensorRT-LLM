@@ -86,6 +86,8 @@ void InferenceRequest::initBindings(py::module_& m)
         .def_property("min_length", &InferenceRequest::getMinLengthUnchecked, &InferenceRequest::setMinLength)
         .def_property(
             "presence_penalty", &InferenceRequest::getPresencePenaltyUnchecked, &InferenceRequest::setPresencePenalty)
+        .def_property("frequency_penalty", &InferenceRequest::getFrequencyPenaltyUnchecked,
+            &InferenceRequest::setFrequencyPenalty)
         .def_property("random_seed", &InferenceRequest::getRandomSeedUnchecked, &InferenceRequest::setRandomSeed)
         .def_property(
             "return_log_probs", &InferenceRequest::getReturnLogProbsUnchecked, &InferenceRequest::setReturnLogProbs)

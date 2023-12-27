@@ -16,13 +16,11 @@
  */
 #pragma once
 
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
+
 #include <cassert>
 #include <memory>
-#include <mpi.h>
-#include <nccl.h>
 #include <set>
 #include <string>
 #include <vector>

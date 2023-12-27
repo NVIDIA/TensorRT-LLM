@@ -86,7 +86,8 @@ public:
     TensorPtr attentionMask;       // without attention plugin
     TensorPtr positionIds;
     TensorPtr lastTokenIds;
-    TensorPtr requestTypes; // with attention plugin. Host tensor
+    TensorPtr requestTypes;        // with attention plugin. Host tensor
+    TensorPtr allGenerationLogits; // pre-allocate a buffer to save all generation logits, device tensor
 
     std::vector<TensorPtr> presentKeysVals;
     std::vector<TensorPtr> presentKeysValsAlt;  // without attention plugin
@@ -117,6 +118,14 @@ public:
     PromptTuningParams promptTuningParams;
     TensorPtr promptTuningTasksHost; // Tensor to hold tasks on host
 
+    // Context and generation logits buffer
+    TensorPtr cacheContextLogits;
+    TensorPtr cacheContextLogitsHost;
+    TensorPtr cacheGenerationLogits;
+    TensorPtr cacheGenerationLogitsHost;
+    TensorPtr cacheGenerationFragmentPointerDevice;
+    TensorPtr cacheGenerationFragmentPointerHost;
+
     bool allocated{false};
 
 public:
@@ -138,9 +147,6 @@ public:
 
     void postContextStep(std::vector<RuntimeBuffers> const& contextBuffers, BufferManager& manager,
         GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
-
-    void postEachGenerationStep(BufferManager& manager, TensorPtr outputGenerationLogits, SizeType step,
-        SizeType firstBatchSlotIdx, SizeType microBatchSize, SizeType beamWidth, WorldConfig const& worldConfig);
 
     void prepareContextStep(TensorPtr const& inputIds, TokenIdType padId, BufferManager& manager,
         KvCacheManager const* kvCacheManager, SizeType firstBatchSlotIdx, GptModelConfig const& modelConfig,

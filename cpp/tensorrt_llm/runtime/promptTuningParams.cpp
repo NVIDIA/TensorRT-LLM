@@ -80,7 +80,7 @@ void PromptTuningParams::fillTasksTensor(TensorPtr tasksHost, const SizeType bat
     if (packedInput)
     {
         tasks = manager.copyFrom(
-            promptTasksHost, runtime::ITensor::makeShape({1, totalInputSize}), runtime::MemoryType::kGPU);
+            promptTasksHost, runtime::ITensor::makeShape({totalInputSize}), runtime::MemoryType::kGPU);
     }
     else
     {

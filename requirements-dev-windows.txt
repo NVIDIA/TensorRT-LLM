@@ -6,7 +6,6 @@ mypy
 parameterized
 pre-commit
 pybind11-stubgen
-pynvml>=11.5.0
 pytest-cov
 pytest-forked
 pytest-xdist

@@ -14,11 +14,13 @@
 # limitations under the License.
 import copy
 import json
+import math
 import os
 import time
+from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Optional, Union
+from typing import Dict, Optional, Union
 
 import tensorrt as trt
 from packaging import version
@@ -72,6 +74,28 @@ class BuilderConfig(object):
     @property
     def trt_builder_config(self) -> trt.IBuilderConfig:
         return self._trt_builder_config
+
+    def to_dict(self) -> Dict:
+        '''return a dict with keys
+        {
+            "builder_config": {
+                # all key values set by the _init function
+            },
+            "plugin_config": {
+                # the network plugin_config (if any) attached to this BuilderConfig object
+                # inside the Builder.build_engine
+            }
+        }
+        '''
+        config = {'builder_config': {}}
+        for k in self.__dict__.keys():
+            if k != '_trt_builder_config' and k != 'plugin_config':
+                config['builder_config'][k] = self.__getattribute__(k)
+        if hasattr(self, 'plugin_config'):
+            assert isinstance(self.plugin_config, PluginConfig), \
+                f"Found unexpected plugin_config object with type: {type(self.plugin_config)}"
+            config['plugin_config'] = to_dict(self.plugin_config)
+        return config
 
 
 class Builder():
@@ -140,11 +164,10 @@ class Builder():
         config = self.trt_builder.create_builder_config()
         if not strongly_typed:
             fp8 = quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache()
-
-            if precision == 'float16':
+            if precision == 'float16' or precision == trt.DataType.HALF:
                 config.set_flag(trt.BuilderFlag.FP16)
                 config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
-            elif precision == 'bfloat16':
+            elif precision == 'bfloat16' or precision == trt.DataType.BF16:
                 config.set_flag(trt.BuilderFlag.BF16)
                 config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
             if int8:
@@ -202,10 +225,23 @@ class Builder():
             profile = self.trt_builder.create_optimization_profile()
             for input_name in input_tensors.keys():
                 shape_profile = input_tensors[input_name].profiles[i]
-                profile.set_shape(input_name, shape_profile.min,
-                                  shape_profile.opt, shape_profile.max)
+                min_shape = [*shape_profile.min]
+                opt_shape = [*shape_profile.opt]
+                max_shape = [*shape_profile.max]
+                if network._autopp_config is not None:
+                    io_shards = network._autopp_config["io_shards"]
+                    if input_name in io_shards:
+                        shards = io_shards[input_name]
+                        for dim, shard_num in shards.items():
+                            min_shape[dim] = int(
+                                math.floor(min_shape[dim] / shard_num))
+                            opt_shape[dim] = int(
+                                round(opt_shape[dim] / shard_num))
+                            max_shape[dim] = int(
+                                math.ceil(max_shape[dim] / shard_num))
+                profile.set_shape(input_name, min_shape, opt_shape, max_shape)
                 logger.debug(
-                    f'{input_name}, min: {shape_profile.min}, opt: {shape_profile.opt}, max: {shape_profile.max}, dimension names: {shape_profile.dimension_names}'
+                    f'{input_name}, min: {min_shape}, opt: {opt_shape}, max: {max_shape}, dimension names: {shape_profile.dimension_names}'
                 )
             builder_config.trt_builder_config.add_optimization_profile(profile)
         assert self._validate_named_dimensions(
@@ -301,7 +337,9 @@ class Builder():
         '''
         assert isinstance(network, Network)
         builder_config.plugin_config = network.plugin_config
-        self._add_optimization_profile(network, builder_config)
+        builder_config.autopp_config = network.autopp_config
+        if builder_config.trt_builder_config.num_optimization_profiles == 0:
+            self._add_optimization_profile(network, builder_config)
         engine = None
         logger.info(f'Build TensorRT engine {network.trt_network.name}')
         tik = time.time()
@@ -315,6 +353,7 @@ class Builder():
                     raise RuntimeError(f'Failed to set weight: {name}')
 
         # Build engine
+        network._fill_weights()
         engine = self.trt_builder.build_serialized_network(
             network.trt_network, builder_config.trt_builder_config)
         if engine is None:
@@ -348,29 +387,21 @@ class Builder():
 
     @staticmethod
     def save_config(builder_config: BuilderConfig, config_path: str):
-        config = {'builder_config': {}}
-        for k in builder_config.__dict__.keys():
-            if k != '_trt_builder_config' and k != 'plugin_config':
-                config['builder_config'][k] = builder_config.__getattribute__(k)
-        config['plugin_config'] = to_dict(builder_config.plugin_config)
+        config = builder_config.to_dict()
         to_json_file(config, config_path)
         logger.info(f'Config saved to {config_path}.')
 
 
+@dataclass
 class BuildConfig:
-
-    def __init__(self, max_input_len, max_output_len, max_batch_size,
-                 max_beam_width, max_num_tokens,
-                 max_prompt_embedding_table_size, gather_all_token_logits,
-                 plugin_config):
-        self.max_input_len = max_input_len
-        self.max_output_len = max_output_len
-        self.max_batch_size = max_batch_size
-        self.max_beam_width = max_beam_width
-        self.max_num_tokens = max_num_tokens
-        self.max_prompt_embedding_table_size = max_prompt_embedding_table_size
-        self.gather_all_token_logits = gather_all_token_logits
-        self.plugin_config = plugin_config
+    max_input_len: int = 256
+    max_output_len: int = 256
+    max_batch_size: int = 8
+    max_beam_width: int = 1
+    max_num_tokens: Optional[int] = None
+    max_prompt_embedding_table_size: int = 0
+    gather_all_token_logits: int = False
+    plugin_config: PluginConfig = PluginConfig()
 
     @classmethod
     def from_dict(cls, config):
@@ -573,7 +604,8 @@ def build_shard_model(model: PretrainedModel,
 
     builder_config = builder.create_builder_config(
         precision=model.config.dtype,
-        int8=model.config.quant_mode.has_act_or_weight_quant())
+        int8=model.config.quant_mode.has_act_or_weight_quant()
+        or model.config.quant_mode.has_int8_kv_cache())
 
     # Network -> Engine
     engine = builder.build_engine(network, builder_config)

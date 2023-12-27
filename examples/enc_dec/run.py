@@ -141,6 +141,7 @@ class TRTLLMEncDecModel:
         def engine_setup(component):
             # model config
             config_path = engine_dir / component / "config.json"
+            logger.info(f"Using config path {config_path}")
             model_config, tp_size, pp_size, gpus_per_node, dtype = read_config(
                 config_path)
 
@@ -206,7 +207,7 @@ class TRTLLMEncDecModel:
                 new_ids.append(
                     torch.cat(
                         (torch.IntTensor([first_ids[i]]).to(self.device), row)))
-            input_ids = torch.cat(new_ids).unsqueeze(dim=0)  # [1, num_tokens]
+            input_ids = torch.cat(new_ids)  # [num_tokens]
         else:
             # in padding mode --> keep input, just calculate actual length and max length
             # Note: 1st token should always count, even if it is pad_token_id. e.g., decoder start id in enc-dec models could be a single pad_token_id, we should count
@@ -228,8 +229,12 @@ class TRTLLMEncDecModel:
 
         # each engine has hidden_dim/TP, don't forget to multiply TP
         hidden_size = self.encoder_model_config.hidden_size * self.encoder_runtime_mapping.tp_size
-        hidden_states_shape = (input_ids.shape[0], input_ids.shape[1],
-                               hidden_size)  # [1,num_tokens,D] or [BS,seqlen,D]
+        if input_ids.dim() == 1:
+            hidden_states_shape = (input_ids.shape[0], hidden_size
+                                   )  # [num_tokens,D]
+        else:
+            hidden_states_shape = (input_ids.shape[0], input_ids.shape[1],
+                                   hidden_size)  # [BS,seqlen,D]
         hidden_states_dtype = lambda name: trt_dtype_to_torch(
             self.encoder_session.engine.get_tensor_dtype(name))
 
@@ -247,7 +252,6 @@ class TRTLLMEncDecModel:
                             for sample_length in torch_to_numpy(input_lengths)
                         ]
                         position_ids = torch.cat(position_ids)
-                        position_ids = torch.unsqueeze(position_ids, dim=0)
                     else:
                         bsz, seq_len = input_ids.shape[:2]
                         position_ids = torch.arange(

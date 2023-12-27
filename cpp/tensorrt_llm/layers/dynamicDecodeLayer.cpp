@@ -28,6 +28,7 @@
 
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
+using namespace tensorrt_llm::runtime;
 
 namespace tensorrt_llm
 {
@@ -46,14 +47,13 @@ void DynamicDecodeLayer<T>::initialize()
     mTopPDecode = std::make_unique<TopPSamplingLayer<T>>(
         vocab_size_, vocab_size_padded_, stream_, allocator_, false, cuda_device_prop_);
 
-    auto manager = runtime::BufferManager{std::make_shared<runtime::CudaStream>(stream_, common::getDevice(), false)};
-    mIdsPtrHost = manager.emptyBuffer(runtime::MemoryType::kPINNED, runtime::TRTDataType<int*>::value);
+    mIdsPtrHost = runtime::BufferManager::pinned(ITensor::makeShape({}), runtime::TRTDataType<int*>::value);
 }
 
 template <typename T>
 DynamicDecodeLayer<T>::DynamicDecodeLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-    IAllocator* allocator, bool is_free_buffer_after_forward, cudaDeviceProp* cuda_device_prop)
-    : BaseLayer(stream, allocator, is_free_buffer_after_forward)
+    std::shared_ptr<IAllocator> allocator, bool is_free_buffer_after_forward, cudaDeviceProp* cuda_device_prop)
+    : BaseLayer(stream, std::move(allocator), is_free_buffer_after_forward)
     , vocab_size_(vocab_size)
     , vocab_size_padded_(vocab_size_padded)
     , cuda_device_prop_(cuda_device_prop)
@@ -109,8 +109,8 @@ bool allSame(std::optional<std::vector<T>> const& vOpt)
 
 bool hasDiffRuntimeArgs(DecodingSetupParams const& params)
 {
-    return !allSame(params.presence_penalty) || !allSame(params.repetition_penalty) || !allSame(params.temperature)
-        || !allSame(params.min_length);
+    return !allSame(params.frequency_penalty) || !allSame(params.presence_penalty)
+        || !allSame(params.repetition_penalty) || !allSame(params.temperature) || !allSame(params.min_length);
 }
 } // namespace
 
@@ -127,14 +127,16 @@ void DynamicDecodeLayer<T>::setup(size_t batch_size, size_t beam_width, SetupPar
         samplingParams.min_length = setupParams.min_length;
         samplingParams.repetition_penalty = setupParams.repetition_penalty;
         samplingParams.presence_penalty = setupParams.presence_penalty;
+        samplingParams.frequency_penalty = setupParams.frequency_penalty;
 
         samplingParams.runtime_top_k = setupParams.runtime_top_k;
         samplingParams.runtime_top_p = setupParams.runtime_top_p;
-        samplingParams.random_seed = setupParams.random_seed;
+        samplingParams.randomSeed = setupParams.randomSeed;
 
         samplingParams.top_p_decay = setupParams.top_p_decay;
         samplingParams.top_p_min = setupParams.top_p_min;
         samplingParams.top_p_reset_ids = setupParams.top_p_reset_ids;
+        samplingParams.normalize_log_probs = setupParams.normalize_log_probs;
 
         mTopKDecode->setup(batch_size, samplingParams);
         mTopPDecode->setup(batch_size, samplingParams);
@@ -147,6 +149,7 @@ void DynamicDecodeLayer<T>::setup(size_t batch_size, size_t beam_width, SetupPar
         beamSearchParams.min_length = setupParams.min_length;
         beamSearchParams.repetition_penalty = setupParams.repetition_penalty;
         beamSearchParams.presence_penalty = setupParams.presence_penalty;
+        beamSearchParams.frequency_penalty = setupParams.frequency_penalty;
 
         beamSearchParams.beam_search_diversity_rate = setupParams.beam_search_diversity_rate;
         beamSearchParams.length_penalty = setupParams.length_penalty;

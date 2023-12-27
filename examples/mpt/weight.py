@@ -658,7 +658,7 @@ def load_from_awq_mpt(tensorrt_llm_mpt: GPTLMHeadModel,
     if mapping.is_last_pp_rank():
         tensorrt_llm_mpt.ln_f.weight.value = v.to(torch_dtype).cpu().numpy()
         # MPT do not have LN bias, we set 0 here.
-        random_bias = tensorrt_llm_mpt.ln_f.weight._value
+        random_bias = tensorrt_llm_mpt.ln_f.weight.raw_value
         tensorrt_llm_mpt.ln_f.bias.value = np.zeros(random_bias.shape).astype(
             random_bias.dtype)
 
@@ -694,14 +694,14 @@ def load_from_awq_mpt(tensorrt_llm_mpt: GPTLMHeadModel,
         # 4.5 input_layernorm
         v = load(prefix + awq_key_list[6])
         layer.input_layernorm.weight.value = v.to(torch_dtype).cpu().numpy()
-        random_bias = layer.input_layernorm.bias._value
+        random_bias = layer.input_layernorm.bias.raw_value
         layer.input_layernorm.bias.value = np.zeros(random_bias.shape).astype(
             random_bias.dtype)
 
         # 4.6 post_layernorm
         v = load(prefix + awq_key_list[7])
         layer.post_layernorm.weight.value = v.to(torch_dtype).cpu().numpy()
-        random_bias = layer.post_layernorm.bias._value
+        random_bias = layer.post_layernorm.bias.raw_value
         layer.post_layernorm.bias.value = np.zeros(random_bias.shape).astype(
             random_bias.dtype)
 

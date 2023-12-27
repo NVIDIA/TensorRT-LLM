@@ -13,6 +13,7 @@ Welcome to TensorRT-LLM's documentation!
    architecture.md
    gpt_runtime.md
    batch_manager.md
+   inference_request.md
    gpt_attention.md
    precision.md
    installation.md

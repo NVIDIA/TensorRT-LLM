@@ -25,7 +25,7 @@ from ..functional import (AttentionMaskType, PositionEmbeddingType,
                           concat, constant, embedding, expand_dims, expand_mask,
                           generate_alibi_biases, generate_alibi_slopes,
                           gpt_attention, matmul, repeat_interleave, round,
-                          shape, slice, softmax, split, view, where)
+                          shape, slice, softmax, split, unsqueeze, view, where)
 from ..module import Module
 from ..parameter import Parameter
 from ..quantization import QuantMode
@@ -147,29 +147,32 @@ class RopeEmbeddingUtils:
         return (tensor * cos) + (rotate_func(tensor) * sin)
 
     @staticmethod
-    def apply_rotary_pos_emb_chatglm(
-        qkv,
-        position_embedding,
-        num_attention_heads,
-        attention_head_size,
-        max_position_embeddings,
-        rotary_embedding_scale,
-    ) -> Tensor:
+    def apply_rotary_pos_emb_chatglm(qkv, position_embedding,
+                                     num_attention_heads, attention_head_size,
+                                     max_position_embeddings,
+                                     rotary_embedding_scale,
+                                     remove_input_padding) -> Tensor:
 
         half_head_size = attention_head_size // 2
-        qkv_shape = shape(qkv)
-        qkv = qkv.view(
-            concat([
-                shape(qkv, 0),
-                shape(qkv, 1),
-                num_attention_heads,
-                3,
-                attention_head_size,
-            ]))
-        query, key, value = split(qkv, 1, dim=3)
+        input = qkv[0] if isinstance(qkv, list) else qkv
+        input_shape = shape(input)
+        batch_size = 1 if remove_input_padding else shape(input, 0)
+        seqlen = shape(input, 0 if remove_input_padding else 1)
+        if isinstance(qkv, list):
+            query, key, value = qkv
+        else:
+            qkv = qkv.view(
+                concat([
+                    batch_size,
+                    seqlen,
+                    num_attention_heads,
+                    3,
+                    attention_head_size,
+                ]))
+            query, key, value = split(qkv, 1, dim=3)
         q_shape = concat([
-            shape(qkv, 0),
-            shape(qkv, 1),
+            batch_size,
+            seqlen,
             num_attention_heads,
             attention_head_size,
         ])
@@ -191,6 +194,9 @@ class RopeEmbeddingUtils:
             axis=1,
         )
 
+        if remove_input_padding:
+            position_embedding = unsqueeze(position_embedding, 0)
+
         embedding_weight = constant(embedding_weight)
         position_embedding = embedding(position_embedding, embedding_weight)
         position_embedding, block_embedding = split(
@@ -202,8 +208,8 @@ class RopeEmbeddingUtils:
         sin1, cos1 = split(block_embedding, half_head_size, dim=3)
 
         new_shape = concat([
-            shape(qkv, 0),
-            shape(qkv, 1),
+            batch_size,
+            seqlen,
             1,
             half_head_size,
         ])
@@ -226,8 +232,15 @@ class RopeEmbeddingUtils:
             if key.dtype != value.dtype:
                 key = cast(key, value.dtype)
 
-        qkv = concat([query, key, value], dim=2)
-        qkv = qkv.view(qkv_shape)
+        if isinstance(qkv, list):
+            qkv = [
+                query.view(input_shape),
+                key.view(input_shape),
+                value.view(input_shape),
+            ]
+        else:
+            qkv = concat([query, key, value], dim=2)
+            qkv = qkv.view(input_shape)
 
         return qkv
 
@@ -353,6 +366,7 @@ class Attention(Module):
         tp_group=None,
         tp_size=1,
         tp_rank=0,
+        use_auto_parallel=False,
         quant_mode: QuantMode = QuantMode(0),
         q_scaling=1.0,
         cross_attention=False,
@@ -381,6 +395,10 @@ class Attention(Module):
         self.dtype = dtype
         if dense_bias is None:
             dense_bias = bias
+        self.use_auto_parallel = use_auto_parallel
+        self.unfuse_qkv_gemm = use_auto_parallel
+        if self.use_auto_parallel:
+            assert self.tp_size == 1, "please disable manual tp when enable auto_parallel"
 
         self.num_layers = num_layers
         self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
@@ -428,7 +446,7 @@ class Attention(Module):
         else:
             self.register_parameter('kv_orig_quant_scale', None)
             self.register_parameter('kv_quant_orig_scale', None)
-
+        self.instance_id = instance_id
         # The output feature size is therefore (h/tp + 2*kvh/tp) * d, where h is num_heads,
         # d is head_size, kvh is the num_kv_heads and tp is tensor_parallel_size.
         # In ColumnLinear op, the output dim is calculated by (h + 2*kvh) * d / tp,
@@ -474,6 +492,32 @@ class Attention(Module):
                                    tp_group=tp_group,
                                    tp_size=tp_size,
                                    instance_id=instance_id)
+
+        if self.unfuse_qkv_gemm:
+            linear_class = FP8Linear if self.use_fp8_qdq else ColumnLinear
+            self.q = linear_class(hidden_size,
+                                  hidden_size,
+                                  bias=bias,
+                                  dtype=dtype,
+                                  tp_group=tp_group,
+                                  tp_size=tp_size,
+                                  gather_output=False)
+            self.k = linear_class(hidden_size,
+                                  tp_size * self.num_attention_kv_heads *
+                                  self.attention_head_size,
+                                  bias=bias,
+                                  dtype=dtype,
+                                  tp_group=tp_group,
+                                  tp_size=tp_size,
+                                  gather_output=False)
+            self.v = linear_class(hidden_size,
+                                  tp_size * self.num_attention_kv_heads *
+                                  self.attention_head_size,
+                                  bias=bias,
+                                  dtype=dtype,
+                                  tp_group=tp_group,
+                                  tp_size=tp_size,
+                                  gather_output=False)
 
         # per-layer relative attention table
         if relative_attention:
@@ -526,7 +570,53 @@ class Attention(Module):
             qkv_lora_params = lora_layer_params.get_runtime_params(
                 0, "attn_qkv")
 
-        qkv = self.qkv(hidden_states, qkv_lora_params)
+        unfuse_qkv_gemm = self.unfuse_qkv_gemm
+        if unfuse_qkv_gemm and self.cross_attention and encoder_output is not None:
+            unfuse_qkv_gemm = False
+            del self._modules['q']
+            del self._modules['k']
+            del self._modules['v']
+        if unfuse_qkv_gemm:
+            qkv_gemm = [self.q, self.k, self.v]
+            qkv_weight = self.qkv.weight.raw_value
+            if qkv_weight is not None:
+                weights = np.split(qkv_weight, [
+                    self.q.out_features,
+                    self.q.out_features + self.k.out_features,
+                ])
+                for gemm, weight in zip(qkv_gemm, weights):
+                    gemm.weight.value = weight
+            qkv_bias = self.qkv.bias.raw_value if self.qkv.bias is not None else None
+            if qkv_bias is not None:
+                biases = np.split(qkv_bias, [
+                    self.q.out_features,
+                    self.q.out_features + self.k.out_features,
+                ])
+                for gemm, bias in zip(qkv_gemm, biases):
+                    gemm.bias.value = bias
+            for name, parameter in self.qkv._parameters.items():
+                if name in ['weight', 'bias']:
+                    continue
+                for gemm in qkv_gemm:
+                    setattr(gemm, name, parameter)
+            qkv = [gemm(hidden_states) for gemm in qkv_gemm]
+            if default_net(
+            ).plugin_config.lora_plugin and qkv_lora_params is not None:
+                lora = self.qkv.lora(hidden_states, qkv_lora_params)
+                kv_size = self.attention_head_size * self.num_attention_kv_heads
+                qkv_lora = split(lora, [self.hidden_size, kv_size, kv_size],
+                                 dim=2)
+                qkv = [tensor + lora for tensor, lora in zip(qkv, qkv_lora)]
+            del self._modules['qkv']
+        else:
+            qkv = self.qkv(hidden_states, qkv_lora_params)
+
+        if default_net().plugin_config.remove_input_padding:
+            if unfuse_qkv_gemm:
+                for tensor in qkv:
+                    assert tensor.ndim() == 2
+            else:
+                assert qkv.ndim() == 2
 
         if default_net(
         ).plugin_config.lora_plugin and qkv_lora_params is None and lora_layer_params is not None:
@@ -565,6 +655,7 @@ class Attention(Module):
                 self.attention_head_size,
                 self.max_position_embeddings,
                 self.rotary_embedding_scale,
+                default_net().plugin_config.remove_input_padding,
             )
             self.rotary_embedding_scale_type = RotaryScalingType.none
             self.rotary_embedding_scale = 1.0
@@ -675,8 +766,12 @@ class Attention(Module):
             #   K[bs, num_attention_kv_heads, seqlen, attention_head_size]
             #   V[bs, num_attention_kv_heads, seqlen, attention_head_size]
             kv_size = self.attention_head_size * self.num_attention_kv_heads
-            query, key, value = split(qkv, [self.hidden_size, kv_size, kv_size],
-                                      dim=2)
+            if unfuse_qkv_gemm:
+                query, key, value = qkv[0], qkv[1], qkv[2]
+            else:
+                query, key, value = split(qkv,
+                                          [self.hidden_size, kv_size, kv_size],
+                                          dim=2)
 
             # in cross attention mode, replace kv by encoder_output
             if self.cross_attention and encoder_output is not None:
@@ -1010,6 +1105,9 @@ class BertAttention(Module):
         assert isinstance(hidden_states, Tensor)
 
         qkv = self.qkv(hidden_states)
+
+        if default_net().plugin_config.remove_input_padding:
+            assert qkv.ndim() == 2
 
         if default_net().plugin_config.bert_attention_plugin:
             # TRT plugin mode

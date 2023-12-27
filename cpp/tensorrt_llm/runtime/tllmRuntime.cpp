@@ -147,8 +147,9 @@ void TllmRuntime::setInputTensors(SizeType contextIndex, TensorMap const& tensor
                         "%s: expected dim[%d] = %d, provided dim[%d] = %d", name, j, dimExpected, j, dimProvided);
                 }
             }
-            TLLM_CHECK_WITH_INFO(context.setInputShape(name, shapeProvided), "Tensor '%s' has invalid shape %s", name,
-                ITensor::toString(shapeProvided).c_str());
+            TLLM_CHECK_WITH_INFO(context.setInputShape(name, shapeProvided),
+                "Tensor '%s' has invalid shape %s, expected %s", name, ITensor::toString(shapeProvided).c_str(),
+                ITensor::toString(shapeExpected).c_str());
             auto* const data = tensor->data();
             if (data)
             {

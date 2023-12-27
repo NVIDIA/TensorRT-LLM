@@ -152,23 +152,23 @@ template void cudaH2Dcpy(unsigned int* tgt, const unsigned int* src, size_t size
 template void cudaH2Dcpy(int8_t* tgt, const int8_t* src, size_t size);
 
 template <typename T>
-void cudaD2Dcpy(T* tgt, const T* src, const size_t size)
+void cudaD2Dcpy(T* tgt, const T* src, const size_t size, cudaStream_t stream)
 {
-    check_cuda_error(cudaMemcpy(tgt, src, sizeof(T) * size, cudaMemcpyDeviceToDevice));
+    check_cuda_error(cudaMemcpyAsync(tgt, src, sizeof(T) * size, cudaMemcpyDeviceToDevice, stream));
 }
 
-template void cudaD2Dcpy(float* tgt, const float* src, size_t size);
-template void cudaD2Dcpy(half* tgt, const half* src, size_t size);
+template void cudaD2Dcpy(float* tgt, const float* src, size_t size, cudaStream_t stream);
+template void cudaD2Dcpy(half* tgt, const half* src, size_t size, cudaStream_t stream);
 #ifdef ENABLE_BF16
-template void cudaD2Dcpy(__nv_bfloat16* tgt, const __nv_bfloat16* src, size_t size);
+template void cudaD2Dcpy(__nv_bfloat16* tgt, const __nv_bfloat16* src, size_t size, cudaStream_t stream);
 #endif
-template void cudaD2Dcpy(int* tgt, const int* src, size_t size);
-template void cudaD2Dcpy(bool* tgt, const bool* src, size_t size);
-template void cudaD2Dcpy(int8_t* tgt, const int8_t* src, size_t size);
+template void cudaD2Dcpy(int* tgt, const int* src, size_t size, cudaStream_t stream);
+template void cudaD2Dcpy(bool* tgt, const bool* src, size_t size, cudaStream_t stream);
+template void cudaD2Dcpy(int8_t* tgt, const int8_t* src, size_t size, cudaStream_t stream);
 #ifdef ENABLE_FP8
-template void cudaD2Dcpy(__nv_fp8_e4m3* tgt, const __nv_fp8_e4m3* src, size_t size);
+template void cudaD2Dcpy(__nv_fp8_e4m3* tgt, const __nv_fp8_e4m3* src, size_t size, cudaStream_t stream);
 #endif
-template void cudaD2Dcpy(unsigned long long* tgt, const unsigned long long* src, size_t size);
+template void cudaD2Dcpy(unsigned long long* tgt, const unsigned long long* src, size_t size, cudaStream_t stream);
 
 template <typename T_OUT, typename T_IN>
 __global__ void cudaCast(T_OUT* dst, T_IN* src, const size_t size)
@@ -227,6 +227,7 @@ template void cudaAutoCpy(int8_t* tgt, const int8_t* src, size_t size, cudaStrea
 template void cudaAutoCpy(uint8_t* tgt, const uint8_t* src, size_t size, cudaStream_t stream);
 template void cudaAutoCpy(uint32_t* tgt, const uint32_t* src, size_t size, cudaStream_t stream);
 template void cudaAutoCpy(unsigned long long* tgt, const unsigned long long* src, size_t size, cudaStream_t stream);
+template void cudaAutoCpy(unsigned long* tgt, const unsigned long* src, size_t size, cudaStream_t stream);
 template void cudaAutoCpy(char* tgt, const char* src, size_t size, cudaStream_t stream);
 
 template void cudaAutoCpy(float const** tgt, float const* const* src, size_t size, cudaStream_t stream);

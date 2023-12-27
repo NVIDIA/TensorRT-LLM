@@ -22,6 +22,7 @@
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.h"
 #include "tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommonImpl.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
 #include <algorithm>
 #include <cstdint>
 #include <functional>
@@ -40,15 +41,16 @@ GPTAttentionPlugin::GPTAttentionPlugin(int num_heads, int num_kv_heads, int head
     int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
     float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
     float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
+    bool unfuse_qkv_gemm,                                                                       // for AutoPP
     tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
     bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
     int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled,
     bool cross_attention, int max_distance, bool use_paged_context_fmha, bool use_cache)
     : GPTAttentionPluginCommon(num_heads, num_kv_heads, head_size, unidirectional, q_scaling, position_embedding_type,
         rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale,
-        rotary_embedding_max_positions, tp_size, tp_rank, context_fmha_type, multi_block_mode, kv_cache_quant_mode,
-        remove_input_padding, mask_type, paged_kv_cache, tokens_per_block, type, max_context_length, qkv_bias_enabled,
-        cross_attention, max_distance, use_paged_context_fmha, use_cache)
+        rotary_embedding_max_positions, tp_size, tp_rank, unfuse_qkv_gemm, context_fmha_type, multi_block_mode,
+        kv_cache_quant_mode, remove_input_padding, mask_type, paged_kv_cache, tokens_per_block, type,
+        max_context_length, qkv_bias_enabled, cross_attention, max_distance, use_paged_context_fmha, use_cache)
 {
     initEntryIdx();
 }
@@ -64,6 +66,8 @@ bool GPTAttentionPlugin::isEntryUsed(const IdxEntry& entry) const
     switch (entry)
     {
     case IdxEntry::QKV_TENSOR: return true;
+    case IdxEntry::K_TENSOR: return mUnfuseQkvGemm;
+    case IdxEntry::V_TENSOR: return mUnfuseQkvGemm;
     case IdxEntry::SEQUENCE_LENGTH: return useKVCache();
     case IdxEntry::HOST_PAST_KEY_VALUE_LENGTHS: return useKVCache();
     case IdxEntry::HOST_MAX_ATTENTION_WINDOW: return true;
@@ -110,8 +114,13 @@ GPTAttentionPlugin* GPTAttentionPlugin::clone() const noexcept
     return dynamic_cast<GPTAttentionPlugin*>(this->cloneImpl<GPTAttentionPlugin>());
 }
 
+static int getPackedTensorHiddenDimIndex(bool removePadding)
+{
+    return removePadding ? 1 : 2;
+}
+
 // outputs
-//     output_tensor [batch_size, seq_len, local_hidden_size]
+//     output_tensor [batch_size, seq_len, local_hidden_size] or [num_tokens, local_hidden_size]
 //     present_key_value_pool (optional if mPagedKVCache is false) [batch_size, 2, local_num_kv_heads, max_seq_len,
 //     head_size]
 nvinfer1::DimsExprs GPTAttentionPlugin::getOutputDimensions(
@@ -121,7 +130,7 @@ nvinfer1::DimsExprs GPTAttentionPlugin::getOutputDimensions(
     if (outputIndex == 0)
     {
         auto ret = inputs[getIdx(IdxEntry::QKV_TENSOR)];
-        ret.d[2] = exprBuilder.operation(
+        ret.d[getPackedTensorHiddenDimIndex(mRemovePadding)] = exprBuilder.operation(
             DimensionOperation::kPROD, *exprBuilder.constant(mHeadSize), *exprBuilder.constant(mNumHeads));
         return ret;
     }
@@ -204,13 +213,27 @@ size_t GPTAttentionPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* in
     const int total_num_seq = inputs[getIdx(IdxEntry::CONTEXT_LENGTHS)].dims.d[0];
     size_t const generation_workspace_size = getWorkspaceSizeForGeneration(type, total_num_seq);
 
-    return std::max(context_workspace_size, generation_workspace_size);
+    size_t attention_input_workspace_size = 0;
+    if (mUnfuseQkvGemm)
+    {
+        int const local_hidden_units_q
+            = inputs[getIdx(IdxEntry::QKV_TENSOR)].dims.d[getPackedTensorHiddenDimIndex(mRemovePadding)];
+        int const local_hidden_units_kv
+            = inputs[getIdx(IdxEntry::K_TENSOR)].dims.d[getPackedTensorHiddenDimIndex(mRemovePadding)];
+        size_t const size = tensorrt_llm::runtime::BufferDataType(type).getSize();
+        size_t const attention_input_size
+            = size * nbReq * max_context_length * (local_hidden_units_q + 2 * local_hidden_units_kv);
+        size_t workspaces[1];
+        workspaces[0] = attention_input_size;
+        attention_input_workspace_size = tensorrt_llm::common::calculateTotalWorkspaceSize(workspaces, 1);
+    }
+    return std::max(context_workspace_size, generation_workspace_size) + attention_input_workspace_size;
 }
 
-static int32_t getStride(nvinfer1::Dims const& dims, int n)
+static size_t getStride(nvinfer1::Dims const& dims, int n)
 {
     TLLM_CHECK(n >= 0 && n < dims.nbDims);
-    return std::accumulate(dims.d + n + 1, dims.d + dims.nbDims, 1, std::multiplies<int32_t>{});
+    return std::accumulate(dims.d + n + 1, dims.d + dims.nbDims, 1, std::multiplies<size_t>{});
 }
 
 template <typename T, typename KVCacheBuffer>
@@ -275,13 +298,14 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 {
     //     relative_attention_bias [head_num, max_seq_len, max_seq_len] (optional in relative position)
     //                          or [head_num, num_buckets] (optional in implicit relative attention)
-    //     cross_qkv [batch_size, seq_len, 3 * local_hidden_size] or [1, num_tokens, 3 * local_hidden_size]
+    //     cross_qkv [batch_size, seq_len, 3 * local_hidden_size] or [num_tokens, 3 * local_hidden_size]
     //               when enable remove_input_padding (optional in cross attention mode)
     //     cross_qkv_length [int] max encoder input context length (optional in cross attention mode)
     //     encoder_input_lengths [batch_size] raw sequence lengths (optional in cross attention mode)
 
     const T* attention_input = static_cast<const T*>(inputs[getIdx(IdxEntry::QKV_TENSOR)])
-        + inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[2] * tokenIdxBeg;
+        + inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[getPackedTensorHiddenDimIndex(mRemovePadding)]
+            * size_t(tokenIdxBeg);
     const T* qkv_bias = nullptr;
     if (mQKVBiasEnabled)
     {
@@ -290,6 +314,38 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
     auto const reqTypeInBatchPtr = static_cast<RequestType const*>(inputs[getIdx(IdxEntry::REQUEST_TYPES)]) + seqIdxBeg;
     bool const is_context = (reqTypeInBatchPtr[0] == RequestType::kCONTEXT);
+
+    if (mUnfuseQkvGemm)
+    {
+        int const max_seqlen = inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[mRemovePadding ? 0 : 1];
+        int const batch_size = mRemovePadding ? 1 : inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[0];
+
+        T const* attention_input_q = static_cast<T const*>(inputs[getIdx(IdxEntry::QKV_TENSOR)]);
+        T const* attention_input_k = static_cast<T const*>(inputs[getIdx(IdxEntry::K_TENSOR)]);
+        T const* attention_input_v = static_cast<T const*>(inputs[getIdx(IdxEntry::V_TENSOR)]);
+        size_t const hidden_units_q
+            = inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[getPackedTensorHiddenDimIndex(mRemovePadding)];
+        size_t const hidden_units_kv
+            = inputDesc[getIdx(IdxEntry::K_TENSOR)].dims.d[getPackedTensorHiddenDimIndex(mRemovePadding)];
+        size_t const hidden_units = hidden_units_q + 2 * hidden_units_kv;
+        size_t const size_qkv = sizeof(T) * hidden_units;
+        size_t const size_q = sizeof(T) * hidden_units_q;
+        size_t const size_kv = sizeof(T) * hidden_units_kv;
+        size_t const total_size = size_qkv * batch_size * max_seqlen;
+        int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(workspace);
+        size_t offset = 0;
+        T* attention_input_qkv = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, total_size));
+        workspace = reinterpret_cast<void*>(workspace_byte_ptr + offset);
+
+        cudaMemcpy2DAsync(attention_input_qkv, size_qkv, attention_input_q, size_q, size_q, batch_size * max_seqlen,
+            cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpy2DAsync(attention_input_qkv + hidden_units_q, size_qkv, attention_input_k, size_kv, size_kv,
+            batch_size * max_seqlen, cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpy2DAsync(attention_input_qkv + hidden_units_q + hidden_units_kv, size_qkv, attention_input_v, size_kv,
+            size_kv, batch_size * max_seqlen, cudaMemcpyDeviceToDevice, stream);
+
+        attention_input = attention_input_qkv + hidden_units * tokenIdxBeg;
+    }
 
     const int* context_q_lengths = reinterpret_cast<const int*>(inputs[getIdx(IdxEntry::CONTEXT_LENGTHS)]) + seqIdxBeg;
     const int* sequence_kv_length = useKVCache()
@@ -358,13 +414,21 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         host_block_pointers = const_cast<void*>(static_cast<void const*>(typed_host_block_pointers));
     }
 
-    T* context_buf_ = (T*) (outputs[0]) + outputDesc[0].dims.d[2] * tokenIdxBeg;
+    T* context_buf_
+        = (T*) (outputs[0]) + outputDesc[0].dims.d[getPackedTensorHiddenDimIndex(mRemovePadding)] * tokenIdxBeg;
     void* key_value_cache = nullptr;
     if (useKVCache() && !mPagedKVCache)
     {
         auto const cacheElemSize = (mKVCacheQuantMode.hasKvCacheQuant() ? 1 : sizeof(T));
         key_value_cache
             = static_cast<std::byte*>(outputs[1]) + cacheElemSize * getStride(outputDesc[1].dims, 0) * seqIdxBeg;
+        void const* past_key_value_cache = inputs[getIdx(IdxEntry::PAST_KEY_VALUE)];
+        if (past_key_value_cache != outputs[1])
+        {
+            auto shape = outputDesc[1].dims;
+            auto const size = std::accumulate(shape.d, shape.d + shape.nbDims, 1, std::multiplies<size_t>{});
+            cudaMemcpyAsync(outputs[1], past_key_value_cache, size, cudaMemcpyDeviceToDevice, stream);
+        }
     }
 
     const T* alibi_slopes = isALiBi() ? static_cast<const T*>(inputs[getIdx(IdxEntry::ALIBI_SLOPES)]) : nullptr;
@@ -390,7 +454,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             }
             else
             {
-                num_encoder_tokens = inputDesc[getIdx(IdxEntry::CROSS_QKV)].dims.d[1];
+                num_encoder_tokens = inputDesc[getIdx(IdxEntry::CROSS_QKV)].dims.d[0];
             }
         }
 
@@ -573,6 +637,7 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(const char* name, const Plugi
             p.getScalar<int32_t>("rotary_embedding_max_positions").value(),
             static_cast<int32_t>(p.getScalar<int32_t>("tp_size").value()),
             static_cast<int32_t>(p.getScalar<int32_t>("tp_rank").value()),
+            static_cast<bool>(p.getScalar<int8_t>("unfuse_qkv_gemm").value()),
             static_cast<ContextFMHAType>(p.getScalar<int8_t>("context_fmha_type").value()),
             static_cast<bool>(p.getScalar<int8_t>("multi_block_mode").value()),
             p.getScalar<int32_t>("kv_cache_quant_mode").value(),
