@@ -41,6 +41,7 @@ public:
         int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
+        bool unfuse_qkv_gemm,                                                                       // for AutoPP
         tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
         bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
         int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled,
@@ -215,6 +216,7 @@ protected:
     tensorrt_llm::common::QuantMode mKVCacheQuantMode;
     int mTpSize = 1;
     int mTpRank = 0;
+    bool mUnfuseQkvGemm = false;
     nvinfer1::DataType mType;
     int32_t mMaxContextLength;
     bool mQKVBiasEnabled;

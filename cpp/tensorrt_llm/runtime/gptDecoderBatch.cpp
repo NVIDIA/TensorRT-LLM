@@ -52,6 +52,7 @@ SamplingConfig extractSamplingConfig(SamplingConfig const& batchSamplingConfig, 
     extractOptional(samplingConfig.minLength, batchSamplingConfig.minLength);
     extractOptional(samplingConfig.repetitionPenalty, batchSamplingConfig.repetitionPenalty);
     extractOptional(samplingConfig.presencePenalty, batchSamplingConfig.presencePenalty);
+    extractOptional(samplingConfig.frequencyPenalty, batchSamplingConfig.frequencyPenalty);
     // sampling layers
     extractOptional(samplingConfig.topK, batchSamplingConfig.topK);
     extractOptional(samplingConfig.topP, batchSamplingConfig.topP);
@@ -572,7 +573,10 @@ void GptDecoderBatch::newBatch(
 
     auto const inputIdsShape = inputs.ids->getShape();
     TensorPtr inputIdsFlatView = ITensor::view(inputs.ids);
-    inputIdsFlatView->reshape(ITensor::makeShape({inputIdsShape.d[1]}));
+    if (inputs.packed && inputIdsShape.nbDims == 2)
+    { // For users still pass inputs.ids with shape [1, num_tokens], do squeeze for them.
+        inputIdsFlatView->squeeze(0);
+    }
     auto inputLengthsHost = mBufferManager.copyFrom(*inputLengths, MemoryType::kCPU);
     auto inputLengthsPtr = bufferCast<SizeType>(*inputLengthsHost);
     auto inputOffset = 0;
@@ -584,6 +588,7 @@ void GptDecoderBatch::newBatch(
         TensorPtr inputView;
         if (inputs.packed)
         {
+            TLLM_CHECK(inputIdsFlatView->getShape().nbDims == 1);
             inputView = ITensor::slice(inputIdsFlatView, inputOffset, inputLength);
             inputOffset += inputLength;
         }

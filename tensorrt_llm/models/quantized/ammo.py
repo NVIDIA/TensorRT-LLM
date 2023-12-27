@@ -58,9 +58,6 @@ def _quantize_model(model: torch.nn.Module,
         f'Got unsupported AMMO quantization format, {qformat} '
     if qformat == "fp8":
         quant_cfg = atq.FP8_DEFAULT_CFG
-        if quant_cfg_dict:
-            for name, cfg in quant_cfg_dict.items():
-                quant_cfg['quant_cfg'][name] = cfg
     elif qformat == "int8_sq":
         quant_cfg = atq.INT8_SMOOTHQUANT_CFG
     elif qformat == "int4_awq":
@@ -70,6 +67,10 @@ def _quantize_model(model: torch.nn.Module,
             del quant_cfg["quant_cfg"]["*lm_head*"]
     else:
         raise ValueError(f"Unsupported quantization format: {qformat}")
+
+    if quant_cfg_dict:
+        for name, cfg in quant_cfg_dict.items():
+            quant_cfg['quant_cfg'][name] = cfg
 
     def calibrate_loop():
         """Adjusts weights and scaling factors based on selected algorithms."""
@@ -85,11 +86,13 @@ def _quantize_model(model: torch.nn.Module,
     return model
 
 
-def quantize_and_export(model: torch.nn.Module,
-                        qformat: Literal['fp8', 'int8_sq', 'int4_awq'],
-                        calib_dataloader: DataLoader,
-                        export_path: Optional[Union[str, Path]] = None,
-                        tensor_parallel_size: int = 1) -> torch.nn.Module:
+def quantize_and_export(
+        model: torch.nn.Module,
+        qformat: Literal['fp8', 'int8_sq', 'int4_awq'],
+        calib_dataloader: DataLoader,
+        export_path: Optional[Union[str, Path]] = None,
+        tensor_parallel_size: int = 1,
+        quant_cfg_dict: Optional[Dict] = None) -> torch.nn.Module:
 
     model_cls_name = type(model).__name__
     model_lookup = {
@@ -112,11 +115,13 @@ def quantize_and_export(model: torch.nn.Module,
 
     model = _quantize_model(model,
                             qformat=qformat,
-                            calib_dataloader=calib_dataloader)
+                            calib_dataloader=calib_dataloader,
+                            quant_cfg_dict=quant_cfg_dict)
 
     if export_path:
         with torch.inference_mode():
-            if qformat == "int4_awq" and model_type == "qwen":
+            if qformat == "int4_awq" and model_type == "qwen" or \
+                model_type == "chatglm":
                 torch.save(model.state_dict(), export_path)
             else:
                 export_model_config(

@@ -22,6 +22,7 @@
 #include "tensorrt_llm/layers/onlineBeamSearchLayer.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
 #include "tensorrt_llm/layers/topPSamplingLayer.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
 #include <optional>
@@ -44,8 +45,8 @@ template <typename T>
 class DynamicDecodeLayer : public BaseLayer
 {
 public:
-    DynamicDecodeLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream, tc::IAllocator* allocator,
-        bool is_free_buffer_after_forward, cudaDeviceProp* cuda_device_prop);
+    DynamicDecodeLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
+        std::shared_ptr<tc::IAllocator> allocator, bool is_free_buffer_after_forward, cudaDeviceProp* cuda_device_prop);
 
     ~DynamicDecodeLayer() override;
     DynamicDecodeLayer(DynamicDecodeLayer const& dynamic_decode_layer);
@@ -53,16 +54,16 @@ public:
     class SetupParams
     {
     public:
-        std::optional<std::vector<float>> temperature;       // [1] or [batch_size] on cpu
-        std::optional<std::vector<std::int32_t>> min_length; // [1] or [batch_size] on cpu
-        // repetition_penalty and presence_penalty are mutually exclusive.
+        std::optional<std::vector<float>> temperature;        // [1] or [batch_size] on cpu
+        std::optional<std::vector<std::int32_t>> min_length;  // [1] or [batch_size] on cpu
         std::optional<std::vector<float>> repetition_penalty; // [1] or [batch_size] on cpu
         std::optional<std::vector<float>> presence_penalty;   // [1] or [batch_size] on cpu
+        std::optional<std::vector<float>> frequency_penalty;  // [1] or [batch_size] on cpu
 
         // baseSamplingLayer
-        std::optional<std::vector<std::uint32_t>> runtime_top_k;    // [1] or [batch_size] on cpu
-        std::optional<std::vector<float>> runtime_top_p;            // [1] or [batch_size] on cpu
-        std::optional<std::vector<unsigned long long>> random_seed; // [1] or [batch_size] on cpu
+        std::optional<std::vector<std::uint32_t>> runtime_top_k; // [1] or [batch_size] on cpu
+        std::optional<std::vector<float>> runtime_top_p;         // [1] or [batch_size] on cpu
+        std::optional<std::vector<uint64_t>> randomSeed;         // [1] or [batch_size] on cpu
 
         // topPSamplingLayer
         std::optional<std::vector<float>> top_p_decay;            // [batch_size], must between [0, 1]
@@ -72,6 +73,8 @@ public:
         // omlineBeamSearchLayer
         std::optional<std::vector<float>> beam_search_diversity_rate;
         std::optional<std::vector<float>> length_penalty;
+
+        std::optional<bool> normalize_log_probs;
     };
 
     void setup(size_t batch_size, size_t beam_width, SetupParams const& setupParams);

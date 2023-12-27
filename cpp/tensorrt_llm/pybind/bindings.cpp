@@ -202,6 +202,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("min_length", &tr::SamplingConfig::minLength)
         .def_readwrite("repetition_penalty", &tr::SamplingConfig::repetitionPenalty)
         .def_readwrite("presence_penalty", &tr::SamplingConfig::presencePenalty)
+        .def_readwrite("frequency_penalty", &tr::SamplingConfig::frequencyPenalty)
         .def_readwrite("top_k", &tr::SamplingConfig::topK)
         .def_readwrite("top_p", &tr::SamplingConfig::topP)
         .def_readwrite("random_seed", &tr::SamplingConfig::randomSeed)
@@ -282,6 +283,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     tensorNames.attr("REPETITION_PENALTY") = py::str(tb::inference_request::kRepetitionPenaltyTensorName);
     tensorNames.attr("MIN_LENGTH") = py::str(tb::inference_request::kMinLengthTensorName);
     tensorNames.attr("PRESENCE_PENALTY") = py::str(tb::inference_request::kPresencePenaltyTensorName);
+    tensorNames.attr("FREQUENCY_PENALTY") = py::str(tb::inference_request::kFrequencyPenaltyTensorName);
     tensorNames.attr("RANDOM_SEED") = py::str(tb::inference_request::kRandomSeedTensorName);
     tensorNames.attr("RETURN_LOG_PROBS") = py::str(tb::inference_request::kReturnLogProbsTensorName);
     tensorNames.attr("PROMPT_EMBEDDING_TABLE") = py::str(tb::inference_request::kPromptEmbeddingTableName);
@@ -311,7 +313,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("kv_cache_config", &tb::TrtGptModelOptionalParams::kvCacheConfig)
         .def_readwrite("max_num_sequences", &tb::TrtGptModelOptionalParams::maxNumSequences)
         .def_readwrite("enable_trt_overlap", &tb::TrtGptModelOptionalParams::enableTrtOverlap)
-        .def_readwrite("device_ids", &tb::TrtGptModelOptionalParams::deviceIds);
+        .def_readwrite("device_ids", &tb::TrtGptModelOptionalParams::deviceIds)
+        .def_readwrite("normalize_log_probs", &tb::TrtGptModelOptionalParams::normalizeLogProbs);
 
     tpb::GptManager::initBindings(m);
 }

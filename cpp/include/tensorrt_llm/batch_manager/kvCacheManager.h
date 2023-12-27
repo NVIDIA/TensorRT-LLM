@@ -120,6 +120,8 @@ public:
 
     void removeNextBlock(VecTokens const& tokens);
 
+    static std::shared_ptr<KVCacheBlock> findLeafBlock(std::shared_ptr<KVCacheBlock> searchStart);
+
     [[nodiscard]] BlockPtr findMatchingBlock(VecTokens const& tokens) const;
 
     //! \brief Free block from previous block if present.

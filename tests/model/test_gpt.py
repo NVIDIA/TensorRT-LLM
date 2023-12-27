@@ -613,9 +613,8 @@ class TestGPT(unittest.TestCase):
                 return ref[:, -1, :]
 
             if enable_remove_input_padding:
-                ctx_ids = ctx_ids.view([1, batch_size * seq_len])
-                ctx_position_ids = ctx_position_ids.view(
-                    [1, batch_size * seq_len])
+                ctx_ids = ctx_ids.view([batch_size * seq_len])
+                ctx_position_ids = ctx_position_ids.view([batch_size * seq_len])
                 ctx_last_token_ids = torch.cumsum(ctx_last_token_ids,
                                                   dim=0).int()
 
@@ -682,8 +681,8 @@ class TestGPT(unittest.TestCase):
                 return ref
 
             if enable_remove_input_padding:
-                gen_ids = gen_ids.view([1, batch_size])
-                gen_position_ids = gen_position_ids.view([1, batch_size])
+                gen_ids = gen_ids.view([batch_size])
+                gen_position_ids = gen_position_ids.view([batch_size])
                 gen_last_token_ids = torch.ones_like(
                     gen_context_lengths).int().cuda()
                 gen_last_token_ids = torch.cumsum(gen_last_token_ids,
@@ -744,7 +743,7 @@ class TestGPT(unittest.TestCase):
             ],
                                   dim=0)
 
-            input_ids = input_ids.view((1, -1))
+            input_ids = input_ids.view((-1, ))
 
             ctx_position_ids = torch.tensor(
                 range(seq_len), dtype=torch.int32).reshape(
@@ -755,7 +754,7 @@ class TestGPT(unittest.TestCase):
                     (-1, ))).int().cuda() * seq_len
             position_ids = torch.cat(
                 [ctx_position_ids.view((-1, )), gen_position_ids], dim=0).view(
-                    (1, -1))
+                    (-1, ))
 
             input_lengths = torch.tensor([seq_len] * num_context_input +
                                          [1] * num_generation_input,

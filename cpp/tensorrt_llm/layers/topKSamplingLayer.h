@@ -31,21 +31,23 @@ template <typename T>
 class TopKSamplingLayer : public BaseSamplingLayer<T>
 {
 public:
+    static constexpr uint32_t TOP_K_MAX = 1024;
     using Base = BaseSamplingLayer<T>;
     using SetupParams = typename Base::SetupParams;
 
     TopKSamplingLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-        tensorrt_llm::common::IAllocator* allocator, bool is_free_buffer_after_forward);
+        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator, bool is_free_buffer_after_forward);
     TopKSamplingLayer(TopKSamplingLayer<T> const& top_k_sampling_layer);
     ~TopKSamplingLayer();
 
-    void setup(size_t batch_size, SetupParams const& setupParams);
+    void setup(size_t batch_size, SetupParams const& setupParams) override;
 
 protected:
     void runSampling(DecodingOutputParams& outputs, DecodingParams const& params) override;
 
     void freeBuffer() override;
 
+    bool normalize_log_probs = true;
     uint32_t runtime_max_top_k_ = 1;
     uint32_t* runtime_top_k_buf_ = nullptr;
     float* runtime_top_p_buf_ = nullptr;

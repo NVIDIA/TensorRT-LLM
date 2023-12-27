@@ -75,8 +75,8 @@ void update_indir_cache_kernelLauncher(int* tgt_indir_cache, const int* src_indi
 
 template <typename T>
 BaseBeamSearchLayer<T>::BaseBeamSearchLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-    IAllocator* allocator, bool is_free_buffer_after_forward)
-    : BaseLayer(stream, allocator, is_free_buffer_after_forward, nullptr)
+    std::shared_ptr<IAllocator> allocator, bool is_free_buffer_after_forward)
+    : BaseLayer(stream, std::move(allocator), is_free_buffer_after_forward, nullptr)
     , vocab_size_(vocab_size)
     , vocab_size_padded_(vocab_size_padded)
 {
@@ -107,6 +107,8 @@ void BaseBeamSearchLayer<T>::freeBuffer()
         allocator_->free((void**) (&temperature_buf_));
         allocator_->free((void**) (&min_lengths_buf_));
         allocator_->free((void**) (&repetition_penalty_buf_));
+        allocator_->free((void**) (&presence_penalty_buf_));
+        allocator_->free((void**) (&frequency_penalty_buf_));
         is_allocate_buffer_ = false;
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -119,6 +121,8 @@ void BaseBeamSearchLayer<T>::allocateBuffer(size_t batch_size)
     temperature_buf_ = allocator_->reMalloc(temperature_buf_, sizeof(float) * batch_size, false);
     min_lengths_buf_ = allocator_->reMalloc(min_lengths_buf_, sizeof(int) * batch_size, false);
     repetition_penalty_buf_ = allocator_->reMalloc(repetition_penalty_buf_, sizeof(float) * batch_size, false);
+    presence_penalty_buf_ = allocator_->reMalloc(presence_penalty_buf_, sizeof(float) * batch_size, false);
+    frequency_penalty_buf_ = allocator_->reMalloc(frequency_penalty_buf_, sizeof(float) * batch_size, false);
 
     is_allocate_buffer_ = true;
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -135,23 +139,23 @@ void BaseBeamSearchLayer<T>::setupBase(size_t batch_size, SetupParams const& set
     fillBuffers(setupParams.temperature, 1.0f, mTemperature, temperature_buf_);
     fillBuffers(setupParams.min_length, 1, mMinLength, min_lengths_buf_);
 
-    mRepetitionPenaltyType = RepetitionPenaltyType::None;
-    if (setupParams.repetition_penalty || setupParams.presence_penalty)
+    use_repetition_penalty_ = static_cast<bool>(setupParams.repetition_penalty);
+    use_presence_penalty_ = static_cast<bool>(setupParams.presence_penalty);
+    use_frequency_penalty_ = static_cast<bool>(setupParams.frequency_penalty);
+    if (use_repetition_penalty_)
     {
-        TLLM_CHECK_WITH_INFO(!(setupParams.repetition_penalty && setupParams.presence_penalty),
-            "Found ambiguous parameters repetition_penalty and presence_penalty "
-            "which are mutually exclusive. "
-            "Please provide one of repetition_penalty or presence_penalty.");
-        mRepetitionPenaltyType
-            = setupParams.repetition_penalty ? RepetitionPenaltyType::Multiplicative : RepetitionPenaltyType::Additive;
-        if (mRepetitionPenaltyType == RepetitionPenaltyType::Multiplicative)
-        {
-            fillBuffers(setupParams.repetition_penalty, 1.0f, mRepetitionPenalty, repetition_penalty_buf_);
-        }
-        else
-        {
-            fillBuffers(setupParams.presence_penalty, 1.0f, mRepetitionPenalty, repetition_penalty_buf_);
-        }
+        fillBuffers(setupParams.repetition_penalty, getDefaultPenaltyValue(RepetitionPenaltyType::Repetition),
+            mRepetitionPenalty, repetition_penalty_buf_);
+    }
+    if (use_presence_penalty_)
+    {
+        fillBuffers(setupParams.presence_penalty, getDefaultPenaltyValue(RepetitionPenaltyType::Presence),
+            mPresencePenalty, presence_penalty_buf_);
+    }
+    if (use_frequency_penalty_)
+    {
+        fillBuffers(setupParams.frequency_penalty, getDefaultPenaltyValue(RepetitionPenaltyType::Frequency),
+            mFrequencyPenalty, frequency_penalty_buf_);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -181,8 +185,9 @@ void BaseBeamSearchLayer<T>::forward(BeamSearchOutputParams& outputs, ForwardPar
     invokeAddBiasApplyPenalties(logits.getPtr<T>(), output_ids_ptr.template getPtr<const int*>(),
         outputs.parent_ids_ptr.template getPtr<const int*>(), input_lengths, sequence_length, embedding_bias, ite,
         local_batch_size, batch_size, beam_width, vocab_size_, vocab_size_padded_, end_ids, temperature_buf_,
-        mTemperature, repetition_penalty_buf_, mRepetitionPenalty, mRepetitionPenaltyType, min_lengths_buf_,
-        max_seq_len, stream_);
+        mTemperature, repetition_penalty_buf_, presence_penalty_buf_, frequency_penalty_buf_, mRepetitionPenalty,
+        mPresencePenalty, mFrequencyPenalty, use_repetition_penalty_, use_presence_penalty_, use_frequency_penalty_,
+        min_lengths_buf_, max_seq_len, stream_);
     sync_check_cuda_error();
 
     invokeSoftMax(outputs, params);

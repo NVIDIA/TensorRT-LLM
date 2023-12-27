@@ -30,10 +30,6 @@ try:
     from transformers import MixtralForCausalLM
 except ImportError:
     MixtralForCausalLM = None
-from weight import (get_scaling_factors, load_from_awq_llama, load_from_binary,
-                    load_from_gptq_llama, load_from_hf_checkpoint,
-                    load_from_hf_llama, load_from_meta_llama)
-
 import tensorrt_llm
 from tensorrt_llm import profiler
 from tensorrt_llm._utils import str_dtype_to_trt
@@ -48,7 +44,10 @@ from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime.lora_manager import LoraConfig
 
-from weight import parse_bin_config  # isort:skip
+from tensorrt_llm.models.llama.weight import (  # isort:skip
+    get_scaling_factors, load_from_awq_llama, load_from_binary,
+    load_from_gptq_llama, load_from_hf_checkpoint, load_from_hf_llama,
+    load_from_meta_llama, parse_bin_config)
 
 MODEL_NAME = "llama"
 
@@ -549,7 +548,7 @@ def parse_arguments():
     lora_config = LoraConfig.from_hf(args.hf_lora_dir,
                                      hf_modules_to_trtllm_modules)
 
-    if lora_config.is_valid:
+    if lora_config.is_valid and lora_config.vocab_size != 0:
         args.vocab_size = lora_config.vocab_size
 
     args.lora_config = lora_config

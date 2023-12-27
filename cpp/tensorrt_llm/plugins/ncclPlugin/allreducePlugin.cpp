@@ -15,11 +15,9 @@
  * limitations under the License.
  */
 #include "allreducePlugin.h"
-#include "mpi.h"
-#include "plugin.h"
+
 #include "tensorrt_llm/common/mpiUtils.h"
-#include "tensorrt_llm/kernels/customAllReduceKernels.h"
-#include <unistd.h>
+#include <nccl.h>
 
 using namespace nvinfer1;
 using tensorrt_llm::plugins::AllreducePluginCreator;
@@ -33,7 +31,7 @@ std::vector<nvinfer1::PluginField> AllreducePluginCreator::mPluginAttributes;
 
 AllreducePlugin::AllreducePlugin(
     std::set<int> group, nvinfer1::DataType type, AllReduceStrategyType strategy, int32_t counter)
-    : mGroup(group)
+    : mGroup(std::move(group))
     , mType(type)
     , mStrategy(strategy)
     , mCounter(counter)
@@ -188,9 +186,8 @@ int AllreducePlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const 
     }
     else
     {
-        int myRank;
+        auto myRank = COMM_SESSION.getRank();
         int nRanks = inputDesc[1].dims.d[0] / 3;
-        MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &myRank));
         // FIXME: pass world config here
         myRank = myRank % nRanks;
 
@@ -253,47 +250,7 @@ int AllreducePlugin::initialize() noexcept
         return 0;
     }
 
-    int myRank, nRanks;
-    MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &myRank));
-    MPICHECK(MPI_Comm_size(MPI_COMM_WORLD, &nRanks));
-
-    int deviceId;
-    cudaGetDevice(&deviceId);
-
-    auto* commMap = getCommMap();
-    // [] operator inserts T() if it does not exist
-    if ((*commMap)[mGroup] != nullptr)
-    {
-        return 0;
-    }
-
-    int groupRank = 0;
-    for (auto it = mGroup.begin(); it != mGroup.end(); ++it)
-    {
-        if (*it == myRank)
-        {
-            break;
-        }
-        ++groupRank;
-    }
-
-    ncclUniqueId id;
-    if (myRank == *mGroup.begin())
-    {
-        ncclGetUniqueId(&id);
-        for (auto it = std::next(std::begin(mGroup), 1); it != mGroup.end(); ++it)
-        {
-            MPICHECK(MPI_Send(&id, sizeof(id), MPI_BYTE, *it, 0, MPI_COMM_WORLD));
-        }
-    }
-    else
-    {
-        MPI_Status status;
-        MPICHECK(MPI_Recv(&id, sizeof(id), MPI_BYTE, *mGroup.begin(), 0, MPI_COMM_WORLD, &status));
-    }
-    (*commMap)[mGroup] = nullptr;
-    NCCLCHECK(ncclCommInitRank(&((*commMap)[mGroup]), mGroup.size(), id, groupRank));
-
+    initCommMap(mGroup);
     return 0;
 }
 

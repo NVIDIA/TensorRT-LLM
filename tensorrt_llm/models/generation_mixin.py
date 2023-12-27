@@ -343,23 +343,18 @@ class GenerationMixin:
         hidden_states = None
         if remove_input_padding:
             if mapping.is_first_pp_rank():
-                input_ids = Tensor(
-                    name='input_ids',
-                    dtype=trt.int32,
-                    shape=[1, -1],
-                    dim_range=OrderedDict([
-                        ('batch_size_fake',
-                         [1, 1] if enable_two_optimization_profiles else [1]),
-                        ('num_tokens', num_tokens_range),
-                    ]))
+                input_ids = Tensor(name='input_ids',
+                                   dtype=trt.int32,
+                                   shape=[-1],
+                                   dim_range=OrderedDict([
+                                       ('num_tokens', num_tokens_range),
+                                   ]))
                 if position_encoding_2d:
                     position_ids = Tensor(
                         name='position_ids',
                         dtype=trt.int32,
-                        shape=[1, 2, -1],
+                        shape=[2, -1],
                         dim_range=OrderedDict([
-                            ('batch_size_fake', [1, 1]
-                             if enable_two_optimization_profiles else [1]),
                             ('2', [2, 2]
                              if enable_two_optimization_profiles else [2]),
                             ('num_tokens', num_tokens_range),
@@ -369,10 +364,8 @@ class GenerationMixin:
                     position_ids = Tensor(
                         name='position_ids',
                         dtype=trt.int32,
-                        shape=[1, -1],
+                        shape=[-1],
                         dim_range=OrderedDict([
-                            ('batch_size_fake', [1, 1]
-                             if enable_two_optimization_profiles else [1]),
                             ('num_tokens', num_tokens_range),
                         ]),
                     )
@@ -382,10 +375,8 @@ class GenerationMixin:
                 hidden_states = Tensor(
                     name='hidden_states_input',
                     dtype=dtype,
-                    shape=[1, -1, head_size * num_heads],
+                    shape=[-1, head_size * num_heads],
                     dim_range=OrderedDict([
-                        ('batch_size_fake',
-                         [1, 1] if enable_two_optimization_profiles else [1]),
                         ('num_tokens', num_tokens_range),
                         ('hidden_size',
                          [head_size * num_heads, head_size *
@@ -477,15 +468,12 @@ class GenerationMixin:
                      if enable_two_optimization_profiles else [hidden_size]),
                 ]))
             if remove_input_padding:
-                tasks = Tensor(
-                    name='tasks',
-                    dtype=trt.int32,
-                    shape=[1, -1],
-                    dim_range=OrderedDict([
-                        ('batch_size_fake',
-                         [1, 1] if enable_two_optimization_profiles else [1]),
-                        ('input_len_task', num_tokens_range),
-                    ]))
+                tasks = Tensor(name='tasks',
+                               dtype=trt.int32,
+                               shape=[-1],
+                               dim_range=OrderedDict([
+                                   ('input_len_task', num_tokens_range),
+                               ]))
             else:
                 tasks = Tensor(
                     name='tasks',

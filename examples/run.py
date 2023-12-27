@@ -98,6 +98,8 @@ def parse_arguments(args=None):
     parser.add_argument('--top_p', type=float, default=0.0)
     parser.add_argument('--length_penalty', type=float, default=1.0)
     parser.add_argument('--repetition_penalty', type=float, default=1.0)
+    parser.add_argument('--presence_penalty', type=float, default=0.0)
+    parser.add_argument('--frequency_penalty', type=float, default=0.0)
     parser.add_argument('--debug_mode',
                         default=False,
                         action='store_true',
@@ -203,7 +205,7 @@ def parse_input(tokenizer,
                       base_vocab_size + length)) + batch_input_ids[i]
 
     batch_input_ids = [
-        torch.tensor(x, dtype=torch.int32).unsqueeze(0) for x in batch_input_ids
+        torch.tensor(x, dtype=torch.int32) for x in batch_input_ids
     ]
     return batch_input_ids
 
@@ -257,16 +259,30 @@ def print_output(tokenizer,
         batch_size = input_lengths.size(0)
         vocab_size_padded = context_logits.shape[-1]
         context_logits = context_logits.reshape([1, -1, vocab_size_padded])
-        context_logits = torch.index_select(context_logits, 1,
-                                            last_token_ids - 1).view(
-                                                batch_size, 1,
-                                                vocab_size_padded)
-        logits = torch.cat([context_logits, generation_logits], axis=1)
-        logits = logits.reshape(-1, num_beams, logits.shape[1], logits.shape[2])
-        output_file = Path(output_logits_npy)
-        output_file.parent.mkdir(exist_ok=True, parents=True)
-        outputs = np.array(logits.cpu().contiguous(), dtype='float32')
-        np.save(output_file, outputs)
+        contex_last_token_logits = torch.index_select(context_logits, 1,
+                                                      last_token_ids - 1).view(
+                                                          batch_size, 1,
+                                                          vocab_size_padded)
+        generation_logits = torch.cat(
+            [contex_last_token_logits, generation_logits], axis=1)
+        generation_logits = generation_logits.reshape(
+            -1, num_beams, generation_logits.shape[1], generation_logits.
+            shape[2])  # [batchSize, beamWidth, maxOutputLength, vocabSize]
+        # Save context logits
+        output_context_logits_npy = output_logits_npy.split(
+            '.npy')[0] + "_context"
+        output_context_logits_file = Path(output_context_logits_npy)
+        context_outputs = np.array(
+            context_logits.squeeze(0).cpu().contiguous(),
+            dtype='float32')  # [promptLengthSum, vocabSize]
+        np.save(output_context_logits_file, context_outputs)
+        # Save generation logits
+        output_generation_logits_npy = output_logits_npy.split(
+            '.npy')[0] + "_generation"
+        output_generation_logits_file = Path(output_generation_logits_npy)
+        generation_outputs = np.array(generation_logits.cpu().contiguous(),
+                                      dtype='float32')
+        np.save(output_generation_logits_file, generation_outputs)
 
 
 def main(args):
@@ -307,7 +323,7 @@ def main(args):
                                   max_input_length=args.max_input_length,
                                   pad_id=pad_id,
                                   num_prepend_vtokens=args.num_prepend_vtokens)
-    input_lengths = [x.size(1) for x in batch_input_ids]
+    input_lengths = [x.size(0) for x in batch_input_ids]
 
     if not PYTHON_BINDINGS and not args.use_py_session:
         logger.warning(
@@ -342,6 +358,8 @@ def main(args):
             num_beams=args.num_beams,
             length_penalty=args.length_penalty,
             repetition_penalty=args.repetition_penalty,
+            presence_penalty=args.presence_penalty,
+            frequency_penalty=args.frequency_penalty,
             stop_words_list=stop_words_list,
             bad_words_list=bad_words_list,
             lora_uids=args.lora_task_uids,
@@ -352,10 +370,10 @@ def main(args):
             return_dict=True)
         torch.cuda.synchronize()
 
-    if runtime_rank == 0:
-        if args.streaming:
-            for curr_outputs in throttle_generator(outputs,
-                                                   args.streaming_interval):
+    if args.streaming:
+        for curr_outputs in throttle_generator(outputs,
+                                               args.streaming_interval):
+            if runtime_rank == 0:
                 output_ids = curr_outputs['output_ids']
                 sequence_lengths = curr_outputs['sequence_lengths']
                 print_output(tokenizer,
@@ -364,7 +382,8 @@ def main(args):
                              sequence_lengths,
                              output_csv=args.output_csv,
                              output_npy=args.output_npy)
-        else:
+    else:
+        if runtime_rank == 0:
             output_ids = outputs['output_ids']
             sequence_lengths = outputs['sequence_lengths']
             context_logits = None

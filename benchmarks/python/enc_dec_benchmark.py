@@ -20,6 +20,7 @@ from base_benchmark import BaseBenchmark, get_engine_name
 
 import tensorrt_llm
 from tensorrt_llm._utils import trt_dtype_to_torch
+from tensorrt_llm.quantization import QuantMode
 
 
 class EncDecBenchmark(BaseBenchmark):
@@ -38,11 +39,18 @@ class EncDecBenchmark(BaseBenchmark):
         self.in_out_lens = in_out_lens
         self.num_beams = args.num_beams
         self.build_time = 0
+        self.quant_mode = QuantMode(0)
         # In current implementation, encoder and decoder have the same name,
         # builder config, and plugin config. But they can be different in the future.
         # So we use separate variables for encoder and decoder here.
         self.encoder_engine_model_name = args.model
         self.decoder_engine_model_name = args.model
+
+        if self.engine_dir is None:
+            # TODO: Build engine
+            assert False, "Engine directory is currently required for enc-dec benchmarks"
+            encoder_engine_buffer = None
+            decoder_engine_buffer = None
 
         if self.engine_dir is not None:
 
@@ -168,11 +176,6 @@ class EncDecBenchmark(BaseBenchmark):
                                                        self.decoder_engine_name)
             with open(self.decoder_serialize_path, "rb") as f:
                 decoder_engine_buffer = f.read()
-        else:
-            # TODO: Build engine
-            assert False, "Engine directory is currently required for enc-dec benchmarks"
-            encoder_engine_buffer = None
-            decoder_engine_buffer = None
 
         assert encoder_engine_buffer is not None
         assert decoder_engine_buffer is not None
@@ -263,6 +266,14 @@ class EncDecBenchmark(BaseBenchmark):
             device=self.device,
         ).contiguous()
 
+        if self.encoder_model_config.has_position_embedding:
+            bsz, seq_len = encoder_input_ids.shape[:2]
+            position_ids = torch.arange(seq_len,
+                                        dtype=torch.int32,
+                                        device=encoder_input_ids.device).expand(
+                                            bsz, -1)
+            inputs['position_ids'] = position_ids.contiguous()
+
         # output tensors
         outputs = {}
         outputs["encoder_output"] = torch.empty(
@@ -286,7 +297,7 @@ class EncDecBenchmark(BaseBenchmark):
             torch.max(decoder_input_lengths).item(),
             output_len,
             beam_width=self.num_beams,
-            max_kv_cache_length=None,
+            max_attention_window_size=None,
             encoder_max_input_length=torch.max(encoder_input_lengths).item(),
         )
         torch.cuda.synchronize()

@@ -19,8 +19,8 @@ import tensorrt as trt
 
 from .._common import default_net, default_trtnet
 from .._utils import str_dtype_to_trt
-from ..functional import (Tensor, _create_tensor, allgather, allreduce, cast,
-                          matmul)
+from ..functional import (Tensor, _add_plugin_info, _create_tensor, allgather,
+                          allreduce, cast, matmul)
 from ..module import Module
 from ..parameter import Parameter
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
@@ -57,6 +57,7 @@ def _gemm_plugin(input: Tensor,
     gemm_plug = plg_creator.create_plugin("gemm", pfc)
     plug_inputs = [input.trt_tensor, mat2.trt_tensor]
     layer = default_trtnet().add_plugin_v2(plug_inputs, gemm_plug)
+    _add_plugin_info(layer, plg_creator, "gemm", pfc)
     return _create_tensor(layer.get_output(0), layer)
 
 

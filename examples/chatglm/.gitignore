@@ -1,8 +1,11 @@
 __pycache__/
 .vscode/
+*.pt
 awq/
-chatglm*_6b*/
+chatglm*/
 dataset/
-glm_10b/
-output_*/
+engine_outputs/
+glm*/
 model.cache
+output_*/
+smooth/

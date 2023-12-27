@@ -188,20 +188,12 @@ Then, you can add any combination of `--per-token` and `--per-channel` to get th
 Examples of build invocations:
 
 ```bash
-# Build model for SmoothQuant in the _per_tensor_ mode.
+# Build model for SmoothQuant in the _per_token_ + _per_channel_ mode
 # 7B model
 python build.py --ft_model_dir=./internlm-chat-7b/smooth_internlm/sq0.5/1-gpu/ \
-                --use_smooth_quant \
-                --output_dir ./internlm-chat-7b/trt_engines/smoothquant/1-gpu
-
-# 20B model
-python build.py --ft_model_dir=./internlm-chat-20b/smooth_internlm/sq0.5/1-gpu/ \
-                --use_smooth_quant \
-                --output_dir ./internlm-chat-20b/trt_engines/smoothquant/1-gpu
-
-# OR build model for SmoothQuant in the _per_token_ + _per_channel_ mode
-# 7B model
-python build.py --ft_model_dir=./internlm-chat-7b/smooth_internlm/sq0.5/1-gpu/ \
+                --use_gpt_attention_plugin float16 \
+                --remove_input_padding \
+                --enable_context_fmha \
                 --use_smooth_quant \
                 --per_token \
                 --per_channel \
@@ -209,6 +201,9 @@ python build.py --ft_model_dir=./internlm-chat-7b/smooth_internlm/sq0.5/1-gpu/ \
 
 # 20B model
 python build.py --ft_model_dir=./internlm-chat-20b/smooth_internlm/sq0.5/1-gpu/ \
+                --use_gpt_attention_plugin float16 \
+                --remove_input_padding \
+                --enable_context_fmha \
                 --use_smooth_quant \
                 --per_token \
                 --per_channel \

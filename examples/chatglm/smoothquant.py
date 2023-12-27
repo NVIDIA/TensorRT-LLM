@@ -108,7 +108,7 @@ def smooth_ln_fcs(ln, fcs, act_scales, alpha=0.5):
 def capture_activation_range(model,
                              tokenizer,
                              dataset,
-                             num_samples=512,
+                             num_samples=8,
                              seq_len=512):
     model.eval()
     device = next(model.parameters()).device
@@ -132,8 +132,8 @@ def capture_activation_range(model,
         stat_tensor(name, y, act_scales, "y")
 
         if act_scales[name]["w"] is None:
-            act_scales[name]["w"] = m.weight.abs().clip(1e-8,
-                                                        None).max(dim=0)[0]
+            act_scales[name]["w"] = m.weight.abs().clip(
+                1e-8, None).max(dim=1)[0]  # wili
 
     hooks = []
     for name, m in model.named_modules():
@@ -143,7 +143,7 @@ def capture_activation_range(model,
                     functools.partial(stat_input_hook, name=name)))
 
     for i in tqdm(range(num_samples), desc="calibrating model"):
-        input_ids = tokenizer(dataset[i]["text"],
+        input_ids = tokenizer(dataset[i]["article"],
                               return_tensors="pt",
                               max_length=seq_len,
                               truncation=True).input_ids.to(device)

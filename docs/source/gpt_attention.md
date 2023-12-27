@@ -222,7 +222,7 @@ where `batch_beam_size` is the batch size (number of sequences) for the context
 phase and the batch size multiplied by the beam width for the generation phase.
 Having different beam widths per sequence in padded mode is not supported.
 
-In packed mode, its shape is `[1, num_tokens, 3 * hidden_dim]` where
+In packed mode, its shape is `[num_tokens, 3 * hidden_dim]` where
 `num_tokens` is the total number of tokens in the batch. For the sequences in
 context phase, the number of tokens of a sequence corresponds to its input
 length (even if the beam width is greater than `1` for beam search).  For the
@@ -241,13 +241,6 @@ for seq in context_phase:
 for seq in generation_phase:
     num_tokens += seq.beam_width
 ```
-
-In a future release of TensorRT-LLM, the rank of that packed input tensor
-may be reduced from 3 to 2. The current rank is to maintain the homogeneity
-between padded and packed modes. It is no longer justified if support for
-padded mode is removed.
-
-## Additional Features
 
 ### Rotary Positional Embedding (RoPE)
 
@@ -270,7 +263,7 @@ In MHA, the output of the `Q*K^T` product is scaled by a constant value that
 is computed as:
 
 ```
-scaling = 1.f / (q_scaling * sqrt(head_size)).
+norm_factor = 1.f / (q_scaling * sqrt(head_size)).
 ```
 
 ### Cross Attention

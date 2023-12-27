@@ -34,7 +34,8 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from examples.llama.weight import load_from_hf_llama
+from tensorrt_llm.models.llama.weight import (load_from_hf_llama,
+                                              load_from_meta_llama)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import getSMVersion
@@ -261,9 +262,8 @@ class TestMistral(unittest.TestCase):
         ref = hf_outputs.logits[:, -1, :]
 
         if enable_remove_input_padding:
-            ctx_ids = ctx_ids.view([1, batch_size * input_len])
-            ctx_position_ids = ctx_position_ids.view(
-                [1, batch_size * input_len])
+            ctx_ids = ctx_ids.view([batch_size * input_len])
+            ctx_position_ids = ctx_position_ids.view([batch_size * input_len])
             ctx_last_token_ids = torch.cumsum(ctx_last_token_ids, dim=0).int()
 
         cache_indirections = [
@@ -342,8 +342,8 @@ class TestMistral(unittest.TestCase):
         ref = hf_outputs.logits[:, -1, :]
 
         if enable_remove_input_padding:
-            step1_id = step1_id.view([1, batch_size])
-            gen_position_ids = gen_position_ids.view([1, batch_size])
+            step1_id = step1_id.view([batch_size])
+            gen_position_ids = gen_position_ids.view([batch_size])
             gen_last_token_ids = torch.ones_like(
                 gen_context_lengths).int().cuda()
             gen_last_token_ids = torch.cumsum(gen_last_token_ids, dim=0).int()
@@ -438,18 +438,17 @@ class TestMistral(unittest.TestCase):
             print(name, np.concatenate([tl, br]).flatten())
 
         def print_layers(m: tensorrt_llm.models.LLaMAForCausalLM):
-            print_corner("vocab", m.vocab_embedding.weight._value)
-            print_corner("lm_head", m.lm_head.weight._value)
-            print_corner("ln_f", m.ln_f.weight._value)
-            print_corner("qkv", m.layers[0].attention.qkv.weight._value)
-            print_corner("gate", m.layers[0].mlp.gate.weight._value)
-            print_corner("inorm", m.layers[0].input_layernorm.weight._value)
+            print_corner("vocab", m.vocab_embedding.weight.raw_value)
+            print_corner("lm_head", m.lm_head.weight.raw_value)
+            print_corner("ln_f", m.ln_f.weight.raw_value)
+            print_corner("qkv", m.layers[0].attention.qkv.weight.raw_value)
+            print_corner("gate", m.layers[0].mlp.gate.weight.raw_value)
+            print_corner("inorm", m.layers[0].input_layernorm.weight.raw_value)
             print(flush=True)
             return
 
         import tensorrt as trt
 
-        from examples.llama.weight import load_from_meta_llama
         tp_size = tp_info[0]
         rank = tp_info[1]
         dtype = "float16"
@@ -516,18 +515,19 @@ class TestMistral(unittest.TestCase):
         # print_layers(tensorrt_llm_mistral_wMAI)
         # token embedding
         np.testing.assert_allclose(
-            tensorrt_llm_mistral_wHF.vocab_embedding.weight._value,
-            tensorrt_llm_mistral_wMAI.vocab_embedding.weight._value,
+            tensorrt_llm_mistral_wHF.vocab_embedding.weight.raw_value,
+            tensorrt_llm_mistral_wMAI.vocab_embedding.weight.raw_value,
             atol=1e-3)
         # output
         np.testing.assert_allclose(
-            tensorrt_llm_mistral_wHF.lm_head.weight._value,
-            tensorrt_llm_mistral_wMAI.lm_head.weight._value,
+            tensorrt_llm_mistral_wHF.lm_head.weight.raw_value,
+            tensorrt_llm_mistral_wMAI.lm_head.weight.raw_value,
             atol=1e-3)
         # norm
-        np.testing.assert_allclose(tensorrt_llm_mistral_wHF.ln_f.weight._value,
-                                   tensorrt_llm_mistral_wMAI.ln_f.weight._value,
-                                   atol=1e-3)
+        np.testing.assert_allclose(
+            tensorrt_llm_mistral_wHF.ln_f.weight.raw_value,
+            tensorrt_llm_mistral_wMAI.ln_f.weight.raw_value,
+            atol=1e-3)
         # Checking all of the layers takes too much time, just check one random layer
         l = np.random.randint(0, tensorrt_llm_mistral_wHF.num_layers)
         # for l in range(tensorrt_llm_mistral_wHF.num_layers):
@@ -535,42 +535,43 @@ class TestMistral(unittest.TestCase):
             print(f"Checking Layer-{l} weights ...", flush=True)
             # layer{l}.input_layernorm
             np.testing.assert_allclose(tensorrt_llm_mistral_wHF.layers[l].
-                                       input_layernorm.weight._value,
+                                       input_layernorm.weight.raw_value,
                                        tensorrt_llm_mistral_wMAI.layers[l].
-                                       input_layernorm.weight._value,
+                                       input_layernorm.weight.raw_value,
                                        atol=1e-3)
             # layer{l}.post_layernorm
-            np.testing.assert_allclose(
-                tensorrt_llm_mistral_wHF.layers[l].post_layernorm.weight._value,
-                tensorrt_llm_mistral_wMAI.layers[l].post_layernorm.weight.
-                _value,
-                atol=1e-3)
+            np.testing.assert_allclose(tensorrt_llm_mistral_wHF.layers[l].
+                                       post_layernorm.weight.raw_value,
+                                       tensorrt_llm_mistral_wMAI.layers[l].
+                                       post_layernorm.weight._value,
+                                       atol=1e-3)
             # layer{l}.mlp.gate
             np.testing.assert_allclose(
-                tensorrt_llm_mistral_wHF.layers[l].mlp.gate.weight._value,
-                tensorrt_llm_mistral_wMAI.layers[l].mlp.gate.weight._value,
+                tensorrt_llm_mistral_wHF.layers[l].mlp.gate.weight.raw_value,
+                tensorrt_llm_mistral_wMAI.layers[l].mlp.gate.weight.raw_value,
                 atol=1e-3)
             # layer{l}.mlp.proj
             np.testing.assert_allclose(
-                tensorrt_llm_mistral_wHF.layers[l].mlp.proj.weight._value,
-                tensorrt_llm_mistral_wMAI.layers[l].mlp.proj.weight._value,
+                tensorrt_llm_mistral_wHF.layers[l].mlp.proj.weight.raw_value,
+                tensorrt_llm_mistral_wMAI.layers[l].mlp.proj.weight.raw_value,
                 atol=1e-3)
             # layer{l}.mlp.fc
             np.testing.assert_allclose(
-                tensorrt_llm_mistral_wHF.layers[l].mlp.fc.weight._value,
-                tensorrt_llm_mistral_wMAI.layers[l].mlp.fc.weight._value,
+                tensorrt_llm_mistral_wHF.layers[l].mlp.fc.weight.raw_value,
+                tensorrt_llm_mistral_wMAI.layers[l].mlp.fc.weight.raw_value,
                 atol=1e-3)
             # layer{l}.dense
             np.testing.assert_allclose(tensorrt_llm_mistral_wHF.layers[l].
-                                       attention.dense.weight._value,
+                                       attention.dense.weight.raw_value,
                                        tensorrt_llm_mistral_wMAI.layers[l].
-                                       attention.dense.weight._value,
+                                       attention.dense.weight.raw_value,
                                        atol=1e-3)
             # layer{l}.qkv
-            np.testing.assert_allclose(
-                tensorrt_llm_mistral_wHF.layers[l].attention.qkv.weight._value,
-                tensorrt_llm_mistral_wMAI.layers[l].attention.qkv.weight._value,
-                atol=1e-3)
+            np.testing.assert_allclose(tensorrt_llm_mistral_wHF.layers[l].
+                                       attention.qkv.weight.raw_value,
+                                       tensorrt_llm_mistral_wMAI.layers[l].
+                                       attention.qkv.weight.raw_value,
+                                       atol=1e-3)
         return
 
 

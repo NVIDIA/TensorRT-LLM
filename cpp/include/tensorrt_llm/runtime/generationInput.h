@@ -49,7 +49,7 @@ public:
     // mandatory parameters
     SizeType endId;
     SizeType padId;
-    TensorPtr ids;     // [1, packedLength] or [batchSize, maxInputLength], on gpu
+    TensorPtr ids;     // [packedLength] or [batchSize, maxInputLength], on gpu
     TensorPtr lengths; // [batchSize], on gpu
     bool packed;       // indicates if ids are packed or padded to maxInputLength
 

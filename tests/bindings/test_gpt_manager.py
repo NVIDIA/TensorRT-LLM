@@ -84,7 +84,7 @@ def test_gpt_manager(variant, results_file, llm_root: _pl.Path,
     remaining_requests = len(given_input)
     for i, (req, length) in enumerate(zip(given_input, given_input_lengths)):
         ir = _tb.InferenceRequest(i)
-        ir.input_ids = _tor.tensor([req[:length].tolist()], dtype=_tor.int32)
+        ir.input_ids = _tor.tensor(req[:length].tolist(), dtype=_tor.int32)
         ir.max_new_tokens = _tor.tensor([[length + max_new_tokens]],
                                         dtype=_tor.int32)
         ir.end_id = _tor.tensor([end_id], dtype=_tor.int32)

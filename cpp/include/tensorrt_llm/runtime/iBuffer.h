@@ -507,7 +507,7 @@ public:
     template <typename T>
     static UniquePtr wrap(T* data, std::size_t size)
     {
-        return wrap<T>(data, size);
+        return wrap<T>(data, size, size);
     }
 
     template <typename T>

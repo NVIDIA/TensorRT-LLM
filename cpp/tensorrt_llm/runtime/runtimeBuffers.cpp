@@ -43,8 +43,22 @@ RuntimeBuffers::GenerationConfig RuntimeBuffers::GenerationConfig::fromInput(ITe
     if (inputPacked)
     {
         inputLengthSum = std::accumulate(inputLengthsPtr, inputLengthsPtr + batchSize, 0);
-        TLLM_CHECK_WITH_INFO(inputShape.d[0] == 1 && inputShape.d[1] == inputLengthSum,
-            "Packed input must have shape [1, <sum of input lengths>].");
+        TLLM_CHECK_WITH_INFO(inputShape.nbDims == 1 || inputShape.nbDims == 2,
+            "Packed input must have shape [<sum of input lengths>] or [1, <sum of input lengths>].");
+        if (inputShape.nbDims == 1)
+        {
+            TLLM_CHECK_WITH_INFO(inputShape.d[0] == inputLengthSum,
+                "Packed 1D input must have shape [<sum of input lengths>]. Expected (Infer from inputLengths): [%d], "
+                "supplied: [%d]",
+                inputLengthSum, inputShape.d[0]);
+        }
+        else if (inputShape.nbDims == 2)
+        {
+            TLLM_CHECK_WITH_INFO(inputShape.d[1] == inputLengthSum,
+                "Packed 2D input must have shape [1, <sum of input lengths>]. Expected (Infer from inputLengths): [1, "
+                "%d], supplied: [%d, %d]",
+                inputLengthSum, inputShape.d[0], inputShape.d[1]);
+        }
     }
     else
     {
@@ -113,6 +127,21 @@ void RuntimeBuffers::create(TllmRuntime& runtime, GptModelConfig const& modelCon
     {
         auto const logitsType = engine.getTensorDataType("logits");
         logits = manager.emptyTensor(MemoryType::kGPU, logitsType);
+
+        if (modelConfig.computeGenerationLogits())
+        {
+            allGenerationLogits = manager.emptyTensor(MemoryType::kGPU, logitsType);
+            cacheGenerationLogits = manager.emptyTensor(MemoryType::kGPU, logitsType);
+            cacheGenerationLogitsHost = manager.emptyTensor(MemoryType::kPINNED, logitsType);
+
+            cacheGenerationFragmentPointerDevice = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT64);
+            cacheGenerationFragmentPointerHost = manager.emptyTensor(MemoryType::kPINNED, nvinfer1::DataType::kINT64);
+        }
+        if (modelConfig.computeContextLogits())
+        {
+            cacheContextLogits = manager.emptyTensor(MemoryType::kGPU, logitsType);
+            cacheContextLogitsHost = manager.emptyTensor(MemoryType::kPINNED, logitsType);
+        }
     }
 
     contextLengthsHost = manager.emptyTensor(MemoryType::kPINNED, nvinfer1::DataType::kINT32);
@@ -205,11 +234,26 @@ void RuntimeBuffers::reshape(GptModelConfig const& modelConfig, WorldConfig cons
     auto const beamWidth = generationConfig.beamWidth;
     auto const maxInputLength = generationConfig.maxInputLength;
     auto const maxAttentionWindow = generationConfig.maxAttentionWindow;
+    auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
 
-    if (worldConfig.isLastPipelineParallelRank() && !modelConfig.computeContextLogits())
+    if (worldConfig.isLastPipelineParallelRank())
     {
-        auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
-        logits->reshape(ITensor::makeShape({batchSize, 1, vocabSizePadded}));
+        if (!modelConfig.computeContextLogits())
+        {
+            logits->reshape(ITensor::makeShape({batchSize, 1, vocabSizePadded}));
+        }
+
+        if (modelConfig.computeGenerationLogits())
+        {
+            allGenerationLogits->reshape(
+                ITensor::makeShape({(generationConfig.maxSeqLength - generationConfig.maxInputLength), batchSize,
+                    beamWidth, vocabSizePadded}));
+
+            cacheGenerationFragmentPointerDevice->reshape(
+                ITensor::makeShape({batchSize, (generationConfig.maxSeqLength - generationConfig.maxInputLength)}));
+            cacheGenerationFragmentPointerHost->reshape(
+                ITensor::makeShape({batchSize, (generationConfig.maxSeqLength - generationConfig.maxInputLength)}));
+        }
     }
 
     lastTokenIds->reshape(ITensor::makeShape({batchSize}));
@@ -260,7 +304,8 @@ void RuntimeBuffers::reshape(GptModelConfig const& modelConfig, WorldConfig cons
         // reserve max size
         auto const maxNumTokens = std::max(beamWidth, maxInputLength);
         auto const hiddenSize = modelConfig.getHiddenSize() * worldConfig.getTensorParallelism();
-        auto const hiddenStatesShape = ITensor::makeShape({batchSize, maxNumTokens, hiddenSize});
+        auto const hiddenStatesShape = ITensor::makeShape(
+            {batchSize, maxNumTokens, hiddenSize}); // reserve space in traditional [bs, seq_len, hidden_state] way.
         hiddenStates->reshape(hiddenStatesShape);
     }
 
@@ -345,6 +390,9 @@ std::vector<RuntimeBuffers> RuntimeBuffers::split(
 
             if (worldConfig.isPipelineParallel())
             {
+                TLLM_CHECK_WITH_INFO(hiddenStates->getShape().nbDims == 3,
+                    "Invalid shape for hiddenStates."); // Expect hiddens states shape to be [bs, seq_len, hidden_size]
+                                                        // at generation buffer split stage.
                 buffers.hiddenStates = ITensor::slice(hiddenStates, offset, batchSize);
             }
 
@@ -374,16 +422,19 @@ void RuntimeBuffers::gatherLastTokenLogits(
 
     if (worldConfig.isLastPipelineParallelRank())
     {
-        auto const batchSize = generationConfig.batchSize;
-        auto const beamWidth = generationConfig.beamWidth;
         auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
 
-        auto const tiledTensorShape = ITensor::makeShape({batchSize, beamWidth, vocabSizePadded});
-        auto tiledTensor = std::shared_ptr(manager.gpu(tiledTensorShape, logits->getDataType()));
+        TensorPtr tiledTensor = ITensor::slice(allGenerationLogits, 0, 1);
+        tiledTensor->squeeze(0);
         kernels::gatherLastTokenLogits(*tiledTensor, *logits, *lastTokenIds, manager.getStream());
         manager.getStream().synchronize();
 
         std::swap(logits, tiledTensor);
+        if (modelConfig.usePackedInput())
+        {
+            tiledTensor->reshape(
+                ITensor::makeShape({generationConfig.inputLengthSum, vocabSizePadded})); // [packedSize, vocabSize]
+        }
     }
 
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
@@ -510,21 +561,6 @@ void RuntimeBuffers::postContextStep(std::vector<RuntimeBuffers> const& contextB
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-void RuntimeBuffers::postEachGenerationStep(BufferManager& manager, TensorPtr outputGenerationLogits, SizeType step,
-    SizeType firstBatchSlotIdx, SizeType microBatchSize, SizeType beamWidth, WorldConfig const& worldConfig)
-{
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
-
-    if (worldConfig.isLastPipelineParallelRank())
-    {
-        kernels::copyLatestTokenLogitsInGeneration(
-            *outputGenerationLogits, *logits, step, firstBatchSlotIdx, microBatchSize, beamWidth, manager.getStream());
-        manager.getStream().synchronize();
-    }
-
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
-}
-
 void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType const padId, BufferManager& manager,
     KvCacheManager const* kvCacheManager, SizeType firstBatchSlotIdx, GptModelConfig const& modelConfig,
     WorldConfig const& worldConfig)
@@ -579,7 +615,7 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
             if (modelConfig.usePackedInput())
             {
                 int num_tokens = (int) positionIdsVec.size() / 2;
-                auto const positionIdsShape = ITensor::makeShape({1, 2, num_tokens});
+                auto const positionIdsShape = ITensor::makeShape({2, num_tokens});
                 positionIds = manager.copyFrom(positionIdsVec, positionIdsShape, MemoryType::kGPU);
             }
             else
@@ -600,8 +636,11 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
 
         if (worldConfig.isPipelineParallel())
         {
-            auto const hiddenSize = hiddenStates->getShape().d[2];
-            auto const hiddenStatesShape = ITensor::makeShape({inputShape.d[0], inputShape.d[1], hiddenSize});
+            auto const hiddenSize
+                = hiddenStates->getShape().nbDims == 2 ? hiddenStates->getShape().d[1] : hiddenStates->getShape().d[2];
+            auto const hiddenStatesShape = modelConfig.usePackedInput()
+                ? ITensor::makeShape({inputShape.d[0], hiddenSize})
+                : ITensor::makeShape({inputShape.d[0], inputShape.d[1], hiddenSize});
             hiddenStates->reshape(hiddenStatesShape);
         }
 
@@ -674,7 +713,7 @@ RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, B
     if (modelConfig.usePackedInput())
     {
         // batch in last dim
-        inputShape = ITensor::makeShape({1, batchSize * beamWidth});
+        inputShape = ITensor::makeShape({batchSize * beamWidth});
     }
     else
     {
@@ -709,7 +748,7 @@ RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, B
                 contextLengthsHostPtr, modelConfig.useGptAttentionPlugin(), modelConfig.usePackedInput());
             if (modelConfig.usePackedInput())
             {
-                auto const positionIdsShape = ITensor::makeShape({1, 2, batchSize * beamWidth});
+                auto const positionIdsShape = ITensor::makeShape({2, batchSize * beamWidth});
                 positionIds = manager.copyFrom(positionIdsVec, positionIdsShape, MemoryType::kGPU);
             }
             else
@@ -725,8 +764,11 @@ RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType const step, B
 
         if (worldConfig.isPipelineParallel())
         {
-            auto const hiddenSize = hiddenStates->getShape().d[2];
-            auto const hiddenStatesShape = ITensor::makeShape({inputShape.d[0], inputShape.d[1], hiddenSize});
+            auto const hiddenSize
+                = hiddenStates->getShape().nbDims == 2 ? hiddenStates->getShape().d[1] : hiddenStates->getShape().d[2];
+            auto const hiddenStatesShape = modelConfig.usePackedInput()
+                ? ITensor::makeShape({inputShape.d[0], hiddenSize})
+                : ITensor::makeShape({inputShape.d[0], inputShape.d[1], hiddenSize});
             hiddenStates->reshape(hiddenStatesShape);
         }
     }

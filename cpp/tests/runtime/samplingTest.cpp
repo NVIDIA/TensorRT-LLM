@@ -54,9 +54,9 @@ protected:
 };
 
 typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferManager& manager,
-    tc::CudaAllocator& allocator, size_t vocabSize, size_t vocabSizePadded, size_t batchSize, size_t beamWidth,
-    int step, int ite, int maxInputLength, size_t maxSeqLength, int localBatchSize, std::vector<int>& cpuOutputIds,
-    std::vector<float> cpuLogits, int noRepeatNgramSizeValue = 0)
+    std::shared_ptr<tc::CudaAllocator> allocator, size_t vocabSize, size_t vocabSizePadded, size_t batchSize,
+    size_t beamWidth, int step, int ite, int maxInputLength, size_t maxSeqLength, int localBatchSize,
+    std::vector<int>& cpuOutputIds, std::vector<float> cpuLogits, int noRepeatNgramSizeValue = 0)
 {
     constexpr int endId = 1;
     constexpr bool isFreeBufferAfterForward{false};
@@ -74,12 +74,12 @@ typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferMan
     int* gpuNewTokens = nullptr;
     int* gpuNoRepeatNgramSize = nullptr;
 
-    gpuLogits = allocator.reMalloc(gpuLogits, batchSize * beamWidth * vocabSizePadded * sizeof(float));
-    gpuEndIds = allocator.reMalloc(gpuEndIds, batchSize * sizeof(int));
-    gpuOutputIds = allocator.reMalloc(gpuOutputIds, batchSize * beamWidth * maxSeqLength * sizeof(int));
-    gpuSequenceLengths = allocator.reMalloc(gpuSequenceLengths, batchSize * sizeof(int));
-    gpuNewTokens = allocator.reMalloc(gpuNewTokens, batchSize * beamWidth * sizeof(int));
-    gpuNoRepeatNgramSize = allocator.reMalloc(gpuNoRepeatNgramSize, batchSize * sizeof(int));
+    gpuLogits = allocator->reMalloc(gpuLogits, batchSize * beamWidth * vocabSizePadded * sizeof(float));
+    gpuEndIds = allocator->reMalloc(gpuEndIds, batchSize * sizeof(int));
+    gpuOutputIds = allocator->reMalloc(gpuOutputIds, batchSize * beamWidth * maxSeqLength * sizeof(int));
+    gpuSequenceLengths = allocator->reMalloc(gpuSequenceLengths, batchSize * sizeof(int));
+    gpuNewTokens = allocator->reMalloc(gpuNewTokens, batchSize * beamWidth * sizeof(int));
+    gpuNoRepeatNgramSize = allocator->reMalloc(gpuNoRepeatNgramSize, batchSize * sizeof(int));
 
     cudaMemcpy(gpuLogits, cpuLogits.data(), cpuLogits.size() * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(gpuEndIds, cpuEndIds.data(), cpuEndIds.size() * sizeof(int), cudaMemcpyHostToDevice);
@@ -97,7 +97,7 @@ typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferMan
     tc::Tensor noRepeatNgramSize{tc::MEMORY_GPU, tc::TYPE_INT32, {batchSize}, gpuNoRepeatNgramSize};
 
     auto ddLayer = tl::DynamicDecodeLayer<float>(
-        vocabSize, vocabSizePadded, manager.getStream().get(), &allocator, isFreeBufferAfterForward, &prop);
+        vocabSize, vocabSizePadded, manager.getStream().get(), allocator, isFreeBufferAfterForward, &prop);
 
     typename tl::DynamicDecodeLayer<float>::SetupParams setupParams;
 
@@ -120,7 +120,7 @@ TEST_F(SamplingTest, SamplingWithNoRepeatNGramSize)
 {
     auto streamPtr = std::make_shared<CudaStream>();
     BufferManager manager(streamPtr);
-    tc::CudaAllocator allocator(manager);
+    auto allocator = std::make_shared<tc::CudaAllocator>(manager);
 
     constexpr size_t vocabSize{200};
     constexpr size_t vocabSizePadded{256};

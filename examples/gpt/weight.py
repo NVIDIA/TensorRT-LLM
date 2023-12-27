@@ -607,7 +607,7 @@ def load_from_hf_gpt(tensorrt_llm_gpt: GPTLMHeadModel,
 
     if not valid_lm_head_weight:
         # Use wte as lm_head weight to match the load_from_ft implementation.
-        lm_head_weight = tensorrt_llm_gpt.embedding.vocab_embedding.weight._value
+        lm_head_weight = tensorrt_llm_gpt.embedding.vocab_embedding.weight.raw_value
         vocab_size = hf_gpt.config.vocab_size
         if vocab_size % tensor_parallel != 0:
             # padding

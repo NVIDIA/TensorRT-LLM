@@ -63,7 +63,7 @@ FROM devel as release
 WORKDIR /app/tensorrt_llm
 COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl .
 COPY --from=wheel /src/tensorrt_llm/cpp/include/ include/
-RUN pip install tensorrt_llm*.whl && \
+RUN pip install tensorrt_llm*.whl --extra-index-url https://pypi.nvidia.com && \
     rm tensorrt_llm*.whl
 COPY README.md ./
 COPY examples examples

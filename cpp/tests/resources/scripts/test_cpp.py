@@ -245,10 +245,7 @@ def prepare_model_tests(model_name: str,
     ] + only_fp8_arg + only_multi_gpu_arg
     if only_multi_gpu_arg:
         generate_expected_output = [
-            "mpirun",
-            "-n",
-            "4",
-            "--allow-run-as-root",
+            "mpirun", "-n", "4", "--allow-run-as-root", "--timeout", "600"
         ] + generate_expected_output
     run_command(generate_expected_output, cwd=root_dir, env=model_env)
 

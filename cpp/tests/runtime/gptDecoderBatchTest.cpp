@@ -179,7 +179,7 @@ void verifyResults(BufferManager& manager, GptDecoderBatch const& decoder,
 }
 
 void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> const& samplingConfigs,
-    SizeType maxBeamWidth, bool computeLogProbs)
+    SizeType maxBeamWidth, bool computeLogProbs, bool normalizeLogProbs)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     SizeType constexpr tensorParallelism{1};
@@ -537,7 +537,7 @@ TEST_P(ParamTest, Test)
         samplingConfigs.emplace_back(beamWidth);
     }
 
-    testDecoder(dtype, samplingConfigs, beamConfig.maxBeamWidth, computeLogProbs);
+    testDecoder(dtype, samplingConfigs, beamConfig.maxBeamWidth, computeLogProbs, true);
 }
 
 INSTANTIATE_TEST_SUITE_P(GptDecoderBwTest, ParamTest,
@@ -556,6 +556,7 @@ TEST_P(ParamWavefrontTest, Test)
     nvinfer1::DataType const dtype{std::get<0>(GetParam())};
     BeamConfig const beamConfig{std::get<1>(GetParam())};
     bool const computeLogProbs{std::get<2>(GetParam())};
+    bool const normalizeLogProbs{true};
     std::vector<SamplingConfig> samplingConfigs;
     for (auto const beamWidth : beamConfig.beamWidths)
     {

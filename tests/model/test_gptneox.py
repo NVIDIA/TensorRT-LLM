@@ -257,8 +257,8 @@ class TestGPTNeoX(unittest.TestCase):
         sequence_length_buffer = ctx_context_lengths.detach().clone()
 
         if enable_remove_input_padding:
-            ctx_ids = ctx_ids.view([1, batch_size * seq_len])
-            ctx_position_ids = ctx_position_ids.view([1, batch_size * seq_len])
+            ctx_ids = ctx_ids.view([batch_size * seq_len])
+            ctx_position_ids = ctx_position_ids.view([batch_size * seq_len])
             ctx_last_token_ids = torch.cumsum(ctx_last_token_ids, dim=0).int()
 
         cache_indirections = [
@@ -370,8 +370,8 @@ class TestGPTNeoX(unittest.TestCase):
         ref = hf_outputs.logits[:, -1, :]
 
         if enable_remove_input_padding:
-            step1_id = step1_id.view([1, batch_size])
-            gen_position_ids = gen_position_ids.view([1, batch_size])
+            step1_id = step1_id.view([batch_size])
+            gen_position_ids = gen_position_ids.view([batch_size])
             gen_last_token_ids = torch.ones_like(
                 gen_context_lengths).int().cuda()
             gen_last_token_ids = torch.cumsum(gen_last_token_ids, dim=0).int()

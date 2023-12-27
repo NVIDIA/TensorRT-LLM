@@ -43,8 +43,8 @@ public:
         std::optional<std::vector<float>> length_penalty;             // [1] or [batch_size] on cpu
     };
 
-    OnlineBeamSearchLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream, tc::IAllocator* allocator,
-        bool is_free_buffer_after_forward);
+    OnlineBeamSearchLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
+        std::shared_ptr<tc::IAllocator> allocator, bool is_free_buffer_after_forward);
 
     OnlineBeamSearchLayer(OnlineBeamSearchLayer<T> const& beam_search_layer);
 

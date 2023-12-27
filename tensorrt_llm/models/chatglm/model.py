@@ -109,6 +109,7 @@ class ChatGLMParams:
         vocab_size=65024,
     )
     default_config["chatglm3_6b"] = default_config["chatglm2_6b"]
+    default_config["chatglm3_6b_base"] = default_config["chatglm2_6b"]
     default_config["chatglm2_6b_32k"] = deepcopy(default_config["chatglm2_6b"])
     default_config["chatglm2_6b_32k"].rotary_embedding_scaling = 50.0
     default_config["chatglm3_6b_32k"] = default_config["chatglm2_6b_32k"]
@@ -162,36 +163,46 @@ class ChatGLMDecoderLayer(Module):
 
         super().__init__()
 
-        self.model_name = config.model_name
-        self.use_cache = config.use_cache
-        self.rotary_embedding_base = 10000.0
         rotary_embedding_scaling = None
+        self.model_name = config.model_name
+        self.rotary_embedding_base = 10000.0
+        self.use_cache = config.use_cache
+
+        # parameters for Smooth Quantization
+        self.apply_query_key_layer_scaling = config.apply_query_key_layer_scaling
+        self.dtype = config.dtype
+        self.hidden_size = config.hidden_size
+        self.ffn_hidden_size = config.ffn_hidden_size
+        self.max_seq_length = config.max_seq_length
+        self.num_heads = config.num_heads
+        self.num_kv_heads = config.num_kv_heads
+        self.num_layers = config.num_layers
+        self.tp_group = config.mapping.tp_group
+        self.tp_size = config.mapping.tp_size
+        self.hidden_act = config.hidden_act
+        self.bias = config.qkv_bias
+        self.dense_bias = config.linear_bias
 
         if self.model_name in ["chatglm_6b"]:
             self.alpha = (2 * config.num_layers)**0.5
             self.norm = LayerNorm
-            attention_mask_type = AttentionMaskType.bidirectional
-            position_embedding_type = PositionEmbeddingType.chatglm
+            self.attention_mask_type = AttentionMaskType.bidirectional
+            self.position_embedding_type = PositionEmbeddingType.chatglm
         elif config.model_name in [
                 "chatglm2_6b", "chatglm2_6b_32k", "chatglm3_6b",
                 "chatglm3_6b_base", "chatglm3_6b_32k"
         ]:
             self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
             self.norm = RmsNorm if config.rmsnorm else LayerNorm
-            attention_mask_type = AttentionMaskType.causal
-            position_embedding_type = PositionEmbeddingType.rope_gptj
-            if config.model_name in ["chatglm2_6b_32k"]:
-                rotary_embedding_scaling = {
-                    "type": "linear",
-                    "factor": config.rotary_embedding_scaling
-                }
-            elif config.model_name in ["chatglm3_6b_32k"]:
+            self.attention_mask_type = AttentionMaskType.causal
+            self.position_embedding_type = PositionEmbeddingType.rope_gptj
+            if config.model_name in ["chatglm2_6b_32k", "chatglm3_6b_32k"]:
                 self.rotary_embedding_base *= config.rotary_embedding_scaling
         elif config.model_name in ["glm_10b"]:
             self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
             self.norm = LayerNorm
-            attention_mask_type = AttentionMaskType.bidirectionalglm
-            position_embedding_type = PositionEmbeddingType.learned_absolute
+            self.attention_mask_type = AttentionMaskType.bidirectionalglm
+            self.position_embedding_type = PositionEmbeddingType.learned_absolute
 
         self.pre_norm = self.norm(
             normalized_shape=config.hidden_size,
@@ -207,10 +218,10 @@ class ChatGLMDecoderLayer(Module):
             max_position_embeddings=config.max_seq_length,
             num_layers=config.num_layers,
             apply_query_key_layer_scaling=config.apply_query_key_layer_scaling,
-            attention_mask_type=attention_mask_type,
+            attention_mask_type=self.attention_mask_type,
             bias=config.qkv_bias,
             dtype=config.dtype,
-            position_embedding_type=position_embedding_type,
+            position_embedding_type=self.position_embedding_type,
             rotary_embedding_base=self.rotary_embedding_base,
             rotary_embedding_scaling=rotary_embedding_scaling,
             rotary_embedding_percentage=0.5,
@@ -569,6 +580,8 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
         max_new_tokens: int = 0,
         use_cache: bool = True,
         max_beam_width: int = 1,
+        gather_all_token_logits: bool = False,
+        use_custom_all_reduce: bool = False,
     ):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
@@ -590,10 +603,10 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
             use_gpt_attention_plugin=default_net().plugin_config.
             gpt_attention_plugin,
             use_gemm_plugin=default_net().plugin_config.gemm_plugin,
-            use_custom_all_reduce=False,
+            use_custom_all_reduce=use_custom_all_reduce,
             paged_kv_cache=default_net().plugin_config.paged_kv_cache,
             tokens_per_block=self.tokens_per_block,
-            gather_all_token_logits=False,
+            gather_all_token_logits=gather_all_token_logits,
             dtype=self.kv_dtype,
             num_heads=self.num_heads,
             mapping=self.mapping,

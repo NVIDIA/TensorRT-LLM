@@ -18,15 +18,19 @@ import tensorrt as trt
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
-from ...functional import Tensor, gather_last_token_logits, recv, send
+from ...functional import (RotaryScalingType, Tensor, gather_last_token_logits,
+                           recv, send)
 from ...layers import (MOE, Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, FusedGatedMLP, GatedMLP,
                        KeyValueCacheParams, LoraParams, MoeConfig,
                        PositionEmbeddingType, PromptTuningEmbedding, RmsNorm)
 from ...mapping import Mapping
-from ...module import Module, ModuleList
+from ...module import Module, ModuleList, TopLevelModuleMixin
+from ...parameter import Parameter
 from ...quantization import QuantMode
+from ...quantization.layers import FP8Linear, FP8RowLinear
 from ..generation_mixin import GenerationMixin
+from ..modeling_utils import PretrainedConfig
 
 
 class LLaMADecoderLayer(Module):
@@ -47,6 +51,7 @@ class LLaMADecoderLayer(Module):
                  tp_group=None,
                  tp_size=1,
                  tp_rank=0,
+                 use_auto_parallel=False,
                  quant_mode=QuantMode(0),
                  rms_norm_eps=1e-06,
                  attn_bias=False,
@@ -70,7 +75,7 @@ class LLaMADecoderLayer(Module):
         self.input_layernorm = RmsNorm(normalized_shape=hidden_size,
                                        eps=rms_norm_eps,
                                        dtype=dtype)
-
+        self.mlp_bias = mlp_bias
         self.attention = Attention(
             hidden_size,
             num_attention_heads,
@@ -84,6 +89,7 @@ class LLaMADecoderLayer(Module):
             rotary_embedding_scaling=rotary_scaling,
             tp_group=tp_group,
             tp_size=tp_size,
+            use_auto_parallel=use_auto_parallel,
             quant_mode=quant_mode,
             instance_id=2 * layer_id,
         )
@@ -175,6 +181,7 @@ class LLaMAModel(Module):
                  rotary_base=10000.0,
                  rotary_scaling=None,
                  mapping=Mapping(),
+                 use_auto_parallel=False,
                  quant_mode=QuantMode(0),
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
@@ -218,6 +225,7 @@ class LLaMAModel(Module):
                 tp_group=mapping.tp_group,
                 tp_size=mapping.tp_size,
                 tp_rank=mapping.tp_rank,
+                use_auto_parallel=use_auto_parallel,
                 quant_mode=quant_mode,
                 rms_norm_eps=rms_norm_eps,
                 attn_bias=attn_bias,
@@ -304,7 +312,7 @@ class LLaMAModel(Module):
         return hidden_states
 
 
-class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
+class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopLevelModuleMixin):
 
     def __init__(self,
                  num_layers,
@@ -321,6 +329,7 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                  rotary_base=10000.0,
                  rotary_scaling=None,
                  mapping=Mapping(),
+                 use_auto_parallel=False,
                  quant_mode=QuantMode(0),
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
@@ -330,6 +339,31 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                  mlp_bias=False,
                  moe_config=MoeConfig(),
                  use_prompt_tuning: bool = False):
+        config = PretrainedConfig(
+            architecture="LLaMAForCausalLM",
+            dtype=dtype,
+            logits_dtype=logits_dtype,
+            vocab_size=vocab_size,
+            max_position_embeddings=max_position_embeddings,
+            hidden_size=hidden_size,
+            num_hidden_layers=num_layers,
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_kv_heads,
+            hidden_act=hidden_act,
+            intermediate_size=mlp_hidden_size,
+            norm_epsilon=rms_norm_eps,
+            position_embedding_type=str(position_embedding_type),
+            world_size=mapping.world_size,
+            tp_size=mapping.tp_size,
+            pp_size=mapping.pp_size,
+            quant_mode=quant_mode,
+            quant_kwargs={},
+            use_prompt_tuning=use_prompt_tuning)
+        self.config = config
+        # TODO: there is an issue of PretrainedConfig that it does not hold the info of "current rank"
+        # it internally constructs a mapping object from the world_size/tp_size/pp_size
+        # thus override the config.mapping here to the user provided one, which shall include current rank
+        self.config.mapping = mapping
 
         if isinstance(dtype, str):
             self.dtype = str_dtype_to_trt(dtype)
@@ -362,11 +396,12 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
         self.use_parallel_embedding = use_parallel_embedding
         self.embedding_sharding_dim = embedding_sharding_dim
         self.moe_config = moe_config
+        self.use_fused_mlp = use_fused_mlp
 
         super().__init__(num_layers, num_heads, num_kv_heads, hidden_size,
                          vocab_size, hidden_act, max_position_embeddings, dtype,
                          mlp_hidden_size, position_embedding_type, rotary_base,
-                         rotary_scaling, mapping, quant_mode,
+                         rotary_scaling, mapping, use_auto_parallel, quant_mode,
                          use_parallel_embedding, embedding_sharding_dim,
                          rms_norm_eps, use_fused_mlp, attn_bias, mlp_bias,
                          moe_config, use_prompt_tuning)
@@ -516,3 +551,173 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin):
                 max_context_length=max_input_len,
                 host_request_types=model_inputs['host_request_types']),
         )
+
+    @classmethod
+    def from_hugging_face(cls,
+                          hf_model_dir,
+                          dtype='float16',
+                          mapping: Optional[Mapping] = None,
+                          **kwargs):
+        # TODO: discuss this can be our own config object if needed, instead of from transformers
+        # but why reinvent wheels. And we already direct depends on transformers lib
+        import transformers
+        from transformers import LlamaConfig
+
+        from ... import profiler
+        from ...runtime.lora_manager import LoraConfig
+        from .weight import load_from_hf_llama
+        cfg = LlamaConfig.from_pretrained(hf_model_dir)
+
+        num_kv_heads = cfg.num_key_value_heads if hasattr(cfg, "num_key_value_heads") \
+            else cfg.num_attention_heads
+        if mapping is None:
+            mapping = Mapping()
+        tllm_llama = LLaMAForCausalLM(
+            num_layers=cfg.num_hidden_layers,
+            num_heads=cfg.num_attention_heads,
+            num_kv_heads=num_kv_heads,
+            hidden_size=cfg.hidden_size,
+            vocab_size=cfg.vocab_size,
+            hidden_act=cfg.hidden_act,
+            max_position_embeddings=cfg.max_position_embeddings,
+            dtype=dtype,
+            mlp_hidden_size=cfg.intermediate_size,
+            position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
+            mapping=mapping,
+            rotary_base=getattr(cfg, 'rotary_base', 10000.0),
+            rotary_scaling=getattr(cfg, 'rotary_scaling', None),
+            rms_norm_eps=cfg.rms_norm_eps,
+            # current load_from_hf_llama can read these, so need to set these here,
+            # ideally these attributes shall be set after the from_hugging_face returned an object to user
+            # since these attributes are not related to the hugging face model, they only affect the TRT-LLM module
+            # the weights transformation or any model optimization shall be done outside from_hugging_face
+            quant_mode=kwargs.get("quant_mode", QuantMode(0)),
+            use_parallel_embedding=kwargs.get("use_parallel_embedding", False),
+            embedding_sharding_dim=kwargs.get("embedding_sharding_dim", 0),
+            use_fused_mlp=kwargs.get("use_fused_mlp", False),
+            moe_config=kwargs.get("moe_config",
+                                  MoeConfig()),  # load weights use this
+            use_prompt_tuning=kwargs.get("use_prompt_tuning", False))
+
+        # For debug purpose, skip weights loading to be faster
+        if kwargs.get("skip_loading_weights", False):
+            return tllm_llama
+
+        hf_model = transformers.LlamaForCausalLM
+        #TODO: support mixtral
+        profiler.start("Loading weights from HF")
+        hf_llama = hf_model.from_pretrained(
+            hf_model_dir,
+            device_map={
+                "model": "cpu",
+                "lm_head": "cpu",
+                "embed_tokens": "cpu",
+                "layers": "cpu",
+                "norm": "cpu",
+            },  # Load to CPU memory
+            torch_dtype='auto',
+        )
+        load_from_hf_llama(
+            tllm_llama,
+            hf_llama,
+            mapping=mapping,
+            dtype=dtype,
+            #TODO: these shall be outside from_hugging_face too.
+            use_gemm_woq_plugin=kwargs.get("use_gemm_woq_plugin", False),
+            lora_config=kwargs.get("lora_config", LoraConfig()),
+        )
+        profiler.stop("Loading weights from HF")
+        del hf_llama
+        return tllm_llama
+
+    def quantize(self, quant_mode: QuantMode):
+        '''Quantize the model, raise Exception when the quantization failed
+        '''
+        #TODO: support all quantized scheme
+        if quant_mode.has_int8_kv_cache():
+            self.kv_dtype = str_dtype_to_trt('int8')
+        elif quant_mode.has_fp8_kv_cache():
+            self.kv_dtype = str_dtype_to_trt('fp8')
+        for layer_idx in range(len(self.layers)):
+            decoder = self.layers[layer_idx]
+            assert isinstance(
+                decoder, LLaMADecoderLayer
+            ), f"Unexpected layer type, expecting LLaMADecoderLayer, got {type(decoder)}"
+            attention = decoder.attention
+            assert isinstance(
+                attention, Attention
+            ), f"Unexpected layer type, expecting Attention, got {type(attention)}"
+
+            # Code from the tensorrt_llm/layers/attention.py Attention.__init__()
+            # TODO: can remove the duplicate later
+            attention.quant_mode = quant_mode
+            attention.use_int8_kv_cache = self.quant_mode.has_int8_kv_cache()
+            if self.quant_mode.has_kv_cache_quant():
+                attention.kv_orig_quant_scale = Parameter(shape=(1, ),
+                                                          dtype='float32')
+                attention.kv_quant_orig_scale = Parameter(shape=(1, ),
+                                                          dtype='float32')
+            if self.quant_mode.has_fp8_qdq():
+                attention.qkv = FP8Linear(
+                    self.hidden_size,
+                    self.mapping.tp_size * self.num_attention_heads *
+                    self.attention_head_size +
+                    (2 * self.mapping.tp_size * self.num_attention_kv_heads *
+                     self.attention_head_size),
+                    bias=attention.
+                    bias,  #WARNING: quantize does not support changing the bias/dtype after module ctor
+                    dtype=attention.dtype,
+                    tp_group=self.mapping.tp_group,
+                    tp_size=self.mapping.tp_size,
+                    gather_output=False)
+                attention.dense = FP8RowLinear(
+                    self.hidden_size,
+                    self.hidden_size,
+                    bias=attention.bias,
+                    dtype=attention.dtype,
+                    tp_group=self.mapping.tp_group,
+                    tp_size=self.mapping.tp_size,
+                    instance_id=attention.instance_id)
+            mlp = decoder.mlp
+            assert isinstance(
+                mlp, (GatedMLP, MOE,
+                      FusedGatedMLP)), f"Unexpected type, got {type(mlp)}"
+            mlp_kwargs = {}
+            if self.moe_config:
+                ClsMLP = MOE
+                mlp_kwargs = {
+                    "moe_config": self.moe_config,
+                    "tp_rank": self.mapping.tp_rank,
+                }
+            elif self.use_fused_mlp:
+                ClsMLP = FusedGatedMLP
+            self.mlp = ClsMLP(hidden_size=self.hidden_size,
+                              ffn_hidden_size=decoder.mlp_hidden_size,
+                              hidden_act=decoder.hidden_act,
+                              dtype=self.dtype,
+                              bias=decoder.mlp_bias,
+                              tp_group=self.mapping.tp_group,
+                              tp_size=self.mapping.tp_size,
+                              quant_mode=quant_mode,
+                              instance_id=2 * layer_idx + 1,
+                              **mlp_kwargs)
+        self.quant_mode = quant_mode  # to_trt may use this
+        return self
+
+    # llama specific setters, user shall has the chance to change the module attributes after
+    # from_hugging_face factory method created the model when these attributes is not included in the huggingface checkpoint
+
+    def rotary_base(self, val):
+        for decoder in self.layers:
+            decoder.attention.rotary_embedding_base = val
+        return self
+
+    def rotary_scaling(self, scaling_type, factor):
+        #TODO: what if there are some other behaviors triggered by the these changes?
+        # should implement these assignment as setters of the Attention Module
+        assert scaling_type in ("linear", "dynamic"), f"Got {scaling_type}"
+        assert factor > 1.0, f"Got {factor}"
+        for decoder in self.layers:
+            decoder.attention.rotary_embedding_scale_type = RotaryScalingType.linear if scaling_type == "linear" else RotaryScalingType.dynamic
+            decoder.attention.rotary_embedding_scale = factor
+        return self

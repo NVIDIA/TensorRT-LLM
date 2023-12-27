@@ -75,19 +75,25 @@ class TestPluginNoCache(unittest.TestCase):
                 use_cache=use_cache,
             )
 
-            qkv = Tensor(
-                name="qkv",
-                shape=(-1, -1, hidden_size * 3),
-                dtype=str_dtype_to_trt(dtype),
-                dim_range=OrderedDict([
-                    ('batch_size',
-                     [1] if remove_input_padding else [(1, max_batch_size // 2,
-                                                        max_batch_size)]),
-                    ('tokens', [(1, num_tokens // 2, num_tokens)]
-                     if remove_input_padding else [(1, max_input_len // 2,
-                                                    max_input_len)]),
-                    ('hidden_size', [hidden_size * 3]),
-                ]))
+            if remove_input_padding:
+                qkv = Tensor(name="qkv",
+                             shape=(-1, hidden_size * 3),
+                             dtype=str_dtype_to_trt(dtype),
+                             dim_range=OrderedDict([
+                                 ('tokens', [(1, num_tokens // 2, num_tokens)]),
+                                 ('hidden_size', [hidden_size * 3]),
+                             ]))
+            else:
+                qkv = Tensor(name="qkv",
+                             shape=(-1, -1, hidden_size * 3),
+                             dtype=str_dtype_to_trt(dtype),
+                             dim_range=OrderedDict([
+                                 ('batch_size', [(1, max_batch_size // 2,
+                                                  max_batch_size)]),
+                                 ('tokens', [(1, max_input_len // 2,
+                                              max_input_len)]),
+                                 ('hidden_size', [hidden_size * 3]),
+                             ]))
 
             sequence_length = inputs['sequence_length']
             host_context_lengths = inputs['host_context_lengths']
@@ -153,8 +159,8 @@ class TestPluginNoCache(unittest.TestCase):
         str_dtype_to_trt(dtype)
 
         if remove_input_padding:
-            qkv_shape = (1, max_batch_size * max_input_len, hidden_size * 3)
-            out_shape = (1, max_batch_size * max_input_len, hidden_size)
+            qkv_shape = (max_batch_size * max_input_len, hidden_size * 3)
+            out_shape = (max_batch_size * max_input_len, hidden_size)
         else:
             qkv_shape = (max_batch_size, max_input_len, hidden_size * 3)
             out_shape = (max_batch_size, max_input_len, hidden_size)

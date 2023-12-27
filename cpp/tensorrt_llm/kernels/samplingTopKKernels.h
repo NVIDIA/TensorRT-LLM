@@ -63,14 +63,15 @@ template <typename T>
 void invokeBatchTopKSampling(void* workspace, size_t& workspaceSize, const T* logProbs, int** ids, int* sequenceLengths,
     const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     curandState_t* curandstate, const int maxTopK, const int* topKs, const float topP, const float* topPs,
-    const int vocabSizePadded, const int* endIds, cudaStream_t stream, const int batchSize, const bool* skipDecode);
+    const int vocabSizePadded, const int* endIds, cudaStream_t stream, const int batchSize, const bool* skipDecode,
+    const bool normalizeLogProbs);
 
 //! \brief Specialization of invokeBatchTopKSampling with topPs=nullptr and topKs=nullptr
 template <typename T>
 void invokeTopKSampling(void* workspace, size_t& workspaceSize, const T* logProbs, int** outputIds, int* sequenceLength,
     const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     curandState_t* curandstate, const int topK, const float topP, const int vocabSizePadded, const int* endIds,
-    cudaStream_t stream, const int batchSize, const bool* skipDecode);
+    cudaStream_t stream, const int batchSize, const bool* skipDecode, const bool normalizeLogProbs);
 
 //! \brief Applies mask and bias to logits. Sets -MAX_FLT value for tokens in range [vocabSize; vocabSizePadded) to
 //! prevent them being chosen If request finished the generation, sets MAX_FLT to endId token and -MAX_FLT to all other

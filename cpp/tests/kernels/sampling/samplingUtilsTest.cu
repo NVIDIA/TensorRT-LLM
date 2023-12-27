@@ -107,8 +107,8 @@ TEST_F(SamplingUtilsKernelTest, CurandBatchInitialize)
     auto randomSeedsDevice = mBufferManager->copyFrom(*randomSeedsHost, MemoryType::kGPU);
 
     // Initialize curand states.
-    tk::invokeCurandBatchInitialize(curandStates, batchSize,
-        reinterpret_cast<unsigned long long*>(bufferCast<int64_t>(*randomSeedsDevice)), mStream->get());
+    tk::invokeCurandBatchInitialize(
+        curandStates, batchSize, reinterpret_cast<uint64_t*>(bufferCast<int64_t>(*randomSeedsDevice)), mStream->get());
     sync_check_cuda_error();
 
     // Generate random numbers using initialized curand states.

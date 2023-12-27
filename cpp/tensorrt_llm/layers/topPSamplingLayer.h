@@ -33,22 +33,15 @@ class TopPSamplingLayer : public BaseSamplingLayer<T>
 {
 public:
     using Base = BaseSamplingLayer<T>;
-
-    class SetupParams : public Base::SetupParams
-    {
-    public:
-        std::optional<std::vector<float>> top_p_decay;            // [batch_size], must between [0, 1]
-        std::optional<std::vector<float>> top_p_min;              // [batch_size], must between [0, 1]
-        std::optional<std::vector<std::int32_t>> top_p_reset_ids; // [batch_size]
-    };
+    using SetupParams = typename Base::SetupParams;
 
     TopPSamplingLayer(std::size_t vocab_size, std::size_t vocab_size_padded, cudaStream_t stream,
-        tensorrt_llm::common::IAllocator* allocator, bool is_free_buffer_after_forward,
+        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator, bool is_free_buffer_after_forward,
         cudaDeviceProp* cuda_device_prop);
     TopPSamplingLayer(TopPSamplingLayer<T> const& top_p_sampling_layer);
     ~TopPSamplingLayer();
 
-    void setup(std::size_t batch_size, SetupParams const& setupParams);
+    void setup(std::size_t batch_size, SetupParams const& setupParams) override;
 
 protected:
     void runSampling(DecodingOutputParams& outputs, DecodingParams const& params) override;

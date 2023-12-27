@@ -33,11 +33,8 @@ engine_target_path = _pl.Path(__file__).parent.parent / "models/rt_engine"
 import build as _ecb
 
 
-def build_engine(model_name: str, weight_dir: _pl.Path, engine_dir: _pl.Path,
-                 world_size, *args):
+def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, world_size, *args):
     args = [
-        '-m',
-        str(model_name),
         '--log_level=error',
         '--model_dir',
         str(weight_dir),
@@ -94,7 +91,7 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
     for model_name, hf_dir, trt_dir in zip(model_name_list, hf_dir_list,
                                            trt_dir_list):
         print("Building %s" % model_name)
-        build_engine(model_name, hf_dir, trt_dir, world_size)
+        build_engine(hf_dir, trt_dir, world_size)
 
     if not _Path(engine_target_path).exists():
         _Path(engine_target_path).mkdir(parents=True, exist_ok=True)

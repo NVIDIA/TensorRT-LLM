@@ -69,8 +69,7 @@ def get_calib_dataloader(data="cnn_dailymail",
 def get_tokenizer(ckpt_path, **kwargs):
     logger.info(f"Loading tokenizer from {ckpt_path}")
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path,
-                                              use_fast=False,
-                                              trust_remote_code=True,
+                                              padding_side="left",
                                               **kwargs)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -104,8 +103,18 @@ def get_args():
         type=str,
         choices=['fp8', 'int4_awq'],
         default='fp8',
-        help='Quantization format. Currently only fp8 is supported. '
+        help=
+        'Quantization format. Currently only fp8 and int4_awq are supported. '
         'For int8 smoothquant, use smoothquant.py instead. ')
+    parser.add_argument('--group_size',
+                        type=int,
+                        default=128,
+                        help='Group size used in AWQ quantization.')
+    parser.add_argument(
+        '--quantize_lm_head',
+        default=False,
+        action="store_true",
+        help='Quantize lm_head weight as well when using int4_awq.')
     parser.add_argument("--calib_size",
                         type=int,
                         default=512,
@@ -130,16 +139,40 @@ def main():
         random.seed(args.seed)
         np.random.seed(args.seed)
 
-    tokenizer = get_tokenizer(args.model_dir, cache_dir=args.cache_dir)
+    tokenizer = get_tokenizer(args.model_dir,
+                              cache_dir=args.cache_dir,
+                              use_fast=True,
+                              trust_remote_code=True)
     model = get_model(args.model_dir, args.dtype, cache_dir=args.cache_dir)
 
     calib_dataloader = get_calib_dataloader(tokenizer=tokenizer,
                                             calib_size=args.calib_size,
                                             cache_dir=args.cache_dir)
+
+    quant_cfg_dict = {}
+    if not args.quantize_lm_head:
+        quant_cfg_dict.update({
+            "*lm_head*": {
+                "enable": False
+            },
+        })
+    if args.group_size != 128:
+        quant_cfg_dict.update({
+            "*weight_quantizer": {
+                "num_bits": 4,
+                "block_sizes": {
+                    -1: args.group_size
+                },
+                "enable": True
+            },
+        })
+    print(f"quant_cfg_dict: {quant_cfg_dict}")
+
     model = quantize_and_export(model,
                                 qformat=args.qformat,
                                 calib_dataloader=calib_dataloader,
-                                export_path=args.export_path)
+                                export_path=args.export_path,
+                                quant_cfg_dict=quant_cfg_dict)
 
 
 if __name__ == "__main__":

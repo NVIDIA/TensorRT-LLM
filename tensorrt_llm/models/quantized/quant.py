@@ -17,9 +17,9 @@ from typing import Any, Union
 import numpy as np
 
 from ...layers import ColumnLinear, RowLinear
-from ...models import (BaichuanForCausalLM, BloomForCausalLM, FalconForCausalLM,
-                       GPTJForCausalLM, GPTLMHeadModel, LLaMAForCausalLM,
-                       QWenForCausalLM)
+from ...models import (BaichuanForCausalLM, BloomForCausalLM, ChatGLMHeadModel,
+                       FalconForCausalLM, GPTJForCausalLM, GPTLMHeadModel,
+                       LLaMAForCausalLM, QWenForCausalLM)
 from ...module import Module
 from ...quantization import QuantMode
 from ...quantization.layers import FP8Linear, FP8RowLinear
@@ -103,11 +103,12 @@ def _smooth_quantize_llama(model, quant_mode):
             tp_group=layer.tp_group,
             tp_size=layer.tp_size,
             quant_mode=quant_mode,
-            bias=False)
+            bias=layer.attention.qkv.bias is not None)
 
         assert hasattr(layer, "mlp"), "The layer has no mlp"
-        assert not model.moe_config.has_moe(
-        ), "MOE does not support smooth quant"
+        if hasattr(model, "moe_config"):
+            assert not model.moe_config.has_moe(
+            ), "MOE does not support smooth quant"
         layer.mlp = SmoothQuantGatedMLP(hidden_size=model.hidden_size,
                                         ffn_hidden_size=layer.mlp_hidden_size,
                                         hidden_act=layer.hidden_act,
@@ -115,7 +116,7 @@ def _smooth_quantize_llama(model, quant_mode):
                                         tp_group=layer.tp_group,
                                         tp_size=layer.tp_size,
                                         quant_mode=quant_mode,
-                                        bias=False)
+                                        bias=layer.mlp.fc.bias is not None)
         assert hasattr(
             layer,
             "post_layernorm"), "The layer has no post_rmspost_layernormnorm"
@@ -261,10 +262,53 @@ def _smooth_quantize_qwen(model, quant_mode):
     return model
 
 
+def _smooth_quantize_chatglm(model, quant_mode):
+    assert quant_mode.has_act_and_weight_quant()
+    for layer in model.layers:
+        assert hasattr(layer, "pre_norm"), "The layer has no pre_norm"
+        layer.pre_norm = SmoothQuantRmsNorm(
+            normalized_shape=layer.hidden_size,
+            dtype=layer.dtype,
+            quant_mode=quant_mode,
+        )
+        assert hasattr(layer, "attention"), "The layer has no attention"
+        layer.attention = SmoothQuantAttention(
+            layer.hidden_size,
+            num_attention_heads=layer.num_heads,
+            num_kv_heads=layer.num_kv_heads,
+            max_position_embeddings=layer.max_seq_length,
+            num_layers=layer.num_layers,
+            apply_query_key_layer_scaling=layer.apply_query_key_layer_scaling,
+            dtype=layer.dtype,
+            attention_mask_type=layer.attention_mask_type,
+            position_embedding_type=layer.position_embedding_type,
+            tp_group=layer.tp_group,
+            tp_size=layer.tp_size,
+            quant_mode=quant_mode,
+        )
+        assert hasattr(layer, "mlp"), "The layer has no mlp"
+        layer.mlp = SmoothQuantMLP(
+            hidden_size=layer.hidden_size,
+            ffn_hidden_size=layer.ffn_hidden_size,
+            hidden_act=layer.hidden_act,
+            dtype=layer.dtype,
+            tp_group=layer.tp_group,
+            tp_size=layer.tp_size,
+            quant_mode=quant_mode,
+        )
+        assert hasattr(layer, "post_norm"), "The layer has no post_norm"
+        layer.post_norm = SmoothQuantRmsNorm(
+            normalized_shape=layer.hidden_size,
+            dtype=layer.dtype,
+            quant_mode=quant_mode,
+        )
+    return model
+
+
 def _smooth_quantize(model, quant_mode):
     assert isinstance(model, GPTLMHeadModel) or isinstance(model, LLaMAForCausalLM) \
             or isinstance(model, BloomForCausalLM) or isinstance(model, BaichuanForCausalLM) \
-            or isinstance(model, QWenForCausalLM), \
+            or isinstance(model, QWenForCausalLM) or isinstance(model, ChatGLMHeadModel), \
             "Only GPTLMHeadModel, LLaMAForCausalLM BloomForCausalLM and BaichuanForCausalLM are well tested now"
     if isinstance(model, GPTLMHeadModel):
         return _smooth_quantize_gpt(model, quant_mode)
@@ -276,6 +320,8 @@ def _smooth_quantize(model, quant_mode):
         return _smooth_quantize_baichuan(model, quant_mode)
     elif isinstance(model, QWenForCausalLM):
         return _smooth_quantize_qwen(model, quant_mode)
+    elif isinstance(model, ChatGLMHeadModel):
+        return _smooth_quantize_chatglm(model, quant_mode)
     else:
         assert False, f"Model {type(model).__name__} is not supported by SmoothQuant yet"
 
