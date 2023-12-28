@@ -46,7 +46,7 @@ __global__ void lookup_kernel(T* output, const Idx* input, const T* weight, cons
          index += blockDim.x * gridDim.x)
     {
         const int word_index = input[index / n_embed] - offset;
-        const int col_index = index % n_embed;
+        const int col_index = n_embed - index % n_embed - 1;
         T embedding;
         if (word_index < 0 || word_index >= size)
         {
@@ -54,7 +54,7 @@ __global__ void lookup_kernel(T* output, const Idx* input, const T* weight, cons
         }
         else
         {
-            embedding = weight[word_index * n_embed + col_index];
+            embedding = weight[ word_index * n_embed + col_index ];
         }
         output[index] = embedding;
     } // end for index

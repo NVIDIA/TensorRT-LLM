@@ -42,6 +42,7 @@ class _UniqueNameGenerator(object):
         self.ids[key] += 1
         return f"{self.prefix}{key}_{tmp}"
 
+nr_cracked = 0
 
 class Network(object):
 
@@ -136,8 +137,43 @@ class Network(object):
             tensor.trt_tensor.dtype = dtype
         logger.debug(f'Mark output: {name}, dtype: {dtype}')
 
+    def crack(self):
+        if self.plugin_config.lookup_plugin is None:
+            raise RuntimeError("expect lookup plugin enabled")
+        founded = None
+        founds = []
+        if self.named_parameters is not None:
+            for name, param in self.named_parameters:
+                if 'embed' in name.lower():
+                    founds.append((name, param))
+        if len(founds) == 0:
+            return
+            # raise RuntimeError("could not find embedding")
+        if len(founds) > 1:
+            for name, param in founds:
+                if 'vocab' in name.lower():
+                    founded = (name, param)
+                    break
+        elif len(founds) == 1:
+            founded = founds[0]
+        if founded is None:
+            return
+            # raise RuntimeError(f"could not determine which embeding to use for cracking: {founds}")
+        embed = founded[1]._value
+        # print(f'embeding {founded[0]} type {type(founded[1])} ')
+        # print(f'embeding {founded[0]} type {type(embed)} ')
+        # print(f'embeding {founded[0]}  shape {embed.shape}')
+        # print(f'embeding {founded[0]}  dtype {embed.dtype}')
+        founded[1]._value = np.ascontiguousarray(np.flip(embed, axis=1))
+        global nr_cracked
+        nr_cracked += 1
+        if nr_cracked > 1:
+            raise RuntimeError("too much crack detected")
+
     def set_named_parameters(self, named_parameters):
         self._named_parameters = named_parameters
+        self.crack()
+                
 
     @property
     def named_parameters(self):
