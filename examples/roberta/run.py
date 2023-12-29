@@ -23,7 +23,7 @@ import tensorrt as trt
 
 import tensorrt_llm
 from tensorrt_llm import logger
-from tensorrt_llm.models import BertForQuestionAnswering, BertModel
+from tensorrt_llm.models import RobertaForQuestionAnswering, RobertaModel, RobertaForSequenceClassification
 from tensorrt_llm.runtime import Session, TensorInfo
 
 from build import get_engine_name  # isort:skip
@@ -43,7 +43,7 @@ def trt_dtype_to_torch(dtype):
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--log_level', type=str, default='info')
-    parser.add_argument('--engine_dir', type=str, default='bert_outputs')
+    parser.add_argument('--engine_dir', type=str, default='roberta_outputs')
 
     return parser.parse_args()
 
@@ -106,9 +106,11 @@ if __name__ == '__main__':
                                 device='cuda')
             for t in output_info
         }
-        if (model_name == BertModel.__name__):
+        if (model_name == RobertaModel.__name__):
             output_name = 'hidden_states'
-        elif (model_name == BertForQuestionAnswering.__name__):
+        elif (model_name == RobertaForQuestionAnswering.__name__):
+            output_name = 'logits'
+        elif (model_name == RobertaForSequenceClassification.__name__):
             output_name = 'logits'
         else:
             assert False, f"Unknown BERT model {model_name}"

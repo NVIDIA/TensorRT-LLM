@@ -20,7 +20,7 @@ from collections import OrderedDict
 import torch
 import tensorrt as trt
 # isort: on
-from transformers import BertConfig, BertForQuestionAnswering, BertModel
+from transformers import RobertaConfig, RobertaForQuestionAnswering, RobertaModel, RobertaForSequenceClassification
 
 import tensorrt_llm
 from tensorrt_llm.builder import Builder
@@ -28,7 +28,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
-from weight import load_from_hf_bert, load_from_hf_qa_bert  # isort:skip
+from weight import load_from_hf_roberta, load_from_hf_qa_roberta, load_from_hf_cls_roberta  # isort:skip
 
 
 def get_engine_name(model, dtype, tp_size, rank):
@@ -58,7 +58,7 @@ def parse_arguments():
     parser.add_argument('--max_batch_size', type=int, default=256)
     parser.add_argument('--max_input_len', type=int, default=512)
     parser.add_argument('--gpus_per_node', type=int, default=8)
-    parser.add_argument('--output_dir', type=str, default='bert_outputs')
+    parser.add_argument('--output_dir', type=str, default='roberta_outputs')
     parser.add_argument('--use_bert_attention_plugin',
                         nargs='?',
                         const='float16',
@@ -88,10 +88,10 @@ def parse_arguments():
                         action='store_true')
     parser.add_argument(
         '--model',
-        default=tensorrt_llm.models.BertModel.__name__,
+        default=tensorrt_llm.models.RobertaModel.__name__,
         choices=[
-            tensorrt_llm.models.BertModel.__name__,
-            tensorrt_llm.models.BertForQuestionAnswering.__name__
+            tensorrt_llm.models.RobertaModel.__name__,
+            tensorrt_llm.models.RobertaForQuestionAnswering.__name__
         ])
     return parser.parse_args()
 
@@ -118,7 +118,7 @@ if __name__ == '__main__':
     )
     # Initialize model
 
-    bert_config = BertConfig(
+    roberta_config = RobertaConfig(
         vocab_size=args.vocab_size,
         hidden_size=args.n_embd,
         num_hidden_layers=args.n_layer,
@@ -130,56 +130,85 @@ if __name__ == '__main__':
     )
 
     output_name = 'hidden_states'
-    if args.model == tensorrt_llm.models.BertModel.__name__:
-        hf_bert = BertModel(bert_config, add_pooling_layer=False)
-        tensorrt_llm_bert = tensorrt_llm.models.BertModel(
-            num_layers=bert_config.num_hidden_layers,
-            num_heads=bert_config.num_attention_heads,
-            hidden_size=bert_config.hidden_size,
-            vocab_size=bert_config.vocab_size,
-            hidden_act=bert_config.hidden_act,
-            max_position_embeddings=bert_config.max_position_embeddings,
-            type_vocab_size=bert_config.type_vocab_size,
+    if args.model == tensorrt_llm.models.RobertaModel.__name__:
+        hf_roberta = RobertaModel(roberta_config, add_pooling_layer=False)
+        tensorrt_llm_roberta = tensorrt_llm.models.RobertaModel(
+            num_layers=roberta_config.num_hidden_layers,
+            num_heads=roberta_config.num_attention_heads,
+            hidden_size=roberta_config.hidden_size,
+            vocab_size=roberta_config.vocab_size,
+            hidden_act=roberta_config.hidden_act,
+            max_position_embeddings=roberta_config.max_position_embeddings,
+            type_vocab_size=roberta_config.type_vocab_size,
+            pad_token_id=roberta_config.pad_token_id,
             mapping=Mapping(world_size=args.world_size,
                             rank=args.rank,
                             tp_size=args.world_size),  # TP only
             dtype=trt_dtype)
-        load_from_hf_bert(
-            tensorrt_llm_bert,
-            hf_bert,
-            bert_config,
+        load_from_hf_roberta(
+            tensorrt_llm_roberta,
+            hf_roberta,
+            roberta_config,
             rank=args.rank,
             tensor_parallel=args.world_size,
             fp16=(args.dtype == 'float16'),
         )
 
-    elif args.model == tensorrt_llm.models.BertForQuestionAnswering.__name__:
-        hf_bert = BertForQuestionAnswering(bert_config)
-        tensorrt_llm_bert = tensorrt_llm.models.BertForQuestionAnswering(
-            num_layers=bert_config.num_hidden_layers,
-            num_heads=bert_config.num_attention_heads,
-            hidden_size=bert_config.hidden_size,
-            vocab_size=bert_config.vocab_size,
-            hidden_act=bert_config.hidden_act,
-            max_position_embeddings=bert_config.max_position_embeddings,
-            type_vocab_size=bert_config.type_vocab_size,
+    elif args.model == tensorrt_llm.models.RobertaForQuestionAnswering.__name__:
+        hf_roberta = RobertaForQuestionAnswering(roberta_config)
+        tensorrt_llm_roberta = tensorrt_llm.models.RobertaForQuestionAnswering(
+            num_layers=roberta_config.num_hidden_layers,
+            num_heads=roberta_config.num_attention_heads,
+            hidden_size=roberta_config.hidden_size,
+            vocab_size=roberta_config.vocab_size,
+            hidden_act=roberta_config.hidden_act,
+            max_position_embeddings=roberta_config.max_position_embeddings,
+            type_vocab_size=roberta_config.type_vocab_size,
+            pad_token_id=roberta_config.pad_token_id,
             num_labels=args.
             n_labels,  # TODO: this might just need to be a constant
             mapping=Mapping(world_size=args.world_size,
                             rank=args.rank,
                             tp_size=args.world_size),  # TP only
             dtype=trt_dtype)
-        load_from_hf_qa_bert(
-            tensorrt_llm_bert,
-            hf_bert,
-            bert_config,
+        load_from_hf_qa_roberta(
+            tensorrt_llm_roberta,
+            hf_roberta,
+            roberta_config,
             rank=args.rank,
             tensor_parallel=args.world_size,
             fp16=(args.dtype == 'float16'),
         )
         output_name = 'logits'
+    elif args.model == tensorrt_llm.models.RobertaForSequenceClassification.__name__:
+        hf_roberta = RobertaForSequenceClassification(roberta_config).cuda().to(
+                torch_dtype).eval()
+        output_name = "logits"
+        tensorrt_llm_roberta = tensorrt_llm.models.RobertaForSequenceClassification(
+            num_layers=roberta_config.num_hidden_layers,
+            num_heads=roberta_config.num_attention_heads,
+            hidden_size=roberta_config.hidden_size,
+            vocab_size=roberta_config.vocab_size,
+            hidden_act=roberta_config.hidden_act,
+            max_position_embeddings=roberta_config.max_position_embeddings,
+            type_vocab_size=roberta_config.type_vocab_size,
+            pad_token_id=roberta_config.pad_token_id,
+            num_labels=
+            2,  # just make it a const here, seems to me not worth as a config
+            mapping=tensorrt_llm.Mapping(
+                world_size=args.world_size,
+                rank=args.rank,
+                tp_size=args.world_size),  # TP only
+            dtype=trt_dtype)
+        load_from_hf_cls_roberta(tensorrt_llm_roberta,
+                                hf_roberta,
+                                roberta_config,
+                                rank=args.rank,
+                                tensor_parallel=args.world_size,
+                                fp16=(args.dtype == 'float16'))
+
     else:
-        assert False, f"Unknown BERT model {args.model}"
+        assert False, f"Unknown Roberta model {args.model}"
 
     # Module -> Network
     network = builder.create_network()
@@ -203,7 +232,7 @@ if __name__ == '__main__':
         network.plugin_config.set_nccl_plugin(args.dtype)
     with net_guard(network):
         # Prepare
-        network.set_named_parameters(tensorrt_llm_bert.named_parameters())
+        network.set_named_parameters(tensorrt_llm_roberta.named_parameters())
 
         # Forward
         input_ids = tensorrt_llm.Tensor(
@@ -231,7 +260,7 @@ if __name__ == '__main__':
                                             ]))
 
         # logits for QA BERT, or hidden_state for vanila BERT
-        output = tensorrt_llm_bert(input_ids=input_ids,
+        output = tensorrt_llm_roberta(input_ids=input_ids,
                                    input_lengths=input_lengths,
                                    token_type_ids=token_type_ids)
 

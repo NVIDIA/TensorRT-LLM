@@ -14,6 +14,7 @@
 # limitations under the License.
 from .baichuan.model import BaichuanForCausalLM
 from .bert.model import BertForQuestionAnswering, BertModel, BertForSequenceClassification
+from .roberta.model import RobertaForQuestionAnswering, RobertaModel, RobertaForSequenceClassification
 from .bloom.model import BloomForCausalLM, BloomModel
 from .chatglm.model import ChatGLMHeadModel, ChatGLMModel
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
@@ -31,6 +32,10 @@ from .quantized.quant import quantize_model  # noqa # isort:skip
 __all__ = [
     'BertModel',
     'BertForQuestionAnswering',
+    'BertForSequenceClassification',
+    'RobertaModel',
+    'RobertaForQuestionAnswering',
+    'RobertaForSequenceClassification',
     'BloomModel',
     'BloomForCausalLM',
     'FalconForCausalLM',

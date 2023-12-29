@@ -397,7 +397,7 @@ class TestBert(unittest.TestCase):
                     input_ids_with_padding['attention_mask'],
                     device=input_ids.device, dtype=torch.int32)
             else:
-                input_ids = torch.randint(100, (batch_size, input_len)).int().cuda()
+                input_ids = torch.randint(bert_config.vocab_size, (batch_size, input_len)).int().cuda()
                 input_lengths = input_len * torch.ones(
                     (batch_size, ), dtype=torch.int32, device='cuda')
 

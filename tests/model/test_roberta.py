@@ -25,9 +25,10 @@ import torch
 import tensorrt as trt
 # isort: on
 from parameterized import parameterized
-from transformers import BertConfig, BertForQuestionAnswering, BertModel, BertForSequenceClassification, AutoTokenizer
+from transformers import RobertaConfig, RobertaForQuestionAnswering, RobertaModel, RobertaForSequenceClassification, AutoTokenizer
 
 import tensorrt_llm
+from tensorrt_llm.models import roberta
 import tensorrt_llm.runtime
 from tensorrt_llm import Builder
 from tensorrt_llm._utils import trt_dtype_to_torch, str_dtype_to_trt
@@ -54,63 +55,63 @@ def split(v, tp_size, idx, dim=0):
     return None
 
 
-def load_from_hf_bert(tensorrt_llm_bert,
-                      hf_bert,
-                      hf_bert_config,
+def load_from_hf_roberta(tensorrt_llm_roberta,
+                      hf_roberta,
+                      hf_roberta_config,
                       rank=0,
                       tensor_parallel=1,
                       fp16=False):
     qkv_weight = [[None, None, None]
-                  for _ in range(hf_bert_config.num_hidden_layers)]
+                  for _ in range(hf_roberta_config.num_hidden_layers)]
 
     qkv_bias = [[None, None, None]
-                for _ in range(hf_bert_config.num_hidden_layers)]
+                for _ in range(hf_roberta_config.num_hidden_layers)]
 
     torch_dtype = torch.float16 if fp16 else torch.float32
-    for k, v in hf_bert.state_dict().items():
+    for k, v in hf_roberta.state_dict().items():
         v = v.to(torch_dtype).cpu().numpy()
         if 'embeddings.word_embeddings.weight' in k:
-            tensorrt_llm_bert.embedding.vocab_embedding.weight.value = v
+            tensorrt_llm_roberta.embedding.vocab_embedding.weight.value = v
         elif 'embeddings.position_embeddings.weight' in k:
-            tensorrt_llm_bert.embedding.position_embedding.weight.value = v
+            tensorrt_llm_roberta.embedding.position_embedding.weight.value = v
         elif 'embeddings.token_type_embeddings.weight' in k:
-            tensorrt_llm_bert.embedding.token_embedding.weight.value = v
+            tensorrt_llm_roberta.embedding.token_embedding.weight.value = v
         elif 'embeddings.LayerNorm.weight' in k:
-            tensorrt_llm_bert.embedding.embedding_ln.weight.value = v
+            tensorrt_llm_roberta.embedding.embedding_ln.weight.value = v
         elif 'embeddings.LayerNorm.bias' in k:
-            tensorrt_llm_bert.embedding.embedding_ln.bias.value = v
+            tensorrt_llm_roberta.embedding.embedding_ln.bias.value = v
         else:
             layer_idx = extract_layer_idx(k)
             if layer_idx is None:
                 continue
             idx = int(layer_idx)
             if 'attention.output.dense.weight' in k:
-                tensorrt_llm_bert.layers[
+                tensorrt_llm_roberta.layers[
                     idx].attention.dense.weight.value = split(v,
                                                               tensor_parallel,
                                                               rank,
                                                               dim=1)
             elif 'attention.output.dense.bias' in k:
-                tensorrt_llm_bert.layers[idx].attention.dense.bias.value = v
+                tensorrt_llm_roberta.layers[idx].attention.dense.bias.value = v
             elif 'attention.output.LayerNorm.weight' in k:
-                tensorrt_llm_bert.layers[idx].input_layernorm.weight.value = v
+                tensorrt_llm_roberta.layers[idx].input_layernorm.weight.value = v
             elif 'attention.output.LayerNorm.bias' in k:
-                tensorrt_llm_bert.layers[idx].input_layernorm.bias.value = v
+                tensorrt_llm_roberta.layers[idx].input_layernorm.bias.value = v
             elif 'intermediate.dense.weight' in k:
-                tensorrt_llm_bert.layers[idx].mlp.fc.weight.value = split(
+                tensorrt_llm_roberta.layers[idx].mlp.fc.weight.value = split(
                     v, tensor_parallel, rank)
             elif 'intermediate.dense.bias' in k:
-                tensorrt_llm_bert.layers[idx].mlp.fc.bias.value = split(
+                tensorrt_llm_roberta.layers[idx].mlp.fc.bias.value = split(
                     v, tensor_parallel, rank)
             elif 'output.dense.weight' in k:
-                tensorrt_llm_bert.layers[idx].mlp.proj.weight.value = split(
+                tensorrt_llm_roberta.layers[idx].mlp.proj.weight.value = split(
                     v, tensor_parallel, rank, dim=1)
             elif 'output.dense.bias' in k:
-                tensorrt_llm_bert.layers[idx].mlp.proj.bias.value = v
+                tensorrt_llm_roberta.layers[idx].mlp.proj.bias.value = v
             elif 'output.LayerNorm.weight' in k:
-                tensorrt_llm_bert.layers[idx].post_layernorm.weight.value = v
+                tensorrt_llm_roberta.layers[idx].post_layernorm.weight.value = v
             elif 'output.LayerNorm.bias' in k:
-                tensorrt_llm_bert.layers[idx].post_layernorm.bias.value = v
+                tensorrt_llm_roberta.layers[idx].post_layernorm.bias.value = v
             elif 'attention.self.query.weight' in k:
                 qkv_weight[idx][0] = v
             elif 'attention.self.query.bias' in k:
@@ -124,58 +125,58 @@ def load_from_hf_bert(tensorrt_llm_bert,
             elif 'attention.self.value.bias' in k:
                 qkv_bias[idx][2] = v
 
-    for i in range(hf_bert_config.num_hidden_layers):
-        tensorrt_llm_bert.layers[i].attention.qkv.weight.value = split(
+    for i in range(hf_roberta_config.num_hidden_layers):
+        tensorrt_llm_roberta.layers[i].attention.qkv.weight.value = split(
             np.concatenate(qkv_weight[i]), tensor_parallel, rank)
-        tensorrt_llm_bert.layers[i].attention.qkv.bias.value = split(
+        tensorrt_llm_roberta.layers[i].attention.qkv.bias.value = split(
             np.concatenate(qkv_bias[i]), tensor_parallel, rank)
 
 
-def load_from_hf_qa_bert(tensorrt_llm_qa_bert,
-                         hf_qa_bert,
-                         hf_bert_config,
+def load_from_hf_qa_roberta(tensorrt_llm_qa_roberta,
+                         hf_qa_roberta,
+                         hf_roberta_config,
                          rank=0,
                          tensor_parallel=1,
                          fp16=False):
-    load_from_hf_bert(tensorrt_llm_qa_bert.bert, hf_qa_bert, hf_bert_config,
+    load_from_hf_roberta(tensorrt_llm_qa_roberta.roberta, hf_qa_roberta, hf_roberta_config,
                       rank, tensor_parallel, fp16)
-    states = hf_qa_bert.state_dict()
+    states = hf_qa_roberta.state_dict()
 
     torch_dtype = torch.float16 if fp16 else torch.float32
 
-    tensorrt_llm_qa_bert.qa_outputs.weight.value = states[
+    tensorrt_llm_qa_roberta.qa_outputs.weight.value = states[
         'qa_outputs.weight'].to(torch_dtype).cpu().numpy()
-    tensorrt_llm_qa_bert.qa_outputs.bias.value = states['qa_outputs.bias'].to(
+    tensorrt_llm_qa_roberta.qa_outputs.bias.value = states['qa_outputs.bias'].to(
         torch_dtype).cpu().numpy()
 
-def load_from_hf_cls_bert(tensorrt_llm_qa_bert,
-                         hf_qa_bert,
-                         hf_bert_config,
+def load_from_hf_cls_roberta(tensorrt_llm_cls_roberta,
+                         hf_qa_roberta,
+                         hf_roberta_config,
                          rank=0,
                          tensor_parallel=1,
                          fp16=False):
-    load_from_hf_bert(tensorrt_llm_qa_bert.bert, hf_qa_bert, hf_bert_config,
+    load_from_hf_roberta(tensorrt_llm_cls_roberta.roberta, hf_qa_roberta, hf_roberta_config,
                       rank, tensor_parallel, fp16)
-    states = hf_qa_bert.state_dict()
+    states = hf_qa_roberta.state_dict()
 
     torch_dtype = torch.float16 if fp16 else torch.float32
 
-    tensorrt_llm_qa_bert.pooler.dense.weight.value = states[
-        'bert.pooler.dense.weight'].to(torch_dtype).cpu().numpy()
-    tensorrt_llm_qa_bert.pooler.dense.bias.value = states[
-        'bert.pooler.dense.bias'].to(torch_dtype).cpu().numpy()
+    tensorrt_llm_cls_roberta.classifier.dense.weight.value = states[
+        'classifier.dense.weight'].to(torch_dtype).cpu().numpy()
+    tensorrt_llm_cls_roberta.classifier.dense.bias.value = states[
+        'classifier.dense.bias'].to(torch_dtype).cpu().numpy()
 
-    tensorrt_llm_qa_bert.classifier.weight.value = states[
-        'classifier.weight'].to(torch_dtype).cpu().numpy()
-    tensorrt_llm_qa_bert.classifier.bias.value = states[
-        'classifier.bias'].to(torch_dtype).cpu().numpy()
+    tensorrt_llm_cls_roberta.classifier.out_proj.weight.value = states[
+        'classifier.out_proj.weight'].to(torch_dtype).cpu().numpy()
+    tensorrt_llm_cls_roberta.classifier.out_proj.bias.value = states[
+        'classifier.out_proj.bias'].to(torch_dtype).cpu().numpy()
 
 
-class TestBert(unittest.TestCase):
+class TestRoberta(unittest.TestCase):
 
     def load_test_cases():
-        models = [BertForSequenceClassification.__name__, BertModel.__name__, BertForQuestionAnswering.__name__]
-        model_dirs = ['', 'bert-base-uncased'] # add more tests for read data.
+        models = [RobertaForSequenceClassification.__name__, RobertaModel.__name__, RobertaForQuestionAnswering.__name__]
+        model_dirs = ['', 'roberta-base'] # add more tests for read data.
         test_cases = []
         test_cases += product(models, [False], [False], [False],
                               [ContextFMHAType.disabled], ['float32'], model_dirs)
@@ -193,7 +194,7 @@ class TestBert(unittest.TestCase):
         )
 
     @parameterized.expand(load_test_cases, name_func=custom_name_func)
-    def test_bert(self, model, use_refit, use_plugin, fast_building,
+    def test_roberta(self, model, use_refit, use_plugin, fast_building,
                   context_fmha_type, dtype, model_dir):
         tensorrt_llm.logger.set_level('error')
         fp16 = (dtype == 'float16')
@@ -248,16 +249,16 @@ class TestBert(unittest.TestCase):
                                                     ]))
                 # Initialize model
                 if model_dir:
-                    bert_config = BertConfig.from_pretrained(model_dir, torch_dtype=torch_dtype)
-                    vocab_size = bert_config.vocab_size
-                    hidden_size = bert_config.hidden_size
-                    num_layers = bert_config.num_hidden_layers
-                    num_heads = bert_config.num_attention_heads
-                    hidden_size = bert_config.intermediate_size // 4
-                    hidden_act = bert_config.hidden_act
-                    max_position_embeddings = bert_config.max_position_embeddings
+                    roberta_config = RobertaConfig.from_pretrained(model_dir, torch_dtype=torch_dtype)
+                    vocab_size = roberta_config.vocab_size
+                    hidden_size = roberta_config.hidden_size
+                    num_layers = roberta_config.num_hidden_layers
+                    num_heads = roberta_config.num_attention_heads
+                    hidden_size = roberta_config.intermediate_size // 4
+                    hidden_act = roberta_config.hidden_act
+                    max_position_embeddings = roberta_config.max_position_embeddings
                 else:
-                    bert_config = BertConfig(
+                    roberta_config = RobertaConfig(
                         vocab_size=vocab_size,
                         hidden_size=hidden_size,
                         num_hidden_layers=num_layers,
@@ -269,49 +270,51 @@ class TestBert(unittest.TestCase):
                     )
 
                 output_name = "hidden_states"
-                if model == BertModel.__name__:
+                if model == RobertaModel.__name__:
                     if model_dir:
-                        hf_bert = BertModel.from_pretrained(
+                        hf_roberta = RobertaModel.from_pretrained(
                             model_dir).cuda().to(torch_dtype).eval()
                     else:
-                        hf_bert = BertModel(
-                            bert_config,
+                        hf_roberta = RobertaModel(
+                            roberta_config,
                             add_pooling_layer=False).cuda().to(torch_dtype).eval()
-                    tensorrt_llm_bert = tensorrt_llm.models.BertModel(
+                    tensorrt_llm_roberta = tensorrt_llm.models.RobertaModel(
                         num_layers=num_layers,
                         num_heads=num_heads,
                         hidden_size=hidden_size,
                         vocab_size=vocab_size,
                         hidden_act=hidden_act,
                         max_position_embeddings=max_position_embeddings,
-                        type_vocab_size=bert_config.type_vocab_size,
+                        type_vocab_size=roberta_config.type_vocab_size,
+                        pad_token_id=roberta_config.pad_token_id,
                         mapping=tensorrt_llm.Mapping(
                             world_size=world_size,
                             rank=rank,
                             tp_size=world_size),  # TP only
                         dtype=trt_dtype)
-                    load_from_hf_bert(tensorrt_llm_bert,
-                                      hf_bert,
-                                      bert_config,
+                    load_from_hf_roberta(tensorrt_llm_roberta,
+                                      hf_roberta,
+                                      roberta_config,
                                       rank=rank,
                                       tensor_parallel=world_size,
                                       fp16=fp16)
-                elif model == BertForQuestionAnswering.__name__:
+                elif model == RobertaForQuestionAnswering.__name__:
                     if model_dir:
-                        hf_bert = BertForQuestionAnswering.from_pretrained(
+                        hf_roberta = RobertaForQuestionAnswering.from_pretrained(
                             model_dir).cuda().to(torch_dtype).eval()
                     else:
-                        hf_bert = BertForQuestionAnswering(bert_config).cuda().to(
+                        hf_roberta = RobertaForQuestionAnswering(roberta_config).cuda().to(
                             torch_dtype).eval()
                     output_name = "logits"
-                    tensorrt_llm_bert = tensorrt_llm.models.BertForQuestionAnswering(
+                    tensorrt_llm_roberta = tensorrt_llm.models.RobertaForQuestionAnswering(
                         num_layers=num_layers,
                         num_heads=num_heads,
                         hidden_size=hidden_size,
                         vocab_size=vocab_size,
                         hidden_act=hidden_act,
                         max_position_embeddings=max_position_embeddings,
-                        type_vocab_size=bert_config.type_vocab_size,
+                        type_vocab_size=roberta_config.type_vocab_size,
+                        pad_token_id=roberta_config.pad_token_id,
                         num_labels=
                         2,  # just make it a const here, seems to me not worth as a config
                         mapping=tensorrt_llm.Mapping(
@@ -319,28 +322,29 @@ class TestBert(unittest.TestCase):
                             rank=rank,
                             tp_size=world_size),  # TP only
                         dtype=trt_dtype)
-                    load_from_hf_qa_bert(tensorrt_llm_bert,
-                                         hf_bert,
-                                         bert_config,
+                    load_from_hf_qa_roberta(tensorrt_llm_roberta,
+                                         hf_roberta,
+                                         roberta_config,
                                          rank=rank,
                                          tensor_parallel=world_size,
                                          fp16=fp16)
-                elif model == BertForSequenceClassification.__name__:
+                elif model == RobertaForSequenceClassification.__name__:
                     if model_dir:
-                        hf_bert = BertForSequenceClassification.from_pretrained(
+                        hf_roberta = RobertaForSequenceClassification.from_pretrained(
                             model_dir).cuda().to(torch_dtype).eval()
                     else:
-                        hf_bert = BertForSequenceClassification(bert_config).cuda().to(
+                        hf_roberta = RobertaForSequenceClassification(roberta_config).cuda().to(
                             torch_dtype).eval()
                     output_name = "logits"
-                    tensorrt_llm_bert = tensorrt_llm.models.BertForSequenceClassification(
+                    tensorrt_llm_roberta = tensorrt_llm.models.RobertaForSequenceClassification(
                         num_layers=num_layers,
                         num_heads=num_heads,
                         hidden_size=hidden_size,
                         vocab_size=vocab_size,
                         hidden_act=hidden_act,
                         max_position_embeddings=max_position_embeddings,
-                        type_vocab_size=bert_config.type_vocab_size,
+                        type_vocab_size=roberta_config.type_vocab_size,
+                        pad_token_id=roberta_config.pad_token_id,
                         num_labels=
                         2,  # just make it a const here, seems to me not worth as a config
                         mapping=tensorrt_llm.Mapping(
@@ -348,9 +352,9 @@ class TestBert(unittest.TestCase):
                             rank=rank,
                             tp_size=world_size),  # TP only
                         dtype=trt_dtype)
-                    load_from_hf_cls_bert(tensorrt_llm_bert,
-                                         hf_bert,
-                                         bert_config,
+                    load_from_hf_cls_roberta(tensorrt_llm_roberta,
+                                         hf_roberta,
+                                         roberta_config,
                                          rank=rank,
                                          tensor_parallel=world_size,
                                          fp16=fp16)
@@ -359,18 +363,21 @@ class TestBert(unittest.TestCase):
                     assert False, f"Unknown model {model}"
                 # Prepare
                 network.set_named_parameters(
-                    tensorrt_llm_bert.named_parameters())
+                    tensorrt_llm_roberta.named_parameters())
 
                 # Forward
-                output = tensorrt_llm_bert(input_ids=input_ids,
+                output = tensorrt_llm_roberta(input_ids=input_ids,
                                            input_lengths=input_lengths)
 
                 # Mark outputs
                 output_dtype = trt.float16 if fp16 else trt.float32
                 output.mark_output(output_name, output_dtype)
 
-                for k, v in tensorrt_llm_bert.named_network_outputs():
-                    network._mark_output(v, k, str_dtype_to_trt(dtype))
+                for k, v in tensorrt_llm_roberta.named_network_outputs():
+                    if '_ids' in k or 'attention_mask' in k:
+                        network._mark_output(v, k, str_dtype_to_trt('int32'))
+                    else:
+                         network._mark_output(v, k, str_dtype_to_trt(dtype))
 
             # Build engine
             engine_buffer = builder.build_engine(network, builder_config)
@@ -397,7 +404,8 @@ class TestBert(unittest.TestCase):
                     input_ids_with_padding['attention_mask'],
                     device=input_ids.device, dtype=torch.int32)
             else:
-                input_ids = torch.randint(100, (batch_size, input_len)).int().cuda()
+                # since 1 is default padding toekn id, we need to be careful about use 1.
+                input_ids = torch.randint(2, roberta_config.vocab_size, (batch_size, input_len)).int().cuda()
                 input_lengths = input_len * torch.ones(
                     (batch_size, ), dtype=torch.int32, device='cuda')
 
@@ -426,14 +434,14 @@ class TestBert(unittest.TestCase):
 
             with torch.no_grad():
                 if model_dir:
-                    hf_outputs = hf_bert.forward(
+                    hf_outputs = hf_roberta.forward(
                         input_ids=input_ids,
                         attention_mask=attention_mask)
                 else:
-                    hf_outputs = hf_bert.forward(input_ids)
+                    hf_outputs = hf_roberta.forward(input_ids)
             torch.cuda.synchronize()
 
-            if model == BertModel.__name__:
+            if model == RobertaModel.__name__:
                 ref = hf_outputs.last_hidden_state
                 if use_plugin and model_dir:
                     # when we use_plugin and have real-data model_dir and input
@@ -446,7 +454,7 @@ class TestBert(unittest.TestCase):
                                            res.cpu().numpy(),
                                            atol=1e-2,
                                            rtol=1e-2)
-            elif model == BertForQuestionAnswering.__name__:
+            elif model == RobertaForQuestionAnswering.__name__:
                 res_start_logits, res_end_logits = torch.split(res, 1, -1)
                 res_start_logits = res_start_logits.squeeze()
                 res_end_logits = res_end_logits.squeeze()
@@ -467,7 +475,7 @@ class TestBert(unittest.TestCase):
                 np.testing.assert_allclose(ref_end_logits.cpu().numpy(),
                                            res_end_logits.cpu().numpy(),
                                            atol=1.5e-2)
-            elif model == BertForSequenceClassification.__name__:
+            elif model == RobertaForSequenceClassification.__name__:
                 ref = hf_outputs.logits
                 np.testing.assert_allclose(ref.cpu().numpy(),
                                            res.cpu().numpy(),
