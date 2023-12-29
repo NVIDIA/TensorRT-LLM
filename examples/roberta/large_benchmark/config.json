@@ -1,0 +1,22 @@
+{
+  "builder_config": {
+    "max_batch_size": 256,
+    "max_input_len": 512,
+    "name": "bert",
+    "precision": "float16",
+    "tensor_parallel": 1,
+    "use_refit": false
+  },
+  "plugin_config": {
+    "bert_attention_plugin": false,
+    "context_fmha_enabled": false,
+    "gemm_plugin": false,
+    "gpt_attention_plugin": false,
+    "identity_plugin": false,
+    "layernorm_plugin": false,
+    "layernorm_quantization_plugin": false,
+    "nccl_plugin": false,
+    "smooth_quant_gemm_plugin": false,
+    "weight_only_quant_matmul_plugin": false
+  }
+}
