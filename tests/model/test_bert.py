@@ -25,12 +25,12 @@ import torch
 import tensorrt as trt
 # isort: on
 from parameterized import parameterized
-from transformers import BertConfig, BertForQuestionAnswering, BertModel
+from transformers import BertConfig, BertForQuestionAnswering, BertModel, BertForSequenceClassification, AutoTokenizer
 
 import tensorrt_llm
 import tensorrt_llm.runtime
 from tensorrt_llm import Builder
-from tensorrt_llm._utils import trt_dtype_to_torch
+from tensorrt_llm._utils import trt_dtype_to_torch, str_dtype_to_trt
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.runtime import TensorInfo
@@ -148,18 +148,41 @@ def load_from_hf_qa_bert(tensorrt_llm_qa_bert,
     tensorrt_llm_qa_bert.qa_outputs.bias.value = states['qa_outputs.bias'].to(
         torch_dtype).cpu().numpy()
 
+def load_from_hf_cls_bert(tensorrt_llm_qa_bert,
+                         hf_qa_bert,
+                         hf_bert_config,
+                         rank=0,
+                         tensor_parallel=1,
+                         fp16=False):
+    load_from_hf_bert(tensorrt_llm_qa_bert.bert, hf_qa_bert, hf_bert_config,
+                      rank, tensor_parallel, fp16)
+    states = hf_qa_bert.state_dict()
+
+    torch_dtype = torch.float16 if fp16 else torch.float32
+
+    tensorrt_llm_qa_bert.pooler.dense.weight.value = states[
+        'bert.pooler.dense.weight'].to(torch_dtype).cpu().numpy()
+    tensorrt_llm_qa_bert.pooler.dense.bias.value = states[
+        'bert.pooler.dense.bias'].to(torch_dtype).cpu().numpy()
+
+    tensorrt_llm_qa_bert.classifier.weight.value = states[
+        'classifier.weight'].to(torch_dtype).cpu().numpy()
+    tensorrt_llm_qa_bert.classifier.bias.value = states[
+        'classifier.bias'].to(torch_dtype).cpu().numpy()
+
 
 class TestBert(unittest.TestCase):
 
     def load_test_cases():
-        models = [BertModel.__name__, BertForQuestionAnswering.__name__]
+        models = [BertForSequenceClassification.__name__, BertModel.__name__, BertForQuestionAnswering.__name__]
+        model_dirs = ['', 'bert-base-uncased'] # add more tests for read data.
         test_cases = []
         test_cases += product(models, [False], [False], [False],
-                              [ContextFMHAType.disabled], ['float32'])
+                              [ContextFMHAType.disabled], ['float32'], model_dirs)
         test_cases += product(models, [False], [True], [True], [
             ContextFMHAType.disabled, ContextFMHAType.enabled,
             ContextFMHAType.enabled_with_fp32_acc
-        ], ['float16'])
+        ], ['float16'], model_dirs)
 
         return test_cases
 
@@ -171,7 +194,7 @@ class TestBert(unittest.TestCase):
 
     @parameterized.expand(load_test_cases, name_func=custom_name_func)
     def test_bert(self, model, use_refit, use_plugin, fast_building,
-                  context_fmha_type, dtype):
+                  context_fmha_type, dtype, model_dir):
         tensorrt_llm.logger.set_level('error')
         fp16 = (dtype == 'float16')
         world_size = 1
@@ -224,22 +247,36 @@ class TestBert(unittest.TestCase):
                                                          [bs_range])
                                                     ]))
                 # Initialize model
-                bert_config = BertConfig(
-                    vocab_size=vocab_size,
-                    hidden_size=hidden_size,
-                    num_hidden_layers=num_layers,
-                    num_attention_heads=num_heads,
-                    intermediate_size=4 * hidden_size,
-                    hidden_act=hidden_act,
-                    max_position_embeddings=max_position_embeddings,
-                    torch_dtype=torch_dtype,
-                )
+                if model_dir:
+                    bert_config = BertConfig.from_pretrained(model_dir, torch_dtype=torch_dtype)
+                    vocab_size = bert_config.vocab_size
+                    hidden_size = bert_config.hidden_size
+                    num_layers = bert_config.num_hidden_layers
+                    num_heads = bert_config.num_attention_heads
+                    hidden_size = bert_config.intermediate_size // 4
+                    hidden_act = bert_config.hidden_act
+                    max_position_embeddings = bert_config.max_position_embeddings
+                else:
+                    bert_config = BertConfig(
+                        vocab_size=vocab_size,
+                        hidden_size=hidden_size,
+                        num_hidden_layers=num_layers,
+                        num_attention_heads=num_heads,
+                        intermediate_size=4 * hidden_size,
+                        hidden_act=hidden_act,
+                        max_position_embeddings=max_position_embeddings,
+                        torch_dtype=torch_dtype,
+                    )
 
                 output_name = "hidden_states"
                 if model == BertModel.__name__:
-                    hf_bert = BertModel(
-                        bert_config,
-                        add_pooling_layer=False).cuda().to(torch_dtype).eval()
+                    if model_dir:
+                        hf_bert = BertModel.from_pretrained(
+                            model_dir).cuda().to(torch_dtype).eval()
+                    else:
+                        hf_bert = BertModel(
+                            bert_config,
+                            add_pooling_layer=False).cuda().to(torch_dtype).eval()
                     tensorrt_llm_bert = tensorrt_llm.models.BertModel(
                         num_layers=num_layers,
                         num_heads=num_heads,
@@ -260,8 +297,12 @@ class TestBert(unittest.TestCase):
                                       tensor_parallel=world_size,
                                       fp16=fp16)
                 elif model == BertForQuestionAnswering.__name__:
-                    hf_bert = BertForQuestionAnswering(bert_config).cuda().to(
-                        torch_dtype).eval()
+                    if model_dir:
+                        hf_bert = BertForQuestionAnswering.from_pretrained(
+                            model_dir).cuda().to(torch_dtype).eval()
+                    else:
+                        hf_bert = BertForQuestionAnswering(bert_config).cuda().to(
+                            torch_dtype).eval()
                     output_name = "logits"
                     tensorrt_llm_bert = tensorrt_llm.models.BertForQuestionAnswering(
                         num_layers=num_layers,
@@ -284,6 +325,36 @@ class TestBert(unittest.TestCase):
                                          rank=rank,
                                          tensor_parallel=world_size,
                                          fp16=fp16)
+                elif model == BertForSequenceClassification.__name__:
+                    if model_dir:
+                        hf_bert = BertForSequenceClassification.from_pretrained(
+                            model_dir).cuda().to(torch_dtype).eval()
+                    else:
+                        hf_bert = BertForSequenceClassification(bert_config).cuda().to(
+                            torch_dtype).eval()
+                    output_name = "logits"
+                    tensorrt_llm_bert = tensorrt_llm.models.BertForSequenceClassification(
+                        num_layers=num_layers,
+                        num_heads=num_heads,
+                        hidden_size=hidden_size,
+                        vocab_size=vocab_size,
+                        hidden_act=hidden_act,
+                        max_position_embeddings=max_position_embeddings,
+                        type_vocab_size=bert_config.type_vocab_size,
+                        num_labels=
+                        2,  # just make it a const here, seems to me not worth as a config
+                        mapping=tensorrt_llm.Mapping(
+                            world_size=world_size,
+                            rank=rank,
+                            tp_size=world_size),  # TP only
+                        dtype=trt_dtype)
+                    load_from_hf_cls_bert(tensorrt_llm_bert,
+                                         hf_bert,
+                                         bert_config,
+                                         rank=rank,
+                                         tensor_parallel=world_size,
+                                         fp16=fp16)
+
                 else:
                     assert False, f"Unknown model {model}"
                 # Prepare
@@ -298,6 +369,9 @@ class TestBert(unittest.TestCase):
                 output_dtype = trt.float16 if fp16 else trt.float32
                 output.mark_output(output_name, output_dtype)
 
+                for k, v in tensorrt_llm_bert.named_network_outputs():
+                    network._mark_output(v, k, str_dtype_to_trt(dtype))
+
             # Build engine
             engine_buffer = builder.build_engine(network, builder_config)
             session = tensorrt_llm.runtime.Session.from_serialized_engine(
@@ -307,9 +381,25 @@ class TestBert(unittest.TestCase):
             # Inference
             # The dtype of input_ids should be queried from the engine,
             # for testing purpose, int32 is fine for now.
-            input_ids = torch.randint(100, (batch_size, input_len)).int().cuda()
-            input_lengths = input_len * torch.ones(
-                (batch_size, ), dtype=torch.int32, device='cuda')
+            attention_mask = None
+            if model_dir:
+                hf_tokenizer = AutoTokenizer.from_pretrained(model_dir)
+                input_strings = ['Hello world!' for _ in range(batch_size)]
+                input_ids_with_padding = hf_tokenizer(
+                    input_strings, padding='max_length', max_length=input_len)
+                input_ids_without_padding = hf_tokenizer(
+                    input_strings)
+                input_ids = torch.tensor(input_ids_with_padding['input_ids']).int().cuda()
+                input_lengths = [len(x) for x in input_ids_without_padding['input_ids']]
+                input_lengths = torch.tensor(
+                    input_lengths, device=input_ids.device, dtype=torch.int32)
+                attention_mask = torch.tensor(
+                    input_ids_with_padding['attention_mask'],
+                    device=input_ids.device, dtype=torch.int32)
+            else:
+                input_ids = torch.randint(100, (batch_size, input_len)).int().cuda()
+                input_lengths = input_len * torch.ones(
+                    (batch_size, ), dtype=torch.int32, device='cuda')
 
             output_info = session.infer_shapes([
                 TensorInfo('input_ids', trt.DataType.INT32,
@@ -335,11 +425,23 @@ class TestBert(unittest.TestCase):
             res = outputs[output_name]
 
             with torch.no_grad():
-                hf_outputs = hf_bert.forward(input_ids)
+                if model_dir:
+                    hf_outputs = hf_bert.forward(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask)
+                else:
+                    hf_outputs = hf_bert.forward(input_ids)
             torch.cuda.synchronize()
 
             if model == BertModel.__name__:
                 ref = hf_outputs.last_hidden_state
+                if use_plugin and model_dir:
+                    # when we use_plugin and have real-data model_dir and input
+                    # We do not need to care about the output of padding positions:
+                    attention_mask_tmp = attention_mask.unsqueeze(-1)
+                    ref = ref * attention_mask_tmp
+                    res = res * attention_mask_tmp
+
                 np.testing.assert_allclose(ref.cpu().numpy(),
                                            res.cpu().numpy(),
                                            atol=1e-2,
@@ -351,6 +453,13 @@ class TestBert(unittest.TestCase):
 
                 ref_start_logits = hf_outputs.start_logits
                 ref_end_logits = hf_outputs.end_logits
+                if use_plugin and model_dir:
+                    # when we use_plugin and have real-data model_dir and input
+                    # We do not need to care about the output of padding positions:
+                    ref_start_logits = ref_start_logits * attention_mask
+                    ref_end_logits = ref_end_logits * attention_mask
+                    res_start_logits = res_start_logits * attention_mask
+                    res_end_logits = res_end_logits * attention_mask
 
                 np.testing.assert_allclose(ref_start_logits.cpu().numpy(),
                                            res_start_logits.cpu().numpy(),
@@ -358,6 +467,12 @@ class TestBert(unittest.TestCase):
                 np.testing.assert_allclose(ref_end_logits.cpu().numpy(),
                                            res_end_logits.cpu().numpy(),
                                            atol=1.5e-2)
+            elif model == BertForSequenceClassification.__name__:
+                ref = hf_outputs.logits
+                np.testing.assert_allclose(ref.cpu().numpy(),
+                                           res.cpu().numpy(),
+                                           atol=1e-2,
+                                           rtol=1e-2)
 
 
 if __name__ == '__main__':

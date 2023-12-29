@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .baichuan.model import BaichuanForCausalLM
-from .bert.model import BertForQuestionAnswering, BertModel
+from .bert.model import BertForQuestionAnswering, BertModel, BertForSequenceClassification
 from .bloom.model import BloomForCausalLM, BloomModel
 from .chatglm.model import ChatGLMHeadModel, ChatGLMModel
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder

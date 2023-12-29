@@ -12,13 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from email.quoprimime import unquote
 import math
 
 import numpy as np
 
 from ..._common import default_net
 from ...functional import (bert_attention, concat, constant, expand, matmul,
-                           shape, slice, softmax, split)
+                           shape, slice, softmax, split, cast, unsqueeze, select, ACT2FN)
 from ...layers import MLP, ColumnLinear, Embedding, LayerNorm, Linear, RowLinear
 from ...mapping import Mapping
 from ...module import Module, ModuleList
@@ -212,7 +213,8 @@ class BertModel(Module):
                  mapping=Mapping(),
                  dtype=None):
         super().__init__()
-
+        self.max_position_embeddings = max_position_embeddings
+        self.dtype = dtype
         self.embedding = BertEmbedding(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
@@ -238,9 +240,28 @@ class BertModel(Module):
                 hidden_states=None):
         hidden_states = self.embedding(input_ids, position_ids, token_type_ids)
 
+        # creat extended_attention_mask as https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_utils.py
+        seq_len_2d = concat([1, shape(input_ids, 1)])
+        position_ids_buffer = constant(
+            np.expand_dims(
+                np.arange(self.max_position_embeddings).astype(np.int32), 0))
+        tmp_position_ids = slice(position_ids_buffer,
+                                starts=[0, 0],
+                                sizes=seq_len_2d)
+        tmp_position_ids = expand(tmp_position_ids, shape(input_ids)) #BxL
+        tmp_input_lengths = unsqueeze(input_lengths, 1) #Bx1
+        tmp_input_lengths = expand(tmp_input_lengths, shape(input_ids)) #BxL
+        mask = tmp_position_ids < tmp_input_lengths # BxL
+        mask = cast(mask, 'int32')
+        extended_attention_mask = unsqueeze(mask, 1)
+        extended_attention_mask = unsqueeze(extended_attention_mask, 1) # Bx1x1xL
+        extended_attention_mask = (1 - extended_attention_mask) * -214748364 # a small negative number in int32 range
+        extended_attention_mask = cast(extended_attention_mask, self.dtype)
+
         for layer in self.layers:
             hidden_states = layer(hidden_states=hidden_states,
-                                  input_lengths=input_lengths)
+                                  input_lengths=input_lengths,
+                                  attention_mask=extended_attention_mask)
 
         return hidden_states
 
@@ -285,5 +306,64 @@ class BertForQuestionAnswering(Module):
                                           hidden_states=hidden_states)
 
         logits = self.qa_outputs(hidden_states)
+
+        return logits
+
+class BertPooler(Module):
+    def __init__(self, hidden_size, dtype):
+        super().__init__()
+        self.dense = Linear(hidden_size, hidden_size, dtype=dtype)
+        self.activation = ACT2FN['tanh']
+
+    def forward(self, hidden_states):
+        # We "pool" the model by simply taking the hidden state corresponding
+        # to the first token.
+        first_token_tensor = select(hidden_states, 1, 0)
+        pooled_output = self.dense(first_token_tensor)
+        pooled_output = self.activation(pooled_output)
+        return pooled_output
+
+
+class BertForSequenceClassification(Module):
+
+    def __init__(self,
+                 num_layers,
+                 num_heads,
+                 hidden_size,
+                 vocab_size,
+                 hidden_act,
+                 max_position_embeddings,
+                 type_vocab_size,
+                 num_labels=2,
+                 mapping=Mapping(),
+                 dtype=None):
+        super().__init__()
+        self.bert = BertModel(num_layers=num_layers,
+                              num_heads=num_heads,
+                              hidden_size=hidden_size,
+                              vocab_size=vocab_size,
+                              hidden_act=hidden_act,
+                              max_position_embeddings=max_position_embeddings,
+                              type_vocab_size=type_vocab_size,
+                              mapping=mapping,
+                              dtype=dtype)
+        self.num_labels = num_labels
+        self.pooler = BertPooler(hidden_size=hidden_size, dtype=dtype)
+        self.classifier = Linear(hidden_size, num_labels, dtype=dtype)
+
+    def forward(self,
+                input_ids=None,
+                input_lengths=None,
+                token_type_ids=None,
+                position_ids=None,
+                hidden_states=None):
+
+        hidden_states = self.bert.forward(input_ids=input_ids,
+                                          input_lengths=input_lengths,
+                                          token_type_ids=token_type_ids,
+                                          position_ids=position_ids,
+                                          hidden_states=hidden_states)
+        pooled_output = self.pooler(hidden_states)
+        logits = self.classifier(pooled_output)
 
         return logits
