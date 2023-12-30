@@ -52,7 +52,7 @@ python ../llama/build.py --model_dir ./Mixtral-8x7B-v0.1 \
                 --output_dir ./trt_engines/mixtral/TP
 ```
 
-Then, you can test your engine with the [run.py](./examples/run.py) script:
+Then, you can test your engine with the [run.py](../run.py) script:
 
 ```
 mpirun -n 2 python3 ../run.py --engine_dir ./trt_engines/mixtral/TP --tokenizer_dir ./Mixtral-8x7B-v0.1 --max_output_len 8 --input_text "I love french quiche"
