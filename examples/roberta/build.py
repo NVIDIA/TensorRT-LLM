@@ -91,7 +91,8 @@ def parse_arguments():
         default=tensorrt_llm.models.RobertaModel.__name__,
         choices=[
             tensorrt_llm.models.RobertaModel.__name__,
-            tensorrt_llm.models.RobertaForQuestionAnswering.__name__
+            tensorrt_llm.models.RobertaForQuestionAnswering.__name__,
+            tensorrt_llm.models.RobertaForSequenceClassification.__name__
         ])
     return parser.parse_args()
 
