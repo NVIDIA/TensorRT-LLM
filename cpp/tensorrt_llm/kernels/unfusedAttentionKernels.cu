@@ -1600,15 +1600,14 @@ __global__ void transpose4dBatchMajorKVCache(const T* kSrc, const T* vSrc, KVCac
         return;
     }
 
-    // Apply cyclic kv cache if tokenIdx >= max_attention_window_size.
-    tokenIdx = tokenIdx % attentionWindowSize;
-
+    // Get token index in kv cache
+    auto tokenKVIdx = kvCacheBuffer.getKVTokenIdx(tokenIdx);
     // Get pointer to the dst block given sequence, head and token ids
-    auto valDst = handle_k ? reinterpret_cast<T_dst*>(kvCacheBuffer.getKBlockPtr(batchIdx, tokenIdx))
-                           : reinterpret_cast<T_dst*>(kvCacheBuffer.getVBlockPtr(batchIdx, tokenIdx));
+    auto valDst = handle_k ? reinterpret_cast<T_dst*>(kvCacheBuffer.getKBlockPtr(batchIdx, tokenKVIdx))
+                           : reinterpret_cast<T_dst*>(kvCacheBuffer.getVBlockPtr(batchIdx, tokenKVIdx));
 
     // Local to block dst idx
-    int inBlockIdx = kvCacheBuffer.getKVLocalIdx(tokenIdx, headIdx, sizePerHeadDivX, channelIdx);
+    int inBlockIdx = kvCacheBuffer.getKVLocalIdx(tokenKVIdx, headIdx, sizePerHeadDivX, channelIdx);
 
     // 16 byte loads will handle "x" dimension
     const size_t srcOffset = (batchIdx * headNum + headIdx) * sizePerHead * seqLen;
@@ -1758,6 +1757,212 @@ INSTANTIATE_ADD_RELATIVE_ATTENTION_BIAS_UNALIGNED(__nv_bfloat16, __nv_bfloat16);
 INSTANTIATE_ADD_RELATIVE_ATTENTION_BIAS_UNALIGNED(float, __nv_bfloat16);
 #endif
 #undef INSTANTIATE_ADD_RELATIVE_ATTENTION_BIAS_UNALIGNED
+
+template <typename T, typename T_cache, typename KVCacheBuffer>
+__global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBuffer, const int sizePerHead,
+    const int timestep, const int beam_width, const int maxKCacheLen, const int sinkTokenLen,
+    const float* kScaleQuantOrig, const int* sequence_lengths, const int* input_lengths, const int rotary_embedding_dim,
+    float rotary_embedding_base, RotaryScalingType const rotary_scale_type, float rotary_embedding_scale,
+    const int rotary_embedding_max_positions, PositionEmbeddingType const position_embedding_type)
+{
+    // We allow only fp32/fp16/bf16 as the data types to apply rotary
+    static_assert(sizeof(T) == 4 || sizeof(T) == 2, "");
+    // Use 8bit cache.
+    static constexpr bool ENABLE_8BITS_CACHE = sizeof(T_cache) == 1;
+    // FP8 KV Cache.
+    static constexpr bool FP8_K_CACHE = std::is_same<T_cache, __nv_fp8_e4m3>::value;
+    // INT8 KV Cache.
+    static constexpr bool INT8_K_CACHE = std::is_same<T_cache, int8_t>::value;
+
+    extern __shared__ __align__(sizeof(float2)) char smem_[]; // align on largest vector type
+    // Each thread will handle 16 bytes.
+    constexpr int vec_size = 16u / sizeof(T);
+    using Vec_k = typename mmha::packed_type<T, vec_size>::type;
+    using Vec_k_cache = typename mmha::packed_type<T_cache, vec_size>::type;
+    using T_dst = T;
+    const int sizePerHeadDivX = sizePerHead / vec_size;
+
+    // The start token idx for the cyclic part in k cache
+    const int cyclic_k_cache_start_idx
+        = (timestep <= maxKCacheLen) ? sinkTokenLen : sinkTokenLen + timestep - maxKCacheLen;
+    // The token idx
+    int token_idx
+        = (kvCacheBuffer.isSinkToken(blockIdx.x)) ? blockIdx.x : cyclic_k_cache_start_idx + blockIdx.x - sinkTokenLen;
+    // The position idx
+    const int token_pos_idx = blockIdx.x;
+    // Head
+    const int head_idx = blockIdx.y;
+    // The batch beam idx
+    const int batch_beam_idx = blockIdx.z;
+    // The beam idx
+    const int beam_idx = batch_beam_idx % beam_width;
+    // Thread idx
+    const int tidx = threadIdx.x;
+
+    // The actual sequence length excluding the paddings.
+    // minus 1 because it includes the current timestep while tlength denotes the past token length.
+    const int tlength = sequence_lengths[batch_beam_idx] - 1;
+    // The context length
+    const int inlength = input_lengths[batch_beam_idx];
+    // The k cache valid token length
+    const int cache_length = (tlength > maxKCacheLen) ? maxKCacheLen : tlength;
+    // Mask out the tokens exceed the real total length and tokens in the context phase with beam_idx>0
+    const bool valid_seq = token_idx < tlength && !(token_idx < inlength && beam_idx > 0);
+    const bool is_head_size_masked = tidx * vec_size >= sizePerHead;
+
+    // Dequant scales for 8bits k cache
+    float k_scale_quant_orig = (ENABLE_8BITS_CACHE ? kScaleQuantOrig[0] : 1.0f);
+
+    if (!valid_seq || is_head_size_masked)
+    {
+        return;
+    }
+
+    mmha::update_rotary_base_n_scale(rotary_embedding_base, rotary_embedding_scale, rotary_scale_type,
+        rotary_embedding_dim, rotary_embedding_max_positions, cache_length);
+
+    // Get token index in kv cache
+    auto token_kv_idx = kvCacheBuffer.getKVTokenIdx(token_idx);
+
+    // Read k cache
+    Vec_k k;
+    Vec_k_cache k_cache;
+    T_cache* k_cache_batch = reinterpret_cast<T_cache*>(kvCacheBuffer.getKBlockPtr(batch_beam_idx, token_kv_idx));
+    int inBlockIdx_r = kvCacheBuffer.getKVLocalIdx(token_kv_idx, head_idx, sizePerHead, tidx * vec_size);
+    k_cache = *reinterpret_cast<const Vec_k_cache*>(&k_cache_batch[inBlockIdx_r]);
+    if constexpr (INT8_K_CACHE)
+    {
+        using Packed_Float_t = typename mmha::packed_type<float, vec_size>::type;
+        mmha::convert_from_float(
+            &k, mmha::mul<Packed_Float_t, float>(k_scale_quant_orig, mmha::float_from_int8(k_cache)));
+    }
+#ifdef ENABLE_FP8
+    else if constexpr (FP8_K_CACHE)
+    {
+        mmha::convert_from_8bit_kv_cache<Vec_k_cache, Vec_k, T_cache, float>(&k, k_cache, k_scale_quant_orig);
+    }
+#endif // ENABLE_FP8
+    else
+    {
+        k = k_cache;
+    }
+
+    // Apply position embedding
+    switch (position_embedding_type)
+    {
+    case PositionEmbeddingType::kROPE_GPTJ:
+    {
+        mmha::apply_rotary_embedding(
+            k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, token_pos_idx);
+        break;
+    }
+    case PositionEmbeddingType::kROPE_GPT_NEOX:
+    {
+        const bool do_rotary = vec_size * tidx < rotary_embedding_dim;
+
+        T* k_smem = reinterpret_cast<T*>(smem_);
+
+        const int half_rotary_dim = rotary_embedding_dim / 2;
+        const int half_idx = (tidx * vec_size) / half_rotary_dim;
+        const int intra_half_idx = (tidx * vec_size) % half_rotary_dim;
+        const int smem_pitch = half_rotary_dim; // TODO: adjust for bank conflicts?
+
+        if (do_rotary)
+        {
+            *reinterpret_cast<Vec_k*>(k_smem + half_idx * smem_pitch + intra_half_idx) = k;
+        }
+
+        __syncthreads();
+
+        const int transpose_idx = half_idx * (half_rotary_dim / 2) + intra_half_idx / 2;
+        constexpr int tidx_factor = vec_size / 2;
+        if (do_rotary)
+        {
+            mmha::vec_from_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
+            mmha::apply_rotary_embedding(k, transpose_idx / tidx_factor, rotary_embedding_dim, rotary_embedding_base,
+                rotary_embedding_scale, token_pos_idx);
+            mmha::write_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
+        }
+
+        __syncthreads();
+
+        if (do_rotary)
+        {
+            k = *reinterpret_cast<Vec_k*>(k_smem + half_idx * smem_pitch + intra_half_idx);
+        }
+        break;
+    }
+    }
+
+    // Write k cache
+    auto token_k_idx = shiftKCacheBuffer.getKVTokenIdx(token_idx);
+    T_dst* kDst = reinterpret_cast<T_dst*>(shiftKCacheBuffer.getKBlockPtr(batch_beam_idx, token_k_idx));
+    int inBlockIdx_w = shiftKCacheBuffer.getKVLocalIdx(token_k_idx, head_idx, sizePerHeadDivX, tidx);
+    reinterpret_cast<Vec_k*>(kDst)[inBlockIdx_w] = k;
+}
+
+template <typename T, typename KVCacheBuffer>
+void invokeShiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBuffer, const KvCacheDataType cache_type,
+    const int sizePerHead, const int timestep, const int batch_beam, const int kv_head_num, const int beam_width,
+    const int maxKCacheLen, const int sinkTokenLen, const float* kScaleQuantOrig, const int* sequence_lengths,
+    const int* input_lengths, const int rotary_embedding_dim, float rotary_embedding_base,
+    RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, const int rotary_embedding_max_positions,
+    PositionEmbeddingType const position_embedding_type, cudaStream_t stream)
+{
+    // Block handles K tile.
+    const int token_num_in_k = (timestep <= maxKCacheLen) ? timestep : maxKCacheLen;
+    const int vec_size = 16u / sizeof(T);
+    dim3 block((sizePerHead / vec_size + 31) / 32 * 32);
+    dim3 grid(token_num_in_k, kv_head_num, batch_beam);
+    size_t smem_size
+        = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX ? 2 * rotary_embedding_dim * sizeof(T) : 0);
+
+    if (cache_type == KvCacheDataType::INT8)
+    {
+        shiftKCache<T, int8_t, KVCacheBuffer><<<grid, block, smem_size, stream>>>(kvCacheBuffer, shiftKCacheBuffer,
+            sizePerHead, timestep, beam_width, maxKCacheLen, sinkTokenLen, kScaleQuantOrig, sequence_lengths,
+            input_lengths, rotary_embedding_dim, rotary_embedding_base, rotary_scale_type, rotary_embedding_scale,
+            rotary_embedding_max_positions, position_embedding_type);
+    }
+#ifdef ENABLE_FP8
+    else if (cache_type == KvCacheDataType::FP8)
+    {
+        shiftKCache<T, __nv_fp8_e4m3, KVCacheBuffer><<<grid, block, smem_size, stream>>>(kvCacheBuffer,
+            shiftKCacheBuffer, sizePerHead, timestep, beam_width, maxKCacheLen, sinkTokenLen, kScaleQuantOrig,
+            sequence_lengths, input_lengths, rotary_embedding_dim, rotary_embedding_base, rotary_scale_type,
+            rotary_embedding_scale, rotary_embedding_max_positions, position_embedding_type);
+    }
+#endif // ENABLE_FP8
+    else
+    {
+        shiftKCache<T, T, KVCacheBuffer><<<grid, block, smem_size, stream>>>(kvCacheBuffer, shiftKCacheBuffer,
+            sizePerHead, timestep, beam_width, maxKCacheLen, sinkTokenLen, kScaleQuantOrig, sequence_lengths,
+            input_lengths, rotary_embedding_dim, rotary_embedding_base, rotary_scale_type, rotary_embedding_scale,
+            rotary_embedding_max_positions, position_embedding_type);
+    }
+}
+
+#define INSTANTIATE_SHIFT_K_CACHE_CACHE_TYPE(T, KVCacheBuffer)                                                         \
+    template void invokeShiftKCache<T, KVCacheBuffer>(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCacheBuffer,   \
+        const KvCacheDataType cache_type, const int sizePerHead, const int timestep, const int batch_beam,             \
+        const int kv_head_num, const int beam_width, const int maxKCacheLen, const int sinkTokenLen,                   \
+        const float* kScaleQuantOrig, const int* sequence_lengths, const int* input_lengths,                           \
+        const int rotary_embedding_dim, float rotary_embedding_base, RotaryScalingType const rotary_scale_type,        \
+        float rotary_embedding_scale, const int rotary_embedding_max_positions,                                        \
+        PositionEmbeddingType const position_embedding_type, cudaStream_t stream)
+
+#define INSTANTIATE_SHIFT_K_CACHE(T)                                                                                   \
+    INSTANTIATE_SHIFT_K_CACHE_CACHE_TYPE(T, KVBlockArray);                                                             \
+    INSTANTIATE_SHIFT_K_CACHE_CACHE_TYPE(T, KVLinearBuffer);
+
+INSTANTIATE_SHIFT_K_CACHE(float)
+INSTANTIATE_SHIFT_K_CACHE(uint16_t)
+#ifdef ENABLE_BF16
+INSTANTIATE_SHIFT_K_CACHE(__nv_bfloat16);
+#endif
+
+#undef INSTANTIATE_SHIFT_K_CACHE_CACHE_TYPE
+#undef INSTANTIATE_SHIFT_K_CACHE
 
 } // namespace kernels
 } // namespace tensorrt_llm

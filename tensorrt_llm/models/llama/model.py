@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,10 +25,11 @@ from ...layers import (MOE, Attention, AttentionMaskType, AttentionParams,
                        KeyValueCacheParams, LoraParams, MoeConfig,
                        PositionEmbeddingType, PromptTuningEmbedding, RmsNorm)
 from ...mapping import Mapping
-from ...module import Module, ModuleList, TopLevelModuleMixin
+from ...module import Module, ModuleList
 from ...parameter import Parameter
 from ...quantization import QuantMode
 from ...quantization.layers import FP8Linear, FP8RowLinear
+from ...top_model_mixin import TopModelMixin
 from ..generation_mixin import GenerationMixin
 from ..modeling_utils import PretrainedConfig
 
@@ -57,6 +58,8 @@ class LLaMADecoderLayer(Module):
                  attn_bias=False,
                  mlp_bias=False,
                  use_fused_mlp=False,
+                 enable_pos_shift=False,
+                 dense_context_fmha=False,
                  moe_config: MoeConfig = MoeConfig()):
         super().__init__()
         self._layer_id = layer_id  # useful for debugging
@@ -92,6 +95,8 @@ class LLaMADecoderLayer(Module):
             use_auto_parallel=use_auto_parallel,
             quant_mode=quant_mode,
             instance_id=2 * layer_id,
+            enable_pos_shift=enable_pos_shift,
+            dense_context_fmha=dense_context_fmha,
         )
         if not mlp_hidden_size:
             self.mlp_hidden_size = hidden_size * 4
@@ -190,7 +195,9 @@ class LLaMAModel(Module):
                  attn_bias=False,
                  mlp_bias=False,
                  moe_config: MoeConfig = MoeConfig(),
-                 use_prompt_tuning: bool = False):
+                 use_prompt_tuning: bool = False,
+                 enable_pos_shift=False,
+                 dense_context_fmha=False):
         super().__init__()
         self.mapping = mapping
         self.use_prompt_tuning = use_prompt_tuning
@@ -231,6 +238,8 @@ class LLaMAModel(Module):
                 attn_bias=attn_bias,
                 mlp_bias=mlp_bias,
                 use_fused_mlp=use_fused_mlp,
+                enable_pos_shift=enable_pos_shift,
+                dense_context_fmha=dense_context_fmha,
                 moe_config=moe_config,
             ) for i in self.mapping.pp_layers(num_layers)
         ])
@@ -291,6 +300,8 @@ class LLaMAModel(Module):
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
                     host_max_attention_window_sizes=max_attention_window_size,
+                    host_sink_token_length=kv_cache_params.
+                    host_sink_token_length,
                     kv_cache_block_pointers=[pointer],
                     host_kv_cache_block_pointers=[host_pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
@@ -312,7 +323,7 @@ class LLaMAModel(Module):
         return hidden_states
 
 
-class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopLevelModuleMixin):
+class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopModelMixin):
 
     def __init__(self,
                  num_layers,
@@ -338,7 +349,9 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopLevelModuleMixin):
                  attn_bias=False,
                  mlp_bias=False,
                  moe_config=MoeConfig(),
-                 use_prompt_tuning: bool = False):
+                 use_prompt_tuning: bool = False,
+                 enable_pos_shift=False,
+                 dense_context_fmha=False):
         config = PretrainedConfig(
             architecture="LLaMAForCausalLM",
             dtype=dtype,
@@ -404,7 +417,8 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopLevelModuleMixin):
                          rotary_scaling, mapping, use_auto_parallel, quant_mode,
                          use_parallel_embedding, embedding_sharding_dim,
                          rms_norm_eps, use_fused_mlp, attn_bias, mlp_bias,
-                         moe_config, use_prompt_tuning)
+                         moe_config, use_prompt_tuning, enable_pos_shift,
+                         dense_context_fmha)
 
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
         if self.mapping.is_last_pp_rank():
@@ -527,6 +541,7 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopLevelModuleMixin):
                     'host_past_key_value_lengths'],
                 host_max_attention_window_sizes=model_inputs[
                     'host_max_attention_window_sizes'],
+                host_sink_token_length=model_inputs['host_sink_token_length'],
                 kv_cache_block_pointers=model_inputs[
                     'kv_cache_block_pointers_list'],
                 host_kv_cache_block_pointers=model_inputs[

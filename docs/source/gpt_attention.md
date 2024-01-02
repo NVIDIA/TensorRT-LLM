@@ -197,6 +197,23 @@ This tensor will serve as the buffer for `max_attention_window_size`,
 setting unique values for each layer. However, it’s important to note that the
 memory allocation for the kv cache still relies on the buffer’s maximum value._
 
+## StreamingLLM
+
+The StreamingLLM feature uses a window attention to perform efficient and stable LLM
+on long texts, which means that only `N` tokens need to be stored in the KV cache.
+Similar to the cyclic KV cache feature in TensorRT-LLM, `max_attention_window_size`
+parameter is used to determine `N`. Different from the cyclic KV cache feature,
+the first `S` tokens, called sink tokens, are always kept in the attention window,
+where `S` is determined by `sink_token_length` parameter in `GenerationSession.setup`.
+In addition, the relative position embedding is also changed in StreamingLLM.
+When determining the relative distance and adding positional information to tokens,
+StreamingLLM use the positions within the cache rather than those in the original text.
+`enable_pos_shift` flag is used to enable this feature.
+
+In context phase, the self-attentions is dense in the official implementation of
+StreamingLLM, and it uses all of the tokens for computation and only saves `N` tokens
+to the KV cache. This mode is determined by the `dense_context_fmha` flag.
+
 ## Beam-Search
 
 The GPT attention operator supports beam-search. In the context phase, a single

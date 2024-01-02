@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +24,7 @@ from .gptneox.model import GPTNeoXForCausalLM, GPTNeoXModel
 from .llama.model import LLaMAForCausalLM, LLaMAModel
 from .modeling_utils import PretrainedConfig, PretrainedModel
 from .opt.model import OPTForCausalLM, OPTModel
+from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
 
 from .quantized.quant import quantize_model  # noqa # isort:skip
@@ -45,6 +46,8 @@ __all__ = [
     'GPTJForCausalLM',
     'GPTNeoXModel',
     'GPTNeoXForCausalLM',
+    'PhiModel',
+    'PhiForCausalLM',
     'quantize_model',
     'ChatGLMHeadModel',
     'ChatGLMModel',
@@ -60,4 +63,5 @@ __all__ = [
 MODEL_MAP = {
     'OPTForCausalLM': OPTForCausalLM,
     'BloomForCausalLM': BloomForCausalLM,
+    'FalconForCausalLM': FalconForCausalLM,
 }

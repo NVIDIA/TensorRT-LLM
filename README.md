@@ -108,15 +108,15 @@ concepts used in TensorRT-LLM, we recommend you to read the following
 
 ## Installation
 
-*For Windows installation, see [`Windows`](windows/README.md).*
-
-TensorRT-LLM must be built from source, instructions can be found
+The documentation for installing TensorRT-LLM can be found
 [here](./docs/source/installation.md). An image of a Docker container with
 TensorRT-LLM and its Triton Inference Server Backend will be made available
 soon.
 
 The remaining commands in that document must be executed from the TensorRT-LLM
 container.
+
+*For Windows installation, see [`Windows`](windows/README.md).*
 
 ## Quick Start
 
@@ -206,13 +206,17 @@ Lovelace architectures. Certain limitations may, however, apply.
 Various numerical precisions are supported in TensorRT-LLM. The support for
 some of those numerical features require specific architectures:
 
-|                     | FP32 | FP16 | BF16 | FP8  | INT8 | INT4 |
-| :------------------ | :--- | :--- | :--- | :--- | :--- | :--- |
-| Volta (SM70)        | Y    | Y    | N    | N    | Y    | Y    |
-| Turing (SM75)       | Y    | Y    | N    | N    | Y    | Y    |
-| Ampere (SM80, SM86) | Y    | Y    | Y    | N    | Y    | Y    |
-| Ada-Lovelace (SM89) | Y    | Y    | Y    | Y    | Y    | Y    |
-| Hopper (SM90)       | Y    | Y    | Y    | Y    | Y    | Y    |
+|                     | FP32 | FP16 | BF16 | FP8  | INT8  | INT4  |
+| :------------------ | :--- | :--- | :--- | :--- | :---- | :---- |
+| Volta (SM70)        | Y    | Y    | N    | N    | Y (1) | Y (2) |
+| Turing (SM75)       | Y    | Y    | N    | N    | Y (1) | Y (2) |
+| Ampere (SM80, SM86) | Y    | Y    | Y    | N    | Y     | Y (3) |
+| Ada-Lovelace (SM89) | Y    | Y    | Y    | Y    | Y     | Y     |
+| Hopper (SM90)       | Y    | Y    | Y    | Y    | Y     | Y     |
+
+(1) INT8 SmoothQuant is not supported on SM70 and SM75.<br>
+(2) INT4 AWQ and GPTQ are not supported on SM < 80.<br>
+(3) INT4 AWQ and GPTQ with FP8 activations require SM >= 89.
 
 In this release of TensorRT-LLM, the support for FP8 and quantized data types
 (INT8 or INT4) is not implemented for all the models. See the
@@ -267,6 +271,7 @@ The list of supported models is:
 * [MPT](examples/mpt)
 * [mT5](examples/enc_dec)
 * [OPT](examples/opt)
+* [Phi-1.5/Phi-2](examples/phi)
 * [Qwen](examples/qwen)
 * [Replit Code](examples/mpt)
 * [SantaCoder](examples/gpt)

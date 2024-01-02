@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +15,9 @@
 # limitations under the License.
 
 import json
+import pathlib as _pl
+import subprocess as _sp
+import typing as _tp
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +34,14 @@ import run  # isort:skip
 
 resources_dir = Path(
     __file__).parent.parent.parent.parent.parent / "examples/chatglm"
+
+
+def run_command(command: _tp.Sequence[str], *, cwd=None, **kwargs) -> None:
+
+    command = [str(i) for i in command]
+    print(f"Running: cd %s && %s" %
+          (str(cwd or _pl.Path.cwd()), " ".join(command)))
+    _sp.check_call(command, cwd=cwd, **kwargs)
 
 
 def generate(model_name, batch_size, beam_width):
@@ -227,6 +238,12 @@ def generate(model_name, batch_size, beam_width):
 
 
 if __name__ == '__main__':
+
+    # chatglm needs 4.33.1 in case of tokenizer issues
+    # AttributeError: 'ChatGLMTokenizer' object has no attribute 'sp_tokenizer'. Did you mean: '_tokenize'?
+    run_command(["pip", "install", "--force-reinstall", "transformers==4.33.1"],
+                cwd=resources_dir)
+
     generate("chatglm_6b", batch_size=1, beam_width=1)
     generate("chatglm2_6b", batch_size=1, beam_width=1)
     generate("chatglm2_6b", batch_size=2, beam_width=1)
@@ -235,3 +252,7 @@ if __name__ == '__main__':
     generate("chatglm3_6b", batch_size=2, beam_width=1)
     generate("chatglm3_6b", batch_size=1, beam_width=2)
     print("Done.")
+
+    # upgrade to 4.36.1 after generating tokens.
+    run_command(["pip", "install", "--force-reinstall", "transformers==4.36.1"],
+                cwd=resources_dir)

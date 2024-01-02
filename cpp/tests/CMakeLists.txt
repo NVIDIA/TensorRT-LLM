@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -106,6 +106,7 @@ add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
 add_gtest(weightOnlyKernelTest kernels/weightOnly/weightOnlyKernelTest.cpp)
 add_gtest(decodingKernelsTest kernels/decodingKernelTest.cpp)
 add_gtest(stopCriteriaKernelsTest kernels/stopCriteriaKernelsTest.cpp)
+add_gtest(shiftKCacheKernelTest kernels/shiftKCacheKernelTest.cu)
 set(SAMPLING_LAYER_TEST_SRC
     layers/samplingLayerTest.cpp layers/topKSamplingLayerTest.cpp
     layers/topPSamplingLayerTest.cpp)

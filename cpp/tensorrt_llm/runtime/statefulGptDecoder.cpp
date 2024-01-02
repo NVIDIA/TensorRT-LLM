@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,7 +43,7 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
     auto& dInput = mDecodingInput;
     auto dummyLogits = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     auto endIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-    dInput = std::make_unique<DecodingInput>(0, 0, 0, std::move(dummyLogits), std::move(endIds));
+    dInput = std::make_unique<DecodingInput>(0, 0, 0, 0, std::move(dummyLogits), std::move(endIds));
 
     dInput->sequenceLimitLength = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     dInput->lengths = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
@@ -65,18 +65,18 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
 }
 
 void StatefulGptDecoder::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow,
-    SizeType maxSequenceLength, SizeType maxTokensPerStep, nvinfer1::DataType dtype)
+    SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep, nvinfer1::DataType dtype)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(maxTokensPerStep == 1);
     mDecoder = IGptDecoder::create(dtype, mVocabSize, mVocabSizePadded, mStream);
 
-    reshapeBuffers(maxBatchSize, maxBeamWidth, maxAttentionWindow, maxSequenceLength);
+    reshapeBuffers(maxBatchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSequenceLength);
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-void StatefulGptDecoder::reshapeBuffers(
-    SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow, SizeType maxSequenceLength)
+void StatefulGptDecoder::reshapeBuffers(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow,
+    SizeType sinkTokenLength, SizeType maxSequenceLength)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(batchSize > 0);
@@ -85,6 +85,7 @@ void StatefulGptDecoder::reshapeBuffers(
 
     mMaxSequenceLength = maxSequenceLength;
     mMaxAttentionWindow = maxAttentionWindow;
+    mSinkTokenLength = sinkTokenLength;
 
     auto const batchSizeShape = ITensor::makeShape({batchSize});
     auto const batchSizeXbeamWidth = ITensor::makeShape({batchSize, beamWidth});
@@ -137,7 +138,7 @@ void StatefulGptDecoder::newBatch(
     auto const batchSize = inputLengthsShape.d[0];
     auto const beamWidth = samplingConfig.beamWidth;
 
-    reshapeBuffers(batchSize, beamWidth, mMaxAttentionWindow, mMaxSequenceLength);
+    reshapeBuffers(batchSize, beamWidth, mMaxAttentionWindow, mSinkTokenLength, mMaxSequenceLength);
     mDecoder->setup(samplingConfig, batchSize, mMaxSequenceLength);
 
     // sanity checks, should always be true after reshape
@@ -168,6 +169,7 @@ void StatefulGptDecoder::newBatch(
     auto& dInput = *mDecodingInput;
     dInput.maxLength = maxInputLength;
     dInput.maxAttentionWindow = mMaxAttentionWindow;
+    dInput.sinkTokenLength = mSinkTokenLength;
     dInput.batchSize = batchSize;
     kernels::invokeFill(const_cast<ITensor&>(*dInput.endIds), endId, *stream);
     dInput.embeddingBias = inputs.embeddingBias;

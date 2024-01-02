@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -312,6 +312,9 @@ class TestMistral(unittest.TestCase):
         ctx_shape['host_past_key_value_lengths'] = (batch_size, )
         ctx_buffer['host_past_key_value_lengths'] = torch.tensor(
             [0] * batch_size, dtype=torch.int32)
+        ctx_shape['host_sink_token_length'] = (1, )
+        ctx_buffer['host_sink_token_length'] = torch.tensor([0],
+                                                            dtype=torch.int32)
 
         context = runtime.ctx_context
         runtime._set_shape(context, ctx_shape)
@@ -366,6 +369,7 @@ class TestMistral(unittest.TestCase):
             step1_shape[f'host_max_attention_window_size_{i}'] = (1, )
         step1_shape['sequence_length'] = (batch_size, )
         step1_shape['host_past_key_value_lengths'] = (batch_size, )
+        step1_shape['host_sink_token_length'] = (1, )
         for i in range(mistral_config.num_hidden_layers):
             step1_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             step1_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
@@ -375,6 +379,8 @@ class TestMistral(unittest.TestCase):
             'host_past_key_value_lengths'] = sequence_length_buffer.cpu()
         sequence_length_buffer = torch.add(sequence_length_buffer, step)
         step1_buffer['sequence_length'] = sequence_length_buffer
+        step1_buffer['host_sink_token_length'] = torch.tensor([0],
+                                                              dtype=torch.int32)
 
         context = runtime.context_1
         runtime._set_shape(context, step1_shape)

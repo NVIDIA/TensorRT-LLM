@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,8 +31,9 @@ except ImportError:
     pynvml = None
 import traceback
 
-from tensorrt_llm.builder import _is_building
 from tensorrt_llm.logger import logger
+
+from ._common import _is_building
 
 if psutil is None:
     logger.warning("A required package 'psutil' is not installed. Will not "

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -124,9 +124,8 @@ class Linear(Module):
                               lora_runtime_params=lora_runtime_params)
 
         if self.bias is not None:
-            if x.dtype != self.bias.value.dtype:
-                x = cast(x, self.bias.value.dtype)
-            x = x + self.bias.value
+            bias = cast(self.bias.value, x.dtype)
+            x = x + bias
 
         if self.gather_output and self.tp_size > 1 and self.tp_group is not None:
             # [dim0, local_dim] -> [dim0 * tp_size, local_dim] --> [dim0, local_dim * tp_size]
@@ -207,10 +206,8 @@ class RowLinear(Module):
             x = allreduce(x, self.tp_group, workspace, self.instance_id)
 
         if self.bias is not None:
-            if x.dtype != self.bias.value.dtype:
-                x = cast(x, self.bias.value.dtype)
-
-            x = x + self.bias.value
+            bias = cast(self.bias.value, x.dtype)
+            x = x + bias
 
         return x
 

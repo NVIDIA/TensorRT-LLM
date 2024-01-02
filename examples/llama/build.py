@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -55,7 +55,6 @@ MODEL_NAME = "llama"
 # are direct copy from gpt example, TODO: put in utils?
 
 import onnx
-import tensorrt as trt
 from onnx import TensorProto, helper
 
 
@@ -151,6 +150,14 @@ def parse_arguments():
         help=
         'The path of to read timing cache from, will be ignored if the file does not exist'
     )
+    parser.add_argument(
+        '--profiling_verbosity',
+        type=str,
+        default='layer_names_only',
+        choices=['layer_names_only', 'detailed', 'none'],
+        help=
+        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
+    )
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument('--vocab_size', type=int, default=32000)
     parser.add_argument('--n_layer', type=int, default=32)
@@ -231,7 +238,18 @@ def parse_arguments():
         'For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded '
         '(0.45734 vs 0.45755 for LLaMA-v2 7B using ammo/examples/hf/instruct_eval/mmlu.py).'
     )
-
+    parser.add_argument('--enable_pos_shift',
+                        default=False,
+                        action='store_true',
+                        help='Enable position shift for streamingllm method')
+    parser.add_argument(
+        '--dense_context_fmha',
+        default=False,
+        action='store_true',
+        help=
+        'Enable dense fmha in context phase, otherwise sliding window attention.'
+        'If dense_context_fmha=False, the sliding window size is the max attention window size.'
+    )
     # Arguments related to the quantization of the model.
     parser.add_argument(
         '--use_smooth_quant',
@@ -578,6 +596,10 @@ def parse_arguments():
             args.multiple_of)
         logger.info(f"Setting inter_size to {args.inter_size}.")
 
+    if args.enable_pos_shift:
+        assert args.use_gpt_attention_plugin, "Position shift is only support in the gpt attention plugin."
+        assert args.enable_context_fmha or args.enable_context_fmha_fp32_acc
+
     if args.moe_num_experts and args.moe_top_k == 0:
         args.moe_top_k = 1
     args.moe_config = MoeConfig(args.moe_num_experts, args.moe_top_k,
@@ -627,6 +649,8 @@ def build_rank_engine(builder: Builder,
         rms_norm_eps=args.rms_norm_eps,
         use_fused_mlp=args.use_fused_mlp,
         use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
+        enable_pos_shift=args.enable_pos_shift,
+        dense_context_fmha=args.dense_context_fmha,
         moe_config=args.moe_config)
     quantize_kwargs = {}
     if args.use_smooth_quant or args.use_weight_only:
@@ -746,10 +770,10 @@ def build_rank_engine(builder: Builder,
     if args.use_weight_only and not args.disable_weight_only_quant_plugin:
         if args.per_group:
             network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
-                dtype='float16')
+                dtype=args.dtype)
         else:
             network.plugin_config.set_weight_only_quant_matmul_plugin(
-                dtype='float16')
+                dtype=args.dtype)
     if args.world_size > 1:
         network.plugin_config.set_nccl_plugin(args.dtype,
                                               args.use_custom_all_reduce)
@@ -813,13 +837,18 @@ def build(rank, args):
             continue
         tik = time.time()
 
-        # NOTE: when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
-        int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
-            not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
+        # NOTE: int8 flag is required to be true when INT8 tensors are exposed to TRT
+        # TRT-LLM has INT8 I/O when act/weights are quantized without group-scaling (AWQ, GPTQ)
+        # OR INT8 KV cache is set to contiguous (without paged KV cache enabled).
+        int8_trt_flag = (args.quant_mode.has_act_or_weight_quant()
+                         and not args.quant_mode.has_per_group_scaling()) or (
+                             not args.paged_kv_cache
+                             and args.quant_mode.has_int8_kv_cache())
         builder_config = builder.create_builder_config(
             name=MODEL_NAME,
             precision=args.dtype,
             timing_cache=args.timing_cache if cache is None else cache,
+            profiling_verbosity=args.profiling_verbosity,
             tensor_parallel=args.tp_size,
             pipeline_parallel=args.pp_size,
             parallel_build=args.parallel_build,

@@ -41,7 +41,8 @@ std::vector<nvinfer1::PluginField> WeightOnlyGroupwiseQuantMatmulPluginCreator::
 void WeightOnlyGroupwiseQuantGemmPluginProfiler::runTactic(int m, int n, int k,
     const WeightOnlyGroupwiseQuantGemmPluginProfiler::Config& tactic, char* workspace, const cudaStream_t& stream)
 {
-    const int originalN = n * INT8_INT4_RATIO;
+    // Quantized weights are packed in FP16 format (INT4*4 -> FP16)
+    const int originalN = n * FP16_INT4_RATIO;
     half* actPtr = reinterpret_cast<half*>(workspace);
     cutlass::uint4b_t* weightPtr = reinterpret_cast<cutlass::uint4b_t*>(
         nextWorkspacePtr(reinterpret_cast<int8_t*>(actPtr), m * k * sizeof(half)));
@@ -73,7 +74,8 @@ void WeightOnlyGroupwiseQuantGemmPluginProfiler::runTactic(int m, int n, int k,
 
 void WeightOnlyGroupwiseQuantGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
 {
-    const int originalN = n * INT8_INT4_RATIO;
+    // Quantized weights are packed in FP16 format (INT4*4 -> FP16)
+    const int originalN = n * FP16_INT4_RATIO;
     std::vector<size_t> workspaces = {
         maxM * k * sizeof(half),                   // A
         k * n * sizeof(float),                     // B
@@ -222,7 +224,7 @@ nvinfer1::DimsExprs WeightOnlyGroupwiseQuantMatmulPlugin::getOutputDimensions(
         }
 
         // int4 weight only quant
-        ret.d[nbDimsA - 1] = exprBuilder.constant(inputs[mWeightInputIdx].d[1]->getConstantValue() * INT8_INT4_RATIO);
+        ret.d[nbDimsA - 1] = exprBuilder.constant(inputs[mWeightInputIdx].d[1]->getConstantValue() * FP16_INT4_RATIO);
 
         return ret;
     }
@@ -241,12 +243,12 @@ bool WeightOnlyGroupwiseQuantMatmulPlugin::supportsFormatCombination(
         if (pos == mWeightInputIdx)
         {
             // weights
-            return inOut[mWeightInputIdx].type == nvinfer1::DataType::kINT8
+            return inOut[mWeightInputIdx].type == nvinfer1::DataType::kHALF
                 && inOut[mWeightInputIdx].format == TensorFormat::kLINEAR;
         }
         else
         {
-            return inOut[pos].type == mType && inOut[pos].format == TensorFormat::kLINEAR;
+            return inOut[pos].type == nvinfer1::DataType::kHALF && inOut[pos].format == TensorFormat::kLINEAR;
         }
     }
     else
@@ -264,11 +266,12 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::configurePlugin(const nvinfer1::Dynam
     const auto maxM = std::accumulate(in[0].max.d, in[0].max.d + in[0].max.nbDims - 1, 1, std::multiplies<int>());
 
     const int maxK = in[0].max.d[in[0].max.nbDims - 1];
-    // int8 packed int4 elements
-    const int maxN = in[mWeightInputIdx].max.d[1] * INT8_INT4_RATIO;
+
+    // Quantized weights are packed in FP16 format (INT4*4 -> FP16)
+    const int maxN = in[mWeightInputIdx].max.d[1] * FP16_INT4_RATIO;
 
     const auto K = maxK;
-    const auto N = maxN / INT8_INT4_RATIO;
+    const auto N = maxN / FP16_INT4_RATIO;
 
     if (!mDims.isInitialized())
     {
@@ -343,7 +346,8 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
 #endif
 
     tensorrt_llm::kernels::WeightOnlyActivationType weight_only_act_type;
-    int real_n = n * INT8_INT4_RATIO;
+    // Quantized weights are packed in FP16 format (INT4*4 -> FP16)
+    int real_n = n * FP16_INT4_RATIO;
     if (mType == nvinfer1::DataType::kHALF)
     {
         weight_only_act_type = tensorrt_llm::kernels::WeightOnlyActivationType::FP16;

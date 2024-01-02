@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -103,7 +103,8 @@ typename tl::DynamicDecodeLayer<T>::ForwardParams prepareInputs(DecodingInput co
 
     auto constexpr ite = 0; // no pipeline parallelism
     typename tl::DynamicDecodeLayer<T>::ForwardParams forwardParams{input.step, ite, input.maxLength,
-        input.maxAttentionWindow, input.batchSize, tcc::toTllmTensor(*input.logits), tcc::toTllmTensor(*input.endIds)};
+        input.maxAttentionWindow, input.sinkTokenLength, input.batchSize, tcc::toTllmTensor(*input.logits),
+        tcc::toTllmTensor(*input.endIds)};
 
     if (input.cacheIndirection)
     {

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -67,9 +67,10 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                 shape=th_pre_quant_scale.shape,
                 dtype=tensorrt_llm._utils.str_dtype_to_trt(dtype))
             # Init TensorRT-LLM tensor for weight
-            weight = Tensor(name='weight',
-                            shape=th_weight.shape,
-                            dtype=tensorrt_llm._utils.str_dtype_to_trt("int8"))
+            weight = Tensor(
+                name='weight',
+                shape=th_weight.shape,
+                dtype=tensorrt_llm._utils.str_dtype_to_trt("float16"))
             # Init TensorRT-LLM tensor for scale
             scale = Tensor(name='scale',
                            shape=th_scale.shape,
@@ -149,7 +150,8 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
         qweight_int8 = _utils.woq_groupwise_extract_int4(
             qweight_unprocessed, uint4_input).char()
         qweight_int4x2_interleaved = preprocessor(
-            packer(qweight_int8 - uint4_input * 8), torch.quint4x2)
+            packer(qweight_int8 - uint4_input * 8),
+            torch.quint4x2).view(torch.float16)
 
         ref_th_weight = qweight_int8.half() * scale.repeat_interleave(
             group_size, dim=0) - uint4_input * 8 * scale.repeat_interleave(

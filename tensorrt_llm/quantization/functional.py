@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -328,8 +328,7 @@ def dequantize(input: Tensor,
 
 def quantize_per_token(x: Tensor) -> Tuple[Tensor]:
     if not default_net().plugin_config.quantize_per_token_plugin:
-        if x.dtype != trt.float32:
-            x = cast(x, 'float32')
+        x = cast(x, 'float32')
         xmax = x.abs().max(-1, keepdim=True)
         scale = xmax / 127.0
         out = x * 127.0 / xmax

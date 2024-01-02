@@ -1,3 +1,2 @@
-janus
 uvicorn
 fastapi

@@ -85,7 +85,7 @@ class PretrainedConfig:
         mapping = config.pop('mapping', {
             'world_size': 1,
             'tp_size': 1,
-            'pp_size': 0
+            'pp_size': 1
         })
         world_size = mapping.get('world_size', 1)
         tp_size = mapping.get('tp_size', 1)
@@ -98,6 +98,9 @@ class PretrainedConfig:
                 'per_token': False,
                 'per_group': False,
                 'group_size': 128,
+                'zero': False,
+                'pre_quant_scale': False,
+                'exclude_modules': None,
                 'int8_kv_cache': False,
                 'enable_fp8': False,
                 'fp8_kv_cache': False,
@@ -109,6 +112,9 @@ class PretrainedConfig:
         per_token = quantization.get('per_token', False)
         per_group = quantization.get('per_group', False)
         group_size = quantization.get('group_size', 128)
+        zero = quantization.get('zero', False)
+        pre_quant_scale = quantization.get('pre_quant_scale', False)
+        exclude_modules = quantization.get('exclude_modules', None)
         int8_kv_cache = quantization.get('int8_kv_cache', False)
         enable_fp8 = quantization.get('enable_fp8', False)
         fp8_kv_cache = quantization.get('fp8_kv_cache', False)
@@ -137,7 +143,12 @@ class PretrainedConfig:
             use_fp8_qdq=enable_fp8,
         )
 
-        quant_kwargs = {'group_size': group_size}
+        quant_kwargs = {
+            'group_size': group_size,
+            'zero': zero,
+            'pre_quant_scale': pre_quant_scale,
+            'exclude_modules': exclude_modules,
+        }
 
         return cls(architecture, dtype, logits_dtype, vocab_size,
                    max_position_embeddings, hidden_size, num_hidden_layers,
@@ -174,6 +185,12 @@ class PretrainedConfig:
             self.quant_mode.has_per_group_scaling(),
             'group_size':
             self.quant_kwargs.get('group_size', 128),
+            'zero':
+            self.quant_kwargs.get('zero', False),
+            'pre_quant_scale':
+            self.quant_kwargs.get('pre_quant_scale', False),
+            'exclude_modules':
+            self.quant_kwargs.get('exclude_modules', None),
             'int8_kv_cache':
             self.quant_mode.has_int8_kv_cache(),
             'enable_fp8':
@@ -240,6 +257,8 @@ class DecoderLayerList(ModuleList):
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
                     host_max_attention_window_sizes=max_attention_window_size,
+                    host_sink_token_length=kv_cache_params.
+                    host_sink_token_length,
                     kv_cache_block_pointers=[pointer],
                     host_kv_cache_block_pointers=[host_pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
@@ -271,7 +290,7 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
 
     def __post_init__(self):
         self.check_config()
-        quantize(self, self.config.quant_mode)
+        quantize(self, self.config.quant_mode, **self.config.quant_kwargs)
 
     def check_config(self):
         raise NotImplementedError(
@@ -302,9 +321,17 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
         return model
 
     def load(self, weights):
+        expected_names = set([name for name, param in self.named_parameters()])
+        provided_names = set(weights.keys())
+        if provided_names != expected_names:
+            err_msg = "Provided tensor names are different from those expected by the engine."
+            if expected_names.difference(provided_names):
+                err_msg += f"\nExpected but not provided tensors: {expected_names.difference(provided_names)}"
+            if provided_names.difference(expected_names):
+                err_msg += f"\nProvided but not expected tensors: {provided_names.difference(expected_names)}"
+            raise RuntimeError(err_msg)
+
         for name, param in self.named_parameters():
-            if name not in weights:
-                continue
             param.value = weights[name]
 
     def prepare_inputs(self,
@@ -377,6 +404,7 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
                     'host_past_key_value_lengths'],
                 host_max_attention_window_sizes=model_inputs[
                     'host_max_attention_window_sizes'],
+                host_sink_token_length=model_inputs['host_sink_token_length'],
                 kv_cache_block_pointers=model_inputs[
                     'kv_cache_block_pointers_list'],
                 host_kv_cache_block_pointers=model_inputs[
@@ -395,10 +423,10 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
         if prompt_embedding_table_size > 0:
             result['prompt_embedding_table'] = model_inputs[
                 'prompt_embedding_table']
-            result['tasks'] = model_inputs['tasks']
+            result['prompt_tasks'] = model_inputs['tasks']
             result['prompt_vocab_size'] = model_inputs['prompt_vocab_size']
         if model_inputs['hidden_states_input'] is not None:
-            result['hidden_states_input'] = model_inputs['hidden_states_input']
+            result['hidden_states'] = model_inputs['hidden_states_input']
         if model_inputs['all_reduce_workspace'] is not None:
             result['all_reduce_workspace'] = model_inputs[
                 'all_reduce_workspace']
@@ -469,7 +497,7 @@ class DecoderModelForCausalLM(PretrainedModel):
             lm_logits = self.lm_head(hidden_states)
             lm_logits.mark_output('logits', self.config.logits_dtype)
         else:
-            hidden_states.mark_output('hidden_states_output', self.dtype)
+            hidden_states.mark_output('hidden_states_output', self.config.dtype)
 
         if use_cache and default_net().plugin_config.paged_kv_cache == False:
             for i, present in zip(

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -89,6 +89,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                  max_output_len: Optional[int] = None,
                  max_beam_width: Optional[int] = None,
                  max_attention_window_size: Optional[int] = None,
+                 sink_token_length: Optional[int] = None,
                  debug_mode: bool = False,
                  lora_ckpt_source: str = "hf") -> 'ModelRunnerCpp':
         """
@@ -119,6 +120,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 will be used.
             max_attention_window_size (int):
                 The attention window size that controls the sliding window attention / cyclic kv cache behaviour.
+            sink_token_length (int) :
+                The sink token length, default=0.
             debug_mode (bool):
                 Whether or not to turn on the debug mode.
             lora_ckpt_source (str):
@@ -162,7 +165,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                           max_sequence_length=max_input_len +
                                           max_output_len)
         session_config.kv_cache_config = KvCacheConfig(
-            max_attention_window=max_attention_window_size)
+            max_attention_window=max_attention_window_size,
+            sink_token_length=sink_token_length)
         session = GptSession(config=session_config,
                              model_config=model_config,
                              world_config=world_config,

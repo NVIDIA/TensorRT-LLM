@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -90,6 +90,7 @@ def main(args):
     output_len = args.output_len
     test_token_num = args.max_input_length
     max_attention_window_size = args.max_attention_window_size
+    sink_token_length = args.sink_token_length
 
     # random_seed = 5
     temperature = args.temperature
@@ -115,7 +116,8 @@ def main(args):
                 max_input_len=test_token_num,
                 max_output_len=output_len,
                 max_beam_width=num_beams,
-                max_attention_window_size=max_attention_window_size)
+                max_attention_window_size=max_attention_window_size,
+                sink_token_length=sink_token_length)
         runner = runner_cls.from_dir(**runner_kwargs)
         assert not (args.eval_ppl and not runner.gather_all_token_logits), \
             "PPL evaluation requires engine built with gather_all_token_logits enabled"
@@ -219,6 +221,7 @@ def main(args):
                 batch_input_ids,
                 max_new_tokens=output_len,
                 max_attention_window_size=max_attention_window_size,
+                sink_token_length=sink_token_length,
                 end_id=end_id,
                 pad_id=pad_id,
                 temperature=temperature,
@@ -555,6 +558,10 @@ if __name__ == '__main__':
         help=
         'The attention window size that controls the sliding window attention / cyclic kv cache behaviour'
     )
+    parser.add_argument('--sink_token_length',
+                        type=int,
+                        default=None,
+                        help='The sink token length.')
     parser.add_argument('--num_beams', type=int, default=1)
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--top_k', type=int, default=1)

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -253,6 +253,7 @@ int main(int argc, char* argv[])
     options.add_options()("gen_micro_batch_size", "Batch size for generation phase.", cxxopts::value<int>());
     options.add_options()("max_attention_window", "Max kv cache length per sequence.", cxxopts::value<int>());
     options.add_options()("max_tokens_in_paged_kvcache", "Max tokens in paged K-V Cache.", cxxopts::value<int>());
+    options.add_options()("sink_token_len", "Sink token length in kv cache per sequence.", cxxopts::value<int>());
     options.add_options()(
         "kv_cache_free_gpu_mem_fraction", "K-V Cache Free Gpu Mem Fraction.", cxxopts::value<float>());
 
@@ -352,6 +353,11 @@ int main(int argc, char* argv[])
     if (result.count("max_attention_window"))
     {
         sessionConfig.kvCacheConfig.maxAttentionWindow = result["max_attention_window"].as<int>();
+    }
+    // Argument: Sink token length
+    if (result.count("sink_token_len"))
+    {
+        sessionConfig.kvCacheConfig.sinkTokenLength = result["sink_token_len"].as<int>();
     }
     // Argument: K-V Cache Free Gpu Mem Fraction
     if (result.count("kv_cache_free_gpu_mem_fraction"))

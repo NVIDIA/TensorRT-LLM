@@ -117,8 +117,8 @@ After quantization, `mpt_tp1_rank0.npz` file will be generated under export path
 # Build INT4 AWQ engine
 python3 build.py --model_dir=./ft_ckpts/mpt-7b/fp16/1-gpu \
                  --max_batch_size 64 \
-                 --use_weight_only \
-                 --weight_only_precision int4 \
+                 --remove_input_padding \
+                 --enable_context_fmha \
                  --use_gpt_attention_plugin \
                  --use_gemm_plugin \
                  --output_dir ./trt_engines/mpt-7b/int4_awq/1-gpu \

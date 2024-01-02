@@ -287,8 +287,8 @@ public:
     }
 
     template <typename T, bool HAS_BEAM>
-    void run(const XQAParams& xqaParams, KVLinearBuffer& kv_linear_buffer, const cudaStream_t& stream,
-        int multiprocessor_count, int max_multi_block_slots) const
+    void run(const XQAParams& xqaParams, KVLinearBuffer& kv_linear_buffer, int2& rotary_kernel_launch_cache,
+        const cudaStream_t& stream, int multiprocessor_count, int max_multi_block_slots) const
     {
         unsigned int head_size = xqaParams.head_size;
         int num_q_heads = xqaParams.num_q_heads;
@@ -303,11 +303,12 @@ public:
 
         invokeApplyBiasRopeUpdateKVCache<T, KVLinearBuffer, true>(static_cast<T*>(const_cast<void*>(xqaParams.qkv)),
             nullptr, kv_linear_buffer, static_cast<const T*>(xqaParams.qkv_bias), xqaParams.sequence_lengths, nullptr,
-            nullptr, xqaParams.batch_size, 1, xqaParams.cyclic_attention_window_size, xqaParams.batch_size * beam_width,
-            xqaParams.num_q_heads, xqaParams.num_kv_heads, xqaParams.head_size, xqaParams.rotary_embedding_dim,
-            xqaParams.rotary_embedding_base, xqaParams.rotary_embedding_scale_type, xqaParams.rotary_embedding_scale,
-            xqaParams.rotary_embedding_max_positions, xqaParams.position_embedding_type, (float*) nullptr, 0,
-            cache_type, xqaParams.kv_scale_orig_quant, false, stream, beam_width);
+            nullptr, xqaParams.batch_size, 1, xqaParams.cyclic_attention_window_size, xqaParams.sink_token_length,
+            xqaParams.batch_size * beam_width, xqaParams.num_q_heads, xqaParams.num_kv_heads, xqaParams.head_size,
+            xqaParams.rotary_embedding_dim, xqaParams.rotary_embedding_base, xqaParams.rotary_embedding_scale_type,
+            xqaParams.rotary_embedding_scale, xqaParams.rotary_embedding_max_positions,
+            xqaParams.position_embedding_type, xqaParams.position_shift_enabled, (float*) nullptr, 0, cache_type,
+            xqaParams.kv_scale_orig_quant, false, beam_width, rotary_kernel_launch_cache, stream);
 
         XQAKernelRuntimeHashKey hash_key{xqaParams.kv_cache_data_type, head_size, num_q_heads_over_kv, beam_width};
         const auto findIter = mFunctions.find(hash_key);
@@ -459,8 +460,8 @@ public:
         return xqaKernel->supportConfig(xqaParams) && xqaKernel->mayHavePerfGain(xqaParams, mMultiProcessorCount);
     }
 
-    void run(const XQAParams& xqa_params, KVLinearBuffer& kv_linear_buffer, const cudaStream_t& stream,
-        int max_multi_block_slots);
+    void run(const XQAParams& xqa_params, KVLinearBuffer& kv_linear_buffer, int2& rotary_kernel_launch_cache,
+        const cudaStream_t& stream, int max_multi_block_slots);
 
 private:
     const XQAKernelList* xqaKernel;
@@ -470,17 +471,17 @@ private:
 };
 
 void DecoderXQARunner::xqaImpl::run(const XQAParams& xqa_params, KVLinearBuffer& kv_linear_buffer,
-    const cudaStream_t& stream, int max_multi_block_slots)
+    int2& rotary_kernel_launch_cache, const cudaStream_t& stream, int max_multi_block_slots)
 {
     if (xqa_params.beam_width > 1)
     {
-        xqaKernel->template run<__half, true>(
-            xqa_params, kv_linear_buffer, stream, mMultiProcessorCount, max_multi_block_slots);
+        xqaKernel->template run<__half, true>(xqa_params, kv_linear_buffer, rotary_kernel_launch_cache, stream,
+            mMultiProcessorCount, max_multi_block_slots);
     }
     else
     {
-        xqaKernel->template run<__half, false>(
-            xqa_params, kv_linear_buffer, stream, mMultiProcessorCount, max_multi_block_slots);
+        xqaKernel->template run<__half, false>(xqa_params, kv_linear_buffer, rotary_kernel_launch_cache, stream,
+            mMultiProcessorCount, max_multi_block_slots);
     }
 }
 
@@ -545,7 +546,7 @@ void DecoderXQARunner::run(const XQAParams& xqa_params, KVLinearBuffer& kv_linea
 {
     int max_multi_block_slots = kMaxBeamWidth * XQALaunchParam<true>::GetMaxBatchSizePerWave(mMultiProcessorCount)
         * kMaxNbCtaPerKVHeadFactor * mNumKVHeads;
-    return pimpl->run(xqa_params, kv_linear_buffer, stream, max_multi_block_slots);
+    return pimpl->run(xqa_params, kv_linear_buffer, mLaunchGridBlockCache, stream, max_multi_block_slots);
 }
 
 } // namespace kernels

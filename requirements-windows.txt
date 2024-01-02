@@ -1,6 +1,6 @@
 --extra-index-url https://download.pytorch.org/whl/cu121
 --extra-index-url https://pypi.nvidia.com
-accelerate==0.20.3
+accelerate==0.25.0
 build
 colored
 cuda-python==12.2.0
@@ -20,5 +20,5 @@ torch==2.1.0+cu121
 torchdata==0.7.0
 torchtext==0.16.0+cpu
 torchvision==0.16.0+cu121
-transformers==4.33.1
+transformers==4.36.1
 wheel

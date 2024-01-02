@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -49,11 +49,13 @@ public:
         GenerationConfig() = default;
 
         explicit GenerationConfig(SizeType batchSize, SizeType beamWidth, SizeType maxInputLength,
-            SizeType maxAttentionWindow, SizeType maxSeqLength, SizeType inputLengthSum = SizeType(0))
+            SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSeqLength,
+            SizeType inputLengthSum = SizeType(0))
             : batchSize{batchSize}
             , beamWidth{beamWidth}
             , maxInputLength{maxInputLength}
             , maxAttentionWindow{maxAttentionWindow}
+            , sinkTokenLength{sinkTokenLength}
             , maxSeqLength{maxSeqLength}
             , inputLengthSum{inputLengthSum}
         {
@@ -63,11 +65,12 @@ public:
         SizeType beamWidth{};
         SizeType maxInputLength{};
         SizeType maxAttentionWindow{};
+        SizeType sinkTokenLength{};
         SizeType maxSeqLength{};
         SizeType inputLengthSum{}; // Initialized only if inputPacked is set to true in fromInput.
 
         static GenerationConfig fromInput(ITensor const& inputIds, ITensor const& inputLengths, bool inputPacked,
-            SizeType beamWidth, SizeType maxAttentionWindow, SizeType maxSequenceLength);
+            SizeType beamWidth, SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSequenceLength);
     };
 
 public:
@@ -92,6 +95,7 @@ public:
     std::vector<TensorPtr> presentKeysVals;
     std::vector<TensorPtr> presentKeysValsAlt;  // without attention plugin
     std::vector<TensorPtr> maxAttentionWindows; // with attention plugin, host tensor
+    TensorPtr sinkTokenLengths;                 // with attention plugin, host tensor
     TensorPtr kvCacheBlockPointersHost;         // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
     TensorPtr kvCacheBlockPointersDevice;       // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
 
@@ -135,7 +139,7 @@ public:
     void create(TllmRuntime& runtime, GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void initFromInput(ITensor const& inputIds, TensorPtr const& inputLengths, bool inputPacked, SizeType beamWidth,
-        SizeType maxAttentionWindow, SizeType maxSequenceLength, BufferManager& manager);
+        SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSequenceLength, BufferManager& manager);
 
     //! \brief Reshape buffers based on current GenerationConfig
     void reshape(GptModelConfig const& modelConfig, WorldConfig const& worldConfig);

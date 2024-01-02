@@ -56,16 +56,18 @@ public:
     {
     public:
         ForwardParams(int step, int ite, tc::Tensor logits, tc::Tensor endIds, tc::Tensor src_cache_indirection,
-            int max_attention_window, int max_seq_len)
+            int max_attention_window, int sink_token_length, int max_seq_len)
             : SoftmaxParams(step, ite, std::move(logits), std::move(endIds))
             , src_cache_indirection{std::move(src_cache_indirection)}
             , max_attention_window{max_attention_window}
+            , sink_token_length{sink_token_length}
             , max_seq_len{max_seq_len}
         {
         }
 
         // mandatory parameters
         int max_attention_window;
+        int sink_token_length;
         int max_seq_len;
         tc::Tensor src_cache_indirection; // [local_batch_size, beam_width, max_seq_len]
 

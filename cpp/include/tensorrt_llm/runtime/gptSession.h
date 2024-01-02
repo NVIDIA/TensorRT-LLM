@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -145,10 +145,10 @@ private:
 
     void createContexts();
     void createBuffers(SizeType numMicroBatches);
-    void createDecoders(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow, SizeType maxSequenceLength,
-        nvinfer1::DataType logitsType, bool decoderPerRequest, SizeType numMicroBatches);
+    void createDecoders(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow, SizeType sinkTokenLength,
+        SizeType maxSequenceLength, nvinfer1::DataType logitsType, bool decoderPerRequest, SizeType numMicroBatches);
     void createKvCacheManager(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow,
-        SizeType maxSequenceLength, KvCacheConfig const& config);
+        SizeType sinkTokenLength, SizeType maxSequenceLength, KvCacheConfig const& config);
     void createCustomAllReduceWorkspace(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength);
 
     void executeContextStep(std::vector<GenerationInput> const& microBatchesInputs,
@@ -257,6 +257,7 @@ private:
 
     SizeType mDecoderMaxSequenceLength{};
     SizeType mDecoderMaxAttentionWindow{};
+    SizeType mDecoderSinkTokenLength{};
 
     LoggerPtr mLogger;
     std::shared_ptr<TllmRuntime> mRuntime;

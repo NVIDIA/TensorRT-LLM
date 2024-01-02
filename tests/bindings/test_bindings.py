@@ -553,7 +553,7 @@ def test_inference_request():
 def test_trt_gpt_model_optional_params():
     opt_params = _tb.TrtGptModelOptionalParams()
 
-    kv_cache_config = _tb.KvCacheConfig(10, 10, 0.5, False)
+    kv_cache_config = _tb.KvCacheConfig(10, 10, 0, 0.5, False)
     opt_params.kv_cache_config = kv_cache_config
     assert opt_params.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
 

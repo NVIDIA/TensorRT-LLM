@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,7 +31,7 @@ from ._common import default_net, default_trtnet, precision
 from ._utils import (bf16_array, dim_resolve_negative, dim_to_trt_axes,
                      fp16_array, fp32_array, int32_array, np_dtype_to_trt,
                      str_dtype_to_np, str_dtype_to_trt, torch_to_numpy,
-                     trt_dtype_to_torch)
+                     trt_dtype_to_np, trt_dtype_to_torch)
 from .logger import logger
 from .network import PluginInfo, set_np_weight, set_plugin_info
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE
@@ -293,7 +293,9 @@ class Tensor(object):
         if location is not None:
             self.trt_tensor.location = location
 
-    def mark_output(self, name, dtype):
+    def mark_output(self,
+                    name: Optional[str] = None,
+                    dtype: Optional[Union[str, trt.DataType]] = None):
         '''
         Mark a tensor as a network output.
 
@@ -302,7 +304,12 @@ class Tensor(object):
         allocating buffers to store the output tensors when preparing the
         execution of the TensorRT engine.
         '''
-        if isinstance(dtype, str):
+        if name is None:
+            name = self.name
+
+        if dtype is None:
+            dtype = self.dtype
+        elif isinstance(dtype, str):
             dtype = str_dtype_to_trt(dtype)
         else:
             assert isinstance(dtype, trt.DataType)
@@ -785,6 +792,10 @@ def cast(input: Tensor, dtype: Union[str, trt.DataType]):
     else:
         raise TypeError("%s is not supported" % type(dtype))
 
+    if input.dtype == cvt_dtype:
+        # If input type and cast dtype are the same, do nothing
+        return input
+
     layer = default_trtnet().add_cast(input.trt_tensor, cvt_dtype)
     if not default_net().strongly_typed:
         layer.set_output_type(0, cvt_dtype)
@@ -934,7 +945,8 @@ def interpolate(input: Tensor,
 def matmul(input: Tensor,
            mat2: Tensor,
            transa: bool = False,
-           transb: bool = False) -> Tensor:
+           transb: bool = False,
+           use_fp32_acc: bool = True) -> Tensor:
     '''
     Add a matrix multiplication.
 
@@ -957,18 +969,19 @@ def matmul(input: Tensor,
             Is the second input transposed? Set to 'True' if you want the
             second input to be transposed, 'False' otherwise.
 
+        use_fp32_acc: bool
+            Set to 'True' if for accuracy reason, this fp16 matmul needs to use
+            fp32 accumulation. This can be a per model and per matmul decision.
     Returns:
         The tensor produced by the inserted layer.
     '''
-
-    # MatMul with fp32 accumulation in strongly typed mode will cause engine building failed.
-    # Will be fixed it in TRT 10.0.
-    matmul_fp32_acc = False
-    if (input.dtype == trt.DataType.HALF or mat2.dtype
-            == trt.DataType.HALF) and not default_net()._strongly_typed:
+    # This option is only supported for fp16, but not bf16 or any other precisions.
+    # TODO: fp32 accum has issues with strongly_typed and it will be fixed in TensorRT 10.0
+    use_fp32_acc = use_fp32_acc and input.dtype == trt.DataType.HALF and mat2.dtype == trt.DataType.HALF and not default_net(
+    ).strongly_typed
+    if use_fp32_acc:
         input = cast(input, 'float32')
         mat2 = cast(mat2, 'float32')
-        matmul_fp32_acc = True
 
     input, mat2 = broadcast_helper(input, mat2)
     op0 = trt.MatrixOperation.TRANSPOSE if transa \
@@ -977,10 +990,11 @@ def matmul(input: Tensor,
         else trt.MatrixOperation.NONE
     layer = default_trtnet().add_matrix_multiply(input.trt_tensor, op0,
                                                  mat2.trt_tensor, op1)
-    if matmul_fp32_acc:
-        return cast(_create_tensor(layer.get_output(0), layer), 'float16')
+    output = _create_tensor(layer.get_output(0), layer)
+    if use_fp32_acc:
+        output = cast(output, "float16")
 
-    return _create_tensor(layer.get_output(0), layer)
+    return output
 
 
 def constant(ndarray: np.ndarray) -> Tensor:
@@ -1004,7 +1018,7 @@ def constant(ndarray: np.ndarray) -> Tensor:
     # Prevent underlying numpy array from going out of scope
     default_net().register_ndarray(ndarray)
     layer = default_trtnet().add_constant(trt.Dims(ndarray.shape), weights)
-    if not default_net()._strongly_typed:
+    if not default_net().strongly_typed:
         layer.set_output_type(0, np_dtype_to_trt(ndarray.dtype))
     tensor = _create_tensor(layer.get_output(0), layer)
     # TODO: remove this WAR after https://nvbugs/4359151 fixed.
@@ -1507,11 +1521,8 @@ def expand_dims_like(left: Union[Tensor, int, float], right: Tensor) -> Tensor:
     if isinstance(left, int):
         left = constant(int32_array([left]))
     elif isinstance(left, float):
-        if default_net().strongly_typed:
-            if isinstance(right, Tensor) and right.dtype == trt.DataType.HALF:
-                left = constant(fp16_array([left]))
-            else:
-                left = constant(fp32_array([left]))
+        if isinstance(right, Tensor) and right.dtype == trt.DataType.HALF:
+            left = constant(fp16_array([left]))
         else:
             left = constant(fp32_array([left]))
     left_ndim = left.ndim()
@@ -1733,6 +1744,141 @@ def index_select(input: Tensor, dim: int, index: Tensor) -> Tensor:
 
     layer = default_trtnet().add_gather(input.trt_tensor, index.trt_tensor, dim)
     return _create_tensor(layer.get_output(0), layer).view(concat(new_shape))
+
+
+def masked_select(input: Tensor, mask: Tensor) -> Tensor:
+    '''
+    Add an operation to select elements from a tensor according to a boolean
+    mask tensor.
+
+    Given an input tensor, that function creates an operation that selects
+    elements at the indices indicated by the boolean mask tensor to create
+    a new tensor. The output tensor is a 1-D tensor.
+
+    The input tensor must have rank >= 1. The shapes of the input tensor and
+    the mask tensor don’t need to match, but they must be broadcastable.
+
+    For example, on input=[[4, 2, 5], [2, 1, 2], [4, 7, 1]], which has a shape
+    [3, 3],
+
+        masked_select(input, [[True, False, True], [False, True, False], [True, False, True]])
+
+    will create a tensor of shape [5] that contains the [4, 5, 1, 4, 1].
+
+        masked_select(input, [[True], [False], [True]])
+
+    will create a tensor of shape [6] that contains the [4, 2, 5, 4, 7, 1].
+
+        masked_select(input, [[False, False, True]])
+
+    will create a tensor of shape [3] that contains the [5, 2, 1].
+
+        masked_select(input, [False])
+
+    will create a tensor of shape [0] which is empty.
+
+    That operation is implemented by NonZero, Shuffle and GatherV2 layers
+    in TensorRT.
+
+    Parameters:
+        input : Tensor
+            The input tensor to select from.
+
+        mask : Tensor
+            The boolean mask tensor that indicates elements to select.
+
+    Returns:
+        The 1-D tensor containing the selected elements.
+    '''
+    assert input.rank() >= 1, "input should have rank >= 1"
+    input, mask = broadcast_helper(input, mask)
+    expanded_mask = expand(mask, shape(input))
+
+    non_zero_layer = default_trtnet().add_non_zero(expanded_mask.trt_tensor)
+
+    shuffle_layer = default_trtnet().add_shuffle(non_zero_layer.get_output(0))
+    shuffle_layer.second_transpose = (1, 0)
+
+    gather_layer = default_trtnet().add_gather_v2(input.trt_tensor,
+                                                  shuffle_layer.get_output(0),
+                                                  mode=trt.GatherMode.ND)
+    return _create_tensor(gather_layer.get_output(0), gather_layer)
+
+
+def cumsum(input: Tensor, dim: int) -> Tensor:
+    '''
+    Add an operation to calculate inclusive cumulative sum of elements of
+    a tensor in a given dimension.
+
+    Given an input tensor, that function creates an operation that calculates
+    inclusive cumulative sum of elements in the dimension 'dim' to create
+    a new tensor. The output tensor has the same shape as the input tensor.
+
+    The input tensor must have rank >= 1. The 'dim' must be valid, and negative
+    value is supported.
+
+    For example, on input=[[4, 2, 5], [2, 1, 2], [4, 7, 1]], which has a shape
+    [3, 3],
+
+        cumsum(input, 0)
+
+    will produce [[4, 2, 5], [6, 3, 7], [10, 10, 8]].
+
+        cumsum(input, 1)
+
+    will produce [[4, 6, 11], [2, 3, 5], [4, 11, 12]].
+
+    That operation is implemented by TensorRT ILoopLayer.
+
+    Parameters:
+        input : Tensor
+            The input tensor to calculate the inclusive cumulative sum.
+
+        dim : int
+            The dimension to calculate the inclusive cumulative sum. Negative
+            value is supported.
+
+    Returns:
+        The tensor containing the inclusive cumulative sum of input.
+    '''
+    assert input.rank() >= 1, "input should have rank >= 1"
+    assert dim < input.rank() and dim >= -input.rank(
+    ), f"dim should be in [{-input.rank()}, {input.rank()}) when input have rank {input.rank()}"
+
+    dim = dim_resolve_negative(dim, input.ndim())[0]
+
+    slice_shape = []
+    for i in range(input.ndim()):
+        if i != dim:
+            slice_shape.append(shape(input, i))
+
+    zero_tensor = constant(np.array(0, dtype=trt_dtype_to_np(input.dtype)))
+    if len(slice_shape) > 0:
+        zero_tensor = expand_dims(zero_tensor,
+                                  [i for i in range(len(slice_shape))])
+        slice_shape = concat(slice_shape)
+        zero_tensor = expand(zero_tensor, slice_shape)
+
+    loop_layer = default_trtnet().add_loop()
+    trip_limit = shape(input, dim).trt_tensor
+    loop_layer.add_trip_limit(trip_limit, trt.TripLimit.COUNT)
+
+    iterator_layer = loop_layer.add_iterator(input.trt_tensor, dim)
+    cur_slice = iterator_layer.get_output(0)
+
+    running_sum_layer = loop_layer.add_recurrence(zero_tensor.trt_tensor)
+    running_sum = running_sum_layer.get_output(0)
+
+    cur_sum_layer = default_trtnet().add_elementwise(
+        cur_slice, running_sum, trt.ElementWiseOperation.SUM)
+    cur_sum = cur_sum_layer.get_output(0)
+    running_sum_layer.set_input(1, cur_sum)
+
+    loop_output_layer = loop_layer.add_loop_output(cur_sum,
+                                                   trt.LoopOutput.CONCATENATE,
+                                                   dim)
+    loop_output_layer.set_input(1, trip_limit)
+    return _create_tensor(loop_output_layer.get_output(0), loop_output_layer)
 
 
 def concat(inputs: Sequence[Union[Tensor, int]], dim: int = 0) -> Tensor:
@@ -3209,6 +3355,7 @@ def gpt_attention(
     sequence_length: Tensor,
     host_past_key_value_lengths: Optional[Tensor],
     host_max_attention_window_sizes: Tensor,
+    host_sink_token_length: Tensor,
     context_lengths: Optional[Tensor],
     cache_indirection: Optional[Tensor],
     host_request_types: Tensor,
@@ -3240,6 +3387,10 @@ def gpt_attention(
     relative_attention_bias: Optional[Tensor] = None,  # for relative attention
     max_distance: int = 0,  # for relative attention
     host_context_lengths: Optional[Tensor] = None,  # for pad-free input mode
+    enable_pos_shift: Optional[
+        bool] = False,  # for position shift attention mode in streamingllm
+    dense_context_fmha: Optional[
+        bool] = False,  # for dense fmha in context phase
     qkv_bias: Optional[Tensor] = None,
     use_cache: bool = True,
 ) -> Tuple[Tensor, Optional[Tensor]]:
@@ -3404,6 +3555,12 @@ def gpt_attention(
         host_context_lengths: Tensor = None (On CPU)
             A host tensor that contains the lengths of the different inputs,
 
+        enable_pos_shift: bool = False
+            Do we enable position shift in attention to support streamingllm method,
+
+        dense_context_fmha: bool = False
+            Do we use dense fmha in context phase,
+
         qkv_bias: Tensor = None,
 
     Returns:
@@ -3418,6 +3575,7 @@ def gpt_attention(
     ).plugin_config.remove_input_padding
     assert isinstance(max_context_length, int)
     assert host_max_attention_window_sizes is not None
+    assert host_sink_token_length is not None
 
     paged_kv_cache_flag = default_net().plugin_config.paged_kv_cache
     if isinstance(qkv, list):
@@ -3502,6 +3660,13 @@ def gpt_attention(
     max_context_length = trt.PluginField("max_context_length",
                                          np.array(max_context_length, np.int32),
                                          trt.PluginFieldType.INT32)
+    pos_shift_enabled = trt.PluginField(
+        "pos_shift_enabled", np.array(np.int8(enable_pos_shift), dtype=np.int8),
+        trt.PluginFieldType.INT8)
+    dense_context_fmha = trt.PluginField(
+        "dense_context_fmha",
+        np.array(np.int8(dense_context_fmha), dtype=np.int8),
+        trt.PluginFieldType.INT8)
     if qkv_bias is None:
         qkv_bias_enabled = trt.PluginField("qkv_bias_enabled",
                                            np.array(0, dtype=np.int8),
@@ -3533,7 +3698,8 @@ def gpt_attention(
         context_fmha_type, multi_block_mode, kv_cache_quant_mode_field,
         remove_input_padding, mask_type, paged_kv_cache, tokens_per_block,
         pf_type, max_context_length, qkv_bias_enabled, do_cross_attention_field,
-        max_distance, use_paged_context_fmha_field, use_cache_pf
+        max_distance, pos_shift_enabled, dense_context_fmha,
+        use_paged_context_fmha_field, use_cache_pf
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
@@ -3543,6 +3709,7 @@ def gpt_attention(
             sequence_length,
             host_past_key_value_lengths,
             host_max_attention_window_sizes,
+            host_sink_token_length,
             context_lengths,
             cache_indirection,
             host_request_types,
@@ -3550,6 +3717,7 @@ def gpt_attention(
     else:
         plug_inputs += [
             host_max_attention_window_sizes,
+            host_sink_token_length,
             context_lengths,
             host_request_types,
         ]
@@ -3597,7 +3765,7 @@ def gpt_attention(
 
     if kv_cache_quant_mode.has_int8_kv_cache() and not paged_kv_cache_flag:
         # past key value
-        layer.get_input(7).set_dynamic_range(-127, 127)
+        layer.get_input(8).set_dynamic_range(-127, 127)
         # present key value
         layer.get_output(1).set_dynamic_range(-127, 127)
 

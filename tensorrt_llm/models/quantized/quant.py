@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -380,15 +380,15 @@ def _weight_only_groupwise_quantize(model,
 
 
 def quantize_model(model: Module, quant_mode: QuantMode, **kwargs: Any):
-    if quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache():
-        model = _fp8_quantize(model, quant_mode, **kwargs)
-    elif quant_mode.has_act_and_weight_quant():
-        model = _smooth_quantize(model, quant_mode)
-    elif quant_mode.is_weight_only():
+    if quant_mode.is_weight_only():
         if quant_mode.has_per_group_scaling():
             model = _weight_only_groupwise_quantize(model, quant_mode, **kwargs)
         else:
             model = weight_only_quantize(model, quant_mode, **kwargs)
+    elif quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache():
+        model = _fp8_quantize(model, quant_mode, **kwargs)
+    elif quant_mode.has_act_and_weight_quant():
+        model = _smooth_quantize(model, quant_mode)
 
     setattr(model, "quant_mode", quant_mode)
     return model

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -39,7 +39,6 @@ from tensorrt_llm.quantization import QuantMode
 MODEL_NAME = "qwen"
 
 import onnx
-import tensorrt as trt
 from onnx import TensorProto, helper
 
 now_dir = os.path.dirname(os.path.abspath(__file__))
@@ -138,6 +137,14 @@ def parse_arguments():
         default='model.cache',
         help=
         'The path of to read timing cache from, will be ignored if the file does not exist'
+    )
+    parser.add_argument(
+        '--profiling_verbosity',
+        type=str,
+        default='layer_names_only',
+        choices=['layer_names_only', 'detailed', 'none'],
+        help=
+        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
     )
     parser.add_argument('--log_level',
                         type=str,
@@ -582,12 +589,18 @@ def build(rank, args):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
-        int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
-            not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
+        # NOTE: int8 flag is required to be true when INT8 tensors are exposed to TRT
+        # TRT-LLM has INT8 I/O when act/weights are quantized without group-scaling (AWQ, GPTQ)
+        # OR INT8 KV cache is set to contiguous (without paged KV cache enabled).
+        int8_trt_flag = (args.quant_mode.has_act_or_weight_quant()
+                         and not args.quant_mode.has_per_group_scaling()) or (
+                             not args.paged_kv_cache
+                             and args.quant_mode.has_int8_kv_cache())
         builder_config = builder.create_builder_config(
             name=MODEL_NAME,
             precision=args.dtype,
             timing_cache=args.timing_cache if cache is None else cache,
+            profiling_verbosity=args.profiling_verbosity,
             tensor_parallel=args.tp_size,
             pipeline_parallel=args.pp_size,
             parallel_build=args.parallel_build,

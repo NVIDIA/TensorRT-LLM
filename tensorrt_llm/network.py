@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -221,19 +221,12 @@ class Network(object):
     def _mark_output(self, tensor, name, dtype):
         from .functional import cast
 
+        # In strongly_typed, if tensor output is not the same, add a cast
         if self.strongly_typed:
-            if tensor.trt_tensor.dtype != dtype:
-                # If stronglyTyped mode is enabled and inferred output dtype does not match desired dtype, add a cast.
-                cast_output = cast(tensor, dtype)
-                self.trt_network.mark_output(cast_output.trt_tensor)
-                cast_output.trt_tensor.name = name
-            else:
-                # Otherwise, mark the tensor as network output. We should not set tensor dtype in stronglyTyped mode.
-                self.trt_network.mark_output(tensor.trt_tensor)
-                tensor.trt_tensor.name = name
-        else:
-            self.trt_network.mark_output(tensor.trt_tensor)
-            tensor.trt_tensor.name = name
+            tensor = cast(tensor, dtype)
+        self.trt_network.mark_output(tensor.trt_tensor)
+        tensor.trt_tensor.name = name
+        if not self.strongly_typed:
             tensor.trt_tensor.dtype = dtype
         logger.debug(f'Mark output: {name}, dtype: {dtype}')
 

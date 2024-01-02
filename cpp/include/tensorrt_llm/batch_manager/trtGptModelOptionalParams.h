@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,12 +34,14 @@ public:
 
     explicit TrtGptModelOptionalParams(KvCacheConfig const& kvCacheConfig = KvCacheConfig{},
         std::optional<SizeType> maxNumSequences = std::nullopt, bool enableTrtOverlap = true,
-        std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt, bool normalizeLogProbs = true)
+        std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt, bool normalizeLogProbs = true,
+        bool logIterationData = false)
         : kvCacheConfig{kvCacheConfig}
         , maxNumSequences{maxNumSequences}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(deviceIds)
         , normalizeLogProbs{normalizeLogProbs}
+        , logIterationData{logIterationData}
     {
     }
 
@@ -48,6 +50,7 @@ public:
     bool enableTrtOverlap;
     std::optional<std::vector<SizeType>> deviceIds;
     bool normalizeLogProbs;
+    bool logIterationData;
 };
 
 } // namespace tensorrt_llm::batch_manager

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -175,6 +175,7 @@ class GenerationMixin:
         host_context_lengths = None
         host_past_key_value_lengths = None
         host_max_attention_window_sizes = None
+        host_sink_token_length = None
         attention_mask = None
         cache_indirection = None
         host_request_types = None
@@ -242,6 +243,15 @@ class GenerationMixin:
                 host_max_attention_window_sizes.append(
                     host_max_attention_window_tensor)
 
+            host_sink_token_length = Tensor(
+                name=f'host_sink_token_length',
+                dtype=trt.int32,
+                shape=[1],
+                dim_range=OrderedDict([
+                    ('scalar',
+                     [1, 1] if enable_two_optimization_profiles else [1])
+                ]))
+
         if use_cache:
             cache_indirection = Tensor(
                 name='cache_indirection',
@@ -259,6 +269,7 @@ class GenerationMixin:
             'sequence_length': sequence_length,
             'host_past_key_value_lengths': host_past_key_value_lengths,
             'host_max_attention_window_sizes': host_max_attention_window_sizes,
+            'host_sink_token_length': host_sink_token_length,
             'past_key_value': past_key_value,
             'cache_indirection': cache_indirection,
             'kv_cache_block_pointers_list': kv_cache_block_pointers_list,

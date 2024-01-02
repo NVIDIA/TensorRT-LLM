@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,11 +37,11 @@ public:
         = 0;
 
     virtual void forward(th::Tensor& logits, // (batch_size, beam_width, hidden_size)
-        int step, int max_input_length, int max_attention_window, uint64_t ite, int local_batch_size, th::Tensor end_id,
-        th::optional<th::Tensor> embedding_bias_opt, th::optional<th::Tensor> input_lengths_opt,
-        th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
-        th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-        th::optional<th::Tensor> src_cache_indirection_opt,
+        int step, int max_input_length, int max_attention_window, int sink_token_length, uint64_t ite,
+        int local_batch_size, th::Tensor end_id, th::optional<th::Tensor> embedding_bias_opt,
+        th::optional<th::Tensor> input_lengths_opt, th::optional<th::Tensor> sequence_limit_length_opt,
+        th::optional<th::Tensor> stop_words_list_opt, th::optional<th::Tensor> bad_words_list_opt,
+        th::optional<th::Tensor> no_repeat_ngram_size_opt, th::optional<th::Tensor> src_cache_indirection_opt,
         // Outputs
         th::Tensor& output_token_ids, th::Tensor& newTokens, th::Tensor& should_stop,
         th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
@@ -74,11 +74,11 @@ public:
         th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt) override;
 
     void forward(th::Tensor& logits, // (batch_size, beam_width, hidden_size)
-        int step, int max_input_length, int max_attention_window, uint64_t ite, int local_batch_size, th::Tensor end_id,
-        th::optional<th::Tensor> embedding_bias_opt, th::optional<th::Tensor> input_lengths_opt,
-        th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
-        th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-        th::optional<th::Tensor> src_cache_indirection_opt,
+        int step, int max_input_length, int max_attention_window, int sink_token_length, uint64_t ite,
+        int local_batch_size, th::Tensor end_id, th::optional<th::Tensor> embedding_bias_opt,
+        th::optional<th::Tensor> input_lengths_opt, th::optional<th::Tensor> sequence_limit_length_opt,
+        th::optional<th::Tensor> stop_words_list_opt, th::optional<th::Tensor> bad_words_list_opt,
+        th::optional<th::Tensor> no_repeat_ngram_size_opt, th::optional<th::Tensor> src_cache_indirection_opt,
         // Outputs
         th::Tensor& output_token_ids, th::Tensor& newTokens, th::Tensor& should_stop,
         th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
@@ -116,8 +116,8 @@ public:
         th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt);
 
     th::Tensor forward(th::Tensor logits, // (batch_size, beam_width, vocab_size)
-        int64_t step, int64_t max_input_length, int64_t max_attention_window, int64_t ite, int64_t local_batch_size,
-        th::Tensor end_id, th::optional<th::Tensor> embedding_bias_opt,
+        int64_t step, int64_t max_input_length, int64_t max_attention_window, int64_t sink_token_length, int64_t ite,
+        int64_t local_batch_size, th::Tensor end_id, th::optional<th::Tensor> embedding_bias_opt,
         th::optional<th::Tensor> input_lengths_opt, // length of input contexts.
         th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
         th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,

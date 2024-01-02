@@ -357,7 +357,7 @@ int LoraPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinf
     //     ... (there are mNumLoraModules lora_weights_ptr inputs)
     //     host_context_lengths [batch_size] on cpu
     // outputs
-    //     output [-1, mNumLoraModules, N] (view as 2D)
+    //     output [-1, N] (view as 2D)
     //     ... (there are mNumLoraModules outputs)
 
     auto const typeSize = tensorrt_llm::runtime::BufferDataType(mType).getSize();
@@ -385,7 +385,8 @@ int LoraPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinf
         cudaMemsetAsync(outputs[loraModuleIdx], 0, size * typeSize, stream);
     }
 
-    bool useUnifiedGemm = false;
+    char* useUnifiedGemmChar = std::getenv("LORA_USE_UNIFIED_GEMM");
+    bool useUnifiedGemm = (useUnifiedGemmChar != nullptr && std::string(useUnifiedGemmChar) == "ON");
     for (int batchIdx = 0; batchIdx < batch_size; batchIdx++)
     {
         for (int loraModuleIdx = 0; loraModuleIdx < mNumLoraModules; loraModuleIdx++)
@@ -445,7 +446,6 @@ int LoraPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinf
     }
     else
     {
-        int handled_token_num = 0;
         std::vector<cutlass::gemm::GemmCoord> problem_sizes;
         problem_sizes.reserve(batch_size * mNumLoraModules);
         std::vector<void*> ptrA;
@@ -468,21 +468,32 @@ int LoraPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinf
         std::vector<void*> ptrD_2;
         ptrD_2.reserve(batch_size * mNumLoraModules);
 
-        for (int batchIdx = 0; batchIdx < batch_size; batchIdx++)
+        for (int loraModuleIdx = 0; loraModuleIdx < mNumLoraModules; loraModuleIdx++)
         {
-            const RequestType reqType = reqTypes[batchIdx];
-            const auto M = (reqType != RequestType::kCONTEXT)
-                ? 1
-                : (mRemoveInputPadding ? host_context_lengths[batchIdx] : inputDesc[0].dims.d[1]);
+            auto const lora_ranks = static_cast<int32_t const*>(inputs[getLoraRanksIdx() + loraModuleIdx]);
+            auto const lora_weights_ptr = static_cast<int64_t const*>(inputs[getLoraWeightsPtrsIdx() + loraModuleIdx]);
 
-            for (int loraModuleIdx = 0; loraModuleIdx < mNumLoraModules; loraModuleIdx++)
+            // The following loop aggregates the contiguous requests that use the same LoRA weights to reduce
+            // the problem_size of grouped GEMMs and increase the M dimension of those GEMMs.
+            int batchIdx = 0;
+            int handled_token_num = 0;
+            while (batchIdx < batch_size)
             {
-                auto const lora_ranks = static_cast<int32_t const*>(inputs[getLoraRanksIdx() + loraModuleIdx]);
-                auto const lora_weights_ptr
-                    = static_cast<int64_t const*>(inputs[getLoraWeightsPtrsIdx() + loraModuleIdx]);
-
                 const auto lora_rank = lora_ranks[batchIdx];
                 const auto N = lora_rank;
+                int count = 0;
+                size_t M = 0;
+                while (batchIdx + count < batch_size && lora_rank == lora_ranks[batchIdx + count]
+                    && lora_weights_ptr[batchIdx * 2] == lora_weights_ptr[(batchIdx + count) * 2]
+                    && lora_weights_ptr[batchIdx * 2 + 1] == lora_weights_ptr[(batchIdx + count) * 2 + 1])
+                {
+                    const RequestType reqType = reqTypes[batchIdx + count];
+                    M += (reqType != RequestType::kCONTEXT)
+                        ? 1
+                        : (mRemoveInputPadding ? host_context_lengths[batchIdx + count] : inputDesc[0].dims.d[1]);
+                    count++;
+                }
+
                 if (N > 0)
                 {
                     TLLM_CHECK_WITH_INFO(N <= mMaxLowRank,
@@ -498,17 +509,20 @@ int LoraPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinf
                         static_cast<char*>(const_cast<void*>(inputs[0])) + handled_token_num * K * typeSize));
                     ptrB.push_back(reinterpret_cast<void*>(lora_weights_ptr[batchIdx * 2]));
                     ptrC.push_back(static_cast<void*>(static_cast<char*>(lowRankWorkSpace)
-                        + (handled_token_num * mNumLoraModules * mMaxLowRank + loraModuleIdx * mMaxLowRank)
+                        + (loraModuleIdx * batch_size * mMaxContextLength * mMaxLowRank
+                              + handled_token_num * mMaxLowRank)
                             * typeSize));
                     ptrD.push_back(static_cast<void*>(static_cast<char*>(lowRankWorkSpace)
-                        + (handled_token_num * mNumLoraModules * mMaxLowRank + loraModuleIdx * mMaxLowRank)
+                        + (loraModuleIdx * batch_size * mMaxContextLength * mMaxLowRank
+                              + handled_token_num * mMaxLowRank)
                             * typeSize));
 
                     const auto N2 = outputDesc[loraModuleIdx].dims.d[nbDimsA - 1];
                     cutlass::gemm::GemmCoord problem_2(M, N2, N);
                     problem_sizes_2.push_back(problem_2);
                     ptrA_2.push_back(static_cast<void*>(static_cast<char*>(lowRankWorkSpace)
-                        + (handled_token_num * mNumLoraModules * mMaxLowRank + loraModuleIdx * mMaxLowRank)
+                        + (loraModuleIdx * batch_size * mMaxContextLength * mMaxLowRank
+                              + handled_token_num * mMaxLowRank)
                             * typeSize));
                     ptrB_2.push_back(reinterpret_cast<void*>(lora_weights_ptr[batchIdx * 2 + 1]));
                     ptrC_2.push_back(static_cast<void*>(
@@ -516,8 +530,9 @@ int LoraPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinf
                     ptrD_2.push_back(static_cast<void*>(
                         static_cast<char*>(outputs[loraModuleIdx]) + handled_token_num * N2 * typeSize));
                 }
+                handled_token_num += M;
+                batchIdx += count;
             }
-            handled_token_num += M;
         }
         tensorrt_llm::kernels::gropuedGemm(problem_sizes, ptrA, ptrB, ptrC, ptrD, cutlassWorkSpace,
             cutlassWorkSpaceSize, cublasWorkSpace, CUBLAS_WORKSPACE_SIZE, true, mType, stream);

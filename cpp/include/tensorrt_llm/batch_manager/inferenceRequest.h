@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -170,6 +170,7 @@ public:
                                                                                                                        \
     void set##funcName(TensorPtr const& tensor)                                                                        \
     {                                                                                                                  \
+        TLLM_CHECK_WITH_INFO(tensor, "Cannot set nullptr when calling %s", __FUNCTION__);                              \
         mInputTensors[tensorName] = tensor;                                                                            \
     }
 
