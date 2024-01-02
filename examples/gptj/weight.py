@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -703,7 +703,7 @@ def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
         qweight_int8 = torch.clamp(torch.round(weight.cuda()).char(), -8, 7)
         int4_weight = packer(qweight_int8.cpu())
         int4_weight = preprocessor(int4_weight, torch.quint4x2)
-        return int4_weight.view(torch.int8).cpu().numpy()
+        return int4_weight.view(torch.float16).cpu().numpy()
 
     def process_and_assign_weight(awq_gpt_j, mPrefix, mOp, tp_dim=0):
         weight = awq_gpt_j[mPrefix + ".weight"].T.contiguous()
@@ -720,9 +720,9 @@ def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
             pre_quant_scale = pre_quant_scale.split(k // mapping.tp_size,
                                                     dim=1)[mapping.tp_rank]
         scale = amax / 8.0
-        mOp.qweight.value = AWQ_quantize_pack_preprocess(weight, scale)
-        mOp.scale.value = scale.to(torch_dtype).cpu().numpy()
-        mOp.pre_quant_scale.value = pre_quant_scale.to(
+        mOp.weight.value = AWQ_quantize_pack_preprocess(weight, scale)
+        mOp.weights_scaling_factor.value = scale.to(torch_dtype).cpu().numpy()
+        mOp.prequant_scaling_factor.value = pre_quant_scale.to(
             torch_dtype).cpu().numpy()
 
     def deSmooth(weight, pre_quant_scale):
@@ -789,10 +789,11 @@ def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
         qkv_weights = torch.cat((q_weight, k_weight, v_weight), dim=1)
         qkv_scale = torch.cat((q_scale, k_scale, v_scale), dim=1)
 
-        mOp.pre_quant_scale.value = qkv_pre_quant_scale.to(
+        mOp.prequant_scaling_factor.value = qkv_pre_quant_scale.to(
             torch_dtype).cpu().numpy()
-        mOp.qweight.value = AWQ_quantize_pack_preprocess(qkv_weights, qkv_scale)
-        mOp.scale.value = qkv_scale.to(torch_dtype).cpu().numpy()
+        mOp.weight.value = AWQ_quantize_pack_preprocess(qkv_weights, qkv_scale)
+        mOp.weights_scaling_factor.value = qkv_scale.to(
+            torch_dtype).cpu().numpy()
 
     #check if we need to pad vocab
     v = awq_gpt_j.get('transformer.wte.weight')
@@ -879,11 +880,11 @@ def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
         new_amax = new_amax.split(new_amax.shape[1] // mapping.tp_size,
                                   dim=1)[mapping.tp_rank]
         new_scale = new_amax / 8
-        tensorrt_llm_gpt_j.lm_head.qweight.value = AWQ_quantize_pack_preprocess(
+        tensorrt_llm_gpt_j.lm_head.weight.value = AWQ_quantize_pack_preprocess(
             new_weight, new_scale)
-        tensorrt_llm_gpt_j.lm_head.scale.value = new_scale.to(
+        tensorrt_llm_gpt_j.lm_head.weights_scaling_factor.value = new_scale.to(
             torch_dtype).cpu().numpy()
-        tensorrt_llm_gpt_j.lm_head.pre_quant_scale.value = awq_gpt_j[
+        tensorrt_llm_gpt_j.lm_head.prequant_scaling_factor.value = awq_gpt_j[
             'lm_head.input_quantizer._pre_quant_scale'].to(
                 torch_dtype).cpu().numpy()
 

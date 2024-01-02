@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -579,7 +579,7 @@ def load_from_gptq_qwen(
         qweight_unpacked_int8 = (
             unpack_int32_into_int8(qweight_int32.T).T.contiguous() - 8)
         qweight_interleaved = preprocessor(packer(qweight_unpacked_int8),
-                                           torch.quint4x2)
+                                           torch.quint4x2).view(torch.float16)
         # zeros = zeros * scales
         qzeros_unpacked_int32 = unpack_int32_into_int8(qzeros_int32)
 
@@ -654,11 +654,12 @@ def load_from_gptq_qwen(
             split_qkv_suf[2],
         )
         tensorrt_llm_qwen.layers[
-            idx].attention.qkv.qweight.value = th_qweight.numpy()
+            idx].attention.qkv.weight.value = th_qweight.numpy()
         tensorrt_llm_qwen.layers[idx].attention.qkv.zero.value = th_zero.to(
             torch_dtype).numpy()
-        tensorrt_llm_qwen.layers[idx].attention.qkv.scale.value = th_scale.to(
-            torch_dtype).numpy()
+        tensorrt_llm_qwen.layers[
+            idx].attention.qkv.weights_scaling_factor.value = th_scale.to(
+                torch_dtype).numpy()
 
     for k, v in tqdm(model_params.items(),
                      ncols=80,
@@ -701,12 +702,12 @@ def load_from_gptq_qwen(
                 th_qweight, th_zero, th_scale = preprocess_groupwise_weight_params(
                     None, split_v_suf[0], split_v_suf[1], split_v_suf[2])
                 tensorrt_llm_qwen.layers[
-                    idx].attention.dense.qweight.value = th_qweight.numpy()
+                    idx].attention.dense.weight.value = th_qweight.numpy()
                 tensorrt_llm_qwen.layers[
                     idx].attention.dense.zero.value = th_zero.to(
                         torch_dtype).numpy()
                 tensorrt_llm_qwen.layers[
-                    idx].attention.dense.scale.value = th_scale.to(
+                    idx].attention.dense.weights_scaling_factor.value = th_scale.to(
                         torch_dtype).numpy()
             elif "mlp.w1.qweight" in k:
                 split_v_suf = []
@@ -718,11 +719,11 @@ def load_from_gptq_qwen(
                 th_qweight, th_zero, th_scale = preprocess_groupwise_weight_params(
                     None, split_v_suf[0], split_v_suf[1], split_v_suf[2])
                 tensorrt_llm_qwen.layers[
-                    idx].mlp.gate.qweight.value = th_qweight.numpy()
+                    idx].mlp.gate.weight.value = th_qweight.numpy()
                 tensorrt_llm_qwen.layers[idx].mlp.gate.zero.value = th_zero.to(
                     torch_dtype).numpy()
                 tensorrt_llm_qwen.layers[
-                    idx].mlp.gate.scale.value = th_scale.to(
+                    idx].mlp.gate.weights_scaling_factor.value = th_scale.to(
                         torch_dtype).numpy()
             elif "mlp.c_proj.qweight" in k:
                 split_v_suf = []
@@ -734,11 +735,11 @@ def load_from_gptq_qwen(
                 th_qweight, th_zero, th_scale = preprocess_groupwise_weight_params(
                     None, split_v_suf[0], split_v_suf[1], split_v_suf[2])
                 tensorrt_llm_qwen.layers[
-                    idx].mlp.proj.qweight.value = th_qweight.numpy()
+                    idx].mlp.proj.weight.value = th_qweight.numpy()
                 tensorrt_llm_qwen.layers[idx].mlp.proj.zero.value = th_zero.to(
                     torch_dtype).numpy()
                 tensorrt_llm_qwen.layers[
-                    idx].mlp.proj.scale.value = th_scale.to(
+                    idx].mlp.proj.weights_scaling_factor.value = th_scale.to(
                         torch_dtype).numpy()
             elif "mlp.w2.qweight" in k:
                 split_v_suf = []
@@ -750,11 +751,12 @@ def load_from_gptq_qwen(
                 th_qweight, th_zero, th_scale = preprocess_groupwise_weight_params(
                     None, split_v_suf[0], split_v_suf[1], split_v_suf[2])
                 tensorrt_llm_qwen.layers[
-                    idx].mlp.fc.qweight.value = th_qweight.numpy()
+                    idx].mlp.fc.weight.value = th_qweight.numpy()
                 tensorrt_llm_qwen.layers[idx].mlp.fc.zero.value = th_zero.to(
                     torch_dtype).numpy()
-                tensorrt_llm_qwen.layers[idx].mlp.fc.scale.value = th_scale.to(
-                    torch_dtype).numpy()
+                tensorrt_llm_qwen.layers[
+                    idx].mlp.fc.weights_scaling_factor.value = th_scale.to(
+                        torch_dtype).numpy()
 
     tok = time.time()
     t = time.strftime("%h:%m:%s", time.gmtime(tok - tik))
@@ -810,7 +812,7 @@ def load_from_awq_qwen(tensorrt_llm_qwen: QWenForCausalLM,
         int4_weight = packer(qweight_int8.cpu())
         int4_weight = preprocessor(int4_weight,
                                    torch.quint4x2)  # int8 save as uint4
-        return int4_weight.cpu().numpy()
+        return int4_weight.view(torch.float16).cpu().numpy()
 
     def process_and_assign_weight(model_params, mPrefix, mOp, tp_dim=0):
         weight = model_params[mPrefix + ".weight"].T.contiguous()
@@ -827,9 +829,9 @@ def load_from_awq_qwen(tensorrt_llm_qwen: QWenForCausalLM,
             pre_quant_scale = pre_quant_scale.split(k // mapping.tp_size,
                                                     dim=1)[mapping.tp_rank]
         scale = amax / 8.0
-        mOp.qweight.value = AWQ_quantize_pack_preprocess(weight, scale)
-        mOp.scale.value = scale.to(torch_dtype).cpu().numpy()
-        mOp.pre_quant_scale.value = pre_quant_scale.to(
+        mOp.weight.value = AWQ_quantize_pack_preprocess(weight, scale)
+        mOp.weights_scaling_factor.value = scale.to(torch_dtype).cpu().numpy()
+        mOp.prequant_scaling_factor.value = pre_quant_scale.to(
             torch_dtype).cpu().numpy()
 
     # Check if we need to pad vocab
@@ -918,11 +920,11 @@ def load_from_awq_qwen(tensorrt_llm_qwen: QWenForCausalLM,
         new_amax[:vocab_size, :] = amax
         new_amax = new_amax.T.contiguous()
         new_scale = new_amax / 8
-        tensorrt_llm_qwen.lm_head.qweight.value = AWQ_quantize_pack_preprocess(
+        tensorrt_llm_qwen.lm_head.weight.value = AWQ_quantize_pack_preprocess(
             new_weight, new_scale)
-        tensorrt_llm_qwen.lm_head.scale.value = new_scale.to(
+        tensorrt_llm_qwen.lm_head.weights_scaling_factor.value = new_scale.to(
             torch_dtype).cpu().numpy()
-        tensorrt_llm_qwen.lm_head.pre_quant_scale.value = model_params[
+        tensorrt_llm_qwen.lm_head.prequant_scaling_factor.value = model_params[
             'lm_head.input_quantizer._pre_quant_scale'].to(
                 torch_dtype).cpu().numpy()
     else:

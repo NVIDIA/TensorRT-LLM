@@ -8,7 +8,7 @@ There are 3 steps in the new workflow:
 2. build the TensorRT-LLM checkpoint into TensorRT engine(s) with a unified build command
 3. load the engine(s) to TensorRT-LLM model runner and make evaluation with different evaluation tasks
 
-```txt
+```
 NeMo -------------
                   |
 HuggingFace ------
@@ -108,7 +108,7 @@ python3 convert_checkpoint.py --model_dir ./opt-125m \
 
 Here is the checkpoint directory:
 
-```txt
+```
 ./opt/125M/trt_ckpt/fp16/1-gpu/
     config.json
     rank0.safetensors

@@ -4,7 +4,7 @@
 
 ` pip install -r examples/server/requirements.txt`
 
-### Directly from python, with the HL API
+## Directly from python, with the HL API
 
 Due to limitation from the HLAPI implementation, currently only LLaMA models are supported:
 `python3 examples/server/async.py <path_to_hf_llama_dir>`

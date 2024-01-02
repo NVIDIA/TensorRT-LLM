@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -40,6 +40,10 @@ def parse_arguments(args=None):
         help=
         'The attention window size that controls the sliding window attention / cyclic kv cache behaviour'
     )
+    parser.add_argument('--sink_token_length',
+                        type=int,
+                        default=None,
+                        help='The sink token length.')
     parser.add_argument('--log_level', type=str, default='error')
     parser.add_argument('--engine_dir', type=str, default='engine_outputs')
     parser.add_argument('--use_py_session',
@@ -155,7 +159,8 @@ def parse_input(tokenizer,
                 add_special_tokens=True,
                 max_input_length=923,
                 pad_id=None,
-                num_prepend_vtokens=[]):
+                num_prepend_vtokens=[],
+                model_name=None):
     if pad_id is None:
         pad_id = tokenizer.pad_token_id
 
@@ -203,7 +208,9 @@ def parse_input(tokenizer,
             batch_input_ids[i] = list(
                 range(base_vocab_size,
                       base_vocab_size + length)) + batch_input_ids[i]
-
+    if model_name == 'glm_10b':
+        for ids in batch_input_ids:
+            ids.append(tokenizer.sop_token_id)
     batch_input_ids = [
         torch.tensor(x, dtype=torch.int32) for x in batch_input_ids
     ]
@@ -322,12 +329,18 @@ def main(args):
                                   add_special_tokens=args.add_special_tokens,
                                   max_input_length=args.max_input_length,
                                   pad_id=pad_id,
-                                  num_prepend_vtokens=args.num_prepend_vtokens)
+                                  num_prepend_vtokens=args.num_prepend_vtokens,
+                                  model_name=model_name)
     input_lengths = [x.size(0) for x in batch_input_ids]
 
     if not PYTHON_BINDINGS and not args.use_py_session:
         logger.warning(
             "Python bindings of C++ session is unavailable, fallback to Python session."
+        )
+        args.use_py_session = True
+    if args.debug_mode and not args.use_py_session:
+        logger.warning(
+            "Debug mode is not supported in C++ session for now, fallback to Python session."
         )
         args.use_py_session = True
     runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
@@ -342,7 +355,9 @@ def main(args):
             max_input_len=max(input_lengths),
             max_output_len=args.max_output_len,
             max_beam_width=args.num_beams,
-            max_attention_window_size=args.max_attention_window_size)
+            max_attention_window_size=args.max_attention_window_size,
+            sink_token_length=args.sink_token_length,
+        )
     runner = runner_cls.from_dir(**runner_kwargs)
 
     with torch.no_grad():
@@ -350,6 +365,7 @@ def main(args):
             batch_input_ids,
             max_new_tokens=args.max_output_len,
             max_attention_window_size=args.max_attention_window_size,
+            sink_token_length=args.sink_token_length,
             end_id=end_id,
             pad_id=pad_id,
             temperature=args.temperature,

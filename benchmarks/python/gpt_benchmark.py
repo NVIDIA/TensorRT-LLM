@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -56,7 +56,7 @@ class GPTBenchmark(BaseBenchmark):
             if args.max_output_len is not None:
                 self.max_output_len = args.max_output_len
 
-            self.quant_mode, _, _, _ = get_quant_mode(args.quantization)
+            self.quant_mode, _, _ = get_quant_mode(args.quantization)
             self.enable_fp8 = self.quant_mode.has_fp8_qdq()
             self.fp8_kv_cache = self.quant_mode.has_fp8_kv_cache()
 

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import copy
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, wait
@@ -22,9 +23,13 @@ from typing import Union
 
 import torch
 
-from ..builder import BuildConfig, build
+from ..builder import BuildConfig, Builder
+from ..graph_rewriting import optimize
 from ..logger import logger
-from ..models import PretrainedConfig
+from ..models import MODEL_MAP, PretrainedConfig, PretrainedModel
+from ..network import net_guard
+from ..runtime.engine import Engine, EngineConfig
+from ..version import __version__
 
 
 def parse_arguments():
@@ -117,10 +122,105 @@ def parse_arguments():
     parser.add_argument('--gather_all_token_logits',
                         action='store_true',
                         default=False)
+    parser.add_argument('--strongly_typed', action='store_true', default=False)
 
     args = parser.parse_args()
 
     return args
+
+
+def build_shard_model(model: PretrainedModel,
+                      build_config: BuildConfig) -> Engine:
+    builder = Builder()
+    builder_config = builder.create_builder_config(
+        precision=model.config.dtype,
+        int8=model.config.quant_mode.has_act_or_weight_quant()
+        or model.config.quant_mode.has_int8_kv_cache(),
+        strongly_typed=build_config.strongly_typed,
+        quant_mode=model.config.quant_mode)
+
+    network = builder.create_network()
+    network._plugin_config = build_config.plugin_config
+
+    use_weight_only = model.config.quant_mode.is_weight_only()
+    per_group = model.config.quant_mode.has_per_group_scaling()
+    use_smooth_quant = model.config.quant_mode.has_act_and_weight_quant()
+    if use_weight_only:
+        if per_group:
+            network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
+                dtype='float16')
+        else:
+            network.plugin_config.set_weight_only_quant_matmul_plugin(
+                dtype='float16')
+    if use_smooth_quant:
+        network.plugin_config.set_smooth_quant_gemm_plugin(dtype='float16')
+        network.plugin_config.set_rmsnorm_quantization_plugin(dtype='float16')
+        network.plugin_config.set_layernorm_quantization_plugin(dtype='float16')
+        network.plugin_config.set_quantize_tensor_plugin()
+        network.plugin_config.set_quantize_per_token_plugin()
+    nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else False
+    if nccl_plugin:
+        network.plugin_config.set_nccl_plugin(
+            nccl_plugin, network.plugin_config.use_custom_all_reduce)
+
+    with net_guard(network):
+        # Prepare
+        network.set_named_parameters(model.named_parameters())
+
+        # Forward
+        inputs = model.prepare_inputs(
+            build_config.max_batch_size, build_config.max_input_len,
+            build_config.max_output_len, True, build_config.max_beam_width,
+            build_config.max_num_tokens,
+            build_config.max_prompt_embedding_table_size)
+        model(**inputs)
+
+    optimize(network)
+
+    # Network -> Engine
+    engine = builder.build_engine(network, builder_config)
+    engine_config = EngineConfig(model.config, build_config, __version__)
+
+    return Engine(engine_config, engine)
+
+
+def build(build_config: Union[str, BuildConfig],
+          rank: int = 0,
+          ckpt_dir: str = None,
+          model_config: Union[str, PretrainedConfig] = None,
+          weights=None,
+          model_cls=None) -> Engine:
+    if ckpt_dir is not None:
+        model_config = PretrainedConfig.from_json_file(
+            os.path.join(ckpt_dir, 'config.json'))
+    else:
+        assert model_config is not None
+        if isinstance(model_config, PretrainedConfig):
+            model_config = model_config
+        else:
+            model_config = PretrainedConfig.from_json_file(model_config)
+
+    if isinstance(build_config, str):
+        build_config = BuildConfig.from_json_file(build_config)
+
+    assert rank < model_config.mapping.world_size
+    architecture = model_config.architecture
+
+    if model_cls is None:
+        if architecture not in MODEL_MAP:
+            raise RuntimeError(
+                f'Unsupported model architecture: {architecture}')
+        model_cls = MODEL_MAP[architecture]
+
+    if ckpt_dir is not None:
+        model = model_cls.from_checkpoint(ckpt_dir, rank=rank)
+    else:
+        rank_config = copy.deepcopy(model_config)
+        rank_config.set_rank(rank)
+        model = model_cls.from_config(rank_config)
+        if weights is not None:
+            model.load(weights)
+    return build_shard_model(model, build_config)
 
 
 def build_and_save_shard(rank, gpu_id, ckpt_dir, build_config, output_dir,
@@ -199,6 +299,8 @@ def main():
             args.max_prompt_embedding_table_size,
             'gather_all_token_logits':
             args.gather_all_token_logits,
+            'strongly_typed':
+            args.strongly_typed,
             'plugin_config': {
                 'gpt_attention_plugin': args.use_gpt_attention_plugin,
                 'gemm_plugin': args.use_gemm_plugin,

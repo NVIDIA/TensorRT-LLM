@@ -2,7 +2,7 @@ import argparse
 from asyncio import run
 from pathlib import Path
 
-from engine import AsyncLLMEngine
+from tensorrt_llm.engine import AsyncLLMEngine
 
 
 async def main(model_dir: Path):

@@ -80,3 +80,4 @@ Blogs
 
    blogs/H100vsA100.md
    blogs/H200launch.md
+   blogs/Falcon180B-H200.md

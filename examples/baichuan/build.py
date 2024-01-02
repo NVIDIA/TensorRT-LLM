@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -136,13 +136,20 @@ def parse_arguments():
                         type=str,
                         default='float32',
                         choices=['float16', 'float32'])
-
     parser.add_argument(
         '--timing_cache',
         type=str,
         default='model.cache',
         help=
         'The path of to read timing cache from, will be ignored if the file does not exist'
+    )
+    parser.add_argument(
+        '--profiling_verbosity',
+        type=str,
+        default='layer_names_only',
+        choices=['layer_names_only', 'detailed', 'none'],
+        help=
+        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
     )
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument('--vocab_size', type=int, default=64000)
@@ -522,6 +529,7 @@ def build_rank_engine(builder: Builder,
     tensorrt_llm_baichuan = quantize_model(tensorrt_llm_baichuan,
                                            args.quant_mode, **quantize_kwargs)
 
+    use_gemm_woq_plugin = not args.disable_weight_only_quant_plugin
     if args.per_group:
         if args.weight_only_precision == 'int4_awq':
             load_from_awq_baichuan(tensorrt_llm_baichuan=tensorrt_llm_baichuan,
@@ -559,7 +567,8 @@ def build_rank_engine(builder: Builder,
                               args.model_version,
                               rank,
                               args.world_size,
-                              dtype=args.dtype)
+                              dtype=args.dtype,
+                              use_gemm_woq_plugin=use_gemm_woq_plugin)
         del hf_baichuan
     elif args.bin_model_dir is not None:
         load_from_binary(tensorrt_llm_baichuan,
@@ -567,7 +576,9 @@ def build_rank_engine(builder: Builder,
                          args.model_version,
                          mapping,
                          fp16=(args.dtype == 'float16'),
-                         multi_query_mode=False)
+                         multi_query_mode=False,
+                         dtype=args.dtype,
+                         use_gemm_woq_plugin=use_gemm_woq_plugin)
 
     # Module -> Network
     network = builder.create_network()
@@ -596,7 +607,7 @@ def build_rank_engine(builder: Builder,
             ContextFMHAType.enabled_with_fp32_acc)
     if args.multi_block_mode:
         network.plugin_config.enable_mmha_multi_block_mode()
-    if args.use_weight_only:
+    if args.use_weight_only and not args.disable_weight_only_quant_plugin:
         if args.per_group:
             network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
                 dtype='float16')
@@ -664,13 +675,18 @@ def build(rank, args):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
-        # NOTE(nkorobov): when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
-        int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
-            not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
+        # NOTE: int8 flag is required to be true when INT8 tensors are exposed to TRT
+        # TRT-LLM has INT8 I/O when act/weights are quantized without group-scaling (AWQ, GPTQ)
+        # OR INT8 KV cache is set to contiguous (without paged KV cache enabled).
+        int8_trt_flag = (args.quant_mode.has_act_or_weight_quant()
+                         and not args.quant_mode.has_per_group_scaling()) or (
+                             not args.paged_kv_cache
+                             and args.quant_mode.has_int8_kv_cache())
         builder_config = builder.create_builder_config(
             name=model_name,
             precision=args.dtype,
             timing_cache=args.timing_cache if cache is None else cache,
+            profiling_verbosity=args.profiling_verbosity,
             tensor_parallel=args.world_size,  # TP only
             parallel_build=args.parallel_build,
             num_layers=args.n_layer,

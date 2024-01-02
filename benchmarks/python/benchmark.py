@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -89,7 +89,14 @@ def parse_arguments():
                         type=float,
                         default="0",
                         help=('Specify Top-P value of decoding.'))
-
+    parser.add_argument(
+        '--profiling_verbosity',
+        type=str,
+        default='layer_names_only',
+        choices=['layer_names_only', 'detailed', 'none'],
+        help=
+        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
+    )
     parser.add_argument(
         '--log_level',
         type=str,
@@ -180,6 +187,10 @@ def parse_arguments():
         help=
         'Quick sanity check with num_layer=1; will be silently ignored if --engine_dir is specified.'
     )
+    parser.add_argument('--strongly_typed',
+                        default=False,
+                        action='store_true',
+                        help='This option will reduce the building time.')
 
     parser.add_argument('--csv',
                         default=False,

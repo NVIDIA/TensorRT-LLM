@@ -32,7 +32,7 @@ namespace layers
 
 __global__ void update_indir_cache_kernel(int* tgt_indir_cache, const int* src_indir_cache, const int** parent_ids,
     const FinishedState* finished, const int* sequence_lengths, const int* input_lengths, int batch_dim,
-    int local_batch_size, int beam_width, int max_attention_window, int max_seq_len)
+    int local_batch_size, int beam_width, int max_attention_window, int sink_token_length, int max_seq_len)
 {
     int time_step = threadIdx.x + blockIdx.x * blockDim.x;
     int bb_id = threadIdx.y + blockIdx.y * blockDim.y;   // should be just blockIdx.y?
@@ -48,7 +48,12 @@ __global__ void update_indir_cache_kernel(int* tgt_indir_cache, const int* src_i
     {
         return;
     }
-    int time_step_circ = time_step % max_attention_window;
+    int time_step_circ = time_step;
+    if (time_step_circ >= sink_token_length)
+    {
+        time_step_circ
+            = sink_token_length + (time_step - sink_token_length) % (max_attention_window - sink_token_length);
+    }
 
     // for the parent_ids, we will still keep it for all past tokens (i.e. max_seq_len)
     const int src_beam = parent_ids[batch_id][beam_id * max_seq_len + current_step];
@@ -64,13 +69,15 @@ __global__ void update_indir_cache_kernel(int* tgt_indir_cache, const int* src_i
 
 void update_indir_cache_kernelLauncher(int* tgt_indir_cache, const int* src_indir_cache, const int** parent_ids,
     const FinishedState* finished, const int* sequence_lengths, const int* input_lengths, int batch_dim,
-    int local_batch_size, int beam_width, int max_seq_len, int max_attention_window, cudaStream_t stream)
+    int local_batch_size, int beam_width, int max_seq_len, int max_attention_window, int sink_token_length,
+    cudaStream_t stream)
 {
     const dim3 block(32);
     // Update indirections steps [input_length[bb_id], sequence_lengths[bb_id]], included
     const dim3 grid((max_seq_len + block.x - 1) / block.x, local_batch_size * beam_width);
     update_indir_cache_kernel<<<grid, block, 0, stream>>>(tgt_indir_cache, src_indir_cache, parent_ids, finished,
-        sequence_lengths, input_lengths, batch_dim, local_batch_size, beam_width, max_attention_window, max_seq_len);
+        sequence_lengths, input_lengths, batch_dim, local_batch_size, beam_width, max_attention_window,
+        sink_token_length, max_seq_len);
 }
 
 template <typename T>
@@ -200,7 +207,7 @@ void BaseBeamSearchLayer<T>::forward(BeamSearchOutputParams& outputs, ForwardPar
             reinterpret_cast<const FinishedState*>(
                 outputs.finished->template getPtr<const FinishedState::UnderlyingType>()),
             sequence_length, input_lengths, batch_size, local_batch_size, beam_width, max_seq_len,
-            params.max_attention_window, stream_);
+            params.max_attention_window, params.sink_token_length, stream_);
         sync_check_cuda_error();
     }
     sync_check_cuda_error();

@@ -135,6 +135,7 @@ This release of TensorRT-LLM contains the following examples:
 | Mistral    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | MPT        |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
 | OPT        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| Phi        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Replit Code|   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | SantaCoder |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | StarCoder  |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |

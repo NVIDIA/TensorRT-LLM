@@ -41,9 +41,11 @@ enum class WeightTypeId
     INT4 = 2,
 };
 
+constexpr int32_t FP16_BITS = 16;
 constexpr int32_t INT8_BITS = 8;
 constexpr int32_t INT4_BITS = 4;
 constexpr int32_t INT8_INT4_RATIO = INT8_BITS / INT4_BITS;
+constexpr int32_t FP16_INT4_RATIO = FP16_BITS / INT4_BITS;
 
 inline int32_t getWeightTypeMultiplier(WeightTypeId weightTypeId)
 {

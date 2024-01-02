@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -898,6 +898,8 @@ class DecoderModel(Module, GenerationMixin):
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
                     host_max_attention_window_sizes=max_attention_window_size,
+                    host_sink_token_length=kv_cache_params.
+                    host_sink_token_length,
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
                 all_reduce_workspace=all_reduce_workspace)
@@ -1224,6 +1226,11 @@ class DecoderModel(Module, GenerationMixin):
                     dim_range=OrderedDict([('scalar', [1])]))
                 host_max_attention_window_sizes.append(
                     host_attention_window_size_tensor)
+            host_sink_token_length = Tensor(name=f'host_sink_token_length',
+                                            dtype=trt.int32,
+                                            shape=[1],
+                                            dim_range=OrderedDict([('scalar',
+                                                                    [1])]))
 
         for i in layers_range:
             kv_dim_range = OrderedDict([
@@ -1263,6 +1270,7 @@ class DecoderModel(Module, GenerationMixin):
                 past_key_value=past_key_value,
                 host_past_key_value_lengths=host_past_key_value_lengths,
                 host_max_attention_window_sizes=host_max_attention_window_sizes,
+                host_sink_token_length=host_sink_token_length,
                 cache_indirection=cache_indirection)
 
             attention_params = AttentionParams(

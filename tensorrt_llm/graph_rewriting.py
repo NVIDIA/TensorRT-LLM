@@ -408,12 +408,9 @@ class FLayerInfo:
         def _swap_tensor_info(new, deprecated):
             name = deprecated.trt_tensor.name
             deprecated.trt_tensor.name = name + '_deprecated'
-            from ._common import default_net
             from .functional import cast
 
-            if default_net().strongly_typed:
-                if new.trt_tensor.dtype != deprecated.trt_tensor.dtype:
-                    new = cast(new, deprecated.trt_tensor.dtype)
+            new = cast(new, deprecated.dtype)
             new.trt_tensor.name = name
 
         def _reset_network_output_tensors(network, out, new_out):

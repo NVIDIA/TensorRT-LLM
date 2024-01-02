@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,7 @@ import csv
 import math
 from dataclasses import dataclass, field
 from functools import reduce, wraps
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Union
 
 import numpy as np
@@ -29,7 +30,8 @@ import tensorrt as trt
 from cuda import cudart
 
 from .._ipc_utils import IpcMemory, set_peer_access
-from .._utils import pad_vocab_size, str_dtype_to_torch, trt_dtype_to_torch
+from .._utils import (pad_vocab_size, str_dtype_to_torch, torch_to_numpy,
+                      trt_dtype_to_torch)
 from ..logger import logger
 from ..mapping import Mapping
 from ..quantization import QuantMode
@@ -251,6 +253,13 @@ class _Runtime(object):
                 context.set_input_shape(t.name, t.shape)
             context.set_tensor_address(t.name, t.data)
 
+    def _check_tensors(self, context: trt.IExecutionContext) -> None:
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            ptr = context.get_tensor_address(name)
+            if ptr == 0:
+                raise RuntimeError(f"Engine I/O tensor {name} is unbound")
+
     def _run(self,
              context: trt.IExecutionContext,
              stream: Union[int, torch.cuda.Stream] = None) -> bool:
@@ -302,6 +311,7 @@ class SamplingConfig:
     max_new_tokens: int = field(default=20)
     num_beams: int = field(default=1)
     max_attention_window_size: Optional[int] = field(default=None)
+    sink_token_length: Optional[int] = field(default=None)
     output_sequence_lengths: bool = field(default=False)
     return_dict: bool = field(default=False)
     stop_words_list: Optional[torch.Tensor] = field(default=None)
@@ -474,6 +484,8 @@ class GenerationSession(object):
         self.top_p_reset_ids = None
         #TODO: in tensorrt_llm/cpp/tensorrt_llm/thop/dynamicDecodeOp.cpp it's T, can be float or half?
         self.embedding_bias_opt = None
+        # use one more block in paged kv cache.
+        self.use_one_more_block = False
 
         self.buffer = None
         self.buffer_allocated = False
@@ -551,7 +563,7 @@ class GenerationSession(object):
         if model_config.gpt_attention_plugin:
             expected_tensor_names += [
                 'sequence_length', 'context_lengths', 'host_request_types',
-                'host_past_key_value_lengths'
+                'host_past_key_value_lengths', 'host_sink_token_length'
             ]
             expected_tensor_names += [
                 f'host_max_attention_window_size_{i}'
@@ -984,6 +996,7 @@ class GenerationSession(object):
               max_new_tokens: int,
               beam_width: int = 1,
               max_attention_window_size: Optional[int] = None,
+              sink_token_length: Optional[int] = None,
               encoder_max_input_length: Optional[int] = None,
               lora_manager: LoraManager = None,
               lora_uids: List[str] = None):
@@ -1042,6 +1055,20 @@ class GenerationSession(object):
             ]
         else:
             assert False, "invalid max_attention_window_size!"
+
+        if sink_token_length is None:
+            self.sink_token_length = 0
+            self.host_sink_token_length = torch.zeros((1, ), dtype=torch.int32)
+        elif isinstance(sink_token_length, int):
+            self.sink_token_length = sink_token_length
+            self.host_sink_token_length = torch.ones(
+                (1, ), dtype=torch.int32) * self.sink_token_length
+        else:
+            assert False, "invalid sink_token_length!"
+
+        self.use_one_more_block = (
+            self.paged_kv_cache and beam_width > 1
+            and self.max_seq_length > self.max_attention_window_size)
         self.lora_manager = lora_manager
 
         self.buffer = {}
@@ -1060,8 +1087,15 @@ class GenerationSession(object):
                 device=self.device)
 
         if self.paged_kv_cache:
+            bubble_len = 0
+            if self.sink_token_length % self.tokens_per_block > 0:
+                bubble_len += (self.tokens_per_block -
+                               self.sink_token_length % self.tokens_per_block)
             blocks = batch_size * beam_width * math.ceil(
-                self.max_attention_window_size / self.tokens_per_block)
+                (self.max_attention_window_size + bubble_len) /
+                self.tokens_per_block)
+            if self.use_one_more_block:
+                blocks += batch_size * beam_width
             cache_shape = (
                 blocks,
                 2,
@@ -1324,6 +1358,8 @@ class GenerationSession(object):
             # field 0: past_key_value_length, field 1: is_context (deprecated). changed to [0], otherwise affects batch padded input mode
             add_tensor_with_shape(host_context_lengths,
                                   'host_past_key_value_lengths', (batch_size, ))
+            add_tensor_with_shape(self.host_sink_token_length,
+                                  'host_sink_token_length', (1, ))
             add_tensor(host_request_types, 'host_request_types')
             for idx in range(self.first_layer, self.last_layer):
                 add_tensor_with_shape(
@@ -1502,7 +1538,8 @@ class GenerationSession(object):
                 sequence_length += 1
             add_tensor_with_shape(sequence_length, 'sequence_length',
                                   (batch_size * beam_width, ))
-
+            add_tensor_with_shape(self.host_sink_token_length,
+                                  'host_sink_token_length', (1, ))
             for idx in range(self.first_layer, self.last_layer):
                 add_tensor_with_shape(
                     self.host_max_attention_window_sizes[idx -
@@ -1734,6 +1771,8 @@ class GenerationSession(object):
                 # context mode, clean cuda graph instances
                 self.runtime.cuda_graph_instances = [None for _ in range(2)]
 
+        if self.debug_mode:
+            self.runtime._check_tensors(context)
         # dynamic_decoder currently use torch's current stream, so must let TRT enqueue use same stream here
         stream = torch.cuda.current_stream().cuda_stream
         instance_idx = step % 2
@@ -1850,11 +1889,6 @@ class GenerationSession(object):
             # one way to prolong it is to return the list, and destroy it in next step by assigning new values
             self.runtime._set_tensors(next_context, next_step_tensors)
 
-            if self.debug_mode:
-                self.debug_buffer = {
-                    name: tensor.to_torch()
-                    for name, tensor in next_step_tensors.items()
-                }
             if self.cuda_graph_mode:
                 # capture cuda graph
                 CUASSERT(
@@ -1885,19 +1919,6 @@ class GenerationSession(object):
         logits = None
         if self.mapping.is_last_pp_rank():
             logits = self.buffer['logits']
-            if self.debug_mode:
-                for k in self.debug_buffer:
-                    # if needed, apply filter based on output name
-                    tensors_to_save = self.debug_tensors
-                    if self.debug_tensors_to_save is not None:
-                        tensors_to_save = self.debug_tensors_to_save
-                    if all([kk not in k for kk in tensors_to_save]):
-                        continue
-                    t = self.debug_buffer[k]
-                    t = t.view(-1, t.shape[-1])  # consolidate all but last dim
-                    # convert tensor name to valid file name
-                    fname = "".join(c for c in k if (c.isalnum() or c in "._-"))
-                    np.savetxt(f"{fname}-step{step}.txt", t.cpu().detach())
             if logits is not None:
                 if logits_processor is not None:
                     final_output_ids = self.finalize_decoder(context_lengths,
@@ -1917,14 +1938,15 @@ class GenerationSession(object):
 
                 should_stop = self.dynamic_decoder.forward(
                     next_token_logits, decode_step, max_context_length,
-                    self.max_attention_window_size, ite, batch_size,
-                    self.end_ids, self.embedding_bias_opt, context_lengths,
-                    sequence_limit_lengths, stop_words_list, bad_words_list,
-                    no_repeat_ngram_size, this_src_cache_indirection,
-                    self.output_ids, self.new_tokens, self.finished,
-                    self.finished, self.sequence_length_buffer,
-                    self.cum_log_probs, self.log_probs, self.parent_ids,
-                    this_tgt_cache_indirection, self.beam_hyps_output_ids_tgt,
+                    self.max_attention_window_size, self.sink_token_length, ite,
+                    batch_size, self.end_ids, self.embedding_bias_opt,
+                    context_lengths, sequence_limit_lengths, stop_words_list,
+                    bad_words_list, no_repeat_ngram_size,
+                    this_src_cache_indirection, self.output_ids,
+                    self.new_tokens, self.finished, self.finished,
+                    self.sequence_length_buffer, self.cum_log_probs,
+                    self.log_probs, self.parent_ids, this_tgt_cache_indirection,
+                    self.beam_hyps_output_ids_tgt,
                     self.beam_hyps_sequence_lengths_tgt,
                     self.beam_hyps_cum_log_probs, self.beam_hyps_normed_scores,
                     self.beam_hyps_log_probs, self.beam_hyps_min_normed_scores,
@@ -1954,7 +1976,38 @@ class GenerationSession(object):
                 # With in-flight batching and while loop we'll free some sequences, when they are done
                 self.kv_cache_manager.step([True] * batch_size)
 
+        if self.debug_mode:
+            self.dump_debug_buffers(step)
+
+            self.debug_buffer = {
+                name: tensor.to_torch()
+                for name, tensor in next_step_tensors.items()
+            }
+
         return should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, encoder_input_lengths
+
+    def dump_debug_buffers(self, step: int) -> None:
+        if self.debug_tensors_to_save is not None:
+            # restricted written tensors according to filter
+            for k in self.debug_buffer.keys():
+                if k not in self.debug_tensors_to_save:
+                    self.debug_buffer.pop(k)
+
+        debug_dir = Path(
+            f"tllm_debug/PP_{self.mapping.pp_rank}/TP_{self.mapping.tp_rank}")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        for name, t in self.debug_buffer.items():
+            # convert tensor name to valid file name
+            fname = name.replace("/", ".")
+            t = torch_to_numpy(t)
+            np.save(debug_dir / f"{fname}-step{step}.npy", t)
+
+            txt_format = "%d" if t.dtype in [np.int32, np.int8] else '%.18e'
+            np.savetxt(
+                debug_dir / f"{fname}-step{step}.txt",
+                t.reshape(-1, t.shape[-1]),  # savetxt accepts 2 dims only
+                fmt=txt_format)
 
     def decode_regular(self,
                        batch_size: int,
@@ -2205,6 +2258,9 @@ class GenerationSession(object):
         assert beam_width == self.beam_width, \
             "Given beam width is different from the one used in setup()," \
             "rerun the setup function with the new beam width to avoid buffer overflow."
+        assert self.sink_token_length <= torch.min(context_lengths).item(), \
+            "Given sink token length is larger than shortest context length," \
+            "rerun the setup function with a smaller sink token length."
         ite = 0  # index of local batches, will always be 0 if pp_size = 1
 
         if self.remove_input_padding and input_ids.dim() == 2:
@@ -2255,8 +2311,15 @@ class GenerationSession(object):
 
         # Init KV cache block manager
         if self.paged_kv_cache:
-            max_blocks_per_seq = math.ceil(self.max_attention_window_size /
-                                           self.tokens_per_block)
+            bubble_len = 0
+            if self.sink_token_length % self.tokens_per_block > 0:
+                bubble_len += (self.tokens_per_block -
+                               self.sink_token_length % self.tokens_per_block)
+            max_blocks_per_seq = math.ceil(
+                (self.max_attention_window_size + bubble_len) /
+                self.tokens_per_block)
+            if self.use_one_more_block:
+                max_blocks_per_seq += 1
             blocks = batch_size * beam_width * max_blocks_per_seq
             memory_pools = [
                 self.buffer[f'present_key_value_{i}']
@@ -2264,7 +2327,8 @@ class GenerationSession(object):
             ]
             self.kv_cache_manager = KVCacheManager(
                 memory_pools, blocks, self.tokens_per_block, max_blocks_per_seq,
-                self.max_attention_window_size, beam_width)
+                self.max_attention_window_size, self.sink_token_length,
+                beam_width, self.use_one_more_block)
 
             # Add sequences to the manager
             for bi in range(batch_size):
@@ -2365,8 +2429,8 @@ class ChatGLMGenerationSession(GenerationSession):
                         mask_index.int(), gmask_index, smask_index, tail_index
                     ],
                                            dim=0).min()
-                    position_ids[i, 0, max_context_length - 1] = int(mask_index)
-                    position_ids[i, 1, max_context_length - 1] = 1
+                    position_ids[i, 0, length - 1] = int(mask_index)
+                    position_ids[i, 1, length - 1] = 1
                     self.mask_index_tensor[i] = int(mask_index)
             else:
                 for i in range(batch_size):

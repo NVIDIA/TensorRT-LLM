@@ -622,3 +622,33 @@ mpirun -n 2 python ../run.py --engine_dir "/tmp/new_lora_13b/trt_engines/fp16/2-
  Input: "今天天气很好，我到公园的时后，"
 Output: "我看见一个人坐在那边边看书书，我看起来还挺像你，可是我走过过去问了一下他说你是你吗，他说没有，然后我就说你看我看看你像你，他说说你看我像你，我说你是你，他说你是你，"
 ```
+
+## Run LLaMa with StreamingLLM
+
+* Build engine. Set `--enable_pos_shift` to use positions in KV cache for RoPE, and set `--dense_context_fmha` to use dense context fmha in context phase.
+
+```bash
+# Build the LLaMA 7B model with StreamingLLM feature using a single GPU and FP16.
+python build.py --model_dir ./tmp/llama/7B/ \
+                --dtype float16 \
+                --remove_input_padding \
+                --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
+                --use_gemm_plugin float16 \
+                --enable_pos_shift \
+                --dense_context_fmha \
+                --output_dir ./tmp/llama/7B/trt_engines/fp16_StreamingLLM/1-gpu/
+```
+
+* Run inference. Use `--sink_token_length` to set the number of sink tokens, and use `--max_attention_window_size` to set the `sliding_window` value.
+
+```bash
+# Run LLaMA 7B fp16 inference with sliding window/cache size 2048 and sink token length 4.
+python3 run.py --max_output_len=50 \
+               --tokenizer_dir ./tmp/llama/7B/ \
+               --engine_dir=./tmp/llama/7B/trt_engines/fp16_StreamingLLM/1-gpu/ \
+               --max_attention_window_size=2048 \
+               --sink_token_length=4
+```
+
+Note that the sink tokens is included in the sliding attention tokens, and there are at most `max_attention_window_size` tokens are stored in the KV cache.

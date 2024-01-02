@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -122,6 +122,10 @@ def parse_arguments():
                         default=False,
                         action='store_true',
                         help="Build engines serially")
+    parser.add_argument('--strongly_typed',
+                        default=False,
+                        action='store_true',
+                        help='This option will reduce the building time.')
 
     parser.add_argument(
         '--rank',
@@ -143,23 +147,19 @@ def parse_arguments():
 
 def get_quant_mode(quantization):
     quant_mode = QuantMode(0)
-    strongly_typed = False
     use_smooth_quant = False
     per_token = False
     per_channel = False
     weight_only_precision = 'int8'
 
     if quantization == "fp8":
-        strongly_typed = True
         quant_mode = quant_mode.set_fp8_qdq()
         quant_mode = quant_mode.set_fp8_kv_cache()
 
     elif quantization == "fp8_gemm":
-        strongly_typed = True
         quant_mode = quant_mode.set_fp8_qdq()
 
     elif quantization == "fp8_kv_cache":
-        strongly_typed = True
         quant_mode = quant_mode.set_fp8_kv_cache()
 
     elif quantization == "int8_sq_per_tensor":
@@ -205,7 +205,7 @@ def get_quant_mode(quantization):
     else:
         raise Exception(f'Unexpected quantization: {quantization}')
 
-    return quant_mode, strongly_typed, use_smooth_quant, weight_only_precision
+    return quant_mode, use_smooth_quant, weight_only_precision
 
 
 def build_gpt(args):
@@ -223,6 +223,9 @@ def build_gpt(args):
     if not args.serial_build:
         torch.cuda.set_device(runtime_rank)
 
+    strongly_typed = args.strongly_typed
+    if args.quantization is not None and "fp8" in args.quantization:
+        strongly_typed = True
     num_kv_heads = build_config['num_heads'] \
         if build_config['num_kv_heads'] is None else build_config['num_kv_heads']
     apply_query_key_layer_scaling = False
@@ -234,7 +237,7 @@ def build_gpt(args):
         if args.max_output_len is None else args.max_output_len
     max_beam_width = build_config['max_beam_width'] \
         if args.max_beam_width is None else args.max_beam_width
-    quant_mode, strongly_typed, use_smooth_quant, weight_only_precision = get_quant_mode(
+    quant_mode, use_smooth_quant, weight_only_precision = get_quant_mode(
         args.quantization)
     use_weight_only = quant_mode.is_weight_only()
 
@@ -243,6 +246,7 @@ def build_gpt(args):
         name=args.model,
         precision=args.dtype,
         timing_cache=None,
+        profiling_verbosity=args.profiling_verbosity,
         tensor_parallel=world_size,  # TP only
         parallel_build=True,
         num_layers=build_config['num_layers'],
@@ -468,21 +472,117 @@ def build_gpt(args):
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.BloomForCausalLM(config)
     elif family == "falcon":
-        tensorrt_llm_model = tensorrt_llm.models.FalconForCausalLM(
+        config = {
+            'architecture':
+            'FalconForCausalLM',
+            'dtype':
+            args.dtype,
+            'num_hidden_layers':
+            build_config['num_layers'],
+            'num_attention_heads':
+            build_config['num_heads'],
+            'num_key_value_heads':
+            build_config['num_heads'] if build_config['num_kv_heads'] is None
+            else build_config['num_kv_heads'],
+            'hidden_size':
+            build_config['hidden_size'],
+            'vocab_size':
+            build_config['vocab_size'],
+            'position_embedding_type':
+            'alibi_with_scale'
+            if build_config['use_alibi'] else 'rope_gpt_neox',
+            'max_position_embeddings':
+            build_config['n_positions'],
+            'hidden_act':
+            build_config['hidden_act'],
+            'quantization': {
+                'use_smooth_quant':
+                quant_mode.has_act_and_weight_quant(),
+                'per_channel':
+                quant_mode.has_per_channel_scaling(),
+                'per_token':
+                quant_mode.has_per_token_dynamic_scaling(),
+                'per_group':
+                quant_mode.has_per_group_scaling(),
+                'group_size':
+                128,
+                'int8_kv_cache':
+                quant_mode.has_int8_kv_cache(),
+                'enable_fp8':
+                quant_mode.has_fp8_qdq(),
+                'fp8_kv_cache':
+                quant_mode.has_fp8_kv_cache(),
+                'use_weight_only':
+                quant_mode.is_weight_only(),
+                'weight_only_precision':
+                'int8' if quant_mode.is_int8_weight_only() else 'int4',
+            },
+            'mapping': {
+                'world_size': world_size,
+                'tp_size': world_size
+            },
+            'bias':
+            build_config['bias'],
+            'parallel_attention':
+            build_config['parallel_attention'],
+            'new_decoder_architecture':
+            build_config['new_decoder_architecture'],
+        }
+        if quant_mode.is_weight_only() and quant_mode.has_per_group_scaling():
+            config['quantization'].update({
+                'zero': False,
+                'pre_quant_scale': True,
+                'exclude_modules': [],
+            })
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.FalconForCausalLM(config)
+    elif family == "baichuan_7b":
+        tensorrt_llm_model = tensorrt_llm.models.BaichuanForCausalLM(
+            num_layers=build_config['num_layers'],
+            num_heads=build_config['num_heads'],
+            num_kv_heads=None,
+            hidden_size=build_config['hidden_size'],
+            vocab_size=build_config['vocab_size'],
+            hidden_act=build_config['hidden_act'],
+            max_position_embeddings=build_config['n_positions'],
+            position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
+            dtype=kv_dtype,
+            mlp_hidden_size=build_config['inter_size'],
+            mapping=tensorrt_llm.Mapping(world_size=world_size,
+                                         tp_size=world_size),
+            quant_mode=quant_mode)
+    elif family == "baichuan_13b":
+        tensorrt_llm_model = tensorrt_llm.models.BaichuanForCausalLM(
+            num_layers=build_config['num_layers'],
+            num_heads=build_config['num_heads'],
+            num_kv_heads=None,
+            hidden_size=build_config['hidden_size'],
+            vocab_size=build_config['vocab_size'],
+            hidden_act=build_config['hidden_act'],
+            max_position_embeddings=build_config['n_positions'],
+            position_embedding_type=PositionEmbeddingType.alibi,
+            dtype=kv_dtype,
+            mlp_hidden_size=build_config['inter_size'],
+            mapping=tensorrt_llm.Mapping(world_size=world_size,
+                                         tp_size=world_size),
+            quant_mode=quant_mode)
+    elif family == "internlm":
+        tensorrt_llm_model = tensorrt_llm.models.LLaMAForCausalLM(
             num_layers=build_config['num_layers'],
             num_heads=build_config['num_heads'],
             num_kv_heads=num_kv_heads,
             hidden_size=build_config['hidden_size'],
             vocab_size=build_config['vocab_size'],
+            hidden_act=build_config['hidden_act'],
             max_position_embeddings=build_config['n_positions'],
             dtype=kv_dtype,
-            bias=build_config['bias'],
-            quant_mode=quant_mode,
-            use_alibi=build_config['use_alibi'],
-            new_decoder_architecture=build_config['new_decoder_architecture'],
-            parallel_attention=build_config['parallel_attention'],
+            mlp_hidden_size=build_config['inter_size'],
             mapping=tensorrt_llm.Mapping(world_size=world_size,
-                                         tp_size=world_size))
+                                         tp_size=world_size),  # TP only
+            quant_mode=quant_mode,
+            embedding_sharding_dim=1,
+            use_fused_mlp=False,
+            attn_bias=build_config['bias'])
     else:
         raise Exception(f'Unexpected model: {args.model}')
 
@@ -501,7 +601,7 @@ def build_gpt(args):
                 "zero": True,
                 "pre_quant_scale": False,
             }
-    if family not in ['opt', 'bloom']:
+    if family not in ['opt', 'bloom', 'falcon']:
         tensorrt_llm_model = quantize_model(tensorrt_llm_model, quant_mode,
                                             **quant_kwargs)
 
@@ -550,7 +650,7 @@ def build_gpt(args):
                                                    max_input_len,
                                                    max_output_len, True,
                                                    max_beam_width)
-        if family in ['opt', 'bloom']:
+        if family in ['opt', 'bloom', 'falcon']:
             tensorrt_llm_model(**inputs)
         else:
             tensorrt_llm_model(*inputs)
@@ -604,6 +704,7 @@ def build_bert(args):
         name=args.model,
         precision=args.dtype,
         timing_cache=None,
+        profiling_verbosity=args.profiling_verbosity,
         tensor_parallel=world_size,  # TP only
         parallel_build=True,
         num_layers=build_config['num_layers'],

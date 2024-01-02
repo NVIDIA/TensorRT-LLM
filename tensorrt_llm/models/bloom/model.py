@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -49,7 +49,8 @@ class BloomDecoderLayer(Module):
             tp_group=tp_group,
             tp_size=tp_size,
             tp_rank=tp_rank,
-            quant_mode=config.quant_mode)
+            quant_mode=config.quant_mode,
+            instance_id=2 * layer_idx)
 
         mlp_hidden_size = hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
 
@@ -60,7 +61,8 @@ class BloomDecoderLayer(Module):
                        bias=True,
                        tp_group=tp_group,
                        tp_size=tp_size,
-                       quant_mode=config.quant_mode)
+                       quant_mode=config.quant_mode,
+                       instance_id=2 * layer_idx + 1)
         self.post_layernorm = LayerNorm(normalized_shape=hidden_size,
                                         dtype=dtype)
 
@@ -69,7 +71,8 @@ class BloomDecoderLayer(Module):
                 attention_mask=None,
                 use_cache=False,
                 kv_cache_params=None,
-                attention_params=None):
+                attention_params=None,
+                all_reduce_workspace=None):
 
         assert isinstance(hidden_states, Tensor)
 
@@ -81,7 +84,8 @@ class BloomDecoderLayer(Module):
                                           attention_mask=attention_mask,
                                           use_cache=use_cache,
                                           kv_cache_params=kv_cache_params,
-                                          attention_params=attention_params)
+                                          attention_params=attention_params,
+                                          workspace=all_reduce_workspace)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -91,7 +95,7 @@ class BloomDecoderLayer(Module):
         residual = hidden_states
         hidden_states = self.post_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, all_reduce_workspace)
 
         hidden_states = residual + hidden_states
 
@@ -135,8 +139,9 @@ class BloomModel(Module):
                 prompt_embedding_table=None,
                 prompt_tasks=None,
                 prompt_vocab_size=None,
-                attention_params=None):
-        hidden_states = self.embedding(input_ids)
+                attention_params=None,
+                all_reduce_workspace=None):
+        hidden_states = self.embedding(input_ids, all_reduce_workspace)
 
         hidden_states = self.ln_embed(hidden_states)
 
@@ -144,7 +149,8 @@ class BloomModel(Module):
                                     use_cache=use_cache,
                                     attention_mask=attention_mask,
                                     kv_cache_params=kv_cache_params,
-                                    attention_params=attention_params)
+                                    attention_params=attention_params,
+                                    all_reduce_workspace=all_reduce_workspace)
 
         if use_cache:
             hidden_states, presents = hidden_states

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -57,6 +57,7 @@ def build_trt_llm(python_exe: str,
                   root_dir: _pl.Path,
                   build_dir: _pl.Path,
                   cuda_architectures: _tp.Optional[str] = None,
+                  use_ccache: _tp.Optional[bool] = False,
                   dist_dir: _tp.Optional[str] = None,
                   trt_root: _tp.Optional[str] = None):
     # Build wheel again to WAR issue that the "google-tests" target needs the cmake generated files
@@ -70,6 +71,10 @@ def build_trt_llm(python_exe: str,
         str(build_dir), "--dist_dir",
         str(dist_dir), "--python_bindings"
     ]
+
+    if use_ccache:
+        build_wheel.append("--use_ccache")
+
     if trt_root is not None:
         build_wheel += ["--trt_root", str(trt_root)]
 
@@ -93,7 +98,8 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
               run_fp8=False,
               only_multi_gpu=False,
               trt_root: _tp.Optional[str] = None,
-              build_only=False) -> None:
+              build_only=False,
+              use_ccache=False) -> None:
     root_dir = find_root_dir()
     _log.info("Using root directory: %s", str(root_dir))
 
@@ -105,6 +111,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                   root_dir=root_dir,
                   build_dir=build_dir,
                   cuda_architectures=cuda_architectures,
+                  use_ccache=use_ccache,
                   dist_dir=dist_dir,
                   trt_root=trt_root)
 
@@ -355,6 +362,9 @@ if __name__ == "__main__":
     parser = _arg.ArgumentParser()
 
     parser.add_argument("--cuda_architectures", "-a")
+    parser.add_argument("--use_ccache",
+                        action="store_true",
+                        help="Use ccache in cmake building stage")
     parser.add_argument("--build_dir",
                         type=str,
                         help="Directory where cpp sources are built")

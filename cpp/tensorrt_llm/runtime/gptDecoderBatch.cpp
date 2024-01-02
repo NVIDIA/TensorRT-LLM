@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -86,7 +86,7 @@ GptDecoderBatch::GptDecoderBatch(
     auto& dInput = mJointDecodingInput;
     auto dummyLogits = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     auto endIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-    dInput = std::make_unique<DecodingInput>(0, 0, 0, std::move(dummyLogits), std::move(endIds));
+    dInput = std::make_unique<DecodingInput>(0, 0, 0, 0, std::move(dummyLogits), std::move(endIds));
 
     dInput->sequenceLimitLength = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     dInput->lengths = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
@@ -116,7 +116,7 @@ GptDecoderBatch::GptDecoderBatch(
 }
 
 void GptDecoderBatch::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow,
-    SizeType maxSequenceLength, SizeType maxTokensPerStep, nvinfer1::DataType dtype)
+    SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep, nvinfer1::DataType dtype)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(maxBatchSize > 0);
@@ -127,6 +127,7 @@ void GptDecoderBatch::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeTy
     mGeneratedTokensPerStep.resize(maxBatchSize);
     mMaxSequenceLength = maxSequenceLength;
     mMaxAttentionWindow = maxAttentionWindow;
+    mSinkTokenLength = sinkTokenLength;
     mMaxTokensPerStep = maxTokensPerStep;
 
     auto const maxBatchSizeShape = ITensor::makeShape({maxBatchSize});
@@ -249,7 +250,7 @@ void GptDecoderBatch::newRequest(
     TensorPtr endIdTensorPtr{ITensor::slice(constPointerCast(dJointInput.endIds), batchIdx, localBatchSize)};
     kernels::invokeFill(*endIdTensorPtr, endId, *stream);
     dInput = std::make_unique<DecodingInput>(
-        inputLength, mMaxAttentionWindow, localBatchSize, dJointInput.logits, endIdTensorPtr);
+        inputLength, mMaxAttentionWindow, mSinkTokenLength, localBatchSize, dJointInput.logits, endIdTensorPtr);
 
     // Here, we need to add leading 1 dimension since decoderInput expects batchSize as leading dim
     // and decoder_batch::Request doesn't have batch dimension

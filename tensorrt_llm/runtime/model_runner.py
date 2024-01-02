@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,10 +23,10 @@ import torch
 
 from .. import profiler
 from .._utils import mpi_world_size
-from ..builder import Engine, get_engine_version
 from ..logger import logger
 from ..mapping import Mapping
 from ..quantization import QuantMode
+from .engine import Engine, get_engine_version
 from .generation import (ChatGLMGenerationSession, GenerationSession,
                          LogitsProcessor, LoraManager, ModelConfig,
                          QWenForCausalLMGenerationSession, SamplingConfig,
@@ -551,6 +551,7 @@ class ModelRunner(ModelRunnerMixin):
             max_new_tokens=sampling_config.max_new_tokens,
             beam_width=sampling_config.num_beams,
             max_attention_window_size=sampling_config.max_attention_window_size,
+            sink_token_length=sampling_config.sink_token_length,
             lora_manager=self.lora_manager,
             lora_uids=lora_uids)
 

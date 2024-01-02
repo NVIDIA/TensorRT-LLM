@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -55,8 +55,8 @@ protected:
 
 typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferManager& manager,
     std::shared_ptr<tc::CudaAllocator> allocator, size_t vocabSize, size_t vocabSizePadded, size_t batchSize,
-    size_t beamWidth, int step, int ite, int maxInputLength, size_t maxSeqLength, int localBatchSize,
-    std::vector<int>& cpuOutputIds, std::vector<float> cpuLogits, int noRepeatNgramSizeValue = 0)
+    size_t beamWidth, int step, int ite, int maxInputLength, size_t maxSeqLength, size_t sinkTokenLength,
+    int localBatchSize, std::vector<int>& cpuOutputIds, std::vector<float> cpuLogits, int noRepeatNgramSizeValue = 0)
 {
     constexpr int endId = 1;
     constexpr bool isFreeBufferAfterForward{false};
@@ -104,7 +104,7 @@ typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferMan
     ddLayer.setup(batchSize, beamWidth, setupParams);
 
     typename tl::DynamicDecodeLayer<float>::ForwardParams forwardParams(
-        step, ite, maxInputLength, static_cast<int>(maxSeqLength), localBatchSize, logits, endIds);
+        step, ite, maxInputLength, static_cast<int>(maxSeqLength), sinkTokenLength, localBatchSize, logits, endIds);
     forwardParams.no_repeat_ngram_size = noRepeatNgramSize;
 
     typename tl::DynamicDecodeLayer<float>::OutputParams outputParams(outputIds);
@@ -132,6 +132,7 @@ TEST_F(SamplingTest, SamplingWithNoRepeatNGramSize)
     constexpr int maxSeqLength{9};
     constexpr int localBatchSize{batchSize};
     constexpr int noRepeatNgramSize{3};
+    constexpr int sinkTokenLength{0};
 
     std::vector<int> cpuOutputIds(batchSize * beamWidth * maxSeqLength);
     int ids[maxInputLength] = {10, 11, 12, 40, 41, 42, 40, 41};
@@ -147,7 +148,7 @@ TEST_F(SamplingTest, SamplingWithNoRepeatNGramSize)
     cpuLogits[43] = 5.0;
 
     auto outputParams = dynamicDecodeTest(manager, allocator, vocabSize, vocabSizePadded, batchSize, beamWidth, step,
-        ite, maxInputLength, maxSeqLength, localBatchSize, cpuOutputIds, cpuLogits, noRepeatNgramSize);
+        ite, maxInputLength, maxSeqLength, sinkTokenLength, localBatchSize, cpuOutputIds, cpuLogits, noRepeatNgramSize);
 
     cudaMemcpy(cpuOutputIds.data(), outputParams.output_ids.getPtr<int>(), cpuOutputIds.size() * sizeof(int),
         cudaMemcpyDeviceToHost);

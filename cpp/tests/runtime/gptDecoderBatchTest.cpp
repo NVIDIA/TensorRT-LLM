@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -240,10 +240,12 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> con
 
     // We set maxAttentionWindow = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
     auto const maxAttentionWindow = maxSeqLength;
+    SizeType const sinkTokenLength{0};
 
     // set up decoder
     auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr);
-    decoder.setup(batchSize, maxBeamWidth, maxSeqLength, maxAttentionWindow, maxGeneratedTokensPerStep, dataType);
+    decoder.setup(batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength, maxGeneratedTokensPerStep,
+        dataType);
 
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
@@ -350,10 +352,12 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
 
     // We set maxAttentionWindow = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
     auto const maxAttentionWindow = maxSeqLength;
+    SizeType const sinkTokenLength{0};
 
     // set up decoder
     auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr);
-    decoder.setup(batchSize, maxBeamWidth, maxSeqLength, maxAttentionWindow, maxGeneratedTokensPerStep, dataType);
+    decoder.setup(batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength, maxGeneratedTokensPerStep,
+        dataType);
 
     std::vector<SizeType> expectedSteps(batchSize, 0);
     auto expectedLengths = tiledInputLengths;
@@ -459,10 +463,12 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
 
     // We set maxAttentionWindow = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
     auto const maxAttentionWindow = maxSeqLength;
+    SizeType const sinkTokenLength{0};
 
     // set up decoder
     auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr);
-    decoder.setup(batchSize, maxBeamWidth, maxSeqLength, maxAttentionWindow, maxGeneratedTokensPerStep, dataType);
+    decoder.setup(batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength, maxGeneratedTokensPerStep,
+        dataType);
 
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {

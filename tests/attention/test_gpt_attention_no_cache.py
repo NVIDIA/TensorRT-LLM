@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -99,6 +99,7 @@ class TestPluginNoCache(unittest.TestCase):
             host_context_lengths = inputs['host_context_lengths']
             host_max_attention_window_sizes = inputs[
                 'host_max_attention_window_sizes'][0]
+            host_sink_token_length = inputs['host_sink_token_length']
             context_lengths = inputs['context_lengths']
             host_request_types = inputs['host_request_types']
 
@@ -114,6 +115,7 @@ class TestPluginNoCache(unittest.TestCase):
                 sequence_length=sequence_length,
                 host_past_key_value_lengths=host_past_key_value_lengths,
                 host_max_attention_window_sizes=host_max_attention_window_sizes,
+                host_sink_token_length=host_sink_token_length,
                 context_lengths=context_lengths,
                 cache_indirection=cache_indirection,
                 host_request_types=host_request_types,
@@ -174,6 +176,7 @@ class TestPluginNoCache(unittest.TestCase):
                                                   dtype=torch.int32).cpu()
         host_max_attention_window_sizes = torch.tensor([max_input_len],
                                                        dtype=torch.int32).cpu()
+        host_sink_token_length = torch.tensor([0], dtype=torch.int32).cpu()
         context_lengths = torch.full([max_batch_size],
                                      max_input_len,
                                      dtype=torch.int32).cuda()
@@ -214,6 +217,7 @@ class TestPluginNoCache(unittest.TestCase):
         inputs = {
             'qkv': qkv,
             'host_max_attention_window_size_0': host_max_attention_window_sizes,
+            'host_sink_token_length': host_sink_token_length,
             'context_lengths': context_lengths,
             'host_request_types': host_request_types,
         }
@@ -244,6 +248,7 @@ class TestPluginNoCache(unittest.TestCase):
             'sequence_length': sequence_length,
             'host_past_key_value_lengths': host_past_key_value_lengths,
             'host_max_attention_window_size_0': host_max_attention_window_sizes,
+            'host_sink_token_length': host_sink_token_length,
             'context_lengths': context_lengths,
             'cache_indirection': cache_indirection,
             'host_request_types': host_request_types,

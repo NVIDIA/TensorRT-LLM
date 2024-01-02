@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -267,13 +267,19 @@ public:
         batch_scheduler::SchedulerPolicy schedulerPolicy, TrtGptModelOptionalParams const& optionalParams,
         std::shared_ptr<Recorder> recorder, std::optional<uint64_t> terminateReqId)
     {
+        ReturnBatchManagerStatsCallback iterationDataCallback{nullptr};
+        if (optionalParams.logIterationData)
+        {
+            iterationDataCallback = [this](const std::string& s) { return TLLM_LOG_INFO(s); };
+        }
+
         mBatchManager = std::make_shared<GptManager>(
             trtEnginePath, modelType, maxBeamWidth, schedulerPolicy,
             [this](int max_num_requests) { return getInferenceRequests(max_num_requests); },
             [this](uint64_t requestId, std::list<NamedTensor> response_tensors, bool final_response,
                 const std::string& errMsg)
             { return sendResponse(requestId, response_tensors, final_response, errMsg); },
-            nullptr, nullptr, optionalParams, terminateReqId);
+            nullptr, iterationDataCallback, optionalParams, terminateReqId);
         mRecorder = recorder;
         mTerminateReqId = terminateReqId;
     }
@@ -459,8 +465,14 @@ std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId,
     request->setMaxNewTokens(
         bufferManager.copyFrom(&request_output_len, ITensor::makeShape({1, 1}), MemoryType::kPINNED));
     request->setBeamWidth(beamWidthTensor);
-    request->setEndId(eosId);
-    request->setPadId(padId);
+    if (eosId != nullptr)
+    {
+        request->setEndId(eosId);
+    }
+    if (padId != nullptr)
+    {
+        request->setPadId(padId);
+    }
     return request;
 }
 
@@ -571,6 +583,8 @@ int main(int argc, char* argv[])
 
     options.add_options()("log_level", "Choose log level between verbose/info/warning/error/internal_error.",
         cxxopts::value<std::string>()->default_value("error"));
+    options.add_options()(
+        "log_iteration_data", "On each decoder iteration, print batch state metadata.", cxxopts::value<bool>());
 
     auto result = options.parse(argc, argv);
 
@@ -617,6 +631,11 @@ int main(int argc, char* argv[])
     if (result.count("enable_trt_overlap"))
     {
         optionalParams.enableTrtOverlap = result["enable_trt_overlap"].as<bool>();
+    }
+    // Argument: Enable batch stats output
+    if (result.count("log_iteration_data"))
+    {
+        optionalParams.logIterationData = result["log_iteration_data"].as<bool>();
     }
 
     std::optional<int32_t> padId;

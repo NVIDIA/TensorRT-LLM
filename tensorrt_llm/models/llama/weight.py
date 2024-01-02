@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,8 +23,8 @@ from safetensors import safe_open
 
 import tensorrt_llm
 import tensorrt_llm.logger as logger
-from tensorrt_llm._utils import (str_dtype_to_np, str_dtype_to_torch,
-                                 torch_to_numpy)
+from tensorrt_llm._utils import (numpy_to_torch, str_dtype_to_np,
+                                 str_dtype_to_torch, torch_to_numpy)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import LLaMAForCausalLM
 from tensorrt_llm.models.quantized.quant import get_dummy_quant_scales
@@ -334,15 +334,15 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
-                            torch.tensor(v), plugin_weight_only_quant_type)
+                            numpy_to_torch(v), plugin_weight_only_quant_type)
                     if not use_gemm_woq_plugin:
-                        dst.value = torch.tensor(v).numpy().astype(
+                        dst.value = numpy_to_torch(v).numpy().astype(
                             str_dtype_to_np(dtype))
                     else:
-                        dst.value = processed_torch_weights.numpy()
+                        dst.value = torch_to_numpy(processed_torch_weights)
                     scales = tensorrt_llm_llama.layers[
                         idx].attention.qkv.per_channel_scale
-                    scales.value = torch_weight_scales.numpy()
+                    scales.value = torch_to_numpy(torch_weight_scales)
                 else:
                     dst.value = np.ascontiguousarray(split_v)
             elif 'self_attn.o_proj.weight' in k:
@@ -352,15 +352,15 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
-                            torch.tensor(v), plugin_weight_only_quant_type)
+                            numpy_to_torch(v), plugin_weight_only_quant_type)
                     if not use_gemm_woq_plugin:
-                        dst.value = torch.tensor(v).numpy().astype(
+                        dst.value = numpy_to_torch(v).numpy().astype(
                             str_dtype_to_np(dtype))
                     else:
-                        dst.value = processed_torch_weights.numpy()
+                        dst.value = torch_to_numpy(processed_torch_weights)
                     scales = tensorrt_llm_llama.layers[
                         idx].attention.dense.per_channel_scale
-                    scales.value = torch_weight_scales.numpy()
+                    scales.value = torch_to_numpy(torch_weight_scales)
                 else:
                     dst.value = np.ascontiguousarray(split_v)
             elif 'mlp.up_proj.weight' in k:
@@ -370,17 +370,17 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
-                            torch.tensor(v), plugin_weight_only_quant_type)
+                            numpy_to_torch(v), plugin_weight_only_quant_type)
 
                     if not use_gemm_woq_plugin:
-                        dst.value = torch.tensor(v).numpy().astype(
+                        dst.value = numpy_to_torch(v).numpy().astype(
                             str_dtype_to_np(dtype))
                     else:
-                        dst.value = processed_torch_weights.numpy()
+                        dst.value = torch_to_numpy(processed_torch_weights)
 
                     scales = tensorrt_llm_llama.layers[
                         idx].mlp.gate.per_channel_scale
-                    scales.value = torch_weight_scales.numpy()
+                    scales.value = torch_to_numpy(torch_weight_scales)
                 else:
                     dst.value = np.ascontiguousarray(split_v)
             elif 'mlp.down_proj.weight' in k:
@@ -390,15 +390,15 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
-                            torch.tensor(v), plugin_weight_only_quant_type)
+                            numpy_to_torch(v), plugin_weight_only_quant_type)
                     if not use_gemm_woq_plugin:
-                        dst.value = torch.tensor(v).numpy().astype(
+                        dst.value = numpy_to_torch(v).numpy().astype(
                             str_dtype_to_np(dtype))
                     else:
-                        dst.value = processed_torch_weights.numpy()
+                        dst.value = torch_to_numpy(processed_torch_weights)
                     scales = tensorrt_llm_llama.layers[
                         idx].mlp.proj.per_channel_scale
-                    scales.value = torch_weight_scales.numpy()
+                    scales.value = torch_to_numpy(torch_weight_scales)
                 else:
                     dst.value = np.ascontiguousarray(split_v)
             elif 'mlp.gate_proj.weight' in k:
@@ -408,16 +408,16 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
-                            torch.tensor(v), plugin_weight_only_quant_type)
+                            numpy_to_torch(v), plugin_weight_only_quant_type)
 
                     if not use_gemm_woq_plugin:
-                        dst.value = torch.tensor(v).numpy().astype(
+                        dst.value = numpy_to_torch(v).numpy().astype(
                             str_dtype_to_np(dtype))
                     else:
-                        dst.value = processed_torch_weights.numpy()
+                        dst.value = torch_to_numpy(processed_torch_weights)
                     scales = tensorrt_llm_llama.layers[
                         idx].mlp.fc.per_channel_scale
-                    scales.value = torch_weight_scales.numpy()
+                    scales.value = torch_to_numpy(torch_weight_scales)
                 else:
                     dst.value = np.ascontiguousarray(split_v)
             elif 'experts.w2.weight' in k:
@@ -429,7 +429,7 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                         np.transpose(split_v, axes=(0, 2, 1)))
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
-                            torch.tensor(v), plugin_weight_only_quant_type)
+                            numpy_to_torch(v), plugin_weight_only_quant_type)
                     dst.value = processed_torch_weights
                     tensorrt_llm_llama.layers[
                         idx].mlp.experts_scale_2.value = torch_weight_scales
@@ -444,7 +444,7 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
                         np.transpose(split_v, axes=(0, 2, 1)))
                     processed_torch_weights, torch_weight_scales = \
                         torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
-                            torch.tensor(v), plugin_weight_only_quant_type)
+                            numpy_to_torch(v), plugin_weight_only_quant_type)
                     dst.value = processed_torch_weights
                     tensorrt_llm_llama.layers[
                         idx].mlp.experts_scale_1.value = torch_weight_scales
@@ -1246,7 +1246,7 @@ def load_from_gptq_llama(tensorrt_llm_llama,
         qweight_unpacked_int8 = unpack_int32_into_int8(
             qweight_int32.T).T.contiguous() - 8
         qweight_interleaved = preprocessor(packer(qweight_unpacked_int8),
-                                           torch.quint4x2).view(torch.int8)
+                                           torch.quint4x2).view(torch.float16)
         # zeros = zeros * scales
         qzeros_unpacked_int32 = unpack_int32_into_int8(qzeros_int32)
         if not USE_UINT4_INPUT:
@@ -1259,8 +1259,8 @@ def load_from_gptq_llama(tensorrt_llm_llama,
         zeros_x_scales_fp16 = zeros_x_scales_fp16.half()
 
         # return processed interleaved weight, original scales and zeros * scales
-        mOp.qweight.value = qweight_interleaved.cpu().numpy()
-        mOp.scale.value = scales_fp16.cpu().numpy()
+        mOp.weight.value = qweight_interleaved.cpu().numpy()
+        mOp.weights_scaling_factor.value = scales_fp16.cpu().numpy()
         mOp.zero.value = zeros_x_scales_fp16.cpu().numpy()
 
     # Load weights from GPTQ checkpoint into TRT-LLM module
@@ -1413,8 +1413,10 @@ def load_from_awq_llama(tensorrt_llm_llama: LLaMAForCausalLM,
         assert False, "Unsupported AWQ quantized checkpoint format"
 
     quant_mode = getattr(tensorrt_llm_llama, 'quant_mode', QuantMode(0))
-    # Int8 KV cache
+    # INT8 KV cache
     use_int8_kv_cache = quant_mode.has_int8_kv_cache()
+    # FP8 KV cache
+    use_fp8_kv_cache = quant_mode.has_fp8_kv_cache()
 
     packer = torch.ops.fastertransformer.pack_int8_tensor_to_packed_int4
     preprocessor = torch.ops.fastertransformer.preprocess_weights_for_mixed_gemm
@@ -1442,7 +1444,7 @@ def load_from_awq_llama(tensorrt_llm_llama: LLaMAForCausalLM,
         weight /= scale.repeat_interleave(group_size, dim=0)
         qweight_int8 = torch.clamp(torch.round(weight.cuda()).char(), -8, 7)
         int4_weight = preprocessor(packer(qweight_int8.cpu()), torch.quint4x2)
-        return int4_weight.view(torch.int8).cpu().numpy()
+        return int4_weight.view(torch.float16).cpu().numpy()
 
     def process_and_assign_weight(mOp, v, tp_dim=0):
         weight = v[0].T.contiguous()
@@ -1454,9 +1456,9 @@ def load_from_awq_llama(tensorrt_llm_llama: LLaMAForCausalLM,
         if tp_dim == 0:
             pre_quant_scale = torch_split(pre_quant_scale, 1)
         scale = amax / 8.0
-        mOp.qweight.value = AWQ_quantize_pack_preprocess(weight, scale)
-        mOp.scale.value = scale.to(torch_dtype).cpu().numpy()
-        mOp.pre_quant_scale.value = pre_quant_scale.to(
+        mOp.weight.value = AWQ_quantize_pack_preprocess(weight, scale)
+        mOp.weights_scaling_factor.value = scale.to(torch_dtype).cpu().numpy()
+        mOp.prequant_scaling_factor.value = pre_quant_scale.to(
             torch_dtype).cpu().numpy()
 
     def reSmooth_and_get_scale(weight, pre_quant_scale, avg_pre_quant_scale):
@@ -1506,10 +1508,11 @@ def load_from_awq_llama(tensorrt_llm_llama: LLaMAForCausalLM,
         qkv_weights = torch.cat((q_weight, k_weight, v_weight), dim=1)
         qkv_scale = torch.cat((q_scale, k_scale, v_scale), dim=1)
 
-        mOp.pre_quant_scale.value = qkv_pre_quant_scale.to(
+        mOp.prequant_scaling_factor.value = qkv_pre_quant_scale.to(
             torch_dtype).cpu().numpy()
-        mOp.qweight.value = AWQ_quantize_pack_preprocess(qkv_weights, qkv_scale)
-        mOp.scale.value = qkv_scale.to(torch_dtype).cpu().numpy()
+        mOp.weight.value = AWQ_quantize_pack_preprocess(qkv_weights, qkv_scale)
+        mOp.weights_scaling_factor.value = qkv_scale.to(
+            torch_dtype).cpu().numpy()
 
     # Load weights from AWQ checkpoint into TRT-LLM module
     # 1. vocab_embedding
@@ -1578,7 +1581,7 @@ def load_from_awq_llama(tensorrt_llm_llama: LLaMAForCausalLM,
         v = load(prefix + awq_key_list[10])
         layer.post_layernorm.weight.value = v.to(torch_dtype).cpu().numpy()
 
-        # 4.8 attention.kv_quant_orig_scale / kv_quant_orig_scale
+        # 4.8 attention.kv_quant_orig_scale / kv_quant_orig_scale for INT8 KV cache
         if use_int8_kv_cache:
             assert bin_model_dir, "You must pass --bin_model_dir to tell TRT-LLM where to look for scales of INT8 kv cache."
             t = fromfile(
@@ -1586,6 +1589,12 @@ def load_from_awq_llama(tensorrt_llm_llama: LLaMAForCausalLM,
                 '.attention.query_key_value.scale_y_quant_orig.bin', [1],
                 np.float32)
             assert t is not None, f"{bin_model_dir} does not contain model.layers.{layer_idx}.attention.query_key_value.scale_y_quant_orig.bin"
+            layer.attention.kv_orig_quant_scale.value = 1.0 / t
+            layer.attention.kv_quant_orig_scale.value = t
+
+        # 4.9 attention.kv_quant_orig_scale / kv_quant_orig_scale for FP8 KV cache
+        if use_fp8_kv_cache:
+            t = torch.Tensor([1.0])
             layer.attention.kv_orig_quant_scale.value = 1.0 / t
             layer.attention.kv_quant_orig_scale.value = t
 

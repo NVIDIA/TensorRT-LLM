@@ -2,6 +2,8 @@ import os
 import tempfile
 from typing import List
 
+import pytest
+import torch
 from transformers import AutoTokenizer
 
 from tensorrt_llm.hlapi.llm import (LLM, ModelConfig, SamplingConfig,
@@ -9,21 +11,23 @@ from tensorrt_llm.hlapi.llm import (LLM, ModelConfig, SamplingConfig,
 
 llm_models_root = os.environ.get('LLM_MODELS_ROOT',
                                  '/scratch.trt_llm_data/llm-models/')
+llm_engine_root = os.environ.get('LLM_ENGINE_ROOT', None)
+
 llama_model_path = os.path.join(llm_models_root, "llama-models/llama-7b-hf")
+
+prompts = ["Tell a story", "Who are you"]
 
 
 def test_llm_loadding_from_hf():
     config = ModelConfig(model_dir=llama_model_path)
     llm = LLM(config)
 
-    prompts = ["hello world", "What is"]
-
     for output in llm(prompts):
         print(output)
 
 
-def llm_loading_from_engine():
-    # TODO[chunweiy]: Enable this test later
+def _test_llm_loading_from_engine():
+    # TODO[chunweiy]: Enable this test later, OOM
     # build the engine
     config = ModelConfig(model_dir=llama_model_path)
     llm = LLM(config)
@@ -34,8 +38,6 @@ def llm_loading_from_engine():
 
         config = ModelConfig(model_dir=tmpdir)
         new_llm = LLM(config)
-
-        prompts = ["hello world", "What is"]
 
         for output in new_llm(prompts):
             print(output)
@@ -79,8 +81,6 @@ def test_llm_with_customized_tokenizer():
         # a customized tokenizer is passed to override the default one
         tokenizer=MyTokenizer.from_pretrained(config.model_dir))
 
-    prompts = ["hello world", "What is"]
-
     for output in llm(prompts):
         print(output)
 
@@ -102,3 +102,31 @@ def test_llm_without_tokenizer():
 
     for output in llm(prompts, sampling_config=sampling_config):
         print(output)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="The test needs at least 2 GPUs, skipping")
+def test_llm_build_engine_for_tp2():
+    config = ModelConfig(model_dir=llama_model_path)
+    config.parallel_config.tp_size = 2
+    llm = LLM(config)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        engine_path = llm_engine_root or tmpdir
+        llm.save(engine_path)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="The test needs at least 2 GPUs, skipping")
+def test_llm_generate_for_tp2():
+    config = ModelConfig(model_dir=llama_model_path)
+    config.parallel_config.tp_size = 2
+    llm = LLM(config)
+    for output in llm(prompts):
+        print(output)
+
+
+# TODO[chunweiy]: Add a multi-gpu test on loading engine
+
+if __name__ == '__main__':
+    test_llm_loadding_from_hf()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -72,6 +72,11 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
         ["pip", "install", "-r",
          str(resources_dir) + "/requirements.txt"],
         cwd=resources_dir)
+
+    # chatglm needs 4.33.1 in case of tokenizer issues
+    # AttributeError: 'ChatGLMTokenizer' object has no attribute 'sp_tokenizer'. Did you mean: '_tokenize'?
+    run_command(["pip", "install", "--force-reinstall", "transformers==4.33.1"],
+                cwd=resources_dir)
 
     # Clone the model directory
     for model_name, hf_dir in zip(model_name_list, hf_dir_list):

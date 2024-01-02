@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -504,7 +504,7 @@ class TestGPT(unittest.TestCase):
             kv_cache_manager = KVCacheManager(key_value_cache_buffers, blocks,
                                               tokens_per_block,
                                               max_blocks_per_seq, total_length,
-                                              beam_width)
+                                              0, beam_width)
 
             # Add sequences to the manager
             for bi in range(batch_size):
@@ -524,6 +524,7 @@ class TestGPT(unittest.TestCase):
                        cache_indirection,
                        host_past_key_value_lengths,
                        host_max_attention_window_sizes,
+                       host_sink_token_length,
                        sequence_length=None,
                        host_context_lengths=None):
 
@@ -536,6 +537,7 @@ class TestGPT(unittest.TestCase):
                 'cache_indirection': cache_indirection,
                 'host_past_key_value_lengths': host_past_key_value_lengths,
                 'sequence_length': sequence_length,
+                'host_sink_token_length': host_sink_token_length,
             }
 
             assert host_request_types is not None
@@ -620,6 +622,7 @@ class TestGPT(unittest.TestCase):
 
             host_max_attention_window_sizes = torch.tensor([total_length],
                                                            dtype=torch.int32)
+            host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
             host_context_lengths = ctx_context_lengths.cpu(
             ) if enable_remove_input_padding else None
@@ -641,6 +644,7 @@ class TestGPT(unittest.TestCase):
                 cache_indirection=cache_indirections[0],
                 host_past_key_value_lengths=host_past_key_value_lengths,
                 host_max_attention_window_sizes=host_max_attention_window_sizes,
+                host_sink_token_length=host_sink_token_length,
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types)
@@ -693,6 +697,7 @@ class TestGPT(unittest.TestCase):
                                                        dtype=torch.int32)
             host_max_attention_window_sizes = torch.tensor([seq_len + step],
                                                            dtype=torch.int32)
+            host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
             host_context_lengths = gen_context_lengths.cpu(
             ) if enable_remove_input_padding else None
@@ -711,6 +716,7 @@ class TestGPT(unittest.TestCase):
                 cache_indirection=cache_indirections[1],
                 host_past_key_value_lengths=host_past_key_value_lengths,
                 host_max_attention_window_sizes=host_max_attention_window_sizes,
+                host_sink_token_length=host_sink_token_length,
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types)
@@ -769,6 +775,8 @@ class TestGPT(unittest.TestCase):
             host_max_attention_window_sizes = torch.tensor([total_length],
                                                            dtype=torch.int32)
 
+            host_sink_token_length = torch.tensor([0], dtype=torch.int32)
+
             context_lengths = torch.tensor([seq_len] * batch_size,
                                            dtype=torch.int32).cuda()
             if enable_remove_input_padding:
@@ -792,6 +800,7 @@ class TestGPT(unittest.TestCase):
                 cache_indirection=cache_indirections[0],
                 host_past_key_value_lengths=host_past_key_value_lengths,
                 host_max_attention_window_sizes=host_max_attention_window_sizes,
+                host_sink_token_length=host_sink_token_length,
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types,

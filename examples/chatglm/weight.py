@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -540,7 +540,7 @@ def load_from_awq(
         weight = torch.clamp(torch.round(weight.cuda()).char(), -8, 7)
         weight = int8_to_int4(weight.cpu())
         weight = int4_to_int4x2(weight, torch.quint4x2)
-        return weight
+        return weight.view(torch.float16)
 
     def process_and_assign_weight(op, prefix, tp_dim=0):
         name = prefix + ".weight"
@@ -563,9 +563,10 @@ def load_from_awq(
                                                     dim=1)[mapping.tp_rank]
 
         scale = amax / 8.0
-        op.qweight.value = AWQ_quantize_pack_preprocess(weight, scale)
-        op.scale.value = scale.to(torch_dtype).cpu().numpy()
-        op.pre_quant_scale.value = pre_quant_scale.to(torch_dtype).cpu().numpy()
+        op.weight.value = AWQ_quantize_pack_preprocess(weight, scale)
+        op.weights_scaling_factor.value = scale.to(torch_dtype).cpu().numpy()
+        op.prequant_scaling_factor.value = pre_quant_scale.to(
+            torch_dtype).cpu().numpy()
 
     if mapping.is_first_pp_rank():
         # Embedding

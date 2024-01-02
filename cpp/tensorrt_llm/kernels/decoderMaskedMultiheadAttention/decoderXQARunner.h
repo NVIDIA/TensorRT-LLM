@@ -63,6 +63,7 @@ struct XQAParams
     int32_t beam_width = 0;
     int32_t max_attention_window_size = 0;
     int32_t cyclic_attention_window_size = 0;
+    int32_t sink_token_length = 0;
     int timestep = 0;
     const void* qkv_bias;
     const int32_t* sequence_lengths; //
@@ -82,6 +83,7 @@ struct XQAParams
     float rotary_embedding_scale;
     int rotary_embedding_max_positions;
     tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type;
+    bool position_shift_enabled = false;
     bool remove_padding = false;
     tensorrt_llm::kernels::AttentionMaskType mask_type;
     bool paged_kv_cache;
@@ -144,6 +146,8 @@ public:
             SUPPORT_RETURN_FALSE("beam_width");
         if (xqaParams.cyclic_attention_window_size != xqaParams.max_attention_window_size)
             SUPPORT_RETURN_FALSE("cyclic_attention_window_size != max_attention_window_size");
+        if (xqaParams.position_shift_enabled || xqaParams.sink_token_length > 0)
+            SUPPORT_RETURN_FALSE("streaming-llm");
         return shouldUseImpl(xqaParams);
     }
 
@@ -181,6 +185,10 @@ private:
     static constexpr int kMaxNbCtaPerKVHeadFactor = 4;
 
     static constexpr int kMaxBeamWidth = 4;
+
+    // Cache the grid_size and block_size that gives the highest occupancy for
+    //  invokeApplyBiasRopeUpdateKVCache.
+    int2 mLaunchGridBlockCache = make_int2(0, 0);
 
     class xqaImpl;
     std::unique_ptr<xqaImpl> pimpl;

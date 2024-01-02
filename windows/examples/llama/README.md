@@ -6,6 +6,9 @@ This document shows how to run a quick benchmark of LLaMA model with TensorRT-LL
 
 The TensorRT-LLM LLaMA example code is located in [`examples/llama`](../../../examples/llama/) and contains detailed instructions on how to build [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) and perform inference using the the LLaMA model. Please consult the [instructions](../../../examples/llama/README.md) in that folder for details.
 
+Please refer to [these instructions](../../../examples/llama/README.md#awq) for AWQ weight quantization and engine generation.
+Sample int4 AWQ quantized weights can be downloaded from [llama2-13b-int4-chat](https://catalog.ngc.nvidia.com/orgs/nvidia/models/llama2-13b/files?version=1.3), [code-llama-13b-int4-instruct](https://catalog.ngc.nvidia.com/orgs/nvidia/models/code_llama/files?version=1.1).
+
 Rather, here we showcase how to run a quick benchmark using the provided `benchmark.py` script. This script builds, runs, and benchmarks an INT4-GPTQ quantized LLaMA model using TensorRT.
 
 ```bash

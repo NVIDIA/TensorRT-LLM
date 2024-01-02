@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ namespace tc = tensorrt_llm::common;
 
 RuntimeBuffers::GenerationConfig RuntimeBuffers::GenerationConfig::fromInput(ITensor const& inputIds,
     ITensor const& inputLengthsHost, bool const inputPacked, SizeType const beamWidth,
-    SizeType const maxAttentionWindow, SizeType const maxSequenceLength)
+    SizeType const maxAttentionWindow, SizeType const sinkTokenLength, SizeType const maxSequenceLength)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     auto const batchSize = static_cast<SizeType>(inputLengthsHost.getSize());
@@ -73,7 +73,7 @@ RuntimeBuffers::GenerationConfig RuntimeBuffers::GenerationConfig::fromInput(ITe
 
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
     return GenerationConfig{
-        batchSize, beamWidth, maxInputLength, maxAttentionWindow, maxSequenceLength, inputLengthSum};
+        batchSize, beamWidth, maxInputLength, maxAttentionWindow, sinkTokenLength, maxSequenceLength, inputLengthSum};
 }
 
 void RuntimeBuffers::clear()
@@ -190,6 +190,7 @@ void RuntimeBuffers::create(TllmRuntime& runtime, GptModelConfig const& modelCon
         pastKeyValueLengths = manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32);
         maxAttentionWindows
             = utils::createBufferVector(runtime, localNbLayers, MemoryType::kCPU, nvinfer1::DataType::kINT32);
+        sinkTokenLengths = manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32);
     }
     else
     {
@@ -215,7 +216,8 @@ void RuntimeBuffers::create(TllmRuntime& runtime, GptModelConfig const& modelCon
 }
 
 void RuntimeBuffers::initFromInput(ITensor const& inputIds, TensorPtr const& inputLengths, bool inputPacked,
-    SizeType beamWidth, SizeType maxAttentionWindow, SizeType maxSequenceLength, BufferManager& manager)
+    SizeType beamWidth, SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSequenceLength,
+    BufferManager& manager)
 {
     contextLengthsDevice = inputLengths;
     contextLengthsHost->reshape(inputLengths->getShape());
@@ -223,7 +225,7 @@ void RuntimeBuffers::initFromInput(ITensor const& inputIds, TensorPtr const& inp
     manager.getStream().synchronize(); // wait for context lengths to be copied to host
 
     generationConfig = RuntimeBuffers::GenerationConfig::fromInput(
-        inputIds, *contextLengthsHost, inputPacked, beamWidth, maxAttentionWindow, maxSequenceLength);
+        inputIds, *contextLengthsHost, inputPacked, beamWidth, maxAttentionWindow, sinkTokenLength, maxSequenceLength);
 }
 
 void RuntimeBuffers::reshape(GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
@@ -234,6 +236,8 @@ void RuntimeBuffers::reshape(GptModelConfig const& modelConfig, WorldConfig cons
     auto const beamWidth = generationConfig.beamWidth;
     auto const maxInputLength = generationConfig.maxInputLength;
     auto const maxAttentionWindow = generationConfig.maxAttentionWindow;
+    auto const sinkTokenLen = generationConfig.sinkTokenLength;
+    auto const maxSeqLength = generationConfig.maxSeqLength;
     auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
 
     if (worldConfig.isLastPipelineParallelRank())
@@ -266,7 +270,15 @@ void RuntimeBuffers::reshape(GptModelConfig const& modelConfig, WorldConfig cons
     {
         auto const localNbLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
         auto const tokensPerBlock = modelConfig.getTokensPerBlock();
-        auto const maxBlocksPerSeq = (maxAttentionWindow + tokensPerBlock - 1) / tokensPerBlock;
+        SizeType bubbleLen
+            = (sinkTokenLen % tokensPerBlock == 0) ? 0 : tokensPerBlock - (sinkTokenLen % tokensPerBlock);
+        auto maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow + bubbleLen, tokensPerBlock);
+        // If beamWidth > 1, use one more block for each sequence in the paged kv cache to avoid dropping the needed
+        // tokens, when enabling cyclic kv cache.
+        if (beamWidth > 1 && maxSeqLength > maxAttentionWindow)
+        {
+            maxBlocksPerSeq += 1;
+        }
 
         // reserve batchSize * beamWidth and resize to batchSize
         auto cacheBlockPointersShape = ITensor::makeShape({localNbLayers, batchSize * beamWidth, 2, maxBlocksPerSeq});
@@ -286,6 +298,7 @@ void RuntimeBuffers::reshape(GptModelConfig const& modelConfig, WorldConfig cons
         pastKeyValueLengths->reshape(ITensor::makeShape({batchSize}));
         requestTypes->reshape(ITensor::makeShape({batchSize}));
         utils::reshapeBufferVector(maxAttentionWindows, ITensor::makeShape({1}));
+        sinkTokenLengths->reshape(ITensor::makeShape({1}));
     }
     else
     {
@@ -381,6 +394,7 @@ std::vector<RuntimeBuffers> RuntimeBuffers::split(
             {
                 buffers.pastKeyValueLengths = ITensor::slice(pastKeyValueLengths, offset, batchSize);
                 buffers.maxAttentionWindows = maxAttentionWindows;
+                buffers.sinkTokenLengths = sinkTokenLengths;
                 buffers.requestTypes = ITensor::slice(requestTypes, offset, batchSize);
             }
             else
@@ -585,11 +599,12 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
         TLLM_CHECK(requestTypes->getSize() == static_cast<std::size_t>(batchSize));
         std::fill_n(RequestTypesPtr, batchSize, 0);
 
-        // Set maxAttentionWindows buffer to the same value currently.
+        // Set maxAttentionWindows buffer and sinkTokenLengths to the same value currently.
         for (auto layer = 0; layer < localNbLayers; ++layer)
         {
             bufferCast<SizeType>(*maxAttentionWindows[layer])[0] = generationConfig.maxAttentionWindow;
         }
+        bufferCast<SizeType>(*sinkTokenLengths)[0] = generationConfig.sinkTokenLength;
 
         auto const& inputShape = inputIds->getShape();
         auto const contextLengthsHostPtr = bufferCast<SizeType const>(*contextLengthsHost);
@@ -866,6 +881,7 @@ void RuntimeBuffers::getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outpu
         inputBuffers.insert_or_assign("host_past_key_value_lengths", pastKeyValueLengths);
         inputBuffers.insert_or_assign("host_request_types", requestTypes);
         inputBuffers.insert_or_assign("sequence_length", sequenceLengths);
+        inputBuffers.insert_or_assign("host_sink_token_length", sinkTokenLengths);
         utils::insertTensorVector(inputBuffers, "host_max_attention_window_size_", maxAttentionWindows, firstLayerId);
 
         if (modelConfig.usePackedInput())

@@ -15,8 +15,8 @@ from tensorrt_llm import logger
 from tensorrt_llm.runtime import Session, TensorInfo
 
 
-def get_engine_name(model, dtype, tp_size, rank):
-    return '{}_{}_tp{}_rank{}.engine'.format(model, dtype, tp_size, rank)
+def get_engine_name(rank):
+    return 'rank{}.engine'.format(rank)
 
 
 def trt_dtype_to_torch(dtype):
@@ -31,20 +31,21 @@ def trt_dtype_to_torch(dtype):
 
 
 def TRTOPT(args, config):
-    dtype = config['builder_config']['precision']
-    world_size = config['builder_config']['tensor_parallel']
+    dtype = config['pretrained_config']['dtype']
+    world_size = config['pretrained_config']['mapping']['world_size']
     assert world_size == tensorrt_llm.mpi_world_size(), \
         f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
 
     use_gpt_attention_plugin = bool(
-        config['plugin_config']['gpt_attention_plugin'])
-    world_size = config['builder_config']['tensor_parallel']
-    num_heads = config['builder_config']['num_heads'] // world_size
-    hidden_size = config['builder_config']['hidden_size'] // world_size
-    vocab_size = config['builder_config']['vocab_size']
-    num_layers = config['builder_config']['num_layers']
-    remove_input_padding = config['plugin_config']['remove_input_padding']
-    max_prompt_embedding_table_size = config['builder_config'].get(
+        config['build_config']['plugin_config']['gpt_attention_plugin'])
+
+    num_heads = config['pretrained_config']['num_attention_heads'] // world_size
+    hidden_size = config['pretrained_config']['hidden_size'] // world_size
+    vocab_size = config['pretrained_config']['vocab_size']
+    num_layers = config['pretrained_config']['num_hidden_layers']
+    remove_input_padding = config['build_config']['plugin_config'][
+        'remove_input_padding']
+    max_prompt_embedding_table_size = config['build_config'].get(
         'max_prompt_embedding_table_size', 0)
 
     model_config = tensorrt_llm.runtime.ModelConfig(
@@ -62,7 +63,7 @@ def TRTOPT(args, config):
     runtime_mapping = tensorrt_llm.Mapping(world_size, runtime_rank)
     torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
 
-    engine_name = get_engine_name('opt', dtype, world_size, runtime_rank)
+    engine_name = get_engine_name(runtime_rank)
     serialize_path = os.path.join(args.opt_engine_dir, engine_name)
 
     tensorrt_llm.logger.set_level(args.log_level)
@@ -73,8 +74,7 @@ def TRTOPT(args, config):
                                                      engine_buffer,
                                                      runtime_mapping)
 
-    dtype = config['builder_config']['precision']
-    max_input_len = config['builder_config']['max_input_len']
+    max_input_len = config['build_config']['max_input_len']
     return decoder, model_config, world_size, dtype, max_input_len
 
 

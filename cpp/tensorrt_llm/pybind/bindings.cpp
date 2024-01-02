@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -63,11 +63,14 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     tpr::GenerationOutput::initBindings(m);
 
     py::class_<tbk::KvCacheConfig>(m, "KvCacheConfig")
-        .def(py::init<std::optional<SizeType>, std::optional<SizeType>, std::optional<float>, bool>(),
+        .def(py::init<std::optional<SizeType>, std::optional<SizeType>, std::optional<SizeType>, std::optional<float>,
+                 bool>(),
             py::arg("max_tokens") = py::none(), py::arg("max_attention_window") = py::none(),
-            py::arg("free_gpu_memory_fraction") = py::none(), py::arg("enable_block_reuse") = false)
+            py::arg("sink_token_length") = py::none(), py::arg("free_gpu_memory_fraction") = py::none(),
+            py::arg("enable_block_reuse") = false)
         .def_readwrite("max_tokens", &tbk::KvCacheConfig::maxTokens)
         .def_readwrite("max_attention_window", &tbk::KvCacheConfig::maxAttentionWindow)
+        .def_readwrite("sink_token_length", &tbk::KvCacheConfig::sinkTokenLength)
         .def_readwrite("free_gpu_memory_fraction", &tbk::KvCacheConfig::freeGpuMemoryFraction)
         .def_readwrite("enable_block_reuse", &tbk::KvCacheConfig::enableBlockReuse);
 

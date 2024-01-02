@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -297,5 +297,12 @@ class FusedGatedMLP(GatedMLP):
             raise NotImplementedError(
                 f"Activation {self.hidden_act} not yet implemented for FusedGatedMLP"
             )
-        output = self.proj(inter, workspace)
+
+        mlp_proj_lora_params = None
+        if lora_layer_params is not None:
+            mlp_proj_lora_params = lora_layer_params.get_runtime_params(
+                0, "mlp_4h_to_h")
+        output = self.proj(inter,
+                           workspace,
+                           lora_runtime_params=mlp_proj_lora_params)
         return output

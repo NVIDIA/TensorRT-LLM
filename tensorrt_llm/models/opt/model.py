@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -45,7 +45,8 @@ class OPTDecoderLayer(Module):
             attention_mask_type=AttentionMaskType.causal,
             dtype=dtype,
             tp_group=tp_group,
-            tp_size=tp_size)
+            tp_size=tp_size,
+            instance_id=2 * layer_idx)
 
         mlp_hidden_size = hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
 
@@ -54,7 +55,8 @@ class OPTDecoderLayer(Module):
                        hidden_act=config.hidden_act,
                        dtype=dtype,
                        tp_group=tp_group,
-                       tp_size=tp_size)
+                       tp_size=tp_size,
+                       instance_id=2 * layer_idx + 1)
         self.post_layernorm = LayerNorm(normalized_shape=hidden_size,
                                         dtype=dtype)
 
@@ -63,7 +65,8 @@ class OPTDecoderLayer(Module):
                 attention_mask=None,
                 use_cache=False,
                 kv_cache_params=None,
-                attention_params=None):
+                attention_params=None,
+                all_reduce_workspace=None):
         residual = hidden_states
 
         attention_input = hidden_states
@@ -77,7 +80,8 @@ class OPTDecoderLayer(Module):
                                           attention_mask=attention_mask,
                                           use_cache=use_cache,
                                           kv_cache_params=kv_cache_params,
-                                          attention_params=attention_params)
+                                          attention_params=attention_params,
+                                          workspace=all_reduce_workspace)
         if use_cache:
             attention_output, presents = attention_output
 
@@ -89,7 +93,7 @@ class OPTDecoderLayer(Module):
         if self.do_layer_norm_before:
             hidden_states = self.post_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, all_reduce_workspace)
 
         hidden_states = residual + hidden_states
 
@@ -139,17 +143,19 @@ class OPTModel(Module):
                 attention_params=None,
                 prompt_embedding_table=None,
                 prompt_tasks=None,
-                prompt_vocab_size=None):
+                prompt_vocab_size=None,
+                all_reduce_workspace=None):
 
         hidden_states = self.embedding(input_ids, position_ids,
                                        prompt_embedding_table, prompt_tasks,
-                                       prompt_vocab_size)
+                                       prompt_vocab_size, all_reduce_workspace)
 
         hidden_states = self.layers(hidden_states,
                                     use_cache=use_cache,
                                     attention_mask=attention_mask,
                                     kv_cache_params=kv_cache_params,
-                                    attention_params=attention_params)
+                                    attention_params=attention_params,
+                                    all_reduce_workspace=all_reduce_workspace)
 
         if use_cache:
             hidden_states, presents = hidden_states
