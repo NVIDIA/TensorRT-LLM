@@ -195,7 +195,7 @@ def load_decoder_weight(
     tensorrt_llm.logger.info('Loading decoder weights from PT...')
 
     quant_mode = getattr(tllm_model, 'quant_mode', QuantMode(0))
-    param_dtype = getattr(tllm_model, '_dtype', 'float16')
+    param_dtype = 'float16'
     
     if quant_mode.is_int8_weight_only():
         plugin_weight_only_quant_type = torch.int8
