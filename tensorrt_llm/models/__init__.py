@@ -26,6 +26,7 @@ from .modeling_utils import PretrainedConfig, PretrainedModel
 from .opt.model import OPTForCausalLM, OPTModel
 from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
+from .rwkv.model import RwkvModel, RwkvForCausalLM
 
 from .quantized.quant import quantize_model  # noqa # isort:skip
 
@@ -52,7 +53,12 @@ __all__ = [
     'ChatGLMHeadModel',
     'ChatGLMModel',
     'BaichuanForCausalLM',
+    'InternLMForCausalLM',
+    'InternLMModel',
+    'RwkvForCausalLM'
     'QWenForCausalLM',
+    'RwkvModel', 
+    'RwkvForCausalLM', 
     'EncoderModel',
     'DecoderModel',
     'PretrainedConfig',
