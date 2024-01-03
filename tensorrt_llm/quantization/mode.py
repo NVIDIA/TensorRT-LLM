@@ -18,6 +18,8 @@ from enum import IntFlag, auto
 class QuantMode(IntFlag):
     # [WARNING] KEEP BELOW DEFINITION IN SYNC WITH cpp/tensorrt_llm/common/quantization.h
 
+    # No quantization.
+    NONE = 0
     # The weights are quantized to 4 bits.
     INT4_WEIGHTS = auto()
     # The weights are quantized to 8 bits.
