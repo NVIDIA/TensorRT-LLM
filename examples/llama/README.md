@@ -606,8 +606,7 @@ mpirun -n 2 python ../run.py --engine_dir "/tmp/new_lora_13b/trt_engines/fp16/2-
  Input: "今天天气很好，我到公园的时后，"
 Output: "发现那里有很多小朋友们都在玩。他们都在玩跳绳，跳绳的花样都很多，我看他们玩的很开心。我看他们玩的的时候，我也想跟着他们一起玩，于是我也买了一个跳绳，跟着他们一起玩。我们玩的很开心"
 ```
-
-If users don't want to skip lora module, please pass uid -1 like `--lora_task_uids -1`, then the model would not run lora module and the results would be little different.
+Users who want to skip LoRA module may pass uid -1 with --lora_task_uids -1. In that case, the model will not run the LoRA module and the results will be different.
 
 ```bash
 mpirun -n 2 python ../run.py --engine_dir "/tmp/new_lora_13b/trt_engines/fp16/2-gpu/" \
