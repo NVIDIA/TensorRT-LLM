@@ -860,6 +860,8 @@ class SmoothQuantGatedMLP(SmoothQuantMLP):
         else:
             self.register_parameter('quantization_scaling_factor', None)
 
+        self.dtype = dtype
+
     def forward(self, hidden_states, workspace=None, lora_layer_params=None):
         assert lora_layer_params is None, "lora is not supported on SmoothQuantGatedMLP now"
         inter = self.fc(hidden_states)
