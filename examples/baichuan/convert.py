@@ -176,6 +176,13 @@ def write_int8(vals,
         save_multi_query_mode_qkv_int8(vals["scale_y_accum_quant.col"], dir,
                                        base_key, "scale_y_accum_quant.col",
                                        factor, i, local_dim, head_size)
+        save_multi_query_mode_qkv_int8(vals["scale_w_quant_orig"], dir,
+                                       base_key, "scale_w_quant_orig", factor,
+                                       i, local_dim, head_size)
+        save_multi_query_mode_qkv_int8(vals["scale_y_accum_quant"], dir,
+                                       base_key, "scale_y_accum_quant", factor,
+                                       i, local_dim, head_size)
+        saved_keys_once = ["scale_x_orig_quant", "scale_y_quant_orig"]
     else:
         save_split(np.split(vals["weight.int8"], factor, axis=split_dim), dir,
                    f"{base_key}.weight.int8", i, factor)
@@ -192,6 +199,17 @@ def write_int8(vals,
                          factor,
                          axis=split_dim), dir,
                 f"{base_key}.scale_y_accum_quant.col", i, factor)
+            if is_qkv:
+                save_split(
+                    np.split(vals["scale_y_accum_quant"],
+                             factor,
+                             axis=split_dim), dir,
+                    f"{base_key}.scale_y_accum_quant", i, factor)
+                save_split(
+                    np.split(vals["scale_w_quant_orig"], factor,
+                             axis=split_dim), dir,
+                    f"{base_key}.scale_w_quant_orig", i, factor)
+                saved_keys_once = ["scale_x_orig_quant", "scale_y_quant_orig"]
         else:
             saved_keys_once += [
                 "scale_w_quant_orig.col", "scale_y_accum_quant.col"
