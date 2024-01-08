@@ -44,7 +44,7 @@ from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime.lora_manager import LoraConfig
 
-from tensorrt_llm.models.llama.weight import (  # isort:skip
+from weight import (  # isort:skip
     get_scaling_factors, load_from_awq_llama, load_from_binary,
     load_from_gptq_llama, load_from_hf_checkpoint, load_from_hf_llama,
     load_from_meta_llama, parse_bin_config)
@@ -649,8 +649,6 @@ def build_rank_engine(builder: Builder,
         rms_norm_eps=args.rms_norm_eps,
         use_fused_mlp=args.use_fused_mlp,
         use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
-        enable_pos_shift=args.enable_pos_shift,
-        dense_context_fmha=args.dense_context_fmha,
         moe_config=args.moe_config)
     quantize_kwargs = {}
     if args.use_smooth_quant or args.use_weight_only:

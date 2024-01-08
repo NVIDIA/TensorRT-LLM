@@ -31,7 +31,7 @@ from tensorrt_llm.models.quantized.quant import get_dummy_quant_scales
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime.lora_manager import LoraConfig
 
-from .utils import (iterate_shard_files, load_state_dict,
+from utils import (iterate_shard_files, load_state_dict,
                     retrieved_layer_index_from_name)
 
 

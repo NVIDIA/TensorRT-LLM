@@ -21,6 +21,7 @@ from .kv_cache_manager import GenerationSequence, KVCacheManager
 from .lora_manager import LoraManager  # autoflake: skip
 from .model_runner import ModelRunner
 from .session import Session, TensorInfo
+from .engine import get_engine_version
 
 try:
     from .model_runner_cpp import ModelRunnerCpp
