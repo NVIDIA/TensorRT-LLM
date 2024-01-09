@@ -19,6 +19,16 @@ python3 llm_examples.py --task run_llm_on_tensor_parallel \
     --prompt="<prompt>" \
     --hf_model_dir=<llama-model-path>
 ```
+## Build and install
+
+The high-level APIs depend on some C++ pybind features, thus we need to **build it in a docker container with the following commands**
+
+```sh
+python3 scripts/build_wheel.py --trt_root /usr/local/tensorrt -p
+```
+
+Please refer to [Build TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/installation.md#build-tensorrt-llm) for building the docker and other details.
+
 
 ## Model preparation
 
