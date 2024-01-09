@@ -1,5 +1,5 @@
 from concurrent.futures import Future
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
@@ -45,6 +45,12 @@ class MpiSession:
         return [
             self.mpi_pool.submit(task, *args) for i in range(self.n_workers)
         ]
+
+    def submit_sync(self, task: (...), *args) -> List[Any]:
+        futures = [
+            self.mpi_pool.submit(task, *args) for i in range(self.n_workers)
+        ]
+        return [future.result() for future in futures]
 
     def shutdown(self):
         assert self.mpi_pool, 'MPI session not started'

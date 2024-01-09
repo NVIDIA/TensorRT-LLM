@@ -19,6 +19,9 @@ set(SRCS
     utils/sessionUtils.cpp
     utils/debugUtils.cu
     bufferManager.cpp
+    loraManager.cpp
+    loraUtils.cpp
+    loraModule.cpp
     decodingOutput.cpp
     gptDecoder.cpp
     gptDecoderBatch.cpp

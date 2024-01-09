@@ -1,3 +1,5 @@
 datasets>=2.14.4
 nemo-toolkit[all]<=1.20.0,>=1.18.0
 rouge_score~=0.1.2
+transformers_stream_generator==0.0.4
+tiktoken

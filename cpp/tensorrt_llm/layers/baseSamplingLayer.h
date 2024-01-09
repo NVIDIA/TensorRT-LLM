@@ -72,7 +72,7 @@ public:
         std::optional<tc::Tensor> input_lengths;  // [local_batch_size * beam_width]
     };
 
-    void forward(DecodingOutputParams& outputs, ForwardParams const& params);
+    void forward(DecodingOutputParams& outputs, ForwardParams const& params, int* penalty_workspace);
 
     virtual void setup(size_t batch_size, SetupParams const& setupParams) = 0;
 
@@ -89,7 +89,7 @@ protected:
     float* repetition_penalty_buf_ = nullptr;
     float* presence_penalty_buf_ = nullptr;
     float* frequency_penalty_buf_ = nullptr;
-    int32_t* min_lengths_buf_ = nullptr;
+    int* min_lengths_buf_ = nullptr;
     bool* skip_decode_buf_ = nullptr;
     T* runtime_logits_buf_ = nullptr;
 
@@ -97,13 +97,15 @@ protected:
     std::vector<float> mRepetitionPenalty;
     std::vector<float> mPresencePenalty;
     std::vector<float> mFrequencyPenalty;
-    std::vector<int32_t> mMinLengths;
+    std::vector<int> mMinLengths;
     bool* skip_decode_ = nullptr;
     bool skip_any_ = false;
 
+    bool use_temperature_ = false;
     bool use_repetition_penalty_ = false;
     bool use_presence_penalty_ = false;
     bool use_frequency_penalty_ = false;
+    bool use_min_lengths_ = false;
 
     virtual void runSampling(DecodingOutputParams& outputs, DecodingParams const& params) = 0;
 

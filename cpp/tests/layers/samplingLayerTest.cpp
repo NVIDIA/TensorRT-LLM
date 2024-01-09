@@ -44,6 +44,8 @@ void SamplingLayerTest<T>::setup(uint64_t seed, SamplingParams const& params)
 
     mLogitsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSize}),
         std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
+    mPenaltyWorkspaceDevice
+        = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSize}), nvinfer1::DataType::kINT32);
 
     mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
     mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
@@ -86,7 +88,7 @@ void SamplingLayerTest<T>::setup(uint64_t seed, SamplingParams const& params)
     }
 
     typename TopKSamplingLayer<T>::SetupParams setupParams;
-    setupParams.randomSeed = {seed};
+    setupParams.randomSeed = std::make_optional<std::vector<uint64_t>>({seed});
     setupParams.temperature
         = params.temperatures.size() ? std::make_optional<std::vector<float>>(params.temperatures) : std::nullopt;
     setupParams.runtime_top_k
@@ -209,7 +211,7 @@ void SamplingLayerTest<T>::runTest(
             // Reset by the test value since the sampling layer internally update the logit buffer.
             batchCopy(step);
             inputTensors.step = step;
-            mSamplingLayer->forward(outputTensors, inputTensors);
+            mSamplingLayer->forward(outputTensors, inputTensors, bufferCast<int32_t>(*mPenaltyWorkspaceDevice));
             mStream->synchronize();
         }
 

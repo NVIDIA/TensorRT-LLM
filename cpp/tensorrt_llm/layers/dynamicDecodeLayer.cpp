@@ -165,6 +165,17 @@ void DynamicDecodeLayer<T>::allocateBuffer(size_t batch_size, size_t beam_width,
     TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     mIdsPtrHost->resize(2 * batch_size);
     zero_parent_ids = allocator_->reMalloc(zero_parent_ids, sizeof(int*) * 2 * batch_size, false);
+    const size_t workspace_size = sizeof(int*) * batch_size * beam_width * vocab_size_;
+    if (beam_width == 1)
+    { // sampling layers
+        top_k_workspace = allocator_->reMalloc(top_k_workspace, workspace_size, false);
+        top_p_workspace = allocator_->reMalloc(top_p_workspace, workspace_size, false);
+    }
+    else
+    { // beam search layer
+        beam_search_workspace_0 = allocator_->reMalloc(beam_search_workspace_0, workspace_size, false);
+        beam_search_workspace_1 = allocator_->reMalloc(beam_search_workspace_1, workspace_size, false);
+    }
 }
 
 template <typename T>
@@ -172,6 +183,22 @@ void DynamicDecodeLayer<T>::freeBuffer()
 {
     TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     allocator_->free((void**) &zero_parent_ids);
+    if (top_k_workspace != nullptr)
+    {
+        allocator_->free((void**) &top_k_workspace);
+    }
+    if (top_p_workspace != nullptr)
+    {
+        allocator_->free((void**) &top_p_workspace);
+    }
+    if (beam_search_workspace_0 != nullptr)
+    {
+        allocator_->free((void**) &beam_search_workspace_0);
+    }
+    if (beam_search_workspace_1 != nullptr)
+    {
+        allocator_->free((void**) &beam_search_workspace_1);
+    }
 }
 
 template <typename T>
@@ -329,7 +356,9 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
 
             // only OnlineBeamSearchLayer support beam_search_diversity_rate
             // when beamHypotheses is used
-            mOnlineBeamsearchDecode->forward(dynamic_decode_outputs, dynamic_decode_input_tensors);
+            mOnlineBeamsearchDecode->forward(
+                dynamic_decode_outputs, dynamic_decode_input_tensors, beam_search_workspace_0, beam_search_workspace_1);
+            std::swap(beam_search_workspace_0, beam_search_workspace_1);
         } // end of dynamic_ite
     }
     else
@@ -387,8 +416,8 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
         // then topk_decode handles [4, x, 4 + 0.5]
         //      topp_decode handles [x, 0.5, x]
         // where "x" are skipped.
-        mTopKDecode->forward(decode_outputs, decode_input_tensors);
-        mTopPDecode->forward(decode_outputs, decode_input_tensors);
+        mTopKDecode->forward(decode_outputs, decode_input_tensors, top_k_workspace);
+        mTopPDecode->forward(decode_outputs, decode_input_tensors, top_p_workspace);
     }
 
     if (params.stop_words_list)

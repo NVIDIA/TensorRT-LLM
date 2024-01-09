@@ -141,7 +141,7 @@ mpirun --allow-run-as-root -np 4 python3 run.py --engine_dir tmp/trt_engines/t5-
 mpirun --allow-run-as-root -np 4 python3 run.py --engine_dir tmp/trt_engines/flan-t5-small/4-gpu/bfloat16/tp2 --engine_name flan-t5-small --model_name google/flan-t5-small --max_new_token=64 --num_beams=1
 
 # Example 4: For BART, inference w/ single GPU, FP32, greedy search, compare results with HuggingFace FP32
-python3 run.py --engine_dir tmp/trt_engines/bart-large-cnn/1-gpu/float32/tp1 --engine_name bart-large-cnn --model_name bart-large-cnn --max_new_token=64 --num_beams=1 --compare_hf_fp32
+python3 run.py --engine_dir tmp/trt_engines/bart-large-cnn/1-gpu/float32/tp1 --engine_name bart-large-cnn --model_name tmp/hf_models/bart-large-cnn --max_new_token=64 --num_beams=1 --compare_hf_fp32
 ```
 
 ### Benchmark

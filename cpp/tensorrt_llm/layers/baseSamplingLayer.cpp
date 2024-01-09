@@ -18,8 +18,9 @@
 #include "tensorrt_llm/layers/baseSamplingLayer.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/kernels/samplingPenaltyKernels.h"
+#include "tensorrt_llm/kernels/penaltyKernels.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
+#include "tensorrt_llm/layers/fillBuffers.h"
 
 #include <algorithm>
 
@@ -127,32 +128,18 @@ void BaseSamplingLayer<T>::setupBase(const size_t batch_size, SetupParams const&
     }
 
     // Setup penalties.
-    auto fillBuffers
-        = [this, &batch_size](auto const& optParam, auto const defaultValue, auto& hostBuffer, auto& deviceBuffer)
-    {
-        hostBuffer.resize(batch_size);
-        if (!optParam)
-        {
-            std::fill(std::begin(hostBuffer), std::end(hostBuffer), defaultValue);
-        }
-        else if (optParam->size() == 1)
-        {
-            std::fill(std::begin(hostBuffer), std::end(hostBuffer), optParam->front());
-        }
-        else
-        {
-            TLLM_CHECK_WITH_INFO(optParam->size() == batch_size, "Argument vector size mismatch.");
-            std::copy(optParam->begin(), optParam->end(), std::begin(hostBuffer));
-        }
-        cudaAutoCpy(deviceBuffer, hostBuffer.data(), batch_size, stream_);
-    };
+    FillBuffers const fillBuffers{batch_size, stream_};
 
-    fillBuffers(setupParams.temperature, 1.0f, mTemperature, temperature_buf_);
-    fillBuffers(setupParams.min_length, 0, mMinLengths, min_lengths_buf_);
-
+    use_temperature_ = static_cast<bool>(setupParams.temperature);
     use_repetition_penalty_ = static_cast<bool>(setupParams.repetition_penalty);
     use_presence_penalty_ = static_cast<bool>(setupParams.presence_penalty);
     use_frequency_penalty_ = static_cast<bool>(setupParams.frequency_penalty);
+    use_min_lengths_ = static_cast<bool>(setupParams.min_length);
+    if (use_temperature_)
+    {
+        fillBuffers(setupParams.temperature, getDefaultPenaltyValue(RepetitionPenaltyType::Temperature), mTemperature,
+            temperature_buf_);
+    }
     if (use_repetition_penalty_)
     {
         fillBuffers(setupParams.repetition_penalty, getDefaultPenaltyValue(RepetitionPenaltyType::Repetition),
@@ -168,10 +155,15 @@ void BaseSamplingLayer<T>::setupBase(const size_t batch_size, SetupParams const&
         fillBuffers(setupParams.frequency_penalty, getDefaultPenaltyValue(RepetitionPenaltyType::Frequency),
             mFrequencyPenalty, frequency_penalty_buf_);
     }
+    if (use_min_lengths_)
+    {
+        fillBuffers(setupParams.min_length, (int) getDefaultPenaltyValue(RepetitionPenaltyType::MinLength), mMinLengths,
+            min_lengths_buf_);
+    }
 }
 
 template <typename T>
-void BaseSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams const& params)
+void BaseSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams const& params, int* penalty_workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -204,40 +196,41 @@ void BaseSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams 
     }
 
     auto* embedding_bias = params.embedding_bias ? params.embedding_bias->template getPtr<T const>() : nullptr;
-    if (embedding_bias != nullptr
-        || !ALL_OF(std::begin(mTemperature) + ite * local_batch_size, local_batch_size, float, 1.0f))
-    {
-        invokeBatchApplyTemperaturePenalty(logits, embedding_bias, temperature_buf_ + ite * local_batch_size,
-            local_batch_size, vocab_size_, vocab_size_padded_, stream_);
-    }
-    sync_check_cuda_error();
+    auto* temperatures = (use_temperature_
+                             && !ALL_OF(std::begin(mTemperature) + ite * local_batch_size, local_batch_size, float,
+                                 getDefaultPenaltyValue(RepetitionPenaltyType::Temperature)))
+        ? temperature_buf_ + ite * local_batch_size
+        : nullptr;
+    auto* repetition_penalties
+        = (use_repetition_penalty_
+              && !ALL_OF(std::begin(mRepetitionPenalty) + ite * local_batch_size, local_batch_size, float,
+                  getDefaultPenaltyValue(RepetitionPenaltyType::Repetition)))
+        ? repetition_penalty_buf_ + ite * local_batch_size
+        : nullptr;
+    auto* presence_penalties = (use_presence_penalty_
+                                   && !ALL_OF(std::begin(mPresencePenalty) + ite * local_batch_size, local_batch_size,
+                                       float, getDefaultPenaltyValue(RepetitionPenaltyType::Presence)))
+        ? presence_penalty_buf_ + ite * local_batch_size
+        : nullptr;
+    auto* frequency_penalties = (use_frequency_penalty_
+                                    && !ALL_OF(std::begin(mFrequencyPenalty) + ite * local_batch_size, local_batch_size,
+                                        float, getDefaultPenaltyValue(RepetitionPenaltyType::Frequency)))
+        ? frequency_penalty_buf_ + ite * local_batch_size
+        : nullptr;
+    auto* min_lengths = (use_min_lengths_
+                            && !ALL_OF(std::begin(mMinLengths) + ite * local_batch_size, local_batch_size, int,
+                                (int) getDefaultPenaltyValue(RepetitionPenaltyType::MinLength)))
+        ? min_lengths_buf_ + ite * local_batch_size
+        : nullptr;
 
-    if (step > 1)
-    {
-        const bool use_repetition = use_repetition_penalty_
-            && (!ALL_OF(std::begin(mRepetitionPenalty) + ite * local_batch_size, local_batch_size, float,
-                getDefaultPenaltyValue(RepetitionPenaltyType::Repetition)));
-        const bool use_presence = use_presence_penalty_
-            && (!ALL_OF(std::begin(mPresencePenalty) + ite * local_batch_size, local_batch_size, float,
-                getDefaultPenaltyValue(RepetitionPenaltyType::Presence)));
-        const bool use_frequency = use_frequency_penalty_
-            && (!ALL_OF(std::begin(mFrequencyPenalty) + ite * local_batch_size, local_batch_size, float,
-                getDefaultPenaltyValue(RepetitionPenaltyType::Frequency)));
-
-        if (use_repetition || use_presence || use_frequency)
-        {
-            invokeBatchApplyRepetitionPenalty(logits, repetition_penalty_buf_ + ite * local_batch_size,
-                presence_penalty_buf_ + ite * local_batch_size, frequency_penalty_buf_ + ite * local_batch_size,
-                use_repetition, use_presence, use_frequency, outputs.output_ids_ptr.template getPtr<const int*>(),
-                outputs.sequence_length->getPtr<const int>(), batch_size, vocab_size_padded_, params.max_seq_len,
-                stream_);
-            sync_check_cuda_error();
-        }
-    }
-
-    auto* end_ids = params.end_ids.template getPtr<const int>();
-    invokeMinLengthPenalty(logits, min_lengths_buf_ + ite * local_batch_size, end_ids,
-        outputs.sequence_length->getPtr<const int>(), input_lengths, local_batch_size, vocab_size_padded_, stream_);
+    InvokeBatchApplyPenaltyParams<T> penalty_params{logits, embedding_bias,
+        penalty_workspace + ite * local_batch_size * vocab_size_, nullptr, temperatures, repetition_penalties,
+        presence_penalties, frequency_penalties,
+        (use_repetition_penalty_ || use_presence_penalty_ || use_frequency_penalty_), local_batch_size, 1,
+        params.max_seq_len, vocab_size_, vocab_size_padded_, outputs.output_ids_ptr.template getPtr<const int*>(),
+        nullptr, input_lengths, outputs.sequence_length->getPtr<const int>(), min_lengths,
+        params.end_ids.template getPtr<const int>(), stream_};
+    invokeBatchApplyPenalty(penalty_params);
     sync_check_cuda_error();
 #undef ALL_OF
 

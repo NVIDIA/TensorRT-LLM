@@ -302,10 +302,14 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
         return cls(config)
 
     @classmethod
-    def from_checkpoint(cls, ckpt_dir: str, rank: int = 0):
-        config = PretrainedConfig.from_json_file(
-            os.path.join(ckpt_dir, 'config.json'))
-        config.set_rank(rank)
+    def from_checkpoint(cls,
+                        ckpt_dir: str,
+                        rank: int = 0,
+                        config: PretrainedConfig = None):
+        if config is None:
+            config = PretrainedConfig.from_json_file(
+                os.path.join(ckpt_dir, 'config.json'))
+            config.set_rank(rank)
         model = cls.from_config(config)
 
         weights = {}
@@ -342,7 +346,8 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
                        max_beam_width: int = 1,
                        max_num_tokens: int = None,
                        prompt_embedding_table_size: int = 0,
-                       gather_all_token_logits: bool = False,
+                       gather_context_logits: bool = False,
+                       gather_generation_logits: bool = False,
                        lora_target_modules: List[str] = None):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
@@ -381,7 +386,8 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
             dtype=str_dtype_to_trt(self.config.dtype),
             prompt_embedding_table_size=prompt_embedding_table_size,
             mapping=self.config.mapping,
-            gather_all_token_logits=gather_all_token_logits,
+            gather_context_logits=gather_context_logits,
+            gather_generation_logits=gather_generation_logits,
             use_custom_all_reduce=use_custom_all_reduce,
             use_lora_plugin=use_lora_plugin,
             lora_target_modules=lora_target_modules)

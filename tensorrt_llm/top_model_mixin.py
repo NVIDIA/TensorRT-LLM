@@ -1,8 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple, Union
 
-import tensorrt as trt
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 
 from . import profiler
 from ._utils import mpi_rank
@@ -10,6 +27,7 @@ from .builder import Builder
 from .mapping import Mapping
 from .network import net_guard
 from .plugin.plugin import ContextFMHAType, PluginConfig
+from .quantization.mode import QuantMode
 from .runtime import (GenerationSession, LoraManager, ModelRunner,
                       SamplingConfig, model_runner)
 
@@ -36,19 +54,31 @@ class TopModelMixin:
         self._config = cfg
 
     @classmethod
-    def from_hugging_face(cls, hf_model_dir: str, **kwargs):
-        '''create and object and load weights from hugging face'''
+    def from_hugging_face(cls,
+                          hf_model_dir: str,
+                          dtype: Optional[str] = 'float16',
+                          mapping: Optional[Mapping] = None,
+                          quant_mode: Optional[QuantMode] = None,
+                          **kwargs):
+        '''
+        Create and object and load weights from hugging face
+        Parameters:
+            hf_model_dir: the hugging face model directory
+            dtype: str, the default weights data type when loading from the hugging face model
+            mapping: Mapping, specify the multi-gpu parallel strategy, when it's None, single GPU is used
+            quant_mode: QuantMode the quantization algorithm to be used, when it's None, no quantization is done
+        '''
         raise NotImplementedError("Subclass shall override this")
 
     @classmethod
-    def from_faster_transformer(cls, ft_model_dir: str, **kwargs):
-        '''create and object and load weights from FasterTransformer'''
+    def from_faster_transformer(cls, ft_model_dir: str):
+        '''
+        create and object and load weights from FasterTransformer'''
         raise NotImplementedError("Subclass shall override this")
 
-    def quantize(self, *args, **kwargs):
-        '''Quantize a given model object and return the quantized Module object
-        '''
-        raise NotImplementedError("Will add in future release")
+    @classmethod
+    def from_checkpoint(cls, checkpoint_dir: str):
+        raise NotImplementedError("Will implement in the future release")
 
     def to_trt(self,
                batch_size: int,
@@ -101,19 +131,25 @@ class TopModelMixin:
             max_output_len=output_len,
             max_beam_width=kwargs.get("max_beam_width", 1),
             max_num_tokens=kwargs.get("max_num_tokens", batch_size * input_len),
-            int8=False,  #TODO: support int8, see examples/llama/build.py
-            strongly_typed=kwargs.get("strongly_typed", False),
+            int8=False,  # TODO: support int8, see examples/llama/build.py
+            # default to turn on strong type, which is different with the older lower level API
+            strongly_typed=kwargs.get("strongly_typed", True),
             opt_level=kwargs.get("builder_opt", None),
             max_prompt_embedding_table_size=getattr(
                 self, 'max_prompt_embedding_table_size', 0),
-            gather_all_token_logits=kwargs.get('gather_all_token_logits',
-                                               False),
-            lora_target_modules=None,  #TODO: support lora
+            gather_context_logits=kwargs.get('gather_context_logits', False),
+            gather_generation_logits=kwargs.get('gather_generation_logits',
+                                                False),
+            lora_target_modules=None,  # TODO: support lora
         )
+
         network = builder.create_network()
         # use default if user don't provide one
         network.plugin_config = plugin_config if plugin_config is not None else self.default_plugin_config(
             **kwargs)
+        if self.quant_mode.has_fp8_qdq():
+            network.plugin_config.set_gemm_plugin(False)
+
         with net_guard(network):
             # Prepare
             network.set_named_parameters(self.named_parameters())
@@ -129,9 +165,11 @@ class TopModelMixin:
                                           batch_size * input_len),
                 prompt_embedding_table_size=getattr(
                     self, 'max_prompt_embedding_table_size', 0),
-                gather_all_token_logits=kwargs.get('gather_all_token_logits',
-                                                   False),
-                lora_target_modules=None)  #TODO: support lora
+                gather_context_logits=kwargs.get('gather_context_logits',
+                                                 False),
+                gather_generation_logits=kwargs.get('gather_generation_logits',
+                                                    False),
+                lora_target_modules=None)  # TODO: support lora
             self(*inputs)
         engine = builder.build_engine(network, builder_config)
         self._trt_engine = engine
@@ -295,7 +333,7 @@ class TopModelMixin:
                 inp, truncation=True, max_length=other_config['max_input_len'])
             batch_input_ids.append(input_ids)
             batch_input_text.append(inp)
-            #TODO: handling batching better, use batch size for demo purpose for now.
+            # TODO: handling batching better, use batch size for demo purpose for now.
             GEN_BATCH_SIZE = 1
             if len(batch_input_ids) >= GEN_BATCH_SIZE:
                 batch_io_pairs = generate_on_batch(batch_input_ids,
@@ -323,7 +361,7 @@ class TopModelMixin:
             return '{}_{}_tp{}_pp{}_rank{}.engine'.format(
                 model, dtype, tp_size, pp_size, rank)
 
-        #TODO: implement multi gpus names
+        # TODO: implement multi gpus names
         engine_path = engine_dir / get_engine_name(
             self._builder_config.name, self.config.dtype,
             self.config.mapping.tp_size, self.config.mapping.pp_size,
@@ -375,12 +413,10 @@ class TopModelMixin:
         plugin_config = PluginConfig()
         plugin_config.set_gpt_attention_plugin()
         plugin_config.set_gemm_plugin()
-        plugin_config.set_rmsnorm_plugin()
-
         # Quantization plugins.
         plugin_config.set_context_fmha(ContextFMHAType.enabled_with_fp32_acc)
         if self.mapping.world_size > 1:
             plugin_config.set_nccl_plugin()
         plugin_config.enable_remove_input_padding()
-        #TODO: tune this to get best perf with minimum code change
+        plugin_config.enable_paged_kv_cache()
         return plugin_config

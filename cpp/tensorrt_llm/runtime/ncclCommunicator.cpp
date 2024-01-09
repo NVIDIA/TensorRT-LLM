@@ -91,8 +91,10 @@ ncclComm_t NcclCommunicator::createComm(int worldSize, int rank, mpi::MpiComm co
 
 NcclCommunicator::~NcclCommunicator()
 {
+#if ENABLE_MULTI_DEVICE
     if (mComm && ncclCommDestroy(mComm) != ncclSuccess)
     {
         TLLM_LOG_WARNING("Failed to destroy NCCL communicator.");
     }
+#endif // ENABLE_MULTI_DEVICE
 }

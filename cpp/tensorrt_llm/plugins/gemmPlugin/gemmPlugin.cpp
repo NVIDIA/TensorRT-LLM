@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 #include "gemmPlugin.h"
+#include "plugin.h"
+#include <NvInferRuntimeBase.h>
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::common;
@@ -97,17 +99,14 @@ bool CublasLtGemmPluginProfiler::checkTactic(int m, int n, int k, const Config& 
 
 void CublasLtGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
 {
-    size_t dataSize = sizeof(half);
-    if (mType == DataType::kFLOAT)
-    {
-        dataSize = sizeof(float);
-    }
+    size_t dataSize = typeSize(mType);
+    size_t outputDataSize = typeSize(mOutputType);
 
     std::vector<size_t> workspaces = {
-        maxM * k * dataSize,  // A
-        n * k * dataSize,     // B
-        maxM * n * dataSize,  // C
-        CUBLAS_WORKSPACE_SIZE // workspace
+        maxM * k * dataSize,       // A
+        n * k * dataSize,          // B
+        maxM * n * outputDataSize, // C
+        CUBLAS_WORKSPACE_SIZE      // workspace
     };
     size_t bytes = calculateTotalWorkspaceSize(workspaces.data(), workspaces.size(), ALIGNMENT);
     setTmpWorkspaceSizeInBytes(bytes);
@@ -134,6 +133,7 @@ GemmPlugin::GemmPlugin(
     , mType(type)
     , mUseFp8(useFp8)
     , mPluginProfiler(pluginProfiler)
+    , mOutputType(type)
 {
     init();
 }
@@ -148,6 +148,7 @@ GemmPlugin::GemmPlugin(const void* data, size_t length, const GemmPlugin::Plugin
     read(d, mType);
     read(d, mUseFp8);
     read(d, mDims);
+    read(d, mOutputType);
 
     init();
 
@@ -163,6 +164,7 @@ void GemmPlugin::init()
     mCublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
 
     mPluginProfiler->setTranspose(mTransA, mTransB);
+    mPluginProfiler->setOutputType(mOutputType);
 
     mGemmId = GemmIdCublas(mDims.n, mDims.k, mType, mTransA, mTransB);
 }
@@ -171,7 +173,7 @@ void GemmPlugin::setGemmConfig()
 {
     if (mType == DataType::kHALF)
     {
-        mCublasWrapper->setFP16GemmConfig();
+        mCublasWrapper->setFP16GemmConfig(trtToCublasDtype(mOutputType));
     }
     else if (mType == DataType::kFLOAT)
     {
@@ -180,14 +182,14 @@ void GemmPlugin::setGemmConfig()
 #ifdef ENABLE_BF16
     else if (mType == DataType::kBF16)
     {
-        mCublasWrapper->setBF16GemmConfig();
+        mCublasWrapper->setBF16GemmConfig(trtToCublasDtype(mOutputType));
     }
 #endif
 
 #ifdef ENABLE_FP8
     if (mUseFp8)
     {
-        mCublasWrapper->setFP8GemmConfig(trtToCublasDtype(mType));
+        mCublasWrapper->setFP8GemmConfig(trtToCublasDtype(mOutputType));
     }
 #endif
 }
@@ -263,7 +265,18 @@ nvinfer1::DimsExprs GemmPlugin::getOutputDimensions(
 bool GemmPlugin::supportsFormatCombination(
     int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
 {
-    return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
+    const auto& desc = inOut[pos];
+    if (desc.format != TensorFormat::kLINEAR)
+    {
+        return false;
+    }
+
+    if (pos < nbInputs)
+    {
+        return desc.type == mType;
+    }
+
+    return desc.type == mType || desc.type == nvinfer1::DataType::kFLOAT;
 }
 
 int32_t computeMDimension(bool transA, const int32_t nbDims, const int32_t* dims)
@@ -323,6 +336,8 @@ void GemmPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, in
     }
     mGemmId.n = N;
     mGemmId.k = K;
+
+    mOutputType = out[0].desc.type;
 }
 
 size_t GemmPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
@@ -393,7 +408,7 @@ void GemmPlugin::destroy() noexcept
 size_t GemmPlugin::getSerializationSize() const noexcept
 {
     return sizeof(mTransA) + sizeof(mTransB) + sizeof(mType) + sizeof(mDims) + sizeof(mUseFp8)
-        + mPluginProfiler->getSerializationSize(mGemmId); // selected tactics container size
+        + mPluginProfiler->getSerializationSize(mGemmId) + sizeof(mOutputType); // selected tactics container size
 }
 
 void GemmPlugin::serialize(void* buffer) const noexcept
@@ -404,6 +419,7 @@ void GemmPlugin::serialize(void* buffer) const noexcept
     write(d, mType);
     write(d, mUseFp8);
     write(d, mDims);
+    write(d, mOutputType);
     mPluginProfiler->serialize(d, mGemmId);
 
     assert(d == a + getSerializationSize());

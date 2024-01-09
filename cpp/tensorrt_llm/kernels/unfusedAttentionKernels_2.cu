@@ -387,9 +387,9 @@ __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, KVCacheBuffer kvCacheBu
 #define APPLY_BIAS_ROPE_UPDATE_KV_CACHE(Dh_MAX, ADD_BIAS, STORE_QKV, POS_SHIFT)                                        \
     if (grid_block_cache.x == 0 || grid_block_cache.y == 0)                                                            \
     {                                                                                                                  \
-        cudaOccupancyMaxPotentialBlockSize(&grid_block_cache.y, &grid_block_cache.x,                                   \
+        TLLM_CUDA_CHECK(cudaOccupancyMaxPotentialBlockSize(&grid_block_cache.y, &grid_block_cache.x,                   \
             applyBiasRopeUpdateKVCache<T, T_cache, Dh_MAX, ADD_BIAS, STORE_QKV, POS_SHIFT, KVCacheBuffer,              \
-                IS_GENERATE>);                                                                                         \
+                IS_GENERATE>));                                                                                        \
     }                                                                                                                  \
     int block_size = grid_block_cache.x, grid_size = grid_block_cache.y;                                               \
     int tokens_per_block = (block_size + WARP_SIZE - 1) / WARP_SIZE;                                                   \

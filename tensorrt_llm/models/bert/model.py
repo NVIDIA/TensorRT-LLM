@@ -138,7 +138,8 @@ class BertAttention(Module):
 
             attention_probs = softmax(attention_scores, dim=-1)
 
-            context = matmul(attention_probs, value).permute([0, 2, 1, 3])
+            context = matmul(attention_probs, value,
+                             use_fp32_acc=False).permute([0, 2, 1, 3])
             context = context.view(
                 concat([shape(context, 0),
                         shape(context, 1), self.hidden_size]))

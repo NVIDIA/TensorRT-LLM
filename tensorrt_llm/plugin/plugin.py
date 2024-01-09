@@ -14,6 +14,7 @@
 # limitations under the License.
 import ctypes
 import platform
+from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
 
@@ -51,37 +52,34 @@ class ContextFMHAType(IntEnum):
     enabled_with_fp32_acc = 2
 
 
-class PluginConfig(object):
-
-    def __init__(self) -> None:
-        self.init()
-
-    def init(self):
-        self.bert_attention_plugin = False
-        self.gpt_attention_plugin = False
-        self.multi_block_mode = False
-        self.identity_plugin = False
-        self.gemm_plugin = False
-        self.smooth_quant_gemm_plugin = False
-        self.layernorm_plugin = False
-        self.layernorm_quantization_plugin = False
-        self.rmsnorm_plugin = False
-        self.rmsnorm_quantization_plugin = False
-        self.attention_qk_half_accumulation = False
-        self.remove_input_padding = False
-        self.context_fmha_type = ContextFMHAType.disabled
-        self.weight_only_groupwise_quant_matmul_plugin = False
-        self.weight_only_quant_matmul_plugin = False
-        self.nccl_plugin = False
-        self.use_custom_all_reduce = False
-        self.quantize_per_token_plugin = False
-        self.quantize_tensor_plugin = False
-        self.paged_kv_cache = False
-        self.tokens_per_block = 0
-        self.lookup_plugin = False
-        self.lora_plugin = False
-        self.use_paged_context_fmha = False
-        self.use_context_fmha_for_generation = False
+@dataclass
+class PluginConfig:
+    bert_attention_plugin: bool = False
+    gpt_attention_plugin: bool = False
+    multi_block_mode: bool = False
+    identity_plugin: bool = False
+    gemm_plugin: bool = False
+    smooth_quant_gemm_plugin: bool = False
+    layernorm_plugin: bool = False
+    layernorm_quantization_plugin: bool = False
+    rmsnorm_plugin: bool = False
+    rmsnorm_quantization_plugin: bool = False
+    attention_qk_half_accumulation: bool = False
+    remove_input_padding: bool = False
+    context_fmha_type: ContextFMHAType = ContextFMHAType.disabled
+    weight_only_groupwise_quant_matmul_plugin: bool = False
+    weight_only_quant_matmul_plugin: bool = False
+    nccl_plugin: bool = False
+    # TODO[kevin]: smart strategy to choose all reduce plugin
+    use_custom_all_reduce: bool = False
+    quantize_per_token_plugin: bool = False
+    quantize_tensor_plugin: bool = False
+    paged_kv_cache: bool = False
+    tokens_per_block: int = 0
+    lookup_plugin: bool = False
+    lora_plugin: bool = False
+    use_paged_context_fmha: bool = False
+    use_context_fmha_for_generation: bool = False
 
     def enable_qk_half_accum(self):
         self.attention_qk_half_accumulation = True
@@ -90,7 +88,8 @@ class PluginConfig(object):
 
     def set_context_fmha(self, context_fmha_type=ContextFMHAType.enabled):
         assert context_fmha_type in \
-            [ContextFMHAType.disabled, ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc]
+            [ContextFMHAType.disabled, ContextFMHAType.enabled,
+                ContextFMHAType.enabled_with_fp32_acc]
         self.context_fmha_type = context_fmha_type
         if context_fmha_type == ContextFMHAType.enabled:
             logger.info(f"Context FMHA Enabled")

@@ -80,7 +80,7 @@ def load_from_hf_phi(tensorrt_llm_phi: PhiForCausalLM,
     if tensorrt_llm_phi._use_parallel_embedding:
         v = numpy_split(v, tp_size, rank,
                         tensorrt_llm_phi._embedding_sharding_dim)
-    tensorrt_llm_phi.embedding.weight.value = v
+    tensorrt_llm_phi.vocab_embedding.weight.value = v
 
     n_layer = hf_phi.config.num_hidden_layers
 

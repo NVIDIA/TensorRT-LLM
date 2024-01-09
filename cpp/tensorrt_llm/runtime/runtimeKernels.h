@@ -76,6 +76,8 @@ void initOutputIds(ITensor& outputIds, ITensor const& inputIds, ITensor const& i
 
 void scatterTensor(ITensor& output, ITensor const& input, SizeType beamWidth, CudaStream const& stream);
 
+void splitTransposed(ITensor& output, ITensor const& input, SizeType split, CudaStream const& stream);
+
 void tileTensor(ITensor& output, ITensor const& input, SizeType beamWidth, CudaStream const& stream);
 
 void tileTensorInplace(ITensor& tensor, SizeType beamWidth, CudaStream const& stream);

@@ -1,5 +1,6 @@
 import inspect
 import json
+import pickle
 import tempfile
 from pathlib import Path
 
@@ -341,6 +342,7 @@ def test_gpt_json_config():
             "use_custom_all_reduce": False,
             "use_context_fmha_for_generation": False,
             "use_paged_context_fmha": False,
+            "lora_plugin": False,
         }
     }
 
@@ -521,6 +523,14 @@ def test_inference_request():
     ir.prompt_vocab_size = data_tensor
     assert torch.equal(ir.prompt_vocab_size, data_tensor)
 
+    assert ir.lora_weights is None
+    ir.lora_weights = data_tensor
+    assert torch.equal(ir.lora_weights, data_tensor)
+
+    assert ir.lora_config is None
+    ir.lora_config = data_tensor
+    assert torch.equal(ir.lora_config, data_tensor)
+
     assert ir.random_seed is None
     ir.random_seed = data_tensor
     assert torch.equal(ir.random_seed, data_tensor)
@@ -548,6 +558,14 @@ def test_inference_request():
     assert ir.temperature is None
     ir.temperature = data_tensor
     assert torch.equal(ir.temperature, data_tensor)
+
+    serialized = pickle.dumps(ir)
+    deserialized = pickle.loads(serialized)
+
+    assert isinstance(deserialized, _tb.InferenceRequest)
+    assert deserialized.request_id == ir.request_id
+    assert deserialized.is_streaming == ir.is_streaming
+    assert torch.equal(deserialized.input_ids, ir.input_ids)
 
 
 def test_trt_gpt_model_optional_params():

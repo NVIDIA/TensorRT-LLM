@@ -119,18 +119,34 @@ def parse_arguments():
         action='store_true',
         help=
         'Activates latency-optimized algorithm for all-reduce instead of NCCL.')
-    parser.add_argument('--gather_all_token_logits',
+    parser.add_argument(
+        '--gather_all_token_logits',
+        action='store_true',
+        default=False,
+        help='Enable both gather_context_logits and gather_generation_logits')
+    parser.add_argument('--gather_context_logits',
                         action='store_true',
-                        default=False)
+                        default=False,
+                        help='Gather context logits')
+    parser.add_argument('--gather_generation_logits',
+                        action='store_true',
+                        default=False,
+                        help='Gather generation logits')
     parser.add_argument('--strongly_typed', action='store_true', default=False)
+    parser.add_argument('--logits_dtype',
+                        type=str,
+                        default=None,
+                        choices=['float16', 'float32'])
 
     args = parser.parse_args()
+    if args.gather_all_token_logits:
+        args.gather_context_logits = True
+        args.gather_generation_logits = True
 
     return args
 
 
-def build_shard_model(model: PretrainedModel,
-                      build_config: BuildConfig) -> Engine:
+def build_model(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     builder = Builder()
     builder_config = builder.create_builder_config(
         precision=model.config.dtype,
@@ -169,10 +185,15 @@ def build_shard_model(model: PretrainedModel,
 
         # Forward
         inputs = model.prepare_inputs(
-            build_config.max_batch_size, build_config.max_input_len,
-            build_config.max_output_len, True, build_config.max_beam_width,
+            build_config.max_batch_size,
+            build_config.max_input_len,
+            build_config.max_output_len,
+            True,
+            build_config.max_beam_width,
             build_config.max_num_tokens,
-            build_config.max_prompt_embedding_table_size)
+            build_config.max_prompt_embedding_table_size,
+            gather_context_logits=build_config.gather_context_logits,
+            gather_generation_logits=build_config.gather_generation_logits)
         model(**inputs)
 
     optimize(network)
@@ -189,7 +210,8 @@ def build(build_config: Union[str, BuildConfig],
           ckpt_dir: str = None,
           model_config: Union[str, PretrainedConfig] = None,
           weights=None,
-          model_cls=None) -> Engine:
+          model_cls=None,
+          **kwargs) -> Engine:
     if ckpt_dir is not None:
         model_config = PretrainedConfig.from_json_file(
             os.path.join(ckpt_dir, 'config.json'))
@@ -203,6 +225,11 @@ def build(build_config: Union[str, BuildConfig],
     if isinstance(build_config, str):
         build_config = BuildConfig.from_json_file(build_config)
 
+    logits_dtype = kwargs.pop('logits_dtype', None)
+    if logits_dtype is not None:
+        model_config.logits_dtype = logits_dtype
+    model_config.use_prompt_tuning = build_config.max_prompt_embedding_table_size > 0
+
     assert rank < model_config.mapping.world_size
     architecture = model_config.architecture
 
@@ -212,35 +239,41 @@ def build(build_config: Union[str, BuildConfig],
                 f'Unsupported model architecture: {architecture}')
         model_cls = MODEL_MAP[architecture]
 
+    rank_config = copy.deepcopy(model_config)
+    rank_config.set_rank(rank)
+
     if ckpt_dir is not None:
-        model = model_cls.from_checkpoint(ckpt_dir, rank=rank)
+        model = model_cls.from_checkpoint(ckpt_dir,
+                                          rank=rank,
+                                          config=rank_config)
     else:
-        rank_config = copy.deepcopy(model_config)
-        rank_config.set_rank(rank)
         model = model_cls.from_config(rank_config)
         if weights is not None:
             model.load(weights)
-    return build_shard_model(model, build_config)
+
+    return build_model(model, build_config)
 
 
-def build_and_save_shard(rank, gpu_id, ckpt_dir, build_config, output_dir,
-                         log_level, model_config, model_cls):
+def build_and_save(rank, gpu_id, ckpt_dir, build_config, output_dir, log_level,
+                   model_config, model_cls, **kwargs):
     torch.cuda.set_device(gpu_id)
     logger.set_level(log_level)
     engine = build(build_config,
                    rank,
                    ckpt_dir,
                    model_config,
-                   model_cls=model_cls)
+                   model_cls=model_cls,
+                   **kwargs)
     engine.save(output_dir)
 
 
-def build_and_save(ckpt_dir_or_model_config: str,
+def parallel_build(ckpt_dir_or_model_config: str,
                    build_config: Union[str, BuildConfig],
                    output_dir: str,
                    workers: int = 1,
                    log_level: str = 'info',
-                   model_cls=None):
+                   model_cls=None,
+                   **kwargs):
     ckpt_dir = ckpt_dir_or_model_config
     if ckpt_dir_or_model_config.lower().endswith('.json'):
         model_config = PretrainedConfig.from_json_file(ckpt_dir_or_model_config)
@@ -251,15 +284,16 @@ def build_and_save(ckpt_dir_or_model_config: str,
 
     if workers == 1:
         for rank in range(model_config.mapping.world_size):
-            build_and_save_shard(rank, rank % workers, ckpt_dir, build_config,
-                                 output_dir, log_level, model_config, model_cls)
+            build_and_save(rank, rank % workers, ckpt_dir, build_config,
+                           output_dir, log_level, model_config, model_cls,
+                           **kwargs)
     else:
         with ProcessPoolExecutor(mp_context=get_context('spawn'),
                                  max_workers=workers) as p:
             futures = [
-                p.submit(build_and_save_shard, rank, rank % workers, ckpt_dir,
+                p.submit(build_and_save, rank, rank % workers, ckpt_dir,
                          build_config, output_dir, log_level, model_config,
-                         model_cls)
+                         model_cls, **kwargs)
                 for rank in range(model_config.mapping.world_size)
             ]
             wait(futures)
@@ -297,8 +331,10 @@ def main():
             args.max_num_tokens,
             'max_prompt_embedding_table_size':
             args.max_prompt_embedding_table_size,
-            'gather_all_token_logits':
-            args.gather_all_token_logits,
+            'gather_context_logits':
+            args.gather_context_logits,
+            'gather_generation_logits':
+            args.gather_generation_logits,
             'strongly_typed':
             args.strongly_typed,
             'plugin_config': {
@@ -316,8 +352,9 @@ def main():
         })
 
     source = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_config
-    build_and_save(source, build_config, args.output_dir, workers,
-                   args.log_level, model_cls)
+    kwargs = {'logits_dtype': args.logits_dtype}
+    parallel_build(source, build_config, args.output_dir, workers,
+                   args.log_level, model_cls, **kwargs)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

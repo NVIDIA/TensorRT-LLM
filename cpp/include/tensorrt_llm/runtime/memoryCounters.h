@@ -120,6 +120,7 @@ public:
 
     static MemoryCounters& getInstance()
     {
+        static thread_local MemoryCounters mInstance;
         return mInstance;
     }
 
@@ -127,12 +128,11 @@ public:
 
     static std::string bytesToString(DiffType bytes, int precision = 2);
 
-    std::string toString() const;
+    [[nodiscard]] std::string toString() const;
 
 private:
     SizeType mGpu{}, mCpu{}, mPinned{};
     DiffType mGpuDiff{}, mCpuDiff{}, mPinnedDiff{};
-    static thread_local MemoryCounters mInstance;
 };
 
 } // namespace tensorrt_llm::runtime

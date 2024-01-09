@@ -19,13 +19,15 @@ import numpy as np
 import tensorrt as trt
 
 from .._common import default_net, precision
-from .._utils import numpy_fp32_to_bf16, trt_dtype_to_np
+from .._utils import (fp32_array, int32_array, numpy_fp32_to_bf16,
+                      trt_dtype_to_np, trt_dtype_to_str)
 from ..functional import (AttentionMaskType, PositionEmbeddingType,
-                          RotaryScalingType, Tensor, bert_attention, cast,
-                          concat, constant, embedding, expand_dims, expand_mask,
-                          generate_alibi_biases, generate_alibi_slopes,
-                          gpt_attention, matmul, repeat_interleave, shape,
-                          slice, softmax, split, unsqueeze, view, where)
+                          RotaryScalingType, Tensor, arange, bert_attention,
+                          cast, concat, constant, embedding, expand,
+                          expand_dims, expand_mask, generate_alibi_biases,
+                          generate_alibi_slopes, gpt_attention, matmul,
+                          repeat_interleave, shape, slice, softmax, split,
+                          unsqueeze, view, where)
 from ..module import Module
 from ..parameter import Parameter
 from ..quantization import QuantMode
@@ -236,6 +238,25 @@ class RopeEmbeddingUtils:
             qkv = qkv.view(input_shape)
 
         return qkv
+
+
+def make_causal_mask(bsz, tgt_len, past_key_values_length, dtype):
+    _range = arange(start=constant(int32_array(0)),
+                    end=tgt_len,
+                    dtype=trt_dtype_to_str(dtype))
+    mask = repeat_interleave(_range, tgt_len, 0).view(concat([tgt_len,
+                                                              tgt_len]))
+    mask = where(mask < mask.transpose(-1, -2), 1.0, 0.0)
+
+    zero = constant(fp32_array(0))
+    zero = expand_dims(zero, [0, 1])
+    zero = expand(zero, concat([tgt_len, past_key_values_length]))
+    mask = concat([zero, mask], dim=1)
+    mask *= np.finfo(trt_dtype_to_np(dtype)).min.item()
+    mask = mask.view(concat([1, 1, tgt_len, tgt_len + past_key_values_length]))
+    mask = expand(mask,
+                  concat([bsz, 1, tgt_len, tgt_len + past_key_values_length]))
+    return mask
 
 
 class AttentionParams(object):
@@ -925,20 +946,31 @@ class Attention(Module):
             # Note that when we added to another bias tensor B (for example, with AliBi), the values in the lower-
             # triangular part of the B tensor are not affected and the upper-triangular ones are set to +INF.
             if self.attention_mask_type == AttentionMaskType.causal:
-                query_length = shape(query, 2)
-                starts = concat([0, 0, key_length - query_length, 0])
-                sizes = concat([1, 1, query_length, key_length])
-                select_buf = np.expand_dims(
-                    np.tril(
-                        np.ones((self.max_position_embeddings,
-                                 self.max_position_embeddings))).astype(bool),
-                    (0, 1))
+                if self.position_embedding_type.is_alibi():
+                    query_length = shape(query, 2)
+                    # bsz, tatget_length, past_key_value_length
+                    buffer = make_causal_mask(shape(query, 0), query_length,
+                                              key_length - query_length, dtype)
+                    starts = concat([0, 0, 0, 0])
+                    sizes = concat([1, 1, query_length, key_length])
+                    generated_mask = slice(buffer, starts, sizes)
 
-                select_buf = np.logical_not(select_buf)
-                mask_buf = np.zeros_like(select_buf, np.float32)
-                mask_buf[select_buf] = float('-inf')
-                buffer = constant(mask_buf)
-                generated_mask = slice(buffer, starts, sizes)
+                else:
+                    query_length = shape(query, 2)
+                    starts = concat([0, 0, key_length - query_length, 0])
+                    sizes = concat([1, 1, query_length, key_length])
+                    select_buf = np.expand_dims(
+                        np.tril(
+                            np.ones(
+                                (self.max_position_embeddings,
+                                 self.max_position_embeddings))).astype(bool),
+                        (0, 1))
+
+                    select_buf = np.logical_not(select_buf)
+                    mask_buf = np.zeros_like(select_buf, np.float32)
+                    mask_buf[select_buf] = float('-inf')
+                    buffer = constant(mask_buf)
+                    generated_mask = slice(buffer, starts, sizes)
 
             elif self.attention_mask_type == AttentionMaskType.bidirectional:
                 query_length = shape(query, 2)
@@ -980,6 +1012,7 @@ class Attention(Module):
                         AttentionMaskType.causal,
                         AttentionMaskType.bidirectional
                 ]:
+
                     bias = generated_mask if bias is None else bias + generated_mask
 
                 if bias is not None and not self.cross_attention:
@@ -988,7 +1021,8 @@ class Attention(Module):
 
             attention_probs = softmax(attention_scores, dim=-1)
 
-            context = matmul(attention_probs, value).permute([0, 2, 1, 3])
+            context = matmul(attention_probs, value,
+                             use_fp32_acc=False).permute([0, 2, 1, 3])
             context = context.view(
                 concat([shape(context, 0),
                         shape(context, 1), self.hidden_size]))
@@ -1121,7 +1155,7 @@ class BertAttention(Module):
             value = transpose_for_scores(value)
 
             key = key.permute([0, 1, 3, 2])
-            attention_scores = matmul(query, key)
+            attention_scores = matmul(query, key, use_fp32_acc=False)
             attention_scores = attention_scores / self.norm_factor
 
             if attention_mask is not None:
@@ -1129,7 +1163,8 @@ class BertAttention(Module):
 
             attention_probs = softmax(attention_scores, dim=-1)
 
-            context = matmul(attention_probs, value).permute([0, 2, 1, 3])
+            context = matmul(attention_probs, value,
+                             use_fp32_acc=False).permute([0, 2, 1, 3])
             context = context.view(
                 concat([shape(context, 0),
                         shape(context, 1), self.hidden_size]))

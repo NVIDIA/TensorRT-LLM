@@ -171,9 +171,9 @@ public:
     {
     }
 
-    void addToken()
+    void addNewTokens(SizeType n)
     {
-        mNumTokens++;
+        mNumTokens += n;
     }
 
     [[nodiscard]] SizeType getSequenceSlotIdx() const
@@ -426,6 +426,8 @@ public:
     {
         return mPools;
     }
+
+    void addContextTokens(SizeType seqSlotIdx, SizeType numTokens);
 
     void addToken(SizeType seqSlotIdx);
 

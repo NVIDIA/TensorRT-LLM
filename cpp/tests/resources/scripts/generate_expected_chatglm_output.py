@@ -103,6 +103,11 @@ def generate(model_name, batch_size, beam_width):
                                   rank=runtime_rank)
     serialize_path = Path(args.engine_dir) / engine_name
 
+    # Remove this if transformers fix the bug in tokenizer
+    if model_name in ["chatglm_6b"]:
+        import os
+        os.system(f"cp {resources_dir}/tokenization_chatglm.py {tokenizer_dir}")
+
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.tokenizer_dir, trust_remote_code=True)
     end_id = tokenizer.eos_token_id

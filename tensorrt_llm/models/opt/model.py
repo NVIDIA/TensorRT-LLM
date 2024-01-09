@@ -16,9 +16,8 @@
 from ..._utils import pad_vocab_size
 from ...functional import Tensor
 from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
-                       LayerNorm, PositionEmbeddingType)
+                       Embedding, LayerNorm, PromptTuningEmbedding)
 from ...module import Module
-from ..gpt.model import GPTEmbedding
 from ..modeling_utils import DecoderLayerList, DecoderModelForCausalLM
 
 
@@ -93,7 +92,7 @@ class OPTDecoderLayer(Module):
         if self.do_layer_norm_before:
             hidden_states = self.post_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states, all_reduce_workspace)
+        hidden_states = self.mlp(hidden_states, workspace=all_reduce_workspace)
 
         hidden_states = residual + hidden_states
 
@@ -110,23 +109,22 @@ class OPTModel(Module):
     def __init__(self, config):
         super().__init__()
         self.do_layer_norm_before = config.do_layer_norm_before
-        use_parallel_embedding = config.use_parallel_embedding
-        embedding_sharding_dim = config.embedding_sharding_dim
-        use_prompt_tuning = config.use_prompt_tuning
+        self.use_prompt_tuning = config.use_prompt_tuning
         mapping = config.mapping
 
-        self.embedding = GPTEmbedding(
+        EmbeddingCls = PromptTuningEmbedding if config.use_prompt_tuning else Embedding
+        self.vocab_embedding = EmbeddingCls(
             config.vocab_size,
             config.hidden_size,
-            config.max_position_embeddings,
-            position_embedding_type=PositionEmbeddingType.learned_absolute,
             dtype=config.dtype,
-            use_prompt_tuning=use_prompt_tuning,
-            tensor_parallel=mapping.tp_size if use_parallel_embedding else 1,
-            tensor_parallel_group=mapping.tp_group
-            if use_parallel_embedding else None,
-            sharding_dim=embedding_sharding_dim,
+            tp_size=mapping.tp_size if config.use_parallel_embedding else 1,
+            tp_group=mapping.tp_group
+            if config.use_parallel_embedding else None,
+            sharding_dim=config.embedding_sharding_dim,
             tp_rank=mapping.tp_rank)
+        self.position_embedding = Embedding(config.max_position_embeddings,
+                                            config.hidden_size,
+                                            dtype=config.dtype)
 
         self.layers = DecoderLayerList(OPTDecoderLayer, config)
 
@@ -146,9 +144,12 @@ class OPTModel(Module):
                 prompt_vocab_size=None,
                 all_reduce_workspace=None):
 
-        hidden_states = self.embedding(input_ids, position_ids,
-                                       prompt_embedding_table, prompt_tasks,
-                                       prompt_vocab_size, all_reduce_workspace)
+        args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size
+                ] if self.use_prompt_tuning else []
+        hidden_states = self.vocab_embedding(input_ids,
+                                             *args,
+                                             workspace=all_reduce_workspace)
+        hidden_states = hidden_states + self.position_embedding(position_ids)
 
         hidden_states = self.layers(hidden_states,
                                     use_cache=use_cache,

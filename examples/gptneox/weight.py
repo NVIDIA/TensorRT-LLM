@@ -127,7 +127,7 @@ def load_from_hf_gpt_neox(tensorrt_llm_gpt_neox: GPTNeoXForCausalLM,
     if tensorrt_llm_gpt_neox._use_parallel_embedding:
         v = numpy_split(v, tp_size, rank,
                         tensorrt_llm_gpt_neox._embedding_sharding_dim)
-    tensorrt_llm_gpt_neox.embedding.weight.value = v
+    tensorrt_llm_gpt_neox.vocab_embedding.weight.value = v
 
     n_layer = hf_gpt_neox.config.num_hidden_layers
 

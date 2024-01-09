@@ -66,6 +66,12 @@ def parse_arguments():
         'You must also use --use_weight_only for that argument to have an impact.'
     )
     parser.add_argument(
+        '--quantize_lm_head',
+        default=False,
+        action="store_true",
+        help='Quantize lm_head weights as well when using int4_awq.')
+
+    parser.add_argument(
         '--enable_fp8',
         default=False,
         action='store_true',
@@ -435,7 +441,7 @@ def convert_hf_falcon(hf_model: FalconForCausalLM,
 
     embed_w = get_weight(model_params, 'transformer.word_embeddings', dtype)
     if mapping.is_first_pp_rank():
-        weights['transformer.embedding.weight'] = embed_w
+        weights['transformer.vocab_embedding.weight'] = embed_w
     if mapping.is_last_pp_rank():
         weights['lm_head.weight'] = split_matrix(embed_w.clone(),
                                                  mapping.tp_size,
@@ -583,7 +589,7 @@ def load_from_hf_falcon_checkpoint(
             else:
                 if 'word_embeddings' in name:
                     if mapping.is_first_pp_rank():
-                        weights['transformer.embedding.weight'] = param
+                        weights['transformer.vocab_embedding.weight'] = param
                     if mapping.is_last_pp_rank():
                         weights['lm_head.weight'] = split_matrix(
                             param.clone(),
@@ -607,6 +613,7 @@ def load_from_hf_falcon_checkpoint(
 def load_from_awq_falcon(quant_ckpt_path: str,
                          hf_config: FalconConfig,
                          mapping: Mapping,
+                         quantize_lm_head: bool = False,
                          dtype: str = "float16"):
     weights = {}
     tik = time.time()
@@ -666,7 +673,7 @@ def load_from_awq_falcon(quant_ckpt_path: str,
         weight /= scale.repeat_interleave(group_size, dim=0)
         qweight_int8 = torch.clamp(torch.round(weight.cuda()).char(), -8, 7)
         int4_weight = preprocessor(packer(qweight_int8.cpu()), torch.quint4x2)
-        return int4_weight.view(torch.int8)
+        return int4_weight.view(torch.float16)
 
     def get_tllm_weight_from_awq(v: List[torch.Tensor],
                                  tllm_prex: str,
@@ -725,21 +732,26 @@ def load_from_awq_falcon(quant_ckpt_path: str,
     # 1. embedding
     v = load(awq_key_list[0])
     # TRT-LLM requires vocab_size to be multiple of 64 for successful GEMM
-    if v.shape[0] % 64 != 0:
+    if quantize_lm_head and v.shape[0] % 64 != 0:
         v = torch.nn.functional.pad(v, [0, 0, 0, 64 - v.shape[0] % 64])
     if mapping.is_first_pp_rank():
         # tensorrt_llm_falcon.embedding.weight.value = v.to(torch_dtype)
-        weights['transformer.embedding.weight'] = v.to(torch_dtype)
+        weights['transformer.vocab_embedding.weight'] = v.to(torch_dtype)
 
     # 2. lm_head
-    v = [load(awq_key_list[1] + suf) for suf in awq_suffix_list]
-    if v[0].shape[0] % 64 != 0:
-        v[0] = torch.nn.functional.pad(v[0], [0, 0, 0, 64 - v[0].shape[0] % 64])
-        v[1] = torch.nn.functional.pad(v[1], [0, 0, 0, 64 - v[1].shape[0] % 64],
-                                       value=1)
     if mapping.is_last_pp_rank():
-        # process_and_assign_weight(tensorrt_llm_falcon.lm_head, v, 1)
-        weights.update(get_tllm_weight_from_awq(v, 'lm_head', 1))
+        if quantize_lm_head:
+            v = [load(awq_key_list[1] + suf) for suf in awq_suffix_list]
+            if v[0].shape[0] % 64 != 0:
+                v[0] = torch.nn.functional.pad(
+                    v[0], [0, 0, 0, 64 - v[0].shape[0] % 64])
+                v[1] = torch.nn.functional.pad(
+                    v[1], [0, 0, 0, 64 - v[1].shape[0] % 64], value=1)
+            # process_and_assign_weight(tensorrt_llm_falcon.lm_head, v, 1)
+            weights.update(get_tllm_weight_from_awq(v, 'lm_head', 1))
+        else:
+            v = load(awq_key_list[1] + awq_suffix_list[0])
+            weights['lm_head.weight'] = torch_split(v.to(torch_dtype), 0)
 
     # 3. ln_f
     v_weight = load(awq_key_list[2] + split_sym + "weight")
@@ -984,11 +996,14 @@ if __name__ == '__main__':
         'new_decoder_architecture': hf_config.new_decoder_architecture,
     }
     if args.weight_only_precision == 'int4_awq':
+        exclude_modules = ['lm_head'] if not args.quantize_lm_head else []
         config['quantization'].update({
             'zero': False,
             'pre_quant_scale': True,
-            'exclude_modules': [],
+            'exclude_modules': exclude_modules,
         })
+        if args.quantize_lm_head and config['vocab_size'] % 64 != 0:
+            config['vocab_size'] = int((config['vocab_size'] + 63) / 64) * 64
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)
@@ -1005,10 +1020,12 @@ if __name__ == '__main__':
                           pp_size=args.pp_size)
 
         if args.use_weight_only and args.weight_only_precision == 'int4_awq':
-            weights = load_from_awq_falcon(args.ammo_quant_ckpt_path,
-                                           hf_config,
-                                           mapping,
-                                           dtype=args.dtype)
+            weights = load_from_awq_falcon(
+                args.ammo_quant_ckpt_path,
+                hf_config,
+                mapping,
+                quantize_lm_head=args.quantize_lm_head,
+                dtype=args.dtype)
         else:
             if args.load_by_shard:
                 weights = load_from_hf_falcon_checkpoint(

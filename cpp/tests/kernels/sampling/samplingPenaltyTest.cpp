@@ -115,6 +115,7 @@ protected:
     using SamplingKernelTest<T>::mLogitsHost;
 
     TensorPtr mLogitsDevice;
+    TensorPtr mPenaltyWorkspaceDevice;
     TensorPtr mBiasHost;
     TensorPtr mBiasDevice;
     TensorPtr mTemperaturesDevice;
@@ -130,6 +131,9 @@ protected:
         mLogitsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSizePadded}),
             std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
 
+        mPenaltyWorkspaceDevice
+            = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSize}), nvinfer1::DataType::kINT32);
+
         mBiasHost = mBufferManager->pinned(ITensor::makeShape({mVocabSizePadded}),
             std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
         mBiasDevice = mBufferManager->gpu(ITensor::makeShape({mVocabSizePadded}),
@@ -141,13 +145,10 @@ protected:
         mBufferManager->copy(*mLogitsHost, *mLogitsDevice);
         mBufferManager->copy(*mBiasHost, *mBiasDevice);
 
-        if (param.temperaturesSize > 1)
-        {
-            ASSERT_EQ(param.temperaturesSize, param.batchSize) << "Invalid test configuration.";
-            mTemperaturesDevice
-                = mBufferManager->gpu(ITensor::makeShape({param.temperaturesSize}), nvinfer1::DataType::kFLOAT);
-            mBufferManager->copy(*param.temperatures, *mTemperaturesDevice);
-        }
+        ASSERT_EQ(param.temperaturesSize, param.batchSize) << "Invalid test configuration.";
+        mTemperaturesDevice
+            = mBufferManager->gpu(ITensor::makeShape({param.temperaturesSize}), nvinfer1::DataType::kFLOAT);
+        mBufferManager->copy(*param.temperatures, *mTemperaturesDevice);
     }
 
     void computeReference(T* logits, const T* bias, const float* temperatures, const size_t temperaturesSize)
@@ -156,7 +157,7 @@ protected:
         const T MAX_T_VAL = (IS_FP16) ? 65504.F : FLT_MAX;
         for (size_t i = 0; i < mBatchSize; ++i)
         {
-            float temperature = temperaturesSize > 1 ? temperatures[i] : temperatures[0];
+            float temperature = temperatures[i];
             ASSERT_GT(temperature, 0.0f) << "temperature should be positive but got " << temperature;
             for (size_t j = 0; j < mVocabSizePadded; ++j)
             {
@@ -176,16 +177,11 @@ public:
     {
         subsetup(param);
         // Do test
-        if (param.temperaturesSize == 1)
-        {
-            tk::invokeApplyTemperaturePenalty(bufferCast<T>(*mLogitsDevice), bufferCast<T>(*mBiasDevice),
-                bufferCast<float>(*param.temperatures)[0], mBatchSize, mVocabSize, mVocabSizePadded, mStream->get());
-        }
-        else
-        {
-            tk::invokeBatchApplyTemperaturePenalty(bufferCast<T>(*mLogitsDevice), bufferCast<T>(*mBiasDevice),
-                bufferCast<float>(*mTemperaturesDevice), mBatchSize, mVocabSize, mVocabSizePadded, mStream->get());
-        }
+        InvokeBatchApplyPenaltyParams<T> penalty_params{bufferCast<T>(*mLogitsDevice), bufferCast<T>(*mBiasDevice),
+            bufferCast<int32_t>(*mPenaltyWorkspaceDevice), nullptr, bufferCast<float>(*mTemperaturesDevice), nullptr,
+            nullptr, nullptr, false, mBatchSize, 1, 1, mVocabSize, mVocabSizePadded, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, mStream->get()};
+        tk::invokeBatchApplyPenalty(penalty_params);
         auto logitsOutHost = mBufferManager->copyFrom(*mLogitsDevice, MemoryType::kCPU);
 
         mStream->synchronize();
@@ -197,82 +193,11 @@ public:
             mBatchSize * mVocabSizePadded);
         EXPECT_TRUE(passed);
     }
-
-    void runConsistencyTest(TemperatureTestParam param)
-    {
-        // Set up test
-        ASSERT_EQ(param.temperaturesSize, 1) << "A consistency test assumes temperaturesSize=1";
-        subsetup(param);
-
-        // Run a single runtime value case.
-        tk::invokeApplyTemperaturePenalty(bufferCast<T>(*mLogitsDevice), bufferCast<T>(*mBiasDevice),
-            bufferCast<float>(*param.temperatures)[0], mBatchSize, mVocabSize, mVocabSizePadded, mStream->get());
-
-        float temperature = bufferCast<float>(*param.temperatures)[0];
-        auto temperaturesHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kFLOAT);
-        auto temperaturesHostPtr = bufferCast<float>(*temperaturesHost);
-        for (size_t i = 0; i < mBatchSize; ++i)
-        {
-            temperaturesHostPtr[i] = temperature;
-        }
-
-        mTemperaturesDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kFLOAT);
-        mBufferManager->copy(*temperaturesHost, *mTemperaturesDevice);
-
-        auto logitsBatchDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSizePadded}),
-            std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
-
-        mBufferManager->copy(*mLogitsHost, *logitsBatchDevice);
-
-        tk::invokeBatchApplyTemperaturePenalty(bufferCast<T>(*logitsBatchDevice), bufferCast<T>(*mBiasDevice),
-            bufferCast<float>(*mTemperaturesDevice), mBatchSize, mVocabSize, mVocabSizePadded, mStream->get());
-
-        auto logitsOutHost = mBufferManager->copyFrom(*mLogitsDevice, MemoryType::kCPU);
-        auto logitsBatchOutHost = mBufferManager->copyFrom(*logitsBatchDevice, MemoryType::kCPU);
-
-        mStream->synchronize();
-
-        bool passed = checkResult(param.toString(), bufferCast<T>(*logitsOutHost), bufferCast<T>(*logitsBatchOutHost),
-            mBatchSize * mVocabSizePadded);
-        EXPECT_TRUE(passed);
-    }
 };
 
 TYPED_TEST_SUITE(TemperaturePenaltyTest, FloatAndHalfTypes);
 
 TYPED_TEST(TemperaturePenaltyTest, NoPenalty)
-{
-    TensorPtr temperaturesHost = this->mBufferManager->pinned(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
-    bufferCast<float>(*temperaturesHost)[0] = 1.0f;
-    this->runTest(TemperatureTestParam().setBatchSize(6).setVocabSize(4).setTemperaturesSize(1).setTemperatures(
-        temperaturesHost));
-}
-
-TYPED_TEST(TemperaturePenaltyTest, LessThanOne)
-{
-    TensorPtr temperaturesHost = this->mBufferManager->pinned(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
-    bufferCast<float>(*temperaturesHost)[0] = 0.53f;
-    this->runTest(TemperatureTestParam().setBatchSize(6).setVocabSize(4).setTemperaturesSize(1).setTemperatures(
-        temperaturesHost));
-}
-
-TYPED_TEST(TemperaturePenaltyTest, GreaterThaneOne)
-{
-    TensorPtr temperaturesHost = this->mBufferManager->pinned(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
-    bufferCast<float>(*temperaturesHost)[0] = 2.01f;
-    this->runTest(TemperatureTestParam().setBatchSize(6).setVocabSize(4).setTemperaturesSize(1).setTemperatures(
-        temperaturesHost));
-}
-
-TYPED_TEST(TemperaturePenaltyTest, LargeVocab)
-{
-    TensorPtr temperaturesHost = this->mBufferManager->pinned(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
-    bufferCast<float>(*temperaturesHost)[0] = 2.01f;
-    this->runTest(TemperatureTestParam().setBatchSize(6).setVocabSize(50001).setTemperaturesSize(1).setTemperatures(
-        temperaturesHost));
-}
-
-TYPED_TEST(TemperaturePenaltyTest, BatchNoPenalty)
 {
     int32_t batchSize = 6;
     TensorPtr temperaturesHost
@@ -286,7 +211,7 @@ TYPED_TEST(TemperaturePenaltyTest, BatchNoPenalty)
             temperaturesHost));
 }
 
-TYPED_TEST(TemperaturePenaltyTest, BatchLessThanOne)
+TYPED_TEST(TemperaturePenaltyTest, LessThanOne)
 {
     int32_t batchSize = 6;
     TensorPtr temperaturesHost
@@ -300,7 +225,7 @@ TYPED_TEST(TemperaturePenaltyTest, BatchLessThanOne)
             temperaturesHost));
 }
 
-TYPED_TEST(TemperaturePenaltyTest, BatchGreaterThaneOne)
+TYPED_TEST(TemperaturePenaltyTest, GreaterThaneOne)
 {
     int32_t batchSize = 6;
     TensorPtr temperaturesHost
@@ -314,7 +239,7 @@ TYPED_TEST(TemperaturePenaltyTest, BatchGreaterThaneOne)
             temperaturesHost));
 }
 
-TYPED_TEST(TemperaturePenaltyTest, BatchMixed)
+TYPED_TEST(TemperaturePenaltyTest, Mixed)
 {
     int32_t batchSize = 6;
     TensorPtr temperaturesHost
@@ -328,14 +253,20 @@ TYPED_TEST(TemperaturePenaltyTest, BatchMixed)
             temperaturesHost));
 }
 
-TYPED_TEST(TemperaturePenaltyTest, Consistency)
+TYPED_TEST(TemperaturePenaltyTest, LargeVocab)
 {
-    float temperature = 2.01f;
-    TensorPtr temperaturesHost = this->mBufferManager->pinned(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
-    bufferCast<float>(*temperaturesHost)[0] = 2.01f;
-    this->runConsistencyTest(
-        TemperatureTestParam().setBatchSize(6).setVocabSize(4).setTemperaturesSize(1).setTemperatures(
-            temperaturesHost));
+    int32_t batchSize = 6;
+    TensorPtr temperaturesHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    for (int32_t i = 0; i < batchSize; ++i)
+    {
+        bufferCast<float>(*temperaturesHost)[i] = 0.53f + 0.2f * i;
+    }
+    this->runTest(TemperatureTestParam()
+                      .setBatchSize(batchSize)
+                      .setVocabSize(50001)
+                      .setTemperaturesSize(batchSize)
+                      .setTemperatures(temperaturesHost));
 }
 
 struct RepetitionPenaltyTestCase
@@ -432,9 +363,13 @@ protected:
     using SamplingKernelTest<T>::mLogitsHost;
 
     TensorPtr mLogitsDevice;
+    TensorPtr mPenaltyWorkspaceDevice;
 
     TensorPtr mOutputIdsHost;
     TensorPtr mOutputIdsDevice;
+
+    TensorPtr mContextLengthHost;
+    TensorPtr mContextLengthDevice;
 
     TensorPtr mSeqLengthHost;
     TensorPtr mSeqLengthDevice;
@@ -459,6 +394,9 @@ protected:
         mLogitsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSizePadded}),
             std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
 
+        mPenaltyWorkspaceDevice
+            = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSize}), nvinfer1::DataType::kINT32);
+
         mOutputIdsHost
             = mBufferManager->pinned(ITensor::makeShape({mBatchSize, mSequenceLength}), nvinfer1::DataType::kINT32);
         mOutputIdsDevice
@@ -467,6 +405,9 @@ protected:
         mSeqLengthHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
         mSeqLengthDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
 
+        mContextLengthHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
+        mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
+
         mIdsPtrHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT64);
         mIdsPtrDevice = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT64);
 
@@ -474,6 +415,10 @@ protected:
             bufferCast<T>(*mLogitsHost), static_cast<T*>(nullptr), mBatchSize, mVocabSize, mVocabSizePadded);
         initRandomInt(bufferCast<int32_t>(*mOutputIdsHost), mSequenceLength * mBatchSize, 0, mVocabSize);
         initRandomInt(bufferCast<int32_t>(*mSeqLengthHost), mBatchSize, 1, mSequenceLength);
+        for (size_t i = 0; i < mBatchSize; ++i)
+        {
+            bufferCast<int32_t>(*mContextLengthHost)[i] = bufferCast<int32_t>(*mSeqLengthHost)[i];
+        }
 
         auto idsPtrHostPtr = reinterpret_cast<void**>(bufferCast<int64_t>(*mIdsPtrHost));
         auto outputIdsDevicePtr = bufferCast<int32_t>(*mOutputIdsDevice);
@@ -484,6 +429,7 @@ protected:
 
         mBufferManager->copy(*mLogitsHost, *mLogitsDevice);
         mBufferManager->copy(*mOutputIdsHost, *mOutputIdsDevice);
+        mBufferManager->copy(*mContextLengthHost, *mContextLengthDevice);
         mBufferManager->copy(*mSeqLengthHost, *mSeqLengthDevice);
         mBufferManager->copy(*mIdsPtrHost, *mIdsPtrDevice);
 
@@ -534,11 +480,14 @@ public:
     void runTest(RepetitionPenaltyTestCase param)
     {
         subsetup(param);
-        tk::invokeBatchApplyRepetitionPenalty(bufferCast<T>(*mLogitsDevice),
+        InvokeBatchApplyPenaltyParams<T> penalty_params{bufferCast<T>(*mLogitsDevice), nullptr,
+            bufferCast<int32_t>(*mPenaltyWorkspaceDevice), nullptr, nullptr,
             bufferCast<float>(*mRepetitionPenaltiesDevice), bufferCast<float>(*mPresencePenaltiesDevice),
-            bufferCast<float>(*mFrequencyPenaltiesDevice), true, true, true,
-            reinterpret_cast<const int32_t**>(bufferCast<int64_t>(*mIdsPtrDevice)),
-            bufferCast<int32_t>(*mSeqLengthHost), mBatchSize, mVocabSizePadded, mSequenceLength, mStream->get());
+            bufferCast<float>(*mFrequencyPenaltiesDevice), true, mBatchSize, 1, mSequenceLength, mVocabSize,
+            mVocabSizePadded, reinterpret_cast<const int32_t**>(bufferCast<int64_t>(*mIdsPtrDevice)), nullptr,
+            bufferCast<int32_t>(*mContextLengthDevice), bufferCast<int32_t>(*mSeqLengthDevice), nullptr, nullptr,
+            mStream->get()};
+        tk::invokeBatchApplyPenalty(penalty_params);
 
         auto logitsOutHost = mBufferManager->copyFrom(*mLogitsDevice, MemoryType::kCPU);
 
@@ -928,6 +877,7 @@ protected:
     using SamplingKernelTest<T>::mLogitsHost;
 
     TensorPtr mLogitsDevice;
+    TensorPtr mPenaltyWorkspaceDevice;
 
     TensorPtr mContextLengthHost;
     TensorPtr mContextLengthDevice;
@@ -953,6 +903,9 @@ protected:
             std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
         mLogitsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSizePadded}),
             std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
+
+        mPenaltyWorkspaceDevice
+            = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSize}), nvinfer1::DataType::kINT32);
 
         mSeqLengthHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
         mSeqLengthDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
@@ -1012,9 +965,12 @@ public:
     void runTest(MinLengthPenaltyTestParams param)
     {
         subsetup(param);
-        tk::invokeMinLengthPenalty(bufferCast<T>(*mLogitsDevice), bufferCast<int32_t>(*mMinLengthDevice),
-            bufferCast<int32_t>(*mEndIdsDevice), bufferCast<int32_t>(*mSeqLengthDevice),
-            bufferCast<int32_t>(*mContextLengthDevice), mBatchSize, mVocabSizePadded, mStream->get());
+        InvokeBatchApplyPenaltyParams<T> penalty_params{bufferCast<T>(*mLogitsDevice), nullptr,
+            bufferCast<int32_t>(*mPenaltyWorkspaceDevice), nullptr, nullptr, nullptr, nullptr, nullptr, false,
+            mBatchSize, 1, mSequenceLength, mVocabSize, mVocabSizePadded, nullptr, nullptr,
+            bufferCast<int32_t>(*mContextLengthDevice), bufferCast<int32_t>(*mSeqLengthDevice),
+            bufferCast<int32_t>(*mMinLengthDevice), bufferCast<int32_t>(*mEndIdsDevice), mStream->get()};
+        tk::invokeBatchApplyPenalty(penalty_params);
 
         mStream->synchronize();
 

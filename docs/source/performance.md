@@ -48,7 +48,7 @@ This data has been updated for v0.6.1, unless specified.
 <sup> * The following data is from TensorRT-LLM v0.5. </sup>
 
 
-| Model                        | Batch Size | TP (1)    | Input Length | Output Length | Throughput (out tok/s) |
+| Model                        | Batch Size | TP (1)    | Input Length | Output Length | Throughput (out tok/s/GPU) |
 | :--------------------------- | :--------- | :-------- | :----------- | :------------ | ---------------------: |
 | GPT-J 6B                     | 64         | 1         | 128          | 128           |                  3,630 |
 | GPT-J 6B                     | 64         | 1         | 128          | 2048          |                  1,859 |
@@ -63,7 +63,7 @@ This data has been updated for v0.6.1, unless specified.
 
 ### A100 GPUs (FP16)
 
-| Model                        | Batch Size | TP (1)    | Input Length | Output Length | Throughput (out tok/s) |
+| Model                        | Batch Size | TP (1)    | Input Length | Output Length | Throughput (out tok/s/GPU) |
 | :--------------------------- | :--------- | :-------- | :----------- | :------------ | ---------------------: |
 | GPT-J 6B                     | 512        | 1         | 128          | 128           |                  6,374 |
 | GPT-J 6B                     | 120        | 2         | 128          | 2048          |                  2,192 |
@@ -238,6 +238,15 @@ in [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM).
 
 ## Benchmarking per Model
 
+> [!WARNING]
+> In some cases, using Group Query Attention (GQA) can improve performance of some networks. These
+kernels are currently experimental and not enabled by default. In order to enable them, simply run
+`export TRTLLM_ENABLE_XQA=1` in your shell. The kernels are an inference runtime optimization, so
+previously built engines should still function. For the benchmarks below, we have enabled GQA where
+our tests displayed performance benefits. If your network is not listed below, be sure to try both
+GQA-enabled and GQA-disabled configurations to find the configuration that works best.
+For more details see our documentation about [GPT Attention](./gpt_attention.md#generation-phase).
+
 ### GPT-J 6B
 
 ---
@@ -384,6 +393,7 @@ python examples/llama/build.py \
 #### Throughput Benchmark
 
 ```shell
+export TRTLLM_ENABLE_XQA=1
 in_out_sizes=("64:128,128" "64:128,2048" "64:2048,128" "64:2048,2048")
 for in_out in ${in_out_sizes[@]}
 do
@@ -398,6 +408,7 @@ done
 #### First Token Latency Benchmark
 
 ```shell
+export TRTLLM_ENABLE_XQA=1
 in_out_sizes=("64:128,1" "64:128,1")
 for in_out in ${in_out_sizes[@]}
 do
@@ -419,6 +430,7 @@ to the large footprint of the model and the large input size of 2048. You can bu
 each engine one at a time with the following loop.
 
 ```shell
+export TRTLLM_ENABLE_XQA=1
 # Benchmark specific batch size:isl:osl combinations.
 in_out_sizes=("96:128,128" "96:128,2048" "64:2048,128")
 for in_out in ${in_out_sizes[@]}

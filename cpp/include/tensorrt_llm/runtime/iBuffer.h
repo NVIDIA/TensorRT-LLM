@@ -566,9 +566,14 @@ public:
     using iterator = pointer;
     using const_iterator = const_pointer;
 
+    BufferRange(T* data, size_type size)
+        : mData{data}
+        , mSize{size}
+    {
+    }
+
     explicit BufferRange(IBuffer& buffer)
-        : mData(bufferCast<T>(buffer))
-        , mSize(buffer.getSize())
+        : BufferRange(bufferCast<T>(buffer), buffer.getSize())
     {
     }
 

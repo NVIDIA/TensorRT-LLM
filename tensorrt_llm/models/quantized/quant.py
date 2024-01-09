@@ -12,14 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Union
+from typing import Any
 
 import numpy as np
 
 from ...layers import ColumnLinear, RowLinear
-from ...models import (BaichuanForCausalLM, BloomForCausalLM, ChatGLMHeadModel,
-                       FalconForCausalLM, GPTJForCausalLM, GPTLMHeadModel,
-                       LLaMAForCausalLM, QWenForCausalLM)
 from ...module import Module
 from ...quantization import QuantMode
 from ...quantization.layers import FP8Linear, FP8RowLinear
@@ -273,7 +270,7 @@ def _smooth_quantize_chatglm(model, quant_mode):
         )
         assert hasattr(layer, "attention"), "The layer has no attention"
         layer.attention = SmoothQuantAttention(
-            layer.hidden_size,
+            hidden_size=layer.hidden_size,
             num_attention_heads=layer.num_heads,
             num_kv_heads=layer.num_kv_heads,
             max_position_embeddings=layer.max_seq_length,
@@ -282,9 +279,12 @@ def _smooth_quantize_chatglm(model, quant_mode):
             dtype=layer.dtype,
             attention_mask_type=layer.attention_mask_type,
             position_embedding_type=layer.position_embedding_type,
+            rotary_embedding_base=layer.rotary_embedding_base,
             tp_group=layer.tp_group,
             tp_size=layer.tp_size,
             quant_mode=quant_mode,
+            bias=layer.dense_bias,
+            qkv_bias_only=layer.bias and not layer.dense_bias,
         )
         assert hasattr(layer, "mlp"), "The layer has no mlp"
         layer.mlp = SmoothQuantMLP(
@@ -295,6 +295,7 @@ def _smooth_quantize_chatglm(model, quant_mode):
             tp_group=layer.tp_group,
             tp_size=layer.tp_size,
             quant_mode=quant_mode,
+            bias=layer.dense_bias,
         )
         assert hasattr(layer, "post_norm"), "The layer has no post_norm"
         layer.post_norm = SmoothQuantRmsNorm(
@@ -306,6 +307,9 @@ def _smooth_quantize_chatglm(model, quant_mode):
 
 
 def _smooth_quantize(model, quant_mode):
+    from ...models import (BaichuanForCausalLM, BloomForCausalLM,
+                           ChatGLMHeadModel, GPTLMHeadModel, LLaMAForCausalLM,
+                           QWenForCausalLM)
     assert isinstance(model, GPTLMHeadModel) or isinstance(model, LLaMAForCausalLM) \
             or isinstance(model, BloomForCausalLM) or isinstance(model, BaichuanForCausalLM) \
             or isinstance(model, QWenForCausalLM) or isinstance(model, ChatGLMHeadModel), \
@@ -453,8 +457,7 @@ def _quantize_layer(layer, layer_idx, quant_mode, quant_scales):
     return layer
 
 
-def _default_fp8_quantize(model: Union[GPTLMHeadModel, LLaMAForCausalLM,
-                                       GPTJForCausalLM],
+def _default_fp8_quantize(model,
                           quant_mode: QuantMode,
                           quant_scales: dict = None):
     """
@@ -481,6 +484,8 @@ def _default_fp8_quantize(model: Union[GPTLMHeadModel, LLaMAForCausalLM,
 
 
 def _fp8_quantize(model, quant_mode: QuantMode, quant_scales: dict = None):
+    from ...models import (BaichuanForCausalLM, FalconForCausalLM,
+                           GPTJForCausalLM, GPTLMHeadModel, LLaMAForCausalLM)
     if isinstance(model, (FalconForCausalLM, GPTJForCausalLM, GPTLMHeadModel,
                           LLaMAForCausalLM, BaichuanForCausalLM)):
         return _default_fp8_quantize(model, quant_mode, quant_scales)

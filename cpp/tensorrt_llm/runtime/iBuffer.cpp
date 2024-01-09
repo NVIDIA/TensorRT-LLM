@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/tllmBuffers.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"

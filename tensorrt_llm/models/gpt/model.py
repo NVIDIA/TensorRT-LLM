@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional
+from typing import List
 
 import tensorrt as trt
 
@@ -57,57 +57,6 @@ def MLPFactory(hidden_size,
     hidden_act = non_gated_version(hidden_act)
     return MLPClass(hidden_size, ffn_hidden_size, hidden_act, bias, dtype,
                     tp_group, tp_size, quant_mode, instance_id)
-
-
-class GPTEmbedding(Module):
-
-    def __init__(self,
-                 vocab_size,
-                 hidden_size,
-                 max_position_embeddings,
-                 position_embedding_type=PositionEmbeddingType.learned_absolute,
-                 dtype=None,
-                 use_prompt_tuning=False,
-                 tensor_parallel=1,
-                 tensor_parallel_group=None,
-                 sharding_dim=0,
-                 tp_rank=None,
-                 instance_id: int = 0):
-        super().__init__()
-        self.max_position_embeddings = max_position_embeddings
-        self.position_embedding_type = position_embedding_type
-        self.use_prompt_tuning = use_prompt_tuning
-
-        EmbeddingCls = PromptTuningEmbedding if use_prompt_tuning else Embedding
-        self.vocab_embedding = EmbeddingCls(vocab_size,
-                                            hidden_size,
-                                            dtype=dtype,
-                                            tp_size=tensor_parallel,
-                                            tp_group=tensor_parallel_group,
-                                            sharding_dim=sharding_dim,
-                                            tp_rank=tp_rank,
-                                            instance_id=instance_id)
-
-        if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
-            self.position_embedding = Embedding(max_position_embeddings,
-                                                hidden_size,
-                                                dtype=dtype)
-
-    def forward(self,
-                input_ids,
-                position_ids,
-                prompt_embedding_table=None,
-                prompt_tasks=None,
-                prompt_vocab_size=None,
-                workspace: Optional[Tensor] = None):
-        args = []
-        if self.use_prompt_tuning:
-            args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size]
-        x = self.vocab_embedding(input_ids, *args, workspace=workspace)
-        if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
-            x = x + self.position_embedding(position_ids)
-
-        return x
 
 
 class GPTDecoderLayer(Module):
@@ -255,21 +204,23 @@ class GPTModel(Module):
                  moe_config=MoeConfig()):
         super().__init__()
         self.mapping = mapping
+        self.use_prompt_tuning = use_prompt_tuning
+        self.position_embedding_type = position_embedding_type
 
-        self.embedding = GPTEmbedding(
+        EmbeddingCls = PromptTuningEmbedding if use_prompt_tuning else Embedding
+        self.vocab_embedding = EmbeddingCls(
             vocab_size,
             hidden_size,
-            max_position_embeddings,
-            position_embedding_type,
             dtype=dtype,
-            use_prompt_tuning=use_prompt_tuning,
-            tensor_parallel=mapping.tp_size if use_parallel_embedding else 1,
-            tensor_parallel_group=mapping.tp_group
-            if use_parallel_embedding else None,
+            tp_size=mapping.tp_size if use_parallel_embedding else 1,
+            tp_group=mapping.tp_group if use_parallel_embedding else None,
             sharding_dim=embedding_sharding_dim,
             tp_rank=mapping.tp_rank,
-            instance_id=2 * num_layers,
-        )
+            instance_id=2 * num_layers)
+        if position_embedding_type == PositionEmbeddingType.learned_absolute:
+            self.position_embedding = Embedding(max_position_embeddings,
+                                                hidden_size,
+                                                dtype=dtype)
 
         self.layers = ModuleList([
             GPTDecoderLayer(
@@ -313,12 +264,14 @@ class GPTModel(Module):
                 workspace=None,
                 lora_params=None):
 
-        hidden_states = self.embedding(input_ids,
-                                       position_ids,
-                                       prompt_embedding_table,
-                                       prompt_tasks,
-                                       prompt_vocab_size,
-                                       workspace=workspace)
+        args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size
+                ] if self.use_prompt_tuning else []
+        hidden_states = self.vocab_embedding(input_ids,
+                                             *args,
+                                             workspace=workspace)
+        if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
+            hidden_states = hidden_states + self.position_embedding(
+                position_ids)
 
         kv_cache_params.fill_none_tensor_list(len(self.layers))
 
@@ -513,7 +466,8 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                        max_beam_width: int = 1,
                        max_num_tokens: int = None,
                        prompt_embedding_table_size: int = 0,
-                       gather_all_token_logits: bool = False,
+                       gather_context_logits: bool = False,
+                       gather_generation_logits: bool = False,
                        max_draft_len: int = 0,
                        lora_target_modules: List[str] = None):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
@@ -552,7 +506,8 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             use_custom_all_reduce=use_custom_all_reduce,
             paged_kv_cache=paged_kv_cache,
             tokens_per_block=tokens_per_block,
-            gather_all_token_logits=gather_all_token_logits,
+            gather_context_logits=gather_context_logits,
+            gather_generation_logits=gather_generation_logits,
             mapping=self.mapping,
             max_num_tokens=max_num_tokens,
             prompt_embedding_table_size=prompt_embedding_table_size,

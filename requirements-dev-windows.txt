@@ -1,5 +1,6 @@
 -r requirements-windows.txt
 --extra-index-url https://download.pytorch.org/whl/cu121
+datasets
 einops
 graphviz
 mypy
@@ -10,4 +11,5 @@ pytest-cov
 pytest-forked
 pytest-xdist
 pywin32
+rouge_score
 typing-extensions==4.8.0

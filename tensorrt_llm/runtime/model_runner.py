@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
+import tensorrt as trt
 import torch
 
 from .. import profiler
@@ -110,8 +111,9 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     has_position_embedding = builder_config.get('has_position_embedding', True)
     has_token_type_embedding = builder_config.get('has_token_type_embedding',
                                                   False)
-    gather_all_token_logits = builder_config.get('gather_all_token_logits',
-                                                 False)
+    gather_context_logits = builder_config.get('gather_context_logits', False)
+    gather_generation_logits = builder_config.get('gather_generation_logits',
+                                                  False)
     max_prompt_embedding_table_size = builder_config.get(
         'max_prompt_embedding_table_size', 0)
     quant_mode = QuantMode(builder_config.get('quant_mode', 0))
@@ -143,7 +145,8 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         tokens_per_block=tokens_per_block,
         max_prompt_embedding_table_size=max_prompt_embedding_table_size,
         quant_mode=quant_mode,
-        gather_all_token_logits=gather_all_token_logits,
+        gather_context_logits=gather_context_logits,
+        gather_generation_logits=gather_generation_logits,
         dtype=dtype,
         use_custom_all_reduce=use_custom_all_reduce,
         lora_plugin=lora_plugin,
@@ -396,7 +399,11 @@ class ModelRunner(ModelRunnerMixin):
                 paged_kv_cache=build_config.plugin_config.paged_kv_cache,
                 tokens_per_block=build_config.plugin_config.tokens_per_block,
                 quant_mode=pretrained_config.quant_mode,
+                gather_context_logits=build_config.gather_context_logits,
+                gather_generation_logits=build_config.gather_generation_logits,
                 dtype=pretrained_config.dtype,
+                max_prompt_embedding_table_size=build_config.
+                max_prompt_embedding_table_size,
             )
             max_batch_size = build_config.max_batch_size
             max_input_len = build_config.max_input_len
@@ -416,13 +423,12 @@ class ModelRunner(ModelRunnerMixin):
         logger.info(f'Load engine takes: {loading_time} sec')
 
         if session.use_lora_plugin:
-            assert lora_dir is not None, \
-                "lora_dir should not be None for engine built with lora_plugin enabled."
             lora_manager = LoraManager()
-            lora_manager.load_from_ckpt(model_dir=lora_dir,
-                                        model_config=model_config,
-                                        runtime_mapping=runtime_mapping,
-                                        ckpt_source=lora_ckpt_source)
+            if lora_dir is not None:
+                lora_manager.load_from_ckpt(model_dir=lora_dir,
+                                            model_config=model_config,
+                                            runtime_mapping=runtime_mapping,
+                                            ckpt_source=lora_ckpt_source)
         else:
             lora_manager = None
 
@@ -474,16 +480,12 @@ class ModelRunner(ModelRunnerMixin):
         return self.session.max_prompt_embedding_table_size
 
     @property
-    def compute_context_logits(self) -> bool:
-        return self.session.gather_all_token_logits
+    def gather_context_logits(self) -> bool:
+        return self.session.gather_context_logits
 
     @property
-    def compute_generation_logits(self) -> bool:
-        return self.session.gather_all_token_logits
-
-    @property
-    def gather_all_token_logits(self) -> bool:
-        return self.session.gather_all_token_logits
+    def gather_generation_logits(self) -> bool:
+        return self.session.gather_generation_logits
 
     def generate(self,
                  batch_input_ids: List[torch.Tensor],
@@ -527,7 +529,8 @@ class ModelRunner(ModelRunnerMixin):
                 If return_dict=False, the method returns generated output_ids.
                 If return_dict=True, the method returns a dict of output_ids,
                 sequence_lengths (if sampling_config.output_sequence_lengths=True),
-                context_logits and generation_logits (if self.gather_all_token_logits=True).
+                context_logits and generation_logits (if self.gather_context_logits=True
+                and self.gather_generation_logits=True, respectively).
         """
         # Use sampling_config like HF's generation_config
         if sampling_config is None:
@@ -540,10 +543,6 @@ class ModelRunner(ModelRunnerMixin):
         batch_size = len(batch_input_ids)
         batch_input_ids, input_lengths = self._prepare_inputs(
             batch_input_ids, sampling_config.pad_id)
-
-        if self.use_lora_plugin:
-            assert lora_uids is not None, \
-                "lora_uids should not be None for engine built with lora_plugin enabled."
 
         self.session.setup(
             batch_size=batch_size,
@@ -578,3 +577,12 @@ class ModelRunner(ModelRunnerMixin):
             else:
                 outputs = self._prepare_outputs(outputs, input_lengths)
         return outputs
+
+    def serialize_engine(self) -> trt.IHostMemory:
+        """
+        Serialize the engine.
+
+        Returns:
+            bytes: The serialized engine.
+        """
+        return self.session.runtime.serialize_engine()

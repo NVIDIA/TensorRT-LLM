@@ -40,7 +40,6 @@ class BloomDecoderLayer(Module):
             hidden_size,
             config.num_attention_heads,
             config.num_key_value_heads,
-            max_position_embeddings=2048,
             num_layers=config.num_hidden_layers,
             dtype=dtype,
             attention_mask_type=AttentionMaskType.causal,
@@ -95,7 +94,7 @@ class BloomDecoderLayer(Module):
         residual = hidden_states
         hidden_states = self.post_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states, all_reduce_workspace)
+        hidden_states = self.mlp(hidden_states, workspace=all_reduce_workspace)
 
         hidden_states = residual + hidden_states
 
@@ -113,7 +112,7 @@ class BloomModel(Module):
         tp_size = config.mapping.tp_size
         tp_rank = config.mapping.tp_rank
         if config.use_parallel_embedding:
-            self.embedding = Embedding(
+            self.vocab_embedding = Embedding(
                 config.vocab_size,
                 config.hidden_size,
                 dtype=dtype,
@@ -122,9 +121,9 @@ class BloomModel(Module):
                 sharding_dim=config.embedding_sharding_dim,
                 tp_rank=tp_rank)
         else:
-            self.embedding = Embedding(config.vocab_size,
-                                       config.hidden_size,
-                                       dtype=dtype)
+            self.vocab_embedding = Embedding(config.vocab_size,
+                                             config.hidden_size,
+                                             dtype=dtype)
         self.ln_embed = LayerNorm(normalized_shape=config.hidden_size,
                                   dtype=dtype)
         self.layers = DecoderLayerList(BloomDecoderLayer, config)
@@ -141,7 +140,7 @@ class BloomModel(Module):
                 prompt_vocab_size=None,
                 attention_params=None,
                 all_reduce_workspace=None):
-        hidden_states = self.embedding(input_ids, all_reduce_workspace)
+        hidden_states = self.vocab_embedding(input_ids, all_reduce_workspace)
 
         hidden_states = self.ln_embed(hidden_states)
 

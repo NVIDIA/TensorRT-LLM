@@ -54,8 +54,29 @@ auto constexpr kPresencePenaltyTensorName = "presence_penalty";
 auto constexpr kFrequencyPenaltyTensorName = "frequency_penalty";
 auto constexpr kRandomSeedTensorName = "random_seed";
 auto constexpr kReturnLogProbsTensorName = "return_log_probs";
+auto constexpr kReturnContextLogitsTensorName = "return_context_logits";
+auto constexpr kReturnGenerationLogitsTensorName = "return_generation_logits";
 auto constexpr kPromptEmbeddingTableName = "prompt_embedding_table";
 auto constexpr kPromptVocabSizeName = "prompt_vocab_size";
+// weights for a lora adapter shape [ num_lora_modules_layers, D x Hi + Ho x D ]
+// where the last dimension holds the in / out adapter weights for the associated module (e.g. attn_qkv) and model layer
+// each of the in / out tensors are first flattened and then concatenated together in the format above.
+// D=adapter_size (R value), Hi=hidden_size_in, Ho=hidden_size_out.
+auto constexpr kLoraWeights = "lora_weights";
+// module identifier (same size a first dimension of lora_weights)
+// See LoraModule::ModuleType for model id mapping
+//
+// "attn_qkv": 0     # compbined qkv adapter
+// "attn_q": 1       # q adapter
+// "attn_k": 2       # k adapter
+// "attn_v": 3       # v adapter
+// "attn_dense": 4   # adapter for the dense layer in attention
+// "mlp_h_to_4h": 5  # for llama2 adapter for gated mlp layer after attention / RMSNorm: up projection
+// "mlp_4h_to_h": 6  # for llama2 adapter for gated mlp layer after attention / RMSNorm: down projection
+// "mlp_gate": 7     # for llama2 adapter for gated mlp later after attention / RMSNorm: gate
+//
+// last dim holds [ module_id, layer_idx, adapter_size (D / R value) ]
+auto constexpr kLoraConfig = "lora_config"; // [num_lora_modules_layers, 3]
 
 // Obsolete names for backward compatibility
 auto constexpr kInputLengthsTensorName = "input_lengths";
@@ -115,6 +136,11 @@ public:
         return mRequestId;
     }
 
+    TensorMap const& getInputTensors() const
+    {
+        return mInputTensors;
+    }
+
     static std::array constexpr kTensorNames = {
         inference_request::kInputIdsTensorName,
         inference_request::kDraftInputIdsTensorName,
@@ -136,10 +162,14 @@ public:
         inference_request::kFrequencyPenaltyTensorName,
         inference_request::kRandomSeedTensorName,
         inference_request::kReturnLogProbsTensorName,
+        inference_request::kReturnContextLogitsTensorName,
+        inference_request::kReturnGenerationLogitsTensorName,
         inference_request::kPromptEmbeddingTableName,
         inference_request::kPromptVocabSizeName,
         // obsolete names for backward compatibility
         inference_request::kInputLengthsTensorName,
+        inference_request::kLoraWeights,
+        inference_request::kLoraConfig,
     };
 
 #define TENSOR_GETTER_SETTER(funcName, tensorName)                                                                     \
@@ -194,8 +224,12 @@ public:
     TENSOR_GETTER_SETTER(FrequencyPenalty, inference_request::kFrequencyPenaltyTensorName)
     TENSOR_GETTER_SETTER(RandomSeed, inference_request::kRandomSeedTensorName)
     TENSOR_GETTER_SETTER(ReturnLogProbs, inference_request::kReturnLogProbsTensorName)
+    TENSOR_GETTER_SETTER(ReturnContextLogits, inference_request::kReturnContextLogitsTensorName)
+    TENSOR_GETTER_SETTER(ReturnGenerationLogits, inference_request::kReturnGenerationLogitsTensorName)
     TENSOR_GETTER_SETTER(PromptEmbeddingTable, inference_request::kPromptEmbeddingTableName)
     TENSOR_GETTER_SETTER(PromptVocabSize, inference_request::kPromptVocabSizeName)
+    TENSOR_GETTER_SETTER(LoraWeights, inference_request::kLoraWeights)
+    TENSOR_GETTER_SETTER(LoraConfig, inference_request::kLoraConfig)
 
 #undef TENSOR_GETTER_SETTER
 

@@ -31,7 +31,12 @@ from tensorrt_llm import logger
 from tensorrt_llm._utils import torch_to_numpy, trt_dtype_to_torch
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 
-from build import get_engine_name  # isort:skip
+
+def get_engine_name(model, dtype, tp_size, pp_size, rank):
+    if pp_size == 1:
+        return '{}_{}_tp{}_rank{}.engine'.format(model, dtype, tp_size, rank)
+    return '{}_{}_tp{}_pp{}_rank{}.engine'.format(model, dtype, tp_size,
+                                                  pp_size, rank)
 
 
 def print_tensor(tensor_name, tensor, num_elements=10):
@@ -80,8 +85,12 @@ def read_config(config_path: Path):
     use_custom_all_reduce = config['plugin_config'].get('use_custom_all_reduce',
                                                         False)
     dtype = builder_config["precision"]
-    gather_all_token_logits = builder_config.get('gather_all_token_logits',
-                                                 False)
+
+    gather_context_logits = builder_config.get('gather_context_logits', False)
+    gather_generation_logits = builder_config.get('gather_generation_logits',
+                                                  False)
+    max_prompt_embedding_table_size = builder_config.get(
+        'max_prompt_embedding_table_size', 0)
 
     model_config = ModelConfig(
         num_heads=num_heads,
@@ -97,7 +106,9 @@ def read_config(config_path: Path):
         has_token_type_embedding=has_token_type_embedding,
         use_custom_all_reduce=use_custom_all_reduce,
         dtype=dtype,
-        gather_all_token_logits=gather_all_token_logits)
+        gather_context_logits=gather_context_logits,
+        gather_generation_logits=gather_generation_logits,
+        max_prompt_embedding_table_size=max_prompt_embedding_table_size)
 
     return model_config, tp_size, pp_size, gpus_per_node, dtype
 
@@ -192,7 +203,8 @@ class TRTLLMEncDecModel:
     def process_input(self,
                       input_ids,
                       remove_input_padding=False,
-                      pad_token_id=0):
+                      pad_token_id=0,
+                      prompt_tasks=None):
         if remove_input_padding:
             # in remove padding mode --> flatten input, calculate actual length and max length
             # Note: 1st token should never be removed, even if it is pad_token_id
@@ -208,6 +220,8 @@ class TRTLLMEncDecModel:
                     torch.cat(
                         (torch.IntTensor([first_ids[i]]).to(self.device), row)))
             input_ids = torch.cat(new_ids)  # [num_tokens]
+            if prompt_tasks is not None:
+                prompt_tasks = prompt_tasks[:input_ids.shape[0]]
         else:
             # in padding mode --> keep input, just calculate actual length and max length
             # Note: 1st token should always count, even if it is pad_token_id. e.g., decoder start id in enc-dec models could be a single pad_token_id, we should count
@@ -217,7 +231,7 @@ class TRTLLMEncDecModel:
                 dtype=torch.int32,
                 device=self.device)
         max_input_length = torch.max(input_lengths).item()
-        return input_ids, input_lengths, max_input_length
+        return input_ids, input_lengths, max_input_length, prompt_tasks
 
     def encoder_run(self,
                     input_ids,
@@ -225,7 +239,10 @@ class TRTLLMEncDecModel:
                     max_input_length,
                     position_ids=None,
                     token_type_ids=None,
-                    debug_mode=False):
+                    debug_mode=False,
+                    prompt_embedding_table=None,
+                    prompt_tasks=None,
+                    prompt_vocab_size=None):
 
         # each engine has hidden_dim/TP, don't forget to multiply TP
         hidden_size = self.encoder_model_config.hidden_size * self.encoder_runtime_mapping.tp_size
@@ -260,12 +277,20 @@ class TRTLLMEncDecModel:
                 inputs['position_ids'] = position_ids.contiguous()
             if self.encoder_model_config.has_token_type_embedding:
                 inputs['token_type_ids'] = token_type_ids.contiguous()
+
+            if self.encoder_model_config.max_prompt_embedding_table_size > 0:
+                inputs[
+                    'prompt_embedding_table'] = prompt_embedding_table.contiguous(
+                    )
+                inputs['tasks'] = prompt_tasks.contiguous()
+                inputs['prompt_vocab_size'] = prompt_vocab_size.contiguous()
         else:
             # just need a placeholder, engine will call NCCL to recv and fill data from previous rank
             inputs['hidden_states_input'] = torch.empty(
                 hidden_states_shape,
                 dtype=hidden_states_dtype('hidden_states_input'),
                 device=self.device).contiguous()
+
         inputs['input_lengths'] = input_lengths
         # use shape info to pass max length info in remove padding mode
         inputs['max_input_length'] = torch.empty(
@@ -363,6 +388,9 @@ class TRTLLMEncDecModel:
         bos_token_id=None,
         debug_mode=False,
         return_dict=False,
+        prompt_embedding_table=None,
+        prompt_tasks=None,
+        prompt_vocab_size=None,
     ):
         ## ensure all externally provided tensors are on the correct device.
         encoder_input_ids = encoder_input_ids.to(self.device)
@@ -370,17 +398,21 @@ class TRTLLMEncDecModel:
 
         ## encoder run
         logger.info(f"Rank {self.runtime_rank} Running encoder engine ...")
-        encoder_input_ids, encoder_input_lengths, encoder_max_input_length = self.process_input(
+        encoder_input_ids, encoder_input_lengths, encoder_max_input_length, prompt_tasks = self.process_input(
             encoder_input_ids, self.encoder_model_config.remove_input_padding,
-            pad_token_id)
-        encoder_output = self.encoder_run(encoder_input_ids,
-                                          encoder_input_lengths,
-                                          encoder_max_input_length,
-                                          debug_mode=debug_mode)
+            pad_token_id, prompt_tasks)
+        encoder_output = self.encoder_run(
+            encoder_input_ids,
+            encoder_input_lengths,
+            encoder_max_input_length,
+            debug_mode=debug_mode,
+            prompt_embedding_table=prompt_embedding_table,
+            prompt_tasks=prompt_tasks,
+            prompt_vocab_size=prompt_vocab_size)
 
         ## decoder run
         logger.info(f"Rank {self.runtime_rank} Running decoder engine ...")
-        decoder_input_ids, decoder_input_lengths, decoder_max_input_length = self.process_input(
+        decoder_input_ids, decoder_input_lengths, decoder_max_input_length, _ = self.process_input(
             decoder_input_ids, self.decoder_model_config.remove_input_padding,
             pad_token_id)
 

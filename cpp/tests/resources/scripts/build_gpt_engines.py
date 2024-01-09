@@ -35,7 +35,7 @@ def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, world_size, *args):
         '--output_dir',
         str(engine_dir),
         '--max_batch_size=256',
-        '--max_input_len=40',
+        '--max_input_len=512',
         '--max_output_len=20',
         '--max_beam_width=2',
         '--builder_opt=0',
@@ -147,10 +147,13 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
                  '--remove_input_padding')
     # this engine can be use for in-flight batching
     ifb_args = [
-        '--dtype=float16', '--use_gpt_attention_plugin=float16',
-        '--remove_input_padding', '--paged_kv_cache',
-        '--enable_context_fmha_fp32_acc', '--max_num_tokens=10000',
-        '--use_paged_context_fmha'
+        '--dtype=float16',
+        '--use_gpt_attention_plugin=float16',
+        '--remove_input_padding',
+        '--paged_kv_cache',
+        '--enable_context_fmha_fp32_acc',
+        '--max_num_tokens=10000',
+        '--use_paged_context_fmha',
     ]
     build_engine(fp16_weight_dir_x_gpu,
                  engine_dir / 'fp16-plugin-packed-paged' / tp_pp_dir, tp_size,
@@ -168,6 +171,12 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
         fp16_weight_dir_x_gpu, engine_dir /
         'fp16-plugin-packed-paged-context-fmha-for-gen' / tp_pp_dir, tp_size,
         '--use_context_fmha_for_generation', '--max_draft_len=5', *ifb_args)
+
+    # build engine with lora enabled
+    build_engine(fp16_weight_dir_x_gpu,
+                 engine_dir / "fp16-plugin-packed-paged-lora" / tp_pp_dir,
+                 tp_size, '--use_lora_plugin=float16',
+                 '--lora_target_modules=attn_qkv', *ifb_args)
 
     if has_safetensor:
         _pl.Path(str(safetensor_file) + ".bak").rename(safetensor_file)

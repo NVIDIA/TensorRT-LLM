@@ -597,6 +597,7 @@ class SmoothQuantMLP(Module):
 
         self.hidden_act = hidden_act
         self.quant_mode = quant_mode
+        self.dtype = dtype
 
         if self.quant_mode.has_act_static_scaling():
             self.quantization_scaling_factor = Parameter(shape=(1, ),
@@ -749,11 +750,12 @@ class FP8Linear(Linear):
         assert lora_runtime_params is None, "lora is not supported on FP8Linear now"
         if default_net().strongly_typed:
             if isinstance(self.dtype, str):
-                assert x.dtype == str_dtype_to_trt(self.dtype)
+                assert x.dtype == str_dtype_to_trt(
+                    self.dtype
+                ), f"Got input type {x.dtype}, expecting {self.dtype}"
             else:
-                assert x.dtype == self.dtype
-            assert x.dtype == self.weight.value.dtype
-
+                assert x.dtype == self.dtype, f"Got input type {x.dtype}, expecting {self.dtype}"
+            assert x.dtype == self.weight.value.dtype, f"Got input type {x.dtype}, got weight dtype{self.weight.value.dtype}"
         activation_scaling_factor = cast(self.activation_scaling_factor.value,
                                          self.dtype)
         quantized_out = quantize(x, activation_scaling_factor, 'fp8')
@@ -801,6 +803,7 @@ class FP8RowLinear(RowLinear):
                 assert x.dtype == str_dtype_to_trt(self.dtype)
             else:
                 assert x.dtype == self.dtype
+
             assert x.dtype == self.weight.value.dtype
 
         activation_scaling_factor = cast(self.activation_scaling_factor.value,
@@ -1147,7 +1150,8 @@ class SmoothQuantAttention(Module):
                 attention_scores = attention_scores / self.norm_factor
                 attention_probs = softmax(attention_scores, dim=-1)
 
-            context = matmul(attention_probs, value).permute([0, 2, 1, 3])
+            context = matmul(attention_probs, value,
+                             use_fp32_acc=False).permute([0, 2, 1, 3])
             context = context.view(
                 concat([shape(context, 0),
                         shape(context, 1), self.hidden_size]))

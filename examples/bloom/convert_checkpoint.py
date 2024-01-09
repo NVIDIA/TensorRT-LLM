@@ -845,10 +845,10 @@ def convert_hf_bloom(hf_bloom,
                                                     dim=0)
 
     if not use_parallel_embedding:
-        weights['transformer.embedding.weight'] = embed_w
+        weights['transformer.vocab_embedding.weight'] = embed_w
     else:
         assert hf_bloom.config.vocab_size % tensor_parallel == 0
-        weights['transformer.embedding.weight'] = split_matrix_tp(
+        weights['transformer.vocab_embedding.weight'] = split_matrix_tp(
             embed_w, tensor_parallel, rank, dim=sharding_dim)
 
     embed_f_w, embed_f_b = get_weight_and_bias(
@@ -874,8 +874,8 @@ def rename_hf_to_tllm(name: str):
         if not name.startswith('transformer.'):
             name = f'transformer.{name}'
     elif 'word_embeddings.' in name:
-        name = name.replace('word_embeddings', 'embedding')
-    if name.startswith(('ln_embed.', 'embedding.', 'ln_f.')):
+        name = name.replace('word_embeddings', 'vocab_embedding')
+    if name.startswith(('ln_embed.', 'vocab_embedding.', 'ln_f.')):
         name = f'transformer.{name}'
 
     # Parameter names in layers
