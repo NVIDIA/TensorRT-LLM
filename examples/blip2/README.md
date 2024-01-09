@@ -27,8 +27,7 @@
     # OPT-2.7B
     python3 convert_checkpoint.py --model_dir ./opt-2.7b \
                 --dtype float16 \
-                --output_dir ./opt/2.7B/trt_ckpt/fp16/1-gpu/ \
-                --use_prompt_tuning
+                --output_dir ./opt/2.7B/trt_ckpt/fp16/1-gpu/
     ```
 - Build TRT-LLM engines from TRT-LLM checkpoint (only need to add --max_prompt_embedding_table_size)
 
@@ -53,7 +52,6 @@
     python3 convert_checkpoint.py --model_dir ./opt-2.7b \
                 --dtype float16 \
                 --output_dir ./opt/2.7B/trt_ckpt/int4_weightonly/1-gpu/
-                --use_prompt_tuning \
                 --use_weight_only \
                 --weight_only_precision int4
 

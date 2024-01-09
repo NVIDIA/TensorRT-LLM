@@ -91,6 +91,12 @@ public:
     TensorPtr lastTokenIds;
     TensorPtr requestTypes;        // with attention plugin. Host tensor
     TensorPtr allGenerationLogits; // pre-allocate a buffer to save all generation logits, device tensor
+    TensorPtr originalLogitsPtr;   // Record the initially created buffer address.
+                                 // `logits` will point to new buffer (i.e. `allGenerationLogits`) for each iteration to
+                                 // avoid overwrite during gather context/generation logits.
+                                 // `originalLogitsPtr` could reset the `logits` point to the initially buffer when
+                                 // microBatch call `buffer.reshape()`. This could avoid next microBatch's `logits`
+                                 // still point to `allGenerationLogits` and bring overwrite conflict.
 
     std::vector<TensorPtr> presentKeysVals;
     std::vector<TensorPtr> presentKeysValsAlt;  // without attention plugin

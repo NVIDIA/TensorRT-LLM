@@ -22,11 +22,9 @@ import torch
 from safetensors import safe_open
 
 import tensorrt_llm
-import tensorrt_llm.logger as logger
 from tensorrt_llm._utils import (numpy_to_torch, str_dtype_to_np,
                                  str_dtype_to_torch, torch_to_numpy)
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import LLaMAForCausalLM
 from tensorrt_llm.models.quantized.quant import get_dummy_quant_scales
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime.lora_manager import LoraConfig
@@ -72,16 +70,15 @@ def get_scaling_factors(
     """
 
     if model_path is None:
-        logger.warning(f"--quantized_fp8_model_path not specified. "
-                       f"Initialize quantization scales automatically.")
+        tensorrt_llm.logger.warning(
+            f"--quantized_fp8_model_path not specified. "
+            f"Initialize quantization scales automatically.")
         return get_dummy_quant_scales(num_layers)
     weight_dict = np.load(model_path)
-
     # yapf: disable
     scaling_factor = {
         'qkv_act': [],
         'qkv_weights': [],
-        'qkv_output': [],
         'dense_act': [],
         'dense_weights': [],
         'fc_act': [],
@@ -91,6 +88,9 @@ def get_scaling_factors(
         'proj_act': [],
         'proj_weights': [],
     }
+
+    if quant_mode is not None and quant_mode.has_fp8_kv_cache():
+        scaling_factor['qkv_output'] = []
 
     for layer in range(num_layers):
         scaling_factor['qkv_act'].append(max(
@@ -188,7 +188,7 @@ def parse_bin_config(ini_file):
     return n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, n_kv_head
 
 
-def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
+def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
                        hf_llama,
                        mapping=Mapping(),
                        dtype='float32',
@@ -463,7 +463,7 @@ def load_from_hf_llama(tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
 class QkvWeightHelper:
     """ A helper utility for loading QKV weights from sharded files. """
 
-    def __init__(self, model: tensorrt_llm.models.LLaMAForCausalLM):
+    def __init__(self, model: 'LLaMAForCausalLM'):
         self.hidden_size = model.hidden_size
         self.num_heads = model.num_heads
         self.num_kv_heads = model.num_kv_heads
@@ -526,7 +526,7 @@ class QkvWeightHelper:
 
 
 def load_from_hf_checkpoint(
-        tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
+        tensorrt_llm_llama: 'LLaMAForCausalLM',
         model_dir: Union[str, Path],
         mapping=Mapping(),
         dtype: Union[str, torch.dtype] = torch.float32,
@@ -559,10 +559,10 @@ def load_from_hf_checkpoint(
     for model_file in iterate_shard_files(model_dir,
                                           rank=mapping.tp_rank,
                                           progress_bar=False):
-        logger.debug(f'Loading file {str(model_file)}...')
+        tensorrt_llm.logger.debug(f'Loading file {str(model_file)}...')
         model_params = load_state_dict(model_file, dtype=dtype)
         for name, param in model_params.items():
-            logger.debug(f'Converting weight {name}...')
+            tensorrt_llm.logger.debug(f'Converting weight {name}...')
             i = retrieved_layer_index_from_name(name)
             if i is None:
                 layer = None
@@ -657,11 +657,10 @@ def load_from_hf_checkpoint(
     tensorrt_llm.logger.info(f'Weights loaded. Total time: {t}')
 
 
-def load_from_meta_llama(
-        tensorrt_llm_llama: tensorrt_llm.models.LLaMAForCausalLM,
-        meta_ckpt_dir,
-        mapping=Mapping(),
-        dtype="float32"):
+def load_from_meta_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
+                         meta_ckpt_dir,
+                         mapping=Mapping(),
+                         dtype="float32"):
     torch_dtype = str_dtype_to_torch(dtype)
 
     def gather_ckpts(ckpts):
@@ -878,7 +877,7 @@ def load_from_meta_llama(
     return
 
 
-def load_from_binary(tensorrt_llm_llama: LLaMAForCausalLM,
+def load_from_binary(tensorrt_llm_llama: 'LLaMAForCausalLM',
                      dir_path,
                      mapping=Mapping(),
                      fp16=False,
@@ -1337,8 +1336,9 @@ def load_from_gptq_llama(tensorrt_llm_llama,
     return
 
 
-def load_from_awq_llama(tensorrt_llm_llama: LLaMAForCausalLM,
+def load_from_awq_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
                         quant_ckpt_path,
+                        quantize_lm_head=False,
                         mapping=Mapping(),
                         dtype="float16",
                         bin_model_dir=None):
@@ -1518,22 +1518,29 @@ def load_from_awq_llama(tensorrt_llm_llama: LLaMAForCausalLM,
     # 1. vocab_embedding
     v = load(awq_key_list[0])
     # TRT-LLM requires vocab_size to be multiple of 64 for successful GEMM
-    if v.shape[0] % 64 != 0:
+    if quantize_lm_head and v.shape[0] % 64 != 0:
         v = torch.nn.functional.pad(v, [0, 0, 0, 64 - v.shape[0] % 64])
     if mapping.is_first_pp_rank():
         tensorrt_llm_llama.vocab_embedding.weight.value = v.to(
             torch_dtype).cpu().numpy()
 
     # 2. lm_head
-    v = [load(awq_key_list[1] + suf) for suf in awq_suffix_list]
-    if v[0].shape[0] % 64 != 0:
-        v[0] = torch.nn.functional.pad(v[0], [0, 0, 0, 64 - v[0].shape[0] % 64])
-        scale_align = 64 * (v[0].shape[1] // group_size)
-        v[1] = v[1].reshape(-1)
-        v[1] = torch.nn.functional.pad(
-            v[1], [0, scale_align - v[1].shape[0] % scale_align], value=1)
-    if mapping.is_last_pp_rank():
-        process_and_assign_weight(tensorrt_llm_llama.lm_head, v, 1)
+    if quantize_lm_head:
+        v = [load(awq_key_list[1] + suf) for suf in awq_suffix_list]
+        if v[0].shape[0] % 64 != 0:
+            v[0] = torch.nn.functional.pad(v[0],
+                                           [0, 0, 0, 64 - v[0].shape[0] % 64])
+            scale_align = 64 * (v[0].shape[1] // group_size)
+            v[1] = v[1].reshape(-1)
+            v[1] = torch.nn.functional.pad(
+                v[1], [0, scale_align - v[1].shape[0] % scale_align], value=1)
+        if mapping.is_last_pp_rank():
+            process_and_assign_weight(tensorrt_llm_llama.lm_head, v, 1)
+    else:
+        v = load(awq_key_list[1] + awq_suffix_list[0])
+        if mapping.is_last_pp_rank():
+            tensorrt_llm_llama.lm_head.weight.value = torch_split(
+                v, 0).to(torch_dtype).cpu().numpy()
 
     # 3. ln_f
     v = load(awq_key_list[2])

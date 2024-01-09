@@ -96,7 +96,8 @@ public:
             parent_ids_ptr; // [batch_size] int*, each array is [beam_width, max_seq_len], necessary in beam search
     };
 
-    void forward(BeamSearchOutputParams& outputs, ForwardParams const& params);
+    void forward(BeamSearchOutputParams& outputs, ForwardParams const& params, int* penalty_workspace,
+        const int* penalty_workspace_prev);
 
 protected:
     // meta data
@@ -106,19 +107,23 @@ protected:
     size_t topk_softmax_workspace_size_;
     void* topk_softmax_workspace_ = nullptr;
 
-    std::vector<float> mTemperature;
-    std::vector<int> mMinLength;
-    std::vector<float> mRepetitionPenalty;
-    std::vector<float> mPresencePenalty;
-    std::vector<float> mFrequencyPenalty;
     float* temperature_buf_;
-    int* min_lengths_buf_;
     float* repetition_penalty_buf_;
     float* presence_penalty_buf_;
     float* frequency_penalty_buf_;
+    int* min_lengths_buf_;
+
+    std::vector<float> mTemperature;
+    std::vector<float> mRepetitionPenalty;
+    std::vector<float> mPresencePenalty;
+    std::vector<float> mFrequencyPenalty;
+    std::vector<int> mMinLengths;
+
+    bool use_temperature_ = false;
     bool use_repetition_penalty_ = false;
     bool use_presence_penalty_ = false;
     bool use_frequency_penalty_ = false;
+    bool use_min_lengths_ = false;
 
     virtual void invokeSoftMax(BeamSearchOutputParams& outputs, SoftmaxParams const& params) = 0;
 

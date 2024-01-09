@@ -72,6 +72,8 @@ function(add_gtest test_name test_src)
   add_dependencies(google-tests ${test_name})
 endfunction()
 
+add_gtest(loraManagerTest runtime/loraManagerTest.cpp)
+add_gtest(loraUtilsTest runtime/loraUtilsTest.cpp)
 add_gtest(attentionKernelTest runtime/transposeKVKernelTest.cpp)
 add_gtest(gptDecoderTest runtime/gptDecoderTest.cpp)
 add_gtest(gptDecoderBatchTest runtime/gptDecoderBatchTest.cpp)

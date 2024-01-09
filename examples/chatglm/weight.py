@@ -12,9 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -25,7 +25,6 @@ import tensorrt_llm.logger as logger
 from tensorrt_llm._utils import (str_dtype_to_np, str_dtype_to_torch,
                                  torch_to_numpy)
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.quantized.quant import get_dummy_quant_scales
 from tensorrt_llm.quantization import QuantMode
 
 
@@ -94,8 +93,10 @@ def load_from_hf(
 
     tik = time.time()
 
-    hf_model = transformers.AutoModel.from_pretrained(hf_model_dir,
-                                                      trust_remote_code=True)
+    hf_model = transformers.AutoModel.from_pretrained(
+        hf_model_dir,
+        trust_remote_code=True,
+    )
     hidden_size = hf_model.config.hidden_size
     num_heads = hf_model.config.num_attention_heads
     num_layers = hf_model.config.num_layers
@@ -114,7 +115,7 @@ def load_from_hf(
               (mapping.pp_rank + 1) * layers_per_pipeline_stage))
     feed_weight_count = 0
 
-    if model_name in ["chatglm_6b", "glm_10b"]:
+    if model_name in ["chatglm_6b", "glm_2b", "glm_10b", "glm_10b_chinese"]:
         num_kv_heads = hf_model.config.num_attention_heads
     elif model_name in [
             "chatglm2_6b",
@@ -127,10 +128,10 @@ def load_from_hf(
 
     if mapping.is_first_pp_rank():
         # Embedding
+        dst = trtllm_model.vocab_embedding.weight
         if model_name in ["chatglm_6b"]:
-            weight = hf_model.transformer.word_embeddings.weight.to(
-                torch_type).detach()
-            trtllm_model.embedding.weight.value = torch_to_numpy(weight)
+            v = hf_model.transformer.word_embeddings.weight
+            dst.value = torch_to_numpy(v.to(torch_type).detach())
             feed_weight_count += 1
         elif model_name in [
                 "chatglm2_6b",
@@ -139,31 +140,29 @@ def load_from_hf(
                 "chatglm3_6b_base",
                 "chatglm3_6b_32k",
         ]:
-            weight = hf_model.transformer.embedding.word_embeddings.weight.to(
-                torch_type).detach()
-            trtllm_model.embedding.weight.value = torch_to_numpy(weight)
+            v = hf_model.transformer.embedding.word_embeddings.weight
+            dst.value = torch_to_numpy(v.to(torch_type).detach())
             feed_weight_count += 1
-        elif model_name in ["glm_10b"]:
-            weight = hf_model.word_embeddings.weight.to(torch_type).detach()
-            trtllm_model.embedding.weight.value = torch_to_numpy(weight)
-            weight = hf_model.transformer.position_embeddings.weight.to(
-                torch_type).detach()
-            trtllm_model.position_embeddings.weight.value = torch_to_numpy(
-                weight)
-            weight = hf_model.transformer.block_position_embeddings.weight.to(
-                torch_type).detach()
-            trtllm_model.block_embeddings.weight.value = torch_to_numpy(weight)
+        elif model_name in ["glm_2b", "glm_10b", "glm_10b_chinese"]:
+            v = hf_model.word_embeddings.weight
+            dst.value = torch_to_numpy(v.to(torch_type).detach())
+            v = hf_model.transformer.position_embeddings.weight
+            v = v.to(torch_type).detach()
+            trtllm_model.position_embedding.weight.value = torch_to_numpy(v)
+            v = hf_model.transformer.block_position_embeddings.weight
+            v = v.to(torch_type).detach()
+            trtllm_model.block_embedding.weight.value = torch_to_numpy(v)
             feed_weight_count += 3
 
     if mapping.is_last_pp_rank():
         # Final normalization
-        if model_name in ["chatglm_6b"]:
-            weight = hf_model.transformer.final_layernorm.weight.to(
-                torch_type).detach()
-            trtllm_model.final_norm.weight.value = torch_to_numpy(weight)
-            bias = hf_model.transformer.final_layernorm.bias.to(
-                torch_type).detach()
-            trtllm_model.final_norm.bias.value = torch_to_numpy(bias)
+        dst = trtllm_model.final_norm.weight
+        if model_name in ["chatglm_6b", "glm_2b", "glm_10b", "glm_10b_chinese"]:
+            v = hf_model.transformer.final_layernorm.weight
+            dst.value = torch_to_numpy(v.to(torch_type).detach())
+            v = hf_model.transformer.final_layernorm.bias
+            v = v.to(torch_type).detach()
+            trtllm_model.final_norm.bias.value = torch_to_numpy(v)
             feed_weight_count += 2
         elif model_name in [
                 "chatglm2_6b",
@@ -172,30 +171,14 @@ def load_from_hf(
                 "chatglm3_6b_base",
                 "chatglm3_6b_32k",
         ]:
-            weight = hf_model.transformer.encoder.final_layernorm.weight.to(
-                torch_type).detach()
-            trtllm_model.final_norm.weight.value = torch_to_numpy(weight)
+            v = hf_model.transformer.encoder.final_layernorm.weight
+            dst.value = torch_to_numpy(v.to(torch_type).detach())
             feed_weight_count += 1
-        elif model_name in ["glm_10b"]:
-            weight = hf_model.transformer.final_layernorm.weight.to(
-                torch_type).detach()
-            trtllm_model.final_norm.weight.value = torch_to_numpy(weight)
-            bias = hf_model.transformer.final_layernorm.bias.to(
-                torch_type).detach()
-            trtllm_model.final_norm.bias.value = torch_to_numpy(bias)
-            feed_weight_count += 2
 
         # Final LM
+        output_features = trtllm_model.lm_head.out_features
         if model_name in ["chatglm_6b"]:
-            weight = hf_model.lm_head.weight.to(torch_type).detach()
-            if weight.shape[0] % mapping.tp_size != 0:
-                pad_width = trtllm_model.lm_head.out_features * mapping.tp_size - weight.shape[
-                    0]
-                weight = F.pad(weight, (0, 0, 0, pad_width))
-            split_weight = torch.chunk(weight, mapping.tp_size,
-                                       dim=0)[mapping.rank]
-            trtllm_model.lm_head.weight.value = torch_to_numpy(split_weight)
-            feed_weight_count += 1
+            v = hf_model.lm_head.weight
         elif model_name in [
                 "chatglm2_6b",
                 "chatglm2_6b_32k",
@@ -203,40 +186,39 @@ def load_from_hf(
                 "chatglm3_6b_base",
                 "chatglm3_6b_32k",
         ]:
-            weight = hf_model.transformer.output_layer.weight.to(
-                torch_type).detach()
-            if weight.shape[0] % mapping.tp_size != 0:
-                pad_width = trtllm_model.lm_head.out_features * mapping.tp_size - weight.shape[
-                    0]
-                weight = F.pad(weight, (0, 0, 0, pad_width))
-            split_weight = torch.chunk(weight, mapping.tp_size,
-                                       dim=0)[mapping.rank]
-            trtllm_model.lm_head.weight.value = torch_to_numpy(split_weight)
-            feed_weight_count += 1
-        elif model_name in ["glm_10b"]:
-            weight = hf_model.word_embeddings.weight.to(torch_type).detach()
-            if weight.shape[0] % mapping.tp_size != 0:
-                pad_width = trtllm_model.lm_head.out_features * mapping.tp_size - weight.shape[
-                    0]
-                weight = F.pad(weight, (0, 0, 0, pad_width))
-            split_weight = torch.chunk(weight, mapping.tp_size,
-                                       dim=0)[mapping.rank]
-            trtllm_model.lm_head.weight.value = torch_to_numpy(split_weight)
-            feed_weight_count += 1
+            v = hf_model.transformer.output_layer.weight
+        elif model_name in ["glm_2b", "glm_10b", "glm_10b_chinese"]:
+            v = hf_model.word_embeddings.weight
+
+        v = v.to(torch_type).detach()
+        if v.shape[0] % mapping.tp_size != 0:
+            pad_width = output_features * mapping.tp_size - v.shape[0]
+            v = F.pad(v, (0, 0, 0, pad_width))
+        v = torch.chunk(v, mapping.tp_size, dim=0)[mapping.tp_rank]
+        trtllm_model.lm_head.weight.value = torch_to_numpy(v)
+        feed_weight_count += 1
 
     # Weight per layer
     for layer_idx in layers_range:
         i = layer_idx - mapping.pp_rank * layers_per_pipeline_stage
         layer = trtllm_model.layers[i]
+        if model_name in ["chatglm_6b", "glm_2b", "glm_10b", "glm_10b_chinese"]:
+            hf_layer = hf_model.transformer.layers[i]
+        elif model_name in [
+                "chatglm2_6b",
+                "chatglm2_6b_32k",
+                "chatglm3_6b",
+                "chatglm3_6b_base",
+                "chatglm3_6b_32k",
+        ]:
+            hf_layer = hf_model.transformer.encoder.layers[i]
 
         # Pre normalization
-        if model_name in ["chatglm_6b"]:
-            weight = hf_model.transformer.layers[i].input_layernorm.weight.to(
-                torch_type).detach()
-            layer.pre_norm.weight.value = torch_to_numpy(weight)
-            bias = hf_model.transformer.layers[i].input_layernorm.bias.to(
-                torch_type).detach()
-            layer.pre_norm.bias.value = torch_to_numpy(bias)
+        if model_name in ["chatglm_6b", "glm_2b", "glm_10b", "glm_10b_chinese"]:
+            v = hf_layer.input_layernorm.weight.to(torch_type).detach()
+            layer.pre_norm.weight.value = torch_to_numpy(v)
+            v = hf_layer.input_layernorm.bias.to(torch_type).detach()
+            layer.pre_norm.bias.value = torch_to_numpy(v)
             feed_weight_count += 2
         elif model_name in [
                 "chatglm2_6b",
@@ -245,23 +227,13 @@ def load_from_hf(
                 "chatglm3_6b_base",
                 "chatglm3_6b_32k",
         ]:
-            weight = hf_model.transformer.encoder.layers[
-                i].input_layernorm.weight.to(torch_type).detach()
-            layer.pre_norm.weight.value = torch_to_numpy(weight)
+            v = hf_layer.input_layernorm.weight.to(torch_type).detach()
+            layer.pre_norm.weight.value = torch_to_numpy(v)
             feed_weight_count += 1
-        elif model_name in ["glm_10b"]:
-            weight = hf_model.transformer.layers[i].input_layernorm.weight.to(
-                torch_type).detach()
-            layer.pre_norm.weight.value = torch_to_numpy(weight)
-            bias = hf_model.transformer.layers[i].input_layernorm.bias.to(
-                torch_type).detach()
-            layer.pre_norm.bias.value = torch_to_numpy(bias)
-            feed_weight_count += 2
 
         # QKV multiplication weight
-        if model_name in ["chatglm_6b"]:
-            weight = hf_model.transformer.layers[
-                i].attention.query_key_value.weight.to(torch_type).detach()
+        if model_name in ["chatglm_6b", "glm_2b", "glm_10b", "glm_10b_chinese"]:
+            v = hf_layer.attention.query_key_value.weight
         elif model_name in [
                 "chatglm2_6b",
                 "chatglm2_6b_32k",
@@ -269,30 +241,25 @@ def load_from_hf(
                 "chatglm3_6b_base",
                 "chatglm3_6b_32k",
         ]:
-            weight = hf_model.transformer.encoder.layers[
-                i].self_attention.query_key_value.weight.to(
-                    torch_type).detach()
-        elif model_name in ["glm_10b"]:
-            weight = hf_model.transformer.layers[
-                i].attention.query_key_value.weight.to(torch_type).detach()
+            v = hf_layer.self_attention.query_key_value.weight
 
-        split_weight = split_qkv(weight, mapping.tp_size, mapping.tp_rank,
-                                 hidden_size, num_heads, num_kv_heads)
-        dst = layer.attention.qkv
+        v = v.to(torch_type).detach()
+        v = split_qkv(v, mapping.tp_size, mapping.tp_rank, hidden_size,
+                      num_heads, num_kv_heads)
+        dst = layer.attention
         if use_weight_only:
             load_quant_weight(
-                src=split_weight,
-                value_dst=dst.weight,
-                scale_dst=dst.per_channel_scale,
+                src=v,
+                value_dst=dst.qkv.weight,
+                scale_dst=dst.qkv.per_channel_scale,
                 plugin_weight_only_quant_type=plugin_weight_only_quant_type)
         else:
-            dst.weight.value = torch_to_numpy(split_weight)
+            dst.qkv.weight.value = torch_to_numpy(v)
         feed_weight_count += 1
 
         # QKV multiplication bias
-        if model_name in ["chatglm_6b"]:
-            bias = hf_model.transformer.layers[
-                i].attention.query_key_value.bias.to(torch_type).detach()
+        if model_name in ["chatglm_6b", "glm_2b", "glm_10b", "glm_10b_chinese"]:
+            v = hf_layer.attention.query_key_value.bias
         elif model_name in [
                 "chatglm2_6b",
                 "chatglm2_6b_32k",
@@ -300,21 +267,17 @@ def load_from_hf(
                 "chatglm3_6b_base",
                 "chatglm3_6b_32k",
         ]:
-            bias = hf_model.transformer.encoder.layers[
-                i].self_attention.query_key_value.bias.to(torch_type).detach()
-        elif model_name in ["glm_10b"]:
-            bias = hf_model.transformer.layers[
-                i].attention.query_key_value.bias.to(torch_type).detach()
+            v = hf_layer.self_attention.query_key_value.bias
 
-        split_bias = split_qkv(bias, mapping.tp_size, mapping.tp_rank,
-                               hidden_size, num_heads, num_kv_heads)
-        layer.attention.qkv.bias.value = torch_to_numpy(split_bias)
+        v = v.to(torch_type).detach()
+        v = split_qkv(v, mapping.tp_size, mapping.tp_rank, hidden_size,
+                      num_heads, num_kv_heads)
+        layer.attention.qkv.bias.value = torch_to_numpy(v)
         feed_weight_count += 1
 
         # Dense multiplication weight
-        if model_name in ["chatglm_6b"]:
-            weight = hf_model.transformer.layers[i].attention.dense.weight.to(
-                torch_type).detach()
+        if model_name in ["chatglm_6b", "glm_2b", "glm_10b", "glm_10b_chinese"]:
+            v = hf_layer.attention.dense.weight
         elif model_name in [
                 "chatglm2_6b",
                 "chatglm2_6b_32k",
@@ -322,42 +285,38 @@ def load_from_hf(
                 "chatglm3_6b_base",
                 "chatglm3_6b_32k",
         ]:
-            weight = hf_model.transformer.encoder.layers[
-                i].self_attention.dense.weight.to(torch_type).detach()
-        elif model_name in ["glm_10b"]:
-            weight = hf_model.transformer.layers[i].attention.dense.weight.to(
-                torch_type).detach()
+            v = hf_layer.self_attention.dense.weight
 
-        split_weight = torch.chunk(weight, mapping.tp_size, dim=1)[mapping.rank]
+        v = v.to(torch_type).detach()
+        v = torch.chunk(v, mapping.tp_size, dim=1)[mapping.tp_rank]
         dst = layer.attention.dense
         if use_weight_only:
             load_quant_weight(
-                src=split_weight,
+                src=v,
                 value_dst=dst.weight,
                 scale_dst=dst.per_channel_scale,
                 plugin_weight_only_quant_type=plugin_weight_only_quant_type)
         else:
-            dst.weight.value = np.ascontiguousarray(
-                torch_to_numpy(split_weight))
+            # need np.ascontiguousarray since weight is split by column
+            dst.weight.value = np.ascontiguousarray(torch_to_numpy(v))
         feed_weight_count += 1
 
         # Dense multiplication bias, only GLM-10B
-        if model_name in ["glm_10b"]:
-            bias = hf_model.transformer.layers[i].attention.dense.bias.to(
-                torch_type).detach()
-            split_bias = split_qkv(bias, mapping.tp_size, mapping.tp_rank,
-                                   hidden_size, num_heads, num_kv_heads)
-            layer.attention.dense.bias.value = torch_to_numpy(split_bias)
+        if model_name in ["glm_2b", "glm_10b", "glm_10b_chinese"]:
+            v = hf_layer.attention.dense.bias.to(torch_type).detach()
+            v = split_qkv(v, mapping.tp_size, mapping.tp_rank, hidden_size,
+                          num_heads, num_kv_heads)
+            layer.attention.dense.bias.value = torch_to_numpy(v)
             feed_weight_count += 1
 
         # Post normalization
-        if model_name in ["chatglm_6b"]:
-            weight = hf_model.transformer.layers[
-                i].post_attention_layernorm.weight.to(torch_type).detach()
-            layer.post_norm.weight.value = torch_to_numpy(weight)
-            bias = hf_model.transformer.layers[
-                i].post_attention_layernorm.bias.to(torch_type).detach()
-            layer.post_norm.bias.value = torch_to_numpy(bias)
+        if model_name in ["chatglm_6b", "glm_2b", "glm_10b", "glm_10b_chinese"]:
+            v = hf_layer.post_attention_layernorm.weight
+            v = v.to(torch_type).detach()
+            layer.post_norm.weight.value = torch_to_numpy(v)
+            v = hf_layer.post_attention_layernorm.bias
+            v = v.to(torch_type).detach()
+            layer.post_norm.bias.value = torch_to_numpy(v)
             feed_weight_count += 2
         elif model_name in [
                 "chatglm2_6b",
@@ -366,25 +325,15 @@ def load_from_hf(
                 "chatglm3_6b_base",
                 "chatglm3_6b_32k",
         ]:
-            weight = hf_model.transformer.encoder.layers[
-                i].post_attention_layernorm.weight.to(torch_type).detach()
-            layer.post_norm.weight.value = torch_to_numpy(weight)
+            v = hf_layer.post_attention_layernorm.weight
+            v = v.to(torch_type).detach()
+            layer.post_norm.weight.value = torch_to_numpy(v)
             feed_weight_count += 1
-        elif model_name in ["glm_10b"]:
-            weight = hf_model.transformer.layers[
-                i].post_attention_layernorm.weight.to(torch_type).detach()
-            layer.post_norm.weight.value = torch_to_numpy(weight)
-            bias = hf_model.transformer.layers[
-                i].post_attention_layernorm.bias.to(torch_type).detach()
-            layer.post_norm.bias.value = torch_to_numpy(bias)
-            feed_weight_count += 2
 
         # Multilayer perceptron h -> 4h weight
-        if model_name in ["chatglm_6b"]:
-            weight = hf_model.transformer.layers[i].mlp.dense_h_to_4h.weight.to(
-                torch_type).detach()
-            split_weight = torch.chunk(weight, mapping.tp_size,
-                                       dim=0)[mapping.rank]
+        if model_name in ["chatglm_6b", "glm_2b", "glm_10b", "glm_10b_chinese"]:
+            v = hf_layer.mlp.dense_h_to_4h.weight.to(torch_type).detach()
+            v = torch.chunk(v, mapping.tp_size, dim=0)[mapping.tp_rank]
         elif model_name in [
                 "chatglm2_6b",
                 "chatglm2_6b_32k",
@@ -392,47 +341,39 @@ def load_from_hf(
                 "chatglm3_6b_base",
                 "chatglm3_6b_32k",
         ]:
-            weight = hf_model.transformer.encoder.layers[
-                i].mlp.dense_h_to_4h.weight.to(torch_type).detach()
-            split_weight = torch.chunk(weight, 2 * mapping.tp_size, dim=0)
-            # swap first and second half weight in columns to adapt trt_llm Swiglu
-            split_weight = torch.cat(
+            v = hf_layer.mlp.dense_h_to_4h.weight.to(torch_type).detach()
+            v = torch.chunk(v, 2 * mapping.tp_size, dim=0)
+            # swap halves of weight in column to adapt TRT-LLM's Swiglu
+            v = torch.cat(
                 [
-                    split_weight[mapping.rank + mapping.tp_size],
-                    split_weight[mapping.rank],
+                    v[mapping.tp_rank + mapping.tp_size],
+                    v[mapping.tp_rank],
                 ],
                 dim=0,
             )
-        elif model_name in ["glm_10b"]:
-            weight = hf_model.transformer.layers[i].mlp.dense_h_to_4h.weight.to(
-                torch_type).detach()
-            split_weight = torch.chunk(weight, mapping.tp_size,
-                                       dim=0)[mapping.rank]
 
         dst = layer.mlp.fc
         if use_weight_only:
             load_quant_weight(
-                src=split_weight,
+                src=v,
                 value_dst=dst.weight,
                 scale_dst=dst.per_channel_scale,
                 plugin_weight_only_quant_type=plugin_weight_only_quant_type)
         else:
-            dst.weight.value = torch_to_numpy(split_weight)
+            dst.weight.value = torch_to_numpy(v)
         feed_weight_count += 1
 
         # Multilayer perceptron h -> 4h bias, only GLM-10B
-        if model_name in ["glm_10b"]:
-            bias = hf_model.transformer.layers[i].mlp.dense_h_to_4h.bias.to(
-                torch_type).detach()
+        if model_name in ["glm_2b", "glm_10b", "glm_10b_chinese"]:
+            bias = hf_layer.mlp.dense_h_to_4h.bias.to(torch_type).detach()
             split_bias = split_qkv(bias, mapping.tp_size, mapping.tp_rank,
                                    hidden_size, num_heads, num_kv_heads)
             layer.mlp.fc.bias.value = torch_to_numpy(split_bias)
             feed_weight_count += 1
 
         # Multilayer perceptron 4h -> h weight
-        if model_name in ["chatglm_6b"]:
-            weight = hf_model.transformer.layers[i].mlp.dense_4h_to_h.weight.to(
-                torch_type).detach()
+        if model_name in ["chatglm_6b", "glm_2b", "glm_10b", "glm_10b_chinese"]:
+            v = hf_layer.mlp.dense_4h_to_h.weight.to(torch_type).detach()
         elif model_name in [
                 "chatglm2_6b",
                 "chatglm2_6b_32k",
@@ -440,29 +381,24 @@ def load_from_hf(
                 "chatglm3_6b_base",
                 "chatglm3_6b_32k",
         ]:
-            weight = hf_model.transformer.encoder.layers[
-                i].mlp.dense_4h_to_h.weight.to(torch_type).detach()
-        elif model_name in ["glm_10b"]:
-            weight = hf_model.transformer.layers[i].mlp.dense_4h_to_h.weight.to(
-                torch_type).detach()
+            v = hf_layer.mlp.dense_4h_to_h.weight.to(torch_type).detach()
 
-        split_weight = torch.chunk(weight, mapping.tp_size, dim=1)[mapping.rank]
+        v = torch.chunk(v, mapping.tp_size, dim=1)[mapping.tp_rank]
         dst = layer.mlp.proj
         if use_weight_only:
             load_quant_weight(
-                src=split_weight,
+                src=v,
                 value_dst=dst.weight,
                 scale_dst=dst.per_channel_scale,
                 plugin_weight_only_quant_type=plugin_weight_only_quant_type)
         else:
-            dst.weight.value = np.ascontiguousarray(
-                torch_to_numpy(split_weight))
+            # need np.ascontiguousarray since weight is split by column
+            dst.weight.value = np.ascontiguousarray(torch_to_numpy(v))
         feed_weight_count += 1
 
         # Multilayer perceptron 4h -> h bias, only GLM-10B
-        if model_name in ["glm_10b"]:
-            bias = hf_model.transformer.layers[i].mlp.dense_4h_to_h.bias.to(
-                torch_type).detach()
+        if model_name in ["glm_2b", "glm_10b", "glm_10b_chinese"]:
+            bias = hf_layer.mlp.dense_4h_to_h.bias.to(torch_type).detach()
             split_bias = split_qkv(bias, mapping.tp_size, mapping.tp_rank,
                                    hidden_size, num_heads, num_kv_heads)
             layer.mlp.proj.bias.value = torch_to_numpy(split_bias)
@@ -482,7 +418,7 @@ def load_from_hf(
             "chatglm3_6b_32k",
     ]:
         weight_count = 3 + num_layers * 7
-    elif model_name in ["glm_10b"]:
+    elif model_name in ["glm_2b", "glm_10b", "glm_10b_chinese"]:
         weight_count = 6 + num_layers * 12
     if feed_weight_count < weight_count:
         logger.error("%d weights not loaded from HF" %
@@ -510,7 +446,7 @@ def load_from_awq(
     ], \
         f"INT4-AWQ is not supported in {model_name} yet."
 
-    if not (Path(quant_ckpt_path).exists() and quant_ckpt_path.endswith(".pt")):
+    if not (str(quant_ckpt_path).endswith(".pt") and quant_ckpt_path.exists()):
         logger.info(f"No .pt weight file found from {quant_ckpt_path}")
         return
     else:
@@ -519,7 +455,6 @@ def load_from_awq(
     tik = time.time()
 
     awq_weight = torch.load(quant_ckpt_path, map_location=torch.device('cpu'))
-
     num_layers = trtllm_model.num_layers
     name = "transformer.encoder.layers.0.self_attention.query_key_value"
     group_size = awq_weight[name + ".weight"].numel() // \
@@ -571,7 +506,8 @@ def load_from_awq(
     if mapping.is_first_pp_rank():
         # Embedding
         v = awq_weight['transformer.embedding.word_embeddings.weight']
-        trtllm_model.embedding.weight.value = v.to(torch_dtype).cpu().numpy()
+        trtllm_model.vocab_embedding.weight.value = v.to(
+            torch_dtype).cpu().numpy()
         feed_weight_count += 1
 
     if mapping.is_last_pp_rank():
@@ -581,9 +517,8 @@ def load_from_awq(
         feed_weight_count += 1
 
         # Final LM
-        op = trtllm_model.lm_head
         prefix = "transformer.output_layer"
-        process_and_assign_weight(op, prefix, 1)
+        process_and_assign_weight(trtllm_model.lm_head, prefix, 1)
         feed_weight_count += 1
 
     # Weight per layer
@@ -598,9 +533,8 @@ def load_from_awq(
         feed_weight_count += 1
 
         # QKV multiplication weight
-        op = layer.attention.qkv
         name = prefix + "self_attention.query_key_value"
-        process_and_assign_weight(op, name, 1)
+        process_and_assign_weight(layer.attention.qkv, name, 1)
         feed_weight_count += 1
 
         # QKV multiplication bias
@@ -609,9 +543,8 @@ def load_from_awq(
         feed_weight_count += 1
 
         # Dense multiplication
-        op = layer.attention.dense
         name = prefix + "self_attention.dense"
-        process_and_assign_weight(op, name, 0)
+        process_and_assign_weight(layer.attention.dense, name, 0)
         feed_weight_count += 1
 
         # Post normalization
@@ -620,20 +553,18 @@ def load_from_awq(
         feed_weight_count += 1
 
         # Multilayer perceptron h -> 4h
-        op = layer.mlp.fc
         name = prefix + "mlp.dense_h_to_4h"
-        # swap first and second half weight in columns to adapt trt_llm Swiglu
+        # swap halves of weight in column to adapt TRT-LLM's Swiglu
         v = awq_weight[name + ".weight"]
         v = torch.split(v, v.shape[0] // 2, 0)
         v = torch.concat(v[::-1], 0)
         awq_weight[name + ".weight"] = v
-        process_and_assign_weight(op, name, 1)
+        process_and_assign_weight(layer.mlp.fc, name, 1)
         feed_weight_count += 1
 
         # Multilayer perceptron 4h -> h
-        op = layer.mlp.proj
         name = prefix + "mlp.dense_4h_to_h"
-        process_and_assign_weight(op, name, 0)
+        process_and_assign_weight(layer.mlp.proj, name, 0)
         feed_weight_count += 1
 
     tok = time.time()
@@ -649,7 +580,7 @@ def load_from_awq(
             "chatglm3_6b_32k",
     ]:
         weight_count = 3 + num_layers * 7
-    elif model_name in ["glm_10b"]:
+    elif model_name in ["glm_2b", "glm_10b", "glm_10b_chinese"]:
         weight_count = 6 + num_layers * 12
     if feed_weight_count < weight_count:
         logger.error("%d weights not loaded from HF" %
@@ -661,64 +592,77 @@ def load_from_awq(
 
 def load_from_sq(
     trtllm_model,
-    dir_path,
+    model_dir: Path = None,
     mapping: Mapping = Mapping(),
-    dtype: str = "float32",
+    dtype: str = "float16",
     model_name: str = None,
 ):
 
     assert model_name is not None, "Model name must be set"
     assert model_name in [
+            "chatglm2_6b",
             "chatglm2_6b_32k",
             "chatglm3_6b",
             "chatglm3_6b_base",
             "chatglm3_6b_32k",
     ], \
-        f"INT4-AWQ is not supported in {model_name} yet."
+        f"Smooth Quantization is not supported in {model_name} yet."
 
-    if not dir_path.exists():
-        logger.info(f"No weight file found from {dir_path}")
+    if not model_dir.exists():
+        logger.info(f"No weight file found from {model_dir}")
         return
     else:
-        logger.info("Loading weights from FT SmoothQuant checkpoint")
+        logger.info(f"Loading weights from {model_dir}")
 
     tik = time.time()
 
-    n_embd = 4096
-    n_layer = 28
-    vocab_size = 65024
-    inter_size = 13696
+    quant_mode = getattr(trtllm_model, "quant_mode", QuantMode(0))
+    use_smooth_quant = quant_mode.has_act_and_weight_quant()
+    quant_per_token_dyn = quant_mode.has_per_token_dynamic_scaling()
+    quant_per_channel = quant_mode.has_per_channel_scaling()
+    use_int8_kv_cache = quant_mode.has_int8_kv_cache()
+    suffix = f"{mapping.tp_rank}.bin"
+    if use_smooth_quant:
+        sq_prefix = "int8."
+        if quant_per_channel:
+            sq_prefix += "col."
+        suffix = sq_prefix + suffix
+
+    with open(model_dir / "config.json", "r") as f:
+        js = json.loads(f.read())
+    ffn_hidden_size = js["ffn_hidden_size"]
+    hidden_size = js["hidden_size"]
+    n_groups = js["multi_query_group_num"]
+    num_attention_heads = js["num_attention_heads"]
+    num_layers = js["num_layers"]
+    vocab_size = js["padded_vocab_size"]
+    qkv_size = (hidden_size + hidden_size // num_attention_heads * n_groups * 2)
+    qkv_size = qkv_size // mapping.tp_size
     np_dtype = str_dtype_to_np(dtype)
-    quant_mode = getattr(trtllm_model, 'quant_mode', QuantMode(0))
-    tensor_parallel = mapping.tp_size
-    rank = mapping.tp_rank
+    w_type = np.int8 if use_smooth_quant else np_dtype  # The type of weights
 
-    def fromfile(dir_path, name, shape=None, dtype=None):
+    layers_per_pipeline_stage = num_layers // mapping.pp_size
+    layers_range = list(
+        range(mapping.pp_rank * layers_per_pipeline_stage,
+              (mapping.pp_rank + 1) * layers_per_pipeline_stage))
+
+    def fromfile(
+        name,
+        shape=None,
+        dtype=None,
+    ):
         dtype = np_dtype if dtype is None else dtype
-        p = dir_path + '/' + name
+        p = model_dir / name
         if Path(p).exists():
-            t = np.fromfile(p, dtype=dtype)
+            v = np.fromfile(p, dtype=dtype)
             if shape is not None:
-                t = t.reshape(shape)
-            return t
+                v = v.reshape(shape)
+            return v
         return None
-
-    def squeezeQKV(t):
-        q = t[..., :4096]
-        k = t[..., 4096:4096 + 256]
-        v = t[..., 4096 * 2:4096 * 2 + 256]
-        if isinstance(t, torch.Tensor):
-            return torch.concatenate([q, k, v], axis=-1).contiguous()
-        elif isinstance(t, np.ndarray):
-            return np.ascontiguousarray(np.concatenate([q, k, v], axis=-1))
-        else:
-            print(f"Type {type(t)} is not supported")
-            return None
 
     def set_smoothquant_scale_factors(
         module,
         pre_scale_weight,
-        dir_path,
         basename,
         shape,
         per_tok_dyn,
@@ -726,234 +670,187 @@ def load_from_sq(
         is_qkv=False,
         rank=None,
     ):
+        suffix = "bin"
+        if per_channel:
+            if rank is not None:
+                suffix = f"{rank}." + suffix
+            suffix = "col." + suffix
 
-        shape if (per_channel or is_qkv) else [1, 1]
+        col_shape = shape if (per_channel or is_qkv) else [1, 1]
+
         if per_tok_dyn:
             if pre_scale_weight is not None:
                 pre_scale_weight.value = np.array([1.0], dtype=np.float32)
-            t = fromfile(
-                dir_path,
-                f"{basename}scale_w_quant_orig.{suffix}",
-                None,
-                np.float32,
-            )
-            if "attention.query_key_value" in basename:
-                t = squeezeQKV(t.reshape(1, 3 * 4096))
-            elif "attention.dense" in basename:
-                t = t.reshape(1, 4096)
-            elif "h_to_4h" in basename:
-                t = t.reshape(1, 27392)
-                #v_left = t[:, :13696]
-                #v_right = t[:, 13696:]
-                #t = np.concatenate([v_left, v_right], axis=-1)
-            elif "4h_to_h" in basename:
-                t = t.reshape(1, 4096)
-            module.per_channel_scale.value = t
+            if is_qkv and not per_channel:
+                name = f"{basename}scale_w_quant_orig.{rank}.{suffix}"
+            else:
+                name = f"{basename}scale_w_quant_orig.{suffix}"
+            v = fromfile(name, col_shape, np.float32)
+            module.per_channel_scale.value = np.ascontiguousarray(v)
         else:
-            t = fromfile(
-                dir_path,
-                f"{basename}scale_x_orig_quant.bin",
-                [1],
-                np.float32,
-            )
-            pre_scale_weight.value = t
-            t = fromfile(
-                dir_path,
-                f"{basename}scale_y_accum_quant.{suffix}",
-                [1, 4096 * 3],
-                np.float32,
-            )
-            module.per_channel_scale.value = squeezeQKV(t)
-            t = fromfile(
-                dir_path,
-                f"{basename}scale_y_quant_orig.bin",
-                [1, 1],
-                np.float32,
-            )
-            module.act_scale.value = t
+            name = f"{basename}scale_x_orig_quant.bin",
+            v = fromfile(name, [1], np.float32)
+            pre_scale_weight.value = np.ascontiguousarray(v)
+            if is_qkv:
+                name = f"{basename}scale_y_accum_quant.{rank}.{suffix}"
+            else:
+                name = f"{basename}scale_y_accum_quant.{suffix}"
+            v = fromfile(name, col_shape, np.float32)
+            module.per_channel_scale.value = np.ascontiguousarray(v)
+            name = f"{basename}scale_y_quant_orig.bin"
+            v = fromfile(name, [1, 1], np.float32)
+            module.act_scale.value = np.ascontiguousarray(v)
 
-    # Determine the quantization mode.
-    quant_mode = getattr(trtllm_model, "quant_mode", QuantMode(0))
-    # Do we use SmoothQuant?
-    use_smooth_quant = quant_mode.has_act_and_weight_quant()
-    # Do we use quantization per token?
-    quant_per_token_dyn = quant_mode.has_per_token_dynamic_scaling()
-    # Do we use quantization per channel?
-    quant_per_channel = quant_mode.has_per_channel_scaling()
-    # Int8 KV cache
-    use_int8_kv_cache = quant_mode.has_int8_kv_cache()
-    #Enable FP8 Gemm
-    quant_mode.has_fp8_qdq()
+    def set_smoother(
+        module,
+        basename,
+        shape,
+        rank,
+    ):
+        v = fromfile(f"{basename}.smoother.{rank}.bin", shape, np.float32)
+        module.smoother.value = np.ascontiguousarray(v)
 
-    # Debug
-    suffix = f"{rank}.bin"
-    if use_smooth_quant:
-        sq_prefix = "int8."
-        if quant_per_channel:
-            sq_prefix += "col."
-        suffix = sq_prefix + suffix
+    if mapping.is_first_pp_rank():
+        # Embedding
+        v = fromfile('embedding.weight.bin', [vocab_size, hidden_size])
+        trtllm_model.vocab_embedding.weight.value = np.ascontiguousarray(v)
 
-    # The type of weights.
-    w_type = np_dtype if not use_smooth_quant else np.int8
+    if mapping.is_last_pp_rank():
+        # Final normalization
+        v = fromfile('final_norm.weight.bin', [hidden_size])
+        trtllm_model.final_norm.weight.value = np.ascontiguousarray(v)
 
-    # Embedding
-    v = fromfile(dir_path, 'model.wte.bin', [vocab_size, n_embd])
-    trtllm_model.embedding.weight.value = np.ascontiguousarray(v)
-
-    # Final normalization
-    v = fromfile(dir_path, 'model.final_layernorm.weight.bin')
-    trtllm_model.final_norm.weight.value = np.ascontiguousarray(v)
-
-    # Final LM
-    v = fromfile(dir_path, 'model.lm_head.weight.bin', [vocab_size, n_embd])
-    dst = trtllm_model.lm_head.weight
-    if vocab_size % tensor_parallel != 0:
-        pad_width = trtllm_model.lm_head.out_features * tensor_parallel - vocab_size
-        v = np.pad(v, ((0, pad_width), (0, 0)), 'constant', constant_values=0)
-    v = torch.chunk(v, mapping.tp_size, dim=0)[mapping.rank]
-    dst.value = np.ascontiguousarray(v)
+        # Final LM
+        v = fromfile('lm_head.weight.bin', [vocab_size, hidden_size])
+        if vocab_size % mapping.tp_size != 0:
+            pad_width = trtllm_model.lm_head.out_features * mapping.tp_size - vocab_size
+            v = np.pad(v, [[0, pad_width], [0, 0]])
+        v = np.split(v, mapping.tp_size, axis=0)[mapping.tp_rank]
+        trtllm_model.lm_head.weight.value = np.ascontiguousarray(v)
 
     # Weight per layer
-    for i in range(n_layer):
-        c_attn_out_dim = 4608
+    for layer_idx in layers_range:
+        i = layer_idx - mapping.pp_rank * layers_per_pipeline_stage
         layer = trtllm_model.layers[i]
 
         # Pre normalization
-        v = fromfile(dir_path, f'model.layers.{i}.input_layernorm.weight.bin')
-        layer.pre_norm.weight.value = v
+        v = fromfile(f'layers.{i}.pre_norm.weight.bin', [hidden_size])
+        layer.pre_norm.weight.value = np.ascontiguousarray(v)
 
         # QKV multiplication weight
-        t = fromfile(
-            dir_path,
-            f'model.layers.{i}.attention.query_key_value.weight.' + suffix,
-            [n_embd * 3 * n_embd],
-            w_type,
-        )
-        # [4096,4096*3]->[4096,4608]->[4608,4096]
-        t = squeezeQKV(t.transpose(1, 0))
-        layer.attention.qkv.weight.value = np.ascontiguousarray(t)
+        basename = f'layers.{i}.attention.query_key_value.'
+        name = basename + 'weight.' + suffix
+        v = fromfile(name, [hidden_size, qkv_size], w_type)
+        dst = layer.attention.qkv.weight
+        dst.value = np.ascontiguousarray(v.transpose(1, 0))
         set_smoothquant_scale_factors(
-            layer.attention.qkv,
-            layer.pre_norm.scale_to_int,
-            dir_path,
-            f'model.layers.{i}.attention.query_key_value.',
-            [1, c_attn_out_dim],
-            quant_per_token_dyn,
-            quant_per_channel,
-            rank=rank,
+            module=layer.attention.qkv,
+            pre_scale_weight=layer.pre_norm.scale_to_int,
+            basename=basename,
+            shape=[1, qkv_size],
+            per_tok_dyn=quant_per_token_dyn,
+            per_channel=quant_per_channel,
             is_qkv=True,
+            rank=mapping.tp_rank,
         )
 
         # QKV multiplication bias
         if layer.bias:
-            t = fromfile(
-                dir_path,
-                f'model.layers.{i}.attention.query_key_value.bias.{rank}.bin',
-            )
-            layer.attention.qkv.bias.value = np.ascontiguousarray(t)
+            name = f'layers.{i}.attention.query_key_value.bias.{mapping.tp_rank}.bin'
+            v = fromfile(name, [qkv_size])
+            layer.attention.qkv.bias.value = np.ascontiguousarray(v)
 
         # Dense multiplication weight
-        t = fromfile(
-            dir_path,
-            f'model.layers.{i}.attention.dense.weight.' + suffix,
-            [n_embd // tensor_parallel, n_embd],
-            w_type,
-        )
-        t = t.transpose(1, 0)
-        layer.attention.dense.weight.value = np.ascontiguousarray(t)
+        basename = f'layers.{i}.attention.dense.'
+        name = basename + 'weight.' + suffix
+        shape = [hidden_size // mapping.tp_size, hidden_size]
+        v = fromfile(name, shape, w_type)
+        dst = layer.attention.dense.weight
+        dst.value = np.ascontiguousarray(v.transpose(1, 0))
+        dense_scale = layer.attention.quantization_scaling_factor
         set_smoothquant_scale_factors(
-            layer.attention.dense,
-            getattr(layer.attention, "quantization_scaling_factor", None),
-            dir_path,
-            'model.layers.' + str(i) + '.attention.dense.',
-            [1, n_embd],
-            quant_per_token_dyn,
-            quant_per_channel,
+            module=layer.attention.dense,
+            pre_scale_weight=dense_scale,
+            basename=basename,
+            shape=[1, hidden_size],
+            per_tok_dyn=quant_per_token_dyn,
+            per_channel=quant_per_channel,
+            is_qkv=False,
+            rank=None,
         )
-        # change it to the real smoother if dense layer is applied smooth quant
-        layer.attention.dense.smoother.value = np.ones(
-            [1, n_embd // tensor_parallel],
-            dtype=np.float32,
+        set_smoother(
+            module=layer.attention.dense,
+            basename=basename[:-1],
+            shape=[1, hidden_size // mapping.tp_size],
+            rank=mapping.tp_rank,
         )
 
         # Dense multiplication bias, only GLM-10B
         if layer.dense_bias:
-            t = fromfile(
-                dir_path,
-                f'model.layers.{i}.attention.dense.bias.bin',
-            )
-            layer.attention.dense.bias = np.ascontiguousarray(t)
+            v = fromfile(f'layers.{i}.attention.dense.bias.bin', [hidden_size])
+            layer.attention.dense.bias = np.ascontiguousarray(v)
 
         # Post normalization
-        t = fromfile(
-            dir_path,
-            f'model.layers.{i}.post_attention_layernorm.weight.bin',
-        )
-        layer.post_norm.weight.value = np.ascontiguousarray(t)
+        v = fromfile(f'layers.{i}.post_norm.weight.bin', [hidden_size])
+        layer.post_norm.weight.value = np.ascontiguousarray(v)
 
         # Multilayer perceptron h -> 4h weight
-        t = fromfile(
-            dir_path,
-            f'model.layers.{i}.mlp.dense_h_to_4h.weight.' + suffix,
-            [n_embd, inter_size * 2 // tensor_parallel],
-            w_type,
-        )
-        t = t.transpose(1, 0)
-        #v_left = t[:, :inter_size * 2 // tensor_parallel]
-        #v_right = t[:, inter_size * 2 // tensor_parallel:]
-        #t = np.concatenate([v_right, v_left], axis=-1)
-        layer.mlp.fc.weight.value = np.ascontiguousarray(t)
+        basename = f'layers.{i}.mlp.fc.'
+        name = basename + 'weight.' + suffix
+        shape = [hidden_size, ffn_hidden_size * 2 // mapping.tp_size]
+        v = fromfile(name, shape, w_type)
+        # swap halves of weight in column to adapt TRT-LLM's Swiglu
+        v_left = v[:, :ffn_hidden_size // mapping.tp_size]
+        v_right = v[:, ffn_hidden_size // mapping.tp_size:]
+        v = np.concatenate([v_right, v_left], axis=-1)
+        layer.mlp.fc.weight.value = np.ascontiguousarray(v.transpose(1, 0))
         set_smoothquant_scale_factors(
-            layer.mlp.fc,
-            layer.post_norm.scale_to_int,
-            dir_path,
-            f'model.layers.{i}.mlp.dense_h_to_4h.',
-            [1, inter_size // tensor_parallel],
-            quant_per_token_dyn,
-            quant_per_channel,
-            rank=rank,
+            module=layer.mlp.fc,
+            pre_scale_weight=layer.post_norm.scale_to_int,
+            basename=basename,
+            shape=[1, ffn_hidden_size * 2 // mapping.tp_size],
+            per_tok_dyn=quant_per_token_dyn,
+            per_channel=quant_per_channel,
+            is_qkv=False,
+            rank=mapping.tp_rank,
         )
 
         # Multilayer perceptron 4h -> h weight
-        t = fromfile(
-            dir_path,
-            f'model.layers.{i}.mlp.dense_4h_to_h.weight.' + suffix,
-            [inter_size // tensor_parallel, n_embd],
-            w_type,
-        )
-        t = t.transpose(1, 0)
-        layer.mlp.proj.weight.value = np.ascontiguousarray(t)
+        basename = f'layers.{i}.mlp.proj.'
+        name = basename + 'weight.' + suffix
+        shape = [ffn_hidden_size // mapping.tp_size, hidden_size]
+        v = fromfile(name, shape, w_type)
+        layer.mlp.proj.weight.value = np.ascontiguousarray(v.transpose(1, 0))
+        proj_scale = layer.mlp.quantization_scaling_factor
         set_smoothquant_scale_factors(
-            layer.mlp.proj,
-            getattr(layer.mlp, "quantization_scaling_factor", None),
-            dir_path,
-            f'model.layers.{i}.mlp.dense_4h_to_h.',
-            [1, n_embd],
-            quant_per_token_dyn,
-            quant_per_channel,
+            module=layer.mlp.proj,
+            pre_scale_weight=proj_scale,
+            basename=basename,
+            shape=[1, hidden_size],
+            per_tok_dyn=quant_per_token_dyn,
+            per_channel=quant_per_channel,
+            is_qkv=False,
+            rank=None,
         )
-        # change it to the real smoother if proj layer is applied smooth quant
-        layer.mlp.proj.smoother.value = np.ones(
-            [1, inter_size // tensor_parallel],
-            dtype=np.float32,
+        set_smoother(
+            module=layer.mlp.proj,
+            basename=basename[:-1],
+            shape=[1, ffn_hidden_size // mapping.tp_size],
+            rank=mapping.tp_rank,
         )
 
         if use_int8_kv_cache:
-            t = fromfile(
-                dir_path,
-                f'model.layers.{i}.attention.query_key_value.scale_y_quant_orig.bin',
-                [1],
-                np.float32,
-            )
-            layer.attention.kv_orig_quant_scale.value = 1.0 / t
-            layer.attention.kv_quant_orig_scale.value = t
+            name = f'layers.{i}.attention.query_key_value.scale_y_quant_orig.bin'
+            v = fromfile(name, [1], np.float32)
+            dst = layer.attention
+            dst.kv_orig_quant_scale.value = np.ascontiguousarray(1.0 / v)
+            dst.kv_quant_orig_scale.value = np.ascontiguousarray(v)
 
     tok = time.time()
-    logger.info("Loading weights finish in %.2fs" % (tok - tik))
-    return
+    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
+    logger.info(f'Weights loaded. Total time: {t}')
 
 
-#===============================================================================
 def load_from_gptq(
         trtllm_model,
         quant_ckpt_path,
@@ -967,10 +864,10 @@ def load_from_gptq(
 
 
 def get_scaling_factors(
-    model_path: Union[str, Path],
-    num_layers: int,
-    quant_mode: Optional[QuantMode] = None,
-) -> Optional[Dict[str, List[int]]]:
+    model_path: Path = None,
+    num_layers: int = 0,
+    quant_mode: QuantMode = None,
+):
     """ Get the scaling factors for model
 
     Returns a dictionary of scaling factors for the selected layers of the model.

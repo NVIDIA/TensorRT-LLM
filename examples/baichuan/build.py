@@ -445,7 +445,7 @@ def parse_arguments():
             args.vocab_size = 125696
             args.hidden_act = 'silu'
 
-    if args.weight_only_precision == 'int4_awq':
+    if args.quantize_lm_head and args.weight_only_precision == 'int4_awq':
         if args.vocab_size % 64 != 0:
             args.vocab_size = int((args.vocab_size + 63) / 64) * 64
             logger.info("To use awq we pad it to {}.".format(args.vocab_size))

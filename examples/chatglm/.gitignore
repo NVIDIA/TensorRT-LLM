@@ -8,4 +8,7 @@ engine_outputs/
 glm*/
 model.cache
 output_*/
-smooth/
+sq/
+
+*.pt
+model.cache

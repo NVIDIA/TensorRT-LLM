@@ -19,7 +19,9 @@
 #include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 
+#if ENABLE_MULTI_DEVICE
 #include <nccl.h>
+#endif // ENABLE_MULTI_DEVICE
 
 #include <algorithm>
 
@@ -61,6 +63,7 @@ TEST(MPIUtils, Broadcast)
     testBroadcast<std::uint64_t>();
 }
 
+#if ENABLE_MULTI_DEVICE
 TEST(MPIUtils, BroadcastNcclId)
 {
     auto& comm = mpi::MpiComm::world();
@@ -79,6 +82,7 @@ TEST(MPIUtils, BroadcastNcclId)
     EXPECT_TRUE(std::any_of(
         id.internal, id.internal + sizeof(id.internal) / sizeof(id.internal[0]), [](auto x) { return x != 0; }));
 }
+#endif // ENABLE_MULTI_DEVICE
 
 template <typename T>
 void testBroadcastBuffer()

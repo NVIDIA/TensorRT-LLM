@@ -123,22 +123,22 @@ This release of TensorRT-LLM contains the following examples:
 | ChatGLM    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | ChatGLM-v2 |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | ChatGLM-v3 |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| Falcon     |   Y   |   Y   |   Y   |   Y   |    .    |   .   |   .   |     .     |     .      |
+| Falcon     |   Y   |   Y   |   Y   |   Y   |    .    |   Y   |   Y   |     Y     |     .      |
 | Flan-T5    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | GPT        |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     .     |     .      |
-| GPT-J      |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
+| GPT-J      |   Y   |   Y   |   Y   |   Y   |    .    |   Y   |   Y   |     Y     |     .      |
 | GPT-NeMo   |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | GPT-NeoX   |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     Y      |
 | InternLM   |   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     .     |     .      |
-| LLaMA      |   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     Y     |     Y      |
+| LLaMA      |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
 | LLaMA-v2   |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
-| Mistral    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| Mistral    |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
 | MPT        |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
 | OPT        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Phi        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| Replit Code|   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| SantaCoder |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| StarCoder  |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| Replit Code|   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     .     |     .      |
+| SantaCoder |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
+| StarCoder  |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
 | T5         |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 
 

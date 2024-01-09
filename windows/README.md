@@ -112,7 +112,7 @@ Note: After building, you'll need to copy files out of your container. `docker c
 
 #### Acquiring an Image
 
-The Docker container will be hosted for public download in a future release. At this time, it must be built manually. See [windows/docker/README.md](windows/docker/README.md) for image build instructions.
+The Docker container will be hosted for public download in a future release. At this time, it must be built manually. See [windows/docker/README.md](/windows/docker/README.md) for image build instructions.
 
 #### Running the Container
 

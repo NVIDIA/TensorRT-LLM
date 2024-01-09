@@ -12,10 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import tempfile
+from pathlib import Path
 from typing import List, Optional
 
 import tensorrt as trt
 
+from ... import profiler
 from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
 from ...functional import (RotaryScalingType, Tensor, gather_last_token_logits,
@@ -25,13 +28,14 @@ from ...layers import (MOE, Attention, AttentionMaskType, AttentionParams,
                        KeyValueCacheParams, LoraParams, MoeConfig,
                        PositionEmbeddingType, PromptTuningEmbedding, RmsNorm)
 from ...mapping import Mapping
+from ...models.quantized.quant import quantize_model
 from ...module import Module, ModuleList
-from ...parameter import Parameter
 from ...quantization import QuantMode
-from ...quantization.layers import FP8Linear, FP8RowLinear
+from ...runtime.lora_manager import LoraConfig
 from ...top_model_mixin import TopModelMixin
 from ..generation_mixin import GenerationMixin
 from ..modeling_utils import PretrainedConfig
+from .weight import get_scaling_factors, load_from_awq_llama, load_from_hf_llama
 
 
 class LLaMADecoderLayer(Module):
@@ -159,7 +163,7 @@ class LLaMADecoderLayer(Module):
             self.register_network_output(f"norm1", hidden_states)
 
         hidden_states = self.mlp(hidden_states,
-                                 all_reduce_workspace,
+                                 workspace=all_reduce_workspace,
                                  lora_layer_params=lora_layer_params)
         if self._layer_id == 0:
             self.register_network_output(f"mlp", hidden_states)
@@ -485,7 +489,8 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopModelMixin):
                        max_beam_width,
                        max_num_tokens: int = None,
                        prompt_embedding_table_size: int = 0,
-                       gather_all_token_logits: bool = False,
+                       gather_context_logits: bool = False,
+                       gather_generation_logits: bool = False,
                        lora_target_modules: List[str] = None):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
@@ -525,7 +530,8 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopModelMixin):
             mapping=self.mapping,
             max_num_tokens=max_num_tokens,
             prompt_embedding_table_size=prompt_embedding_table_size,
-            gather_all_token_logits=gather_all_token_logits,
+            gather_context_logits=gather_context_logits,
+            gather_generation_logits=gather_generation_logits,
             use_lora_plugin=use_lora_plugin,
             lora_target_modules=lora_target_modules)
 
@@ -572,21 +578,20 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopModelMixin):
                           hf_model_dir,
                           dtype='float16',
                           mapping: Optional[Mapping] = None,
+                          quant_mode: Optional[QuantMode] = None,
                           **kwargs):
-        # TODO: discuss this can be our own config object if needed, instead of from transformers
-        # but why reinvent wheels. And we already direct depends on transformers lib
         import transformers
         from transformers import LlamaConfig
 
-        from ... import profiler
-        from ...runtime.lora_manager import LoraConfig
-        from .weight import load_from_hf_llama
         cfg = LlamaConfig.from_pretrained(hf_model_dir)
 
         num_kv_heads = cfg.num_key_value_heads if hasattr(cfg, "num_key_value_heads") \
             else cfg.num_attention_heads
         if mapping is None:
             mapping = Mapping()
+        if quant_mode is None:
+            quant_mode = QuantMode(0)
+
         tllm_llama = LLaMAForCausalLM(
             num_layers=cfg.num_hidden_layers,
             num_heads=cfg.num_attention_heads,
@@ -606,7 +611,7 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopModelMixin):
             # ideally these attributes shall be set after the from_hugging_face returned an object to user
             # since these attributes are not related to the hugging face model, they only affect the TRT-LLM module
             # the weights transformation or any model optimization shall be done outside from_hugging_face
-            quant_mode=kwargs.get("quant_mode", QuantMode(0)),
+            quant_mode=quant_mode,
             use_parallel_embedding=kwargs.get("use_parallel_embedding", False),
             embedding_sharding_dim=kwargs.get("embedding_sharding_dim", 0),
             use_fused_mlp=kwargs.get("use_fused_mlp", False),
@@ -614,110 +619,101 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopModelMixin):
                                   MoeConfig()),  # load weights use this
             use_prompt_tuning=kwargs.get("use_prompt_tuning", False))
 
+        if quant_mode.has_any_quant():
+            tllm_llama._quantize(hf_model_dir, dtype, **kwargs)
+
         # For debug purpose, skip weights loading to be faster
         if kwargs.get("skip_loading_weights", False):
             return tllm_llama
 
-        hf_model = transformers.LlamaForCausalLM
-        #TODO: support mixtral
-        profiler.start("Loading weights from HF")
-        hf_llama = hf_model.from_pretrained(
-            hf_model_dir,
-            device_map={
-                "model": "cpu",
-                "lm_head": "cpu",
-                "embed_tokens": "cpu",
-                "layers": "cpu",
-                "norm": "cpu",
-            },  # Load to CPU memory
-            torch_dtype='auto',
-        )
-        load_from_hf_llama(
-            tllm_llama,
-            hf_llama,
-            mapping=mapping,
-            dtype=dtype,
-            #TODO: these shall be outside from_hugging_face too.
-            use_gemm_woq_plugin=kwargs.get("use_gemm_woq_plugin", False),
-            lora_config=kwargs.get("lora_config", LoraConfig()),
-        )
-        profiler.stop("Loading weights from HF")
-        del hf_llama
+        # TODO: support mixtral
+
+        # weights already loaded in _quantize for int4 weight only
+        if not quant_mode.is_int4_weight_only_per_group():
+            hf_model = transformers.LlamaForCausalLM
+            profiler.start("Loading weights from HF")
+            hf_llama = hf_model.from_pretrained(
+                hf_model_dir,
+                device_map={
+                    "model": "cpu",
+                    "lm_head": "cpu",
+                    "embed_tokens": "cpu",
+                    "layers": "cpu",
+                    "norm": "cpu",
+                },  # Load to CPU memory
+                torch_dtype='auto',
+            )
+            load_from_hf_llama(
+                tllm_llama,
+                hf_llama,
+                mapping=mapping,
+                dtype=dtype,
+                # TODO: these shall be outside from_hugging_face too.
+                use_gemm_woq_plugin=kwargs.get("use_gemm_woq_plugin", False),
+                lora_config=kwargs.get("lora_config", LoraConfig()),
+            )
+            profiler.stop("Loading weights from HF")
+            del hf_llama
         return tllm_llama
 
-    def quantize(self, quant_mode: QuantMode):
-        '''Quantize the model, raise Exception when the quantization failed
+    def _quantize(self, hf_model_dir, dtype, **kwargs):
+        '''Given the quant_mode set in the Module object, read from given hf model
+           call AMMO to generate quantization scales, and set the scales back the module parameters.
         '''
-        #TODO: support all quantized scheme
-        if quant_mode.has_int8_kv_cache():
-            self.kv_dtype = str_dtype_to_trt('int8')
-        elif quant_mode.has_fp8_kv_cache():
-            self.kv_dtype = str_dtype_to_trt('fp8')
-        for layer_idx in range(len(self.layers)):
-            decoder = self.layers[layer_idx]
-            assert isinstance(
-                decoder, LLaMADecoderLayer
-            ), f"Unexpected layer type, expecting LLaMADecoderLayer, got {type(decoder)}"
-            attention = decoder.attention
-            assert isinstance(
-                attention, Attention
-            ), f"Unexpected layer type, expecting Attention, got {type(attention)}"
+        # use self destructed temporary path if kwargs[quantization_cache_dir] is not specified
+        # sometimes the quantization checkpoint path needs to be saved for debug purpose
+        quantized_temp_dir = tempfile.TemporaryDirectory("llama-quantized")
+        quantized_checkpoint_path = kwargs.get("quantization_cache_dir",
+                                               quantized_temp_dir.name)
+        quantize_lm_head = kwargs.get("quantize_lm_head", False)
+        quant_mode = self.quant_mode
+        ammo_qformat = None
+        calib_size = None
+        if quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache():
+            ammo_qformat = 'fp8'
+            calib_size = 512
+        # TODO: how to distinguish from quant_mode about int4_awq or int4_gptq?
+        elif quant_mode.is_int4_weight_only_per_group():
+            ammo_qformat = 'int4_awq'
+            calib_size = 32
+        assert ammo_qformat is not None
 
-            # Code from the tensorrt_llm/layers/attention.py Attention.__init__()
-            # TODO: can remove the duplicate later
-            attention.quant_mode = quant_mode
-            attention.use_int8_kv_cache = self.quant_mode.has_int8_kv_cache()
-            if self.quant_mode.has_kv_cache_quant():
-                attention.kv_orig_quant_scale = Parameter(shape=(1, ),
-                                                          dtype='float32')
-                attention.kv_quant_orig_scale = Parameter(shape=(1, ),
-                                                          dtype='float32')
-            if self.quant_mode.has_fp8_qdq():
-                attention.qkv = FP8Linear(
-                    self.hidden_size,
-                    self.mapping.tp_size * self.num_attention_heads *
-                    self.attention_head_size +
-                    (2 * self.mapping.tp_size * self.num_attention_kv_heads *
-                     self.attention_head_size),
-                    bias=attention.
-                    bias,  #WARNING: quantize does not support changing the bias/dtype after module ctor
-                    dtype=attention.dtype,
-                    tp_group=self.mapping.tp_group,
-                    tp_size=self.mapping.tp_size,
-                    gather_output=False)
-                attention.dense = FP8RowLinear(
-                    self.hidden_size,
-                    self.hidden_size,
-                    bias=attention.bias,
-                    dtype=attention.dtype,
-                    tp_group=self.mapping.tp_group,
-                    tp_size=self.mapping.tp_size,
-                    instance_id=attention.instance_id)
-            mlp = decoder.mlp
-            assert isinstance(
-                mlp, (GatedMLP, MOE,
-                      FusedGatedMLP)), f"Unexpected type, got {type(mlp)}"
-            mlp_kwargs = {}
-            if self.moe_config:
-                ClsMLP = MOE
-                mlp_kwargs = {
-                    "moe_config": self.moe_config,
-                    "tp_rank": self.mapping.tp_rank,
-                }
-            elif self.use_fused_mlp:
-                ClsMLP = FusedGatedMLP
-            self.mlp = ClsMLP(hidden_size=self.hidden_size,
-                              ffn_hidden_size=decoder.mlp_hidden_size,
-                              hidden_act=decoder.hidden_act,
-                              dtype=self.dtype,
-                              bias=decoder.mlp_bias,
-                              tp_group=self.mapping.tp_group,
-                              tp_size=self.mapping.tp_size,
-                              quant_mode=quant_mode,
-                              instance_id=2 * layer_idx + 1,
-                              **mlp_kwargs)
-        self.quant_mode = quant_mode  # to_trt may use this
-        return self
+        # local import to avoid pytest issue when importing AMMO and transformers lib
+        from .quantize import quantize_llama_and_export
+        quantize_llama_and_export(hf_model_dir,
+                                  quantized_checkpoint_path,
+                                  ammo_qformat,
+                                  dtype,
+                                  calib_size=calib_size,
+                                  quantize_lm_head=quantize_lm_head)
+
+        ckpt = Path(quantized_checkpoint_path) / "llama_tp1_rank0.npz"
+        assert ckpt.exists(), f"The expecting checkpoint path {ckpt} does not exist" \
+                  "it's likely quantization failed, pls check error logs"
+        if ammo_qformat == 'fp8':
+            quant_scales = get_scaling_factors(ckpt,
+                                               num_layers=self.num_layers,
+                                               quant_mode=quant_mode)
+            quantize_kwargs = {"quant_scales": quant_scales}
+        else:
+            assert ammo_qformat == 'int4_awq'
+            exclude_modules = ['lm_head'] if not quantize_lm_head else []
+            quantize_kwargs = {
+                "group_size": 128,  # default from examples/llama/build.py
+                "zero": False,
+                "pre_quant_scale": True,
+                "exclude_modules": exclude_modules,
+            }
+        # for fp8, the quantize_model only set scale factors to the model parameters
+        quantize_model(self, quant_mode, **quantize_kwargs)
+
+        if ammo_qformat == 'int4_awq':
+            load_from_awq_llama(tensorrt_llm_llama=self,
+                                quant_ckpt_path=str(ckpt),
+                                mapping=self.mapping,
+                                dtype=dtype,
+                                quantize_lm_head=quantize_lm_head,
+                                bin_model_dir=None)
 
     # llama specific setters, user shall has the chance to change the module attributes after
     # from_hugging_face factory method created the model when these attributes is not included in the huggingface checkpoint
@@ -728,7 +724,7 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopModelMixin):
         return self
 
     def rotary_scaling(self, scaling_type, factor):
-        #TODO: what if there are some other behaviors triggered by the these changes?
+        # TODO: what if there are some other behaviors triggered by the these changes?
         # should implement these assignment as setters of the Attention Module
         assert scaling_type in ("linear", "dynamic"), f"Got {scaling_type}"
         assert factor > 1.0, f"Got {factor}"
@@ -736,3 +732,9 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopModelMixin):
             decoder.attention.rotary_embedding_scale_type = RotaryScalingType.linear if scaling_type == "linear" else RotaryScalingType.dynamic
             decoder.attention.rotary_embedding_scale = factor
         return self
+
+    def default_plugin_config(self, **kwargs):
+        plugin_config = super().default_plugin_config(**kwargs)
+        if self.quant_mode.is_int4_weight_only_per_group():
+            plugin_config.set_weight_only_groupwise_quant_matmul_plugin()
+        return plugin_config

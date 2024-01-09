@@ -14,8 +14,8 @@
 
 ## Overview
 
-This document contains instructions to install TensorRT-LLM.
-We recommend the use of [Docker](https://www.docker.com) to build and run
+This document contains instructions to install TensorRT-LLM for Linux. We
+recommend the use of [Docker](https://www.docker.com) to build and run
 TensorRT-LLM. Instructions to install an environment to run Docker containers
 for the NVIDIA platform can be found
 [here](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
@@ -44,14 +44,16 @@ The first step to build TensorRT-LLM is to fetch the sources:
 # TensorRT-LLM uses git-lfs, which needs to be installed in advance.
 apt-get update && apt-get -y install git git-lfs
 
+git lfs install
+git lfs pull
 git clone https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
 git submodule update --init --recursive
-git lfs install
-git lfs pull
 ```
 
-## Build TensorRT-LLM in One Step
+Note: There are two options to create TensorRT-LLM Docker image and approximate disk space required to build the image is 63 GB
+
+## Option 1: Build TensorRT-LLM in One Step
 
 TensorRT-LLM contains a simple command to create a Docker image:
 
@@ -79,7 +81,7 @@ The `make` command supports the `LOCAL_USER=1` argument to switch to the local
 user account instead of `root` inside the container.  The examples of
 TensorRT-LLM are installed in directory `/app/tensorrt_llm/examples`.
 
-## Build Step-by-step
+## Option 2: Build Step-by-step
 
 For users looking for more flexibility, TensorRT-LLM has commands to create and
 run a development container in which TensorRT-LLM can be built.

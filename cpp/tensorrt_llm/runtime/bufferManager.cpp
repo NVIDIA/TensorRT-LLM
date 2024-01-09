@@ -70,6 +70,16 @@ BufferManager::ITensorPtr BufferManager::pinned(nvinfer1::Dims dims, nvinfer1::D
     return std::make_unique<PinnedTensor>(dims, type);
 }
 
+BufferManager::IBufferPtr BufferManager::pinnedPool(std::size_t size, nvinfer1::DataType type)
+{
+    return std::make_unique<PinnedPoolBuffer>(size, type);
+}
+
+BufferManager::ITensorPtr BufferManager::pinnedPool(nvinfer1::Dims dims, nvinfer1::DataType type)
+{
+    return std::make_unique<PinnedPoolTensor>(dims, type);
+}
+
 void BufferManager::setZero(IBuffer& buffer) const
 {
     if (buffer.getMemoryType() == MemoryType::kGPU)

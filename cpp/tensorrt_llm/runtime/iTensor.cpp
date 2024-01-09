@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/tensorView.h"
+#include "tensorrt_llm/runtime/tllmBuffers.h"
 
 #include <initializer_list>
 #include <memory>

@@ -258,24 +258,12 @@ def print_output(tokenizer,
         outputs = np.array(output_ids.cpu().contiguous(), dtype='int32')
         np.save(output_file, outputs)
 
-    if generation_logits is not None and output_logits_npy is not None and num_beams == 1:
-        input_lengths = torch.Tensor(input_lengths)
+    # Save context logits
+    if context_logits is not None and output_logits_npy is not None:
         context_logits = torch.cat(context_logits, axis=0)
-        generation_logits = generation_logits.squeeze(1)
-        last_token_ids = torch.cumsum(input_lengths, dim=0).int().cuda()
-        batch_size = input_lengths.size(0)
         vocab_size_padded = context_logits.shape[-1]
         context_logits = context_logits.reshape([1, -1, vocab_size_padded])
-        contex_last_token_logits = torch.index_select(context_logits, 1,
-                                                      last_token_ids - 1).view(
-                                                          batch_size, 1,
-                                                          vocab_size_padded)
-        generation_logits = torch.cat(
-            [contex_last_token_logits, generation_logits], axis=1)
-        generation_logits = generation_logits.reshape(
-            -1, num_beams, generation_logits.shape[1], generation_logits.
-            shape[2])  # [batchSize, beamWidth, maxOutputLength, vocabSize]
-        # Save context logits
+
         output_context_logits_npy = output_logits_npy.split(
             '.npy')[0] + "_context"
         output_context_logits_file = Path(output_context_logits_npy)
@@ -283,7 +271,9 @@ def print_output(tokenizer,
             context_logits.squeeze(0).cpu().contiguous(),
             dtype='float32')  # [promptLengthSum, vocabSize]
         np.save(output_context_logits_file, context_outputs)
-        # Save generation logits
+
+    # Save generation logits
+    if generation_logits is not None and output_logits_npy is not None and num_beams == 1:
         output_generation_logits_npy = output_logits_npy.split(
             '.npy')[0] + "_generation"
         output_generation_logits_file = Path(output_generation_logits_npy)
@@ -404,8 +394,9 @@ def main(args):
             sequence_lengths = outputs['sequence_lengths']
             context_logits = None
             generation_logits = None
-            if runner.gather_all_token_logits:
+            if runner.gather_context_logits:
                 context_logits = outputs['context_logits']
+            if runner.gather_generation_logits:
                 generation_logits = outputs['generation_logits']
             print_output(tokenizer,
                          output_ids,

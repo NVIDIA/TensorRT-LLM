@@ -15,9 +15,10 @@
 import tempfile
 import unittest
 
-import tensorrt as trt
-
+# isort: off
 import tensorrt_llm
+import tensorrt as trt
+# isort: on
 
 
 class MyAddModule(tensorrt_llm.Module):

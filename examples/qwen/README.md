@@ -337,11 +337,11 @@ To run the AWQ Qwen example, the following steps are required:
     NVIDIA AMMO toolkit is used for AWQ weight quantization. Please see [examples/quantization/README.md](/examples/quantization/README.md#preparation) for AMMO installation instructions.
 
 ```bash
-python3 quantize.py --model_dir ./tmp/Qwen/7B \
-                    --dtype float16 \
-                    --qformat int4_awq \
-                    --export_path ./qwen_7b_4bit_gs128_awq.pt \
-                    --calib_size 32
+python3 ../quantization/quantize.py --model_dir ./tmp/Qwen/7B \
+                                    --dtype float16 \
+                                    --qformat int4_awq \
+                                    --export_path ./qwen_7b_4bit_gs128_awq.pt \
+                                    --calib_size 32
 ```
 
 2. TRT-LLM engine:

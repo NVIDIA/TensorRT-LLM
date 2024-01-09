@@ -305,19 +305,19 @@ batchSize, beamWidth]`_.
  * `logProbs`, is a tensor of floating-point values on the GPU to store the
    log-prob of the generated tokens. Its shape is `[maxNewTokens, batchSize,
    beamWidth]`. Its shape will likely change in a future release to match the
-   shape of the output `ids` tensor,
+   shape of the output `ids` tensor.
  * `contextLogits`, is a tensor of values on the GPU (same datatype as the
    computation type) to store the logits for the context. Its shape is
    `[batchSize, maxSequenceLength, vocabSizePadded]`. If use `remove_input_padding`, its shape is `[packedSize, vocabSizePadded]`. This buffer will only be
-   filled in if the TensorRT engine was built with the
+   filled in if the TensorRT engine was built with the `gather_context_logits` or
    `gather_all_token_logits` parameter enabled. It is important to point out
    that enabling that computation may have an impact on performance (the final
    LM head has to perform a matrix multiplication on all the context tokens
-   instead of a just the last one),
+   instead of a just the last one).
  * `generationLogits`, is a tensor of values on the GPU (same datatype as the
    computation type) to store the logits for the generation. Its shape is
    `[batchSize, beamWidth, maxOutputLen, vocabSizePadded]`. This buffer will only be
-   filled in if the TensorRT engine was built with the
+   filled in if the TensorRT engine was built with the `gather_generation_logits` or
    `gather_all_token_logits` parameter enabled.
  * `onTokenGenerated`, is a callback function invoked in the generation loop to
    pass newly generated tokens to the caller while the loop continues to

@@ -119,8 +119,10 @@ def main(args):
                 max_attention_window_size=max_attention_window_size,
                 sink_token_length=sink_token_length)
         runner = runner_cls.from_dir(**runner_kwargs)
-        assert not (args.eval_ppl and not runner.gather_all_token_logits), \
+        assert not (args.eval_ppl and not (runner.gather_context_logits and runner.gather_generation_logits)), \
             "PPL evaluation requires engine built with gather_all_token_logits enabled"
+        assert not (args.eval_ppl and not args.use_py_session), \
+            "PPL evaluation is not supported with C++ session"
 
     if test_hf:
         profiler.start('load HF model')
@@ -254,7 +256,8 @@ def main(args):
             if eval_ppl:
                 seq_lengths = outputs['sequence_lengths']
                 context_logits = outputs['context_logits']
-                generation_logits = outputs['generation_logits']
+                # Remove the first generation logits which are same to last context logits
+                generation_logits = outputs['generation_logits'][:, :, 1:]
                 for batch_idx in range(batch_size):
                     # [batch, beam, step]
                     for beam_idx in range(num_beams):
@@ -500,6 +503,9 @@ def main(args):
                     logger.info(
                         f"  Per-token perplexity: {np.mean(ppls_trt_llm[beam_idx])}"
                     )
+                    if args.check_accuracy and beam_idx == 0:
+                        assert np.mean(ppls_trt_llm[beam_idx]
+                                       ) < args.tensorrt_llm_ppl_threshold
         if test_hf:
             np.random.seed(0)  # rouge score use sampling to compute the score
             logger.info(
@@ -540,9 +546,12 @@ if __name__ == '__main__':
         type=str,
         default='summarize',
         choices=['summarize', 'summarize_long', 'code_completion'])
-    parser.add_argument('--eval_ppl', action='store_true')
     parser.add_argument('--check_accuracy', action='store_true')
     parser.add_argument('--tensorrt_llm_rouge1_threshold',
+                        type=float,
+                        default=15.0)
+    parser.add_argument('--eval_ppl', action='store_true')
+    parser.add_argument('--tensorrt_llm_ppl_threshold',
                         type=float,
                         default=15.0)
     parser.add_argument('--dataset_path', type=str, default='')

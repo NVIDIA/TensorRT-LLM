@@ -50,7 +50,7 @@ async def generate(request: Request) -> Response:
 
     async def stream_results() -> AsyncGenerator[bytes, None]:
         async for output in generator:
-            yield (json.dumps(output) + "\0").encode("utf-8")
+            yield (json.dumps(output.text) + "\0").encode("utf-8")
 
     if streaming:
         return StreamingResponse(stream_results())

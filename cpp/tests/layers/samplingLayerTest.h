@@ -24,7 +24,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 
-#include "tensorrt_llm/kernels/samplingPenaltyKernels.h"
+#include "tensorrt_llm/kernels/penaltyKernels.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -75,6 +75,7 @@ protected:
     int32_t mEndId = mVocabSize;
 
     TensorPtr mLogitsDevice;
+    TensorPtr mPenaltyWorkspaceDevice;
     TensorPtr mContextLengthDevice;
     TensorPtr mSeqLengthsDevice;
     TensorPtr mFinishedDevice;

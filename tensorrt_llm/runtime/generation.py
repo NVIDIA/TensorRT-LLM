@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Union
 
 import numpy as np
+import tensorrt as trt
 
 # isort: off
 import torch
@@ -150,6 +151,9 @@ class _Runtime(object):
 
     def __init__(self, engine_buffer, mapping: Mapping):
         self.__prepare(mapping, engine_buffer)
+
+    def serialize_engine(self) -> trt.IHostMemory:
+        return self.engine.serialize()
 
     def __create_and_setup_context(self, address, profile_idx,
                                    stream) -> trt.IExecutionContext:
@@ -295,7 +299,8 @@ class ModelConfig:
     tokens_per_block: int = 64
     max_prompt_embedding_table_size: int = 0
     quant_mode: QuantMode = QuantMode(0)
-    gather_all_token_logits: bool = False
+    gather_context_logits: bool = False
+    gather_generation_logits: bool = False
     dtype: str = ""
     use_custom_all_reduce: bool = False
     lora_plugin: bool = False
@@ -331,8 +336,8 @@ class SamplingConfig:
     frequency_penalty: Union[float, torch.Tensor] = field(default=0.0)
     use_beam_hyps: bool = field(default=True)
 
-    ## None here means user didn't set it, and dynamicDecodeOp.cpp take optional value
-    ## The real default value is set in dynamicDecodeOp.cpp when it's None
+    # None here means user didn't set it, and dynamicDecodeOp.cpp take optional value
+    # The real default value is set in dynamicDecodeOp.cpp when it's None
     beam_search_diversity_rate: Union[float, torch.Tensor] = field(init=False,
                                                                    default=0.0)
     random_seed: Union[int, torch.Tensor] = field(init=False, default=None)
@@ -413,7 +418,9 @@ class RuntimeTensor:
                 override_shape, tuple)
             assert all([lambda x: x >= 0 for x in override_shape
                         ]), f"Expect all dimensions >=0, got {override_shape}"
-            volumeFunc = lambda dims: reduce(lambda x, y: x * y, dims, 1)
+
+            def volumeFunc(dims):
+                return reduce(lambda x, y: x * y, dims, 1)
             assert volumeFunc(override_shape) <= volumeFunc(torch_shape), \
                 f"Override the shape to be larger than the underlying torch Tensor, got {override_shape}, torch tensor shape {torch_shape}"
         else:
@@ -482,7 +489,7 @@ class GenerationSession(object):
         self.top_p_decay = None
         self.top_p_min = None
         self.top_p_reset_ids = None
-        #TODO: in tensorrt_llm/cpp/tensorrt_llm/thop/dynamicDecodeOp.cpp it's T, can be float or half?
+        # TODO: in tensorrt_llm/cpp/tensorrt_llm/thop/dynamicDecodeOp.cpp it's T, can be float or half?
         self.embedding_bias_opt = None
         # use one more block in paged kv cache.
         self.use_one_more_block = False
@@ -527,7 +534,7 @@ class GenerationSession(object):
 
         if self.mapping.is_last_pp_rank():
             expected_tensor_names += ['logits']
-            if not model_config.gather_all_token_logits:
+            if not model_config.gather_context_logits:
                 expected_tensor_names += ['last_token_ids']
         else:
             expected_tensor_names += ['hidden_states_output']
@@ -627,8 +634,8 @@ class GenerationSession(object):
             logger.error(f"Expected tensor names: {expected_tensor_names}")
             logger.error(f"Found tensor names: {found_tensor_names}")
             raise RuntimeError(
-                "Tensor names in engine are not the same as expected, to use this GenerationSession, " \
-                    "you need to use GPTLMHeadModel.prepare_inputs to create TRT Network inputs."
+                "Tensor names in engine are not the same as expected, to use this GenerationSession, "
+                "you need to use GPTLMHeadModel.prepare_inputs to create TRT Network inputs."
             )
         if self.debug_mode:
             self.debug_tensors = list(
@@ -693,8 +700,12 @@ class GenerationSession(object):
         return self._model_config.quant_mode
 
     @property
-    def gather_all_token_logits(self):
-        return self._model_config.gather_all_token_logits
+    def gather_context_logits(self):
+        return self._model_config.gather_context_logits
+
+    @property
+    def gather_generation_logits(self):
+        return self._model_config.gather_generation_logits
 
     @property
     def dtype(self):
@@ -1074,8 +1085,8 @@ class GenerationSession(object):
         self.buffer = {}
         if self.mapping.is_last_pp_rank():
             self.buffer['logits'] = torch.empty(
-                (batch_size, self.vocab_size_padded)
-                if not self.gather_all_token_logits else
+                (batch_size,
+                 self.vocab_size_padded) if not self.gather_context_logits else
                 (batch_size, max_context_length, self.vocab_size_padded),
                 dtype=self._tensor_dtype('logits'),
                 device=self.device)
@@ -1158,7 +1169,8 @@ class GenerationSession(object):
             set_peer_access(self.mapping)
             float_element_size = torch.tensor([],
                                               dtype=torch.float).element_size()
-            buffer_size = batch_size * beam_width * max_context_length * self.hidden_size * self.mapping.tp_size * float_element_size
+            buffer_size = batch_size * beam_width * max_context_length * \
+                self.hidden_size * self.mapping.tp_size * float_element_size
             barrier_size = IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * self.mapping.tp_size
 
             self.ipc_buffers = IpcMemory(self.mapping, buffer_size)
@@ -1236,10 +1248,17 @@ class GenerationSession(object):
             encoder_output: torch.Tensor = None,
             encoder_input_lengths: torch.Tensor = None) -> List[RuntimeTensor]:
         tensors = {}
-        sym = lambda x, name: RuntimeTensor.from_torch(name, x)
-        add_tensor = lambda x, name: tensors.update({name: sym(x, name)})
-        add_tensor_with_shape = lambda x, name, shape: tensors.update(
-            {name: RuntimeTensor.from_torch(name, x, override_shape=shape)})
+
+        def sym(x, name):
+            return RuntimeTensor.from_torch(name, x)
+
+        def add_tensor(x, name):
+            return tensors.update({name: sym(x, name)})
+
+        def add_tensor_with_shape(x, name, shape):
+            return tensors.update(
+                {name: RuntimeTensor.from_torch(name, x, override_shape=shape)})
+
         if self.use_gpt_attention_plugin:
             add_tensor(context_lengths, 'context_lengths')
         add_tensor(cache_indirection, 'cache_indirection')
@@ -1264,8 +1283,7 @@ class GenerationSession(object):
 
         if self.mapping.is_last_pp_rank():
             add_tensor(self.buffer['logits'], 'logits')
-
-            if not self.gather_all_token_logits:
+            if not self.gather_context_logits:
                 add_tensor(last_token_ids, 'last_token_ids')
         else:
             add_tensor(hidden_states_input, 'hidden_states_output')
@@ -1406,10 +1424,17 @@ class GenerationSession(object):
             encoder_output: torch.Tensor = None,
             encoder_input_lengths: torch.Tensor = None):
         tensors = {}  # Dict[str, RuntimeTensor]
-        sym = lambda x, name: RuntimeTensor.from_torch(name, x)
-        add_tensor = lambda x, name: tensors.update({name: sym(x, name)})
-        add_tensor_with_shape = lambda x, name, shape: tensors.update(
-            {name: RuntimeTensor.from_torch(name, x, override_shape=shape)})
+
+        def sym(x, name):
+            return RuntimeTensor.from_torch(name, x)
+
+        def add_tensor(x, name):
+            return tensors.update({name: sym(x, name)})
+
+        def add_tensor_with_shape(x, name, shape):
+            return tensors.update(
+                {name: RuntimeTensor.from_torch(name, x, override_shape=shape)})
+
         context_lengths_local = context_lengths.clone()
         host_context_lengths_local = host_context_lengths.clone()
         if self.use_context_fmha_for_generation:
@@ -1430,8 +1455,7 @@ class GenerationSession(object):
 
         if self.mapping.is_last_pp_rank():
             add_tensor(self.buffer['logits'], 'logits')
-
-            if not self.gather_all_token_logits:
+            if not self.gather_context_logits:
                 add_tensor(last_token_ids, 'last_token_ids')
         else:
             add_tensor(hidden_states_input, 'hidden_states_output')
@@ -1793,7 +1817,7 @@ class GenerationSession(object):
 
         context_logits = None
         if self.mapping.is_last_pp_rank():
-            if step == 0 and self.gather_all_token_logits:
+            if step == 0 and self.gather_context_logits:
                 context_logits = self.buffer['logits'].detach().clone()
                 if self.remove_input_padding:
                     # reshape self.buffer['logits'] from [bs, max_context_length, vocab]
@@ -2048,8 +2072,9 @@ class GenerationSession(object):
                 outputs[
                     'sequence_lengths'] = self.sequence_length_buffer.reshape(
                         [batch_size, beam_width])
-            if self.gather_all_token_logits:
+            if self.gather_context_logits:
                 outputs['context_logits'] = context_logits
+            if self.gather_generation_logits:
                 outputs['generation_logits'] = generation_logits
             return outputs
 
@@ -2065,6 +2090,8 @@ class GenerationSession(object):
                                                     step_count)
 
         next_step_tensors = None
+        last_token_ids = torch.cumsum(context_lengths.clone().detach(),
+                                      dim=0).int()
         for step in range(0, self.max_new_tokens):
             should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, logits, encoder_input_lengths = self.handle_per_step(
                 cache_indirections, step, batch_size, max_context_length,
@@ -2081,11 +2108,35 @@ class GenerationSession(object):
                     benchmark_profiler.record_cuda_event('first_token')
             else:
                 generation_phase_step_count = generation_phase_step_count + 1
-            if self.gather_all_token_logits:
-                if self.mapping.is_last_pp_rank():
-                    if step == 0:
-                        context_logits = logits
-                    else:
+
+            if self.mapping.is_last_pp_rank():
+                if step == 0:
+                    if self.gather_context_logits:
+                        context_logits = logits.clone().detach()
+                    if self.gather_generation_logits:
+                        if self.gather_context_logits:
+                            # gather last token of context
+                            vocab_size_padded = context_logits.shape[-1]
+                            contex_logits_reshape = context_logits.clone(
+                            ).detach().reshape([1, -1, vocab_size_padded])
+                            contex_last_token_logits = torch.index_select(
+                                contex_logits_reshape, 1,
+                                last_token_ids - 1).view(
+                                    batch_size, vocab_size_padded
+                                )  # [batch_size, vocab_size_padded]
+                            # Repate beam_width times
+                            contex_last_token_logits = contex_last_token_logits.repeat(
+                                1, beam_width
+                            ).reshape(
+                                batch_size * beam_width, vocab_size_padded
+                            )  # [batch_size * beam_width, vocab_size_padded]
+                            generation_logits.append(
+                                contex_last_token_logits.clone().detach())
+                        else:
+                            # If not gather context, just append
+                            generation_logits.append(logits.clone().detach())
+                else:
+                    if self.gather_generation_logits:
                         l = next_step_tensors['logits'].to_torch()
                         generation_logits.append(l.clone().detach())
 
@@ -2099,11 +2150,12 @@ class GenerationSession(object):
                         return get_outputs_dict(final_output_ids)
                     else:
                         return final_output_ids
-                elif self.mapping.is_last_pp_rank(
-                ) and self.gather_all_token_logits:
+                elif self.mapping.is_last_pp_rank():
                     outputs = {}
-                    outputs['context_logits'] = context_logits
-                    outputs['generation_logits'] = generation_logits
+                    if self.gather_context_logits:
+                        outputs['context_logits'] = context_logits
+                    if self.gather_generation_logits:
+                        outputs['generation_logits'] = generation_logits
                     return outputs
                 else:
                     return None
@@ -2112,16 +2164,17 @@ class GenerationSession(object):
 
         final_output_ids = self.finalize_decoder(context_lengths, batch_size,
                                                  beam_width, scfg)
-
         if self.mapping.is_first_pp_rank():
             if return_dict:
                 return get_outputs_dict(final_output_ids)
             else:
                 return final_output_ids
-        elif self.mapping.is_last_pp_rank() and self.gather_all_token_logits:
+        elif self.mapping.is_last_pp_rank():
             outputs = {}
-            outputs['context_logits'] = context_logits
-            outputs['generation_logits'] = generation_logits
+            if self.gather_context_logits:
+                outputs['context_logits'] = context_logits
+            if self.gather_generation_logits:
+                outputs['generation_logits'] = generation_logits
             return outputs
         else:
             return None
@@ -2164,7 +2217,7 @@ class GenerationSession(object):
                 outputs[
                     'sequence_lengths'] = self.sequence_length_buffer.reshape(
                         [batch_size, beam_width])
-            if self.gather_all_token_logits:
+            if self.gather_context_logits:
                 outputs['context_logits'] = context_logits
             return outputs
 
@@ -2396,16 +2449,16 @@ class ChatGLMGenerationSession(GenerationSession):
             input_lengths_acc = torch.cumsum(torch.cat(
                 [torch.IntTensor([0]).cuda(), context_lengths], dim=0),
                                              dim=0)
-            position_ids = torch.zeros([1, 2, input_lengths_acc[-1]],
+            position_ids = torch.zeros([2, input_lengths_acc[-1]],
                                        dtype=torch.int32)
             for i in range(batch_size):
-                position_ids[0, 0, input_lengths_acc[i]:input_lengths_acc[
+                position_ids[0, input_lengths_acc[i]:input_lengths_acc[
                     i + 1]] = torch.arange(0,
                                            context_lengths[i],
                                            dtype=torch.int32)
-                position_ids[0, 0, input_lengths_acc[i + 1] -
+                position_ids[0, input_lengths_acc[i + 1] -
                              1] = context_lengths[i] - 2
-                position_ids[0, 1, input_lengths_acc[i + 1] - 1] = 1
+                position_ids[1, input_lengths_acc[i + 1] - 1] = 1
             position_ids = position_ids.int().cuda()
             last_token_ids = torch.cumsum(last_token_ids, dim=0).int().cuda()
         else:
@@ -2413,22 +2466,24 @@ class ChatGLMGenerationSession(GenerationSession):
                                        dtype=torch.int32)
             position_ids[:, 0, :] = torch.arange(max_context_length)
 
-            if kwargs["pad_id"] == 50256:  # specialization for GLM-10B
-                self.mask_index_tensor = torch.zeros([batch_size],
-                                                     dtype=torch.int32)
+            # specialization for GLM series models
+            if kwargs["pad_id"] in [50256, 50259]:
+                if kwargs["pad_id"] == 50256:  # glm_2b / glm_10b
+                    mask_ids = [50260, 50264, 50263]
+                else:  # glm_10b_chinese / glm_large_chinese
+                    mask_ids = [50003, 50008, 50009]
+
+                self.mask_index_tensor = \
+                    torch.zeros([batch_size], dtype=torch.int32)
                 for i in range(batch_size):
                     length = context_lengths[i]
-                    mask_index = torch.where(
-                        kwargs["input_ids"][i] == 50260)[0].int()
-                    gmask_index = torch.where(
-                        kwargs["input_ids"][i] == 50263)[0].int()
-                    smask_index = torch.where(
-                        kwargs["input_ids"][i] == 50264)[0].int()
+                    input_ids = kwargs["input_ids"][i]
+                    mask_index = [
+                        torch.where(input_ids == id)[0].int() for id in mask_ids
+                    ]
                     tail_index = torch.Tensor([max_context_length]).int().cuda()
-                    mask_index = torch.cat([
-                        mask_index.int(), gmask_index, smask_index, tail_index
-                    ],
-                                           dim=0).min()
+                    mask_index.append(tail_index)
+                    mask_index = torch.cat(mask_index, dim=0).min()
                     position_ids[i, 0, length - 1] = int(mask_index)
                     position_ids[i, 1, length - 1] = 1
                     self.mask_index_tensor[i] = int(mask_index)
@@ -2458,16 +2513,27 @@ class ChatGLMGenerationSession(GenerationSession):
         last_token_ids = torch.ones_like(context_lengths)
 
         if remove_input_padding:
-            position_ids = torch.zeros([1, 2, batch_size], dtype=torch.int32)
+
+            def _tile_beam_width_chatglm(tensor: torch.Tensor, num_beams: int):
+                new_shape = np.array(tensor.shape)
+                new_shape[1] = new_shape[1] * num_beams
+                tile_size = np.ones(new_shape.shape, dtype=np.int32)
+                tile_size = np.insert(tile_size, 2, num_beams)
+                new_tensor = torch.unsqueeze(tensor, 2)
+                new_tensor = new_tensor.tile(tile_size.tolist())
+                new_tensor = new_tensor.reshape(new_shape.tolist())
+                return new_tensor
+
+            position_ids = torch.zeros([2, batch_size], dtype=torch.int32)
             for i in range(batch_size):
-                position_ids[0, 0, i] = context_lengths[i * num_beams] - 2
-                position_ids[0, 1, i] = step + 2
-            position_ids = torch.tile(position_ids, [1, 1, num_beams])
+                position_ids[0, i] = context_lengths[i * num_beams] - 2
+                position_ids[1, i] = step + 2
+            position_ids = _tile_beam_width_chatglm(position_ids, num_beams)
             position_ids = position_ids.int().cuda()
             last_token_ids = torch.cumsum(last_token_ids, dim=0).int().cuda()
         else:
             data = []
-            if self.mask_index_tensor is not None:  # specialization for GLM-10B
+            if self.mask_index_tensor is not None:  # specialization for GLM series models
                 for i in range(batch_size):
                     data.append([[self.mask_index_tensor[i]], [step + 2]])
             else:

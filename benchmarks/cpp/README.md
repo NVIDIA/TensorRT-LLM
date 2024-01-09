@@ -59,7 +59,9 @@ mpirun -n 8 ./benchmarks/gptSessionBenchmark \
 # [BENCHMARK] batch_size 1 input_length 60 output_length 20 latency(ms) 792.14
 ```
 
-If you want to obtain context and generation logits, you could build an enigne with `--gather_all_token_logits` and run gptSessionBenchmark with `--print_all_logits`. This will print a large number of logit values and has a certain impact on performance.
+If you want to obtain context and generation logits, you could build an enigne with `--gather_context_logits` and `--gather_generation_logits`, respectively. Enable `--gather_all_token_logits` will enable both of them.
+
+If you want to get the logits, you could run gptSessionBenchmark with `--print_all_logits`. This will print a large number of logit values and has a certain impact on performance.
 
 *Please note that the expected outputs in that document are only for reference, specific performance numbers depend on the GPU you're using.*
 

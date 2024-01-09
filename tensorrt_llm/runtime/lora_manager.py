@@ -5,11 +5,21 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .._utils import (_str_to_np_dict, fromfile, numpy_to_torch,
+from .._utils import (fromfile, numpy_to_torch, str_dtype_to_np,
                       str_dtype_to_torch)
 
 
 class LoraConfig(object):
+    LORA_MODULE_IDS = {
+        "attn_qkv": 0,
+        "attn_q": 1,
+        "attn_k": 2,
+        "attn_v": 3,
+        "attn_dense": 4,
+        "mlp_h_to_4h": 5,
+        "mlp_4h_to_h": 6,
+        "mlp_gate": 7,
+    }
 
     def __init__(self,
                  hf_lora_dir: str = None,
@@ -131,6 +141,7 @@ class LoraManager(object):
         with open(model_dir / "lora_weights.json", 'r') as f:
             config = json.load(f)
         lora_config = config['lora_config']
+        precision = config.get('precision', 'float16')
         for key in lora_config['lora_kqv_adapter']:
             self._lora_uid_to_key[lora_config['lora_kqv_adapter'][key]
                                   ['key']] = key
@@ -158,7 +169,7 @@ class LoraManager(object):
                             fromfile(
                                 model_dir, f'{prefix}.linear_in.weight.bin',
                                 [model_config.hidden_size, low_rank],
-                                _str_to_np_dict['bfloat16']).transpose(
+                                str_dtype_to_np(precision)).transpose(
                                     1,
                                     0))).cuda()  # t_in: [low_rank, hidden_size]
 
@@ -167,7 +178,7 @@ class LoraManager(object):
                             fromfile(model_dir,
                                      f'{prefix}.linear_out.weight.bin',
                                      [low_rank, model_config.hidden_size * 3],
-                                     _str_to_np_dict['bfloat16']).transpose(
+                                     str_dtype_to_np(precision)).transpose(
                                          1, 0))).cuda(
                                          )  # t_in: [hidden_size * 3, low_rank]
                     t_in = t_in.float().to(str_dtype_to_torch(dtype))

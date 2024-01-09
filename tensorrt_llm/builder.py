@@ -384,7 +384,8 @@ class BuildConfig:
     max_beam_width: int = 1
     max_num_tokens: Optional[int] = None
     max_prompt_embedding_table_size: int = 0
-    gather_all_token_logits: int = False
+    gather_context_logits: int = False
+    gather_generation_logits: int = False
     strongly_typed: bool = False
     plugin_config: PluginConfig = PluginConfig()
 
@@ -397,7 +398,8 @@ class BuildConfig:
         max_num_tokens = config.pop('max_num_tokens')
         max_prompt_embedding_table_size = config.pop(
             'max_prompt_embedding_table_size', 0)
-        gather_all_token_logits = config.pop('gather_all_token_logits', False)
+        gather_context_logits = config.pop('gather_context_logits', False)
+        gather_generation_logits = config.pop('gather_generation_logits', False)
         strongly_typed = config.pop('strongly_typed', False)
 
         plugin_config = PluginConfig()
@@ -409,7 +411,8 @@ class BuildConfig:
                 max_beam_width=max_beam_width,
                 max_num_tokens=max_num_tokens,
                 max_prompt_embedding_table_size=max_prompt_embedding_table_size,
-                gather_all_token_logits=gather_all_token_logits,
+                gather_context_logits=gather_context_logits,
+                gather_generation_logits=gather_generation_logits,
                 plugin_config=plugin_config)
 
         config = config['plugin_config']
@@ -454,7 +457,8 @@ class BuildConfig:
             max_beam_width=max_beam_width,
             max_num_tokens=max_num_tokens,
             max_prompt_embedding_table_size=max_prompt_embedding_table_size,
-            gather_all_token_logits=gather_all_token_logits,
+            gather_context_logits=gather_context_logits,
+            gather_generation_logits=gather_generation_logits,
             strongly_typed=strongly_typed,
             plugin_config=plugin_config)
 

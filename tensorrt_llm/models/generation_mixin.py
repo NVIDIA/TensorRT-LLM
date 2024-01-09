@@ -19,6 +19,7 @@ from typing import List
 import tensorrt as trt
 
 from ..functional import Tensor
+from ..logger import logger
 from ..mapping import Mapping
 
 
@@ -295,7 +296,8 @@ class GenerationMixin:
                              use_custom_all_reduce=False,
                              paged_kv_cache=False,
                              tokens_per_block=64,
-                             gather_all_token_logits=False,
+                             gather_context_logits=False,
+                             gather_generation_logits=False,
                              dtype=None,
                              num_heads=None,
                              mapping=Mapping(),
@@ -321,12 +323,19 @@ class GenerationMixin:
         inlen_range_gen = [1, 1, 1]
 
         if max_num_tokens is None:
-            num_tokens_range_ctx = default_range(max_input_len * max_batch_size)
-            num_tokens_range_gen = default_range(max_batch_size *
-                                                 max_beam_width)
-        else:
-            num_tokens_range_ctx = default_range(max_num_tokens)
-            num_tokens_range_gen = default_range(max_num_tokens)
+            default_max_num_tokens = 4096
+            logger.warning(
+                "max_num_tokens is not set, will choose a smaller "
+                f"value between max_input_len * max_batch_size ({max_input_len * max_batch_size}) "
+                f"and default_max_num_tokens ({default_max_num_tokens}).")
+            max_num_tokens = min(max_input_len * max_batch_size,
+                                 default_max_num_tokens)
+        if max_num_tokens < max_input_len:
+            logger.warning(
+                f"max_num_tokens ({max_num_tokens}) should be greater than "
+                f"max_input_len ({max_input_len}), specifying to "
+                f"max_input_len ({max_input_len}).")
+            max_num_tokens = max_input_len
 
         enable_two_optimization_profiles = GenerationMixin.has_two_optimization_profiles(
             use_gpt_attention_plugin, use_gemm_plugin, remove_input_padding,
@@ -335,19 +344,15 @@ class GenerationMixin:
             bb_range = [bb_range_cxt, bb_range_gen]
             bbd_range = [bbd_range_ctx, bbd_range_gen]
             inlen_range = [inlen_range_cxt, inlen_range_gen]
+            num_tokens_range_ctx = default_range(max_num_tokens)
+            num_tokens_range_gen = default_range(max_batch_size *
+                                                 max_beam_width)
             num_tokens_range = [num_tokens_range_ctx, num_tokens_range_gen]
         else:
             bb_range = [bb_range_gen]
             bbd_range = [bbd_range_gen]
             inlen_range = [[1, 1, max_input_len]]
-            if max_num_tokens is None:
-                num_tokens_range = [[
-                    1, max_batch_size * max_beam_width,
-                    max(max_input_len * max_batch_size,
-                        max_beam_width * max_batch_size)
-                ]]
-            else:
-                num_tokens_range = [num_tokens_range_ctx]
+            num_tokens_range = [default_range(max_num_tokens)]
 
         input_ids = None
         position_ids = None
@@ -543,7 +548,7 @@ class GenerationMixin:
                 lora_ranks.append(lora_rank_dict)
 
         last_token_ids = None
-        if mapping.is_last_pp_rank() and not gather_all_token_logits:
+        if mapping.is_last_pp_rank() and not gather_context_logits:
             last_token_ids = Tensor(
                 name='last_token_ids',
                 dtype=trt.int32,

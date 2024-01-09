@@ -113,7 +113,7 @@ class PhiModel(Module):
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0):
         super().__init__()
-        self.embedding = Embedding(
+        self.vocab_embedding = Embedding(
             num_embeddings=vocab_size,
             embedding_dim=hidden_size,
             dtype=dtype,
@@ -146,7 +146,7 @@ class PhiModel(Module):
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None):
-        hidden_states = self.embedding(input_ids)
+        hidden_states = self.vocab_embedding(input_ids)
 
         kv_cache_params.fill_none_tensor_list(len(self.layers))
 

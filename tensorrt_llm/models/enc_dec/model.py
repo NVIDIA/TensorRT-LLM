@@ -28,7 +28,7 @@ from tensorrt_llm.layers import (MLP, Attention, AttentionMaskType,
                                  AttentionParams, BertAttention, ColumnLinear,
                                  Conv1d, Embedding, FusedGatedMLP, GatedMLP,
                                  GroupNorm, KeyValueCacheParams, LayerNorm,
-                                 RmsNorm)
+                                 PromptTuningEmbedding, RmsNorm)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.generation_mixin import GenerationMixin
 from tensorrt_llm.module import Module, ModuleList
@@ -60,6 +60,7 @@ class EncDecEmbedding(Module):
                  layernorm_eps=1e-5,
                  layernorm_type=LayerNormType.LayerNorm,
                  dtype=None,
+                 use_prompt_tuning=False,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
                  mapping=Mapping()):
@@ -67,8 +68,10 @@ class EncDecEmbedding(Module):
 
         self.layernorm_type = layernorm_type
         ln_type = layernorm_map[layernorm_type]
+        self.use_prompt_tuning = use_prompt_tuning
 
-        self.vocab_embedding = Embedding(
+        EmbeddingCls = PromptTuningEmbedding if use_prompt_tuning else Embedding
+        self.vocab_embedding = EmbeddingCls(
             vocab_size,
             hidden_size,
             dtype=dtype,
@@ -115,12 +118,23 @@ class EncDecEmbedding(Module):
         # Note: embedding offset in BART is not considered as a standard. For the specific case,
         # we just need to shrink its position embedding table by [offset:] during weight loading
 
-    def forward(self, input_ids, position_ids=None, token_type_ids=None):
+    def forward(self,
+                input_ids,
+                position_ids=None,
+                token_type_ids=None,
+                prompt_embedding_table=None,
+                prompt_tasks=None,
+                prompt_vocab_size=None):
         # position_ids and token_type_ids are provided inputs
         # and should not be formulated determinisitically
 
-        x = self.vocab_embedding(input_ids) * self.embedding_scale
-
+        ptuning_args = []
+        if self.use_prompt_tuning:
+            ptuning_args = [
+                prompt_embedding_table, prompt_tasks, prompt_vocab_size
+            ]
+        x = self.vocab_embedding(input_ids, *
+                                 ptuning_args) * self.embedding_scale
         self.register_network_output('word_embeddings', x)
 
         if self.position_embedding:
@@ -470,6 +484,7 @@ class EncoderModel(Module, GenerationMixin):
                  hidden_act="relu",
                  mlp_type=MLPType.MLP,
                  residual_scaling=1.0,
+                 use_prompt_tuning=False,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
                  mapping=Mapping()):
@@ -518,6 +533,7 @@ class EncoderModel(Module, GenerationMixin):
                 layernorm_eps=layernorm_eps,
                 layernorm_type=layernorm_type,
                 dtype=dtype,
+                use_prompt_tuning=use_prompt_tuning,
                 use_parallel_embedding=use_parallel_embedding,
                 embedding_sharding_dim=embedding_sharding_dim,
                 mapping=self.mapping)
@@ -559,12 +575,17 @@ class EncoderModel(Module, GenerationMixin):
                 token_type_ids=None,
                 hidden_states=None,
                 all_reduce_workspace=None,
-                max_input_length=None):
+                max_input_length=None,
+                prompt_embedding_table=None,
+                prompt_tasks=None,
+                prompt_vocab_size=None):
 
         # In PP, layer 0 has ids as inputs, all other layers have hidden_states as inputs
         if self.mapping.is_first_pp_rank():
             hidden_states = self.embedding(input_ids, position_ids,
-                                           token_type_ids)
+                                           token_type_ids,
+                                           prompt_embedding_table, prompt_tasks,
+                                           prompt_vocab_size)
             self.register_network_output('embedding_layer_output',
                                          hidden_states)
         else:
@@ -587,7 +608,10 @@ class EncoderModel(Module, GenerationMixin):
 
         return hidden_states
 
-    def prepare_inputs(self, max_batch_size, max_input_len):
+    def prepare_inputs(self,
+                       max_batch_size,
+                       max_input_len,
+                       prompt_embedding_table_size: int = 0):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -701,8 +725,45 @@ class EncoderModel(Module, GenerationMixin):
             dim_range=OrderedDict([("max_input_length", [inlen_range])]),
         )
 
+        prompt_embedding_table = None
+        tasks = None
+        prompt_vocab_size = None
+
+        if self.mapping.is_first_pp_rank() and prompt_embedding_table_size > 0:
+            p_embedding_range = [[
+                1, prompt_embedding_table_size // 2, prompt_embedding_table_size
+            ]]
+
+            prompt_embedding_table = Tensor(name='prompt_embedding_table',
+                                            dtype=self._dtype,
+                                            shape=[-1, hidden_size],
+                                            dim_range=OrderedDict([
+                                                ('prompt_embedding_table_size',
+                                                 p_embedding_range),
+                                                ('hidden_size', [hidden_size]),
+                                            ]))
+            if remove_input_padding:
+                tasks = Tensor(name='tasks',
+                               dtype=trt.int32,
+                               shape=[-1],
+                               dim_range=OrderedDict([('input_len_task',
+                                                       [num_tokens_range])]))
+            else:
+                tasks = Tensor(name='tasks',
+                               dtype=trt.int32,
+                               shape=[-1, 1],
+                               dim_range=OrderedDict([
+                                   ('batch_size_beam_width', bs_range),
+                                   ('broadcast_dim', [1]),
+                               ]))
+            prompt_vocab_size = Tensor(name='prompt_vocab_size',
+                                       dtype=trt.int32,
+                                       shape=[1],
+                                       dim_range=OrderedDict([('size', [1])]))
+
         return (input_ids, input_lengths, position_ids, token_type_ids,
-                hidden_states, all_reduce_workspace, max_input_length)
+                hidden_states, all_reduce_workspace, max_input_length,
+                prompt_embedding_table, tasks, prompt_vocab_size)
 
 
 class DecoderModel(Module, GenerationMixin):
@@ -958,7 +1019,8 @@ class DecoderModel(Module, GenerationMixin):
         max_decoder_input_len,
         max_new_tokens,
         max_encoder_input_len,
-        gather_all_token_logits: bool = False,
+        gather_context_logits: bool = False,
+        gather_generation_logits: bool = False,
     ):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
@@ -1171,7 +1233,7 @@ class DecoderModel(Module, GenerationMixin):
                                         ]))
 
         last_token_ids = None
-        if self.mapping.is_last_pp_rank() and not gather_all_token_logits:
+        if self.mapping.is_last_pp_rank() and not gather_context_logits:
             last_token_ids = Tensor(
                 name="last_token_ids",
                 dtype=trt.int32,

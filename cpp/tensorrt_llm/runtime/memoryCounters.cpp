@@ -45,8 +45,6 @@ std::string doubleBytesToString(double bytes, int precision)
 
 namespace tensorrt_llm::runtime
 {
-thread_local MemoryCounters MemoryCounters::mInstance;
-
 std::string MemoryCounters::bytesToString(SizeType bytes, int precision)
 {
     return doubleBytesToString(static_cast<double>(bytes), precision);

@@ -342,11 +342,11 @@ where FP8 scaling factors are stored.
 
 ```bash
 # Quantize HF LLaMA 70B into FP8 and export a single-rank checkpoint
-python quantize.py --model_dir ./tmp/llama/70B \
-                   --dtype float16 \
-                   --qformat fp8 \
-                   --export_path ./quantized_fp8 \
-                   --calib_size 512 \
+python examples/quantization/quantize.py --model_dir ./tmp/llama/70B \
+                                         --dtype float16 \
+                                         --qformat fp8 \
+                                         --export_path ./quantized_fp8 \
+                                         --calib_size 512 \
 
 # Build LLaMA 70B TP=2 using original HF checkpoint + PTQ scaling factors from the single-rank checkpoint
 python build.py --model_dir ./tmp/llama/70B \
@@ -383,11 +383,11 @@ AWQ/GPTQ examples below involves 2 steps:
 
     ```bash
     # Quantize HF LLaMA 7B checkpoint into INT4 AWQ format
-    python quantize.py --model_dir ./tmp/llama/7B \
-                    --dtype float16 \
-                    --qformat int4_awq \
-                    --export_path ./quantized_int4-awq \
-                    --calib_size 32
+    python examples/quantization/quantize.py --model_dir ./tmp/llama/7B \
+                                             --dtype float16 \
+                                             --qformat int4_awq \
+                                             --export_path ./quantized_int4-awq \
+                                             --calib_size 32
     ```
     The quantized model checkpoint is saved to `./quantized_int4-awq/llama_tp1_rank0.npz` for future TRT-LLM engine build.
 
@@ -606,8 +606,9 @@ mpirun -n 2 python ../run.py --engine_dir "/tmp/new_lora_13b/trt_engines/fp16/2-
  Input: "今天天气很好，我到公园的时后，"
 Output: "发现那里有很多小朋友们都在玩。他们都在玩跳绳，跳绳的花样都很多，我看他们玩的很开心。我看他们玩的的时候，我也想跟着他们一起玩，于是我也买了一个跳绳，跟着他们一起玩。我们玩的很开心"
 ```
-
-If users don't want to skip lora module, please pass uid -1 like `--lora_task_uids -1`, then the model would not run lora module and the results would be little different.
+Users who want to skip LoRA module may pass uid -1 with `--lora_task_uids -1`.
+In that case, the model will not run the LoRA module and the results will be
+different.
 
 ```bash
 mpirun -n 2 python ../run.py --engine_dir "/tmp/new_lora_13b/trt_engines/fp16/2-gpu/" \

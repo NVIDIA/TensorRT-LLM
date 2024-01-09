@@ -315,6 +315,11 @@ def parse_arguments():
         'You must also use --use_weight_only for that argument to have an impact.'
     )
     parser.add_argument(
+        '--quantize_lm_head',
+        default=False,
+        action="store_true",
+        help='Quantize lm_head weights as well when using int4_awq.')
+    parser.add_argument(
         '--use_inflight_batching',
         action="store_true",
         default=False,
@@ -468,6 +473,12 @@ def parse_arguments():
 
     assert args.pp_size * args.tp_size == args.world_size
 
+    if args.weight_only_precision == 'int4_awq' and args.quantize_lm_head:
+        if args.vocab_size % 64 != 0:
+            args.vocab_size = int((args.vocab_size + 63) / 64) * 64
+            logger.info("To use awq we pad vocab_size to {}.".format(
+                args.vocab_size))
+
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha
 
@@ -538,12 +549,14 @@ def build_rank_engine(builder: Builder,
             tensorrt_llm_internlm = quantize_model(tensorrt_llm_internlm,
                                                    args.quant_mode)
         elif args.weight_only_precision == 'int4_awq':
-            tensorrt_llm_internlm = quantize_model(model=tensorrt_llm_internlm,
-                                                   quant_mode=args.quant_mode,
-                                                   group_size=args.group_size,
-                                                   zero=False,
-                                                   pre_quant_scale=True,
-                                                   exclude_modules=[])
+            exclude_modules = ['lm_head'] if not args.quantize_lm_head else []
+            tensorrt_llm_internlm = quantize_model(
+                model=tensorrt_llm_internlm,
+                quant_mode=args.quant_mode,
+                group_size=args.group_size,
+                zero=False,
+                pre_quant_scale=True,
+                exclude_modules=exclude_modules)
         elif args.weight_only_precision == 'int4_gptq':
             tensorrt_llm_internlm = quantize_model(model=tensorrt_llm_internlm,
                                                    quant_mode=args.quant_mode,
@@ -562,11 +575,17 @@ def build_rank_engine(builder: Builder,
 
     use_gemm_woq_plugin = args.use_gemm_plugin and args.use_weight_only
     if args.per_group:
-        load_func = load_from_awq_internlm if args.weight_only_precision == 'int4_awq' else load_from_gptq_internlm
-        load_func(tensorrt_llm_internlm=tensorrt_llm_internlm,
-                  quant_ckpt_path=args.quant_ckpt_path,
-                  mapping=mapping,
-                  dtype=args.dtype)
+        if args.weight_only_precision == 'int4_awq':
+            load_from_awq_internlm(tensorrt_llm_internlm=tensorrt_llm_internlm,
+                                   quant_ckpt_path=args.quant_ckpt_path,
+                                   quantize_lm_head=args.quantize_lm_head,
+                                   mapping=mapping,
+                                   dtype=args.dtype)
+        else:
+            load_from_gptq_internlm(tensorrt_llm_internlm=tensorrt_llm_internlm,
+                                    quant_ckpt_path=args.quant_ckpt_path,
+                                    mapping=mapping,
+                                    dtype=args.dtype)
     elif args.meta_ckpt_dir is not None:
         load_from_meta_internlm(tensorrt_llm_internlm, args.meta_ckpt_dir,
                                 mapping, args.dtype)

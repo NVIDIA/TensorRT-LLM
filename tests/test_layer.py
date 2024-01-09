@@ -258,18 +258,24 @@ class TestLayer(unittest.TestCase):
                                    **kwargs)
 
     @parameterized.expand([["float32", False], ["float32", True],
-                           ["bfloat16", False], ["bfloat16", True]])
-    def test_linear(self, dtype, use_plugin):
+                           ["float16", False], ["float16", True],
+                           ["float16", True, "float32"], ["bfloat16", False],
+                           ["bfloat16", True], ["bfloat16", True, "float32"]])
+    def test_linear(self, dtype, use_plugin, output_dtype=None):
         # Skip tests that are not supported on V100
         if getSMVersion() < 80:
             if dtype == 'bfloat16':
                 pytest.skip(
                     "bfloat16 is not supported in pre-ampere architecture")
 
+        if output_dtype is None:
+            output_dtype = dtype
+
         # test data
         torch.manual_seed(0)
-        x_data = torch.randn(128, 20, dtype=str_dtype_to_torch(dtype))
-        m = torch.nn.Linear(20, 30, dtype=str_dtype_to_torch(dtype))
+        torch_dtype = str_dtype_to_torch(dtype)
+        x_data = torch.randn(128, 20, dtype=torch_dtype)
+        m = torch.nn.Linear(20, 30, dtype=torch.float32)
 
         # construct trt network
         builder = tensorrt_llm.Builder()
@@ -284,27 +290,32 @@ class TestLayer(unittest.TestCase):
 
             gm = tensorrt_llm.layers.Linear(20, 30, dtype=dtype)
 
-            gm.weight.value = torch_to_numpy(m.weight.detach().cpu())
-            gm.bias.value = torch_to_numpy(m.bias.detach().cpu())
+            gm.weight.value = torch_to_numpy(
+                m.weight.to(torch_dtype).detach().cpu())
+            gm.bias.value = torch_to_numpy(
+                m.bias.to(torch_dtype).detach().cpu())
             output = gm.forward(x).trt_tensor
             output.name = 'output'
+            output.dtype = tensorrt_llm.str_dtype_to_trt(output_dtype)
             network.mark_output(output)
 
         # trt run
         build_engine = EngineFromNetwork(
             (builder.trt_builder, net.trt_network),
-            CreateConfig(bf16=dtype == "bfloat16",
+            CreateConfig(fp16=dtype == "float16",
+                         bf16=dtype == "bfloat16",
                          precision_constraints="obey"))
         with TrtRunner(build_engine) as runner:
             outputs = runner.infer(feed_dict={'x': x_data})
 
         # pytorch run
         with torch.no_grad():
-            ref = m(x_data)
+            ref = m(x_data.to(torch.float32)).to(
+                str_dtype_to_torch(output_dtype))
 
         # The absolute tolerance for bfloat16 is increased marginally because
         # a single value (out of 4000) breaks tolerance on a 4090 linux/windows.
-        atols = {"float32": 1e-6, "bfloat16": 1.03 * 1e-2}
+        atols = {"float32": 1e-6, "float16": 1e-2, "bfloat16": 1.6e-2}
 
         # compare diff
         np.testing.assert_allclose(ref.to(torch.float32).cpu().numpy(),

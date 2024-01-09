@@ -15,8 +15,10 @@
 import unittest
 from collections import OrderedDict
 
-import tensorrt as trt
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from parameterized import parameterized
 
 import tensorrt_llm

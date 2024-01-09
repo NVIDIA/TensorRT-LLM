@@ -18,6 +18,7 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
   * BF16
   * FP8
   * FP8 KV CACHE
+  * Groupwise quantization (AWQ)
   * Tensor Parallel
   * STRONGLY TYPED
 
@@ -241,11 +242,11 @@ where FP8 scaling factors are stored.
 
 ```bash
 # Quantize HF Falcon 180B checkpoint into FP8 and export a single-rank checkpoint
-python quantize.py --model_dir ./falcon/180b \
-                   --dtype float16 \
-                   --qformat fp8 \
-                   --export_path quantized_fp8 \
-                   --calib_size 16
+python examples/quantization/quantize.py --model_dir falcon/180b \
+                                         --dtype float16 \
+                                         --qformat fp8 \
+                                         --export_path quantized_fp8 \
+                                         --calib_size 16
 
 # Convert the HF weights and AMMO quantization scales to trtllm checkpoint
 python3 convert_checkpoint.py --model_dir ./falcon/180b \
@@ -275,6 +276,54 @@ mpirun -n 8 --allow-run-as-root --oversubscribe \
     python ../summarize.py --test_trt_llm \
                            --hf_model_dir ./falcon/180b \
                            --engine_dir ./falcon/180b/trt_engines/bf16/tp4-pp2/
+```
+
+### Groupwise quantization (AWQ)
+
+The examples below use the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
+
+First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+
+Now quantize HF Falcon weights as follows.
+After successfully running the script, the output should be in .npz format, e.g. `quantized_int4_awq/falcon_tp1_rank0.npz`,
+where INT4 AWQ scaling factors are stored.
+
+```bash
+# Quantize HF Falcon 180B checkpoint into INT4-AWQ and export a single-rank checkpoint
+python quantize.py --model_dir ./falcon/180b \
+                   --dtype float16 \
+                   --qformat int4_awq \
+                   --export_path quantized_int4_awq \
+                   --calib_size 16
+
+# Convert the HF weights and AMMO quantization scales to trtllm checkpoint
+python3 convert_checkpoint.py --model_dir ./falcon/180b \
+                              --dtype float16 \
+                              --ammo_quant_ckpt_path ./quantized_int4_awq/falcon_tp1_rank0.npz \
+                              --use_weight_only \
+                              --weight_only_precision int4_awq \
+                              --per_group \
+                              --output_dir ./falcon/180b/trt_ckpt/int4_awq/tp2/ \
+                              --world_size 2 \
+                              --tp_size 2 \
+                              --pp_size 1 \
+                              --load_by_shard \
+                              --workers 2
+
+# Build trtllm engines from the trtllm checkpoint
+trtllm-build --checkpoint_dir ./falcon/180b/trt_ckpt/int4_awq/tp2/ \
+             --use_gemm_plugin float16 \
+             --remove_input_padding \
+             --use_gpt_attention_plugin float16 \
+             --enable_context_fmha \
+             --output_dir ./falcon/180b/trt_engines/int4_awq/tp2/ \
+             --workers 2
+
+# Run the summarization task
+mpirun -n 2 --allow-run-as-root --oversubscribe \
+    python ../summarize.py --test_trt_llm \
+                           --hf_model_dir ./falcon/180b \
+                           --engine_dir ./falcon/180b/trt_engines/int4_awq/tp2/
 ```
 
 ## Troubleshooting

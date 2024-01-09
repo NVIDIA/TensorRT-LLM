@@ -354,6 +354,11 @@ def parse_arguments():
         'You must also use --use_weight_only for that argument to have an impact.'
     )
     parser.add_argument(
+        '--quantize_lm_head',
+        default=False,
+        action="store_true",
+        help='Quantize lm_head weights as well when using int4_awq.')
+    parser.add_argument(
         '--use_inflight_batching',
         action="store_true",
         default=False,
@@ -391,9 +396,19 @@ def parse_arguments():
         type=int,
         default=0,
         help='Setting to a value > 0 enables support for prompt tuning.')
-    parser.add_argument('--gather_all_token_logits',
+    parser.add_argument(
+        '--gather_all_token_logits',
+        action='store_true',
+        default=False,
+        help='Enable both gather_context_logits and gather_generation_logits')
+    parser.add_argument('--gather_context_logits',
                         action='store_true',
-                        default=False)
+                        default=False,
+                        help='Gather context logits')
+    parser.add_argument('--gather_generation_logits',
+                        action='store_true',
+                        default=False,
+                        help='Gather generation logits')
     parser.add_argument(
         '--use_lora_plugin',
         nargs='?',
@@ -401,6 +416,23 @@ def parse_arguments():
         default=False,
         choices=['float16', 'float32', 'bfloat16'],
         help="Activates the lora plugin which enables embedding sharing.")
+    parser.add_argument(
+        '--lora_target_modules',
+        nargs='+',
+        default=None,
+        choices=[
+            "attn_qkv",
+            "attn_q",
+            "attn_k",
+            "attn_v",
+            "attn_dense",
+            "mlp_h_to_4h",
+            "mlp_gate",
+            "mlp_4h_to_h",
+        ],
+        help=
+        "Add lora in which modules. Only be activated when use_lora_plugin is enabled."
+    )
     parser.add_argument('--hf_lora_dir', type=str, default=None)
     parser.add_argument(
         '--moe_num_experts',
@@ -568,13 +600,15 @@ def parse_arguments():
 
     if lora_config.is_valid and lora_config.vocab_size != 0:
         args.vocab_size = lora_config.vocab_size
+        args.lora_target_modules = lora_config.lora_target_modules
 
     args.lora_config = lora_config
 
-    if args.weight_only_precision == 'int4_awq':
+    if args.weight_only_precision == 'int4_awq' and args.quantize_lm_head:
         if args.vocab_size % 64 != 0:
             args.vocab_size = int((args.vocab_size + 63) / 64) * 64
-            logger.info("To use awq we pad it to {}.".format(args.vocab_size))
+            logger.info("To use awq we pad vocab_size to {}.".format(
+                args.vocab_size))
 
     assert args.pp_size * args.tp_size == args.world_size
 
@@ -605,6 +639,10 @@ def parse_arguments():
     args.moe_config = MoeConfig(args.moe_num_experts, args.moe_top_k,
                                 args.moe_tp_mode,
                                 args.moe_renorm_mode).validate()
+
+    if args.gather_all_token_logits:
+        args.gather_context_logits = True
+        args.gather_generation_logits = True
 
     return args
 
@@ -655,11 +693,12 @@ def build_rank_engine(builder: Builder,
     quantize_kwargs = {}
     if args.use_smooth_quant or args.use_weight_only:
         if args.weight_only_precision == 'int4_awq':
+            exclude_modules = ['lm_head'] if not args.quantize_lm_head else []
             quantize_kwargs = {
                 "group_size": args.group_size,
                 "zero": False,
                 "pre_quant_scale": True,
-                "exclude_modules": [],
+                "exclude_modules": exclude_modules,
             }
         elif args.weight_only_precision == 'int4_gptq':
             quantize_kwargs = {
@@ -684,12 +723,19 @@ def build_rank_engine(builder: Builder,
     tensorrt_llm_llama = quantize_model(tensorrt_llm_llama, args.quant_mode,
                                         **quantize_kwargs)
     if args.per_group:
-        load_func = load_from_awq_llama if args.weight_only_precision == 'int4_awq' else load_from_gptq_llama
-        load_func(tensorrt_llm_llama=tensorrt_llm_llama,
-                  quant_ckpt_path=args.quant_ckpt_path,
-                  mapping=mapping,
-                  dtype=args.dtype,
-                  bin_model_dir=args.bin_model_dir)
+        if args.weight_only_precision == 'int4_awq':
+            load_from_awq_llama(tensorrt_llm_llama=tensorrt_llm_llama,
+                                quant_ckpt_path=args.quant_ckpt_path,
+                                quantize_lm_head=args.quantize_lm_head,
+                                mapping=mapping,
+                                dtype=args.dtype,
+                                bin_model_dir=args.bin_model_dir)
+        else:
+            load_from_gptq_llama(tensorrt_llm_llama=tensorrt_llm_llama,
+                                 quant_ckpt_path=args.quant_ckpt_path,
+                                 mapping=mapping,
+                                 dtype=args.dtype,
+                                 bin_model_dir=args.bin_model_dir)
     elif args.meta_ckpt_dir is not None:
         load_from_meta_llama(tensorrt_llm_llama, args.meta_ckpt_dir, mapping,
                              args.dtype)
@@ -795,8 +841,9 @@ def build_rank_engine(builder: Builder,
             args.max_beam_width,
             args.max_num_tokens,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size,
-            gather_all_token_logits=args.gather_all_token_logits,
-            lora_target_modules=args.lora_config.lora_target_modules)
+            gather_context_logits=args.gather_context_logits,
+            gather_generation_logits=args.gather_generation_logits,
+            lora_target_modules=args.lora_target_modules)
         tensorrt_llm_llama(*inputs)
         if args.enable_debug_output:
             # mark intermediate nodes' outputs
@@ -870,8 +917,10 @@ def build(rank, args):
             opt_level=args.builder_opt,
             max_prompt_embedding_table_size=args.
             max_prompt_embedding_table_size,
-            gather_all_token_logits=args.gather_all_token_logits,
-            lora_target_modules=args.lora_config.lora_target_modules,
+            gather_context_logits=args.gather_context_logits,
+            gather_generation_logits=args.gather_generation_logits,
+            lora_target_modules=args.lora_target_modules,
+            mlp_hidden_size=args.inter_size,
         )
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.tp_size,
                                       args.pp_size, cur_rank)

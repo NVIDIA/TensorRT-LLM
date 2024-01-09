@@ -55,10 +55,10 @@ public:
     {
     public:
         std::optional<std::vector<float>> temperature;        // [1] or [batch_size] on cpu
-        std::optional<std::vector<std::int32_t>> min_length;  // [1] or [batch_size] on cpu
         std::optional<std::vector<float>> repetition_penalty; // [1] or [batch_size] on cpu
         std::optional<std::vector<float>> presence_penalty;   // [1] or [batch_size] on cpu
         std::optional<std::vector<float>> frequency_penalty;  // [1] or [batch_size] on cpu
+        std::optional<std::vector<std::int32_t>> min_length;  // [1] or [batch_size] on cpu
 
         // baseSamplingLayer
         std::optional<std::vector<std::uint32_t>> runtime_top_k; // [1] or [batch_size] on cpu
@@ -162,6 +162,10 @@ private:
     size_t vocab_size_padded_;
     cudaDeviceProp* cuda_device_prop_;
     int* zero_parent_ids = nullptr;
+    int* top_k_workspace = nullptr;
+    int* top_p_workspace = nullptr;
+    int* beam_search_workspace_0 = nullptr;
+    int* beam_search_workspace_1 = nullptr;
     runtime::IBuffer::SharedPtr mIdsPtrHost;
 
     bool has_diff_runtime_args_ = false;

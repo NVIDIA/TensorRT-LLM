@@ -16,25 +16,63 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 
 ## Support Matrix
 
-|    Model Name    | FP16  | FMHA  |  WO   |  AWQ  |  SQ   |  TP   |  PP   |  ST   | C++ Runtime | benchmark |  IFB  |
-| :--------------: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---------: | :-------: | :---: |
-|    chatglm_6b    |   Y   |       |   Y   |       |       |   Y   |       |   Y   |      Y      |     Y     |   Y   |
-|   chatglm2_6b    |   Y   |   Y   |   Y   |   Y   |       |   Y   |       |   Y   |      Y      |     Y     |   Y   |
-| chatglm2_6b_32k  |   Y   |   Y   |   Y   |   Y   |       |   Y   |       |   Y   |      Y      |     Y     |   Y   |
-|   chatglm3_6b    |   Y   |   Y   |   Y   |   Y   |       |   Y   |       |   Y   |      Y      |     Y     |   Y   |
-| chatglm3_6b_base |   Y   |   Y   |   Y   |   Y   |       |   Y   |       |   Y   |      Y      |     Y     |   Y   |
-| chatglm3_6b_32k  |   Y   |   Y   |   Y   |   Y   |       |   Y   |       |   Y   |      Y      |     Y     |   Y   |
-|     glm_10b      |   Y   |   Y   |   Y   |       |       |   Y   |       |   Y   |             |           |       |
+|    Model Name    | FP16  | FMHA  |  WO   |  AWQ  |  SQ   |  TP   |  PP   |  ST   |  C++  | benchmark |  IFB  |
+| :--------------: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :-------: | :---: |
+|    chatglm_6b    |   Y   |       |   Y   |       |       |   Y   |       |   Y   |   Y   |     Y     |   Y   |
+|   chatglm2_6b    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |       |   Y   |   Y   |     Y     |   Y   |
+| chatglm2_6b_32k  |   Y   |   Y   |   Y   |   Y   |       |   Y   |       |   Y   |   Y   |     Y     |   Y   |
+|   chatglm3_6b    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |       |   Y   |   Y   |     Y     |   Y   |
+| chatglm3_6b_base |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |       |   Y   |   Y   |     Y     |   Y   |
+| chatglm3_6b_32k  |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |       |   Y   |   Y   |     Y     |   Y   |
+|     glm_10b      |   Y   |   Y   |   Y   |       |       |   Y   |       |   Y   |       |           |       |
 
 * Model Name: the name of the model, the same as the name on HuggingFace
 * FMHA: Fused MultiHead Attention (see introduction below)
 * WO: Weight Only Quantization (int8 / int4)
 * AWQ: Activation Aware Weight Quantization (int4)
-* SQ: Smooth Quantization
+* SQ: Smooth Quantization (int8)
 * TP: Tensor Parallel
 * PP: Pipeline Parallel
 * ST: Strongly Typed
+* C++: C++ Runtime
+* benchmark: benchmark by python / C++ Runtime
 * IFB: In-flight Batching (see introduction below)
+
+## Model comparison
+
+|       Name       |  nL   |  nAH  |  nKH  |  nHW  |  nH   |  nF   | nMSL  |   nV   | bP2D  | bBQKV | bBDense | Comments                                                           |
+| :--------------: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :----: | :---: | :---: | :-----: | :----------------------------------------------------------------- |
+|    chatglm_6b    |  28   |  32   |  32   |  128  | 4096  | 16384 | 2048  | 130528 |   Y   |   Y   |    Y    |                                                                    |
+|   chatglm2_6b    |  28   |  32   |   2   |  128  | 4096  | 13696 | 32768 | 65024  |   N   |   Y   |    N    | Multi_query_attention, RMSNorm rather than LayerNorm in chatglm_6b |
+| chatglm2_6b_32k  |  28   |  32   |   2   |  128  | 4096  | 13696 | 32768 | 65024  |   N   |   Y   |    N    | RoPE base=160000 rather than 10000 in chatglm2_6b                  |
+|   chatglm3_6b    |  28   |  32   |   2   |  128  | 4096  | 13696 | 8192  | 65024  |   N   |   Y   |    N    | Different in preprocess and postprocess than chatglm2_6b           |
+| chatglm3_6b_base |  28   |  32   |   2   |  128  | 4096  | 13696 | 32768 | 65024  |   N   |   Y   |    N    |                                                                    |
+| chatglm3_6b_32k  |  28   |  32   |   2   |  128  | 4096  | 13696 | 32768 | 65024  |   N   |   Y   |    N    | RoPE base=500000 rather than 10000 in chatglm3_6b                  |
+|     glm_10b      |  48   |  64   |  32   |  64   | 4096  | 16384 | 1024  | 50304  |   Y   |   Y   |    Y    |                                                                    |
+
+* nL: number of layers
+* nAH: number of attention heads
+* nKH: number of kv heads (less than nAH if multi_query_attention is used)
+* nHW: head width
+* nH: hidden size
+* nF: FFN hidden size
+* nMSL: max sequence length (input + output)
+* nV: vocabulary size
+* bP2D: use position_encoding_2d (Y: Yes, N: No)
+* bBQKV: use bias for QKV multiplication in self-attention
+* bBDense: use bias for Dense multiplication in self-attention
+
+## Tokenizer and special tokens comparison
+
+|       Name       |    Tokenizer     |  bos   |  eos   |  pad  |  cls  | startofpiece | endofpiece |  mask  | smask | gmask  |
+| :--------------: | :--------------: | :----: | :----: | :---: | :---: | :----------: | :--------: | :----: | :---: | :----: |
+|    chatglm_6b    | ChatGLMTokenizer | 130004 | 130005 |   3   |       |    130004    |   130005   | 130000 |       | 130001 |
+|   chatglm2_6b    | ChatGLMTokenizer |   1    |   2    |   0   |       |              |            |        |       |        |
+| chatglm2_6b_32k  | ChatGLMTokenizer |   1    |   2    |   0   |       |              |            |        |       |        |
+|   chatglm3_6b    | ChatGLMTokenizer |   1    |   2    |   0   |       |              |            | 130000 |       |        |
+| chatglm2_6b_base | ChatGLMTokenizer |   1    |   2    |   0   |       |              |            | 130000 |       |        |
+| chatglm2_6b_32k  | ChatGLMTokenizer |   1    |   2    |   0   |       |              |            | 130000 |       |        |
+|     glm_10b      | GLMGPT2Tokenizer | 50257  | 50256  | 50256 | 50259 |    50257     |   50258    | 50260  | 50264 | 50263  |
 
 ## Usage
 
@@ -56,6 +94,10 @@ git clone https://huggingface.co/THUDM/chatglm3-6b      chatglm3_6b
 git clone https://huggingface.co/THUDM/chatglm3-6b-base chatglm3_6b_base
 git clone https://huggingface.co/THUDM/chatglm3-6b-32k  chatglm3_6b_32k
 git clone https://huggingface.co/THUDM/glm-10b          glm_10b
+
+# replace tokenizationfile if using transformers-4.36.1 for model ChatGLM-6B (this might be needless in the future)
+cp chatglm_6b/tokenization_chatglm.py chatglm_6b/tokenization_chatglm.py-backup
+cp tokenization_chatglm.py chatglm_6b
 ```
 
 ### 2. Build TensorRT engine(s)
@@ -102,7 +144,7 @@ python3 build.py --model_dir chatglm3_6b_base --output_dir trt_engines/chatglm3_
 python3 build.py --model_dir chatglm3_6b_32k --output_dir trt_engines/chatglm3_6b_32k/fp16/1-gpu
 
 # Build a engine of GLM-10B on single GPU, other configurations are the same as default example
-python3 build.py --model_dir glm_10b --output_dir trt_engines/glm_10b/fp16/1-gpu
+python3 build.py --model_dir glm_10b --max_input_len=512 --output_dir trt_engines/glm_10b/fp16/1-gpu
 ```
 
 #### example of output from build.py with "--log_level=info"
@@ -218,13 +260,12 @@ python3 build.py --model_dir glm_10b --output_dir trt_engines/glm_10b/fp16/1-gpu
 
 ```bash
 # Build INT4-AWQ weights file
-python quantize.py \
-    --model_dir=chatglm3_6b \
-    --dtype=float16 \
-    --qformat=int4_awq \
-    --export_path=awq.pt \
-    --calib_size=32 \
-    --cache_dir=./dataset
+python examples/quantization/quantize.py --model_dir=chatglm3_6b \
+                                         --dtype=float16 \
+                                         --qformat=int4_awq \
+                                         --export_path=awq.pt \
+                                         --calib_size=32 \
+                                         --cache_dir=./dataset
 
 # Build INT4-AWQ TRT-LLM engine
 python build.py \
@@ -235,25 +276,23 @@ python build.py \
     --per_group
 ```
 
-#### Activation-aware Weight Quantization (AWQ)
+#### Smooth Quantization (SQ)
 
 * Use hf_chatglm_convert.py to enable smooth quantization
 
 ```bash
 # Get  smooth quantization weights file
-python3 hf_chatglm_convert.py \
-    -m chatglm3_6b \
+python3 convert_chatglm.py \
     -i chatglm3_6b/ \
     -o sq \
-    --smoothquant 0.5 \
-    -t float16 \
-    --dataset-cache-dir=../chatglm/dataset
+    -sq=0.5 \
+    --cache_dir=dataset/ \
+    --calib_size=64
 
 # Build smooth quantization TRT-LLM engine
 python build.py \
     -m chatglm3_6b \
-    --model_dir=chatglm3_6b \
-    --quant_ckpt_path=sq/1-gpu/ \
+    --model_dir=sq/1-gpu/ \
     --use_smooth_quant \
     --per_token \
     --per_channel
@@ -291,7 +330,7 @@ python3 ../run.py --input_text "What's new between ChatGLM3-6B and ChatGLM2-6B?"
 
 # Run the default engine of GLM3-10B on single GPU, other model name is available if built.
 # Token "[MASK]" or "[sMASK]" or "[gMASK]" must be included in the prompt as the original model commanded.
-python3 ../run.py --input_text "Peking University is [MASK] than Tsinghua Univercity." \
+python3 ../run.py --input_text "Peking University is [MASK] than Tsinghua University." \
                   --max_output_len 50 \
                   --tokenizer_dir glm_10b \
                   --engine_dir trt_engines/glm_10b/fp16/1-gpu
@@ -322,10 +361,30 @@ Output [Text 0 Beam 0]: "lawyer and later became a prominent figure in the Frenc
 ```bash
 # Run the summarization of ChatGLM3-6B task, other model name is available if built.
 python3 ../summarize.py \
-    --test_hf \
     --test_trt_llm \
+    --check_accuracy \
     --hf_model_dir chatglm3_6b \
-    --engine_dir trt_engines/chatglm3_6b/fp16/1-gpu
+    --engine_dir engine_outputs/chatglm3_6b/fp10/1-gpu \
+```
+
+#### Example of output from summarize.py (might not be actually same on various environments)
+
+```txt
+[12/26/2023-20:05:51] [TRT-LLM] [I] Load engine takes: 4.738909959793091 sec
+[12/26/2023-20:06:11] [TRT-LLM] [I] ---------------------------------------------------------
+[12/26/2023-20:06:11] [TRT-LLM] [I] TensorRT-LLM Generated :
+[12/26/2023-20:06:11] [TRT-LLM] [I]  Input : ['(CNN)The Palestinian Authority officially became the ... .']
+[12/26/2023-20:06:11] [TRT-LLM] [I]
+ Reference : ['Membership gives the ICC jurisdiction over alleged crimes committed in Palestinian ... .']
+[12/26/2023-20:06:11] [TRT-LLM] [I]
+ Output : [['The Palestinian Authority has officially joined the International Criminal Court... .']]
+[12/26/2023-20:06:11] [TRT-LLM] [I] ---------------------------------------------------------
+[12/26/2023-20:06:53] [TRT-LLM] [I] TensorRT-LLM (total latency: 37.75311541557312 sec)
+[12/26/2023-20:06:53] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[12/26/2023-20:06:53] [TRT-LLM] [I]   rouge1 : 29.333249265005644
+[12/26/2023-20:06:53] [TRT-LLM] [I]   rouge2 : 13.082063357001006
+[12/26/2023-20:06:53] [TRT-LLM] [I]   rougeL : 21.888991441896124
+[12/26/2023-20:06:53] [TRT-LLM] [I]   rougeLsum : 25.018667613572227
 ```
 
 ## Benchmark

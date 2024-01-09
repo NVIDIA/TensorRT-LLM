@@ -100,6 +100,20 @@ memory is not enough when multi-block mode is not enabled. To get masked MHA
 kernel work in these cases, multi-block mode is forced on and a warning log is
 printed.
 
+
+Another optimization for MQA/GQA in generation phase called XQA optimization.
+It is still experimental feature and support limited configurations. LLAMA2 70B
+is one model that it supports. To enable this, you need to set environment
+variable `TRTLLM_ENABLE_XQA=1`. Now it supports fp16 accuracy with fp16/fp8 KV
+cache for LLAMA2 70B. Note that a heuristic algorithm is also used to decide
+whether to use XQA kernel or masked MHA kernel to get better performance. That
+means even `TRTLLM_ENABLE_XQA=1` is set, XQA kernels may not also be used.
+If you want to use that kernel when possible, `TRTLLM_FORCE_XQA=1` can be set
+to force use XQA kernels when the model config is supported. Detailed supported
+configuration can be found function `shouldUse` of class `DecoderXQARunner` in
+`cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h`
+
+
 ## Inflight batching
 
 TensorRT-LLM supports a feature called in-flight batching. With that feature,

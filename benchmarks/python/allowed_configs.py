@@ -69,13 +69,15 @@ class EncDecBuildConfig:
     hidden_size: int
     vocab_size: int
     hidden_act: Optional[str]
-    n_positions: int
     max_batch_size: int
+    n_positions: int = 0
     num_decoder_layers: Optional[int] = None
     head_size: Optional[int] = None
     ffn_hidden_size: Optional[int] = None
-    num_buckets: Optional[int] = None
-    max_distance: Optional[int] = None
+    num_buckets: int = 0
+    max_distance: int = 0
+    has_embedding_scale: bool = False
+    normalize_before: Optional[bool] = None
     max_encoder_input_len: Optional[int] = None
     max_decoder_input_len: Optional[int] = None
     max_output_len: Optional[int] = None
@@ -765,7 +767,7 @@ _allowed_configs = {
                 )),
     "flan_t5_small":
     ModelConfig(name="flan_t5_small",
-                family="t5",
+                family="flan_t5",
                 benchmark_type="enc_dec",
                 build_config=EncDecBuildConfig(
                     num_layers=8,
@@ -775,7 +777,7 @@ _allowed_configs = {
                     ffn_hidden_size=1024,
                     hidden_size=512,
                     vocab_size=32128,
-                    hidden_act="gated-gelu",
+                    hidden_act="gelu_new",
                     n_positions=512,
                     num_buckets=32,
                     max_distance=128,
@@ -787,7 +789,7 @@ _allowed_configs = {
                 )),
     "flan_t5_base":
     ModelConfig(name="flan_t5_base",
-                family="t5",
+                family="flan_t5",
                 benchmark_type="enc_dec",
                 build_config=EncDecBuildConfig(
                     num_layers=12,
@@ -797,7 +799,7 @@ _allowed_configs = {
                     ffn_hidden_size=2048,
                     hidden_size=768,
                     vocab_size=32128,
-                    hidden_act="gated-gelu",
+                    hidden_act="gelu_new",
                     n_positions=512,
                     num_buckets=32,
                     max_distance=128,
@@ -809,7 +811,7 @@ _allowed_configs = {
                 )),
     "flan_t5_large":
     ModelConfig(name="flan_t5_large",
-                family="t5",
+                family="flan_t5",
                 benchmark_type="enc_dec",
                 build_config=EncDecBuildConfig(
                     num_layers=24,
@@ -819,7 +821,7 @@ _allowed_configs = {
                     ffn_hidden_size=2816,
                     hidden_size=1024,
                     vocab_size=32128,
-                    hidden_act="gated-gelu",
+                    hidden_act="gelu_new",
                     n_positions=512,
                     num_buckets=32,
                     max_distance=128,
@@ -831,7 +833,7 @@ _allowed_configs = {
                 )),
     "flan_t5_xl":
     ModelConfig(name="flan_t5_xl",
-                family="t5",
+                family="flan_t5",
                 benchmark_type="enc_dec",
                 build_config=EncDecBuildConfig(
                     num_layers=24,
@@ -841,7 +843,7 @@ _allowed_configs = {
                     ffn_hidden_size=5120,
                     hidden_size=2048,
                     vocab_size=32128,
-                    hidden_act="gated-gelu",
+                    hidden_act="gelu_new",
                     n_positions=512,
                     num_buckets=32,
                     max_distance=128,
@@ -853,7 +855,7 @@ _allowed_configs = {
                 )),
     "flan_t5_xxl":
     ModelConfig(name="flan_t5_xxl",
-                family="t5",
+                family="flan_t5",
                 benchmark_type="enc_dec",
                 build_config=EncDecBuildConfig(
                     num_layers=24,
@@ -888,6 +890,8 @@ _allowed_configs = {
                     hidden_act="gelu",
                     n_positions=1024,
                     num_buckets=32,
+                    has_embedding_scale=False,
+                    normalize_before=False,
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
@@ -908,6 +912,8 @@ _allowed_configs = {
                     vocab_size=250054,
                     hidden_act="relu",
                     n_positions=1024,
+                    has_embedding_scale=True,
+                    normalize_before=True,
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
@@ -1019,6 +1025,40 @@ _allowed_configs = {
                     max_output_len=200,
                     builder_opt=None,
                     bias=False,
+                )),
+    "qwen_7b_chat":
+    ModelConfig(name="qwen_7b_chat",
+                family="qwen",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=32,
+                    num_heads=32,
+                    hidden_size=4096,
+                    vocab_size=151936,
+                    hidden_act='silu',
+                    n_positions=8192,
+                    inter_size=22016,
+                    max_batch_size=128,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                )),
+    "qwen_14b_chat":
+    ModelConfig(name="qwen_14b_chat",
+                family="qwen",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=40,
+                    num_heads=40,
+                    hidden_size=5120,
+                    vocab_size=152064,
+                    hidden_act='silu',
+                    n_positions=8192,
+                    inter_size=27392,
+                    max_batch_size=64,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
                 )),
 }
 

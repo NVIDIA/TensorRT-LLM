@@ -406,8 +406,9 @@ public:
         bool final_response, [[maybe_unused]] const std::string& errMsg)
     {
         // `response_tensors` contains `outputIds, sequenceLength, [contextLogits, generationLogits], logProbs,
-        // cumLogProbs`. `contextLogits, generationLogits` are optional, only contained when 'gather_all_token_logits'
-        // are set
+        // cumLogProbs`. `contextLogits, generationLogits` are optional, only contained when `gather_context_logits` and
+        // `gather_generation_logits` are enabled respectively. Or enable 'gather_all_token_logits' to enable both of
+        // them.
         try
         {
             if (final_response)

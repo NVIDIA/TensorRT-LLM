@@ -127,7 +127,7 @@ class FalconDecoderLayer(Module):
         else:
             hidden_states = mlp_ln_output
 
-        hidden_states = self.mlp(hidden_states, all_reduce_workspace)
+        hidden_states = self.mlp(hidden_states, workspace=all_reduce_workspace)
 
         if self.is_parallel_attention:
             hidden_states = hidden_states + attention_output
@@ -149,9 +149,9 @@ class FalconModel(Module):
         self.config = config
 
         if config.mapping.is_first_pp_rank():
-            self.embedding = Embedding(config.vocab_size,
-                                       config.hidden_size,
-                                       dtype=config.dtype)
+            self.vocab_embedding = Embedding(config.vocab_size,
+                                             config.hidden_size,
+                                             dtype=config.dtype)
 
         self.layers = DecoderLayerList(FalconDecoderLayer, config)
         if config.mapping.is_last_pp_rank():
@@ -174,7 +174,7 @@ class FalconModel(Module):
             presents = []
 
         if self.config.mapping.is_first_pp_rank():
-            hidden_states = self.embedding(input_ids)
+            hidden_states = self.vocab_embedding(input_ids)
         else:
             hidden_states = recv(hidden_states,
                                  self.config.mapping.prev_pp_rank())

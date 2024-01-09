@@ -9,7 +9,7 @@ async def main(model_dir: Path):
     engine = AsyncLLMEngine.from_hf_dir(model_dir)
     text = "deep learning is"
     async for response in engine.generate(prompt=text, max_new_tokens=16):
-        text += response
+        text += response.text
         print(text)
 
 

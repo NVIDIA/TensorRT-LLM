@@ -127,10 +127,11 @@ void RuntimeBuffers::create(TllmRuntime& runtime, GptModelConfig const& modelCon
     {
         auto const logitsType = engine.getTensorDataType("logits");
         logits = manager.emptyTensor(MemoryType::kGPU, logitsType);
+        originalLogitsPtr = logits;
 
+        allGenerationLogits = manager.emptyTensor(MemoryType::kGPU, logitsType);
         if (modelConfig.computeGenerationLogits())
         {
-            allGenerationLogits = manager.emptyTensor(MemoryType::kGPU, logitsType);
             cacheGenerationLogits = manager.emptyTensor(MemoryType::kGPU, logitsType);
             cacheGenerationLogitsHost = manager.emptyTensor(MemoryType::kPINNED, logitsType);
 
@@ -242,8 +243,22 @@ void RuntimeBuffers::reshape(GptModelConfig const& modelConfig, WorldConfig cons
 
     if (worldConfig.isLastPipelineParallelRank())
     {
-        if (!modelConfig.computeContextLogits())
+        if (modelConfig.computeContextLogits())
         {
+            if (!modelConfig.computeGenerationLogits())
+            {
+                // If only enable computeContextLogits, also need to have a generation buffer to store the last token of
+                // context
+                allGenerationLogits->reshape(ITensor::makeShape({1, batchSize, beamWidth, vocabSizePadded}));
+            }
+        }
+        else
+        {
+            // If only gather generation logits
+            if (modelConfig.computeGenerationLogits())
+            {
+                logits = originalLogitsPtr; // logits point to original buffer
+            }
             logits->reshape(ITensor::makeShape({batchSize, 1, vocabSizePadded}));
         }
 
@@ -437,7 +452,6 @@ void RuntimeBuffers::gatherLastTokenLogits(
     if (worldConfig.isLastPipelineParallelRank())
     {
         auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
-
         TensorPtr tiledTensor = ITensor::slice(allGenerationLogits, 0, 1);
         tiledTensor->squeeze(0);
         kernels::gatherLastTokenLogits(*tiledTensor, *logits, *lastTokenIds, manager.getStream());

@@ -26,18 +26,22 @@ namespace kernels
 
 enum class RepetitionPenaltyType
 {
-    Repetition, // the repetition penalty
-    Presence,   // the presence penalty
-    Frequency,  // the frequency penalty
+    Temperature, // the temperature penalty
+    Repetition,  // the repetition penalty
+    Presence,    // the presence penalty
+    Frequency,   // the frequency penalty
+    MinLength,   // the min length penalty
 };
 
 inline float getDefaultPenaltyValue(RepetitionPenaltyType penalty_type)
 {
     switch (penalty_type)
     {
+    case RepetitionPenaltyType::Temperature: return 1.0f;
     case RepetitionPenaltyType::Repetition: return 1.0f;
     case RepetitionPenaltyType::Presence: return 0.0f;
     case RepetitionPenaltyType::Frequency: return 0.0f;
+    case RepetitionPenaltyType::MinLength: return 1.0f;
     default: break;
     }
     return 0.0f;

@@ -46,6 +46,6 @@ public:
     std::optional<SizeType> sinkTokenLength;
     std::optional<float> freeGpuMemoryFraction;
     bool enableBlockReuse;
-    static constexpr auto kDefaultGpuMemFraction = 0.85f;
+    static constexpr auto kDefaultGpuMemFraction = 0.9f;
 };
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

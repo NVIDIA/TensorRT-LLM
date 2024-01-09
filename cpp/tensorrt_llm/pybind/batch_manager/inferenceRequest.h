@@ -53,6 +53,11 @@ public:
     }
 
     [[nodiscard]] std::shared_ptr<tensorrt_llm::batch_manager::InferenceRequest> toTrtLlm() const;
+
+    std::string serialize() const;
+
+    static std::shared_ptr<InferenceRequest> deserialize(std::string const& serialized);
+
     static void initBindings(pybind11::module_& m);
 };
 

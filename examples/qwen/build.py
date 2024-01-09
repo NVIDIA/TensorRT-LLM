@@ -173,12 +173,12 @@ def parse_arguments():
     parser.add_argument('--use_gpt_attention_plugin',
                         nargs='?',
                         type=str,
-                        default="float16",
+                        default=None,
                         choices=['float16', 'bfloat16', 'float32', None])
     parser.add_argument('--use_gemm_plugin',
                         nargs='?',
                         type=str,
-                        default="float16",
+                        default=None,
                         choices=['float16', 'bfloat16', 'float32', None])
     parser.add_argument('--parallel_build', default=False, action='store_true')
     parser.add_argument('--enable_context_fmha',
@@ -262,6 +262,11 @@ def parse_arguments():
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
     )
+    parser.add_argument(
+        '--quantize_lm_head',
+        default=False,
+        action="store_true",
+        help='Quantize lm_head weights as well when using int4_awq.')
     parser.add_argument(
         '--use_inflight_batching',
         action="store_true",
@@ -384,7 +389,7 @@ def parse_arguments():
         args.hidden_act = "silu"
         args.kv_channels = hf_config.kv_channels
         args.rotary_emb_base = hf_config.rotary_emb_base
-    assert args.use_gpt_attention_plugin is not None, "QWen must use gpt attention plugin"
+
     if args.n_kv_head is not None and args.n_kv_head != args.n_head:
         assert (args.n_head % args.n_kv_head) == 0, \
             "MQA/GQA requires the number of heads to be divisible by the number of K/V heads."
@@ -393,6 +398,12 @@ def parse_arguments():
         "This limitation will be removed in a future version."
 
     assert args.pp_size * args.tp_size == args.world_size
+
+    if args.weight_only_precision == 'int4_awq' and args.quantize_lm_head:
+        if args.vocab_size % 64 != 0:
+            args.vocab_size = int((args.vocab_size + 63) / 64) * 64
+            logger.info("To use awq we pad vocab_size to {}.".format(
+                args.vocab_size))
 
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha
@@ -442,13 +453,15 @@ def build_rank_engine(builder: Builder,
         quant_mode=args.quant_mode,
     )
     quantize_kwargs = {}
+    use_gemm_woq_plugin = args.use_gemm_plugin and args.use_weight_only
     if args.use_smooth_quant or args.use_weight_only:
         if args.weight_only_precision == 'int4_awq':
+            exclude_modules = ['lm_head'] if not args.quantize_lm_head else []
             quantize_kwargs = {
                 "group_size": args.group_size,
                 "zero": False,
                 "pre_quant_scale": True,
-                "exclude_modules": [],
+                "exclude_modules": exclude_modules,
             }
         elif args.weight_only_precision == 'int4_gptq':
             quantize_kwargs = {
@@ -460,11 +473,17 @@ def build_rank_engine(builder: Builder,
                                        **quantize_kwargs)
     ft_dir_path = args.ft_dir_path
     if args.per_group:
-        load_func = load_from_awq_qwen if args.weight_only_precision == 'int4_awq' else load_from_gptq_qwen
-        load_func(tensorrt_llm_qwen=tensorrt_llm_qwen,
-                  quant_ckpt_path=args.quant_ckpt_path,
-                  mapping=mapping,
-                  dtype=args.dtype)
+        if args.weight_only_precision == 'int4_awq':
+            load_from_awq_qwen(tensorrt_llm_qwen=tensorrt_llm_qwen,
+                               quant_ckpt_path=args.quant_ckpt_path,
+                               quantize_lm_head=args.quantize_lm_head,
+                               mapping=mapping,
+                               dtype=args.dtype)
+        else:
+            load_from_gptq_qwen(tensorrt_llm_qwen=tensorrt_llm_qwen,
+                                quant_ckpt_path=args.quant_ckpt_path,
+                                mapping=mapping,
+                                dtype=args.dtype)
     elif args.hf_model_dir is not None and \
         (ft_dir_path is None or not os.path.exists(ft_dir_path)):
         logger.info(f'Loading HF QWen ... from {args.hf_model_dir}')
@@ -488,7 +507,8 @@ def build_rank_engine(builder: Builder,
                           kv_channels=args.kv_channels,
                           rotary_emb_base=args.rotary_emb_base,
                           dtype=args.dtype,
-                          multi_query_mode=multi_query_mode)
+                          multi_query_mode=multi_query_mode,
+                          use_gemm_woq_plugin=use_gemm_woq_plugin)
         del hf_qwen
     elif ft_dir_path is not None:
         dir_path = ft_dir_path
@@ -497,7 +517,8 @@ def build_rank_engine(builder: Builder,
                      dir_path,
                      mapping,
                      dtype=args.dtype,
-                     multi_query_mode=multi_query_mode)
+                     multi_query_mode=multi_query_mode,
+                     use_gemm_woq_plugin=use_gemm_woq_plugin)
     else:
         raise ValueError(
             "You must specify either --hf_model_dir or --ft_dir_path")
@@ -522,7 +543,7 @@ def build_rank_engine(builder: Builder,
     if args.enable_context_fmha_fp32_acc:
         network.plugin_config.set_context_fmha(
             ContextFMHAType.enabled_with_fp32_acc)
-    if args.use_weight_only:
+    if args.use_weight_only and args.use_gemm_plugin:
         if args.per_group:
             network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
                 dtype='float16')

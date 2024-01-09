@@ -274,25 +274,25 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
 
     pe = fromfile(dir_path, 'model.wpe.bin', [n_positions, n_embd])
     if pe is not None:
-        tensorrt_llm_gpt.embedding.position_embedding.weight.value = (pe)
+        tensorrt_llm_gpt.position_embedding.weight.value = (pe)
 
     vocab_embedding_weight = fromfile(dir_path, 'model.wte.bin',
                                       [vocab_size, n_embd])
     if not use_parallel_embedding:
-        tensorrt_llm_gpt.embedding.vocab_embedding.weight.value = vocab_embedding_weight
+        tensorrt_llm_gpt.vocab_embedding.weight.value = vocab_embedding_weight
     else:
         if sharding_dim == 0:
             if vocab_size % tensor_parallel != 0:
                 # padding
                 vocab_size_padded = pad_vocab_size(
-                    tensorrt_llm_gpt.embedding.vocab_embedding.num_embeddings,
+                    tensorrt_llm_gpt.vocab_embedding.num_embeddings,
                     tensor_parallel)
                 pad_width = vocab_size_padded - vocab_size
                 vocab_embedding_weight = np.pad(vocab_embedding_weight,
                                                 ((0, pad_width), (0, 0)),
                                                 'constant',
                                                 constant_values=0)
-        tensorrt_llm_gpt.embedding.vocab_embedding.weight.value = np.ascontiguousarray(
+        tensorrt_llm_gpt.vocab_embedding.weight.value = np.ascontiguousarray(
             split(vocab_embedding_weight,
                   tensor_parallel,
                   rank,
@@ -647,7 +647,7 @@ def load_from_awq_mpt(tensorrt_llm_mpt: GPTLMHeadModel,
     if v.shape[0] % 64 != 0:
         v = torch.nn.functional.pad(v, [0, 0, 0, 64 - v.shape[0] % 64])
     if mapping.is_first_pp_rank():
-        tensorrt_llm_mpt.embedding.vocab_embedding.weight.value = v.to(
+        tensorrt_llm_mpt.vocab_embedding.weight.value = v.to(
             torch_dtype).cpu().numpy()
     if mapping.is_last_pp_rank():
         tp_dim = 0

@@ -1125,6 +1125,7 @@ def load_from_gptq_internlm(tensorrt_llm_internlm,
 
 def load_from_awq_internlm(tensorrt_llm_internlm: LLaMAForCausalLM,
                            quant_ckpt_path,
+                           quantize_lm_head=False,
                            mapping=Mapping(),
                            dtype="float16"):
     tensorrt_llm.logger.info(
@@ -1164,6 +1165,15 @@ def load_from_awq_internlm(tensorrt_llm_internlm: LLaMAForCausalLM,
     packer = torch.ops.fastertransformer.pack_int8_tensor_to_packed_int4
     preprocessor = torch.ops.fastertransformer.preprocess_weights_for_mixed_gemm
     torch_dtype = str_dtype_to_torch(dtype)
+
+    def torch_split(v, dim):
+        if v.shape[dim] % mapping.tp_size != 0:
+            tensorrt_llm.logger.error(
+                "Current weight shape is invalid for mapping.tp_size=" +
+                str(mapping.tp_size))
+            assert False, "Invalid TP size"
+        return v.split(v.shape[dim] // mapping.tp_size,
+                       dim=dim)[mapping.tp_rank]
 
     def AWQ_quantize_pack_preprocess(weight, scale):
         scale = scale.repeat_interleave(group_size, dim=0)
@@ -1271,7 +1281,7 @@ def load_from_awq_internlm(tensorrt_llm_internlm: LLaMAForCausalLM,
     [vocab_size, k] = v.shape
     pad_vocab = False
     pad_vocab_size = vocab_size
-    if vocab_size % 64 != 0:
+    if quantize_lm_head and vocab_size % 64 != 0:
         pad_vocab = True
         pad_vocab_size = int((vocab_size + 63) / 64) * 64
     if pad_vocab:
@@ -1333,7 +1343,7 @@ def load_from_awq_internlm(tensorrt_llm_internlm: LLaMAForCausalLM,
         tensorrt_llm_internlm.ln_f.weight.value = v.to(
             torch_dtype).cpu().numpy()
 
-    #lm_head
+    # lm_head
     if pad_vocab:
         weight = awq_internlm['lm_head.weight']
         [vocab_size, k] = weight.shape
@@ -1353,11 +1363,14 @@ def load_from_awq_internlm(tensorrt_llm_internlm: LLaMAForCausalLM,
         tensorrt_llm_internlm.lm_head.prequant_scaling_factor.value = awq_internlm[
             'lm_head.input_quantizer._pre_quant_scale'].to(
                 torch_dtype).cpu().numpy()
-    else:
+    elif quantize_lm_head:
         mPrefix = "lm_head"
         mOp = tensorrt_llm_internlm.lm_head
         if mapping.is_last_pp_rank():
             process_and_assign_weight(awq_internlm, mPrefix, mOp, 1)
+    else:
+        tensorrt_llm_internlm.lm_head.weight.value = torch_split(
+            awq_internlm['lm_head.weight'], 0).to(torch_dtype).cpu().numpy()
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

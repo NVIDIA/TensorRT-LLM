@@ -65,7 +65,8 @@ class TestGPT(unittest.TestCase):
                                   batch_size, input_len, output_len, fp16,
                                   gpt_attention_plugin, tensor_parallel,
                                   apply_query_key_layer_scaling,
-                                  gather_all_token_logits):
+                                  gather_context_logits,
+                                  gather_generation_logits):
         num_layers = gpt_config.n_layer
         num_heads = gpt_config.n_head
         hidden_size = gpt_config.n_embd
@@ -94,7 +95,8 @@ class TestGPT(unittest.TestCase):
                 output_len,
                 use_cache=True,
                 max_beam_width=1,
-                gather_all_token_logits=gather_all_token_logits)
+                gather_context_logits=gather_context_logits,
+                gather_generation_logits=gather_generation_logits)
             load_from_hf_gpt(tensorrt_llm_gpt,
                              hf_gpt,
                              dtype="float16" if fp16 else "float32")
@@ -125,7 +127,8 @@ class TestGPT(unittest.TestCase):
                                   enable_remove_input_padding=False,
                                   enable_paged_kv_cache=False,
                                   tokens_per_block=128,
-                                  gather_all_token_logits=False):
+                                  gather_context_logits=False,
+                                  gather_generation_logits=False):
         mapping = tensorrt_llm.Mapping(world_size, rank, tp_size=world_size)
 
         runtime = None
@@ -140,7 +143,8 @@ class TestGPT(unittest.TestCase):
                 timing_cache='model.cache',
                 tensor_parallel=world_size,  # TP only
                 use_refit=use_refit,
-                gather_all_token_logits=gather_all_token_logits,
+                gather_context_logits=gather_context_logits,
+                gather_generation_logits=gather_generation_logits,
                 strongly_typed=fp16,
             )
             network = builder.create_network()
@@ -158,7 +162,8 @@ class TestGPT(unittest.TestCase):
                                            batch_size, input_len, output_len,
                                            fp16, use_plugin, world_size,
                                            apply_query_key_layer_scaling,
-                                           gather_all_token_logits)
+                                           gather_context_logits,
+                                           gather_generation_logits)
 
             engine_buffer = builder.build_engine(network, builder_config)
             runtime = tensorrt_llm.runtime.generation._Runtime(
@@ -394,7 +399,7 @@ class TestGPT(unittest.TestCase):
             product([False, True], [False, True], [False, True], [
                 ContextFMHAType.disabled, ContextFMHAType.enabled,
                 ContextFMHAType.enabled_with_fp32_acc
-            ], [False, True], [False, True], [False, True]))
+            ], [False, True], [False, True], [False, True], [False, True]))
 
         return test_cases
 
@@ -402,9 +407,10 @@ class TestGPT(unittest.TestCase):
     def test_gpt_plugin(self, use_refit, fast_building,
                         apply_query_key_layer_scaling, context_fmha_type,
                         enable_remove_input_padding, enable_paged_kv_cache,
-                        gather_all_token_logits):
+                        gather_context_logits, gather_generation_logits):
         # inflight batching mode only works with remove_input_padding and paged_kv_cache
-        use_in_flight_batching = enable_remove_input_padding and enable_paged_kv_cache and not gather_all_token_logits
+        use_in_flight_batching = enable_remove_input_padding and enable_paged_kv_cache and not (
+            gather_context_logits or gather_generation_logits)
 
         # Skip tests that are not supported in pre-ampere architecture
         if getSMVersion() < 80:
@@ -441,7 +447,7 @@ class TestGPT(unittest.TestCase):
             use_plugin, batch_size, seq_len, max_length, use_refit,
             fast_building, apply_query_key_layer_scaling, context_fmha_type,
             enable_remove_input_padding, enable_paged_kv_cache,
-            tokens_per_block, gather_all_token_logits)
+            tokens_per_block, gather_context_logits, gather_generation_logits)
         key_value_cache_buffers = []
         value_cache_buffers = []
         head_size = gpt_config.n_embd // gpt_config.n_head
@@ -649,7 +655,7 @@ class TestGPT(unittest.TestCase):
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types)
 
-            if gather_all_token_logits:
+            if gather_context_logits:
                 np.testing.assert_allclose(ref.cpu().numpy().flatten(),
                                            res.cpu().numpy().flatten(),
                                            atol=1e-1)

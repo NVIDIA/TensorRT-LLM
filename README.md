@@ -45,6 +45,8 @@ H200 is now 2.4x faster on Llama-70B with recent improvements to TensorRT-LLM GQ
 
 - [TensorRT-LLM Overview](#tensorrt-llm-overview)
 - [Installation](#installation)
+  - [Linux](./docs/source/installation.md)
+  - [Windows](windows/README.md)
 - [Quick Start](#quick-start)
 - [Support Matrix](#support-matrix)
   - [Devices](#devices)
@@ -108,23 +110,20 @@ concepts used in TensorRT-LLM, we recommend you to read the following
 
 ## Installation
 
-The documentation for installing TensorRT-LLM can be found
-[here](./docs/source/installation.md). An image of a Docker container with
-TensorRT-LLM and its Triton Inference Server Backend will be made available
-soon.
-
-The remaining commands in that document must be executed from the TensorRT-LLM
-container.
-
+*For Linux installation, see [`Linux`](./docs/source/installation.md).*
 *For Windows installation, see [`Windows`](windows/README.md).*
 
+Once installed, commands to build and run LLMs must be executed from the TensorRT-LLM container.
+
 ## Quick Start
+
+Please be sure to complete the [installation steps](#installation) before proceeding with the following steps.
 
 To create a TensorRT engine for an existing model, there are 3 steps:
 
 1. Download pre-trained weights,
 2. Build a fully-optimized engine of the model,
-3. Deploy the engine.
+3. Deploy the engine, in other words, run the fully-optimized model.
 
 The following sections show how to use TensorRT-LLM to run the
 [BLOOM-560m](https://huggingface.co/bigscience/bloom-560m) model.
@@ -180,6 +179,8 @@ More details about the script and how to run the BLOOM model can be found in
 the example [folder](examples/bloom). Many more [models](#models) than BLOOM
 are implemented in TensorRT-LLM. They can be found in the
 [examples](./examples/) directory.
+
+Beyond local execution, you can also use the NVIDIA Triton Inference Server to create a production-ready deployment of your LLM as described in this [blog](https://developer.nvidia.com/blog/optimizing-inference-on-llms-with-tensorrt-llm-now-publicly-available/).
 
 ## Support Matrix
 

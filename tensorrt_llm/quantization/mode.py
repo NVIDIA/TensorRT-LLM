@@ -98,7 +98,8 @@ class QuantMode(IntFlag):
         return self._any(self.FP8_QDQ)
 
     def has_any_quant(self):
-        return self._any(self.INT8_WEIGHTS | self.ACTIVATIONS
+        return self._any(self.INT4_WEIGHTS | self.INT8_WEIGHTS
+                         | self.ACTIVATIONS
                          | self.INT8_KV_CACHE | self.FP8_KV_CACHE
                          | self.FP8_QDQ)
 

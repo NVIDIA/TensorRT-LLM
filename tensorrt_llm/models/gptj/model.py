@@ -125,7 +125,7 @@ class GPTJModel(Module):
                  quant_mode=QuantMode(0)):
         super().__init__()
         self.mapping = mapping
-        self.embedding = Embedding(vocab_size, hidden_size, dtype=dtype)
+        self.vocab_embedding = Embedding(vocab_size, hidden_size, dtype=dtype)
 
         self.layers = ModuleList([
             GPTJDecoderLayer(hidden_size=hidden_size,
@@ -147,7 +147,7 @@ class GPTJModel(Module):
                 kv_cache_params=None,
                 attention_params=None):
 
-        hidden_states = self.embedding(input_ids)
+        hidden_states = self.vocab_embedding(input_ids)
 
         kv_cache_params.fill_none_tensor_list(len(self.layers))
 

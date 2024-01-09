@@ -188,11 +188,11 @@ where FP8 scaling factors are stored.
 
 ```bash
 # Quantize HF Baichuan v2 13B into FP8 and export a single-rank checkpoint
-python quantize.py --model_dir /code/model/Baichuan2-13B-Chat/ \
-                   --dtype float16 \
-                   --qformat fp8 \
-                   --export_path ./quantized_fp8 \
-                   --calib_size 256 \
+python examples/quantization/quantize.py --model_dir /code/model/Baichuan2-13B-Chat/ \
+                                         --dtype float16 \
+                                         --qformat fp8 \
+                                         --export_path ./quantized_fp8 \
+                                         --calib_size 256 \
 
 # Build Baichuan v2 13B TP=1 using original HF checkpoint + PTQ scaling factors from the single-rank checkpoint
 python build.py --model_version v2_13b \
@@ -230,12 +230,12 @@ AWQ/GPTQ examples below involves 2 steps:
 
     ```bash
     # Quantize HF Baichuan 13B checkpoint into INT4 AWQ format
-    python quantize.py --model_dir baichuan-inc/Baichuan-13B-Chat \
-                       --dtype float16 \
-                       --qformat int4_awq \
-                       --group_size 128 \
-                       --export_path ./quantized_int4-awq_gs128 \
-                       --calib_size 32
+    python examples/quantization/quantize.py --model_dir baichuan-inc/Baichuan-13B-Chat \
+                                             --dtype float16 \
+                                             --qformat int4_awq \
+                                             --group_size 128 \
+                                             --export_path ./quantized_int4-awq_gs128 \
+                                             --calib_size 32
     ```
     The quantized model checkpoint is saved to `./quantized_int4-awq_gs128/baichuan_tp1_rank0.npz` for future TensorRT-LLM engine build.
 
