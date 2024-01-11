@@ -18,6 +18,8 @@ from typing import List, Optional
 import numpy as np
 import tensorrt as trt
 
+from tensorrt_llm.logger import logger
+
 from .._common import default_net, precision
 from .._utils import numpy_fp32_to_bf16, trt_dtype_to_np
 from ..functional import (AttentionMaskType, PositionEmbeddingType,
@@ -474,6 +476,7 @@ class Attention(Module):
         else:
             # out dim is not necessarily hidden_size + kv specific size (in MQA/GQA), but num_heads * heads_size
             # example: d_model != num_heads * head_size in Flan-T5
+            logger.info(f'qkv = column linear')
             self.qkv = ColumnLinear(
                 hidden_size,
                 tp_size * self.num_attention_heads * self.attention_head_size +
@@ -548,9 +551,12 @@ class Attention(Module):
                 workspace=None,
                 position_embedding=None,
                 norm_before_bmm1=False,
-                lora_layer_params=None):
+                lora_layer_params=None,
+                ia3_layer_params=None):
 
         assert isinstance(hidden_states, Tensor)
+
+        logger.info(f'in forward. {self.unfuse_qkv_gemm}')
 
         alibi_slopes = None
         if self.position_embedding_type.is_alibi():
@@ -569,6 +575,12 @@ class Attention(Module):
         if lora_layer_params is not None:
             qkv_lora_params = lora_layer_params.get_runtime_params(
                 0, "attn_qkv")
+            
+        qkv_ia3_params = None
+        if ia3_layer_params is not None:
+            qkv_ia3_params = ia3_layer_params.get_runtime_params(
+                0, "attn_qkv"
+            )
 
         unfuse_qkv_gemm = self.unfuse_qkv_gemm
         if unfuse_qkv_gemm and self.cross_attention and encoder_output is not None:
@@ -609,7 +621,7 @@ class Attention(Module):
                 qkv = [tensor + lora for tensor, lora in zip(qkv, qkv_lora)]
             del self._modules['qkv']
         else:
-            qkv = self.qkv(hidden_states, qkv_lora_params)
+            qkv = self.qkv(hidden_states, qkv_lora_params, qkv_ia3_params)
 
         if default_net().plugin_config.remove_input_padding:
             if unfuse_qkv_gemm:

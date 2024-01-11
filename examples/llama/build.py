@@ -570,6 +570,8 @@ def parse_arguments():
         args.vocab_size = lora_config.vocab_size
 
     args.lora_config = lora_config
+    
+    # TODO: add ia3 config
 
     if args.weight_only_precision == 'int4_awq':
         if args.vocab_size % 64 != 0:
@@ -796,7 +798,8 @@ def build_rank_engine(builder: Builder,
             args.max_num_tokens,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size,
             gather_all_token_logits=args.gather_all_token_logits,
-            lora_target_modules=args.lora_config.lora_target_modules)
+            lora_target_modules=args.lora_config.lora_target_modules,
+            ia3_target_modules=args.ia3_config.ia3_target_modules)
         tensorrt_llm_llama(*inputs)
         if args.enable_debug_output:
             # mark intermediate nodes' outputs

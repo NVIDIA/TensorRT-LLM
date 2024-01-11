@@ -304,6 +304,7 @@ class GenerationMixin:
                              position_encoding_2d=False,
                              use_lora_plugin: bool = False,
                              lora_target_modules: List[str] = None,
+                             ia3_target_modules: List[str] = None,
                              max_draft_len=0):
 
         default_range = GenerationMixin.default_range
@@ -504,6 +505,28 @@ class GenerationMixin:
                      [1, 1] if enable_two_optimization_profiles else [1])
                 ]))
 
+
+        ia3_weights_pointers = None
+        if ia3_target_modules is not None:
+            ia3_weights_pointers = []
+            layers_range = mapping.pp_layers(num_layers)
+            for i in layers_range:
+                ia3_weight_pointer_dict = {}
+                for ia3_module in ia3_target_modules:
+                    ia3_weight_pointer = Tensor(
+                        name=f'{ia3_module}_ia3_weights_pointers_{i}',
+                        dtype=trt.float32,
+                        shape=[-1],
+                        dim_range=OrderedDict([
+                            ('batch_size_beam_width', bb_range),
+                        ]))
+                    ia3_weight_pointer_dict.update({
+                        f'{ia3_module}_ia3_weights_poiners':
+                        ia3_weight_pointer
+                    })
+                ia3_weights_pointers.append(ia3_weight_pointer_dict)                    
+                    
+
         lora_weights_pointers = None
         lora_ranks = None
         if use_lora_plugin:
@@ -564,6 +587,7 @@ class GenerationMixin:
             'all_reduce_workspace': all_reduce_workspace,
             'lora_ranks': lora_ranks,
             'lora_weights_pointers': lora_weights_pointers,
+            'ia3_weights_pointers': ia3_weights_pointers,
         }
 
         attention_inputs = self.prepare_attention_inputs(

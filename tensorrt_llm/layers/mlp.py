@@ -90,6 +90,9 @@ class MLP(Module):
 
         inter = self.fc(hidden_states, mlp_fc_lora_params)
         inter = ACT2FN[self.hidden_act](inter)
+        
+        # TODO: IA3
+        
         output = self.proj(inter,
                            workspace,
                            lora_runtime_params=mlp_proj_lora_params)
