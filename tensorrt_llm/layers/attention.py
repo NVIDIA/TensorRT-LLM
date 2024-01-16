@@ -17,10 +17,11 @@ from typing import List, Optional
 
 import numpy as np
 import tensorrt as trt
+from packaging import version
 
 from .._common import default_net, precision
 from .._utils import (fp32_array, int32_array, numpy_fp32_to_bf16,
-                      trt_dtype_to_np, trt_dtype_to_str)
+                      trt_dtype_to_np, trt_dtype_to_str, trt_version)
 from ..functional import (AttentionMaskType, PositionEmbeddingType,
                           RotaryScalingType, Tensor, arange, bert_attention,
                           cast, concat, constant, embedding, expand,
@@ -365,35 +366,38 @@ class KeyValueCacheParams:
 
 class Attention(Module):
 
-    def __init__(self,
-                 hidden_size,
-                 num_attention_heads,
-                 num_kv_heads=None,
-                 max_position_embeddings=1024,
-                 num_layers=1,
-                 apply_query_key_layer_scaling=False,
-                 attention_head_size=None,
-                 attention_mask_type=AttentionMaskType.padding,
-                 bias=True,
-                 dtype=None,
-                 position_embedding_type=PositionEmbeddingType.learned_absolute,
-                 rotary_embedding_base=10000.0,
-                 rotary_embedding_scaling=None,
-                 rotary_embedding_percentage=1.0,
-                 tp_group=None,
-                 tp_size=1,
-                 tp_rank=0,
-                 use_auto_parallel=False,
-                 quant_mode: QuantMode = QuantMode(0),
-                 q_scaling=1.0,
-                 cross_attention=False,
-                 relative_attention=False,
-                 max_distance=0,
-                 num_buckets=0,
-                 instance_id: int = 0,
-                 dense_bias=None,
-                 enable_pos_shift=False,
-                 dense_context_fmha=False):
+    def __init__(
+        self,
+        hidden_size,
+        num_attention_heads,
+        num_kv_heads=None,
+        max_position_embeddings=1024,
+        num_layers=1,
+        apply_query_key_layer_scaling=False,
+        attention_head_size=None,
+        attention_mask_type=AttentionMaskType.padding,
+        bias=True,
+        dtype=None,
+        position_embedding_type=PositionEmbeddingType.learned_absolute,
+        rotary_embedding_base=10000.0,
+        rotary_embedding_scaling=None,
+        rotary_embedding_percentage=1.0,
+        tp_group=None,
+        tp_size=1,
+        tp_rank=0,
+        use_auto_parallel=False,
+        quant_mode: QuantMode = QuantMode(0),
+        q_scaling=1.0,
+        cross_attention=False,
+        relative_attention=False,
+        max_distance=0,
+        num_buckets=0,
+        instance_id: int = 0,
+        dense_bias=None,
+        enable_pos_shift=False,
+        dense_context_fmha=False,
+        max_lora_rank=None,
+    ):
         super().__init__()
 
         self.cross_attention = cross_attention
@@ -449,6 +453,7 @@ class Attention(Module):
         self.embed_positions = None
         self.rotary_enabled = False
         self.rotary_embedding_dim = 0
+        self._layer_id = instance_id // 2
 
         if self.position_embedding_type.is_rope():
             self.rotary_embedding_dim = int(self.attention_head_size *
@@ -462,11 +467,10 @@ class Attention(Module):
         self.quant_mode = quant_mode
         self.use_int8_kv_cache = self.quant_mode.has_int8_kv_cache()
         if self.quant_mode.has_kv_cache_quant():
-            self.kv_orig_quant_scale = Parameter(shape=(1, ), dtype='float32')
-            self.kv_quant_orig_scale = Parameter(shape=(1, ), dtype='float32')
+            self.kv_cache_scaling_factor = Parameter(shape=(1, ),
+                                                     dtype='float32')
         else:
-            self.register_parameter('kv_orig_quant_scale', None)
-            self.register_parameter('kv_quant_orig_scale', None)
+            self.register_parameter('kv_cache_scaling_factor', None)
         self.instance_id = instance_id
         # The output feature size is therefore (h/tp + 2*kvh/tp) * d, where h is num_heads,
         # d is head_size, kvh is the num_kv_heads and tp is tensor_parallel_size.
@@ -491,7 +495,8 @@ class Attention(Module):
                                       dtype=dtype,
                                       tp_group=tp_group,
                                       tp_size=tp_size,
-                                      instance_id=instance_id)
+                                      instance_id=instance_id,
+                                      max_lora_rank=max_lora_rank)
         else:
             # out dim is not necessarily hidden_size + kv specific size (in MQA/GQA), but num_heads * heads_size
             # example: d_model != num_heads * head_size in Flan-T5
@@ -512,7 +517,8 @@ class Attention(Module):
                                    dtype=dtype,
                                    tp_group=tp_group,
                                    tp_size=tp_size,
-                                   instance_id=instance_id)
+                                   instance_id=instance_id,
+                                   max_lora_rank=max_lora_rank)
 
         if self.unfuse_qkv_gemm:
             linear_class = FP8Linear if self.use_fp8_qdq else ColumnLinear
@@ -546,6 +552,11 @@ class Attention(Module):
                                                    tp_size, num_buckets),
                                             dtype=dtype)
 
+        if max_lora_rank is None:
+            max_lora_rank = min(
+                hidden_size,
+                self.num_attention_heads * self.attention_head_size,
+                self.num_attention_kv_heads * self.attention_head_size)
         self.qkv_lora = Lora(
             in_hidden_size=hidden_size,
             out_hidden_sizes=[
@@ -553,20 +564,18 @@ class Attention(Module):
                 self.num_attention_kv_heads * self.attention_head_size,
                 self.num_attention_kv_heads * self.attention_head_size
             ],
-            max_low_rank=min(
-                hidden_size,
-                self.num_attention_heads * self.attention_head_size,
-                self.num_attention_kv_heads * self.attention_head_size),
+            max_low_rank=max_lora_rank,
         )
 
     def forward(self,
                 hidden_states: Tensor,
                 attention_mask=None,
+                medusa_packed_mask=None,
+                medusa_position_offsets=None,
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None,
                 encoder_output: Optional[Tensor] = None,
-                workspace=None,
                 position_embedding=None,
                 norm_before_bmm1=False,
                 lora_layer_params=None):
@@ -626,7 +635,7 @@ class Attention(Module):
                 lora = self.qkv.lora(hidden_states, qkv_lora_params)
                 kv_size = self.attention_head_size * self.num_attention_kv_heads
                 qkv_lora = split(lora, [self.hidden_size, kv_size, kv_size],
-                                 dim=2)
+                                 dim=1)
                 qkv = [tensor + lora for tensor, lora in zip(qkv, qkv_lora)]
             del self._modules['qkv']
         else:
@@ -665,7 +674,8 @@ class Attention(Module):
 
                 q_lora, k_lora, v_lora = self.qkv_lora(hidden_states,
                                                        qkv_lora_params)
-                qkv_lora = concat([q_lora, k_lora, v_lora], dim=2)
+                qkv_lora = concat([q_lora, k_lora, v_lora],
+                                  dim=q_lora.rank() - 1)
                 qkv = qkv + qkv_lora
 
         if self.position_embedding_type == PositionEmbeddingType.chatglm:
@@ -713,9 +723,11 @@ class Attention(Module):
                 AttentionMaskType.causal, AttentionMaskType.bidirectional,
                 AttentionMaskType.bidirectionalglm
             ], 'Plugin only support masked MHA.'
-            kv_orig_quant_scale = self.kv_orig_quant_scale.value if self.quant_mode.has_kv_cache_quant(
+            kv_orig_quant_scale = constant(
+                fp32_array([1.0])
+            ) / self.kv_cache_scaling_factor.value if self.quant_mode.has_kv_cache_quant(
             ) else None
-            kv_quant_orig_scale = self.kv_quant_orig_scale.value if self.quant_mode.has_kv_cache_quant(
+            kv_quant_orig_scale = self.kv_cache_scaling_factor.value if self.quant_mode.has_kv_cache_quant(
             ) else None
             context, past_key_value = gpt_attention(
                 qkv=qkv,
@@ -762,6 +774,8 @@ class Attention(Module):
                 enable_pos_shift=self.enable_pos_shift,
                 dense_context_fmha=self.dense_context_fmha,
                 use_cache=use_cache,
+                medusa_position_offsets=medusa_position_offsets,
+                medusa_packed_mask=medusa_packed_mask,
             )
 
         else:
@@ -884,8 +898,8 @@ class Attention(Module):
             if past_key_value is not None:
                 if (self.use_fp8_qdq and self.quant_mode.has_kv_cache_quant()
                     ) or self.use_int8_kv_cache:
-                    past_key_value = dequantize(past_key_value,
-                                                self.kv_quant_orig_scale.value)
+                    past_key_value = dequantize(
+                        past_key_value, self.kv_cache_scaling_factor.value)
 
                 # past_key_value [bs, 2, num_heads, max_seq_len, head_dim]
                 past_key, past_value = split(past_key_value, 1, dim=1)
@@ -917,14 +931,12 @@ class Attention(Module):
                 past_key_value = concat([inflated_key, inflated_value], dim=1)
 
                 # TRT quantizes the tensor value by doing `cast(clip(fp_value / scale))` while
-                # the plugin quantizes it by doing `cast(clip(fp_value * scale))`. Therefore,
-                # we should use `kv_quant_orig_scale` instead of `kv_orig_quant_scale` here.
+                # the plugin quantizes it by doing `cast(clip(fp_value * scale))`.
                 if (self.use_fp8_qdq and self.quant_mode.has_kv_cache_quant()
                     ) or self.use_int8_kv_cache:
-                    self.register_parameter('kv_orig_quant_scale', None)
                     past_key_value = quantize(
                         past_key_value,
-                        self.kv_quant_orig_scale.value,
+                        self.kv_cache_scaling_factor.value,
                         dtype='fp8' if self.use_fp8_qdq else 'int8')
 
             # MQA broadcast
@@ -1004,7 +1016,13 @@ class Attention(Module):
                 if norm_before_bmm1:
                     # Apply norm on query earlier to prevent matmul fp16 overflow.
                     query /= self.norm_factor
-                attention_scores = matmul(query, key)
+                if version.parse(trt_version(
+                )).major > 9 or self.position_embedding_type.is_alibi():
+                    attention_scores = matmul(query, key)
+                else:
+                    # For trt_version() == 9.x, need this WAR to fuse mha.
+                    attention_scores = matmul(cast(query, 'float32'),
+                                              cast(key, 'float32'))
                 if not norm_before_bmm1:
                     attention_scores = attention_scores / self.norm_factor
 
@@ -1021,8 +1039,17 @@ class Attention(Module):
 
             attention_probs = softmax(attention_scores, dim=-1)
 
-            context = matmul(attention_probs, value,
-                             use_fp32_acc=False).permute([0, 2, 1, 3])
+            if version.parse(trt_version(
+            )).major > 9 or self.position_embedding_type.is_alibi():
+                # For trt_version() == 9.x and pos_embed == alibi, TRT has gpu buffer management issues. Need this WAR to avoid peak gpu mem regression.
+                context = matmul(attention_probs, value,
+                                 use_fp32_acc=False).permute([0, 2, 1, 3])
+            else:
+                # For trt_version() == 9.x, need this WAR to fuse mha.
+                context = matmul(attention_probs,
+                                 cast(value, 'float32')).permute([0, 2, 1, 3])
+                if context.dtype != value.dtype:
+                    context = cast(context, value.dtype)
             context = context.view(
                 concat([shape(context, 0),
                         shape(context, 1), self.hidden_size]))
@@ -1031,9 +1058,7 @@ class Attention(Module):
         if lora_layer_params is not None:
             dense_lora_params = lora_layer_params.get_runtime_params(
                 0, "attn_dense")
-        context = self.dense(context,
-                             workspace,
-                             lora_runtime_params=dense_lora_params)
+        context = self.dense(context, lora_runtime_params=dense_lora_params)
 
         if use_cache:
             return (context, past_key_value)
@@ -1059,7 +1084,8 @@ class BertAttention(Module):
                  tp_rank=0,
                  relative_attention=False,
                  max_distance=0,
-                 num_buckets=0):
+                 num_buckets=0,
+                 max_lora_rank=None):
         super().__init__()
 
         self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
@@ -1116,7 +1142,6 @@ class BertAttention(Module):
                 hidden_states: Tensor,
                 attention_mask=None,
                 input_lengths=None,
-                workspace=None,
                 max_input_length=None):
         assert isinstance(hidden_states, Tensor)
 
@@ -1169,6 +1194,6 @@ class BertAttention(Module):
                 concat([shape(context, 0),
                         shape(context, 1), self.hidden_size]))
 
-        context = self.dense(context, workspace)
+        context = self.dense(context)
 
         return context

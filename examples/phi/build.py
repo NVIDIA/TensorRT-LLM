@@ -32,6 +32,8 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 MODEL_NAME = "phi"
+# Fixed code revision or updated config can break the tests.
+HF_CODE_REVISION = "cb2f4533604d8b67de604e7df03bfe6f3ca22869"
 hf_gpt = None
 
 
@@ -168,15 +170,20 @@ def parse_arguments():
     if args.model_dir is not None:
         global hf_gpt
         logger.info(f'Loading HF Phi model from {args.model_dir}...')
-        hf_gpt = AutoModelForCausalLM.from_pretrained(args.model_dir,
-                                                      trust_remote_code=True)
+        hf_gpt = AutoModelForCausalLM.from_pretrained(
+            args.model_dir,
+            code_revision=HF_CODE_REVISION,
+            trust_remote_code=True)
         args.n_embd = hf_gpt.config.hidden_size
         args.n_head = hf_gpt.config.num_attention_heads
         args.n_layer = hf_gpt.config.num_hidden_layers
         args.n_positions = hf_gpt.config.max_position_embeddings
         args.vocab_size = hf_gpt.config.vocab_size
-        args.rotary_pct = hf_gpt.config.rotary_dim / (args.n_embd //
-                                                      args.n_head)
+        try:
+            args.rotary_pct = hf_gpt.config.partial_rotary_factor
+        except:
+            args.rotary_pct = hf_gpt.config.rotary_dim / (args.n_embd //
+                                                          args.n_head)
 
     return args
 

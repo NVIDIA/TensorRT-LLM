@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from tensorrt_llm.plugin.plugin import init_all_reduce_helper
+
 from ..._utils import pad_vocab_size
 from ...functional import Tensor, allreduce, recv, send
 from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
@@ -97,8 +99,7 @@ class FalconDecoderLayer(Module):
                 attention_mask=None,
                 use_cache=False,
                 kv_cache_params=None,
-                attention_params=None,
-                all_reduce_workspace=None):
+                attention_params=None):
         assert isinstance(hidden_states, Tensor)
 
         residual = hidden_states
@@ -111,8 +112,7 @@ class FalconDecoderLayer(Module):
                                           attention_mask=attention_mask,
                                           use_cache=use_cache,
                                           kv_cache_params=kv_cache_params,
-                                          attention_params=attention_params,
-                                          workspace=all_reduce_workspace)
+                                          attention_params=attention_params)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -127,14 +127,13 @@ class FalconDecoderLayer(Module):
         else:
             hidden_states = mlp_ln_output
 
-        hidden_states = self.mlp(hidden_states, workspace=all_reduce_workspace)
+        hidden_states = self.mlp(hidden_states)
 
         if self.is_parallel_attention:
             hidden_states = hidden_states + attention_output
             if self.config.mapping.tp_size > 1:
                 hidden_states = allreduce(hidden_states,
-                                          self.config.mapping.tp_group,
-                                          all_reduce_workspace, self.layer_idx)
+                                          self.config.mapping.tp_group)
 
         hidden_states = residual + hidden_states
         if use_cache:
@@ -147,11 +146,22 @@ class FalconModel(Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
+        init_all_reduce_helper()
 
         if config.mapping.is_first_pp_rank():
-            self.vocab_embedding = Embedding(config.vocab_size,
-                                             config.hidden_size,
-                                             dtype=config.dtype)
+            if config.use_parallel_embedding:
+                self.vocab_embedding = Embedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    dtype=config.dtype,
+                    tp_group=config.mapping.tp_group,
+                    tp_size=config.mapping.tp_size,
+                    sharding_dim=config.embedding_sharding_dim,
+                    tp_rank=config.mapping.tp_rank)
+            else:
+                self.vocab_embedding = Embedding(config.vocab_size,
+                                                 config.hidden_size,
+                                                 dtype=config.dtype)
 
         self.layers = DecoderLayerList(FalconDecoderLayer, config)
         if config.mapping.is_last_pp_rank():
@@ -165,8 +175,7 @@ class FalconModel(Module):
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
-                hidden_states=None,
-                all_reduce_workspace=None):
+                hidden_states=None):
 
         kv_cache_params.fill_none_tensor_list(len(self.layers))
 
@@ -198,8 +207,7 @@ class FalconModel(Module):
                     kv_cache_block_pointers=[pointer],
                     host_kv_cache_block_pointers=[host_pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
-                attention_params=attention_params,
-                all_reduce_workspace=all_reduce_workspace)
+                attention_params=attention_params)
 
             if use_cache:
                 presents.append(hidden_states[1])
@@ -219,24 +227,28 @@ class FalconModel(Module):
 class FalconForCausalLM(DecoderModelForCausalLM):
 
     def __init__(self, config: PretrainedConfig):
+        self.check_config(config)
         transformer = FalconModel(config)
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
         if config.mapping.is_last_pp_rank():
-            lm_head = ColumnLinear(
-                config.hidden_size,
-                vocab_size_padded,
-                bias=False,
-                dtype=config.dtype,
-                tp_group=config.mapping.tp_group,
-                tp_size=config.mapping.tp_size,
-                gather_output=True,
-            )
+            share_weight = None
+            if config.share_embedding_table:
+                share_weight = transformer.vocab_embedding.weight
+
+            lm_head = ColumnLinear(config.hidden_size,
+                                   vocab_size_padded,
+                                   bias=False,
+                                   dtype=config.dtype,
+                                   tp_group=config.mapping.tp_group,
+                                   tp_size=config.mapping.tp_size,
+                                   gather_output=True,
+                                   share_weight=share_weight)
         else:
             lm_head = None
         super().__init__(config, transformer, lm_head)
 
-    def check_config(self):
-        self.config.set_if_not_exist('bias', True)
-        self.config.set_if_not_exist('new_decoder_architecture', False)
-        self.config.set_if_not_exist('parallel_attention', False)
+    def check_config(self, config):
+        config.set_if_not_exist('bias', True)
+        config.set_if_not_exist('new_decoder_architecture', False)
+        config.set_if_not_exist('parallel_attention', False)

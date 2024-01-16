@@ -197,8 +197,8 @@ _allowed_configs = {
                     builder_opt=None,
                     quantization="int8_sq_per_token_channel",
                 )),
-    "gpt-next_2b":
-    ModelConfig(name="gpt-next_2b",
+    "gpt_next_2b":
+    ModelConfig(name="gpt_next_2b",
                 family="gpt",
                 benchmark_type="gpt",
                 build_config=BuildConfig(
@@ -305,25 +305,6 @@ _allowed_configs = {
                     max_output_len=200,
                     builder_opt=None,
                 )),
-    "llama_7b_moe":
-    ModelConfig(name="llama_7b_moe",
-                family="llama",
-                benchmark_type="gpt",
-                build_config=BuildConfig(
-                    num_layers=32,
-                    num_heads=32,
-                    hidden_size=4096,
-                    vocab_size=32000,
-                    hidden_act='silu',
-                    n_positions=2048,
-                    inter_size=11008,
-                    max_batch_size=128,
-                    max_input_len=512,
-                    max_output_len=200,
-                    builder_opt=None,
-                    moe_num_experts=4,
-                    moe_top_k=1,
-                )),
     "llama_13b":
     ModelConfig(name="llama_13b",
                 family="llama",
@@ -427,6 +408,25 @@ _allowed_configs = {
                                          max_output_len=200,
                                          builder_opt=None,
                                          quantization="int8_sq_per_tensor")),
+    "mixtral_8x7b":
+    ModelConfig(name="mixtral_8x7b",
+                family="llama",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=32,
+                    num_heads=32,
+                    hidden_size=4096,
+                    vocab_size=32000,
+                    hidden_act='swiglu',
+                    n_positions=2048,
+                    inter_size=14336,
+                    max_batch_size=128,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                    moe_num_experts=8,
+                    moe_top_k=2,
+                )),
     "gptj_6b":
     ModelConfig(name="gptj_6b",
                 family="gptj",

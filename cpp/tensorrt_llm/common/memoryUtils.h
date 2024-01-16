@@ -258,5 +258,8 @@ size_t cuda_datatype_size(TRTLLMCudaDataType dt);
 template <typename T>
 bool invokeCheckRange(const T* buffer, const size_t size, T min, T max, bool* d_within_range, cudaStream_t stream);
 
+size_t calcAlignedSize(const std::vector<size_t>& sizes, size_t ALIGN_BYTES = 256);
+void calcAlignedPointers(
+    std::vector<void*>& outPtrs, const void* p, const std::vector<size_t>& sizes, size_t ALIGN_BYTES = 256);
 } // namespace common
 } // namespace tensorrt_llm

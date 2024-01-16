@@ -128,13 +128,12 @@ public:
     PromptTuningParams promptTuningParams;
     TensorPtr promptTuningTasksHost; // Tensor to hold tasks on host
 
-    // Context and generation logits buffer
-    TensorPtr cacheContextLogits;
-    TensorPtr cacheContextLogitsHost;
-    TensorPtr cacheGenerationLogits;
-    TensorPtr cacheGenerationLogitsHost;
-    TensorPtr cacheGenerationFragmentPointerDevice;
-    TensorPtr cacheGenerationFragmentPointerHost;
+    // generation logit pointer list
+    std::shared_ptr<std::vector<TensorPtr>> generationLogitsFragments;
+    TensorPtr
+        cacheGenerationFragmentPointerDevice; // device pointer array, used in merge generation logits fragments kernel
+    TensorPtr
+        cacheGenerationFragmentPointerHost;   // host pointer array, used in merge generation logits fragments kernel
 
     bool allocated{false};
 

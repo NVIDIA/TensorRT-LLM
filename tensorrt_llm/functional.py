@@ -34,7 +34,7 @@ from ._utils import (bf16_array, dim_resolve_negative, dim_to_trt_axes,
                      trt_dtype_to_np, trt_dtype_to_torch)
 from .logger import logger
 from .network import PluginInfo, set_np_weight, set_plugin_info
-from .plugin import TRT_LLM_PLUGIN_NAMESPACE
+from .plugin import TRT_LLM_PLUGIN_NAMESPACE, current_all_reduce_helper
 from .quantization import QuantMode
 
 
@@ -1489,6 +1489,55 @@ def unsqueeze(input: Tensor, axis: int):
     return expand_dims(input, axis)
 
 
+def stack(inputs: Sequence[Tensor], dim: int = 0) -> Tensor:
+    '''
+    Add an operation to contact input tensors along a new dimension.
+
+    The function creates an operation that creates a new dim for all the
+    input tensors and then concatenates them along that new dim.
+.
+
+    All the tensors in 'inputs' must have the same shape.
+
+        for ii in range(inputs[0].rank()):
+            assert all(inp.shape[ii] == inputs[0].shape[ii] for inp in inputs)
+
+    The shape of the output tensor is defined as:
+
+        output.rank() = inputs[0].rank() + 1
+
+        output.shape[dim] = len(inputs)
+
+        for ii in range(inputs[0].rank()):
+            if ii < dim:
+                output.shape[ii] = inputs[0].shape[ii]
+            else:
+                output.shape[ii+1] = inputs[0].shape[ii]
+
+    For example, given a sequence of two 2D tensors [[0, 1], [2, 3]] and
+    [[4, 5], [6, 7]] both of shape [2, 2],
+
+        stack(inputs, 0)
+
+    will produce [[[0, 1], [2, 3]], [[4, 5], [6, 7]]] of shape [2, 2, 2] and
+
+        stack(inputs, 1)
+
+    will produce [[[0, 1], [4, 5]], [[2, 3], [6, 7]]] of shape [2, 2, 2].
+
+    Parameters:
+        inputs : Sequence[Tensor]
+            The sequence of tensors to stack.
+
+        dim : int
+            The dimension in which the stack is performed.
+
+    Returns:
+        A tensor that contains the input tensors stacked along a new dimension.
+    '''
+    return concat([unsqueeze(inp, axis=dim) for inp in inputs], dim=dim)
+
+
 def expand_dims_like(left: Union[Tensor, int, float], right: Tensor) -> Tensor:
     '''
     Add an operation to expand the first tensor to the same rank as the second
@@ -1910,7 +1959,7 @@ def concat(inputs: Sequence[Union[Tensor, int]], dim: int = 0) -> Tensor:
 
         concat(inputs, 0)
 
-    will produce [[[0, 1], [2, 3]], [[4, 5], [6, 7]]] of shape [4, 2] and
+    will produce [[0, 1], [2, 3], [4, 5], [6, 7]] of shape [4, 2] and
 
         concat(inputs, 1)
 
@@ -2021,9 +2070,7 @@ def embedding(input: Tensor,
               tp_size=1,
               tp_group=None,
               sharding_dim=0,
-              tp_rank=None,
-              workspace: Optional[Tensor] = None,
-              instance_id: int = 0) -> Tensor:
+              tp_rank=None) -> Tensor:
     '''
     Add an operation to perform embedding lookup.
 
@@ -2074,12 +2121,6 @@ def embedding(input: Tensor,
         tp_rank : int
             The tensor parallelism rank. Used to calculate offset in TP on vocab dim.
 
-        workspace: Optional[Tensor]
-            See allreduce's documentation for workspace.
-
-        instance_id: int
-            See allreduce's documentation for instance_id.
-
     Returns:
         The tensor produced by the embedding lookup layer.
     '''
@@ -2093,7 +2134,7 @@ def embedding(input: Tensor,
 
             if default_net().plugin_config.lookup_plugin:
                 x = _lookup_plugin(input, weight, tp_rank)
-                x = allreduce(x, tp_group, workspace, instance_id)
+                x = allreduce(x, tp_group)
             else:
                 shape_weight = shape(weight)
                 vocab_size = slice(shape_weight, starts=[0], sizes=[1])
@@ -2118,7 +2159,7 @@ def embedding(input: Tensor,
                 x = where(is_qualified_expand, tmp_output, placeholder)
 
                 # Use all reduce to collect the results
-                x = allreduce(x, tp_group, workspace, instance_id)
+                x = allreduce(x, tp_group)
 
         elif sharding_dim == 1:  # TP on hidden dimension
             layer = default_trtnet().add_gather(weight.trt_tensor,
@@ -2955,8 +2996,6 @@ class AllReduceStrategy(IntEnum):
 
 def allreduce(tensor: Tensor,
               group: List[int],
-              workspace: Optional[Tensor] = None,
-              instance_id: int = 0,
               strategy: Optional[AllReduceStrategy] = None) -> Tensor:
     '''
     Add an operation that performs a collective all-reduce.
@@ -2984,17 +3023,9 @@ def allreduce(tensor: Tensor,
         group : List[int]
             The ranks participating into the all-reduce operation.
 
-        workspace: Optional[Tensor]
-            When using CUSTOM or AUTO mode, a tensor containing pointers to memory
-            visible to all GPUs. It should be 3 poitners per TP rank -
-            ptr to data buffer, ptr to barriers in, ptr to barriers out.
-            It must be initialized using IpcMemory class.
-
-        instance_id: int
-            Used for synchronization with CUSTOM or AUTO. Corresponding plugins MUST have the same
-            instance_id. I.e. GPU#0's allreduce after MLP at layer i must have the same instance_id as
-            GPU#1, GPU#2... Also, instance_id MUST be unique per model. There should not be two allreduce instances
-            in GPU#0 that have the same id.
+        strategy: AllReduceStrategy
+            RING delegates all-reduce to NCCL while ONESHOT and TWOSHOT are custom latency-optimal algorithms.
+            AUTO chooses amongst the three based on a message-size heuristic.
 
     Returns:
         The tensor produced by that layer.
@@ -3009,15 +3040,12 @@ def allreduce(tensor: Tensor,
         else:
             strategy = AllReduceStrategy.RING
 
-    if strategy != AllReduceStrategy.RING:
-        if not hasattr(allreduce, "ids"):
-            allreduce.ids = set()
+    counter = 0
+    workspace = None
 
-        if instance_id not in allreduce.ids:
-            allreduce.ids.add(instance_id)
-        else:
-            logger.warning(
-                f"Custom allreduce has already used id {instance_id}")
+    if strategy != AllReduceStrategy.RING:
+        counter = current_all_reduce_helper().gen_id()
+        workspace = current_all_reduce_helper().workspace
 
     assert allreduce_plg_creator is not None
 
@@ -3032,8 +3060,7 @@ def allreduce(tensor: Tensor,
     p_strategy = trt.PluginField("strategy", np.array([int(strategy)], np.int8),
                                  trt.PluginFieldType.INT8)
     pfc.append(p_strategy)
-    p_counter = trt.PluginField("counter", np.array([instance_id + 1],
-                                                    np.int32),
+    p_counter = trt.PluginField("counter", np.array([counter], np.int32),
                                 trt.PluginFieldType.INT32)
     pfc.append(p_counter)
 
@@ -3393,6 +3420,8 @@ def gpt_attention(
         bool] = False,  # for dense fmha in context phase
     qkv_bias: Optional[Tensor] = None,
     use_cache: bool = True,
+    medusa_position_offsets: Tensor = None,
+    medusa_packed_mask: Tensor = None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     '''
     Add an operation that performs the multi-head attention in GPT-like models.
@@ -3562,6 +3591,18 @@ def gpt_attention(
             Do we use dense fmha in context phase,
 
         qkv_bias: Tensor = None,
+            The qkv bias tensor.
+
+        use_cache: bool = False
+            Do we need to store kv cache ? not needed if there is no generation phase.
+
+        medusa_position_offsets: Tensor = None,
+            The medusa tokens's position offsets (shared by all sequences).
+            Shape: [Num_medusa_tokens + 1].
+
+        medusa_packed_mask: Tensor = None,
+            The medusa tokens's attention mask (packed into uint32_t bits).
+            Shape: [Num_medusa_tokens + 1, divUp(Num_medusa_tokens + 1, 32)].
 
     Returns:
         The tensor produced by that layer.
@@ -3631,6 +3672,10 @@ def gpt_attention(
         "remove_input_padding",
         np.array(np.int8(default_net().plugin_config.remove_input_padding),
                  dtype=np.int8), trt.PluginFieldType.INT8)
+    is_medusa_enabled = trt.PluginField(
+        "is_medusa_enabled",
+        np.array(np.int8(medusa_packed_mask is not None), dtype=np.int8),
+        trt.PluginFieldType.INT8)
     p_dtype = default_net().plugin_config.gpt_attention_plugin
     pf_type = trt.PluginField(
         "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
@@ -3641,6 +3686,10 @@ def gpt_attention(
     multi_block_mode = trt.PluginField(
         "multi_block_mode",
         np.array(np.int8(default_net().plugin_config.multi_block_mode),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    enable_xqa = trt.PluginField(
+        "enable_xqa",
+        np.array(np.int8(default_net().plugin_config.enable_xqa),
                  dtype=np.int8), trt.PluginFieldType.INT8)
     tp_size = trt.PluginField("tp_size", np.array(tp_size, dtype=np.int32),
                               trt.PluginFieldType.INT32)
@@ -3695,11 +3744,12 @@ def gpt_attention(
         position_embedding_type, rotary_embedding_dim, rotary_embedding_base,
         rotary_embedding_scale_type, rotary_embedding_scale,
         rotary_embedding_max_positions, tp_size, tp_rank, unfuse_qkv_gemm,
-        context_fmha_type, multi_block_mode, kv_cache_quant_mode_field,
-        remove_input_padding, mask_type, paged_kv_cache, tokens_per_block,
-        pf_type, max_context_length, qkv_bias_enabled, do_cross_attention_field,
-        max_distance, pos_shift_enabled, dense_context_fmha,
-        use_paged_context_fmha_field, use_cache_pf
+        context_fmha_type, multi_block_mode, enable_xqa,
+        kv_cache_quant_mode_field, remove_input_padding, mask_type,
+        paged_kv_cache, tokens_per_block, pf_type, max_context_length,
+        qkv_bias_enabled, do_cross_attention_field, max_distance,
+        pos_shift_enabled, dense_context_fmha, use_paged_context_fmha_field,
+        use_cache_pf, is_medusa_enabled
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
@@ -3747,6 +3797,11 @@ def gpt_attention(
 
     if qkv_bias is not None:
         plug_inputs += [qkv_bias]
+
+    if medusa_packed_mask is not None:
+        # add position_ids as well only if medusa mode
+        assert medusa_position_offsets is not None
+        plug_inputs += [medusa_packed_mask, medusa_position_offsets]
 
     plug_inputs = [i.trt_tensor for i in plug_inputs]
     layer = default_trtnet().add_plugin_v2(plug_inputs, attn_plug)
@@ -4162,19 +4217,35 @@ def gather_last_token_logits(hidden_states: Tensor, last_token_ids: Tensor,
             concat([shape(last_token_ids, 0),
                     shape(hidden_states, 1)]))
     else:
-        # only calculate logits for the last token
-        # [batch_size, seqlen, hidden_size] -> [batch_size, hidden_size]
-        last_token_ids = last_token_ids.view(
-            concat([shape(last_token_ids, 0), 1, 1]))
-        last_token_ids = expand(
-            last_token_ids,
-            concat([shape(last_token_ids, 0), 1,
-                    shape(hidden_states, 2)]))
-        last_token_ids = last_token_ids - 1
-        hidden_states = gather(
-            hidden_states, dim=1, indices=last_token_ids).view(
-                concat([shape(hidden_states, 0),
+        ndim = last_token_ids.ndim()
+        if ndim == 1:
+            # only calculate logits for the last token
+            # [batch_size, seqlen, hidden_size] -> [batch_size, hidden_size]
+            last_token_ids = last_token_ids.view(
+                concat([shape(last_token_ids, 0), 1, 1]))
+            last_token_ids = expand(
+                last_token_ids,
+                concat([shape(last_token_ids, 0), 1,
                         shape(hidden_states, 2)]))
+            last_token_ids = last_token_ids - 1
+            hidden_states = gather(
+                hidden_states, dim=1, indices=last_token_ids).view(
+                    concat([shape(hidden_states, 0),
+                            shape(hidden_states, 2)]))
+        elif ndim == 2:  # speculative decoding needs last few token's logits
+            # last_token_ids is of shape [batch_size, num_last_tokens]
+            # So [batch_size, seqlen, hidden_size] -> [batch_size, num_last_tokens, hidden_size]
+            last_token_ids = last_token_ids.view(
+                concat([shape(last_token_ids, 0),
+                        shape(last_token_ids, 1), 1]))
+            last_token_ids = expand(
+                last_token_ids,
+                concat([
+                    shape(last_token_ids, 0),
+                    shape(last_token_ids, 1),
+                    shape(hidden_states, 2)
+                ]))
+            hidden_states = gather(hidden_states, dim=1, indices=last_token_ids)
     return hidden_states
 
 

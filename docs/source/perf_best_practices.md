@@ -50,7 +50,7 @@ this [Document](gpt_attention.md#padded-and-packed-tensors).
 It is recommended to tune `--max_num_tokens` for better performance. The
 `--max_num_tokens` could be roughly estimated as:
 ```
-max_batch_size * max_input_len * alpha + max_batch_size * (1 - alpha)
+max_batch_size * max_input_len * alpha + max_batch_size * max_beam_width * (1 - alpha)
 ```
 where `alpha` is a floating-point value between `0.0` and `1.0`. It stands for
 a rough estimation of the number of requests in their context phase at each
@@ -240,7 +240,8 @@ latency if requests have to be paused.
 When TensorRT overlap is enabled, available requests are partitioned into 2
 micro-batches that can be run concurrently. It allows TensorRT-LLM to hide
 exposed CPU runtime. However, it may not give performance benefits when the
-size of the model is not big enough to overlap the host overhead.
+size of the model is not big enough to overlap the host overhead, or when the
+number of requests is too small.
 
 If the goal is to increase throughput, it is recommended to try setting that
 argument to `True`. However, it must be noted that it may actually hurt

@@ -325,8 +325,6 @@ class Builder():
         if builder_config.trt_builder_config.num_optimization_profiles == 0:
             self._add_optimization_profile(network, builder_config)
         engine = None
-        logger.info(f'Build TensorRT engine {network.trt_network.name}')
-        tik = time.time()
 
         # Rename weights
         if network.named_parameters is not None:
@@ -336,8 +334,10 @@ class Builder():
                         param._get_weights(), name):
                     raise RuntimeError(f'Failed to set weight: {name}')
 
-        # Build engine
         network._fill_weights()
+        # Build engine
+        logger.info(f'Build TensorRT engine {network.trt_network.name}')
+        tik = time.time()
         engine = self.trt_builder.build_serialized_network(
             network.trt_network, builder_config.trt_builder_config)
         if engine is None:

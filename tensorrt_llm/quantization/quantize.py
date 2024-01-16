@@ -185,13 +185,10 @@ def quantize_kv_cache(model, quant_mode):
 
     for layer in model.transformer.layers:
         if quant_mode.has_kv_cache_quant():
-            layer.attention.kv_orig_quant_scale = Parameter(shape=(1, ),
-                                                            dtype='float32')
-            layer.attention.kv_quant_orig_scale = Parameter(shape=(1, ),
-                                                            dtype='float32')
+            layer.attention.kv_cache_scaling_factor = Parameter(shape=(1, ),
+                                                                dtype='float32')
         else:
-            layer.attention.register_parameter('kv_orig_quant_scale', None)
-            layer.attention.register_parameter('kv_quant_orig_scale', None)
+            layer.attention.register_parameter('kv_cache_scaling_factor', None)
 
     return model
 

@@ -16,7 +16,7 @@ Welcome to TensorRT-LLM's documentation!
    inference_request.md
    gpt_attention.md
    precision.md
-   installation.md
+   build_from_source.md
    performance.md
    2023-05-19-how-to-debug.md
    2023-05-17-how-to-add-a-new-model.md

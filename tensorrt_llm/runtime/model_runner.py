@@ -118,6 +118,12 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         'max_prompt_embedding_table_size', 0)
     quant_mode = QuantMode(builder_config.get('quant_mode', 0))
     lora_target_modules = builder_config.get('lora_target_modules')
+    lora_hf_modules_to_trtllm_modules = builder_config.get(
+        'hf_modules_to_trtllm_modules')
+    lora_trtllm_modules_to_hf_modules = builder_config.get(
+        'trtllm_modules_to_hf_modules')
+    max_medusa_token_len = builder_config.get('max_medusa_token_len', 0)
+    num_medusa_heads = builder_config.get('num_medusa_heads', 0)
 
     plugin_config = config['plugin_config']
     use_gpt_attention_plugin = bool(plugin_config['gpt_attention_plugin'])
@@ -151,7 +157,12 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         use_custom_all_reduce=use_custom_all_reduce,
         lora_plugin=lora_plugin,
         lora_target_modules=lora_target_modules,
-        use_context_fmha_for_generation=use_context_fmha_for_generation)
+        use_context_fmha_for_generation=use_context_fmha_for_generation,
+        hf_modules_to_trtllm_modules=lora_hf_modules_to_trtllm_modules,
+        trtllm_modules_to_hf_modules=lora_trtllm_modules_to_hf_modules,
+        num_medusa_heads=num_medusa_heads,
+        max_medusa_tokens=max_medusa_token_len,
+    )
 
     other_config = {
         'world_size': world_size,
@@ -218,7 +229,7 @@ class ModelRunnerMixin:
             if 'context_logits' in outputs:
                 context_logits = outputs['context_logits']
                 if self.remove_input_padding:
-                    context_logits = context_logits.flatten(end_dim=1)
+                    context_logits = context_logits.flatten(end_dim=-2)
 
                     seg_points = [0] + input_lengths.cumsum(dim=0).tolist()
                     context_logits = [
@@ -324,7 +335,8 @@ class ModelRunner(ModelRunnerMixin):
                  lora_dir: Optional[str] = None,
                  rank: int = 0,
                  debug_mode: bool = False,
-                 lora_ckpt_source: str = "hf") -> 'ModelRunner':
+                 lora_ckpt_source: str = "hf",
+                 medusa_choices: List[List[int]] = None) -> 'ModelRunner':
         """
         Create a ModelRunner instance from an engine directory.
 
@@ -337,6 +349,8 @@ class ModelRunner(ModelRunnerMixin):
                 The runtime rank id.
             debug_mode (bool):
                 Whether or not to turn on the debug mode.
+            medusa_choices (List[List[int]]):
+                Medusa choices to use when in Medusa decoding
         Returns:
             ModelRunner: An instance of ModelRunner.
         """
@@ -412,6 +426,11 @@ class ModelRunner(ModelRunnerMixin):
             session_cls = GenerationSession
             engine_buffer = engine.engine
             runtime_mapping = pretrained_config.mapping
+
+        if medusa_choices is not None:
+            assert session_cls == GenerationSession, "Medusa is only supported by GenerationSession"
+            assert model_config.max_medusa_tokens > 0, \
+                "medusa_chioce is specified but model_config.max_medusa_tokens is 0."
 
         torch.cuda.set_device(rank % runtime_mapping.gpus_per_node)
         session = session_cls(model_config,
@@ -496,6 +515,7 @@ class ModelRunner(ModelRunnerMixin):
                  streaming: bool = False,
                  stopping_criteria: Optional[StoppingCriteria] = None,
                  logits_processor: Optional[LogitsProcessor] = None,
+                 medusa_choices: Optional[List[List[int]]] = None,
                  **kwargs) -> Union[torch.Tensor, dict]:
         """
         Generates sequences of token ids.
@@ -521,6 +541,8 @@ class ModelRunner(ModelRunnerMixin):
                 Custom stopping criteria.
             logits_processor (LogitsProcessor):
                 Custom logits processors.
+            medusa_choices (List[List[int]]):
+                Medusa decoding choices.
             kwargs (Dict[str, Any]:
                 Ad hoc parametrization of sampling_config.
                 The passed **kwargs matching the sampling_config's attributes will override them.
@@ -552,7 +574,8 @@ class ModelRunner(ModelRunnerMixin):
             max_attention_window_size=sampling_config.max_attention_window_size,
             sink_token_length=sampling_config.sink_token_length,
             lora_manager=self.lora_manager,
-            lora_uids=lora_uids)
+            lora_uids=lora_uids,
+            medusa_choices=medusa_choices)
 
         batch_input_ids = batch_input_ids.cuda()
         input_lengths = input_lengths.cuda()

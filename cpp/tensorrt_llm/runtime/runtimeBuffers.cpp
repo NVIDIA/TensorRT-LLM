@@ -132,16 +132,10 @@ void RuntimeBuffers::create(TllmRuntime& runtime, GptModelConfig const& modelCon
         allGenerationLogits = manager.emptyTensor(MemoryType::kGPU, logitsType);
         if (modelConfig.computeGenerationLogits())
         {
-            cacheGenerationLogits = manager.emptyTensor(MemoryType::kGPU, logitsType);
-            cacheGenerationLogitsHost = manager.emptyTensor(MemoryType::kPINNED, logitsType);
-
             cacheGenerationFragmentPointerDevice = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT64);
             cacheGenerationFragmentPointerHost = manager.emptyTensor(MemoryType::kPINNED, nvinfer1::DataType::kINT64);
-        }
-        if (modelConfig.computeContextLogits())
-        {
-            cacheContextLogits = manager.emptyTensor(MemoryType::kGPU, logitsType);
-            cacheContextLogitsHost = manager.emptyTensor(MemoryType::kPINNED, logitsType);
+
+            generationLogitsFragments = std::make_shared<std::vector<TensorPtr>>();
         }
     }
 

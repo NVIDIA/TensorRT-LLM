@@ -100,18 +100,26 @@ memory is not enough when multi-block mode is not enabled. To get masked MHA
 kernel work in these cases, multi-block mode is forced on and a warning log is
 printed.
 
+#### XQA Optimization
 
 Another optimization for MQA/GQA in generation phase called XQA optimization.
 It is still experimental feature and support limited configurations. LLAMA2 70B
-is one model that it supports. To enable this, you need to set environment
-variable `TRTLLM_ENABLE_XQA=1`. Now it supports fp16 accuracy with fp16/fp8 KV
-cache for LLAMA2 70B. Note that a heuristic algorithm is also used to decide
-whether to use XQA kernel or masked MHA kernel to get better performance. That
-means even `TRTLLM_ENABLE_XQA=1` is set, XQA kernels may not also be used.
-If you want to use that kernel when possible, `TRTLLM_FORCE_XQA=1` can be set
-to force use XQA kernels when the model config is supported. Detailed supported
-configuration can be found function `shouldUse` of class `DecoderXQARunner` in
-`cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h`
+is one model that it supports.
+
+Support matrix of the XQA optimization:
+ - FP16 / BF16 compute data type.
+ - FP16 / BF16 / FP8 / INT8 KV cache data type.
+ - Paged KV cache (64 / 128 tokens per block).
+
+To enable this, you need to use the
+flag `--enable_xqa` when building the engines. Note that a heuristic algorithm
+is also used to decide whether to use XQA kernel or masked MHA kernel to get
+better performance. That means even `--enable_xqa` is set, XQA kernels
+may not also be used. If you want to always use that kernel when possible,
+`TRTLLM_FORCE_XQA=1` can be set to force use XQA kernels when the model config
+is supported. Detailed supported configuration can be found function `shouldUse`
+of class `DecoderXQARunner` in
+`cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h`.
 
 
 ## Inflight batching
@@ -176,13 +184,13 @@ outputs. However, TensorRT-LLM supports INT8 and FP8
 The GPT attention operator populates the KV cache. When INT8 or FP8 KV caches
 are enabled, the input values have to be quantized to 8 bits using a scaling
 factor. For quantization, the scaling factor is stored in the
-`kv_orig_quant_scale` tensor. Its shape is `[1]` and only per-tensor
-quantization is supported in the current version.
+`kv_cache_scaling_factor` tensor. Its shape is `[1]` and only per-tensor
+quantization is supported in the current version. Quantization uses inversed scale
+since it does multiply as `fp_value * (1.0 / kv_cache_scaling_factor)` in plugin.
 
 During generation, the values read from the cache are dequantized on-the-fly in
-the MHA/MQA kernel. The scaling factor to dequantize those values is stored in
-the `kv_quant_orig_scale` tensor. That tensor contains a single value (per
-tensor scaling).
+the MHA/MQA kernel, dequantization can be described as
+`quantized_value * kv_cache_scaling_factor`.
 
 
 ## Sliding Window Attention, Cyclic (Rolling Buffer) KV Cache

@@ -843,8 +843,7 @@ def load_from_sq(
             name = f'layers.{i}.attention.query_key_value.scale_y_quant_orig.bin'
             v = fromfile(name, [1], np.float32)
             dst = layer.attention
-            dst.kv_orig_quant_scale.value = np.ascontiguousarray(1.0 / v)
-            dst.kv_quant_orig_scale.value = np.ascontiguousarray(v)
+            dst.kv_cache_scaling_factor.value = np.ascontiguousarray(v)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

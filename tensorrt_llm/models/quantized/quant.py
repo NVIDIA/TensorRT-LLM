@@ -169,8 +169,52 @@ def _smooth_quantize_bloom(model, quant_mode):
 
 
 def _smooth_quantize_baichuan(model, quant_mode):
-    # Baichuan models' structures are similar to LLaMA so we can reuse the impl
-    return _smooth_quantize_llama(model, quant_mode)
+    assert quant_mode.has_act_and_weight_quant()
+    for layer in model.layers:
+        assert hasattr(layer,
+                       "input_layernorm"), "The layer has no input_layernorm"
+        layer.input_layernorm = SmoothQuantRmsNorm(
+            normalized_shape=layer.hidden_size,
+            dtype=layer.dtype,
+            quant_mode=quant_mode)
+        assert hasattr(layer, "attention"), "The layer has no attention"
+        layer.attention = SmoothQuantAttention(
+            layer.hidden_size,
+            num_attention_heads=layer.num_attention_heads,
+            num_kv_heads=layer.num_kv_heads,
+            max_position_embeddings=layer.max_position_embeddings,
+            num_layers=model.num_layers,
+            dtype=layer.dtype,
+            attention_mask_type=layer.attention_mask_type,
+            position_embedding_type=layer.position_embedding_type,
+            rotary_embedding_base=layer.attention.rotary_embedding_base,
+            tp_group=layer.tp_group,
+            tp_size=layer.tp_size,
+            tp_rank=layer.tp_rank,
+            quant_mode=quant_mode,
+            bias=layer.attention.qkv.bias is not None)
+
+        assert hasattr(layer, "mlp"), "The layer has no mlp"
+        if hasattr(model, "moe_config"):
+            assert not model.moe_config.has_moe(
+            ), "MOE does not support smooth quant"
+        layer.mlp = SmoothQuantGatedMLP(hidden_size=model.hidden_size,
+                                        ffn_hidden_size=layer.mlp_hidden_size,
+                                        hidden_act=layer.hidden_act,
+                                        dtype=layer.dtype,
+                                        tp_group=layer.tp_group,
+                                        tp_size=layer.tp_size,
+                                        quant_mode=quant_mode,
+                                        bias=layer.mlp.fc.bias is not None)
+        assert hasattr(
+            layer,
+            "post_layernorm"), "The layer has no post_rmspost_layernormnorm"
+        layer.post_layernorm = SmoothQuantRmsNorm(
+            normalized_shape=layer.hidden_size,
+            dtype=layer.dtype,
+            quant_mode=quant_mode)
+
+    return model
 
 
 def _smooth_quantize_internlm(model, quant_mode):
@@ -445,10 +489,8 @@ def _quantize_layer(layer, layer_idx, quant_mode, quant_scales):
     layer.attention.qkv.weights_scaling_factor.value = np.array(
         [quant_scales['qkv_weights'][layer_idx]], dtype=fake_fp8_sf_dt)
     if quant_mode.has_fp8_kv_cache():
-        layer.attention.kv_orig_quant_scale.value = np.array(
+        layer.attention.kv_cache_scaling_factor.value = np.array(
             [quant_scales['qkv_output'][layer_idx]], dtype=fake_fp8_sf_dt)
-        layer.attention.kv_quant_orig_scale.value = np.array(
-            [1.0 / quant_scales['qkv_output'][layer_idx]], dtype=fake_fp8_sf_dt)
     layer.attention.dense.activation_scaling_factor.value = np.array(
         [quant_scales['dense_act'][layer_idx]], dtype=fake_fp8_sf_dt)
     layer.attention.dense.weights_scaling_factor.value = np.array(

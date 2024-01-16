@@ -79,7 +79,7 @@ private:
             params.vocabSize, nullptr, this->mMaxTopP, bufferCast<float>(*this->mTopPsDevice), this->mStream->get(),
             nullptr);
 
-        // Perform batched TopK sampling
+        // Perform batched TopP sampling
         tk::invokeTopPInitialize(bufferCast<int32_t>(*this->mTopPIdValsDevice),
             bufferCast<int32_t>(*this->mEndOffsetsDevice), bufferCast<int32_t>(*this->mBeginOffsetsDevice),
             params.batchSize, params.vocabSize, this->mStream->get());

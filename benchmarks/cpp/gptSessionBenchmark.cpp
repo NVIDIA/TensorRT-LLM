@@ -123,6 +123,17 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                     bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32),
                     bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32)};
 
+                if (session.getModelConfig().computeContextLogits())
+                {
+                    generationOutput.contextLogits
+                        = bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
+                }
+                if (session.getModelConfig().computeGenerationLogits())
+                {
+                    generationOutput.generationLogits
+                        = bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
+                }
+
                 TLLM_LOG_INFO(memoryCounter.toString());
 
                 for (auto r = 0; r < warmUp; ++r)
@@ -175,21 +186,20 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                     if (session.getModelConfig().computeContextLogits() && printAllLogits)
                     {
                         std::cout << "generationOutput.contextLogits.shape: "
-                                  << generationOutput.contextLogitsHost->getShape()
+                                  << generationOutput.contextLogits->getShape()
                                   << std::endl; // (batchsize, prompt_len, vocabsize)
-                        std::cout << "generationOutput.contextLogits: " << *generationOutput.contextLogitsHost
-                                  << std::endl;
+                        std::cout << "generationOutput.contextLogits: " << *generationOutput.contextLogits << std::endl;
                     }
 
                     if (session.getModelConfig().computeGenerationLogits() && printAllLogits)
                     {
                         std::cout << "generationOutput.generationLogits.shape: "
-                                  << generationOutput.generationLogitsHost->getShape()
+                                  << generationOutput.generationLogits->getShape()
                                   << std::endl; // (batchsize, beamwidth, maxNewTokens, vocabsize)
-                        generationOutput.generationLogitsHost->reshape(ITensor::makeShape({batchSize * beamWidth,
+                        generationOutput.generationLogits->reshape(ITensor::makeShape({batchSize * beamWidth,
                             maxNewTokens, modelConfig.getVocabSizePadded(worldConfig.getSize())}));
 
-                        std::cout << "generationOutput.generationLogits: " << *generationOutput.generationLogitsHost
+                        std::cout << "generationOutput.generationLogits: " << *generationOutput.generationLogits
                                   << std::endl;
                     }
                 }

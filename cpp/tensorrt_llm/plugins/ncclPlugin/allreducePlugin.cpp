@@ -16,7 +16,9 @@
  */
 #include "allreducePlugin.h"
 
+#include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/mpiUtils.h"
+#include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include <nccl.h>
 
 using namespace nvinfer1;
@@ -102,41 +104,34 @@ size_t AllreducePlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* input
     return 0;
 }
 
-AllReduceStrategyType AllreducePlugin::selectImplementation(size_t messageSize, int worldSize) const noexcept
+AllReduceStrategyType AllreducePlugin::selectImplementation(size_t messageSize, int worldSize) noexcept
 {
-    if (worldSize <= 2)
+    const auto maxWorkspaceSize = utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(worldSize);
+
+    if (messageSize > maxWorkspaceSize)
     {
-        if (messageSize < 16 * 1000 * 1000)
-        {
-            return AllReduceStrategyType::ONESHOT;
-        }
+        return AllReduceStrategyType::RING;
     }
 
-    if (worldSize > 2 && worldSize <= 4)
+    if (worldSize <= 2)
+    {
+        return AllReduceStrategyType::ONESHOT;
+    }
+
+    if (worldSize <= 4)
     {
         if (messageSize < 1 * 1000 * 1000)
         {
             return AllReduceStrategyType::ONESHOT;
         }
-        if (messageSize < 8 * 1000 * 1000)
-        {
-            return AllReduceStrategyType::TWOSHOT;
-        }
+        return AllReduceStrategyType::TWOSHOT;
     }
 
-    if (worldSize > 4)
+    if (messageSize < 500 * 1000)
     {
-        if (messageSize < 500 * 1000)
-        {
-            return AllReduceStrategyType::ONESHOT;
-        }
-        if (messageSize < 8 * 1000 * 1000)
-        {
-            return AllReduceStrategyType::TWOSHOT;
-        }
+        return AllReduceStrategyType::ONESHOT;
     }
-
-    return AllReduceStrategyType::RING;
+    return AllReduceStrategyType::TWOSHOT;
 }
 
 int AllreducePlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
@@ -187,15 +182,13 @@ int AllreducePlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const 
     else
     {
         auto myRank = COMM_SESSION.getRank();
-        int nRanks = inputDesc[1].dims.d[0] / 3;
+        int nRanks = inputDesc[1].dims.d[0] / utils::customAllReduceUtils::NUM_POINTERS_PER_RANK;
         // FIXME: pass world config here
         myRank = myRank % nRanks;
 
         auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(
             reinterpret_cast<const int32_t*>(inputs[1]), nRanks, myRank, mCounter);
 
-        // Make sure all GPUs have finished using their peer_comm_buffer_ptrs in previous invocations
-        tensorrt_llm::kernels::invokeMultiGpuBarrier(params, stream);
         cudaMemcpyAsync(
             params.peer_comm_buffer_ptrs[myRank], inputs[0], size * sizePerElem, cudaMemcpyDeviceToDevice, stream);
 

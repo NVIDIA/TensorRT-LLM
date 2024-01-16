@@ -136,7 +136,17 @@ When using V1 batching, the following additional statistics are reported per V1 
     - `freeGpuMemoryFraction` (default: 0.9) a number between 0 and 1 to indicate the maximum fraction of GPU memory (after loading the model) that may be used for KV cache. If `maxTokens` is specified, allocated KV cache is the minimum of `maxTokens` and the value inferred from `freeGpuMemoryFraction`.
     - `enableBlockReuse` (default: `false`) allow reuse of previously computed KV cache blocks across requests. This is expected to optimize memory use and computation.
   - `maxNumSequences` (default: unspecified) maximum number of sequences that can be in progress in any iteration. It is recommended that this value be left unspecified and the value will be inferred from the TRT-LLM engine.
-  - `enableTrtOverlap` (default: `true`) when `true`, GptManager partitions available requests into 2 'microbatches' that can be run concurrently to hide exposed CPU runtime.
+  - `enableTrtOverlap` (default: `false`) when `true`, GptManager partitions available requests into 2 'microbatches' that can be run concurrently to hide exposed CPU runtime. However, it may not give performance benefits when the size of the model is not big enough to overlap the host overhead, or when the number of requests is too small.
+
+### Responses content
+The responses from `SendResponseCallback` are stored in a `std::shared_ptr<Tensor>` list, which contains the following tensors of a specific request:
+* output Ids: a CPU tensor that contains the output token IDs. Its shape is
+[1, beamWidth, maxSeqLength].
+* sequence length: a CPU tensor that indicates the length of inputID + outputID. Its shape is [1, 1].
+* context logits: a CPU tensor that contains context logits. Its shape is [1, promptLength, vocabSizePadded] if the engine is built with `gather_context_logits` or `gather_all_token_logits`. Otherwise, it is a dummy tensor with shape [1, 1, 1].
+* generation logits:  a CPU tensor that contains generation logits. Its shape is [1, beamWidth, outputLength, vocabSizePadded]. if the engine is built with `gather_generation_logits` or `gather_all_token_logits`. Otherwise, it is a dummy tensor with shape [1, 1, 1, 1].
+* logProb: a CPU tensor that stores the log-prob of the generated tokens. Its shape is [1, beamWidth, outputLength]
+* cumLogProb: a CPU tensor that stores the cumLogProb. Its shape is [1, beamWidth]
 
 ### GptManager Design
 

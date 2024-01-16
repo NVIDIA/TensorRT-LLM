@@ -76,11 +76,12 @@ public:
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
         bool unfuse_qkv_gemm,                                                                       // for AutoPP
-        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
-        bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
-        int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled,
-        bool cross_attention = false, int max_distance = 0, bool pos_shift_enabled = false,
-        bool dense_context_fmha = false, bool use_paged_context_fmha = false, bool use_cache = true);
+        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, bool enable_xqa,
+        int kv_cache_quant_mode, bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
+        bool paged_kv_cache, int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length,
+        bool qkv_bias_enabled, bool cross_attention = false, int max_distance = 0, bool pos_shift_enabled = false,
+        bool dense_context_fmha = false, bool use_paged_context_fmha = false, bool use_cache = true,
+        bool is_medusa_enabled = false);
 
     GPTAttentionPlugin(const void* data, size_t length);
 
@@ -163,12 +164,18 @@ private:
         ENCODER_INPUT_LENGTH,
         HOST_CONTEXT_LENGTH,
         QKV_BIAS_TENSOR,
+        MEDUSA_PACKED_MASK,
+        MEDUSA_POSITION_OFFSETS,
         ENUM_SIZE,
     };
 
     bool isEntryUsed(const IdxEntry& entry) const;
     void initEntryIdx();
     IndexType getIdx(const IdxEntry& entry) const;
+
+    // Get generation input sequence length (might be larger than 1 in the Medusa mode).
+    int getGenerationInputSequenceLength(
+        const nvinfer1::PluginTensorDesc* inputDesc, int32_t localNbSeq, int32_t localNbTokens) const;
 };
 
 class GPTAttentionPluginCreator : public GPTAttentionPluginCreatorCommon

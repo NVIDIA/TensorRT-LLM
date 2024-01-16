@@ -126,10 +126,10 @@ def quantize_llama_and_export(hf_model_dir,
                                             calib_size=calib_size,
                                             cache_dir=hf_cache_dir)
     quant_cfg_dict = {}
-    if not quantize_lm_head:
+    if quantize_lm_head:
         quant_cfg_dict.update({
             "*lm_head*": {
-                "enable": False
+                "enable": True
             },
         })
 

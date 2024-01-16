@@ -314,7 +314,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     py::class_<tb::TrtGptModelOptionalParams>(m, "TrtGptModelOptionalParams")
         .def(py::init<tbk::KvCacheConfig, std::optional<SizeType>, bool>(),
             py::arg("kv_cache_config") = tbk::KvCacheConfig{}, py::arg("max_num_sequences") = py::none(),
-            py::arg("enable_trt_overlap") = true)
+            py::arg("enable_trt_overlap") = false)
         .def_readwrite("kv_cache_config", &tb::TrtGptModelOptionalParams::kvCacheConfig)
         .def_readwrite("max_num_sequences", &tb::TrtGptModelOptionalParams::maxNumSequences)
         .def_readwrite("enable_trt_overlap", &tb::TrtGptModelOptionalParams::enableTrtOverlap)

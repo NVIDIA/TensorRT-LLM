@@ -33,6 +33,8 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.generation_mixin import GenerationMixin
 from tensorrt_llm.module import Module, ModuleList
 from tensorrt_llm.parameter import Parameter
+from tensorrt_llm.plugin.plugin import (current_all_reduce_helper,
+                                        init_all_reduce_helper)
 
 layernorm_map = {
     LayerNormType.LayerNorm: LayerNorm,
@@ -226,7 +228,6 @@ class EncoderLayer(Module):
                 hidden_states: Tensor,
                 attention_mask=None,
                 input_lengths=None,
-                all_reduce_workspace=None,
                 max_input_length=None):
         assert isinstance(hidden_states, Tensor)
 
@@ -239,7 +240,6 @@ class EncoderLayer(Module):
         attention_output = self.attention(hidden_states,
                                           attention_mask=attention_mask,
                                           input_lengths=input_lengths,
-                                          workspace=all_reduce_workspace,
                                           max_input_length=max_input_length)
 
         self.register_network_output('attention_output', attention_output)
@@ -255,7 +255,7 @@ class EncoderLayer(Module):
         if self.layernorm_position == LayerNormPositionType.pre_layernorm:
             hidden_states = self.mlp_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states, workspace=all_reduce_workspace)
+        hidden_states = self.mlp(hidden_states)
 
         self.register_network_output('mlp_output', hidden_states)
 
@@ -380,8 +380,7 @@ class DecoderLayer(Module):
                 attention_mask=None,
                 use_cache=False,
                 kv_cache_params=None,
-                attention_params=None,
-                all_reduce_workspace=None):
+                attention_params=None):
         assert isinstance(hidden_states, Tensor)
 
         if encoder_output:
@@ -398,8 +397,7 @@ class DecoderLayer(Module):
             attention_mask=attention_mask,
             use_cache=use_cache,
             kv_cache_params=kv_cache_params,
-            attention_params=attention_params,
-            workspace=all_reduce_workspace)
+            attention_params=attention_params)
 
         if use_cache:
             attention_output, presents_self = attention_output
@@ -423,8 +421,7 @@ class DecoderLayer(Module):
             encoder_output=encoder_output,
             use_cache=use_cache,
             kv_cache_params=kv_cache_params,
-            attention_params=attention_params,
-            workspace=all_reduce_workspace)
+            attention_params=attention_params)
 
         if use_cache:
             attention_output, presents_cross = attention_output
@@ -442,7 +439,7 @@ class DecoderLayer(Module):
         if self.layernorm_position == LayerNormPositionType.pre_layernorm:
             hidden_states = self.mlp_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states, workspace=all_reduce_workspace)
+        hidden_states = self.mlp(hidden_states)
         self.register_network_output('mlp_output', hidden_states)
 
         hidden_states = residual + hidden_states
@@ -489,6 +486,7 @@ class EncoderModel(Module, GenerationMixin):
                  embedding_sharding_dim=0,
                  mapping=Mapping()):
         super().__init__()
+        init_all_reduce_helper()
         self.mapping = mapping
 
         self.has_position_embedding = has_position_embedding
@@ -574,7 +572,6 @@ class EncoderModel(Module, GenerationMixin):
                 position_ids=None,
                 token_type_ids=None,
                 hidden_states=None,
-                all_reduce_workspace=None,
                 max_input_length=None,
                 prompt_embedding_table=None,
                 prompt_tasks=None,
@@ -592,11 +589,9 @@ class EncoderModel(Module, GenerationMixin):
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
         for encoder_layer in self.encoder_layers:
-            hidden_states = encoder_layer(
-                hidden_states=hidden_states,
-                input_lengths=input_lengths,
-                all_reduce_workspace=all_reduce_workspace,
-                max_input_length=max_input_length)
+            hidden_states = encoder_layer(hidden_states=hidden_states,
+                                          input_lengths=input_lengths,
+                                          max_input_length=max_input_length)
 
         if self.mapping.is_last_pp_rank():
             if self.has_model_final_layernorm:
@@ -700,17 +695,9 @@ class EncoderModel(Module, GenerationMixin):
                                            ('hidden_size', [hidden_size]),
                                        ]))
 
-        all_reduce_workspace = None
         if use_custom_all_reduce and self.mapping.tp_size > 1:
-            # 3 (= buffer + signals_in + signals_out)
-            workspace_size = 3 * self.mapping.tp_size
-            all_reduce_workspace = Tensor(name='all_reduce_workspace',
-                                          dtype=trt.int64,
-                                          shape=[workspace_size],
-                                          dim_range=OrderedDict([
-                                              ('all_reduce_size',
-                                               [workspace_size])
-                                          ]))
+            current_all_reduce_helper().set_workspace_tensor(
+                self.mapping, False)
 
         input_lengths = Tensor(
             name="input_lengths",
@@ -762,8 +749,8 @@ class EncoderModel(Module, GenerationMixin):
                                        dim_range=OrderedDict([('size', [1])]))
 
         return (input_ids, input_lengths, position_ids, token_type_ids,
-                hidden_states, all_reduce_workspace, max_input_length,
-                prompt_embedding_table, tasks, prompt_vocab_size)
+                hidden_states, max_input_length, prompt_embedding_table, tasks,
+                prompt_vocab_size)
 
 
 class DecoderModel(Module, GenerationMixin):
@@ -806,6 +793,7 @@ class DecoderModel(Module, GenerationMixin):
                  embedding_sharding_dim=0,
                  mapping=Mapping()):
         super().__init__()
+        init_all_reduce_helper()
         self.mapping = mapping
 
         self.has_position_embedding = has_position_embedding  # TODO: remove dup codes
@@ -925,8 +913,7 @@ class DecoderModel(Module, GenerationMixin):
                 last_token_ids=None,
                 kv_cache_params=None,
                 attention_params=None,
-                hidden_states=None,
-                all_reduce_workspace=None):
+                hidden_states=None):
         if self.mapping.is_first_pp_rank():
             assert isinstance(decoder_input_ids, Tensor)
         else:
@@ -962,8 +949,7 @@ class DecoderModel(Module, GenerationMixin):
                     host_sink_token_length=kv_cache_params.
                     host_sink_token_length,
                     cache_indirection=kv_cache_params.cache_indirection),
-                attention_params=attention_params,
-                all_reduce_workspace=all_reduce_workspace)
+                attention_params=attention_params)
 
             if use_cache:
                 presents_self, presents_cross = hidden_states[1], hidden_states[
@@ -1264,17 +1250,9 @@ class DecoderModel(Module, GenerationMixin):
             ]),
         )
 
-        all_reduce_workspace = None
         if use_custom_all_reduce and self.mapping.tp_size > 1:
-            # 3 (= buffer + signals_in + signals_out)
-            workspace_size = 3 * self.mapping.tp_size
-            all_reduce_workspace = Tensor(name='all_reduce_workspace',
-                                          dtype=trt.int64,
-                                          shape=[workspace_size],
-                                          dim_range=OrderedDict([
-                                              ('all_reduce_size',
-                                               [workspace_size])
-                                          ]))
+            current_all_reduce_helper().set_workspace_tensor(
+                self.mapping, False)
 
         layers_range = self.mapping.pp_layers(self.total_num_layers)
 
@@ -1347,7 +1325,7 @@ class DecoderModel(Module, GenerationMixin):
 
         return (input_ids, encoder_output, position_ids, token_type_ids, True,
                 attention_mask, last_token_ids, kv_cache_params,
-                attention_params, hidden_states, all_reduce_workspace)
+                attention_params, hidden_states)
 
 
 class WhisperEncoder(Module):
@@ -1381,7 +1359,7 @@ class WhisperEncoder(Module):
         self.ln_post = LayerNorm(n_state)
         self._dtype = dtype
 
-    def forward(self, x: Tensor):
+    def forward(self, x: Tensor, input_lengths=None):
 
         x = self.conv1(x)
         x = gelu(x)
@@ -1391,9 +1369,9 @@ class WhisperEncoder(Module):
         x = x + self.positional_embedding.value
 
         hidden_states = x
-
         for encoder_layer in self.encoder_layers:
-            hidden_states = encoder_layer(hidden_states)
+            hidden_states = encoder_layer(hidden_states,
+                                          input_lengths=input_lengths)
 
         x = hidden_states
         x = self.ln_post(x)
@@ -1412,4 +1390,10 @@ class WhisperEncoder(Module):
                        ("feature_dim", [self.n_mels]),
                        ("feature_len_range", [3000]),
                    ]))
-        return (x)
+        input_lengths = Tensor(
+            name="input_lengths",
+            dtype=trt.int32,
+            shape=[-1],
+            dim_range=OrderedDict([("batch_size", [bs_range])]),
+        )
+        return (x, input_lengths)

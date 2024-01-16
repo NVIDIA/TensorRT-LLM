@@ -8,9 +8,9 @@ import torch
 import tensorrt as trt
 # isort: on
 import requests
-from lavis.models import load_model_and_preprocess
 from PIL import Image
-from transformers import AutoTokenizer
+from transformers import (AutoTokenizer, Blip2ForConditionalGeneration,
+                          Blip2Processor)
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
@@ -142,14 +142,13 @@ class ViT_qformer_wrapper(torch.nn.Module):
     def __init__(self, model):
         super().__init__()
 
-        self.visual_wrapper = torch.nn.Sequential(model.visual_encoder,
-                                                  model.ln_vision).float()
-        self.qformer = model.Qformer.bert
-        self.opt_proj = model.opt_proj
+        self.visual_wrapper = model.vision_model
+        self.qformer = model.qformer
+        self.opt_proj = model.language_projection
         self.query_tokens = model.query_tokens
 
     def forward(self, image):
-        image_embeds = self.visual_wrapper(image)
+        image_embeds = self.visual_wrapper(image)[0]
 
         image_atts = torch.ones(image_embeds.size()[:-1],
                                 dtype=torch.long).to(image.device)
@@ -175,13 +174,16 @@ if __name__ == '__main__':
 
     device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
 
-    blip2_model, vis_processors, _ = load_model_and_preprocess(
-        name="blip2_opt",
-        model_type="pretrain_opt2.7b",
-        is_eval=True,
-        device=device)
+    processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
+    blip2_model = Blip2ForConditionalGeneration.from_pretrained(
+        "Salesforce/blip2-opt-2.7b", torch_dtype=torch.float16)
+    blip2_model.to(device)
 
-    image = vis_processors["eval"](raw_image).unsqueeze(0).to(device)
+    prompt = args.input_text
+    inputs = processor(images=raw_image, text=prompt,
+                       return_tensors="pt").to(device, torch.float16)
+
+    image = inputs['pixel_values']
 
     vit_qformer = ViT_qformer_wrapper(blip2_model)
 
@@ -190,8 +192,6 @@ if __name__ == '__main__':
     inputs_opt = vit_qformer(image)
     atts_opt = torch.ones(inputs_opt.size()[:-1],
                           dtype=torch.long).to(image.device)
-
-    prompt = args.input_text
 
     prompt = [prompt] * image.size(0)
 

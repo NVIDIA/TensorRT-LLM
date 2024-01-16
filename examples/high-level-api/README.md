@@ -19,26 +19,32 @@ python3 llm_examples.py --task run_llm_on_tensor_parallel \
     --prompt="<prompt>" \
     --hf_model_dir=<llama-model-path>
 ```
-## Build and install
-
-The high-level APIs depend on some C++ pybind features, thus we need to **build it in a docker container with the following commands**
-
-```sh
-python3 scripts/build_wheel.py --trt_root /usr/local/tensorrt -p
-```
-
-Please refer to [Build TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/installation.md#build-tensorrt-llm) for building the docker and other details.
-
 
 ## Model preparation
 
 Given its popularity, the TRT-LLM high-level API chooses to support HuggingFace format as start point, to use the high-level API on LLaMA models, you need to run the following conversion script provided in [transformers/llama](https://huggingface.co/docs/transformers/main/model_doc/llama) or [transformers/llama2](https://huggingface.co/docs/transformers/main/model_doc/llama2) to convert the Meta checkpoint to HuggingFace format.
-For instance, for a 7B model, the command is as below:
+
+For instance, specially for a LLaMA2 7B model, the official way to retrieve the model is to visit the [LLaMA2 7B model page](https://huggingface.co/transformers/llama2-7B), normally you need to submit a request for the the model file.
+For a quick start, you can also download the model checkpoint files directly from [modelscope.cn](https://www.modelscope.cn/models/shakechen/Llama-2-7b/files), the command is as follows:
 
 ``` sh
-python src/transformers/models/llama/convert_llama_weights_to_hf.py \
-    --input_dir /path/to/downloaded/llama/weights --model_size 7B --output_dir /output/path
+git clone https://www.modelscope.cn/shakechen/Llama-2-7b.git
 ```
+
+And to convert the checkpoint files, a script from transformers is required, thus please also clone the transformers repo with the following code:
+
+```sh
+git clone https://github.com/huggingface/transformers.git
+```
+
+Finally, the command to convert the checkpoint files to HuggingFace format is as follows:
+
+``` sh
+python <transformers-dir>/src/transformers/models/llama/convert_llama_weights_to_hf.py \
+    --input_dir Llama-2-7b --model_size 7B --output_dir llama-hf-7b
+```
+
+That should produce a HuggingFace format model in `./llama-hf-7b`, which could be used by the high-level API.
 
 ## Basic usage
 To use the API, import the `LLM` and `ModelConfig` from the `tensorrt_llm` package and create an LLM object with a HuggingFace model directly.

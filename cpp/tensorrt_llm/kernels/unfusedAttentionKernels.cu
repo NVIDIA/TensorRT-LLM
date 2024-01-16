@@ -1044,51 +1044,51 @@ __global__ void transpose_remove_padding(const T* src, T* dst, const int batch_s
 }
 
 // clang-format off
-template<typename T>
-void invokeTransposeAttentionOutRemovePadding(T*           src,
-                                              T*           dst,
-                                              const int    valid_word_num,
-                                              const int    batch_size,
-                                              const int    seq_len,
-                                              const int    head_num,
-                                              const int    size_per_head,
-                                              const int*   mask_offset,
-                                              const float* scale,
-                                              const int    int8_mode,
-                                              cudaStream_t stream)
-{
-#ifdef ENABLE_BF16
-    bool is_half2 = (std::is_same<T, half>::value || std::is_same<T, __nv_bfloat16>::value) && (size_per_head % 2 == 0);
-#else
-    bool is_half2 = (std::is_same<T, half>::value) && (size_per_head % 2 == 0);
-#endif
-    using T2       = typename TypeConverter<T>::Type;  // fp16 to half2, bf16 to bf162
-    int block_size = head_num * size_per_head;
-    if (is_half2) {
-        while (block_size > 512) {
-            if (block_size % 2 == 0) {
-                block_size /= 2;
-            }
-            else {
-                is_half2   = false;
-                block_size = std::min(block_size, 1024);
-                break;
-            }
-        }
-    }
-    else {
-        block_size = std::min(block_size, 1024);
-    }
+ template<typename T>
+ void invokeTransposeAttentionOutRemovePadding(T*           src,
+                                               T*           dst,
+                                               const int    valid_word_num,
+                                               const int    batch_size,
+                                               const int    seq_len,
+                                               const int    head_num,
+                                               const int    size_per_head,
+                                               const int*   mask_offset,
+                                               const float* scale,
+                                               const int    int8_mode,
+                                               cudaStream_t stream)
+ {
+ #ifdef ENABLE_BF16
+     bool is_half2 = (std::is_same<T, half>::value || std::is_same<T, __nv_bfloat16>::value) && (size_per_head % 2 == 0);
+ #else
+     bool is_half2 = (std::is_same<T, half>::value) && (size_per_head % 2 == 0);
+ #endif
+     using T2       = typename TypeConverter<T>::Type;  // fp16 to half2, bf16 to bf162
+     int block_size = head_num * size_per_head;
+     if (is_half2) {
+         while (block_size > 512) {
+             if (block_size % 2 == 0) {
+                 block_size /= 2;
+             }
+             else {
+                 is_half2   = false;
+                 block_size = std::min(block_size, 1024);
+                 break;
+             }
+         }
+     }
+     else {
+         block_size = std::min(block_size, 1024);
+     }
 
-    if (is_half2) {
-        transpose_remove_padding<T2><<<valid_word_num, block_size, 0, stream>>>(
-            (T2*)src, (T2*)dst, batch_size, seq_len, head_num, size_per_head / 2, mask_offset, scale, int8_mode);
-    }
-    else {
-        transpose_remove_padding<<<valid_word_num, block_size, 0, stream>>>(
-            src, dst, batch_size, seq_len, head_num, size_per_head, mask_offset, scale, int8_mode);
-    }
-}
+     if (is_half2) {
+         transpose_remove_padding<T2><<<valid_word_num, block_size, 0, stream>>>(
+             (T2*)src, (T2*)dst, batch_size, seq_len, head_num, size_per_head / 2, mask_offset, scale, int8_mode);
+     }
+     else {
+         transpose_remove_padding<<<valid_word_num, block_size, 0, stream>>>(
+             src, dst, batch_size, seq_len, head_num, size_per_head, mask_offset, scale, int8_mode);
+     }
+ }
 
 // clang-format on
 

@@ -184,8 +184,9 @@ def parse_arguments(args):
     )
     parser.add_argument(
         '--log_level',
+        '-l',
         type=str,
-        default='error',
+        default='verbose',
         choices=['verbose', 'info', 'warning', 'error', 'internal_error'],
         help='Level of log information',
     )
@@ -464,7 +465,7 @@ def parse_arguments(args):
             args.max_output_len,
             min(args.max_num_tokens, js["max_sequence_length"]),
         )
-        args.max_num_tokens = args.max_batch_size * args.max_seq_length
+        args.max_num_tokens = args.max_batch_size * args.max_beam_width * args.max_seq_length
         args.multi_block_mode = False
         args.multi_query_mode = False
         args.norm_epsilon = js["layernorm_epsilon"]
@@ -496,7 +497,7 @@ def parse_arguments(args):
             args.max_output_len,
             min(args.max_num_tokens, js["seq_length"]),
         )
-        args.max_num_tokens = args.max_batch_size * args.max_seq_length
+        args.max_num_tokens = args.max_batch_size * args.max_beam_width * args.max_seq_length
         args.multi_block_mode = False
         args.multi_query_mode = False  # regardless of config.json
         args.norm_epsilon = js["layernorm_epsilon"]
@@ -507,6 +508,9 @@ def parse_arguments(args):
         args.rmsnorm = js["rmsnorm"]
         if args.model_name in ["chatglm2_6b_32k", "chatglm3_6b_32k"]:
             args.rotary_embedding_scaling = js["rope_ratio"]
+            assert args.max_num_tokens < 2**31 / (
+                args.ffn_hidden_size * 2
+            ), "max_num_tokens is too large for TensorRT, try to reduce max_batch_size / max_beam_width / max_input_len / max_output_len"
         else:
             args.rotary_embedding_scaling = 1.0
         args.use_cache = js["use_cache"]
@@ -524,7 +528,7 @@ def parse_arguments(args):
             min(args.max_num_tokens, js["max_sequence_length"]),
             True,
         )
-        args.max_num_tokens = args.max_batch_size * args.max_seq_length
+        args.max_num_tokens = args.max_batch_size * args.max_beam_width * args.max_seq_length
         args.multi_block_mode = False
         args.multi_query_mode = False
         args.norm_epsilon = 1.0e-5

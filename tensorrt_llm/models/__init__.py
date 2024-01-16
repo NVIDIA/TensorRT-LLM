@@ -22,6 +22,7 @@ from .gpt.model import GPTLMHeadModel, GPTModel
 from .gptj.model import GPTJForCausalLM, GPTJModel
 from .gptneox.model import GPTNeoXForCausalLM, GPTNeoXModel
 from .llama.model import LLaMAForCausalLM, LLaMAModel
+from .medusa.model import MedusaLM
 from .modeling_utils import PretrainedConfig, PretrainedModel
 from .opt.model import OPTForCausalLM, OPTModel
 from .phi.model import PhiForCausalLM, PhiModel
@@ -42,6 +43,7 @@ __all__ = [
     'OPTModel',
     'LLaMAForCausalLM',
     'LLaMAModel',
+    'MedusaLM',
     'GPTJModel',
     'GPTJForCausalLM',
     'GPTNeoXModel',

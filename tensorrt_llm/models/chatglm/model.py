@@ -293,7 +293,6 @@ class ChatGLMDecoderLayer(Module):
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
             encoder_output=None,
-            workspace=None,
             position_embedding=position_ids,
         )
 

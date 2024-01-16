@@ -102,6 +102,7 @@ set(SAMPLING_KERNEL_TEST_SRC
     kernels/sampling/samplingTest.cpp
     kernels/sampling/samplingTopKTest.cpp
     kernels/sampling/samplingTopPTest.cpp
+    kernels/sampling/samplingAirTopPTest.cpp
     kernels/sampling/samplingPenaltyTest.cpp
     kernels/sampling/samplingUtilsTest.cu)
 add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")

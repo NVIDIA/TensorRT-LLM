@@ -45,10 +45,10 @@ def load_from_hf_phi(tensorrt_llm_phi: PhiForCausalLM,
                      tp_size=1):
 
     hf_model_phi_block_names = [
-        "ln.weight",
-        "ln.bias",
-        "mixer.out_proj.weight",
-        "mixer.out_proj.bias",
+        "input_layernorm.weight",
+        "input_layernorm.bias",
+        "self_attn.dense.weight",
+        "self_attn.dense.bias",
         "mlp.fc1.weight",
         "mlp.fc1.bias",
         "mlp.fc2.weight",
@@ -75,7 +75,7 @@ def load_from_hf_phi(tensorrt_llm_phi: PhiForCausalLM,
 
     # [vocab_size, hidden_size]
     v = torch_to_numpy(
-        hf_phi_state_dict.get('transformer.embd.wte.weight').to(
+        hf_phi_state_dict.get('model.embed_tokens.weight').to(
             torch_dtype).cpu())
     if tensorrt_llm_phi._use_parallel_embedding:
         v = numpy_split(v, tp_size, rank,
@@ -85,7 +85,7 @@ def load_from_hf_phi(tensorrt_llm_phi: PhiForCausalLM,
     n_layer = hf_phi.config.num_hidden_layers
 
     for layer_idx in range(n_layer):
-        prefix = "transformer.h." + str(layer_idx) + "."
+        prefix = "model.layers." + str(layer_idx) + "."
         for idx, hf_attr in enumerate(hf_model_phi_block_names):
             v = torch_to_numpy(
                 hf_phi_state_dict.get(prefix + hf_attr).to(torch_dtype).cpu())
@@ -94,7 +94,7 @@ def load_from_hf_phi(tensorrt_llm_phi: PhiForCausalLM,
                 tensorrt_llm_phi.layers[layer_idx])
 
             if tp_size > 1:
-                if 'mixer.out_proj.weight' in hf_attr:
+                if 'self_attn.dense.weight' in hf_attr:
                     # [n=hidden_size, k=hidden_size] ->
                     # [n=hidden_size, k=hidden_size // tp_size]
                     split_v = numpy_split(v, tp_size, rank, dim=1)
@@ -121,8 +121,14 @@ def load_from_hf_phi(tensorrt_llm_phi: PhiForCausalLM,
 
         # Attention QKV Linear
         # [(num_heads x q)|(num_heads x k)|(num_heads x v), hidden_size]
-        qkv_weights = hf_phi_state_dict.get(prefix + "mixer.Wqkv.weight")
-        qkv_bias = hf_phi_state_dict.get(prefix + "mixer.Wqkv.bias")
+        q_weights = hf_phi_state_dict.get(prefix + "self_attn.q_proj.weight")
+        k_weights = hf_phi_state_dict.get(prefix + "self_attn.k_proj.weight")
+        v_weights = hf_phi_state_dict.get(prefix + "self_attn.v_proj.weight")
+        q_bias = hf_phi_state_dict.get(prefix + "self_attn.q_proj.bias")
+        k_bias = hf_phi_state_dict.get(prefix + "self_attn.k_proj.bias")
+        v_bias = hf_phi_state_dict.get(prefix + "self_attn.v_proj.bias")
+        qkv_weights = torch.cat((q_weights, k_weights, v_weights), dim=0)
+        qkv_bias = torch.cat((q_bias, k_bias, v_bias), dim=0)
 
         qkv_weights = qkv_weights.reshape([hidden_size * 3, hidden_size])
         qkv_bias = qkv_bias.reshape([hidden_size * 3])
@@ -151,14 +157,14 @@ def load_from_hf_phi(tensorrt_llm_phi: PhiForCausalLM,
             tensorrt_llm_phi.layers[layer_idx].attention.qkv.bias.value = \
                 torch_to_numpy(qkv_bias.to(torch_dtype).cpu())
 
-    v = hf_phi_state_dict.get('lm_head.ln.weight')
+    v = hf_phi_state_dict.get('model.final_layernorm.weight')
     tensorrt_llm_phi.ln_f.weight.value = torch_to_numpy(v.to(torch_dtype).cpu())
 
-    v = hf_phi_state_dict.get('lm_head.ln.bias')
+    v = hf_phi_state_dict.get('model.final_layernorm.bias')
     tensorrt_llm_phi.ln_f.bias.value = torch_to_numpy(v.to(torch_dtype).cpu())
 
     v = torch_to_numpy(
-        hf_phi_state_dict.get('lm_head.linear.weight').to(torch_dtype).cpu())
+        hf_phi_state_dict.get('lm_head.weight').to(torch_dtype).cpu())
     if tp_size > 1:
         # [vocab_size, hidden_size] ->
         # [vocab_size // tp_size, hidden_size]
@@ -176,7 +182,7 @@ def load_from_hf_phi(tensorrt_llm_phi: PhiForCausalLM,
         tensorrt_llm_phi.lm_head.weight.value = v
 
     v = torch_to_numpy(
-        hf_phi_state_dict.get('lm_head.linear.bias').to(torch_dtype).cpu())
+        hf_phi_state_dict.get('lm_head.bias').to(torch_dtype).cpu())
     split_v = numpy_split(v, tp_size, rank, dim=0)
 
     tensorrt_llm_phi.lm_head.bias.value = split_v

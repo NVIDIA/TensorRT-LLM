@@ -335,11 +335,8 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
                 i].attention.qkv.weights_scaling_factor.value = np.array(
                     [scaling_factors['qkv_weights'][i]], dtype=fake_fp8_sf_dt)
             tensorrt_llm_gpt.layers[
-                i].attention.kv_orig_quant_scale.value = np.array(
+                i].attention.kv_cache_scaling_factor.value = np.array(
                     [scaling_factors['qkv_output'][i]], dtype=np.float32)
-            tensorrt_llm_gpt.layers[
-                i].attention.kv_quant_orig_scale.value = np.array(
-                    [1.0 / scaling_factors['qkv_output'][i]], dtype=np.float32)
 
         dst = gpt_layer.attention.dense.weight
         t = fromfile(
@@ -474,9 +471,7 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
                 dir_path, 'model.layers.' + str(i) +
                 '.attention.query_key_value.scale_y_quant_orig.bin', [1],
                 np.float32)
-            tensorrt_llm_gpt.layers[
-                i].attention.kv_orig_quant_scale.value = 1.0 / t
-            gpt_layer.attention.kv_quant_orig_scale.value = t
+            gpt_layer.attention.kv_cache_scaling_factor.value = t
 
         if enable_fp8_qdq:
             tensorrt_llm_gpt.layers[

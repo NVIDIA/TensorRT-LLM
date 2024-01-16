@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import argparse
+import ast
 from pathlib import Path
 
 import evaluate
@@ -110,6 +111,13 @@ def main(args):
         runner_kwargs = dict(engine_dir=args.engine_dir,
                              rank=runtime_rank,
                              debug_mode=args.debug_mode)
+        if args.medusa_choices is not None:
+            args.medusa_choices = ast.literal_eval(args.medusa_choices)
+            assert args.use_py_session, "Medusa is only supported by py_session"
+            assert args.temperature == 0, "Medusa should use temperature == 0"
+            assert args.batch_size == 1, "Medusa should use max_batch_size == 1"
+            assert args.num_beams == 1, "Medusa should use num_beams == 1"
+            runner_kwargs.update(medusa_choices=args.medusa_choices)
         if not args.use_py_session:
             runner_kwargs.update(
                 max_batch_size=max_batch_size,
@@ -121,8 +129,6 @@ def main(args):
         runner = runner_cls.from_dir(**runner_kwargs)
         assert not (args.eval_ppl and not (runner.gather_context_logits and runner.gather_generation_logits)), \
             "PPL evaluation requires engine built with gather_all_token_logits enabled"
-        assert not (args.eval_ppl and not args.use_py_session), \
-            "PPL evaluation is not supported with C++ session"
 
     if test_hf:
         profiler.start('load HF model')
@@ -235,7 +241,8 @@ def main(args):
                 presence_penalty=presence_penalty,
                 frequency_penalty=frequency_penalty,
                 output_sequence_lengths=True,
-                return_dict=True)
+                return_dict=True,
+                medusa_choices=args.medusa_choices)
             torch.cuda.synchronize()
 
         # Extract a list of tensors of shape beam_width x output_ids.
@@ -253,6 +260,11 @@ def main(args):
             ]
 
             ppls = [[] for _ in range(batch_size)]
+            seq_lengths_array = outputs["sequence_lengths"].cpu().tolist()
+            lengths_info = {
+                'input_lengths': input_lengths,
+                'seq_lengths': seq_lengths_array
+            }
             if eval_ppl:
                 seq_lengths = outputs['sequence_lengths']
                 context_logits = outputs['context_logits']
@@ -278,8 +290,8 @@ def main(args):
                         )
                         ppls[batch_idx].append(curr_ppl)
 
-            return output_beams_list, output_ids_list, ppls
-        return [], [], []
+            return output_beams_list, output_ids_list, ppls, lengths_info
+        return [], [], [], {}
 
     def eval_hf(datapoint,
                 eval_task='summarize',
@@ -406,6 +418,7 @@ def main(args):
 
     ite_count = 0
     data_point_idx = 0
+    total_output_token_count_trt_llm = 0  # only valid for runtime_rank == 0
     while (data_point_idx < len(dataset)) and (ite_count < args.max_ite):
         if runtime_rank == 0:
             logger.debug(
@@ -415,12 +428,19 @@ def main(args):
 
         if test_trt_llm:
             profiler.start('tensorrt_llm')
-            output_tensorrt_llm, _, curr_ppls_trt_llm = eval_trt_llm(
+            output_tensorrt_llm, output_ids_trt_llm, curr_ppls_trt_llm, lengths_info = eval_trt_llm(
                 datapoint,
                 eval_task=args.eval_task,
                 eval_ppl=args.eval_ppl,
                 add_special_tokens=args.add_special_tokens)
             profiler.stop('tensorrt_llm')
+            if runtime_rank == 0:
+                input_lengths = lengths_info['input_lengths']
+                seq_lengths = lengths_info['seq_lengths']
+                output_token_count_trt_llm = sum(
+                    seq_lengths[idx][0] - input_lengths[idx]
+                    for idx in range(len(input_lengths)))
+                total_output_token_count_trt_llm += output_token_count_trt_llm
 
         if test_hf:
             profiler.start('hf')
@@ -487,6 +507,12 @@ def main(args):
             np.random.seed(0)  # rouge score use sampling to compute the score
             logger.info(
                 f'TensorRT-LLM (total latency: {profiler.elapsed_time_in_sec("tensorrt_llm")} sec)'
+            )
+            logger.info(
+                f'TensorRT-LLM (total output tokens: {total_output_token_count_trt_llm})'
+            )
+            logger.info(
+                f'TensorRT-LLM (tokens per second: {total_output_token_count_trt_llm / profiler.elapsed_time_in_sec("tensorrt_llm")})'
             )
             for beam_idx in range(num_beams):
                 logger.info(f"TensorRT-LLM beam {beam_idx} result")
@@ -600,6 +626,13 @@ if __name__ == '__main__':
         help="Directory where to save output sentences. 'trtllm.out' for "
         "TensorRT-LLM outputs, and 'hf.out' for HF outputs.  If None, do not "
         "save outputs.")
+    parser.add_argument(
+        '--medusa_choices',
+        type=str,
+        default=None,
+        help="Medusa choice to use, if not none, will use Medusa decoding."
+        "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 medusa tokens."
+    )
 
     args = parser.parse_args()
 

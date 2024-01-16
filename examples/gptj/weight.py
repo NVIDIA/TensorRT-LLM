@@ -357,11 +357,8 @@ def load_from_bin_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
                 i].attention.qkv.weights_scaling_factor.value = np.array(
                     [scaling_factors['qkv_weights'][i]], dtype=fake_fp8_sf_dt)
             tensorrt_llm_gpt_j.layers[
-                i].attention.kv_orig_quant_scale.value = np.array(
+                i].attention.kv_cache_scaling_factor.value = np.array(
                     [scaling_factors['qkv_output'][i]], dtype=np.float32)
-            tensorrt_llm_gpt_j.layers[
-                i].attention.kv_quant_orig_scale.value = np.array(
-                    [1.0 / scaling_factors['qkv_output'][i]], dtype=np.float32)
 
         dst = tensorrt_llm_gpt_j.layers[i].attention.dense.weight
         t = fromfile(
@@ -474,8 +471,7 @@ def load_from_bin_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
                 '.attention.query_key_value.scale_y_quant_orig.bin', [1],
                 np.float32)
             tensorrt_llm_gpt_j.layers[
-                i].attention.kv_orig_quant_scale.value = 1.0 / t
-            tensorrt_llm_gpt_j.layers[i].attention.kv_quant_orig_scale.value = t
+                i].attention.kv_cache_scaling_factor.value = t
 
         if enable_fp8_qdq:
             tensorrt_llm_gpt_j.layers[
@@ -607,12 +603,8 @@ def load_from_hf_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
         if quant_mode.has_fp8_kv_cache():
             if scaling_factors:
                 tensorrt_llm_gpt_j.layers[
-                    layer_idx].attention.kv_orig_quant_scale.value = np.array(
+                    layer_idx].attention.kv_cache_scaling_factor.value = np.array(
                         [scaling_factors['qkv_output'][layer_idx]],
-                        dtype=np.float32)
-                tensorrt_llm_gpt_j.layers[
-                    layer_idx].attention.kv_quant_orig_scale.value = np.array(
-                        [1.0 / scaling_factors['qkv_output'][layer_idx]],
                         dtype=np.float32)
 
         # Attention Dense (out_proj) Linear
@@ -874,9 +866,7 @@ def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
                 np.float32)
             assert t is not None, f"{ft_model_dir} does not contain model.layers.{layer_idx}.attention.query_key_value.scale_y_quant_orig.bin"
             tensorrt_llm_gpt_j.layers[
-                layer_idx].attention.kv_orig_quant_scale.value = 1.0 / t
-            tensorrt_llm_gpt_j.layers[
-                layer_idx].attention.kv_quant_orig_scale.value = t
+                layer_idx].attention.kv_cache_scaling_factor.value = t
 
     v = load('final_layernorm:weight')
     tensorrt_llm_gpt_j.ln_f.weight.value = v.to(torch_dtype).cpu().numpy()

@@ -24,7 +24,7 @@ This document shows how to run multimodal pipelines with TensorRT-LLM, e.g. from
 
     ```bash
     python ../enc_dec/build.py --model_type t5 \
-                --weight_dir tmp/hf_models/${MODEL_NAME} \
+                --weight_dir tmp/hf_models/${MODEL_NAME}/tp1 \
                 --output_dir trt_engines/${MODEL_NAME}/1-gpu \
                 --engine_name ${MODEL_NAME} \
                 --remove_input_padding \
@@ -52,6 +52,7 @@ This document shows how to run multimodal pipelines with TensorRT-LLM, e.g. from
 
     ```bash
     python run.py \
+              --blip_encoder \
               --max_new_tokens 30 \
               --input_text "Question: which city is this? Answer:" \
               --hf_model_dir tmp/hf_models/${MODEL_NAME} \
@@ -94,6 +95,7 @@ OPT pipeline needs few minor changes from T5 pipeline
     python build_visual_engine.py --model_name ${MODEL_NAME} --model_path tmp/hf_models/${MODEL_NAME}
 
     python run.py \
+              --blip_encoder \
               --max_new_tokens 30 \
               --input_text "Question: which city is this? Answer:" \
               --hf_model_dir tmp/hf_models/${MODEL_NAME} \
