@@ -116,8 +116,10 @@ please run the following commands to install TensorRT-LLM.
 nvidia-docker run --entrypoint /bin/bash -it nvidia/cuda:12.1.0-devel-ubuntu22.04
 # Install dependencies, TensorRT-LLM requires Python 3.10
 apt-get update && apt-get -y install python3.10 python3-pip openmpi-bin libopenmpi-dev
-# Install the latest version of TensorRT-LLM
-pip3 install tensorrt_llm -U --extra-index-url https://pypi.nvidia.com
+# Install the latest preview version (corresponding to the main branch) of TensorRT-LLM.
+# If you want to install the stable version (corresponding to the release branch), please
+# remove the `--pre` option.
+pip3 install tensorrt_llm -U --pre --extra-index-url https://pypi.nvidia.com
 # Check installation
 python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"
 ```
