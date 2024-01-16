@@ -22,7 +22,7 @@ from ...functional import (RotaryScalingType, Tensor, gather_last_token_logits,
                            recv, send)
 from ...layers import (MOE, Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, FusedGatedMLP, GatedMLP,
-                       KeyValueCacheParams, LoraParams, MoeConfig,
+                       KeyValueCacheParams, LoraParams, Ia3Params, MoeConfig,
                        PositionEmbeddingType, PromptTuningEmbedding, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
@@ -162,7 +162,8 @@ class LLaMADecoderLayer(Module):
 
         hidden_states = self.mlp(hidden_states,
                                  all_reduce_workspace,
-                                 lora_layer_params=lora_layer_params)
+                                 lora_layer_params=lora_layer_params,
+                                 ia3_layer_params=ia3_layer_params)
         if self._layer_id == 0:
             self.register_network_output(f"mlp", hidden_states)
 
@@ -577,7 +578,7 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopModelMixin):
                 max_context_length=max_input_len,
                 host_request_types=model_inputs['host_request_types']),
             Ia3Params(
-                model_inputs['lora_weights_pointers']
+                model_inputs['ia3_weights_pointers']
             )
         )
 

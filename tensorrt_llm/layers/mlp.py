@@ -77,7 +77,11 @@ class MLP(Module):
         self.dtype = dtype
         self.bias = bias
 
-    def forward(self, hidden_states, workspace=None, lora_layer_params=None):
+    def forward(self, 
+                hidden_states, 
+                workspace=None, 
+                lora_layer_params=None,
+                ia3_layer_params=None):
         mlp_fc_lora_params = None
         if lora_layer_params is not None:
             mlp_fc_lora_params = lora_layer_params.get_runtime_params(
@@ -87,11 +91,18 @@ class MLP(Module):
         if lora_layer_params is not None:
             mlp_proj_lora_params = lora_layer_params.get_runtime_params(
                 0, "mlp_4h_to_h")
+            
+        mlp_fc_ia3_params = None
+        if ia3_layer_params is not None:
+            mlp_fc_ia3_params = ia3_layer_params.get_runtime_params(
+                0, "mlp_h_to_4h")
 
         inter = self.fc(hidden_states, mlp_fc_lora_params)
         inter = ACT2FN[self.hidden_act](inter)
         
-        # TODO: IA3
+        assert mlp_fc_ia3_params is not None
+        if mlp_fc_ia3_params is not None:
+            inter = inter * mlp_fc_ia3_params.ia3_weights_pointers[0]
         
         output = self.proj(inter,
                            workspace,
@@ -149,11 +160,20 @@ class GatedMLP(MLP):
                                      tp_size=tp_size,
                                      gather_output=False)
 
-    def forward(self, hidden_states, workspace=None, lora_layer_params=None):
+    def forward(self, 
+                hidden_states, 
+                workspace=None, 
+                lora_layer_params=None,
+                ia3_layer_params=None):
 
         mlp_fc_lora_params = None
         if lora_layer_params is not None:
             mlp_fc_lora_params = lora_layer_params.get_runtime_params(
+                0, "mlp_h_to_4h")
+            
+        mlp_fc_ia3_params = None
+        if ia3_layer_params is not None:
+            mlp_fc_ia3_params = ia3_layer_params.get_runtime_params(
                 0, "mlp_h_to_4h")
 
         mlp_gate_lora_params = None
@@ -165,14 +185,26 @@ class GatedMLP(MLP):
         if lora_layer_params is not None:
             mlp_proj_lora_params = lora_layer_params.get_runtime_params(
                 0, "mlp_4h_to_h")
+            
+        mlp_proj_ia3_params = None
+        if ia3_layer_params is not None:
+            mlp_proj_ia3_params = ia3_layer_params.get_runtime_params(
+                0, "mlp_4h_to_h")
 
-        inter = self.fc(hidden_states, mlp_fc_lora_params)
+        inter = self.fc(hidden_states, mlp_fc_lora_params)    
         inter = ACT2FN[self.hidden_act](inter)
+        if mlp_fc_ia3_params is not None:
+            inter = inter * mlp_fc_ia3_params.ia3_weights_pointers[0]
+
         gate = self.gate(hidden_states, mlp_gate_lora_params)
+        
         intermediate = inter * gate
         output = self.proj(intermediate,
                            workspace,
                            lora_runtime_params=mlp_proj_lora_params)
+        if mlp_proj_ia3_params is not None:
+            output = output * mlp_proj_ia3_params.ia3_weights_pointers[0]
+        
         return output
 
 
@@ -206,7 +238,11 @@ class FusedGatedMLP(GatedMLP):
             max_low_rank=min(hidden_size, ffn_hidden_size // tp_size),
         )
 
-    def forward(self, hidden_states, workspace=None, lora_layer_params=None):
+    def forward(self, 
+                hidden_states, 
+                workspace=None, 
+                lora_layer_params=None,
+                ia3_layer_params=None):
         # Combine the following pattern
         #
         #   SiLU(FC(x)) + Gate(x)
@@ -293,6 +329,11 @@ class FusedGatedMLP(GatedMLP):
                     hidden_states, mlp_in_lora_params)
                 mlp_in_result = concat([mlp_gate_lora, mlp_fc_lora], dim=2)
                 inter = inter + mlp_in_result
+                
+        mlp_fc_ia3_params = None
+        if ia3_layer_params is not None:
+            mlp_fc_ia3_params = ia3_layer_params.get_runtime_params(
+                0, "mlp_h_to_4h")
 
         if self.hidden_act == 'silu':
             inter = ACT2FN['swiglu'](inter)
@@ -300,6 +341,11 @@ class FusedGatedMLP(GatedMLP):
             raise NotImplementedError(
                 f"Activation {self.hidden_act} not yet implemented for FusedGatedMLP"
             )
+        
+        assert mlp_fc_ia3_params is not None
+        if mlp_fc_ia3_params is not None:
+            # TODO: plugin here
+            pass
 
         mlp_proj_lora_params = None
         if lora_layer_params is not None:

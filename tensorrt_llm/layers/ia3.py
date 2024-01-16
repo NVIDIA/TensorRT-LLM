@@ -1,3 +1,4 @@
+from ..module import Module
 
 
 class Ia3RuntimeParams(object):
@@ -24,3 +25,23 @@ class Ia3Params(object):
             )
         else:
             return None
+
+
+class Ia3QKV(Module):
+
+    def __init__(self,
+                 query_size,
+                 kv_size):
+        super().__init__()
+        self.query_size = query_size
+        self.kv_size = kv_size
+
+    def forward(self,
+                qkv,
+                k_runtime_params: Ia3RuntimeParams = None,
+                v_runtime_params: Ia3RuntimeParams = None,
+                unfuse_qkv_gemm: bool = False):
+        
+        # TODO: plugin here
+
+        pass

@@ -108,6 +108,7 @@ def main(args):
             args.use_py_session = True
         runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
         runner_kwargs = dict(engine_dir=args.engine_dir,
+                             ia3_dir=args.ia3_dir,
                              rank=runtime_rank,
                              debug_mode=args.debug_mode)
         if not args.use_py_session:
@@ -233,7 +234,8 @@ def main(args):
                 presence_penalty=presence_penalty,
                 frequency_penalty=frequency_penalty,
                 output_sequence_lengths=True,
-                return_dict=True)
+                return_dict=True,
+                ia3_uids=[0 for _ in range(batch_size)])
             torch.cuda.synchronize()
 
         # Extract a list of tensors of shape beam_width x output_ids.
@@ -531,6 +533,7 @@ if __name__ == '__main__':
         choices=['fp32', 'fp16', 'bf16', 'float32', 'float16', 'bfloat16'],
         default='fp16')
     parser.add_argument('--engine_dir', type=str, default='engine_outputs')
+    parser.add_argument('--ia3_dir', type=str, default=None)
     parser.add_argument('--use_py_session',
                         default=False,
                         action='store_true',

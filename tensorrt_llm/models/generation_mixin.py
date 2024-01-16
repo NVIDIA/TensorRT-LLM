@@ -521,10 +521,10 @@ class GenerationMixin:
                             ('batch_size_beam_width', bb_range),
                         ]))
                     ia3_weight_pointer_dict.update({
-                        f'{ia3_module}_ia3_weights_poiners':
+                        f'{ia3_module}_ia3_weights_pointers':
                         ia3_weight_pointer
                     })
-                ia3_weights_pointers.append(ia3_weight_pointer_dict)                    
+                ia3_weights_pointers.append(ia3_weight_pointer_dict)       
                     
 
         lora_weights_pointers = None

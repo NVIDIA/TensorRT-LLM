@@ -43,6 +43,7 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime.lora_manager import LoraConfig
+from tensorrt_llm.runtime.ia3_manager import Ia3Config
 
 from tensorrt_llm.models.llama.weight import (  # isort:skip
     get_scaling_factors, load_from_awq_llama, load_from_binary,
@@ -402,6 +403,7 @@ def parse_arguments():
         choices=['float16', 'float32', 'bfloat16'],
         help="Activates the lora plugin which enables embedding sharing.")
     parser.add_argument('--hf_lora_dir', type=str, default=None)
+    parser.add_argument('--hf_ia3_dir', type=str, default=None)
     parser.add_argument(
         '--moe_num_experts',
         default=0,
@@ -571,7 +573,10 @@ def parse_arguments():
 
     args.lora_config = lora_config
     
-    # TODO: add ia3 config
+    ia3_config = Ia3Config.from_hf(args.hf_ia3_dir,
+                                   hf_modules_to_trtllm_modules)
+    
+    args.ia3_config = ia3_config
 
     if args.weight_only_precision == 'int4_awq':
         if args.vocab_size % 64 != 0:

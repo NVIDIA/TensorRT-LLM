@@ -108,8 +108,7 @@ class Linear(Module):
                         weight,
                         gemm_plugin,
                         use_fp8=False,
-                        lora_runtime_params: LoraRuntimeParams = None,
-                        ia3_runtime_params: Ia3RuntimeParams = None):
+                        lora_runtime_params: LoraRuntimeParams = None):
         hidden_state = x
 
         if gemm_plugin:
@@ -133,21 +132,16 @@ class Linear(Module):
         if self.gather_output and self.tp_size > 1 and self.tp_group is not None:
             # [dim0, local_dim] -> [dim0 * tp_size, local_dim] --> [dim0, local_dim * tp_size]
             x = allgather(x, self.tp_group, gather_dim=-1)
-            
-        if ia3_runtime_params is not None:
-            x = x * ia3_runtime_params.weight
 
         return x
 
     def forward(self, 
                 x, 
-                lora_runtime_params: LoraRuntimeParams = None, 
-                ia3_runtime_params: Ia3RuntimeParams = None):
+                lora_runtime_params: LoraRuntimeParams = None):
         return self.multiply_gather(x,
                                     self.weight.value,
                                     default_net().plugin_config.gemm_plugin,
-                                    lora_runtime_params=lora_runtime_params,
-                                    ia3_runtime_params=ia3_runtime_params)
+                                    lora_runtime_params=lora_runtime_params)
 
 
 ColumnLinear = Linear

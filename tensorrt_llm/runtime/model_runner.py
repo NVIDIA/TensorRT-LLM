@@ -30,7 +30,7 @@ from .engine import Engine, get_engine_version
 from .generation import (ChatGLMGenerationSession, GenerationSession,
                          LogitsProcessor, LoraManager, ModelConfig,
                          QWenForCausalLMGenerationSession, SamplingConfig,
-                         StoppingCriteria)
+                         StoppingCriteria, Ia3Manager)
 
 
 def get_engine_name(model: str, dtype: str, tp_size: int, pp_size: int,
@@ -289,7 +289,8 @@ class ModelRunner(ModelRunnerMixin):
                  max_input_len: int,
                  max_output_len: int,
                  max_beam_width: int,
-                 lora_manager: Optional[LoraManager] = None) -> None:
+                 lora_manager: Optional[LoraManager] = None,
+                 ia3_manager: Optional[Ia3Manager] = None) -> None:
         """
         Create a ModelRunner instance.
         You are recommended to use the from_dir method to load the engine and create a ModelRunner instance.
@@ -314,11 +315,13 @@ class ModelRunner(ModelRunnerMixin):
         self.max_output_len = max_output_len
         self.max_beam_width = max_beam_width
         self.lora_manager = lora_manager
+        self.ia3_manager = ia3_manager
 
     @classmethod
     def from_dir(cls,
                  engine_dir: str,
                  lora_dir: Optional[str] = None,
+                 ia3_dir: Optional[str] = None,
                  rank: int = 0,
                  debug_mode: bool = False,
                  lora_ckpt_source: str = "hf") -> 'ModelRunner':
@@ -396,7 +399,7 @@ class ModelRunner(ModelRunnerMixin):
                 paged_kv_cache=build_config.plugin_config.paged_kv_cache,
                 tokens_per_block=build_config.plugin_config.tokens_per_block,
                 quant_mode=pretrained_config.quant_mode,
-                dtype=pretrained_config.dtype,
+                dtype=pretrained_config.dtype
             )
             max_batch_size = build_config.max_batch_size
             max_input_len = build_config.max_input_len
@@ -426,12 +429,22 @@ class ModelRunner(ModelRunnerMixin):
         else:
             lora_manager = None
 
+        if ia3_dir is not None:
+            ia3_manager = Ia3Manager()
+            ia3_manager.load_from_hf(
+                model_dir=ia3_dir,
+                model_config=model_config
+            )
+        else:
+            ia3_manager = None
+
         return cls(session,
                    max_batch_size,
                    max_input_len,
                    max_output_len,
                    max_beam_width,
-                   lora_manager=lora_manager)
+                   lora_manager=lora_manager,
+                   ia3_manager=ia3_manager)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -491,6 +504,7 @@ class ModelRunner(ModelRunnerMixin):
                  prompt_table_path: Optional[str] = None,
                  prompt_tasks: Optional[str] = None,
                  lora_uids: Optional[list] = None,
+                 ia3_uids: Optional[list] = None,
                  streaming: bool = False,
                  stopping_criteria: Optional[StoppingCriteria] = None,
                  logits_processor: Optional[LogitsProcessor] = None,
@@ -553,7 +567,9 @@ class ModelRunner(ModelRunnerMixin):
             max_attention_window_size=sampling_config.max_attention_window_size,
             sink_token_length=sampling_config.sink_token_length,
             lora_manager=self.lora_manager,
-            lora_uids=lora_uids)
+            lora_uids=lora_uids,
+            ia3_manager=self.ia3_manager,
+            ia3_uids=ia3_uids)
 
         batch_input_ids = batch_input_ids.cuda()
         input_lengths = input_lengths.cuda()

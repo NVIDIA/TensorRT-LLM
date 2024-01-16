@@ -21,6 +21,7 @@ from .conv import Conv1d, Conv2d, ConvTranspose2d
 from .embedding import Embedding, PromptTuningEmbedding
 from .linear import ColumnLinear, Linear, RowLinear
 from .lora import Lora, LoraParams, LoraRuntimeParams
+from .ia3 import Ia3Params
 from .mlp import MLP, FusedGatedMLP, GatedMLP
 from .moe import MOE, MoeConfig
 from .normalization import GroupNorm, LayerNorm, RmsNorm
@@ -52,6 +53,7 @@ __all__ = [
     'KeyValueCacheParams',
     'Lora',
     'LoraParams',
+    'Ia3Params',
     'LoraRuntimeParams',
     'MOE',
     'MoeConfig',

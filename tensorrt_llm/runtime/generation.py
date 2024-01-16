@@ -37,6 +37,7 @@ from ..mapping import Mapping
 from ..quantization import QuantMode
 from .kv_cache_manager import GenerationSequence, KVCacheManager
 from .lora_manager import LoraManager
+from .ia3_manager import Ia3Manager
 from .session import _scoped_stream
 
 
@@ -599,7 +600,7 @@ class GenerationSession(object):
         if self.mapping.tp_size > 1 and model_config.use_custom_all_reduce:
             expected_tensor_names += ['all_reduce_workspace']
 
-        self.ia3_target_modules = model_config.ia3_target_modules
+        self.ia3_target_modules = ['attn_v', 'attn_k', 'mlp_4h_to_h'] #model_config.ia3_target_modules
         
         if self.ia3_target_modules is not None:
             for ia3_module in self.ia3_target_modules:
@@ -747,6 +748,10 @@ class GenerationSession(object):
     @property
     def use_lora_plugin(self):
         return self._model_config.lora_plugin
+    
+    @property
+    def use_ia3(self):
+        return True
 
     @property
     def use_context_fmha_for_generation(self):
@@ -1184,7 +1189,6 @@ class GenerationSession(object):
                 dtype=torch.int64,
                 device="cpu")
 
-        # TODO: fill ia3 weights
         if self.use_ia3 and self.ia3_manager is not None:
             assert ia3_uids is not None
             
@@ -1192,15 +1196,15 @@ class GenerationSession(object):
                 layer_idx = idx + self.first_layer
                 for ia3_module in self.ia3_target_modules:
                     self.buffer.update({
-                        f'{ia3_module}_ia3_weights_pointers_{layer_idx}':
-                        torch.ones(size=(batch_size),
-                                   dtype=torch.float32).contiguous().cpu()
+                            f'{ia3_module}_ia3_weights_pointers_{layer_idx}':
+                            torch.zeros(size=(batch_size, ),
+                                        dtype=torch.int64).contiguous().cpu()
                     })
                     for batch_idx in range(batch_size):
                         ia3_uid = ia3_uids[batch_idx]
                         if ia3_uid is not None and ia3_uid != "-1":
                             self.buffer[
-                                f'{ia3_module}_ia3_weights_poiners_{layer_idx}'][
+                                f'{ia3_module}_ia3_weights_pointers_{layer_idx}'][
                                     batch_idx] = self.ia3_manager.ia3_weights_pointers_list[
                                         layer_idx][ia3_uid][ia3_module]
 
@@ -1408,6 +1412,13 @@ class GenerationSession(object):
         if self.use_custom_all_reduce and self.mapping.tp_size > 1:
             add_tensor(self.all_reduce_workspace, 'all_reduce_workspace')
 
+        if self.use_ia3:
+            for idx in range(self.num_layers):
+                for ia3_module in self.ia3_target_modules:
+                    layer_idx = idx + self.first_layer
+                    ia3_weights = f'{ia3_module}_ia3_weights_pointers_{layer_idx}'
+                    add_tensor(self.buffer[ia3_weights], ia3_weights)
+
         if self.use_lora_plugin:
             for idx in range(self.num_layers):
                 for lora_module in self.lora_target_modules:
@@ -1587,7 +1598,12 @@ class GenerationSession(object):
         if self.use_custom_all_reduce and self.mapping.tp_size > 1:
             add_tensor(self.all_reduce_workspace, 'all_reduce_workspace')
 
-        # TODO: add ia3 tensors
+        if self.use_ia3:
+            for idx in range(self.num_layers):
+                for ia3_module in self.ia3_target_modules:
+                    layer_idx = idx + self.first_layer
+                    ia3_weights = f'{ia3_module}_ia3_weights_pointers_{layer_idx}'
+                    add_tensor(self.buffer[ia3_weights], ia3_weights)
 
         if self.use_lora_plugin:
             for idx in range(self.num_layers):
