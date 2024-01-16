@@ -106,6 +106,10 @@ def get_args():
                         choices=['fp8', 'int8_sq', 'int4_awq'],
                         default='fp8',
                         help='Quantization format.')
+    parser.add_argument('--calibrate_kv_cache',
+                        default=False,
+                        action="store_true",
+                        help='Calibrate kv cache for int8 quantization.')
     parser.add_argument('--group_size',
                         type=int,
                         default=128,
@@ -150,10 +154,10 @@ def main():
                                             cache_dir=args.cache_dir)
 
     quant_cfg_dict = {}
-    if not args.quantize_lm_head:
+    if args.quantize_lm_head:
         quant_cfg_dict.update({
             "*lm_head*": {
-                "enable": False
+                "enable": True
             },
         })
     if args.group_size != 128:
@@ -166,7 +170,24 @@ def main():
                 "enable": True
             },
         })
-    print(f"quant_cfg_dict: {quant_cfg_dict}")
+    if args.calibrate_kv_cache:
+        quant_cfg_dict.update({
+            "*.query_key_value.output_quantizer": {
+                "num_bits": 8,
+                "axis": None,
+                "enable": True
+            },
+            "*.k_proj.output_quantizer": {
+                "num_bits": 8,
+                "axis": None,
+                "enable": True
+            },
+            "*.v_proj.output_quantizer": {
+                "num_bits": 8,
+                "axis": None,
+                "enable": True
+            },
+        })
 
     model = quantize_and_export(model,
                                 qformat=args.qformat,

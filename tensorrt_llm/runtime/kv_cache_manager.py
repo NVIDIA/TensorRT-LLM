@@ -108,8 +108,11 @@ class BlocksManager(object):
                     self.blocks * elts_per_block * self._sizeof[pool.dtype])
             self.free_blocks.append(Block(bi, k_ptrs, v_ptrs))
 
+        beam_width = self.beam_width
+        # Here use beam_width instead of self.beam_width to remove cyclic reference between self and
+        # self.allocated_blocks by preventing capture self, which may cause memory leak.
         self.allocated_blocks = defaultdict(
-            lambda: [[] for _ in range(self.beam_width)])
+            lambda: [[] for _ in range(beam_width)])
 
     def has_free_block(self) -> bool:
         """
@@ -381,3 +384,74 @@ class KVCacheManager(object):
                 self.blocks_manager.get_pointer_array(
                     pool, beam_width).view(dtype=torch.int64))
         return pointer_arrays
+
+
+class KVCacheUpdater:
+
+    def __init__(self):
+        self.use_paged_kv_cache = None
+        self.num_kv_heads = None
+        self.head_dim = None
+        self.elt_size = None
+        self.past_key_value_list = None
+        self.max_kv_cache_length = None
+        self.kv_cache_manager = None
+
+    def init_linear_kv_cache(self, num_kv_heads, head_dim, kv_cache_type,
+                             past_key_value_list):
+        self.use_paged_kv_cache = False
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.past_key_value_list = past_key_value_list
+        self.elt_size = torch.zeros(1, dtype=kv_cache_type).element_size()
+        self.max_kv_cache_length = past_key_value_list[0].shape[3]
+
+    def init_paged_kv_cache(self, num_kv_heads, head_dim, kv_cache_type,
+                            kv_cache_manager):
+        self.use_paged_kv_cache = True
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.kv_cache_manager = kv_cache_manager
+        self.elt_size = torch.zeros(1, dtype=kv_cache_type).element_size()
+
+    def update(self, accepted_draft_token_offsets,
+               packed_accepted_draft_tokens_indices, sequence_length_buffer,
+               rewind_tokens):
+        assert self.use_paged_kv_cache is not None
+        if self.use_paged_kv_cache:
+            host_kv_cache_block_pointers = self.kv_cache_manager.get_pointer_arrays(
+                1)
+            kv_cache_block_pointers = [
+                x.to('cuda') for x in host_kv_cache_block_pointers
+            ]
+            torch.ops.tensorrt_llm.update_kv_cache_draft_token_location(
+                accepted_draft_token_offsets,
+                packed_accepted_draft_tokens_indices,
+                sequence_length_buffer,
+                True,
+                self.num_kv_heads,
+                self.head_dim * self.elt_size,
+                rewind_tokens,
+                self.kv_cache_manager.max_attention_window_size,
+                None,
+                kv_cache_block_pointers,
+                self.kv_cache_manager.blocks_manager.max_blocks_per_seq,
+                self.kv_cache_manager.tokens_per_block,
+                None,
+            )
+        else:
+            torch.ops.tensorrt_llm.update_kv_cache_draft_token_location(
+                accepted_draft_token_offsets,
+                packed_accepted_draft_tokens_indices,
+                sequence_length_buffer,
+                False,
+                self.num_kv_heads,
+                self.head_dim * self.elt_size,
+                rewind_tokens,
+                self.max_kv_cache_length,
+                self.past_key_value_list,
+                None,
+                None,
+                None,
+                None,
+            )

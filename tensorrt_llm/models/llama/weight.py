@@ -1164,9 +1164,7 @@ def load_from_binary(tensorrt_llm_llama: 'LLaMAForCausalLM',
                 '.attention.query_key_value.scale_y_quant_orig.bin', [1],
                 np.float32)
             tensorrt_llm_llama.layers[
-                idx].attention.kv_orig_quant_scale.value = 1.0 / t
-            tensorrt_llm_llama.layers[
-                idx].attention.kv_quant_orig_scale.value = t
+                idx].attention.kv_cache_scaling_factor.value = t
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
@@ -1588,7 +1586,7 @@ def load_from_awq_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
         v = load(prefix + awq_key_list[10])
         layer.post_layernorm.weight.value = v.to(torch_dtype).cpu().numpy()
 
-        # 4.8 attention.kv_quant_orig_scale / kv_quant_orig_scale for INT8 KV cache
+        # 4.8 attention.kv_cache_scaling_factor for INT8 KV cache
         if use_int8_kv_cache:
             assert bin_model_dir, "You must pass --bin_model_dir to tell TRT-LLM where to look for scales of INT8 kv cache."
             t = fromfile(
@@ -1596,14 +1594,12 @@ def load_from_awq_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
                 '.attention.query_key_value.scale_y_quant_orig.bin', [1],
                 np.float32)
             assert t is not None, f"{bin_model_dir} does not contain model.layers.{layer_idx}.attention.query_key_value.scale_y_quant_orig.bin"
-            layer.attention.kv_orig_quant_scale.value = 1.0 / t
-            layer.attention.kv_quant_orig_scale.value = t
+            layer.attention.kv_cache_scaling_factor.value = t
 
-        # 4.9 attention.kv_quant_orig_scale / kv_quant_orig_scale for FP8 KV cache
+        # 4.9 attention.kv_cache_scaling_factor for FP8 KV cache
         if use_fp8_kv_cache:
             t = torch.Tensor([1.0])
-            layer.attention.kv_orig_quant_scale.value = 1.0 / t
-            layer.attention.kv_quant_orig_scale.value = t
+            layer.attention.kv_cache_scaling_factor.value = t
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

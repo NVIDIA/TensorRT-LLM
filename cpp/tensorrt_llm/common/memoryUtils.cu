@@ -860,5 +860,47 @@ bool invokeCheckRange(const T* buffer, const size_t size, T min, T max, bool* d_
 template bool invokeCheckRange<int>(
     const int* buffer, const size_t size, int min, int max, bool* d_within_range, cudaStream_t stream);
 
+/*
+ *  Determine the total workspace size based on a vector containing multiple variable sizes.
+ */
+size_t calcAlignedSize(const std::vector<size_t>& sizes, const size_t ALIGN_BYTES)
+{
+    const size_t ALIGN_MASK = ~(ALIGN_BYTES - 1);
+    // Check ALIGN_BYTES is a power of 2
+    assert((ALIGN_BYTES & (ALIGN_BYTES - 1)) == 0);
+
+    size_t total = 0;
+    for (auto sz : sizes)
+    {
+        total += (sz + ALIGN_BYTES - 1) & ALIGN_MASK;
+    }
+
+    // We add extra "ALIGN_BYTES - 1" bytes in case the start address passed to the function calcAlignedPointers() is
+    // not aligned.
+    return total + ALIGN_BYTES - 1;
+}
+
+/*
+ * Given the address of the workspace and the vector containing multiple variable sizes, calculate the start addresses
+ * of each variable.
+ */
+void calcAlignedPointers(
+    std::vector<void*>& outPtrs, const void* p, const std::vector<size_t>& sizes, size_t ALIGN_BYTES)
+{
+    const size_t ALIGN_MASK = ~(ALIGN_BYTES - 1);
+    // Check ALIGN_BYTES is a power of 2
+    assert((ALIGN_BYTES & (ALIGN_BYTES - 1)) == 0);
+
+    // In case the start address is not aligned
+    char* ptr = reinterpret_cast<char*>((reinterpret_cast<size_t>(p) + ALIGN_BYTES - 1) & ALIGN_MASK);
+
+    outPtrs.reserve(sizes.size());
+    for (auto sz : sizes)
+    {
+        outPtrs.push_back(ptr);
+        ptr += (sz + ALIGN_BYTES - 1) & ALIGN_MASK;
+    }
+}
+
 } // namespace common
 } // namespace tensorrt_llm

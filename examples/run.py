@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import argparse
+import ast
 import csv
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from utils import (DEFAULT_HF_MODEL_DIRS, DEFAULT_PROMPT_TEMPLATES,
                    load_tokenizer, read_model_name, throttle_generator)
 
 import tensorrt_llm
+import tensorrt_llm.profiler
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
 
@@ -128,6 +130,7 @@ def parse_arguments(args=None):
     parser.add_argument('--lora_dir',
                         type=str,
                         default=None,
+                        nargs="+",
                         help="The directory of LoRA weights")
     parser.add_argument(
         '--lora_task_uids',
@@ -140,7 +143,6 @@ def parse_arguments(args=None):
                         default="hf",
                         choices=["hf", "nemo"],
                         help="The source of lora checkpoint.")
-
     parser.add_argument(
         '--num_prepend_vtokens',
         nargs="+",
@@ -148,6 +150,18 @@ def parse_arguments(args=None):
         help="Number of (default) virtual tokens to prepend to each sentence."
         " For example, '--num_prepend_vtokens=10' will prepend the tokens"
         " [vocab_size, vocab_size + 1, ..., vocab_size + 9] to the sentence.")
+    parser.add_argument(
+        '--run_profiling',
+        default=False,
+        action='store_true',
+        help="Run several 10 iterations to profile the inference latencies.")
+    parser.add_argument(
+        '--medusa_choices',
+        type=str,
+        default=None,
+        help="Medusa choice to use, if not none, will use Medusa decoding."
+        "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 medusa tokens."
+    )
 
     return parser.parse_args(args=args)
 
@@ -339,6 +353,14 @@ def main(args):
                          rank=runtime_rank,
                          debug_mode=args.debug_mode,
                          lora_ckpt_source=args.lora_ckpt_source)
+    if args.medusa_choices is not None:
+        args.medusa_choices = ast.literal_eval(args.medusa_choices)
+        assert args.use_py_session, "Medusa is only supported by py_session"
+        assert args.temperature == 0, "Medusa should use temperature == 0"
+        assert len(
+            batch_input_ids) == 1, "Medusa should use max_batch_size == 1"
+        assert args.num_beams == 1, "Medusa should use num_beams == 1"
+        runner_kwargs.update(medusa_choices=args.medusa_choices)
     if not args.use_py_session:
         runner_kwargs.update(
             max_batch_size=len(batch_input_ids),
@@ -373,7 +395,8 @@ def main(args):
             prompt_tasks=args.prompt_tasks,
             streaming=args.streaming,
             output_sequence_lengths=True,
-            return_dict=True)
+            return_dict=True,
+            medusa_choices=args.medusa_choices)
         torch.cuda.synchronize()
 
     if args.streaming:
@@ -407,6 +430,67 @@ def main(args):
                          context_logits=context_logits,
                          generation_logits=generation_logits,
                          output_logits_npy=args.output_logits_npy)
+
+    if args.run_profiling:
+        ite = 10
+        # warmup
+        for _ in range(ite):
+            with torch.no_grad():
+                outputs = runner.generate(
+                    batch_input_ids,
+                    max_new_tokens=args.max_output_len,
+                    max_attention_window_size=args.max_attention_window_size,
+                    end_id=end_id,
+                    pad_id=pad_id,
+                    temperature=args.temperature,
+                    top_k=args.top_k,
+                    top_p=args.top_p,
+                    num_beams=args.num_beams,
+                    length_penalty=args.length_penalty,
+                    repetition_penalty=args.repetition_penalty,
+                    presence_penalty=args.presence_penalty,
+                    frequency_penalty=args.frequency_penalty,
+                    stop_words_list=stop_words_list,
+                    bad_words_list=bad_words_list,
+                    lora_uids=args.lora_task_uids,
+                    prompt_table_path=args.prompt_table_path,
+                    prompt_tasks=args.prompt_tasks,
+                    streaming=args.streaming,
+                    output_sequence_lengths=True,
+                    return_dict=True)
+                torch.cuda.synchronize()
+
+        tensorrt_llm.profiler.start("tmp")
+        for _ in range(ite):
+            with torch.no_grad():
+                outputs = runner.generate(
+                    batch_input_ids,
+                    max_new_tokens=args.max_output_len,
+                    max_attention_window_size=args.max_attention_window_size,
+                    end_id=end_id,
+                    pad_id=pad_id,
+                    temperature=args.temperature,
+                    top_k=args.top_k,
+                    top_p=args.top_p,
+                    num_beams=args.num_beams,
+                    length_penalty=args.length_penalty,
+                    repetition_penalty=args.repetition_penalty,
+                    presence_penalty=args.presence_penalty,
+                    frequency_penalty=args.frequency_penalty,
+                    stop_words_list=stop_words_list,
+                    bad_words_list=bad_words_list,
+                    lora_uids=args.lora_task_uids,
+                    prompt_table_path=args.prompt_table_path,
+                    prompt_tasks=args.prompt_tasks,
+                    streaming=args.streaming,
+                    output_sequence_lengths=True,
+                    return_dict=True)
+                torch.cuda.synchronize()
+        tensorrt_llm.profiler.stop("tmp")
+
+        print(
+            f"batch_size: {len(batch_input_ids)}, avg latency of {ite} iterations: : {tensorrt_llm.profiler.elapsed_time_in_sec('tmp') / ite} sec"
+        )
 
 
 if __name__ == '__main__':

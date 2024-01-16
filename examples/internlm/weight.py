@@ -905,9 +905,7 @@ def load_from_binary(tensorrt_llm_internlm: LLaMAForCausalLM,
                 '.attention.query_key_value.scale_y_quant_orig.bin', [1],
                 np.float32)
             tensorrt_llm_internlm.layers[
-                idx].attention.kv_orig_quant_scale.value = 1.0 / t
-            tensorrt_llm_internlm.layers[
-                idx].attention.kv_quant_orig_scale.value = t
+                idx].attention.kv_cache_scaling_factor.value = t
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

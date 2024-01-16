@@ -65,7 +65,6 @@ def set_peer_access(mapping: Mapping, enabled: bool = True):
 
 class IpcMemory():
 
-    IPC_BUFFERS_SIZE = 50331648
     IPC_BARRIERS_SIZE_PER_GPU = 25 * 4  # Max all reduce blocks * sizeof(float)
 
     def __init__(self, mapping, size):

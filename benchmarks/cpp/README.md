@@ -7,7 +7,7 @@ multiple GPUs or multiple nodes with multiple GPUs.
 
 ### 1. Build TensorRT-LLM and benchmarking source code
 
-Please follow the [`installation document`](../../docs/source/installation.md) to build TensorRT-LLM.
+Please follow the [`installation document`](../../README.md#installation) to build TensorRT-LLM.
 
 Note that the benchmarking source code for C++ runtime is not built by default, you can use the argument `--benchmarks` in [`build_wheel.py`](source:scripts/build_wheel.py) to build the corresponding executable.
 

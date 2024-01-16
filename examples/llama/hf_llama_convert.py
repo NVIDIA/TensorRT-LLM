@@ -18,6 +18,7 @@ Convert huggingface GPT model. Use https://huggingface.co/gpt2 as demo.
 import argparse
 import configparser
 import os
+import platform
 from pathlib import Path
 
 import torch
@@ -348,6 +349,12 @@ if __name__ == "__main__":
     parser.add_argument("--convert-model-on-cpu", action="store_true")
 
     args = parser.parse_args()
+    if args.processes > 1 and platform.system() == "Windows":
+        print(
+            "Resetting processes to 1 because multi-process on Windows is not implemented."
+        )
+        args.processes = 1
+
     print("\n=============== Argument ===============")
     for key in vars(args):
         print("{}: {}".format(key, vars(args)[key]))

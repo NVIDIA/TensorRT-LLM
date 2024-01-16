@@ -24,7 +24,8 @@ import tensorrt as trt
 
 from ._common import default_net
 from ._utils import (copy_torch_to_numpy, np_dtype_to_trt, str_dtype_to_trt,
-                     torch_to_numpy, trt_dtype_to_np, trt_dtype_to_torch)
+                     torch_dtype_to_np, torch_to_numpy, trt_dtype_to_np,
+                     trt_dtype_to_torch)
 from .functional import Tensor, constant
 from .logger import logger
 
@@ -43,7 +44,7 @@ class Parameter:
         dtype = self._DEFAULT_DTYPE if dtype is None else dtype
         if isinstance(dtype, str):
             dtype = str_dtype_to_trt(dtype)
-        self._dtype = dtype
+        self._dtype: trt.DataType = dtype
         if value is None:
             assert isinstance(shape, (list, tuple))
             self._shape = tuple(shape)
@@ -112,9 +113,11 @@ class Parameter:
         assert v.shape == self._shape, \
             f'The value updated is not the same shape as the original. ' \
             f'Updated: {v.shape}, original: {self._shape}'
-        if self._dtype != v.dtype:
+        dtype = v.dtype if isinstance(v, np.ndarray) else torch_dtype_to_np(
+            v.dtype)
+        if trt_dtype_to_np(self._dtype) != dtype:
             logger.warning(
-                f"Parameter was initialized as {self._dtype} but set to {v.dtype}"
+                f"Parameter was initialized as {self._dtype} but set to {dtype}"
             )
         self._value = v
 

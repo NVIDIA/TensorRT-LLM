@@ -15,7 +15,8 @@ repos:
     rev: v4.1.0
     hooks:
     -   id: check-added-large-files
-        exclude: 'cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/'
+        exclude: |
+            (?x)^(.*cubin.cpp)$
     -   id: check-merge-conflict
     -   id: check-symlinks
     -   id: detect-private-key

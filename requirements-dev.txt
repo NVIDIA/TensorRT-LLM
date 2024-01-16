@@ -6,6 +6,7 @@ graphviz
 mypy
 parameterized
 pre-commit
+pybind11
 pybind11-stubgen
 pytest-cov
 pytest-forked

@@ -7,9 +7,9 @@ import numpy as np
 import requests
 import tensorrt as trt
 import torch
-from lavis.models import load_model_and_preprocess
 from PIL import Image
-from transformers import AutoConfig, AutoTokenizer
+from transformers import (AutoConfig, AutoTokenizer,
+                          Blip2ForConditionalGeneration, Blip2Processor)
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
@@ -209,12 +209,9 @@ class MultiModalModel:
         return features, atts
 
     def vit_pass(self, image):
-        visual_features = {
-            'input': image.float() if self.args.blip_encoder else image.half()
-        }
-        dtype = trt.DataType.FLOAT if self.args.blip_encoder else trt.DataType.HALF
+        visual_features = {'input': image.half()}
         visual_output_info = self.vit_session.infer_shapes(
-            [TensorInfo('input', dtype, image.shape)])
+            [TensorInfo('input', trt.DataType.HALF, image.shape)])
         visual_outputs = {
             t.name: torch.empty(tuple(t.shape),
                                 dtype=trt_dtype_to_torch(t.dtype),
@@ -235,13 +232,13 @@ class MultiModalModel:
         query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1,
                                                 -1).contiguous().to("cuda")
         qformer_inputs = {
-            'query_tokens': query_tokens.float(),
-            'image_embeds': image_embeds.float(),
+            'query_tokens': query_tokens.half(),
+            'image_embeds': image_embeds.half(),
             'image_atts': image_atts
         }
         qformer_output_info = self.vit_qformer.infer_shapes([
-            TensorInfo('query_tokens', trt.DataType.FLOAT, query_tokens.shape),
-            TensorInfo('image_embeds', trt.DataType.FLOAT, image_embeds.shape),
+            TensorInfo('query_tokens', trt.DataType.HALF, query_tokens.shape),
+            TensorInfo('image_embeds', trt.DataType.HALF, image_embeds.shape),
             TensorInfo('image_atts', trt.DataType.INT64, image_atts.shape)
         ])
         qformer_outputs = {
@@ -352,17 +349,19 @@ if __name__ == '__main__':
     image = load_test_image()
     if args.blip_encoder:
         if 'opt-2.7b' in args.hf_model_dir:
-            model_type, pretrain_model_name = 'blip2_opt', 'pretrain_opt2.7b'
+            model_type = 'Salesforce/blip2-opt-2.7b'
         else:
-            model_type, pretrain_model_name = 'blip2_t5', 'pretrain_flant5xl'
+            model_type = 'Salesforce/blip2-flan-t5-xl'
 
-        model, vis_processors, _ = load_model_and_preprocess(
-            name=model_type,
-            model_type=pretrain_model_name,
-            is_eval=True,
-            device="cuda")
+        device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
+        processor = Blip2Processor.from_pretrained(model_type)
+        model = Blip2ForConditionalGeneration.from_pretrained(
+            model_type, torch_dtype=torch.float16)
+        model.to(device)
 
-        image = vis_processors["eval"](image).unsqueeze(0)
+        prompt = "Question: which city is this in? Answer:"
+        inputs = processor(image, prompt, return_tensors="pt").to(device)
+        image = inputs['pixel_values']
         image = image.expand(args.batch_size, -1, -1,
                              -1).contiguous().to("cuda")
 

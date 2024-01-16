@@ -37,7 +37,7 @@ public:
 
     TopPSamplingLayer(std::size_t vocab_size, std::size_t vocab_size_padded, cudaStream_t stream,
         std::shared_ptr<tensorrt_llm::common::IAllocator> allocator, bool is_free_buffer_after_forward,
-        cudaDeviceProp* cuda_device_prop);
+        cudaDeviceProp* cuda_device_prop, bool is_deterministic = true);
     TopPSamplingLayer(TopPSamplingLayer<T> const& top_p_sampling_layer);
     ~TopPSamplingLayer();
 
@@ -59,6 +59,8 @@ protected:
     std::int32_t* topp_offset_buf_ = nullptr;
     std::int32_t* begin_topp_offset_buf_ = nullptr;
     std::size_t cub_temp_storage_size_;
+    bool is_deterministic_ = true;
+    int air_topp_block_num_;
 
     using Base::vocab_size_;
     using Base::vocab_size_padded_;
@@ -75,6 +77,7 @@ protected:
     using Base::stream_;
     using Base::allocator_;
     using Base::is_allocate_buffer_;
+    using Base::cuda_device_prop_;
 
 private:
     void allocateBuffer(std::size_t batch_size, std::vector<float> const& top_k);

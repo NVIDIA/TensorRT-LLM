@@ -45,8 +45,6 @@ H200 is now 2.4x faster on Llama-70B with recent improvements to TensorRT-LLM GQ
 
 - [TensorRT-LLM Overview](#tensorrt-llm-overview)
 - [Installation](#installation)
-  - [Linux](./docs/source/installation.md)
-  - [Windows](windows/README.md)
 - [Quick Start](#quick-start)
 - [Support Matrix](#support-matrix)
   - [Devices](#devices)
@@ -110,10 +108,26 @@ concepts used in TensorRT-LLM, we recommend you to read the following
 
 ## Installation
 
-*For Linux installation, see [`Linux`](./docs/source/installation.md).*
-*For Windows installation, see [`Windows`](windows/README.md).*
+After installing the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit),
+please run the following commands to install TensorRT-LLM.
 
-Once installed, commands to build and run LLMs must be executed from the TensorRT-LLM container.
+```bash
+# Obtain and start the basic docker image environment
+nvidia-docker run --entrypoint /bin/bash -it nvidia/cuda:12.1.0-devel-ubuntu22.04
+# Install dependencies, TensorRT-LLM requires Python 3.10
+apt-get update && apt-get -y install python3.10 python3-pip openmpi-bin libopenmpi-dev
+# Install the latest preview version (corresponding to the main branch) of TensorRT-LLM.
+# If you want to install the stable version (corresponding to the release branch), please
+# remove the `--pre` option.
+pip3 install tensorrt_llm -U --pre --extra-index-url https://pypi.nvidia.com
+# Check installation
+python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"
+```
+
+For users who require the best performance or debugging capabilities, please refer to the instructions for
+[building from source code](docs/source/build_from_source.md).
+
+For Windows installation, see [`Windows`](windows/README.md).
 
 ## Quick Start
 

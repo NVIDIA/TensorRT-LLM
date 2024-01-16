@@ -207,11 +207,10 @@ def parse_arguments():
         help=
         'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
         'Note: the flag might not take effect when the criteria are not met.')
-    parser.add_argument(
-        '--output_dir',
-        type=Path,
-        default='baichuan_tllm_checkpoint',
-        help='The path to save the baichuan TensorRT-LLM checkpoint')
+    parser.add_argument('--output_dir',
+                        type=Path,
+                        default='tllm_checkpoint',
+                        help='The path to save the TensorRT-LLM checkpoint')
     parser.add_argument(
         "--smoothquant",
         "-sq",
@@ -711,11 +710,8 @@ def convert_hf_bloom(hf_bloom,
             kv_cache_weights = {}
 
             kv_cache_weights[
-                tllm_prex + 'attention.kv_orig_quant_scale'] = torch.from_numpy(
-                    np.array([1.0 / int8_weights['scale_y_quant_orig']],
-                             dtype=np.float32)).contiguous()
-            kv_cache_weights[
-                tllm_prex + 'attention.kv_quant_orig_scale'] = torch.from_numpy(
+                tllm_prex +
+                'attention.kv_cache_scaling_factor'] = torch.from_numpy(
                     np.array([int8_weights['scale_y_quant_orig']],
                              dtype=np.float32)).contiguous()
             weights.update(kv_cache_weights)

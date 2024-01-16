@@ -15,6 +15,8 @@
 
 import tensorrt as trt
 
+from tensorrt_llm.plugin.plugin import init_all_reduce_helper
+
 from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
 from ...functional import (Tensor, gather_last_token_logits, partial, recv,
@@ -112,7 +114,6 @@ class QWenBlock(Module):
         use_cache=False,
         kv_cache_params=None,
         attention_params=None,
-        all_reduce_workspace=None,
     ):
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
@@ -121,7 +122,6 @@ class QWenBlock(Module):
             use_cache=use_cache,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
-            workspace=all_reduce_workspace,
         )
         if use_cache:
             attention_output, presents = attention_output
@@ -208,8 +208,7 @@ class QWenModel(Module):
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None,
-                hidden_states=None,
-                all_reduce_workspace=None):
+                hidden_states=None):
 
         if kv_cache_params.past_key_value is None:
             tuple([None] * len(self.layers))
@@ -243,8 +242,7 @@ class QWenModel(Module):
                     kv_cache_block_pointers=[pointer],
                     host_kv_cache_block_pointers=[host_pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
-                attention_params=attention_params,
-                all_reduce_workspace=all_reduce_workspace)
+                attention_params=attention_params)
 
             if use_cache:
                 presents.append(hidden_states[1])
@@ -284,6 +282,7 @@ class QWenForCausalLM(QWenModel, GenerationMixin):
         embedding_sharding_dim=0,
         rms_norm_eps=1e-06,
     ):
+        init_all_reduce_helper()
         self.mapping = mapping
         if isinstance(dtype, str):
             self.dtype = str_dtype_to_trt(dtype)
@@ -347,11 +346,10 @@ class QWenForCausalLM(QWenModel, GenerationMixin):
                 last_token_ids=None,
                 kv_cache_params=None,
                 attention_params=None,
-                hidden_states=None,
-                all_reduce_workspace=None):
+                hidden_states=None):
         hidden_states = super().forward(input_ids, position_ids, use_cache,
                                         kv_cache_params, attention_params,
-                                        hidden_states, all_reduce_workspace)
+                                        hidden_states)
         if use_cache:
             hidden_states, presents = hidden_states
 
@@ -426,7 +424,9 @@ class QWenForCausalLM(QWenModel, GenerationMixin):
         )
 
         return (
-            model_inputs['input_ids'], model_inputs['position_ids'], True,
+            model_inputs['input_ids'],
+            model_inputs['position_ids'],
+            True,
             model_inputs['last_token_ids'],
             KeyValueCacheParams(
                 past_key_value=model_inputs['past_key_value'],
@@ -448,4 +448,4 @@ class QWenForCausalLM(QWenModel, GenerationMixin):
                 max_context_length=max_input_len,
                 host_request_types=model_inputs['host_request_types']),
             model_inputs['hidden_states_input'],
-            model_inputs['all_reduce_workspace'])
+        )

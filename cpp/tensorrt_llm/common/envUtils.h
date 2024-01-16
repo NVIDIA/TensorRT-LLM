@@ -20,6 +20,9 @@
 namespace tensorrt_llm::common
 {
 
+// XQA kernels (optimized kernels for generation phase).
+bool forceXQAKernels();
+
 // Tune the number of blocks per sequence for accuracy/performance purpose.
 bool getEnvMmhaMultiblockDebug();
 

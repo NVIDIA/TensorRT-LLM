@@ -167,9 +167,9 @@ if __name__ == '__main__':
     batch_size = 1
     image = image.expand(batch_size, -1, -1, -1).contiguous()
     # assert image.iscontigous()
-    visual_inputs = {'input': image.float()}
+    visual_inputs = {'input': image.half()}
     visual_output_info = session_vit.infer_shapes(
-        [TensorInfo('input', trt.DataType.FLOAT, image.shape)])
+        [TensorInfo('input', trt.DataType.HALF, image.shape)])
     visual_outputs = {
         t.name: torch.empty(tuple(t.shape),
                             dtype=trt_dtype_to_torch(t.dtype),
@@ -193,13 +193,13 @@ if __name__ == '__main__':
                                        -1).contiguous()
     # assert query_tokens.is_contiguous()
     qformer_inputs = {
-        'query_tokens': query_tokens.float(),
-        'image_embeds': image_embeds.float(),
+        'query_tokens': query_tokens.half(),
+        'image_embeds': image_embeds.half(),
         'image_atts': image_atts
     }
     qformer_output_info = session_qformer.infer_shapes([
-        TensorInfo('query_tokens', trt.DataType.FLOAT, query_tokens.shape),
-        TensorInfo('image_embeds', trt.DataType.FLOAT, image_embeds.shape),
+        TensorInfo('query_tokens', trt.DataType.HALF, query_tokens.shape),
+        TensorInfo('image_embeds', trt.DataType.HALF, image_embeds.shape),
         TensorInfo('image_atts', trt.DataType.INT64, image_atts.shape)
     ])
     qformer_outputs = {

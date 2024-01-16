@@ -205,7 +205,7 @@ def build_model(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     return Engine(engine_config, engine)
 
 
-def build(build_config: Union[str, BuildConfig],
+def build(build_config: BuildConfig,
           rank: int = 0,
           ckpt_dir: str = None,
           model_config: Union[str, PretrainedConfig] = None,
@@ -221,9 +221,6 @@ def build(build_config: Union[str, BuildConfig],
             model_config = model_config
         else:
             model_config = PretrainedConfig.from_json_file(model_config)
-
-    if isinstance(build_config, str):
-        build_config = BuildConfig.from_json_file(build_config)
 
     logits_dtype = kwargs.pop('logits_dtype', None)
     if logits_dtype is not None:
@@ -268,7 +265,7 @@ def build_and_save(rank, gpu_id, ckpt_dir, build_config, output_dir, log_level,
 
 
 def parallel_build(ckpt_dir_or_model_config: str,
-                   build_config: Union[str, BuildConfig],
+                   build_config: BuildConfig,
                    output_dir: str,
                    workers: int = 1,
                    log_level: str = 'info',
@@ -316,7 +313,6 @@ def main():
 
     workers = min(torch.cuda.device_count(), args.workers)
 
-    build_config = args.build_config
     if args.build_config is None:
         build_config = BuildConfig.from_dict({
             'max_input_len':
@@ -350,6 +346,8 @@ def main():
                 'use_custom_all_reduce': args.use_custom_all_reduce,
             }
         })
+    else:
+        build_config = BuildConfig.from_json_file(args.build_config)
 
     source = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_config
     kwargs = {'logits_dtype': args.logits_dtype}

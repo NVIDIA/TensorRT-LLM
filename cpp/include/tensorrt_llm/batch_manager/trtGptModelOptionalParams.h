@@ -33,7 +33,7 @@ public:
     using SizeType = tensorrt_llm::runtime::SizeType;
 
     explicit TrtGptModelOptionalParams(KvCacheConfig const& kvCacheConfig = KvCacheConfig{},
-        std::optional<SizeType> maxNumSequences = std::nullopt, bool enableTrtOverlap = true,
+        std::optional<SizeType> maxNumSequences = std::nullopt, bool enableTrtOverlap = false,
         std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt, bool normalizeLogProbs = true,
         bool logIterationData = false)
         : kvCacheConfig{kvCacheConfig}

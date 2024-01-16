@@ -71,7 +71,7 @@ def build_trt_llm(python_exe: str,
         python_exe, "scripts/build_wheel.py", "--cuda_architectures",
         cuda_architectures, "--build_dir",
         str(build_dir), "--dist_dir",
-        str(dist_dir), "--python_bindings"
+        str(dist_dir)
     ]
 
     if use_ccache:
@@ -233,7 +233,8 @@ def prepare_all_model_tests(python_exe: str,
         prepare_model_tests(model_name="chatglm",
                             python_exe=python_exe,
                             root_dir=root_dir,
-                            resources_dir=resources_dir)
+                            resources_dir=resources_dir,
+                            model_cache_arg=model_cache_arg)
     else:
         _log.info("Skipping ChatGLM tests")
 

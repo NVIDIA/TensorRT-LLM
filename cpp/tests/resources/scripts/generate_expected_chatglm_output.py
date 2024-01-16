@@ -15,10 +15,8 @@
 # limitations under the License.
 
 import json
-import pathlib as _pl
-import subprocess as _sp
-import typing as _tp
-from pathlib import Path
+import shutil as _shutil
+from pathlib import Path as _Path
 
 import numpy as np
 import torch
@@ -32,16 +30,8 @@ from tensorrt_llm.runtime.model_runner import get_engine_name
 
 import run  # isort:skip
 
-resources_dir = Path(
+resources_dir = _Path(
     __file__).parent.parent.parent.parent.parent / "examples/chatglm"
-
-
-def run_command(command: _tp.Sequence[str], *, cwd=None, **kwargs) -> None:
-
-    command = [str(i) for i in command]
-    print(f"Running: cd %s && %s" %
-          (str(cwd or _pl.Path.cwd()), " ".join(command)))
-    _sp.check_call(command, cwd=cwd, **kwargs)
 
 
 def generate(model_name, batch_size, beam_width):
@@ -49,13 +39,13 @@ def generate(model_name, batch_size, beam_width):
     print("generate expected %s output BatchSize=%d, BeamWidth=%d" %
           (model_name, batch_size, beam_width))
 
-    engine_dir = Path(__file__).parent.parent / f"models/rt_engine/{model_name}"
-    tokenizer_dir = resources_dir / model_name
+    engine_dir = _Path(
+        __file__).parent.parent / f"models/rt_engine/{model_name}"
     args = run.parse_arguments([
         '--engine_dir',
         str(engine_dir),
         '--tokenizer_dir',
-        str(tokenizer_dir),
+        str(resources_dir / model_name),
         '--max_output_len',
         str(1024),
         '--num_beams',
@@ -64,16 +54,16 @@ def generate(model_name, batch_size, beam_width):
         "What's new between ChatGLM3-6B and ChatGLM2-6B?",
         "Could you introduce NVIDIA Corporation for me?",
     ])
-
     args.random_seed = 1
-    if batch_size == 1:
-        args.input_text = args.input_text[:1]
-    elif batch_size > 2:
-        args.input_text += args.input_text[0] * (batch_size - 2)
 
     tensorrt_llm.logger.set_level(args.log_level)
 
-    config_path = Path(args.engine_dir) / 'config.json'
+    if batch_size == 1:
+        args.input_text = args.input_text[:1]
+    else:
+        args.input_text += args.input_text[0] * (batch_size - 2)
+
+    config_path = _Path(args.engine_dir) / 'config.json'
     with open(config_path, 'r') as f:
         config = json.load(f)
     assert (config['builder_config']['name'] == model_name)
@@ -101,12 +91,12 @@ def generate(model_name, batch_size, beam_width):
                                   tp_size=world_size,
                                   pp_size=1,
                                   rank=runtime_rank)
-    serialize_path = Path(args.engine_dir) / engine_name
+    serialize_path = _Path(args.engine_dir) / engine_name
 
-    # Remove this if transformers fix the bug in tokenizer
-    if model_name in ["chatglm_6b"]:
-        import os
-        os.system(f"cp {resources_dir}/tokenization_chatglm.py {tokenizer_dir}")
+    # fix remained error in chatglm_6b, hope to remove this in the future
+    if model_name == "chatglm_6b":
+        _shutil.copy(resources_dir / "tokenization_chatglm.py",
+                     args.tokenizer_dir)
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.tokenizer_dir, trust_remote_code=True)
@@ -115,8 +105,7 @@ def generate(model_name, batch_size, beam_width):
     if model_name in ["glm_10b"]:
         sop_id = tokenizer.sop_token_id
         eop_id = tokenizer.eop_token_id
-    input_text = args.input_text
-    tokenized = tokenizer(input_text,
+    tokenized = tokenizer(args.input_text,
                           return_tensors="pt",
                           padding=True,
                           return_length=True)
@@ -184,7 +173,7 @@ def generate(model_name, batch_size, beam_width):
     sampling_config = SamplingConfig(
         end_id=eop_id if model_name in ["glm_10b"] else end_id,
         pad_id=pad_id,
-        num_beams=args.num_beams,
+        num_beams=beam_width,
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
@@ -205,7 +194,7 @@ def generate(model_name, batch_size, beam_width):
     )
 
     decoder.setup(
-        len(input_text),
+        len(args.input_text),
         max_input_len,
         max_output_len,
         beam_width,
@@ -222,9 +211,9 @@ def generate(model_name, batch_size, beam_width):
     output_ids = output["output_ids"]
     output["sequence_lengths"]
 
-    data_path = Path(__file__).parent.parent / "data" / model_name
+    data_path = _Path(__file__).parent.parent / "data" / model_name
     data_path.mkdir(parents=True, exist_ok=True)
-    nBS, nBM = input_ids.size(0), args.num_beams
+    nBS, nBM = input_ids.size(0), beam_width
     np.save(
         str(data_path) + "/inputId-BS%d-BM%d.npy" % (nBS, nBM),
         input_ids.detach().cpu().numpy())
@@ -244,11 +233,6 @@ def generate(model_name, batch_size, beam_width):
 
 if __name__ == '__main__':
 
-    # chatglm needs 4.33.1 in case of tokenizer issues
-    # AttributeError: 'ChatGLMTokenizer' object has no attribute 'sp_tokenizer'. Did you mean: '_tokenize'?
-    run_command(["pip", "install", "--force-reinstall", "transformers==4.33.1"],
-                cwd=resources_dir)
-
     generate("chatglm_6b", batch_size=1, beam_width=1)
     generate("chatglm2_6b", batch_size=1, beam_width=1)
     generate("chatglm2_6b", batch_size=2, beam_width=1)
@@ -256,8 +240,5 @@ if __name__ == '__main__':
     generate("chatglm3_6b", batch_size=1, beam_width=1)
     generate("chatglm3_6b", batch_size=2, beam_width=1)
     generate("chatglm3_6b", batch_size=1, beam_width=2)
-    print("Done.")
 
-    # upgrade to 4.36.1 after generating tokens.
-    run_command(["pip", "install", "--force-reinstall", "transformers==4.36.1"],
-                cwd=resources_dir)
+    print("Done")

@@ -4,8 +4,8 @@ from time import time
 
 import tensorrt as trt
 import torch
-from lavis.models import load_model_and_preprocess
 from PIL import Image
+from transformers import Blip2ForConditionalGeneration, Blip2Processor
 
 
 def export_visual_wrapper_onnx(visual_wrapper, image, output_dir):
@@ -97,22 +97,23 @@ def build_trt_engine(part_id,
 
 
 def build_blip_engine(args):
-    model_type = 'blip2_opt' if args.model_name == 'opt-2.7b' else 'blip2_t5'
-    pretrain_model_name = 'pretrain_' + args.model_name.replace('-', '')
-    model, vis_processors, _ = load_model_and_preprocess(
-        name=model_type,
-        model_type=pretrain_model_name,
-        is_eval=True,
-        device=device)
+    model_type = 'Salesforce/blip2-' + args.model_name
+    device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
+    processor = Blip2Processor.from_pretrained(model_type)
+    model = Blip2ForConditionalGeneration.from_pretrained(
+        model_type, torch_dtype=torch.float16)
+    model.to(device)
 
-    image = Image.new('RGB', [10, 10])  # dummy image
-    image = vis_processors["eval"](image).unsqueeze(0).to(device)
+    raw_image = Image.new('RGB', [10, 10])  # dummy image
+    # image = vis_processors["eval"](image).unsqueeze(0).to(device)
+    prompt = "Question: what is this? Answer:"
+    inputs = processor(raw_image, prompt,
+                       return_tensors="pt").to(device, torch.float16)
+    image = inputs['pixel_values']
 
-    visual_wrapper = torch.nn.Sequential(model.visual_encoder,
-                                         model.ln_vision).float()
-    image_embeds = visual_wrapper(image)
-    export_visual_wrapper_onnx(visual_wrapper.cpu(), image.cpu(),
-                               args.output_dir)
+    visual_wrapper = model.vision_model
+    image_embeds = visual_wrapper(image)[0]
+    export_visual_wrapper_onnx(visual_wrapper, image, args.output_dir)
     build_trt_engine(0, image.shape[2], image.shape[3], args.output_dir)
 
     class QformerWrapper(torch.nn.Module):
@@ -129,8 +130,8 @@ def build_blip_engine(args):
                                       return_dict=True)
             return self.projector(query_output.last_hidden_state)
 
-    projector = model.opt_proj if args.model_name == 'opt-2.7b' else model.t5_proj
-    q_wrapper = QformerWrapper(model.Qformer.bert, projector)
+    projector = model.language_projection
+    q_wrapper = QformerWrapper(model.qformer, projector)
 
     image_atts = torch.ones(image_embeds.size()[:-1],
                             dtype=torch.long).to(image.device)

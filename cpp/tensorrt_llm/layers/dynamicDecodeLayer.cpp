@@ -45,7 +45,7 @@ void DynamicDecodeLayer<T>::initialize()
     mTopKDecode = std::make_unique<TopKSamplingLayer<T>>(vocab_size_, vocab_size_padded_, stream_, allocator_, false);
 
     mTopPDecode = std::make_unique<TopPSamplingLayer<T>>(
-        vocab_size_, vocab_size_padded_, stream_, allocator_, false, cuda_device_prop_);
+        vocab_size_, vocab_size_padded_, stream_, allocator_, false, cuda_device_prop_, /* deterministic */ true);
 
     mIdsPtrHost = runtime::BufferManager::pinned(ITensor::makeShape({}), runtime::TRTDataType<int*>::value);
 }

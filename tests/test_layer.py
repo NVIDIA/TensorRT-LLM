@@ -660,15 +660,30 @@ class TestLayer(unittest.TestCase):
                                    outputs['output'],
                                    atol=1e-6)
 
+    # The activation memory usage baseline is acquired by `session.engine.device_memory_size` and hardcoded here since it shouldn't change much across platforms if we fused mha successfully.
     @parameterized.expand([
-        (12, 512, 16, 64, 'float16', PositionEmbeddingType.alibi, False),
-        (128, 128, 12, 32, 'float16', PositionEmbeddingType.alibi, True),
-        (1, 200, 8, 128, 'float32', PositionEmbeddingType.alibi, False),
-        (48, 30, 24, 80, 'float32', PositionEmbeddingType.alibi, True),
+        (
+            12, 512, 16, 64, 'float16', PositionEmbeddingType.alibi, False,
+            402653184
+        ),  # TRT has gpu buffer management issues with fmha + alibi, so the baseline here is tested w./o. fused mha.
+        (128, 128, 12, 32, 'float16', PositionEmbeddingType.alibi, True,
+         201326592),
+        (1, 200, 8, 128, 'float32', PositionEmbeddingType.alibi, False,
+         5017600),
+        (48, 30, 24, 80, 'float32', PositionEmbeddingType.alibi, True,
+         55296000),
+        (12, 512, 16, 64, 'float16', PositionEmbeddingType.learned_absolute,
+         False, 88113152),
+        (128, 128, 12, 32, 'float16', PositionEmbeddingType.learned_absolute,
+         True, 88866816),
+        (1, 200, 8, 128, 'float32', PositionEmbeddingType.learned_absolute,
+         False, 5017600),
+        (48, 30, 24, 80, 'float32', PositionEmbeddingType.learned_absolute,
+         True, 55296000),
         (2, 128, 4, 64, 'float16', PositionEmbeddingType.learned_absolute, True,
-         True),
+         35588608, True),
         (2, 128, 4, 64, 'float32', PositionEmbeddingType.learned_absolute, True,
-         True),
+         36833280, True),
     ])
     def test_attention(self,
                        batch_size,
@@ -678,6 +693,7 @@ class TestLayer(unittest.TestCase):
                        dtype,
                        pos_emb_type,
                        causal_mask,
+                       act_mem_baseline=None,
                        use_plugin=False):
 
         hidden_size = head_num * head_size
@@ -843,6 +859,17 @@ class TestLayer(unittest.TestCase):
         engine_buffer = builder.build_engine(net, builder_config)
         session = tensorrt_llm.runtime.Session.from_serialized_engine(
             engine_buffer)
+        act_mem = session.engine.device_memory_size
+
+        # TRT doesn't support context fmha in pre-turing architecture.
+        if act_mem_baseline != None and getSMVersion() >= 75:
+            if not pos_emb_type.is_alibi():
+                # TRT has gpu buffer management issues with fmha + alibi.
+                assert act_mem < act_mem_baseline * (1 + 0.1)
+            assert act_mem > act_mem_baseline * (
+                1 - 0.1
+            ), f"The mr activation memory usage is better than baseline, please update the test_attention in test_layer.py. The outdated baseline is {act_mem_baseline}, and the new baseline is {act_mem}."
+
         stream = torch.cuda.current_stream().cuda_stream
 
         if use_plugin:

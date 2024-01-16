@@ -21,6 +21,7 @@
 
 #include "iBuffer.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/runtime/gptDecoderBatch.h"
@@ -220,8 +221,10 @@ void GptSession::createCustomAllReduceWorkspace(
     setPeerAccess(mWorldConfig, true);
 
     mIpcMemoryHandles.clear();
-    const std::size_t bufferSize = static_cast<std::size_t>(maxBatchSize) * maxBeamWidth * maxSequenceLength
-        * mModelConfig.getHiddenSize() * mWorldConfig.getTensorParallelism() * sizeof(float);
+    const std::size_t bufferSize = std::min(static_cast<std::size_t>(maxBatchSize) * maxBeamWidth * maxSequenceLength
+            * mModelConfig.getHiddenSize() * mWorldConfig.getTensorParallelism() * sizeof(float),
+        ::tensorrt_llm::utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(mWorldConfig.getTensorParallelism()));
+    mIpcMemoryHandles.emplace_back(std::make_shared<IpcMemory>(mWorldConfig, bufferSize));
     mIpcMemoryHandles.emplace_back(std::make_shared<IpcMemory>(mWorldConfig, bufferSize));
     mIpcMemoryHandles.emplace_back(std::make_shared<IpcMemory>(mWorldConfig, IpcMemory::FLAGS_SIZE * sizeof(int32_t)));
     mIpcMemoryHandles.emplace_back(std::make_shared<IpcMemory>(mWorldConfig, IpcMemory::FLAGS_SIZE * sizeof(int32_t)));
@@ -526,13 +529,10 @@ std::vector<GenerationOutput> splitOutputs(GenerationOutput& outputs, SizeType m
         if (outputs.contextLogits)
         {
             outputBatches.back().contextLogits = ITensor::slice(outputs.contextLogits, batchOffset, batchSize);
-            outputBatches.back().contextLogitsHost = ITensor::slice(outputs.contextLogitsHost, batchOffset, batchSize);
         }
         if (outputs.generationLogits)
         {
             outputBatches.back().generationLogits = ITensor::slice(outputs.generationLogits, batchOffset, batchSize);
-            outputBatches.back().generationLogitsHost
-                = ITensor::slice(outputs.generationLogitsHost, batchOffset, batchSize);
         }
     }
 
@@ -591,11 +591,12 @@ void GptSession::generate(
 
             if (mModelConfig.computeContextLogits())
             {
-                outputs.contextLogits = mBuffers.back()->cacheContextLogits;
+                // outputs.contextLogits = mBuffers.back()->cacheContextLogits;
+                if (!outputs.contextLogits)
+                {
+                    outputs.contextLogits = manager.emptyTensor(MemoryType::kGPU, getLogitDataType());
+                }
                 outputs.contextLogits->reshape(ITensor::makeShape({batchSize, maxInputLength, vocabSizePadded}));
-
-                outputs.contextLogitsHost = mBuffers.back()->cacheContextLogitsHost;
-                outputs.contextLogitsHost->reshape(ITensor::makeShape({batchSize, maxInputLength, vocabSizePadded}));
             }
 
             // Initialize the output generation logits buffer
@@ -616,12 +617,11 @@ void GptSession::generate(
 
                 TLLM_CHECK_WITH_INFO(maxNewTokens, "maxNewTokens is null");
 
-                outputs.generationLogits = mBuffers.back()->cacheGenerationLogits;
+                if (!outputs.generationLogits)
+                {
+                    outputs.generationLogits = manager.emptyTensor(MemoryType::kGPU, getLogitDataType());
+                }
                 outputs.generationLogits->reshape(
-                    ITensor::makeShape({batchSize, beamWidth, maxNewTokens, vocabSizePadded}));
-
-                outputs.generationLogitsHost = mBuffers.back()->cacheGenerationLogitsHost;
-                outputs.generationLogitsHost->reshape(
                     ITensor::makeShape({batchSize, beamWidth, maxNewTokens, vocabSizePadded}));
 
                 auto const generationLogitsShape = outputs.generationLogits->getShape();
@@ -818,11 +818,9 @@ void GptSession::generateBatched(std::vector<GenerationOutput>& microBatchesOutp
                 = ITensor::slice(buffers.cacheGenerationFragmentPointerDevice, microBatchId, 1);
             TensorPtr cachePointerHost = ITensor::slice(buffers.cacheGenerationFragmentPointerHost, microBatchId, 1);
             tensorrt_llm::runtime::kernels::mergeLogitsFragments(manager, *microBatchOutputs.generationLogits,
-                *microBatchOutputs.generationLogitsFragments, *cachePointerDevice, *cachePointerHost, 0, microBatchSize,
+                *buffers.generationLogitsFragments, *cachePointerDevice, *cachePointerHost, 0, microBatchSize,
                 beamWidth, manager.getStream(), 0);
-
-            // Copy to host
-            manager.copy(*microBatchOutputs.generationLogits, *microBatchOutputs.generationLogitsHost);
+            buffers.generationLogitsFragments->clear();
         }
     }
 
@@ -871,20 +869,13 @@ void GptSession::executeContextStep(std::vector<GenerationInput> const& microBat
         }
 
         generationBuffers.postContextStep(contextBuffers, manager, mModelConfig, mWorldConfig);
-        if (mModelConfig.computeContextLogits())
-        {
-            // Copy back to host
-            auto& outputs = microBatchesOutputs.at(generationBatchId);
-            outputs.contextLogitsHost->reshape(outputs.contextLogits->getShape());
-            manager.copy(*outputs.contextLogits, *outputs.contextLogitsHost);
-        }
         sync_check_cuda_error();
 
-        // Save the last token logits of context into generation loigt
+        // Save the last token logits of context into generation logits
         if (mModelConfig.computeGenerationLogits())
         {
-            auto& outputs = microBatchesOutputs.at(generationBatchId);
-            outputs.generationLogitsFragments->push_back(generationBuffers.logits);
+            auto& buffers = *mBuffers.at(generationBatchId);
+            buffers.generationLogitsFragments->push_back(generationBuffers.logits);
         }
 
         std::swap(generationBuffers.cacheIndirectionDecoderInput, generationBuffers.cacheIndirectionDecoderOutput);
@@ -964,8 +955,8 @@ SizeType GptSession::executeGenerationStep(SizeType step, std::vector<Generation
 
         if (mModelConfig.computeGenerationLogits())
         {
-            auto& outputs = microBatchesOutputs.at(generationBatchId);
-            outputs.generationLogitsFragments->push_back(buffers.logits);
+            auto& buffers = *mBuffers.at(generationBatchId);
+            buffers.generationLogitsFragments->push_back(buffers.logits);
         }
         sync_check_cuda_error();
 

@@ -62,9 +62,6 @@ def _quantize_model(model: torch.nn.Module,
         quant_cfg = atq.INT8_SMOOTHQUANT_CFG
     elif qformat == "int4_awq":
         quant_cfg = atq.INT4_AWQ_CFG
-        # AMMO 0.5.0 disables lm_head quantization by default, remove the filter
-        if "*lm_head*" in quant_cfg["quant_cfg"]:
-            del quant_cfg["quant_cfg"]["*lm_head*"]
     else:
         raise ValueError(f"Unsupported quantization format: {qformat}")
 
@@ -81,6 +78,7 @@ def _quantize_model(model: torch.nn.Module,
     _register_falcon_linears(model)
 
     logger.debug("Starting quantization...")
+    print(quant_cfg)
     atq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
     logger.debug("Quantization done")
     return model

@@ -123,9 +123,9 @@ class PyNVMLContext:
             pynvml.nvmlShutdown()
 
 
-def host_memory_info() -> Tuple[int, int, int]:
+def host_memory_info(pid: Optional[int] = None) -> Tuple[int, int, int]:
     if psutil is not None:
-        process = psutil.Process()
+        process = psutil.Process(pid)
         # USS reports the amount of memory that would be freed if the process
         # was terminated right now.
         #   https://psutil.readthedocs.io/en/latest/index.html#psutil.Process.memory_full_info

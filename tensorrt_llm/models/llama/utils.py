@@ -33,7 +33,7 @@ def load_state_dict(
         from safetensors import safe_open
         with safe_open(file_path, framework='pt', device=device) as f:
             for name in f.keys():
-                model_params[name] = f.get_tensor(name).to(dtype).clone()
+                model_params[name] = f.get_tensor(name).to(dtype)
     elif file_path.suffix == '.bin':
         # load from pytorch bin file
         state_dict = torch.load(file_path, map_location=device)

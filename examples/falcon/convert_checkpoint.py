@@ -30,6 +30,30 @@ def parse_arguments():
                         type=str,
                         default='float32',
                         choices=['float16', 'float32'])
+    parser.add_argument(
+        '--use_parallel_embedding',
+        action="store_true",
+        default=False,
+        help=
+        'By default embedding parallelism is disabled. By setting this flag, embedding parallelism is enabled'
+    )
+    parser.add_argument(
+        '--embedding_sharding_dim',
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=
+        'By default the embedding lookup table is sharded along vocab dimension (embedding_sharding_dim=0). '
+        'To shard it along hidden dimension, set embedding_sharding_dim=1'
+        'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
+    )
+    parser.add_argument(
+        '--use_embedding_sharing',
+        action="store_true",
+        default=False,
+        help=
+        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
+        'Note: the flag might not take effect when the criteria are not met.')
 
     parser.add_argument(
         '--ammo_quant_ckpt_path',
@@ -328,9 +352,11 @@ def convert_hf_falcon(hf_model: FalconForCausalLM,
                       hf_config: FalconConfig,
                       mapping: Mapping,
                       dtype: str = 'float32',
+                      use_parallel_embedding: bool = False,
+                      sharding_dim: int = 0,
+                      share_embedding_table: bool = False,
                       use_weight_only: bool = False,
                       plugin_weight_only_quant_type: torch.dtype = torch.int8):
-
     weights = {}
     tik = time.time()
 
@@ -338,6 +364,7 @@ def convert_hf_falcon(hf_model: FalconForCausalLM,
     dtype = getattr(torch, dtype)
     num_attention_heads = hf_config.num_attention_heads
     hidden_size = hf_config.hidden_size
+    vocab_size = hf_config.vocab_size
     num_kv_heads = getattr(hf_config, 'num_kv_heads', num_attention_heads)
     num_hidden_layers = hf_config.num_hidden_layers
     parallel_attention = hf_config.parallel_attn
@@ -441,12 +468,22 @@ def convert_hf_falcon(hf_model: FalconForCausalLM,
 
     embed_w = get_weight(model_params, 'transformer.word_embeddings', dtype)
     if mapping.is_first_pp_rank():
-        weights['transformer.vocab_embedding.weight'] = embed_w
+        if not use_parallel_embedding:
+            weights['transformer.vocab_embedding.weight'] = embed_w
+        else:
+            if sharding_dim == 0:
+                assert vocab_size % mapping.tp_size == 0
+            else:
+                assert hidden_size % mapping.tp_size == 0
+            weights['transformer.vocab_embedding.weight'] = split_matrix(
+                embed_w, mapping.tp_size, mapping.tp_rank, sharding_dim)
+
     if mapping.is_last_pp_rank():
-        weights['lm_head.weight'] = split_matrix(embed_w.clone(),
-                                                 mapping.tp_size,
-                                                 mapping.tp_rank,
-                                                 dim=0)
+        if not share_embedding_table:
+            weights['lm_head.weight'] = split_matrix(embed_w.clone(),
+                                                     mapping.tp_size,
+                                                     mapping.tp_rank,
+                                                     dim=0)
         ln_f_w, ln_f_b = get_weight_and_bias(model_params, 'transformer.ln_f',
                                              dtype)
         weights['transformer.ln_f.weight'] = ln_f_w
@@ -464,6 +501,9 @@ def load_from_hf_falcon_checkpoint(
         hf_config: FalconConfig,
         mapping: Mapping,
         dtype: str = 'float32',
+        use_parallel_embedding: bool = False,
+        sharding_dim: int = 0,
+        share_embedding_table: bool = False,
         use_weight_only: bool = False,
         plugin_weight_only_quant_type: torch.dtype = torch.int8):
 
@@ -473,6 +513,7 @@ def load_from_hf_falcon_checkpoint(
     dtype = getattr(torch, dtype)
     num_attention_heads = hf_config.num_attention_heads
     hidden_size = hf_config.hidden_size
+    vocab_size = hf_config.vocab_size
     num_kv_heads = getattr(hf_config, 'num_kv_heads', num_attention_heads)
     num_hidden_layers = hf_config.num_hidden_layers
 
@@ -589,8 +630,20 @@ def load_from_hf_falcon_checkpoint(
             else:
                 if 'word_embeddings' in name:
                     if mapping.is_first_pp_rank():
-                        weights['transformer.vocab_embedding.weight'] = param
-                    if mapping.is_last_pp_rank():
+                        if not use_parallel_embedding:
+                            weights[
+                                'transformer.vocab_embedding.weight'] = param
+                        else:
+                            if sharding_dim == 0:
+                                assert vocab_size % mapping.tp_size == 0
+                            else:
+                                assert hidden_size % mapping.tp_size == 0
+                            weights[
+                                'transformer.vocab_embedding.weight'] = split_matrix(
+                                    param, mapping.tp_size, mapping.tp_rank,
+                                    sharding_dim)
+
+                    if mapping.is_last_pp_rank() and not share_embedding_table:
                         weights['lm_head.weight'] = split_matrix(
                             param.clone(),
                             mapping.tp_size,
@@ -613,10 +666,15 @@ def load_from_hf_falcon_checkpoint(
 def load_from_awq_falcon(quant_ckpt_path: str,
                          hf_config: FalconConfig,
                          mapping: Mapping,
+                         use_parallel_embedding: bool = False,
+                         sharding_dim: int = 0,
+                         share_embedding_table: bool = False,
                          quantize_lm_head: bool = False,
                          dtype: str = "float16"):
     weights = {}
     tik = time.time()
+    hidden_size = hf_config.hidden_size
+    vocab_size = hf_config.vocab_size
     num_hidden_layers = hf_config.num_hidden_layers
     parallel_attention = hf_config.parallel_attn
     new_decoder_architecture = hf_config.new_decoder_architecture
@@ -735,21 +793,29 @@ def load_from_awq_falcon(quant_ckpt_path: str,
     if quantize_lm_head and v.shape[0] % 64 != 0:
         v = torch.nn.functional.pad(v, [0, 0, 0, 64 - v.shape[0] % 64])
     if mapping.is_first_pp_rank():
-        # tensorrt_llm_falcon.embedding.weight.value = v.to(torch_dtype)
-        weights['transformer.vocab_embedding.weight'] = v.to(torch_dtype)
+        if not use_parallel_embedding:
+            weights['transformer.vocab_embedding.weight'] = v.to(torch_dtype)
+        else:
+            if sharding_dim == 0:
+                assert vocab_size % mapping.tp_size == 0
+            else:
+                assert hidden_size % mapping.tp_size == 0
+            weights['transformer.vocab_embedding.weight'] = split_matrix(
+                v.to(torch_dtype), mapping.tp_size, mapping.tp_rank,
+                sharding_dim)
 
     # 2. lm_head
     if mapping.is_last_pp_rank():
         if quantize_lm_head:
+            assert not share_embedding_table
             v = [load(awq_key_list[1] + suf) for suf in awq_suffix_list]
             if v[0].shape[0] % 64 != 0:
                 v[0] = torch.nn.functional.pad(
                     v[0], [0, 0, 0, 64 - v[0].shape[0] % 64])
                 v[1] = torch.nn.functional.pad(
                     v[1], [0, 0, 0, 64 - v[1].shape[0] % 64], value=1)
-            # process_and_assign_weight(tensorrt_llm_falcon.lm_head, v, 1)
             weights.update(get_tllm_weight_from_awq(v, 'lm_head', 1))
-        else:
+        elif not share_embedding_table:
             v = load(awq_key_list[1] + awq_suffix_list[0])
             weights['lm_head.weight'] = torch_split(v.to(torch_dtype), 0)
 
@@ -757,25 +823,16 @@ def load_from_awq_falcon(quant_ckpt_path: str,
     v_weight = load(awq_key_list[2] + split_sym + "weight")
     v_bias = load(awq_key_list[2] + split_sym + "bias")
     if mapping.is_last_pp_rank():
-        # tensorrt_llm_falcon.ln_f.weight.value = v_weight.to(torch_dtype)
-        # tensorrt_llm_falcon.ln_f.bias.value = v_bias.to(torch_dtype)
         weights['transformer.ln_f.weight'] = v_weight.to(torch_dtype)
         weights['transformer.ln_f.bias'] = v_bias.to(torch_dtype)
 
     # 4. Weights inside each layer
     layers_range = mapping.pp_layers(num_hidden_layers)
     for l in layers_range:
-        # layer_idx = l - mapping.pp_rank * layers_per_pipeline_stage
-        # prefix = "layers" + split_sym + str(layer_idx) + split_sym
-        # tensorrt_llm.logger.info(f'Process weights in layer: {layer_idx}')
-        # layer = tensorrt_llm_falcon.layers[layer_idx]
-
         prefix = f'layers{split_sym}{l}{split_sym}'
         tllm_prex = f'transformer.layers.{l-layers_range[0]}'
 
         # 4.1 attention.qkv
-        # process_and_assign_qkv_weight(prefix + awq_key_list[3],
-        #                               layer.attention.qkv)
         weights.update(
             get_tllm_qkv_weight_from_awq(prefix + awq_key_list[3],
                                          f'{tllm_prex}.attention.qkv'))
@@ -791,7 +848,6 @@ def load_from_awq_falcon(quant_ckpt_path: str,
 
         # 4.2 attention.dense
         v = [load(prefix + awq_key_list[4] + suf) for suf in awq_suffix_list]
-        # process_and_assign_weight(layer.attention.dense, v, 0)
         weights.update(
             get_tllm_weight_from_awq(v,
                                      f'{tllm_prex}.attention.dense',
@@ -804,7 +860,6 @@ def load_from_awq_falcon(quant_ckpt_path: str,
 
         # 4.4 mlp.fc
         v = [load(prefix + awq_key_list[6] + suf) for suf in awq_suffix_list]
-        # process_and_assign_weight(layer.mlp.fc, v, 1)
         weights.update(
             get_tllm_weight_from_awq(v, f'{tllm_prex}.mlp.fc', tp_dim=1))
         b = load(prefix + awq_key_list[6] + ':bias')
@@ -814,7 +869,6 @@ def load_from_awq_falcon(quant_ckpt_path: str,
 
         # 4.3 mlp.proj
         v = [load(prefix + awq_key_list[5] + suf) for suf in awq_suffix_list]
-        # process_and_assign_weight(layer.mlp.proj, v, 0)
         weights.update(
             get_tllm_weight_from_awq(v, f'{tllm_prex}.mlp.proj', tp_dim=0))
         b = load(prefix + awq_key_list[5] + ':bias')
@@ -826,26 +880,20 @@ def load_from_awq_falcon(quant_ckpt_path: str,
         if new_decoder_architecture:
             # 4.5 input_layernorm
             v = load(prefix + awq_key_list[7] + split_sym + "weight")
-            # layer.input_layernorm.weight.value = v.to(torch_dtype)
             weights[f'{tllm_prex}.input_layernorm.weight'] = v.to(torch_dtype)
             v = load(prefix + awq_key_list[7] + split_sym + "bias")
-            # layer.input_layernorm.bias.value = v.to(torch_dtype)
             weights[f'{tllm_prex}.input_layernorm.bias'] = v.to(torch_dtype)
 
             # 4.6 mlp_layernorm
             v = load(prefix + awq_key_list[8] + split_sym + "weight")
-            # layer.mlp_layernorm.weight.value = v.to(torch_dtype)
             weights[f'{tllm_prex}.mlp_layernorm.weight'] = v.to(torch_dtype)
             v = load(prefix + awq_key_list[8] + split_sym + "bias")
-            # layer.mlp_layernorm.bias.value = v.to(torch_dtype)
             weights[f'{tllm_prex}.mlp_layernorm.bias'] = v.to(torch_dtype)
         else:
             # 4.5 input_layernorm
             v = load(prefix + awq_key_list[7] + split_sym + "weight")
-            # layer.input_layernorm.weight.value = v.to(torch_dtype)
             weights[f'{tllm_prex}.input_layernorm.weight'] = v.to(torch_dtype)
             v = load(prefix + awq_key_list[7] + split_sym + "bias")
-            # layer.input_layernorm.bias.value = v.to(torch_dtype)
             weights[f'{tllm_prex}.input_layernorm.bias'] = v.to(torch_dtype)
 
             if not parallel_attention:
@@ -941,11 +989,8 @@ def load_from_fp8_falcon(quant_ckpt_path: str, hf_config: FalconConfig,
             # Not calibrarting KV cache.
             scaling_factor = 1.0
             weights[
-                f'{tllm_prex}.attention.kv_orig_quant_scale'] = torch.tensor(
+                f'{tllm_prex}.attention.kv_cache_scaling_factor'] = torch.tensor(
                     [scaling_factor], dtype=fake_fp8_sf_dt)
-            weights[
-                f'{tllm_prex}.attention.kv_quant_orig_scale'] = torch.tensor(
-                    [1.0 / scaling_factor], dtype=fake_fp8_sf_dt)
 
     return weights
 
@@ -958,6 +1003,8 @@ if __name__ == '__main__':
     # the op with PyTorch.
     print(tensorrt_llm.__version__)
     args = parse_arguments()
+    assert args.tp_size * args.pp_size == args.world_size
+
     tik = time.time()
 
     if not os.path.exists(args.output_dir):
@@ -978,6 +1025,9 @@ if __name__ == '__main__':
         'alibi_with_scale' if hf_config.alibi else 'rope_gpt_neox',
         'max_position_embeddings': hf_config.max_position_embeddings,
         'hidden_act': 'gelu',
+        'use_parallel_embedding': args.use_parallel_embedding,
+        'embedding_sharding_dim': args.embedding_sharding_dim,
+        'share_embedding_table': args.use_embedding_sharing,
         'quantization': {
             'use_weight_only': args.use_weight_only,
             'weight_only_precision': args.weight_only_precision,
@@ -1024,6 +1074,9 @@ if __name__ == '__main__':
                 args.ammo_quant_ckpt_path,
                 hf_config,
                 mapping,
+                use_parallel_embedding=args.use_parallel_embedding,
+                sharding_dim=args.embedding_sharding_dim,
+                share_embedding_table=args.use_embedding_sharing,
                 quantize_lm_head=args.quantize_lm_head,
                 dtype=args.dtype)
         else:
@@ -1033,6 +1086,9 @@ if __name__ == '__main__':
                     hf_config,
                     mapping,
                     dtype=args.dtype,
+                    use_parallel_embedding=args.use_parallel_embedding,
+                    sharding_dim=args.embedding_sharding_dim,
+                    share_embedding_table=args.use_embedding_sharing,
                     use_weight_only=args.use_weight_only,
                     plugin_weight_only_quant_type=plugin_weight_only_quant_type)
             else:
@@ -1043,6 +1099,9 @@ if __name__ == '__main__':
                     hf_config,
                     mapping,
                     dtype=args.dtype,
+                    use_parallel_embedding=args.use_parallel_embedding,
+                    sharding_dim=args.embedding_sharding_dim,
+                    share_embedding_table=args.use_embedding_sharing,
                     use_weight_only=args.use_weight_only,
                     plugin_weight_only_quant_type=plugin_weight_only_quant_type)
                 del hf_model

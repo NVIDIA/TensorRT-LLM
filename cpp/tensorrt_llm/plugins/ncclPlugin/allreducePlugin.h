@@ -68,7 +68,7 @@ public:
     bool isCustomAllReduceSuported(int ranks_per_node) const noexcept;
 
 private:
-    kernels::AllReduceStrategyType selectImplementation(size_t messageSize, int worldSize) const noexcept;
+    static kernels::AllReduceStrategyType selectImplementation(size_t messageSize, int worldSize) noexcept;
     const std::string mLayerName;
     std::set<int> mGroup;
     nvinfer1::DataType mType;

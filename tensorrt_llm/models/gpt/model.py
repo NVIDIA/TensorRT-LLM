@@ -27,6 +27,7 @@ from ...layers import (MLP, MOE, Attention, AttentionMaskType, AttentionParams,
                        PromptTuningEmbedding)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
+from ...plugin import init_all_reduce_helper
 from ...quantization import QuantMode
 from ..generation_mixin import GenerationMixin
 
@@ -117,8 +118,7 @@ class GPTDecoderLayer(Module):
             tp_size=tp_size,
             use_auto_parallel=use_auto_parallel,
             tp_rank=tp_rank,
-            quant_mode=quant_mode,
-            instance_id=2 * instance_id)
+            quant_mode=quant_mode)
 
         if inter_size is None:
             inter_size = hidden_size * 4
@@ -132,8 +132,7 @@ class GPTDecoderLayer(Module):
                               tp_group=tp_group,
                               tp_size=tp_size,
                               tp_rank=tp_rank,
-                              quant_mode=quant_mode,
-                              instance_id=2 * instance_id + 1)
+                              quant_mode=quant_mode)
         self.post_layernorm = LayerNorm(normalized_shape=hidden_size,
                                         dtype=dtype)
 
@@ -143,7 +142,6 @@ class GPTDecoderLayer(Module):
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None,
-                workspace=None,
                 lora_layer_params=None):
 
         assert isinstance(hidden_states, Tensor)
@@ -157,7 +155,6 @@ class GPTDecoderLayer(Module):
                                           use_cache=use_cache,
                                           kv_cache_params=kv_cache_params,
                                           attention_params=attention_params,
-                                          workspace=workspace,
                                           lora_layer_params=lora_layer_params)
 
         if use_cache:
@@ -168,7 +165,7 @@ class GPTDecoderLayer(Module):
         residual = hidden_states
         hidden_states = self.post_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states, workspace=workspace)
+        hidden_states = self.mlp(hidden_states)
 
         hidden_states = residual + hidden_states
 
@@ -203,6 +200,7 @@ class GPTModel(Module):
                  embedding_sharding_dim=0,
                  moe_config=MoeConfig()):
         super().__init__()
+        init_all_reduce_helper()
         self.mapping = mapping
         self.use_prompt_tuning = use_prompt_tuning
         self.position_embedding_type = position_embedding_type
@@ -215,8 +213,7 @@ class GPTModel(Module):
             tp_size=mapping.tp_size if use_parallel_embedding else 1,
             tp_group=mapping.tp_group if use_parallel_embedding else None,
             sharding_dim=embedding_sharding_dim,
-            tp_rank=mapping.tp_rank,
-            instance_id=2 * num_layers)
+            tp_rank=mapping.tp_rank)
         if position_embedding_type == PositionEmbeddingType.learned_absolute:
             self.position_embedding = Embedding(max_position_embeddings,
                                                 hidden_size,
@@ -261,14 +258,11 @@ class GPTModel(Module):
                 prompt_embedding_table=None,
                 prompt_tasks=None,
                 prompt_vocab_size=None,
-                workspace=None,
                 lora_params=None):
 
         args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size
                 ] if self.use_prompt_tuning else []
-        hidden_states = self.vocab_embedding(input_ids,
-                                             *args,
-                                             workspace=workspace)
+        hidden_states = self.vocab_embedding(input_ids, *args)
         if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
             hidden_states = hidden_states + self.position_embedding(
                 position_ids)
@@ -304,7 +298,6 @@ class GPTModel(Module):
                     host_kv_cache_block_pointers=[host_pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
-                workspace=workspace,
                 lora_layer_params=lora_layer_params)
 
             if use_cache:
@@ -428,15 +421,13 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                 prompt_embedding_table=None,
                 prompt_tasks=None,
                 prompt_vocab_size=None,
-                workspace=None,
                 lora_params=None):
 
         hidden_states = super().forward(input_ids, position_ids, use_cache,
                                         attention_mask, kv_cache_params,
                                         attention_params,
                                         prompt_embedding_table, prompt_tasks,
-                                        prompt_vocab_size, workspace,
-                                        lora_params)
+                                        prompt_vocab_size, lora_params)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -543,7 +534,6 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             model_inputs['prompt_embedding_table'],
             model_inputs['tasks'],
             model_inputs['prompt_vocab_size'],
-            model_inputs['all_reduce_workspace'],
             LoraParams(
                 model_inputs['lora_ranks'],
                 model_inputs['lora_weights_pointers'],

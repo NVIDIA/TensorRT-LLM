@@ -604,7 +604,7 @@ mpirun -n 2 python ../run.py --engine_dir "/tmp/new_lora_13b/trt_engines/fp16/2-
               --use_py_session
 
  Input: "今天天气很好，我到公园的时后，"
-Output: "发现那里有很多小朋友们都在玩。他们都在玩跳绳，跳绳的花样都很多，我看他们玩的很开心。我看他们玩的的时候，我也想跟着他们一起玩，于是我也买了一个跳绳，跟着他们一起玩。我们玩的很开心"
+Output: "发现公园里人很多，有的在打羽毛球，有的在打乒乓球，有的在跳绳，还有的在跑步。我和妈妈来到一个空地上，我和妈妈一起跳绳，我跳了1"
 ```
 Users who want to skip LoRA module may pass uid -1 with `--lora_task_uids -1`.
 In that case, the model will not run the LoRA module and the results will be
@@ -623,6 +623,83 @@ mpirun -n 2 python ../run.py --engine_dir "/tmp/new_lora_13b/trt_engines/fp16/2-
  Input: "今天天气很好，我到公园的时后，"
 Output: "我看见一个人坐在那边边看书书，我看起来还挺像你，可是我走过过去问了一下他说你是你吗，他说没有，然后我就说你看我看看你像你，他说说你看我像你，我说你是你，他说你是你，"
 ```
+
+### Run LLaMa with several lora checkpoints
+
+In this section, we show how to run a model with multiple LoRA modules at the same time. Note that if one of the LoRA module has a
+fine-tuned embedding table or logit GEMM, users should guarantee that all the instances of the model can use the same finetuned
+embedding table or logit GEMM.
+Here, we use two LoRA checkpoints as examples. These two LoRA checkponits add LoRA modules to `q_proj` and `v_proj`. Because we only
+support adding lora modules on `q`, `k` and `v` at the same time, we need to add `--lora_target_modules "attn_q" "attn_k" "attn_v"`.
+In this case, we assign null pointers for the `k` LoRA module in TensorRT-LLM and skip the computation at runtime.
+
+As the rank of the LoRA modules of both checkpoints is 8, we can set `--max_lora_rank 8` to reduce the memory requirement for the LoRA plugin.
+
+In this example, we use a LoRA checkpoint finetuned on the Chinese dataset `luotuo-lora-7b-0.1` and a LoRA checkpoint finetuned on
+the Japanese dataset `Japanese-Alpaca-LoRA-7b-v0`. For the `lora_manager` to load several checkpoints, we pass several directories
+of LoRA checkpoints at the same time: `--lora_dir  "luotuo-lora-7b-0.1/" "Japanese-Alpaca-LoRA-7b-v0/"`.
+Then, `lora_manager` will assign `lora_task_uids` to these checkpoints. `lora_task_uids -1` is a predefined value, which corresponds to
+the base model. If we pass `lora_task_uids 0 1`, this means we want to use the first LoRA checkpoint on first sentence and use the second LoRA checkpoint on the second sentence.
+
+To verify the correctness, we pass the same Chinese input `美国的首都在哪里? \n答案:` three times as well as the same Japanese input `アメリカ合衆国の首都はどこですか? \n答え:` three times (both inputs mean `Where is the capital of America? \nAnswer`). We run on base model, `luotuo-lora-7b-0.1` and `Japanese-Alpaca-LoRA-7b-v0/`.
+
+```bash
+git-lfs clone https://huggingface.co/qychen/luotuo-lora-7b-0.1
+git-lfs clone https://huggingface.co/kunishou/Japanese-Alpaca-LoRA-7b-v0
+BASE_LLAMA_MODEL=llama-7b-hf/
+
+python build.py --model_dir ${BASE_LLAMA_MODEL} \
+                --dtype float16 \
+                --remove_input_padding \
+                --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
+                --use_gemm_plugin float16 \
+                --output_dir "/tmp/llama_7b_with_lora_qkv/trt_engines/fp16/1-gpu/" \
+                --max_batch_size 128 \
+                --max_input_len 512 \
+                --max_output_len 50 \
+                --use_lora_plugin float16 \
+                --hf_lora_dir "Japanese-Alpaca-LoRA-7b-v0/" \
+                --lora_target_modules "attn_q" "attn_k" "attn_v" \
+                --max_lora_rank 8 \
+                --world_size 1 --tp_size 1
+
+python ../run.py --engine_dir "/tmp/llama_7b_with_lora_qkv/trt_engines/fp16/1-gpu/" \
+              --max_output_len 10 \
+              --tokenizer_dir ${BASE_LLAMA_MODEL} \
+              --input_text "美国的首都在哪里? \n答案:" "美国的首都在哪里? \n答案:" "美国的首都在哪里? \n答案:" "アメリカ合衆国の首都はどこですか? \n答え:" "アメリカ合衆国の首都はどこですか? \n答え:" "アメリカ合衆国の首都はどこですか? \n答え:" \
+              --lora_dir  "luotuo-lora-7b-0.1/" "Japanese-Alpaca-LoRA-7b-v0/" \
+              --lora_task_uids -1 0 1 -1 0 1 \
+              --use_py_session --top_p 0.5 --top_k 0
+```
+
+The results would be like
+
+```bash
+Input [Text 0]: "<s> 美国的首都在哪里? \n答案:"
+Output [Text 0 Beam 0]: "Washington, D.C.
+What is the"
+
+Input [Text 1]: "<s> 美国的首都在哪里? \n答案:"
+Output [Text 1 Beam 0]: "华盛顿。
+"
+
+Input [Text 2]: "<s> 美国的首都在哪里? \n答案:"
+Output [Text 2 Beam 0]: "Washington D.C.�����"
+
+Input [Text 3]: "<s> アメリカ合衆国の首都はどこですか? \n答え:"
+Output [Text 3 Beam 0]: "Washington, D.C.
+Which of"
+
+Input [Text 4]: "<s> アメリカ合衆国の首都はどこですか? \n答え:"
+Output [Text 4 Beam 0]: "华盛顿。
+"
+
+Input [Text 5]: "<s> アメリカ合衆国の首都はどこですか? \n答え:"
+Output [Text 5 Beam 0]: "ワシントン D.C."
+```
+
+We can observe that `luotuo-lora-7b-0.1` produces correct answers on the first sentence and the fifth sentence (in Chinese), `Japanese-Alpaca-LoRA-7b-v0` produces correct answers on the sixth sentence (in Japanese).
 
 ## Run LLaMa with StreamingLLM
 

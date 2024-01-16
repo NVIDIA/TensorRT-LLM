@@ -114,9 +114,9 @@ void invokeApplyBiasRopeUpdateKVCache(T* QKV, T* Q, KVCacheBuffer& kvTable, cons
     const int kv_head_num, const int size_per_head, const int rotary_embedding_dim, const float rotary_embedding_base,
     const RotaryScalingType rotary_scale_type, const float rotary_embedding_scale,
     const int rotary_embedding_max_positions, const PositionEmbeddingType position_embedding_type,
-    const bool position_shift_enabled, const float* scale, const int int8_mode, const KvCacheDataType cache_type,
-    const float* kvScaleOrigQuant, const bool enable_paged_kv_fmha, const int beam_width, int2& grid_block_cache,
-    cudaStream_t stream);
+    const int* medusa_position_offsets, const bool position_shift_enabled, const float* scale, const int int8_mode,
+    const KvCacheDataType cache_type, const float* kvScaleOrigQuant, const bool enable_paged_kv_fmha,
+    const int beam_width, int2& grid_block_cache, cudaStream_t stream);
 
 template <typename T, typename BT>
 void invokeAddRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_attention_bias, const int batch_size,

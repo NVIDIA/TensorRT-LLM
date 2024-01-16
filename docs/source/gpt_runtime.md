@@ -310,7 +310,11 @@ batchSize, beamWidth]`_.
    computation type) to store the logits for the context. Its shape is
    `[batchSize, maxSequenceLength, vocabSizePadded]`. If use `remove_input_padding`, its shape is `[packedSize, vocabSizePadded]`. This buffer will only be
    filled in if the TensorRT engine was built with the `gather_context_logits` or
-   `gather_all_token_logits` parameter enabled. It is important to point out
+   `gather_all_token_logits` parameter enabled.
+
+   After inference is complete, you can get the context logits in `GenerationOutput.contextLogits`, these are variables on the GPU. For specific acquisition methods, please refer to the example of [gptSessionBenchmark.cpp](https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/cpp/gptSessionBenchmark.cpp).
+
+   It is important to point out
    that enabling that computation may have an impact on performance (the final
    LM head has to perform a matrix multiplication on all the context tokens
    instead of a just the last one).
@@ -319,6 +323,8 @@ batchSize, beamWidth]`_.
    `[batchSize, beamWidth, maxOutputLen, vocabSizePadded]`. This buffer will only be
    filled in if the TensorRT engine was built with the `gather_generation_logits` or
    `gather_all_token_logits` parameter enabled.
+
+   Generation logits can also be obtained through `GenerationOutput.generationLogits` after inference is completed.
  * `onTokenGenerated`, is a callback function invoked in the generation loop to
    pass newly generated tokens to the caller while the loop continues to
    execute. An implementation of that callback must accept the output `ids`

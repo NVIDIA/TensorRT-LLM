@@ -497,8 +497,7 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
                 '.attention.query_key_value.scale_y_quant_orig.bin', [1],
                 np.float32)
             tensorrt_llm_gpt.layers[
-                i].attention.kv_orig_quant_scale.value = 1.0 / t
-            tensorrt_llm_gpt.layers[i].attention.kv_quant_orig_scale.value = t
+                i].attention.kv_cache_scaling_factor.value = t
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
@@ -706,7 +705,7 @@ def load_from_awq_mpt(tensorrt_llm_mpt: GPTLMHeadModel,
         layer.post_layernorm.bias.value = np.zeros(random_bias.shape).astype(
             random_bias.dtype)
 
-        # 4.7 attention.kv_quant_orig_scale / kv_quant_orig_scale
+        # 4.7 attention.kv_cache_scaling_factor
         if use_int8_kv_cache:
             assert ft_model_dir, "You must pass --ft_model_dir to tell TRT-LLM where to look for scales of INT8 kv cache."
             t = fromfile(
@@ -714,8 +713,7 @@ def load_from_awq_mpt(tensorrt_llm_mpt: GPTLMHeadModel,
                 '.attention.query_key_value.scale_y_quant_orig.bin', [1],
                 np.float32)
             assert t is not None, f"{ft_model_dir} does not contain model.layers.{layer_idx}.attention.query_key_value.scale_y_quant_orig.bin"
-            layer.attention.kv_orig_quant_scale.value = 1.0 / t
-            layer.attention.kv_quant_orig_scale.value = t
+            layer.attention.kv_cache_scaling_factor.value = t
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

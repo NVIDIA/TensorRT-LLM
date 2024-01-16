@@ -54,6 +54,7 @@ class BaichuanDecoderLayer(Module):
         self.hidden_act = hidden_act
         self.tp_group = tp_group
         self.tp_size = tp_size
+        self.tp_rank = tp_rank
         self.mlp_hidden_size = mlp_hidden_size
         self.attention_mask_type = attention_mask_type
         self.position_embedding_type = position_embedding_type

@@ -39,6 +39,9 @@ from examples.phi.weight import load_from_hf_phi
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import getSMVersion
 
+# Fixed code revision or updated config can break the tests.
+HF_CODE_REVISION = "cb2f4533604d8b67de604e7df03bfe6f3ca22869"
+
 
 def compare_max_abs_error(ref, res, str):
     # calculate max abs error
@@ -53,12 +56,14 @@ class TestPhi(unittest.TestCase):
     def _gen_hf_phi(self, hidden_act, n_layer, max_length, dtype):
         # Need to use the latest remote code for config and model class.
         gpt_config = AutoConfig.from_pretrained("microsoft/phi-2",
+                                                code_revision=HF_CODE_REVISION,
                                                 trust_remote_code=True)
-        gpt_config.n_layer = n_layer
+        gpt_config.num_hidden_layers = n_layer
         gpt_config.hidden_act = hidden_act
 
         hf_gpt = AutoModelForCausalLM.from_config(
-            gpt_config, trust_remote_code=True).cuda().to(
+            gpt_config, code_revision=HF_CODE_REVISION,
+            trust_remote_code=True).cuda().to(
                 tensorrt_llm._utils.str_dtype_to_torch(dtype)).eval()
         return gpt_config, hf_gpt
 
@@ -73,7 +78,8 @@ class TestPhi(unittest.TestCase):
         vocab_size = gpt_config.vocab_size
         hidden_act = gpt_config.hidden_act
         max_position_embeddings = gpt_config.max_position_embeddings
-        rotary_dim = gpt_config.rotary_dim
+        rotary_dim = int(gpt_config.partial_rotary_factor *
+                         (hidden_size // num_heads))
 
         list(range(tensor_parallel))
 

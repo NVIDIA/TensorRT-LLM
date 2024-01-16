@@ -168,16 +168,6 @@ void ReduceScatterPlugin::destroy() noexcept
     delete this;
 }
 
-void ReduceScatterPlugin::setPluginNamespace(const char* libNamespace) noexcept
-{
-    mNamespace = libNamespace;
-}
-
-const char* ReduceScatterPlugin::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
-}
-
 ///////////////
 
 ReduceScatterPluginCreator::ReduceScatterPluginCreator()
