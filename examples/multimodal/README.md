@@ -126,7 +126,7 @@ OPT pipeline needs few minor changes from T5 pipeline
     ```bash
     python ../llama/build.py \
         --model_dir tmp/hf_models/${MODEL_NAME} \
-        --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu
+        --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
         --dtype float16 \
         --remove_input_padding \
         --use_gpt_attention_plugin float16 \
