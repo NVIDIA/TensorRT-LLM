@@ -187,6 +187,12 @@ def parse_arguments():
     parser.add_argument('--enable_context_fmha_fp32_acc',
                         default=False,
                         action='store_true')
+     parser.add_argument(
+        '--use_paged_context_fmha',
+        action='store_true',
+        help=
+        'Activates paged context FMHA. This mode of the context FMHA is required for chunked context, speculative decoding and reuse of KV cache blocks. Context FMHA performance is worse when this mode is on.'
+    )
     parser.add_argument('--visualize', default=False, action='store_true')
     parser.add_argument('--enable_debug_output',
                         default=False,
@@ -543,6 +549,9 @@ def build_rank_engine(builder: Builder,
     if args.enable_context_fmha_fp32_acc:
         network.plugin_config.set_context_fmha(
             ContextFMHAType.enabled_with_fp32_acc)
+    if args.use_paged_context_fmha :
+        assert args.enable_context_fmha or args.enable_context_fmha_fp32_acc, "context fmha must be enabled"
+        network.plugin_config.set_paged_context_fmha()
     if args.use_weight_only and args.use_gemm_plugin:
         if args.per_group:
             network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
