@@ -535,9 +535,13 @@ public:
         const KVBlockArray pagedKVCache, const void* cuQSeqlenPtr, const void* cuKVSeqlenPtr, void* outputPtr,
         cudaStream_t stream)
     {
+        KVBlockArrayForContextFMHA pagedKVCacheForContextMHA;
+        pagedKVCacheForContextMHA = KVBlockArrayForContextFMHA(pagedKVCache.mMaxSeqs, pagedKVCache.mMaxBlocksPerSeq,
+            pagedKVCache.mTokensPerBlock, mPagedKVParams.h_kv * mPagedKVParams.d * sizeof(half));
+        pagedKVCacheForContextMHA.data = pagedKVCache.data;
         mPagedKVParams.q_ptr = qPtr;
         mPagedKVParams.tma_desc_paged_kv = reinterpret_cast<cudaTmaDesc*>(pagedKVTmaDesc);
-        mPagedKVParams.paged_kv_cache = pagedKVCache;
+        mPagedKVParams.paged_kv_cache = pagedKVCacheForContextMHA;
         mPagedKVParams.o_ptr = outputPtr;
         mPagedKVParams.cu_q_seqlens = reinterpret_cast<const int*>(cuQSeqlenPtr);
         mPagedKVParams.cu_seqlens = reinterpret_cast<const int*>(cuKVSeqlenPtr);

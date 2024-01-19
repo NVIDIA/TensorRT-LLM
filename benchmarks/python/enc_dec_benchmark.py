@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,11 +15,16 @@
 import json
 import os
 
+# isort: off
 import torch
+#isort: on
+from allowed_configs import get_build_config
 from base_benchmark import BaseBenchmark, get_engine_name
+from build import build_enc_dec
 
 import tensorrt_llm
 from tensorrt_llm._utils import trt_dtype_to_torch
+from tensorrt_llm.quantization import QuantMode
 
 
 class EncDecBenchmark(BaseBenchmark):
@@ -38,6 +43,7 @@ class EncDecBenchmark(BaseBenchmark):
         self.in_out_lens = in_out_lens
         self.num_beams = args.num_beams
         self.build_time = 0
+        self.quant_mode = QuantMode(0)
         # In current implementation, encoder and decoder have the same name,
         # builder config, and plugin config. But they can be different in the future.
         # So we use separate variables for encoder and decoder here.
@@ -97,33 +103,24 @@ class EncDecBenchmark(BaseBenchmark):
                         "use_custom_all_reduce", False),
                     dtype=config_dtype,
                 )
-                # get builder config
-                builder_config = dict()
+                self.max_batch_size = config["builder_config"]["max_batch_size"]
+                self.max_input_len = config["builder_config"][
+                    "max_encoder_input_len"]
+                self.max_output_len = config["builder_config"]["max_output_len"]
+
                 for key, value in config["builder_config"].items():
                     if key == "name":
                         engine_model_name = value
-                    else:
-                        builder_config[key] = value
-                # get plugin config
-                plugin_config = dict()
-                for key, value in config["plugin_config"].items():
-                    # Same effect as self.use_foo_plugin = config.json["foo_plugin"]
-                    if "plugin" in key:
-                        key = "use_" + key
-                    plugin_config[key] = value
-                return engine_model_name, model_config, builder_config, plugin_config
+                        break
+                return engine_model_name, model_config
 
             (
                 self.encoder_engine_model_name,
                 self.encoder_model_config,
-                self.encoder_builder_config,
-                self.encoder_plugin_config,
             ) = read_config("encoder")
             (
                 self.decoder_engine_model_name,
                 self.decoder_model_config,
-                self.decoder_builder_config,
-                self.decoder_plugin_config,
             ) = read_config("decoder")
 
         self.encoder_engine_name = get_engine_name(
@@ -142,13 +139,11 @@ class EncDecBenchmark(BaseBenchmark):
             world_size=self.world_size,
             rank=self.runtime_rank,
             tp_size=self.world_size,
-            gpus_per_node=self.encoder_builder_config.get("gpus_per_node", 8),
         )
         self.decoder_runtime_mapping = tensorrt_llm.Mapping(
             world_size=self.world_size,
             rank=self.runtime_rank,
             tp_size=self.world_size,
-            gpus_per_node=self.encoder_builder_config.get("gpus_per_node", 8),
         )
 
         if not args.serial_build:
@@ -169,10 +164,24 @@ class EncDecBenchmark(BaseBenchmark):
             with open(self.decoder_serialize_path, "rb") as f:
                 decoder_engine_buffer = f.read()
         else:
-            # TODO: Build engine
-            assert False, "Engine directory is currently required for enc-dec benchmarks"
-            encoder_engine_buffer = None
-            decoder_engine_buffer = None
+            build_config = get_build_config(self.model_name)
+            self.max_batch_size = build_config['max_batch_size'] \
+                if args.max_batch_size is None else args.max_batch_size
+            self.max_input_len = build_config['max_encoder_input_len'] \
+                if args.max_input_len is None else args.max_input_len
+            self.max_output_len = build_config['max_output_len'] \
+                if args.max_output_len is None else args.max_output_len
+            # Build engine
+            (
+                encoder_engine_buffer,
+                decoder_engine_buffer,
+                self.encoder_model_config,
+                self.decoder_model_config,
+                encoder_build_time,
+                decoder_build_time,
+            ) = build_enc_dec(args)
+
+            self.build_time = encoder_build_time + decoder_build_time
 
         assert encoder_engine_buffer is not None
         assert decoder_engine_buffer is not None
@@ -187,20 +196,18 @@ class EncDecBenchmark(BaseBenchmark):
         )
 
     def get_config(self):
-        max_batch_size = self.encoder_builder_config["max_batch_size"]
         for inlen, outlen in self.in_out_lens:
-            if (inlen > self.encoder_builder_config["max_encoder_input_len"]
-                    or outlen > self.encoder_builder_config["max_output_len"]):
+            if (inlen > self.max_input_len or outlen > self.max_output_len):
                 print(
                     f"[WARNING] check inlen({inlen}) <= max_inlen({self.max_input_len}) and "
                     f"outlen({outlen}) <= max_outlen({self.max_output_len}) failed, skipping."
                 )
                 continue
             for batch_size in self.batch_sizes:
-                if batch_size > max_batch_size:
+                if batch_size > self.max_batch_size:
                     print(
                         f"[WARNING] check batch_size({batch_size}) "
-                        f"<= max_batch_size({max_batch_size}) failed, skipping."
+                        f"<= max_batch_size({self.max_batch_size}) failed, skipping."
                     )
                     continue
                 yield (batch_size, inlen, outlen)
@@ -243,8 +250,8 @@ class EncDecBenchmark(BaseBenchmark):
             stream,
         ) = inputs
 
-        hidden_size = (self.encoder_model_config.hidden_size *
-                       self.encoder_runtime_mapping.tp_size)
+        hidden_size = (self.encoder_model_config.hidden_size * self.world_size
+                       )  # tp_size
         hidden_states_shape = (
             encoder_input_ids.shape[0],
             encoder_input_ids.shape[1],
@@ -258,10 +265,18 @@ class EncDecBenchmark(BaseBenchmark):
         inputs["input_ids"] = encoder_input_ids.contiguous()
         inputs["input_lengths"] = encoder_input_lengths
         inputs["max_input_length"] = torch.empty(
-            (self.encoder_builder_config["max_encoder_input_len"], ),
+            (self.max_input_len, ),
             dtype=hidden_states_dtype("max_input_length"),
             device=self.device,
         ).contiguous()
+
+        if self.encoder_model_config.has_position_embedding:
+            bsz, seq_len = encoder_input_ids.shape[:2]
+            position_ids = torch.arange(seq_len,
+                                        dtype=torch.int32,
+                                        device=encoder_input_ids.device).expand(
+                                            bsz, -1)
+            inputs['position_ids'] = position_ids.contiguous()
 
         # output tensors
         outputs = {}
@@ -286,7 +301,7 @@ class EncDecBenchmark(BaseBenchmark):
             torch.max(decoder_input_lengths).item(),
             output_len,
             beam_width=self.num_beams,
-            max_kv_cache_length=None,
+            max_attention_window_size=None,
             encoder_max_input_length=torch.max(encoder_input_lengths).item(),
         )
         torch.cuda.synchronize()

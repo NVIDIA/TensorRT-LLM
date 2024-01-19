@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,8 +31,9 @@ except ImportError:
     pynvml = None
 import traceback
 
-from tensorrt_llm.builder import _is_building
 from tensorrt_llm.logger import logger
+
+from ._common import _is_building
 
 if psutil is None:
     logger.warning("A required package 'psutil' is not installed. Will not "
@@ -122,9 +123,9 @@ class PyNVMLContext:
             pynvml.nvmlShutdown()
 
 
-def host_memory_info() -> Tuple[int, int, int]:
+def host_memory_info(pid: Optional[int] = None) -> Tuple[int, int, int]:
     if psutil is not None:
-        process = psutil.Process()
+        process = psutil.Process(pid)
         # USS reports the amount of memory that would be freed if the process
         # was terminated right now.
         #   https://psutil.readthedocs.io/en/latest/index.html#psutil.Process.memory_full_info
@@ -207,6 +208,7 @@ def check_gpt_mem_usage(engine, kv_dtype, use_gpt_attention_plugin,
                         head_size, num_layers):
     # Get the amount of memory
     runtime = trt.Runtime(logger.trt_logger)
+    # 1. TensorRT engine activation memory
     activation_size = 0
     try:
         cuda_engine = runtime.deserialize_cuda_engine(engine)
@@ -218,24 +220,31 @@ def check_gpt_mem_usage(engine, kv_dtype, use_gpt_attention_plugin,
             f'Exception when deserializing engine: {traceback.format_exc()}')
         logger.warning(f'Activation memory size will be regarded as 0.')
     logger.info(f'Activation memory size: {activation_size:.2f} MiB')
-    weights_size = engine.nbytes / 1024 / 1024
+
+    # 2. Weights
+    weights_size = bytes_to_target_unit(engine.nbytes, 'MiB')
     logger.info(f'Weights memory size: {weights_size:.2f} MiB')
+
+    # 3. Estimated max KV Cache size
     kv_cache_size = max_batch_size * max_beam_width * 2 * local_num_kv_heads * (
         max_input_len +
-        max_output_len) * (head_size) * num_layers * kv_dtype.itemsize
+        max_output_len) * head_size * num_layers * kv_dtype.itemsize
     # without plugin, we need two set of kv cache buffers,
     # one for inputs, and the other for outputs.
     if not use_gpt_attention_plugin:
         kv_cache_size *= 2
-    kv_cache_size = kv_cache_size / 1024 / 1024
+    kv_cache_size = bytes_to_target_unit(kv_cache_size, 'MiB')
     logger.info(f'Max KV Cache memory size: {kv_cache_size:.2f} MiB')
+
+    # Estimated total amount of memory
     est_memory_size = activation_size + weights_size + kv_cache_size
     logger.info(
         f'Estimated max memory usage on runtime: {est_memory_size:.2f} MiB')
     _, _, total_mem = device_memory_info(torch.cuda.current_device())
+    total_mem = bytes_to_target_unit(total_mem, 'MiB')
     if est_memory_size > total_mem:
         logger.warning(
-            f'Engine is successfully built, but GPU Memory ({total_mem:.2f} GB)'
+            f'Engine is successfully built, but GPU Memory ({total_mem:.2f} MB)'
             ' may not be enough when inferencing on max shape.')
         if paged_kv_cache:
             logger.warning(f'Since paged_kv_cache is enabled, the max KV Cache '

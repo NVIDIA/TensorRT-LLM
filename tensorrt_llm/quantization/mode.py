@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -98,7 +98,8 @@ class QuantMode(IntFlag):
         return self._any(self.FP8_QDQ)
 
     def has_any_quant(self):
-        return self._any(self.INT8_WEIGHTS | self.ACTIVATIONS
+        return self._any(self.INT4_WEIGHTS | self.INT8_WEIGHTS
+                         | self.ACTIVATIONS
                          | self.INT8_KV_CACHE | self.FP8_KV_CACHE
                          | self.FP8_QDQ)
 

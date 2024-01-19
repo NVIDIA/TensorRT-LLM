@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,12 +18,15 @@ import hashlib
 import weakref
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, OrderedDict, Set
+from typing import Any, Dict, Iterable, List, Optional, OrderedDict, Set, Tuple
 
 import numpy as np
 import tensorrt as trt
 
+from tensorrt_llm.module import Module
+
 from ._common import set_network
+from ._utils import get_extra_attr, has_extra_attr, set_extra_attr
 from .logger import logger
 from .plugin import PluginConfig
 
@@ -43,6 +46,76 @@ class _UniqueNameGenerator(object):
         return f"{self.prefix}{key}_{tmp}"
 
 nr_cracked = 0
+
+class PluginInfo:
+    plugin_creator: trt.IPluginCreator
+    plugin_name: str
+    pfc: trt.PluginFieldCollection
+
+    def __init__(self, plugin_creator: trt.IPluginCreator, plugin_name: str,
+                 pfc: trt.PluginFieldCollection):
+        self.plugin_creator = plugin_creator
+        self.plugin_name = plugin_name
+        self.pfc = pfc
+        self._parse_pfc(pfc)
+
+    def _parse_pfc(self, pfc: trt.PluginFieldCollection):
+        self.pfc_as_ndarray = {}
+        self.pfc_as_list = {}
+        for i in range(len(pfc)):
+            name, data = pfc[i].name, pfc[i].data
+            array_data = data
+            self.pfc_as_ndarray[name] = array_data.copy()
+            list_data = array_data.tolist()
+            self.pfc_as_list[name] = list_data
+
+
+def get_plugin_info(trt_network: trt.INetworkDefinition,
+                    layer_name: str) -> PluginInfo:
+    if not has_extra_attr(trt_network, "plugin_infos"):
+        return None
+    plugin_infos = get_extra_attr(trt_network, "plugin_infos")
+    if layer_name not in plugin_infos:
+        return None
+    return plugin_infos[layer_name]
+
+
+def set_plugin_info(trt_network: trt.INetworkDefinition, layer_name: str,
+                    plugin_info: PluginInfo):
+    if not has_extra_attr(trt_network, "plugin_infos"):
+        set_extra_attr(trt_network, "plugin_infos", {})
+    plugin_infos = get_extra_attr(trt_network, "plugin_infos")
+    plugin_infos[layer_name] = plugin_info
+
+
+def delete_plugin_info(trt_network: trt.INetworkDefinition, layer_name: str):
+    if not has_extra_attr(trt_network, "plugin_infos"):
+        return
+    plugin_infos = get_extra_attr(trt_network, "plugin_infos")
+    if layer_name not in plugin_infos:
+        return
+    del plugin_infos[layer_name]
+
+
+# TODO: remove this WAR after https://nvbugs/4359151 fixed.
+def get_np_weight(trt_network: trt.INetworkDefinition,
+                  layer_name: str) -> np.array:
+    if not has_extra_attr(trt_network, "np_weights"):
+        return None
+    np_weights = get_extra_attr(trt_network, "np_weights")
+    if layer_name not in np_weights:
+        return None
+    return np_weights[layer_name]
+
+
+# TODO: remove this WAR after https://nvbugs/4359151 fixed.
+def set_np_weight(trt_network: trt.INetworkDefinition, layer_name: str,
+                  np_weight: np.array):
+    if not has_extra_attr(trt_network, "np_weights"):
+        set_extra_attr(trt_network, "np_weights", {})
+    np_weights = get_extra_attr(trt_network, "np_weights")
+    np_weights[layer_name] = np_weight
+
 
 class Network(object):
 
@@ -72,8 +145,25 @@ class Network(object):
         self._registered_ndarrays = []
         self._strongly_typed = trt.INetworkDefinition.get_flag(
             self._trt_network, trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
+        self._unfilled_weights: Dict[str, Tuple[np.array, np.array]] = {}
+        self._autopp_config: Dict[str, Any] = None
 
         return self
+
+    def _register_unfilled_weights(self, layer_name: str, weights: np.array,
+                                   values: np.array):
+        self._unfilled_weights[layer_name] = (weights, values)
+
+    def _fill_weights(self):
+        from tensorrt_llm.parameter import Parameter
+
+        for layer_name in list(self._unfilled_weights.keys()):
+            weights, values = self._unfilled_weights.pop(layer_name)
+            self.register_ndarray(weights)
+            if values is not None:
+                np.copyto(weights, values, casting='no')
+            else:
+                Parameter.xavier_init(weights)
 
     @property
     def dtype(self) -> trt.DataType:
@@ -92,9 +182,20 @@ class Network(object):
     def plugin_config(self) -> PluginConfig:
         return self._plugin_config
 
+    @plugin_config.setter
+    def plugin_config(self, cfg: PluginConfig):
+        assert isinstance(
+            cfg,
+            PluginConfig), f"Expecting a PluginConfig object, got {type(cfg)}"
+        self._plugin_config = cfg
+
     @property
     def strongly_typed(self) -> bool:
         return self._strongly_typed
+
+    @property
+    def autopp_config(self) -> Dict[str, Any]:
+        return self._autopp_config
 
     def _add_input(self,
                    tensor,
@@ -121,19 +222,12 @@ class Network(object):
     def _mark_output(self, tensor, name, dtype):
         from .functional import cast
 
+        # In strongly_typed, if tensor output is not the same, add a cast
         if self.strongly_typed:
-            if tensor.trt_tensor.dtype != dtype:
-                # If stronglyTyped mode is enabled and inferred output dtype does not match desired dtype, add a cast.
-                cast_output = cast(tensor, dtype)
-                self.trt_network.mark_output(cast_output.trt_tensor)
-                cast_output.trt_tensor.name = name
-            else:
-                # Otherwise, mark the tensor as network output. We should not set tensor dtype in stronglyTyped mode.
-                self.trt_network.mark_output(tensor.trt_tensor)
-                tensor.trt_tensor.name = name
-        else:
-            self.trt_network.mark_output(tensor.trt_tensor)
-            tensor.trt_tensor.name = name
+            tensor = cast(tensor, dtype)
+        self.trt_network.mark_output(tensor.trt_tensor)
+        tensor.trt_tensor.name = name
+        if not self.strongly_typed:
             tensor.trt_tensor.dtype = dtype
         logger.debug(f'Mark output: {name}, dtype: {dtype}')
 
@@ -180,6 +274,7 @@ class Network(object):
         return self._named_parameters
 
     def _set_layer_name(self, layer):
+        original_layer_name = layer.name
         layer_name = str(layer.type).split('.')[-1]
         current_module = self._module_call_stack.get_current_module()
 
@@ -199,6 +294,13 @@ class Network(object):
             # and does not update tensor names when layer name changed by application, needs to
             # change the tensor name to align with the new layer name for better debugging
             layer.get_output(idx).name = f"{layer.name}_output_{idx}"
+        if original_layer_name != layer.name:
+            if layer.type == trt.LayerType.PLUGIN_V2:
+                plugin_info = get_plugin_info(self.trt_network,
+                                              original_layer_name)
+                if plugin_info is not None:
+                    set_plugin_info(self.trt_network, layer.name, plugin_info)
+                    delete_plugin_info(self.trt_network, original_layer_name)
 
     def register_ndarray(self, ndarray: np.ndarray) -> None:
         ''' When the functional APIs need to create local numpy array and use as weights for constant or other layers,
@@ -208,6 +310,32 @@ class Network(object):
             during the TRT network construction and TRT engine building process.
         '''
         self._registered_ndarrays.append(ndarray)
+
+    def _generate_optimization_profiles(self) -> List[trt.IOptimizationProfile]:
+        input_tensors = self._inputs
+        if len(input_tensors) == 0:
+            return []
+        num_profiles = len(list(input_tensors.items())[0][1].profiles)
+        profiles = []
+        for i in range(num_profiles):
+            logger.debug(f'Adding optimization profile {i+1}/{num_profiles}')
+            profile = self._trt_network.builder.create_optimization_profile()
+            for input_name, input_tensor in input_tensors.items():
+                shape_profile = input_tensor.profiles[i]
+                min_shape = list(shape_profile.min)
+                opt_shape = list(shape_profile.opt)
+                max_shape = list(shape_profile.max)
+                if input_tensor.trt_tensor.is_shape_tensor:
+                    profile.set_shape_input(input_name, min_shape, opt_shape,
+                                            max_shape)
+                else:
+                    profile.set_shape(input_name, min_shape, opt_shape,
+                                      max_shape)
+                logger.debug(
+                    f'{input_name}, min: {min_shape}, opt: {opt_shape}, max: {max_shape}'
+                )
+            profiles.append(profile)
+        return profiles
 
     def get_inputs(self):
         '''
@@ -502,6 +630,7 @@ def net_guard(network):
 class _TrtLlmModuleCallStack(object):
     call_stack = []
     module_name_map = weakref.WeakKeyDictionary()
+    module_to_layer_range_map: Dict[str, range] = {}
 
     def __init__(self):
         super().__init__()
@@ -530,6 +659,11 @@ class _TrtLlmModuleCallStack(object):
         if mod_obj in self.module_name_map:
             name = self.module_name_map[mod_obj]
         return name
+
+    def set_layer_range(self, mod_obj: Module, layer_range: range):
+        if mod_obj in self.module_name_map:
+            name = self.module_name_map[mod_obj]
+            self.module_to_layer_range_map[name] = layer_range
 
     def get_stack(self):
         return self.call_stack

@@ -14,13 +14,23 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 * [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
-  * FP16
-  * INT8 & INT4 Weight-Only
-  * Groupwise quantization (AWQ/GPTQ)
-  * SmoothQuant
-  * INT8 KV CACHE
-  * Tensor Parallel
-  * STRONGLY TYPED
+|    Model Name    | FP16  | FMHA  |  WO   |  AWQ   | GPTQ  |  SQ   |  TP   |  ST   | C++ Runtime | benchmark |  IFB  |   Arch  |
+| :--------------: | :---: | :---: | :---: | :---:  | :---: | :---: | :---: |:---: | :---------: | :-------: | :---: |  :---:  |
+|   Qwen-7B-Chat   |   Y   |   Y   |   Y   |   Y    |   Y   |   Y   |   Y   |   Y   |      Y      |     Y     |   Y   | Ampere+ |
+|  Qwen-14B-Chat   |   Y   |   Y   |   Y   |   Y*   |   Y   |   Y   |   Y   |   Y   |      Y      |     Y     |   Y   | Ampere+ |
+|  Qwen-72B-Chat   |   Y   |   Y   |   Y   |   -   |   Y   |   Y   |   Y   |   Y   |      Y      |     Y     |   Y   | Ampere+ |
+
+*Please note that Qwen-14B-Chat model supports AWQ only with single GPU.
+* Model Name: the name of the model, the same as the name on HuggingFace
+* FMHA: Fused MultiHead Attention (see introduction below)
+* WO: Weight Only Quantization (int8 / int4)
+* AWQ: Activation Aware Weight Quantization (int4)
+* GPTQ: Generative Pretrained Transformer Quantization (int4)
+* SQ: Smooth Quantization
+* TP: Tensor Parallel
+* PP: Pipeline Parallel
+* ST: Strongly Typed
+* IFB: In-flight Batching (see introduction below)
 
 ## Usage
 
@@ -128,6 +138,17 @@ python build.py --hf_model_dir ./tmp/Qwen/14B \
                 --output_dir ./tmp/Qwen/14B/trt_engines/fp16/2-gpu/ \
                 --world_size 2 \
                 --tp_size 2
+
+# Build Qwen 72B using 8-way tensor parallelism.
+python build.py --hf_model_dir ./tmp/Qwen/72B \
+                --dtype float16 \
+                --remove_input_padding \
+                --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
+                --use_gemm_plugin float16 \
+                --output_dir ./tmp/Qwen/72B/trt_engines/fp16/8-gpu/ \
+                --world_size 8 \
+                --tp_size 8
 ```
 **Demo output of engine building:**
 ```python
@@ -233,14 +254,11 @@ Then, you can add any combination of `--per-token` and `--per-channel` to get th
 Examples of build invocations:
 
 ```bash
-# Build model for SmoothQuant in the _per_tensor_ mode.
-python3 build.py --ft_dir_path=./tmp/Qwen/7B/sq0.5/1-gpu/ \
-                 --use_smooth_quant \
-                 --hf_model_dir ./tmp/Qwen/7B \
-                 --output_dir ./tmp/Qwen/7B/trt_engines/sq0.5/1-gpu/
-
 # Build model for SmoothQuant in the _per_token_ + _per_channel_ mode
 python3 build.py --ft_dir_path=./tmp/Qwen/7B/sq0.5/1-gpu/ \
+                 --use_gpt_attention_plugin float16 \
+                 --remove_input_padding \
+                 --enable_context_fmha \
                  --use_smooth_quant \
                  --per_token \
                  --per_channel \
@@ -267,40 +285,39 @@ python ../summarize.py --test_trt_llm \
 ```
 #### INT4-GPTQ
 To run the GPTQ Qwen example, the following steps are required:
-1. You need to install the [auto-gptq](https://github.com/PanQiWei/AutoGPTQ) module
+1. Install auto-gptq module:
 ```bash
 pip install auto-gptq
 ```
 
-2. Weight quantization
+2. Download quantized weights, for Qwen-7B-Chat, you can find it [here](https://huggingface.co/Qwen/Qwen-7B-Chat-Int4):
 ```bash
-python3 gptq_convert.py --hf_model_dir ./tmp/Qwen/7B \
-                        --tokenizer_dir ./tmp/Qwen/7B \
-                        --quant_ckpt_path ./tmp/Qwen/7B/int4-gptq
+git lfs install
+git clone https://huggingface.co/Qwen/Qwen-7B-Chat-Int4
 ```
 
 3. Build TRT-LLM engine:
 ```bash
-python build.py --hf_model_dir ./tmp/Qwen/7B \
-                --quant_ckpt_path ./tmp/Qwen/7B/int4-gptq/gptq_model-4bit-128g.safetensors \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --use_weight_only \
-                --weight_only_precision int4_gptq \
-                --per_group \
-                --world_size 1 \
-                --tp_size 1 \
-                --output_dir ./tmp/Qwen/7B/trt_engines/int4-gptq/1-gpu
+python build.py --hf_model_dir Qwen-7B-Chat-Int4 \
+                --quant_ckpt_path Qwen-7B-Chat-Int4 \
+                --dtype float16 \
+                --remove_input_padding \
+                --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
+                --use_gemm_plugin float16 \
+                --use_weight_only \
+                --weight_only_precision int4_gptq \
+                --per_group \
+                --world_size 1 \
+                --tp_size 1 \
+                --output_dir ./tmp/Qwen/7B/trt_engines/int4-gptq/1-gpu
 ```
 
 4. Run int4-gptq
 ```bash
 python3 ../run.py --input_text "你好，请问你叫什么？" \
                   --max_output_len=50 \
-                  --tokenizer_dir ./tmp/Qwen/7B/ \
+                  --tokenizer_dir Qwen-7B-Chat-Int4 \
                   --engine_dir=./tmp/Qwen/7B/trt_engines/int4-gptq/1-gpu
 ```
 ```
@@ -311,7 +328,7 @@ You are a helpful assistant.<|im_end|>
 你好，请问你叫什么？<|im_end|>
 <|im_start|>assistant
 "
-Output [Text 0 Beam 0]: "你好，我叫通义千问。"
+Output [Text 0 Beam 0]: "你好，我是通义千问，由阿里云开发。"
 ```
 
 5. Summarize
@@ -340,11 +357,11 @@ To run the AWQ Qwen example, the following steps are required:
     NVIDIA AMMO toolkit is used for AWQ weight quantization. Please see [examples/quantization/README.md](/examples/quantization/README.md#preparation) for AMMO installation instructions.
 
 ```bash
-python3 quantize.py --model_dir ./tmp/Qwen/7B \
-                    --dtype float16 \
-                    --qformat int4_awq \
-                    --export_path ./qwen_7b_4bit_gs128_awq.pt \
-                    --calib_size 32
+python3 ../quantization/quantize.py --model_dir ./tmp/Qwen/7B \
+                                    --dtype float16 \
+                                    --qformat int4_awq \
+                                    --export_path ./qwen_7b_4bit_gs128_awq.pt \
+                                    --calib_size 32
 ```
 
 2. TRT-LLM engine:
@@ -428,6 +445,13 @@ python3 ../run.py --input_text "你好，请问你叫什么？" \
                   --max_output_len=50 \
                   --tokenizer_dir ./tmp/Qwen/7B/ \
                   --engine_dir=./tmp/Qwen/7B/trt_engines/int4_weight_only/1-gpu/
+
+# Run 72B model with 8-gpu
+mpirun -n 8 --allow-run-as-root \
+    python ../run.py --input_text "What is your name?" \
+                     --max_output_len=50 \
+                     --tokenizer_dir ./tmp/Qwen/72B/ \
+                     --engine_dir=./tmp/Qwen/72B/trt_engines/fp16/8-gpu/
 ```
 
 **Demo output of run.py:**
@@ -448,7 +472,22 @@ You are a helpful assistant.<|im_end|>
 "
 Output: "我是来自阿里云的大规模语言模型，我叫通义千问。"
 ```
-
+```bash
+mpirun -n 8 --allow-run-as-root \
+    python ../run.py --input_text "What is your name?" \
+                     --max_output_len=50 \
+                     --tokenizer_dir ./tmp/Qwen/72B/ \
+                     --engine_dir=./tmp/Qwen/72B/trt_engines/fp16/8-gpu/
+```
+```
+Input [Text 0]: "<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+What is your name?<|im_end|>
+<|im_start|>assistant
+"
+Output [Text 0 Beam 0]: "I am QianWen, a large language model created by Alibaba Cloud."
+```
 ### Summarization using the Qwen model
 
 ```bash

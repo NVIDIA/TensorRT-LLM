@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -79,7 +79,7 @@ private:
             params.vocabSize, nullptr, this->mMaxTopP, bufferCast<float>(*this->mTopPsDevice), this->mStream->get(),
             nullptr);
 
-        // Perform batched TopK sampling
+        // Perform batched TopP sampling
         tk::invokeTopPInitialize(bufferCast<int32_t>(*this->mTopPIdValsDevice),
             bufferCast<int32_t>(*this->mEndOffsetsDevice), bufferCast<int32_t>(*this->mBeginOffsetsDevice),
             params.batchSize, params.vocabSize, this->mStream->get());

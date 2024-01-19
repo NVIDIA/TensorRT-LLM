@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -115,6 +115,7 @@ protected:
     using SamplingKernelTest<T>::mLogitsHost;
 
     TensorPtr mLogitsDevice;
+    TensorPtr mPenaltyWorkspaceDevice;
     TensorPtr mBiasHost;
     TensorPtr mBiasDevice;
     TensorPtr mTemperaturesDevice;
@@ -130,6 +131,9 @@ protected:
         mLogitsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSizePadded}),
             std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
 
+        mPenaltyWorkspaceDevice
+            = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSize}), nvinfer1::DataType::kINT32);
+
         mBiasHost = mBufferManager->pinned(ITensor::makeShape({mVocabSizePadded}),
             std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
         mBiasDevice = mBufferManager->gpu(ITensor::makeShape({mVocabSizePadded}),
@@ -141,13 +145,10 @@ protected:
         mBufferManager->copy(*mLogitsHost, *mLogitsDevice);
         mBufferManager->copy(*mBiasHost, *mBiasDevice);
 
-        if (param.temperaturesSize > 1)
-        {
-            ASSERT_EQ(param.temperaturesSize, param.batchSize) << "Invalid test configuration.";
-            mTemperaturesDevice
-                = mBufferManager->gpu(ITensor::makeShape({param.temperaturesSize}), nvinfer1::DataType::kFLOAT);
-            mBufferManager->copy(*param.temperatures, *mTemperaturesDevice);
-        }
+        ASSERT_EQ(param.temperaturesSize, param.batchSize) << "Invalid test configuration.";
+        mTemperaturesDevice
+            = mBufferManager->gpu(ITensor::makeShape({param.temperaturesSize}), nvinfer1::DataType::kFLOAT);
+        mBufferManager->copy(*param.temperatures, *mTemperaturesDevice);
     }
 
     void computeReference(T* logits, const T* bias, const float* temperatures, const size_t temperaturesSize)
@@ -156,7 +157,7 @@ protected:
         const T MAX_T_VAL = (IS_FP16) ? 65504.F : FLT_MAX;
         for (size_t i = 0; i < mBatchSize; ++i)
         {
-            float temperature = temperaturesSize > 1 ? temperatures[i] : temperatures[0];
+            float temperature = temperatures[i];
             ASSERT_GT(temperature, 0.0f) << "temperature should be positive but got " << temperature;
             for (size_t j = 0; j < mVocabSizePadded; ++j)
             {
@@ -176,16 +177,11 @@ public:
     {
         subsetup(param);
         // Do test
-        if (param.temperaturesSize == 1)
-        {
-            tk::invokeApplyTemperaturePenalty(bufferCast<T>(*mLogitsDevice), bufferCast<T>(*mBiasDevice),
-                bufferCast<float>(*param.temperatures)[0], mBatchSize, mVocabSize, mVocabSizePadded, mStream->get());
-        }
-        else
-        {
-            tk::invokeBatchApplyTemperaturePenalty(bufferCast<T>(*mLogitsDevice), bufferCast<T>(*mBiasDevice),
-                bufferCast<float>(*mTemperaturesDevice), mBatchSize, mVocabSize, mVocabSizePadded, mStream->get());
-        }
+        InvokeBatchApplyPenaltyParams<T> penalty_params{bufferCast<T>(*mLogitsDevice), bufferCast<T>(*mBiasDevice),
+            bufferCast<int32_t>(*mPenaltyWorkspaceDevice), nullptr, bufferCast<float>(*mTemperaturesDevice), nullptr,
+            nullptr, nullptr, false, mBatchSize, 1, 1, mVocabSize, mVocabSizePadded, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, mStream->get()};
+        tk::invokeBatchApplyPenalty(penalty_params);
         auto logitsOutHost = mBufferManager->copyFrom(*mLogitsDevice, MemoryType::kCPU);
 
         mStream->synchronize();
@@ -197,82 +193,11 @@ public:
             mBatchSize * mVocabSizePadded);
         EXPECT_TRUE(passed);
     }
-
-    void runConsistencyTest(TemperatureTestParam param)
-    {
-        // Set up test
-        ASSERT_EQ(param.temperaturesSize, 1) << "A consistency test assumes temperaturesSize=1";
-        subsetup(param);
-
-        // Run a single runtime value case.
-        tk::invokeApplyTemperaturePenalty(bufferCast<T>(*mLogitsDevice), bufferCast<T>(*mBiasDevice),
-            bufferCast<float>(*param.temperatures)[0], mBatchSize, mVocabSize, mVocabSizePadded, mStream->get());
-
-        float temperature = bufferCast<float>(*param.temperatures)[0];
-        auto temperaturesHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kFLOAT);
-        auto temperaturesHostPtr = bufferCast<float>(*temperaturesHost);
-        for (size_t i = 0; i < mBatchSize; ++i)
-        {
-            temperaturesHostPtr[i] = temperature;
-        }
-
-        mTemperaturesDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kFLOAT);
-        mBufferManager->copy(*temperaturesHost, *mTemperaturesDevice);
-
-        auto logitsBatchDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSizePadded}),
-            std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
-
-        mBufferManager->copy(*mLogitsHost, *logitsBatchDevice);
-
-        tk::invokeBatchApplyTemperaturePenalty(bufferCast<T>(*logitsBatchDevice), bufferCast<T>(*mBiasDevice),
-            bufferCast<float>(*mTemperaturesDevice), mBatchSize, mVocabSize, mVocabSizePadded, mStream->get());
-
-        auto logitsOutHost = mBufferManager->copyFrom(*mLogitsDevice, MemoryType::kCPU);
-        auto logitsBatchOutHost = mBufferManager->copyFrom(*logitsBatchDevice, MemoryType::kCPU);
-
-        mStream->synchronize();
-
-        bool passed = checkResult(param.toString(), bufferCast<T>(*logitsOutHost), bufferCast<T>(*logitsBatchOutHost),
-            mBatchSize * mVocabSizePadded);
-        EXPECT_TRUE(passed);
-    }
 };
 
 TYPED_TEST_SUITE(TemperaturePenaltyTest, FloatAndHalfTypes);
 
 TYPED_TEST(TemperaturePenaltyTest, NoPenalty)
-{
-    TensorPtr temperaturesHost = this->mBufferManager->pinned(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
-    bufferCast<float>(*temperaturesHost)[0] = 1.0f;
-    this->runTest(TemperatureTestParam().setBatchSize(6).setVocabSize(4).setTemperaturesSize(1).setTemperatures(
-        temperaturesHost));
-}
-
-TYPED_TEST(TemperaturePenaltyTest, LessThanOne)
-{
-    TensorPtr temperaturesHost = this->mBufferManager->pinned(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
-    bufferCast<float>(*temperaturesHost)[0] = 0.53f;
-    this->runTest(TemperatureTestParam().setBatchSize(6).setVocabSize(4).setTemperaturesSize(1).setTemperatures(
-        temperaturesHost));
-}
-
-TYPED_TEST(TemperaturePenaltyTest, GreaterThaneOne)
-{
-    TensorPtr temperaturesHost = this->mBufferManager->pinned(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
-    bufferCast<float>(*temperaturesHost)[0] = 2.01f;
-    this->runTest(TemperatureTestParam().setBatchSize(6).setVocabSize(4).setTemperaturesSize(1).setTemperatures(
-        temperaturesHost));
-}
-
-TYPED_TEST(TemperaturePenaltyTest, LargeVocab)
-{
-    TensorPtr temperaturesHost = this->mBufferManager->pinned(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
-    bufferCast<float>(*temperaturesHost)[0] = 2.01f;
-    this->runTest(TemperatureTestParam().setBatchSize(6).setVocabSize(50001).setTemperaturesSize(1).setTemperatures(
-        temperaturesHost));
-}
-
-TYPED_TEST(TemperaturePenaltyTest, BatchNoPenalty)
 {
     int32_t batchSize = 6;
     TensorPtr temperaturesHost
@@ -286,7 +211,7 @@ TYPED_TEST(TemperaturePenaltyTest, BatchNoPenalty)
             temperaturesHost));
 }
 
-TYPED_TEST(TemperaturePenaltyTest, BatchLessThanOne)
+TYPED_TEST(TemperaturePenaltyTest, LessThanOne)
 {
     int32_t batchSize = 6;
     TensorPtr temperaturesHost
@@ -300,7 +225,7 @@ TYPED_TEST(TemperaturePenaltyTest, BatchLessThanOne)
             temperaturesHost));
 }
 
-TYPED_TEST(TemperaturePenaltyTest, BatchGreaterThaneOne)
+TYPED_TEST(TemperaturePenaltyTest, GreaterThaneOne)
 {
     int32_t batchSize = 6;
     TensorPtr temperaturesHost
@@ -314,7 +239,7 @@ TYPED_TEST(TemperaturePenaltyTest, BatchGreaterThaneOne)
             temperaturesHost));
 }
 
-TYPED_TEST(TemperaturePenaltyTest, BatchMixed)
+TYPED_TEST(TemperaturePenaltyTest, Mixed)
 {
     int32_t batchSize = 6;
     TensorPtr temperaturesHost
@@ -328,14 +253,20 @@ TYPED_TEST(TemperaturePenaltyTest, BatchMixed)
             temperaturesHost));
 }
 
-TYPED_TEST(TemperaturePenaltyTest, Consistency)
+TYPED_TEST(TemperaturePenaltyTest, LargeVocab)
 {
-    float temperature = 2.01f;
-    TensorPtr temperaturesHost = this->mBufferManager->pinned(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
-    bufferCast<float>(*temperaturesHost)[0] = 2.01f;
-    this->runConsistencyTest(
-        TemperatureTestParam().setBatchSize(6).setVocabSize(4).setTemperaturesSize(1).setTemperatures(
-            temperaturesHost));
+    int32_t batchSize = 6;
+    TensorPtr temperaturesHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    for (int32_t i = 0; i < batchSize; ++i)
+    {
+        bufferCast<float>(*temperaturesHost)[i] = 0.53f + 0.2f * i;
+    }
+    this->runTest(TemperatureTestParam()
+                      .setBatchSize(batchSize)
+                      .setVocabSize(50001)
+                      .setTemperaturesSize(batchSize)
+                      .setTemperatures(temperaturesHost));
 }
 
 struct RepetitionPenaltyTestCase
@@ -344,8 +275,11 @@ struct RepetitionPenaltyTestCase
     int32_t vocabSize;
     int32_t maxInputLength;
     TensorPtr repetitionPenalties;
+    TensorPtr presencePenalties;
+    TensorPtr frequencyPenalties;
     int32_t repetitionPenaltiesSize;
-    RepetitionPenaltyType repetitionPenaltyType;
+    int32_t presencePenaltiesSize;
+    int32_t frequencyPenaltiesSize;
 
     RepetitionPenaltyTestCase& setBatchSize(int32_t bs)
     {
@@ -371,29 +305,45 @@ struct RepetitionPenaltyTestCase
         return *this;
     }
 
+    RepetitionPenaltyTestCase& setPresencePenalties(TensorPtr pp)
+    {
+        presencePenalties = pp;
+        return *this;
+    }
+
+    RepetitionPenaltyTestCase& setFrequencyPenalties(TensorPtr fp)
+    {
+        frequencyPenalties = fp;
+        return *this;
+    }
+
     RepetitionPenaltyTestCase& setRepetitionPenaltiesSize(int32_t rps)
     {
         repetitionPenaltiesSize = rps;
         return *this;
     }
 
-    RepetitionPenaltyTestCase& setRepetitionPenaltyType(RepetitionPenaltyType type)
+    RepetitionPenaltyTestCase& setPresencePenaltiesSize(int32_t pps)
     {
-        repetitionPenaltyType = type;
+        presencePenaltiesSize = pps;
+        return *this;
+    }
+
+    RepetitionPenaltyTestCase& setFrequencyPenaltiesSize(int32_t fps)
+    {
+        frequencyPenaltiesSize = fps;
         return *this;
     }
 
     std::string toString() const
     {
-        static const std::unordered_map<RepetitionPenaltyType, std::string> typestr_map{
-            {RepetitionPenaltyType::Additive, "additive"}, {RepetitionPenaltyType::Multiplicative, "multiplicative"},
-            {RepetitionPenaltyType::None, "none"}};
         return tc::fmtstr(
             "RepetitionPenaltyTestCase[batch=%d, vocab=%d, maxInputLength=%d, "
-            "repetitionPenalties=%s, repetitionPenaltyType=%s]",
+            "repetitionPenalties=%s, presencePenalties=%s, frequencyPenalties=%s]",
             batchSize, vocabSize, maxInputLength,
             tc::arr2str(bufferCast<float>(*repetitionPenalties), repetitionPenaltiesSize).c_str(),
-            typestr_map.at(repetitionPenaltyType).c_str());
+            tc::arr2str(bufferCast<float>(*presencePenalties), presencePenaltiesSize).c_str(),
+            tc::arr2str(bufferCast<float>(*frequencyPenalties), frequencyPenaltiesSize).c_str());
     }
 };
 
@@ -413,9 +363,13 @@ protected:
     using SamplingKernelTest<T>::mLogitsHost;
 
     TensorPtr mLogitsDevice;
+    TensorPtr mPenaltyWorkspaceDevice;
 
     TensorPtr mOutputIdsHost;
     TensorPtr mOutputIdsDevice;
+
+    TensorPtr mContextLengthHost;
+    TensorPtr mContextLengthDevice;
 
     TensorPtr mSeqLengthHost;
     TensorPtr mSeqLengthDevice;
@@ -424,6 +378,8 @@ protected:
     TensorPtr mIdsPtrDevice;
 
     TensorPtr mRepetitionPenaltiesDevice;
+    TensorPtr mPresencePenaltiesDevice;
+    TensorPtr mFrequencyPenaltiesDevice;
 
     void subsetup(RepetitionPenaltyTestCase param)
     {
@@ -438,6 +394,9 @@ protected:
         mLogitsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSizePadded}),
             std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
 
+        mPenaltyWorkspaceDevice
+            = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSize}), nvinfer1::DataType::kINT32);
+
         mOutputIdsHost
             = mBufferManager->pinned(ITensor::makeShape({mBatchSize, mSequenceLength}), nvinfer1::DataType::kINT32);
         mOutputIdsDevice
@@ -446,6 +405,9 @@ protected:
         mSeqLengthHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
         mSeqLengthDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
 
+        mContextLengthHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
+        mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
+
         mIdsPtrHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT64);
         mIdsPtrDevice = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT64);
 
@@ -453,6 +415,10 @@ protected:
             bufferCast<T>(*mLogitsHost), static_cast<T*>(nullptr), mBatchSize, mVocabSize, mVocabSizePadded);
         initRandomInt(bufferCast<int32_t>(*mOutputIdsHost), mSequenceLength * mBatchSize, 0, mVocabSize);
         initRandomInt(bufferCast<int32_t>(*mSeqLengthHost), mBatchSize, 1, mSequenceLength);
+        for (size_t i = 0; i < mBatchSize; ++i)
+        {
+            bufferCast<int32_t>(*mContextLengthHost)[i] = bufferCast<int32_t>(*mSeqLengthHost)[i];
+        }
 
         auto idsPtrHostPtr = reinterpret_cast<void**>(bufferCast<int64_t>(*mIdsPtrHost));
         auto outputIdsDevicePtr = bufferCast<int32_t>(*mOutputIdsDevice);
@@ -463,22 +429,34 @@ protected:
 
         mBufferManager->copy(*mLogitsHost, *mLogitsDevice);
         mBufferManager->copy(*mOutputIdsHost, *mOutputIdsDevice);
+        mBufferManager->copy(*mContextLengthHost, *mContextLengthDevice);
         mBufferManager->copy(*mSeqLengthHost, *mSeqLengthDevice);
         mBufferManager->copy(*mIdsPtrHost, *mIdsPtrDevice);
 
         ASSERT_EQ(param.repetitionPenaltiesSize, param.batchSize) << "Invalid test configuration.";
+        ASSERT_EQ(param.presencePenaltiesSize, param.batchSize) << "Invalid test configuration.";
+        ASSERT_EQ(param.frequencyPenaltiesSize, param.batchSize) << "Invalid test configuration.";
         mRepetitionPenaltiesDevice
             = mBufferManager->gpu(ITensor::makeShape({param.repetitionPenaltiesSize}), nvinfer1::DataType::kFLOAT);
+        mPresencePenaltiesDevice
+            = mBufferManager->gpu(ITensor::makeShape({param.presencePenaltiesSize}), nvinfer1::DataType::kFLOAT);
+        mFrequencyPenaltiesDevice
+            = mBufferManager->gpu(ITensor::makeShape({param.frequencyPenaltiesSize}), nvinfer1::DataType::kFLOAT);
         mBufferManager->copy(*param.repetitionPenalties, *mRepetitionPenaltiesDevice);
+        mBufferManager->copy(*param.presencePenalties, *mPresencePenaltiesDevice);
+        mBufferManager->copy(*param.frequencyPenalties, *mFrequencyPenaltiesDevice);
     }
 
     void computeReference(T* logits, const int* outputIds, const int* sequenceLengths, const float* repetitionPenalties,
-        const int32_t repetitionPenaltiesSize, const RepetitionPenaltyType repetitionPenaltyType)
+        const float* presencePenalties, const float* frequencyPenalties, const int32_t repetitionPenaltiesSize,
+        const int32_t presencePenaltiesSize, const int32_t frequencyPenaltiesSize)
     {
         std::vector<bool> penalized(mVocabSize);
         for (int32_t bi = 0; bi < mBatchSize; ++bi)
         {
             float repetitionPenalty = repetitionPenaltiesSize > 1 ? repetitionPenalties[bi] : repetitionPenalties[0];
+            float presencePenalty = presencePenaltiesSize > 1 ? presencePenalties[bi] : presencePenalties[0];
+            float frequencyPenalty = frequencyPenaltiesSize > 1 ? frequencyPenalties[bi] : frequencyPenalties[0];
 
             std::fill(penalized.begin(), penalized.end(), false);
             size_t offset = bi * mVocabSizePadded;
@@ -489,22 +467,11 @@ protected:
                 if (!penalized[tokenId])
                 {
                     float logit = static_cast<float>(logits[offset + tokenId]);
-                    switch (repetitionPenaltyType)
-                    {
-                    case RepetitionPenaltyType::Additive:
-                        logits[offset + tokenId] = static_cast<T>(logit - repetitionPenalty);
-                        break;
-                    case RepetitionPenaltyType::Multiplicative:
-                        logits[offset + tokenId]
-                            = static_cast<T>(logit < 0.0f ? logit * repetitionPenalty : logit / repetitionPenalty);
-                        break;
-                    case RepetitionPenaltyType::None:
-                        // None. do nothing.
-                        break;
-                    default: throw std::domain_error("Invalid repetition penalty type.");
-                    }
+                    logits[offset + tokenId] = static_cast<T>(
+                        (logit < 0.0f ? logit * repetitionPenalty : logit / repetitionPenalty) - presencePenalty);
                     penalized[tokenId] = true;
                 }
+                logits[offset + tokenId] -= frequencyPenalty;
             }
         }
     }
@@ -513,17 +480,21 @@ public:
     void runTest(RepetitionPenaltyTestCase param)
     {
         subsetup(param);
-        tk::invokeBatchApplyRepetitionPenalty(bufferCast<T>(*mLogitsDevice),
-            bufferCast<float>(*mRepetitionPenaltiesDevice),
-            reinterpret_cast<const int32_t**>(bufferCast<int64_t>(*mIdsPtrDevice)),
-            bufferCast<int32_t>(*mSeqLengthHost), mBatchSize, mVocabSizePadded, param.repetitionPenaltyType,
-            mSequenceLength, mStream->get());
+        InvokeBatchApplyPenaltyParams<T> penalty_params{bufferCast<T>(*mLogitsDevice), nullptr,
+            bufferCast<int32_t>(*mPenaltyWorkspaceDevice), nullptr, nullptr,
+            bufferCast<float>(*mRepetitionPenaltiesDevice), bufferCast<float>(*mPresencePenaltiesDevice),
+            bufferCast<float>(*mFrequencyPenaltiesDevice), true, mBatchSize, 1, mSequenceLength, mVocabSize,
+            mVocabSizePadded, reinterpret_cast<const int32_t**>(bufferCast<int64_t>(*mIdsPtrDevice)), nullptr,
+            bufferCast<int32_t>(*mContextLengthDevice), bufferCast<int32_t>(*mSeqLengthDevice), nullptr, nullptr,
+            mStream->get()};
+        tk::invokeBatchApplyPenalty(penalty_params);
 
         auto logitsOutHost = mBufferManager->copyFrom(*mLogitsDevice, MemoryType::kCPU);
 
         computeReference(bufferCast<T>(*mLogitsHost), bufferCast<int32_t>(*mOutputIdsHost),
             bufferCast<int32_t>(*mSeqLengthHost), bufferCast<float>(*param.repetitionPenalties),
-            param.repetitionPenaltiesSize, param.repetitionPenaltyType);
+            bufferCast<float>(*param.presencePenalties), bufferCast<float>(*param.frequencyPenalties),
+            param.repetitionPenaltiesSize, param.presencePenaltiesSize, param.frequencyPenaltiesSize);
 
         mStream->synchronize();
 
@@ -540,131 +511,330 @@ TYPED_TEST(RepetitionPenaltyTest, BatchNoPenalty)
     int32_t batchSize = 6;
     TensorPtr repetitionPenaltyHost
         = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr presencePenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr frequencyPenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
     for (int32_t i = 0; i < batchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 1.0f;
+        bufferCast<float>(*presencePenaltyHost)[i] = 0.0f;
+        bufferCast<float>(*frequencyPenaltyHost)[i] = 0.0f;
     }
     this->runTest(RepetitionPenaltyTestCase()
                       .setBatchSize(batchSize)
                       .setVocabSize(4)
                       .setMaxInputLength(5)
                       .setRepetitionPenalties(repetitionPenaltyHost)
+                      .setPresencePenalties(presencePenaltyHost)
+                      .setFrequencyPenalties(frequencyPenaltyHost)
                       .setRepetitionPenaltiesSize(batchSize)
-                      .setRepetitionPenaltyType(RepetitionPenaltyType::Multiplicative));
+                      .setPresencePenaltiesSize(batchSize)
+                      .setFrequencyPenaltiesSize(batchSize));
 }
 
-TYPED_TEST(RepetitionPenaltyTest, BatchLessThanOne)
+TYPED_TEST(RepetitionPenaltyTest, BatchRepetitionLessThanOne)
 {
     int32_t batchSize = 6;
     TensorPtr repetitionPenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr presencePenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr frequencyPenaltyHost
         = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
     for (int32_t i = 0; i < batchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 0.53f;
+        bufferCast<float>(*presencePenaltyHost)[i] = 0.0f;
+        bufferCast<float>(*frequencyPenaltyHost)[i] = 0.0f;
     }
     this->runTest(RepetitionPenaltyTestCase()
                       .setBatchSize(batchSize)
                       .setVocabSize(4)
                       .setMaxInputLength(5)
                       .setRepetitionPenalties(repetitionPenaltyHost)
+                      .setPresencePenalties(presencePenaltyHost)
+                      .setFrequencyPenalties(frequencyPenaltyHost)
                       .setRepetitionPenaltiesSize(batchSize)
-                      .setRepetitionPenaltyType(RepetitionPenaltyType::Multiplicative));
+                      .setPresencePenaltiesSize(batchSize)
+                      .setFrequencyPenaltiesSize(batchSize));
 }
 
-TYPED_TEST(RepetitionPenaltyTest, BatchGreaterThaneOne)
+TYPED_TEST(RepetitionPenaltyTest, BatchRepetitionGreaterThaneOne)
 {
     int32_t batchSize = 6;
     TensorPtr repetitionPenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr presencePenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr frequencyPenaltyHost
         = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
     for (int32_t i = 0; i < batchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 2.01f;
+        bufferCast<float>(*presencePenaltyHost)[i] = 0.0f;
+        bufferCast<float>(*frequencyPenaltyHost)[i] = 0.0f;
     }
     this->runTest(RepetitionPenaltyTestCase()
                       .setBatchSize(batchSize)
                       .setVocabSize(4)
                       .setMaxInputLength(5)
                       .setRepetitionPenalties(repetitionPenaltyHost)
+                      .setPresencePenalties(presencePenaltyHost)
+                      .setFrequencyPenalties(frequencyPenaltyHost)
                       .setRepetitionPenaltiesSize(batchSize)
-                      .setRepetitionPenaltyType(RepetitionPenaltyType::Multiplicative));
+                      .setPresencePenaltiesSize(batchSize)
+                      .setFrequencyPenaltiesSize(batchSize));
 }
 
-TYPED_TEST(RepetitionPenaltyTest, BatchMixed)
+TYPED_TEST(RepetitionPenaltyTest, BatchRepetitionMixed)
 {
     int32_t batchSize = 6;
     TensorPtr repetitionPenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr presencePenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr frequencyPenaltyHost
         = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
     for (int32_t i = 0; i < batchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 0.53 + i * 0.2f;
+        bufferCast<float>(*presencePenaltyHost)[i] = 0.0f;
+        bufferCast<float>(*frequencyPenaltyHost)[i] = 0.0f;
     }
     this->runTest(RepetitionPenaltyTestCase()
                       .setBatchSize(batchSize)
                       .setVocabSize(4)
                       .setMaxInputLength(5)
                       .setRepetitionPenalties(repetitionPenaltyHost)
+                      .setPresencePenalties(presencePenaltyHost)
+                      .setFrequencyPenalties(frequencyPenaltyHost)
                       .setRepetitionPenaltiesSize(batchSize)
-                      .setRepetitionPenaltyType(RepetitionPenaltyType::Multiplicative));
+                      .setPresencePenaltiesSize(batchSize)
+                      .setFrequencyPenaltiesSize(batchSize));
 }
 
-TYPED_TEST(RepetitionPenaltyTest, PenaltyTypeAdditive)
+TYPED_TEST(RepetitionPenaltyTest, BatchPresenceMixed)
 {
     int32_t batchSize = 6;
     TensorPtr repetitionPenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr presencePenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr frequencyPenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    for (int32_t i = 0; i < batchSize; ++i)
+    {
+        bufferCast<float>(*repetitionPenaltyHost)[i] = 1.0f;
+        bufferCast<float>(*presencePenaltyHost)[i] = 0.53 + i * 0.2f;
+        bufferCast<float>(*frequencyPenaltyHost)[i] = 0.0f;
+    }
+    this->runTest(RepetitionPenaltyTestCase()
+                      .setBatchSize(batchSize)
+                      .setVocabSize(4)
+                      .setMaxInputLength(5)
+                      .setRepetitionPenalties(repetitionPenaltyHost)
+                      .setPresencePenalties(presencePenaltyHost)
+                      .setFrequencyPenalties(frequencyPenaltyHost)
+                      .setRepetitionPenaltiesSize(batchSize)
+                      .setPresencePenaltiesSize(batchSize)
+                      .setFrequencyPenaltiesSize(batchSize));
+}
+
+TYPED_TEST(RepetitionPenaltyTest, BatchPresenceHasDefaultValueZero2)
+{
+    int32_t batchSize = 6;
+    TensorPtr repetitionPenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr presencePenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr frequencyPenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    for (int32_t i = 0; i < batchSize; ++i)
+    {
+        bufferCast<float>(*repetitionPenaltyHost)[i] = 1.0f;
+        bufferCast<float>(*presencePenaltyHost)[i] = i % 2 == 0 ? 1.0f : 0.0f;
+        bufferCast<float>(*frequencyPenaltyHost)[i] = 0.0f;
+    }
+    this->runTest(RepetitionPenaltyTestCase()
+                      .setBatchSize(batchSize)
+                      .setVocabSize(4)
+                      .setMaxInputLength(5)
+                      .setRepetitionPenalties(repetitionPenaltyHost)
+                      .setPresencePenalties(presencePenaltyHost)
+                      .setFrequencyPenalties(frequencyPenaltyHost)
+                      .setRepetitionPenaltiesSize(batchSize)
+                      .setPresencePenaltiesSize(batchSize)
+                      .setFrequencyPenaltiesSize(batchSize));
+}
+
+TYPED_TEST(RepetitionPenaltyTest, BatchFrequencyMixed)
+{
+    int32_t batchSize = 6;
+    TensorPtr repetitionPenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr presencePenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr frequencyPenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    for (int32_t i = 0; i < batchSize; ++i)
+    {
+        bufferCast<float>(*repetitionPenaltyHost)[i] = 1.0f;
+        bufferCast<float>(*presencePenaltyHost)[i] = 0.0f;
+        bufferCast<float>(*frequencyPenaltyHost)[i] = 0.53 + i * 0.2f;
+    }
+    this->runTest(RepetitionPenaltyTestCase()
+                      .setBatchSize(batchSize)
+                      .setVocabSize(4)
+                      .setMaxInputLength(5)
+                      .setRepetitionPenalties(repetitionPenaltyHost)
+                      .setPresencePenalties(presencePenaltyHost)
+                      .setFrequencyPenalties(frequencyPenaltyHost)
+                      .setRepetitionPenaltiesSize(batchSize)
+                      .setPresencePenaltiesSize(batchSize)
+                      .setFrequencyPenaltiesSize(batchSize));
+}
+
+TYPED_TEST(RepetitionPenaltyTest, BatchFrequencyHasDefaultValueZero2)
+{
+    int32_t batchSize = 6;
+    TensorPtr repetitionPenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr presencePenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr frequencyPenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    for (int32_t i = 0; i < batchSize; ++i)
+    {
+        bufferCast<float>(*repetitionPenaltyHost)[i] = 1.0f;
+        bufferCast<float>(*presencePenaltyHost)[i] = 0.0f;
+        bufferCast<float>(*frequencyPenaltyHost)[i] = i % 2 == 0 ? 1.0f : 0.0f;
+    }
+    this->runTest(RepetitionPenaltyTestCase()
+                      .setBatchSize(batchSize)
+                      .setVocabSize(4)
+                      .setMaxInputLength(5)
+                      .setRepetitionPenalties(repetitionPenaltyHost)
+                      .setPresencePenalties(presencePenaltyHost)
+                      .setFrequencyPenalties(frequencyPenaltyHost)
+                      .setRepetitionPenaltiesSize(batchSize)
+                      .setPresencePenaltiesSize(batchSize)
+                      .setFrequencyPenaltiesSize(batchSize));
+}
+
+TYPED_TEST(RepetitionPenaltyTest, PenaltyTypeRepetitionPresence)
+{
+    int32_t batchSize = 6;
+    TensorPtr repetitionPenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr presencePenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr frequencyPenaltyHost
         = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
     for (int32_t i = 0; i < batchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 0.53 + i * 0.2f;
+        bufferCast<float>(*presencePenaltyHost)[i] = 0.53 + i * 0.2f;
+        bufferCast<float>(*frequencyPenaltyHost)[i] = 0.0f;
     }
     this->runTest(RepetitionPenaltyTestCase()
                       .setBatchSize(batchSize)
                       .setVocabSize(4)
                       .setMaxInputLength(5)
                       .setRepetitionPenalties(repetitionPenaltyHost)
+                      .setPresencePenalties(presencePenaltyHost)
+                      .setFrequencyPenalties(frequencyPenaltyHost)
                       .setRepetitionPenaltiesSize(batchSize)
-                      .setRepetitionPenaltyType(RepetitionPenaltyType::Additive));
+                      .setPresencePenaltiesSize(batchSize)
+                      .setFrequencyPenaltiesSize(batchSize));
 }
 
-TYPED_TEST(RepetitionPenaltyTest, PenaltyTypeAdditiveHasDefaultValueZero2)
+TYPED_TEST(RepetitionPenaltyTest, PenaltyTypeRepetitionFrequency)
 {
     int32_t batchSize = 6;
     TensorPtr repetitionPenaltyHost
         = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
-    for (int32_t i = 0; i < batchSize; ++i)
-    {
-        bufferCast<float>(*repetitionPenaltyHost)[i] = i % 2 == 0 ? 1.0f : 0.0f;
-    }
-    this->runTest(RepetitionPenaltyTestCase()
-                      .setBatchSize(batchSize)
-                      .setVocabSize(4)
-                      .setMaxInputLength(5)
-                      .setRepetitionPenalties(repetitionPenaltyHost)
-                      .setRepetitionPenaltiesSize(batchSize)
-                      .setRepetitionPenaltyType(RepetitionPenaltyType::Additive));
-}
-
-TYPED_TEST(RepetitionPenaltyTest, PenaltyTypeNone)
-{
-    int32_t batchSize = 6;
-    TensorPtr repetitionPenaltyHost
+    TensorPtr presencePenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr frequencyPenaltyHost
         = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
     for (int32_t i = 0; i < batchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 0.53 + i * 0.2f;
+        bufferCast<float>(*presencePenaltyHost)[i] = 0.0f;
+        bufferCast<float>(*frequencyPenaltyHost)[i] = 0.53 + i * 0.2f;
     }
     this->runTest(RepetitionPenaltyTestCase()
                       .setBatchSize(batchSize)
                       .setVocabSize(4)
                       .setMaxInputLength(5)
                       .setRepetitionPenalties(repetitionPenaltyHost)
+                      .setPresencePenalties(presencePenaltyHost)
+                      .setFrequencyPenalties(frequencyPenaltyHost)
                       .setRepetitionPenaltiesSize(batchSize)
-                      .setRepetitionPenaltyType(RepetitionPenaltyType::None));
+                      .setPresencePenaltiesSize(batchSize)
+                      .setFrequencyPenaltiesSize(batchSize));
+}
+
+TYPED_TEST(RepetitionPenaltyTest, PenaltyTypePresenceFrequency)
+{
+    int32_t batchSize = 6;
+    TensorPtr repetitionPenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr presencePenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr frequencyPenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    for (int32_t i = 0; i < batchSize; ++i)
+    {
+        bufferCast<float>(*repetitionPenaltyHost)[i] = 1.0f;
+        bufferCast<float>(*presencePenaltyHost)[i] = 0.53 + i * 0.2f;
+        bufferCast<float>(*frequencyPenaltyHost)[i] = 0.53 + i * 0.2f;
+    }
+    this->runTest(RepetitionPenaltyTestCase()
+                      .setBatchSize(batchSize)
+                      .setVocabSize(4)
+                      .setMaxInputLength(5)
+                      .setRepetitionPenalties(repetitionPenaltyHost)
+                      .setPresencePenalties(presencePenaltyHost)
+                      .setFrequencyPenalties(frequencyPenaltyHost)
+                      .setRepetitionPenaltiesSize(batchSize)
+                      .setPresencePenaltiesSize(batchSize)
+                      .setFrequencyPenaltiesSize(batchSize));
+}
+
+TYPED_TEST(RepetitionPenaltyTest, PenaltyTypeFull)
+{
+    int32_t batchSize = 6;
+    TensorPtr repetitionPenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr presencePenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr frequencyPenaltyHost
+        = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kFLOAT);
+    for (int32_t i = 0; i < batchSize; ++i)
+    {
+        bufferCast<float>(*repetitionPenaltyHost)[i] = 0.53 + i * 0.2f;
+        bufferCast<float>(*presencePenaltyHost)[i] = 0.53 + i * 0.2f;
+        bufferCast<float>(*frequencyPenaltyHost)[i] = 0.53 + i * 0.2f;
+    }
+    this->runTest(RepetitionPenaltyTestCase()
+                      .setBatchSize(batchSize)
+                      .setVocabSize(4)
+                      .setMaxInputLength(5)
+                      .setRepetitionPenalties(repetitionPenaltyHost)
+                      .setPresencePenalties(presencePenaltyHost)
+                      .setFrequencyPenalties(frequencyPenaltyHost)
+                      .setRepetitionPenaltiesSize(batchSize)
+                      .setPresencePenaltiesSize(batchSize)
+                      .setFrequencyPenaltiesSize(batchSize));
 }
 
 struct MinLengthPenaltyTestParams
 {
     int32_t batchSize;
     int32_t vocabSize;
+    int32_t maxSeqLength;
 
     MinLengthPenaltyTestParams& setBatchSize(int32_t bs)
     {
@@ -678,9 +848,16 @@ struct MinLengthPenaltyTestParams
         return *this;
     }
 
+    MinLengthPenaltyTestParams& setMaxSeqLength(int32_t sl)
+    {
+        maxSeqLength = sl;
+        return *this;
+    }
+
     std::string toString() const
     {
-        return tc::fmtstr("MinLengthPenaltyTestParams[batch=%d, vocab=%d]", batchSize, vocabSize);
+        return tc::fmtstr(
+            "MinLengthPenaltyTestParams[batch=%d, vocab=%d, maxSeqLen=%d]", batchSize, vocabSize, maxSeqLength);
     }
 };
 
@@ -700,6 +877,7 @@ protected:
     using SamplingKernelTest<T>::mLogitsHost;
 
     TensorPtr mLogitsDevice;
+    TensorPtr mPenaltyWorkspaceDevice;
 
     TensorPtr mContextLengthHost;
     TensorPtr mContextLengthDevice;
@@ -718,13 +896,16 @@ protected:
         mBatchSize = param.batchSize;
         mVocabSize = param.vocabSize;
         mVocabSizePadded = padVocabSize(mVocabSize);
-        mMaxInputLength = 64;
+        mMaxInputLength = param.maxSeqLength;
         mSequenceLength = 2 * mMaxInputLength; // input + output
 
         mLogitsHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize, mVocabSizePadded}),
             std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
         mLogitsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSizePadded}),
             std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
+
+        mPenaltyWorkspaceDevice
+            = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSize}), nvinfer1::DataType::kINT32);
 
         mSeqLengthHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
         mSeqLengthDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
@@ -753,7 +934,7 @@ protected:
             const auto generatedSeqLen = std::max(0,
                 std::min(
                     static_cast<int32_t>(minLengthHostPtr[bi] + 2 * std::pow(-1, std::rand() % 2)), mMaxInputLength));
-            seqLengthHostPtr[bi] = contextLengthHostPtr[bi] + generatedSeqLen - 1;
+            seqLengthHostPtr[bi] = contextLengthHostPtr[bi] + generatedSeqLen;
         }
 
         mBufferManager->copy(*mLogitsHost, *mLogitsDevice);
@@ -771,7 +952,7 @@ protected:
 
         for (int32_t bi = 0; bi < mBatchSize; ++bi)
         {
-            const auto generatedSeqLen = sequenceLengths[bi] + 1 - contextLengths[bi];
+            const auto generatedSeqLen = sequenceLengths[bi] - contextLengths[bi];
             const auto endId = endIds[bi];
             if (generatedSeqLen < minSeqLen[bi])
             {
@@ -784,9 +965,12 @@ public:
     void runTest(MinLengthPenaltyTestParams param)
     {
         subsetup(param);
-        tk::invokeMinLengthPenalty(bufferCast<T>(*mLogitsDevice), bufferCast<int32_t>(*mMinLengthDevice),
-            bufferCast<int32_t>(*mEndIdsDevice), bufferCast<int32_t>(*mSeqLengthDevice),
-            bufferCast<int32_t>(*mContextLengthDevice), mBatchSize, mVocabSizePadded, mStream->get());
+        InvokeBatchApplyPenaltyParams<T> penalty_params{bufferCast<T>(*mLogitsDevice), nullptr,
+            bufferCast<int32_t>(*mPenaltyWorkspaceDevice), nullptr, nullptr, nullptr, nullptr, nullptr, false,
+            mBatchSize, 1, mSequenceLength, mVocabSize, mVocabSizePadded, nullptr, nullptr,
+            bufferCast<int32_t>(*mContextLengthDevice), bufferCast<int32_t>(*mSeqLengthDevice),
+            bufferCast<int32_t>(*mMinLengthDevice), bufferCast<int32_t>(*mEndIdsDevice), mStream->get()};
+        tk::invokeBatchApplyPenalty(penalty_params);
 
         mStream->synchronize();
 
@@ -806,9 +990,14 @@ public:
 
 TYPED_TEST_SUITE(MinLengthPenaltyTest, FloatAndHalfTypes);
 
-TYPED_TEST(MinLengthPenaltyTest, Batch)
+TYPED_TEST(MinLengthPenaltyTest, BatchMaxSeqLen2)
 {
-    this->runTest(MinLengthPenaltyTestParams().setBatchSize(16).setVocabSize(51200));
+    this->runTest(MinLengthPenaltyTestParams().setBatchSize(16).setVocabSize(10).setMaxSeqLength(2));
+}
+
+TYPED_TEST(MinLengthPenaltyTest, BatchMaxSeqLen64)
+{
+    this->runTest(MinLengthPenaltyTestParams().setBatchSize(16).setVocabSize(51200).setMaxSeqLength(64));
 }
 
 } // namespace

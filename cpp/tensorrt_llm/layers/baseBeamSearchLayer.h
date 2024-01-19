@@ -43,8 +43,8 @@ class BaseBeamSearchLayer : public BaseLayer
 public:
     using SetupParams = DecodingSetupParams;
 
-    BaseBeamSearchLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream, tc::IAllocator* allocator,
-        bool is_free_buffer_after_forward);
+    BaseBeamSearchLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
+        std::shared_ptr<tc::IAllocator> allocator, bool is_free_buffer_after_forward);
 
     BaseBeamSearchLayer(BaseBeamSearchLayer<T> const& beam_search_layer);
 
@@ -56,16 +56,18 @@ public:
     {
     public:
         ForwardParams(int step, int ite, tc::Tensor logits, tc::Tensor endIds, tc::Tensor src_cache_indirection,
-            int max_attention_window, int max_seq_len)
+            int max_attention_window, int sink_token_length, int max_seq_len)
             : SoftmaxParams(step, ite, std::move(logits), std::move(endIds))
             , src_cache_indirection{std::move(src_cache_indirection)}
             , max_attention_window{max_attention_window}
+            , sink_token_length{sink_token_length}
             , max_seq_len{max_seq_len}
         {
         }
 
         // mandatory parameters
         int max_attention_window;
+        int sink_token_length;
         int max_seq_len;
         tc::Tensor src_cache_indirection; // [local_batch_size, beam_width, max_seq_len]
 
@@ -94,7 +96,8 @@ public:
             parent_ids_ptr; // [batch_size] int*, each array is [beam_width, max_seq_len], necessary in beam search
     };
 
-    void forward(BeamSearchOutputParams& outputs, ForwardParams const& params);
+    void forward(BeamSearchOutputParams& outputs, ForwardParams const& params, int* penalty_workspace,
+        const int* penalty_workspace_prev);
 
 protected:
     // meta data
@@ -104,13 +107,23 @@ protected:
     size_t topk_softmax_workspace_size_;
     void* topk_softmax_workspace_ = nullptr;
 
-    std::vector<float> mTemperature;
-    std::vector<int> mMinLength;
-    std::vector<float> mRepetitionPenalty;
     float* temperature_buf_;
-    int* min_lengths_buf_;
     float* repetition_penalty_buf_;
-    tensorrt_llm::kernels::RepetitionPenaltyType mRepetitionPenaltyType;
+    float* presence_penalty_buf_;
+    float* frequency_penalty_buf_;
+    int* min_lengths_buf_;
+
+    std::vector<float> mTemperature;
+    std::vector<float> mRepetitionPenalty;
+    std::vector<float> mPresencePenalty;
+    std::vector<float> mFrequencyPenalty;
+    std::vector<int> mMinLengths;
+
+    bool use_temperature_ = false;
+    bool use_repetition_penalty_ = false;
+    bool use_presence_penalty_ = false;
+    bool use_frequency_penalty_ = false;
+    bool use_min_lengths_ = false;
 
     virtual void invokeSoftMax(BeamSearchOutputParams& outputs, SoftmaxParams const& params) = 0;
 

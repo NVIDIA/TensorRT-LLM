@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -89,6 +89,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                  max_output_len: Optional[int] = None,
                  max_beam_width: Optional[int] = None,
                  max_attention_window_size: Optional[int] = None,
+                 sink_token_length: Optional[int] = None,
                  debug_mode: bool = False,
                  lora_ckpt_source: str = "hf") -> 'ModelRunnerCpp':
         """
@@ -119,6 +120,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 will be used.
             max_attention_window_size (int):
                 The attention window size that controls the sliding window attention / cyclic kv cache behaviour.
+            sink_token_length (int) :
+                The sink token length, default=0.
             debug_mode (bool):
                 Whether or not to turn on the debug mode.
             lora_ckpt_source (str):
@@ -162,7 +165,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                           max_sequence_length=max_input_len +
                                           max_output_len)
         session_config.kv_cache_config = KvCacheConfig(
-            max_attention_window=max_attention_window_size)
+            max_attention_window=max_attention_window_size,
+            sink_token_length=sink_token_length)
         session = GptSession(config=session_config,
                              model_config=model_config,
                              world_config=world_config,
@@ -221,16 +225,12 @@ class ModelRunnerCpp(ModelRunnerMixin):
         return self.session.model_config.max_prompt_embedding_table_size
 
     @property
-    def compute_context_logits(self) -> bool:
+    def gather_context_logits(self) -> bool:
         return self.session.model_config.compute_context_logits
 
     @property
-    def compute_generation_logits(self) -> bool:
+    def gather_generation_logits(self) -> bool:
         return self.session.model_config.compute_generation_logits
-
-    @property
-    def gather_all_token_logits(self) -> bool:
-        return self.compute_context_logits and self.compute_generation_logits
 
     def generate(self,
                  batch_input_ids: List[torch.Tensor],
@@ -274,7 +274,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 If return_dict=False, the method returns generated output_ids.
                 If return_dict=True, the method returns a dict of output_ids,
                 sequence_lengths (if sampling_config.output_sequence_lengths=True),
-                context_logits and generation_logits (if self.gather_all_token_logits=True).
+                context_logits and generation_logits (if self.gather_context_logits=True and
+                self.gather_generation_logits=True, respectively).
         """
         if sampling_config is None:
             sampling_config = SamplingConfig(end_id=None, pad_id=None)
@@ -326,13 +327,13 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                      dtype=torch.int32,
                                      device=cuda_device)
         generation_output = GenerationOutput(output_ids, output_lengths)
-        if self.gather_all_token_logits:
+        if self.gather_generation_logits:
             generation_output.context_logits = torch.empty(
                 (batch_size, self.max_input_len, self.vocab_size_padded),
                 device=cuda_device)
             generation_output.generation_logits = torch.zeros(
                 (batch_size, sampling_config.num_beams,
-                 sampling_config.max_new_tokens - 1, self.vocab_size_padded),
+                 sampling_config.max_new_tokens, self.vocab_size_padded),
                 device=cuda_device)
 
         self.session.generate(generation_output, generation_input,
@@ -341,8 +342,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
             outputs = {'output_ids': generation_output.ids}
             if sampling_config.output_sequence_lengths:
                 outputs['sequence_lengths'] = generation_output.lengths
-            if self.gather_all_token_logits:
+            if self.gather_context_logits:
                 outputs['context_logits'] = generation_output.context_logits
+            if self.gather_generation_logits:
                 outputs[
                     'generation_logits'] = generation_output.generation_logits
             outputs = self._prepare_outputs(outputs, input_lengths)
@@ -359,8 +361,9 @@ def _populate_sampling_config(
     ]
     gpt_sampling_config.length_penalty = [sampling_config.length_penalty]
     gpt_sampling_config.min_length = [sampling_config.min_length]
-    # TODO: cannot set presence_penalty?
+    # TODO: cannot set presence_penalty and frequency_penalty?
     # gpt_sampling_config.presence_penalty = [sampling_config.presence_penalty]
+    # gpt_sampling_config.frequency_penalty = [sampling_config.frequency_penalty]
     if sampling_config.random_seed is not None:
         gpt_sampling_config.random_seed = [sampling_config.random_seed]
     gpt_sampling_config.repetition_penalty = [

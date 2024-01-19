@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -49,7 +49,7 @@ public:
     // mandatory parameters
     SizeType endId;
     SizeType padId;
-    TensorPtr ids;     // [1, packedLength] or [batchSize, maxInputLength], on gpu
+    TensorPtr ids;     // [packedLength] or [batchSize, maxInputLength], on gpu
     TensorPtr lengths; // [batchSize], on gpu
     bool packed;       // indicates if ids are packed or padded to maxInputLength
 

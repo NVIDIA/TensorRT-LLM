@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -45,11 +45,12 @@ public:
         std::optional<SizeType> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
         std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
-        std::optional<SizeType> promptVocabSize = std::nullopt, bool returnLogProbs = false,
+        std::optional<SizeType> promptVocabSize = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
+        std::optional<TensorPtr> loraConfig = std::nullopt, bool returnLogProbs = false,
         std::optional<VecTokens> draftTokens = std::nullopt, std::optional<TensorPtr> draftLogits = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, embeddingBias, badWordsList, stopWordsList, promptEmbeddingTable,
-            promptVocabSize, returnLogProbs,
+            promptVocabSize, loraWeights, loraConfig, returnLogProbs,
             draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))
                                     : std::make_shared<VecTokens>(),
             draftLogits)

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +15,9 @@
  * limitations under the License.
  */
 #include "tensorrt_llm/plugins/common/plugin.h"
+
+#include "tensorrt_llm/common/mpiUtils.h"
+
 #include "checkMacrosPlugin.h"
 #include "cuda.h"
 #include <cstdint>
@@ -43,6 +46,46 @@ std::map<std::set<int>, ncclComm_t>* getCommMap()
     static std::map<std::set<int>, ncclComm_t> commMap;
     return &commMap;
 }
+
+void initCommMap(std::set<int> const& group)
+{
+    auto& commMap = *getCommMap();
+    // [] operator inserts T() if it does not exist
+    if (isBuilding() || commMap[group] != nullptr)
+    {
+        return;
+    }
+    auto& comm = COMM_SESSION;
+    auto const myRank = comm.getRank();
+
+    int groupRank = 0;
+    for (int it : group)
+    {
+        if (it == myRank)
+        {
+            break;
+        }
+        ++groupRank;
+    }
+
+    ncclUniqueId id;
+    if (myRank == *group.begin())
+    {
+        ncclGetUniqueId(&id);
+        for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
+        {
+            comm.send(id, *it, 0);
+        }
+    }
+    else
+    {
+        comm.recv(id, *group.begin(), 0);
+    }
+
+    commMap[group] = nullptr;
+    NCCLCHECK(ncclCommInitRank(&commMap[group], group.size(), id, groupRank));
+}
+
 #endif // ENABLE_MULTI_DEVICE
 
 namespace

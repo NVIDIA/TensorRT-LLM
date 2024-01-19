@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
-#include "tllmBuffers.h"
 #include "tllmLogger.h"
 
 #include <limits>
@@ -147,8 +146,9 @@ void TllmRuntime::setInputTensors(SizeType contextIndex, TensorMap const& tensor
                         "%s: expected dim[%d] = %d, provided dim[%d] = %d", name, j, dimExpected, j, dimProvided);
                 }
             }
-            TLLM_CHECK_WITH_INFO(context.setInputShape(name, shapeProvided), "Tensor '%s' has invalid shape %s", name,
-                ITensor::toString(shapeProvided).c_str());
+            TLLM_CHECK_WITH_INFO(context.setInputShape(name, shapeProvided),
+                "Tensor '%s' has invalid shape %s, expected %s", name, ITensor::toString(shapeProvided).c_str(),
+                ITensor::toString(shapeExpected).c_str());
             auto* const data = tensor->data();
             if (data)
             {

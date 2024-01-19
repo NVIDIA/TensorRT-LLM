@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Optional
+
 import tensorrt as trt
 
 from ..._common import default_net
@@ -19,7 +21,7 @@ from ..._utils import pad_vocab_size, str_dtype_to_trt
 from ...functional import Tensor, gather_last_token_logits
 from ...layers import (Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
-                       RmsNorm)
+                       PromptTuningEmbedding, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
 from ...quantization import QuantMode
@@ -52,6 +54,7 @@ class BaichuanDecoderLayer(Module):
         self.hidden_act = hidden_act
         self.tp_group = tp_group
         self.tp_size = tp_size
+        self.tp_rank = tp_rank
         self.mlp_hidden_size = mlp_hidden_size
         self.attention_mask_type = attention_mask_type
         self.position_embedding_type = position_embedding_type
@@ -129,11 +132,16 @@ class BaichuanModel(Module):
                  dtype,
                  mlp_hidden_size=None,
                  mapping=Mapping(),
-                 quant_mode=QuantMode(0)):
+                 quant_mode=QuantMode(0),
+                 use_prompt_tuning: bool = False):
         super().__init__()
         self.mapping = mapping
         self.num_layers = num_layers
-        self.vocab_embedding = Embedding(vocab_size, hidden_size, dtype=dtype)
+        self.use_prompt_tuning = use_prompt_tuning
+        EmbeddingCls = PromptTuningEmbedding if use_prompt_tuning else Embedding
+        self.vocab_embedding = EmbeddingCls(vocab_size,
+                                            hidden_size,
+                                            dtype=dtype)
 
         self.layers = ModuleList([
             BaichuanDecoderLayer(
@@ -153,15 +161,28 @@ class BaichuanModel(Module):
 
         self.ln_f = RmsNorm(normalized_shape=hidden_size, dtype=dtype)
 
-    def forward(self,
-                input_ids: Tensor,
-                position_ids=None,
-                use_cache=False,
-                attention_mask=None,
-                kv_cache_params=None,
-                attention_params=None):
+    def forward(
+        self,
+        input_ids: Tensor,
+        position_ids=None,
+        use_cache=False,
+        attention_mask=None,
+        kv_cache_params=None,
+        attention_params=None,
+        prompt_embedding_table: Optional[Tensor] = None,
+        prompt_tasks: Optional[Tensor] = None,
+        prompt_vocab_size: Optional[Tensor] = None,
+    ):
+        ptuning_args = []
+        if self.use_prompt_tuning:
+            ptuning_args = [
+                prompt_embedding_table, prompt_tasks, prompt_vocab_size
+            ]
 
-        hidden_states = self.vocab_embedding(input_ids)
+        hidden_states = self.vocab_embedding(
+            input_ids,
+            *ptuning_args,
+        )
 
         kv_cache_params.fill_none_tensor_list(len(self.layers))
 
@@ -182,6 +203,8 @@ class BaichuanModel(Module):
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
                     host_max_attention_window_sizes=max_attention_window_size,
+                    host_sink_token_length=kv_cache_params.
+                    host_sink_token_length,
                     kv_cache_block_pointers=[pointer],
                     host_kv_cache_block_pointers=[host_pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
@@ -213,7 +236,8 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
                  logits_dtype='float32',
                  mlp_hidden_size=None,
                  mapping=Mapping(),
-                 quant_mode=QuantMode(0)):
+                 quant_mode=QuantMode(0),
+                 use_prompt_tuning: bool = False):
         if isinstance(dtype, str):
             self.dtype = str_dtype_to_trt(dtype)
         else:
@@ -246,7 +270,7 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
         super().__init__(num_layers, num_heads, num_kv_heads, hidden_size,
                          vocab_size, hidden_act, max_position_embeddings,
                          position_embedding_type, dtype, mlp_hidden_size,
-                         mapping, quant_mode)
+                         mapping, quant_mode, use_prompt_tuning)
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
         self.lm_head = ColumnLinear(hidden_size,
                                     vocab_size_padded,
@@ -256,17 +280,24 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
                                     tp_size=mapping.tp_size,
                                     gather_output=True)
 
-    def forward(self,
-                input_ids: Tensor,
-                position_ids=None,
-                use_cache=False,
-                last_token_ids=None,
-                attention_mask=None,
-                kv_cache_params=None,
-                attention_params=None):
+    def forward(
+        self,
+        input_ids: Tensor,
+        position_ids=None,
+        use_cache=False,
+        last_token_ids=None,
+        attention_mask=None,
+        kv_cache_params=None,
+        attention_params=None,
+        prompt_embedding_table: Optional[Tensor] = None,
+        prompt_tasks: Optional[Tensor] = None,
+        prompt_vocab_size: Optional[Tensor] = None,
+    ):
         hidden_states = super().forward(input_ids, position_ids, use_cache,
                                         attention_mask, kv_cache_params,
-                                        attention_params)
+                                        attention_params,
+                                        prompt_embedding_table, prompt_tasks,
+                                        prompt_vocab_size)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -286,13 +317,16 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
 
         return lm_logits
 
-    def prepare_inputs(self,
-                       max_batch_size,
-                       max_input_len,
-                       max_new_tokens,
-                       use_cache,
-                       max_beam_width,
-                       max_num_tokens: int = None):
+    def prepare_inputs(
+        self,
+        max_batch_size,
+        max_input_len,
+        max_new_tokens,
+        use_cache,
+        max_beam_width,
+        max_num_tokens: int = None,
+        prompt_embedding_table_size: int = 0,
+    ):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -325,25 +359,36 @@ class BaichuanForCausalLM(BaichuanModel, GenerationMixin):
             dtype=self.dtype,
             num_heads=self.num_heads,
             mapping=self.mapping,
-            max_num_tokens=max_num_tokens)
+            max_num_tokens=max_num_tokens,
+            prompt_embedding_table_size=prompt_embedding_table_size,
+        )
 
-        return (model_inputs['input_ids'], model_inputs['position_ids'], True,
-                model_inputs['last_token_ids'], model_inputs['attention_mask'],
-                KeyValueCacheParams(
-                    past_key_value=model_inputs['past_key_value'],
-                    host_past_key_value_lengths=model_inputs[
-                        'host_past_key_value_lengths'],
-                    host_max_attention_window_sizes=model_inputs[
-                        'host_max_attention_window_sizes'],
-                    kv_cache_block_pointers=model_inputs[
-                        'kv_cache_block_pointers_list'],
-                    host_kv_cache_block_pointers=model_inputs[
-                        'host_kv_cache_block_pointers_list'],
-                    cache_indirection=model_inputs['cache_indirection'],
-                ),
-                AttentionParams(
-                    sequence_length=model_inputs['sequence_length'],
-                    context_lengths=model_inputs['context_lengths'],
-                    host_context_lengths=model_inputs['host_context_lengths'],
-                    max_context_length=max_input_len,
-                    host_request_types=model_inputs['host_request_types']))
+        return (
+            model_inputs['input_ids'],
+            model_inputs['position_ids'],
+            True,
+            model_inputs['last_token_ids'],
+            model_inputs['attention_mask'],
+            KeyValueCacheParams(
+                past_key_value=model_inputs['past_key_value'],
+                host_past_key_value_lengths=model_inputs[
+                    'host_past_key_value_lengths'],
+                host_max_attention_window_sizes=model_inputs[
+                    'host_max_attention_window_sizes'],
+                host_sink_token_length=model_inputs['host_sink_token_length'],
+                kv_cache_block_pointers=model_inputs[
+                    'kv_cache_block_pointers_list'],
+                host_kv_cache_block_pointers=model_inputs[
+                    'host_kv_cache_block_pointers_list'],
+                cache_indirection=model_inputs['cache_indirection'],
+            ),
+            AttentionParams(
+                sequence_length=model_inputs['sequence_length'],
+                context_lengths=model_inputs['context_lengths'],
+                host_context_lengths=model_inputs['host_context_lengths'],
+                max_context_length=max_input_len,
+                host_request_types=model_inputs['host_request_types']),
+            model_inputs['prompt_embedding_table'],
+            model_inputs['tasks'],
+            model_inputs['prompt_vocab_size'],
+        )

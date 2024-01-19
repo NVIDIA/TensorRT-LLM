@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +24,7 @@ from tensorrt_llm import str_dtype_to_torch, str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.functional import LayerNormPositionType, LayerNormType
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models import quantize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.quantization import QuantMode
 
@@ -148,7 +149,8 @@ def parse_arguments():
     logger.set_level(args.log_level)
 
     plugins_args = [
-        'use_gemm_plugin', 'use_layernorm_plugin', 'use_gpt_attention_plugin'
+        'use_gemm_plugin', 'use_layernorm_plugin', 'use_gpt_attention_plugin',
+        'use_bert_attention_plugin'
     ]
     for plugin_arg in plugins_args:
         if getattr(args, plugin_arg) is None:
@@ -158,8 +160,10 @@ def parse_arguments():
             setattr(args, plugin_arg, args.dtype)
 
     if args.use_weight_only:
-        args.quant_mode = QuantMode.use_weight_only(
-            args.weight_only_precision == 'int4')
+        args.quant_mode = QuantMode.from_description(
+            quantize_weights=True,
+            quantize_activations=False,
+            use_int4_weights="int4" in args.weight_only_precision)
     else:
         args.quant_mode = QuantMode(0)
 
@@ -185,6 +189,7 @@ def build_encoder(model, args):
     num_layers = model_metadata['n_audio_layer']
 
     model_is_multilingual = (model_metadata['n_vocab'] >= 51865)
+
     builder_config = builder.create_builder_config(
         name=MODEL_ENCODER_NAME,
         precision=args.dtype,
@@ -193,7 +198,7 @@ def build_encoder(model, args):
         num_heads=num_heads,
         hidden_size=hidden_states,
         max_batch_size=max_batch_size,
-        int8=args.quant_mode.has_act_and_weight_quant(),
+        int8=args.quant_mode.has_act_or_weight_quant(),
         n_mels=model_metadata['n_mels'],
         num_languages=model_metadata['n_vocab'] - 51765 -
         int(model_is_multilingual),
@@ -205,7 +210,7 @@ def build_encoder(model, args):
         model_metadata['n_audio_layer'], str_dtype_to_trt(args.dtype))
 
     if args.use_weight_only:
-        tensorrt_llm_whisper_encoder = weight_only_quantize(
+        tensorrt_llm_whisper_encoder = quantize_model(
             tensorrt_llm_whisper_encoder, args.quant_mode)
 
     load_encoder_weight(tensorrt_llm_whisper_encoder, model_metadata,
@@ -232,7 +237,7 @@ def build_encoder(model, args):
         inputs = tensorrt_llm_whisper_encoder.prepare_inputs(
             args.max_batch_size)
 
-        tensorrt_llm_whisper_encoder(inputs)
+        tensorrt_llm_whisper_encoder(*inputs)
 
         if args.debug_mode:
             for k, v in tensorrt_llm_whisper_encoder.named_network_outputs():
@@ -280,6 +285,7 @@ def build_decoder(model, args):
         cross_attention=True,
         has_position_embedding=True,
         has_token_type_embedding=False,
+        int8=args.quant_mode.has_act_or_weight_quant(),
     )
 
     tensorrt_llm_whisper_decoder = tensorrt_llm.models.DecoderModel(
@@ -312,7 +318,7 @@ def build_decoder(model, args):
         logits_dtype=str_dtype_to_trt(args.dtype))
 
     if args.use_weight_only:
-        tensorrt_llm_whisper_decoder = weight_only_quantize(
+        tensorrt_llm_whisper_decoder = quantize_model(
             tensorrt_llm_whisper_decoder, args.quant_mode)
 
     load_decoder_weight(
@@ -332,9 +338,6 @@ def build_decoder(model, args):
             dtype=args.use_gpt_attention_plugin)
     if args.remove_input_padding:
         network.plugin_config.enable_remove_input_padding()
-    if args.use_weight_only:
-        network.plugin_config.set_weight_only_quant_matmul_plugin(
-            dtype=args.dtype)
 
     with net_guard(network):
         inputs = tensorrt_llm_whisper_decoder.prepare_inputs(

@@ -2,7 +2,7 @@
 
 These instructions provide details on how to build the TensorRT-LLM Windows Docker image manually from source.
 
-You should already have set up Docker Desktop based on the top-level [Windows README instructions](windows/README.md#docker-desktop).
+You should already have set up Docker Desktop based on the top-level [Windows README instructions](/windows/README.md#docker-desktop).
 
 ## Set up Build Context
 
@@ -10,7 +10,7 @@ cuDNN and NvToolsExt cannot be installed via the command line, so you'll need to
 
 ### cuDNN
 
-If you followed the top-level [Windows README](windows/README.md), you'll already have a copy of cuDNN. If not, download and unzip [cuDNN](https://developer.nvidia.com/cudnn).
+If you followed the top-level [Windows README](/windows/README.md), you'll already have a copy of cuDNN. If not, download and unzip [cuDNN](https://developer.nvidia.com/cudnn).
 
 Copy the entire `cuDNN` folder into `TensorRT-LLM/windows/docker`.
 
@@ -28,4 +28,4 @@ Now that `TensorRT-LLM\windows\docker` contains `cuDNN\` and `NvToolsExt\`, run 
 docker build -t tensorrt-llm-windows-build:latest .
 ```
 
-Your image is now ready for use. Return to [Running the Container](windows/README.md#running-the-container) to proceed with your TensorRT-LLM build using Docker.
+Your image is now ready for use. Return to [Running the Container](/windows/README.md#running-the-container) to proceed with your TensorRT-LLM build using Docker.

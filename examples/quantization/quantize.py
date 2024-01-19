@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,7 +33,7 @@ from tensorrt_llm.models.quantized.ammo import quantize_and_export
 def get_calib_dataloader(data="cnn_dailymail",
                          tokenizer=None,
                          batch_size=1,
-                         calib_size=16,
+                         calib_size=512,
                          block_size=512,
                          cache_dir=None):
     print("Loading calibration dataset")
@@ -53,9 +53,12 @@ def get_calib_dataloader(data="cnn_dailymail",
     else:
         raise NotImplementedError
 
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.im_end_id
+
     dataset_input_ids = tokenizer(dataset,
                                   return_tensors="pt",
-                                  padding=True,
+                                  padding="max_length",
                                   truncation=True,
                                   max_length=block_size).input_ids.cuda()
 
@@ -82,6 +85,7 @@ def get_model(ckpt_path, dtype="float16", cache_dir=None):
     model = AutoModelForCausalLM.from_pretrained(
         ckpt_path,
         device_map="auto",
+        cache_dir=cache_dir,
         trust_remote_code=True,
         torch_dtype=torch_dtype,
     )
@@ -102,9 +106,22 @@ def get_args():
                         choices=['fp8', 'int8_sq', 'int4_awq'],
                         default='fp8',
                         help='Quantization format.')
-    parser.add_argument("--calib_size",
+    parser.add_argument('--calibrate_kv_cache',
+                        default=False,
+                        action="store_true",
+                        help='Calibrate kv cache for int8 quantization.')
+    parser.add_argument('--group_size',
                         type=int,
                         default=128,
+                        help='Group size used in AWQ quantization.')
+    parser.add_argument(
+        '--quantize_lm_head',
+        default=False,
+        action="store_true",
+        help='Quantize lm_head weight as well when using int4_awq.')
+    parser.add_argument("--calib_size",
+                        type=int,
+                        default=512,
                         help="Number of samples for calibration.")
     parser.add_argument("--export_path", default="exported_model")
     parser.add_argument("--cache_dir",
@@ -126,16 +143,57 @@ def main():
         random.seed(args.seed)
         np.random.seed(args.seed)
 
-    tokenizer = get_tokenizer(args.model_dir, cache_dir=args.cache_dir)
+    tokenizer = get_tokenizer(args.model_dir,
+                              cache_dir=args.cache_dir,
+                              use_fast=True,
+                              trust_remote_code=True)
     model = get_model(args.model_dir, args.dtype, cache_dir=args.cache_dir)
 
     calib_dataloader = get_calib_dataloader(tokenizer=tokenizer,
                                             calib_size=args.calib_size,
                                             cache_dir=args.cache_dir)
+
+    quant_cfg_dict = {}
+    if args.quantize_lm_head:
+        quant_cfg_dict.update({
+            "*lm_head*": {
+                "enable": True
+            },
+        })
+    if args.group_size != 128:
+        quant_cfg_dict.update({
+            "*weight_quantizer": {
+                "num_bits": 4,
+                "block_sizes": {
+                    -1: args.group_size
+                },
+                "enable": True
+            },
+        })
+    if args.calibrate_kv_cache:
+        quant_cfg_dict.update({
+            "*.query_key_value.output_quantizer": {
+                "num_bits": 8,
+                "axis": None,
+                "enable": True
+            },
+            "*.k_proj.output_quantizer": {
+                "num_bits": 8,
+                "axis": None,
+                "enable": True
+            },
+            "*.v_proj.output_quantizer": {
+                "num_bits": 8,
+                "axis": None,
+                "enable": True
+            },
+        })
+
     model = quantize_and_export(model,
                                 qformat=args.qformat,
                                 calib_dataloader=calib_dataloader,
-                                export_path=args.export_path)
+                                export_path=args.export_path,
+                                quant_cfg_dict=quant_cfg_dict)
 
 
 if __name__ == "__main__":

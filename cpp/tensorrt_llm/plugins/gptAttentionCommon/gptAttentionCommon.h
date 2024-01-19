@@ -41,10 +41,13 @@ public:
         int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
-        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
-        bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
-        int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled,
-        bool cross_attention = false, int max_distance = 0, bool use_paged_context_fmha = false, bool use_cache = true);
+        bool unfuse_qkv_gemm,                                                                       // for AutoPP
+        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, bool enable_xqa,
+        int kv_cache_quant_mode, bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
+        bool paged_kv_cache, int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length,
+        bool qkv_bias_enabled, bool cross_attention = false, int max_distance = 0, bool pos_shift_enabled = false,
+        bool dense_context_fmha = false, bool use_paged_context_fmha = false, bool use_cache = true,
+        bool is_medusa_enabled = false);
 
     GPTAttentionPluginCommon(const void* data, size_t length);
 
@@ -78,7 +81,8 @@ protected:
     size_t getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t nbReq, int32_t max_input_length,
         int32_t max_kv_cache_len, int32_t cross_qkv_length = 0) const noexcept;
     // total_num_seq is the sum of beam_width for multiple requests
-    size_t getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t total_num_seq) const noexcept;
+    size_t getWorkspaceSizeForGeneration(
+        nvinfer1::DataType type, int32_t total_num_seq, int32_t max_kv_cache_length) const noexcept;
 
     template <typename T, typename KVCacheBuffer>
     struct EnqueueContextParams
@@ -93,6 +97,7 @@ protected:
         int32_t max_attention_window;
         // Cyclic kv cache capacity (used to get the cyclic kv cache position for new tokens)
         int32_t cyclic_attention_window_size;
+        int32_t sink_token_length;
         int32_t const* q_seq_lengths;
         int32_t const* kv_seq_lengths;
         float const* kv_scale_orig_quant;
@@ -124,6 +129,8 @@ protected:
     {
         T const* attention_input;
         T const* qkv_bias;
+        // NOTE: input_seq_length might be larger than one in the medusa mode.
+        int32_t input_seq_length;
         int32_t const* sequence_lengths;
         int32_t past_kv_length;
         int32_t beam_width;
@@ -140,6 +147,7 @@ protected:
         int32_t max_attention_window;
         // Cyclic kv cache capacity (used to get the cyclic kv cache position for new tokens)
         int32_t cyclic_attention_window_size;
+        int32_t sink_token_length;
         int32_t num_requests;
         int32_t max_blocks_per_sequence;
         int32_t const* cache_indir;
@@ -151,6 +159,10 @@ protected:
         // optional when cross attention
         int32_t const* encoder_input_lengths = nullptr;
         int32_t const* host_context_lengths = nullptr;
+        // optional when medusa is used.
+        const bool* medusa_mask = nullptr;
+        const int32_t* medusa_packed_mask = nullptr;
+        const int32_t* medusa_position_offsets = nullptr;
     };
 
     template <typename T, typename KVCacheBuffer>
@@ -210,17 +222,26 @@ protected:
     tensorrt_llm::kernels::PositionEmbeddingType mPositionEmbeddingType;
     bool mRemovePadding = false;
     tensorrt_llm::kernels::AttentionMaskType mMaskType;
+    // NOTE: default values for paged kv cache.
     bool mPagedKVCache = false;
-    int mTokensPerBlock;
+    int mTokensPerBlock = 0;
     tensorrt_llm::common::QuantMode mKVCacheQuantMode;
     int mTpSize = 1;
     int mTpRank = 0;
+    bool mUnfuseQkvGemm = false;
     nvinfer1::DataType mType;
     int32_t mMaxContextLength;
     bool mQKVBiasEnabled;
     bool mCrossAttention = false;
     int mMaxDistance = 0;
+    bool mPosShiftEnabled = false;
     bool mPagedContextFMHA = false;
+    bool mDenseContextFMHA = false;
+    bool mIsMedusaEnabled = false;
+
+    // Medusa packed mask.
+    uint4* mMedusaPackedMask;
+    uint4* mMedusaPackedHostMask;
 
     // fmha runner (disable by default)
     // flag: disabled = 0, enabled = 1, enabled with fp32 accumulation = 2
@@ -232,8 +253,12 @@ protected:
     // The default copy constructor will leave it as nullptr. clone() shall initialize it.
     UniqPtrWNullCopy<tensorrt_llm::kernels::MHARunner> mFMHARunner;
     UniqPtrWNullCopy<tensorrt_llm::kernels::DecoderXQARunner> mDecoderXQARunner;
+    // Cache the grid_size and block_size that gives the highest occupancy for
+    //  invokeApplyBiasRopeUpdateKVCache.
+    int2 mLaunchGridBlockCache = make_int2(0, 0);
 
     bool mMultiBlockMode;
+    bool mEnableXQA;
     int mDeviceId = -1;
     static bool mForceMultiBlockWarned;
     // The default copy constructor will leave it as nullptr. clone() shall initialize it.

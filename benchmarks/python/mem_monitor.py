@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,11 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from multiprocessing import Event, Process, Queue
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.profiler import (MemUnitType, bytes_to_target_unit,
-                                   device_memory_info)
+                                   device_memory_info, host_memory_info)
 
 
 class MemoryMonitor:
@@ -28,6 +29,7 @@ class MemoryMonitor:
         self._peak_host_memory = 0
         self._peak_device_memory = 0
 
+        self.pid = os.getpid()
         self.device_handles = {}
 
         self.signal_event = Event()  # Sending signal to subprocess
@@ -49,19 +51,28 @@ class MemoryMonitor:
         self.signal_event.set()
         logger.debug("Sent signal to stop memory monitor subprocess.")
 
+        peak_mem_use = self.peak_mem_queue.get()
+
+        self._peak_host_memory = max(self._peak_host_memory, peak_mem_use[0])
         self._peak_device_memory = max(self._peak_device_memory,
-                                       self.peak_mem_queue.get())
+                                       peak_mem_use[1])
 
         self.mem_monitor_process.join()
         self.mem_monitor_process = None
         logger.debug("Memory monitor subprocess joined.")
 
     def _upd_peak_memory_usage(self, signal_event, peak_mem_queue):
-        peak_used, _, _ = device_memory_info()
+        peak_host_used, peak_device_used = self.get_memory_usage()
         while not signal_event.is_set():
-            used, _, _ = device_memory_info()
-            peak_used = max(used, peak_used)
-        peak_mem_queue.put(peak_used)
+            host_used, device_used = self.get_memory_usage()
+            peak_host_used = max(host_used, peak_host_used)
+            peak_device_used = max(device_used, peak_device_used)
+        peak_mem_queue.put((peak_host_used, peak_device_used))
+
+    def get_memory_usage(self):
+        host_used, _, _ = host_memory_info(self.pid)
+        device_used, _, _ = device_memory_info()
+        return host_used, device_used
 
     def get_peak_memory_usage(self, unit: MemUnitType = 'GiB'):
         return bytes_to_target_unit(self._peak_host_memory, unit), \

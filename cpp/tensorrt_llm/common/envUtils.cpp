@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,21 @@
 
 namespace tensorrt_llm::common
 {
+
+// XQA kernels (optimized kernels for generation phase).
+bool forceXQAKernels()
+{
+    const char* force_xqa_env_var = getenv("TRTLLM_FORCE_XQA");
+    static bool forceXQA = false;
+    if (force_xqa_env_var != nullptr)
+    {
+        if (force_xqa_env_var[0] == '1' && force_xqa_env_var[1] == '\0')
+        {
+            forceXQA = true;
+        }
+    }
+    return forceXQA;
+}
 
 // Tune the number of blocks per sequence for accuracy/performance purpose.
 bool getEnvMmhaMultiblockDebug()

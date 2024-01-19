@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,8 +14,10 @@
 # limitations under the License.
 import contextlib
 import ctypes
+import os
 import platform
 import time
+from functools import wraps
 from pathlib import Path
 
 import numpy as np
@@ -165,3 +167,25 @@ def get_scalar_from_field(field):
     void_p = convert_capsule_to_void_p(field.data)
     np_array = get_nparray_from_void_p(void_p, 1, field.type)
     return np_array[0]
+
+
+class _BuildingFlag:
+
+    def __enter__(self):
+        os.environ['IS_BUILDING'] = '1'
+
+    def __exit__(self, type, value, tb):
+        del os.environ['IS_BUILDING']
+
+
+def _is_building(f):
+    '''Use this to decorate functions which are called during engine building/refiting process,
+    otherwise, the plugin registration will fail.
+    '''
+
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        with _BuildingFlag():
+            return f(*args, **kwargs)
+
+    return decorated

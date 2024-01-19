@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,9 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .plugin import (TRT_LLM_PLUGIN_NAMESPACE, PluginConfig, _load_plugin_lib,
+                     current_all_reduce_helper, init_all_reduce_helper,
                      plugin_lib_path)
 
 __all__ = [
     'TRT_LLM_PLUGIN_NAMESPACE', '_load_plugin_lib', 'PluginConfig',
-    'plugin_lib_path'
+    'plugin_lib_path', "current_all_reduce_helper", "init_all_reduce_helper"
 ]

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -107,8 +107,8 @@ TEST_F(SamplingUtilsKernelTest, CurandBatchInitialize)
     auto randomSeedsDevice = mBufferManager->copyFrom(*randomSeedsHost, MemoryType::kGPU);
 
     // Initialize curand states.
-    tk::invokeCurandBatchInitialize(curandStates, batchSize,
-        reinterpret_cast<unsigned long long*>(bufferCast<int64_t>(*randomSeedsDevice)), mStream->get());
+    tk::invokeCurandBatchInitialize(
+        curandStates, batchSize, reinterpret_cast<uint64_t*>(bufferCast<int64_t>(*randomSeedsDevice)), mStream->get());
     sync_check_cuda_error();
 
     // Generate random numbers using initialized curand states.

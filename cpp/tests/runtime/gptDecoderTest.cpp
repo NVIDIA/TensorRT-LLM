@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -57,6 +57,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
 
     SizeType constexpr maxInputLength{8};
     SizeType constexpr maxNewTokens{2};
+    SizeType constexpr sinkTokenLength{0};
     auto constexpr maxSeqLength = maxInputLength + maxNewTokens;
     decoder->setup(samplingConfig, batchSize, maxSeqLength);
 
@@ -70,7 +71,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     auto endIds
         = std::shared_ptr(manager.copyFrom(endIdsVec, ITensor::makeShape({batchSize, beamWidth}), MemoryType::kGPU));
 
-    DecodingInput inputs{maxInputLength, maxSeqLength, batchSize, logits, endIds};
+    DecodingInput inputs{maxInputLength, maxSeqLength, sinkTokenLength, batchSize, logits, endIds};
     std::vector<std::int32_t> sequenceLimitLengthsVec(batchSize, maxSeqLength);
     inputs.sequenceLimitLength
         = manager.copyFrom(sequenceLimitLengthsVec, ITensor::makeShape({batchSize}), MemoryType::kGPU);

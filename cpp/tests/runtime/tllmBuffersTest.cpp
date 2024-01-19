@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,18 +17,25 @@
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
+#include "tensorrt_llm/batch_manager/namedTensor.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/tllmBuffers.h"
 
+#include <algorithm>
 #include <limits>
 #include <memory>
+#include <random>
 #include <sstream>
+#include <thread>
+#include <tuple>
 #include <type_traits>
+#include <vector>
 
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
+namespace tb = tensorrt_llm::batch_manager;
 
 class TllmBuffersTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
 {
@@ -160,6 +167,9 @@ void testBuffer(IBuffer& buffer, std::int32_t typeSize)
     EXPECT_EQ(bufferWrapped->getMemoryType(), buffer.getMemoryType());
     EXPECT_NO_THROW(bufferWrapped->resize(buffer.getCapacity() / 2));
     EXPECT_THROW(bufferWrapped->resize(buffer.getCapacity() * 2), std::bad_alloc);
+    auto byteBuffer = IBuffer::wrap(static_cast<std::uint8_t*>(buffer.data()), buffer.getSizeInBytes());
+    EXPECT_EQ(byteBuffer->getSizeInBytes(), buffer.getSizeInBytes());
+    EXPECT_EQ(byteBuffer->getCapacity(), buffer.getSizeInBytes());
     auto tensorWrapped = ITensor::wrap(buffer.data(), buffer.getDataType(),
         ITensor::makeShape({static_cast<SizeType>(buffer.getSize())}), buffer.getCapacity());
     EXPECT_EQ(tensorWrapped->getSize(), buffer.getSize());
@@ -380,4 +390,183 @@ TEST_F(TllmBuffersTest, BytesToString)
     EXPECT_EQ(MemoryCounters::bytesToString(diff, precision), "-1.00 TB");
     diff = -(1ll << 40) - (1ll << 39);
     EXPECT_EQ(MemoryCounters::bytesToString(diff, precision), "-1.50 TB");
+}
+
+TEST_F(TllmBuffersTest, PinnedPoolAllocator)
+{
+    if (mDeviceCount == 0)
+        GTEST_SKIP();
+
+    using MemPool = MemoryPool<PinnedAllocator>;
+    auto expectedSize = [](const auto& tensor)
+    {
+        auto s = tensor()->getSizeInBytes();
+        constexpr auto alignment = MemPool::kAlignment;
+        s = s + alignment - 1 - ((s + alignment - 1) % alignment);
+        return s;
+    };
+
+    auto& pool = PinnedPoolAllocator::getPool();
+    auto& segments = pool.getMemorySegments();
+    pool.logSegments();
+    EXPECT_EQ(segments.size(), 0);
+
+    {
+        auto a = tb::NamedTensor{nvinfer1::DataType::kFLOAT, {512, 4, 4}, "a", nullptr};
+        auto b = tb::NamedTensor{nvinfer1::DataType::kHALF, {512, 10}, "b", nullptr};
+        pool.logSegments();
+        auto it = std::begin(segments);
+        EXPECT_NE(it->tag, nullptr);
+        EXPECT_EQ(it->size, expectedSize(a));
+        it = std::next(it);
+        EXPECT_NE(it->tag, nullptr);
+        EXPECT_EQ(it->size, expectedSize(b));
+        it = std::next(it);
+        EXPECT_EQ(it->tag, nullptr);
+        it = std::next(it);
+        EXPECT_EQ(it, std::end(segments));
+    }
+
+    auto const chunkSize = pool.getChunkSize();
+    auto constexpr initChunkSize = MemPool::kInitialChunkSize;
+    EXPECT_EQ(chunkSize, initChunkSize);
+
+    {
+        pool.logSegments();
+        auto it = std::begin(segments);
+        EXPECT_EQ(it->tag, nullptr);
+        EXPECT_EQ(it->size, chunkSize);
+    }
+
+    std::size_t secondChunkSize;
+    {
+        // Test creating a new chunk
+        auto c = tb::NamedTensor{nvinfer1::DataType::kUINT8, {initChunkSize + 1}, "c", nullptr};
+        pool.logSegments();
+        auto it = std::begin(segments);
+        EXPECT_EQ(it->tag, nullptr);
+        EXPECT_EQ(it->size, chunkSize);
+        it = std::next(it);
+        EXPECT_NE(it->tag, nullptr);
+        EXPECT_EQ(it->size, expectedSize(c));
+        it = std::next(it);
+        EXPECT_EQ(it->tag, nullptr);
+        secondChunkSize = expectedSize(c) + it->size;
+        EXPECT_EQ(secondChunkSize, pool.getChunkSize());
+        it = std::next(it);
+        EXPECT_EQ(it, std::end(segments));
+    }
+
+    {
+        pool.logSegments();
+        auto it = std::begin(segments);
+        EXPECT_EQ(it->tag, nullptr);
+        EXPECT_EQ(it->size, chunkSize);
+        it = std::next(it);
+        EXPECT_EQ(it->tag, nullptr);
+        EXPECT_EQ(it->size, secondChunkSize);
+        it = std::next(it);
+        EXPECT_EQ(it, std::end(segments));
+    }
+}
+
+TEST_F(TllmBuffersTest, MemoryPool)
+{
+    using MemPool = MemoryPool<HostAllocator>;
+    auto constexpr alignment = MemPool::kAlignment;
+    auto constexpr chunkSize = alignment * 4;
+    auto& memCounters = MemoryCounters::getInstance();
+    auto const initMemory = memCounters.getCpu();
+    {
+        MemPool pool{chunkSize};
+        EXPECT_EQ(pool.getChunkSize(), chunkSize);
+        EXPECT_EQ(memCounters.getCpu(), initMemory);
+        auto constexpr sizeBytes = alignment / 4;
+        auto ptr_0 = pool.allocate(sizeBytes);
+        auto const oneChunk = initMemory + chunkSize;
+        EXPECT_EQ(memCounters.getCpu(), oneChunk);
+        auto ptr_1 = pool.allocate(0);
+        EXPECT_EQ(memCounters.getCpu(), oneChunk);
+        auto ptr_2 = pool.allocate(sizeBytes);
+        EXPECT_EQ(memCounters.getCpu(), oneChunk);
+        pool.deallocate(ptr_0, sizeBytes);
+        EXPECT_EQ(memCounters.getCpu(), oneChunk);
+        pool.deallocate(ptr_1, 0);
+        EXPECT_EQ(memCounters.getCpu(), oneChunk);
+        pool.deallocate(ptr_2, sizeBytes);
+        EXPECT_EQ(memCounters.getCpu(), oneChunk);
+        EXPECT_EQ(static_cast<std::uint8_t*>(ptr_1) - static_cast<std::uint8_t*>(ptr_0), alignment);
+        EXPECT_EQ(static_cast<std::uint8_t*>(ptr_2) - static_cast<std::uint8_t*>(ptr_1), alignment);
+    }
+    EXPECT_EQ(memCounters.getCpu(), initMemory);
+}
+
+TEST_F(TllmBuffersTest, PinnedPoolStressTest)
+{
+    if (mDeviceCount == 0)
+        GTEST_SKIP();
+
+    using Allocator = PinnedPoolAllocator;
+    using MemPool = Allocator::PoolType;
+    auto& memCounters = MemoryCounters::getInstance();
+    auto const initMemory = memCounters.getPinned();
+    auto constexpr chunkSize = MemPool::kInitialChunkSize / 4;
+    std::mt19937 rnd{42};                               // mersenne_twister_engine seeded with 42 NOLINT(*-msc51-cpp)
+    auto constexpr expectedSize = std::size_t{1} << 20; // 1 MiB
+    std::poisson_distribution distribution{expectedSize};
+    auto constexpr numberOfAllocations = chunkSize * 2 / expectedSize;
+    std::vector<std::tuple<void*, std::size_t>> allocations;
+    allocations.reserve(numberOfAllocations);
+
+    Allocator allocator{};
+    auto& pool = Allocator::getPool();
+    pool.setChunkSize(chunkSize);
+    EXPECT_EQ(pool.getChunkSize(), chunkSize);
+    EXPECT_EQ(memCounters.getPinned(), initMemory);
+    auto const poolReservedSize = pool.getReservedSize();
+    auto const poolUsedSize = pool.getUsedSize();
+    std::size_t totalUsedSize{0};
+    for (std::size_t i = 0; i < numberOfAllocations; ++i)
+    {
+        auto const size = distribution(rnd);
+        auto const ptr = allocator.allocate(size);
+        allocations.emplace_back(ptr, size);
+        totalUsedSize += size;
+    }
+    EXPECT_GE(pool.getUsedSize(), poolUsedSize + totalUsedSize);
+
+    std::shuffle(allocations.begin(), allocations.end(), rnd);
+    auto const deallocIdx = allocations.size() / 2;
+    auto const deallocSize = allocations.size() - deallocIdx;
+    for (auto const& [ptr, size] : BufferRange{allocations.data() + deallocIdx, deallocSize})
+    {
+        allocator.deallocate(ptr, size);
+        totalUsedSize -= size;
+    }
+    allocations.resize(deallocIdx);
+    EXPECT_GE(pool.getUsedSize(), poolUsedSize + totalUsedSize);
+    EXPECT_EQ(memCounters.getPinned() - initMemory, pool.getReservedSize() - poolReservedSize);
+
+    std::thread thread(
+        [&]()
+        {
+            for (std::size_t i = 0; i < deallocSize; ++i)
+            {
+                auto const size = distribution(rnd);
+                auto const ptr = allocator.allocate(size);
+                allocations.emplace_back(ptr, size);
+                totalUsedSize += size;
+            }
+            EXPECT_GE(pool.getUsedSize(), poolUsedSize + totalUsedSize);
+
+            std::shuffle(allocations.begin() + static_cast<std::ptrdiff_t>(deallocIdx), allocations.end(), rnd);
+            for (auto const& [ptr, size] : allocations)
+            {
+                allocator.deallocate(ptr, size);
+                totalUsedSize -= size;
+            }
+            EXPECT_EQ(totalUsedSize, 0u);
+            EXPECT_EQ(pool.getUsedSize(), poolUsedSize);
+        });
+    thread.join();
 }

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import argparse
+import ast
 from pathlib import Path
 
 import evaluate
@@ -90,12 +91,15 @@ def main(args):
     output_len = args.output_len
     test_token_num = args.max_input_length
     max_attention_window_size = args.max_attention_window_size
+    sink_token_length = args.sink_token_length
 
     # random_seed = 5
     temperature = args.temperature
     num_beams = args.num_beams
     length_penalty = args.length_penalty
     repetition_penalty = args.repetition_penalty
+    presence_penalty = args.presence_penalty
+    frequency_penalty = args.frequency_penalty
 
     if test_trt_llm:
         if not PYTHON_BINDINGS and not args.use_py_session:
@@ -107,15 +111,23 @@ def main(args):
         runner_kwargs = dict(engine_dir=args.engine_dir,
                              rank=runtime_rank,
                              debug_mode=args.debug_mode)
+        if args.medusa_choices is not None:
+            args.medusa_choices = ast.literal_eval(args.medusa_choices)
+            assert args.use_py_session, "Medusa is only supported by py_session"
+            assert args.temperature == 0, "Medusa should use temperature == 0"
+            assert args.batch_size == 1, "Medusa should use max_batch_size == 1"
+            assert args.num_beams == 1, "Medusa should use num_beams == 1"
+            runner_kwargs.update(medusa_choices=args.medusa_choices)
         if not args.use_py_session:
             runner_kwargs.update(
                 max_batch_size=max_batch_size,
                 max_input_len=test_token_num,
                 max_output_len=output_len,
                 max_beam_width=num_beams,
-                max_attention_window_size=max_attention_window_size)
+                max_attention_window_size=max_attention_window_size,
+                sink_token_length=sink_token_length)
         runner = runner_cls.from_dir(**runner_kwargs)
-        assert not (args.eval_ppl and not runner.gather_all_token_logits), \
+        assert not (args.eval_ppl and not (runner.gather_context_logits and runner.gather_generation_logits)), \
             "PPL evaluation requires engine built with gather_all_token_logits enabled"
 
     if test_hf:
@@ -137,7 +149,12 @@ def main(args):
             trust_remote_code=True,
             torch_dtype=str_dtype_to_torch(args.data_type),
             device_map='auto' if args.hf_device_map_auto else None)
-        model.to_bettertransformer()
+        try:
+            model.to_bettertransformer()
+        except ValueError as e:
+            logger.warning(
+                f'Fail to call model.to_bettertransformer(), exception:\n{str(e)}'
+            )
         if not args.hf_device_map_auto:
             model.cuda()
         if model_name == 'qwen':
@@ -172,8 +189,9 @@ def main(args):
 
             # TODO: The below lines are used to be compatible with the original code; may need fix
             if model_name.startswith(('chatglm2', 'chatglm3')):
-                input_ids = tokenizer.encode(curr_text, return_tensors='pt')
-                input_ids = input_ids[:, :test_token_num]
+                input_ids = tokenizer.encode(curr_text,
+                                             return_tensors='pt').squeeze(0)
+                input_ids = input_ids[:test_token_num]
             elif model_name == 'qwen':
                 # use make_content to generate prompt
                 system_prompt = "You are a useful assistant, please directly output the corresponding summary according to the article entered by the user."
@@ -184,14 +202,14 @@ def main(args):
                     system=system_prompt,
                     max_input_length=test_token_num,
                 )
-                input_ids = torch.tensor(input_id_list).unsqueeze(0)
+                input_ids = torch.tensor(input_id_list)
             else:
                 input_ids = tokenizer.encode(
                     curr_text,
                     return_tensors='pt',
                     add_special_tokens=add_special_tokens,
                     truncation=True,
-                    max_length=test_token_num)
+                    max_length=test_token_num).squeeze(0)
 
             batch_input_ids.append(input_ids)
         return batch_input_ids
@@ -204,13 +222,14 @@ def main(args):
         batch_input_ids = _prepare_inputs(datapoint[dataset_input_key],
                                           eval_task=eval_task,
                                           add_special_tokens=add_special_tokens)
-        input_lengths = [x.size(1) for x in batch_input_ids]
+        input_lengths = [x.size(0) for x in batch_input_ids]
 
         with torch.no_grad():
             outputs = runner.generate(
                 batch_input_ids,
                 max_new_tokens=output_len,
                 max_attention_window_size=max_attention_window_size,
+                sink_token_length=sink_token_length,
                 end_id=end_id,
                 pad_id=pad_id,
                 temperature=temperature,
@@ -219,8 +238,11 @@ def main(args):
                 num_beams=num_beams,
                 length_penalty=length_penalty,
                 repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
                 output_sequence_lengths=True,
-                return_dict=True)
+                return_dict=True,
+                medusa_choices=args.medusa_choices)
             torch.cuda.synchronize()
 
         # Extract a list of tensors of shape beam_width x output_ids.
@@ -238,10 +260,16 @@ def main(args):
             ]
 
             ppls = [[] for _ in range(batch_size)]
+            seq_lengths_array = outputs["sequence_lengths"].cpu().tolist()
+            lengths_info = {
+                'input_lengths': input_lengths,
+                'seq_lengths': seq_lengths_array
+            }
             if eval_ppl:
                 seq_lengths = outputs['sequence_lengths']
                 context_logits = outputs['context_logits']
-                generation_logits = outputs['generation_logits']
+                # Remove the first generation logits which are same to last context logits
+                generation_logits = outputs['generation_logits'][:, :, 1:]
                 for batch_idx in range(batch_size):
                     # [batch, beam, step]
                     for beam_idx in range(num_beams):
@@ -262,8 +290,8 @@ def main(args):
                         )
                         ppls[batch_idx].append(curr_ppl)
 
-            return output_beams_list, output_ids_list, ppls
-        return [], [], []
+            return output_beams_list, output_ids_list, ppls, lengths_info
+        return [], [], [], {}
 
     def eval_hf(datapoint,
                 eval_task='summarize',
@@ -277,7 +305,7 @@ def main(args):
         batch_input_ids = _prepare_inputs(datapoint[dataset_input_key],
                                           eval_task=eval_task,
                                           add_special_tokens=add_special_tokens)
-        input_lengths = [x.size(1) for x in batch_input_ids]
+        input_lengths = [x.size(0) for x in batch_input_ids]
         # Left padding for HF
         max_length = max(input_lengths)
         paddings = [
@@ -285,8 +313,7 @@ def main(args):
             for l in input_lengths
         ]
         batch_input_ids = [
-            torch.cat([pad, x.squeeze(0)])
-            for x, pad in zip(batch_input_ids, paddings)
+            torch.cat([pad, x]) for x, pad in zip(batch_input_ids, paddings)
         ]
         batch_input_ids = torch.stack(batch_input_ids)
         batch_input_ids = batch_input_ids.cuda()
@@ -391,6 +418,7 @@ def main(args):
 
     ite_count = 0
     data_point_idx = 0
+    total_output_token_count_trt_llm = 0  # only valid for runtime_rank == 0
     while (data_point_idx < len(dataset)) and (ite_count < args.max_ite):
         if runtime_rank == 0:
             logger.debug(
@@ -400,12 +428,19 @@ def main(args):
 
         if test_trt_llm:
             profiler.start('tensorrt_llm')
-            output_tensorrt_llm, _, curr_ppls_trt_llm = eval_trt_llm(
+            output_tensorrt_llm, output_ids_trt_llm, curr_ppls_trt_llm, lengths_info = eval_trt_llm(
                 datapoint,
                 eval_task=args.eval_task,
                 eval_ppl=args.eval_ppl,
                 add_special_tokens=args.add_special_tokens)
             profiler.stop('tensorrt_llm')
+            if runtime_rank == 0:
+                input_lengths = lengths_info['input_lengths']
+                seq_lengths = lengths_info['seq_lengths']
+                output_token_count_trt_llm = sum(
+                    seq_lengths[idx][0] - input_lengths[idx]
+                    for idx in range(len(input_lengths)))
+                total_output_token_count_trt_llm += output_token_count_trt_llm
 
         if test_hf:
             profiler.start('hf')
@@ -473,6 +508,12 @@ def main(args):
             logger.info(
                 f'TensorRT-LLM (total latency: {profiler.elapsed_time_in_sec("tensorrt_llm")} sec)'
             )
+            logger.info(
+                f'TensorRT-LLM (total output tokens: {total_output_token_count_trt_llm})'
+            )
+            logger.info(
+                f'TensorRT-LLM (tokens per second: {total_output_token_count_trt_llm / profiler.elapsed_time_in_sec("tensorrt_llm")})'
+            )
             for beam_idx in range(num_beams):
                 logger.info(f"TensorRT-LLM beam {beam_idx} result")
                 computed_metrics_tensorrt_llm = metric_tensorrt_llm[
@@ -488,6 +529,9 @@ def main(args):
                     logger.info(
                         f"  Per-token perplexity: {np.mean(ppls_trt_llm[beam_idx])}"
                     )
+                    if args.check_accuracy and beam_idx == 0:
+                        assert np.mean(ppls_trt_llm[beam_idx]
+                                       ) < args.tensorrt_llm_ppl_threshold
         if test_hf:
             np.random.seed(0)  # rouge score use sampling to compute the score
             logger.info(
@@ -528,9 +572,12 @@ if __name__ == '__main__':
         type=str,
         default='summarize',
         choices=['summarize', 'summarize_long', 'code_completion'])
-    parser.add_argument('--eval_ppl', action='store_true')
     parser.add_argument('--check_accuracy', action='store_true')
     parser.add_argument('--tensorrt_llm_rouge1_threshold',
+                        type=float,
+                        default=15.0)
+    parser.add_argument('--eval_ppl', action='store_true')
+    parser.add_argument('--tensorrt_llm_ppl_threshold',
                         type=float,
                         default=15.0)
     parser.add_argument('--dataset_path', type=str, default='')
@@ -546,12 +593,18 @@ if __name__ == '__main__':
         help=
         'The attention window size that controls the sliding window attention / cyclic kv cache behaviour'
     )
+    parser.add_argument('--sink_token_length',
+                        type=int,
+                        default=None,
+                        help='The sink token length.')
     parser.add_argument('--num_beams', type=int, default=1)
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--top_k', type=int, default=1)
     parser.add_argument('--top_p', type=float, default=0.0)
     parser.add_argument('--length_penalty', type=float, default=1.0)
     parser.add_argument('--repetition_penalty', type=float, default=1.0)
+    parser.add_argument('--presence_penalty', type=float, default=0.0)
+    parser.add_argument('--frequency_penalty', type=float, default=0.0)
     parser.add_argument('--debug_mode',
                         default=False,
                         action='store_true',
@@ -573,6 +626,13 @@ if __name__ == '__main__':
         help="Directory where to save output sentences. 'trtllm.out' for "
         "TensorRT-LLM outputs, and 'hf.out' for HF outputs.  If None, do not "
         "save outputs.")
+    parser.add_argument(
+        '--medusa_choices',
+        type=str,
+        default=None,
+        help="Medusa choice to use, if not none, will use Medusa decoding."
+        "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 medusa tokens."
+    )
 
     args = parser.parse_args()
 

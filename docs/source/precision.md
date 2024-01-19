@@ -116,28 +116,29 @@ This release of TensorRT-LLM contains the following examples:
 
 | Model      | FP32  | FP16  | BF16  |  FP8  | W8A8 SQ | W8A16 | W4A16 | W4A16 AWQ | W4A16 GPTQ |
 | :--------- | :---: | :---: | :---: | :---: | :-----: | :---: | :---: | :-------: | :--------: |
-| Baichuan   |   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     .     |     .      |
+| Baichuan   |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
 | BERT       |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | BLIP-2     |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | BLOOM      |   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     .     |     .      |
 | ChatGLM    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | ChatGLM-v2 |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | ChatGLM-v3 |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| Falcon     |   Y   |   Y   |   Y   |   Y   |    .    |   .   |   .   |     .     |     .      |
+| Falcon     |   Y   |   Y   |   Y   |   Y   |    .    |   Y   |   Y   |     Y     |     .      |
 | Flan-T5    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | GPT        |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     .     |     .      |
-| GPT-J      |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
+| GPT-J      |   Y   |   Y   |   Y   |   Y   |    .    |   Y   |   Y   |     Y     |     .      |
 | GPT-NeMo   |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | GPT-NeoX   |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     Y      |
 | InternLM   |   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     .     |     .      |
-| LLaMA      |   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     Y     |     Y      |
+| LLaMA      |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
 | LLaMA-v2   |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
-| Mistral    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| Mistral    |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
 | MPT        |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
 | OPT        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| Replit Code|   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| SantaCoder |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| StarCoder  |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| Phi        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| Replit Code|   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     .     |     .      |
+| SantaCoder |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
+| StarCoder  |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
 | T5         |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 
 

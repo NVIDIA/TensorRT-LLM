@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -149,8 +149,7 @@ static_assert(FinishedState::finishedMaxLength().isFinishedMaxLength());
 //! \param batchSize number of states to initialize
 //! \param randomSeed seed to initialize states
 //! \param stream stream
-void invokeCurandInitialize(
-    curandState_t* state, const size_t batchSize, unsigned long long randomSeed, cudaStream_t stream);
+void invokeCurandInitialize(curandState_t* state, const size_t batchSize, uint64_t randomSeed, cudaStream_t stream);
 
 //! \brief Initialize batchSize curand states with given seed per request.
 //!
@@ -159,7 +158,7 @@ void invokeCurandInitialize(
 //! \param randomSeeds input buffer [batchSize] with seeds
 //! \param stream stream
 void invokeCurandBatchInitialize(
-    curandState_t* states, const size_t batchSize, const unsigned long long* randomSeeds, cudaStream_t stream);
+    curandState_t* states, const size_t batchSize, const uint64_t* randomSeeds, cudaStream_t stream);
 
 //! \brief Applies mask, adds bias to logits and computes softmax values.
 //! Sets -MAX_FLT value for tokens in range [vocabSize; vocabSizePadded) to prevent them from being chosen.

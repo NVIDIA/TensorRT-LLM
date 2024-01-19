@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -152,8 +152,8 @@ def main(build_type: str = "Release",
 
     build_pyt = "OFF" if cpp_only else "ON"
     th_common_lib = "" if cpp_only else "th_common"
-    build_pybind = "ON" if python_bindings else "OFF"
-    bindings_lib = "bindings" if python_bindings else ""
+    build_pybind = "OFF" if cpp_only else "ON"
+    bindings_lib = "" if cpp_only else "bindings"
     benchmarks_lib = "benchmarks" if benchmarks else ""
 
     with working_directory(build_dir):
@@ -170,7 +170,6 @@ def main(build_type: str = "Release",
 
     if cpp_only:
         assert not install, "Installing is not supported for cpp_only builds"
-        assert not python_bindings, "Python bindings are not supported for cpp_only builds"
         return
 
     pkg_dir = project_dir / "tensorrt_llm"
@@ -193,7 +192,7 @@ def main(build_type: str = "Release",
             "tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so",
             lib_dir / "libnvinfer_plugin_tensorrt_llm.so")
 
-    if python_bindings:
+    if not cpp_only:
 
         def get_pybind_lib():
             pybind_build_dir = (build_dir / "tensorrt_llm" / "pybind")
@@ -301,10 +300,11 @@ if __name__ == "__main__":
         action="store_true",
         help=
         "Do not build the *.whl files (they are only needed for distribution).")
-    parser.add_argument("--python_bindings",
-                        "-p",
-                        action="store_true",
-                        help="Build the python bindings for the C++ runtime.")
+    parser.add_argument(
+        "--python_bindings",
+        "-p",
+        action="store_true",
+        help="(deprecated) Build the python bindings for the C++ runtime.")
     parser.add_argument("--benchmarks",
                         action="store_true",
                         help="Build the benchmarks for the C++ runtime.")

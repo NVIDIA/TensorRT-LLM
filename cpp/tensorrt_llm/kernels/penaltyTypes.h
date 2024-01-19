@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,17 +26,22 @@ namespace kernels
 
 enum class RepetitionPenaltyType
 {
-    Additive,       // the presence penalty
-    Multiplicative, // the repetition penalty
-    None            // No repetition penalty.
+    Temperature, // the temperature penalty
+    Repetition,  // the repetition penalty
+    Presence,    // the presence penalty
+    Frequency,   // the frequency penalty
+    MinLength,   // the min length penalty
 };
 
 inline float getDefaultPenaltyValue(RepetitionPenaltyType penalty_type)
 {
     switch (penalty_type)
     {
-    case RepetitionPenaltyType::Additive: return 0.0f;
-    case RepetitionPenaltyType::Multiplicative: return 1.0f;
+    case RepetitionPenaltyType::Temperature: return 1.0f;
+    case RepetitionPenaltyType::Repetition: return 1.0f;
+    case RepetitionPenaltyType::Presence: return 0.0f;
+    case RepetitionPenaltyType::Frequency: return 0.0f;
+    case RepetitionPenaltyType::MinLength: return 1.0f;
     default: break;
     }
     return 0.0f;

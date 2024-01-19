@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -118,7 +118,7 @@ class GPTNeoXModel(Module):
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0):
         super().__init__()
-        self.embedding = Embedding(
+        self.vocab_embedding = Embedding(
             num_embeddings=vocab_size,
             embedding_dim=hidden_size,
             dtype=dtype,
@@ -151,7 +151,7 @@ class GPTNeoXModel(Module):
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None):
-        hidden_states = self.embedding(input_ids)
+        hidden_states = self.vocab_embedding(input_ids)
 
         kv_cache_params.fill_none_tensor_list(len(self.layers))
 
@@ -169,6 +169,8 @@ class GPTNeoXModel(Module):
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
                     host_max_attention_window_sizes=max_attention_window_size,
+                    host_sink_token_length=kv_cache_params.
+                    host_sink_token_length,
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params)
 
@@ -293,19 +295,21 @@ class GPTNeoXForCausalLM(GPTNeoXModel, GenerationMixin):
             use_gpt_attention_plugin,
             use_gemm_plugin=use_gemm_plugin)
 
-        return (model_inputs['input_ids'], model_inputs['position_ids'], True,
-                model_inputs['last_token_ids'],
-                KeyValueCacheParams(
-                    past_key_value=model_inputs['past_key_value'],
-                    host_past_key_value_lengths=model_inputs[
-                        'host_past_key_value_lengths'],
-                    host_max_attention_window_sizes=model_inputs[
-                        'host_max_attention_window_sizes'],
-                    cache_indirection=model_inputs['cache_indirection'],
-                ),
-                AttentionParams(
-                    sequence_length=model_inputs['sequence_length'],
-                    context_lengths=model_inputs['context_lengths'],
-                    host_context_lengths=model_inputs['host_context_lengths'],
-                    max_context_length=max_input_len,
-                    host_request_types=model_inputs['host_request_types']))
+        return (
+            model_inputs['input_ids'], model_inputs['position_ids'], True,
+            model_inputs['last_token_ids'],
+            KeyValueCacheParams(
+                past_key_value=model_inputs['past_key_value'],
+                host_past_key_value_lengths=model_inputs[
+                    'host_past_key_value_lengths'],
+                host_max_attention_window_sizes=model_inputs[
+                    'host_max_attention_window_sizes'],
+                host_sink_token_length=model_inputs['host_sink_token_length'],
+                cache_indirection=model_inputs['cache_indirection'],
+            ),
+            AttentionParams(
+                sequence_length=model_inputs['sequence_length'],
+                context_lengths=model_inputs['context_lengths'],
+                host_context_lengths=model_inputs['host_context_lengths'],
+                max_context_length=max_input_len,
+                host_request_types=model_inputs['host_request_types']))

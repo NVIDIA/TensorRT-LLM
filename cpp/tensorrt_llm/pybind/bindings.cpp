@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -63,11 +63,14 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     tpr::GenerationOutput::initBindings(m);
 
     py::class_<tbk::KvCacheConfig>(m, "KvCacheConfig")
-        .def(py::init<std::optional<SizeType>, std::optional<SizeType>, std::optional<float>, bool>(),
+        .def(py::init<std::optional<SizeType>, std::optional<SizeType>, std::optional<SizeType>, std::optional<float>,
+                 bool>(),
             py::arg("max_tokens") = py::none(), py::arg("max_attention_window") = py::none(),
-            py::arg("free_gpu_memory_fraction") = py::none(), py::arg("enable_block_reuse") = false)
+            py::arg("sink_token_length") = py::none(), py::arg("free_gpu_memory_fraction") = py::none(),
+            py::arg("enable_block_reuse") = false)
         .def_readwrite("max_tokens", &tbk::KvCacheConfig::maxTokens)
         .def_readwrite("max_attention_window", &tbk::KvCacheConfig::maxAttentionWindow)
+        .def_readwrite("sink_token_length", &tbk::KvCacheConfig::sinkTokenLength)
         .def_readwrite("free_gpu_memory_fraction", &tbk::KvCacheConfig::freeGpuMemoryFraction)
         .def_readwrite("enable_block_reuse", &tbk::KvCacheConfig::enableBlockReuse);
 
@@ -202,6 +205,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("min_length", &tr::SamplingConfig::minLength)
         .def_readwrite("repetition_penalty", &tr::SamplingConfig::repetitionPenalty)
         .def_readwrite("presence_penalty", &tr::SamplingConfig::presencePenalty)
+        .def_readwrite("frequency_penalty", &tr::SamplingConfig::frequencyPenalty)
         .def_readwrite("top_k", &tr::SamplingConfig::topK)
         .def_readwrite("top_p", &tr::SamplingConfig::topP)
         .def_readwrite("random_seed", &tr::SamplingConfig::randomSeed)
@@ -282,8 +286,11 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     tensorNames.attr("REPETITION_PENALTY") = py::str(tb::inference_request::kRepetitionPenaltyTensorName);
     tensorNames.attr("MIN_LENGTH") = py::str(tb::inference_request::kMinLengthTensorName);
     tensorNames.attr("PRESENCE_PENALTY") = py::str(tb::inference_request::kPresencePenaltyTensorName);
+    tensorNames.attr("FREQUENCY_PENALTY") = py::str(tb::inference_request::kFrequencyPenaltyTensorName);
     tensorNames.attr("RANDOM_SEED") = py::str(tb::inference_request::kRandomSeedTensorName);
     tensorNames.attr("RETURN_LOG_PROBS") = py::str(tb::inference_request::kReturnLogProbsTensorName);
+    tensorNames.attr("RETURN_CONTEXT_LOGITS") = py::str(tb::inference_request::kReturnContextLogitsTensorName);
+    tensorNames.attr("RETURN_GENERATION_LOGITS") = py::str(tb::inference_request::kReturnGenerationLogitsTensorName);
     tensorNames.attr("PROMPT_EMBEDDING_TABLE") = py::str(tb::inference_request::kPromptEmbeddingTableName);
     tensorNames.attr("PROMPT_VOCAB_SIZE") = py::str(tb::inference_request::kPromptVocabSizeName);
 
@@ -307,11 +314,12 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     py::class_<tb::TrtGptModelOptionalParams>(m, "TrtGptModelOptionalParams")
         .def(py::init<tbk::KvCacheConfig, std::optional<SizeType>, bool>(),
             py::arg("kv_cache_config") = tbk::KvCacheConfig{}, py::arg("max_num_sequences") = py::none(),
-            py::arg("enable_trt_overlap") = true)
+            py::arg("enable_trt_overlap") = false)
         .def_readwrite("kv_cache_config", &tb::TrtGptModelOptionalParams::kvCacheConfig)
         .def_readwrite("max_num_sequences", &tb::TrtGptModelOptionalParams::maxNumSequences)
         .def_readwrite("enable_trt_overlap", &tb::TrtGptModelOptionalParams::enableTrtOverlap)
-        .def_readwrite("device_ids", &tb::TrtGptModelOptionalParams::deviceIds);
+        .def_readwrite("device_ids", &tb::TrtGptModelOptionalParams::deviceIds)
+        .def_readwrite("normalize_log_probs", &tb::TrtGptModelOptionalParams::normalizeLogProbs);
 
     tpb::GptManager::initBindings(m);
 }

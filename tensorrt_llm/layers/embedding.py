@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,9 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-from typing import Optional
 
-from ..functional import Tensor, embedding, unsqueeze, where
+from ..functional import embedding, unsqueeze, where
 from ..module import Module
 from ..parameter import Parameter
 
@@ -61,15 +60,13 @@ class Embedding(Module):
                 self.num_embeddings / self.tp_size), self.embedding_dim),
                                     dtype=dtype)
 
-    def forward(self, x, workspace: Optional[Tensor] = None):
+    def forward(self, x):
         return embedding(x,
                          self.weight.value,
                          tp_size=self.tp_size,
                          tp_group=self.tp_group,
                          sharding_dim=self.sharding_dim,
-                         tp_rank=self.tp_rank,
-                         workspace=workspace,
-                         instance_id=self.instance_id)
+                         tp_rank=self.tp_rank)
 
 
 class PromptTuningEmbedding(Embedding):
@@ -97,12 +94,7 @@ class PromptTuningEmbedding(Embedding):
             vocab_size = num_embeddings
         self.vocab_size = vocab_size
 
-    def forward(self,
-                tokens,
-                prompt_embedding_table,
-                tasks,
-                task_vocab_size,
-                workspace: Optional[Tensor] = None):
+    def forward(self, tokens, prompt_embedding_table, tasks, task_vocab_size):
         """
             Pass all tokens through both normal and prompt embedding tables.
             Tokens are masked so that "normal" embedding only see "normal" tokens. Same logic for "prompt" embedding.
@@ -129,13 +121,9 @@ class PromptTuningEmbedding(Embedding):
 
         # clip tokens in the [0, vocab_size) range
         normal_tokens = where(prompt_tokens_mask, self.vocab_size - 1, tokens)
-        normal_embeddings = embedding(normal_tokens,
-                                      self.weight.value,
-                                      self.tp_size,
-                                      self.tp_group,
-                                      self.sharding_dim,
-                                      self.tp_rank,
-                                      workspace=workspace)
+        normal_embeddings = embedding(normal_tokens, self.weight.value,
+                                      self.tp_size, self.tp_group,
+                                      self.sharding_dim, self.tp_rank)
 
         # put virtual tokens in the [0, max_prompt_vocab_size) range
         prompt_tokens = where(prompt_tokens_mask, tokens - self.vocab_size, 0)

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -38,6 +38,7 @@ DEFAULT_HF_MODEL_DIRS = {
     'internlm': 'internlm/internlm-chat-7b',
     'llama': 'meta-llama/Llama-2-7b-hf',
     'mpt': 'mosaicml/mpt-7b',
+    'phi': 'microsoft/phi-2',
     'opt': 'facebook/opt-350m',
     'qwen': 'Qwen/Qwen-7B',
 }
@@ -51,7 +52,7 @@ DEFAULT_PROMPT_TEMPLATES = {
 
 
 def read_model_name(engine_dir: str):
-    engine_version = tensorrt_llm.builder.get_engine_version(engine_dir)
+    engine_version = tensorrt_llm.runtime.engine.get_engine_version(engine_dir)
 
     with open(Path(engine_dir) / "config.json", 'r') as f:
         config = json.load(f)

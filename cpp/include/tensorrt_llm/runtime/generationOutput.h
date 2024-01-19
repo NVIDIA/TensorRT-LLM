@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -48,8 +48,9 @@ public:
     // optional parameters
     TensorPtr cumLogProbs;      // [batchSize, beamWidth], must be float*, on gpu
     TensorPtr logProbs;         // [batchSize, beamWidth, maxInputLength + maxNewTokens], must be float*, on gpu
-    TensorPtr contextLogits;    // [batch_size, max_input_length, vocab_size_padded]
-    TensorPtr generationLogits; // [batch_size, beam_width, max_output_length-1, vocab_size_padded]
+    TensorPtr contextLogits;    // [batch_size, max_input_length, vocab_size_padded], if packed, the shape will be
+                                // [packed_size, vocab_size_padded]
+    TensorPtr generationLogits; // [batch_size, beam_width, max_output_length, vocab_size_padded]
 
     // callbacks
     Callback onTokenGenerated;

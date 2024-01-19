@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,54 +18,15 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
-#include "tensorrt_llm/runtime/tllmLogger.h"
-#include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
 
 #include <algorithm>
-#include <csignal>
-#include <cstdlib>
-#include <mpi.h>
-#include <mutex>
 #include <numeric>
 #include <set>
 
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
-
-namespace
-{
-
-bool mpiInitialized = false;
-std::mutex mpiMutex;
-
-void initMpi(nvinfer1::ILogger& logger, int threadMode = MPI_THREAD_FUNNELED)
-{
-    std::lock_guard<std::mutex> lk(mpiMutex);
-    if (mpiInitialized)
-    {
-        return;
-    }
-
-    int initialized = 0;
-    TLLM_MPI_CHECK(MPI_Initialized(&initialized));
-    if (!initialized)
-    {
-        logger.log(
-            nvinfer1::ILogger::Severity::kINFO, tc::fmtstr("Initializing MPI with thread mode %d", threadMode).c_str());
-        int providedMode;
-        TLLM_MPI_CHECK(MPI_Init_thread(nullptr, nullptr, threadMode, &providedMode));
-        TLLM_CHECK_WITH_INFO(providedMode >= threadMode, "MPI_Init_thread failed");
-        std::atexit([]() { MPI_Finalize(); });
-
-        auto previousHandler = std::signal(SIGABRT, [](int signal) { MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); });
-        TLLM_CHECK_WITH_INFO(previousHandler != SIG_ERR, "Signal handler setup failed");
-    }
-
-    mpiInitialized = true;
-}
-
-} // namespace
 
 WorldConfig::WorldConfig(SizeType tensorParallelism, SizeType pipelineParallelism, SizeType rank, SizeType gpusPerNode,
     std::optional<std::vector<SizeType>> const& deviceIds)
@@ -115,39 +76,24 @@ WorldConfig::WorldConfig(SizeType tensorParallelism, SizeType pipelineParallelis
         mPipelineParallelism);
 }
 
-bool WorldConfig::validConfig(nvinfer1::ILogger& logger, SizeType tensorParallelism, SizeType pipelineParallelism)
+bool WorldConfig::validConfig(SizeType tensorParallelism, SizeType pipelineParallelism)
 {
-    initMpi(logger);
-
-    int mpiSize;
-    TLLM_MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &mpiSize));
-    // TODO martinma: relax this constraint to mpiSize >= tensorParallelism * pipelineParallelism
+    auto const mpiSize = COMM_SESSION.getSize();
     return mpiSize == tensorParallelism * pipelineParallelism;
-}
-
-WorldConfig WorldConfig::mpi(nvinfer1::ILogger& logger, SizeType gpusPerNode, std::optional<SizeType> tensorParallelism,
-    std::optional<SizeType> pipelineParallelism, std::optional<std::vector<SizeType>> const& deviceIds)
-{
-    initMpi(logger);
-
-    int mpiSize, mpiRank;
-    TLLM_MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &mpiSize));
-    TLLM_MPI_CHECK(MPI_Comm_rank(MPI_COMM_WORLD, &mpiRank));
-    logger.log(nvinfer1::ILogger::Severity::kINFO, tc::fmtstr("MPI size: %d, rank: %d", mpiSize, mpiRank).c_str());
-
-    auto pp = pipelineParallelism.value_or(1);
-    auto tp = tensorParallelism.value_or(mpiSize / pp);
-    // TODO martinma: relax this constraint to mpiSize >= tp * pp
-    TLLM_CHECK(mpiSize == tp * pp);
-
-    return WorldConfig{tp, pp, mpiRank, gpusPerNode, deviceIds};
 }
 
 WorldConfig WorldConfig::mpi(SizeType gpusPerNode, std::optional<SizeType> tensorParallelism,
     std::optional<SizeType> pipelineParallelism, std::optional<std::vector<SizeType>> const& deviceIds)
 {
-    TllmLogger logger{};
-    return mpi(logger, gpusPerNode, tensorParallelism, pipelineParallelism, deviceIds);
+    auto& comm = COMM_SESSION;
+    auto const mpiSize = comm.getSize();
+    auto const mpiRank = comm.getRank();
+    TLLM_LOG_INFO("MPI size: %d, rank: %d", mpiSize, mpiRank);
+    auto pp = pipelineParallelism.value_or(1);
+    auto tp = tensorParallelism.value_or(mpiSize / pp);
+    TLLM_CHECK(mpiSize == tp * pp);
+
+    return WorldConfig{tp, pp, mpiRank, gpusPerNode, deviceIds};
 }
 
 std::vector<SizeType> WorldConfig::getPipelineParallelGroup() const

@@ -14,6 +14,8 @@
 
 ## Overview
 
+**NOTE: The Windows release of TensorRT-LLM is currently in beta. We recommend using the `rel` branch for the most stable experience. The latest supported Windows release is 0.6.1. You are currently on `main`.**
+
 TensorRT-LLM is supported on bare-metal Windows for single-GPU inference. The release supports GeForce 40-series GPUs.
 
 The release wheel for Windows can be installed with `pip`. Alternatively, you may build TensorRT-LLM for Windows from source. Building from source is an advanced option and is not necessary for building or running LLM engines. It is, however, required if you plan to use the C++ runtime directly or run C++ benchmarks.
@@ -60,7 +62,7 @@ It may be useful to create a single folder for holding TensorRT-LLM and its depe
 
 Clone TensorRT-LLM:
 ```
-git clone https://github.com/NVIDIA/TensorRT-LLM.git
+git clone --branch rel https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
 git submodule update --init --recursive
 ```
@@ -110,7 +112,7 @@ Note: After building, you'll need to copy files out of your container. `docker c
 
 #### Acquiring an Image
 
-The Docker container will be hosted for public download in a future release. At this time, it must be built manually. See [windows/docker/README.md](windows/docker/README.md) for image build instructions.
+The Docker container will be hosted for public download in a future release. At this time, it must be built manually. See [windows/docker/README.md](/windows/docker/README.md) for image build instructions.
 
 #### Running the Container
 

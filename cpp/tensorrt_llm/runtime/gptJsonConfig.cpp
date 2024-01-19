@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,9 @@
 
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 
+#include "loraManager.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
 
 #include <fstream>
@@ -84,6 +86,7 @@ GptJsonConfig parseJson(InputType&& i)
         auto const pipelineParallelism = parseJsonFieldOr(builderConfig, "pipeline_parallel", 1);
         auto const numHeads = builderConfig.at("num_heads").template get<SizeType>() / tensorParallelism;
         auto const hiddenSize = builderConfig.at("hidden_size").template get<SizeType>() / tensorParallelism;
+        auto const mlpHiddenSize = parseJsonFieldOr(builderConfig, "mlp_hidden_size", SizeType{0}) / tensorParallelism;
         auto const vocabSize = builderConfig.at("vocab_size").template get<SizeType>();
         auto const numLayers = builderConfig.at("num_layers").template get<SizeType>();
 
@@ -112,8 +115,9 @@ GptJsonConfig parseJson(InputType&& i)
         auto const maxPromptEmbeddingTableSize
             = parseJsonFieldOr<SizeType>(builderConfig, "max_prompt_embedding_table_size", 0);
 
-        auto const computeContextLogits = parseJsonFieldOr(builderConfig, "gather_all_token_logits", false);
-        auto const computeGenerationLogits = parseJsonFieldOr(builderConfig, "gather_all_token_logits", false);
+        auto const computeContextLogits = parseJsonFieldOr(builderConfig, "gather_context_logits", false);
+        auto const computeGenerationLogits = parseJsonFieldOr(builderConfig, "gather_generation_logits", false);
+        ;
 
         auto const& pluginConfig = json.at("plugin_config");
         auto const pagedKvCache = pluginConfig.at("paged_kv_cache");
@@ -125,6 +129,8 @@ GptJsonConfig parseJson(InputType&& i)
         auto const useContextFMHAForGeneration
             = pluginConfig.at("use_context_fmha_for_generation").template get<bool>();
         auto const pagedContextFMHA = pluginConfig.at("use_paged_context_fmha").template get<bool>();
+        auto const& loraPlugin = pluginConfig.at("lora_plugin");
+        auto useLoraPlugin = !loraPlugin.is_boolean() || loraPlugin.template get<bool>();
 
         auto modelConfig = GptModelConfig{vocabSize, numLayers, numHeads, hiddenSize, dataType};
         modelConfig.useGptAttentionPlugin(useGptAttentionPlugin);
@@ -138,6 +144,7 @@ GptJsonConfig parseJson(InputType&& i)
         modelConfig.computeGenerationLogits(computeGenerationLogits);
         modelConfig.setUseContextFMHAForGeneration(useContextFMHAForGeneration);
         modelConfig.setPagedContextFMHA(pagedContextFMHA);
+        modelConfig.setMlpHiddenSize(mlpHiddenSize);
 
         modelConfig.setMaxBatchSize(maxBatchSize);
         modelConfig.setMaxBeamWidth(maxBeamWidth);
@@ -146,6 +153,22 @@ GptJsonConfig parseJson(InputType&& i)
         modelConfig.setMaxNumTokens(maxNumTokens);
         modelConfig.setMaxDraftLen(maxDraftLen);
         modelConfig.setMaxPromptEmbeddingTableSize(maxPromptEmbeddingTableSize);
+
+        if (useLoraPlugin)
+        {
+            auto const loraTargetModules
+                = parseJsonFieldOr(builderConfig, "lora_target_modules", std::vector<std::string>{});
+
+            modelConfig.setLoraModules(LoraModule::createLoraModules(loraTargetModules, hiddenSize, mlpHiddenSize,
+                numHeads, numKvHeads, modelConfig.getSizePerHead(), tensorParallelism));
+
+            if (modelConfig.getLoraModules().size() == 0)
+            {
+                TLLM_LOG_WARNING("lora_plugin enabled, but no lora module enabled: setting useLoraPlugin to false");
+                useLoraPlugin = false;
+            }
+        }
+        modelConfig.useLoraPlugin(useLoraPlugin);
 
         if (name == std::string("chatglm_6b") || name == std::string("glm_10b"))
         {
@@ -223,9 +246,8 @@ GptJsonConfig parseJson(InputType&& i)
         auto const maxNumTokens = parseJsonFieldOptional<SizeType>(buildConfig, "max_num_tokens");
         auto const maxPromptEmbeddingTableSize
             = parseJsonFieldOr<SizeType>(buildConfig, "max_prompt_embedding_table_size", 0);
-
-        auto const computeContextLogits = parseJsonFieldOr(buildConfig, "gather_all_token_logits", false);
-        auto const computeGenerationLogits = parseJsonFieldOr(buildConfig, "gather_all_token_logits", false);
+        auto const computeContextLogits = parseJsonFieldOr(buildConfig, "gather_context_logits", false);
+        auto const computeGenerationLogits = parseJsonFieldOr(buildConfig, "gather_generation_logits", false);
 
         auto const& pluginConfig = buildConfig.at("plugin_config");
         auto const pagedKvCache = pluginConfig.at("paged_kv_cache");

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,8 +15,10 @@
 import unittest
 from collections import OrderedDict
 
-import tensorrt as trt
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from parameterized import parameterized
 
 import tensorrt_llm
@@ -75,24 +77,31 @@ class TestPluginNoCache(unittest.TestCase):
                 use_cache=use_cache,
             )
 
-            qkv = Tensor(
-                name="qkv",
-                shape=(-1, -1, hidden_size * 3),
-                dtype=str_dtype_to_trt(dtype),
-                dim_range=OrderedDict([
-                    ('batch_size',
-                     [1] if remove_input_padding else [(1, max_batch_size // 2,
-                                                        max_batch_size)]),
-                    ('tokens', [(1, num_tokens // 2, num_tokens)]
-                     if remove_input_padding else [(1, max_input_len // 2,
-                                                    max_input_len)]),
-                    ('hidden_size', [hidden_size * 3]),
-                ]))
+            if remove_input_padding:
+                qkv = Tensor(name="qkv",
+                             shape=(-1, hidden_size * 3),
+                             dtype=str_dtype_to_trt(dtype),
+                             dim_range=OrderedDict([
+                                 ('tokens', [(1, num_tokens // 2, num_tokens)]),
+                                 ('hidden_size', [hidden_size * 3]),
+                             ]))
+            else:
+                qkv = Tensor(name="qkv",
+                             shape=(-1, -1, hidden_size * 3),
+                             dtype=str_dtype_to_trt(dtype),
+                             dim_range=OrderedDict([
+                                 ('batch_size', [(1, max_batch_size // 2,
+                                                  max_batch_size)]),
+                                 ('tokens', [(1, max_input_len // 2,
+                                              max_input_len)]),
+                                 ('hidden_size', [hidden_size * 3]),
+                             ]))
 
             sequence_length = inputs['sequence_length']
             host_context_lengths = inputs['host_context_lengths']
             host_max_attention_window_sizes = inputs[
                 'host_max_attention_window_sizes'][0]
+            host_sink_token_length = inputs['host_sink_token_length']
             context_lengths = inputs['context_lengths']
             host_request_types = inputs['host_request_types']
 
@@ -108,6 +117,7 @@ class TestPluginNoCache(unittest.TestCase):
                 sequence_length=sequence_length,
                 host_past_key_value_lengths=host_past_key_value_lengths,
                 host_max_attention_window_sizes=host_max_attention_window_sizes,
+                host_sink_token_length=host_sink_token_length,
                 context_lengths=context_lengths,
                 cache_indirection=cache_indirection,
                 host_request_types=host_request_types,
@@ -153,8 +163,8 @@ class TestPluginNoCache(unittest.TestCase):
         str_dtype_to_trt(dtype)
 
         if remove_input_padding:
-            qkv_shape = (1, max_batch_size * max_input_len, hidden_size * 3)
-            out_shape = (1, max_batch_size * max_input_len, hidden_size)
+            qkv_shape = (max_batch_size * max_input_len, hidden_size * 3)
+            out_shape = (max_batch_size * max_input_len, hidden_size)
         else:
             qkv_shape = (max_batch_size, max_input_len, hidden_size * 3)
             out_shape = (max_batch_size, max_input_len, hidden_size)
@@ -168,6 +178,7 @@ class TestPluginNoCache(unittest.TestCase):
                                                   dtype=torch.int32).cpu()
         host_max_attention_window_sizes = torch.tensor([max_input_len],
                                                        dtype=torch.int32).cpu()
+        host_sink_token_length = torch.tensor([0], dtype=torch.int32).cpu()
         context_lengths = torch.full([max_batch_size],
                                      max_input_len,
                                      dtype=torch.int32).cuda()
@@ -208,6 +219,7 @@ class TestPluginNoCache(unittest.TestCase):
         inputs = {
             'qkv': qkv,
             'host_max_attention_window_size_0': host_max_attention_window_sizes,
+            'host_sink_token_length': host_sink_token_length,
             'context_lengths': context_lengths,
             'host_request_types': host_request_types,
         }
@@ -238,6 +250,7 @@ class TestPluginNoCache(unittest.TestCase):
             'sequence_length': sequence_length,
             'host_past_key_value_lengths': host_past_key_value_lengths,
             'host_max_attention_window_size_0': host_max_attention_window_sizes,
+            'host_sink_token_length': host_sink_token_length,
             'context_lengths': context_lengths,
             'cache_indirection': cache_indirection,
             'host_request_types': host_request_types,

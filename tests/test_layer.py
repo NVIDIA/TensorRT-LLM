@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -258,18 +258,24 @@ class TestLayer(unittest.TestCase):
                                    **kwargs)
 
     @parameterized.expand([["float32", False], ["float32", True],
-                           ["bfloat16", False], ["bfloat16", True]])
-    def test_linear(self, dtype, use_plugin):
+                           ["float16", False], ["float16", True],
+                           ["float16", True, "float32"], ["bfloat16", False],
+                           ["bfloat16", True], ["bfloat16", True, "float32"]])
+    def test_linear(self, dtype, use_plugin, output_dtype=None):
         # Skip tests that are not supported on V100
         if getSMVersion() < 80:
             if dtype == 'bfloat16':
                 pytest.skip(
                     "bfloat16 is not supported in pre-ampere architecture")
 
+        if output_dtype is None:
+            output_dtype = dtype
+
         # test data
         torch.manual_seed(0)
-        x_data = torch.randn(128, 20, dtype=str_dtype_to_torch(dtype))
-        m = torch.nn.Linear(20, 30, dtype=str_dtype_to_torch(dtype))
+        torch_dtype = str_dtype_to_torch(dtype)
+        x_data = torch.randn(128, 20, dtype=torch_dtype)
+        m = torch.nn.Linear(20, 30, dtype=torch.float32)
 
         # construct trt network
         builder = tensorrt_llm.Builder()
@@ -284,27 +290,32 @@ class TestLayer(unittest.TestCase):
 
             gm = tensorrt_llm.layers.Linear(20, 30, dtype=dtype)
 
-            gm.weight.value = torch_to_numpy(m.weight.detach().cpu())
-            gm.bias.value = torch_to_numpy(m.bias.detach().cpu())
+            gm.weight.value = torch_to_numpy(
+                m.weight.to(torch_dtype).detach().cpu())
+            gm.bias.value = torch_to_numpy(
+                m.bias.to(torch_dtype).detach().cpu())
             output = gm.forward(x).trt_tensor
             output.name = 'output'
+            output.dtype = tensorrt_llm.str_dtype_to_trt(output_dtype)
             network.mark_output(output)
 
         # trt run
         build_engine = EngineFromNetwork(
             (builder.trt_builder, net.trt_network),
-            CreateConfig(bf16=dtype == "bfloat16",
+            CreateConfig(fp16=dtype == "float16",
+                         bf16=dtype == "bfloat16",
                          precision_constraints="obey"))
         with TrtRunner(build_engine) as runner:
             outputs = runner.infer(feed_dict={'x': x_data})
 
         # pytorch run
         with torch.no_grad():
-            ref = m(x_data)
+            ref = m(x_data.to(torch.float32)).to(
+                str_dtype_to_torch(output_dtype))
 
         # The absolute tolerance for bfloat16 is increased marginally because
         # a single value (out of 4000) breaks tolerance on a 4090 linux/windows.
-        atols = {"float32": 1e-6, "bfloat16": 1.03 * 1e-2}
+        atols = {"float32": 1e-6, "float16": 1e-2, "bfloat16": 1.6e-2}
 
         # compare diff
         np.testing.assert_allclose(ref.to(torch.float32).cpu().numpy(),
@@ -649,15 +660,30 @@ class TestLayer(unittest.TestCase):
                                    outputs['output'],
                                    atol=1e-6)
 
+    # The activation memory usage baseline is acquired by `session.engine.device_memory_size` and hardcoded here since it shouldn't change much across platforms if we fused mha successfully.
     @parameterized.expand([
-        (12, 512, 16, 64, 'float16', PositionEmbeddingType.alibi, False),
-        (128, 128, 12, 32, 'float16', PositionEmbeddingType.alibi, True),
-        (1, 200, 8, 128, 'float32', PositionEmbeddingType.alibi, False),
-        (48, 30, 24, 80, 'float32', PositionEmbeddingType.alibi, True),
+        (
+            12, 512, 16, 64, 'float16', PositionEmbeddingType.alibi, False,
+            402653184
+        ),  # TRT has gpu buffer management issues with fmha + alibi, so the baseline here is tested w./o. fused mha.
+        (128, 128, 12, 32, 'float16', PositionEmbeddingType.alibi, True,
+         201326592),
+        (1, 200, 8, 128, 'float32', PositionEmbeddingType.alibi, False,
+         5017600),
+        (48, 30, 24, 80, 'float32', PositionEmbeddingType.alibi, True,
+         55296000),
+        (12, 512, 16, 64, 'float16', PositionEmbeddingType.learned_absolute,
+         False, 88113152),
+        (128, 128, 12, 32, 'float16', PositionEmbeddingType.learned_absolute,
+         True, 88866816),
+        (1, 200, 8, 128, 'float32', PositionEmbeddingType.learned_absolute,
+         False, 5017600),
+        (48, 30, 24, 80, 'float32', PositionEmbeddingType.learned_absolute,
+         True, 55296000),
         (2, 128, 4, 64, 'float16', PositionEmbeddingType.learned_absolute, True,
-         True),
+         35588608, True),
         (2, 128, 4, 64, 'float32', PositionEmbeddingType.learned_absolute, True,
-         True),
+         36833280, True),
     ])
     def test_attention(self,
                        batch_size,
@@ -667,6 +693,7 @@ class TestLayer(unittest.TestCase):
                        dtype,
                        pos_emb_type,
                        causal_mask,
+                       act_mem_baseline=None,
                        use_plugin=False):
 
         hidden_size = head_num * head_size
@@ -698,6 +725,7 @@ class TestLayer(unittest.TestCase):
             # single tensor since we only have 1 layer here.
             host_max_attention_window_sizes = torch.tensor([max_seq_len],
                                                            dtype=torch.int32)
+            host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
             sequence_length = torch.full([batch_size],
                                          seq_len,
@@ -774,6 +802,10 @@ class TestLayer(unittest.TestCase):
                     name='host_max_attention_window_sizes',
                     shape=tuple(host_max_attention_window_sizes.shape),
                     dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+                host_sink_token_length_tensor = Tensor(
+                    name='host_sink_token_length',
+                    shape=tuple(host_sink_token_length.shape),
+                    dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                 cache_indirection_tensor = Tensor(
                     name='cache_indirection',
                     shape=tuple(cache_indirection.shape),
@@ -806,6 +838,7 @@ class TestLayer(unittest.TestCase):
                         host_past_key_value_lengths_tensor,
                         host_max_attention_window_sizes=
                         host_max_attention_window_sizes_tensor,
+                        host_sink_token_length=host_sink_token_length_tensor,
                         cache_indirection=cache_indirection_tensor),
                     attention_params=AttentionParams(
                         sequence_length=sequence_length_tensor,
@@ -826,6 +859,17 @@ class TestLayer(unittest.TestCase):
         engine_buffer = builder.build_engine(net, builder_config)
         session = tensorrt_llm.runtime.Session.from_serialized_engine(
             engine_buffer)
+        act_mem = session.engine.device_memory_size
+
+        # TRT doesn't support context fmha in pre-turing architecture.
+        if act_mem_baseline != None and getSMVersion() >= 75:
+            if not pos_emb_type.is_alibi():
+                # TRT has gpu buffer management issues with fmha + alibi.
+                assert act_mem < act_mem_baseline * (1 + 0.1)
+            assert act_mem > act_mem_baseline * (
+                1 - 0.1
+            ), f"The mr activation memory usage is better than baseline, please update the test_attention in test_layer.py. The outdated baseline is {act_mem_baseline}, and the new baseline is {act_mem}."
+
         stream = torch.cuda.current_stream().cuda_stream
 
         if use_plugin:
@@ -836,6 +880,7 @@ class TestLayer(unittest.TestCase):
                 'host_past_key_value_lengths': host_past_key_value_lengths,
                 'host_max_attention_window_sizes':
                 host_max_attention_window_sizes,
+                'host_sink_token_length': host_sink_token_length,
                 'context_lengths': context_lengths,
                 'host_request_types': host_request_types,
                 'cache_indirection': cache_indirection

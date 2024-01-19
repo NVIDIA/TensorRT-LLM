@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -104,6 +104,14 @@ def parse_arguments(args):
         default='model.cache',
         help=
         'The path of to read timing cache from, will be ignored if the file does not exist'
+    )
+    parser.add_argument(
+        '--profiling_verbosity',
+        type=str,
+        default='layer_names_only',
+        choices=['layer_names_only', 'detailed', 'none'],
+        help=
+        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
     )
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument('--vocab_size', type=int, default=51200)
@@ -298,9 +306,19 @@ def parse_arguments(args):
         default=False,
         choices=['float16', 'float32', 'bfloat16'],
         help="Activates the lookup plugin which enables embedding sharing.")
-    parser.add_argument('--gather_all_token_logits',
+    parser.add_argument(
+        '--gather_all_token_logits',
+        action='store_true',
+        default=False,
+        help='Enable both gather_context_logits and gather_generation_logits')
+    parser.add_argument('--gather_context_logits',
                         action='store_true',
-                        default=False)
+                        default=False,
+                        help='Gather context logits')
+    parser.add_argument('--gather_generation_logits',
+                        action='store_true',
+                        default=False,
+                        help='Gather generation logits')
 
     parser.add_argument('--enable_fp8', default=False, action='store_true')
     parser.add_argument(
@@ -334,7 +352,6 @@ def parse_arguments(args):
         default=False,
         choices=['float16', 'float32', 'bfloat16'],
         help="Activates the lora plugin which enables embedding sharing.")
-
     parser.add_argument(
         '--max_draft_len',
         type=int,
@@ -360,6 +377,9 @@ def parse_arguments(args):
         default=None,
         choices=[
             "attn_qkv",
+            "attn_q",
+            "attn_k",
+            "attn_v",
             "attn_dense",
             "mlp_h_to_4h",
             "mlp_gate",
@@ -368,7 +388,6 @@ def parse_arguments(args):
         help=
         "Add lora in which modules. Only be activated when use_lora_plugin is enabled."
     )
-
     parser.add_argument(
         '--moe_num_experts',
         default=0,
@@ -482,6 +501,10 @@ def parse_arguments(args):
     args.moe_config = MoeConfig(args.moe_num_experts, args.moe_top_k,
                                 args.moe_tp_mode,
                                 args.moe_renorm_mode).validate()
+
+    if args.gather_all_token_logits:
+        args.gather_context_logits = True
+        args.gather_generation_logits = True
 
     return args
 
@@ -649,7 +672,8 @@ def build_rank_engine(builder: Builder,
             args.max_beam_width,
             args.max_num_tokens,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size,
-            gather_all_token_logits=args.gather_all_token_logits,
+            gather_context_logits=args.gather_context_logits,
+            gather_generation_logits=args.gather_generation_logits,
             max_draft_len=args.max_draft_len,
             lora_target_modules=args.lora_target_modules)
         tensorrt_llm_gpt(*inputs)
@@ -689,6 +713,7 @@ def build(rank, args):
             name=MODEL_NAME,
             precision=args.dtype,
             timing_cache=timing_cache,
+            profiling_verbosity=args.profiling_verbosity,
             tensor_parallel=args.world_size,  # TP only
             parallel_build=args.parallel_build,
             num_layers=args.n_layer,
@@ -710,7 +735,8 @@ def build(rank, args):
             strongly_typed=args.strongly_typed,
             max_prompt_embedding_table_size=args.
             max_prompt_embedding_table_size,
-            gather_all_token_logits=args.gather_all_token_logits,
+            gather_context_logits=args.gather_context_logits,
+            gather_generation_logits=args.gather_generation_logits,
             quant_mode=args.quant_mode,
             use_parallel_embedding=args.use_parallel_embedding,
             lora_target_modules=args.lora_target_modules,

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -138,7 +138,8 @@ class BertAttention(Module):
 
             attention_probs = softmax(attention_scores, dim=-1)
 
-            context = matmul(attention_probs, value).permute([0, 2, 1, 3])
+            context = matmul(attention_probs, value,
+                             use_fp32_acc=False).permute([0, 2, 1, 3])
             context = context.view(
                 concat([shape(context, 0),
                         shape(context, 1), self.hidden_size]))

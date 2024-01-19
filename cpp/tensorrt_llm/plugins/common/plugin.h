@@ -23,6 +23,7 @@
 
 #include <NvInferRuntime.h>
 
+#include <NvInferRuntimeBase.h>
 #include <cstring>
 #include <cublasLt.h>
 #include <cublas_v2.h>
@@ -92,6 +93,25 @@ void read(const char*& buffer, T& val)
     buffer += sizeof(T);
 }
 
+inline size_t typeSize(nvinfer1::DataType type)
+{
+    switch (type)
+    {
+    case nvinfer1::DataType::kBOOL: return 1UL;
+    case nvinfer1::DataType::kFP8: return 1UL;
+    case nvinfer1::DataType::kHALF: return 2UL;
+    case nvinfer1::DataType::kBF16: return 2UL;
+    case nvinfer1::DataType::kFLOAT: return 4UL;
+    case nvinfer1::DataType::kINT8: return 1UL;
+    case nvinfer1::DataType::kUINT8: return 1UL;
+    case nvinfer1::DataType::kINT32: return 4UL;
+    case nvinfer1::DataType::kINT64: return 8UL;
+    }
+
+    TLLM_THROW("Unknown dtype %d", static_cast<int>(type));
+    return 0;
+}
+
 inline cudaDataType_t trtToCublasDtype(nvinfer1::DataType type)
 {
     switch (type)
@@ -152,6 +172,8 @@ inline bool isBuilding()
 std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap();
 
 std::map<std::set<int>, ncclComm_t>* getCommMap();
+
+void initCommMap(std::set<int> const& group);
 #endif // ENABLE_MULTI_DEVICE
 
 //! To save GPU memory, all the plugins share the same cublas and cublasLt handle globally.

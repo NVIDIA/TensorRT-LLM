@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -236,25 +236,25 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
 
     pe = fromfile(dir_path, 'model.wpe.bin', [n_positions, n_embd])
     if pe is not None:
-        tensorrt_llm_gpt.embedding.position_embedding.weight.value = (pe)
+        tensorrt_llm_gpt.position_embedding.weight.value = (pe)
 
     vocab_embedding_weight = fromfile(dir_path, 'model.wte.bin',
                                       [vocab_size, n_embd])
     if not use_parallel_embedding:
-        tensorrt_llm_gpt.embedding.vocab_embedding.weight.value = vocab_embedding_weight
+        tensorrt_llm_gpt.vocab_embedding.weight.value = vocab_embedding_weight
     else:
         if sharding_dim == 0:
             if vocab_size % tensor_parallel != 0:
                 # padding
                 vocab_size_padded = pad_vocab_size(
-                    tensorrt_llm_gpt.embedding.vocab_embedding.num_embeddings,
+                    tensorrt_llm_gpt.vocab_embedding.num_embeddings,
                     tensor_parallel)
                 pad_width = vocab_size_padded - vocab_size
                 vocab_embedding_weight = np.pad(vocab_embedding_weight,
                                                 ((0, pad_width), (0, 0)),
                                                 'constant',
                                                 constant_values=0)
-        tensorrt_llm_gpt.embedding.vocab_embedding.weight.value = np.ascontiguousarray(
+        tensorrt_llm_gpt.vocab_embedding.weight.value = np.ascontiguousarray(
             split(vocab_embedding_weight,
                   tensor_parallel,
                   rank,
@@ -335,11 +335,8 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
                 i].attention.qkv.weights_scaling_factor.value = np.array(
                     [scaling_factors['qkv_weights'][i]], dtype=fake_fp8_sf_dt)
             tensorrt_llm_gpt.layers[
-                i].attention.kv_orig_quant_scale.value = np.array(
+                i].attention.kv_cache_scaling_factor.value = np.array(
                     [scaling_factors['qkv_output'][i]], dtype=np.float32)
-            tensorrt_llm_gpt.layers[
-                i].attention.kv_quant_orig_scale.value = np.array(
-                    [1.0 / scaling_factors['qkv_output'][i]], dtype=np.float32)
 
         dst = gpt_layer.attention.dense.weight
         t = fromfile(
@@ -474,9 +471,7 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
                 dir_path, 'model.layers.' + str(i) +
                 '.attention.query_key_value.scale_y_quant_orig.bin', [1],
                 np.float32)
-            tensorrt_llm_gpt.layers[
-                i].attention.kv_orig_quant_scale.value = 1.0 / t
-            gpt_layer.attention.kv_quant_orig_scale.value = t
+            gpt_layer.attention.kv_cache_scaling_factor.value = t
 
         if enable_fp8_qdq:
             tensorrt_llm_gpt.layers[
@@ -507,9 +502,9 @@ def load_from_hf_gpt(tensorrt_llm_gpt: GPTLMHeadModel,
         torch_dtype = str_dtype_to_torch(dtype)
         v = torch_to_numpy(v.to(torch_dtype).detach().cpu())
         if 'wte.weight' in k:
-            tensorrt_llm_gpt.embedding.vocab_embedding.weight.value = v
+            tensorrt_llm_gpt.vocab_embedding.weight.value = v
         elif 'wpe.weight' in k:
-            tensorrt_llm_gpt.embedding.position_embedding.weight.value = v
+            tensorrt_llm_gpt.position_embedding.weight.value = v
         elif 'ln_f.weight' in k:
             tensorrt_llm_gpt.ln_f.weight.value = v
         elif 'ln_f.bias' in k:
@@ -607,7 +602,7 @@ def load_from_hf_gpt(tensorrt_llm_gpt: GPTLMHeadModel,
 
     if not valid_lm_head_weight:
         # Use wte as lm_head weight to match the load_from_ft implementation.
-        lm_head_weight = tensorrt_llm_gpt.embedding.vocab_embedding.weight._value
+        lm_head_weight = tensorrt_llm_gpt.vocab_embedding.weight.raw_value
         vocab_size = hf_gpt.config.vocab_size
         if vocab_size % tensor_parallel != 0:
             # padding

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,8 +19,11 @@ import unittest
 
 import numpy as np
 import pytest
-import tensorrt as trt
+
+# isort: off
 import torch
+import tensorrt as trt
+# isort: on
 from parameterized import parameterized
 from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 

@@ -2,6 +2,8 @@ from ..layers import MLP, ColumnLinear, GatedMLP, LayerNorm, RmsNorm, RowLinear
 from ..parameter import Parameter
 from .layers import (SmoothQuantAttention, SmoothQuantGatedMLP,
                      SmoothQuantLayerNorm, SmoothQuantMLP, SmoothQuantRmsNorm,
+                     WeightOnlyGroupwiseQuantColumnLinear,
+                     WeightOnlyGroupwiseQuantRowLinear,
                      WeightOnlyQuantColumnLinear, WeightOnlyQuantRowLinear)
 
 
@@ -50,6 +52,61 @@ def weight_only_quantize(model,
         current_key_name.pop(-1)
 
     setattr(model, 'quant_mode', quant_mode)
+
+    return model
+
+
+def weight_only_groupwise_quantize(model,
+                                   quant_mode,
+                                   group_size=128,
+                                   pre_quant_scale=False,
+                                   zero=False,
+                                   exclude_modules=None,
+                                   current_key_name=None):
+    assert quant_mode.is_weight_only()
+
+    exclude_modules = ['lm_head'
+                       ] if exclude_modules is None else exclude_modules
+
+    for name, module in model.named_children():
+        if current_key_name is None:
+            current_key_name = []
+        current_key_name.append(name)
+
+        if len(list(module.children())) > 0:
+            weight_only_groupwise_quantize(module, quant_mode, group_size,
+                                           pre_quant_scale, zero,
+                                           exclude_modules, current_key_name)
+
+        if isinstance(module, ColumnLinear) and name not in exclude_modules:
+            if not any(key in '.'.join(current_key_name)
+                       for key in exclude_modules):
+                model._modules[name] = WeightOnlyGroupwiseQuantColumnLinear(
+                    in_features=module.in_features,
+                    out_features=module.out_features * module.tp_size,
+                    group_size=group_size,
+                    pre_quant_scale=pre_quant_scale,
+                    zero=zero,
+                    bias=module.bias is not None,
+                    dtype=module.dtype,
+                    tp_group=module.tp_group,
+                    tp_size=module.tp_size,
+                    gather_output=module.gather_output)
+        elif isinstance(module, RowLinear) and name not in exclude_modules:
+            if not any(key in '.'.join(current_key_name)
+                       for key in exclude_modules):
+                model._modules[name] = WeightOnlyGroupwiseQuantRowLinear(
+                    in_features=module.in_features * module.tp_size,
+                    out_features=module.out_features,
+                    group_size=group_size,
+                    pre_quant_scale=pre_quant_scale,
+                    zero=zero,
+                    bias=module.bias is not None,
+                    dtype=module.dtype,
+                    tp_group=module.tp_group,
+                    tp_size=module.tp_size)
+
+        current_key_name.pop(-1)
 
     return model
 
@@ -128,21 +185,27 @@ def quantize_kv_cache(model, quant_mode):
 
     for layer in model.transformer.layers:
         if quant_mode.has_kv_cache_quant():
-            layer.attention.kv_orig_quant_scale = Parameter(shape=(1, ),
-                                                            dtype='float32')
-            layer.attention.kv_quant_orig_scale = Parameter(shape=(1, ),
-                                                            dtype='float32')
+            layer.attention.kv_cache_scaling_factor = Parameter(shape=(1, ),
+                                                                dtype='float32')
         else:
-            layer.attention.register_parameter('kv_orig_quant_scale', None)
-            layer.attention.register_parameter('kv_quant_orig_scale', None)
+            layer.attention.register_parameter('kv_cache_scaling_factor', None)
 
     return model
 
 
-def quantize(model, quant_mode):
+def quantize(model, quant_mode, **kwargs):
     quantize_kv_cache(model, quant_mode)
 
     if quant_mode.has_act_and_weight_quant():
         smooth_quantize(model, quant_mode)
     elif quant_mode.is_weight_only():
-        weight_only_quantize(model, quant_mode)
+        if quant_mode.has_per_group_scaling():
+            kwargs = {
+                k: kwargs[k]
+                for k in
+                ['group_size', 'zero', 'pre_quant_scale', 'exclude_modules']
+            }
+            weight_only_groupwise_quantize(model, quant_mode, **kwargs)
+        else:
+            kwargs = {k: kwargs[k] for k in ['exclude_modules']}
+            weight_only_quantize(model, quant_mode, **kwargs)

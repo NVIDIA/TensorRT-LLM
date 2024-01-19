@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,9 +34,9 @@
 
 using namespace tensorrt_llm::batch_manager;
 using namespace tensorrt_llm::runtime;
-using namespace tensorrt_llm::mpi;
 
 namespace tc = tensorrt_llm::common;
+namespace mpi = tensorrt_llm::mpi;
 namespace trt = nvinfer1;
 
 // Class holding all infos regarding a single work item.
@@ -267,13 +267,19 @@ public:
         batch_scheduler::SchedulerPolicy schedulerPolicy, TrtGptModelOptionalParams const& optionalParams,
         std::shared_ptr<Recorder> recorder, std::optional<uint64_t> terminateReqId)
     {
+        ReturnBatchManagerStatsCallback iterationDataCallback{nullptr};
+        if (optionalParams.logIterationData)
+        {
+            iterationDataCallback = [this](const std::string& s) { return TLLM_LOG_INFO(s); };
+        }
+
         mBatchManager = std::make_shared<GptManager>(
             trtEnginePath, modelType, maxBeamWidth, schedulerPolicy,
             [this](int max_num_requests) { return getInferenceRequests(max_num_requests); },
             [this](uint64_t requestId, std::list<NamedTensor> response_tensors, bool final_response,
                 const std::string& errMsg)
             { return sendResponse(requestId, response_tensors, final_response, errMsg); },
-            nullptr, nullptr, optionalParams, terminateReqId);
+            nullptr, iterationDataCallback, optionalParams, terminateReqId);
         mRecorder = recorder;
         mTerminateReqId = terminateReqId;
     }
@@ -325,17 +331,18 @@ public:
     std::list<std::shared_ptr<InferenceRequest>> getInferenceRequests(const int max_num_requests)
     {
         std::list<std::shared_ptr<InferenceRequest>> rval;
+        auto& comm = COMM_SESSION;
         if (max_num_requests > 0)
         {
-            auto world_size = getCommWorldSize();
-            auto rank = getCommWorldRank();
+            auto world_size = comm.getSize();
+            auto rank = comm.getRank();
             if (rank == 0)
             {
-                int64_t num_new_work_items = std::min(static_cast<int64_t>(mWorkItemsQueue.numPendingWorkItems()),
+                auto num_new_work_items = std::min(static_cast<int64_t>(mWorkItemsQueue.numPendingWorkItems()),
                     static_cast<int64_t>(max_num_requests));
                 if (world_size > 1)
                 {
-                    bcast(&num_new_work_items, 1, MPI_TYPE_INT64_T, 0, COMM_WORLD);
+                    comm.bcast(&num_new_work_items, 1, mpi::MpiType::kINT64, 0);
                 }
 
                 if (num_new_work_items > 0)
@@ -368,7 +375,7 @@ public:
                             packed.insert(
                                 packed.end(), std::move_iterator(vpacked.begin()), std::move_iterator(vpacked.end()));
                         }
-                        bcast(packed, 0, COMM_WORLD);
+                        comm.bcast(packed, 0);
                     }
                 }
             }
@@ -376,11 +383,11 @@ public:
             {
                 // subordinate ranks hang until master rank sends work
                 int64_t num_new_work_items;
-                bcast(&num_new_work_items, 1, MPI_TYPE_INT64_T, 0, COMM_WORLD);
+                comm.bcast(&num_new_work_items, 1, mpi::MpiType::kINT64, 0);
                 if (num_new_work_items > 0)
                 {
                     std::vector<int64_t> packed;
-                    bcast(packed, 0, COMM_WORLD);
+                    comm.bcast(packed, 0);
                     int64_t* packed_ptr = packed.data();
                     for (int64_t count = 0; count < num_new_work_items; ++count)
                     {
@@ -398,6 +405,10 @@ public:
     void sendResponse(uint64_t requestId, [[maybe_unused]] std::list<NamedTensor> const& response_tensors,
         bool final_response, [[maybe_unused]] const std::string& errMsg)
     {
+        // `response_tensors` contains `outputIds, sequenceLength, [contextLogits, generationLogits], logProbs,
+        // cumLogProbs`. `contextLogits, generationLogits` are optional, only contained when `gather_context_logits` and
+        // `gather_generation_logits` are enabled respectively. Or enable 'gather_all_token_logits' to enable both of
+        // them.
         try
         {
             if (final_response)
@@ -450,13 +461,19 @@ std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId,
     auto request = std::make_shared<InferenceRequest>(reqId);
     auto const& inputIds = dataset.first[sample_idx];
     request->setInputIds(bufferManager.copyFrom(
-        inputIds, ITensor::makeShape({1, static_cast<SizeType>(inputIds.size())}), MemoryType::kPINNED));
+        inputIds, ITensor::makeShape({static_cast<SizeType>(inputIds.size())}), MemoryType::kPINNED));
     auto const request_output_len = dataset.second[sample_idx];
     request->setMaxNewTokens(
         bufferManager.copyFrom(&request_output_len, ITensor::makeShape({1, 1}), MemoryType::kPINNED));
     request->setBeamWidth(beamWidthTensor);
-    request->setEndId(eosId);
-    request->setPadId(padId);
+    if (eosId != nullptr)
+    {
+        request->setEndId(eosId);
+    }
+    if (padId != nullptr)
+    {
+        request->setPadId(padId);
+    }
     return request;
 }
 
@@ -466,7 +483,7 @@ void benchmarkGptManager([[maybe_unused]] std::string const& modelName, std::fil
     std::shared_ptr<nvinfer1::ILogger> const& logger, TrtGptModelOptionalParams const& optionalParams,
     batch_scheduler::SchedulerPolicy schedulerPolicy)
 {
-    auto const worldConfig = WorldConfig::mpi(*logger);
+    auto const worldConfig = WorldConfig::mpi();
 
     TrtGptModelType modelType;
     if (type == "V1")
@@ -567,6 +584,8 @@ int main(int argc, char* argv[])
 
     options.add_options()("log_level", "Choose log level between verbose/info/warning/error/internal_error.",
         cxxopts::value<std::string>()->default_value("error"));
+    options.add_options()(
+        "log_iteration_data", "On each decoder iteration, print batch state metadata.", cxxopts::value<bool>());
 
     auto result = options.parse(argc, argv);
 
@@ -613,6 +632,11 @@ int main(int argc, char* argv[])
     if (result.count("enable_trt_overlap"))
     {
         optionalParams.enableTrtOverlap = result["enable_trt_overlap"].as<bool>();
+    }
+    // Argument: Enable batch stats output
+    if (result.count("log_iteration_data"))
+    {
+        optionalParams.logIterationData = result["log_iteration_data"].as<bool>();
     }
 
     std::optional<int32_t> padId;

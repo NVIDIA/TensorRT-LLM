@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,7 @@ import pathlib as _pl
 import subprocess as _sp
 import sys as _sys
 import typing as _tp
+from multiprocessing import cpu_count
 
 
 def find_dir_containing(files: _tp.Sequence[str],
@@ -57,8 +58,10 @@ def build_trt_llm(python_exe: str,
                   root_dir: _pl.Path,
                   build_dir: _pl.Path,
                   cuda_architectures: _tp.Optional[str] = None,
+                  use_ccache: _tp.Optional[bool] = False,
                   dist_dir: _tp.Optional[str] = None,
-                  trt_root: _tp.Optional[str] = None):
+                  trt_root: _tp.Optional[str] = None,
+                  job_count: _tp.Optional[int] = None):
     # Build wheel again to WAR issue that the "google-tests" target needs the cmake generated files
     # which were not packaged when running the build job
     # eventually it should be packaged in build job, and run test only on test node
@@ -68,12 +71,19 @@ def build_trt_llm(python_exe: str,
         python_exe, "scripts/build_wheel.py", "--cuda_architectures",
         cuda_architectures, "--build_dir",
         str(build_dir), "--dist_dir",
-        str(dist_dir), "--python_bindings"
+        str(dist_dir)
     ]
+
+    if use_ccache:
+        build_wheel.append("--use_ccache")
+
     if trt_root is not None:
         build_wheel += ["--trt_root", str(trt_root)]
 
-    run_command(build_wheel, cwd=root_dir)
+    if job_count is not None:
+        build_wheel += ["-j", str(job_count)]
+
+    run_command(build_wheel, cwd=root_dir, env=_os.environ)
 
     dist_dir = dist_dir if dist_dir.is_absolute() else root_dir / dist_dir
     wheels = _gl.glob(str(dist_dir / "tensorrt_llm-*.whl"))
@@ -93,7 +103,9 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
               run_fp8=False,
               only_multi_gpu=False,
               trt_root: _tp.Optional[str] = None,
-              build_only=False) -> None:
+              build_only=False,
+              use_ccache=False,
+              job_count: _tp.Optional[int] = None) -> None:
     root_dir = find_root_dir()
     _log.info("Using root directory: %s", str(root_dir))
 
@@ -105,11 +117,30 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                   root_dir=root_dir,
                   build_dir=build_dir,
                   cuda_architectures=cuda_architectures,
+                  use_ccache=use_ccache,
                   dist_dir=dist_dir,
-                  trt_root=trt_root)
+                  trt_root=trt_root,
+                  job_count=job_count)
 
     build_dir = build_dir if build_dir.is_absolute() else root_dir / build_dir
     resources_dir = _pl.Path("cpp") / "tests" / "resources"
+
+    generate_lora_data_args_tp1 = [
+        python_exe,
+        str(resources_dir / "scripts" / "generate_test_lora_weights.py"),
+        "--out-dir=cpp/tests/resources/data/lora-test-weights-tp1",
+        "--tp-size=1"
+    ]
+
+    generate_lora_data_args_tp2 = [
+        python_exe,
+        str(resources_dir / "scripts" / "generate_test_lora_weights.py"),
+        "--out-dir=cpp/tests/resources/data/lora-test-weights-tp2",
+        "--tp-size=2"
+    ]
+
+    run_command(generate_lora_data_args_tp1, cwd=root_dir)
+    run_command(generate_lora_data_args_tp2, cwd=root_dir)
 
     if not only_multi_gpu:
         prepare_all_model_tests(python_exe=python_exe,
@@ -202,7 +233,8 @@ def prepare_all_model_tests(python_exe: str,
         prepare_model_tests(model_name="chatglm",
                             python_exe=python_exe,
                             root_dir=root_dir,
-                            resources_dir=resources_dir)
+                            resources_dir=resources_dir,
+                            model_cache_arg=model_cache_arg)
     else:
         _log.info("Skipping ChatGLM tests")
 
@@ -245,10 +277,7 @@ def prepare_model_tests(model_name: str,
     ] + only_fp8_arg + only_multi_gpu_arg
     if only_multi_gpu_arg:
         generate_expected_output = [
-            "mpirun",
-            "-n",
-            "4",
-            "--allow-run-as-root",
+            "mpirun", "-n", "4", "--allow-run-as-root", "--timeout", "600"
         ] + generate_expected_output
     run_command(generate_expected_output, cwd=root_dir, env=model_env)
 
@@ -317,40 +346,50 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
     ]
     run_command(benchmark, cwd=root_dir)
 
-    generate_batch_manager_data = [
-        python_exe,
-        str(scripts_dir / "generate_batch_manager_data.py")
-    ]
-    run_command(generate_batch_manager_data, cwd=root_dir)
+    prompt_flags = [None, "--long_prompt"]
+    prompt_files = ["dummy_cnn.json", "dummy_long_cnn.json"]
+    token_files = ["prepared_" + s for s in prompt_files]
+    max_input_lens = ["20", "512"]
 
-    benchmark_src_dir = _pl.Path("benchmarks") / "cpp"
-    data_dir = resources_dir / "data"
-    prepare_dataset = [
-        python_exe,
-        str(benchmark_src_dir / "prepare_dataset.py"), "--dataset",
-        str(data_dir / "dummy_cnn.json"), "--max_input_len", "20",
-        "--tokenizer_dir",
-        str(resources_dir / "models" / "gpt2"), "--output",
-        str(data_dir / "prepared_dummy_cnn.json")
-    ]
-    run_command(prepare_dataset, cwd=root_dir)
+    for flag, prompt_f, tokens_f, len in zip(prompt_flags, prompt_files,
+                                             token_files, max_input_lens):
+        generate_batch_manager_data = [
+            python_exe,
+            str(scripts_dir / "generate_batch_manager_data.py"),
+            "--output_filename", prompt_f
+        ]
+        if flag is not None:
+            generate_batch_manager_data.append(flag)
+        run_command(generate_batch_manager_data, cwd=root_dir)
 
-    benchmark = [
-        str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
-        "--engine_dir",
-        str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
-        "--type", "IFB", "--dataset",
-        str(data_dir / "prepared_dummy_cnn.json")
-    ]
-    run_command(benchmark, cwd=root_dir)
-    benchmark = [
-        str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
-        "--engine_dir",
-        str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
-        "--type", "V1", "--dataset",
-        str(data_dir / "prepared_dummy_cnn.json")
-    ]
-    run_command(benchmark, cwd=root_dir)
+        benchmark_src_dir = _pl.Path("benchmarks") / "cpp"
+        data_dir = resources_dir / "data"
+        prepare_dataset = [
+            python_exe,
+            str(benchmark_src_dir / "prepare_dataset.py"), "--dataset",
+            str(data_dir / prompt_f), "--max_input_len", len, "--tokenizer_dir",
+            str(resources_dir / "models" / "gpt2"), "--output",
+            str(data_dir / tokens_f)
+        ]
+        run_command(prepare_dataset, cwd=root_dir)
+
+        benchmark = [
+            str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
+            "--engine_dir",
+            str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
+            "--type", "IFB", "--dataset",
+            str(data_dir / tokens_f)
+        ]
+        run_command(benchmark, cwd=root_dir)
+
+        benchmark = [
+            str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
+            "--engine_dir",
+            str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
+            "--type", "V1", "--dataset",
+            str(data_dir / tokens_f)
+        ]
+        run_command(benchmark, cwd=root_dir)
 
 
 if __name__ == "__main__":
@@ -358,6 +397,15 @@ if __name__ == "__main__":
     parser = _arg.ArgumentParser()
 
     parser.add_argument("--cuda_architectures", "-a")
+    parser.add_argument("--use_ccache",
+                        action="store_true",
+                        help="Use ccache in cmake building stage")
+    parser.add_argument("--job_count",
+                        "-j",
+                        type=int,
+                        const=cpu_count(),
+                        nargs="?",
+                        help="Parallel job count for compiling TensorRT-LLM")
     parser.add_argument("--build_dir",
                         type=str,
                         help="Directory where cpp sources are built")

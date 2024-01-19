@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,7 @@ from pathlib import Path
 
 import torch
 import torch.multiprocessing as mp
+from run import get_engine_name
 
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_trt
@@ -30,13 +31,6 @@ from tensorrt_llm.network import net_guard
 from t5.weight import parse_t5_config, load_from_hf_t5, load_from_binary_t5  # isort:skip
 from bart.weight import parse_bart_config, load_from_binary_bart  # isort:skip
 from nmt.weight import parse_nmt_config, load_from_binary_nmt  # isort:skip
-
-
-def get_engine_name(model, dtype, tp_size, pp_size, rank):
-    if pp_size == 1:
-        return '{}_{}_tp{}_rank{}.engine'.format(model, dtype, tp_size, rank)
-    return '{}_{}_tp{}_pp{}_rank{}.engine'.format(model, dtype, tp_size,
-                                                  pp_size, rank)
 
 
 def serialize_engine(engine, path):
@@ -51,6 +45,7 @@ def serialize_engine(engine, path):
 
 def parse_config(ini_file, component, args):
     config = configparser.ConfigParser()
+    assert ini_file.exists(), f"Missing config file {ini_file}"
     config.read(ini_file)
     model_type = config.get('structure', 'model_type')
     args.model_type = model_type
@@ -113,7 +108,14 @@ def parse_arguments(component):
         help=
         'The path of to read timing cache from, will be ignored if the file does not exist'
     )
-
+    parser.add_argument(
+        '--profiling_verbosity',
+        type=str,
+        default='layer_names_only',
+        choices=['layer_names_only', 'detailed', 'none'],
+        help=
+        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
+    )
     parser.add_argument('--model_type',
                         type=str,
                         choices=['t5', 'bart', 'nmt'],
@@ -214,6 +216,11 @@ def parse_arguments(component):
         help=
         'Seed to use when initializing the random number generator for torch.')
     parser.add_argument(
+        '--max_prompt_embedding_table_size',
+        type=int,
+        default=0,
+        help='Setting to a value > 0 enables support for prompt tuning.')
+    parser.add_argument(
         '--use_parallel_embedding',
         action="store_true",
         default=False,
@@ -242,9 +249,19 @@ def parse_arguments(component):
         help=
         'This option is introduced with trt 9.1.0.1+ and will reduce the building time significantly for fp8.'
     )
-    parser.add_argument('--gather_all_token_logits',
+    parser.add_argument(
+        '--gather_all_token_logits',
+        action='store_true',
+        default=False,
+        help='Enable both gather_context_logits and gather_generation_logits')
+    parser.add_argument('--gather_context_logits',
                         action='store_true',
-                        default=False)
+                        default=False,
+                        help='Gather context logits')
+    parser.add_argument('--gather_generation_logits',
+                        action='store_true',
+                        default=False,
+                        help='Gather generation logits')
 
     # parse cmdline args
     args = parser.parse_args()
@@ -272,6 +289,10 @@ def parse_arguments(component):
 
     if args.dtype == 'bfloat16':
         assert args.use_gemm_plugin, "Please use gemm plugin when dtype is bfloat16"
+
+    if args.gather_all_token_logits:
+        args.gather_context_logits = True
+        args.gather_generation_logits = True
 
     return args
 
@@ -322,6 +343,7 @@ def build_rank_engine(builder: Builder,
             hidden_act=args.hidden_act,
             mlp_type=args.mlp_type,
             dtype=dtype,
+            use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
             use_parallel_embedding=args.use_parallel_embedding,
             embedding_sharding_dim=args.embedding_sharding_dim,
             mapping=mapping)
@@ -416,6 +438,7 @@ def build_rank_engine(builder: Builder,
             inputs = tllm_model.prepare_inputs(
                 args.max_batch_size,
                 args.max_encoder_input_len,
+                args.max_prompt_embedding_table_size,
             )
         elif args.component == 'decoder':
             inputs = tllm_model.prepare_inputs(
@@ -424,8 +447,8 @@ def build_rank_engine(builder: Builder,
                 args.max_decoder_input_len,
                 args.max_output_len,
                 args.max_encoder_input_len,
-                gather_all_token_logits=args.gather_all_token_logits,
-            )
+                gather_context_logits=args.gather_context_logits,
+                gather_generation_logits=args.gather_generation_logits)
 
         tllm_model(*inputs)
 
@@ -461,6 +484,7 @@ def build(rank, args):
             precision=args.dtype,
             timing_cache=component_dir /
             args.timing_cache if cache is None else cache,
+            profiling_verbosity=args.profiling_verbosity,
             tensor_parallel=args.tp_size,
             pipeline_parallel=args.pp_size,
             gpus_per_node=args.gpus_per_node,
@@ -483,7 +507,11 @@ def build(rank, args):
             has_position_embedding=args.has_position_embedding,
             has_token_type_embedding=args.has_token_type_embedding,
             strongly_typed=args.strongly_typed,
-            gather_all_token_logits=args.gather_all_token_logits)
+            gather_context_logits=args.gather_context_logits,
+            gather_generation_logits=args.gather_generation_logits,
+            max_prompt_embedding_table_size=(
+                args.max_prompt_embedding_table_size
+                if args.component == 'encoder' else 0))
 
         engine_name = get_engine_name(args.engine_name, args.dtype,
                                       args.tp_size, args.pp_size, cur_rank)

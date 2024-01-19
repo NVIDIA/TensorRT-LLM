@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -192,7 +192,8 @@ class MixtureOfExperts(Module):
                  tp_size: int = 1,
                  tp_rank: int = 0,
                  instance_id: int = 0,
-                 quant_mode=QuantMode(0)):
+                 quant_mode=QuantMode(0),
+                 max_lora_rank=None):
         super().__init__()
 
         self.moe_config = moe_config
@@ -288,11 +289,7 @@ class MixtureOfExperts(Module):
             self.register_parameter('experts_bias_1', None)
             self.register_parameter('experts_bias_2', None)
 
-    def forward(self,
-                hidden_states,
-                finished=None,
-                workspace=None,
-                lora_layer_params=None):
+    def forward(self, hidden_states, finished=None, lora_layer_params=None):
         assert lora_layer_params is None, "LoRA + MoE is not supported for the moment"
         routing_input = cast(hidden_states, trt.float32)
         if self.tp_size > 1:
@@ -320,10 +317,7 @@ class MixtureOfExperts(Module):
                              tp_rank=self.tp_rank)
 
         if self.tp_size > 1 and self.tp_group is not None and self.moe_config.tp_mode != MoeConfig.ParallelismMode.NONE:
-            output = allreduce(output,
-                               self.tp_group,
-                               workspace=workspace,
-                               instance_id=self.instance_id)
+            output = allreduce(output, self.tp_group)
 
         return output
 

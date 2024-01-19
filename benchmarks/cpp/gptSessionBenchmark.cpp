@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -38,7 +38,7 @@ namespace
 void benchmarkGptSession(std::string const& modelName, std::filesystem::path const& dataPath,
     std::vector<int> const& batchSizes, int beamWidth, std::vector<std::vector<int>> const& inOutLen,
     std::shared_ptr<nvinfer1::ILogger> const& logger, int warmUp, int numRuns, int duration,
-    GptSession::Config& sessionConfig, bool cudaGraphMode, bool printAllLogits)
+    GptSession::Config& sessionConfig, bool cudaGraphMode, bool printAllLogits, bool disableForceMaxTokens)
 {
     std::string modelNameHyphen = modelName;
     std::filesystem::path jsonFileName = dataPath / "config.json";
@@ -47,15 +47,14 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
     auto const inputPacked = modelConfig.usePackedInput();
     SizeType deviceCount{0};
     TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
-    auto const worldConfig
-        = WorldConfig::mpi(*logger, deviceCount, json.getTensorParallelism(), json.getPipelineParallelism());
+    auto const worldConfig = WorldConfig::mpi(deviceCount, json.getTensorParallelism(), json.getPipelineParallelism());
     auto const enginePath = dataPath / json.engineFilename(worldConfig, modelNameHyphen);
     auto const dtype = modelConfig.getDataType();
     auto const useHalf = (dtype == nvinfer1::DataType::kHALF);
 
     SamplingConfig samplingConfig{beamWidth};
     samplingConfig.temperature = std::vector{1.0f};
-    samplingConfig.randomSeed = std::vector{42ull};
+    samplingConfig.randomSeed = std::vector{static_cast<uint64_t>(42ull)};
     samplingConfig.topK = std::vector{1};
     samplingConfig.topP = std::vector{0.0f};
 
@@ -71,7 +70,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
         auto const maxNewTokens = inOut[1];
 
         sessionConfig.maxSequenceLength = maxInputLength + maxNewTokens;
-        samplingConfig.minLength = std::vector{maxNewTokens};
+        samplingConfig.minLength = std::vector{disableForceMaxTokens ? 1 : maxNewTokens};
 
         GptSession session{sessionConfig, modelConfig, worldConfig, enginePath.string(), logger};
 
@@ -106,7 +105,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                 if (inputPacked)
                 {
                     inputIds = bufferManager.copyFrom(
-                        inputsHost, ITensor::makeShape({1, batchSize * maxInputLength}), MemoryType::kGPU);
+                        inputsHost, ITensor::makeShape({batchSize * maxInputLength}), MemoryType::kGPU);
                 }
                 else
                 {
@@ -133,8 +132,8 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                 {
                     generationOutput.generationLogits
                         = bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
-                    bufferManager.setZero(*generationOutput.generationLogits);
                 }
+
                 TLLM_LOG_INFO(memoryCounter.toString());
 
                 for (auto r = 0; r < warmUp; ++r)
@@ -189,16 +188,16 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                         std::cout << "generationOutput.contextLogits.shape: "
                                   << generationOutput.contextLogits->getShape()
                                   << std::endl; // (batchsize, prompt_len, vocabsize)
-                        std::cout << "generationOutput.contextLogits" << *generationOutput.contextLogits << std::endl;
+                        std::cout << "generationOutput.contextLogits: " << *generationOutput.contextLogits << std::endl;
                     }
 
                     if (session.getModelConfig().computeGenerationLogits() && printAllLogits)
                     {
                         std::cout << "generationOutput.generationLogits.shape: "
                                   << generationOutput.generationLogits->getShape()
-                                  << std::endl; // (batchsize, beamwidth, maxNewTokens-1, vocabsize)
+                                  << std::endl; // (batchsize, beamwidth, maxNewTokens, vocabsize)
                         generationOutput.generationLogits->reshape(ITensor::makeShape({batchSize * beamWidth,
-                            maxNewTokens - 1, modelConfig.getVocabSizePadded(worldConfig.getSize())}));
+                            maxNewTokens, modelConfig.getVocabSizePadded(worldConfig.getSize())}));
 
                         std::cout << "generationOutput.generationLogits: " << *generationOutput.generationLogits
                                   << std::endl;
@@ -264,11 +263,13 @@ int main(int argc, char* argv[])
     options.add_options()("gen_micro_batch_size", "Batch size for generation phase.", cxxopts::value<int>());
     options.add_options()("max_attention_window", "Max kv cache length per sequence.", cxxopts::value<int>());
     options.add_options()("max_tokens_in_paged_kvcache", "Max tokens in paged K-V Cache.", cxxopts::value<int>());
+    options.add_options()("sink_token_len", "Sink token length in kv cache per sequence.", cxxopts::value<int>());
     options.add_options()(
         "kv_cache_free_gpu_mem_fraction", "K-V Cache Free Gpu Mem Fraction.", cxxopts::value<float>());
 
     options.add_options()("enable_cuda_graph", "Execute GPT session with CUDA graph.");
     options.add_options()("print_all_logits", "Print all context and generation logits.");
+    options.add_options()("disable_force_max_tokens", "Disable force the engine generating new max_tokens.");
 
     auto result = options.parse(argc, argv);
 
@@ -363,6 +364,11 @@ int main(int argc, char* argv[])
     {
         sessionConfig.kvCacheConfig.maxAttentionWindow = result["max_attention_window"].as<int>();
     }
+    // Argument: Sink token length
+    if (result.count("sink_token_len"))
+    {
+        sessionConfig.kvCacheConfig.sinkTokenLength = result["sink_token_len"].as<int>();
+    }
     // Argument: K-V Cache Free Gpu Mem Fraction
     if (result.count("kv_cache_free_gpu_mem_fraction"))
     {
@@ -372,6 +378,7 @@ int main(int argc, char* argv[])
     // Argument: Enable CUDA graph
     auto enableCudaGraph = result.count("enable_cuda_graph") > 0;
     auto printAllLogits = result.count("print_all_logits") > 0;
+    auto disableForceMaxTokens = result.count("disable_force_max_tokens") > 0;
 
     initTrtLlmPlugins(logger.get());
 
@@ -379,7 +386,7 @@ int main(int argc, char* argv[])
     {
         benchmarkGptSession(result["model"].as<std::string>(), result["engine_dir"].as<std::string>(), batchSizes,
             beamWidth, inOutLen, logger, result["warm_up"].as<int>(), result["num_runs"].as<int>(),
-            result["duration"].as<int>(), sessionConfig, enableCudaGraph, printAllLogits);
+            result["duration"].as<int>(), sessionConfig, enableCudaGraph, printAllLogits, disableForceMaxTokens);
     }
     catch (const std::exception& e)
     {

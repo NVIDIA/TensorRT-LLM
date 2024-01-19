@@ -1,4 +1,4 @@
-# Falcon-180B on a *single* H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100
+# Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100
 
 H200's large capacity & high memory bandwidth, paired with TensorRT-LLM's
 optimizations, maximizes inference performance.

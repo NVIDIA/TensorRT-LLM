@@ -42,6 +42,11 @@ public:
         mTransB = transposeB;
     }
 
+    void setOutputType(nvinfer1::DataType type)
+    {
+        mOutputType = type;
+    }
+
 protected:
     void runTactic(int m, int n, int k, const Config& tactic, char* workspace, const cudaStream_t& stream) override;
 
@@ -54,6 +59,7 @@ protected:
 private:
     bool mTransA;
     bool mTransB;
+    nvinfer1::DataType mOutputType;
 
     static constexpr size_t ALIGNMENT = 256;
 };
@@ -109,6 +115,7 @@ private:
     int mTransA;
     int mTransB;
     nvinfer1::DataType mType;
+    nvinfer1::DataType mOutputType;
 
     // @fixme: seems this is shared across multiple clones.
     // If we deep copy the wrapper inside clone(), then we may avoid the mutex inside the wrapper?

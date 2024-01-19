@@ -319,12 +319,11 @@ Then, you can add any combination of `--per-token` and `--per-channel` to get th
 Examples of build invocations:
 
 ```bash
-# Build model for SmoothQuant in the _per_tensor_ mode.
-python3 build.py --bin_model_dir=/llama/smooth_llama_7B/sq0.8/1-gpu/ \
-                 --use_smooth_quant
-
 # Build model for SmoothQuant in the _per_token_ + _per_channel_ mode
 python3 build.py --bin_model_dir=/llama/smooth_llama_7B/sq0.8/1-gpu/ \
+                 --use_gpt_attention_plugin float16 \
+                 --remove_input_padding \
+                 --enable_context_fmha \
                  --use_smooth_quant \
                  --per_token \
                  --per_channel
@@ -343,11 +342,11 @@ where FP8 scaling factors are stored.
 
 ```bash
 # Quantize HF LLaMA 70B into FP8 and export a single-rank checkpoint
-python quantize.py --model_dir ./tmp/llama/70B \
-                   --dtype float16 \
-                   --qformat fp8 \
-                   --export_path ./quantized_fp8 \
-                   --calib_size 512 \
+python examples/quantization/quantize.py --model_dir ./tmp/llama/70B \
+                                         --dtype float16 \
+                                         --qformat fp8 \
+                                         --export_path ./quantized_fp8 \
+                                         --calib_size 512 \
 
 # Build LLaMA 70B TP=2 using original HF checkpoint + PTQ scaling factors from the single-rank checkpoint
 python build.py --model_dir ./tmp/llama/70B \
@@ -384,11 +383,11 @@ AWQ/GPTQ examples below involves 2 steps:
 
     ```bash
     # Quantize HF LLaMA 7B checkpoint into INT4 AWQ format
-    python quantize.py --model_dir ./tmp/llama/7B \
-                    --dtype float16 \
-                    --qformat int4_awq \
-                    --export_path ./quantized_int4-awq \
-                    --calib_size 32
+    python examples/quantization/quantize.py --model_dir ./tmp/llama/7B \
+                                             --dtype float16 \
+                                             --qformat int4_awq \
+                                             --export_path ./quantized_int4-awq \
+                                             --calib_size 32
     ```
     The quantized model checkpoint is saved to `./quantized_int4-awq/llama_tp1_rank0.npz` for future TRT-LLM engine build.
 
@@ -605,10 +604,11 @@ mpirun -n 2 python ../run.py --engine_dir "/tmp/new_lora_13b/trt_engines/fp16/2-
               --use_py_session
 
  Input: "今天天气很好，我到公园的时后，"
-Output: "发现那里有很多小朋友们都在玩。他们都在玩跳绳，跳绳的花样都很多，我看他们玩的很开心。我看他们玩的的时候，我也想跟着他们一起玩，于是我也买了一个跳绳，跟着他们一起玩。我们玩的很开心"
+Output: "发现公园里人很多，有的在打羽毛球，有的在打乒乓球，有的在跳绳，还有的在跑步。我和妈妈来到一个空地上，我和妈妈一起跳绳，我跳了1"
 ```
-
-If users don't want to skip lora module, please pass uid -1 like `--lora_task_uids -1`, then the model would not run lora module and the results would be little different.
+Users who want to skip LoRA module may pass uid -1 with `--lora_task_uids -1`.
+In that case, the model will not run the LoRA module and the results will be
+different.
 
 ```bash
 mpirun -n 2 python ../run.py --engine_dir "/tmp/new_lora_13b/trt_engines/fp16/2-gpu/" \
@@ -623,3 +623,110 @@ mpirun -n 2 python ../run.py --engine_dir "/tmp/new_lora_13b/trt_engines/fp16/2-
  Input: "今天天气很好，我到公园的时后，"
 Output: "我看见一个人坐在那边边看书书，我看起来还挺像你，可是我走过过去问了一下他说你是你吗，他说没有，然后我就说你看我看看你像你，他说说你看我像你，我说你是你，他说你是你，"
 ```
+
+### Run LLaMa with several lora checkpoints
+
+In this section, we show how to run a model with multiple LoRA modules at the same time. Note that if one of the LoRA module has a
+fine-tuned embedding table or logit GEMM, users should guarantee that all the instances of the model can use the same finetuned
+embedding table or logit GEMM.
+Here, we use two LoRA checkpoints as examples. These two LoRA checkponits add LoRA modules to `q_proj` and `v_proj`. Because we only
+support adding lora modules on `q`, `k` and `v` at the same time, we need to add `--lora_target_modules "attn_q" "attn_k" "attn_v"`.
+In this case, we assign null pointers for the `k` LoRA module in TensorRT-LLM and skip the computation at runtime.
+
+As the rank of the LoRA modules of both checkpoints is 8, we can set `--max_lora_rank 8` to reduce the memory requirement for the LoRA plugin.
+
+In this example, we use a LoRA checkpoint finetuned on the Chinese dataset `luotuo-lora-7b-0.1` and a LoRA checkpoint finetuned on
+the Japanese dataset `Japanese-Alpaca-LoRA-7b-v0`. For the `lora_manager` to load several checkpoints, we pass several directories
+of LoRA checkpoints at the same time: `--lora_dir  "luotuo-lora-7b-0.1/" "Japanese-Alpaca-LoRA-7b-v0/"`.
+Then, `lora_manager` will assign `lora_task_uids` to these checkpoints. `lora_task_uids -1` is a predefined value, which corresponds to
+the base model. If we pass `lora_task_uids 0 1`, this means we want to use the first LoRA checkpoint on first sentence and use the second LoRA checkpoint on the second sentence.
+
+To verify the correctness, we pass the same Chinese input `美国的首都在哪里? \n答案:` three times as well as the same Japanese input `アメリカ合衆国の首都はどこですか? \n答え:` three times (both inputs mean `Where is the capital of America? \nAnswer`). We run on base model, `luotuo-lora-7b-0.1` and `Japanese-Alpaca-LoRA-7b-v0/`.
+
+```bash
+git-lfs clone https://huggingface.co/qychen/luotuo-lora-7b-0.1
+git-lfs clone https://huggingface.co/kunishou/Japanese-Alpaca-LoRA-7b-v0
+BASE_LLAMA_MODEL=llama-7b-hf/
+
+python build.py --model_dir ${BASE_LLAMA_MODEL} \
+                --dtype float16 \
+                --remove_input_padding \
+                --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
+                --use_gemm_plugin float16 \
+                --output_dir "/tmp/llama_7b_with_lora_qkv/trt_engines/fp16/1-gpu/" \
+                --max_batch_size 128 \
+                --max_input_len 512 \
+                --max_output_len 50 \
+                --use_lora_plugin float16 \
+                --hf_lora_dir "Japanese-Alpaca-LoRA-7b-v0/" \
+                --lora_target_modules "attn_q" "attn_k" "attn_v" \
+                --max_lora_rank 8 \
+                --world_size 1 --tp_size 1
+
+python ../run.py --engine_dir "/tmp/llama_7b_with_lora_qkv/trt_engines/fp16/1-gpu/" \
+              --max_output_len 10 \
+              --tokenizer_dir ${BASE_LLAMA_MODEL} \
+              --input_text "美国的首都在哪里? \n答案:" "美国的首都在哪里? \n答案:" "美国的首都在哪里? \n答案:" "アメリカ合衆国の首都はどこですか? \n答え:" "アメリカ合衆国の首都はどこですか? \n答え:" "アメリカ合衆国の首都はどこですか? \n答え:" \
+              --lora_dir  "luotuo-lora-7b-0.1/" "Japanese-Alpaca-LoRA-7b-v0/" \
+              --lora_task_uids -1 0 1 -1 0 1 \
+              --use_py_session --top_p 0.5 --top_k 0
+```
+
+The results would be like
+
+```bash
+Input [Text 0]: "<s> 美国的首都在哪里? \n答案:"
+Output [Text 0 Beam 0]: "Washington, D.C.
+What is the"
+
+Input [Text 1]: "<s> 美国的首都在哪里? \n答案:"
+Output [Text 1 Beam 0]: "华盛顿。
+"
+
+Input [Text 2]: "<s> 美国的首都在哪里? \n答案:"
+Output [Text 2 Beam 0]: "Washington D.C.�����"
+
+Input [Text 3]: "<s> アメリカ合衆国の首都はどこですか? \n答え:"
+Output [Text 3 Beam 0]: "Washington, D.C.
+Which of"
+
+Input [Text 4]: "<s> アメリカ合衆国の首都はどこですか? \n答え:"
+Output [Text 4 Beam 0]: "华盛顿。
+"
+
+Input [Text 5]: "<s> アメリカ合衆国の首都はどこですか? \n答え:"
+Output [Text 5 Beam 0]: "ワシントン D.C."
+```
+
+We can observe that `luotuo-lora-7b-0.1` produces correct answers on the first sentence and the fifth sentence (in Chinese), `Japanese-Alpaca-LoRA-7b-v0` produces correct answers on the sixth sentence (in Japanese).
+
+## Run LLaMa with StreamingLLM
+
+* Build engine. Set `--enable_pos_shift` to use positions in KV cache for RoPE, and set `--dense_context_fmha` to use dense context fmha in context phase.
+
+```bash
+# Build the LLaMA 7B model with StreamingLLM feature using a single GPU and FP16.
+python build.py --model_dir ./tmp/llama/7B/ \
+                --dtype float16 \
+                --remove_input_padding \
+                --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
+                --use_gemm_plugin float16 \
+                --enable_pos_shift \
+                --dense_context_fmha \
+                --output_dir ./tmp/llama/7B/trt_engines/fp16_StreamingLLM/1-gpu/
+```
+
+* Run inference. Use `--sink_token_length` to set the number of sink tokens, and use `--max_attention_window_size` to set the `sliding_window` value.
+
+```bash
+# Run LLaMA 7B fp16 inference with sliding window/cache size 2048 and sink token length 4.
+python3 run.py --max_output_len=50 \
+               --tokenizer_dir ./tmp/llama/7B/ \
+               --engine_dir=./tmp/llama/7B/trt_engines/fp16_StreamingLLM/1-gpu/ \
+               --max_attention_window_size=2048 \
+               --sink_token_length=4
+```
+
+Note that the sink tokens is included in the sliding attention tokens, and there are at most `max_attention_window_size` tokens are stored in the KV cache.

@@ -8,7 +8,7 @@ TensorRT-LLM
 [![python](https://img.shields.io/badge/python-3.10.12-green)](https://www.python.org/downloads/release/python-31012/)
 [![cuda](https://img.shields.io/badge/cuda-12.2-green)](https://developer.nvidia.com/cuda-downloads)
 [![trt](https://img.shields.io/badge/TRT-9.2-green)](https://developer.nvidia.com/tensorrt)
-[![version](https://img.shields.io/badge/release-0.6.1-green)](./setup.py)
+[![version](https://img.shields.io/badge/release-0.7.1-green)](./setup.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](./LICENSE)
 
 [Architecture](./docs/source/architecture.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Results](./docs/source/performance.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](./examples/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](./docs/source/)
@@ -108,23 +108,36 @@ concepts used in TensorRT-LLM, we recommend you to read the following
 
 ## Installation
 
-*For Windows installation, see [`Windows`](windows/README.md).*
+After installing the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit),
+please run the following commands to install TensorRT-LLM.
 
-TensorRT-LLM must be built from source, instructions can be found
-[here](./docs/source/installation.md). An image of a Docker container with
-TensorRT-LLM and its Triton Inference Server Backend will be made available
-soon.
+```bash
+# Obtain and start the basic docker image environment
+nvidia-docker run --entrypoint /bin/bash -it nvidia/cuda:12.1.0-devel-ubuntu22.04
+# Install dependencies, TensorRT-LLM requires Python 3.10
+apt-get update && apt-get -y install python3.10 python3-pip openmpi-bin libopenmpi-dev
+# Install the latest preview version (corresponding to the main branch) of TensorRT-LLM.
+# If you want to install the stable version (corresponding to the release branch), please
+# remove the `--pre` option.
+pip3 install tensorrt_llm -U --pre --extra-index-url https://pypi.nvidia.com
+# Check installation
+python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"
+```
 
-The remaining commands in that document must be executed from the TensorRT-LLM
-container.
+For users who require the best performance or debugging capabilities, please refer to the instructions for
+[building from source code](docs/source/build_from_source.md).
+
+For Windows installation, see [`Windows`](windows/README.md).
 
 ## Quick Start
+
+Please be sure to complete the [installation steps](#installation) before proceeding with the following steps.
 
 To create a TensorRT engine for an existing model, there are 3 steps:
 
 1. Download pre-trained weights,
 2. Build a fully-optimized engine of the model,
-3. Deploy the engine.
+3. Deploy the engine, in other words, run the fully-optimized model.
 
 The following sections show how to use TensorRT-LLM to run the
 [BLOOM-560m](https://huggingface.co/bigscience/bloom-560m) model.
@@ -181,6 +194,8 @@ the example [folder](examples/bloom). Many more [models](#models) than BLOOM
 are implemented in TensorRT-LLM. They can be found in the
 [examples](./examples/) directory.
 
+Beyond local execution, you can also use the NVIDIA Triton Inference Server to create a production-ready deployment of your LLM as described in this [blog](https://developer.nvidia.com/blog/optimizing-inference-on-llms-with-tensorrt-llm-now-publicly-available/).
+
 ## Support Matrix
 
 TensorRT-LLM optimizes the performance of a range of well-known models on
@@ -206,13 +221,17 @@ Lovelace architectures. Certain limitations may, however, apply.
 Various numerical precisions are supported in TensorRT-LLM. The support for
 some of those numerical features require specific architectures:
 
-|                     | FP32 | FP16 | BF16 | FP8  | INT8 | INT4 |
-| :------------------ | :--- | :--- | :--- | :--- | :--- | :--- |
-| Volta (SM70)        | Y    | Y    | N    | N    | Y    | Y    |
-| Turing (SM75)       | Y    | Y    | N    | N    | Y    | Y    |
-| Ampere (SM80, SM86) | Y    | Y    | Y    | N    | Y    | Y    |
-| Ada-Lovelace (SM89) | Y    | Y    | Y    | Y    | Y    | Y    |
-| Hopper (SM90)       | Y    | Y    | Y    | Y    | Y    | Y    |
+|                     | FP32 | FP16 | BF16 | FP8  | INT8  | INT4  |
+| :------------------ | :--- | :--- | :--- | :--- | :---- | :---- |
+| Volta (SM70)        | Y    | Y    | N    | N    | Y (1) | Y (2) |
+| Turing (SM75)       | Y    | Y    | N    | N    | Y (1) | Y (2) |
+| Ampere (SM80, SM86) | Y    | Y    | Y    | N    | Y     | Y (3) |
+| Ada-Lovelace (SM89) | Y    | Y    | Y    | Y    | Y     | Y     |
+| Hopper (SM90)       | Y    | Y    | Y    | Y    | Y     | Y     |
+
+(1) INT8 SmoothQuant is not supported on SM70 and SM75.<br>
+(2) INT4 AWQ and GPTQ are not supported on SM < 80.<br>
+(3) INT4 AWQ and GPTQ with FP8 activations require SM >= 89.
 
 In this release of TensorRT-LLM, the support for FP8 and quantized data types
 (INT8 or INT4) is not implemented for all the models. See the
@@ -267,6 +286,7 @@ The list of supported models is:
 * [MPT](examples/mpt)
 * [mT5](examples/enc_dec)
 * [OPT](examples/opt)
+* [Phi-1.5/Phi-2](examples/phi)
 * [Qwen](examples/qwen)
 * [Replit Code](examples/mpt)
 * [SantaCoder](examples/gpt)
@@ -379,103 +399,43 @@ For example: `mpirun -n 1 python3 examples/gpt/build.py ...`
 
 ### Change Log
 
-#### Version 0.6.1
+#### Versions 0.7.0 / 0.7.1
 
-  * Models
-      * ChatGLM3
-      * InternLM (contributed by @wangruohui)
-      * Mistral 7B (developed in collaboration with Mistral.AI)
-      * MQA/GQA support to MPT (and GPT) models (contributed by @bheilbrun)
-      * Qwen (contributed by @Tlntin and @zhaohb)
-      * Replit Code V-1.5 3B (external contribution)
-      * T5, mT5, Flan-T5 (Python runtime only)
+* Models
+  - BART and mBART support in encoder-decoder models
+  - FairSeq Neural Machine Translation (NMT) family
+  - Mixtral-8x7B model
+    - Support weight loading for HuggingFace Mixtral model
+  - OpenAI Whisper
+  - Mixture of Experts support
+  - MPT - Int4 AWQ / SmoothQuant support
+  - Baichuan FP8 quantization support
+* Features
+  - [Preview] Speculative decoding
+  - Add Python binding for `GptManager`
+  - Add a Python class `ModelRunnerCpp` that wraps C++ `gptSession`
+  - System prompt caching
+  - Enable split-k for weight-only cutlass kernels
+  - FP8 KV cache support for XQA kernel
+  - New Python builder API and `trtllm-build` command(already applied to [blip2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/blip2) and [OPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/opt#3-build-tensorrt-engines) )
+  - Support `StoppingCriteria` and `LogitsProcessor` in Python generate API (thanks to the contribution from @zhang-ge-hao)
+  - fMHA support for chunked attention and paged kv cache
+* Bug fixes
+  - Fix tokenizer usage in quantize.py #288, thanks to the contribution from @0xymoro
+  - Fix LLaMa with LoRA error #637
+  - Fix LLaMA GPTQ failure #580
+  - Fix Python binding for InferenceRequest issue #528
+  - Fix CodeLlama SQ accuracy issue #453
+* Performance
+  - MMHA optimization for MQA and GQA
+  - LoRA optimization: cutlass grouped gemm
+  - Optimize Hopper warp specialized kernels
+  - Optimize AllReduce for parallel attention on Falcon and GPT-J
+  - Enable split-k for weight-only cutlass kernel when SM>=75
+* Documentation
+  - Add [documentation for new builder workflow](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/new_workflow.md)
 
-  * Features
-      * Add runtime statistics related to active requests and KV cache
-        utilization from the batch manager (see
-        the [batch manager](docs/source/batch_manager.md) documentation)
-      * Add `sequence_length` tensor to support proper lengths in beam-search
-        (when beam-width > 1 - see
-        [tensorrt_llm/batch_manager/GptManager.h](cpp/include/tensorrt_llm/batch_manager/GptManager.h))
-      * BF16 support for encoder-decoder models (Python runtime - see
-        [examples/enc_dec](examples/enc_dec/README.md))
-      * Improvements to memory utilization (CPU and GPU - including memory
-        leaks)
-      * Improved error reporting and memory consumption
-      * Improved support for stop and bad words
-      * INT8 SmoothQuant and INT8 KV Cache support for the Baichuan models (see
-        [examples/baichuan](examples/baichuan/README.md))
-      * INT4 AWQ Tensor Parallelism support and INT8 KV cache + AWQ/weight-only
-        support for the GPT-J model (see [examples/gptj](examples/gptj/README.md))
-      * INT4 AWQ support for the Falcon models
-        (see [examples/falcon](examples/falcon/README.md))
-      * LoRA support (functional preview only - limited to the Python runtime,
-        only QKV support and not optimized in terms of runtime performance) for
-        the GPT model (see the
-        [Run LoRA with the Nemo checkpoint](examples/gpt/README.md#Run-LoRA-with-the-Nemo-checkpoint)
-        in the GPT example)
-      * Multi-GPU support for encoder-decoder models (Python runtime - see
-        [examples/enc_dec](examples/enc_dec/README.md))
-      * New heuristic for launching the Multi-block Masked MHA kernel (similar
-        to FlashDecoding - see
-        [decoderMaskedMultiheadAttentionLaunch.h](cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderMaskedMultiheadAttentionLaunch.h))
-      * Prompt-Tuning support for GPT and LLaMA models (see the
-        [Prompt-tuning](examples/gpt/README.md#Prompt-tuning) Section in the GPT example)
-      * Performance optimizations in various CUDA kernels
-      * Possibility to exclude input tokens from the output (see `excludeInputInOutput` in
-        [`GptManager`](cpp/include/tensorrt_llm/batch_manager/GptManager.h))
-      * Python binding for the C++ runtime (GptSession - see [`pybind`](cpp/tensorrt_llm/pybind))
-      * Support for different micro batch sizes for context and generation
-        phases with pipeline parallelism (see `GptSession::Config::ctxMicroBatchSize` and
-        `GptSession::Config::genMicroBatchSize` in
-        [tensorrt_llm/runtime/gptSession.h](cpp/include/tensorrt_llm/runtime/gptSession.h))
-      * Support for "remove input padding" for encoder-decoder models (see
-        [examples/enc_dec](examples/enc_dec/README.md))
-      * Support for context and generation logits (see `mComputeContextLogits` and
-        `mComputeGenerationLogits` in
-        [tensorrt_llm/runtime/gptModelConfig.h](cpp/include/tensorrt_llm/runtime/gptModelConfig.h))
-      * Support for `logProbs` and `cumLogProbs` (see `"output_log_probs"` and
-        `"cum_log_probs"` in [`GptManager`](cpp/include/tensorrt_llm/batch_manager/GptManager.h))
-      * Update to CUTLASS 3.x
-
-  * Bug fixes
-      * Fix for ChatGLM2 #93 and #138
-      * Fix tensor names error "RuntimeError: Tensor names
-        (`host_max_kv_cache_length`) in engine are not the same as expected in
-        the main branch" #369
-      * Fix weights split issue in BLOOM when `world_size = 2` ("array split
-        does not result in an equal division") #374
-      * Fix SmoothQuant multi-GPU failure with tensor parallelism is 2 #267
-      * Fix a crash in GenerationSession if stream keyword argument is not None
-        #202
-      * Fix a typo when calling PyNVML API [BUG] code bug #410
-      * Fix bugs related to the improper management of the `end_id` for various
-        models [C++ and Python]
-      * Fix memory leaks [C++ code and Python models]
-      * Fix the std::alloc error when running the gptManagerBenchmark -- issue
-        gptManagerBenchmark std::bad_alloc error #66
-      * Fix a bug in pipeline parallelism when beam-width > 1
-      * Fix a bug with Llama GPTQ due to improper support of GQA
-      * Fix issue #88
-      * Fix an issue with the Huggingface Transformers version #16
-      * Fix link jump in windows readme.md #30 - by @yuanlehome
-      * Fix typo in batchScheduler.h #56 - by @eltociear
-      * Fix typo #58 - by @RichardScottOZ
-      * Fix Multi-block MMHA: Difference between `max_batch_size` in the engine
-        builder and `max_num_sequences` in TrtGptModelOptionalParams? #65
-      * Fix the log message to be more accurate on KV cache #224
-      * Fix Windows release wheel installation: Failed to install the release
-        wheel for Windows using pip #261
-      * Fix missing torch dependencies: [BUG] The batch_manage.a choice error
-        in --cpp-only when torch's cxx_abi version is different with gcc #151
-      * Fix linking error during compiling google-test & benchmarks #277
-      * Fix logits dtype for Baichuan and ChatGLM: segmentation fault caused by
-        the lack of bfloat16 #335
-      * Minor bug fixes
-
-#### Version 0.5.0
-
-  * TensorRT-LLM v0.5.0 is the first public release.
+#### For history change log, please see [CHANGELOG.md](./CHANGELOG.md).
 
 ### Known Issues
 

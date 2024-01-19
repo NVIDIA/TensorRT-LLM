@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/loraModule.h"
 #include <NvInferRuntime.h>
 
 namespace tensorrt_llm::runtime
@@ -32,7 +33,7 @@ public:
         kGlm = 1, // https://github.com/THUDM/GLM and https://github.com/THUDM/ChatGLM-6B
     };
 
-    constexpr explicit GptModelConfig(
+    explicit GptModelConfig(
         SizeType vocabSize, SizeType nbLayers, SizeType nbHeads, SizeType hiddenSize, nvinfer1::DataType dtype)
         : mVocabSize(vocabSize)
         , mNbLayers(nbLayers)
@@ -58,6 +59,9 @@ public:
         , mMaxDraftLen(0)
         , mUseContextFMHAForGeneration(false)
         , mPagedContextFMHA(false)
+        , mUseLoraPlugin(false)
+        , mLoraModules(std::vector<LoraModule>{})
+        , mMlpHiddenSize(0)
     {
     }
 
@@ -302,6 +306,36 @@ public:
         return mPagedContextFMHA;
     }
 
+    [[nodiscard]] bool constexpr useLoraPlugin() const noexcept
+    {
+        return mUseLoraPlugin;
+    }
+
+    void constexpr useLoraPlugin(bool useLoraPlugin) noexcept
+    {
+        mUseLoraPlugin = useLoraPlugin;
+    }
+
+    std::vector<LoraModule> const& getLoraModules() const noexcept
+    {
+        return mLoraModules;
+    }
+
+    void setLoraModules(std::vector<LoraModule> const& loraModules) noexcept
+    {
+        mLoraModules = loraModules;
+    }
+
+    [[nodiscard]] SizeType constexpr getMlpHiddenSize() const noexcept
+    {
+        return mMlpHiddenSize;
+    }
+
+    void constexpr setMlpHiddenSize(SizeType mlpHiddenSize) noexcept
+    {
+        mMlpHiddenSize = mlpHiddenSize;
+    }
+
 private:
     SizeType mVocabSize;
     SizeType mNbLayers;
@@ -330,6 +364,9 @@ private:
 
     bool mUseContextFMHAForGeneration;
     bool mPagedContextFMHA;
-};
 
+    bool mUseLoraPlugin;
+    std::vector<LoraModule> mLoraModules;
+    SizeType mMlpHiddenSize;
+};
 } // namespace tensorrt_llm::runtime

@@ -23,7 +23,6 @@ git clone https://huggingface.co/mistralai/Mixtral-8x7B-v0.1
 
 We use the LLaMA `build.py` script to build the model. TensorRT-LLM LLaMA builds TensorRT engine(s) from HF checkpoint provided by `--model_dir`.
 If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
-Note that when loading Mixtral weights you must use the `--load_by_shard` option
 
 `--use_inflight_batching` is a shortcut for `--use_gpt_attention_plugin`, `--remove_input_padding` and `--paged_kv_cache`
 

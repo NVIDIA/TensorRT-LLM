@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,10 +14,18 @@
 # limitations under the License.
 import ctypes
 import platform
+from collections import OrderedDict
+from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
+from typing import List, Optional, Tuple
+
+import tensorrt as trt
 
 from tensorrt_llm.logger import logger
+
+from .._ipc_utils import IpcMemory
+from ..mapping import Mapping
 
 TRT_LLM_PLUGIN_NAMESPACE = 'tensorrt_llm'
 
@@ -51,37 +59,35 @@ class ContextFMHAType(IntEnum):
     enabled_with_fp32_acc = 2
 
 
-class PluginConfig(object):
-
-    def __init__(self) -> None:
-        self.init()
-
-    def init(self):
-        self.bert_attention_plugin = False
-        self.gpt_attention_plugin = False
-        self.multi_block_mode = False
-        self.identity_plugin = False
-        self.gemm_plugin = False
-        self.smooth_quant_gemm_plugin = False
-        self.layernorm_plugin = False
-        self.layernorm_quantization_plugin = False
-        self.rmsnorm_plugin = False
-        self.rmsnorm_quantization_plugin = False
-        self.attention_qk_half_accumulation = False
-        self.remove_input_padding = False
-        self.context_fmha_type = ContextFMHAType.disabled
-        self.weight_only_groupwise_quant_matmul_plugin = False
-        self.weight_only_quant_matmul_plugin = False
-        self.nccl_plugin = False
-        self.use_custom_all_reduce = False
-        self.quantize_per_token_plugin = False
-        self.quantize_tensor_plugin = False
-        self.paged_kv_cache = False
-        self.tokens_per_block = 0
-        self.lookup_plugin = False
-        self.lora_plugin = False
-        self.use_paged_context_fmha = False
-        self.use_context_fmha_for_generation = False
+@dataclass
+class PluginConfig:
+    bert_attention_plugin: bool = False
+    gpt_attention_plugin: bool = False
+    multi_block_mode: bool = False
+    enable_xqa: bool = False
+    identity_plugin: bool = False
+    gemm_plugin: bool = False
+    smooth_quant_gemm_plugin: bool = False
+    layernorm_plugin: bool = False
+    layernorm_quantization_plugin: bool = False
+    rmsnorm_plugin: bool = False
+    rmsnorm_quantization_plugin: bool = False
+    attention_qk_half_accumulation: bool = False
+    remove_input_padding: bool = False
+    context_fmha_type: ContextFMHAType = ContextFMHAType.disabled
+    weight_only_groupwise_quant_matmul_plugin: bool = False
+    weight_only_quant_matmul_plugin: bool = False
+    nccl_plugin: bool = False
+    # TODO[kevin]: smart strategy to choose all reduce plugin
+    use_custom_all_reduce: bool = False
+    quantize_per_token_plugin: bool = False
+    quantize_tensor_plugin: bool = False
+    paged_kv_cache: bool = False
+    tokens_per_block: int = 0
+    lookup_plugin: bool = False
+    lora_plugin: bool = False
+    use_paged_context_fmha: bool = False
+    use_context_fmha_for_generation: bool = False
 
     def enable_qk_half_accum(self):
         self.attention_qk_half_accumulation = True
@@ -90,7 +96,8 @@ class PluginConfig(object):
 
     def set_context_fmha(self, context_fmha_type=ContextFMHAType.enabled):
         assert context_fmha_type in \
-            [ContextFMHAType.disabled, ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc]
+            [ContextFMHAType.disabled, ContextFMHAType.enabled,
+                ContextFMHAType.enabled_with_fp32_acc]
         self.context_fmha_type = context_fmha_type
         if context_fmha_type == ContextFMHAType.enabled:
             logger.info(f"Context FMHA Enabled")
@@ -118,6 +125,11 @@ class PluginConfig(object):
     def enable_mmha_multi_block_mode(self):
         self.multi_block_mode = True
         logger.info(f"Generation Multi Block Mode Enabled")
+        return self
+
+    def enable_xqa_optimization(self):
+        self.enable_xqa = True
+        logger.info(f"Optimized Generation MHA kernels (XQA) Enabled")
         return self
 
     def set_bert_attention_plugin(self, dtype='float16'):
@@ -190,3 +202,98 @@ class PluginConfig(object):
     def set_context_fmha_for_generation(self):
         self.use_context_fmha_for_generation = True
         return self
+
+
+class CustomAllReduceHelper:
+    """
+        Globally visible class to help usage of custom_all_reduce plugin.
+        Provides the following utilities:
+
+        gen_id: int
+            Used for synchronization with custom kernels. Plugins instances MUST have the same
+            id across GPUs. I.e.: GPU#0's allreduce after MLP at layer i must have the same id as
+            GPU#1, GPU#2... Also, ids MUST be unique per model. There should not be two allreduce instances
+            in GPU#0 that have the same id.
+
+        workspace: Tensor
+            When using CUSTOM or AUTO mode, a tensor containing pointers to memory
+            visible to all GPUs. It should be 3 poitners per TP rank -
+            ptr to data buffer, ptr to barriers in, ptr to barriers out.
+            It must be initialized using IpcMemory class.
+
+        Usage:
+            - Use `init_all_reduce_helper` to reset the id counter. This must be done in main model class.
+            - Set custom_all_reduce_helper.workspace with the required tensor.
+              Then, each instance of allreduce will reference that tensor automatically.
+    """
+    POINTERS_PER_RANK = 4
+
+    def __init__(self) -> None:
+        self.current_id: int = 1
+        self.workspace: Optional[Tensor] = None
+
+    def gen_id(self) -> int:
+        result = self.current_id
+        self.current_id += 1
+        return result
+
+    def set_workspace_tensor(self,
+                             mapping: Mapping,
+                             two_opt_profiles: Optional[bool] = None):
+        from ..functional import Tensor
+        workspace_size = self.POINTERS_PER_RANK * mapping.tp_size
+
+        dim_range = None
+        if two_opt_profiles is not None:
+            dim_range = OrderedDict([
+                ('all_reduce_size', [workspace_size, workspace_size]
+                 if two_opt_profiles else [workspace_size])
+            ])
+
+        self.workspace = Tensor(
+            name='all_reduce_workspace',
+            dtype=trt.int64,
+            shape=[workspace_size],
+            dim_range=dim_range,
+        )
+
+    @staticmethod
+    def max_workspace_size_auto(tp_size: int) -> int:
+        if tp_size <= 2:
+            return 16_000_000
+        return 8_000_000
+
+    @staticmethod
+    def allocate_workspace(mapping: Mapping,
+                           size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
+        import torch
+        ipc_buffers_ping = IpcMemory(mapping, size)
+        ipc_buffers_pong = IpcMemory(mapping, size)
+        ipc_barriers_in = IpcMemory(
+            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size)
+        ipc_barriers_out = IpcMemory(
+            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size)
+        buffers = [
+            ipc_buffers_ping, ipc_buffers_pong, ipc_barriers_in,
+            ipc_buffers_ping
+        ]
+
+        return buffers, torch.tensor(
+            ipc_buffers_ping.serialize() + ipc_buffers_pong.serialize() +
+            ipc_barriers_in.serialize() + ipc_barriers_out.serialize(),
+            dtype=torch.int64,
+            device="cpu")
+
+
+custom_all_reduce_helper = None
+
+
+def init_all_reduce_helper():
+    global custom_all_reduce_helper
+    custom_all_reduce_helper = CustomAllReduceHelper()
+
+
+def current_all_reduce_helper():
+    global custom_all_reduce_helper
+    assert custom_all_reduce_helper is not None, "You must call `init_all_reduce_helper` first"
+    return custom_all_reduce_helper

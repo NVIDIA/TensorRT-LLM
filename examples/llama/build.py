@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,10 +30,6 @@ try:
     from transformers import MixtralForCausalLM
 except ImportError:
     MixtralForCausalLM = None
-from weight import (get_scaling_factors, load_from_awq_llama, load_from_binary,
-                    load_from_gptq_llama, load_from_hf_checkpoint,
-                    load_from_hf_llama, load_from_meta_llama)
-
 import tensorrt_llm
 from tensorrt_llm import profiler
 from tensorrt_llm._utils import str_dtype_to_trt
@@ -48,7 +44,10 @@ from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime.lora_manager import LoraConfig
 
-from weight import parse_bin_config  # isort:skip
+from tensorrt_llm.models.llama.weight import (  # isort:skip
+    get_scaling_factors, load_from_awq_llama, load_from_binary,
+    load_from_gptq_llama, load_from_hf_checkpoint, load_from_hf_llama,
+    load_from_meta_llama, parse_bin_config)
 
 MODEL_NAME = "llama"
 
@@ -56,17 +55,22 @@ MODEL_NAME = "llama"
 # are direct copy from gpt example, TODO: put in utils?
 
 import onnx
-import tensorrt as trt
 from onnx import TensorProto, helper
 
 
 def trt_dtype_to_onnx(dtype):
     if dtype == trt.float16:
         return TensorProto.DataType.FLOAT16
+    if dtype == trt.bfloat16:
+        return TensorProto.DataType.BFLOAT16
     elif dtype == trt.float32:
         return TensorProto.DataType.FLOAT
     elif dtype == trt.int32:
         return TensorProto.DataType.INT32
+    elif dtype == trt.int64:
+        return TensorProto.DataType.INT64
+    elif dtype == trt.bool:
+        return TensorProto.DataType.BOOL
     else:
         raise TypeError("%s is not supported" % dtype)
 
@@ -132,7 +136,7 @@ def serialize_engine(engine, path):
     logger.info(f'Engine serialized. Total time: {t}')
 
 
-def parse_arguments():
+def parse_arguments(cmd_args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--world_size', type=int, default=1)
     parser.add_argument('--tp_size', type=int, default=1)
@@ -151,6 +155,14 @@ def parse_arguments():
         default='model.cache',
         help=
         'The path of to read timing cache from, will be ignored if the file does not exist'
+    )
+    parser.add_argument(
+        '--profiling_verbosity',
+        type=str,
+        default='layer_names_only',
+        choices=['layer_names_only', 'detailed', 'none'],
+        help=
+        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
     )
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument('--vocab_size', type=int, default=32000)
@@ -204,6 +216,13 @@ def parse_arguments():
         'Split long kv sequence into multiple blocks (applied to generation MHA kernels). \
                         It is beneifical when batchxnum_heads cannot fully utilize GPU.'
     )
+    parser.add_argument(
+        '--enable_xqa',
+        default=False,
+        action='store_true',
+        help=
+        'XQA optimization for the generation MHA. See more details in docs/gpt_attention.'
+    )
     parser.add_argument('--visualize', default=False, action='store_true')
     parser.add_argument('--load_by_shard',
                         action='store_true',
@@ -232,7 +251,18 @@ def parse_arguments():
         'For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded '
         '(0.45734 vs 0.45755 for LLaMA-v2 7B using ammo/examples/hf/instruct_eval/mmlu.py).'
     )
-
+    parser.add_argument('--enable_pos_shift',
+                        default=False,
+                        action='store_true',
+                        help='Enable position shift for streamingllm method')
+    parser.add_argument(
+        '--dense_context_fmha',
+        default=False,
+        action='store_true',
+        help=
+        'Enable dense fmha in context phase, otherwise sliding window attention.'
+        'If dense_context_fmha=False, the sliding window size is the max attention window size.'
+    )
     # Arguments related to the quantization of the model.
     parser.add_argument(
         '--use_smooth_quant',
@@ -337,6 +367,11 @@ def parse_arguments():
         'You must also use --use_weight_only for that argument to have an impact.'
     )
     parser.add_argument(
+        '--quantize_lm_head',
+        default=False,
+        action="store_true",
+        help='Quantize lm_head weights as well when using int4_awq.')
+    parser.add_argument(
         '--use_inflight_batching',
         action="store_true",
         default=False,
@@ -379,9 +414,19 @@ def parse_arguments():
         type=int,
         default=0,
         help='Setting to a value > 0 enables support for prompt tuning.')
-    parser.add_argument('--gather_all_token_logits',
+    parser.add_argument(
+        '--gather_all_token_logits',
+        action='store_true',
+        default=False,
+        help='Enable both gather_context_logits and gather_generation_logits')
+    parser.add_argument('--gather_context_logits',
                         action='store_true',
-                        default=False)
+                        default=False,
+                        help='Gather context logits')
+    parser.add_argument('--gather_generation_logits',
+                        action='store_true',
+                        default=False,
+                        help='Gather generation logits')
     parser.add_argument(
         '--use_lora_plugin',
         nargs='?',
@@ -389,7 +434,30 @@ def parse_arguments():
         default=False,
         choices=['float16', 'float32', 'bfloat16'],
         help="Activates the lora plugin which enables embedding sharing.")
+    parser.add_argument(
+        '--lora_target_modules',
+        nargs='+',
+        default=None,
+        choices=[
+            "attn_qkv",
+            "attn_q",
+            "attn_k",
+            "attn_v",
+            "attn_dense",
+            "mlp_h_to_4h",
+            "mlp_gate",
+            "mlp_4h_to_h",
+        ],
+        help=
+        "Add lora in which modules. Only be activated when use_lora_plugin is enabled."
+    )
     parser.add_argument('--hf_lora_dir', type=str, default=None)
+    parser.add_argument(
+        '--max_lora_rank',
+        type=int,
+        default=64,
+        help='maximum lora rank for different lora modules. '
+        'It is used to compute the workspace size of lora plugin.')
     parser.add_argument(
         '--moe_num_experts',
         default=0,
@@ -417,7 +485,7 @@ def parse_arguments():
         'Controls renormalization after gate logits. Check layers/moe.py for accepted values',
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(cmd_args)
     logger.set_level(args.log_level)
 
     assert not (
@@ -543,26 +611,42 @@ def parse_arguments():
 
     hf_modules_to_trtllm_modules = {
         "q_proj": "attn_q",
-        "v_proj": "attn_k",
-        "k_proj": "attn_v",
+        "k_proj": "attn_k",
+        "v_proj": "attn_v",
         "o_proj": "attn_dense",
         "gate_proj": "mlp_h_to_4h",
         "down_proj": "mlp_4h_to_h",
         "up_proj": "mlp_gate"
     }  # lora modules on llama
 
+    trtllm_modules_to_hf_modules = {
+        "attn_q": "q_proj",
+        "attn_k": "k_proj",
+        "attn_v": "v_proj",
+        "attn_dense": "o_proj",
+        "mlp_h_to_4h": "gate_proj",
+        "mlp_4h_to_h": "down_proj",
+        "mlp_gate": "up_proj",
+    }
+
     lora_config = LoraConfig.from_hf(args.hf_lora_dir,
-                                     hf_modules_to_trtllm_modules)
+                                     hf_modules_to_trtllm_modules,
+                                     trtllm_modules_to_hf_modules)
 
     if lora_config.is_valid:
-        args.vocab_size = lora_config.vocab_size
+        if args.lora_target_modules is None:
+            args.lora_target_modules = lora_config.lora_target_modules
+        # the lora checkpoint might finetune the embedding
+        if lora_config.vocab_size != 0:
+            args.vocab_size = lora_config.vocab_size
 
     args.lora_config = lora_config
 
-    if args.weight_only_precision == 'int4_awq':
+    if args.weight_only_precision == 'int4_awq' and args.quantize_lm_head:
         if args.vocab_size % 64 != 0:
             args.vocab_size = int((args.vocab_size + 63) / 64) * 64
-            logger.info("To use awq we pad it to {}.".format(args.vocab_size))
+            logger.info("To use awq we pad vocab_size to {}.".format(
+                args.vocab_size))
 
     assert args.pp_size * args.tp_size == args.world_size
 
@@ -584,34 +668,26 @@ def parse_arguments():
             args.multiple_of)
         logger.info(f"Setting inter_size to {args.inter_size}.")
 
+    if args.enable_pos_shift:
+        assert args.use_gpt_attention_plugin, "Position shift is only support in the gpt attention plugin."
+        assert args.enable_context_fmha or args.enable_context_fmha_fp32_acc
+
     if args.moe_num_experts and args.moe_top_k == 0:
         args.moe_top_k = 1
     args.moe_config = MoeConfig(args.moe_num_experts, args.moe_top_k,
                                 args.moe_tp_mode,
                                 args.moe_renorm_mode).validate()
 
+    if args.gather_all_token_logits:
+        args.gather_context_logits = True
+        args.gather_generation_logits = True
+
     return args
 
 
-def build_rank_engine(builder: Builder,
-                      builder_config: tensorrt_llm.builder.BuilderConfig,
-                      engine_name, rank, args):
-    '''
-       @brief: Build the engine on the given rank.
-       @param rank: The rank to build the engine.
-       @param args: The cmd line arguments.
-       @return: The built engine.
-    '''
-    dtype = str_dtype_to_trt(args.dtype)
-    mapping = Mapping(world_size=args.world_size,
-                      rank=rank,
-                      tp_size=args.tp_size,
-                      pp_size=args.pp_size)
-
-    assert args.n_layer % args.pp_size == 0, \
-        f"num_layers {args.n_layer} must be a multiple of pipeline parallelism size {args.pp_size}"
-
-    profiler.print_memory_usage(f'Rank {rank} Engine build starts')
+def get_model_object(args, mapping, trt_dtype=None):
+    if trt_dtype is None:
+        trt_dtype = str_dtype_to_trt(args.dtype)
     # Initialize Module
     tensorrt_llm_llama = tensorrt_llm.models.LLaMAForCausalLM(
         num_layers=args.n_layer,
@@ -621,7 +697,7 @@ def build_rank_engine(builder: Builder,
         vocab_size=args.vocab_size,
         hidden_act=args.hidden_act,
         max_position_embeddings=args.n_positions,
-        dtype=dtype,
+        dtype=trt_dtype,
         mlp_hidden_size=args.inter_size,
         position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
         mapping=mapping,
@@ -633,15 +709,19 @@ def build_rank_engine(builder: Builder,
         rms_norm_eps=args.rms_norm_eps,
         use_fused_mlp=args.use_fused_mlp,
         use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
-        moe_config=args.moe_config)
+        enable_pos_shift=args.enable_pos_shift,
+        dense_context_fmha=args.dense_context_fmha,
+        moe_config=args.moe_config,
+        max_lora_rank=args.max_lora_rank)
     quantize_kwargs = {}
     if args.use_smooth_quant or args.use_weight_only:
         if args.weight_only_precision == 'int4_awq':
+            exclude_modules = ['lm_head'] if not args.quantize_lm_head else []
             quantize_kwargs = {
                 "group_size": args.group_size,
                 "zero": False,
                 "pre_quant_scale": True,
-                "exclude_modules": [],
+                "exclude_modules": exclude_modules,
             }
         elif args.weight_only_precision == 'int4_gptq':
             quantize_kwargs = {
@@ -666,12 +746,19 @@ def build_rank_engine(builder: Builder,
     tensorrt_llm_llama = quantize_model(tensorrt_llm_llama, args.quant_mode,
                                         **quantize_kwargs)
     if args.per_group:
-        load_func = load_from_awq_llama if args.weight_only_precision == 'int4_awq' else load_from_gptq_llama
-        load_func(tensorrt_llm_llama=tensorrt_llm_llama,
-                  quant_ckpt_path=args.quant_ckpt_path,
-                  mapping=mapping,
-                  dtype=args.dtype,
-                  bin_model_dir=args.bin_model_dir)
+        if args.weight_only_precision == 'int4_awq':
+            load_from_awq_llama(tensorrt_llm_llama=tensorrt_llm_llama,
+                                quant_ckpt_path=args.quant_ckpt_path,
+                                quantize_lm_head=args.quantize_lm_head,
+                                mapping=mapping,
+                                dtype=args.dtype,
+                                bin_model_dir=args.bin_model_dir)
+        else:
+            load_from_gptq_llama(tensorrt_llm_llama=tensorrt_llm_llama,
+                                 quant_ckpt_path=args.quant_ckpt_path,
+                                 mapping=mapping,
+                                 dtype=args.dtype,
+                                 bin_model_dir=args.bin_model_dir)
     elif args.meta_ckpt_dir is not None:
         load_from_meta_llama(tensorrt_llm_llama, args.meta_ckpt_dir, mapping,
                              args.dtype)
@@ -715,11 +802,11 @@ def build_rank_engine(builder: Builder,
                          mapping,
                          fp16=(args.dtype == 'float16'),
                          multi_query_mode=(args.n_kv_head != args.n_head))
-    profiler.print_memory_usage(f'Rank {rank} model weight loaded.')
 
-    # Module -> Network
-    network = builder.create_network()
-    network.trt_network.name = engine_name
+    return tensorrt_llm_llama
+
+
+def update_plugin_configs(args, network):
     if args.use_gpt_attention_plugin:
         network.plugin_config.set_gpt_attention_plugin(
             dtype=args.use_gpt_attention_plugin)
@@ -748,14 +835,16 @@ def build_rank_engine(builder: Builder,
             ContextFMHAType.enabled_with_fp32_acc)
     if args.multi_block_mode:
         network.plugin_config.enable_mmha_multi_block_mode()
+    if args.enable_xqa:
+        network.plugin_config.enable_xqa_optimization()
 
     if args.use_weight_only and not args.disable_weight_only_quant_plugin:
         if args.per_group:
             network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
-                dtype='float16')
+                dtype=args.dtype)
         else:
             network.plugin_config.set_weight_only_quant_matmul_plugin(
-                dtype='float16')
+                dtype=args.dtype)
     if args.world_size > 1:
         network.plugin_config.set_nccl_plugin(args.dtype,
                                               args.use_custom_all_reduce)
@@ -763,6 +852,38 @@ def build_rank_engine(builder: Builder,
         network.plugin_config.enable_remove_input_padding()
     if args.paged_kv_cache:
         network.plugin_config.enable_paged_kv_cache(args.tokens_per_block)
+    return
+
+
+def build_rank_engine(builder: Builder,
+                      builder_config: tensorrt_llm.builder.BuilderConfig,
+                      engine_name, rank, args):
+    '''
+       @brief: Build the engine on the given rank.
+       @param rank: The rank to build the engine.
+       @param args: The cmd line arguments.
+       @return: The built engine.
+    '''
+    dtype = str_dtype_to_trt(args.dtype)
+    mapping = Mapping(world_size=args.world_size,
+                      rank=rank,
+                      tp_size=args.tp_size,
+                      pp_size=args.pp_size)
+
+    assert args.n_layer % args.pp_size == 0, \
+        f"num_layers {args.n_layer} must be a multiple of pipeline parallelism size {args.pp_size}"
+
+    profiler.print_memory_usage(f'Rank {rank} Engine build starts')
+    # Initialize Module
+    tensorrt_llm_llama = get_model_object(args,
+                                          mapping=mapping,
+                                          trt_dtype=dtype)
+    profiler.print_memory_usage(f'Rank {rank} model weight loaded.')
+
+    # Module -> Network
+    network = builder.create_network()
+    network.trt_network.name = engine_name
+    update_plugin_configs(args, network)
 
     if args.use_lookup_plugin:
         network.plugin_config.set_lookup_plugin(dtype=args.dtype)
@@ -780,8 +901,9 @@ def build_rank_engine(builder: Builder,
             args.max_beam_width,
             args.max_num_tokens,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size,
-            gather_all_token_logits=args.gather_all_token_logits,
-            lora_target_modules=args.lora_config.lora_target_modules)
+            gather_context_logits=args.gather_context_logits,
+            gather_generation_logits=args.gather_generation_logits,
+            lora_target_modules=args.lora_target_modules)
         tensorrt_llm_llama(*inputs)
         if args.enable_debug_output:
             # mark intermediate nodes' outputs
@@ -807,6 +929,51 @@ def build_rank_engine(builder: Builder,
     return engine
 
 
+def get_builder_config_namespace(args, cache):
+    # NOTE: int8 flag is required to be true when INT8 tensors are exposed to TRT
+    # TRT-LLM has INT8 I/O when act/weights are quantized without group-scaling (AWQ, GPTQ)
+    # OR INT8 KV cache is set to contiguous (without paged KV cache enabled).
+    int8_trt_flag = (args.quant_mode.has_act_or_weight_quant()
+                     and not args.quant_mode.has_per_group_scaling()) or (
+                         not args.paged_kv_cache
+                         and args.quant_mode.has_int8_kv_cache())
+    config = argparse.Namespace(
+        name=MODEL_NAME,
+        precision=args.dtype,
+        timing_cache=args.timing_cache if cache is None else cache,
+        profiling_verbosity=args.profiling_verbosity,
+        tensor_parallel=args.tp_size,
+        pipeline_parallel=args.pp_size,
+        parallel_build=args.parallel_build,
+        num_layers=args.n_layer,
+        num_heads=args.n_head,
+        num_kv_heads=args.n_kv_head,
+        hidden_size=args.n_embd,
+        vocab_size=args.vocab_size,
+        hidden_act=args.hidden_act,
+        max_position_embeddings=args.n_positions,
+        max_batch_size=args.max_batch_size,
+        max_beam_width=args.max_beam_width,
+        max_input_len=args.max_input_len,
+        max_output_len=args.max_output_len,
+        max_num_tokens=args.max_num_tokens,
+        int8=int8_trt_flag,
+        quant_mode=args.quant_mode,
+        strongly_typed=args.strongly_typed,
+        opt_level=args.builder_opt,
+        max_prompt_embedding_table_size=args.max_prompt_embedding_table_size,
+        gather_context_logits=args.gather_context_logits,
+        gather_generation_logits=args.gather_generation_logits,
+        lora_target_modules=args.lora_target_modules,
+        mlp_hidden_size=args.inter_size,
+        hf_modules_to_trtllm_modules=args.lora_config.
+        hf_modules_to_trtllm_modules,
+        trtllm_modules_to_hf_modules=args.lora_config.
+        trtllm_modules_to_hf_modules,
+    )
+    return config
+
+
 def build(rank, args):
     torch.cuda.set_device(rank % args.gpus_per_node)
     logger.set_level(args.log_level)
@@ -822,37 +989,15 @@ def build(rank, args):
             continue
         tik = time.time()
 
-        # NOTE: when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
-        int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
-            not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
+        # NOTE: int8 flag is required to be true when INT8 tensors are exposed to TRT
+        # TRT-LLM has INT8 I/O when act/weights are quantized without group-scaling (AWQ, GPTQ)
+        # OR INT8 KV cache is set to contiguous (without paged KV cache enabled).
+        int8_trt_flag = (args.quant_mode.has_act_or_weight_quant()
+                         and not args.quant_mode.has_per_group_scaling()) or (
+                             not args.paged_kv_cache
+                             and args.quant_mode.has_int8_kv_cache())
         builder_config = builder.create_builder_config(
-            name=MODEL_NAME,
-            precision=args.dtype,
-            timing_cache=args.timing_cache if cache is None else cache,
-            tensor_parallel=args.tp_size,
-            pipeline_parallel=args.pp_size,
-            parallel_build=args.parallel_build,
-            num_layers=args.n_layer,
-            num_heads=args.n_head,
-            num_kv_heads=args.n_kv_head,
-            hidden_size=args.n_embd,
-            vocab_size=args.vocab_size,
-            hidden_act=args.hidden_act,
-            max_position_embeddings=args.n_positions,
-            max_batch_size=args.max_batch_size,
-            max_beam_width=args.max_beam_width,
-            max_input_len=args.max_input_len,
-            max_output_len=args.max_output_len,
-            max_num_tokens=args.max_num_tokens,
-            int8=int8_trt_flag,
-            quant_mode=args.quant_mode,
-            strongly_typed=args.strongly_typed,
-            opt_level=args.builder_opt,
-            max_prompt_embedding_table_size=args.
-            max_prompt_embedding_table_size,
-            gather_all_token_logits=args.gather_all_token_logits,
-            lora_target_modules=args.lora_config.lora_target_modules,
-        )
+            **vars(get_builder_config_namespace(args, cache)))
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.tp_size,
                                       args.pp_size, cur_rank)
         engine = build_rank_engine(builder, builder_config, engine_name,

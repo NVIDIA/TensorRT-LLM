@@ -29,7 +29,7 @@ project(tensorrt_llm LANGUAGES CXX)
 # Build options
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
 option(BUILD_PYBIND "Build Python bindings for C++ runtime and batch manager"
-       OFF)
+       ON)
 option(BUILD_TESTS "Build Google tests" ON)
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
 option(NVTX_DISABLE "Disable all NVTX features" ON)

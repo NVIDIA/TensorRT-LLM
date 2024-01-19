@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -42,7 +42,10 @@ class ChatGLMParams:
     linear_bias: bool = None
     logits_dtype: str = None
     mapping: Mapping = None
+    max_batch_size: int = None
+    max_beam_width: int = None
     max_input_len: int = None
+    max_num_tokens: int = None
     max_output_len: int = None
     max_seq_length: int = None
     model_name: str = None
@@ -70,8 +73,11 @@ class ChatGLMParams:
         linear_bias=True,
         logits_dtype="float16",
         mapping=Mapping(),
-        max_input_len=1024,
-        max_output_len=1024,
+        max_batch_size=256,
+        max_beam_width=1,
+        max_input_len=512,
+        max_num_tokens=256 * 512,
+        max_output_len=512,
         max_seq_length=2048,
         norm_epsilon=1.0e-5,
         num_heads=32,
@@ -94,8 +100,11 @@ class ChatGLMParams:
         linear_bias=False,
         logits_dtype="float16",
         mapping=Mapping(),
-        max_input_len=1024,
-        max_output_len=1024,
+        max_batch_size=256,
+        max_beam_width=1,
+        max_input_len=512,
+        max_num_tokens=256 * 512,
+        max_output_len=512,
         max_seq_length=32768,
         norm_epsilon=1.0e-5,
         num_heads=32,
@@ -109,6 +118,7 @@ class ChatGLMParams:
         vocab_size=65024,
     )
     default_config["chatglm3_6b"] = default_config["chatglm2_6b"]
+    default_config["chatglm3_6b_base"] = default_config["chatglm2_6b"]
     default_config["chatglm2_6b_32k"] = deepcopy(default_config["chatglm2_6b"])
     default_config["chatglm2_6b_32k"].rotary_embedding_scaling = 50.0
     default_config["chatglm3_6b_32k"] = default_config["chatglm2_6b_32k"]
@@ -122,13 +132,16 @@ class ChatGLMParams:
         linear_bias=True,
         logits_dtype="float16",
         mapping=Mapping(),
+        max_batch_size=256,
+        max_beam_width=1,
         max_input_len=1024,
+        max_num_tokens=256 * 1024,
         max_output_len=1024,
         max_seq_length=2048,
         norm_epsilon=1.0e-5,
         num_heads=32,
         num_kv_heads=32,
-        num_layers=28,
+        num_layers=48,
         qkv_bias=True,
         quant_mode=QuantMode(0),
         rmsnorm=False,
@@ -136,6 +149,13 @@ class ChatGLMParams:
         use_cache=True,
         vocab_size=50304,
     )
+    default_config["glm_2b"] = deepcopy(default_config["glm_10b"])
+    default_config["glm_2b"].num_layers = 36
+    default_config["glm_2b"].num_heads = 32
+    default_config["glm_2b"].hidden_size = 2048
+    default_config["glm_2b"].ffn_hidden_size = 8192
+    default_config["glm_10b_chinese"] = deepcopy(default_config["glm_10b"])
+    default_config["glm_10b_chinese"].vocab_size = 50048
 
     def __init__(self, **args):
 
@@ -162,36 +182,46 @@ class ChatGLMDecoderLayer(Module):
 
         super().__init__()
 
-        self.model_name = config.model_name
-        self.use_cache = config.use_cache
-        self.rotary_embedding_base = 10000.0
         rotary_embedding_scaling = None
+        self.model_name = config.model_name
+        self.rotary_embedding_base = 10000.0
+        self.use_cache = config.use_cache
+
+        # Save for Smooth Quantization
+        self.apply_query_key_layer_scaling = config.apply_query_key_layer_scaling
+        self.dtype = config.dtype
+        self.hidden_size = config.hidden_size
+        self.ffn_hidden_size = config.ffn_hidden_size
+        self.max_seq_length = config.max_seq_length
+        self.num_heads = config.num_heads
+        self.num_kv_heads = config.num_kv_heads
+        self.num_layers = config.num_layers
+        self.tp_group = config.mapping.tp_group
+        self.tp_size = config.mapping.tp_size
+        self.hidden_act = config.hidden_act
+        self.bias = config.qkv_bias
+        self.dense_bias = config.linear_bias
 
         if self.model_name in ["chatglm_6b"]:
             self.alpha = (2 * config.num_layers)**0.5
             self.norm = LayerNorm
-            attention_mask_type = AttentionMaskType.bidirectional
-            position_embedding_type = PositionEmbeddingType.chatglm
+            self.attention_mask_type = AttentionMaskType.bidirectional
+            self.position_embedding_type = PositionEmbeddingType.chatglm
         elif config.model_name in [
                 "chatglm2_6b", "chatglm2_6b_32k", "chatglm3_6b",
                 "chatglm3_6b_base", "chatglm3_6b_32k"
         ]:
             self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
             self.norm = RmsNorm if config.rmsnorm else LayerNorm
-            attention_mask_type = AttentionMaskType.causal
-            position_embedding_type = PositionEmbeddingType.rope_gptj
-            if config.model_name in ["chatglm2_6b_32k"]:
-                rotary_embedding_scaling = {
-                    "type": "linear",
-                    "factor": config.rotary_embedding_scaling
-                }
-            elif config.model_name in ["chatglm3_6b_32k"]:
+            self.attention_mask_type = AttentionMaskType.causal
+            self.position_embedding_type = PositionEmbeddingType.rope_gptj
+            if config.model_name in ["chatglm2_6b_32k", "chatglm3_6b_32k"]:
                 self.rotary_embedding_base *= config.rotary_embedding_scaling
-        elif config.model_name in ["glm_10b"]:
+        elif config.model_name in ["glm_2b", "glm_10b", "glm_10b_chinese"]:
             self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
             self.norm = LayerNorm
-            attention_mask_type = AttentionMaskType.bidirectionalglm
-            position_embedding_type = PositionEmbeddingType.learned_absolute
+            self.attention_mask_type = AttentionMaskType.bidirectionalglm
+            self.position_embedding_type = PositionEmbeddingType.learned_absolute
 
         self.pre_norm = self.norm(
             normalized_shape=config.hidden_size,
@@ -207,10 +237,10 @@ class ChatGLMDecoderLayer(Module):
             max_position_embeddings=config.max_seq_length,
             num_layers=config.num_layers,
             apply_query_key_layer_scaling=config.apply_query_key_layer_scaling,
-            attention_mask_type=attention_mask_type,
+            attention_mask_type=self.attention_mask_type,
             bias=config.qkv_bias,
             dtype=config.dtype,
-            position_embedding_type=position_embedding_type,
+            position_embedding_type=self.position_embedding_type,
             rotary_embedding_base=self.rotary_embedding_base,
             rotary_embedding_scaling=rotary_embedding_scaling,
             rotary_embedding_percentage=0.5,
@@ -263,7 +293,6 @@ class ChatGLMDecoderLayer(Module):
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
             encoder_output=None,
-            workspace=None,
             position_embedding=position_ids,
         )
 
@@ -284,8 +313,14 @@ class ChatGLMDecoderLayer(Module):
             output = residual * self.alpha + mlp_output
 
         elif self.model_name in [
-                "chatglm2_6b", "chatglm2_6b_32k", "chatglm3_6b",
-                "chatglm3_6b_base", "chatglm3_6b_32k", "glm_10b"
+                "chatglm2_6b",
+                "chatglm2_6b_32k",
+                "chatglm3_6b",
+                "chatglm3_6b_base",
+                "chatglm3_6b_32k",
+                "glm_2b",
+                "glm_10b",
+                "glm_10b_chinese",
         ]:
             residual = norm_output if self.apply_residual_connection_post_layernorm else hidden_states
 
@@ -309,17 +344,25 @@ class ChatGLMModel(Module):
         super().__init__()
 
         self.model_name = config.model_name
-
-        if config.model_name in ["chatglm_6b", "glm_10b"]:
+        self.use_cache = config.use_cache
+        if config.model_name in [
+                "chatglm_6b",
+                "glm_2b",
+                "glm_10b",
+                "glm_10b_chinese",
+        ]:
             self.norm = LayerNorm
         elif config.model_name in [
-                "chatglm2_6b", "chatglm2_6b_32k", "chatglm3_6b",
-                "chatglm3_6b_base", "chatglm3_6b_32k"
+                "chatglm2_6b",
+                "chatglm2_6b_32k",
+                "chatglm3_6b",
+                "chatglm3_6b_base",
+                "chatglm3_6b_32k",
         ]:
             self.norm = RmsNorm
-        self.use_cache = config.use_cache
+            self.hidden_size = config.hidden_size
 
-        self.embedding = Embedding(
+        self.vocab_embedding = Embedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
             dtype=config.dtype,
@@ -330,8 +373,8 @@ class ChatGLMModel(Module):
             instance_id=config.num_layers * 2,
         )
 
-        if config.model_name in ["glm_10b"]:
-            self.position_embeddings = Embedding(
+        if config.model_name in ["glm_2b", "glm_10b", "glm_10b_chinese"]:
+            self.position_embedding = Embedding(
                 config.max_seq_length + 1,
                 config.hidden_size,
                 dtype=config.dtype,
@@ -341,7 +384,7 @@ class ChatGLMModel(Module):
                 tp_rank=0,  #config.mapping.rank,
                 instance_id=config.num_layers * 2,
             )
-            self.block_embeddings = Embedding(
+            self.block_embedding = Embedding(
                 config.max_seq_length + 1,
                 config.hidden_size,
                 dtype=config.dtype,
@@ -370,19 +413,19 @@ class ChatGLMModel(Module):
         attention_params: AttentionParams = None,
     ):
 
-        hidden_states = self.embedding(input_ids)
+        hidden_states = self.vocab_embedding(input_ids)
 
-        if self.model_name in ["glm_10b"]:
+        if self.model_name in ["glm_2b", "glm_10b", "glm_10b_chinese"]:
             position_ids_list = position_ids.split(1, dim=1)
-            position_embedding = self.position_embeddings(position_ids_list[0])
-            block_embedding = self.block_embeddings(position_ids_list[1])
+            position_embedding = self.position_embedding(position_ids_list[0])
+            block_embedding = self.block_embedding(position_ids_list[1])
             position_embedding = position_embedding + block_embedding
 
             position_embedding = position_embedding.view(
                 concat([
                     shape(input_ids, 0),
                     shape(input_ids, 1),
-                    4096,
+                    self.hidden_size,
                 ]))
 
             hidden_states = hidden_states + position_embedding
@@ -407,6 +450,8 @@ class ChatGLMModel(Module):
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
                     host_max_attention_window_sizes=max_attention_window_size,
+                    host_sink_token_length=kv_cache_params.
+                    host_sink_token_length,
                     cache_indirection=kv_cache_params.cache_indirection,
                 ),
                 attention_params=attention_params,
@@ -436,8 +481,11 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
         linear_bias: bool = None,
         logits_dtype: str = None,
         mapping: Mapping = None,
+        max_batch_size: int = None,
+        max_beam_width: int = None,
         max_input_len: int = None,
         max_output_len: int = None,
+        max_num_tokens: int = None,
         max_seq_length: int = None,
         model_name: str = None,
         norm_epsilon: float = None,
@@ -470,8 +518,11 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
             linear_bias=linear_bias,
             logits_dtype=logits_dtype,
             mapping=mapping,
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
             max_input_len=max_input_len,
             max_output_len=max_output_len,
+            max_num_tokens=max_num_tokens,
             max_seq_length=max_seq_length,
             model_name=model_name,
             norm_epsilon=norm_epsilon,
@@ -509,7 +560,12 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
 
         self.hidden_size = config.hidden_size
         self.mapping = config.mapping
-        self.max_num_tokens = config.max_output_len + config.max_input_len
+        self.max_batch_size = config.max_batch_size
+        self.max_beam_width = config.max_beam_width
+        self.max_input_len = config.max_input_len
+        self.max_num_tokens = config.max_num_tokens
+        self.max_output_len = config.max_output_len
+        self.max_seq_length = config.max_seq_length
         self.model_name = config.model_name
         self.num_heads = config.num_heads
         self.num_kv_heads = config.num_kv_heads
@@ -531,7 +587,7 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
     def forward(
         self,
         input_ids: Tensor = None,
-        position_ids: Tensor = None,  # only used in ChatGLM-6B
+        position_ids: Tensor = None,  # used in chatglm_6b / glm_*
         last_token_ids: Tensor = None,
         kv_cache_params: KeyValueCacheParams = None,
         attention_params: AttentionParams = None,
@@ -564,11 +620,14 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
 
     def prepare_inputs(
         self,
-        max_batch_size: int = 0,
-        max_input_len: int = 0,
-        max_new_tokens: int = 0,
+        max_batch_size: int = None,
+        max_input_len: int = None,
+        max_output_len: int = None,
         use_cache: bool = True,
         max_beam_width: int = 1,
+        gather_context_logits: bool = False,
+        gather_generation_logits: bool = False,
+        use_custom_all_reduce: bool = False,
     ):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
@@ -576,11 +635,15 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
             @return: a list contains values which can be fed into the self.forward()
         '''
 
+        position_encoding_2d = (self.model_name in [
+            "chatglm_6b", "glm_2b", "glm_10b", "glm_10b_chinese"
+        ])
+
         model_inputs = self.prepare_basic_inputs(
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
             max_input_len=max_input_len,
-            max_new_tokens=max_new_tokens,
+            max_new_tokens=max_output_len,
             num_kv_heads=self.num_kv_heads,
             head_size=self.hidden_size // self.num_heads,
             num_layers=self.num_layers,
@@ -590,36 +653,39 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
             use_gpt_attention_plugin=default_net().plugin_config.
             gpt_attention_plugin,
             use_gemm_plugin=default_net().plugin_config.gemm_plugin,
-            use_custom_all_reduce=False,
+            use_custom_all_reduce=use_custom_all_reduce,
             paged_kv_cache=default_net().plugin_config.paged_kv_cache,
             tokens_per_block=self.tokens_per_block,
-            gather_all_token_logits=False,
+            gather_context_logits=gather_context_logits,
+            gather_generation_logits=gather_generation_logits,
             dtype=self.kv_dtype,
             num_heads=self.num_heads,
             mapping=self.mapping,
             max_num_tokens=self.max_num_tokens,
             prompt_embedding_table_size=0,
-            position_encoding_2d=(self.model_name in ["chatglm_6b", "glm_10b"]),
+            position_encoding_2d=position_encoding_2d,
         )
 
-        return (model_inputs['input_ids'], model_inputs['position_ids'],
-                model_inputs['last_token_ids'],
-                KeyValueCacheParams(
-                    past_key_value=model_inputs['past_key_value'],
-                    host_past_key_value_lengths=model_inputs[
-                        'host_past_key_value_lengths'],
-                    host_max_attention_window_sizes=model_inputs[
-                        'host_max_attention_window_sizes'],
-                    kv_cache_block_pointers=model_inputs[
-                        'kv_cache_block_pointers_list'],
-                    host_kv_cache_block_pointers=model_inputs[
-                        'host_kv_cache_block_pointers_list'],
-                    cache_indirection=model_inputs['cache_indirection'],
-                ),
-                AttentionParams(
-                    sequence_length=model_inputs['sequence_length'],
-                    context_lengths=model_inputs['context_lengths'],
-                    host_context_lengths=model_inputs['host_context_lengths'],
-                    max_context_length=max_input_len,
-                    host_request_types=model_inputs['host_request_types'],
-                ))
+        return (
+            model_inputs['input_ids'], model_inputs['position_ids'],
+            model_inputs['last_token_ids'],
+            KeyValueCacheParams(
+                past_key_value=model_inputs['past_key_value'],
+                host_past_key_value_lengths=model_inputs[
+                    'host_past_key_value_lengths'],
+                host_max_attention_window_sizes=model_inputs[
+                    'host_max_attention_window_sizes'],
+                host_sink_token_length=model_inputs['host_sink_token_length'],
+                kv_cache_block_pointers=model_inputs[
+                    'kv_cache_block_pointers_list'],
+                host_kv_cache_block_pointers=model_inputs[
+                    'host_kv_cache_block_pointers_list'],
+                cache_indirection=model_inputs['cache_indirection'],
+            ),
+            AttentionParams(
+                sequence_length=model_inputs['sequence_length'],
+                context_lengths=model_inputs['context_lengths'],
+                host_context_lengths=model_inputs['host_context_lengths'],
+                max_context_length=max_input_len,
+                host_request_types=model_inputs['host_request_types'],
+            ))

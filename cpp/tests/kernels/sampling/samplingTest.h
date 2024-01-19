@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@
 #include <random>
 
 #include "tensorrt_llm/kernels/decodingCommon.h"
-#include "tensorrt_llm/kernels/samplingPenaltyKernels.h"
+#include "tensorrt_llm/kernels/penaltyKernels.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -192,6 +192,7 @@ struct SamplingKernelTestParam
     uint32_t topK;
     float topP;
     int32_t outputLen;
+    bool normalizeLogProbs = false;
 
     SamplingKernelTestParam& setBatchSize(int32_t bs)
     {

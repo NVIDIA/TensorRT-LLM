@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -303,6 +303,11 @@ inline size_t divUp(const T1& a, const T2& n)
     size_t tmp_a = static_cast<size_t>(a);
     size_t tmp_n = static_cast<size_t>(n);
     return (tmp_a + tmp_n - 1) / tmp_n;
+}
+
+inline int roundUp(int a, int n)
+{
+    return divUp(a, n) * n;
 }
 
 template <typename T, typename U, typename = std::enable_if_t<std::is_integral<T>::value>,

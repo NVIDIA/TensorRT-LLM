@@ -1,6 +1,6 @@
 --extra-index-url https://download.pytorch.org/whl/cu121
 --extra-index-url https://pypi.nvidia.com
-accelerate==0.20.3
+accelerate==0.25.0
 build
 colored
 cuda-python==12.2.0
@@ -9,14 +9,18 @@ mpi4py
 numpy
 onnx>=1.12.0
 polygraphy
+psutil
+pynvml>=11.5.0
 pywin32
 sentencepiece>=0.1.99
 tensorrt==9.2.0.post12.dev5
-tokenizers==0.13.3
+tokenizers>=0.14
 # Default torch is CPU-only on Windows, so need to specify a torch version with GPU support
 torch==2.1.0+cu121
 torchdata==0.7.0
 torchtext==0.16.0+cpu
 torchvision==0.16.0+cu121
-transformers==4.33.1
+transformers==4.36.1
 wheel
+optimum
+evaluate

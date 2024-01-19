@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,11 +29,11 @@ namespace tensorrt_llm::layers
 class DecodingSetupParams
 {
 public:
-    std::optional<std::vector<float>> temperature;       // [1] or [batch_size] on cpu
-    std::optional<std::vector<std::int32_t>> min_length; // [1] or [batch_size] on cpu
-    // repetition_penalty and presence_penalty are mutually exclusive.
+    std::optional<std::vector<float>> temperature;        // [1] or [batch_size] on cpu
+    std::optional<std::vector<std::int32_t>> min_length;  // [1] or [batch_size] on cpu
     std::optional<std::vector<float>> repetition_penalty; // [1] or [batch_size] on cpu
     std::optional<std::vector<float>> presence_penalty;   // [1] or [batch_size] on cpu
+    std::optional<std::vector<float>> frequency_penalty;  // [1] or [batch_size] on cpu
 };
 
 class DecodingParams

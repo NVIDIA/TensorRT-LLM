@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/runtime/bufferView.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 
 #include <stdexcept>
 
@@ -48,7 +49,7 @@ public:
         : BufferView{buffer, offset, size}
         , mDims{dims}
     {
-        Base::resize(nonNegative(volume(dims)));
+        Base::resize(ITensor::volumeNonNegative(dims));
     }
 
     [[nodiscard]] nvinfer1::Dims const& getShape() const override
@@ -58,7 +59,7 @@ public:
 
     void reshape(nvinfer1::Dims const& dims) override
     {
-        Base::resize(nonNegative(volume(dims)));
+        Base::resize(ITensor::volumeNonNegative(dims));
         mDims = dims;
     }
 

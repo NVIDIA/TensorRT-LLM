@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,8 +19,8 @@ import tensorrt as trt
 
 from .._common import default_net, default_trtnet
 from .._utils import str_dtype_to_np, str_dtype_to_trt
-from ..functional import (Tensor, _create_tensor, cast, clip, constant, matmul,
-                          repeat_interleave, round)
+from ..functional import (Tensor, _add_plugin_info, _create_tensor, cast, clip,
+                          constant, matmul, repeat_interleave, round)
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
 
 
@@ -59,6 +59,7 @@ def smooth_quant_gemm(input: Tensor, weights: Tensor, scales_a: Tensor,
             scales_b.trt_tensor
         ]
         layer = default_trtnet().add_plugin_v2(plug_inputs, gemm_plug)
+        _add_plugin_info(layer, plg_creator, "sq_gemm", pfc)
         layer.get_input(0).set_dynamic_range(-127, 127)
         layer.get_input(1).set_dynamic_range(-127, 127)
         return _create_tensor(layer.get_output(0), layer)
@@ -98,6 +99,7 @@ def weight_only_quant_matmul(input: Tensor,
         matmul_plug = plg_creator.create_plugin("woq_matmul", pfc)
         plug_inputs = [input.trt_tensor, weights.trt_tensor, scales.trt_tensor]
         layer = default_trtnet().add_plugin_v2(plug_inputs, matmul_plug)
+        _add_plugin_info(layer, plg_creator, "woq_matmul", pfc)
         layer.get_input(1).set_dynamic_range(-127, 127)
         return _create_tensor(layer.get_output(0), layer)
 
@@ -174,6 +176,7 @@ def weight_only_groupwise_quant_matmul(input: Tensor,
             plug_inputs += [biases.trt_tensor]
 
         layer = default_trtnet().add_plugin_v2(plug_inputs, matmul_plug)
+        _add_plugin_info(layer, plg_creator, "woq_groupwise_matmul", pfc)
         if quant_algo & PRE_QUANT_SCALE:
             layer.get_input(2).set_dynamic_range(-127, 127)
         else:
@@ -230,6 +233,7 @@ def smooth_quant_layer_norm(input: Tensor,
         ]
         layer = default_trtnet().add_plugin_v2(plug_inputs, layernorm_plug)
         layer.get_output(0).set_dynamic_range(-127, 127)
+        _add_plugin_info(layer, plg_creator, "layernorm_quantized", pfc)
         if not dynamic_act_scaling:
             return _create_tensor(layer.get_output(0), layer)
 
@@ -279,6 +283,7 @@ def smooth_quant_rms_norm(input: Tensor,
         ]
         layer = default_trtnet().add_plugin_v2(plug_inputs, rmsnorm_plug)
         layer.get_output(0).set_dynamic_range(-127, 127)
+        _add_plugin_info(layer, plg_creator, "rmsnorm_quantized", pfc)
         if not dynamic_act_scaling:
             return _create_tensor(layer.get_output(0), layer)
 
@@ -323,8 +328,7 @@ def dequantize(input: Tensor,
 
 def quantize_per_token(x: Tensor) -> Tuple[Tensor]:
     if not default_net().plugin_config.quantize_per_token_plugin:
-        if x.dtype != trt.float32:
-            x = cast(x, 'float32')
+        x = cast(x, 'float32')
         xmax = x.abs().max(-1, keepdim=True)
         scale = xmax / 127.0
         out = x * 127.0 / xmax
@@ -344,6 +348,7 @@ def quantize_per_token(x: Tensor) -> Tuple[Tensor]:
         plug_inputs = [x.trt_tensor]
         layer = default_trtnet().add_plugin_v2(plug_inputs, quantize_plug)
         layer.get_output(0).set_dynamic_range(-127, 127)
+        _add_plugin_info(layer, plg_creator, "quantize_per_token_plugin", pfc)
 
         quantized = _create_tensor(layer.get_output(0), layer)
         scales = _create_tensor(layer.get_output(1), layer)
@@ -368,6 +373,7 @@ def quantize_tensor(x, scale):
         plug_inputs = [x.trt_tensor, scale.trt_tensor]
         layer = default_trtnet().add_plugin_v2(plug_inputs, quantize_plug)
         layer.get_output(0).set_dynamic_range(-127, 127)
+        _add_plugin_info(layer, plg_creator, "quantize_tensor_plugin", pfc)
 
         quantized = _create_tensor(layer.get_output(0), layer)
     return quantized
