@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,214 +12,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import math
 
 import tensorrt as trt
 
+from tensorrt_llm.plugin.plugin import init_all_reduce_helper
+
 from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
-from ...functional import (RotaryScalingType, Tensor, gather_last_token_logits,
-                           gpt_attention, partial, recv, send, unary)
-from ...layers import (AttentionMaskType, AttentionParams, ColumnLinear,
-                       Embedding, GatedMLP, KeyValueCacheParams,
-                       PositionEmbeddingType, RmsNorm, RowLinear)
+from ...functional import (Tensor, gather_last_token_logits, partial, recv,
+                           send, unary)
+from ...layers import (Attention, AttentionMaskType, AttentionParams,
+                       ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
+                       PositionEmbeddingType, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
-from ...parameter import Parameter
 from ...quantization import QuantMode
-from ...quantization.layers import FP8Linear, FP8RowLinear
 from ..generation_mixin import GenerationMixin
 
 log = partial(unary, op=trt.UnaryOperation.LOG)
 ceil = partial(unary, op=trt.UnaryOperation.CEIL)
-
-
-class QWenAttention(Module):
-
-    def __init__(
-        self,
-        hidden_size,
-        num_attention_heads,
-        max_position_embeddings,
-        seq_length,  # 2048
-        num_kv_heads=None,
-        num_layers=1,
-        apply_query_key_layer_scaling=False,
-        attention_mask_type=AttentionMaskType.causal,
-        bias=True,
-        dtype=None,
-        position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
-        rotary_embedding_base=10000.0,
-        rotary_embedding_scaling=None,
-        neox_rotary_style=False,
-        rotary_embedding_percentage=1.0,
-        tp_group=None,
-        tp_size=1,
-        quant_mode: QuantMode = QuantMode(0),
-        q_scaling=1.0,
-        cross_attention=False,
-        relative_attention=False,
-        max_distance=0,
-        num_buckets=0,
-        instance_id: int = 0,
-        use_dynamic_ntk=True,
-        use_logn_attn=True,
-    ):
-        super().__init__()
-        self.cross_attention = cross_attention
-        self.seq_length = seq_length
-        self.hidden_size = hidden_size
-        self.num_heads = num_attention_heads
-
-        self.attention_mask_type = attention_mask_type
-        self.bias = bias
-        self.attention_head_size = hidden_size // num_attention_heads
-        self.num_attention_heads = num_attention_heads // tp_size
-        self.num_attention_kv_heads = (
-            num_kv_heads + tp_size - 1
-        ) // tp_size if num_kv_heads is not None else self.num_attention_heads
-        self.hidden_size = hidden_size // tp_size
-        self.max_position_embeddings = max_position_embeddings
-
-        self.num_layers = num_layers
-        self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
-        self.norm_factor = math.sqrt(self.attention_head_size)
-        self.q_scaling = q_scaling
-        if self.apply_query_key_layer_scaling:
-            self.norm_factor *= self.num_layers
-            self.q_scaling *= self.num_layers
-
-        self.position_embedding_type = position_embedding_type
-
-        self.relative_attention = relative_attention
-        self.max_distance = max_distance
-
-        self.rotary_embedding_base = rotary_embedding_base
-        self.rotary_embedding_scale_type = RotaryScalingType.none
-        self.rotary_embedding_scale = 1.0
-        if rotary_embedding_scaling is not None:
-            assert rotary_embedding_scaling["type"] in ["linear", "dynamic"]
-            self.rotary_embedding_scale_type = RotaryScalingType.linear if rotary_embedding_scaling[
-                "type"] == "linear" else RotaryScalingType.dynamic
-            self.rotary_embedding_scale = rotary_embedding_scaling["factor"]
-            assert self.rotary_embedding_scale > 1.0
-        self.rotary_embedding_dim = 0
-        self.neox_rotary_style = neox_rotary_style
-        if self.position_embedding_type == PositionEmbeddingType.rope_gpt_neox:
-            self.rotary_embedding_dim = int(self.attention_head_size *
-                                            rotary_embedding_percentage)
-
-        self.dtype = dtype
-        self.quant_mode = quant_mode
-
-        self.use_int8_kv_cache = self.quant_mode.has_int8_kv_cache()
-        if self.use_int8_kv_cache:
-            self.kv_orig_quant_scale = Parameter(shape=(1, ), dtype='float32')
-            self.kv_quant_orig_scale = Parameter(shape=(1, ), dtype='float32')
-        else:
-            self.register_parameter('kv_orig_quant_scale', None)
-            self.register_parameter('kv_quant_orig_scale', None)
-
-        self.use_fp8_qdq = self.quant_mode.has_fp8_qdq()
-        if self.use_fp8_qdq:
-            self.qkv = FP8Linear(hidden_size,
-                                 hidden_size +
-                                 (2 * tp_size * self.num_attention_kv_heads *
-                                  self.attention_head_size),
-                                 bias=True,
-                                 dtype=dtype,
-                                 tp_group=tp_group,
-                                 tp_size=tp_size,
-                                 gather_output=False)
-            self.dense = FP8RowLinear(hidden_size,
-                                      hidden_size,
-                                      bias=bias,
-                                      dtype=dtype,
-                                      tp_group=tp_group,
-                                      tp_size=tp_size,
-                                      instance_id=instance_id)
-        else:
-            self.qkv = ColumnLinear(hidden_size,
-                                    hidden_size +
-                                    (2 * tp_size * self.num_attention_kv_heads *
-                                     self.attention_head_size),
-                                    bias=True,
-                                    dtype=dtype,
-                                    tp_group=tp_group,
-                                    tp_size=tp_size,
-                                    gather_output=False)
-            self.dense = RowLinear(hidden_size,
-                                   hidden_size,
-                                   bias=bias,
-                                   dtype=dtype,
-                                   tp_group=tp_group,
-                                   tp_size=tp_size,
-                                   instance_id=instance_id)
-
-        if relative_attention:
-            self.rel_attn_table = Parameter(shape=(num_attention_heads //
-                                                   tp_size, num_buckets),
-                                            dtype=dtype)
-
-        self.use_dynamic_ntk = use_dynamic_ntk
-        self.use_logn_attn = use_logn_attn
-
-    def forward(
-        self,
-        hidden_states: Tensor,
-        use_cache=False,
-        kv_cache_params=None,
-        attention_params=None,
-        workspace=None,
-    ):
-        if not default_net().plugin_config.gpt_attention_plugin:
-            raise ValueError('QWen is only supported with GPTAttention plugin')
-
-        assert isinstance(hidden_states, Tensor)
-        qkv = self.qkv(hidden_states)
-
-        kv_orig_quant_scale = self.kv_orig_quant_scale.value if self.use_int8_kv_cache else None
-        kv_quant_orig_scale = self.kv_quant_orig_scale.value if self.use_int8_kv_cache else None
-
-        # return outputs
-        context, past_key_value = gpt_attention(
-            qkv=qkv,
-            past_key_value=kv_cache_params.get_first_past_key_value(),
-            sequence_length=attention_params.sequence_length,
-            host_past_key_value_lengths=kv_cache_params.
-            host_past_key_value_lengths,
-            host_max_attention_window_sizes=kv_cache_params.
-            host_max_attention_window_sizes,
-            context_lengths=attention_params.context_lengths,
-            cache_indirection=kv_cache_params.cache_indirection,
-            host_request_types=attention_params.host_request_types,
-            num_heads=self.num_attention_heads,
-            num_kv_heads=self.num_attention_kv_heads,
-            hidden_size_per_head=self.attention_head_size,
-            q_scaling=self.q_scaling,
-            rotary_embedding_dim=self.
-            rotary_embedding_dim,  # when we use it 0, we will not use rotary embedding in plugin
-            rotary_embedding_scale_type=self.neox_rotary_style,
-            rotary_embedding_max_positions=self.max_position_embeddings,
-            position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
-            kv_orig_quant_scale=kv_orig_quant_scale,
-            kv_quant_orig_scale=kv_quant_orig_scale,
-            kv_cache_quant_mode=QuantMode.from_description(
-                use_int8_kv_cache=self.use_int8_kv_cache),
-            kv_cache_block_pointers=kv_cache_params.
-            get_first_kv_cache_block_pointers(),
-            host_kv_cache_block_pointers=kv_cache_params.
-            get_first_host_kv_cache_block_pointers(),
-            max_context_length=attention_params.max_context_length,
-            mask_type=self.attention_mask_type.value,
-            host_context_lengths=attention_params.host_context_lengths)
-
-        context = self.dense(context, workspace=workspace)
-
-        if use_cache:
-            return (context, past_key_value)
-        else:
-            return context
 
 
 class QWenBlock(Module):
@@ -267,23 +78,20 @@ class QWenBlock(Module):
                             eps=rms_norm_eps,
                             dtype=dtype)
 
-        self.attention = QWenAttention(
+        self.attention = Attention(
             hidden_size=self.hidden_size,
             num_attention_heads=self.num_attention_heads,
             max_position_embeddings=self.max_position_embeddings,
             num_layers=self.num_layers,
-            seq_length=self.seq_length,
             dtype=self.dtype,
             attention_mask_type=self.attention_mask_type,
-            bias=bias,
             position_embedding_type=self.position_embedding_type,
             rotary_embedding_base=rotary_base,
             rotary_embedding_scaling=rotary_scaling,
-            neox_rotary_style=neox_rotary_style,
             tp_group=self.tp_group,
             tp_size=self.tp_size,
             quant_mode=quant_mode,
-        )
+            dense_bias=bias)
         if not mlp_hidden_size:
             mlp_hidden_size = hidden_size * 4
 
@@ -306,7 +114,6 @@ class QWenBlock(Module):
         use_cache=False,
         kv_cache_params=None,
         attention_params=None,
-        all_reduce_workspace=None,
     ):
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
@@ -315,7 +122,6 @@ class QWenBlock(Module):
             use_cache=use_cache,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
-            workspace=all_reduce_workspace,
         )
         if use_cache:
             attention_output, presents = attention_output
@@ -402,8 +208,7 @@ class QWenModel(Module):
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None,
-                hidden_states=None,
-                all_reduce_workspace=None):
+                hidden_states=None):
 
         if kv_cache_params.past_key_value is None:
             tuple([None] * len(self.layers))
@@ -432,11 +237,12 @@ class QWenModel(Module):
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
                     host_max_attention_window_sizes=max_attention_window_size,
+                    host_sink_token_length=kv_cache_params.
+                    host_sink_token_length,
                     kv_cache_block_pointers=[pointer],
                     host_kv_cache_block_pointers=[host_pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
-                attention_params=attention_params,
-                all_reduce_workspace=all_reduce_workspace)
+                attention_params=attention_params)
 
             if use_cache:
                 presents.append(hidden_states[1])
@@ -476,6 +282,7 @@ class QWenForCausalLM(QWenModel, GenerationMixin):
         embedding_sharding_dim=0,
         rms_norm_eps=1e-06,
     ):
+        init_all_reduce_helper()
         self.mapping = mapping
         if isinstance(dtype, str):
             self.dtype = str_dtype_to_trt(dtype)
@@ -539,11 +346,10 @@ class QWenForCausalLM(QWenModel, GenerationMixin):
                 last_token_ids=None,
                 kv_cache_params=None,
                 attention_params=None,
-                hidden_states=None,
-                all_reduce_workspace=None):
+                hidden_states=None):
         hidden_states = super().forward(input_ids, position_ids, use_cache,
                                         kv_cache_params, attention_params,
-                                        hidden_states, all_reduce_workspace)
+                                        hidden_states)
         if use_cache:
             hidden_states, presents = hidden_states
 
@@ -617,25 +423,29 @@ class QWenForCausalLM(QWenModel, GenerationMixin):
             max_num_tokens=max_num_tokens,
         )
 
-        return (model_inputs['input_ids'], model_inputs['position_ids'], True,
-                model_inputs['last_token_ids'],
-                KeyValueCacheParams(
-                    past_key_value=model_inputs['past_key_value'],
-                    host_past_key_value_lengths=model_inputs[
-                        'host_past_key_value_lengths'],
-                    host_max_attention_window_sizes=model_inputs[
-                        'host_max_attention_window_sizes'],
-                    kv_cache_block_pointers=model_inputs[
-                        'kv_cache_block_pointers_list'],
-                    host_kv_cache_block_pointers=model_inputs[
-                        'host_kv_cache_block_pointers_list'],
-                    cache_indirection=model_inputs['cache_indirection'],
-                ),
-                AttentionParams(
-                    sequence_length=model_inputs['sequence_length'],
-                    context_lengths=model_inputs['context_lengths'],
-                    host_context_lengths=model_inputs['host_context_lengths'],
-                    max_context_length=max_input_len,
-                    host_request_types=model_inputs['host_request_types']),
-                model_inputs['hidden_states_input'],
-                model_inputs['all_reduce_workspace'])
+        return (
+            model_inputs['input_ids'],
+            model_inputs['position_ids'],
+            True,
+            model_inputs['last_token_ids'],
+            KeyValueCacheParams(
+                past_key_value=model_inputs['past_key_value'],
+                host_past_key_value_lengths=model_inputs[
+                    'host_past_key_value_lengths'],
+                host_max_attention_window_sizes=model_inputs[
+                    'host_max_attention_window_sizes'],
+                host_sink_token_length=model_inputs['host_sink_token_length'],
+                kv_cache_block_pointers=model_inputs[
+                    'kv_cache_block_pointers_list'],
+                host_kv_cache_block_pointers=model_inputs[
+                    'host_kv_cache_block_pointers_list'],
+                cache_indirection=model_inputs['cache_indirection'],
+            ),
+            AttentionParams(
+                sequence_length=model_inputs['sequence_length'],
+                context_lengths=model_inputs['context_lengths'],
+                host_context_lengths=model_inputs['host_context_lengths'],
+                max_context_length=max_input_len,
+                host_request_types=model_inputs['host_request_types']),
+            model_inputs['hidden_states_input'],
+        )

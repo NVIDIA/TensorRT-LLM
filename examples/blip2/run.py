@@ -15,8 +15,8 @@ from tensorrt_llm import logger
 from tensorrt_llm.runtime import Session, TensorInfo
 
 
-def get_engine_name(model, dtype, tp_size, rank):
-    return '{}_{}_tp{}_rank{}.engine'.format(model, dtype, tp_size, rank)
+def get_engine_name(rank):
+    return 'rank{}.engine'.format(rank)
 
 
 def trt_dtype_to_torch(dtype):
@@ -31,20 +31,21 @@ def trt_dtype_to_torch(dtype):
 
 
 def TRTOPT(args, config):
-    dtype = config['builder_config']['precision']
-    world_size = config['builder_config']['tensor_parallel']
+    dtype = config['pretrained_config']['dtype']
+    world_size = config['pretrained_config']['mapping']['world_size']
     assert world_size == tensorrt_llm.mpi_world_size(), \
         f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
 
     use_gpt_attention_plugin = bool(
-        config['plugin_config']['gpt_attention_plugin'])
-    world_size = config['builder_config']['tensor_parallel']
-    num_heads = config['builder_config']['num_heads'] // world_size
-    hidden_size = config['builder_config']['hidden_size'] // world_size
-    vocab_size = config['builder_config']['vocab_size']
-    num_layers = config['builder_config']['num_layers']
-    remove_input_padding = config['plugin_config']['remove_input_padding']
-    max_prompt_embedding_table_size = config['builder_config'].get(
+        config['build_config']['plugin_config']['gpt_attention_plugin'])
+
+    num_heads = config['pretrained_config']['num_attention_heads'] // world_size
+    hidden_size = config['pretrained_config']['hidden_size'] // world_size
+    vocab_size = config['pretrained_config']['vocab_size']
+    num_layers = config['pretrained_config']['num_hidden_layers']
+    remove_input_padding = config['build_config']['plugin_config'][
+        'remove_input_padding']
+    max_prompt_embedding_table_size = config['build_config'].get(
         'max_prompt_embedding_table_size', 0)
 
     model_config = tensorrt_llm.runtime.ModelConfig(
@@ -62,7 +63,7 @@ def TRTOPT(args, config):
     runtime_mapping = tensorrt_llm.Mapping(world_size, runtime_rank)
     torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
 
-    engine_name = get_engine_name('opt', dtype, world_size, runtime_rank)
+    engine_name = get_engine_name(runtime_rank)
     serialize_path = os.path.join(args.opt_engine_dir, engine_name)
 
     tensorrt_llm.logger.set_level(args.log_level)
@@ -73,8 +74,7 @@ def TRTOPT(args, config):
                                                      engine_buffer,
                                                      runtime_mapping)
 
-    dtype = config['builder_config']['precision']
-    max_input_len = config['builder_config']['max_input_len']
+    max_input_len = config['build_config']['max_input_len']
     return decoder, model_config, world_size, dtype, max_input_len
 
 
@@ -167,9 +167,9 @@ if __name__ == '__main__':
     batch_size = 1
     image = image.expand(batch_size, -1, -1, -1).contiguous()
     # assert image.iscontigous()
-    visual_inputs = {'input': image.float()}
+    visual_inputs = {'input': image.half()}
     visual_output_info = session_vit.infer_shapes(
-        [TensorInfo('input', trt.DataType.FLOAT, image.shape)])
+        [TensorInfo('input', trt.DataType.HALF, image.shape)])
     visual_outputs = {
         t.name: torch.empty(tuple(t.shape),
                             dtype=trt_dtype_to_torch(t.dtype),
@@ -193,13 +193,13 @@ if __name__ == '__main__':
                                        -1).contiguous()
     # assert query_tokens.is_contiguous()
     qformer_inputs = {
-        'query_tokens': query_tokens.float(),
-        'image_embeds': image_embeds.float(),
+        'query_tokens': query_tokens.half(),
+        'image_embeds': image_embeds.half(),
         'image_atts': image_atts
     }
     qformer_output_info = session_qformer.infer_shapes([
-        TensorInfo('query_tokens', trt.DataType.FLOAT, query_tokens.shape),
-        TensorInfo('image_embeds', trt.DataType.FLOAT, image_embeds.shape),
+        TensorInfo('query_tokens', trt.DataType.HALF, query_tokens.shape),
+        TensorInfo('image_embeds', trt.DataType.HALF, image_embeds.shape),
         TensorInfo('image_atts', trt.DataType.INT64, image_atts.shape)
     ])
     qformer_outputs = {

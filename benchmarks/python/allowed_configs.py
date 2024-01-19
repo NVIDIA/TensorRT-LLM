@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -69,13 +69,15 @@ class EncDecBuildConfig:
     hidden_size: int
     vocab_size: int
     hidden_act: Optional[str]
-    n_positions: int
     max_batch_size: int
+    n_positions: int = 0
     num_decoder_layers: Optional[int] = None
     head_size: Optional[int] = None
     ffn_hidden_size: Optional[int] = None
-    num_buckets: Optional[int] = None
-    max_distance: Optional[int] = None
+    num_buckets: int = 0
+    max_distance: int = 0
+    has_embedding_scale: bool = False
+    normalize_before: Optional[bool] = None
     max_encoder_input_len: Optional[int] = None
     max_decoder_input_len: Optional[int] = None
     max_output_len: Optional[int] = None
@@ -84,7 +86,6 @@ class EncDecBuildConfig:
     def __post_init__(self) -> None:
         assert self.head_size is not None
         assert self.ffn_hidden_size is not None
-        assert self.num_buckets is not None
 
 
 @dataclass
@@ -196,8 +197,8 @@ _allowed_configs = {
                     builder_opt=None,
                     quantization="int8_sq_per_token_channel",
                 )),
-    "gpt-next_2b":
-    ModelConfig(name="gpt-next_2b",
+    "gpt_next_2b":
+    ModelConfig(name="gpt_next_2b",
                 family="gpt",
                 benchmark_type="gpt",
                 build_config=BuildConfig(
@@ -304,25 +305,6 @@ _allowed_configs = {
                     max_output_len=200,
                     builder_opt=None,
                 )),
-    "llama_7b_moe":
-    ModelConfig(name="llama_7b_moe",
-                family="llama",
-                benchmark_type="gpt",
-                build_config=BuildConfig(
-                    num_layers=32,
-                    num_heads=32,
-                    hidden_size=4096,
-                    vocab_size=32000,
-                    hidden_act='silu',
-                    n_positions=2048,
-                    inter_size=11008,
-                    max_batch_size=128,
-                    max_input_len=512,
-                    max_output_len=200,
-                    builder_opt=None,
-                    moe_num_experts=4,
-                    moe_top_k=1,
-                )),
     "llama_13b":
     ModelConfig(name="llama_13b",
                 family="llama",
@@ -426,6 +408,25 @@ _allowed_configs = {
                                          max_output_len=200,
                                          builder_opt=None,
                                          quantization="int8_sq_per_tensor")),
+    "mixtral_8x7b":
+    ModelConfig(name="mixtral_8x7b",
+                family="llama",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=32,
+                    num_heads=32,
+                    hidden_size=4096,
+                    vocab_size=32000,
+                    hidden_act='swiglu',
+                    n_positions=2048,
+                    inter_size=14336,
+                    max_batch_size=128,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                    moe_num_experts=8,
+                    moe_top_k=2,
+                )),
     "gptj_6b":
     ModelConfig(name="gptj_6b",
                 family="gptj",
@@ -590,7 +591,7 @@ _allowed_configs = {
                     num_heads=32,
                     hidden_size=2048,
                     vocab_size=50304,
-                    hidden_act=None,
+                    hidden_act='gelu',
                     n_positions=2048,
                     max_batch_size=256,
                     max_input_len=1024,
@@ -611,7 +612,7 @@ _allowed_configs = {
                     num_kv_heads=1,
                     hidden_size=4544,
                     vocab_size=65024,
-                    hidden_act=None,
+                    hidden_act='gelu',
                     n_positions=2048,
                     max_batch_size=128,
                     max_input_len=512,
@@ -632,7 +633,7 @@ _allowed_configs = {
                     num_kv_heads=8,
                     hidden_size=8192,
                     vocab_size=65024,
-                    hidden_act=None,
+                    hidden_act='gelu',
                     n_positions=2048,
                     max_batch_size=64,
                     max_input_len=512,
@@ -653,7 +654,7 @@ _allowed_configs = {
                     num_kv_heads=8,
                     hidden_size=14848,
                     vocab_size=65024,
-                    hidden_act=None,
+                    hidden_act='gelu',
                     n_positions=2048,
                     max_batch_size=8,
                     max_input_len=1024,
@@ -766,7 +767,7 @@ _allowed_configs = {
                 )),
     "flan_t5_small":
     ModelConfig(name="flan_t5_small",
-                family="t5",
+                family="flan_t5",
                 benchmark_type="enc_dec",
                 build_config=EncDecBuildConfig(
                     num_layers=8,
@@ -776,7 +777,7 @@ _allowed_configs = {
                     ffn_hidden_size=1024,
                     hidden_size=512,
                     vocab_size=32128,
-                    hidden_act="gated-gelu",
+                    hidden_act="gelu_new",
                     n_positions=512,
                     num_buckets=32,
                     max_distance=128,
@@ -788,7 +789,7 @@ _allowed_configs = {
                 )),
     "flan_t5_base":
     ModelConfig(name="flan_t5_base",
-                family="t5",
+                family="flan_t5",
                 benchmark_type="enc_dec",
                 build_config=EncDecBuildConfig(
                     num_layers=12,
@@ -798,7 +799,7 @@ _allowed_configs = {
                     ffn_hidden_size=2048,
                     hidden_size=768,
                     vocab_size=32128,
-                    hidden_act="gated-gelu",
+                    hidden_act="gelu_new",
                     n_positions=512,
                     num_buckets=32,
                     max_distance=128,
@@ -810,7 +811,7 @@ _allowed_configs = {
                 )),
     "flan_t5_large":
     ModelConfig(name="flan_t5_large",
-                family="t5",
+                family="flan_t5",
                 benchmark_type="enc_dec",
                 build_config=EncDecBuildConfig(
                     num_layers=24,
@@ -820,7 +821,7 @@ _allowed_configs = {
                     ffn_hidden_size=2816,
                     hidden_size=1024,
                     vocab_size=32128,
-                    hidden_act="gated-gelu",
+                    hidden_act="gelu_new",
                     n_positions=512,
                     num_buckets=32,
                     max_distance=128,
@@ -832,7 +833,7 @@ _allowed_configs = {
                 )),
     "flan_t5_xl":
     ModelConfig(name="flan_t5_xl",
-                family="t5",
+                family="flan_t5",
                 benchmark_type="enc_dec",
                 build_config=EncDecBuildConfig(
                     num_layers=24,
@@ -842,7 +843,7 @@ _allowed_configs = {
                     ffn_hidden_size=5120,
                     hidden_size=2048,
                     vocab_size=32128,
-                    hidden_act="gated-gelu",
+                    hidden_act="gelu_new",
                     n_positions=512,
                     num_buckets=32,
                     max_distance=128,
@@ -854,7 +855,7 @@ _allowed_configs = {
                 )),
     "flan_t5_xxl":
     ModelConfig(name="flan_t5_xxl",
-                family="t5",
+                family="flan_t5",
                 benchmark_type="enc_dec",
                 build_config=EncDecBuildConfig(
                     num_layers=24,
@@ -871,6 +872,191 @@ _allowed_configs = {
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
+                    max_output_len=200,
+                    builder_opt=None,
+                )),
+    "bart_large_cnn":
+    ModelConfig(name="bart_large_cnn",
+                family="bart",
+                benchmark_type="enc_dec",
+                build_config=EncDecBuildConfig(
+                    num_layers=12,
+                    num_decoder_layers=12,
+                    num_heads=16,
+                    head_size=64,
+                    ffn_hidden_size=4096,
+                    hidden_size=1024,
+                    vocab_size=50265,
+                    hidden_act="gelu",
+                    n_positions=1024,
+                    num_buckets=32,
+                    has_embedding_scale=False,
+                    normalize_before=False,
+                    max_batch_size=8,
+                    max_encoder_input_len=1024,
+                    max_decoder_input_len=1,
+                    max_output_len=200,
+                    builder_opt=None,
+                )),
+    "mbart_large_50_many_to_one_mmt":
+    ModelConfig(name="mbart_large_50_many_to_one_mmt",
+                family="bart",
+                benchmark_type="enc_dec",
+                build_config=EncDecBuildConfig(
+                    num_layers=12,
+                    num_decoder_layers=12,
+                    num_heads=16,
+                    head_size=64,
+                    ffn_hidden_size=4096,
+                    hidden_size=1024,
+                    vocab_size=250054,
+                    hidden_act="relu",
+                    n_positions=1024,
+                    has_embedding_scale=True,
+                    normalize_before=True,
+                    max_batch_size=8,
+                    max_encoder_input_len=1024,
+                    max_decoder_input_len=1,
+                    max_output_len=200,
+                    builder_opt=None,
+                )),
+    "baichuan_7b":
+    ModelConfig(name="baichuan_7b",
+                family="baichuan_7b",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=32,
+                    num_heads=32,
+                    hidden_size=4096,
+                    vocab_size=64000,
+                    hidden_act='silu',
+                    n_positions=4096,
+                    inter_size=11008,
+                    max_batch_size=128,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                )),
+    "baichuan2_7b_chat":
+    ModelConfig(name="baichuan2_7b_chat",
+                family="baichuan_7b",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=32,
+                    num_heads=32,
+                    hidden_size=4096,
+                    vocab_size=125696,
+                    hidden_act='silu',
+                    n_positions=4096,
+                    inter_size=11008,
+                    max_batch_size=128,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                )),
+    "baichuan_13b_chat":
+    ModelConfig(name="baichuan_13b_chat",
+                family="baichuan_13b",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=40,
+                    num_heads=40,
+                    hidden_size=5120,
+                    vocab_size=64000,
+                    hidden_act='silu',
+                    n_positions=4096,
+                    inter_size=13696,
+                    max_batch_size=64,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                )),
+    "baichuan2_13b_chat":
+    ModelConfig(name="baichuan2_13b_chat",
+                family="baichuan_13b",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=40,
+                    num_heads=40,
+                    hidden_size=5120,
+                    vocab_size=125696,
+                    hidden_act='silu',
+                    n_positions=4096,
+                    inter_size=13696,
+                    max_batch_size=64,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                )),
+    "internlm_chat_7b":
+    ModelConfig(name="internlm_chat_7b",
+                family="internlm",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=32,
+                    num_heads=32,
+                    num_kv_heads=32,
+                    hidden_size=4096,
+                    vocab_size=103168,
+                    hidden_act='silu',
+                    n_positions=2048,
+                    inter_size=11008,
+                    max_batch_size=128,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                    bias=True,
+                )),
+    "internlm_chat_20b":
+    ModelConfig(name="internlm_chat_20b",
+                family="internlm",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=60,
+                    num_heads=40,
+                    num_kv_heads=40,
+                    hidden_size=5120,
+                    vocab_size=103168,
+                    hidden_act='silu',
+                    n_positions=4096,
+                    inter_size=13824,
+                    max_batch_size=64,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                    bias=False,
+                )),
+    "qwen_7b_chat":
+    ModelConfig(name="qwen_7b_chat",
+                family="qwen",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=32,
+                    num_heads=32,
+                    hidden_size=4096,
+                    vocab_size=151936,
+                    hidden_act='silu',
+                    n_positions=8192,
+                    inter_size=22016,
+                    max_batch_size=128,
+                    max_input_len=512,
+                    max_output_len=200,
+                    builder_opt=None,
+                )),
+    "qwen_14b_chat":
+    ModelConfig(name="qwen_14b_chat",
+                family="qwen",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=40,
+                    num_heads=40,
+                    hidden_size=5120,
+                    vocab_size=152064,
+                    hidden_act='silu',
+                    n_positions=8192,
+                    inter_size=27392,
+                    max_batch_size=64,
+                    max_input_len=512,
                     max_output_len=200,
                     builder_opt=None,
                 )),

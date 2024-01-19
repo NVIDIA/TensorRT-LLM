@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,46 +14,23 @@
 # limitations under the License.
 import copy
 import json
+import math
 import os
 import time
-from functools import wraps
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Dict, Optional, Union
 
 import tensorrt as trt
 from packaging import version
 
+from ._common import _is_building
 from ._utils import to_dict, to_json_file, trt_version
-from .graph_rewriting import optimize
 from .logger import logger
-from .models import MODEL_MAP, PretrainedConfig, PretrainedModel
-from .network import Network, net_guard
+from .network import Network
 from .plugin import PluginConfig
 from .plugin.plugin import ContextFMHAType
 from .quantization import QuantMode
-from .version import __version__
-
-
-class _BuildingFlag:
-
-    def __enter__(self):
-        os.environ['IS_BUILDING'] = '1'
-
-    def __exit__(self, type, value, tb):
-        del os.environ['IS_BUILDING']
-
-
-def _is_building(f):
-    '''Use this to decorate functions which are called during engine building/refiting process,
-    otherwise, the plugin registration will fail.
-    '''
-
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        with _BuildingFlag():
-            return f(*args, **kwargs)
-
-    return decorated
 
 
 class BuilderConfig(object):
@@ -72,6 +49,28 @@ class BuilderConfig(object):
     @property
     def trt_builder_config(self) -> trt.IBuilderConfig:
         return self._trt_builder_config
+
+    def to_dict(self) -> Dict:
+        '''return a dict with keys
+        {
+            "builder_config": {
+                # all key values set by the _init function
+            },
+            "plugin_config": {
+                # the network plugin_config (if any) attached to this BuilderConfig object
+                # inside the Builder.build_engine
+            }
+        }
+        '''
+        config = {'builder_config': {}}
+        for k in self.__dict__.keys():
+            if k != '_trt_builder_config' and k != 'plugin_config':
+                config['builder_config'][k] = self.__getattribute__(k)
+        if hasattr(self, 'plugin_config'):
+            assert isinstance(self.plugin_config, PluginConfig), \
+                f"Found unexpected plugin_config object with type: {type(self.plugin_config)}"
+            config['plugin_config'] = to_dict(self.plugin_config)
+        return config
 
 
 class Builder():
@@ -115,6 +114,7 @@ class Builder():
                               int8: bool = False,
                               strongly_typed: bool = False,
                               opt_level: Optional[int] = None,
+                              profiling_verbosity: str = "layer_names_only",
                               **kwargs) -> BuilderConfig:
         ''' @brief Create a builder config with given precisions and timing cache
             @param precision: one of allowed precisions, defined in Builder._ALLOWED_PRECISIONS
@@ -140,11 +140,10 @@ class Builder():
         config = self.trt_builder.create_builder_config()
         if not strongly_typed:
             fp8 = quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache()
-
-            if precision == 'float16':
+            if precision == 'float16' or precision == trt.DataType.HALF:
                 config.set_flag(trt.BuilderFlag.FP16)
                 config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
-            elif precision == 'bfloat16':
+            elif precision == 'bfloat16' or precision == trt.DataType.BF16:
                 config.set_flag(trt.BuilderFlag.BF16)
                 config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
             if int8:
@@ -162,6 +161,14 @@ class Builder():
 
         if opt_level is not None:
             config.builder_optimization_level = opt_level
+
+        # Set TRT Engine profiling verbosity
+        if profiling_verbosity == "detailed":
+            config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
+        elif profiling_verbosity == "none":
+            config.profiling_verbosity = trt.ProfilingVerbosity.NONE
+        else:
+            config.profiling_verbosity = trt.ProfilingVerbosity.LAYER_NAMES_ONLY
 
         # set timing cache
         cache = None
@@ -202,10 +209,23 @@ class Builder():
             profile = self.trt_builder.create_optimization_profile()
             for input_name in input_tensors.keys():
                 shape_profile = input_tensors[input_name].profiles[i]
-                profile.set_shape(input_name, shape_profile.min,
-                                  shape_profile.opt, shape_profile.max)
+                min_shape = [*shape_profile.min]
+                opt_shape = [*shape_profile.opt]
+                max_shape = [*shape_profile.max]
+                if network._autopp_config is not None:
+                    io_shards = network._autopp_config["io_shards"]
+                    if input_name in io_shards:
+                        shards = io_shards[input_name]
+                        for dim, shard_num in shards.items():
+                            min_shape[dim] = int(
+                                math.floor(min_shape[dim] / shard_num))
+                            opt_shape[dim] = int(
+                                round(opt_shape[dim] / shard_num))
+                            max_shape[dim] = int(
+                                math.ceil(max_shape[dim] / shard_num))
+                profile.set_shape(input_name, min_shape, opt_shape, max_shape)
                 logger.debug(
-                    f'{input_name}, min: {shape_profile.min}, opt: {shape_profile.opt}, max: {shape_profile.max}, dimension names: {shape_profile.dimension_names}'
+                    f'{input_name}, min: {min_shape}, opt: {opt_shape}, max: {max_shape}, dimension names: {shape_profile.dimension_names}'
                 )
             builder_config.trt_builder_config.add_optimization_profile(profile)
         assert self._validate_named_dimensions(
@@ -301,10 +321,10 @@ class Builder():
         '''
         assert isinstance(network, Network)
         builder_config.plugin_config = network.plugin_config
-        self._add_optimization_profile(network, builder_config)
+        builder_config.autopp_config = network.autopp_config
+        if builder_config.trt_builder_config.num_optimization_profiles == 0:
+            self._add_optimization_profile(network, builder_config)
         engine = None
-        logger.info(f'Build TensorRT engine {network.trt_network.name}')
-        tik = time.time()
 
         # Rename weights
         if network.named_parameters is not None:
@@ -314,7 +334,10 @@ class Builder():
                         param._get_weights(), name):
                     raise RuntimeError(f'Failed to set weight: {name}')
 
+        network._fill_weights()
         # Build engine
+        logger.info(f'Build TensorRT engine {network.trt_network.name}')
+        tik = time.time()
         engine = self.trt_builder.build_serialized_network(
             network.trt_network, builder_config.trt_builder_config)
         if engine is None:
@@ -348,29 +371,23 @@ class Builder():
 
     @staticmethod
     def save_config(builder_config: BuilderConfig, config_path: str):
-        config = {'builder_config': {}}
-        for k in builder_config.__dict__.keys():
-            if k != '_trt_builder_config' and k != 'plugin_config':
-                config['builder_config'][k] = builder_config.__getattribute__(k)
-        config['plugin_config'] = to_dict(builder_config.plugin_config)
+        config = builder_config.to_dict()
         to_json_file(config, config_path)
         logger.info(f'Config saved to {config_path}.')
 
 
+@dataclass
 class BuildConfig:
-
-    def __init__(self, max_input_len, max_output_len, max_batch_size,
-                 max_beam_width, max_num_tokens,
-                 max_prompt_embedding_table_size, gather_all_token_logits,
-                 plugin_config):
-        self.max_input_len = max_input_len
-        self.max_output_len = max_output_len
-        self.max_batch_size = max_batch_size
-        self.max_beam_width = max_beam_width
-        self.max_num_tokens = max_num_tokens
-        self.max_prompt_embedding_table_size = max_prompt_embedding_table_size
-        self.gather_all_token_logits = gather_all_token_logits
-        self.plugin_config = plugin_config
+    max_input_len: int = 256
+    max_output_len: int = 256
+    max_batch_size: int = 8
+    max_beam_width: int = 1
+    max_num_tokens: Optional[int] = None
+    max_prompt_embedding_table_size: int = 0
+    gather_context_logits: int = False
+    gather_generation_logits: int = False
+    strongly_typed: bool = False
+    plugin_config: PluginConfig = PluginConfig()
 
     @classmethod
     def from_dict(cls, config):
@@ -381,7 +398,9 @@ class BuildConfig:
         max_num_tokens = config.pop('max_num_tokens')
         max_prompt_embedding_table_size = config.pop(
             'max_prompt_embedding_table_size', 0)
-        gather_all_token_logits = config.pop('gather_all_token_logits', False)
+        gather_context_logits = config.pop('gather_context_logits', False)
+        gather_generation_logits = config.pop('gather_generation_logits', False)
+        strongly_typed = config.pop('strongly_typed', False)
 
         plugin_config = PluginConfig()
         if 'plugin_config' not in config:
@@ -392,7 +411,8 @@ class BuildConfig:
                 max_beam_width=max_beam_width,
                 max_num_tokens=max_num_tokens,
                 max_prompt_embedding_table_size=max_prompt_embedding_table_size,
-                gather_all_token_logits=gather_all_token_logits,
+                gather_context_logits=gather_context_logits,
+                gather_generation_logits=gather_generation_logits,
                 plugin_config=plugin_config)
 
         config = config['plugin_config']
@@ -437,7 +457,9 @@ class BuildConfig:
             max_beam_width=max_beam_width,
             max_num_tokens=max_num_tokens,
             max_prompt_embedding_table_size=max_prompt_embedding_table_size,
-            gather_all_token_logits=gather_all_token_logits,
+            gather_context_logits=gather_context_logits,
+            gather_generation_logits=gather_generation_logits,
+            strongly_typed=strongly_typed,
             plugin_config=plugin_config)
 
     @classmethod
@@ -452,170 +474,3 @@ class BuildConfig:
         plugin_config_dict = copy.deepcopy(plugin_config.__dict__)
         output['plugin_config'] = plugin_config_dict
         return output
-
-
-def serialize_engine(engine, path):
-    logger.info(f'Serializing engine to {path}...')
-    tik = time.time()
-    with open(path, 'wb') as f:
-        f.write(bytearray(engine))
-    tok = time.time()
-    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
-    logger.info(f'Engine serialized. Total time: {t}')
-
-
-class EngineConfig:
-
-    def __init__(self, pretrained_config: PretrainedConfig,
-                 build_config: BuildConfig, version: str):
-        self.pretrained_config = pretrained_config
-        self.build_config = build_config
-        self.version = version
-
-    @classmethod
-    def from_json_file(cls, config_file):
-        with open(config_file) as f:
-            config = json.load(f)
-            return cls(PretrainedConfig.from_dict(config['pretrained_config']),
-                       BuildConfig.from_dict(config['build_config']),
-                       config['version'])
-
-    def to_dict(self):
-        return {
-            'version': self.version,
-            'pretrained_config': self.pretrained_config.to_dict(),
-            'build_config': self.build_config.to_dict(),
-        }
-
-
-class Engine:
-
-    def __init__(self, config: EngineConfig, engine: trt.IHostMemory):
-        self.config = config
-        self.engine = engine
-
-    def save(self, engine_dir: str):
-        if self.config.pretrained_config.mapping.rank == 0:
-            with open(os.path.join(engine_dir, 'config.json'),
-                      "w",
-                      encoding="utf-8") as f:
-                json.dump(self.config.to_dict(), f, indent=4)
-        serialize_engine(
-            self.engine,
-            os.path.join(
-                engine_dir,
-                f'rank{self.config.pretrained_config.mapping.rank}.engine'))
-
-    @classmethod
-    def from_dir(cls, engine_dir: str, rank: int = 0):
-        with open(os.path.join(engine_dir, f'rank{rank}.engine'), 'rb') as f:
-            engine_buffer = f.read()
-
-        config = EngineConfig.from_json_file(
-            os.path.join(engine_dir, 'config.json'))
-        config.pretrained_config.set_rank(rank)
-
-        return cls(config, engine_buffer)
-
-
-def get_engine_version(engine_dir: str) -> Union[None, str]:
-    engine_dir = Path(engine_dir)
-    config_path = engine_dir / "config.json"
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-
-    if 'version' not in config:
-        return None
-
-    return config['version']
-
-
-def build_shard_model(model: PretrainedModel,
-                      build_config: BuildConfig) -> Engine:
-    builder = Builder()
-    network = builder.create_network()
-    network._plugin_config = build_config.plugin_config
-
-    use_weight_only = model.config.quant_mode.is_weight_only()
-    per_group = model.config.quant_mode.has_per_group_scaling()
-    use_smooth_quant = model.config.quant_mode.has_act_and_weight_quant()
-    if use_weight_only:
-        if per_group:
-            network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
-                dtype='float16')
-        else:
-            network.plugin_config.set_weight_only_quant_matmul_plugin(
-                dtype='float16')
-    if use_smooth_quant:
-        network.plugin_config.set_smooth_quant_gemm_plugin(dtype='float16')
-        network.plugin_config.set_rmsnorm_quantization_plugin(dtype='float16')
-        network.plugin_config.set_layernorm_quantization_plugin(dtype='float16')
-        network.plugin_config.set_quantize_tensor_plugin()
-        network.plugin_config.set_quantize_per_token_plugin()
-    nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else False
-    if nccl_plugin:
-        network.plugin_config.set_nccl_plugin(
-            nccl_plugin, network.plugin_config.use_custom_all_reduce)
-
-    with net_guard(network):
-        # Prepare
-        network.set_named_parameters(model.named_parameters())
-
-        # Forward
-        inputs = model.prepare_inputs(
-            build_config.max_batch_size, build_config.max_input_len,
-            build_config.max_output_len, True, build_config.max_beam_width,
-            build_config.max_num_tokens,
-            build_config.max_prompt_embedding_table_size)
-        model(**inputs)
-
-    optimize(network)
-
-    builder_config = builder.create_builder_config(
-        precision=model.config.dtype,
-        int8=model.config.quant_mode.has_act_or_weight_quant())
-
-    # Network -> Engine
-    engine = builder.build_engine(network, builder_config)
-    engine_config = EngineConfig(model.config, build_config, __version__)
-
-    return Engine(engine_config, engine)
-
-
-def build(build_config: Union[str, BuildConfig],
-          rank: int = 0,
-          ckpt_dir: str = None,
-          model_config: Union[str, PretrainedConfig] = None,
-          weights=None,
-          model_cls=None) -> Engine:
-    if ckpt_dir is not None:
-        model_config = PretrainedConfig.from_json_file(
-            os.path.join(ckpt_dir, 'config.json'))
-    else:
-        assert model_config is not None
-        if isinstance(model_config, PretrainedConfig):
-            model_config = model_config
-        else:
-            model_config = PretrainedConfig.from_json_file(model_config)
-
-    if isinstance(build_config, str):
-        build_config = BuildConfig.from_json_file(build_config)
-
-    assert rank < model_config.mapping.world_size
-    architecture = model_config.architecture
-
-    if model_cls is None:
-        if architecture not in MODEL_MAP:
-            raise RuntimeError(
-                f'Unsupported model architecture: {architecture}')
-        model_cls = MODEL_MAP[architecture]
-
-    if ckpt_dir is not None:
-        model = model_cls.from_checkpoint(ckpt_dir, rank=rank)
-    else:
-        rank_config = copy.deepcopy(model_config)
-        rank_config.set_rank(rank)
-        model = model_cls.from_config(rank_config)
-        if weights is not None:
-            model.load(weights)
-    return build_shard_model(model, build_config)

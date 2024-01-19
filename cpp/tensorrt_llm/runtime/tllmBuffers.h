@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,28 +28,35 @@
 #include <NvInferRuntime.h>
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <list>
 #include <memory>
+#include <mutex>
+#include <tuple>
 #include <type_traits>
+#include <vector>
 
 namespace tensorrt_llm::runtime
 {
 
 // CRTP base class
-template <typename TDerived, MemoryType memoryType>
+template <typename TDerived, MemoryType memoryType, bool count = true>
 class BaseAllocator
 {
 public:
     using ValueType = void;
     using PointerType = ValueType*;
     using SizeType = std::size_t;
+    static auto constexpr kMemoryType = memoryType;
 
     PointerType allocate(SizeType n)
     {
         PointerType ptr{};
         static_cast<TDerived*>(this)->allocateImpl(&ptr, n);
-        MemoryCounters::getInstance().allocate<memoryType>(n);
+        if constexpr (count)
+            MemoryCounters::getInstance().allocate<memoryType>(n);
         return ptr;
     }
 
@@ -58,7 +65,8 @@ public:
         if (ptr)
         {
             static_cast<TDerived*>(this)->deallocateImpl(ptr, n);
-            MemoryCounters::getInstance().deallocate<memoryType>(n);
+            if constexpr (count)
+                MemoryCounters::getInstance().deallocate<memoryType>(n);
         }
     }
 
@@ -82,7 +90,7 @@ protected:
     }
 
     void deallocateImpl( // NOLINT(readability-convert-member-functions-to-static)
-        PointerType ptr, [[gnu::unused]] SizeType n)
+        PointerType ptr, [[maybe_unused]] SizeType n)
     {
         TLLM_CUDA_CHECK(::cudaFree(ptr));
     }
@@ -112,7 +120,7 @@ protected:
         TLLM_CUDA_CHECK(::cudaMallocAsync(ptr, n, mCudaStream->get()));
     }
 
-    void deallocateImpl(PointerType ptr, [[gnu::unused]] SizeType n)
+    void deallocateImpl(PointerType ptr, [[maybe_unused]] SizeType n)
     {
         TLLM_CUDA_CHECK(::cudaFreeAsync(ptr, mCudaStream->get()));
     }
@@ -126,6 +134,7 @@ class PinnedAllocator : public BaseAllocator<PinnedAllocator, MemoryType::kPINNE
     friend class BaseAllocator<PinnedAllocator, MemoryType::kPINNED>;
 
 public:
+    using Base = BaseAllocator<PinnedAllocator, MemoryType::kPINNED>;
     PinnedAllocator() noexcept = default;
 
 protected:
@@ -135,7 +144,7 @@ protected:
     }
 
     void deallocateImpl( // NOLINT(readability-convert-member-functions-to-static)
-        PointerType ptr, [[gnu::unused]] SizeType n)
+        PointerType ptr, [[maybe_unused]] SizeType n)
     {
         TLLM_CUDA_CHECK(::cudaFreeHost(ptr));
     }
@@ -159,21 +168,21 @@ protected:
     }
 
     void deallocateImpl( // NOLINT(readability-convert-member-functions-to-static)
-        PointerType ptr, [[gnu::unused]] SizeType n)
+        PointerType ptr, [[maybe_unused]] SizeType n)
     {
         std::free(ptr);
     }
 };
 
 template <MemoryType memoryType>
-class BorrowingAllocator : public BaseAllocator<BorrowingAllocator<memoryType>, memoryType>
+class BorrowingAllocator : public BaseAllocator<BorrowingAllocator<memoryType>, memoryType, false>
 {
-    friend class BaseAllocator<BorrowingAllocator<memoryType>, memoryType>;
+    friend class BaseAllocator<BorrowingAllocator<memoryType>, memoryType, false>;
 
 public:
-    using Base = BaseAllocator<BorrowingAllocator<memoryType>, memoryType>;
-    using typename Base::PointerType;
-    using typename Base::SizeType;
+    using Base = BaseAllocator<BorrowingAllocator<memoryType>, memoryType, false>;
+    using PointerType = typename Base::PointerType;
+    using SizeType = typename Base::SizeType;
 
     BorrowingAllocator(void* ptr, SizeType capacity)
         : mPtr(ptr)
@@ -197,18 +206,277 @@ protected:
     }
 
     void deallocateImpl( // NOLINT(readability-convert-member-functions-to-static)
-        [[gnu::unused]] PointerType ptr, [[gnu::unused]] SizeType n)
+        [[maybe_unused]] PointerType ptr, [[maybe_unused]] SizeType n)
     {
     }
 
 private:
-    typename Base::PointerType mPtr;
-    typename Base::SizeType mCapacity;
+    PointerType mPtr;
+    SizeType mCapacity;
 };
 
 using CpuBorrowingAllocator = BorrowingAllocator<MemoryType::kCPU>;
 using GpuBorrowingAllocator = BorrowingAllocator<MemoryType::kGPU>;
 using PinnedBorrowingAllocator = BorrowingAllocator<MemoryType::kPINNED>;
+
+/**
+ * A memory manager that acts as a memory pool, preallocating a configurable
+ * amount of memory. It is able to grow in size and allocate memory chunks as required.
+ */
+template <typename TAllocator>
+class MemoryPool : public BaseAllocator<MemoryPool<TAllocator>, TAllocator::kMemoryType, false>
+{
+    friend class BaseAllocator<MemoryPool<TAllocator>, TAllocator::kMemoryType, false>;
+
+public:
+    using Base = BaseAllocator<MemoryPool<TAllocator>, TAllocator::kMemoryType, false>;
+    using PointerType = typename Base::PointerType;
+    using SizeType = typename Base::SizeType;
+
+    using Allocator = TAllocator;
+    static_assert(std::is_same_v<typename Allocator::PointerType, PointerType>);
+    static_assert(std::is_same_v<typename Allocator::SizeType, SizeType>);
+
+    static SizeType constexpr kInitialChunkSize{SizeType{1} << 30}; // 1 GB
+    static SizeType constexpr kChunkResizeFactor{2};
+    static SizeType constexpr kAlignment{256};
+
+    explicit MemoryPool(SizeType chunkSize = kInitialChunkSize, Allocator allocator = Allocator{})
+        : mChunkSize(chunkSize)
+        , mAllocator{allocator}
+    {
+    }
+
+    ~MemoryPool()
+    {
+        std::lock_guard<std::mutex> lock(mLock);
+        TLLM_LOG_DEBUG("MemoryPool: Deallocating %zu chunks", mAllocatedChunks.size());
+        for (auto const& [ptr, size] : mAllocatedChunks)
+        {
+            TLLM_LOG_DEBUG("MemoryPool: Deallocating %zu B", size);
+            try
+            {
+                mAllocator.deallocate(ptr, size);
+            }
+            catch (std::exception const& e)
+            {
+                TLLM_LOG_EXCEPTION(e);
+            }
+        }
+        mAllocatedChunks.clear();
+    }
+
+    [[nodiscard]] SizeType getChunkSize() const
+    {
+        std::lock_guard<std::mutex> lock(mLock);
+        return mChunkSize;
+    }
+
+    void setChunkSize(SizeType chunkSize)
+    {
+        std::lock_guard<std::mutex> lock(mLock);
+        mChunkSize = chunkSize;
+    }
+
+    [[nodiscard]] SizeType getUsedSize() const
+    {
+        std::lock_guard<std::mutex> lock(mLock);
+        return std::accumulate(mMemorySegments.cbegin(), mMemorySegments.cend(), SizeType{0},
+            [](SizeType sum, auto const& chunk) { return chunk.tag ? sum + chunk.size : sum; });
+    }
+
+    [[nodiscard]] SizeType getReservedSize() const
+    {
+        std::lock_guard<std::mutex> lock(mLock);
+        return std::accumulate(mAllocatedChunks.cbegin(), mAllocatedChunks.cend(), SizeType{0},
+            [](SizeType sum, auto const& chunk) { return sum + std::get<1>(chunk); });
+    }
+
+    class MemorySegment
+    {
+    public:
+        MemorySegment(PointerType basePointer, SizeType size, SizeType offset = 0, PointerType tag = nullptr)
+            : basePointer{basePointer}
+            , size{size}
+            , offset{offset}
+            , tag{tag}
+        {
+        }
+
+        PointerType const basePointer;
+        SizeType size;
+        SizeType offset;
+        PointerType tag;
+    };
+
+    // for debugging purposes only
+    std::list<MemorySegment> const& getMemorySegments() const
+    {
+        std::lock_guard<std::mutex> lock(mLock);
+        return mMemorySegments;
+    }
+
+    // for debugging purposes only
+    void logSegments() const;
+
+protected:
+    void allocateImpl(PointerType* ptr, SizeType requestedSize);
+
+    void deallocateImpl(PointerType tag, SizeType n);
+
+private:
+    SizeType mChunkSize;
+    TAllocator mAllocator;
+    std::mutex mutable mLock{};
+
+    std::list<MemorySegment> mMemorySegments = {};
+    std::vector<std::tuple<PointerType, SizeType>> mAllocatedChunks = {};
+
+    void allocateChunk()
+    {
+        TLLM_LOG_DEBUG("MemoryPool: Allocating %zu B", mChunkSize);
+        auto basePointer = mAllocator.allocate(mChunkSize);
+        mAllocatedChunks.emplace_back(basePointer, mChunkSize);
+        mMemorySegments.push_back(MemorySegment{basePointer, mChunkSize});
+    }
+};
+
+template <typename TAllocator>
+void MemoryPool<TAllocator>::allocateImpl(MemoryPool::PointerType* ptr, MemoryPool::SizeType requestedSize)
+{
+    std::lock_guard<std::mutex> lock(mLock);
+    // Align requested size to kAlignment
+    // When requesting 0 B, default to allocating 1 B (from "Effective C++", item 51)
+    // See https://stackoverflow.com/questions/2660076/returning-aligned-memory-with-new
+    const std::size_t alignedRequest{
+        requestedSize == 0 ? kAlignment : common::ceilDiv(requestedSize, kAlignment) * kAlignment};
+
+    TLLM_LOG_DEBUG("MemoryPool: Requested to reserve %zu B (%zu B aligned)", requestedSize, alignedRequest);
+
+    // Finds first free segment providing sufficient space
+    auto it = std::find_if(mMemorySegments.begin(), mMemorySegments.end(),
+        [alignedRequest](const auto& ms) { return ms.tag == nullptr && ms.size >= alignedRequest; });
+
+    if (it == mMemorySegments.end())
+    {
+        // There is no space available for this request
+        // If the request is bigger than mChunkSize / chunkResizeFactor, adapt mChunkSize to request *
+        // chunkResizeFactor
+        // Allocate more space in mChunkSize, and fulfill this request
+        TLLM_LOG_DEBUG("MemoryPool: Needs more space to accommodate request of %zu B", requestedSize);
+        auto const minChunkSize = alignedRequest * kChunkResizeFactor;
+        if (mChunkSize < minChunkSize)
+        {
+            mChunkSize = minChunkSize;
+            TLLM_LOG_DEBUG("MemoryPool: Increasing chunk size to %zu B", mChunkSize);
+        }
+        allocateChunk();
+        it = std::prev(mMemorySegments.end());
+    }
+
+    // Start of allocation
+    auto const offset = it->offset;
+    auto const basePointer = it->basePointer;
+
+    // Update current segment
+    it->offset += alignedRequest;
+    it->size -= alignedRequest;
+    if (it->size == 0)
+    {
+        it = mMemorySegments.erase(it);
+    }
+
+    // Update pointer
+    *ptr = static_cast<PointerType>(static_cast<std::uint8_t*>(basePointer) + offset);
+
+    // Insert an occupied segment
+    mMemorySegments.insert(it, MemorySegment{basePointer, alignedRequest, offset, *ptr});
+}
+
+template <typename TAllocator>
+void MemoryPool<TAllocator>::deallocateImpl(PointerType tag, SizeType n)
+{
+    std::lock_guard<std::mutex> lock(mLock);
+    auto it = std::find_if(mMemorySegments.begin(), mMemorySegments.end(),
+        [&tag](const MemorySegment& segment) { return segment.tag == tag; });
+
+    TLLM_CHECK_WITH_INFO(it != mMemorySegments.end(), "MemoryPool free: Requested tag %p could not be found", tag);
+
+    // Free found tag
+    it->tag = nullptr;
+
+    if (it->size < n)
+    {
+        TLLM_LOG_WARNING("MemoryPool: Requested to free %zu B, but only %zu B available", n, it->size);
+    }
+
+    // Check if previous segment is free, in which case, join
+    if (it != mMemorySegments.begin())
+    {
+        auto previousIt = std::prev(it);
+        if (previousIt->tag == nullptr && previousIt->basePointer == it->basePointer)
+        {
+            previousIt->size += it->size;
+            // Remove current element, and point to previous one
+            it = std::prev(mMemorySegments.erase(it));
+        }
+    }
+
+    // Check if next segment is free, in which case, join
+    if (std::next(it) != mMemorySegments.end())
+    {
+        auto nextIt = std::next(it);
+        if (nextIt->tag == nullptr && nextIt->basePointer == it->basePointer)
+        {
+            it->size += nextIt->size;
+            // Remove next tag
+            mMemorySegments.erase(nextIt);
+        }
+    }
+}
+
+template <typename TAllocator>
+void MemoryPool<TAllocator>::logSegments() const
+{
+    std::lock_guard<std::mutex> lock(mLock);
+    TLLM_LOG_DEBUG("MemoryPool segments:");
+    for (auto ms : mMemorySegments)
+    {
+        TLLM_LOG_DEBUG("* Segment size %zu, tag %p, basePointer %p", ms.size, ms.tag, ms.basePointer);
+    }
+}
+
+template <typename TAllocator>
+class PoolAllocator : public BaseAllocator<PoolAllocator<TAllocator>, TAllocator::kMemoryType, false>
+{
+    friend class BaseAllocator<PoolAllocator<TAllocator>, TAllocator::kMemoryType, false>;
+
+public:
+    using Base = BaseAllocator<PoolAllocator<TAllocator>, TAllocator::kMemoryType, false>;
+    using PointerType = typename Base::PointerType;
+    using SizeType = typename Base::SizeType;
+    using PoolType = MemoryPool<TAllocator>;
+
+    static PoolType& getPool()
+    {
+        static PoolType pool;
+        return pool;
+    }
+
+protected:
+    void allocateImpl(PointerType* ptr, SizeType n) // NOLINT(readability-convert-member-functions-to-static)
+    {
+        *ptr = getPool().allocate(n);
+    }
+
+    void deallocateImpl( // NOLINT(readability-convert-member-functions-to-static)
+        typename TAllocator::PointerType ptr, SizeType n)
+    {
+        getPool().deallocate(ptr, n);
+    }
+};
+
+using PinnedPoolAllocator = PoolAllocator<PinnedAllocator>;
 
 // Adopted from https://github.com/NVIDIA/TensorRT/blob/release/8.6/samples/common/buffers.h
 
@@ -355,7 +623,7 @@ public:
         {
             mAllocator.deallocate(mBuffer, toBytes(mCapacity));
         }
-        catch (std::exception& e)
+        catch (std::exception const& e)
         {
             TLLM_LOG_EXCEPTION(e);
         }
@@ -383,6 +651,7 @@ private:
 using DeviceBuffer = GenericBuffer<CudaAllocatorAsync>;
 using HostBuffer = GenericBuffer<HostAllocator>;
 using PinnedBuffer = GenericBuffer<PinnedAllocator>;
+using PinnedPoolBuffer = GenericBuffer<PinnedPoolAllocator>;
 
 template <typename T>
 typename std::make_unsigned<T>::type nonNegative(T value)
@@ -470,5 +739,6 @@ private:
 using DeviceTensor = GenericTensor<CudaAllocatorAsync>;
 using HostTensor = GenericTensor<HostAllocator>;
 using PinnedTensor = GenericTensor<PinnedAllocator>;
+using PinnedPoolTensor = GenericTensor<PinnedPoolAllocator>;
 
 } // namespace tensorrt_llm::runtime

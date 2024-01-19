@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -106,12 +106,7 @@ public:
 
     [[nodiscard]] std::vector<SizeType> getPipelineParallelGroup() const;
 
-    static bool validConfig(nvinfer1::ILogger& logger, SizeType tensorParallelism, SizeType pipelineParallelism);
-
-    static WorldConfig mpi(nvinfer1::ILogger& logger, SizeType gpusPerNode = kDefaultGpusPerNode,
-        std::optional<SizeType> tensorParallelism = std::nullopt,
-        std::optional<SizeType> pipelineParallelism = std::nullopt,
-        std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt);
+    static bool validConfig(SizeType tensorParallelism, SizeType pipelineParallelism);
 
     static WorldConfig mpi(SizeType gpusPerNode = kDefaultGpusPerNode,
         std::optional<SizeType> tensorParallelism = std::nullopt,

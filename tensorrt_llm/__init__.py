@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,7 @@ from ._utils import mpi_rank  # NOQA
 from ._utils import mpi_world_size, str_dtype_to_torch, str_dtype_to_trt  # NOQA
 from .builder import Builder, BuilderConfig
 from .functional import Tensor, constant
+from .hlapi.llm import LLM, ModelConfig
 from .logger import logger
 from .mapping import Mapping
 from .module import Module
@@ -55,6 +56,8 @@ __all__ = [
     'models',
     'quantization',
     'tools',
+    'LLM',
+    'ModelConfig',
     '__version__',
 ]
 

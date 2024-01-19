@@ -42,24 +42,25 @@ namespace tensorrt_llm::plugins
 
 // inputs (see GPTAttentionPlugin::isEntryUsed for when each tensor is actually used)
 //     0.  input_tensor [batch_size, seq_len, local_hidden_size + 2 * local_num_kv_heads * head_size] or
-//                      [1, num_tokens, local_hidden_size + 2 * local_num_kv_heads * head_size] when
+//                      [num_tokens, local_hidden_size + 2 * local_num_kv_heads * head_size] when
 //                      enable_remove_input_padding
 //     1.  sequence_length [batch_size] (optional)
 //     2.  host_past_key_value_lengths [batch_size] (int32) (optional)
 //     3.  host_max_attention_window_sizes [1] (int32)
-//     4.  context_lengths [batch_size]
-//     5.  cache_indir [num_gen_requests, beam_width, memory_max_len] (required in beamsearch) (optional)
-//     6.  host_request_types [batch_size] int32. 0: context; 1: generation: 2: none. When not in inflight-batching
+//     4.  host_sink_token_length [1] (int32)
+//     5.  context_lengths [batch_size]
+//     6.  cache_indir [num_gen_requests, beam_width, memory_max_len] (required in beamsearch) (optional)
+//     7.  host_request_types [batch_size] int32. 0: context; 1: generation: 2: none. When not in inflight-batching
 //     mode,
 //                      all elements must be identical.
-//     6.  past_key_value_pool [batch_size, 2, local_num_kv_heads, max_seq_len, head_size] or
+//     8.  past_key_value_pool [batch_size, 2, local_num_kv_heads, max_seq_len, head_size] or
 //         block_pointers [batch_size, 2, max_blocks_per_seq] if paged kv cache (optional)
-//     6.1 host_block_pointers [batch_size, 2, max_blocks_per_seq] if paged kv cache (optional)
-//     7.  kv_cache_quantization_scale [1] (optional)
-//     8.  kv_cache_dequantization_scale [1] (optional)
-//     9.  alibi_slopes [num_heads] (optional for ALiBi position embedding)
-//     10. host_context_lengths [batch_size] int32. (optional, required when remove_input_padding is true)
-//     11. qkv_bias (optional) [local_hidden_size * 3]
+//     8.1 host_block_pointers [batch_size, 2, max_blocks_per_seq] if paged kv cache (optional)
+//     9.  kv_cache_quantization_scale [1] (optional)
+//     10. kv_cache_dequantization_scale [1] (optional)
+//     11. alibi_slopes [num_heads] (optional for ALiBi position embedding)
+//     12. host_context_lengths [batch_size] int32. (optional, required when remove_input_padding is true)
+//     13. qkv_bias (optional) [local_hidden_size * 3]
 //
 // outputs
 //     output_tensor [batch_size, seq_len, local_hidden_size]
@@ -74,10 +75,13 @@ public:
         int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
-        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
-        bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
-        int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled,
-        bool cross_attention = false, int max_distance = 0, bool use_paged_context_fmha = false, bool use_cache = true);
+        bool unfuse_qkv_gemm,                                                                       // for AutoPP
+        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, bool enable_xqa,
+        int kv_cache_quant_mode, bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
+        bool paged_kv_cache, int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length,
+        bool qkv_bias_enabled, bool cross_attention = false, int max_distance = 0, bool pos_shift_enabled = false,
+        bool dense_context_fmha = false, bool use_paged_context_fmha = false, bool use_cache = true,
+        bool is_medusa_enabled = false);
 
     GPTAttentionPlugin(const void* data, size_t length);
 
@@ -139,9 +143,12 @@ private:
     enum class IdxEntry : size_t
     {
         QKV_TENSOR,
+        K_TENSOR,
+        V_TENSOR,
         SEQUENCE_LENGTH,
         HOST_PAST_KEY_VALUE_LENGTHS,
         HOST_MAX_ATTENTION_WINDOW,
+        HOST_SINK_TOKEN_LENGTH,
         CONTEXT_LENGTHS,
         CACHE_INDIR,
         REQUEST_TYPES,
@@ -157,12 +164,18 @@ private:
         ENCODER_INPUT_LENGTH,
         HOST_CONTEXT_LENGTH,
         QKV_BIAS_TENSOR,
+        MEDUSA_PACKED_MASK,
+        MEDUSA_POSITION_OFFSETS,
         ENUM_SIZE,
     };
 
     bool isEntryUsed(const IdxEntry& entry) const;
     void initEntryIdx();
     IndexType getIdx(const IdxEntry& entry) const;
+
+    // Get generation input sequence length (might be larger than 1 in the Medusa mode).
+    int getGenerationInputSequenceLength(
+        const nvinfer1::PluginTensorDesc* inputDesc, int32_t localNbSeq, int32_t localNbTokens) const;
 };
 
 class GPTAttentionPluginCreator : public GPTAttentionPluginCreatorCommon

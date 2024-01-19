@@ -1,0 +1,4 @@
+datasets~=2.14.5
+evaluate~=0.4.1
+rouge_score~=0.1.2
+einops~=0.7.0

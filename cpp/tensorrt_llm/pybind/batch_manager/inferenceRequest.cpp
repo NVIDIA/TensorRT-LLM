@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,11 +17,11 @@
 #include "inferenceRequest.h"
 
 #include "tensorrt_llm/batch_manager/inferenceRequest.h"
+#include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
 #include <memory>
 
 #include <pybind11/functional.h>
-#include <pybind11/operators.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
 
@@ -32,14 +32,19 @@ using namespace tensorrt_llm::pybind::batch_manager;
 
 namespace
 {
-
-void copy_tensor(NamedTensor const& src, tb::NamedTensor& dst)
+std::shared_ptr<InferenceRequest> fromTrtLlm(tb::InferenceRequest const& request)
 {
-    TLLM_CHECK_WITH_INFO(src.name == dst.name, "names do not match: %s != %s", src.name.c_str(), dst.name.c_str());
-    if (src.tensor.has_value())
+    InferenceRequest::TensorMap tensorMap;
+    for (auto const& [name, tensor] : request.getInputTensors())
     {
-        dst.tensor = tr::TorchView::of(src.tensor.value());
+        if (tensor)
+        {
+            tensorMap[name] = tr::Torch::tensor(tensor);
+        }
     }
+    auto inferenceRequest = std::make_shared<InferenceRequest>(request.getRequestId(), std::move(tensorMap));
+    inferenceRequest->setIsStreaming(request.isStreaming());
+    return inferenceRequest;
 }
 } // namespace
 
@@ -53,9 +58,24 @@ std::shared_ptr<tb::InferenceRequest> InferenceRequest::toTrtLlm() const
             tensorMap[name] = tr::TorchView::of(tensor.value());
         }
     }
-    auto inferenceRequest = std::make_shared<tb::InferenceRequest>(tensorMap, mRequestId);
+    auto inferenceRequest = std::make_shared<tb::InferenceRequest>(std::move(tensorMap), mRequestId);
     inferenceRequest->setIsStreaming(isStreaming());
     return inferenceRequest;
+}
+
+std::string InferenceRequest::serialize() const
+{
+    std::vector<std::int64_t> serialized{toTrtLlm()->serialize()};
+    static_assert(sizeof(decltype(serialized)::value_type) / sizeof(char) == 8);
+    return {reinterpret_cast<char const*>(serialized.data()), serialized.size() * 8};
+}
+
+std::shared_ptr<InferenceRequest> InferenceRequest::deserialize(std::string const& serialized)
+{
+    TLLM_CHECK(serialized.size() % 8 == 0);
+    auto data = reinterpret_cast<std::int64_t const*>(serialized.data());
+    auto request = tb::InferenceRequest::deserialize(std::vector<std::int64_t>(data, data + serialized.size() / 8));
+    return fromTrtLlm(*request);
 }
 
 void InferenceRequest::initBindings(py::module_& m)
@@ -86,6 +106,8 @@ void InferenceRequest::initBindings(py::module_& m)
         .def_property("min_length", &InferenceRequest::getMinLengthUnchecked, &InferenceRequest::setMinLength)
         .def_property(
             "presence_penalty", &InferenceRequest::getPresencePenaltyUnchecked, &InferenceRequest::setPresencePenalty)
+        .def_property("frequency_penalty", &InferenceRequest::getFrequencyPenaltyUnchecked,
+            &InferenceRequest::setFrequencyPenalty)
         .def_property("random_seed", &InferenceRequest::getRandomSeedUnchecked, &InferenceRequest::setRandomSeed)
         .def_property(
             "return_log_probs", &InferenceRequest::getReturnLogProbsUnchecked, &InferenceRequest::setReturnLogProbs)
@@ -93,6 +115,15 @@ void InferenceRequest::initBindings(py::module_& m)
             &InferenceRequest::setPromptEmbeddingTable)
         .def_property(
             "prompt_vocab_size", &InferenceRequest::getPromptVocabSizeUnchecked, &InferenceRequest::setPromptVocabSize)
+        .def_property("lora_weights", &InferenceRequest::getLoraWeightsUnchecked, &InferenceRequest::setLoraWeights)
+        .def_property("lora_config", &InferenceRequest::getLoraConfigUnchecked, &InferenceRequest::setLoraConfig)
         .def_property("is_streaming", &InferenceRequest::isStreaming, &InferenceRequest::setIsStreaming)
-        .def_property_readonly("request_id", &InferenceRequest::getRequestId);
+        .def_property_readonly("request_id", &InferenceRequest::getRequestId)
+        .def(py::pickle(
+            [](const InferenceRequest& p) { // __getstate__
+                return py::bytearray(p.serialize());
+            },
+            [](py::bytearray const& t) { // __setstate__
+                return *InferenceRequest::deserialize(static_cast<std::string>(t));
+            }));
 }

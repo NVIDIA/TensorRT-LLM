@@ -5,6 +5,8 @@ from typing import List, Optional
 
 import safetensors
 
+from tensorrt_llm.plugin.plugin import init_all_reduce_helper
+
 from .._common import default_net
 from .._utils import str_dtype_to_trt
 from ..functional import PositionEmbeddingType, Tensor, gather_last_token_logits
@@ -18,14 +20,30 @@ from .generation_mixin import GenerationMixin
 
 class PretrainedConfig:
 
-    def __init__(self, architecture: str, dtype: str, logits_dtype: str,
-                 vocab_size: int, max_position_embeddings: int,
-                 hidden_size: int, num_hidden_layers: int,
-                 num_attention_heads: int, num_key_value_heads: int,
-                 hidden_act: str, intermediate_size: int, norm_epsilon: float,
-                 position_embedding_type: str, world_size: int, tp_size: int,
-                 pp_size: int, quant_mode: QuantMode, quant_kwargs: dict,
-                 use_prompt_tuning: bool, **kwargs):
+    def __init__(self,
+                 architecture: str,
+                 dtype: str,
+                 logits_dtype: str,
+                 vocab_size: int,
+                 max_position_embeddings: int,
+                 hidden_size: int,
+                 num_hidden_layers: int,
+                 num_attention_heads: int,
+                 num_key_value_heads: int,
+                 hidden_act: str,
+                 intermediate_size: int,
+                 norm_epsilon: float,
+                 position_embedding_type: str,
+                 world_size: int,
+                 tp_size: int,
+                 pp_size: int,
+                 quant_mode: QuantMode,
+                 quant_kwargs: dict,
+                 use_prompt_tuning: bool = False,
+                 use_parallel_embedding: bool = False,
+                 embedding_sharding_dim: int = 0,
+                 share_embedding_table: bool = False,
+                 **kwargs):
         self.architecture = architecture
         self.dtype = dtype
         self.logits_dtype = logits_dtype
@@ -42,6 +60,9 @@ class PretrainedConfig:
         self.position_embedding_type = PositionEmbeddingType.from_string(
             position_embedding_type)
         self.use_prompt_tuning = use_prompt_tuning
+        self.use_parallel_embedding = use_parallel_embedding
+        self.embedding_sharding_dim = embedding_sharding_dim
+        self.share_embedding_table = share_embedding_table
         self.mapping = Mapping(world_size=world_size,
                                tp_size=tp_size,
                                pp_size=pp_size)
@@ -81,15 +102,26 @@ class PretrainedConfig:
         intermediate_size = config.pop('intermediate_size', None)
         max_position_embeddings = config.pop('max_position_embeddings', None)
         use_prompt_tuning = config.pop('use_prompt_tuning', False)
+        use_parallel_embedding = config.pop('use_parallel_embedding', False)
+        embedding_sharding_dim = config.pop('embedding_sharding_dim', 0)
+        share_embedding_table = config.pop('share_embedding_table', False)
 
         mapping = config.pop('mapping', {
             'world_size': 1,
             'tp_size': 1,
-            'pp_size': 0
+            'pp_size': 1
         })
         world_size = mapping.get('world_size', 1)
         tp_size = mapping.get('tp_size', 1)
         pp_size = mapping.get('pp_size', 1)
+
+        if share_embedding_table and mapping.tp_size > 1:
+            if (not use_parallel_embedding) or (use_parallel_embedding and
+                                                embedding_sharding_dim == 1):
+                raise NotImplementedError(
+                    "For multiple-processes cases, sharing the embedding table must set" \
+                        "use_parallel_embedding=True and embedding_sharding_dim=0"
+                )
 
         quantization = config.pop(
             'quantization', {
@@ -98,6 +130,9 @@ class PretrainedConfig:
                 'per_token': False,
                 'per_group': False,
                 'group_size': 128,
+                'zero': False,
+                'pre_quant_scale': False,
+                'exclude_modules': None,
                 'int8_kv_cache': False,
                 'enable_fp8': False,
                 'fp8_kv_cache': False,
@@ -109,6 +144,9 @@ class PretrainedConfig:
         per_token = quantization.get('per_token', False)
         per_group = quantization.get('per_group', False)
         group_size = quantization.get('group_size', 128)
+        zero = quantization.get('zero', False)
+        pre_quant_scale = quantization.get('pre_quant_scale', False)
+        exclude_modules = quantization.get('exclude_modules', None)
         int8_kv_cache = quantization.get('int8_kv_cache', False)
         enable_fp8 = quantization.get('enable_fp8', False)
         fp8_kv_cache = quantization.get('fp8_kv_cache', False)
@@ -137,14 +175,20 @@ class PretrainedConfig:
             use_fp8_qdq=enable_fp8,
         )
 
-        quant_kwargs = {'group_size': group_size}
+        quant_kwargs = {
+            'group_size': group_size,
+            'zero': zero,
+            'pre_quant_scale': pre_quant_scale,
+            'exclude_modules': exclude_modules,
+        }
 
         return cls(architecture, dtype, logits_dtype, vocab_size,
                    max_position_embeddings, hidden_size, num_hidden_layers,
                    num_attention_heads, num_key_value_heads, hidden_act,
                    intermediate_size, norm_epsilon, position_embedding_type,
                    world_size, tp_size, pp_size, quant_mode, quant_kwargs,
-                   use_prompt_tuning, **config)
+                   use_prompt_tuning, use_parallel_embedding,
+                   embedding_sharding_dim, share_embedding_table, **config)
 
     @classmethod
     def from_json_file(cls, config_file: str):
@@ -174,6 +218,12 @@ class PretrainedConfig:
             self.quant_mode.has_per_group_scaling(),
             'group_size':
             self.quant_kwargs.get('group_size', 128),
+            'zero':
+            self.quant_kwargs.get('zero', False),
+            'pre_quant_scale':
+            self.quant_kwargs.get('pre_quant_scale', False),
+            'exclude_modules':
+            self.quant_kwargs.get('exclude_modules', None),
             'int8_kv_cache':
             self.quant_mode.has_int8_kv_cache(),
             'enable_fp8':
@@ -207,7 +257,6 @@ class DecoderLayerList(ModuleList):
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
-                all_reduce_workspace=None,
                 lora_params=None):
         kv_cache_params.fill_none_tensor_list(len(self.layer_list))
 
@@ -227,8 +276,6 @@ class DecoderLayerList(ModuleList):
                 lora_param = lora_params.get_layer_params(layer_idx)
 
             kwargs = {}
-            if all_reduce_workspace is not None:
-                kwargs['all_reduce_workspace'] = all_reduce_workspace
             if lora_param is not None:
                 kwargs['lora_param'] = lora_param
             hidden_states = layer(
@@ -240,6 +287,8 @@ class DecoderLayerList(ModuleList):
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
                     host_max_attention_window_sizes=max_attention_window_size,
+                    host_sink_token_length=kv_cache_params.
+                    host_sink_token_length,
                     kv_cache_block_pointers=[pointer],
                     host_kv_cache_block_pointers=[host_pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
@@ -270,23 +319,21 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
         self.config = config
 
     def __post_init__(self):
-        self.check_config()
-        quantize(self, self.config.quant_mode)
-
-    def check_config(self):
-        raise NotImplementedError(
-            f"{self.__class__} is an abstract class. Only classes inheriting this class can be called."
-        )
+        quantize(self, self.config.quant_mode, **self.config.quant_kwargs)
 
     @classmethod
     def from_config(cls, config: PretrainedConfig):
         return cls(config)
 
     @classmethod
-    def from_checkpoint(cls, ckpt_dir: str, rank: int = 0):
-        config = PretrainedConfig.from_json_file(
-            os.path.join(ckpt_dir, 'config.json'))
-        config.set_rank(rank)
+    def from_checkpoint(cls,
+                        ckpt_dir: str,
+                        rank: int = 0,
+                        config: PretrainedConfig = None):
+        if config is None:
+            config = PretrainedConfig.from_json_file(
+                os.path.join(ckpt_dir, 'config.json'))
+            config.set_rank(rank)
         model = cls.from_config(config)
 
         weights = {}
@@ -302,9 +349,17 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
         return model
 
     def load(self, weights):
+        expected_names = set([name for name, param in self.named_parameters()])
+        provided_names = set(weights.keys())
+        if provided_names != expected_names:
+            err_msg = "Provided tensor names are different from those expected by the engine."
+            if expected_names.difference(provided_names):
+                err_msg += f"\nExpected but not provided tensors: {expected_names.difference(provided_names)}"
+            if provided_names.difference(expected_names):
+                err_msg += f"\nProvided but not expected tensors: {provided_names.difference(expected_names)}"
+            raise RuntimeError(err_msg)
+
         for name, param in self.named_parameters():
-            if name not in weights:
-                continue
             param.value = weights[name]
 
     def prepare_inputs(self,
@@ -315,7 +370,8 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
                        max_beam_width: int = 1,
                        max_num_tokens: int = None,
                        prompt_embedding_table_size: int = 0,
-                       gather_all_token_logits: bool = False,
+                       gather_context_logits: bool = False,
+                       gather_generation_logits: bool = False,
                        lora_target_modules: List[str] = None):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
@@ -354,7 +410,8 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
             dtype=str_dtype_to_trt(self.config.dtype),
             prompt_embedding_table_size=prompt_embedding_table_size,
             mapping=self.config.mapping,
-            gather_all_token_logits=gather_all_token_logits,
+            gather_context_logits=gather_context_logits,
+            gather_generation_logits=gather_generation_logits,
             use_custom_all_reduce=use_custom_all_reduce,
             use_lora_plugin=use_lora_plugin,
             lora_target_modules=lora_target_modules)
@@ -377,6 +434,7 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
                     'host_past_key_value_lengths'],
                 host_max_attention_window_sizes=model_inputs[
                     'host_max_attention_window_sizes'],
+                host_sink_token_length=model_inputs['host_sink_token_length'],
                 kv_cache_block_pointers=model_inputs[
                     'kv_cache_block_pointers_list'],
                 host_kv_cache_block_pointers=model_inputs[
@@ -395,13 +453,10 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
         if prompt_embedding_table_size > 0:
             result['prompt_embedding_table'] = model_inputs[
                 'prompt_embedding_table']
-            result['tasks'] = model_inputs['tasks']
+            result['prompt_tasks'] = model_inputs['tasks']
             result['prompt_vocab_size'] = model_inputs['prompt_vocab_size']
         if model_inputs['hidden_states_input'] is not None:
-            result['hidden_states_input'] = model_inputs['hidden_states_input']
-        if model_inputs['all_reduce_workspace'] is not None:
-            result['all_reduce_workspace'] = model_inputs[
-                'all_reduce_workspace']
+            result['hidden_states'] = model_inputs['hidden_states_input']
         if use_lora_plugin:
             result['lora_params'] = LoraParams(
                 model_inputs['lora_ranks'],
@@ -429,11 +484,11 @@ class DecoderModelForCausalLM(PretrainedModel):
                 kv_cache_params=None,
                 attention_params=None,
                 hidden_states=None,
-                all_reduce_workspace=None,
                 prompt_embedding_table: Optional[Tensor] = None,
                 prompt_tasks: Optional[Tensor] = None,
                 prompt_vocab_size: Optional[Tensor] = None,
                 lora_params=None):
+        init_all_reduce_helper()
         kwargs = {
             'input_ids': input_ids,
             'position_ids': position_ids,
@@ -442,8 +497,6 @@ class DecoderModelForCausalLM(PretrainedModel):
             'kv_cache_params': kv_cache_params,
             'attention_params': attention_params,
         }
-        if all_reduce_workspace is not None:
-            kwargs['all_reduce_workspace'] = all_reduce_workspace
         if lora_params is not None:
             kwargs['lora_params'] = lora_params
         if hidden_states is not None:
@@ -469,7 +522,7 @@ class DecoderModelForCausalLM(PretrainedModel):
             lm_logits = self.lm_head(hidden_states)
             lm_logits.mark_output('logits', self.config.logits_dtype)
         else:
-            hidden_states.mark_output('hidden_states_output', self.dtype)
+            hidden_states.mark_output('hidden_states_output', self.config.dtype)
 
         if use_cache and default_net().plugin_config.paged_kv_cache == False:
             for i, present in zip(

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -68,6 +68,16 @@ BufferManager::IBufferPtr BufferManager::pinned(std::size_t size, nvinfer1::Data
 BufferManager::ITensorPtr BufferManager::pinned(nvinfer1::Dims dims, nvinfer1::DataType type)
 {
     return std::make_unique<PinnedTensor>(dims, type);
+}
+
+BufferManager::IBufferPtr BufferManager::pinnedPool(std::size_t size, nvinfer1::DataType type)
+{
+    return std::make_unique<PinnedPoolBuffer>(size, type);
+}
+
+BufferManager::ITensorPtr BufferManager::pinnedPool(nvinfer1::Dims dims, nvinfer1::DataType type)
+{
+    return std::make_unique<PinnedPoolTensor>(dims, type);
 }
 
 void BufferManager::setZero(IBuffer& buffer) const

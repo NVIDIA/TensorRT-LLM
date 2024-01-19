@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -79,6 +79,10 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
                 name='host_max_attention_window_sizes',
                 shape=shape_dict['host_max_attention_window_sizes'],
                 dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            host_sink_token_length_tensor = Tensor(
+                name='host_sink_token_length',
+                shape=shape_dict['host_sink_token_length'],
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
             context_lengths_tensor = Tensor(
                 name='context_lengths',
                 shape=shape_dict['context_lengths'],
@@ -128,6 +132,7 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
                 host_past_key_value_lengths=host_past_key_value_lengths_tensor,
                 host_max_attention_window_sizes=
                 host_max_attention_window_sizes_tensor,
+                host_sink_token_length=host_sink_token_length_tensor,
                 context_lengths=context_lengths_tensor,
                 cache_indirection=cache_indirection_tensor,
                 host_request_types=host_request_types_tensor,
@@ -178,7 +183,8 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
         'input': (batch_size, in_len, hidden_size),
         'output': (batch_size, in_len, hidden_size),
         'host_past_key_value_lengths': (batch_size, ),
-        'host_max_attention_window_sizes': (1, )
+        'host_max_attention_window_sizes': (1, ),
+        'host_sink_token_length': (1, )
     }
 
     weight = torch.randn(shape_dict['weight'],

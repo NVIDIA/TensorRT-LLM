@@ -7,9 +7,9 @@ multiple GPUs or multiple nodes with multiple GPUs.
 
 ### 1. Build TensorRT-LLM and benchmarking source code
 
-Please follow the [`installation document`](../../docs/source/installation.md) to build TensorRT-LLM.
+Please follow the [`installation document`](../../README.md#installation) to build TensorRT-LLM.
 
-Note that the benchmarking source code for C++ runtime is not built by default, you can use the argument `--benchmarks` in [`build_wheel.py`](../../scripts/build_wheel.py) to build that.
+Note that the benchmarking source code for C++ runtime is not built by default, you can use the argument `--benchmarks` in [`build_wheel.py`](source:scripts/build_wheel.py) to build the corresponding executable.
 
 Windows users: Follow the
 [`Windows installation document`](../../windows/README.md)
@@ -22,7 +22,7 @@ instead, and be sure to set DLL paths as specified in
 
 Before you launch C++ benchmarking, please make sure that you have already built engine(s) using TensorRT-LLM API, C++ benchmarking code cannot generate engine(s) for you.
 
-You can use the [`build.py`](../python/build.py) script to build the engine(s). Alternatively, if you have already benchmarked Python Runtime, you can reuse the engine(s) built by benchmarking code, please see that [`document`](../python/README.md).
+You can use the [`build.py`](source:benchmarks/python/build.py) script to build the engine(s). Alternatively, if you have already benchmarked Python Runtime, you can reuse the engine(s) built previously, please see that [`document`](../python/README.md).
 
 ####  Launch benchmarking
 
@@ -59,7 +59,9 @@ mpirun -n 8 ./benchmarks/gptSessionBenchmark \
 # [BENCHMARK] batch_size 1 input_length 60 output_length 20 latency(ms) 792.14
 ```
 
-If you want to obtain context and generation logits, you could build an enigne with `--gather_all_token_logits` and run gptSessionBenchmark with `--print_all_logits`. This will print a large number of logit values and has a certain impact on performance.
+If you want to obtain context and generation logits, you could build an enigne with `--gather_context_logits` and `--gather_generation_logits`, respectively. Enable `--gather_all_token_logits` will enable both of them.
+
+If you want to get the logits, you could run gptSessionBenchmark with `--print_all_logits`. This will print a large number of logit values and has a certain impact on performance.
 
 *Please note that the expected outputs in that document are only for reference, specific performance numbers depend on the GPU you're using.*
 

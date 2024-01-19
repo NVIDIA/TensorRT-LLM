@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
@@ -29,27 +30,39 @@ namespace tensorrt_llm::runtime
 class NcclCommunicator
 {
 public:
-    template <typename T>
-    void send(T* sendbuff, size_t count, int peer, CudaStream const& stream) const;
+    explicit NcclCommunicator(ncclComm_t comm)
+        : mComm{comm} {};
 
-    template <typename T>
+    explicit NcclCommunicator(int worldSize, int rank, mpi::MpiComm const& mpiComm = COMM_SESSION)
+        : mComm{createComm(worldSize, rank, mpiComm)} {};
+
+    explicit NcclCommunicator(WorldConfig const& worldConfig, mpi::MpiComm const& mpiComm = COMM_SESSION)
+        : NcclCommunicator{worldConfig.getSize(), worldConfig.getRank(), mpiComm} {};
+
+    ~NcclCommunicator();
+
+    // no copy
+    NcclCommunicator(const NcclCommunicator&) = delete;
+    NcclCommunicator& operator=(const NcclCommunicator&) = delete;
+
     void send(IBuffer const& buf, int peer, CudaStream const& stream) const
     {
-        send(bufferCast<T>(buf), buf.getSize(), peer, stream);
+        send(buf.data(), buf.getSize(), buf.getDataType(), peer, stream);
     }
 
-    template <typename T>
-    void receive(T* sendbuff, size_t count, int peer, CudaStream const& stream) const;
-
-    template <typename T>
     void receive(IBuffer& buf, int peer, CudaStream const& stream) const
     {
-        receive(bufferCast<T>(buf), buf.getSize(), peer, stream);
+        receive(buf.data(), buf.getSize(), buf.getDataType(), peer, stream);
     }
 
-    static std::shared_ptr<NcclCommunicator> createPipelineComm(WorldConfig const& worldConfig);
-
 private:
+    void send(
+        void const* sendbuff, size_t count, nvinfer1::DataType dataType, int peer, CudaStream const& stream) const;
+
+    void receive(void* sendbuff, size_t count, nvinfer1::DataType dataType, int peer, CudaStream const& stream) const;
+
+    static ncclComm_t createComm(int worldSize, int rank, mpi::MpiComm const& mpiComm);
+
     ncclComm_t mComm;
 };
 

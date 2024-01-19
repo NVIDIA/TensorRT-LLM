@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,7 +48,6 @@ MODEL_NAME = "internlm"
 # are direct copy from gpt example, TODO: put in utils?
 
 import onnx
-import tensorrt as trt
 from onnx import TensorProto, helper
 
 
@@ -143,6 +142,14 @@ def parse_arguments():
         default='model.cache',
         help=
         'The path of to read timing cache from, will be ignored if the file does not exist'
+    )
+    parser.add_argument(
+        '--profiling_verbosity',
+        type=str,
+        default='layer_names_only',
+        choices=['layer_names_only', 'detailed', 'none'],
+        help=
+        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
     )
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument('--vocab_size', type=int, default=103168)
@@ -308,6 +315,11 @@ def parse_arguments():
         'You must also use --use_weight_only for that argument to have an impact.'
     )
     parser.add_argument(
+        '--quantize_lm_head',
+        default=False,
+        action="store_true",
+        help='Quantize lm_head weights as well when using int4_awq.')
+    parser.add_argument(
         '--use_inflight_batching',
         action="store_true",
         default=False,
@@ -406,7 +418,6 @@ def parse_arguments():
 
     # Since gpt_attenttion_plugin is the only way to apply RoPE now,
     # force use the plugin for now with the correct data type.
-    args.use_gpt_attention_plugin = args.dtype
     if args.model_dir is not None:
         hf_config = AutoConfig.from_pretrained(args.model_dir,
                                                trust_remote_code=True)
@@ -450,7 +461,7 @@ def parse_arguments():
         args.rms_norm_eps = 1e-06
         logger.warning("Set rms_norm_eps to 1e-06 directly.")
         args.attn_bias = attn_bias
-    assert args.use_gpt_attention_plugin, "InternLM must use gpt attention plugin"
+
     if args.n_kv_head is None:
         args.n_kv_head = args.n_head
     elif args.n_kv_head != args.n_head:
@@ -460,10 +471,13 @@ def parse_arguments():
             "MQA/GQA requires either the number of K/V heads to be divisible by the tensor parallelism size OR " \
             "the tensor parallelism size to be divisible by the number of K/V heads."
 
-    if args.dtype == 'bfloat16':
-        assert args.use_gemm_plugin, "Please use gemm plugin when dtype is bfloat16"
-
     assert args.pp_size * args.tp_size == args.world_size
+
+    if args.weight_only_precision == 'int4_awq' and args.quantize_lm_head:
+        if args.vocab_size % 64 != 0:
+            args.vocab_size = int((args.vocab_size + 63) / 64) * 64
+            logger.info("To use awq we pad vocab_size to {}.".format(
+                args.vocab_size))
 
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha
@@ -535,12 +549,14 @@ def build_rank_engine(builder: Builder,
             tensorrt_llm_internlm = quantize_model(tensorrt_llm_internlm,
                                                    args.quant_mode)
         elif args.weight_only_precision == 'int4_awq':
-            tensorrt_llm_internlm = quantize_model(model=tensorrt_llm_internlm,
-                                                   quant_mode=args.quant_mode,
-                                                   group_size=args.group_size,
-                                                   zero=False,
-                                                   pre_quant_scale=True,
-                                                   exclude_modules=[])
+            exclude_modules = ['lm_head'] if not args.quantize_lm_head else []
+            tensorrt_llm_internlm = quantize_model(
+                model=tensorrt_llm_internlm,
+                quant_mode=args.quant_mode,
+                group_size=args.group_size,
+                zero=False,
+                pre_quant_scale=True,
+                exclude_modules=exclude_modules)
         elif args.weight_only_precision == 'int4_gptq':
             tensorrt_llm_internlm = quantize_model(model=tensorrt_llm_internlm,
                                                    quant_mode=args.quant_mode,
@@ -556,12 +572,20 @@ def build_rank_engine(builder: Builder,
         tensorrt_llm_internlm = quantize_model(tensorrt_llm_internlm,
                                                quant_mode=args.quant_mode,
                                                quant_scales=quant_scales)
+
+    use_gemm_woq_plugin = args.use_gemm_plugin and args.use_weight_only
     if args.per_group:
-        load_func = load_from_awq_internlm if args.weight_only_precision == 'int4_awq' else load_from_gptq_internlm
-        load_func(tensorrt_llm_internlm=tensorrt_llm_internlm,
-                  quant_ckpt_path=args.quant_ckpt_path,
-                  mapping=mapping,
-                  dtype=args.dtype)
+        if args.weight_only_precision == 'int4_awq':
+            load_from_awq_internlm(tensorrt_llm_internlm=tensorrt_llm_internlm,
+                                   quant_ckpt_path=args.quant_ckpt_path,
+                                   quantize_lm_head=args.quantize_lm_head,
+                                   mapping=mapping,
+                                   dtype=args.dtype)
+        else:
+            load_from_gptq_internlm(tensorrt_llm_internlm=tensorrt_llm_internlm,
+                                    quant_ckpt_path=args.quant_ckpt_path,
+                                    mapping=mapping,
+                                    dtype=args.dtype)
     elif args.meta_ckpt_dir is not None:
         load_from_meta_internlm(tensorrt_llm_internlm, args.meta_ckpt_dir,
                                 mapping, args.dtype)
@@ -582,14 +606,17 @@ def build_rank_engine(builder: Builder,
         load_from_hf_internlm(tensorrt_llm_internlm,
                               hf_internlm,
                               mapping=mapping,
-                              dtype=args.dtype)
+                              dtype=args.dtype,
+                              use_gemm_woq_plugin=use_gemm_woq_plugin)
         del hf_internlm
     elif args.ft_model_dir is not None:
         load_from_binary(tensorrt_llm_internlm,
                          args.ft_model_dir,
                          mapping,
                          fp16=(args.dtype == 'float16'),
-                         multi_query_mode=(args.n_kv_head != args.n_head))
+                         multi_query_mode=(args.n_kv_head != args.n_head),
+                         dtype=args.dtype,
+                         use_gemm_woq_plugin=use_gemm_woq_plugin)
 
     # Module -> Network
     network = builder.create_network()
@@ -616,7 +643,7 @@ def build_rank_engine(builder: Builder,
             ContextFMHAType.enabled_with_fp32_acc)
     if args.multi_block_mode:
         network.plugin_config.enable_mmha_multi_block_mode()
-    if args.use_weight_only:
+    if args.use_weight_only and args.use_gemm_plugin:
         if args.per_group:
             network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
                 dtype='float16')
@@ -679,13 +706,18 @@ def build(rank, args):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
-        # NOTE: when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
-        int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
-            not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
+        # NOTE: int8 flag is required to be true when INT8 tensors are exposed to TRT
+        # TRT-LLM has INT8 I/O when act/weights are quantized without group-scaling (AWQ, GPTQ)
+        # OR INT8 KV cache is set to contiguous (without paged KV cache enabled).
+        int8_trt_flag = (args.quant_mode.has_act_or_weight_quant()
+                         and not args.quant_mode.has_per_group_scaling()) or (
+                             not args.paged_kv_cache
+                             and args.quant_mode.has_int8_kv_cache())
         builder_config = builder.create_builder_config(
             name=MODEL_NAME,
             precision=args.dtype,
             timing_cache=args.timing_cache if cache is None else cache,
+            profiling_verbosity=args.profiling_verbosity,
             tensor_parallel=args.tp_size,
             pipeline_parallel=args.pp_size,
             parallel_build=args.parallel_build,

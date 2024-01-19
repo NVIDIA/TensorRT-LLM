@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -65,6 +65,12 @@ public:
 
     //! \brief Allocates a pinned `ITensor` of the given dimensions on the CPU.
     [[nodiscard]] static ITensorPtr pinned(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
+
+    //! \brief Allocates a pinned `IBuffer` of the given size on the CPU in the default memory pool.
+    [[nodiscard]] static IBufferPtr pinnedPool(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE);
+
+    //! \brief Allocates a pinned `ITensor` of the given dimensions on the CPU in the default memory pool.
+    [[nodiscard]] static ITensorPtr pinnedPool(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates an `IBuffer` of the given size and memory type.
     [[nodiscard]] IBufferPtr allocate(

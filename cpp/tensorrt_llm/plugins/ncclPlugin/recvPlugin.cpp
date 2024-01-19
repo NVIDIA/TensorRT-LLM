@@ -16,6 +16,10 @@
  */
 #include "recvPlugin.h"
 
+#include "tensorrt_llm/common/mpiUtils.h"
+
+#include <nccl.h>
+
 using namespace nvinfer1;
 using tensorrt_llm::plugins::RecvPluginCreator;
 using tensorrt_llm::plugins::RecvPlugin;
@@ -119,13 +123,8 @@ int RecvPlugin::initialize() noexcept
     {
         return 0;
     }
-    int myRank, nRanks;
-    MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &myRank));
-    MPICHECK(MPI_Comm_size(MPI_COMM_WORLD, &nRanks));
-
     ncclUniqueId id;
-    MPI_Status status;
-    MPICHECK(MPI_Recv(&id, sizeof(id), MPI_BYTE, mSrcRank, 0, MPI_COMM_WORLD, &status));
+    COMM_SESSION.recv(id, mSrcRank, 0);
     NCCLCHECK(ncclCommInitRank(&mComm, 2, id, 1));
     return 0;
 }

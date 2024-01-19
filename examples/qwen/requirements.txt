@@ -1,7 +1,7 @@
-datasets~=2.3.2
+datasets~=2.14.5
 evaluate~=0.4.1
 rouge_score~=0.1.2
-transformers~=4.33.1
+transformers~=4.36.1
 transformers-stream-generator
 sentencepiece~=0.1.99
 tiktoken

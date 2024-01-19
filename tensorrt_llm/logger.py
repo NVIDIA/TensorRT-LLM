@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -51,6 +51,7 @@ class Logger(metaclass=Singleton):
         if invalid_severity:
             min_severity = "warning"
 
+        self._min_severity = min_severity
         self._trt_logger = trt.Logger(severity_map[min_severity][0])
         logging.basicConfig(level=severity_map[min_severity][1],
                             format='[%(asctime)s] %(message)s',
@@ -105,12 +106,17 @@ class Logger(metaclass=Singleton):
     def debug(self, msg):
         self.log(self.VERBOSE, msg)
 
+    @property
+    def level(self) -> str:
+        return self._min_severity
+
     def set_level(self, min_severity):
         if self._set_from_env:
             self.warning(
                 f"Logger level already set from environment. Discard new verbosity: {min_severity}"
             )
             return
+        self._min_severity = min_severity
         self._trt_logger.min_severity = severity_map[min_severity][0]
         self._logger.setLevel(severity_map[min_severity][1])
         if self._polygraphy_logger is not None:

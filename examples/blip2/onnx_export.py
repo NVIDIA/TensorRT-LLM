@@ -3,45 +3,42 @@ import os
 import requests
 import torch
 from PIL import Image
-
-# In docker environment
-if os.getcwd().startswith('/workspace'):
-    os.environ['TORCH_HOME'] = '/workspace/.cache'
-    os.environ['TRANSFORMERS_CACHE'] = '/workspace/.cache'
-
-from lavis.models import load_model_and_preprocess
+from transformers import Blip2ForConditionalGeneration, Blip2Processor
 
 img_url = 'https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png'
 raw_image = Image.open(requests.get(img_url, stream=True).raw).convert('RGB')
 
 device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
-model, vis_processors, _ = load_model_and_preprocess(
-    name="blip2_opt",
-    model_type="pretrain_opt2.7b",
-    is_eval=True,
-    device=device)
+processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
+model = Blip2ForConditionalGeneration.from_pretrained(
+    "Salesforce/blip2-opt-2.7b", torch_dtype=torch.float16)
+model.to(device)
+prompt = "Question: which city is this? Answer:"
+inputs = processor(images=raw_image, text=prompt,
+                   return_tensors="pt").to(device, torch.float16)
+image = inputs['pixel_values']
+for k in inputs.keys():
+    print(k, inputs[k].shape)
+generated_ids = model.generate(**inputs)
+generated_text = processor.batch_decode(generated_ids,
+                                        skip_special_tokens=True)[0].strip()
+print(generated_text)
 
-image = vis_processors["eval"](raw_image).unsqueeze(0).to(device)
-
-torch.save(model.query_tokens, 'query_tokens.pt')
+if not os.path.exists('query_tokens.pt'):
+    torch.save(model.query_tokens, 'query_tokens.pt')
 
 if not os.path.exists('image.pt'):
     torch.save(image, 'image.pt')
 
-txt_caption = model.generate({
-    "image": image,
-    "prompt": "Question: which city is this? Answer:"
-})
-print(txt_caption)
+visual_wrapper = model.vision_model
 
-visual_wrapper = torch.nn.Sequential(model.visual_encoder, model.ln_vision)
-visual_wrapper.float()
-image_embeds = visual_wrapper(image)
-# torch.save(image_embeds, 'image_embeds.pt')
+vision_outputs = visual_wrapper(image)
+image_embeds = vision_outputs[0]
+print('image_embeds: ', image_embeds.shape)
 
 os.system('mkdir -p ./onnx/visual_encoder')
-torch.onnx.export(visual_wrapper.cpu(),
-                  image.cpu(),
+torch.onnx.export(visual_wrapper,
+                  image,
                   './onnx/visual_encoder/visual_encoder.onnx',
                   opset_version=17,
                   input_names=['input'],
@@ -51,7 +48,7 @@ torch.onnx.export(visual_wrapper.cpu(),
                   }})
 
 image_atts = torch.ones(image_embeds.size()[:-1],
-                        dtype=torch.long).to(image.device)
+                        dtype=torch.long).to(image_embeds.device)
 query_tokens = model.query_tokens.expand(image_embeds.shape[0], -1, -1)
 
 
@@ -70,7 +67,7 @@ class Qformer_wrapper(torch.nn.Module):
         return self.opt_proj(query_output.last_hidden_state)
 
 
-q_wrapper = Qformer_wrapper(model.Qformer.bert, model.opt_proj)
+q_wrapper = Qformer_wrapper(model.qformer, model.language_projection)
 inputs_opt = q_wrapper(query_tokens, image_embeds, image_atts)
 # torch.save(inputs_opt, 'inputs_opt.pt')
 os.system('mkdir -p ./onnx/Qformer')

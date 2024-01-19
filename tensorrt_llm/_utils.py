@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,8 +16,10 @@ import copy
 import json
 import math
 import struct
+import weakref
 from functools import partial
 from pathlib import Path, PosixPath
+from typing import Any, Dict, List
 
 import numpy as np
 
@@ -70,6 +72,14 @@ def bf16_array(x):
     return x
 
 
+def copy_torch_to_numpy(x: torch.Tensor, ndarray: np.array):
+    if x.dtype != torch.bfloat16:
+        torch.from_numpy(ndarray).copy_(x)
+        return ndarray
+    torch.from_numpy(ndarray.view(np.int16)).copy_(x.view(torch.int16))
+    return ndarray
+
+
 def trt_version():
     return trt.__version__
 
@@ -81,7 +91,10 @@ def torch_version():
 _str_to_np_dict = dict(
     float16=np.float16,
     float32=np.float32,
+    int64=np.int64,
     int32=np.int32,
+    int8=np.int8,
+    bool=np.bool_,
     bfloat16=np_bfloat16,
 )
 
@@ -96,8 +109,10 @@ _str_to_torch_dtype_dict = dict(
     bfloat16=torch.bfloat16,
     float16=torch.float16,
     float32=torch.float32,
+    int64=torch.int64,
     int32=torch.int32,
     int8=torch.int8,
+    bool=torch.bool,
 )
 
 
@@ -123,19 +138,30 @@ def str_dtype_to_trt(dtype):
     return ret
 
 
+_trt_to_str_dtype_dict = {v: k for k, v in _str_to_trt_dtype_dict.items()}
+
+
+def trt_dtype_to_str(dtype: trt.DataType) -> str:
+    assert isinstance(dtype, trt.DataType)
+    return _trt_to_str_dtype_dict[dtype]
+
+
 _np_to_trt_dtype_dict = {
     np.int8: trt.int8,
     np.int32: trt.int32,
+    np.int64: trt.int64,
     np.float16: trt.float16,
     np.float32: trt.float32,
+    np.bool_: trt.bool,
 
     # hash of np.dtype('int32') != np.int32
     np.dtype('int8'): trt.int8,
     np.dtype('int32'): trt.int32,
+    np.dtype('int64'): trt.int64,
     np.dtype('float16'): trt.float16,
     np.dtype('float32'): trt.float32,
+    np.dtype('bool'): trt.bool,
     np_bfloat16: trt.bfloat16,
-    np.bool_: trt.bool,
 }
 
 
@@ -148,6 +174,7 @@ def np_dtype_to_trt(dtype):
 _trt_to_np_dtype_dict = {
     trt.int8: np.int8,
     trt.int32: np.int32,
+    trt.int64: np.int64,
     trt.float16: np.float16,
     trt.float32: np.float32,
     trt.bool: np.bool_,
@@ -162,8 +189,18 @@ def trt_dtype_to_np(dtype):
 
 
 _torch_to_np_dtype_dict = {
+    torch.bool: np.bool_,
+    torch.uint8: np.uint8,
+    torch.int8: np.int8,
+    torch.int16: np.int16,
+    torch.int32: np.int32,
+    torch.int64: np.int64,
     torch.float16: np.float16,
+    torch.bfloat16: np_bfloat16,
     torch.float32: np.float32,
+    torch.float64: np.float64,
+    torch.complex64: np.complex64,
+    torch.complex128: np.complex128,
 }
 
 
@@ -176,8 +213,10 @@ def torch_dtype_to_np(dtype):
 _trt_to_torch_dtype_dict = {
     trt.float16: torch.float16,
     trt.float32: torch.float32,
+    trt.int64: torch.int64,
     trt.int32: torch.int32,
     trt.int8: torch.int8,
+    trt.bool: torch.bool,
     trt.bfloat16: torch.bfloat16
 }
 
@@ -199,6 +238,16 @@ def dim_to_trt_axes(dim):
         axes |= 1 << d
 
     return axes
+
+
+def trt_axes_to_dim(axes: int) -> List[int]:
+    """Converts tensorrt axes bitmask to dims"""
+    dim = []
+    for i in range(32):
+        if axes & (1 << i):
+            dim.append(i)
+
+    return dim
 
 
 def dim_resolve_negative(dim, ndim):
@@ -223,6 +272,10 @@ def mpi_rank():
 
 def mpi_world_size():
     return mpi_comm().Get_size()
+
+
+def mpi_barrier():
+    mpi_comm().Barrier()
 
 
 def pad_vocab_size(vocab_size, tp_size):
@@ -272,3 +325,31 @@ def fromfile(dir_path, name, shape=None, dtype=None):
             t = t.reshape(shape)
         return t
     return None
+
+
+_extra_attrs_by_object: Dict[int, Dict[str, Any]] = {}
+
+
+def get_extra_attr(obj, attr_name):
+    if id(obj) not in _extra_attrs_by_object:
+        return None
+    extra_attrs = _extra_attrs_by_object[id(obj)]
+    return extra_attrs.get(attr_name)
+
+
+def _clean_extra_attrs(obj_id):
+    if obj_id in _extra_attrs_by_object:
+        del _extra_attrs_by_object[obj_id]
+
+
+def set_extra_attr(obj, attr_name, value):
+    if id(obj) not in _extra_attrs_by_object:
+        _extra_attrs_by_object[id(obj)] = {}
+        weakref.finalize(obj, _clean_extra_attrs, id(obj))
+    _extra_attrs_by_object[id(obj)][attr_name] = value
+
+
+def has_extra_attr(obj, attr_name):
+    if id(obj) not in _extra_attrs_by_object:
+        return False
+    return attr_name in _extra_attrs_by_object[id(obj)]

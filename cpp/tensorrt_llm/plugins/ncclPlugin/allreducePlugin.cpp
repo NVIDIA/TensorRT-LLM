@@ -15,11 +15,11 @@
  * limitations under the License.
  */
 #include "allreducePlugin.h"
-#include "mpi.h"
-#include "plugin.h"
+
+#include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
-#include <unistd.h>
+#include <nccl.h>
 
 using namespace nvinfer1;
 using tensorrt_llm::plugins::AllreducePluginCreator;
@@ -33,7 +33,7 @@ std::vector<nvinfer1::PluginField> AllreducePluginCreator::mPluginAttributes;
 
 AllreducePlugin::AllreducePlugin(
     std::set<int> group, nvinfer1::DataType type, AllReduceStrategyType strategy, int32_t counter)
-    : mGroup(group)
+    : mGroup(std::move(group))
     , mType(type)
     , mStrategy(strategy)
     , mCounter(counter)
@@ -104,41 +104,34 @@ size_t AllreducePlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* input
     return 0;
 }
 
-AllReduceStrategyType AllreducePlugin::selectImplementation(size_t messageSize, int worldSize) const noexcept
+AllReduceStrategyType AllreducePlugin::selectImplementation(size_t messageSize, int worldSize) noexcept
 {
-    if (worldSize <= 2)
+    const auto maxWorkspaceSize = utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(worldSize);
+
+    if (messageSize > maxWorkspaceSize)
     {
-        if (messageSize < 16 * 1000 * 1000)
-        {
-            return AllReduceStrategyType::ONESHOT;
-        }
+        return AllReduceStrategyType::RING;
     }
 
-    if (worldSize > 2 && worldSize <= 4)
+    if (worldSize <= 2)
+    {
+        return AllReduceStrategyType::ONESHOT;
+    }
+
+    if (worldSize <= 4)
     {
         if (messageSize < 1 * 1000 * 1000)
         {
             return AllReduceStrategyType::ONESHOT;
         }
-        if (messageSize < 8 * 1000 * 1000)
-        {
-            return AllReduceStrategyType::TWOSHOT;
-        }
+        return AllReduceStrategyType::TWOSHOT;
     }
 
-    if (worldSize > 4)
+    if (messageSize < 500 * 1000)
     {
-        if (messageSize < 500 * 1000)
-        {
-            return AllReduceStrategyType::ONESHOT;
-        }
-        if (messageSize < 8 * 1000 * 1000)
-        {
-            return AllReduceStrategyType::TWOSHOT;
-        }
+        return AllReduceStrategyType::ONESHOT;
     }
-
-    return AllReduceStrategyType::RING;
+    return AllReduceStrategyType::TWOSHOT;
 }
 
 int AllreducePlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
@@ -188,17 +181,14 @@ int AllreducePlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const 
     }
     else
     {
-        int myRank;
-        int nRanks = inputDesc[1].dims.d[0] / 3;
-        MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &myRank));
+        auto myRank = COMM_SESSION.getRank();
+        int nRanks = inputDesc[1].dims.d[0] / utils::customAllReduceUtils::NUM_POINTERS_PER_RANK;
         // FIXME: pass world config here
         myRank = myRank % nRanks;
 
         auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(
             reinterpret_cast<const int32_t*>(inputs[1]), nRanks, myRank, mCounter);
 
-        // Make sure all GPUs have finished using their peer_comm_buffer_ptrs in previous invocations
-        tensorrt_llm::kernels::invokeMultiGpuBarrier(params, stream);
         cudaMemcpyAsync(
             params.peer_comm_buffer_ptrs[myRank], inputs[0], size * sizePerElem, cudaMemcpyDeviceToDevice, stream);
 
@@ -253,47 +243,7 @@ int AllreducePlugin::initialize() noexcept
         return 0;
     }
 
-    int myRank, nRanks;
-    MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &myRank));
-    MPICHECK(MPI_Comm_size(MPI_COMM_WORLD, &nRanks));
-
-    int deviceId;
-    cudaGetDevice(&deviceId);
-
-    auto* commMap = getCommMap();
-    // [] operator inserts T() if it does not exist
-    if ((*commMap)[mGroup] != nullptr)
-    {
-        return 0;
-    }
-
-    int groupRank = 0;
-    for (auto it = mGroup.begin(); it != mGroup.end(); ++it)
-    {
-        if (*it == myRank)
-        {
-            break;
-        }
-        ++groupRank;
-    }
-
-    ncclUniqueId id;
-    if (myRank == *mGroup.begin())
-    {
-        ncclGetUniqueId(&id);
-        for (auto it = std::next(std::begin(mGroup), 1); it != mGroup.end(); ++it)
-        {
-            MPICHECK(MPI_Send(&id, sizeof(id), MPI_BYTE, *it, 0, MPI_COMM_WORLD));
-        }
-    }
-    else
-    {
-        MPI_Status status;
-        MPICHECK(MPI_Recv(&id, sizeof(id), MPI_BYTE, *mGroup.begin(), 0, MPI_COMM_WORLD, &status));
-    }
-    (*commMap)[mGroup] = nullptr;
-    NCCLCHECK(ncclCommInitRank(&((*commMap)[mGroup]), mGroup.size(), id, groupRank));
-
+    initCommMap(mGroup);
     return 0;
 }
 

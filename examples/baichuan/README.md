@@ -20,8 +20,9 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
   * FP8
   * BF16
   * INT4 & INT8 Weight-Only
-  * INT8 KV CACHE
+  * INT8 KV CACHE (+ AWQ/per-channel weight-only)
   * INT8 Smooth Quant
+  * Groupwise quantization (AWQ/GPTQ)
 
 ## Usage
 
@@ -88,8 +89,10 @@ python build.py --model_version v1_13b \
                 --world_size 2
 ```
 
-#### INT8 weight only + INT8 KV cache
-For INT8 KV cache, [`hf_baichuan_convert.py`](./hf_baichuan_convert.py) features a
+#### INT8 KV cache
+INT8 KV cache could be enabled to reduce memory footprint. It will bring more performance gains when batch size gets larger.
+
+You can get the INT8 scale of KV cache through [`hf_baichuan_convert.py`](./hf_baichuan_convert.py), which features a
 `--calibrate-kv-cache, -kv` option. Setting `-kv` will calibrate the model,
 and then export the scaling factors needed for INT8 KV cache inference.
 
@@ -102,22 +105,44 @@ python3 hf_baichuan_convert.py -i baichuan-inc/Baichuan-13B-Chat -o ./tmp/baichu
 
 [`build.py`](./build.py) add new options for the support of INT8 KV cache.
 
-`--int8_kv_cache` is the command-line option to enable INT8 KV cache.
+`--int8_kv_cache` is the command-line option to enable INT8 KV cache, and `--bin_model_dir` is the directory where the INT8 KV cache scales are located.
 
-In addition, it could be combined with INT8 weight-only quantization, as follows:
+**INT8 KV cache + per-channel weight-only quantization**
+
+INT8 KV cache could be combined with per-channel weight-only quantization, as follows:
 
 Examples of INT8 weight-only quantization + INT8 KV cache
 
 ```bash
 # Build model with both INT8 weight-only and INT8 KV cache enabled
 python build.py --model_version v1_13b \
-                --bin_model_dir=./tmp/baichuan_v1_13b/int8_kv_cache/1-gpu/ \
+                --bin_model_dir ./tmp/baichuan_v1_13b/int8_kv_cache/1-gpu/ \
                 --dtype float16 \
                 --use_gpt_attention_plugin float16 \
                 --use_gemm_plugin float16 \
                 --output_dir ./tmp/baichuan_v1_13b/trt_engines/int8_kv_cache_weight_only/1-gpu \
                 --int8_kv_cache \
                 --use_weight_only
+```
+
+**INT8 KV cache + AWQ**
+
+In addition, you can enable INT8 KV cache together with AWQ (per-group INT4 weight-only quantization) like the following command.
+
+**NOTE**: AWQ checkpoint is passed through `--quant_ckpt_path`, and the INT8 scales for the KV cache are expected to be in the directory pointed by `--bin_model_dir`.
+
+```bash
+python build.py --model_version v1_13b \
+                --quant_ckpt_path ./baichuan-v1-13b-4bit-gs128-awq.pt \
+                --dtype float16 \
+                --use_gpt_attention_plugin float16 \
+                --use_gemm_plugin float16 \
+                --use_weight_only \
+                --weight_only_precision int4_awq \
+                --per_group \
+                --output_dir ./tmp/baichuan_v1_13b/trt_engines/int8_kv_cache_int4_awq/1-gpu \
+                --int8_kv_cache \ # Turn on INT8 KV cache
+                --bin_model_dir=./tmp/baichuan_v1_13b/int8_kv_cache/1-gpu/ # Directory to look for INT8 scale of KV cache
 ```
 
 #### SmoothQuant
@@ -139,17 +164,13 @@ Then, you can add any combination of `--per-token` and `--per-channel` to get th
 Examples of build invocations:
 
 ```bash
-# Build model for SmoothQuant in the _per_tensor_ mode.
-python3 build.py --model_version v1_13b \
-                 --bin_model_dir=./tmp/baichuan_v1_13b/sq0.8/1-gpu/ \
-                 --use_smooth_quant \
-                 --use_gpt_attention_plugin float16 \
-
 # Build model for SmoothQuant in the _per_token_ + _per_channel_ mode
 python3 build.py --model_version v1_13b \
                  --bin_model_dir=./tmp/baichuan_v1_13b/sq0.8/1-gpu/ \
-                 --use_smooth_quant \
                  --use_gpt_attention_plugin float16 \
+                 --remove_input_padding \
+                 --enable_context_fmha \
+                 --use_smooth_quant \
                  --per_token \
                  --per_channel
 ```
@@ -167,11 +188,11 @@ where FP8 scaling factors are stored.
 
 ```bash
 # Quantize HF Baichuan v2 13B into FP8 and export a single-rank checkpoint
-python quantize.py --model_dir /code/model/Baichuan2-13B-Chat/ \
-                   --dtype float16 \
-                   --qformat fp8 \
-                   --export_path ./quantized_fp8 \
-                   --calib_size 256 \
+python examples/quantization/quantize.py --model_dir /code/model/Baichuan2-13B-Chat/ \
+                                         --dtype float16 \
+                                         --qformat fp8 \
+                                         --export_path ./quantized_fp8 \
+                                         --calib_size 256 \
 
 # Build Baichuan v2 13B TP=1 using original HF checkpoint + PTQ scaling factors from the single-rank checkpoint
 python build.py --model_version v2_13b \
@@ -187,6 +208,83 @@ python build.py --model_version v2_13b \
                 --strongly_typed \
                 --world_size 1
 ```
+
+#### Groupwise quantization (AWQ/GPTQ)
+One can enable AWQ/GPTQ INT4 weight-only quantization with these options when building engine with `build.py`:
+
+- `--use_weight_only` enables weight-only GEMMs in the network.
+- `--per_group` enable groupwise weight-only quantization.
+- `--group_size` can support 64 and 128 now. Default value is 128. For Baichuan 13B models and TP=2, we should use 64 group size for kernel compatibility.
+- `--weight_only_precision` should specify the weight-only quantization format. Supported formats are `int4_awq` or `int4_gptq`.
+- `--quant_ckpt_path` passes the quantized checkpoint to build the engine.
+- `--quantize_lm_head` add this flag to quantize lm_head layer for quantize.py and build.py when using AWQ. Do NOT quantize LM head by default.
+
+AWQ/GPTQ examples below involves 2 steps:
+1. Weight quantization
+2. Build TRT-LLM engine
+
+##### AWQ
+1. Weight quantization:
+
+    NVIDIA AMMO toolkit is used for AWQ weight quantization. Please see [examples/quantization/README.md](/examples/quantization/README.md#preparation) for AMMO installation instructions.
+
+    ```bash
+    # Quantize HF Baichuan 13B checkpoint into INT4 AWQ format
+    python examples/quantization/quantize.py --model_dir baichuan-inc/Baichuan-13B-Chat \
+                                             --dtype float16 \
+                                             --qformat int4_awq \
+                                             --group_size 128 \
+                                             --export_path ./quantized_int4-awq_gs128 \
+                                             --calib_size 32
+    ```
+    The quantized model checkpoint is saved to `./quantized_int4-awq_gs128/baichuan_tp1_rank0.npz` for future TensorRT-LLM engine build.
+
+2. Build TRT-LLM engine:
+
+    ```bash
+    python build.py --model_version v1_13b \
+                    --quant_ckpt_path ./quantized_int4-awq_gs128/baichuan_tp1_rank0.npz \
+                    --dtype float16 \
+                    --remove_input_padding \
+                    --use_gpt_attention_plugin float16 \
+                    --enable_context_fmha \
+                    --use_gemm_plugin float16 \
+                    --use_weight_only \
+                    --weight_only_precision int4_awq \
+                    --per_group \
+                    --group_size 128 \
+                    --output_dir ./tmp/baichuan_v1_13b/trt_engines/int4_awq_gs128/1-gpu/
+    ```
+
+##### GPTQ
+To run the GPTQ Baichuan example, the following steps are required:
+
+1. Weight quantization:
+
+    Quantized weights for GPTQ can be generated using an open source project such as [GPTQ-for-LLaMa](https://github.com/qwopqwop200/GPTQ-for-LLaMa.git).
+
+    Let us build the TensorRT-LLM engine with the saved `./baichuan-2-13b-4bit-gs64.safetensors`.
+
+2. Build TensorRT-LLM engine:
+
+    ```bash
+    # Build the Baichuan2 13B model using 2-way tensor parallelism and apply INT4 GPTQ quantization.
+    # Compressed checkpoint safetensors are generated separately from GPTQ.
+    python build.py --model_version v2_13b \
+                    --quant_ckpt_path ./baichuan-2-13b-4bit-gs64.safetensors \
+                    --dtype float16 \
+                    --remove_input_padding \
+                    --use_gpt_attention_plugin float16 \
+                    --enable_context_fmha \
+                    --use_gemm_plugin float16 \
+                    --use_weight_only \
+                    --weight_only_precision int4_gptq \
+                    --per_group \
+                    --group_size 64 \
+                    --world_size 2 \
+                    --tp_size 2 \
+                    --output_dir ./tmp/baichuan_v2_13b/trt_engines/int4_gptq_gs64/2-gpu/
+    ```
 
 ### Run
 
@@ -247,9 +345,3 @@ mpirun -n 2 --allow-run-as-root \
                            --data_type fp16 \
                            --engine_dir ./tmp/baichuan_v1_13b/trt_engines/fp16/2-gpu/
 ```
-
-### Known Issues
-
- * The implementation of the Baichuan-7B model with INT8 Weight-Only and Tensor
-   Parallelism greater than 2 might have accuracy issues. It is under
-   investigation.

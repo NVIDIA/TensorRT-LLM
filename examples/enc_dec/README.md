@@ -66,7 +66,7 @@ We should distinguish between `X` - TP size and `Y` - total number of GPU ranks:
 * When `X < Y`, both TP and PP are enabled. In such case, please make sure you have completed weight conversion step for `TP=X`.
 
 ```bash
-# Example 1: build t5-small using a single GPU, FP32, running gready search
+# Example 1: build t5-small using a single GPU, FP32, running greedy search
 # use_gpt_attention_plugin is necessary in Enc-Dec.
 # Try use_gemm_plugin to prevent accuracy issue.
 # It is recommend to use --remove_input_padding along with --use_gpt_attention_plugin for better performance
@@ -112,7 +112,7 @@ python build.py --model_type t5 \
                 --dtype bfloat16 \
                 --max_beam_width 3
 
-# Example 4: build bart-large-cnn using a single GPU, FP32, running gready search
+# Example 4: build bart-large-cnn using a single GPU, FP32, running greedy search
 python build.py --model_type bart \
                 --weight_dir tmp/trt_models/bart-large-cnn/tp1 \
                 -o tmp/trt_engines/bart-large-cnn/1-gpu \
@@ -141,7 +141,7 @@ mpirun --allow-run-as-root -np 4 python3 run.py --engine_dir tmp/trt_engines/t5-
 mpirun --allow-run-as-root -np 4 python3 run.py --engine_dir tmp/trt_engines/flan-t5-small/4-gpu/bfloat16/tp2 --engine_name flan-t5-small --model_name google/flan-t5-small --max_new_token=64 --num_beams=1
 
 # Example 4: For BART, inference w/ single GPU, FP32, greedy search, compare results with HuggingFace FP32
-python3 run.py --engine_dir tmp/trt_engines/bart-large-cnn/1-gpu/float32/tp1 --engine_name bart-large-cnn --model_name bart-large-cnn --max_new_token=64 --num_beams=1 --compare_hf_fp32
+python3 run.py --engine_dir tmp/trt_engines/bart-large-cnn/1-gpu/float32/tp1 --engine_name bart-large-cnn --model_name tmp/hf_models/bart-large-cnn --max_new_token=64 --num_beams=1 --compare_hf_fp32
 ```
 
 ### Benchmark
@@ -153,7 +153,7 @@ Step 1: In `examples/enc_dec/`:
 After downloading the models and converting/splitting the weights, build the engine **without** the `--remove_input_padding` flag and **without** pipeline parallelism.
 
 ```bash
-# Example 1: build t5-small using a single GPU, FP32, running gready search
+# Example 1: build t5-small using a single GPU, FP32, running greedy search
 python build.py --model_type t5 \
                 --weight_dir tmp/trt_models/t5-small/tp1 \
                 -o tmp/trt_engines/t5-small/1-gpu \
@@ -164,7 +164,7 @@ python build.py --model_type t5 \
                 --dtype float32 \
                 --max_beam_width 1
 
-# Example 2: build t5-small using 4-way tensor parallelism on a node with 8 GPUs, BF16, enabling beam search up to width=3
+# Example 2: build t5-small using 4-way tensor parallelism on a node with 8 GPUs (but only use 4 of them for demonstration purpose), BF16, enabling beam search up to width=3
 python build.py --model_type t5 \
                 --world_size 4 \
                 --tp_size 4 \
@@ -207,6 +207,18 @@ mpirun --allow-run-as-root -np 4 python benchmark.py \
 - Batched/Ragged input with beam search is having subtle issues with some sequence results being truncated. For the time being, please follow (1) if batch size = 1, no problem (2) if batched input is padded (i.e., not using `--remove_input_padding` flag), no problem (3) if batched input is ragged (i.e., using `--remove_input_padding`), only use greedy search for now.
 - For T5 and Flan-T5 family that have relative attention bias design, the relative attention table is split along `num_heads` dimension in Tensor Parallelism mode. Therefore, `num_heads` must be divisible by `tp_size`. Please be aware of this when setting the TP parameter.
 - For mBART, models that can control output languages (e.g. [`mbart-large-50-many-to-many-mmt`](https://huggingface.co/facebook/mbart-large-50-many-to-many-mmt)) are not currently supported, as the script does not support `ForcedBOSTokenLogitsProcessor` to control output languages.
+
+### Attention Scaling Factors
+
+The `q_scaling` convention in the TRT-LLM plugin is defined as follows:
+```
+norm_factor = 1.f / (q_scaling * sqrt(head_size))
+```
+In the Multi-Head Attention (MHA) mechanism, the output of the `Q*K^T` product is scaled by this constant value `norm_factor` as `norm_factor * (Q*K^T)` for `softmax`. This scaling factor can be adjusted or neutralized based on the model's requirements.
+
+Handling in Different Models:
+- BART/FairSeq NMT: For the BART model, `q_scaling` is set to `1.f`. Therefore, the `norm_factor` for BART becomes `1.f / sqrt(head_size)`. TRT-LLM uses the default value `q_scaling = 1.f` as seen in [`bart/convert.py`](./bart/convert.py). Similar to FairSeq NMT models.
+- T5: For the T5 model, `q_scaling` is `1.f/sqrt(head_size)`, leading to a `norm_factor` of `1.f`. This is handled in T5 by the TRT-LLM's `get_offset_q_scaling()` function in [`t5/convert.py`](./t5/convert.py#L158-163), which reads `head_size` from the T5 model configuration and sets `q_scaling = 1.f/sqrt(head_size)` to effectively offset the `norm_factor` to `1.f`.
 
 ### Run FairSeq NMT (Neural Machine Translation) models
 

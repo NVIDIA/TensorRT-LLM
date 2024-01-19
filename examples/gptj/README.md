@@ -108,11 +108,11 @@ where FP8 scaling factors are stored.
 
 ```bash
 # Quantize HF GPT-J 6B checkpoint into FP8 format
-python quantize.py --model_dir gptj_model \
-                   --dtype float16 \
-                   --qformat fp8 \
-                   --export_path ./quantized_fp8 \
-                   --calib_size 512
+python examples/quantization/quantize.py --model_dir gptj_model \
+                                         --dtype float16 \
+                                         --qformat fp8 \
+                                         --export_path ./quantized_fp8 \
+                                         --calib_size 512
 
 # Build GPT-J 6B using original HF checkpoint + PTQ scaling factors
 python build.py --model_dir gptj_model \
@@ -215,6 +215,33 @@ The linear layer in the AWQ int4 weight only quantized weights should have 3 par
 1. FP16 smoothed_weights (=weights/pre_quant_scale) with shape [n, k] ;
 2. FP16 amax (the max abs values of the smoothed_weights) with shape [n, k/group_size];
 3. FP16 pre_quant_scale (the smooth scales used to multiply by activation) with shape [k];
+
+```bash
+# Using AMMO to generate INT4_AWQ .npz file.
+python3 ../quantization/quantize.py --model_dir ./gpt-j-6b/ \
+                                    --export_path ./awq/ \
+                                    --qformat int4_awq \
+                                    --dtype float16 \
+                                    --quantize_lm_head
+```
+```bash
+# Build AWQ engine.
+python3 build.py --dtype float16 \
+                 --enable_context_fmha \
+                 --remove_input_padding \
+                 --use_gpt_attention_plugin float16 \
+                 --use_gemm_plugin float16 \
+                 --max_batch_size 32 \
+                 --max_input_len 2048 \
+                 --max_output_len 128 \
+                 --output_dir int4_awq \
+                 --use_weight_only \
+                 --weight_only_precision int4_awq \
+                 --per_group \
+                 --model_dir ./gpt-j-6b/ \
+                 --quant_ckpt_path awq/gptj_tp1_rank0.npz \
+                 --quantize_lm_head
+```
 
 ### 3. Run
 

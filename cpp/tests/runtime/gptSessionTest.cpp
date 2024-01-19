@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -241,7 +241,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
     verifyModelConfig(modelConfig, modelSpec);
 
     const int worldSize = modelSpec.mTPSize * modelSpec.mPPSize;
-    auto const worldConfig = WorldConfig::mpi(*logger, worldSize, modelSpec.mTPSize, modelSpec.mPPSize);
+    auto const worldConfig = WorldConfig::mpi(worldSize, modelSpec.mTPSize, modelSpec.mPPSize);
 
     auto enginePath = modelPath / json.engineFilename(worldConfig);
     ASSERT_TRUE(fs::exists(enginePath));
@@ -264,17 +264,18 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
 
     SamplingConfig samplingConfig{beamWidth};
     samplingConfig.temperature = std::vector{1.0f};
-    samplingConfig.minLength = std::vector{1};
+    SizeType const minLength = 1;
+    samplingConfig.minLength = std::vector{minLength};
     if (isChatGlmTest)
     {
-        samplingConfig.randomSeed = std::vector{1ull};
+        samplingConfig.randomSeed = std::vector{static_cast<uint64_t>(1ull)};
         samplingConfig.topK = std::vector{1};
         samplingConfig.topP = std::vector{1.0f};
         samplingConfig.lengthPenalty = std::vector{1.0f};
     }
     else
     {
-        samplingConfig.randomSeed = std::vector{42ull};
+        samplingConfig.randomSeed = std::vector{static_cast<uint64_t>(42ull)};
         samplingConfig.topK = std::vector{0};
         samplingConfig.topP = std::vector{0.0f};
     }
@@ -298,7 +299,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
         {
             const auto endIdRow = std::rand() % nbGivenInputs;
             const auto endIdBeam = std::rand() % beamWidth;
-            const auto endIdCol = givenInputLengths[endIdRow] + std::rand() % maxNewTokens;
+            const auto endIdCol = givenInputLengths[endIdRow] + minLength + std::rand() % (maxNewTokens - minLength);
             auto const endIdIndex = tc::flat_index2((endIdRow * beamWidth + endIdBeam), endIdCol, maxSeqLength);
             endId = expectedOutputData[endIdIndex];
         }
@@ -565,7 +566,7 @@ TEST_P(ParamTest, Test)
     if (!modelSpec.mUseGptAttentionPlugin && beamWidth > 1)
         GTEST_SKIP();
 
-    if (!WorldConfig::validConfig(*mLogger, modelSpec.mTPSize, modelSpec.mPPSize))
+    if (!WorldConfig::validConfig(modelSpec.mTPSize, modelSpec.mPPSize))
     {
         GTEST_SKIP() << "Model's world size " << modelSpec.mPPSize * modelSpec.mTPSize
                      << " is not equal to the system world size";

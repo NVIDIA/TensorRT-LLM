@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,7 +19,6 @@ import pytest
 
 # isort: off
 import torch
-import tensorrt as trt
 # isort: on
 from cuda import cudart
 from parameterized import parameterized
@@ -27,8 +26,10 @@ from polygraphy.backend.trt import CreateConfig, EngineFromNetwork
 
 import tensorrt_llm as tllm
 from tensorrt_llm import Mapping, Tensor
-from tensorrt_llm._ipc_utils import IpcMemory, peer_access
+from tensorrt_llm._ipc_utils import peer_access
 from tensorrt_llm.functional import AllReduceStrategy, allreduce
+from tensorrt_llm.plugin.plugin import (current_all_reduce_helper,
+                                        init_all_reduce_helper)
 
 
 def custom_name_func(testcase_func, param_num, param):
@@ -68,20 +69,13 @@ class TestCommunicationPlugin(unittest.TestCase):
 
         workspace = None
 
-        ipc_buffers = IpcMemory(self.mapping, IpcMemory.IPC_BUFFERS_SIZE)
-        ipc_barriers_in = IpcMemory(
-            self.mapping,
-            IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * self.mapping.tp_size)
-        ipc_barriers_out = IpcMemory(
-            self.mapping,
-            IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * self.mapping.tp_size)
-        workspace = torch.tensor(ipc_buffers.serialize() +
-                                 ipc_barriers_in.serialize() +
-                                 ipc_barriers_out.serialize(),
-                                 dtype=torch.int64,
-                                 device="cpu")
-
         torch_dtype = tllm._utils.str_dtype_to_torch(dtype)
+        dtype_size = torch.finfo(torch_dtype).bits // 8
+        init_all_reduce_helper()
+        _, workspace = current_all_reduce_helper().allocate_workspace(
+            self.mapping, size * dtype_size)
+        print(workspace)
+
         allreduce_ref = torch.zeros(self.reference_tensors[0][:size].shape,
                                     dtype=torch_dtype,
                                     device="cuda")
@@ -103,17 +97,12 @@ class TestCommunicationPlugin(unittest.TestCase):
                 x = Tensor(name='x',
                            shape=input.shape,
                            dtype=tllm.str_dtype_to_trt(dtype))
-
-                w = Tensor(name='workspace',
-                           shape=workspace.shape,
-                           dtype=trt.int64)
+                current_all_reduce_helper().set_workspace_tensor(self.mapping)
 
                 current = x
                 for i in range(inner_loop):
-                    current = allreduce(
-                        current, self.mapping.tp_group,
-                        w if strategy != AllReduceStrategy.RING else None, i,
-                        strategy)
+                    current = allreduce(current, self.mapping.tp_group,
+                                        strategy)
                 output = current.trt_tensor
 
                 output.name = 'output'
@@ -131,7 +120,7 @@ class TestCommunicationPlugin(unittest.TestCase):
             output = torch.zeros_like(input)
 
             stream = torch.cuda.current_stream()
-            feed_dict = {'x': input, 'workspace': workspace}
+            feed_dict = {'x': input, 'all_reduce_workspace': workspace}
 
             session = tllm.runtime.Session.from_engine(build_engine())
             session.run(inputs=feed_dict,

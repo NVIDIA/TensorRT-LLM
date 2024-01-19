@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,23 +27,21 @@ namespace torch_ext
 class IFtDynamicDecode
 {
 public:
-    virtual ~IFtDynamicDecode() {}
-
     virtual void setup(size_t batch_size, size_t beam_width, th::optional<th::Tensor> runtime_top_k_opt,
         th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
         th::optional<th::Tensor> repetition_penalty_opt, th::optional<th::Tensor> presence_penalty_opt,
-        th::optional<th::Tensor> min_length_opt, th::optional<th::Tensor> length_penalty_opt,
-        th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
-        th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
-        th::optional<th::Tensor> top_p_reset_ids_opt)
+        th::optional<th::Tensor> frequency_penalty_opt, th::optional<th::Tensor> min_length_opt,
+        th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
+        th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
+        th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt)
         = 0;
 
     virtual void forward(th::Tensor& logits, // (batch_size, beam_width, hidden_size)
-        int step, int max_input_length, int max_attention_window, uint64_t ite, int local_batch_size, th::Tensor end_id,
-        th::optional<th::Tensor> embedding_bias_opt, th::optional<th::Tensor> input_lengths_opt,
-        th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
-        th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-        th::optional<th::Tensor> src_cache_indirection_opt,
+        int step, int max_input_length, int max_attention_window, int sink_token_length, uint64_t ite,
+        int local_batch_size, th::Tensor end_id, th::optional<th::Tensor> embedding_bias_opt,
+        th::optional<th::Tensor> input_lengths_opt, th::optional<th::Tensor> sequence_limit_length_opt,
+        th::optional<th::Tensor> stop_words_list_opt, th::optional<th::Tensor> bad_words_list_opt,
+        th::optional<th::Tensor> no_repeat_ngram_size_opt, th::optional<th::Tensor> src_cache_indirection_opt,
         // Outputs
         th::Tensor& output_token_ids, th::Tensor& newTokens, th::Tensor& should_stop,
         th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
@@ -66,22 +64,21 @@ public:
 
     FtDynamicDecode(const size_t vocab_size, const size_t vocab_size_padded, const int tensor_para_size,
         const int pipeline_para_size);
-    ~FtDynamicDecode() override;
 
     void setup(size_t batch_size, size_t beam_width, th::optional<th::Tensor> runtime_top_k_opt,
         th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
         th::optional<th::Tensor> repetition_penalty_opt, th::optional<th::Tensor> presence_penalty_opt,
-        th::optional<th::Tensor> min_length_opt, th::optional<th::Tensor> length_penalty_opt,
-        th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
-        th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
-        th::optional<th::Tensor> top_p_reset_ids_opt) override;
+        th::optional<th::Tensor> frequency_penalty_opt, th::optional<th::Tensor> min_length_opt,
+        th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
+        th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
+        th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt) override;
 
     void forward(th::Tensor& logits, // (batch_size, beam_width, hidden_size)
-        int step, int max_input_length, int max_attention_window, uint64_t ite, int local_batch_size, th::Tensor end_id,
-        th::optional<th::Tensor> embedding_bias_opt, th::optional<th::Tensor> input_lengths_opt,
-        th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
-        th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-        th::optional<th::Tensor> src_cache_indirection_opt,
+        int step, int max_input_length, int max_attention_window, int sink_token_length, uint64_t ite,
+        int local_batch_size, th::Tensor end_id, th::optional<th::Tensor> embedding_bias_opt,
+        th::optional<th::Tensor> input_lengths_opt, th::optional<th::Tensor> sequence_limit_length_opt,
+        th::optional<th::Tensor> stop_words_list_opt, th::optional<th::Tensor> bad_words_list_opt,
+        th::optional<th::Tensor> no_repeat_ngram_size_opt, th::optional<th::Tensor> src_cache_indirection_opt,
         // Outputs
         th::Tensor& output_token_ids, th::Tensor& newTokens, th::Tensor& should_stop,
         th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
@@ -98,10 +95,9 @@ private:
     const size_t vocab_size_;
     const size_t vocab_size_padded_;
 
-    tensorrt_llm::common::IAllocator* allocator_;
     cudaDeviceProp prop_;
 
-    tensorrt_llm::layers::DynamicDecodeLayer<T>* dynamic_decode_layer_;
+    std::shared_ptr<tensorrt_llm::layers::DynamicDecodeLayer<T>> dynamic_decode_layer_;
     tensorrt_llm::runtime::ITensor::SharedPtr finished_sum_;
 };
 
@@ -110,19 +106,18 @@ class DynamicDecodeOp : public th::jit::CustomClassHolder
 public:
     DynamicDecodeOp(const int64_t vocab_size, const int64_t vocab_size_padded, const int64_t tensor_para_size,
         const int64_t pipeline_para_size, at::ScalarType scalar_type);
-    ~DynamicDecodeOp();
 
     void setup(int64_t batch_size, int64_t beam_width, th::optional<th::Tensor> runtime_top_k_opt,
         th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
-        th::optional<th::Tensor> reptition_penalty_opt, th::optional<th::Tensor> presence_penalty_opt,
-        th::optional<th::Tensor> min_length_opt, th::optional<th::Tensor> length_penalty_opt,
-        th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
-        th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
-        th::optional<th::Tensor> top_p_reset_ids_opt);
+        th::optional<th::Tensor> repetition_penalty_opt, th::optional<th::Tensor> presence_penalty_opt,
+        th::optional<th::Tensor> frequency_penalty_opt, th::optional<th::Tensor> min_length_opt,
+        th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
+        th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
+        th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt);
 
     th::Tensor forward(th::Tensor logits, // (batch_size, beam_width, vocab_size)
-        int64_t step, int64_t max_input_length, int64_t max_attention_window, int64_t ite, int64_t local_batch_size,
-        th::Tensor end_id, th::optional<th::Tensor> embedding_bias_opt,
+        int64_t step, int64_t max_input_length, int64_t max_attention_window, int64_t sink_token_length, int64_t ite,
+        int64_t local_batch_size, th::Tensor end_id, th::optional<th::Tensor> embedding_bias_opt,
         th::optional<th::Tensor> input_lengths_opt, // length of input contexts.
         th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
         th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
@@ -130,7 +125,7 @@ public:
         // output buffers.
         th::Tensor output_token_ids, th::Tensor newTokens, th::optional<th::Tensor> finished_input,
         th::optional<th::Tensor> finished_output,
-        th::optional<th::Tensor> seuqence_lengths_opt, // length of the current sequences.
+        th::optional<th::Tensor> sequence_lengths_opt, // length of the current sequences.
         th::optional<th::Tensor> cum_log_probs_opt, th::optional<th::Tensor> output_log_probs_opt,
         th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,
         th::optional<th::Tensor> beam_hyps_output_ids_tgt_opt,

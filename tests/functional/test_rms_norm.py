@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +15,7 @@
 import os
 import sys
 import unittest
+from itertools import product
 
 import numpy as np
 import pytest
@@ -47,8 +48,9 @@ class TestFunctional(unittest.TestCase):
             y = y * weight
         return y
 
-    @parameterized.expand([['float16'], ['float32'], ['bfloat16']])
-    def test_rms_norm_plugin(self, dtype):
+    @parameterized.expand(
+        list(product([True, False], ['float16', 'float32', 'bfloat16'])))
+    def test_rms_norm_plugin(self, remove_batch_dim, dtype):
 
         # Skip tests that are not supported in pre-ampere architecture
         if getSMVersion() < 80:
@@ -58,7 +60,8 @@ class TestFunctional(unittest.TestCase):
 
         # test data
         hidden_size = 1024
-        x_data = torch.randn((8, 128, hidden_size),
+        x_data = torch.randn((8, 128, hidden_size) if not remove_batch_dim else
+                             (8 * 128, hidden_size),
                              dtype=torch.float64,
                              device="cuda")
         weight = torch.randn((hidden_size), dtype=torch.float64, device="cuda")

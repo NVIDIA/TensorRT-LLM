@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +23,6 @@ import pytest
 
 # isort: off
 import torch
-import tensorrt as trt
 # isort: on
 from parameterized import parameterized
 from transformers import BloomConfig, BloomForCausalLM
@@ -37,7 +36,7 @@ from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.generation import _prepare_attention_mask
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from examples.bloom.weight import load_from_hf_bloom
+from examples.bloom.convert_checkpoint import convert_hf_bloom
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import getSMVersion
@@ -61,38 +60,42 @@ class TestBloom(unittest.TestCase):
                                   output_len, fp16, gpt_attention_plugin,
                                   tensor_parallel,
                                   apply_query_key_layer_scaling):
-        num_layers = bloom_config.n_layer
-        num_heads = bloom_config.n_head
-        hidden_size = bloom_config.hidden_size
-        vocab_size = bloom_config.vocab_size
-        n_positions = input_len + output_len
+        dtype = 'float16' if fp16 else 'float32'
+        config = {
+            'architecture': 'BloomForCausalLM',
+            'dtype': dtype,
+            'num_hidden_layers': bloom_config.n_layer,
+            'num_attention_heads': bloom_config.n_head,
+            'hidden_size': bloom_config.hidden_size,
+            'vocab_size': bloom_config.vocab_size,
+            'position_embedding_type': 'alibi',
+            'max_position_embeddings': input_len + output_len,
+            'hidden_act': 'gelu',
+            'mapping': {
+                'world_size': tensor_parallel,
+                'tp_size': tensor_parallel
+            },
+            'use_parallel_embedding': False,
+            'embedding_sharding_dim': 0,
+            'share_embedding_table': False,
+        }
+        config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
+        # config.set_rank(rank)
+        weights = convert_hf_bloom(hf_bloom,
+                                   tensor_parallel=tensor_parallel,
+                                   dtype=dtype)
+        tensorrt_llm_bloom = tensorrt_llm.models.BloomForCausalLM(config)
+        tensorrt_llm_bloom.load(weights)
 
         with net_guard(network):
-            kv_dtype = trt.float16 if fp16 else trt.float32
-            # Initialize model
-            tensorrt_llm_bloom = tensorrt_llm.models.BloomForCausalLM(
-                num_layers=num_layers,
-                num_heads=num_heads,
-                hidden_size=hidden_size,
-                vocab_size=vocab_size,
-                hidden_act='gelu',
-                max_position_embeddings=n_positions,
-                dtype=kv_dtype,
-                mapping=tensorrt_llm.Mapping(
-                    world_size=tensor_parallel,
-                    tp_size=tensor_parallel),  # TP only
-            )
+            network.set_named_parameters(tensorrt_llm_bloom.named_parameters())
             inputs = tensorrt_llm_bloom.prepare_inputs(batch_size,
                                                        input_len,
                                                        output_len,
                                                        use_cache=True,
                                                        max_beam_width=1)
-            load_from_hf_bloom(tensorrt_llm_bloom, hf_bloom, fp16=fp16)
-
             # Prepare
-            network.set_named_parameters(tensorrt_llm_bloom.named_parameters())
-
-            tensorrt_llm_bloom(*inputs)
+            tensorrt_llm_bloom(**inputs)
 
         return network
 
@@ -214,6 +217,7 @@ class TestBloom(unittest.TestCase):
                                                        dtype=torch.int32)
         host_max_attention_window_sizes = torch.tensor([total_length],
                                                        dtype=torch.int32)
+        host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
         cache_indirections = [
             torch.full((
@@ -248,6 +252,7 @@ class TestBloom(unittest.TestCase):
             ctx_buffer['sequence_length'] = ctx_sequence_length
             ctx_buffer[
                 'host_past_key_value_lengths'] = ctx_host_past_key_value_lengths
+            ctx_buffer['host_sink_token_length'] = host_sink_token_length
             if enable_remove_input_padding:
                 ctx_host_context_lengths = ctx_context_lengths.cpu()
                 ctx_buffer["host_context_lengths"] = ctx_host_context_lengths
@@ -315,6 +320,7 @@ class TestBloom(unittest.TestCase):
                                                        dtype=torch.int32)
         gen_host_max_attention_window_sizes = torch.tensor([total_length],
                                                            dtype=torch.int32)
+        gen_host_sink_token_length = torch.tensor([0], dtype=torch.int32)
         step1_buffer = {
             'input_ids': gen_id,
             'context_lengths': gen_context_lengths.contiguous(),
@@ -331,6 +337,7 @@ class TestBloom(unittest.TestCase):
                 'host_past_key_value_lengths'] = gen_host_past_key_value_lengths
             gen_host_context_lengths = gen_context_lengths.cpu()
             step1_buffer['host_context_lengths'] = gen_host_context_lengths
+            step1_buffer['host_sink_token_length'] = gen_host_sink_token_length
         else:
             step1_buffer['attention_mask'] = gen_attention_mask
 

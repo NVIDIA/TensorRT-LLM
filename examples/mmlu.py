@@ -259,7 +259,7 @@ class Pipeline:
 
     def __call__(self, prompt):
         # Run the model in batch size 1 and beam size 1
-        inputs = self.tokenizer.encode(prompt, return_tensors="pt")
+        inputs = self.tokenizer.encode(prompt, return_tensors="pt").squeeze(0)
         batch_input_ids = [inputs]
 
         # For multi-choice tasks like MMLU, we don't need to adjust following parameters
@@ -267,7 +267,7 @@ class Pipeline:
         top_k = 1
         top_p = 0.0
 
-        input_lengths = [x.size(1) for x in batch_input_ids]
+        input_lengths = [x.size(0) for x in batch_input_ids]
 
         with torch.no_grad():
             if isinstance(self.model, nn.Module):
@@ -278,7 +278,7 @@ class Pipeline:
                     for l in input_lengths
                 ]
                 batch_input_ids = [
-                    torch.cat([pad, x.squeeze(0)])
+                    torch.cat([pad, x])
                     for x, pad in zip(batch_input_ids, paddings)
                 ]
                 batch_input_ids = torch.stack(batch_input_ids)

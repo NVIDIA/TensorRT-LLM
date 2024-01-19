@@ -24,6 +24,8 @@
 namespace tensorrt_llm::runtime::kernels
 {
 
+using TensorPtr = runtime::ITensor::SharedPtr;
+
 template <typename T>
 void invokeFill(IBuffer& buffer, T value, CudaStream const& stream);
 
@@ -74,6 +76,8 @@ void initOutputIds(ITensor& outputIds, ITensor const& inputIds, ITensor const& i
 
 void scatterTensor(ITensor& output, ITensor const& input, SizeType beamWidth, CudaStream const& stream);
 
+void splitTransposed(ITensor& output, ITensor const& input, SizeType split, CudaStream const& stream);
+
 void tileTensor(ITensor& output, ITensor const& input, SizeType beamWidth, CudaStream const& stream);
 
 void tileTensorInplace(ITensor& tensor, SizeType beamWidth, CudaStream const& stream);
@@ -83,5 +87,9 @@ void gatherLastTokenLogits(
 
 void copyLatestTokenLogitsInGeneration(ITensor& output, ITensor const& input, SizeType step, SizeType firstBatchSlotIdx,
     SizeType microBatchSize, SizeType beamWidth, CudaStream const& stream);
+
+void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output, std::vector<TensorPtr> inputVector,
+    ITensor& cachePointerDevice, ITensor& cachePointerHost, SizeType firstBatchSlotIdx, SizeType const microBatchSize,
+    SizeType const beamWidth, CudaStream const& stream, int stepOffset);
 
 } // namespace tensorrt_llm::runtime::kernels

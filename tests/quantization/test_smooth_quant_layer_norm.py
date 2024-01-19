@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,16 +29,23 @@ class TestFunctional(unittest.TestCase):
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    @parameterized.expand([('float16', False, True), ('float16', True, True),
-                           ('float32', False, True), ('float32', True, True),
-                           ('float16', True, False)])
+    def load_test_cases():
+        test_cases = [('float16', False, True), ('float16', True, True),
+                      ('float32', False, True), ('float32', True, True),
+                      ('float16', True, False)]
+        return [i + (True, )
+                for i in test_cases] + [i + (False, ) for i in test_cases]
+
+    @parameterized.expand(load_test_cases)
     def test_smooth_quant_layer_norm_plugin(self, dtype, dynamic_act_scaling,
-                                            elementwise_affine):
+                                            elementwise_affine,
+                                            remove_batch_dim):
         torch.manual_seed(1997)
         # test data
         hidden_size = 1024
         x_data = torch.randn(
-            (8, 128, hidden_size),
+            (8, 128, hidden_size) if not remove_batch_dim else
+            (8 * 128, hidden_size),
             dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype)).cuda()
         eps = 1e-5
 

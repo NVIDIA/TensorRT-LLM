@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -76,7 +76,7 @@ void benchmarkBert(std::string const& modelName, std::filesystem::path const& da
     std::vector<int> const& batchSizes, std::vector<int> const& inLens,
     std::shared_ptr<nvinfer1::ILogger> const& logger, int warmUp, int numRuns, int duration)
 {
-    auto const worldConfig = WorldConfig::mpi(*logger);
+    auto const worldConfig = WorldConfig::mpi();
     auto const enginePath = dataPath / engineFilename(dataPath, worldConfig, modelName);
     auto engineBlob = loadEngine(enginePath.string());
 

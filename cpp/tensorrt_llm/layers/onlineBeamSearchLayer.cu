@@ -190,8 +190,8 @@ void OnlineBeamSearchLayer<T>::freeBuffer()
 
 template <typename T>
 OnlineBeamSearchLayer<T>::OnlineBeamSearchLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-    IAllocator* allocator, bool is_free_buffer_after_forward)
-    : BaseBeamSearchLayer<T>(vocab_size, vocab_size_padded, stream, allocator, is_free_buffer_after_forward)
+    std::shared_ptr<IAllocator> allocator, bool is_free_buffer_after_forward)
+    : BaseBeamSearchLayer<T>(vocab_size, vocab_size_padded, stream, std::move(allocator), is_free_buffer_after_forward)
 {
 }
 

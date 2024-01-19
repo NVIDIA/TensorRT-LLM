@@ -274,25 +274,25 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
 
     pe = fromfile(dir_path, 'model.wpe.bin', [n_positions, n_embd])
     if pe is not None:
-        tensorrt_llm_gpt.embedding.position_embedding.weight.value = (pe)
+        tensorrt_llm_gpt.position_embedding.weight.value = (pe)
 
     vocab_embedding_weight = fromfile(dir_path, 'model.wte.bin',
                                       [vocab_size, n_embd])
     if not use_parallel_embedding:
-        tensorrt_llm_gpt.embedding.vocab_embedding.weight.value = vocab_embedding_weight
+        tensorrt_llm_gpt.vocab_embedding.weight.value = vocab_embedding_weight
     else:
         if sharding_dim == 0:
             if vocab_size % tensor_parallel != 0:
                 # padding
                 vocab_size_padded = pad_vocab_size(
-                    tensorrt_llm_gpt.embedding.vocab_embedding.num_embeddings,
+                    tensorrt_llm_gpt.vocab_embedding.num_embeddings,
                     tensor_parallel)
                 pad_width = vocab_size_padded - vocab_size
                 vocab_embedding_weight = np.pad(vocab_embedding_weight,
                                                 ((0, pad_width), (0, 0)),
                                                 'constant',
                                                 constant_values=0)
-        tensorrt_llm_gpt.embedding.vocab_embedding.weight.value = np.ascontiguousarray(
+        tensorrt_llm_gpt.vocab_embedding.weight.value = np.ascontiguousarray(
             split(vocab_embedding_weight,
                   tensor_parallel,
                   rank,
@@ -497,8 +497,7 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
                 '.attention.query_key_value.scale_y_quant_orig.bin', [1],
                 np.float32)
             tensorrt_llm_gpt.layers[
-                i].attention.kv_orig_quant_scale.value = 1.0 / t
-            tensorrt_llm_gpt.layers[i].attention.kv_quant_orig_scale.value = t
+                i].attention.kv_cache_scaling_factor.value = t
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
@@ -573,7 +572,7 @@ def load_from_awq_mpt(tensorrt_llm_mpt: GPTLMHeadModel,
         weight /= scale.repeat_interleave(group_size, dim=0)
         qweight_int8 = torch.clamp(torch.round(weight.cuda()).char(), -8, 7)
         int4_weight = preprocessor(packer(qweight_int8.cpu()), torch.quint4x2)
-        return int4_weight.view(torch.int8).cpu().numpy()
+        return int4_weight.view(torch.float16).cpu().numpy()
 
     def process_and_assign_weight(mOp, v, tp_dim=0):
         weight = v[0].T.contiguous()
@@ -585,9 +584,9 @@ def load_from_awq_mpt(tensorrt_llm_mpt: GPTLMHeadModel,
         if tp_dim == 0:
             pre_quant_scale = torch_split(pre_quant_scale, 1)
         scale = amax / 8.0
-        mOp.qweight.value = AWQ_quantize_pack_preprocess(weight, scale)
-        mOp.scale.value = scale.to(torch_dtype).cpu().numpy()
-        mOp.pre_quant_scale.value = pre_quant_scale.to(
+        mOp.weight.value = AWQ_quantize_pack_preprocess(weight, scale)
+        mOp.weights_scaling_factor.value = scale.to(torch_dtype).cpu().numpy()
+        mOp.prequant_scaling_factor.value = pre_quant_scale.to(
             torch_dtype).cpu().numpy()
 
     def reSmooth_and_get_scale(weight, pre_quant_scale, avg_pre_quant_scale):
@@ -634,10 +633,11 @@ def load_from_awq_mpt(tensorrt_llm_mpt: GPTLMHeadModel,
         qkv_weights = torch.cat((q_weight, k_weight, v_weight), dim=1)
         qkv_scale = torch.cat((q_scale, k_scale, v_scale), dim=1)
 
-        mOp.pre_quant_scale.value = qkv_pre_quant_scale.to(
+        mOp.prequant_scaling_factor.value = qkv_pre_quant_scale.to(
             torch_dtype).cpu().numpy()
-        mOp.qweight.value = AWQ_quantize_pack_preprocess(qkv_weights, qkv_scale)
-        mOp.scale.value = qkv_scale.to(torch_dtype).cpu().numpy()
+        mOp.weight.value = AWQ_quantize_pack_preprocess(qkv_weights, qkv_scale)
+        mOp.weights_scaling_factor.value = qkv_scale.to(
+            torch_dtype).cpu().numpy()
 
     # Load weights from AWQ checkpoint into TRT-LLM module
     # 1. vocab_embedding and lm_head
@@ -646,7 +646,7 @@ def load_from_awq_mpt(tensorrt_llm_mpt: GPTLMHeadModel,
     if v.shape[0] % 64 != 0:
         v = torch.nn.functional.pad(v, [0, 0, 0, 64 - v.shape[0] % 64])
     if mapping.is_first_pp_rank():
-        tensorrt_llm_mpt.embedding.vocab_embedding.weight.value = v.to(
+        tensorrt_llm_mpt.vocab_embedding.weight.value = v.to(
             torch_dtype).cpu().numpy()
     if mapping.is_last_pp_rank():
         tp_dim = 0
@@ -658,7 +658,7 @@ def load_from_awq_mpt(tensorrt_llm_mpt: GPTLMHeadModel,
     if mapping.is_last_pp_rank():
         tensorrt_llm_mpt.ln_f.weight.value = v.to(torch_dtype).cpu().numpy()
         # MPT do not have LN bias, we set 0 here.
-        random_bias = tensorrt_llm_mpt.ln_f.weight._value
+        random_bias = tensorrt_llm_mpt.ln_f.weight.raw_value
         tensorrt_llm_mpt.ln_f.bias.value = np.zeros(random_bias.shape).astype(
             random_bias.dtype)
 
@@ -694,18 +694,18 @@ def load_from_awq_mpt(tensorrt_llm_mpt: GPTLMHeadModel,
         # 4.5 input_layernorm
         v = load(prefix + awq_key_list[6])
         layer.input_layernorm.weight.value = v.to(torch_dtype).cpu().numpy()
-        random_bias = layer.input_layernorm.bias._value
+        random_bias = layer.input_layernorm.bias.raw_value
         layer.input_layernorm.bias.value = np.zeros(random_bias.shape).astype(
             random_bias.dtype)
 
         # 4.6 post_layernorm
         v = load(prefix + awq_key_list[7])
         layer.post_layernorm.weight.value = v.to(torch_dtype).cpu().numpy()
-        random_bias = layer.post_layernorm.bias._value
+        random_bias = layer.post_layernorm.bias.raw_value
         layer.post_layernorm.bias.value = np.zeros(random_bias.shape).astype(
             random_bias.dtype)
 
-        # 4.7 attention.kv_quant_orig_scale / kv_quant_orig_scale
+        # 4.7 attention.kv_cache_scaling_factor
         if use_int8_kv_cache:
             assert ft_model_dir, "You must pass --ft_model_dir to tell TRT-LLM where to look for scales of INT8 kv cache."
             t = fromfile(
@@ -713,8 +713,7 @@ def load_from_awq_mpt(tensorrt_llm_mpt: GPTLMHeadModel,
                 '.attention.query_key_value.scale_y_quant_orig.bin', [1],
                 np.float32)
             assert t is not None, f"{ft_model_dir} does not contain model.layers.{layer_idx}.attention.query_key_value.scale_y_quant_orig.bin"
-            layer.attention.kv_orig_quant_scale.value = 1.0 / t
-            layer.attention.kv_quant_orig_scale.value = t
+            layer.attention.kv_cache_scaling_factor.value = t
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

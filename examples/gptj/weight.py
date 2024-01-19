@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -265,20 +265,20 @@ def load_from_bin_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
     vocab_embedding_weight = fromfile(dir_path, 'model.wte.bin',
                                       [vocab_size, n_embd])
     if not use_parallel_embedding:
-        tensorrt_llm_gpt_j.embedding.weight.value = vocab_embedding_weight
+        tensorrt_llm_gpt_j.vocab_embedding.weight.value = vocab_embedding_weight
     else:
         if sharding_dim == 0:
             if vocab_size % tensor_parallel != 0:
                 # padding
                 vocab_size_padded = pad_vocab_size(
-                    tensorrt_llm_gpt_j.embedding.num_embeddings,
+                    tensorrt_llm_gpt_j.vocab_embedding.num_embeddings,
                     tensor_parallel)
                 pad_width = vocab_size_padded - vocab_size
                 vocab_embedding_weight = np.pad(vocab_embedding_weight,
                                                 ((0, pad_width), (0, 0)),
                                                 'constant',
                                                 constant_values=0)
-        tensorrt_llm_gpt_j.embedding.weight.value = np.ascontiguousarray(
+        tensorrt_llm_gpt_j.vocab_embedding.weight.value = np.ascontiguousarray(
             split(vocab_embedding_weight,
                   tensor_parallel,
                   rank,
@@ -357,11 +357,8 @@ def load_from_bin_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
                 i].attention.qkv.weights_scaling_factor.value = np.array(
                     [scaling_factors['qkv_weights'][i]], dtype=fake_fp8_sf_dt)
             tensorrt_llm_gpt_j.layers[
-                i].attention.kv_orig_quant_scale.value = np.array(
+                i].attention.kv_cache_scaling_factor.value = np.array(
                     [scaling_factors['qkv_output'][i]], dtype=np.float32)
-            tensorrt_llm_gpt_j.layers[
-                i].attention.kv_quant_orig_scale.value = np.array(
-                    [1.0 / scaling_factors['qkv_output'][i]], dtype=np.float32)
 
         dst = tensorrt_llm_gpt_j.layers[i].attention.dense.weight
         t = fromfile(
@@ -474,8 +471,7 @@ def load_from_bin_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
                 '.attention.query_key_value.scale_y_quant_orig.bin', [1],
                 np.float32)
             tensorrt_llm_gpt_j.layers[
-                i].attention.kv_orig_quant_scale.value = 1.0 / t
-            tensorrt_llm_gpt_j.layers[i].attention.kv_quant_orig_scale.value = t
+                i].attention.kv_cache_scaling_factor.value = t
 
         if enable_fp8_qdq:
             tensorrt_llm_gpt_j.layers[
@@ -529,7 +525,8 @@ def load_from_hf_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
     hf_gpt_j_state_dict = hf_gpt_j.state_dict()
 
     v = hf_gpt_j_state_dict.get('transformer.wte.weight')
-    tensorrt_llm_gpt_j.embedding.weight.value = v.to(torch_dtype).cpu().numpy()
+    tensorrt_llm_gpt_j.vocab_embedding.weight.value = v.to(
+        torch_dtype).cpu().numpy()
 
     n_layer = hf_gpt_j.config.n_layer
 
@@ -606,12 +603,8 @@ def load_from_hf_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
         if quant_mode.has_fp8_kv_cache():
             if scaling_factors:
                 tensorrt_llm_gpt_j.layers[
-                    layer_idx].attention.kv_orig_quant_scale.value = np.array(
+                    layer_idx].attention.kv_cache_scaling_factor.value = np.array(
                         [scaling_factors['qkv_output'][layer_idx]],
-                        dtype=np.float32)
-                tensorrt_llm_gpt_j.layers[
-                    layer_idx].attention.kv_quant_orig_scale.value = np.array(
-                        [1.0 / scaling_factors['qkv_output'][layer_idx]],
                         dtype=np.float32)
 
         # Attention Dense (out_proj) Linear
@@ -655,18 +648,17 @@ def load_from_hf_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
 
 
 def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
-                        awq_gpt_j,
-                        config,
+                        quant_ckpt_path: str,
+                        quantize_lm_head=False,
                         mapping=Mapping(),
                         fp16=False,
-                        group_size=128,
                         ft_model_dir=None):
 
     awq_gptj_block_names = [
-        "ln_1.weight",
-        "ln_1.bias",
-        "mlp.fc_in.bias",
-        "mlp.fc_out.bias",
+        "input_layernorm:weight",
+        "input_layernorm:bias",
+        "mlp:fc:bias",
+        "mlp:proj:bias",
     ]
 
     tensorrt_llm_model_gptj_block_names = [
@@ -675,6 +667,30 @@ def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
         "mlp.fc.bias",
         "mlp.proj.bias",
     ]
+
+    awq_gpt_j = np.load(quant_ckpt_path)
+    awq_prefix = "_np:"
+    AMMO_WEIGHT_SCALING_FACTOR_COEFF = 7
+
+    def load(key):
+        v = torch.from_numpy(awq_gpt_j[awq_prefix + key])
+        if "weights_scaling_factor" in key:
+            v *= AMMO_WEIGHT_SCALING_FACTOR_COEFF  # For AMMO *.npz checkpoints
+        return v
+
+    group_size = load("layers:0:attention:dense:weight").numel() // load(
+        "layers:0:attention:dense:weights_scaling_factor").numel()
+
+    quant_mode = getattr(tensorrt_llm_gpt_j, 'quant_mode', QuantMode(0))
+    # Int8 KV cache
+    use_int8_kv_cache = quant_mode.has_int8_kv_cache()
+
+    packer = torch.ops.fastertransformer.pack_int8_tensor_to_packed_int4
+    preprocessor = torch.ops.fastertransformer.preprocess_weights_for_mixed_gemm
+    torch_dtype = torch.float16 if fp16 else torch.float32
+
+    tensorrt_llm.logger.info('Loading weights from AWQ GPT-J...')
+    tik = time.time()
 
     def fromfile(dir_path, name, shape=None, dtype=None):
         p = dir_path + '/' + name
@@ -685,17 +701,14 @@ def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
             return t
         return None
 
-    quant_mode = getattr(tensorrt_llm_gpt_j, 'quant_mode', QuantMode(0))
-    # Int8 KV cache
-    use_int8_kv_cache = quant_mode.has_int8_kv_cache()
-
-    packer = torch.ops.fastertransformer.pack_int8_tensor_to_packed_int4
-    preprocessor = torch.ops.fastertransformer.preprocess_weights_for_mixed_gemm
-
-    tensorrt_llm.logger.info('Loading weights from AWQ GPT-J...')
-    tik = time.time()
-
-    torch_dtype = torch.float16 if fp16 else torch.float32
+    def torch_split(v, dim):
+        if v.shape[dim] % mapping.tp_size != 0:
+            tensorrt_llm.logger.error(
+                "Current weight shape is invalid for mapping.tp_size=" +
+                str(mapping.tp_size))
+            assert False, "Invalid TP size"
+        return v.split(v.shape[dim] // mapping.tp_size,
+                       dim=dim)[mapping.tp_rank]
 
     def AWQ_quantize_pack_preprocess(weight, scale):
         scale = scale.repeat_interleave(group_size, dim=0)
@@ -703,26 +716,26 @@ def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
         qweight_int8 = torch.clamp(torch.round(weight.cuda()).char(), -8, 7)
         int4_weight = packer(qweight_int8.cpu())
         int4_weight = preprocessor(int4_weight, torch.quint4x2)
-        return int4_weight.view(torch.int8).cpu().numpy()
+        return int4_weight.view(torch.float16).cpu().numpy()
 
-    def process_and_assign_weight(awq_gpt_j, mPrefix, mOp, tp_dim=0):
-        weight = awq_gpt_j[mPrefix + ".weight"].T.contiguous()
+    def process_and_assign_weight(mPrefix, mOp, tp_dim=0):
+        weight = load(mPrefix + ":weight").T.contiguous()
         [k, n] = weight.shape
         weight = weight.split(weight.shape[tp_dim] // mapping.tp_size,
                               dim=tp_dim)[mapping.tp_rank]
-        amax = awq_gpt_j[mPrefix + ".weight_quantizer._amax"].reshape(
+        amax = load(mPrefix + ":weights_scaling_factor").reshape(
             (n, int(k / group_size))).T.contiguous()
         amax = amax.split(amax.shape[tp_dim] // mapping.tp_size,
                           dim=tp_dim)[mapping.tp_rank]
-        pre_quant_scale = awq_gpt_j[
-            mPrefix + ".input_quantizer._pre_quant_scale"].reshape((1, k))
+        pre_quant_scale = load(mPrefix + ":prequant_scaling_factor").reshape(
+            (1, k))
         if tp_dim == 0:
             pre_quant_scale = pre_quant_scale.split(k // mapping.tp_size,
                                                     dim=1)[mapping.tp_rank]
         scale = amax / 8.0
-        mOp.qweight.value = AWQ_quantize_pack_preprocess(weight, scale)
-        mOp.scale.value = scale.to(torch_dtype).cpu().numpy()
-        mOp.pre_quant_scale.value = pre_quant_scale.to(
+        mOp.weight.value = AWQ_quantize_pack_preprocess(weight, scale)
+        mOp.weights_scaling_factor.value = scale.to(torch_dtype).cpu().numpy()
+        mOp.prequant_scaling_factor.value = pre_quant_scale.to(
             torch_dtype).cpu().numpy()
 
     def deSmooth(weight, pre_quant_scale):
@@ -749,15 +762,17 @@ def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
         return amax / 8
 
     def reSmooth_and_get_scale(weight, pre_quant_scale, avg_pre_quant_scale):
-        weight = deSmooth(weight, pre_quant_scale)
-        weight = reSmooth(weight, avg_pre_quant_scale)
+        if quant_ckpt_path.endswith("pt"):
+            # NPZ files are already re-smoothed
+            weight = deSmooth(weight, pre_quant_scale)
+            weight = reSmooth(weight, avg_pre_quant_scale)
         scale = get_scale(weight)
         return weight, scale
 
-    def process_and_assign_qkv_weight(awq_gpt_j, prefix, mOp):
-        q_weight = awq_gpt_j[prefix + "attn.q_proj.weight"].T.contiguous()
-        k_weight = awq_gpt_j[prefix + "attn.k_proj.weight"].T.contiguous()
-        v_weight = awq_gpt_j[prefix + "attn.v_proj.weight"].T.contiguous()
+    def process_and_assign_qkv_weight(prefix, mOp):
+        q_weight = load(prefix + "attention:qkv:q:weight").T.contiguous()
+        k_weight = load(prefix + "attention:qkv:k:weight").T.contiguous()
+        v_weight = load(prefix + "attention:qkv:v:weight").T.contiguous()
         k = q_weight.shape[0]
 
         q_weight = q_weight.split(q_weight.shape[1] // mapping.tp_size,
@@ -767,15 +782,12 @@ def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
         v_weight = v_weight.split(v_weight.shape[1] // mapping.tp_size,
                                   dim=1)[mapping.tp_rank]
 
-        q_pre_quant_scale = awq_gpt_j[
-            prefix + "attn.q_proj.input_quantizer._pre_quant_scale"].reshape(
-                (1, k))
-        k_pre_quant_scale = awq_gpt_j[
-            prefix + "attn.k_proj.input_quantizer._pre_quant_scale"].reshape(
-                (1, k))
-        v_pre_quant_scale = awq_gpt_j[
-            prefix + "attn.v_proj.input_quantizer._pre_quant_scale"].reshape(
-                (1, k))
+        q_pre_quant_scale = load(
+            prefix + "attention:qkv:q:prequant_scaling_factor").reshape((1, k))
+        k_pre_quant_scale = load(
+            prefix + "attention:qkv:k:prequant_scaling_factor").reshape((1, k))
+        v_pre_quant_scale = load(
+            prefix + "attention:qkv:v:prequant_scaling_factor").reshape((1, k))
 
         qkv_pre_quant_scale = (q_pre_quant_scale + k_pre_quant_scale +
                                v_pre_quant_scale) / 3.0
@@ -789,35 +801,38 @@ def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
         qkv_weights = torch.cat((q_weight, k_weight, v_weight), dim=1)
         qkv_scale = torch.cat((q_scale, k_scale, v_scale), dim=1)
 
-        mOp.pre_quant_scale.value = qkv_pre_quant_scale.to(
+        mOp.prequant_scaling_factor.value = qkv_pre_quant_scale.to(
             torch_dtype).cpu().numpy()
-        mOp.qweight.value = AWQ_quantize_pack_preprocess(qkv_weights, qkv_scale)
-        mOp.scale.value = qkv_scale.to(torch_dtype).cpu().numpy()
+        mOp.weight.value = AWQ_quantize_pack_preprocess(qkv_weights, qkv_scale)
+        mOp.weights_scaling_factor.value = qkv_scale.to(
+            torch_dtype).cpu().numpy()
 
-    #check if we need to pad vocab
-    v = awq_gpt_j.get('transformer.wte.weight')
+    # check if we need to pad vocab
+    v = load('vocab_embedding:weight')
     [vocab_size, k] = v.shape
     pad_vocab = False
     pad_vocab_size = vocab_size
-    if vocab_size % 64 != 0:
+    if quantize_lm_head and vocab_size % 64 != 0:
         pad_vocab = True
         pad_vocab_size = int((vocab_size + 63) / 64) * 64
     if pad_vocab:
         new_v = torch.zeros([pad_vocab_size, k])
         new_v[:vocab_size, :] = v
         v = new_v
-    tensorrt_llm_gpt_j.embedding.weight.value = v.to(torch_dtype).cpu().numpy()
+    if mapping.is_first_pp_rank():
+        tensorrt_llm_gpt_j.embedding.weight.value = v.to(
+            torch_dtype).cpu().numpy()
 
-    n_layer = config["n_layer"]
+    n_layer = len(tensorrt_llm_gpt_j.layers)
 
     for layer_idx in range(n_layer):
-        prefix = "transformer.h." + str(layer_idx) + "."
+        prefix = "layers:" + str(layer_idx) + ":"
         tensorrt_llm.logger.info(f'Process weights in layer: {layer_idx}')
         for idx, awq_attr in enumerate(awq_gptj_block_names):
-            v = awq_gpt_j[prefix + awq_attr]
-            if awq_attr == "mlp.fc_in.bias":
+            v = load(prefix + awq_attr)
+            if awq_attr == "mlp:fc:bias":
                 v = v.split(v.shape[0] // mapping.tp_size, dim=0)[mapping.rank]
-            elif awq_attr == "mlp.fc_out.bias":
+            elif awq_attr == "mlp:proj:bias":
                 v = torch.zeros_like(v) if mapping.rank != 0 else v
             layer = attrgetter(tensorrt_llm_model_gptj_block_names[idx])(
                 tensorrt_llm_gpt_j.layers[layer_idx])
@@ -826,23 +841,22 @@ def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
         # Attention QKV Linear
         # concatenate the Q, K, V layers weights.
         process_and_assign_qkv_weight(
-            awq_gpt_j, prefix,
-            tensorrt_llm_gpt_j.layers[layer_idx].attention.qkv)
+            prefix, tensorrt_llm_gpt_j.layers[layer_idx].attention.qkv)
 
-        # Attention Dense (out_proj) Linear
-        mPrefix = prefix + "attn.out_proj"
+        # Attention Dense Linear
+        mPrefix = prefix + "attention:dense"
         mOp = tensorrt_llm_gpt_j.layers[layer_idx].attention.dense
-        process_and_assign_weight(awq_gpt_j, mPrefix, mOp, 0)
+        process_and_assign_weight(mPrefix, mOp, 0)
 
         # MLP Dense (mlp.fc) Linear
-        mPrefix = prefix + "mlp.fc_in"
+        mPrefix = prefix + "mlp:fc"
         mOp = tensorrt_llm_gpt_j.layers[layer_idx].mlp.fc
-        process_and_assign_weight(awq_gpt_j, mPrefix, mOp, 1)
+        process_and_assign_weight(mPrefix, mOp, 1)
 
         # MLP Dense (mlp.proj) Linear
-        mPrefix = prefix + "mlp.fc_out"
+        mPrefix = prefix + "mlp:proj"
         mOp = tensorrt_llm_gpt_j.layers[layer_idx].mlp.proj
-        process_and_assign_weight(awq_gpt_j, mPrefix, mOp, 0)
+        process_and_assign_weight(mPrefix, mOp, 0)
 
         if use_int8_kv_cache:
             assert ft_model_dir, "You must pass --ft_model_dir to tell TRT-LLM where to look for scales of INT8 kv cache."
@@ -852,26 +866,24 @@ def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
                 np.float32)
             assert t is not None, f"{ft_model_dir} does not contain model.layers.{layer_idx}.attention.query_key_value.scale_y_quant_orig.bin"
             tensorrt_llm_gpt_j.layers[
-                layer_idx].attention.kv_orig_quant_scale.value = 1.0 / t
-            tensorrt_llm_gpt_j.layers[
-                layer_idx].attention.kv_quant_orig_scale.value = t
+                layer_idx].attention.kv_cache_scaling_factor.value = t
 
-    v = awq_gpt_j['transformer.ln_f.weight']
+    v = load('final_layernorm:weight')
     tensorrt_llm_gpt_j.ln_f.weight.value = v.to(torch_dtype).cpu().numpy()
 
-    v = awq_gpt_j['transformer.ln_f.bias']
+    v = load('final_layernorm:bias')
     tensorrt_llm_gpt_j.ln_f.bias.value = v.to(torch_dtype).cpu().numpy()
 
-    #lm_head
+    # lm_head
     if pad_vocab:
-        weight = awq_gpt_j['lm_head.weight']
+        weight = load('lm_head:weight')
         [vocab_size, k] = weight.shape
         new_weight = torch.zeros([pad_vocab_size, k])
         new_weight[:vocab_size, :] = weight
         new_weight = new_weight.T.contiguous()
         new_weight = new_weight.split(new_weight.shape[1] // mapping.tp_size,
                                       dim=1)[mapping.tp_rank]
-        amax = awq_gpt_j['lm_head.weight_quantizer._amax'].reshape(
+        amax = load('lm_head:weights_scaling_factor').reshape(
             [vocab_size, int(k / group_size)])
         new_amax = torch.ones([pad_vocab_size, int(k / group_size)])
         new_amax[:vocab_size, :] = amax
@@ -879,28 +891,34 @@ def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
         new_amax = new_amax.split(new_amax.shape[1] // mapping.tp_size,
                                   dim=1)[mapping.tp_rank]
         new_scale = new_amax / 8
-        tensorrt_llm_gpt_j.lm_head.qweight.value = AWQ_quantize_pack_preprocess(
+        tensorrt_llm_gpt_j.lm_head.weight.value = AWQ_quantize_pack_preprocess(
             new_weight, new_scale)
-        tensorrt_llm_gpt_j.lm_head.scale.value = new_scale.to(
+        tensorrt_llm_gpt_j.lm_head.weights_scaling_factor.value = new_scale.to(
             torch_dtype).cpu().numpy()
-        tensorrt_llm_gpt_j.lm_head.pre_quant_scale.value = awq_gpt_j[
-            'lm_head.input_quantizer._pre_quant_scale'].to(
-                torch_dtype).cpu().numpy()
+        tensorrt_llm_gpt_j.lm_head.prequant_scaling_factor.value = load(
+            'lm_head:prequant_scaling_factor').to(torch_dtype).cpu().numpy()
 
-        bias = awq_gpt_j['lm_head.bias']
+        bias = load('lm_head:bias')
         new_bias = torch.zeros([pad_vocab_size])
         new_bias[:vocab_size] = bias
         new_bias = new_bias.split(pad_vocab_size // mapping.tp_size,
                                   dim=0)[mapping.tp_rank]
         tensorrt_llm_gpt_j.lm_head.bias.value = new_bias.to(
             torch_dtype).cpu().numpy()
-    else:
+    elif quantize_lm_head:
         mPrefix = "lm_head"
         mOp = tensorrt_llm_gpt_j.lm_head
-        process_and_assign_weight(awq_gpt_j, mPrefix, mOp, 1)
-
-        v = awq_gpt_j['lm_head.bias']
-        tensorrt_llm_gpt_j.lm_head.bias.value = v.to(torch_dtype).cpu().numpy()
+        process_and_assign_weight(mPrefix, mOp, 1)
+        v = load('lm_head:bias')
+        tensorrt_llm_gpt_j.lm_head.bias.value = torch_split(
+            v, 0).to(torch_dtype).cpu().numpy()
+    else:
+        weight = load('lm_head:weight')
+        tensorrt_llm_gpt_j.lm_head.weight.value = torch_split(
+            weight, 0).to(torch_dtype).cpu().numpy()
+        bias = load('lm_head:bias')
+        tensorrt_llm_gpt_j.lm_head.bias.value = torch_split(
+            bias, 0).to(torch_dtype).cpu().numpy()
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

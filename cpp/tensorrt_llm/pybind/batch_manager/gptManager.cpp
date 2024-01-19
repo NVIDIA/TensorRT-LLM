@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -101,7 +101,18 @@ void GptManager::initBindings(py::module_& m)
             py::arg("return_batch_manager_stats_cb") = nullptr,
             py::arg_v("optional_params", tb::TrtGptModelOptionalParams(), "TrtGptModelOptionalParams"),
             py::arg("terminate_req_id") = std::nullopt)
-        .def("shutdown", &GptManager::exit)
+
+        // Note: attempting to bind &GptManager::shutdown() will result in a compiler error:
+        //
+        //  pybind11.h:1482:56: error: static assertion failed: Cannot bind an inaccessible base class method; use a
+        //  lambda definition instead 1482 |         detail::is_accessible_base_of<Class, Derived>::value,
+        //      |                                                        ^~~~~
+        //
+        // The issue is that the parent class has no bindings and is therefore not visible to pybind11.
+        // To resolve, we can add something like:
+        //
+        //  py::class_<tensorrt_llm::batch_manager::GptManager>(m, "_GptManagerBase");
+        .def("shutdown", [](GptManager& self) { self.shutdown(); })
         .def("__enter__", &GptManager::enter)
         .def("__exit__", &GptManager::exit);
 }

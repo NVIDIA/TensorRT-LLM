@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
-import json
 import math
 import os
 import time
@@ -69,6 +68,7 @@ def parse_arguments(args):
         type=str,
         default=None,
         help='The path to HF GPT-J model / checkpoints to read weights from')
+    parser.add_argument('--quant_ckpt_path', type=str, default=None)
     parser.add_argument(
         '--ft_model_dir',
         type=str,
@@ -90,6 +90,14 @@ def parse_arguments(args):
         default='model.cache',
         help=
         'The path of to read timing cache from, will be ignored if the file does not exist'
+    )
+    parser.add_argument(
+        '--profiling_verbosity',
+        type=str,
+        default='layer_names_only',
+        choices=['layer_names_only', 'detailed', 'none'],
+        help=
+        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
     )
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument('--vocab_size', type=int, default=50401)
@@ -208,11 +216,16 @@ def parse_arguments(args):
         type=str,
         nargs='?',
         default='int8',
-        choices=['int8', 'int4'],
+        choices=['int8', 'int4', 'int4_awq'],
         help=
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
     )
+    parser.add_argument(
+        '--quantize_lm_head',
+        default=False,
+        action="store_true",
+        help='Quantize lm_head weights as well when using int4_awq.')
     parser.add_argument(
         '--strongly_typed',
         default=False,
@@ -232,32 +245,13 @@ def parse_arguments(args):
 
     if args.model_dir is not None:
         global hf_gpt
-        if args.use_weight_only and args.weight_only_precision == 'int4' and args.per_group:
-            logger.info(f'Loading AWQ GPTJ model from {args.model_dir}...')
-            global awq_gptj_config
-            with open(args.model_dir + "/config.json",
-                      encoding='utf-8') as config_file:
-                awq_gptj_config = json.load(config_file)
-                args.n_embd = awq_gptj_config['n_embd']
-                args.n_head = awq_gptj_config['n_head']
-                args.n_layer = awq_gptj_config['n_layer']
-                args.n_positions = awq_gptj_config['n_positions']
-                args.vocab_size = awq_gptj_config['vocab_size']
-                if args.vocab_size % 64 != 0:
-                    args.vocab_size = int(
-                        (awq_gptj_config['vocab_size'] + 63) / 64) * 64
-                    print(
-                        "vocab_size is {}, to use awq we pad it to {}.".format(
-                            awq_gptj_config['vocab_size'], args.vocab_size))
-            hf_gpt = torch.load(args.model_dir + "/gptj_quantized.pth")
-        else:
-            logger.info(f'Loading HF GPTJ model from {args.model_dir}...')
-            hf_gpt = AutoModelForCausalLM.from_pretrained(args.model_dir)
-            args.n_embd = hf_gpt.config.n_embd
-            args.n_head = hf_gpt.config.n_head
-            args.n_layer = hf_gpt.config.n_layer
-            args.n_positions = hf_gpt.config.n_positions
-            args.vocab_size = hf_gpt.config.vocab_size
+        logger.info(f'Loading HF GPTJ model from {args.model_dir}...')
+        hf_gpt = AutoModelForCausalLM.from_pretrained(args.model_dir)
+        args.n_embd = hf_gpt.config.n_embd
+        args.n_head = hf_gpt.config.n_head
+        args.n_layer = hf_gpt.config.n_layer
+        args.n_positions = hf_gpt.config.n_positions
+        args.vocab_size = hf_gpt.config.vocab_size
     elif args.ft_model_dir is not None:
         logger.info(f"Setting model configuration from {args.ft_model_dir}.")
         n_embd, n_head, n_layer, n_positions, vocab_size, _, hidden_act, rotary_pct, bias, inter_size, multi_query_mode, dtype, prompt_num_tasks, prompt_max_vocab_size = parse_config(
@@ -274,9 +268,13 @@ def parse_arguments(args):
         args.inter_size = inter_size
         args.multi_query_mode = multi_query_mode
 
+    if args.quantize_lm_head and args.weight_only_precision == 'int4_awq':
+        if args.vocab_size % 64 != 0:
+            args.vocab_size = int((args.vocab_size + 63) / 64) * 64
+            logger.info("To use awq we pad it to {}.".format(args.vocab_size))
+
     if args.use_weight_only:
         if args.per_group:
-            assert args.weight_only_precision == 'int4', "We only support per-group quantization (AWQ/GPT-Q) with INT4 precision"
             args.quant_mode = QuantMode.from_description(
                 quantize_weights=True,
                 quantize_activations=False,
@@ -289,6 +287,12 @@ def parse_arguments(args):
                 args.weight_only_precision == 'int4')
     else:
         args.quant_mode = QuantMode(0)
+
+    if args.weight_only_precision == 'int4_awq' and args.quantize_lm_head:
+        if args.vocab_size % 64 != 0:
+            args.vocab_size = int((args.vocab_size + 63) / 64) * 64
+            logger.info("To use awq we pad vocab_size to {}.".format(
+                args.vocab_size))
 
     if args.int8_kv_cache:
         args.quant_mode = args.quant_mode.set_int8_kv_cache()
@@ -357,12 +361,12 @@ def build_rank_engine(builder: Builder,
 
     quantize_kwargs = {}
     if args.use_weight_only and args.per_group:
-        assert args.weight_only_precision == 'int4'
+        assert args.weight_only_precision == 'int4_awq'
         quantize_kwargs = {
             "group_size": 128,
             "zero": False,
             "pre_quant_scale": True,
-            "exclude_modules": [],
+            "exclude_modules": ['lm_head'] if not args.quantize_lm_head else [],
         }
     tensorrt_llm_gpt = quantize_model(tensorrt_llm_gpt, args.quant_mode,
                                       **quantize_kwargs)
@@ -374,11 +378,11 @@ def build_rank_engine(builder: Builder,
                 args.quantized_fp8_model_path, args.n_layer, args.quant_mode)
         else:
             gptj_scaling_factors = None
-        if args.use_weight_only and args.weight_only_precision == 'int4' and args.per_group:
+        if args.use_weight_only and args.weight_only_precision == 'int4_awq' and args.per_group:
             load_from_awq_gpt_j(tensorrt_llm_gpt,
-                                awq_gpt_j=hf_gpt,
+                                quant_ckpt_path=args.quant_ckpt_path,
+                                quantize_lm_head=args.quantize_lm_head,
                                 ft_model_dir=args.ft_model_dir,
-                                config=awq_gptj_config,
                                 mapping=mapping,
                                 fp16=(args.dtype == 'float16'))
         else:
@@ -469,14 +473,19 @@ def build(rank, args):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
-        # NOTE(nkorobov): when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
-        int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
-            not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
+        # NOTE: int8 flag is required to be true when INT8 tensors are exposed to TRT
+        # TRT-LLM has INT8 I/O when act/weights are quantized without group-scaling (AWQ, GPTQ)
+        # OR INT8 KV cache is set to contiguous (without paged KV cache enabled).
+        int8_trt_flag = (args.quant_mode.has_act_or_weight_quant()
+                         and not args.quant_mode.has_per_group_scaling()) or (
+                             not args.paged_kv_cache
+                             and args.quant_mode.has_int8_kv_cache())
 
         builder_config = builder.create_builder_config(
             name=MODEL_NAME,
             precision=args.dtype,
             timing_cache=args.timing_cache if cache is None else cache,
+            profiling_verbosity=args.profiling_verbosity,
             tensor_parallel=args.world_size,  # TP only
             parallel_build=args.parallel_build,
             num_layers=args.n_layer,

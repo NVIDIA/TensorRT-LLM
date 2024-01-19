@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,7 @@ Convert Baichuan models. Use https://huggingface.co/baichuan-inc/Baichuan2-7B-Ch
 import argparse
 import configparser
 import os
+import platform
 from pathlib import Path
 
 import torch
@@ -280,6 +281,12 @@ if __name__ == "__main__":
                         choices=["fp32", "fp16"])
 
     args = parser.parse_args()
+    if args.processes > 1 and platform.system() == "Windows":
+        print(
+            "Resetting processes to 1 because multi-process on Windows is not implemented."
+        )
+        args.processes = 1
+
     print("\n=============== Argument ===============")
     for key in vars(args):
         print("{}: {}".format(key, vars(args)[key]))

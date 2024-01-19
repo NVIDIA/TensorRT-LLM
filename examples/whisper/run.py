@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -87,12 +87,21 @@ class WhisperEncoding:
         return session
 
     def get_audio_features(self, mel):
-        inputs = OrderedDict()
-        output_list = []
 
-        inputs.update({'x': mel})
-        output_list.append(
-            TensorInfo('x', str_dtype_to_trt(self.dtype), mel.shape))
+        input_lengths = torch.tensor(
+            [mel.shape[2] // 2 for _ in range(mel.shape[0])],
+            dtype=torch.int32,
+            device=mel.device)
+
+        inputs = OrderedDict()
+        inputs['x'] = mel
+        inputs['input_lengths'] = input_lengths
+
+        output_list = [
+            TensorInfo('x', str_dtype_to_trt(self.dtype), mel.shape),
+            TensorInfo('input_lengths', str_dtype_to_trt('int32'),
+                       input_lengths.shape)
+        ]
 
         output_info = (self.session).infer_shapes(output_list)
 
@@ -373,7 +382,7 @@ if __name__ == '__main__':
                                              "test-set",
                                              results,
                                              enable_log=True)
-        if args.dataset == "hf-internal-testing/librispeech_asr_dummy":
+        if args.dataset == "hf-internal-testing/librispeech_asr_dummy" and not args.input_file:
             assert total_error_rate <= 3.1, f"Word Error rate using whisper large model should be less than 3.1% but got {total_error_rate}"
 
     rtf = elapsed / total_duration

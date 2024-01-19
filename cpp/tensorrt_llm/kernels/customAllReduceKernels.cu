@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,33 +15,15 @@
  */
 
 #include "customAllReduceKernels.h"
+#include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include <tuple>
 
 namespace tensorrt_llm::kernels
 {
 
-using tensorrt_llm::common::hadd2;
 using tensorrt_llm::common::datatype_enum;
 using tensorrt_llm::common::divUp;
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static inline __device__ uint32_t myHadd2(const uint32_t& a, const uint32_t& b)
-{
-    uint32_t c;
-    asm volatile("add.f16x2 %0, %1, %2;\n" : "=r"(c) : "r"(a), "r"(b));
-    return c;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static inline __device__ uint32_t fadd(const uint32_t& a, const uint32_t& b)
-{
-    uint32_t c;
-    asm volatile("add.f32 %0, %1, %2;\n" : "=r"(c) : "r"(a), "r"(b));
-    return c;
-}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -69,79 +51,61 @@ static inline __device__ void ld_flag_acquire(uint32_t& flag, uint32_t* flag_add
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Type Converter that packs data format to 128 bits data type
-template <typename T>
-struct ARTypeConverter
+//
+using PackedFloat = union
 {
-    using Type = uint4;
+    int4 packed;
+    float unpacked[4];
+};
+
+using PackedHalf = union
+{
+    int4 packed;
+    half2 unpacked[4];
+};
+
+template <typename T>
+struct PackedOn16Bytes
+{
+};
+
+template <>
+struct PackedOn16Bytes<float>
+{
+    using Type = PackedFloat;
+};
+
+template <>
+struct PackedOn16Bytes<half>
+{
+    using Type = PackedHalf;
 };
 
 #ifdef ENABLE_BF16
-template <>
-struct ARTypeConverter<__nv_bfloat16>
+using PackedBFloat16 = union
 {
-    using Type = bf168;
+    int4 packed;
+    __nv_bfloat162 unpacked[4];
+};
+
+template <>
+struct PackedOn16Bytes<__nv_bfloat16>
+{
+    using Type = PackedBFloat16;
 };
 #endif
 
 // add two 128b data
-template <typename T_IN, typename T_COMP>
-inline __device__ T_IN add128b(T_IN a, T_IN b);
-
-template <>
-inline __device__ uint4 add128b<uint4, uint16_t>(uint4 a, uint4 b)
-{
-    uint4 c;
-    c.x = myHadd2(a.x, b.x);
-    c.y = myHadd2(a.y, b.y);
-    c.z = myHadd2(a.z, b.z);
-    c.w = myHadd2(a.w, b.w);
-    return c;
-}
-
-template <>
-inline __device__ uint4 add128b<uint4, uint32_t>(uint4 a, uint4 b)
-{
-    uint4 c;
-    c.x = fadd(a.x, b.x);
-    c.y = fadd(a.y, b.y);
-    c.z = fadd(a.z, b.z);
-    c.w = fadd(a.w, b.w);
-    return c;
-}
-
-#ifdef ENABLE_BF16
-template <>
-inline __device__ bf168 add128b<bf168, __nv_bfloat16>(bf168 a, bf168 b)
-{
-    bf168 c;
-    c.x = hadd2(a.x, b.x);
-    c.y = hadd2(a.y, b.y);
-    c.z = hadd2(a.z, b.z);
-    c.w = hadd2(a.w, b.w);
-    return c;
-}
-#endif
-
-// init 128bits data with 0
 template <typename T>
-inline __device__ T init_packed_type();
-
-template <>
-inline __device__ uint4 init_packed_type()
+inline __device__ int4 add128b(T& a, T& b)
 {
-    return make_uint4(0u, 0u, 0u, 0u);
+    T c;
+    c.unpacked[0] = a.unpacked[0] + b.unpacked[0];
+    c.unpacked[1] = a.unpacked[1] + b.unpacked[1];
+    c.unpacked[2] = a.unpacked[2] + b.unpacked[2];
+    c.unpacked[3] = a.unpacked[3] + b.unpacked[3];
+    return c.packed;
 }
-
-#ifdef ENABLE_BF16
-template <>
-inline __device__ bf168 init_packed_type()
-{
-    bf168 val;
-    uint4& val_u = reinterpret_cast<uint4&>(val);
-    val_u = make_uint4(0u, 0u, 0u, 0u);
-    return val;
-}
-#endif
 
 __inline__ __device__ void multi_gpu_barrier(
     uint32_t** signals, const uint32_t flag, const size_t rank, const size_t world_size, const int tidx, const int bidx)
@@ -179,10 +143,10 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams params)
     const int tidx = threadIdx.x;
 
     // The number of elements packed into one for comms
-    static constexpr int NUM_ELTS = std::is_same<T, uint32_t>::value ? 4 : 8;
+    static constexpr int NUM_ELTS = 16 / sizeof(T);
 
     // Packed data type for comms
-    using PackedType = typename ARTypeConverter<T>::Type;
+    using PackedStruct = typename PackedOn16Bytes<T>::Type;
 
     multi_gpu_barrier(params.peer_barrier_ptrs_in, params.barrier_flag, params.local_rank, RANKS_PER_NODE, tidx, bidx);
 
@@ -204,23 +168,24 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams params)
     for (size_t iter_offset = offset; iter_offset < max_offset; iter_offset += blockDim.x * NUM_ELTS)
     {
         // Iterate over the different ranks/devices on the node to load the values.
-        PackedType vals[RANKS_PER_NODE];
+        PackedStruct vals[RANKS_PER_NODE];
 #pragma unroll
         for (int ii = 0; ii < RANKS_PER_NODE; ++ii)
         {
-            vals[ii] = reinterpret_cast<const PackedType*>(&src_d[ii][iter_offset])[0];
+            vals[ii].packed = *reinterpret_cast<const int4*>(&src_d[ii][iter_offset]);
         }
 
         // Sum the values from the different ranks.
-        PackedType sums = init_packed_type<PackedType>();
+        PackedStruct sums;
+        sums.packed = {0, 0, 0, 0};
 #pragma unroll
         for (int ii = 0; ii < RANKS_PER_NODE; ++ii)
         {
-            sums = add128b<PackedType, T>(sums, vals[ii]);
+            sums.packed = add128b(sums, vals[ii]);
         }
 
         // Store to the destination buffer.
-        reinterpret_cast<PackedType*>(&reinterpret_cast<T*>(params.local_output_buffer_ptr)[iter_offset])[0] = sums;
+        *reinterpret_cast<int4*>(&reinterpret_cast<T*>(params.local_output_buffer_ptr)[iter_offset]) = sums.packed;
     }
 }
 
@@ -234,10 +199,10 @@ static __global__ void twoShotAllReduceKernel(AllReduceParams params)
     const int tidx = threadIdx.x;
 
     // The number of elements packed into one for comms
-    static constexpr int NUM_ELTS = std::is_same<T, uint32_t>::value ? 4 : 8;
+    static constexpr int NUM_ELTS = 16 / sizeof(T);
 
     // Packed data type for comms
-    using PackedType = typename ARTypeConverter<T>::Type;
+    using PackedType = typename PackedOn16Bytes<T>::Type;
 
     // The location in the destination array (load 8 fp16 or load 4 fp32 using LDG.128).
     const size_t block_offset = bidx * params.elts_per_block + tidx * NUM_ELTS;
@@ -268,19 +233,20 @@ static __global__ void twoShotAllReduceKernel(AllReduceParams params)
 #pragma unroll
         for (int ii = 0; ii < RANKS_PER_NODE; ++ii)
         {
-            vals[ii] = reinterpret_cast<const PackedType*>(&src_d[ii][local_offset])[0];
+            vals[ii].packed = *reinterpret_cast<const int4*>(&src_d[ii][local_offset]);
         }
 
         // Sum the values from the different ranks.
-        PackedType sums = init_packed_type<PackedType>();
+        PackedType sums;
+        sums.packed = {0, 0, 0, 0};
 #pragma unroll
         for (int ii = 0; ii < RANKS_PER_NODE; ++ii)
         {
-            sums = add128b<PackedType, T>(sums, vals[ii]);
+            sums.packed = add128b(sums, vals[ii]);
         }
 
         // Store to the local buffer.
-        reinterpret_cast<PackedType*>(&src_d[0][local_offset])[0] = sums;
+        *reinterpret_cast<int4*>(&src_d[0][local_offset]) = sums.packed;
     }
 
     // sync threads to make sure all block threads have the sums
@@ -318,8 +284,8 @@ static __global__ void twoShotAllReduceKernel(AllReduceParams params)
             {
                 continue;
             }
-            reinterpret_cast<PackedType*>(&reinterpret_cast<T*>(params.local_output_buffer_ptr)[offset_rank])[0]
-                = reinterpret_cast<PackedType*>(&src_d[ii][offset_rank])[0];
+            *reinterpret_cast<int4*>(&reinterpret_cast<T*>(params.local_output_buffer_ptr)[offset_rank])
+                = *reinterpret_cast<int4*>(&src_d[ii][offset_rank]);
         }
     }
 }
@@ -434,18 +400,22 @@ AllReduceParams AllReduceParams::deserialize(const int32_t* buffer, size_t tpSiz
 {
     void* const* buffer_ptrs = reinterpret_cast<void* const*>(buffer);
     AllReduceParams params;
+    // Even plugins use ping buffers, odd plugins use pong.
+    // That way, we don't need to wait for other GPUs to be done
+    // before copying input tensor to workspace.
+    const auto buffer_offset = (flag_value % 2 == 0) ? 0 : tpSize;
 
     for (int i = 0; i < tpSize; ++i)
     {
-        params.peer_comm_buffer_ptrs[i] = buffer_ptrs[i];
+        params.peer_comm_buffer_ptrs[i] = buffer_ptrs[buffer_offset + i];
     }
     for (int i = 0; i < tpSize; ++i)
     {
-        params.peer_barrier_ptrs_in[i] = reinterpret_cast<uint32_t*>(buffer_ptrs[tpSize + i]);
+        params.peer_barrier_ptrs_in[i] = reinterpret_cast<uint32_t*>(buffer_ptrs[2 * tpSize + i]);
     }
     for (int i = 0; i < tpSize; ++i)
     {
-        params.peer_barrier_ptrs_out[i] = reinterpret_cast<uint32_t*>(buffer_ptrs[2 * tpSize + i]);
+        params.peer_barrier_ptrs_out[i] = reinterpret_cast<uint32_t*>(buffer_ptrs[3 * tpSize + i]);
     }
     params.barrier_flag = flag_value;
     params.ranks_per_node = tpSize;
@@ -463,19 +433,18 @@ void customAllReduce(kernels::AllReduceParams& params, void* data, size_t elts, 
 
     if (dataType == datatype_enum::TYPE_FP32)
     {
-        using T = CustomARCommTypeConverter<float>::Type;
-        kernels::invokeOneOrTwoShotAllReduceKernel<T>(params, strat, stream);
+        kernels::invokeOneOrTwoShotAllReduceKernel<float>(params, strat, stream);
     }
     else if (dataType == datatype_enum::TYPE_FP16)
     {
-        using T = CustomARCommTypeConverter<half>::Type;
-        kernels::invokeOneOrTwoShotAllReduceKernel<T>(params, strat, stream);
+        kernels::invokeOneOrTwoShotAllReduceKernel<half>(params, strat, stream);
     }
+#ifdef ENABLE_BF16
     else if (dataType == datatype_enum::TYPE_BF16)
     {
-        using T = CustomARCommTypeConverter<__nv_bfloat16>::Type;
-        kernels::invokeOneOrTwoShotAllReduceKernel<T>(params, strat, stream);
+        kernels::invokeOneOrTwoShotAllReduceKernel<__nv_bfloat16>(params, strat, stream);
     }
+#endif
     else
     {
         TLLM_THROW("Unsupported dataType for customAllReduce");

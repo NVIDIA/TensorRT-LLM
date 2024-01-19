@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -51,12 +51,14 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
     auto badWordsList = from_torch(mBadWordsList);
     auto stopWordsList = from_torch(mStopWordsList);
     auto promptEmbeddingTable = from_torch(mPromptEmbeddingTable);
+    auto loraWeights = from_torch(mLoraWeights);
+    auto loraConfig = from_torch(mLoraConfig);
     auto draftLogits = from_torch(mDraftLogits);
 
     return std::make_shared<tb::LlmRequest>(mRequestId, mMaxNewTokens,
         std::make_shared<std::vector<TokenIdType>>(mTokens.at(0)), mSamplingConfig, mIsStreaming, mEndId, mPadId,
-        embeddingBias, badWordsList, stopWordsList, promptEmbeddingTable, mPromptVocabSize, mReturnLogProbs,
-        mDraftTokens, draftLogits);
+        embeddingBias, badWordsList, stopWordsList, promptEmbeddingTable, mPromptVocabSize, loraWeights, loraConfig,
+        mReturnLogProbs, mDraftTokens, draftLogits);
 }
 
 void LlmRequest::initBindings(py::module_& m)
@@ -66,13 +68,15 @@ void LlmRequest::initBindings(py::module_& m)
                  std::optional<LlmRequest::SizeType>, std::optional<LlmRequest::SizeType>,
                  std::optional<LlmRequest::TensorPtr>, std::optional<LlmRequest::TensorPtr>,
                  std::optional<LlmRequest::TensorPtr>, std::optional<LlmRequest::TensorPtr>,
-                 std::optional<LlmRequest::SizeType>, bool, std::optional<LlmRequest::VecTokens>,
+                 std::optional<LlmRequest::SizeType>, std::optional<LlmRequest::TensorPtr>,
+                 std::optional<LlmRequest::TensorPtr>, bool, std::optional<LlmRequest::VecTokens>,
                  std::optional<LlmRequest::TensorPtr>>(),
             py::arg("request_id"), py::arg("max_new_tokens"), py::arg("input_tokens"), py::arg("sampling_config"),
             py::arg("is_streaming"), py::arg("end_id") = std::nullopt, py::arg("pad_id") = std::nullopt,
             py::arg("embedding_bias") = std::nullopt, py::arg("bad_words_list") = std::nullopt,
             py::arg("stop_words_list") = std::nullopt, py::arg("prompt_embedding_table") = std::nullopt,
-            py::arg("prompt_vocab_size") = std::nullopt, py::arg("return_log_probs") = false,
+            py::arg("prompt_vocab_size") = std::nullopt, py::arg("lora_weights") = std::nullopt,
+            py::arg("lora_config") = std::nullopt, py::arg("return_log_probs") = false,
             py::arg("draft_tokens") = std::nullopt, py::arg("draft_logits") = std::nullopt)
         .def("get_num_tokens", &LlmRequest::getNumTokens, py::arg("beam"))
         .def_property_readonly("max_beam_num_tokens", &LlmRequest::getMaxBeamNumTokens)

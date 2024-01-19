@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -120,12 +120,16 @@ public:
 
     void removeNextBlock(VecTokens const& tokens);
 
+    static std::shared_ptr<KVCacheBlock> findLeafBlock(std::shared_ptr<KVCacheBlock> searchStart);
+
     [[nodiscard]] BlockPtr findMatchingBlock(VecTokens const& tokens) const;
 
     //! \brief Free block from previous block if present.
     void freeLeafBlock();
 
     [[nodiscard]] bool isFull() const;
+
+    [[nodiscard]] bool isShared() const;
 
 private:
     // Linear index of block in pool
@@ -167,9 +171,9 @@ public:
     {
     }
 
-    void addToken()
+    void addNewTokens(SizeType n)
     {
-        mNumTokens++;
+        mNumTokens += n;
     }
 
     [[nodiscard]] SizeType getSequenceSlotIdx() const
@@ -195,6 +199,11 @@ public:
     void addCacheBlock(SizeType beamIdx, SizeType blockIdx)
     {
         mCacheBlockIds.at(beamIdx).push_back(blockIdx);
+    }
+
+    void changeCacheBlock(SizeType beamIdx, SizeType pagedBlockIdx, SizeType blockIdx)
+    {
+        mCacheBlockIds.at(beamIdx).at(pagedBlockIdx) = blockIdx;
     }
 
     void clearCacheBlocks()
@@ -257,11 +266,13 @@ public:
     void addSequence(GenerationRequest& sequence, SizeType inputLength, std::shared_ptr<LlmRequest> const& llmRequest);
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
-    void addSequence(GenerationRequest& sequence, SizeType inputLength, bool enableCyclicKvCache);
+    void addSequence(GenerationRequest& sequence, SizeType numBlocks, SizeType unsharedBlockIdx);
 
     //! \brief Allocate new block for each beam of the sequence.
     //! \details Might free cached blocks if no free blocks are available.
     void allocateBlock(GenerationRequest& sequence, bool shareAmongBeams = false);
+
+    void replaceSharedBlock(GenerationRequest& sequence, SizeType blockIdx);
 
     //! \brief Release blocks of the sequence. Store blocks for reuse if llmReqeust is provided.
     void releaseBlocks(GenerationRequest& sequence, std::shared_ptr<LlmRequest> const& llmRequest = nullptr);
@@ -352,8 +363,8 @@ public:
 
     KVCacheManager(SizeType numLayers, SizeType numHeads, SizeType numKvHeads, SizeType hiddenSize,
         SizeType tokensPerBlock, SizeType maxNumBlocks, SizeType maxNumSequences, SizeType maxBeamWidth,
-        SizeType maxBlocksPerSeq, SizeType maxAttentionWindow, nvinfer1::DataType dtype, CudaStreamPtr stream,
-        bool enableBlockReuse = false);
+        SizeType maxBlocksPerSeq, SizeType maxAttentionWindow, SizeType sinkTokenLength, bool useOneMoreBlock,
+        nvinfer1::DataType dtype, CudaStreamPtr stream, bool enableBlockReuse = false);
 
     void startScheduling();
 
@@ -416,6 +427,8 @@ public:
         return mPools;
     }
 
+    void addContextTokens(SizeType seqSlotIdx, SizeType numTokens);
+
     void addToken(SizeType seqSlotIdx);
 
     void addSequence(SizeType seqSlotIdx, SizeType inputLength, SizeType beamWidth,
@@ -464,6 +477,7 @@ private:
     void resetBlockPointers(SizeType seqSlotIdx, SizeType beamWidth);
     void cacheBlockPointers(GenerationRequest const& seq, SizeType seqSlotIdx);
     void cacheNewBlockPointers(GenerationRequest const& seq, SizeType seqSlotIdx);
+    void updateNewBlockPointer(const GenerationRequest& seq, SizeType seqSlotIdx, SizeType blockIdx);
 
 private:
     // Number of elements per one blocks
@@ -477,6 +491,14 @@ private:
     // Maximum kv cache length per sequence
     // Enable cyclic kv cache when it exceeds
     SizeType mMaxAttentionWindow;
+    // Sink token length in the kv cache per sequence
+    SizeType mSinkTokenLength;
+    // Bubble token length
+    SizeType mBubbleLength;
+    // Maximum token length (including bubble)
+    SizeType mMaxTokenNum;
+    // Number of tokens in the sink blocks
+    SizeType mSinkBlockTokenLength;
     // Pools
     std::vector<runtime::ITensor::SharedPtr> mPools;
     // Block manager

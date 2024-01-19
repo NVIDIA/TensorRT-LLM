@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -282,9 +282,10 @@ class TestKVCacheManager(unittest.TestCase):
         manager = KVCacheManager(memory_pools=[memory_pool_1, memory_pool_2],
                                  blocks=blocks,
                                  tokens_per_block=tokens_per_block,
+                                 max_blocks_per_seq=max_blocks_per_seq,
                                  max_attention_window_size=max_blocks_per_seq *
                                  tokens_per_block,
-                                 max_blocks_per_seq=max_blocks_per_seq)
+                                 sink_token_len=0)
         manager.add_sequence(GenerationSequence(seq_idx=0, batch_idx=0), 30)
         manager.add_sequence(GenerationSequence(seq_idx=1, batch_idx=1), 35)
         manager.add_sequence(GenerationSequence(seq_idx=2, batch_idx=2), 31)

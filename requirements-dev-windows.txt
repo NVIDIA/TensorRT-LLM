@@ -1,14 +1,15 @@
 -r requirements-windows.txt
 --extra-index-url https://download.pytorch.org/whl/cu121
+datasets
 einops
 graphviz
 mypy
 parameterized
 pre-commit
 pybind11-stubgen
-pynvml>=11.5.0
 pytest-cov
 pytest-forked
 pytest-xdist
 pywin32
+rouge_score
 typing-extensions==4.8.0

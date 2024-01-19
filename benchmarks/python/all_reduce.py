@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +17,6 @@ from argparse import ArgumentParser
 
 # isort: off
 import torch
-import tensorrt as trt
 # isort: on
 from cuda import cuda, cudart
 from mpi4py import MPI
@@ -25,8 +24,10 @@ from polygraphy.backend.trt import CreateConfig, EngineFromNetwork
 
 import tensorrt_llm as tllm
 from tensorrt_llm import Mapping, Tensor
-from tensorrt_llm._ipc_utils import IpcMemory, peer_access
+from tensorrt_llm._ipc_utils import peer_access
 from tensorrt_llm.functional import AllReduceStrategy, allreduce
+from tensorrt_llm.plugin.plugin import (current_all_reduce_helper,
+                                        init_all_reduce_helper)
 
 
 def allreduce_benchmark(dtype: str, test_range: str = "10,10000000,10"):
@@ -42,25 +43,17 @@ def allreduce_benchmark(dtype: str, test_range: str = "10,10000000,10"):
     if world_size == 1:
         raise RuntimeError("Benchmark must run with mpi_world_size > 1")
 
-    ipc_barriers_in = IpcMemory(
-        mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size)
-    ipc_barriers_out = IpcMemory(
-        mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size)
     torch_dtype = tllm._utils.str_dtype_to_torch(dtype)
-
     min_size, max_size, ratio = [int(i) for i in test_range.split(",")]
     inner_loop = 1000
 
     size = min_size
+    dtype_size = torch.finfo(torch_dtype).bits // 8
+    init_all_reduce_helper()
     while size < max_size:
-        ipc_buffers = IpcMemory(mapping, size * 4)
-        workspace = torch.tensor(ipc_buffers.serialize() +
-                                 ipc_barriers_in.serialize() +
-                                 ipc_barriers_out.serialize(),
-                                 dtype=torch.int64,
-                                 device="cpu")
-
-        input = torch.zeros(size, dtype=torch_dtype, device="cuda")
+        _buffers, workspace = current_all_reduce_helper().allocate_workspace(
+            mapping, size * dtype_size)
+        input = torch.ones(size, dtype=torch_dtype, device="cuda")
 
         for strategy in [
                 AllReduceStrategy.RING, AllReduceStrategy.ONESHOT,
@@ -77,16 +70,11 @@ def allreduce_benchmark(dtype: str, test_range: str = "10,10000000,10"):
                            shape=input.shape,
                            dtype=tllm.str_dtype_to_trt(dtype))
 
-                w = Tensor(name='workspace',
-                           shape=workspace.shape,
-                           dtype=trt.int64)
+                current_all_reduce_helper().set_workspace_tensor(mapping)
 
                 current = x
-                for i in range(inner_loop):
-                    current = allreduce(
-                        current, mapping.tp_group,
-                        w if strategy != AllReduceStrategy.RING else None, i,
-                        strategy)
+                for _ in range(inner_loop):
+                    current = allreduce(current, mapping.tp_group, strategy)
                 output = current.trt_tensor
 
                 output.name = 'output'
@@ -104,7 +92,7 @@ def allreduce_benchmark(dtype: str, test_range: str = "10,10000000,10"):
             output = torch.zeros_like(input)
 
             stream = torch.cuda.current_stream()
-            feed_dict = {'x': input, 'workspace': workspace}
+            feed_dict = {'x': input, 'all_reduce_workspace': workspace}
 
             session = tllm.runtime.Session.from_engine(build_engine())
             _, start = cuda.cuEventCreate(0)
@@ -119,9 +107,11 @@ def allreduce_benchmark(dtype: str, test_range: str = "10,10000000,10"):
                 cuda.cuEventRecord(stop, stream.cuda_stream)
             torch.cuda.synchronize()
             _, ms = cuda.cuEventElapsedTime(start, stop)
+            assert torch.allclose(output, (input * world_size)**inner_loop)
 
             if mapping.rank == 0:
                 print(f"{size=}, {strategy=}, {ms=}")
+
         size *= ratio
         if mapping.rank == 0:
             print("")

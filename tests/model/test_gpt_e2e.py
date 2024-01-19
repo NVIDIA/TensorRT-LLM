@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -180,6 +180,7 @@ def check_accuracy(engine_dir, input_tokens, max_output_len):
 
     for j, batch_size in enumerate([1, 2, 4, 8, 4, 2, 1]):
         output = []
+        output_with_fake_dim = []
         print(f"Running batch size: {batch_size}")
         for i in range(num_samples // batch_size):
             samples = input_tokens[i * batch_size:(i + 1) * batch_size]
@@ -188,7 +189,8 @@ def check_accuracy(engine_dir, input_tokens, max_output_len):
                 input_ids = np.concatenate(samples)
                 input_ids = torch.tensor(input_ids,
                                          dtype=torch.int,
-                                         device='cuda').unsqueeze(0)
+                                         device='cuda')
+                input_ids_with_fake_dim = input_ids.unsqueeze(0)
                 max_input_length = torch.max(sample_lengths).item()
             else:
                 input_ids = torch.nested.to_padded_tensor(
@@ -201,6 +203,20 @@ def check_accuracy(engine_dir, input_tokens, max_output_len):
                                         sampling_config)
             torch.cuda.synchronize()
 
+            if remove_input_padding:
+                decoder.setup(batch_size, max_input_length, max_output_len)
+                output_ids_with_fake_dim = decoder.decode(
+                    input_ids_with_fake_dim, sample_lengths, sampling_config)
+                outputs_with_fake_dim_list = [
+                    output_ids_with_fake_dim[
+                        batch_idx, :,
+                        sample_lengths[batch_idx]:sample_lengths[batch_idx] +
+                        max_output_len].cpu()
+                    for batch_idx in range(output_ids_with_fake_dim.shape[0])
+                ]
+                outputs_with_fake_dim = torch.cat(outputs_with_fake_dim_list)
+                output_with_fake_dim.append(outputs_with_fake_dim)
+
             outputs_list = [
                 output_ids[batch_idx, :,
                            sample_lengths[batch_idx]:sample_lengths[batch_idx] +
@@ -210,6 +226,11 @@ def check_accuracy(engine_dir, input_tokens, max_output_len):
             outputs = torch.cat(outputs_list)
             output.append(outputs)
         output = torch.stack(output, dim=0)
+        if remove_input_padding:
+            output_with_fake_dim = torch.stack(output_with_fake_dim, dim=0)
+            error = np.mean(output.cpu().numpy().flatten() !=
+                            output_with_fake_dim.cpu().numpy().flatten())
+            assert error < 2.0 / 8, f"diff at batch_size={batch_size}, output_with_fake_dim={output_with_fake_dim}, output={output}"
 
         if j == 0:
             expect_output = output

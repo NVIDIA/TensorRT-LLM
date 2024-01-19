@@ -36,7 +36,7 @@ class BaseSamplingLayer : public BaseLayer
 {
 public:
     BaseSamplingLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-        tensorrt_llm::common::IAllocator* allocator, bool is_free_buffer_after_forward,
+        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator, bool is_free_buffer_after_forward,
         cudaDeviceProp* cuda_device_prop);
 
     BaseSamplingLayer(BaseSamplingLayer const& sampling_layer);
@@ -46,9 +46,13 @@ public:
     class SetupParams : public DecodingSetupParams
     {
     public:
-        std::optional<std::vector<std::uint32_t>> runtime_top_k;    // [1] or [batch_size] on cpu
-        std::optional<std::vector<float>> runtime_top_p;            // [1] or [batch_size] on cpu
-        std::optional<std::vector<unsigned long long>> random_seed; // [1] or [batch_size] on cpu
+        std::optional<std::vector<std::uint32_t>> runtime_top_k;  // [1] or [batch_size] on cpu
+        std::optional<std::vector<float>> runtime_top_p;          // [1] or [batch_size] on cpu
+        std::optional<std::vector<uint64_t>> randomSeed;          // [1] or [batch_size] on cpu
+        std::optional<std::vector<float>> top_p_decay;            // [batch_size], must between [0, 1]
+        std::optional<std::vector<float>> top_p_min;              // [batch_size], must between [0, 1]
+        std::optional<std::vector<std::int32_t>> top_p_reset_ids; // [batch_size]
+        std::optional<bool> normalize_log_probs;
     };
 
     class ForwardParams : public DecodingParams
@@ -68,7 +72,9 @@ public:
         std::optional<tc::Tensor> input_lengths;  // [local_batch_size * beam_width]
     };
 
-    void forward(DecodingOutputParams& outputs, ForwardParams const& params);
+    void forward(DecodingOutputParams& outputs, ForwardParams const& params, int* penalty_workspace);
+
+    virtual void setup(size_t batch_size, SetupParams const& setupParams) = 0;
 
 protected:
     size_t vocab_size_;
@@ -77,22 +83,29 @@ protected:
     size_t sampling_workspace_size_;
     void* sampling_workspace_ = nullptr;
     curandState_t* curandstate_buf_ = nullptr;
-    unsigned long long* random_seeds_buf_ = nullptr;
+    uint64_t* random_seeds_buf_ = nullptr;
 
     float* temperature_buf_ = nullptr;
     float* repetition_penalty_buf_ = nullptr;
-    int32_t* min_lengths_buf_ = nullptr;
+    float* presence_penalty_buf_ = nullptr;
+    float* frequency_penalty_buf_ = nullptr;
+    int* min_lengths_buf_ = nullptr;
     bool* skip_decode_buf_ = nullptr;
     T* runtime_logits_buf_ = nullptr;
 
     std::vector<float> mTemperature;
     std::vector<float> mRepetitionPenalty;
-    std::vector<int32_t> mMinLengths;
+    std::vector<float> mPresencePenalty;
+    std::vector<float> mFrequencyPenalty;
+    std::vector<int> mMinLengths;
     bool* skip_decode_ = nullptr;
     bool skip_any_ = false;
 
-    tensorrt_llm::kernels::RepetitionPenaltyType repetition_penalty_type_
-        = tensorrt_llm::kernels::RepetitionPenaltyType::None;
+    bool use_temperature_ = false;
+    bool use_repetition_penalty_ = false;
+    bool use_presence_penalty_ = false;
+    bool use_frequency_penalty_ = false;
+    bool use_min_lengths_ = false;
 
     virtual void runSampling(DecodingOutputParams& outputs, DecodingParams const& params) = 0;
 

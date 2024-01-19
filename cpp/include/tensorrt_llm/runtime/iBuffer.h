@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -507,7 +507,7 @@ public:
     template <typename T>
     static UniquePtr wrap(T* data, std::size_t size)
     {
-        return wrap<T>(data, size);
+        return wrap<T>(data, size, size);
     }
 
     template <typename T>
@@ -566,9 +566,14 @@ public:
     using iterator = pointer;
     using const_iterator = const_pointer;
 
+    BufferRange(T* data, size_type size)
+        : mData{data}
+        , mSize{size}
+    {
+    }
+
     explicit BufferRange(IBuffer& buffer)
-        : mData(bufferCast<T>(buffer))
-        , mSize(buffer.getSize())
+        : BufferRange(bufferCast<T>(buffer), buffer.getSize())
     {
     }
 

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -109,6 +109,26 @@ else()
   endif()
 endif()
 
+if(NOT MSVC)
+  if(USE_CXX11_ABI)
+    add_custom_command(
+      OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol"
+      COMMAND nm -C $<TARGET_FILE:${BATCH_MANAGER_TARGET}> | grep -q
+              'std::__cxx11::'
+      DEPENDS ${BATCH_MANAGER_TARGET})
+  else()
+    add_custom_command(
+      OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol"
+      COMMAND nm -C $<TARGET_FILE:${BATCH_MANAGER_TARGET}> | grep -qv
+              'std::__cxx11::'
+      DEPENDS ${BATCH_MANAGER_TARGET})
+  endif()
+  add_custom_target(check_symbol
+                    DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol")
+else()
+  add_custom_target(check_symbol)
+endif()
+
 set(TRTLLM_LINK_LIBS
     ${CUBLAS_LIB}
     ${CUBLASLT_LIB}
@@ -142,6 +162,7 @@ endif()
 
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS}
                                               ${UNDEFINED_FLAG})
+add_dependencies(${SHARED_TARGET} check_symbol)
 
 # ################################# STATIC LIBRARY
 # ##############################################################################
@@ -153,6 +174,7 @@ set_target_properties(
                               CXX_EXTENSIONS "NO" POSITION_INDEPENDENT_CODE ON)
 
 target_link_libraries(${STATIC_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
+add_dependencies(${STATIC_TARGET} check_symbol)
 
 # Cyclic dependency of batch manager on TRT-LLM
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${STATIC_TARGET})

@@ -63,9 +63,6 @@ def parse_arguments():
         help=
         'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
         'Note: the flag might not take effect when the criteria are not met.')
-    parser.add_argument('--use_prompt_tuning',
-                        action="store_true",
-                        default=False)
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
@@ -247,15 +244,14 @@ def convert_hf_opt(hf_model,
                                                     dim=0)
 
     if not use_parallel_embedding:
-        weights['transformer.embedding.vocab_embedding.weight'] = embed_w
+        weights['transformer.vocab_embedding.weight'] = embed_w
     else:
         assert hf_model.config.vocab_size % tensor_parallel == 0
-        weights[
-            'transformer.embedding.vocab_embedding.weight'] = split_matrix_tp(
-                embed_w, tensor_parallel, rank, dim=sharding_dim)
+        weights['transformer.vocab_embedding.weight'] = split_matrix_tp(
+            embed_w, tensor_parallel, rank, dim=sharding_dim)
 
     embed_p = get_weight(model_params, 'model.decoder.embed_positions', dtype)
-    weights['transformer.embedding.position_embedding.weight'] = embed_p[2:, :]
+    weights['transformer.position_embedding.weight'] = embed_p[2:, :]
 
     if do_layer_norm_before:
         ln_f_w, ln_f_b = get_weight_and_bias(model_params,
@@ -293,7 +289,6 @@ if __name__ == '__main__':
     config = {
         'architecture': hf_config.architectures[0],
         'dtype': args.dtype,
-        'logits_dtype': 'float32',
         'num_hidden_layers': hf_config.num_hidden_layers,
         'num_attention_heads': hf_config.num_attention_heads,
         'hidden_size': hf_config.hidden_size,
@@ -313,7 +308,6 @@ if __name__ == '__main__':
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
         'do_layer_norm_before': hf_config.do_layer_norm_before,
-        'use_prompt_tuning': args.use_prompt_tuning,
     }
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:

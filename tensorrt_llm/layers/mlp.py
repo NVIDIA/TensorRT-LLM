@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,16 +25,19 @@ from .lora import Lora, LoraRuntimeParams
 
 class MLP(Module):
 
-    def __init__(self,
-                 hidden_size,
-                 ffn_hidden_size,
-                 hidden_act,
-                 bias=True,
-                 dtype=None,
-                 tp_group=None,
-                 tp_size=1,
-                 quant_mode=QuantMode(0),
-                 instance_id: int = 0):
+    def __init__(
+            self,
+            hidden_size,
+            ffn_hidden_size,
+            hidden_act,
+            bias=True,
+            dtype=None,
+            tp_group=None,
+            tp_size=1,
+            quant_mode=QuantMode(0),
+            instance_id: int = 0,
+            max_lora_rank=None,
+    ):
         super().__init__()
         if hidden_act not in ACT2FN:
             raise ValueError(
@@ -49,14 +52,16 @@ class MLP(Module):
                                 dtype=dtype,
                                 tp_group=tp_group,
                                 tp_size=tp_size,
-                                gather_output=False)
+                                gather_output=False,
+                                max_lora_rank=max_lora_rank)
             self.proj = FP8RowLinear(ffn_hidden_size,
                                      hidden_size,
                                      bias=bias,
                                      dtype=dtype,
                                      tp_group=tp_group,
                                      tp_size=tp_size,
-                                     instance_id=instance_id)
+                                     instance_id=instance_id,
+                                     max_lora_rank=max_lora_rank)
         else:
             self.fc = ColumnLinear(hidden_size,
                                    fc_output_size,
@@ -64,20 +69,22 @@ class MLP(Module):
                                    dtype=dtype,
                                    tp_group=tp_group,
                                    tp_size=tp_size,
-                                   gather_output=False)
+                                   gather_output=False,
+                                   max_lora_rank=max_lora_rank)
             self.proj = RowLinear(ffn_hidden_size,
                                   hidden_size,
                                   bias=bias,
                                   dtype=dtype,
                                   tp_group=tp_group,
                                   tp_size=tp_size,
-                                  instance_id=instance_id)
+                                  instance_id=instance_id,
+                                  max_lora_rank=max_lora_rank)
 
         self.hidden_act = hidden_act
         self.dtype = dtype
         self.bias = bias
 
-    def forward(self, hidden_states, workspace=None, lora_layer_params=None):
+    def forward(self, hidden_states, lora_layer_params=None):
         mlp_fc_lora_params = None
         if lora_layer_params is not None:
             mlp_fc_lora_params = lora_layer_params.get_runtime_params(
@@ -90,24 +97,25 @@ class MLP(Module):
 
         inter = self.fc(hidden_states, mlp_fc_lora_params)
         inter = ACT2FN[self.hidden_act](inter)
-        output = self.proj(inter,
-                           workspace,
-                           lora_runtime_params=mlp_proj_lora_params)
+        output = self.proj(inter, lora_runtime_params=mlp_proj_lora_params)
         return output
 
 
 class GatedMLP(MLP):
 
-    def __init__(self,
-                 hidden_size,
-                 ffn_hidden_size,
-                 hidden_act,
-                 bias=True,
-                 dtype=None,
-                 tp_group=None,
-                 tp_size=1,
-                 quant_mode=QuantMode(0),
-                 instance_id: int = 0):
+    def __init__(
+            self,
+            hidden_size,
+            ffn_hidden_size,
+            hidden_act,
+            bias=True,
+            dtype=None,
+            tp_group=None,
+            tp_size=1,
+            quant_mode=QuantMode(0),
+            instance_id: int = 0,
+            max_lora_rank=None,
+    ):
         self.use_fp8_qdq = quant_mode.has_fp8_qdq()
         super().__init__(hidden_size,
                          ffn_hidden_size,
@@ -136,7 +144,8 @@ class GatedMLP(MLP):
                                   dtype=dtype,
                                   tp_group=tp_group,
                                   tp_size=tp_size,
-                                  gather_output=False)
+                                  gather_output=False,
+                                  max_lora_rank=max_lora_rank)
         else:
             self.gate = ColumnLinear(hidden_size,
                                      ffn_hidden_size,
@@ -144,9 +153,10 @@ class GatedMLP(MLP):
                                      dtype=dtype,
                                      tp_group=tp_group,
                                      tp_size=tp_size,
-                                     gather_output=False)
+                                     gather_output=False,
+                                     max_lora_rank=max_lora_rank)
 
-    def forward(self, hidden_states, workspace=None, lora_layer_params=None):
+    def forward(self, hidden_states, lora_layer_params=None):
 
         mlp_fc_lora_params = None
         if lora_layer_params is not None:
@@ -168,23 +178,25 @@ class GatedMLP(MLP):
         gate = self.gate(hidden_states, mlp_gate_lora_params)
         intermediate = inter * gate
         output = self.proj(intermediate,
-                           workspace,
                            lora_runtime_params=mlp_proj_lora_params)
         return output
 
 
 class FusedGatedMLP(GatedMLP):
 
-    def __init__(self,
-                 hidden_size,
-                 ffn_hidden_size,
-                 hidden_act,
-                 bias=True,
-                 dtype=None,
-                 tp_group=None,
-                 tp_size=1,
-                 quant_mode=QuantMode(0),
-                 instance_id: int = 0):
+    def __init__(
+            self,
+            hidden_size,
+            ffn_hidden_size,
+            hidden_act,
+            bias=True,
+            dtype=None,
+            tp_group=None,
+            tp_size=1,
+            quant_mode=QuantMode(0),
+            instance_id: int = 0,
+            max_lora_rank=None,
+    ):
         super().__init__(hidden_size,
                          ffn_hidden_size,
                          hidden_act,
@@ -195,15 +207,17 @@ class FusedGatedMLP(GatedMLP):
                          quant_mode=quant_mode,
                          instance_id=instance_id)
 
+        if max_lora_rank is None:
+            max_lora_rank = min(hidden_size, ffn_hidden_size // tp_size)
         self.mlp_in_lora = Lora(
             in_hidden_size=hidden_size,
             out_hidden_sizes=[
                 ffn_hidden_size // tp_size, ffn_hidden_size // tp_size
             ],
-            max_low_rank=min(hidden_size, ffn_hidden_size // tp_size),
+            max_low_rank=max_lora_rank,
         )
 
-    def forward(self, hidden_states, workspace=None, lora_layer_params=None):
+    def forward(self, hidden_states, lora_layer_params=None):
         # Combine the following pattern
         #
         #   SiLU(FC(x)) + Gate(x)
@@ -288,7 +302,8 @@ class FusedGatedMLP(GatedMLP):
 
                 mlp_fc_lora, mlp_gate_lora = self.mlp_in_lora(
                     hidden_states, mlp_in_lora_params)
-                mlp_in_result = concat([mlp_gate_lora, mlp_fc_lora], dim=2)
+                mlp_in_result = concat([mlp_gate_lora, mlp_fc_lora],
+                                       dim=mlp_fc_lora.rank() - 1)
                 inter = inter + mlp_in_result
 
         if self.hidden_act == 'silu':
@@ -297,5 +312,10 @@ class FusedGatedMLP(GatedMLP):
             raise NotImplementedError(
                 f"Activation {self.hidden_act} not yet implemented for FusedGatedMLP"
             )
-        output = self.proj(inter, workspace)
+
+        mlp_proj_lora_params = None
+        if lora_layer_params is not None:
+            mlp_proj_lora_params = lora_layer_params.get_runtime_params(
+                0, "mlp_4h_to_h")
+        output = self.proj(inter, lora_runtime_params=mlp_proj_lora_params)
         return output

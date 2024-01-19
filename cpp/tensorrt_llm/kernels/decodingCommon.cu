@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include <stdio.h>
@@ -25,7 +26,7 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-__global__ void curandInitialize(curandState_t* state, const int size, const unsigned long long randomSeed)
+__global__ void curandInitialize(curandState_t* state, const int size, const uint64_t randomSeed)
 {
     if (threadIdx.x + blockIdx.x * blockDim.x < size)
     {
@@ -34,14 +35,14 @@ __global__ void curandInitialize(curandState_t* state, const int size, const uns
 }
 
 void invokeCurandInitialize(
-    curandState_t* state, const size_t batchSize, const unsigned long long randomSeed, cudaStream_t stream)
+    curandState_t* state, const size_t batchSize, const uint64_t randomSeed, cudaStream_t stream)
 {
     dim3 block(256);
     dim3 grid((int) (ceil(batchSize * 1.0 / 256)));
     curandInitialize<<<grid, block, 0, stream>>>(state, batchSize, randomSeed);
 }
 
-__global__ void curandBatchInitialize(curandState_t* states, const int size, const unsigned long long* randomSeeds)
+__global__ void curandBatchInitialize(curandState_t* states, const int size, const uint64_t* randomSeeds)
 {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < size)
@@ -51,7 +52,7 @@ __global__ void curandBatchInitialize(curandState_t* states, const int size, con
 }
 
 void invokeCurandBatchInitialize(
-    curandState_t* states, const size_t batchSize, const unsigned long long* randomSeeds, cudaStream_t stream)
+    curandState_t* states, const size_t batchSize, const uint64_t* randomSeeds, cudaStream_t stream)
 {
     dim3 block(256);
     dim3 grid((int) (ceil(batchSize * 1.0 / 256)));
@@ -131,7 +132,8 @@ void invokeAddBiasSoftMax(T* logits, T* probs, const T* bias, const int* endIds,
     const int batchSize, const int vocabSize, const int vocabSizePadded, cudaStream_t stream)
 {
     dim3 grid(batchSize);
-    dim3 block(min(vocabSize, 1024));
+    auto const vocabRoundedToWarp = roundUp(vocabSize, 32);
+    dim3 block(min(vocabRoundedToWarp, 1024));
     // vocabSize, e.g., 30000, 7000.... vocabSize is usually very big.
     addBiasSoftMax<<<grid, block, 0, stream>>>(logits, probs, bias, endIds, finished, vocabSize, vocabSizePadded);
 }

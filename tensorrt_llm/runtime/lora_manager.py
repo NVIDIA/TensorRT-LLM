@@ -5,11 +5,21 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .._utils import (_str_to_np_dict, fromfile, numpy_to_torch,
-                      str_dtype_to_torch)
+from .._utils import (fromfile, numpy_to_torch, str_dtype_to_np,
+                      str_dtype_to_torch, torch_to_numpy)
 
 
 class LoraConfig(object):
+    LORA_MODULE_IDS = {
+        "attn_qkv": 0,
+        "attn_q": 1,
+        "attn_k": 2,
+        "attn_v": 3,
+        "attn_dense": 4,
+        "mlp_h_to_4h": 5,
+        "mlp_4h_to_h": 6,
+        "mlp_gate": 7,
+    }
 
     def __init__(self,
                  hf_lora_dir: str = None,
@@ -17,9 +27,11 @@ class LoraConfig(object):
                  tokenizer_config: dict = {},
                  lora_target_modules: list = [],
                  is_valid: bool = False,
+                 has_tokenizer: bool = False,
                  lm_head_weight=None,
                  embedding_weight=None,
-                 hf_modules_to_trtllm_modules: dict = {}):
+                 hf_modules_to_trtllm_modules: dict = {},
+                 trtllm_modules_to_hf_modules: dict = {}):
         self.hf_lora_dir = hf_lora_dir
         self.adapter_config = adapter_config
         self.tokenizer_config = tokenizer_config
@@ -28,18 +40,23 @@ class LoraConfig(object):
             hf_modules_to_trtllm_modules[m] for m in lora_target_modules
         ]
         self.is_valid = is_valid
+        self.has_tokenizer = has_tokenizer
         self.lm_head_weight = lm_head_weight
         self.embedding_weight = embedding_weight
         self.vocab_size, self.hidden_size = self.lm_head_weight.shape if self.lm_head_weight is not None else (
             0, 0)
+        self.hf_modules_to_trtllm_modules = hf_modules_to_trtllm_modules
+        self.trtllm_modules_to_hf_modules = trtllm_modules_to_hf_modules
 
     @classmethod
-    def from_hf(cls, hf_lora_dir, hf_modules_to_trtllm_modules):
+    def from_hf(cls, hf_lora_dir, hf_modules_to_trtllm_modules,
+                trtllm_modules_to_hf_modules):
         lora_target_modules = {}
         adapter_config = None
         tokenizer_config = None
         hf_lora_dir = hf_lora_dir
         is_valid = True
+        has_tokenizer = True
 
         if os.path.exists(f"{hf_lora_dir}/adapter_config.json"):
             with open(f"{hf_lora_dir}/adapter_config.json") as f:
@@ -52,7 +69,7 @@ class LoraConfig(object):
             with open(f"{hf_lora_dir}/tokenizer_config.json") as f:
                 tokenizer_config = json.load(f)
         else:
-            is_valid = False
+            has_tokenizer = False
 
         lm_head_weight = None
         embedding_weight = None
@@ -69,8 +86,9 @@ class LoraConfig(object):
                         "base_model.model.model.embed_tokens.weight"]
 
         return cls(hf_lora_dir, adapter_config, tokenizer_config,
-                   lora_target_modules, is_valid, lm_head_weight,
-                   embedding_weight, hf_modules_to_trtllm_modules)
+                   lora_target_modules, is_valid, has_tokenizer, lm_head_weight,
+                   embedding_weight, hf_modules_to_trtllm_modules,
+                   trtllm_modules_to_hf_modules)
 
 
 class LoraManager(object):
@@ -111,6 +129,8 @@ class LoraManager(object):
         self._lora_uid_to_low_ranks = {}
         self._lora_weights = []
         self._lora_weights_pointers_list = []
+        self._lora_cpp_weights = {}
+        self._lora_weight_config = {}
 
     def load_from_ckpt(self, model_dir, model_config, runtime_mapping,
                        ckpt_source):
@@ -121,16 +141,17 @@ class LoraManager(object):
         else:
             assert False, f"LoraManager does not support source {ckpt_source}"
 
-    def load_from_nemo(self, model_dir, model_config, runtime_mapping):
+    def load_from_nemo(self, model_dirs, model_config, runtime_mapping):
         '''
         Load lora modules, could be move to client side
         '''
         self._model_config = model_config
-        model_dir = Path(model_dir)
+        model_dir = Path(model_dirs[0])
 
         with open(model_dir / "lora_weights.json", 'r') as f:
             config = json.load(f)
         lora_config = config['lora_config']
+        precision = config.get('precision', 'float16')
         for key in lora_config['lora_kqv_adapter']:
             self._lora_uid_to_key[lora_config['lora_kqv_adapter'][key]
                                   ['key']] = key
@@ -144,6 +165,10 @@ class LoraManager(object):
             for uid, key in self._lora_uid_to_key.items():
                 self._lora_weights_pointers_list[layer_idx].update({uid: {}})
                 low_rank = int(lora_config['lora_kqv_adapter'][key]['low_rank'])
+                if uid not in self._lora_cpp_weights:
+                    self._lora_cpp_weights[uid] = []
+                if uid not in self._lora_weight_config:
+                    self._lora_weight_config[uid] = []
 
                 for lora_module in lora_target_modules:
                     if uid not in self._lora_uid_to_low_ranks:
@@ -158,7 +183,7 @@ class LoraManager(object):
                             fromfile(
                                 model_dir, f'{prefix}.linear_in.weight.bin',
                                 [model_config.hidden_size, low_rank],
-                                _str_to_np_dict['bfloat16']).transpose(
+                                str_dtype_to_np(precision)).transpose(
                                     1,
                                     0))).cuda()  # t_in: [low_rank, hidden_size]
 
@@ -167,7 +192,7 @@ class LoraManager(object):
                             fromfile(model_dir,
                                      f'{prefix}.linear_out.weight.bin',
                                      [low_rank, model_config.hidden_size * 3],
-                                     _str_to_np_dict['bfloat16']).transpose(
+                                     str_dtype_to_np(precision)).transpose(
                                          1, 0))).cuda(
                                          )  # t_in: [hidden_size * 3, low_rank]
                     t_in = t_in.float().to(str_dtype_to_torch(dtype))
@@ -182,13 +207,22 @@ class LoraManager(object):
 
                     self._lora_weights.append(t_in)
                     self._lora_weights.append(t_out)
+                    self._lora_cpp_weights[uid].append(
+                        torch.concatenate([t_in.flatten(),
+                                           t_out.flatten()]))
+                    self._lora_weight_config[uid].append(
+                        np.array([
+                            LoraConfig.LORA_MODULE_IDS[lora_module], layer_idx,
+                            int(low_rank)
+                        ],
+                                 dtype=np.int32))
 
             if "-1" not in self._lora_uid_to_low_ranks:
                 self._lora_uid_to_low_ranks.update(
                     {"-1": [{} for _ in range(model_config.num_layers)]})
             self._lora_uid_to_low_ranks["-1"][layer_idx][lora_module] = 0
 
-    def load_from_hf(self, model_dir, model_config, runtime_mapping):
+    def load_from_hf(self, model_dirs, model_config, runtime_mapping):
         '''
         lora config of https://huggingface.co/hfl/chinese-alpaca-2-lora-7b
         {
@@ -239,18 +273,33 @@ class LoraManager(object):
         '''
         tp_size = runtime_mapping.tp_size
         tp_rank = runtime_mapping.tp_rank
-        lora_model = torch.load(f"{model_dir}/adapter_model.bin")
 
-        with open(f"{model_dir}/adapter_config.json", 'r') as f:
-            hf_config = json.load(f)
+        lora_hf_configs = [{}]
+        ranks = [0]
+        uids = ["-1"]
+        for i, model_dir in enumerate(model_dirs):
+            with open(f"{model_dir}/adapter_config.json", 'r') as f:
+                config = json.load(f)
+                lora_hf_configs.append(config)
+                ranks.append(config["r"])
+                uids.append(str(i))
+        new_model_dirs = [""] + model_dirs
 
         lora_target_modules = model_config.lora_target_modules
         dtype = model_config.dtype
 
-        ranks = [0, hf_config["r"]]
-        uids = ["-1", "0"]  # TODO should be lora from some config
+        for uid, rank, model_dir, hf_config in zip(uids, ranks, new_model_dirs,
+                                                   lora_hf_configs):
+            if uid not in self._lora_cpp_weights:
+                self._lora_cpp_weights[uid] = []
+            if uid not in self._lora_weight_config:
+                self._lora_weight_config[uid] = []
 
-        for uid, rank in zip(uids, ranks):
+            if model_dir != "":
+                lora_model = torch.load(f"{model_dir}/adapter_model.bin")
+            else:
+                lora_model = None
+
             self._lora_uid_to_low_ranks[uid] = []
             for layer_idx in range(model_config.num_layers):
                 self._lora_weights_pointers_list.append({})
@@ -260,7 +309,8 @@ class LoraManager(object):
 
                 prefix = "base_model.model.model.layers"
                 for lora_module in lora_target_modules:
-                    if uid == "-1":
+                    if uid == "-1" or model_config.trtllm_modules_to_hf_modules[
+                            lora_module] not in hf_config["target_modules"]:
                         self._lora_uid_to_low_ranks[uid][layer_idx][
                             lora_module] = 0
                         continue
@@ -326,6 +376,8 @@ class LoraManager(object):
 
                     t_in = t_in.cuda().contiguous()
                     t_out = t_out.cuda().contiguous()
+                    scale = float(hf_config["lora_alpha"] / hf_config["r"])
+                    t_out = t_out * scale
                     t_in = t_in.float().to(str_dtype_to_torch(dtype))
                     t_out = t_out.float().to(str_dtype_to_torch(dtype))
                     self._lora_weights_pointers_list[layer_idx][uid].update(
@@ -339,7 +391,58 @@ class LoraManager(object):
                     # prevent torch free this buffer
                     self._lora_weights.append(t_in)
                     self._lora_weights.append(t_out)
+                    self._lora_cpp_weights[uid].append(
+                        torch.concatenate([t_in.flatten(),
+                                           t_out.flatten()]))
+                    self._lora_weight_config[uid].append(
+                        np.array([
+                            LoraConfig.LORA_MODULE_IDS[lora_module], layer_idx,
+                            int(hf_config['r'])
+                        ],
+                                 dtype=np.int32))
+
         del lora_model
+
+    def save_lora_weights_to_bin(self, out_dir):
+
+        def save_val(val, dir, key, tp_num=None, write_npy=False):
+            ext = "npy" if write_npy else "bin"
+            suffix = ext if tp_num is None else f"{tp_num}.{ext}"
+            if write_npy:
+                np.save(dir / f"model.{key}.{suffix}", val)
+            else:
+                val.tofile(dir / f"model.{key}.{suffix}")
+
+        if isinstance(out_dir, str):
+            out_dir_path = Path(out_dir)
+        elif isinstance(out_dir, Path):
+            out_dir_path = out_dir
+        else:
+            assert False
+        for uid in self._lora_cpp_weights:
+            if uid == '-1':
+                continue
+
+            all_weights = np.expand_dims(
+                np.stack([
+                    torch_to_numpy(w.flatten().contiguous())
+                    for w in self._lora_cpp_weights[uid]
+                ]), 0)
+            all_configs = np.expand_dims(
+                np.stack(self._lora_weight_config[uid]), 0)
+
+            uid_path = out_dir_path / f"{uid}"
+            uid_path.mkdir(parents=True, exist_ok=True)
+            save_val(all_weights,
+                     uid_path,
+                     "lora_weights",
+                     tp_num=None,
+                     write_npy=True)
+            save_val(all_configs,
+                     uid_path,
+                     "lora_config",
+                     tp_num=None,
+                     write_npy=True)
 
     def uid_to_key(self, uid: str):
         assert isinstance(uid, str)

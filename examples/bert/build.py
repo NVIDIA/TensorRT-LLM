@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -47,6 +47,14 @@ def parse_arguments():
                         default='float16',
                         choices=['float16', 'float32'])
     parser.add_argument('--timing_cache', type=str, default='model.cache')
+    parser.add_argument(
+        '--profiling_verbosity',
+        type=str,
+        default='layer_names_only',
+        choices=['layer_names_only', 'detailed', 'none'],
+        help=
+        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
+    )
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument('--vocab_size', type=int, default=51200)
     parser.add_argument('--n_labels', type=int, default=2)
@@ -112,6 +120,7 @@ if __name__ == '__main__':
         name=args.model,
         precision=args.dtype,
         timing_cache=args.timing_cache,
+        profiling_verbosity=args.profiling_verbosity,
         tensor_parallel=args.world_size,  # TP only
         max_batch_size=args.max_batch_size,
         max_input_len=args.max_input_len,

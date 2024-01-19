@@ -1,0 +1,4 @@
+datasets~=2.14.5
+rouge_score~=0.1.2
+sentencepiece~=0.1.99
+evaluate~=0.4.1

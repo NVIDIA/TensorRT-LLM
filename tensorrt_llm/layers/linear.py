@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,8 +19,8 @@ import tensorrt as trt
 
 from .._common import default_net, default_trtnet
 from .._utils import str_dtype_to_trt
-from ..functional import (Tensor, _create_tensor, allgather, allreduce, cast,
-                          matmul)
+from ..functional import (Tensor, _add_plugin_info, _create_tensor, allgather,
+                          allreduce, cast, matmul)
 from ..module import Module
 from ..parameter import Parameter
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
@@ -57,6 +57,7 @@ def _gemm_plugin(input: Tensor,
     gemm_plug = plg_creator.create_plugin("gemm", pfc)
     plug_inputs = [input.trt_tensor, mat2.trt_tensor]
     layer = default_trtnet().add_plugin_v2(plug_inputs, gemm_plug)
+    _add_plugin_info(layer, plg_creator, "gemm", pfc)
     return _create_tensor(layer.get_output(0), layer)
 
 
@@ -71,7 +72,8 @@ class Linear(Module):
                  tp_size=1,
                  gather_output=True,
                  share_weight=None,
-                 strict_dtype=False):
+                 strict_dtype=False,
+                 max_lora_rank=None):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features // tp_size
@@ -93,12 +95,12 @@ class Linear(Module):
         else:
             self.register_parameter('bias', None)
 
+        if max_lora_rank is None:
+            max_lora_rank = min(self.in_features, self.out_features)
         self.lora = Lora(
             in_hidden_size=self.in_features,
             out_hidden_sizes=[self.out_features],
-            max_low_rank=min(
-                self.in_features, self.out_features
-            ),  # Assume low rank is smaller than in/out features
+            max_low_rank=max_lora_rank,
         )
 
     def multiply_gather(self,
@@ -123,9 +125,8 @@ class Linear(Module):
                               lora_runtime_params=lora_runtime_params)
 
         if self.bias is not None:
-            if x.dtype != self.bias.value.dtype:
-                x = cast(x, self.bias.value.dtype)
-            x = x + self.bias.value
+            bias = cast(self.bias.value, x.dtype)
+            x = x + bias
 
         if self.gather_output and self.tp_size > 1 and self.tp_group is not None:
             # [dim0, local_dim] -> [dim0 * tp_size, local_dim] --> [dim0, local_dim * tp_size]
@@ -153,7 +154,8 @@ class RowLinear(Module):
                  tp_group=None,
                  tp_size=1,
                  instance_id: int = 0,
-                 strict_dtype: bool = False):
+                 strict_dtype: bool = False,
+                 max_lora_rank=None):
         super().__init__()
         self.in_features = in_features // tp_size
         self.out_features = out_features
@@ -171,12 +173,12 @@ class RowLinear(Module):
         self.tp_size = tp_size
         self.instance_id = instance_id
 
+        if max_lora_rank is None:
+            max_lora_rank = min(self.in_features, self.out_features)
         self.lora = Lora(
             in_hidden_size=self.in_features,
             out_hidden_sizes=[self.out_features],
-            max_low_rank=min(
-                self.in_features, self.out_features
-            ),  # Assume low rank is smaller than in/out features
+            max_low_rank=max_lora_rank,
         )
         self.strict_dtype = self.dtype if strict_dtype else None
 
@@ -185,7 +187,6 @@ class RowLinear(Module):
                         weight,
                         gemm_plugin,
                         use_fp8=False,
-                        workspace=None,
                         lora_runtime_params: LoraRuntimeParams = None):
         hidden_state = x
         if gemm_plugin:
@@ -203,22 +204,16 @@ class RowLinear(Module):
                               lora_runtime_params=lora_runtime_params)
 
         if self.tp_size > 1 and self.tp_group is not None:
-            x = allreduce(x, self.tp_group, workspace, self.instance_id)
+            x = allreduce(x, self.tp_group)
 
         if self.bias is not None:
-            if x.dtype != self.bias.value.dtype:
-                x = cast(x, self.bias.value.dtype)
-
-            x = x + self.bias.value
+            bias = cast(self.bias.value, x.dtype)
+            x = x + bias
 
         return x
 
-    def forward(self,
-                x,
-                workspace=None,
-                lora_runtime_params: LoraRuntimeParams = None):
+    def forward(self, x, lora_runtime_params: LoraRuntimeParams = None):
         return self.multiply_reduce(x,
                                     self.weight.value,
                                     default_net().plugin_config.gemm_plugin,
-                                    workspace=workspace,
                                     lora_runtime_params=lora_runtime_params)

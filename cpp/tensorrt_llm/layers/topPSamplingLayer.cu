@@ -107,17 +107,34 @@ void TopPSamplingLayer<T>::allocateBuffer(std::size_t batch_size, std::vector<fl
 {
     TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     float const max_top_p = (top_p.size() > 0) ? *std::max_element(std::begin(top_p), std::end(top_p)) : 0.0f;
-    invokeTopPSampling<T>(nullptr, // workspace
-        sampling_workspace_size_, cub_temp_storage_size_,
-        nullptr,                   // output_ids
-        nullptr,                   // sequence_length
-        nullptr,                   // finished_input_buffer
-        nullptr,                   // finished_output_buffer
-        nullptr,                   // cum_log_probs
-        nullptr,                   // output_log_probs
-        nullptr,                   // log_probs
-        topp_id_vals_buf_, topp_offset_buf_, begin_topp_offset_buf_, curandstate_buf_, batch_size, vocab_size_padded_,
-        nullptr, max_top_p, stream_, skip_decode_buf_);
+    if (is_deterministic_)
+    {
+        invokeTopPSampling<T>(nullptr, // workspace
+            sampling_workspace_size_, cub_temp_storage_size_,
+            nullptr,                   // output_ids
+            nullptr,                   // sequence_length
+            nullptr,                   // finished_input_buffer
+            nullptr,                   // finished_output_buffer
+            nullptr,                   // cum_log_probs
+            nullptr,                   // output_log_probs
+            nullptr,                   // log_probs
+            topp_id_vals_buf_, topp_offset_buf_, begin_topp_offset_buf_, curandstate_buf_, batch_size,
+            vocab_size_padded_, nullptr, max_top_p, stream_, skip_decode_buf_);
+    }
+    else
+    {
+        invokeAirTopPSampling<T>(nullptr, sampling_workspace_size_,
+            nullptr, // output_ids
+            nullptr, // sequence_length
+            nullptr, // finished_input_buffer
+            nullptr, // finished_output_buffer
+            nullptr, // cum_log_probs
+            nullptr, // output_log_probs
+            nullptr, // log_probs)
+            curandstate_buf_, batch_size, vocab_size_padded_, nullptr, max_top_p, stream_, air_topp_block_num_,
+            skip_decode_buf_);
+    }
+
     sampling_workspace_ = allocator_->reMalloc(sampling_workspace_, sampling_workspace_size_, true);
     runtime_top_k_buf_ = allocator_->reMalloc(runtime_top_k_buf_, sizeof(std::uint32_t) * batch_size, false);
     runtime_top_p_buf_ = allocator_->reMalloc(runtime_top_p_buf_, sizeof(float) * batch_size, false);
@@ -224,6 +241,12 @@ void TopPSamplingLayer<T>::setup(std::size_t const batch_size, SetupParams const
     std::vector<float> runtime_top_ps(batch_size);
     cudaAutoCpy(runtime_top_ps.data(), runtime_top_p_buf_, batch_size, stream_);
     runtime_max_top_p_ = *std::max_element(std::begin(runtime_top_ps), std::end(runtime_top_ps));
+
+    if (!is_deterministic_)
+    {
+        int sm_cnt = cuda_device_prop_->multiProcessorCount;
+        air_topp_block_num_ = calcAirTopPBlockNum<T, int, float>(batch_size, (int) vocab_size_padded_, sm_cnt);
+    }
 }
 
 template <typename T>
@@ -239,9 +262,12 @@ void TopPSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingPa
     auto* logits = !skip_any_ ? params.logits.template getPtr<T>() : runtime_logits_buf_;
     auto* end_ids = params.end_ids.template getPtr<const int>();
 
-    invokeTopPInitialize(
-        topp_id_vals_buf_, topp_offset_buf_, begin_topp_offset_buf_, local_batch_size, vocab_size_padded_, stream_);
-    sync_check_cuda_error();
+    if (is_deterministic_)
+    {
+        invokeTopPInitialize(
+            topp_id_vals_buf_, topp_offset_buf_, begin_topp_offset_buf_, local_batch_size, vocab_size_padded_, stream_);
+        sync_check_cuda_error();
+    }
 
     FinishedState* finished_input = (params.finished)
         ? reinterpret_cast<FinishedState*>(params.finished->template getPtr<FinishedState::UnderlyingType>())
@@ -257,25 +283,39 @@ void TopPSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingPa
     float* output_log_probs = (outputs.output_log_probs) ? outputs.output_log_probs->template getPtr<float>() : nullptr;
     int* sequence_length = (outputs.sequence_length) ? outputs.sequence_length->template getPtr<int>() : nullptr;
 
-    invokeBatchTopPSampling<T>(sampling_workspace_, sampling_workspace_size_, cub_temp_storage_size_,
-        outputs.output_ids_ptr.template getPtr<int*>(), sequence_length, finished_input, finished_output, cum_log_probs,
-        output_log_probs, logits, topp_id_vals_buf_, topp_offset_buf_, begin_topp_offset_buf_,
-        curandstate_buf_ + ite * local_batch_size, local_batch_size, vocab_size_padded_, end_ids, runtime_max_top_p_,
-        runtime_top_p_buf_ + ite * local_batch_size, stream_, skip_decode_buf_ + ite * local_batch_size);
-    sync_check_cuda_error();
-
-    invokeComputeToppDecay(runtime_top_p_buf_ + ite * local_batch_size, initial_top_p_buf_ + ite * local_batch_size,
-        outputs.output_ids_ptr.template getPtr<const int*>(), top_p_decay_buf_ + ite * local_batch_size,
-        top_p_min_buf_ + ite * local_batch_size, top_p_reset_ids_buf_ + ite * local_batch_size, sequence_length,
-        local_batch_size, stream_);
-    sync_check_cuda_error();
+    if (is_deterministic_)
+    {
+        invokeBatchTopPSampling<T>(sampling_workspace_, sampling_workspace_size_, cub_temp_storage_size_,
+            outputs.output_ids_ptr.template getPtr<int*>(), sequence_length, finished_input, finished_output,
+            cum_log_probs, output_log_probs, logits, topp_id_vals_buf_, topp_offset_buf_, begin_topp_offset_buf_,
+            curandstate_buf_ + ite * local_batch_size, local_batch_size, vocab_size_padded_, end_ids,
+            runtime_max_top_p_, runtime_top_p_buf_ + ite * local_batch_size, stream_,
+            skip_decode_buf_ + ite * local_batch_size);
+        sync_check_cuda_error();
+        invokeComputeToppDecay(runtime_top_p_buf_ + ite * local_batch_size, initial_top_p_buf_ + ite * local_batch_size,
+            outputs.output_ids_ptr.template getPtr<const int*>(), top_p_decay_buf_ + ite * local_batch_size,
+            top_p_min_buf_ + ite * local_batch_size, top_p_reset_ids_buf_ + ite * local_batch_size, sequence_length,
+            local_batch_size, stream_);
+        sync_check_cuda_error();
+    }
+    else
+    {
+        invokeBatchAirTopPSampling<T>(sampling_workspace_, sampling_workspace_size_,
+            outputs.output_ids_ptr.template getPtr<int*>(), sequence_length, finished_input, finished_output,
+            cum_log_probs, output_log_probs, logits, curandstate_buf_ + ite * local_batch_size, local_batch_size,
+            vocab_size_padded_, end_ids, runtime_max_top_p_, runtime_top_p_buf_ + ite * local_batch_size, stream_,
+            air_topp_block_num_, skip_decode_buf_ + ite * local_batch_size);
+        sync_check_cuda_error();
+    }
 }
 
 template <typename T>
 TopPSamplingLayer<T>::TopPSamplingLayer(std::size_t vocab_size, std::size_t vocab_size_padded, cudaStream_t stream,
-    IAllocator* allocator, bool is_free_buffer_after_forward, cudaDeviceProp* cuda_device_prop)
+    std::shared_ptr<IAllocator> allocator, bool is_free_buffer_after_forward, cudaDeviceProp* cuda_device_prop,
+    bool is_deterministic)
     : BaseSamplingLayer<T>(
-        vocab_size, vocab_size_padded, stream, allocator, is_free_buffer_after_forward, cuda_device_prop)
+        vocab_size, vocab_size_padded, stream, std::move(allocator), is_free_buffer_after_forward, cuda_device_prop)
+    , is_deterministic_(is_deterministic)
 {
 }
 

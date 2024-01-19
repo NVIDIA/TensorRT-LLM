@@ -100,6 +100,28 @@ memory is not enough when multi-block mode is not enabled. To get masked MHA
 kernel work in these cases, multi-block mode is forced on and a warning log is
 printed.
 
+#### XQA Optimization
+
+Another optimization for MQA/GQA in generation phase called XQA optimization.
+It is still experimental feature and support limited configurations. LLAMA2 70B
+is one model that it supports.
+
+Support matrix of the XQA optimization:
+ - FP16 / BF16 compute data type.
+ - FP16 / BF16 / FP8 / INT8 KV cache data type.
+ - Paged KV cache (64 / 128 tokens per block).
+
+To enable this, you need to use the
+flag `--enable_xqa` when building the engines. Note that a heuristic algorithm
+is also used to decide whether to use XQA kernel or masked MHA kernel to get
+better performance. That means even `--enable_xqa` is set, XQA kernels
+may not also be used. If you want to always use that kernel when possible,
+`TRTLLM_FORCE_XQA=1` can be set to force use XQA kernels when the model config
+is supported. Detailed supported configuration can be found function `shouldUse`
+of class `DecoderXQARunner` in
+`cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h`.
+
+
 ## Inflight batching
 
 TensorRT-LLM supports a feature called in-flight batching. With that feature,
@@ -162,13 +184,13 @@ outputs. However, TensorRT-LLM supports INT8 and FP8
 The GPT attention operator populates the KV cache. When INT8 or FP8 KV caches
 are enabled, the input values have to be quantized to 8 bits using a scaling
 factor. For quantization, the scaling factor is stored in the
-`kv_orig_quant_scale` tensor. Its shape is `[1]` and only per-tensor
-quantization is supported in the current version.
+`kv_cache_scaling_factor` tensor. Its shape is `[1]` and only per-tensor
+quantization is supported in the current version. Quantization uses inversed scale
+since it does multiply as `fp_value * (1.0 / kv_cache_scaling_factor)` in plugin.
 
 During generation, the values read from the cache are dequantized on-the-fly in
-the MHA/MQA kernel. The scaling factor to dequantize those values is stored in
-the `kv_quant_orig_scale` tensor. That tensor contains a single value (per
-tensor scaling).
+the MHA/MQA kernel, dequantization can be described as
+`quantized_value * kv_cache_scaling_factor`.
 
 
 ## Sliding Window Attention, Cyclic (Rolling Buffer) KV Cache
@@ -197,6 +219,23 @@ This tensor will serve as the buffer for `max_attention_window_size`,
 setting unique values for each layer. However, it’s important to note that the
 memory allocation for the kv cache still relies on the buffer’s maximum value._
 
+## StreamingLLM
+
+The StreamingLLM feature uses a window attention to perform efficient and stable LLM
+on long texts, which means that only `N` tokens need to be stored in the KV cache.
+Similar to the cyclic KV cache feature in TensorRT-LLM, `max_attention_window_size`
+parameter is used to determine `N`. Different from the cyclic KV cache feature,
+the first `S` tokens, called sink tokens, are always kept in the attention window,
+where `S` is determined by `sink_token_length` parameter in `GenerationSession.setup`.
+In addition, the relative position embedding is also changed in StreamingLLM.
+When determining the relative distance and adding positional information to tokens,
+StreamingLLM use the positions within the cache rather than those in the original text.
+`enable_pos_shift` flag is used to enable this feature.
+
+In context phase, the self-attentions is dense in the official implementation of
+StreamingLLM, and it uses all of the tokens for computation and only saves `N` tokens
+to the KV cache. This mode is determined by the `dense_context_fmha` flag.
+
 ## Beam-Search
 
 The GPT attention operator supports beam-search. In the context phase, a single
@@ -222,7 +261,7 @@ where `batch_beam_size` is the batch size (number of sequences) for the context
 phase and the batch size multiplied by the beam width for the generation phase.
 Having different beam widths per sequence in padded mode is not supported.
 
-In packed mode, its shape is `[1, num_tokens, 3 * hidden_dim]` where
+In packed mode, its shape is `[num_tokens, 3 * hidden_dim]` where
 `num_tokens` is the total number of tokens in the batch. For the sequences in
 context phase, the number of tokens of a sequence corresponds to its input
 length (even if the beam width is greater than `1` for beam search).  For the
@@ -241,13 +280,6 @@ for seq in context_phase:
 for seq in generation_phase:
     num_tokens += seq.beam_width
 ```
-
-In a future release of TensorRT-LLM, the rank of that packed input tensor
-may be reduced from 3 to 2. The current rank is to maintain the homogeneity
-between padded and packed modes. It is no longer justified if support for
-padded mode is removed.
-
-## Additional Features
 
 ### Rotary Positional Embedding (RoPE)
 
@@ -270,7 +302,7 @@ In MHA, the output of the `Q*K^T` product is scaled by a constant value that
 is computed as:
 
 ```
-scaling = 1.f / (q_scaling * sqrt(head_size)).
+norm_factor = 1.f / (q_scaling * sqrt(head_size)).
 ```
 
 ### Cross Attention

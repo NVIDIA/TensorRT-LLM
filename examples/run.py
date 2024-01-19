@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import argparse
+import ast
 import csv
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from utils import (DEFAULT_HF_MODEL_DIRS, DEFAULT_PROMPT_TEMPLATES,
                    load_tokenizer, read_model_name, throttle_generator)
 
 import tensorrt_llm
+import tensorrt_llm.profiler
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
 
@@ -40,6 +42,10 @@ def parse_arguments(args=None):
         help=
         'The attention window size that controls the sliding window attention / cyclic kv cache behaviour'
     )
+    parser.add_argument('--sink_token_length',
+                        type=int,
+                        default=None,
+                        help='The sink token length.')
     parser.add_argument('--log_level', type=str, default='error')
     parser.add_argument('--engine_dir', type=str, default='engine_outputs')
     parser.add_argument('--use_py_session',
@@ -98,6 +104,8 @@ def parse_arguments(args=None):
     parser.add_argument('--top_p', type=float, default=0.0)
     parser.add_argument('--length_penalty', type=float, default=1.0)
     parser.add_argument('--repetition_penalty', type=float, default=1.0)
+    parser.add_argument('--presence_penalty', type=float, default=0.0)
+    parser.add_argument('--frequency_penalty', type=float, default=0.0)
     parser.add_argument('--debug_mode',
                         default=False,
                         action='store_true',
@@ -122,6 +130,7 @@ def parse_arguments(args=None):
     parser.add_argument('--lora_dir',
                         type=str,
                         default=None,
+                        nargs="+",
                         help="The directory of LoRA weights")
     parser.add_argument(
         '--lora_task_uids',
@@ -134,7 +143,6 @@ def parse_arguments(args=None):
                         default="hf",
                         choices=["hf", "nemo"],
                         help="The source of lora checkpoint.")
-
     parser.add_argument(
         '--num_prepend_vtokens',
         nargs="+",
@@ -142,6 +150,18 @@ def parse_arguments(args=None):
         help="Number of (default) virtual tokens to prepend to each sentence."
         " For example, '--num_prepend_vtokens=10' will prepend the tokens"
         " [vocab_size, vocab_size + 1, ..., vocab_size + 9] to the sentence.")
+    parser.add_argument(
+        '--run_profiling',
+        default=False,
+        action='store_true',
+        help="Run several 10 iterations to profile the inference latencies.")
+    parser.add_argument(
+        '--medusa_choices',
+        type=str,
+        default=None,
+        help="Medusa choice to use, if not none, will use Medusa decoding."
+        "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 medusa tokens."
+    )
 
     return parser.parse_args(args=args)
 
@@ -153,7 +173,8 @@ def parse_input(tokenizer,
                 add_special_tokens=True,
                 max_input_length=923,
                 pad_id=None,
-                num_prepend_vtokens=[]):
+                num_prepend_vtokens=[],
+                model_name=None):
     if pad_id is None:
         pad_id = tokenizer.pad_token_id
 
@@ -201,9 +222,11 @@ def parse_input(tokenizer,
             batch_input_ids[i] = list(
                 range(base_vocab_size,
                       base_vocab_size + length)) + batch_input_ids[i]
-
+    if model_name == 'glm_10b':
+        for ids in batch_input_ids:
+            ids.append(tokenizer.sop_token_id)
     batch_input_ids = [
-        torch.tensor(x, dtype=torch.int32).unsqueeze(0) for x in batch_input_ids
+        torch.tensor(x, dtype=torch.int32) for x in batch_input_ids
     ]
     return batch_input_ids
 
@@ -249,24 +272,28 @@ def print_output(tokenizer,
         outputs = np.array(output_ids.cpu().contiguous(), dtype='int32')
         np.save(output_file, outputs)
 
-    if generation_logits is not None and output_logits_npy is not None and num_beams == 1:
-        input_lengths = torch.Tensor(input_lengths)
+    # Save context logits
+    if context_logits is not None and output_logits_npy is not None:
         context_logits = torch.cat(context_logits, axis=0)
-        generation_logits = generation_logits.squeeze(1)
-        last_token_ids = torch.cumsum(input_lengths, dim=0).int().cuda()
-        batch_size = input_lengths.size(0)
         vocab_size_padded = context_logits.shape[-1]
         context_logits = context_logits.reshape([1, -1, vocab_size_padded])
-        context_logits = torch.index_select(context_logits, 1,
-                                            last_token_ids - 1).view(
-                                                batch_size, 1,
-                                                vocab_size_padded)
-        logits = torch.cat([context_logits, generation_logits], axis=1)
-        logits = logits.reshape(-1, num_beams, logits.shape[1], logits.shape[2])
-        output_file = Path(output_logits_npy)
-        output_file.parent.mkdir(exist_ok=True, parents=True)
-        outputs = np.array(logits.cpu().contiguous(), dtype='float32')
-        np.save(output_file, outputs)
+
+        output_context_logits_npy = output_logits_npy.split(
+            '.npy')[0] + "_context"
+        output_context_logits_file = Path(output_context_logits_npy)
+        context_outputs = np.array(
+            context_logits.squeeze(0).cpu().contiguous(),
+            dtype='float32')  # [promptLengthSum, vocabSize]
+        np.save(output_context_logits_file, context_outputs)
+
+    # Save generation logits
+    if generation_logits is not None and output_logits_npy is not None and num_beams == 1:
+        output_generation_logits_npy = output_logits_npy.split(
+            '.npy')[0] + "_generation"
+        output_generation_logits_file = Path(output_generation_logits_npy)
+        generation_outputs = np.array(generation_logits.cpu().contiguous(),
+                                      dtype='float32')
+        np.save(output_generation_logits_file, generation_outputs)
 
 
 def main(args):
@@ -306,12 +333,18 @@ def main(args):
                                   add_special_tokens=args.add_special_tokens,
                                   max_input_length=args.max_input_length,
                                   pad_id=pad_id,
-                                  num_prepend_vtokens=args.num_prepend_vtokens)
-    input_lengths = [x.size(1) for x in batch_input_ids]
+                                  num_prepend_vtokens=args.num_prepend_vtokens,
+                                  model_name=model_name)
+    input_lengths = [x.size(0) for x in batch_input_ids]
 
     if not PYTHON_BINDINGS and not args.use_py_session:
         logger.warning(
             "Python bindings of C++ session is unavailable, fallback to Python session."
+        )
+        args.use_py_session = True
+    if args.debug_mode and not args.use_py_session:
+        logger.warning(
+            "Debug mode is not supported in C++ session for now, fallback to Python session."
         )
         args.use_py_session = True
     runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
@@ -320,13 +353,23 @@ def main(args):
                          rank=runtime_rank,
                          debug_mode=args.debug_mode,
                          lora_ckpt_source=args.lora_ckpt_source)
+    if args.medusa_choices is not None:
+        args.medusa_choices = ast.literal_eval(args.medusa_choices)
+        assert args.use_py_session, "Medusa is only supported by py_session"
+        assert args.temperature == 0, "Medusa should use temperature == 0"
+        assert len(
+            batch_input_ids) == 1, "Medusa should use max_batch_size == 1"
+        assert args.num_beams == 1, "Medusa should use num_beams == 1"
+        runner_kwargs.update(medusa_choices=args.medusa_choices)
     if not args.use_py_session:
         runner_kwargs.update(
             max_batch_size=len(batch_input_ids),
             max_input_len=max(input_lengths),
             max_output_len=args.max_output_len,
             max_beam_width=args.num_beams,
-            max_attention_window_size=args.max_attention_window_size)
+            max_attention_window_size=args.max_attention_window_size,
+            sink_token_length=args.sink_token_length,
+        )
     runner = runner_cls.from_dir(**runner_kwargs)
 
     with torch.no_grad():
@@ -334,6 +377,7 @@ def main(args):
             batch_input_ids,
             max_new_tokens=args.max_output_len,
             max_attention_window_size=args.max_attention_window_size,
+            sink_token_length=args.sink_token_length,
             end_id=end_id,
             pad_id=pad_id,
             temperature=args.temperature,
@@ -342,6 +386,8 @@ def main(args):
             num_beams=args.num_beams,
             length_penalty=args.length_penalty,
             repetition_penalty=args.repetition_penalty,
+            presence_penalty=args.presence_penalty,
+            frequency_penalty=args.frequency_penalty,
             stop_words_list=stop_words_list,
             bad_words_list=bad_words_list,
             lora_uids=args.lora_task_uids,
@@ -349,13 +395,14 @@ def main(args):
             prompt_tasks=args.prompt_tasks,
             streaming=args.streaming,
             output_sequence_lengths=True,
-            return_dict=True)
+            return_dict=True,
+            medusa_choices=args.medusa_choices)
         torch.cuda.synchronize()
 
-    if runtime_rank == 0:
-        if args.streaming:
-            for curr_outputs in throttle_generator(outputs,
-                                                   args.streaming_interval):
+    if args.streaming:
+        for curr_outputs in throttle_generator(outputs,
+                                               args.streaming_interval):
+            if runtime_rank == 0:
                 output_ids = curr_outputs['output_ids']
                 sequence_lengths = curr_outputs['sequence_lengths']
                 print_output(tokenizer,
@@ -364,13 +411,15 @@ def main(args):
                              sequence_lengths,
                              output_csv=args.output_csv,
                              output_npy=args.output_npy)
-        else:
+    else:
+        if runtime_rank == 0:
             output_ids = outputs['output_ids']
             sequence_lengths = outputs['sequence_lengths']
             context_logits = None
             generation_logits = None
-            if runner.gather_all_token_logits:
+            if runner.gather_context_logits:
                 context_logits = outputs['context_logits']
+            if runner.gather_generation_logits:
                 generation_logits = outputs['generation_logits']
             print_output(tokenizer,
                          output_ids,
@@ -381,6 +430,67 @@ def main(args):
                          context_logits=context_logits,
                          generation_logits=generation_logits,
                          output_logits_npy=args.output_logits_npy)
+
+    if args.run_profiling:
+        ite = 10
+        # warmup
+        for _ in range(ite):
+            with torch.no_grad():
+                outputs = runner.generate(
+                    batch_input_ids,
+                    max_new_tokens=args.max_output_len,
+                    max_attention_window_size=args.max_attention_window_size,
+                    end_id=end_id,
+                    pad_id=pad_id,
+                    temperature=args.temperature,
+                    top_k=args.top_k,
+                    top_p=args.top_p,
+                    num_beams=args.num_beams,
+                    length_penalty=args.length_penalty,
+                    repetition_penalty=args.repetition_penalty,
+                    presence_penalty=args.presence_penalty,
+                    frequency_penalty=args.frequency_penalty,
+                    stop_words_list=stop_words_list,
+                    bad_words_list=bad_words_list,
+                    lora_uids=args.lora_task_uids,
+                    prompt_table_path=args.prompt_table_path,
+                    prompt_tasks=args.prompt_tasks,
+                    streaming=args.streaming,
+                    output_sequence_lengths=True,
+                    return_dict=True)
+                torch.cuda.synchronize()
+
+        tensorrt_llm.profiler.start("tmp")
+        for _ in range(ite):
+            with torch.no_grad():
+                outputs = runner.generate(
+                    batch_input_ids,
+                    max_new_tokens=args.max_output_len,
+                    max_attention_window_size=args.max_attention_window_size,
+                    end_id=end_id,
+                    pad_id=pad_id,
+                    temperature=args.temperature,
+                    top_k=args.top_k,
+                    top_p=args.top_p,
+                    num_beams=args.num_beams,
+                    length_penalty=args.length_penalty,
+                    repetition_penalty=args.repetition_penalty,
+                    presence_penalty=args.presence_penalty,
+                    frequency_penalty=args.frequency_penalty,
+                    stop_words_list=stop_words_list,
+                    bad_words_list=bad_words_list,
+                    lora_uids=args.lora_task_uids,
+                    prompt_table_path=args.prompt_table_path,
+                    prompt_tasks=args.prompt_tasks,
+                    streaming=args.streaming,
+                    output_sequence_lengths=True,
+                    return_dict=True)
+                torch.cuda.synchronize()
+        tensorrt_llm.profiler.stop("tmp")
+
+        print(
+            f"batch_size: {len(batch_input_ids)}, avg latency of {ite} iterations: : {tensorrt_llm.profiler.elapsed_time_in_sec('tmp') / ite} sec"
+        )
 
 
 if __name__ == '__main__':

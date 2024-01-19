@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -40,7 +40,7 @@ class TestModelDtype(unittest.TestCase):
                                max_position_embeddings=128,
                                dtype=dtype)
         for p in tiny_model.parameter():
-            self.assertEqual(p._value.dtype, str_dtype_to_np(dtype))
+            self.assertEqual(p.raw_value.dtype, str_dtype_to_np(dtype))
 
 
 if __name__ == '__main__':

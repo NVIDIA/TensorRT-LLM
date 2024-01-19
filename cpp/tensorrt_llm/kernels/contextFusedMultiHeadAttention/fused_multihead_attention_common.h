@@ -179,7 +179,7 @@ struct Fused_multihead_attention_paged_kv_params_v2
     // The Q matrices.
     const void* q_ptr;
     // Paged KV Cache buffer.
-    KVBlockArray paged_kv_cache;
+    KVBlockArrayForContextFMHA paged_kv_cache;
     // The O matrix (output).
     void* o_ptr;
     // The packed mask for random mask.
