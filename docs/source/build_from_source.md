@@ -20,7 +20,7 @@ We first recommend that you [`install TensorRT-LLM`](../../README.md#installatio
 Building from source code is necessary for users who require the best performance or debugging
 capabilities, or if the [GNU C++11 ABI](https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html) is required.
 
-We recommend the use of [Docker](https://www.docker.com) to build and run TensorRT-LLM. Instructions
+We recommend the use of [Docker](https://www.docker.com) to build and run TensorRT-LLM. 64GB or more of cpu memory is required. Instructions
 to install an environment to run Docker containers for the NVIDIA platform can be found
 [here](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
 
