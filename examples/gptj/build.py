@@ -333,7 +333,7 @@ def parse_arguments(args):
 
 def build_rank_engine(builder: Builder,
                       builder_config: tensorrt_llm.builder.BuilderConfig,
-                      engine_name, rank, args):
+                      engine_name, rank, args, hf_gpt):
     '''
        @brief: Build the engine on the given rank.
        @param rank: The rank to build the engine.
@@ -459,7 +459,7 @@ def build_rank_engine(builder: Builder,
     return engine
 
 
-def build(rank, args):
+def build(rank, args, hf_gpt):
     torch.cuda.set_device(rank % args.gpus_per_node)
     tensorrt_llm.logger.set_level(args.log_level)
     if not os.path.exists(args.output_dir):
@@ -506,7 +506,7 @@ def build(rank, args):
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.world_size,
                                       cur_rank)
         engine = build_rank_engine(builder, builder_config, engine_name,
-                                   cur_rank, args)
+                                   cur_rank, args, hf_gpt)
         assert engine is not None, f'Failed to build engine for rank {cur_rank}'
 
         local_num_kv_heads = (args.n_head + args.world_size -
@@ -550,11 +550,11 @@ def run_build(args=None):
         logger.warning(
             f'Parallelly build TensorRT engines. Please make sure that all of the {args.world_size} GPUs are totally free.'
         )
-        mp.spawn(build, nprocs=args.world_size, args=(args, ))
+        mp.spawn(build, nprocs=args.world_size, args=(args, hf_gpt))
     else:
         args.parallel_build = False
         logger.info('Serially build TensorRT engines.')
-        build(0, args)
+        build(0, args, hf_gpt)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
