@@ -21,7 +21,8 @@ import typing as _tp
 
 def run_command(command: _tp.Sequence[str], *, cwd=None, **kwargs) -> None:
     print(f"Running: cd %s && %s" %
-          (str(cwd or _pl.Path.cwd()), " ".join(command)))
+          (str(cwd or _pl.Path.cwd()), " ".join(command)),
+          flush=True)
     _sp.check_call(command, cwd=cwd, **kwargs)
 
 

@@ -43,7 +43,11 @@ RmsnormPlugin::RmsnormPlugin(const void* data, size_t length)
     const char *d = reinterpret_cast<const char*>(data), *a = d;
     read(d, mEps);
     read(d, mType);
-    TLLM_CHECK(d == a + length);
+    TLLM_CHECK_WITH_INFO(d == a + length,
+        "Expected length (%d) != real length (%d). This is often "
+        "caused by using different TensorRT-LLM version to build "
+        "engine and run engine.",
+        (int) length, (int) (d - a));
     TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16), "Unsupported data type");
 }
 

@@ -101,60 +101,62 @@ struct XQAKernelRuntimeHasher
 
 // NOTE: we use int32_t sequence lengths as gpt attention plugins use int32_t for that.
 // XQA kernels assume all length should use uint32_t.
-template <bool HasBeam>
+// NOTE: Linear KV cache and paged KV cache uses the same structure.
 struct KVCache
 {
     void* data;
-    int const* sequence_lengths;
-    uint32_t capacity;
-    const int32_t* cacheInDir;
-};
-
-// NOTE: Linear KV cache and paged KV cache uses the same structure.
-template <>
-struct KVCache<false>
-{
-    void* data;
-    int const* sequence_lengths;
+    int32_t const* sequence_lengths;
     // NOTE: max_num_blocks_per_sequence for paged kv cache, max_sequence_length for linear kv cache.
     uint32_t capacity;
 };
 
+struct BeamSearchParams
+{
+    int32_t const* indices;    // cacheIndir with shape: [batchSize][beamWidth][capacity]
+    int32_t capacity;
+    int32_t const* ctxLenList; // shape: [batchSize][beamWidth]. Should be [batchSize] but we have to match trt-llm API.
+};
+
 // XQA kernels assume all integer values should use uint32_t.
-template <bool HasBeam>
 struct XQALaunchParam
 {
     uint32_t num_k_heads;
     void* output;
     const void* qkv;
-    KVCache<HasBeam> kvCacheParams;
+    KVCache kvCacheParams;
+    std::optional<BeamSearchParams> beamSearchParams;
     uint32_t batch_size;
     const float* kv_scale_quant_orig = nullptr;
     void* scratch = nullptr;
 };
 
 // Setup launch params.
-template <typename KVCacheBuffer, bool HasBeam>
-void buildXQALaunchParams(XQALaunchParam<HasBeam>& launchParams, const XQAParams& params, KVCacheBuffer kv_cache_buffer)
+template <typename KVCacheBuffer>
+void buildXQALaunchParams(XQALaunchParam& launchParams, const XQAParams& params, KVCacheBuffer kv_cache_buffer)
 {
     TLLM_CHECK_WITH_INFO(
         params.data_type == DATA_TYPE_FP16 || params.data_type == DATA_TYPE_BF16, "Only fp16 or bf16 supported now.");
-    memset(&launchParams, 0, sizeof(XQALaunchParam<HasBeam>));
+    memset(&launchParams, 0, sizeof(XQALaunchParam));
     launchParams.num_k_heads = params.num_kv_heads;
     launchParams.output = static_cast<uint8_t*>(params.output);
     launchParams.qkv = static_cast<const uint8_t*>(params.qkv);
     launchParams.batch_size = params.batch_size;
-    launchParams.scratch = params.workspaces;
     launchParams.kv_scale_quant_orig = params.kv_scale_quant_orig;
+    launchParams.scratch = params.workspaces;
     launchParams.kvCacheParams.data = kv_cache_buffer.data;
     launchParams.kvCacheParams.sequence_lengths = params.sequence_lengths;
-    // TODO: beam searching has not been implemented yet.
-    if constexpr (HasBeam)
-    {
-        launchParams.kvCacheParams.cacheInDir = params.cache_indir;
-    }
     launchParams.kvCacheParams.capacity
         = params.paged_kv_cache ? params.max_blocks_per_sequence : params.max_attention_window_size;
+    // TODO: beam searching has not been implemented yet.
+    if (params.beam_width > 1)
+    {
+        launchParams.beamSearchParams
+            = BeamSearchParams{params.cache_indir, params.max_attention_window_size, params.context_lengths};
+    }
+    else
+    {
+        launchParams.beamSearchParams = std::nullopt;
+    }
 }
 
 // max number of CTAs for each KV head, multiple CTAs for one KV head is multi-block mode.
@@ -267,7 +269,7 @@ public:
         return static_cast<float>(block_count) * kEnableMinBlockFactor >= static_cast<float>(multiprocessor_count);
     }
 
-    template <typename T, typename KVCacheBuffer, bool HAS_BEAM>
+    template <typename T, typename KVCacheBuffer>
     void run(const XQAParams& xqaParams, KVCacheBuffer& kv_cache_buffer, int2& rotary_kernel_launch_cache,
         int multiprocessor_count, const cudaStream_t& stream) const
     {
@@ -296,6 +298,8 @@ public:
             xqaParams.medusa_position_offsets, xqaParams.position_shift_enabled, (float*) nullptr, 0, cache_type,
             xqaParams.kv_scale_orig_quant, true, beam_width, rotary_kernel_launch_cache, stream);
 
+        sync_check_cuda_error();
+
         // Use mTileSize = 16 kernels when qSeqLen <= 16.
         unsigned int qSeqLen = static_cast<unsigned int>(xqaParams.generation_input_length);
         unsigned int mTileSize = qSeqLen <= 16 ? 16 : 32;
@@ -314,7 +318,7 @@ public:
         const CUfunction func = findIter->second.mDeviceFunction;
         const unsigned int shared_mem_bytes = findIter->second.mSharedMemBytes;
 
-        XQALaunchParam<HAS_BEAM> launchParams;
+        XQALaunchParam launchParams;
         buildXQALaunchParams(launchParams, xqaParams, kv_cache_buffer);
         if (xqaParams.multi_query_tokens)
         {
@@ -342,9 +346,26 @@ public:
         }
         else
         {
-            void* kernelParams[]
-                = {&launchParams.num_k_heads, &launchParams.output, &xqa_q_input_ptr, &launchParams.kvCacheParams,
-                    &launchParams.batch_size, &launchParams.kv_scale_quant_orig, &launchParams.scratch, nullptr};
+            constexpr uint32_t kMAX_NB_KERNEL_PARAMS = 9;
+            uint32_t idxNextParam = 0;
+            void* kernelParams[kMAX_NB_KERNEL_PARAMS];
+            auto appendParam = [&](auto* p) mutable
+            {
+                TLLM_CHECK(idxNextParam < kMAX_NB_KERNEL_PARAMS);
+                kernelParams[idxNextParam++] = p;
+            };
+            appendParam(&launchParams.num_k_heads);
+            appendParam(&launchParams.output);
+            appendParam(&xqa_q_input_ptr);
+            appendParam(&launchParams.kvCacheParams);
+            if (xqaParams.beam_width > 1)
+            {
+                appendParam(&launchParams.beamSearchParams.value());
+            }
+            appendParam(&launchParams.batch_size);
+            appendParam(&launchParams.kv_scale_quant_orig);
+            appendParam(&launchParams.scratch);
+            kernelParams[idxNextParam] = nullptr; // one extra nullptr at end as guard.
             int multi_block = 1;
             if (xqaParams.multi_block_mode)
             {
@@ -478,35 +499,21 @@ private:
     int mMultiProcessorCount;
 };
 
-#define XQA_KERNEL_RUN(DATA_TYPE, HAS_BEAM)                                                                            \
-    xqaKernel->template run<DATA_TYPE, KVCacheBuffer, HAS_BEAM>(                                                       \
+#define XQA_KERNEL_RUN(DATA_TYPE)                                                                                      \
+    xqaKernel->template run<DATA_TYPE, KVCacheBuffer>(                                                                 \
         xqa_params, kv_cache_buffer, rotary_kernel_launch_cache, mMultiProcessorCount, stream);
 
 template <typename KVCacheBuffer>
 void DecoderXQARunner::xqaImpl::run(const XQAParams& xqa_params, KVCacheBuffer& kv_cache_buffer,
     int2& rotary_kernel_launch_cache, const cudaStream_t& stream)
 {
-    if (xqa_params.beam_width > 1)
+    if (mDataType == DATA_TYPE_FP16)
     {
-        if (mDataType == DATA_TYPE_FP16)
-        {
-            XQA_KERNEL_RUN(__half, true);
-        }
-        else
-        {
-            XQA_KERNEL_RUN(__nv_bfloat16, true);
-        }
+        XQA_KERNEL_RUN(__half);
     }
     else
     {
-        if (mDataType == DATA_TYPE_FP16)
-        {
-            XQA_KERNEL_RUN(__half, false);
-        }
-        else
-        {
-            XQA_KERNEL_RUN(__nv_bfloat16, false);
-        }
+        XQA_KERNEL_RUN(__nv_bfloat16);
     }
 }
 

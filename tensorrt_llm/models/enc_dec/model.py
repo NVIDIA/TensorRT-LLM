@@ -33,8 +33,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.generation_mixin import GenerationMixin
 from tensorrt_llm.module import Module, ModuleList
 from tensorrt_llm.parameter import Parameter
-from tensorrt_llm.plugin.plugin import (current_all_reduce_helper,
-                                        init_all_reduce_helper)
+from tensorrt_llm.plugin.plugin import current_all_reduce_helper
 
 layernorm_map = {
     LayerNormType.LayerNorm: LayerNorm,
@@ -378,6 +377,7 @@ class DecoderLayer(Module):
                 hidden_states: Tensor,
                 encoder_output: Optional[Tensor] = None,
                 attention_mask=None,
+                cross_attention_mask=None,
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None):
@@ -417,7 +417,7 @@ class DecoderLayer(Module):
 
         attention_output = self.cross_attention(
             hidden_states=hidden_states,
-            attention_mask=attention_mask,
+            attention_mask=cross_attention_mask,
             encoder_output=encoder_output,
             use_cache=use_cache,
             kv_cache_params=kv_cache_params,
@@ -486,7 +486,6 @@ class EncoderModel(Module, GenerationMixin):
                  embedding_sharding_dim=0,
                  mapping=Mapping()):
         super().__init__()
-        init_all_reduce_helper()
         self.mapping = mapping
 
         self.has_position_embedding = has_position_embedding
@@ -575,7 +574,8 @@ class EncoderModel(Module, GenerationMixin):
                 max_input_length=None,
                 prompt_embedding_table=None,
                 prompt_tasks=None,
-                prompt_vocab_size=None):
+                prompt_vocab_size=None,
+                attention_mask=None):
 
         # In PP, layer 0 has ids as inputs, all other layers have hidden_states as inputs
         if self.mapping.is_first_pp_rank():
@@ -590,6 +590,7 @@ class EncoderModel(Module, GenerationMixin):
 
         for encoder_layer in self.encoder_layers:
             hidden_states = encoder_layer(hidden_states=hidden_states,
+                                          attention_mask=attention_mask,
                                           input_lengths=input_lengths,
                                           max_input_length=max_input_length)
 
@@ -628,6 +629,7 @@ class EncoderModel(Module, GenerationMixin):
         use_custom_all_reduce = default_net(
         ).plugin_config.use_custom_all_reduce
 
+        attention_mask = None
         if remove_input_padding:
             if self.mapping.is_first_pp_rank():
                 input_ids = Tensor(
@@ -695,6 +697,17 @@ class EncoderModel(Module, GenerationMixin):
                                            ('hidden_size', [hidden_size]),
                                        ]))
 
+            if not default_net().plugin_config.bert_attention_plugin:
+                attention_mask = Tensor(
+                    name='attention_mask',
+                    dtype=trt.int32,
+                    shape=[-1, -1],
+                    dim_range=OrderedDict([
+                        ('batch_size', [bs_range]),
+                        ('input_len', [inlen_range]),
+                    ]),
+                )
+
         if use_custom_all_reduce and self.mapping.tp_size > 1:
             current_all_reduce_helper().set_workspace_tensor(
                 self.mapping, False)
@@ -750,7 +763,7 @@ class EncoderModel(Module, GenerationMixin):
 
         return (input_ids, input_lengths, position_ids, token_type_ids,
                 hidden_states, max_input_length, prompt_embedding_table, tasks,
-                prompt_vocab_size)
+                prompt_vocab_size, attention_mask)
 
 
 class DecoderModel(Module, GenerationMixin):
@@ -793,7 +806,6 @@ class DecoderModel(Module, GenerationMixin):
                  embedding_sharding_dim=0,
                  mapping=Mapping()):
         super().__init__()
-        init_all_reduce_helper()
         self.mapping = mapping
 
         self.has_position_embedding = has_position_embedding  # TODO: remove dup codes
@@ -910,6 +922,7 @@ class DecoderModel(Module, GenerationMixin):
                 token_type_ids=None,
                 use_cache=False,
                 attention_mask=None,
+                cross_attention_mask=None,
                 last_token_ids=None,
                 kv_cache_params=None,
                 attention_params=None,
@@ -940,6 +953,7 @@ class DecoderModel(Module, GenerationMixin):
                 hidden_states,
                 encoder_output=encoder_output,
                 attention_mask=attention_mask,
+                cross_attention_mask=cross_attention_mask,
                 use_cache=use_cache,
                 kv_cache_params=KeyValueCacheParams(
                     past_key_value=past,
@@ -988,8 +1002,9 @@ class DecoderModel(Module, GenerationMixin):
             for i, present in zip(self.mapping.pp_layers(self.total_num_layers),
                                   presents):
                 present[0].mark_output(f'present_key_value_{i}', self._kv_dtype)
-                present[1].mark_output(f'cross_present_key_value_{i}',
-                                       self._kv_dtype)
+                if default_net().plugin_config.gpt_attention_plugin:
+                    present[1].mark_output(f'cross_present_key_value_{i}',
+                                           self._kv_dtype)
             if self.mapping.is_last_pp_rank():
                 return (lm_logits, tuple(presents))
             return (hidden_states, tuple(presents))
@@ -1061,6 +1076,7 @@ class DecoderModel(Module, GenerationMixin):
         sequence_length = None
         host_past_key_value_lengths = None
         attention_mask = None
+        cross_attention_mask = None
         use_gpt_attention_plugin = default_net(
         ).plugin_config.gpt_attention_plugin
         remove_input_padding = default_net().plugin_config.remove_input_padding
@@ -1239,6 +1255,17 @@ class DecoderModel(Module, GenerationMixin):
                 ]),
             )
 
+            cross_attention_mask = Tensor(
+                name='cross_attention_mask',
+                dtype=trt.int32,
+                shape=[-1, -1, -1],
+                dim_range=OrderedDict([
+                    ('batch_size_beam_width', [bb_range]),
+                    ('query_len', [1]),
+                    ('encoder_input_len', [encoder_input_len_range]),
+                ]),
+            )
+
         cache_indirection = Tensor(
             name='cache_indirection',
             dtype=trt.int32,
@@ -1256,6 +1283,8 @@ class DecoderModel(Module, GenerationMixin):
 
         layers_range = self.mapping.pp_layers(self.total_num_layers)
 
+        host_max_attention_window_sizes = None
+        host_sink_token_length = None
         if use_gpt_attention_plugin:
             host_max_attention_window_sizes = []
             for i in layers_range:
@@ -1266,7 +1295,7 @@ class DecoderModel(Module, GenerationMixin):
                     dim_range=OrderedDict([('scalar', [1])]))
                 host_max_attention_window_sizes.append(
                     host_attention_window_size_tensor)
-            host_sink_token_length = Tensor(name=f'host_sink_token_length',
+            host_sink_token_length = Tensor(name='host_sink_token_length',
                                             dtype=trt.int32,
                                             shape=[1],
                                             dim_range=OrderedDict([('scalar',
@@ -1285,19 +1314,23 @@ class DecoderModel(Module, GenerationMixin):
                         shape=[-1, 2, num_kv_heads, -1, head_size],
                         dim_range=kv_dim_range)
 
-            cross_kv_dim_range = OrderedDict([
-                ('batch_size_beam_width', [bb_range]),
-                ('kv', [2]),
-                ('cross_num_heads', [encoder_num_kv_heads]),
-                ('cross_past_key_len', [encoder_input_len_range]),
-                ('cross_head_size', [encoder_head_size]),
-            ])
-            cross_kv = Tensor(
-                name=f'cross_past_key_value_{i}',
-                dtype=self._kv_dtype,
-                shape=[-1, 2, encoder_num_kv_heads, -1, encoder_head_size],
-                dim_range=cross_kv_dim_range)
-            past_key_value.append((kv, cross_kv))
+            if use_gpt_attention_plugin:
+                cross_kv_dim_range = OrderedDict([
+                    ('batch_size_beam_width', [bb_range]),
+                    ('kv', [2]),
+                    ('cross_num_heads', [encoder_num_kv_heads]),
+                    ('cross_past_key_len', [encoder_input_len_range]),
+                    ('cross_head_size', [encoder_head_size]),
+                ])
+                cross_kv = Tensor(
+                    name=f'cross_past_key_value_{i}',
+                    dtype=self._kv_dtype,
+                    shape=[-1, 2, encoder_num_kv_heads, -1, encoder_head_size],
+                    dim_range=cross_kv_dim_range)
+                past_key_value.append((kv, cross_kv))
+            else:
+                # use encoder_output directly, no need to save cross_past_key_value
+                past_key_value.append((kv, ))
 
             # TODO: Remove this when TRT fix the named dimension
             if not remove_input_padding:
@@ -1324,8 +1357,8 @@ class DecoderModel(Module, GenerationMixin):
             )
 
         return (input_ids, encoder_output, position_ids, token_type_ids, True,
-                attention_mask, last_token_ids, kv_cache_params,
-                attention_params, hidden_states)
+                attention_mask, cross_attention_mask, last_token_ids,
+                kv_cache_params, attention_params, hidden_states)
 
 
 class WhisperEncoder(Module):

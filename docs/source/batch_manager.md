@@ -135,7 +135,6 @@ When using V1 batching, the following additional statistics are reported per V1 
     - `maxAttentionWindow` (default: unspecified) refers to the maximum number of tokens attended to in the model when using features like sliding window attention or StreamingLLM. If unspecified, each generated tokens attends to all previous tokens like traditional MHA or MQA.
     - `freeGpuMemoryFraction` (default: 0.9) a number between 0 and 1 to indicate the maximum fraction of GPU memory (after loading the model) that may be used for KV cache. If `maxTokens` is specified, allocated KV cache is the minimum of `maxTokens` and the value inferred from `freeGpuMemoryFraction`.
     - `enableBlockReuse` (default: `false`) allow reuse of previously computed KV cache blocks across requests. This is expected to optimize memory use and computation.
-  - `maxNumSequences` (default: unspecified) maximum number of sequences that can be in progress in any iteration. It is recommended that this value be left unspecified and the value will be inferred from the TRT-LLM engine.
   - `enableTrtOverlap` (default: `false`) when `true`, GptManager partitions available requests into 2 'microbatches' that can be run concurrently to hide exposed CPU runtime. However, it may not give performance benefits when the size of the model is not big enough to overlap the host overhead, or when the number of requests is too small.
 
 ### Responses content

@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tensorrt_llm.plugin.plugin import init_all_reduce_helper
-
 from ..._utils import pad_vocab_size
 from ...functional import Tensor, allreduce, recv, send
 from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
@@ -61,7 +59,6 @@ class FalconDecoderLayer(Module):
             bias=config.bias,
             position_embedding_type=config.position_embedding_type,
             quant_mode=config.quant_mode,
-            instance_id=2 * layer_idx,
         )
 
         mlp_hidden_size = hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
@@ -82,7 +79,6 @@ class FalconDecoderLayer(Module):
             tp_group=tp_group,
             tp_size=tp_size,
             quant_mode=config.quant_mode,
-            instance_id=2 * layer_idx + 1,
         )
         if self.is_parallel_attention:
             self.post_layernorm = None
@@ -146,8 +142,6 @@ class FalconModel(Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
-        init_all_reduce_helper()
-
         if config.mapping.is_first_pp_rank():
             if config.use_parallel_embedding:
                 self.vocab_embedding = Embedding(

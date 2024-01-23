@@ -333,7 +333,7 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
                 if use_weight_only:
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = \
-                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                             numpy_to_torch(v), plugin_weight_only_quant_type)
                     if not use_gemm_woq_plugin:
                         dst.value = numpy_to_torch(v).numpy().astype(
@@ -351,7 +351,7 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
                 if use_weight_only:
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = \
-                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                             numpy_to_torch(v), plugin_weight_only_quant_type)
                     if not use_gemm_woq_plugin:
                         dst.value = numpy_to_torch(v).numpy().astype(
@@ -369,7 +369,7 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
                 if use_weight_only:
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = \
-                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                             numpy_to_torch(v), plugin_weight_only_quant_type)
 
                     if not use_gemm_woq_plugin:
@@ -389,7 +389,7 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
                 if use_weight_only:
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = \
-                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                             numpy_to_torch(v), plugin_weight_only_quant_type)
                     if not use_gemm_woq_plugin:
                         dst.value = numpy_to_torch(v).numpy().astype(
@@ -407,7 +407,7 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
                 if use_weight_only:
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = \
-                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                             numpy_to_torch(v), plugin_weight_only_quant_type)
 
                     if not use_gemm_woq_plugin:
@@ -428,7 +428,7 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
                     v = np.ascontiguousarray(
                         np.transpose(split_v, axes=(0, 2, 1)))
                     processed_torch_weights, torch_weight_scales = \
-                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                             numpy_to_torch(v), plugin_weight_only_quant_type)
                     dst.value = processed_torch_weights
                     tensorrt_llm_llama.layers[
@@ -443,7 +443,7 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
                     v = np.ascontiguousarray(
                         np.transpose(split_v, axes=(0, 2, 1)))
                     processed_torch_weights, torch_weight_scales = \
-                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                             numpy_to_torch(v), plugin_weight_only_quant_type)
                     dst.value = processed_torch_weights
                     tensorrt_llm_llama.layers[
@@ -605,7 +605,7 @@ def load_from_hf_checkpoint(
                 if use_weight_only:
                     param = split_v.transpose()
                     processed_torch_weights, torch_weight_scales = \
-                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                             param, plugin_weight_only_quant_type)
                     layer.attention.qkv.weight.value = processed_torch_weights
                     layer.attention.qkv.per_channel_scale.value = torch_weight_scales
@@ -615,7 +615,7 @@ def load_from_hf_checkpoint(
                 split_v = split(param, mapping.tp_size, mapping.tp_rank, dim=1)
                 if use_weight_only:
                     processed_torch_weights, torch_weight_scales = \
-                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                             split_v.transpose(), plugin_weight_only_quant_type)
                     layer.attention.dense.weight.value = processed_torch_weights
                     layer.attention.dense.per_channel_scale.value = torch_weight_scales
@@ -625,7 +625,7 @@ def load_from_hf_checkpoint(
                 split_v = split(param, mapping.tp_size, mapping.tp_rank, dim=0)
                 if use_weight_only:
                     processed_torch_weights, torch_weight_scales = \
-                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                             split_v.transpose(), plugin_weight_only_quant_type)
                     layer.mlp.gate.weight.value = processed_torch_weights
                     layer.mlp.gate.per_channel_scale.value = torch_weight_scales
@@ -635,7 +635,7 @@ def load_from_hf_checkpoint(
                 split_v = split(param, mapping.tp_size, mapping.tp_rank, dim=1)
                 if use_weight_only:
                     processed_torch_weights, torch_weight_scales = \
-                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                             split_v.transpose(), plugin_weight_only_quant_type)
                     layer.mlp.proj.weight.value = processed_torch_weights
                     layer.mlp.proj.per_channel_scale.value = torch_weight_scales
@@ -645,7 +645,7 @@ def load_from_hf_checkpoint(
                 split_v = split(param, mapping.tp_size, mapping.tp_rank, dim=0)
                 if use_weight_only:
                     processed_torch_weights, torch_weight_scales = \
-                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                             split_v.transpose(), plugin_weight_only_quant_type)
                     layer.mlp.fc.weight.value = processed_torch_weights
                     layer.mlp.fc.per_channel_scale.value = torch_weight_scales
@@ -1031,7 +1031,7 @@ def load_from_binary(tensorrt_llm_llama: 'LLaMAForCausalLM',
                     rank=mapping.tp_rank,
                     is_qkv=True)
             elif use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                     torch.tensor(t), plugin_weight_only_quant_type)
                 dst.value = processed_torch_weights.numpy()
                 scales = tensorrt_llm_llama.layers[
@@ -1058,7 +1058,7 @@ def load_from_binary(tensorrt_llm_llama: 'LLaMAForCausalLM',
                          'model.layers.' + str(i) + '.attention.dense',
                          [1, n_embd // mapping.tp_size], mapping.tp_rank)
         elif use_weight_only:
-            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
             dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_llama.layers[
@@ -1090,7 +1090,7 @@ def load_from_binary(tensorrt_llm_llama: 'LLaMAForCausalLM',
                 rank=mapping.tp_rank)
         elif use_weight_only:
             dst = tensorrt_llm_llama.layers[idx].mlp.fc.weight
-            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
 
             dst.value = processed_torch_weights.numpy()
@@ -1119,7 +1119,7 @@ def load_from_binary(tensorrt_llm_llama: 'LLaMAForCausalLM',
                 rank=mapping.tp_rank)
         elif use_weight_only:
             dst = tensorrt_llm_llama.layers[idx].mlp.gate.weight
-            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
             dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_llama.layers[idx].mlp.gate.per_channel_scale
@@ -1148,7 +1148,7 @@ def load_from_binary(tensorrt_llm_llama: 'LLaMAForCausalLM',
                          [1, inter_size // mapping.tp_size], mapping.tp_rank)
         elif use_weight_only:
             dst = tensorrt_llm_llama.layers[idx].mlp.proj.weight
-            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
 
             dst.value = processed_torch_weights.numpy()
@@ -1198,8 +1198,8 @@ def load_from_gptq_llama(tensorrt_llm_llama,
     ]
     split_sym = "."
 
-    packer = torch.ops.fastertransformer.pack_int8_tensor_to_packed_int4
-    preprocessor = torch.ops.fastertransformer.preprocess_weights_for_mixed_gemm
+    packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
+    preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
     torch_dtype = str_dtype_to_torch(dtype)
 
     def load(key, no_prefix=0):
@@ -1416,8 +1416,8 @@ def load_from_awq_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
     # FP8 KV cache
     use_fp8_kv_cache = quant_mode.has_fp8_kv_cache()
 
-    packer = torch.ops.fastertransformer.pack_int8_tensor_to_packed_int4
-    preprocessor = torch.ops.fastertransformer.preprocess_weights_for_mixed_gemm
+    packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
+    preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
     torch_dtype = str_dtype_to_torch(dtype)
 
     def fromfile(dir_path, name, shape=None, dtype=None):
@@ -1515,9 +1515,11 @@ def load_from_awq_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
     # Load weights from AWQ checkpoint into TRT-LLM module
     # 1. vocab_embedding
     v = load(awq_key_list[0])
-    # TRT-LLM requires vocab_size to be multiple of 64 for successful GEMM
-    if quantize_lm_head and v.shape[0] % 64 != 0:
-        v = torch.nn.functional.pad(v, [0, 0, 0, 64 - v.shape[0] % 64])
+    # TRT-LLM requires vocab_size to be multiple of 64 * tp_size for successful GEMM
+    vocab_alignment = mapping.tp_size * 64
+    if quantize_lm_head and v.shape[0] % vocab_alignment != 0:
+        v = torch.nn.functional.pad(
+            v, [0, 0, 0, vocab_alignment - v.shape[0] % vocab_alignment])
     if mapping.is_first_pp_rank():
         tensorrt_llm_llama.vocab_embedding.weight.value = v.to(
             torch_dtype).cpu().numpy()
@@ -1525,10 +1527,11 @@ def load_from_awq_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
     # 2. lm_head
     if quantize_lm_head:
         v = [load(awq_key_list[1] + suf) for suf in awq_suffix_list]
-        if v[0].shape[0] % 64 != 0:
-            v[0] = torch.nn.functional.pad(v[0],
-                                           [0, 0, 0, 64 - v[0].shape[0] % 64])
-            scale_align = 64 * (v[0].shape[1] // group_size)
+        if v[0].shape[0] % vocab_alignment != 0:
+            v[0] = torch.nn.functional.pad(
+                v[0],
+                [0, 0, 0, vocab_alignment - v[0].shape[0] % vocab_alignment])
+            scale_align = vocab_alignment * (v[0].shape[1] // group_size)
             v[1] = v[1].reshape(-1)
             v[1] = torch.nn.functional.pad(
                 v[1], [0, scale_align - v[1].shape[0] % scale_align], value=1)
@@ -1568,14 +1571,54 @@ def load_from_awq_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
 
         # 4.3 mlp.gate
         v = [load(prefix + awq_key_list[6] + suf) for suf in awq_suffix_list]
+
+        alignment = group_size * mapping.tp_size
+        if v[0].shape[0] % alignment != 0:
+            [n, k] = v[0].shape
+            pad_size = alignment - n % alignment
+            # weight padding [n, k] -> [n + pad, k]
+            v[0] = torch.nn.functional.pad(v[0], [0, 0, 0, pad_size],
+                                           'constant', 0)
+            # amax padding
+            v[1] = v[1].reshape((n, k // group_size))
+            v[1] = torch.nn.functional.pad(v[1], [0, 0, 0, pad_size],
+                                           'constant', 0)
+
         process_and_assign_weight(layer.mlp.gate, v, 1)
 
         # 4.4 mlp.proj
         v = [load(prefix + awq_key_list[7] + suf) for suf in awq_suffix_list]
+
+        alignment = group_size * mapping.tp_size
+        if v[0].shape[1] % alignment != 0:
+            [n, k] = v[0].shape
+            pad_size = alignment - k % alignment
+            # weight padding [n, k] -> [n + pad, k]
+            v[0] = torch.nn.functional.pad(v[0], [0, pad_size], 'constant', 0)
+            # amax padding
+            v[1] = v[1].reshape((n, k // group_size))
+            v[1] = torch.nn.functional.pad(v[1], [0, pad_size // group_size],
+                                           'constant', 0)
+            # pre_quant_scale padding
+            v[2] = torch.nn.functional.pad(v[2], [0, pad_size], 'constant', 0)
+
         process_and_assign_weight(layer.mlp.proj, v, 0)
 
         # 4.5 mlp.fc
         v = [load(prefix + awq_key_list[8] + suf) for suf in awq_suffix_list]
+
+        alignment = group_size * mapping.tp_size
+        if v[0].shape[0] % alignment != 0:
+            [n, k] = v[0].shape
+            pad_size = alignment - n % alignment
+            # weight padding [n, k] -> [n + pad, k]
+            v[0] = torch.nn.functional.pad(v[0], [0, 0, 0, pad_size],
+                                           'constant', 0)
+            # amax padding
+            v[1] = v[1].reshape((n, k // group_size))
+            v[1] = torch.nn.functional.pad(v[1], [0, 0, 0, pad_size],
+                                           'constant', 0)
+
         process_and_assign_weight(layer.mlp.fc, v, 1)
 
         # 4.6 input_layernorm

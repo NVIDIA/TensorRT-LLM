@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import sys
 import tempfile
 import unittest
 from collections import OrderedDict
@@ -34,6 +36,9 @@ from tensorrt_llm._utils import trt_dtype_to_torch
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.runtime import TensorInfo
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import getSMVersion
 
 
 def extract_layer_idx(name):
@@ -172,6 +177,12 @@ class TestBert(unittest.TestCase):
     @parameterized.expand(load_test_cases, name_func=custom_name_func)
     def test_bert(self, model, use_refit, use_plugin, fast_building,
                   context_fmha_type, dtype):
+        if getSMVersion() < 80:
+            if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
+                self.skipTest(
+                    "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
+                )
+
         tensorrt_llm.logger.set_level('error')
         fp16 = (dtype == 'float16')
         world_size = 1

@@ -11,7 +11,8 @@ dir_path = os.path.dirname(os.path.realpath(__file__))
 
 import numpy as np
 import torch  # pytype: disable=import-error
-from transformers import AutoModelForSeq2SeqLM, MBartForConditionalGeneration
+from transformers import (AutoModelForSeq2SeqLM, MBartForConditionalGeneration,
+                          VisionEncoderDecoderModel)
 
 from tensorrt_llm._utils import str_dtype_to_torch, torch_to_numpy
 
@@ -81,9 +82,7 @@ def split_and_convert_process(key, val, factor, saved_dir):
             saved_path = saved_dir / f"{saved_key}.{j:d}.bin"
             split_vals[j].tofile(saved_path.as_posix())
 
-    if re.search(
-            'model\.shared\.weight|norm|embed_positions|(out_proj|fc2)\.bias',
-            key) is not None:
+    if re.search('norm|embed_positions|(out_proj|fc2)\.bias', key) is not None:
         saved_path = saved_dir / f"{saved_key}.bin"
         if 'position' in key:
             val = val[2:]  # BART does not use first two position embeddings!
@@ -101,8 +100,9 @@ def split_and_convert_process(key, val, factor, saved_dir):
             val, factor, axis=-1
         )  # no need to split bias, each GPU will add it individually after all reduce
         save_splits(split_vals)  # TODO: support gated activation?
-    elif re.search('lm_head|(en|de)coder.embed_tokens.weight', key) is not None:
-        LOGGER.warning(f"Did not save {key}, using shared.weight directly.")
+    elif re.search('(en|de)coder.embed_tokens.weight', key) is not None:
+        saved_path = saved_dir / f"{saved_key}.bin"
+        val.tofile(saved_path.as_posix())
     elif 'final_logits_bias' in key:  # buffer used to manually control emission prob?
         pass
     else:
@@ -114,29 +114,47 @@ def convert_checkpoint(args):
     saved_dir = Path(args.output_dir) / f"tp{args.inference_tensor_para_size}"
     saved_dir.mkdir(parents=True, exist_ok=True)
 
-    model = AutoModelForSeq2SeqLM.from_pretrained(args.input_dir)
+    if args.nougat:
+        model = VisionEncoderDecoderModel.from_pretrained(args.input_dir)
+        model = model.get_decoder()
+    else:
+        model = AutoModelForSeq2SeqLM.from_pretrained(args.input_dir)
     model = model.to(str_dtype_to_torch(args.weight_data_type))
 
     config = configparser.ConfigParser()
-
-    config['encoder'] = dict()
-    for key, val in model.model.encoder.config.to_dict().items():
-        config["encoder"][key] = f"{val}"
-    config["encoder"]["weight_data_type"] = args.weight_data_type
-    config["encoder"]["q_scaling"] = '1'
-
-    # mBART has final layernorm, BART does not
-    config['encoder']['has_model_final_layernorm'] = str(
-        isinstance(model, MBartForConditionalGeneration))
 
     config['decoder'] = dict()
     for key, val in model.model.decoder.config.to_dict().items():
         config["decoder"][key] = f"{val}"
     config["decoder"]["weight_data_type"] = args.weight_data_type
     config["decoder"]["q_scaling"] = '1'
-    config["decoder"]["rescale_before_lm_head"] = 'false'
+    config["decoder"]["rescale_before_lm_head"] = str(False)
     config['decoder']['has_model_final_layernorm'] = str(
-        isinstance(model, MBartForConditionalGeneration))
+        args.nougat or isinstance(model, MBartForConditionalGeneration))
+
+    if args.nougat:
+        # These flags are true for mbart decoders, but missing in HF config
+        config['decoder']['normalize_before'] = str(True)
+        config['decoder']['normalize_embeddings'] = str(True)
+
+        config['encoder'] = dict()
+        # Init few encoder configs, needed by build, from decoder config
+        encoder_config_keys = [
+            "encoder_ffn_dim", "encoder_layers", "encoder_attention_heads",
+            "encoder_layerdrop", "d_model"
+        ]
+        for key in encoder_config_keys:
+            config['encoder'][key] = config['decoder'][key]
+    else:
+        config['encoder'] = dict()
+        for key, val in model.model.encoder.config.to_dict().items():
+            config["encoder"][key] = f"{val}"
+        config["encoder"]["weight_data_type"] = args.weight_data_type
+        config["encoder"]["q_scaling"] = '1'
+
+        # mBART has final layernorm, BART does not
+        config['encoder']['has_model_final_layernorm'] = str(
+            isinstance(model, MBartForConditionalGeneration))
 
     # add additional config
     for key, val in extra_configs.items():
@@ -190,6 +208,9 @@ if __name__ == "__main__":
                         default="float32",
                         choices=["float32", "float16",
                                  "bfloat16"])  # TODO: test support for bf16?
+    parser.add_argument("--nougat",
+                        action="store_true",
+                        help="Model which uses vision encoder + mbart decoder")
     parser.add_argument("--verbose",
                         action="store_true",
                         help="Provide verbose messages")

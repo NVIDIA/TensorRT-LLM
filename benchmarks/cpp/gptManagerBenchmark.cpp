@@ -14,17 +14,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/batch_manager/GptManager.h"
 
+#include "tensorrt_llm/batch_manager/GptManager.h"
 #include "tensorrt_llm/batch_manager/inferenceRequest.h"
 #include "tensorrt_llm/batch_manager/namedTensor.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <chrono>
 #include <cxxopts.hpp>
@@ -572,12 +572,12 @@ int main(int argc, char* argv[])
         "warm_up", "Specify warm up iterations before benchmark starts.", cxxopts::value<int>()->default_value("2"));
     options.add_options()("eos_id", "Specify the end-of-sequence token id.", cxxopts::value<int>());
     options.add_options()("pad_id", "Specify the padding token id.", cxxopts::value<int>());
-    options.add_options()("max_num_sequences", "Max number of Sequences.", cxxopts::value<int>());
     options.add_options()("max_tokens_in_paged_kvcache", "Max tokens in paged K-V Cache.", cxxopts::value<int>());
     options.add_options()(
         "kv_cache_free_gpu_mem_fraction", "K-V Cache Free Gpu Mem Fraction.", cxxopts::value<float>());
     options.add_options()(
         "enable_trt_overlap", "Overlap TRT context preparation and execution", cxxopts::value<bool>());
+    options.add_options()("enable_kv_cache_reuse", "Enables the KV cache reuse.", cxxopts::value<bool>());
 
     options.add_options()("scheduler_policy", "Choose scheduler policy between max_utilization/guaranteed_no_evict.",
         cxxopts::value<std::string>()->default_value("guaranteed_no_evict"));
@@ -613,11 +613,6 @@ int main(int argc, char* argv[])
     auto const beamWidth = result["beam_width"].as<int>();
 
     TrtGptModelOptionalParams optionalParams;
-    // Argument: Max Num Sequences
-    if (result.count("max_num_sequences"))
-    {
-        optionalParams.maxNumSequences = result["max_num_sequences"].as<int>();
-    }
     // Argument: Max tokens in paged K-V Cache
     if (result.count("max_tokens_in_paged_kvcache"))
     {
@@ -632,6 +627,11 @@ int main(int argc, char* argv[])
     if (result.count("enable_trt_overlap"))
     {
         optionalParams.enableTrtOverlap = result["enable_trt_overlap"].as<bool>();
+    }
+    // Argument: Enable KV cache reuse
+    if (result.count("enable_kv_cache_reuse"))
+    {
+        optionalParams.kvCacheConfig.enableBlockReuse = result["enable_kv_cache_reuse"].as<bool>();
     }
     // Argument: Enable batch stats output
     if (result.count("log_iteration_data"))

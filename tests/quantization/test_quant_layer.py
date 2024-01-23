@@ -613,7 +613,7 @@ class TestSmoothQuant(unittest.TestCase):
         ref_torch_weights, processed_torch_weights, torch_weight_scales = _utils.woq_conversion(
             weight, wTypeId)
         if wTypeId == 2:
-            ref_torch_weights = torch.ops.fastertransformer.unpack_int4_packed_tensor_to_int8(
+            ref_torch_weights = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8(
                 ref_torch_weights)
 
         bias_data = None

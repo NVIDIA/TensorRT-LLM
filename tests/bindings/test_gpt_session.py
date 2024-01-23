@@ -1,10 +1,15 @@
+import os
 import pathlib as _pl
+import sys
 
 import numpy as _np
 import torch as _tor
 from binding_test_utils import *
 
 import tensorrt_llm.bindings as _tb
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import getSMVersion
 
 
 @pytest.mark.parametrize(
@@ -20,6 +25,10 @@ import tensorrt_llm.bindings as _tb
 def test_gpt_session(variant, results_file, load_bytearray, llm_root: _pl.Path,
                      resource_path: _pl.Path, engine_path: _pl.Path,
                      data_path: _pl.Path, llm_model_root):
+    if getSMVersion() < 80:
+        pytest.skip(
+            "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
+        )
     model_dir = "gpt2"
     tp_size = 1
     pp_size = 1

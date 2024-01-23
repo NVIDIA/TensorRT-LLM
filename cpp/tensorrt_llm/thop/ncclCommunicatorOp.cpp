@@ -47,8 +47,7 @@ void NcclCommunicatorOp::recv(th::Tensor& tensor, int64_t fromRank) const
 
 } // namespace torch_ext
 
-static auto fasterTransformerNcclCommunicator
-    = torch::jit::class_<torch_ext::NcclCommunicatorOp>("FasterTransformer", "NcclCommunicatorOp")
-          .def(torch::jit::init<int64_t, int64_t, int64_t>())
-          .def("send", &torch_ext::NcclCommunicatorOp::send)
-          .def("recv", &torch_ext::NcclCommunicatorOp::recv);
+static auto trtllmNcclCommunicator = torch::jit::class_<torch_ext::NcclCommunicatorOp>("trtllm", "NcclCommunicatorOp")
+                                         .def(torch::jit::init<int64_t, int64_t, int64_t>())
+                                         .def("send", &torch_ext::NcclCommunicatorOp::send)
+                                         .def("recv", &torch_ext::NcclCommunicatorOp::recv);

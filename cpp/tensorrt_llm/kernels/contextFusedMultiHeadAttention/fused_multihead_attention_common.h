@@ -303,6 +303,9 @@ struct Launch_params
     ContextAttentionMaskType attention_mask_type = ContextAttentionMaskType::PADDING;
     // use specialized kernels without alibi support.
     bool useKernelWithoutAlibi = false;
+    // enable exp2 optimization (which helps improve performance).
+    // note that this is not compatible with alibi bias due to the accuracy issues.
+    bool useBase2ExpTrick = false;
     // harward properties to determine how to launch blocks
     int multi_processor_count = 0;
     int device_l2_cache_size = 0;
@@ -320,6 +323,7 @@ struct Launch_params
             ? ContextAttentionMaskType::PADDING
             : ContextAttentionMaskType::CAUSAL;
         useKernelWithoutAlibi = false;
+        useBase2ExpTrick = false;
     }
 };
 

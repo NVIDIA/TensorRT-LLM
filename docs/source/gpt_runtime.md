@@ -120,8 +120,8 @@ member variables and exposed through getters and setters):
    [Numerical Precision](precision.md).
  * `maxBatchSize`, indicates the maximum batch size that the TensorRT engine
    was built for,
- * `maxInputLen`/`maxOutputLen`, are the maximum sizes of the input/output
-   sequences.
+ * `maxInputLen`, is the maximum size of the input sequences,
+ * `maxSequenceLen`, is the maximum total size (input+output) of the sequences.
 
 #### World Configuration
 

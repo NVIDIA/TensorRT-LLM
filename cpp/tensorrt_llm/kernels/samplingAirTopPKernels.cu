@@ -26,6 +26,7 @@
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
 #include <cuda/std/limits>
+#include <cuda_fp16.h>
 
 using namespace tensorrt_llm::common;
 
@@ -74,16 +75,6 @@ struct alignas(128) Counter
 
 /*******************************Functions*********************************/
 using WideT = float4;
-
-#ifdef __CUDA_ARCH__
-using ::atomicAdd;
-
-inline __device__ size_t atomicAdd(size_t* address, size_t value)
-{
-    static_assert(sizeof(size_t) == sizeof(unsigned long long int));
-    return atomicAdd((unsigned long long int*) address, (unsigned long long int) value);
-}
-#endif
 
 //! \brief Provide a ceiling division operation ie. ceil(a / b)
 //! \tparam IntType supposed to be only integers for now!
@@ -319,6 +310,9 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, IdxT const* i
     float* outputLogProbs, float* cumLogProbs, IdxT** ids, IdxT const* endIds, IdxT* sequenceLengths,
     FinishedState* finishedOutput, int const batchId, bool earlyStop)
 {
+    static_assert(std::is_same_v<T, half> | std::is_same_v<T, float>, "T needs to be either half or float");
+    static_assert(std::is_same_v<AccT, float>, "AccT needs to be float");
+
     int constexpr numBuckets = calcNumBuckets<BitsPerPass>();
     bool constexpr selectMin = false;
     __shared__ AccT histogramSmem[numBuckets];
@@ -342,8 +336,15 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, IdxT const* i
         auto f = [selectMin, startBit, mask](T value, IdxT)
         {
             int bucket = calcBucket<T, BitsPerPass>(value, startBit, mask, selectMin);
+            if constexpr (std::is_same_v<T, half>)
+            {
+                atomicAdd(histogramSmem + bucket, __half2float(value));
+            }
+            else
+            {
+                atomicAdd(histogramSmem + bucket, value);
+            }
 
-            atomicAdd(histogramSmem + bucket, static_cast<T>(value));
             atomicAdd(countHistogramSmem + bucket, static_cast<IdxT>(1));
         };
         vectorizedProcess(static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x,
@@ -380,7 +381,15 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, IdxT const* i
                 }
 
                 int bucket = calcBucket<T, BitsPerPass>(value, startBit, mask, selectMin);
-                atomicAdd(histogramSmem + bucket, static_cast<T>(value));
+                if constexpr (std::is_same_v<T, half>)
+                {
+                    atomicAdd(histogramSmem + bucket, __half2float(value));
+                }
+                else
+                {
+                    atomicAdd(histogramSmem + bucket, value);
+                }
+
                 atomicAdd(countHistogramSmem + bucket, static_cast<IdxT>(1));
             }
         };
@@ -600,6 +609,9 @@ __global__ void airTopPSsampling(Counter<T, IdxT, AccT>* counters, AccT* histogr
     IdxT* idxBuf1, T* buf2, IdxT* idxBuf2)
 {
     assert(sequenceLengths != nullptr);
+    static_assert(std::is_same_v<T, half> | std::is_same_v<T, float>, "T needs to be either half or float");
+    static_assert(std::is_same_v<AccT, float>, "AccT needs to be float");
+
     int const tid = threadIdx.x;
     int const batchId = blockIdx.y;
     auto counter = counters + batchId;
@@ -848,6 +860,9 @@ void invokeBatchAirTopPSampling(void* workspace, size_t& workspaceSize, int** ou
 {
     using IdxT = int;
     using AccT = float;
+    static_assert(std::is_same_v<T, half> | std::is_same_v<T, float>, "T needs to be either half or float");
+    static_assert(std::is_same_v<AccT, float>, "AccT needs to be float");
+
     IdxT const vocabSize = vocabSizePadded;
     int constexpr BitsPerPass = 11;
     int constexpr numBuckets = calcNumBuckets<BitsPerPass>();

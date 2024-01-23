@@ -204,8 +204,7 @@ def print_memory_usage(
 @_is_building
 def check_gpt_mem_usage(engine, kv_dtype, use_gpt_attention_plugin,
                         paged_kv_cache, max_batch_size, max_beam_width,
-                        max_input_len, max_output_len, local_num_kv_heads,
-                        head_size, num_layers):
+                        max_seq_len, local_num_kv_heads, head_size, num_layers):
     # Get the amount of memory
     runtime = trt.Runtime(logger.trt_logger)
     # 1. TensorRT engine activation memory
@@ -226,9 +225,7 @@ def check_gpt_mem_usage(engine, kv_dtype, use_gpt_attention_plugin,
     logger.info(f'Weights memory size: {weights_size:.2f} MiB')
 
     # 3. Estimated max KV Cache size
-    kv_cache_size = max_batch_size * max_beam_width * 2 * local_num_kv_heads * (
-        max_input_len +
-        max_output_len) * head_size * num_layers * kv_dtype.itemsize
+    kv_cache_size = max_batch_size * max_beam_width * 2 * local_num_kv_heads * max_seq_len * head_size * num_layers * kv_dtype.itemsize
     # without plugin, we need two set of kv cache buffers,
     # one for inputs, and the other for outputs.
     if not use_gpt_attention_plugin:

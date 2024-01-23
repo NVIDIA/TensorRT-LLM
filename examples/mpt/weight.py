@@ -355,7 +355,7 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
                     rank=rank,
                     is_qkv=True)
             elif use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                     torch.tensor(t), plugin_weight_only_quant_type)
                 dst.value = processed_torch_weights.numpy()
                 scales = tensorrt_llm_gpt.layers[
@@ -391,7 +391,7 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
                          'model.layers.' + str(i) + '.attention.dense',
                          [1, n_embd // tensor_parallel], rank)
         elif use_weight_only:
-            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
             dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_gpt.layers[
@@ -434,7 +434,7 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
                 rank=rank)
         elif use_weight_only:
             dst = tensorrt_llm_gpt.layers[i].mlp.fc.weight
-            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
             dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_gpt.layers[i].mlp.fc.per_channel_scale
@@ -478,7 +478,7 @@ def load_from_ft(tensorrt_llm_gpt: GPTLMHeadModel,
                          [1, inter_size // tensor_parallel], rank)
         elif use_weight_only:
             dst = tensorrt_llm_gpt.layers[i].mlp.proj.weight
-            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
             dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_gpt.layers[i].mlp.proj.per_channel_scale
@@ -546,8 +546,8 @@ def load_from_awq_mpt(tensorrt_llm_mpt: GPTLMHeadModel,
     # Int8 KV cache
     use_int8_kv_cache = quant_mode.has_int8_kv_cache()
 
-    packer = torch.ops.fastertransformer.pack_int8_tensor_to_packed_int4
-    preprocessor = torch.ops.fastertransformer.preprocess_weights_for_mixed_gemm
+    packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
+    preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
     torch_dtype = str_dtype_to_torch(dtype)
 
     def fromfile(dir_path, name, shape=None, dtype=None):

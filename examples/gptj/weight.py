@@ -340,7 +340,7 @@ def load_from_bin_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
                     rank=rank,
                     is_qkv=True)
             elif use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                     torch.tensor(t), plugin_weight_only_quant_type)
                 dst.value = processed_torch_weights.numpy()
                 scales = tensorrt_llm_gpt_j.layers[
@@ -378,7 +378,7 @@ def load_from_bin_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
                 i].attention.dense.smoother.value = np.ones(
                     [1, n_embd // tensor_parallel], dtype=np.float32)
         elif use_weight_only:
-            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
             dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_gpt_j.layers[
@@ -413,7 +413,7 @@ def load_from_bin_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
                 rank=rank)
         elif use_weight_only:
             dst = tensorrt_llm_gpt_j.layers[i].mlp.fc.weight
-            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
             dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_gpt_j.layers[i].mlp.fc.per_channel_scale
@@ -452,7 +452,7 @@ def load_from_bin_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
                 [1, inter_size // tensor_parallel], dtype=np.float32)
         elif use_weight_only:
             dst = tensorrt_llm_gpt_j.layers[i].mlp.proj.weight
-            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
             dst.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_gpt_j.layers[i].mlp.proj.per_channel_scale
@@ -559,7 +559,7 @@ def load_from_hf_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
                         dtype=np.float32)
             if use_weight_only and (idx == 2 or idx == 4):
                 processed_torch_weights, torch_weight_scales = \
-                    torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                    torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                         v.transpose(0, 1).contiguous(), plugin_weight_only_quant_type
                     )
                 layer.value = processed_torch_weights.numpy()
@@ -583,7 +583,7 @@ def load_from_hf_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
             tensorrt_llm_gpt_j.layers[layer_idx])
         if use_weight_only:
             processed_torch_weights, torch_weight_scales = \
-                torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 qkv_weights.transpose(0, 1).contiguous(), plugin_weight_only_quant_type)
             layer.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_gpt_j.layers[
@@ -613,7 +613,7 @@ def load_from_hf_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
             tensorrt_llm_gpt_j.layers[layer_idx])
         if use_weight_only:
             processed_torch_weights, torch_weight_scales = \
-                torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 v.transpose(0, 1).contiguous(), plugin_weight_only_quant_type)
             layer.value = processed_torch_weights.numpy()
             scales = tensorrt_llm_gpt_j.layers[
@@ -685,8 +685,8 @@ def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
     # Int8 KV cache
     use_int8_kv_cache = quant_mode.has_int8_kv_cache()
 
-    packer = torch.ops.fastertransformer.pack_int8_tensor_to_packed_int4
-    preprocessor = torch.ops.fastertransformer.preprocess_weights_for_mixed_gemm
+    packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
+    preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
     torch_dtype = torch.float16 if fp16 else torch.float32
 
     tensorrt_llm.logger.info('Loading weights from AWQ GPT-J...')
@@ -820,7 +820,7 @@ def load_from_awq_gpt_j(tensorrt_llm_gpt_j: GPTJForCausalLM,
         new_v[:vocab_size, :] = v
         v = new_v
     if mapping.is_first_pp_rank():
-        tensorrt_llm_gpt_j.embedding.weight.value = v.to(
+        tensorrt_llm_gpt_j.vocab_embedding.weight.value = v.to(
             torch_dtype).cpu().numpy()
 
     n_layer = len(tensorrt_llm_gpt_j.layers)

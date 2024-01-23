@@ -61,33 +61,34 @@ class ContextFMHAType(IntEnum):
 
 @dataclass
 class PluginConfig:
-    bert_attention_plugin: bool = False
-    gpt_attention_plugin: bool = False
+    bert_attention_plugin: Optional[str] = None
+    gpt_attention_plugin: Optional[str] = None
     multi_block_mode: bool = False
     enable_xqa: bool = False
-    identity_plugin: bool = False
-    gemm_plugin: bool = False
-    smooth_quant_gemm_plugin: bool = False
-    layernorm_plugin: bool = False
-    layernorm_quantization_plugin: bool = False
-    rmsnorm_plugin: bool = False
-    rmsnorm_quantization_plugin: bool = False
+    identity_plugin: Optional[str] = None
+    gemm_plugin: Optional[str] = None
+    smooth_quant_gemm_plugin: Optional[str] = None
+    layernorm_plugin: Optional[str] = None
+    layernorm_quantization_plugin: Optional[str] = None
+    rmsnorm_plugin: Optional[str] = None
+    rmsnorm_quantization_plugin: Optional[str] = None
     attention_qk_half_accumulation: bool = False
     remove_input_padding: bool = False
     context_fmha_type: ContextFMHAType = ContextFMHAType.disabled
-    weight_only_groupwise_quant_matmul_plugin: bool = False
-    weight_only_quant_matmul_plugin: bool = False
-    nccl_plugin: bool = False
+    weight_only_groupwise_quant_matmul_plugin: Optional[str] = None
+    weight_only_quant_matmul_plugin: Optional[str] = None
+    nccl_plugin: Optional[str] = None
     # TODO[kevin]: smart strategy to choose all reduce plugin
     use_custom_all_reduce: bool = False
     quantize_per_token_plugin: bool = False
     quantize_tensor_plugin: bool = False
     paged_kv_cache: bool = False
     tokens_per_block: int = 0
-    lookup_plugin: bool = False
-    lora_plugin: bool = False
+    lookup_plugin: Optional[str] = None
+    lora_plugin: Optional[str] = None
     use_paged_context_fmha: bool = False
     use_context_fmha_for_generation: bool = False
+    selective_scan_plugin: bool = False
 
     def enable_qk_half_accum(self):
         self.attention_qk_half_accumulation = True
@@ -176,6 +177,8 @@ class PluginConfig:
                         dtype='float16',
                         use_custom_all_reduce: bool = False):
         self.use_custom_all_reduce = use_custom_all_reduce
+        if use_custom_all_reduce:
+            init_all_reduce_helper()
         self.nccl_plugin = dtype
         return self
 
@@ -201,6 +204,10 @@ class PluginConfig:
 
     def set_context_fmha_for_generation(self):
         self.use_context_fmha_for_generation = True
+        return self
+
+    def set_selective_scan_plugin(self, dtype='float16'):
+        self.selective_scan_plugin = dtype
         return self
 
 

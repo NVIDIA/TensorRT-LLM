@@ -39,6 +39,7 @@
 #include "tensorrt_llm/plugins/quantizeTensorPlugin/quantizeTensorPlugin.h"
 #include "tensorrt_llm/plugins/rmsnormPlugin/rmsnormPlugin.h"
 #include "tensorrt_llm/plugins/rmsnormQuantizationPlugin/rmsnormQuantizationPlugin.h"
+#include "tensorrt_llm/plugins/selectiveScanPlugin/selectiveScanPlugin.h"
 #include "tensorrt_llm/plugins/smoothQuantGemmPlugin/smoothQuantGemmPlugin.h"
 #include "tensorrt_llm/plugins/weightOnlyGroupwiseQuantMatmulPlugin/weightOnlyGroupwiseQuantMatmulPlugin.h"
 #include "tensorrt_llm/plugins/weightOnlyQuantMatmulPlugin/weightOnlyQuantMatmulPlugin.h"
@@ -157,6 +158,7 @@ extern "C"
         static tensorrt_llm::plugins::WeightOnlyQuantMatmulPluginCreator weightOnlyQuantMatmulPluginCreator;
         static tensorrt_llm::plugins::LookupPluginCreator lookupPluginCreator;
         static tensorrt_llm::plugins::LoraPluginCreator loraPluginCreator;
+        static tensorrt_llm::plugins::SelectiveScanPluginCreator selectiveScanPluginCreator;
 
         static std::array pluginCreators
             = { creatorPtr(identityPluginCreator),
@@ -182,6 +184,7 @@ extern "C"
                   creatorPtr(weightOnlyQuantMatmulPluginCreator),
                   creatorPtr(lookupPluginCreator),
                   creatorPtr(loraPluginCreator),
+                  creatorPtr(selectiveScanPluginCreator),
               };
         nbCreators = pluginCreators.size();
         return pluginCreators.data();

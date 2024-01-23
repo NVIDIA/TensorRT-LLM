@@ -24,8 +24,7 @@ import tensorrt as trt
 
 from ._common import default_net
 from ._utils import (copy_torch_to_numpy, np_dtype_to_trt, str_dtype_to_trt,
-                     torch_dtype_to_np, torch_to_numpy, trt_dtype_to_np,
-                     trt_dtype_to_torch)
+                     torch_to_numpy, trt_dtype_to_np, trt_dtype_to_torch)
 from .functional import Tensor, constant
 from .logger import logger
 
@@ -95,6 +94,9 @@ class Parameter:
         with torch.cuda.stream(stream):
             copy_torch_to_numpy(value, weights)
 
+    def is_inited(self) -> bool:
+        return self._value is not None
+
     @property
     def raw_value(self) -> np.ndarray:
         if self._value is None:
@@ -113,9 +115,8 @@ class Parameter:
         assert v.shape == self._shape, \
             f'The value updated is not the same shape as the original. ' \
             f'Updated: {v.shape}, original: {self._shape}'
-        dtype = v.dtype if isinstance(v, np.ndarray) else torch_dtype_to_np(
-            v.dtype)
-        if trt_dtype_to_np(self._dtype) != dtype:
+        dtype = np_dtype_to_trt(v.dtype)
+        if self._dtype != dtype:
             logger.warning(
                 f"Parameter was initialized as {self._dtype} but set to {dtype}"
             )

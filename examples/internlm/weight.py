@@ -286,7 +286,7 @@ def load_from_hf_internlm(
                 if use_weight_only:
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = \
-                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
                     if not use_gemm_woq_plugin:
                         dst.value = torch.tensor(v).numpy().astype(
@@ -318,7 +318,7 @@ def load_from_hf_internlm(
                 if use_weight_only:
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = \
-                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
                     if not use_gemm_woq_plugin:
                         dst.value = torch.tensor(v).numpy().astype(
@@ -340,7 +340,7 @@ def load_from_hf_internlm(
                 if use_weight_only:
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = \
-                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
                     if not use_gemm_woq_plugin:
                         dst.value = torch.tensor(v).numpy().astype(
@@ -358,7 +358,7 @@ def load_from_hf_internlm(
                 if use_weight_only:
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = \
-                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
                     if not use_gemm_woq_plugin:
                         dst.value = torch.tensor(v).numpy().astype(
@@ -376,7 +376,7 @@ def load_from_hf_internlm(
                 if use_weight_only:
                     v = np.ascontiguousarray(split_v.transpose())
                     processed_torch_weights, torch_weight_scales = \
-                        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                         torch.tensor(v), plugin_weight_only_quant_type)
                     if not use_gemm_woq_plugin:
                         dst.value = torch.tensor(v).numpy().astype(
@@ -746,7 +746,7 @@ def load_from_binary(tensorrt_llm_internlm: LLaMAForCausalLM,
                     rank=mapping.tp_rank,
                     is_qkv=True)
             elif use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                     torch.tensor(t), plugin_weight_only_quant_type)
                 if not use_gemm_woq_plugin:
                     dst.value = torch.tensor(t).numpy().astype(
@@ -777,7 +777,7 @@ def load_from_binary(tensorrt_llm_internlm: LLaMAForCausalLM,
                          'model.layers.' + str(i) + '.attention.dense',
                          [1, n_embd // mapping.tp_size], mapping.tp_rank)
         elif use_weight_only:
-            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
             if not use_gemm_woq_plugin:
                 dst.value = torch.tensor(t).numpy().astype(
@@ -824,7 +824,7 @@ def load_from_binary(tensorrt_llm_internlm: LLaMAForCausalLM,
                 rank=mapping.tp_rank)
         elif use_weight_only:
             dst = tensorrt_llm_internlm.layers[i].mlp.fc.weight
-            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
             if not use_gemm_woq_plugin:
                 dst.value = torch.tensor(t).numpy().astype(
@@ -855,7 +855,7 @@ def load_from_binary(tensorrt_llm_internlm: LLaMAForCausalLM,
                 rank=mapping.tp_rank)
         elif use_weight_only:
             dst = tensorrt_llm_internlm.layers[i].mlp.gate.weight
-            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
             if not use_gemm_woq_plugin:
                 dst.value = torch.tensor(t).numpy().astype(
@@ -886,7 +886,7 @@ def load_from_binary(tensorrt_llm_internlm: LLaMAForCausalLM,
                          [1, inter_size // mapping.tp_size], mapping.tp_rank)
         elif use_weight_only:
             dst = tensorrt_llm_internlm.layers[i].mlp.proj.weight
-            processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 torch.tensor(t), plugin_weight_only_quant_type)
             if not use_gemm_woq_plugin:
                 dst.value = torch.tensor(t).numpy().astype(
@@ -955,8 +955,8 @@ def load_from_gptq_internlm(tensorrt_llm_internlm,
 
         UINT4_TO_INT4_FLAG = 1
         GPTQ_FLAG = 1
-        packer = torch.ops.fastertransformer.pack_int8_tensor_to_packed_int4
-        preprocessor = torch.ops.fastertransformer.preprocess_weights_for_mixed_gemm
+        packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
+        preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
 
         qweight_unpacked_int8 = unpack_int32_into_int8(
             qweight_int32.T).T.contiguous() - 8
@@ -1160,8 +1160,8 @@ def load_from_awq_internlm(tensorrt_llm_internlm: LLaMAForCausalLM,
 
     getattr(tensorrt_llm_internlm, 'quant_mode', QuantMode(0))
 
-    packer = torch.ops.fastertransformer.pack_int8_tensor_to_packed_int4
-    preprocessor = torch.ops.fastertransformer.preprocess_weights_for_mixed_gemm
+    packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
+    preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
     torch_dtype = str_dtype_to_torch(dtype)
 
     def torch_split(v, dim):

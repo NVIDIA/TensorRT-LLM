@@ -314,7 +314,7 @@ def get_tllm_linear_weight(
     if use_weight_only:
         v = weight.t().contiguous()
         processed_torch_weights, torch_weight_scales = \
-            torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 v, plugin_weight_only_quant_type)
         results[f'{prefix}.weight'] = processed_torch_weights
         results[f'{prefix}.per_channel_scale'] = torch_weight_scales
@@ -337,7 +337,7 @@ def get_tllm_param(
     if name.endswith('.weight') and use_weight_only:
         v = param.t().contiguous()
         processed_torch_weights, torch_weight_scales = \
-            torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 v, plugin_weight_only_quant_type)
         results[name] = processed_torch_weights
         results[name.replace('weight',
@@ -679,8 +679,8 @@ def load_from_awq_falcon(quant_ckpt_path: str,
     parallel_attention = hf_config.parallel_attn
     new_decoder_architecture = hf_config.new_decoder_architecture
 
-    packer = torch.ops.fastertransformer.pack_int8_tensor_to_packed_int4
-    preprocessor = torch.ops.fastertransformer.preprocess_weights_for_mixed_gemm
+    packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
+    preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
     torch_dtype = tensorrt_llm._utils.str_dtype_to_torch(dtype)
 
     if not quant_ckpt_path.endswith(".npz"):
@@ -997,7 +997,7 @@ def load_from_fp8_falcon(quant_ckpt_path: str, hf_config: FalconConfig,
 
 if __name__ == '__main__':
     # TODO(qijun): Currently, the convert script depends on a torch op:
-    # torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix,
+    # torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix,
     # which is included in tensorrt_llm Python package. Otherwise, the convert
     # script does not need to import tensorrt_llm. Will remove it after reimplementing
     # the op with PyTorch.

@@ -90,9 +90,9 @@ class TestGPT(unittest.TestCase):
                                              tp_size=tensor_parallel),
                 apply_query_key_layer_scaling=apply_query_key_layer_scaling)
             inputs = tensorrt_llm_gpt.prepare_inputs(
-                batch_size,
-                input_len,
-                output_len,
+                max_batch_size=batch_size,
+                max_input_len=input_len,
+                max_seq_len=input_len + output_len,
                 use_cache=True,
                 max_beam_width=1,
                 gather_context_logits=gather_context_logits,
@@ -414,11 +414,7 @@ class TestGPT(unittest.TestCase):
 
         # Skip tests that are not supported in pre-ampere architecture
         if getSMVersion() < 80:
-            if context_fmha_type == ContextFMHAType.enabled:
-                pytest.skip(
-                    "ContextFMHAType is not supported in pre-ampere architecture"
-                )
-            elif context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
+            if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
                 pytest.skip(
                     "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
                 )

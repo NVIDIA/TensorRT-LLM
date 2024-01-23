@@ -22,6 +22,7 @@ from .gpt.model import GPTLMHeadModel, GPTModel
 from .gptj.model import GPTJForCausalLM, GPTJModel
 from .gptneox.model import GPTNeoXForCausalLM, GPTNeoXModel
 from .llama.model import LLaMAForCausalLM, LLaMAModel
+from .mamba.model import MambaLMHeadModel
 from .medusa.model import MedusaLM
 from .modeling_utils import PretrainedConfig, PretrainedModel
 from .opt.model import OPTForCausalLM, OPTModel
@@ -60,10 +61,13 @@ __all__ = [
     'PretrainedConfig',
     'PretrainedModel',
     'WhisperEncoder',
+    'MambaLMHeadModel',
 ]
 
 MODEL_MAP = {
     'OPTForCausalLM': OPTForCausalLM,
     'BloomForCausalLM': BloomForCausalLM,
     'FalconForCausalLM': FalconForCausalLM,
+    'MambaLMHeadModel': MambaLMHeadModel,
+    'GPTNeoXForCausalLM': GPTNeoXForCausalLM,
 }

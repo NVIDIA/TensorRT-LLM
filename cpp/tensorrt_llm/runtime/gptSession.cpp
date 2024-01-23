@@ -278,7 +278,7 @@ void GptSession::setup(Config const& sessionConfig)
         && sessionConfig.kvCacheConfig.maxAttentionWindow.value() > maxSequenceLength)
     {
         TLLM_LOG_WARNING(
-            "The value of maxAttentionWindow cannot exceed mMaxSeqLen. "
+            "The value of maxAttentionWindow cannot exceed maxSequenceLength. "
             "Therefore, it has been adjusted to match the value of maxSequenceLength.");
     }
     auto const maxAttentionWindow = sessionConfig.kvCacheConfig.maxAttentionWindow.has_value()

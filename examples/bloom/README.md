@@ -154,7 +154,7 @@ Unlike the FP16 build where the HF weights are processed and loaded into the Ten
 
 Example:
 ```bash
-python convert_checkpoint.py --model_dir bloom/560M/  --output_dir tllm_checkpoint_1gpu --smoothquant 0.5 --per_token --per_channel --tensor-parallelism 1
+python convert_checkpoint.py --model_dir bloom/560M/  --output_dir tllm_checkpoint_1gpu --smoothquant 0.5 --per_token --per_channel --world_size 1
 ```
 
 [`convert_checkpoint.py`](./convert_checkpoint.py) add new options for the support of INT8 inference of SmoothQuant models.

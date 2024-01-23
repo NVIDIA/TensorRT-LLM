@@ -51,13 +51,13 @@ class MemoryMonitor:
         self.signal_event.set()
         logger.debug("Sent signal to stop memory monitor subprocess.")
 
-        peak_mem_use = self.peak_mem_queue.get()
+        peak_mem_use = self.peak_mem_queue.get(timeout=10)
 
         self._peak_host_memory = max(self._peak_host_memory, peak_mem_use[0])
         self._peak_device_memory = max(self._peak_device_memory,
                                        peak_mem_use[1])
 
-        self.mem_monitor_process.join()
+        self.mem_monitor_process.join(timeout=10)
         self.mem_monitor_process = None
         logger.debug("Memory monitor subprocess joined.")
 

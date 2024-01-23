@@ -27,6 +27,7 @@ from weight import (load_from_awq_qwen, load_from_ft, load_from_gptq_qwen,
                     load_from_hf_qwen)
 
 import tensorrt_llm
+from tensorrt_llm._common import check_max_num_tokens
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
@@ -161,7 +162,7 @@ def parse_arguments():
     parser.add_argument('--n_positions', type=int, default=2048)
     parser.add_argument('--n_embd', type=int, default=4096)
     parser.add_argument('--n_head', type=int, default=32)
-    parser.add_argument('--n_kv_head', type=int, default=None)
+    parser.add_argument('--n_kv_head', type=int, default=32)
     parser.add_argument('--inter_size', type=int, default=11008)
     parser.add_argument('--hidden_act', type=str, default='silu')
     parser.add_argument('--max_batch_size', type=int, default=2)
@@ -288,7 +289,9 @@ def parse_arguments():
         '--max_num_tokens',
         type=int,
         default=None,
-        help='Define the max number of tokens supported by the engine')
+        help=
+        'Define the max number of tokens supported by the engine, note that it takes no effect if --remove_input_padding is not set'
+    )
 
     parser.add_argument(
         '--int8_kv_cache',
@@ -326,6 +329,24 @@ def parse_arguments():
         action='store_true',
         help=
         'Activates latency-optimized algorithm for all-reduce instead of NCCL.')
+    parser.add_argument('--use_rmsnorm_plugin',
+                        nargs='?',
+                        const='float16',
+                        type=str,
+                        default=False,
+                        choices=['float16', 'float32', 'bfloat16'])
+    parser.add_argument(
+        '--max_prompt_embedding_table_size',
+        type=int,
+        default=0,
+        help='Setting to a value > 0 enables support for prompt tuning.')
+    parser.add_argument(
+        '--use_lookup_plugin',
+        nargs='?',
+        const=None,
+        default=False,
+        choices=['float16', 'float32', 'bfloat16'],
+        help="Activates the lookup plugin which enables embedding sharing.")
 
     args = parser.parse_args()
     assert not (
@@ -405,8 +426,11 @@ def parse_arguments():
             logger.info("To use awq we pad vocab_size to {}.".format(
                 args.vocab_size))
 
-    if args.max_num_tokens is not None:
-        assert args.enable_context_fmha
+    args.max_num_tokens = check_max_num_tokens(
+        max_num_tokens=args.max_num_tokens,
+        max_batch_size=args.max_batch_size,
+        max_input_len=args.max_input_len,
+        remove_input_padding=args.remove_input_padding)
 
     assert (math.log2(args.tokens_per_block).is_integer()
             ), "tokens_per_block must be power of 2"
@@ -451,6 +475,7 @@ def build_rank_engine(builder: Builder,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
         quant_mode=args.quant_mode,
+        use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
     )
     quantize_kwargs = {}
     use_gemm_woq_plugin = args.use_gemm_plugin and args.use_weight_only
@@ -558,6 +583,10 @@ def build_rank_engine(builder: Builder,
 
     if args.paged_kv_cache:
         network.plugin_config.enable_paged_kv_cache(args.tokens_per_block)
+    if args.use_rmsnorm_plugin:
+        network.plugin_config.set_rmsnorm_plugin(dtype=args.use_rmsnorm_plugin)
+    if args.use_lookup_plugin:
+        network.plugin_config.set_lookup_plugin(dtype=args.dtype)
 
     with net_guard(network):
         # Prepare
@@ -567,10 +596,11 @@ def build_rank_engine(builder: Builder,
         inputs = tensorrt_llm_qwen.prepare_inputs(
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
-            max_new_tokens=args.max_output_len,
+            max_seq_len=args.max_input_len + args.max_output_len,
             use_cache=True,
             max_beam_width=args.max_beam_width,
             max_num_tokens=args.max_num_tokens,
+            prompt_embedding_table_size=args.max_prompt_embedding_table_size,
         )
         tensorrt_llm_qwen(*inputs)
         if args.enable_debug_output:
@@ -627,6 +657,7 @@ def build(rank, args):
             parallel_build=args.parallel_build,
             num_layers=args.n_layer,
             num_heads=args.n_head,
+            num_kv_heads=args.n_kv_head,
             hidden_size=args.n_embd,
             vocab_size=args.vocab_size,
             hidden_act=args.hidden_act,
@@ -640,7 +671,10 @@ def build(rank, args):
             fp8=args.quant_mode.has_fp8_qdq(),
             quant_mode=args.quant_mode,
             strongly_typed=args.strongly_typed,
-            opt_level=args.builder_opt)
+            opt_level=args.builder_opt,
+            max_prompt_embedding_table_size=args.
+            max_prompt_embedding_table_size,
+        )
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.tp_size,
                                       args.pp_size, cur_rank)
         engine = build_rank_engine(builder, builder_config, engine_name,

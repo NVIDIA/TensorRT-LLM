@@ -627,7 +627,8 @@ class FuseAttentionWithBiasPass(PatternRewriter):
                 return False
             plugin_flayer = FLayerInfoMemo.instance().get(layer.name)
             input = plugin_flayer.raw_inputs['qkv']
-            if input is None or len(list(input.get_users())) != 1:
+            if input is None or isinstance(
+                    input, list) or len(list(input.get_users())) != 1:
                 return False
             parent_layer = input.get_parent()
             if not self.is_elementwise_sum(parent_layer):

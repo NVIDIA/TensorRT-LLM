@@ -25,6 +25,7 @@ from .mlp import MLP, FusedGatedMLP, GatedMLP
 from .moe import MOE, MoeConfig
 from .normalization import GroupNorm, LayerNorm, RmsNorm
 from .pooling import AvgPool2d
+from .ssm import Mamba, MambaParameters
 
 __all__ = [
     'LayerNorm',
@@ -55,4 +56,6 @@ __all__ = [
     'LoraRuntimeParams',
     'MOE',
     'MoeConfig',
+    'Mamba',
+    'MambaParameters',
 ]

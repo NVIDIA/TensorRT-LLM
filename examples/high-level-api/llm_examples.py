@@ -15,7 +15,7 @@ def run_llm_from_huggingface_model(prompts: List[str],
                                    dump_engine_dir: Optional[str] = None):
     ''' Loading a HuggingFace model. '''
     # Load the model from a local HuggingFace model
-    config = ModelConfig(model_dir=llama_model_dir)
+    config = ModelConfig(llama_model_dir)
     llm = LLM(config)
     if dump_engine_dir:
         llm.save(dump_engine_dir)
@@ -26,7 +26,7 @@ def run_llm_from_huggingface_model(prompts: List[str],
 
 def run_llm_from_tllm_engine(prompts: List[str], llama_engine_dir: str):
     ''' Loading a built TensorRT-LLM engine.  '''
-    config = ModelConfig(model_dir=llama_engine_dir)
+    config = ModelConfig(llama_engine_dir)
     llm = LLM(config)
 
     for output in llm.generate(prompts):
@@ -35,7 +35,7 @@ def run_llm_from_tllm_engine(prompts: List[str], llama_engine_dir: str):
 
 def run_llm_on_tensor_parallel(prompts: List[str], llama_model_dir: str):
     ''' Running LLM with Tensor Parallel on multiple GPUs. '''
-    config = ModelConfig(model_dir=llama_model_dir)
+    config = ModelConfig(llama_model_dir)
     config.parallel_config.tp_size = 2  # 2 GPUs
 
     llm = LLM(config)
@@ -48,7 +48,7 @@ def run_llm_generate_async_example(prompts: List[str],
                                    llama_model_dir: str,
                                    streaming: bool = False):
     ''' Running LLM generation asynchronously. '''
-    config = ModelConfig(model_dir=llama_model_dir)
+    config = ModelConfig(llama_model_dir)
 
     llm = LLM(config, async_mode=True)
 
@@ -73,7 +73,7 @@ def run_llm_with_quantization(prompts: List[str],
     quant_type could be 'int4_awq' or 'fp8'.
     '''
 
-    config = ModelConfig(model_dir=llama_model_dir)
+    config = ModelConfig(llama_model_dir)
     if quant_type == 'int4_awq':
         config.quant_config.init_from_description(quantize_weights=True,
                                                   use_int4_weights=True,

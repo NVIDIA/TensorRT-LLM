@@ -27,7 +27,6 @@ from ...layers import (MLP, MOE, Attention, AttentionMaskType, AttentionParams,
                        PromptTuningEmbedding)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
-from ...plugin import init_all_reduce_helper
 from ...quantization import QuantMode
 from ..generation_mixin import GenerationMixin
 
@@ -42,7 +41,7 @@ def MLPFactory(hidden_size,
                tp_size=1,
                tp_rank=0,
                quant_mode=QuantMode(0),
-               instance_id: int = 0):
+               max_lora_rank=None):
     if moe_config.has_moe():
         return MOE(moe_config,
                    hidden_size,
@@ -53,11 +52,19 @@ def MLPFactory(hidden_size,
                    tp_group,
                    tp_size,
                    tp_rank,
-                   quant_mode=quant_mode)
+                   quant_mode=quant_mode,
+                   max_lora_rank=max_lora_rank)
     MLPClass = GatedMLP if is_gated_activation(hidden_act) else MLP
     hidden_act = non_gated_version(hidden_act)
-    return MLPClass(hidden_size, ffn_hidden_size, hidden_act, bias, dtype,
-                    tp_group, tp_size, quant_mode, instance_id)
+    return MLPClass(hidden_size,
+                    ffn_hidden_size,
+                    hidden_act,
+                    bias,
+                    dtype,
+                    tp_group,
+                    tp_size,
+                    quant_mode,
+                    max_lora_rank=max_lora_rank)
 
 
 class GPTDecoderLayer(Module):
@@ -84,7 +91,7 @@ class GPTDecoderLayer(Module):
                  tp_group=None,
                  tp_size=1,
                  tp_rank=0,
-                 instance_id: int = 0):
+                 max_lora_rank=None):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
@@ -118,7 +125,8 @@ class GPTDecoderLayer(Module):
             tp_size=tp_size,
             use_auto_parallel=use_auto_parallel,
             tp_rank=tp_rank,
-            quant_mode=quant_mode)
+            quant_mode=quant_mode,
+            max_lora_rank=max_lora_rank)
 
         if inter_size is None:
             inter_size = hidden_size * 4
@@ -132,7 +140,8 @@ class GPTDecoderLayer(Module):
                               tp_group=tp_group,
                               tp_size=tp_size,
                               tp_rank=tp_rank,
-                              quant_mode=quant_mode)
+                              quant_mode=quant_mode,
+                              max_lora_rank=max_lora_rank)
         self.post_layernorm = LayerNorm(normalized_shape=hidden_size,
                                         dtype=dtype)
 
@@ -198,9 +207,9 @@ class GPTModel(Module):
                  use_prompt_tuning=False,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
-                 moe_config=MoeConfig()):
+                 moe_config=MoeConfig(),
+                 max_lora_rank=None):
         super().__init__()
-        init_all_reduce_helper()
         self.mapping = mapping
         self.use_prompt_tuning = use_prompt_tuning
         self.position_embedding_type = position_embedding_type
@@ -241,8 +250,8 @@ class GPTModel(Module):
                 inter_size=inter_size,
                 bias=bias,
                 quant_mode=quant_mode,
-                instance_id=i,
                 moe_config=moe_config,
+                max_lora_rank=max_lora_rank,
             ) for i in range(num_layers)
         ])
 
@@ -337,7 +346,8 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
                  moe_config=MoeConfig(),
-                 share_embedding_table=False):
+                 share_embedding_table=False,
+                 max_lora_rank=None):
 
         if isinstance(dtype, str):
             self._kv_dtype = str_dtype_to_trt(dtype)
@@ -395,12 +405,13 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             use_parallel_embedding=use_parallel_embedding,
             embedding_sharding_dim=embedding_sharding_dim,
             moe_config=moe_config,
+            max_lora_rank=max_lora_rank,
         )
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
 
         share_weight = None
         if share_embedding_table:
-            share_weight = self.embedding.vocab_embedding.weight
+            share_weight = self.vocab_embedding.weight
         self.lm_head = ColumnLinear(hidden_size,
                                     vocab_size_padded,
                                     bias=False,
@@ -441,7 +452,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
         lm_logits.mark_output('logits', self._logits_dtype)
 
         if use_cache:
-            if default_net().plugin_config.paged_kv_cache == False:
+            if not default_net().plugin_config.paged_kv_cache:
                 for i, present in enumerate(presents):
                     present.mark_output(f'present_key_value_{i}',
                                         self._kv_dtype)
@@ -452,7 +463,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
     def prepare_inputs(self,
                        max_batch_size,
                        max_input_len,
-                       max_new_tokens,
+                       max_seq_len,
                        use_cache,
                        max_beam_width: int = 1,
                        max_num_tokens: int = None,
@@ -484,7 +495,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
             max_input_len=max_input_len,
-            max_new_tokens=max_new_tokens,
+            max_seq_len=max_seq_len,
             num_kv_heads=num_heads_kv,
             head_size=head_size,
             num_layers=self._num_layers,

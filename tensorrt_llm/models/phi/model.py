@@ -261,8 +261,14 @@ class PhiForCausalLM(PhiModel, GenerationMixin):
 
         return lm_logits
 
-    def prepare_inputs(self, max_batch_size, max_input_len, max_new_tokens,
-                       use_cache, max_beam_width):
+    def prepare_inputs(
+        self,
+        max_batch_size,
+        max_input_len,
+        max_seq_len,
+        use_cache,
+        max_beam_width,
+    ):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -278,16 +284,16 @@ class PhiForCausalLM(PhiModel, GenerationMixin):
         use_gemm_plugin = default_net().plugin_config.gemm_plugin
 
         model_inputs = self.prepare_basic_inputs(
-            max_batch_size,
-            max_beam_width,
-            max_input_len,
-            max_new_tokens,
-            num_heads,
-            head_size,
-            self._num_layers,
-            self._kv_dtype,
-            remove_input_padding,
-            use_gpt_attention_plugin,
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_input_len=max_input_len,
+            max_seq_len=max_seq_len,
+            num_kv_heads=num_heads,
+            head_size=head_size,
+            num_layers=self._num_layers,
+            kv_dtype=self._kv_dtype,
+            remove_input_padding=remove_input_padding,
+            use_gpt_attention_plugin=use_gpt_attention_plugin,
             use_gemm_plugin=use_gemm_plugin)
 
         return (

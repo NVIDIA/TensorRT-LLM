@@ -30,7 +30,6 @@ https://huggingface.co/FasterDecoding/medusa-vicuna-7b-v1.3
 ```
 
 We use `build.py` script to build the model for Medusa decoding.
-For now, Medusa decoding supports only `max_batch_size=1` without `--remove_input_padding`.
 Here we also add `--fixed_num_medusa_heads 4` as `medusa_num_heads` is 2 in `config.json` of `medusa-vicuna-7b-v1.3` but it actually has 4.
 
 Here is the example:
@@ -40,7 +39,9 @@ python build.py --model_dir ./vicuna-7b-v1.3 \
                 --medusa_model_dir ./medusa-vicuna-7b-v1.3 \
                 --dtype float16 \
                 --use_gpt_attention_plugin float16 \
-                --max_batch_size 1 \
+                --max_batch_size 8 \
+                --remove_input_padding \
+                --enable_context_fmha \
                 --fixed_num_medusa_heads 4 \
                 --output_dir ./tmp/medusa/7B/trt_engines/fp16/1-gpu/
 
@@ -49,7 +50,9 @@ python build.py --model_dir ./vicuna-13b-v1.3 \
                 --medusa_model_dir ./medusa-vicuna-13b-v1.3 \
                 --dtype float16 \
                 --use_gpt_attention_plugin float16 \
-                --max_batch_size 1 \
+                --max_batch_size 8 \
+                --remove_input_padding \
+                --enable_context_fmha \
                 --fixed_num_medusa_heads 4 \
                 --world_size 4 \
                 --tp_size 4 \

@@ -364,10 +364,10 @@ void MemoryPool<TAllocator>::allocateImpl(MemoryPool::PointerType* ptr, MemoryPo
         // chunkResizeFactor
         // Allocate more space in mChunkSize, and fulfill this request
         TLLM_LOG_DEBUG("MemoryPool: Needs more space to accommodate request of %zu B", requestedSize);
-        auto const minChunkSize = alignedRequest * kChunkResizeFactor;
-        if (mChunkSize < minChunkSize)
+        auto const chunkUnitSize = alignedRequest * kChunkResizeFactor;
+        if (mChunkSize < chunkUnitSize)
         {
-            mChunkSize = minChunkSize;
+            mChunkSize = chunkUnitSize;
             TLLM_LOG_DEBUG("MemoryPool: Increasing chunk size to %zu B", mChunkSize);
         }
         allocateChunk();

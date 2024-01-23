@@ -156,7 +156,9 @@ class MedusaLM(Module, GenerationMixin):
             medusa_logits = []
             for i in range(self.num_medusa_heads):
                 medusa_logits.append(self.medusa_heads[i](hidden_states))
-            medusa_logits = stack(medusa_logits, dim=1)
+            # [num_medusa_heads, batch_size, num_medusa_tokens + 1, padded_vocab_size].
+            # Remove padding [num_medusa_heads, batch_size * num_medusa_tokens + 1, padded_vocab_size].
+            medusa_logits = stack(medusa_logits, dim=0)
             medusa_logits.mark_output('medusa_logits',
                                       self.base_model.logits_dtype)
         else:
@@ -185,7 +187,7 @@ class MedusaLM(Module, GenerationMixin):
         self,
         max_batch_size,
         max_input_len,
-        max_new_tokens,
+        max_seq_len,
         use_cache,
         max_medusa_tokens_len,
         max_beam_width,
@@ -193,13 +195,13 @@ class MedusaLM(Module, GenerationMixin):
         prompt_embedding_table_size: int = 0,
     ):
         base_model_inputs = self.base_model.prepare_inputs(
-            max_batch_size,
-            max_input_len,
-            max_new_tokens,
-            use_cache,
-            max_beam_width,
-            max_num_tokens,
-            prompt_embedding_table_size,
+            max_batch_size=max_batch_size,
+            max_input_len=max_input_len,
+            max_seq_len=max_seq_len,
+            use_cache=use_cache,
+            max_beam_width=max_beam_width,
+            max_num_tokens=max_num_tokens,
+            prompt_embedding_table_size=prompt_embedding_table_size,
             max_draft_len=max_medusa_tokens_len)
         num_profiles = len(base_model_inputs[0].profiles)
         max_gen_token_len = max_medusa_tokens_len + 1
@@ -212,13 +214,24 @@ class MedusaLM(Module, GenerationMixin):
         packed_medusa_mask_len_range = [[0, 1, num_packed_medusa_masks]
                                         ] * num_profiles
 
+        # batch beam range (different sequence may have different medusa offsets or packed masks).
+        bb_range_cxt = GenerationMixin.default_range(max_batch_size)
+        bb_range_gen = GenerationMixin.default_range(max_batch_size *
+                                                     max_beam_width)
+        # enable_two_optimization_profiles
+        if num_profiles == 2:
+            bb_range = [bb_range_cxt, bb_range_gen]
+        else:
+            bb_range = [bb_range_gen]
+
         # medusa position offsets that are fixed during the whole session.
         # it will be shared among all sequences.
         medusa_position_offsets = Tensor(
             name='medusa_position_offsets',
             dtype=trt.int32,
-            shape=[-1],
+            shape=[-1, -1],
             dim_range=OrderedDict([
+                ('batch_size_beam_width', bb_range),
                 ('medusa_position_ids_dim0', medusa_position_len_range),
             ]),
         )
@@ -226,8 +239,9 @@ class MedusaLM(Module, GenerationMixin):
         medusa_packed_mask = Tensor(
             name='medusa_packed_mask',
             dtype=trt.int32,
-            shape=[-1, -1],
+            shape=[-1, -1, -1],
             dim_range=OrderedDict([
+                ('batch_size_beam_width', bb_range),
                 ('medusa_packed_mask_dim0', medusa_mask_len_range),
                 ('medusa_packed_mask_dim1', packed_medusa_mask_len_range),
             ]),

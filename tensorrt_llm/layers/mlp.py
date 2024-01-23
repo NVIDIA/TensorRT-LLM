@@ -35,7 +35,6 @@ class MLP(Module):
             tp_group=None,
             tp_size=1,
             quant_mode=QuantMode(0),
-            instance_id: int = 0,
             max_lora_rank=None,
     ):
         super().__init__()
@@ -60,7 +59,6 @@ class MLP(Module):
                                      dtype=dtype,
                                      tp_group=tp_group,
                                      tp_size=tp_size,
-                                     instance_id=instance_id,
                                      max_lora_rank=max_lora_rank)
         else:
             self.fc = ColumnLinear(hidden_size,
@@ -77,7 +75,6 @@ class MLP(Module):
                                   dtype=dtype,
                                   tp_group=tp_group,
                                   tp_size=tp_size,
-                                  instance_id=instance_id,
                                   max_lora_rank=max_lora_rank)
 
         self.hidden_act = hidden_act
@@ -113,10 +110,8 @@ class GatedMLP(MLP):
             tp_group=None,
             tp_size=1,
             quant_mode=QuantMode(0),
-            instance_id: int = 0,
             max_lora_rank=None,
     ):
-        self.use_fp8_qdq = quant_mode.has_fp8_qdq()
         super().__init__(hidden_size,
                          ffn_hidden_size,
                          hidden_act,
@@ -124,8 +119,7 @@ class GatedMLP(MLP):
                          dtype=dtype,
                          tp_group=tp_group,
                          tp_size=tp_size,
-                         quant_mode=quant_mode,
-                         instance_id=instance_id)
+                         quant_mode=quant_mode)
 
         self.hidden_size = hidden_size
         self.ffn_hidden_size = ffn_hidden_size
@@ -135,7 +129,6 @@ class GatedMLP(MLP):
         self.tp_group = tp_group
         self.tp_size = tp_size
         self.quant_mode = quant_mode
-        self.instance_id = instance_id
 
         if self.use_fp8_qdq:
             self.gate = FP8Linear(hidden_size,
@@ -194,7 +187,6 @@ class FusedGatedMLP(GatedMLP):
             tp_group=None,
             tp_size=1,
             quant_mode=QuantMode(0),
-            instance_id: int = 0,
             max_lora_rank=None,
     ):
         super().__init__(hidden_size,
@@ -204,8 +196,29 @@ class FusedGatedMLP(GatedMLP):
                          dtype=dtype,
                          tp_group=tp_group,
                          tp_size=tp_size,
-                         quant_mode=quant_mode,
-                         instance_id=instance_id)
+                         quant_mode=quant_mode)
+
+        self.is_weight_rewritten = False
+        if self.use_fp8_qdq:
+            self.fused_fc = FP8Linear(
+                self.hidden_size,
+                self.ffn_hidden_size * 2,
+                bias=self.bias,
+                dtype=self.dtype,
+                tp_group=self.tp_group,
+                tp_size=self.tp_size,
+                gather_output=False,
+            )
+        else:
+            self.fused_fc = ColumnLinear(
+                self.hidden_size,
+                self.ffn_hidden_size * 2,
+                bias=self.bias,
+                dtype=self.dtype,
+                tp_group=self.tp_group,
+                tp_size=self.tp_size,
+                gather_output=False,
+            )
 
         if max_lora_rank is None:
             max_lora_rank = min(hidden_size, ffn_hidden_size // tp_size)
@@ -228,56 +241,37 @@ class FusedGatedMLP(GatedMLP):
         #
         # Upside is we don't need to modify 4 different weight loading paths just to concat weights
 
-        _np_dtype = trt_dtype_to_np(self.dtype)
-        concat_weight = np.concatenate(
-            [self.gate.weight.raw_value, self.fc.weight.raw_value],
-            axis=0).astype(_np_dtype)
-        if self.bias:
-            concat_bias = np.concatenate(
-                [self.gate.bias.raw_value, self.fc.bias.raw_value],
-                axis=0).astype(_np_dtype)
+        if not self.is_weight_rewritten:
+            _np_dtype = trt_dtype_to_np(self.dtype)
+            if self.gate.weight.is_inited() or self.fc.weight.is_inited():
+                self.fused_fc.weight.value = np.concatenate(
+                    [self.gate.weight.raw_value, self.fc.weight.raw_value],
+                    axis=0).astype(_np_dtype)
+            if self.bias and (self.gate.bias.is_inited()
+                              or self.fc.bias.is_inited()):
+                self.fused_fc.bias.value = np.concatenate(
+                    [self.gate.bias.raw_value, self.fc.bias.raw_value],
+                    axis=0).astype(_np_dtype)
 
-        if self.use_fp8_qdq:
-            gate_weights_scaling_factor = self.gate.weights_scaling_factor.raw_value
-            fc_weights_scaling_factor = self.fc.weights_scaling_factor.raw_value
-            fc_activation_scaling_factor = self.fc.activation_scaling_factor.raw_value
-            gate_activation_scaling_factor = self.gate.activation_scaling_factor.raw_value
-            assert fc_activation_scaling_factor == gate_activation_scaling_factor, "Activation scales should be identical"
+            if self.use_fp8_qdq:
+                if self.gate.weights_scaling_factor.is_inited(
+                ) or self.fc.weights_scaling_factor.is_inited():
+                    # TODO: need to align with quantization toolkit; preferably put a constraint to equalize
+                    # fc/gate weight scaling factor to allow horizontal fusion without accuracy loss
+                    self.fused_fc.weights_scaling_factor.value = max(
+                        self.gate.weights_scaling_factor.raw_value,
+                        self.fc.weights_scaling_factor.raw_value,
+                    )
+                if self.gate.activation_scaling_factor.is_inited(
+                ) or self.fc.activation_scaling_factor.is_inited():
+                    assert self.fc.activation_scaling_factor.raw_value == self.gate.activation_scaling_factor.raw_value, "Activation scales should be identical"
+                    self.fused_fc.activation_scaling_factor.value = self.fc.activation_scaling_factor.raw_value
 
-        # Remove dangling TRT-LLM parameter references after the graph rewrite.
-        for param, _ in list(self.gate.named_parameters()):
-            self.gate._parameters.pop(param)
-        self.gate = None
+            del self._modules["gate"]
+            del self._modules["fc"]
+            self.is_weight_rewritten = True
 
-        if self.use_fp8_qdq:
-            self.fc = FP8Linear(self.hidden_size,
-                                self.ffn_hidden_size * 2,
-                                bias=self.bias,
-                                dtype=self.dtype,
-                                tp_group=self.tp_group,
-                                tp_size=self.tp_size,
-                                gather_output=False)
-        else:
-            self.fc = ColumnLinear(self.hidden_size,
-                                   self.ffn_hidden_size * 2,
-                                   bias=self.bias,
-                                   dtype=self.dtype,
-                                   tp_group=self.tp_group,
-                                   tp_size=self.tp_size,
-                                   gather_output=False)
-
-        self.fc.weight.value = concat_weight
-
-        if self.use_fp8_qdq:
-            self.fc.activation_scaling_factor.value = fc_activation_scaling_factor
-            # TODO: need to align with quantization toolkit; preferably put a constraint to equalize
-            # fc/gate weight scaling factor to allow horizontal fusion without accuracy loss
-            self.fc.weights_scaling_factor.value = max(
-                gate_weights_scaling_factor, fc_weights_scaling_factor)
-
-        if self.bias:
-            self.fc.bias.value = concat_bias
-        inter = self.fc(hidden_states)
+        inter = self.fused_fc(hidden_states)
 
         if lora_layer_params is not None:
             mlp_fc_lora_params = lora_layer_params.get_runtime_params(

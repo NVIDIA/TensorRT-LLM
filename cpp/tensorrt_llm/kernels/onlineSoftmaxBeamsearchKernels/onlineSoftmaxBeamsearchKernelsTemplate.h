@@ -429,7 +429,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beam_online_softmax_topk_ker
             float val = total.topk.u[i] - total.md.m - d_total_log;
             if (i < K)
             {
-                z[i] = total.topk.p[i] + vector_id * V; // faster transformer needs absolute id
+                z[i] = total.topk.p[i] + vector_id * V; // trtllm needs absolute id
                 v[i] = val + c[0];
             }
         }
@@ -513,7 +513,7 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__
     {
         for (int i = 0; i < 2 * K; i++)
         {
-            reinterpret_cast<int*>(buf_s)[i] = total.topk.p[i] + vector_id * V; // faster transformer needs absolute id
+            reinterpret_cast<int*>(buf_s)[i] = total.topk.p[i] + vector_id * V; // trtllm needs absolute id
             buf_s[MAX_K2 + i] = total.topk.u[i];
         }
         buf_s[2 * MAX_K2] = total.md.d;
@@ -618,7 +618,7 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beam_online_softmax_topk_
         if (threadIdx.x == 0)
         {
             reinterpret_cast<int*>(buf_s)[i]
-                = section_start + total_topk.key + vector_id * V; // faster transformer needs absolute id
+                = section_start + total_topk.key + vector_id * V; // trtllm needs absolute id
             buf_s[MAX_K2 + i] = total_topk.value;
             buf_smem_logprobs[total_topk.key] = -MAX_T_VAL;
             thread_requiring_update = total_topk.key % THREADBLOCK_SIZE;

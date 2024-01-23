@@ -153,7 +153,6 @@ class RowLinear(Module):
                  dtype=None,
                  tp_group=None,
                  tp_size=1,
-                 instance_id: int = 0,
                  strict_dtype: bool = False,
                  max_lora_rank=None):
         super().__init__()
@@ -171,7 +170,6 @@ class RowLinear(Module):
 
         self.tp_group = tp_group
         self.tp_size = tp_size
-        self.instance_id = instance_id
 
         if max_lora_rank is None:
             max_lora_rank = min(self.in_features, self.out_features)

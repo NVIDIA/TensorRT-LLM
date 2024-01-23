@@ -45,8 +45,7 @@ class OPTDecoderLayer(Module):
             attention_mask_type=AttentionMaskType.causal,
             dtype=dtype,
             tp_group=tp_group,
-            tp_size=tp_size,
-            instance_id=2 * layer_idx)
+            tp_size=tp_size)
 
         mlp_hidden_size = hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
 
@@ -55,8 +54,7 @@ class OPTDecoderLayer(Module):
                        hidden_act=config.hidden_act,
                        dtype=dtype,
                        tp_group=tp_group,
-                       tp_size=tp_size,
-                       instance_id=2 * layer_idx + 1)
+                       tp_size=tp_size)
         self.post_layernorm = LayerNorm(normalized_shape=hidden_size,
                                         dtype=dtype)
 

@@ -98,8 +98,9 @@ class TestPhi(unittest.TestCase):
                 mapping=tensorrt_llm.Mapping(world_size=tensor_parallel,
                                              tp_size=tensor_parallel),
                 apply_query_key_layer_scaling=apply_query_key_layer_scaling)
-            inputs = tensorrt_llm_gpt.prepare_inputs(batch_size,
-                                                     input_len,
+            inputs = tensorrt_llm_gpt.prepare_inputs(max_batch_size=batch_size,
+                                                     max_input_len=input_len,
+                                                     max_seq_len=input_len +
                                                      output_len,
                                                      use_cache=True,
                                                      max_beam_width=beam_width)
@@ -188,11 +189,7 @@ class TestPhi(unittest.TestCase):
 
         # Skip tests that are not supported in pre-ampere architecture
         if getSMVersion() < 80:
-            if context_fmha_flag == ContextFMHAType.enabled:
-                pytest.skip(
-                    "ContextFMHAType is not supported in pre-ampere architecture"
-                )
-            elif context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
+            if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
                 pytest.skip(
                     "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
                 )

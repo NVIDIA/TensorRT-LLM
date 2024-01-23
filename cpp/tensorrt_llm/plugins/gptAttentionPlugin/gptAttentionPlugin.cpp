@@ -472,12 +472,15 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     int num_medusa_tokens = 0;
     if (mIsMedusaEnabled)
     {
-        // First dimension of medusa_packed_mask is num_medusa_tokens + 1.
-        num_medusa_tokens = inputDesc[getIdx(IdxEntry::MEDUSA_PACKED_MASK)].dims.d[0] - 1;
+        // Second dimension of medusa_packed_mask is num_medusa_tokens + 1.
+        // [batch_size, num_medusa_tokens + 1, divUp(num_medusa_tokens + 1, 32)]
+        num_medusa_tokens = inputDesc[getIdx(IdxEntry::MEDUSA_PACKED_MASK)].dims.d[1] - 1;
         if (num_medusa_tokens > 0)
         {
-            medusa_packed_mask = static_cast<const int*>(inputs[getIdx(IdxEntry::MEDUSA_PACKED_MASK)]);
-            medusa_position_offsets = static_cast<const int*>(inputs[getIdx(IdxEntry::MEDUSA_POSITION_OFFSETS)]);
+            medusa_packed_mask = static_cast<const int*>(inputs[getIdx(IdxEntry::MEDUSA_PACKED_MASK)])
+                + seqIdxBeg * getStride(inputDesc[getIdx(IdxEntry::MEDUSA_PACKED_MASK)].dims, 0);
+            medusa_position_offsets = static_cast<const int*>(inputs[getIdx(IdxEntry::MEDUSA_POSITION_OFFSETS)])
+                + seqIdxBeg * getStride(inputDesc[getIdx(IdxEntry::MEDUSA_POSITION_OFFSETS)].dims, 0);
         }
     }
 

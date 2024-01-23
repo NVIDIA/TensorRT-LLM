@@ -23,6 +23,7 @@ from typing import Union
 
 import torch
 
+from .._common import check_max_num_tokens
 from ..builder import BuildConfig, Builder
 from ..graph_rewriting import optimize
 from ..logger import logger
@@ -81,6 +82,12 @@ def parse_arguments():
                         default=False,
                         choices=['float16', 'bfloat16', 'float32'])
     parser.add_argument('--use_lookup_plugin',
+                        nargs='?',
+                        const='float16',
+                        type=str,
+                        default=False,
+                        choices=['float16', 'bfloat16', 'float32'])
+    parser.add_argument('--use_selective_scan_plugin',
                         nargs='?',
                         const='float16',
                         type=str,
@@ -185,13 +192,15 @@ def build_model(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 
         # Forward
         inputs = model.prepare_inputs(
-            build_config.max_batch_size,
-            build_config.max_input_len,
+            max_batch_size=build_config.max_batch_size,
+            max_input_len=build_config.max_input_len,
+            max_seq_len=build_config.max_input_len +
             build_config.max_output_len,
-            True,
-            build_config.max_beam_width,
-            build_config.max_num_tokens,
-            build_config.max_prompt_embedding_table_size,
+            use_cache=True,
+            max_beam_width=build_config.max_beam_width,
+            max_num_tokens=build_config.max_num_tokens,
+            prompt_embedding_table_size=build_config.
+            max_prompt_embedding_table_size,
             gather_context_logits=build_config.gather_context_logits,
             gather_generation_logits=build_config.gather_generation_logits)
         model(**inputs)
@@ -314,6 +323,11 @@ def main():
     workers = min(torch.cuda.device_count(), args.workers)
 
     if args.build_config is None:
+        args.max_num_tokens = check_max_num_tokens(
+            max_num_tokens=args.max_num_tokens,
+            max_batch_size=args.max_batch_size,
+            max_input_len=args.max_input_len,
+            remove_input_padding=args.remove_input_padding)
         build_config = BuildConfig.from_dict({
             'max_input_len':
             args.max_input_len,
@@ -344,6 +358,7 @@ def main():
                 'tokens_per_block': args.tokens_per_block,
                 'lookup_plugin': args.use_lookup_plugin,
                 'use_custom_all_reduce': args.use_custom_all_reduce,
+                'selective_scan_plugin': args.use_selective_scan_plugin,
             }
         })
     else:

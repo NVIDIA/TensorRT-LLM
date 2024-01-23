@@ -50,6 +50,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
     auto const worldConfig = WorldConfig::mpi(deviceCount, json.getTensorParallelism(), json.getPipelineParallelism());
     auto const enginePath = dataPath / json.engineFilename(worldConfig, modelNameHyphen);
     auto const dtype = modelConfig.getDataType();
+    auto const maxNumTokens = modelConfig.getMaxNumTokens();
     auto const useHalf = (dtype == nvinfer1::DataType::kHALF);
 
     SamplingConfig samplingConfig{beamWidth};
@@ -85,6 +86,13 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
 
         for (auto const batchSize : batchSizes)
         {
+            if (inputPacked && maxNumTokens != std::nullopt)
+            {
+                TLLM_CHECK_WITH_INFO(maxBatchSize * maxInputLength <= maxNumTokens.value(),
+                    "The engine is built with remove_input_padding=True and max_num_tokens=%d, while trying to "
+                    "benchmark on %d tokens",
+                    maxNumTokens.value(), maxBatchSize * maxInputLength);
+            }
             try
             {
                 TLLM_LOG_INFO(memoryCounter.toString());

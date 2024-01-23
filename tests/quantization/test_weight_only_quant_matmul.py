@@ -17,7 +17,6 @@ import sys
 import unittest
 
 import _utils
-import pytest
 
 # isort: off
 import torch
@@ -32,7 +31,6 @@ from tensorrt_llm.functional import constant
 from tensorrt_llm.quantization.functional import weight_only_quant_matmul
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
 
 
 class TestWeightOnlyQuantMatmul(unittest.TestCase):
@@ -101,7 +99,7 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
         ref_torch_weights, processed_torch_weights, torch_weight_scales = _utils.woq_conversion(
             weight, wTypeId)
         if wTypeId == 2 and use_plugin:
-            ref_torch_weights = torch.ops.fastertransformer.unpack_int4_packed_tensor_to_int8(
+            ref_torch_weights = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8(
                 ref_torch_weights)
         if not use_plugin:
             processed_torch_weights = ref_torch_weights
@@ -131,10 +129,6 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
         (1, 1024, 4096, 'float16', 2, True),
         (128, 6144, 12288, 'float16', 2, True),
     ])  #FP16 * INT4
-    @pytest.mark.skipif(
-        getSMVersion() < 80,
-        reason="weight only groupwise contains bug in pre-ampere architecture"
-    )  # Skip tests that are not supported in pre-ampere architecture
     def test_matmul(self, m, n, k, dtype, wTypeId, use_plugin):
         self._woq_matmul(m, n, k, dtype, wTypeId, use_plugin)
 
@@ -142,10 +136,6 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
         (1024, 4096, 'float16', 1), (4096, 512, 'float16', 1),
         (1024, 4096, 'float16', 2), (4096, 512, 'float16', 2)
     ])
-    @pytest.mark.skipif(
-        getSMVersion() < 80,
-        reason="weight only groupwise contains bug in pre-ampere architecture"
-    )  # Skip tests that are not supported in pre-ampere architecture
     def test_conversion(self, n, k, dtype, wTypeId):
         weight_ref = _utils.woq_gen_weights(n, k, dtype)
         ref_int, perm_int, scale = _utils.woq_conversion(weight_ref, wTypeId)

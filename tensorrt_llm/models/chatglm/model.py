@@ -253,7 +253,6 @@ class ChatGLMDecoderLayer(Module):
             relative_attention=False,
             max_distance=0,
             num_buckets=0,
-            instance_id=layer_id * 2,
             dense_bias=config.linear_bias,
         )
 
@@ -266,7 +265,6 @@ class ChatGLMDecoderLayer(Module):
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
             quant_mode=config.quant_mode,
-            instance_id=layer_id * 2 + 1,
         )
 
         self.post_norm = self.norm(
@@ -370,7 +368,6 @@ class ChatGLMModel(Module):
             tp_group=None,  #config.mapping.tp_group,
             sharding_dim=0,
             tp_rank=0,  #config.mapping.rank,
-            instance_id=config.num_layers * 2,
         )
 
         if config.model_name in ["glm_2b", "glm_10b", "glm_10b_chinese"]:
@@ -382,7 +379,6 @@ class ChatGLMModel(Module):
                 tp_group=None,  #config.mapping.tp_group,
                 sharding_dim=0,
                 tp_rank=0,  #config.mapping.rank,
-                instance_id=config.num_layers * 2,
             )
             self.block_embedding = Embedding(
                 config.max_seq_length + 1,
@@ -392,7 +388,6 @@ class ChatGLMModel(Module):
                 tp_group=None,  #config.mapping.tp_group,
                 sharding_dim=0,
                 tp_rank=0,  #config.mapping.rank,
-                instance_id=config.num_layers * 2,
             )
 
         self.layers = ModuleList(
@@ -622,7 +617,7 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
         self,
         max_batch_size: int = None,
         max_input_len: int = None,
-        max_output_len: int = None,
+        max_seq_len: int = None,
         use_cache: bool = True,
         max_beam_width: int = 1,
         gather_context_logits: bool = False,
@@ -643,7 +638,7 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
             max_input_len=max_input_len,
-            max_new_tokens=max_output_len,
+            max_seq_len=max_seq_len,
             num_kv_heads=self.num_kv_heads,
             head_size=self.hidden_size // self.num_heads,
             num_layers=self.num_layers,

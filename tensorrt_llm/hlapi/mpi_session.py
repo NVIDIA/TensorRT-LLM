@@ -1,11 +1,6 @@
 from concurrent.futures import Future
 from typing import Any, List, Optional
 
-from mpi4py import MPI
-from mpi4py.futures import MPIPoolExecutor
-
-comm = MPI.COMM_WORLD
-
 
 class NodeSession:
     ''' NodeSession Act as a central global state shares between tasks on MPI node.
@@ -37,6 +32,8 @@ class NodeSession:
 class MpiSession:
 
     def __init__(self, n_workers: int):
+        from mpi4py.futures import MPIPoolExecutor
+
         self.n_workers = n_workers
         self.mpi_pool: Optional[MPIPoolExecutor] = None
         self._start()
@@ -58,14 +55,8 @@ class MpiSession:
         self.mpi_pool = None
 
     def _start(self):
+        from mpi4py.futures import MPIPoolExecutor
+
         assert not self.mpi_pool, 'MPI session already started'
 
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers)
-
-
-def mpi_rank() -> int:
-    return comm.Get_rank()
-
-
-def mpi_size() -> int:
-    return comm.Get_size()

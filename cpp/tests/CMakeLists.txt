@@ -37,28 +37,14 @@ function(add_gtest test_name test_src)
 
   if(NOT WIN32) # Linux
     target_link_libraries(
-      ${test_name}
-      PUBLIC ${SHARED_TARGET}
-             ${TORCH_LIBRARIES}
-             ${Python3_LIBRARIES}
-             gtest_main
-             gmock_main
-             nvonnxparser
-             th_common
-             nvinfer_plugin_tensorrt_llm)
+      ${test_name} PUBLIC ${SHARED_TARGET} gtest_main gmock_main nvonnxparser
+                          nvinfer_plugin_tensorrt_llm)
   else()
     # Use STATIC_TARGET on Windows because MSVC is picky about duplicate symbols
     # if the shared and static libs both get linked
     target_link_libraries(
-      ${test_name}
-      PUBLIC ${STATIC_TARGET}
-             ${TORCH_LIBRARIES}
-             ${Python3_LIBRARIES}
-             gtest_main
-             gmock_main
-             nvonnxparser
-             th_common
-             nvinfer_plugin_tensorrt_llm)
+      ${test_name} PUBLIC ${STATIC_TARGET} gtest_main gmock_main nvonnxparser
+                          nvinfer_plugin_tensorrt_llm)
   endif()
 
   target_compile_features(${test_name} PRIVATE cxx_std_17)

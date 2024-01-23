@@ -1,5 +1,5 @@
+import asyncio
 import os
-import subprocess
 import tempfile
 from typing import List
 
@@ -10,11 +10,9 @@ from transformers import AutoTokenizer
 from tensorrt_llm.hlapi.llm import (LLM, ModelConfig, SamplingConfig,
                                     TokenizerBase, TransformersTokenizer)
 
-llm_models_root = os.environ.get('LLM_MODELS_ROOT',
-                                 '/scratch.trt_llm_data/llm-models/')
-llm_engine_dir = os.environ.get('LLM_ENGINE_DIR', None)
-
+llm_models_root = os.environ.get('LLM_MODELS_ROOT', None)
 llama_model_path = os.path.join(llm_models_root, "llama-models/llama-7b-hf")
+llm_engine_dir = os.environ.get('LLM_ENGINE_DIR', './tmp.engine')
 
 prompts = ["Tell a story", "Who are you"]
 
@@ -30,7 +28,7 @@ def test_tokenizer():
 
 
 def test_llm_loadding_from_hf():
-    config = ModelConfig(model_dir=llama_model_path)
+    config = ModelConfig(llama_model_path)
     llm = LLM(config)
 
     for output in llm.generate(prompts):
@@ -69,7 +67,7 @@ class MyTokenizer(TokenizerBase):
 
 
 def test_llm_with_customized_tokenizer():
-    config = ModelConfig(model_dir=llama_model_path)
+    config = ModelConfig(llama_model_path)
     llm = LLM(
         config,
         # a customized tokenizer is passed to override the default one
@@ -80,7 +78,7 @@ def test_llm_with_customized_tokenizer():
 
 
 def test_llm_without_tokenizer():
-    config = ModelConfig(model_dir=llama_model_path)
+    config = ModelConfig(llama_model_path)
     llm = LLM(
         config,
         # this will turn off tokenizer for pre-processing and post-processing
@@ -101,7 +99,7 @@ def test_llm_without_tokenizer():
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="The test needs at least 2 GPUs, skipping")
 def test_llm_build_engine_for_tp2():
-    config = ModelConfig(model_dir=llama_model_path)
+    config = ModelConfig(llama_model_path)
     config.parallel_config.tp_size = 2
     llm = LLM(config)
 
@@ -112,42 +110,50 @@ def test_llm_build_engine_for_tp2():
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="The test needs at least 2 GPUs, skipping")
 def test_llm_generate_for_tp2():
-    config = ModelConfig(model_dir=llama_model_path)
+    config = ModelConfig(llama_model_path)
     config.parallel_config.tp_size = 2
     llm = LLM(config)
     for output in llm.generate(prompts):
         print(output)
 
 
-# TODO[chunweiy]: Add test for loading inmemory model
+def test_llm_generate_async():
+    config = ModelConfig(llama_model_path)
+    llm = LLM(
+        config,
+        async_mode=True,
+        # set to 40%, since by default, the executor will occupy all the free memory, making some other tests OOM in CI
+        kvcahe_free_gpu_memory_fraction=0.4)
 
+    def test_async(streaming: bool):
+
+        async def task(prompt: str):
+            outputs = []
+            async for output in llm.generate_async(prompt, streaming=streaming):
+                print('output', output)
+                outputs.append(output.text)
+            print(' '.join(outputs))
+
+        async def main():
+            tasks = [task(prompt) for prompt in prompts]
+            await asyncio.gather(*tasks)
+
+        asyncio.run(main())
+
+    def test_wait(streaming: bool):
+        for prompt in prompts:
+            future = llm.generate_async(prompt, streaming=streaming)
+            for output in future:
+                print(output)
+
+    test_async(streaming=True)
+    test_async(streaming=False)
+    test_wait(streaming=True)
+    test_wait(streaming=False)
+
+
+# TODO[chunweiy]: Add test for loading inmemory model
 # TODO[chunweiy]: Add a multi-gpu test on loading engine
 
-
-def _test_llm_int4_awq_quantization():
-    # TODO[chunweiy]: Enable it on L0 tests
-    config = ModelConfig(model_dir=llama_model_path)
-    config.quant_config.init_from_description(quantize_weights=True,
-                                              use_int4_weights=True,
-                                              per_group=True)
-    assert config.quant_config.has_any_quant()
-
-    llm = LLM(config)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        llm.save(tmpdir)
-
-
 if __name__ == '__main__':
-
-    def get_faked_engine():
-        temp_dir = tempfile.TemporaryDirectory()
-        subprocess.run([
-            'bash',
-            os.path.join(cur_dir, './fake.sh'), llama_model_path, temp_dir.name
-        ],
-                       check=True)
-
-        return temp_dir
-
-    engine = get_faked_engine()
-    test_llm_generate_async(engine)
+    test_llm_generate_async()

@@ -17,15 +17,13 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/BatchManager.h"
-#include "tensorrt_llm/batch_manager/batchScheduler.h"
 #include "tensorrt_llm/batch_manager/callbacks.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/batch_manager/schedulerPolicy.h"
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
+
 #include <atomic>
-#include <cstdlib>
 #include <filesystem>
-#include <functional>
-#include <map>
 #include <optional>
 
 namespace nvinfer1
@@ -83,7 +81,7 @@ protected:
 
 private:
     SizeType getMaxInputLen() const;
-    SizeType getMaxOutputLen() const;
+    SizeType getMaxSequenceLen() const;
     SizeType getMaxNumSequences() const;
 
     void validateLlmRequest(LlmRequest& newReq) const;

@@ -39,7 +39,7 @@ class TestPluginNoCache(unittest.TestCase):
                      max_batch_size,
                      max_beam_width,
                      max_input_len,
-                     max_new_tokens,
+                     max_seq_len,
                      num_kv_heads,
                      head_size,
                      dtype,
@@ -62,15 +62,15 @@ class TestPluginNoCache(unittest.TestCase):
         net.plugin_config.remove_input_padding = remove_input_padding
         with tensorrt_llm.net_guard(net):
             inputs = GenerationMixin().prepare_attention_inputs(
-                max_batch_size,
-                max_beam_width,
-                max_input_len,
-                max_new_tokens,
-                num_kv_heads,
-                head_size,
-                num_layers,
-                kv_dtype,
-                remove_input_padding,
+                max_batch_size=max_batch_size,
+                max_beam_width=max_beam_width,
+                max_input_len=max_input_len,
+                max_seq_len=max_seq_len,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                num_layers=num_layers,
+                kv_dtype=kv_dtype,
+                remove_input_padding=remove_input_padding,
                 use_gpt_attention_plugin=True,
                 use_gemm_plugin=
                 True,  # because we don't want two optimization profiles
@@ -155,7 +155,7 @@ class TestPluginNoCache(unittest.TestCase):
         max_batch_size = 8
         max_beam_width = 1
         max_input_len = 128
-        max_new_tokens = 0
+        max_seq_len = max_input_len
         num_kv_heads = 16
         head_size = 32
         num_layers = 1
@@ -203,18 +203,19 @@ class TestPluginNoCache(unittest.TestCase):
                                      dtype=str_dtype_to_torch(dtype),
                                      device="cuda")
 
-        engine = TestPluginNoCache.build_engine(qkv_shape,
-                                                max_batch_size,
-                                                max_beam_width,
-                                                max_input_len,
-                                                max_new_tokens,
-                                                num_kv_heads,
-                                                head_size,
-                                                dtype,
-                                                num_layers,
-                                                remove_input_padding,
-                                                fmha_type,
-                                                use_cache=False)
+        engine = TestPluginNoCache.build_engine(
+            qkv_shape=qkv_shape,
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_input_len=max_input_len,
+            max_seq_len=max_seq_len,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=dtype,
+            num_layers=num_layers,
+            remove_input_padding=remove_input_padding,
+            context_fmha_type=fmha_type,
+            use_cache=False)
         session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
         inputs = {
             'qkv': qkv,
@@ -238,11 +239,18 @@ class TestPluginNoCache(unittest.TestCase):
         stream = torch.cuda.current_stream()
         session.run(inputs=inputs, outputs=outputs, stream=stream.cuda_stream)
 
-        engine = TestPluginNoCache.build_engine(qkv_shape, max_batch_size,
-                                                max_beam_width, max_input_len,
-                                                max_new_tokens, num_kv_heads,
-                                                head_size, dtype, num_layers,
-                                                remove_input_padding, fmha_type)
+        engine = TestPluginNoCache.build_engine(
+            qkv_shape=qkv_shape,
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_input_len=max_input_len,
+            max_seq_len=max_seq_len,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=dtype,
+            num_layers=num_layers,
+            remove_input_padding=remove_input_padding,
+            context_fmha_type=fmha_type)
         session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
 
         inputs = {

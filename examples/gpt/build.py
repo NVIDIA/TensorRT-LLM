@@ -22,6 +22,7 @@ import torch
 import torch.multiprocessing as mp
 
 import tensorrt_llm
+from tensorrt_llm._common import check_max_num_tokens
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.layers import MoeConfig, PositionEmbeddingType
@@ -332,7 +333,9 @@ def parse_arguments(args):
         '--max_num_tokens',
         type=int,
         default=None,
-        help='Define the max number of tokens supported by the engine')
+        help=
+        'Define the max number of tokens supported by the engine, note that it takes no effect if --remove_input_padding is not set'
+    )
     parser.add_argument(
         '--strongly_typed',
         default=False,
@@ -388,6 +391,12 @@ def parse_arguments(args):
         help=
         "Add lora in which modules. Only be activated when use_lora_plugin is enabled."
     )
+    parser.add_argument(
+        '--max_lora_rank',
+        type=int,
+        default=64,
+        help='maximum lora rank for different lora modules. '
+        'It is used to compute the workspace size of lora plugin.')
     parser.add_argument(
         '--moe_num_experts',
         default=0,
@@ -493,8 +502,11 @@ def parse_arguments(args):
         assert rotary_scaling["factor"] > 1.0
         args.rotary_scaling = rotary_scaling
 
-    if args.max_num_tokens is not None:
-        assert args.enable_context_fmha or args.enable_context_fmha_fp32_acc
+    args.max_num_tokens = check_max_num_tokens(
+        max_num_tokens=args.max_num_tokens,
+        max_batch_size=args.max_batch_size,
+        max_input_len=args.max_input_len,
+        remove_input_padding=args.remove_input_padding)
 
     if args.moe_num_experts and args.moe_top_k == 0:
         args.moe_top_k = 1
@@ -538,7 +550,8 @@ def build_rank_engine(builder: Builder,
 
     if share_embedding_table:
         logger.info(
-            'Engine will share embedding and language modeling weights.')
+            'Engine will try to share embedding and language modeling weights. Note: Flag --use_lookup_plugin and --use_gemm_plugin are also needed for now.'
+        )
 
     # Initialize Module
     tensorrt_llm_gpt = tensorrt_llm.models.GPTLMHeadModel(
@@ -569,6 +582,7 @@ def build_rank_engine(builder: Builder,
         embedding_sharding_dim=args.embedding_sharding_dim,
         share_embedding_table=share_embedding_table,
         moe_config=args.moe_config,
+        max_lora_rank=args.max_lora_rank,
     )
 
     if args.use_smooth_quant or args.use_weight_only:
@@ -665,12 +679,12 @@ def build_rank_engine(builder: Builder,
 
         # Forward
         inputs = tensorrt_llm_gpt.prepare_inputs(
-            args.max_batch_size,
-            args.max_input_len,
-            args.max_output_len,
-            True,
-            args.max_beam_width,
-            args.max_num_tokens,
+            max_batch_size=args.max_batch_size,
+            max_input_len=args.max_input_len,
+            max_seq_len=args.max_input_len + args.max_output_len,
+            use_cache=True,
+            max_beam_width=args.max_beam_width,
+            max_num_tokens=args.max_num_tokens,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size,
             gather_context_logits=args.gather_context_logits,
             gather_generation_logits=args.gather_generation_logits,
@@ -762,8 +776,7 @@ def build(rank, args):
             paged_kv_cache=args.paged_kv_cache,
             max_batch_size=args.max_batch_size,
             max_beam_width=args.max_beam_width,
-            max_input_len=args.max_input_len,
-            max_output_len=args.max_output_len,
+            max_seq_len=args.max_input_len + args.max_output_len,
             local_num_kv_heads=local_num_kv_heads,
             head_size=args.n_embd / args.n_head,
             num_layers=args.n_layer)

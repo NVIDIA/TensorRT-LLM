@@ -109,7 +109,7 @@ GptJsonConfig parseJson(InputType&& i)
         auto const maxBatchSize = parseJsonFieldOr(builderConfig, "max_batch_size", 0);
         auto const maxBeamWidth = parseJsonFieldOr(builderConfig, "max_beam_width", 0);
         auto const maxInputLen = parseJsonFieldOr(builderConfig, "max_input_len", 0);
-        auto const maxOutputLen = parseJsonFieldOr(builderConfig, "max_output_len", 0);
+        auto const maxSequenceLen = maxInputLen + parseJsonFieldOr(builderConfig, "max_output_len", 0);
         auto const maxDraftLen = parseJsonFieldOr(builderConfig, "max_draft_len", 0);
         auto const maxNumTokens = parseJsonFieldOptional<SizeType>(builderConfig, "max_num_tokens");
         auto const maxPromptEmbeddingTableSize
@@ -122,15 +122,13 @@ GptJsonConfig parseJson(InputType&& i)
         auto const& pluginConfig = json.at("plugin_config");
         auto const pagedKvCache = pluginConfig.at("paged_kv_cache");
         auto const tokensPerBlock = pluginConfig.at("tokens_per_block");
-        auto const& gptAttentionPlugin = pluginConfig.at("gpt_attention_plugin");
-        auto const useGptAttentionPlugin = !gptAttentionPlugin.is_boolean() || gptAttentionPlugin.template get<bool>();
+        auto const useGptAttentionPlugin = !pluginConfig.at("gpt_attention_plugin").is_null();
         auto const removeInputPadding = pluginConfig.at("remove_input_padding").template get<bool>();
         auto const useCustomAllReduce = pluginConfig.at("use_custom_all_reduce").template get<bool>();
         auto const useContextFMHAForGeneration
             = pluginConfig.at("use_context_fmha_for_generation").template get<bool>();
         auto const pagedContextFMHA = pluginConfig.at("use_paged_context_fmha").template get<bool>();
-        auto const& loraPlugin = pluginConfig.at("lora_plugin");
-        auto useLoraPlugin = !loraPlugin.is_boolean() || loraPlugin.template get<bool>();
+        auto useLoraPlugin = !pluginConfig.at("lora_plugin").is_null();
 
         auto modelConfig = GptModelConfig{vocabSize, numLayers, numHeads, hiddenSize, dataType};
         modelConfig.useGptAttentionPlugin(useGptAttentionPlugin);
@@ -149,7 +147,7 @@ GptJsonConfig parseJson(InputType&& i)
         modelConfig.setMaxBatchSize(maxBatchSize);
         modelConfig.setMaxBeamWidth(maxBeamWidth);
         modelConfig.setMaxInputLen(maxInputLen);
-        modelConfig.setMaxOutputLen(maxOutputLen);
+        modelConfig.setMaxSequenceLen(maxSequenceLen);
         modelConfig.setMaxNumTokens(maxNumTokens);
         modelConfig.setMaxDraftLen(maxDraftLen);
         modelConfig.setMaxPromptEmbeddingTableSize(maxPromptEmbeddingTableSize);
@@ -241,7 +239,7 @@ GptJsonConfig parseJson(InputType&& i)
         auto const maxBatchSize = parseJsonFieldOr(buildConfig, "max_batch_size", 0);
         auto const maxBeamWidth = parseJsonFieldOr(buildConfig, "max_beam_width", 0);
         auto const maxInputLen = parseJsonFieldOr(buildConfig, "max_input_len", 0);
-        auto const maxOutputLen = parseJsonFieldOr(buildConfig, "max_output_len", 0);
+        auto const maxSequenceLen = maxInputLen + parseJsonFieldOr(buildConfig, "max_output_len", 0);
         auto const maxDraftLen = parseJsonFieldOr(buildConfig, "max_draft_len", 0);
         auto const maxNumTokens = parseJsonFieldOptional<SizeType>(buildConfig, "max_num_tokens");
         auto const maxPromptEmbeddingTableSize
@@ -252,8 +250,7 @@ GptJsonConfig parseJson(InputType&& i)
         auto const& pluginConfig = buildConfig.at("plugin_config");
         auto const pagedKvCache = pluginConfig.at("paged_kv_cache");
         auto const tokensPerBlock = pluginConfig.at("tokens_per_block");
-        auto const& gptAttentionPlugin = pluginConfig.at("gpt_attention_plugin");
-        auto const useGptAttentionPlugin = !gptAttentionPlugin.is_boolean() || gptAttentionPlugin.template get<bool>();
+        auto const useGptAttentionPlugin = !pluginConfig.at("gpt_attention_plugin").is_null();
         auto const removeInputPadding = pluginConfig.at("remove_input_padding").template get<bool>();
         auto const useCustomAllReduce = pluginConfig.at("use_custom_all_reduce").template get<bool>();
         auto const useContextFMHAForGeneration
@@ -274,7 +271,7 @@ GptJsonConfig parseJson(InputType&& i)
         modelConfig.setMaxBatchSize(maxBatchSize);
         modelConfig.setMaxBeamWidth(maxBeamWidth);
         modelConfig.setMaxInputLen(maxInputLen);
-        modelConfig.setMaxOutputLen(maxOutputLen);
+        modelConfig.setMaxSequenceLen(maxSequenceLen);
         modelConfig.setMaxNumTokens(maxNumTokens);
         modelConfig.setMaxDraftLen(maxDraftLen);
         modelConfig.setMaxPromptEmbeddingTableSize(maxPromptEmbeddingTableSize);

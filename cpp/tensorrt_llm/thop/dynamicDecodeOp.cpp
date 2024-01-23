@@ -348,8 +348,8 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
 
 } // namespace torch_ext
 
-static auto fasterTransformerGptContextDecoderTHS
-    = torch::jit::class_<torch_ext::DynamicDecodeOp>("FasterTransformer", "DynamicDecodeOp")
+static auto trtllmGptContextDecoderTHS
+    = torch::jit::class_<torch_ext::DynamicDecodeOp>("trtllm", "DynamicDecodeOp")
           .def(torch::jit::init<int64_t, int64_t, int64_t, int64_t, at::ScalarType>())
           .def("setup", &torch_ext::DynamicDecodeOp::setup)
           .def("forward", &torch_ext::DynamicDecodeOp::forward);
