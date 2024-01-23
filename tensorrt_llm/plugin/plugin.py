@@ -64,6 +64,7 @@ class PluginConfig(object):
         self.gemm_plugin = False
         self.smooth_quant_gemm_plugin = False
         self.layernorm_plugin = False
+        self.rwkvrnn_plugin = False
         self.layernorm_quantization_plugin = False
         self.rmsnorm_plugin = False
         self.rmsnorm_quantization_plugin = False
@@ -137,6 +138,10 @@ class PluginConfig(object):
 
     def set_layernorm_plugin(self, dtype='float16'):
         self.layernorm_plugin = dtype
+        return self
+    
+    def set_rwkvrnn_plugin(self, dtype='float16'):
+        self.rwkvrnn_plugin = dtype
         return self
 
     def set_layernorm_quantization_plugin(self, dtype='float16'):

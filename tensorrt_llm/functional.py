@@ -31,7 +31,7 @@ from ._common import default_net, default_trtnet, precision
 from ._utils import (bf16_array, dim_resolve_negative, dim_to_trt_axes,
                      fp16_array, fp32_array, int32_array, np_dtype_to_trt,
                      str_dtype_to_np, str_dtype_to_trt, torch_to_numpy,
-                     trt_dtype_to_torch)
+                     trt_dtype_to_torch, trt_dtype_to_np)
 from .logger import logger
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE
 from .quantization import QuantMode
@@ -730,7 +730,7 @@ def swiglu(input: Tensor) -> Tensor:
     return silu(gate) * x
 
 
-def squared_relu(x: Tensor) -> Tensor:
+def squared_relu(x: Tensor, dtype=trt.float32) -> Tensor:
     '''
     Add a Squared ReLU operation.
 
@@ -743,7 +743,7 @@ def squared_relu(x: Tensor) -> Tensor:
     Returns:
         The tensor produced by the activation layer.
     '''
-    return pow(relu(x), 2.0)
+    return pow(relu(x), constant(np.array(2.0, dtype=trt_dtype_to_np(dtype))))
 
 
 def cast(input: Tensor, dtype: Union[str, trt.DataType]):
@@ -3841,8 +3841,10 @@ def repeat_interleave(tensor: Tensor, repeats: int, dim: int) -> Tensor:
         for i in range(expanded_tensor.ndim())
     ])
     tile = expand(expanded_tensor, tile_output_size)
-    tile_reshape_size = [shape(tensor, i) for i in range(tensor.ndim())]
-    tile_reshape_size[dim] = tile_reshape_size[dim] * repeats
+    tile_reshape_size = [
+        repeats * shape(tensor, i) if i == dim else shape(tensor, i) 
+        for i in range(tensor.ndim())
+    ]
     tensor = tile.view(concat(tile_reshape_size))
     return tensor
 

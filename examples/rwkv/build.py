@@ -164,6 +164,16 @@ def parse_arguments():
         help=
         "Activates layernorm plugin. You can specify the plugin dtype or leave blank to use the model dtype."
     )
+    parser.add_argument(
+        '--use_rwkvrnn_plugin',
+        nargs='?',
+        const='float16',
+        type=str,
+        default='float16',
+        choices=['float16', 'float32'],
+        help=
+        "Activates layernorm plugin. You can specify the plugin dtype."
+    )
     parser.add_argument('--parallel_build', default=False, action='store_true')
     parser.add_argument('--visualize', default=False, action='store_true')
     parser.add_argument('--enable_debug_output',
@@ -384,6 +394,9 @@ def build_rank_engine(builder: Builder,
     if args.use_layernorm_plugin:
         network.plugin_config.set_layernorm_plugin(
             dtype=args.use_layernorm_plugin)
+    if args.use_rwkvrnn_plugin:
+        network.plugin_config.set_rwkvrnn_plugin(
+            dtype=args.use_rwkvrnn_plugin)
     if args.use_lookup_plugin:
         # Use the plugin for the embedding parallelism
         network.plugin_config.set_lookup_plugin(dtype=args.dtype)
@@ -439,8 +452,6 @@ def build_rank_engine(builder: Builder,
         config_path = os.path.join(args.output_dir, 'config.json')
         builder.save_config(builder_config, config_path)
 
-    tensorrt_llm.tools.cleanup(network, tensorrt_llm_rwkv)
-
     return engine
     
     
@@ -489,6 +500,7 @@ def build(rank, args):
             max_position_embeddings=args.n_positions,
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
+            max_beam_width=args.max_beam_width, 
             max_output_len=args.max_output_len,
             int8=int8_trt_flag,
             quant_mode=args.quant_mode,

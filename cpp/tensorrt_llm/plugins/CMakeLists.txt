@@ -35,6 +35,7 @@ set(PLUGIN_LISTS
     gptAttentionPlugin
     identityPlugin
     layernormPlugin
+    rwkvRnnPlugin
     rmsnormPlugin
     gemmPlugin
     smoothQuantGemmPlugin

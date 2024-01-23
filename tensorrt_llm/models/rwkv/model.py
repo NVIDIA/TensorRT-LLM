@@ -18,11 +18,14 @@ from collections import OrderedDict
 
 from tensorrt_llm.quantization import QuantMode
 
-from ..._common import default_net
+from ..._common import default_net, default_trtnet
 from ..._utils import pad_vocab_size, str_dtype_to_trt, trt_dtype_to_np
-from ...functional import (gather_last_token_logits, recv, send, select, pow, repeat_interleave, 
-                           layer_norm, group_norm, cast, matmul, slice, arange, concat,
-                           silu, sigmoid, squared_relu, constant, padding_nd, Tensor)
+from ...functional import (gather_last_token_logits, recv, send, gather, 
+                           select, pow, repeat_interleave, flip, int32_array, 
+                           layer_norm, group_norm, cast, matmul, 
+                           slice, arange, concat, shape, _create_tensor, 
+                           silu, sigmoid, squared_relu, constant, 
+                           padding_nd, broadcast_helper, Tensor)
 from ...layers import (Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
                        PositionEmbeddingType, RmsNorm, PromptTuningEmbedding)
@@ -31,6 +34,49 @@ from ...mapping import Mapping
 from ...module import Module, ModuleList
 from ...quantization import QuantMode
 from ..generation_mixin import GenerationMixin
+from ...plugin import TRT_LLM_PLUGIN_NAMESPACE
+
+def rwkv_v52_rnn_kernel(num_att: int, 
+                        state: Tensor, 
+                        r: Tensor, 
+                        k: Tensor, 
+                        v: Tensor, 
+                        w: Tensor, 
+                        u: Tensor):
+    print('========================================')
+    print(state.dtype)
+    print(r.dtype)
+    print(k.dtype)
+    print(v.dtype)
+    print(w.dtype)
+    print(u.dtype)
+    print('========================================')
+    if not default_net().plugin_config.rwkvrnn_plugin:
+        raise RuntimeError("Currently Rwkv5.2 cannot run without rwkv rnn plugin.")
+    
+    plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'RwkvRnn', '5.2', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+    
+    p_dtype = default_net().plugin_config.rwkvrnn_plugin
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(r.dtype)], np.int32),
+        trt.PluginFieldType.INT32)
+    c = trt.PluginField("C", np.array(num_att, dtype=np.int32),
+                            trt.PluginFieldType.INT32)
+    pfc = trt.PluginFieldCollection([pf_type, c])
+    rwkvrnn_plug = plg_creator.create_plugin("rwkvrnn", pfc)
+
+    plug_inputs = [
+        state.trt_tensor, 
+        r.trt_tensor, 
+        k.trt_tensor, 
+        v.trt_tensor, 
+        w.trt_tensor, 
+        u.trt_tensor
+    ]
+    layer = default_trtnet().add_plugin_v2(plug_inputs, rwkvrnn_plug)
+    return _create_tensor(layer.get_output(0), layer)
 
 class RwkvSelfAttentionLayer(Module):
     def __init__(self, 
@@ -66,78 +112,55 @@ class RwkvSelfAttentionLayer(Module):
         self.t_first = Parameter(shape=(num_head, dim_att // num_head), dtype=str_dtype_to_trt('float32')) # special case
         
     def forward(self, x, sx, s):
-        xx = layer_norm(x, [x.shape[2]], weight=self.ln_w.value, bias=self.ln_b.value)
-        constant_one = constant(np.ones(1, dtype=trt_dtype_to_np(self.dtype)))
+        xx = layer_norm(x, [shape(x, -1)], weight=self.ln_w.value, bias=self.ln_b.value)
+        constant_one = constant(np.ones([self.hidden_size], dtype=trt_dtype_to_np(self.dtype)))
         kx = xx * self.k_mix.value + sx * (constant_one - self.k_mix.value)
         vx = xx * self.v_mix.value + sx * (constant_one - self.v_mix.value)
         rx = xx * self.r_mix.value + sx * (constant_one - self.r_mix.value)
         gx = xx * self.g_mix.value + sx * (constant_one - self.g_mix.value)
         
-        T = x.shape[-2] # query length
+        T = shape(x, -2) # query length
         H = self.num_head
-        S = self.hidden_size // self.num_head
+        S = self.hidden_size // H
+        B = shape(x, 0) # batch
         
-        r = cast(self.rxw(rx), self.rkv_dtype).view((T, H, S)).transpose(0, 1)
-        k = cast(self.kxw(kx), self.rkv_dtype).view((T, H, S)).transpose(0, 1).transpose(1, 2)
-        v = cast(self.vxw(vx), self.rkv_dtype).view((T, H, S)).transpose(0, 1)
+        print("T: ", T)
+        print("H: ", H)
+        print("S: ", S)
+        
+        print("dim_att: ", self.dim_att)
+        print("hidden_size: ", self.hidden_size)
+        
+        print('x shape: ', x.shape)
+        print('sx shape: ', sx.shape)
+        print('xx shape: ', xx.shape)
+        print('s shape: ', s.shape)
+        print('rx shape: ', rx.shape)
+        r = cast(self.rxw(rx), self.rkv_dtype).view(concat([B, T, H, S])).transpose(1, 2)
+        print('r shape: ', r.shape)
+        print('kx shape: ', kx.shape)
+        print('kxw shape: ', self.kxw.weight.value.shape)
+        k = cast(self.kxw(kx), self.rkv_dtype)
+        print('k shape: ', k.shape)
+        k = k.view(concat([B, T, H, S])).transpose(1, 2).transpose(2, 3)
+        print('k shape: ', k.shape)
+        v = cast(self.vxw(vx), self.rkv_dtype).view(concat([B, T, H, S])).transpose(1, 2)
+        print('v shape: ', v.shape)
         g = silu(self.gxw(gx))
         
-        print("xx: ", xx.shape)
-        print("&&&&&&&&&&&&&&  shape: ", x.shape)
-        print(T, H, S)
-        print(self.k_mix._value)
-        print(self.k_mix._value.__class__)
-        print(self.t_decay._value)
-        print(self.t_decay._value.__class__)
-        
-        kv = matmul(k.transpose(-2, -1).view((H, T, S, 1)), v.view((H, T, 1, S)))
-        print("kv shape: ", kv.shape)
-        w = self.t_decay.value.view((H, S, 1))
-        print("w shape: ", w.shape)
-        ws = pow(w, T)
-        print("ws shape: ", ws.shape)
-        ind = arange(T-1, -1, self.dtype).view((1, 1, T))
-        print("ind shape: ", ind.shape)
-        w = pow(repeat_interleave(w, T, 2), ind)
-        print("w shape: ", w.shape)
-        wk = w.view((H, S, T))
-        print("wk shape: ", wk.shape)
-        u = self.t_first.value.view((H, S, 1))
-        print("u shape: ", u.shape)
-        w = concat([slice(w, [0, 0, 1], [w.size(0), w.size(1), w.size(2) - 1]), u], dim=2)
-        print("w shape: ", w.shape)
-        w = padding_nd(w, [0], [T])
-        print("w shape: ", w.shape)
-        w = repeat_interleave(w, T, dim=2)
-        print("w shape: ", w.shape)
-        w = slice(w, [0, 0, 0], [w.size(0), w.size(1), 2 * T - 1]).view((H, S, T, 2 * T - 1))
-        print("w shape: ", w.shape)
-        w = slice(w, [0, 0, 0, T - 1], [w.size(0), w.size(1), w.size(2), T]).view(H, S, 1, T, T)
-        print("w shape: ", w.shape)
-        w = repeat_interleave(w, S, dim=2).view((H * S * S, T, T)).transpose(1, 2)
-        print("w shape: ", w.shape) 
-        
-        kv = kv.transpose(1, 2).transpose(2, 3).view((H * S, 1, T))
-        out = matmul(kv, w).view((H * S * S, T)).transpose(0, 1).view((T, H, S, S))
-        out = matmul(r.transpose(0, 1).view(T, H, 1, S), out).view((T, H, S))
-        s = ws * s + matmul(k * wk, v)
-        
-        # # TODO(Rinne): this loop will impact on the performance, needs to be replaced by cuda kernel.
-        # out = (r + constant_one).view((T, H, S))
-        # for t in range(T):
-        #     rt = r[:,t:t+1,:]
-        #     kt = k[:,:,t:t+1]
-        #     vt = v[:,t:t+1,:]
-        #     at = matmul(kt, vt)
-        #     out[t] = matmul(rt, (cast(self.t_first.value, self.dtype) * at + s)).view((H, S))
-        #     s = at + self.t_decay.value * s
+        out = rwkv_v52_rnn_kernel(self.dim_att, s.transpose(-1, -2), r, k, v, self.t_decay.value, self.t_first.value)
+        s = s.transpose(-1, -2)
             
-        out = out.view((T, H * S))
+        out = out.view(concat([B * T, H * S]))
         out = group_norm(out, num_groups=H, weight=self.lx_w.value, bias=self.lx_b.value)
+        out = out.view(concat([B, T, H * S]))
+        print('out shape: ', out.shape)
+        print('g shape: ', g.shape)
         out = cast(out, x.dtype) * g
+        print('out shape: ', out.shape)
         out = self.oxw(out)
         
-        return x + out, select(xx, 1, -1).view((-1, xx.size(2))), s
+        return x + out, slice(xx, constant(int32_array([-1, 0])), concat([shape(xx, 0), shape(xx, 1)])), s
         
 
 class RwkvFeedForwardLayer(Module):
@@ -170,7 +193,7 @@ class RwkvFeedForwardLayer(Module):
         rx = xx * self.r_mix.value + sx * (constant_one - self.r_mix.value)
         
         r = sigmoid(self.rxw(rx))
-        vx = squared_relu(self.kxw(kx))
+        vx = squared_relu(self.kxw(kx), dtype=kx.dtype)
         out = r * self.vxw(vx)
         
         print("xx: ", xx.shape)
@@ -269,7 +292,7 @@ class RwkvModel(Module):
         
         layer_modules = []
         index = 0
-        for i in self.get_transformer_layers(self.mapping, num_layers):
+        for i in range(num_layers):
             layer_modules.append(RwkvDecoderLayer(layer_id=i, 
                                                     dim_att=dim_att, 
                                                     dim_ffn=dim_ffn, 
@@ -328,6 +351,8 @@ class RwkvModel(Module):
             hidden_states, input_states[i], rnn_states[i], output_states[i] = \
                 layer(hidden_states, input_states[i], rnn_states[i], output_states[i])
             print("::::::::::::::::::::::::: hidden states: ", hidden_states.shape)
+            print("::::::::::::::::::::::::: input states: ", input_states[i].shape)
+            print("::::::::::::::::::::::::: rnn states: ", rnn_states[i].shape)
         
         # TODO(Rinne): deal with strategy
         # hidden_states = select(hidden_states, 1, -1)
@@ -360,7 +385,7 @@ class RwkvModel(Module):
             ))
             rnn_states.append(Tensor(
                 name=f'rnn_state{i}', 
-                dtype=self.dtype, 
+                dtype=str_dtype_to_trt('float32'), 
                 shape=(self.num_head, self.dim_att // self.num_head, self.dim_att // self.num_head)
             ))
             output_states.append(Tensor(
@@ -377,25 +402,31 @@ class RwkvModel(Module):
     def _prepare_states(self, 
                         max_batch_size,
                         max_beam_width,
+                        max_input_len, 
+                        max_num_tokens, 
                         remove_input_padding=False,
                         paged_kv_cache=False,
                         use_gpt_attention_plugin=False, 
-                        use_gemm_plugin=False):
-        enable_two_optimization_profiles = False
-        if use_gpt_attention_plugin == False or use_gemm_plugin == False:
-            use_in_flight_batching = use_gpt_attention_plugin and remove_input_padding and paged_kv_cache
-            enable_two_optimization_profiles = not use_in_flight_batching
+                        use_gemm_plugin=False): 
+        default_range = GenerationMixin.default_range
+        bb_range_gen = default_range(max_batch_size * max_beam_width)
+        bw_range_cxt = [1, max(1, max_input_len - 2), max_input_len]
+        bb_range = [bb_range_gen]
+        bw_range = [bw_range_cxt]
+        inlen_range = [[1, 1, max_input_len]]
         
-        bb_range_cxt = [1, (max_batch_size + 1) // 2, max_batch_size]
-        bb_range_gen = [
-            1, (max_batch_size * max_beam_width + 1) // 2,
-            max_batch_size * max_beam_width
-        ]
-        
-        if enable_two_optimization_profiles:
-            bb_range = [bb_range_cxt, bb_range_gen]
+        if max_num_tokens is None:
+            num_tokens_range_ctx = default_range(max_input_len * max_batch_size)
         else:
-            bb_range = [bb_range_gen]
+            num_tokens_range_ctx = default_range(max_num_tokens)
+        if max_num_tokens is None:
+            num_tokens_range = [[
+                1, max_batch_size * max_beam_width,
+                max(max_input_len * max_batch_size,
+                    max_beam_width * max_batch_size)
+            ]]
+        else:
+            num_tokens_range = [num_tokens_range_ctx]
         
         input_states = []
         rnn_states = []
@@ -404,36 +435,33 @@ class RwkvModel(Module):
             input_states.append(Tensor(
                 name=f'input_state{i}', 
                 dtype=self.dtype, 
-                shape=[-1, self.hidden_size], 
+                shape=[-1, -1, self.hidden_size], 
                 dim_range=OrderedDict([
-                    ('batch_size', bb_range),
-                    ('embedding_length', [self.hidden_size, self.hidden_size]
-                        if enable_two_optimization_profiles else [self.hidden_size])
+                    ('batch_size_fake', bb_range),
+                    ('sequence_length', inlen_range), 
+                    ('embedding_length',[self.hidden_size])
                 ])
             ))
             head_length = self.dim_att // self.num_head
             rnn_states.append(Tensor(
                 name=f'rnn_state{i}', 
-                dtype=self.dtype, 
+                dtype=str_dtype_to_trt('float32'), 
                 shape=(-1, self.num_head, head_length, head_length), 
                 dim_range=OrderedDict([
-                    ('batch_size', bb_range),
-                    ('head_count', [self.num_head, self.num_head]
-                        if enable_two_optimization_profiles else [self.num_head]), 
-                    ('head_length0', [head_length, head_length]
-                        if enable_two_optimization_profiles else [head_length]), 
-                    ('head_length1', [head_length, head_length]
-                        if enable_two_optimization_profiles else [head_length])
+                    ('batch_size_fake', bb_range),
+                    ('head_count',[self.num_head]), 
+                    ('head_length0', [head_length]), 
+                    ('head_length1', [head_length])
                 ])
             ))
             output_states.append(Tensor(
                 name=f'output_state{i}', 
                 dtype=self.dtype, 
-                shape=[-1, self.hidden_size], 
+                shape=[-1, -1, self.hidden_size], 
                 dim_range=OrderedDict([
-                    ('batch_size', bb_range),
-                    ('embedding_length', [self.hidden_size, self.hidden_size]
-                        if enable_two_optimization_profiles else [self.hidden_size])
+                    ('batch_size_fake', bb_range),
+                    ('sequence_length', inlen_range), 
+                    ('embedding_length', [self.hidden_size])
                 ])
             ))
         return {
@@ -548,7 +576,6 @@ class RwkvForCausalLM(RwkvModel, GenerationMixin):
 
             @return: a list contains values which can be fed into the self.forward()
         '''
-        
         head_size = self.hidden_size // self.num_head
         remove_input_padding = default_net().plugin_config.remove_input_padding
         use_gpt_attention_plugin = default_net(
@@ -585,6 +612,8 @@ class RwkvForCausalLM(RwkvModel, GenerationMixin):
         model_states = self._prepare_states(
             max_batch_size, 
             max_beam_width, 
+            max_input_len, 
+            max_num_tokens, 
             remove_input_padding, 
             paged_kv_cache, 
             use_gpt_attention_plugin, 
@@ -622,3 +651,199 @@ class RwkvForCausalLM(RwkvModel, GenerationMixin):
             # model_inputs['tasks'],
             # model_inputs['prompt_vocab_size'],
         )
+        
+    def prepare_basic_inputs(self,
+                             max_batch_size,
+                             max_beam_width,
+                             max_input_len,
+                             max_new_tokens,
+                             num_kv_heads,
+                             head_size,
+                             num_layers,
+                             kv_dtype,
+                             remove_input_padding=False,
+                             use_gpt_attention_plugin=False,
+                             use_gemm_plugin=False,
+                             use_custom_all_reduce=False,
+                             paged_kv_cache=False,
+                             tokens_per_block=64,
+                             gather_all_token_logits=False,
+                             dtype=None,
+                             num_heads=None,
+                             mapping=Mapping(),
+                             max_num_tokens=None,
+                             prompt_embedding_table_size: int = 0,
+                             position_encoding_2d=False,
+                             use_lora_plugin: bool = False,
+                             lora_target_modules = None,
+                             max_draft_len=0):
+
+        default_range = GenerationMixin.default_range
+        bb_range_cxt = default_range(max_batch_size)
+        bb_range_gen = default_range(max_batch_size * max_beam_width)
+        bbd_range_ctx = [
+            bb_range_cxt[i] * ((max_draft_len + 1) if i != 0 else 1)
+            for i in range(len(bb_range_cxt))
+        ]
+        bbd_range_gen = [
+            bb_range_gen[i] * ((max_draft_len + 1) if i != 0 else 1)
+            for i in range(len(bb_range_gen))
+        ]
+        inlen_range_cxt = default_range(max_input_len)
+        inlen_range_gen = [1, 1, 1]
+
+        if max_num_tokens is None:
+            num_tokens_range_ctx = default_range(max_input_len * max_batch_size)
+            num_tokens_range_gen = default_range(max_batch_size *
+                                                 max_beam_width)
+        else:
+            num_tokens_range_ctx = default_range(max_num_tokens)
+            num_tokens_range_gen = default_range(max_num_tokens)
+
+        enable_two_optimization_profiles = False
+        if enable_two_optimization_profiles:
+            bb_range = [bb_range_cxt, bb_range_gen]
+            bbd_range = [bbd_range_ctx, bbd_range_gen]
+            inlen_range = [inlen_range_cxt, inlen_range_gen]
+            num_tokens_range = [num_tokens_range_ctx, num_tokens_range_gen]
+        else:
+            bb_range = [bb_range_gen]
+            bbd_range = [bbd_range_gen]
+            inlen_range = [[1, 1, max_input_len]]
+            if max_num_tokens is None:
+                num_tokens_range = [[
+                    1, max_batch_size * max_beam_width,
+                    max(max_input_len * max_batch_size,
+                        max_beam_width * max_batch_size)
+                ]]
+            else:
+                num_tokens_range = [num_tokens_range_ctx]
+
+        input_ids = None
+        hidden_states = None
+        if remove_input_padding:
+            if mapping.is_first_pp_rank():
+                input_ids = Tensor(
+                    name='input_ids',
+                    dtype=trt.int32,
+                    shape=[1, -1],
+                    dim_range=OrderedDict([
+                        ('batch_size_fake',
+                         [1, 1] if enable_two_optimization_profiles else [1]),
+                        ('num_tokens', num_tokens_range),
+                    ]))
+            else:
+                assert dtype is not None
+                assert num_heads is not None
+                hidden_states = Tensor(
+                    name='hidden_states_input',
+                    dtype=dtype,
+                    shape=[1, -1, head_size * num_heads],
+                    dim_range=OrderedDict([
+                        ('batch_size_fake',
+                         [1, 1] if enable_two_optimization_profiles else [1]),
+                        ('num_tokens', num_tokens_range),
+                        ('hidden_size',
+                         [head_size * num_heads, head_size *
+                          num_heads] if enable_two_optimization_profiles else
+                         [head_size * num_heads]),
+                    ]))
+
+        else:
+            if mapping.is_first_pp_rank():
+                input_ids = Tensor(name='input_ids',
+                                   dtype=trt.int32,
+                                   shape=[-1, -1],
+                                   dim_range=OrderedDict([
+                                       ('batch_size_beam_width', bb_range),
+                                       ('input_len', inlen_range),
+                                   ]))
+            else:
+                assert dtype is not None
+                assert num_heads is not None
+                hidden_states = Tensor(
+                    name='hidden_states_input',
+                    dtype=dtype,
+                    shape=[-1, -1, head_size * num_heads],
+                    dim_range=OrderedDict([
+                        ('batch_size_beam_width', bb_range),
+                        ('input_len', inlen_range),
+                        ('hidden_size',
+                         [head_size * num_heads, head_size *
+                          num_heads] if enable_two_optimization_profiles else
+                         [head_size * num_heads]),
+                    ]))
+
+        all_reduce_workspace = None
+        if use_custom_all_reduce and mapping.tp_size > 1:
+            # 3 (= buffer + signals_in + signals_out)
+            workspace_size = 3 * mapping.tp_size
+            all_reduce_workspace = Tensor(
+                name='all_reduce_workspace',
+                dtype=trt.int64,
+                shape=[workspace_size],
+                dim_range=OrderedDict([
+                    ('all_reduce_size', [workspace_size, workspace_size]
+                     if enable_two_optimization_profiles else [workspace_size])
+                ]))
+
+        if prompt_embedding_table_size > 0:
+            assert num_heads is not None
+            
+        lora_weights_pointers = None
+        lora_ranks = None
+        if use_lora_plugin:
+            lora_weights_pointers = []
+            lora_ranks = []
+            layers_range = mapping.pp_layers(num_layers)
+            for i in layers_range:
+                lora_weight_pointer_dict = {}
+                lora_rank_dict = {}
+                for lora_module in lora_target_modules:
+
+                    lora_weight_pointer = Tensor(
+                        name=f'{lora_module}_lora_weights_pointers_{i}',
+                        dtype=trt.int64,
+                        shape=[-1, 2],
+                        dim_range=OrderedDict([
+                            ('batch_size_beam_width', bb_range),
+                            ('in_out', [2, 2]
+                             if enable_two_optimization_profiles else [2]),
+                        ]))
+                    lora_weight_pointer_dict.update({
+                        f"{lora_module}_lora_weights_pointers":
+                        lora_weight_pointer
+                    })
+
+                    lora_rank = Tensor(
+                        name=f'{lora_module}_lora_ranks_{i}',
+                        dtype=trt.int32,
+                        shape=[-1],
+                        dim_range=OrderedDict([('batch_size_beam_width',
+                                                bb_range)]),
+                    )
+                    lora_rank_dict.update(
+                        {f"{lora_module}_lora_ranks": lora_rank})
+
+                lora_weights_pointers.append(lora_weight_pointer_dict)
+                lora_ranks.append(lora_rank_dict)
+
+        last_token_ids = None
+        if mapping.is_last_pp_rank() and not gather_all_token_logits:
+            last_token_ids = Tensor(
+                name='last_token_ids',
+                dtype=trt.int32,
+                shape=[-1],
+                dim_range=OrderedDict([
+                    ('batch_size_last_token_ids', bbd_range),
+                ]),
+            )
+
+        basic_inputs = {
+            'input_ids': input_ids,
+            'hidden_states_input': hidden_states,
+            'last_token_ids': last_token_ids,
+            'all_reduce_workspace': all_reduce_workspace,
+        }
+
+        return basic_inputs

@@ -335,8 +335,8 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     const float* kv_scale_quant_orig = nullptr;
     if (useKVCache() && mKVCacheQuantMode.hasKvCacheQuant())
     {
-        assert(inputDesc[getIdx(IdxEntry::KV_CACHE_QUANTIZATION_SCALE)].type == DataType::kFLOAT);
-        assert(inputDesc[getIdx(IdxEntry::KV_CACHE_DEQUANTIZATION_SCALE)].type == DataType::kFLOAT);
+        assert(inputDesc[getIdx(IdxEntry::KV_CACHE_QUANTIZATION_SCALE)].type == nvinfer1::DataType::kFLOAT);
+        assert(inputDesc[getIdx(IdxEntry::KV_CACHE_DEQUANTIZATION_SCALE)].type == nvinfer1::DataType::kFLOAT);
         kv_scale_orig_quant = reinterpret_cast<const float*>(inputs[getIdx(IdxEntry::KV_CACHE_QUANTIZATION_SCALE)]);
         kv_scale_quant_orig = reinterpret_cast<const float*>(inputs[getIdx(IdxEntry::KV_CACHE_DEQUANTIZATION_SCALE)]);
     }

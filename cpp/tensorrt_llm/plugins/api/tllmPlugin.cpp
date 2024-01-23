@@ -16,6 +16,7 @@
  */
 #include "tllmPlugin.h"
 
+#include "rwkvRnnPlugin.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
@@ -144,6 +145,7 @@ extern "C"
         static tensorrt_llm::plugins::AllgatherPluginCreator allgatherPluginCreator;
 #endif // ENABLE_MULTI_DEVICE
         static tensorrt_llm::plugins::LayernormPluginCreator layernormPluginCreator;
+        static tensorrt_llm::plugins::RwkvRnnPluginCreator rwkvRnnPluginCreator;
         static tensorrt_llm::plugins::RmsnormPluginCreator rmsnormPluginCreator;
         static tensorrt_llm::plugins::SmoothQuantGemmPluginCreator smoothQuantGemmPluginCreator;
         static tensorrt_llm::plugins::LayernormQuantizationPluginCreator layernormQuantizationPluginCreator;
@@ -169,6 +171,7 @@ extern "C"
                   creatorPtr(allgatherPluginCreator),
 #endif // ENABLE_MULTI_DEVICE
                   creatorPtr(layernormPluginCreator),
+                  creatorPtr(rwkvRnnPluginCreator), 
                   creatorPtr(rmsnormPluginCreator),
                   creatorPtr(smoothQuantGemmPluginCreator),
                   creatorPtr(layernormQuantizationPluginCreator),
