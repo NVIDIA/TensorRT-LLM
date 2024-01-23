@@ -122,8 +122,9 @@ class TestFalcon(unittest.TestCase):
         with net_guard(network):
             # Initialize model
             network.set_named_parameters(trtllm_model.named_parameters())
-            inputs = trtllm_model.prepare_inputs(batch_size,
-                                                 input_len,
+            inputs = trtllm_model.prepare_inputs(max_batch_size=batch_size,
+                                                 max_input_len=input_len,
+                                                 max_seq_len=input_len +
                                                  output_len,
                                                  use_cache=True,
                                                  max_beam_width=beam_width)

@@ -49,7 +49,7 @@ public:
         , mMaxBatchSize(0)
         , mMaxBeamWidth(0)
         , mMaxInputLen(0)
-        , mMaxOutputLen(0)
+        , mMaxSequenceLen(0)
         , mMaxNumTokens(std::nullopt)
         , mComputeContextLogits(false)
         , mComputeGenerationLogits(false)
@@ -196,14 +196,14 @@ public:
         mMaxInputLen = maxInputLen;
     }
 
-    [[nodiscard]] SizeType constexpr getMaxOutputLen() const noexcept
+    [[nodiscard]] SizeType constexpr getMaxSequenceLen() const noexcept
     {
-        return mMaxOutputLen;
+        return mMaxSequenceLen;
     }
 
-    void constexpr setMaxOutputLen(SizeType maxOutputLen) noexcept
+    void constexpr setMaxSequenceLen(SizeType maxSequenceLen) noexcept
     {
-        mMaxOutputLen = maxOutputLen;
+        mMaxSequenceLen = maxSequenceLen;
     }
 
     [[nodiscard]] std::optional<SizeType> constexpr getMaxNumTokens() const noexcept
@@ -351,7 +351,7 @@ private:
     SizeType mMaxBatchSize;
     SizeType mMaxBeamWidth;
     SizeType mMaxInputLen;
-    SizeType mMaxOutputLen;
+    SizeType mMaxSequenceLen;
     std::optional<SizeType> mMaxNumTokens;
 
     bool mComputeContextLogits;

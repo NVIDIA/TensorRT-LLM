@@ -30,7 +30,6 @@ from ...layers import (MOE, Attention, AttentionMaskType, AttentionParams,
 from ...mapping import Mapping
 from ...models.quantized.quant import quantize_model
 from ...module import Module, ModuleList
-from ...plugin import init_all_reduce_helper
 from ...quantization import QuantMode
 from ...runtime.lora_manager import LoraConfig
 from ...top_model_mixin import TopModelMixin
@@ -102,7 +101,6 @@ class LLaMADecoderLayer(Module):
             tp_size=tp_size,
             use_auto_parallel=use_auto_parallel,
             quant_mode=quant_mode,
-            instance_id=2 * layer_id,
             enable_pos_shift=enable_pos_shift,
             dense_context_fmha=dense_context_fmha,
             max_lora_rank=max_lora_rank,
@@ -128,7 +126,6 @@ class LLaMADecoderLayer(Module):
                           tp_group=tp_group,
                           tp_size=tp_size,
                           quant_mode=quant_mode,
-                          instance_id=2 * layer_id + 1,
                           max_lora_rank=max_lora_rank,
                           **mlp_kwargs)
         self.post_layernorm = RmsNorm(normalized_shape=hidden_size,
@@ -213,8 +210,6 @@ class LLaMAModel(Module):
                  dense_context_fmha=False,
                  max_lora_rank=None):
         super().__init__()
-        init_all_reduce_helper()
-
         self.mapping = mapping
         self.use_prompt_tuning = use_prompt_tuning
 
@@ -506,7 +501,7 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopModelMixin):
             self,
             max_batch_size,
             max_input_len,
-            max_new_tokens,
+            max_seq_len,
             use_cache,
             max_beam_width,
             max_num_tokens: int = None,
@@ -535,14 +530,14 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopModelMixin):
         use_lora_plugin = default_net().plugin_config.lora_plugin
 
         model_inputs = self.prepare_basic_inputs(
-            max_batch_size,
-            max_beam_width,
-            max_input_len,
-            max_new_tokens,
-            self.num_kv_heads,
-            head_size,
-            self.num_layers,
-            self.kv_dtype,
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_input_len=max_input_len,
+            max_seq_len=max_seq_len,
+            num_kv_heads=self.num_kv_heads,
+            head_size=head_size,
+            num_layers=self.num_layers,
+            kv_dtype=self.kv_dtype,
             remove_input_padding=remove_input_padding,
             use_gpt_attention_plugin=use_gpt_attention_plugin,
             use_gemm_plugin=use_gemm_plugin,

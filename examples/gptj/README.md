@@ -126,83 +126,6 @@ python build.py --model_dir gptj_model \
                 --strongly_typed
 ```
 
-#### Fused MultiHead Attention (FMHA)
-
-You can enable the FMHA kernels for GPT by adding `--enable_context_fmha` to the invocation of `build.py`. Note that it is disabled by default because of possible accuracy issues due to the use of Flash Attention.
-
-If you find that the default fp16 accumulation (`--enable_context_fmha`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--enable_context_fmha_fp32_acc`. However, it is expected to see performance drop.
-
-Note `--enable_context_fmha` / `--enable_context_fmha_fp32_acc` has to be used together with `--use_gpt_attention_plugin float16`.
-
-#### INT8 KV cache
-INT8 KV cache could be enabled to reduce memory footprint. It will bring more performance gains when batch size gets larger.
-
-You can get the INT8 scale of KV cache through `hf_gptj_convert.py`:
-```bash
-# Enable INT8 calibration, and save scales
-python hf_gptj_convert.py -i gptj_model -o gptj_int8_model --calibrate-kv-cache -t float16
-```
-Now the FT-format checkpoint with INT8 KV cache scales is saved to `gptj_int8_model/1-gpu`.
-You can pass this `gptj_int8_model/1-gpu` directory to `build.py` through the argument called `--ft_model_dir`.
-
-INT8 KV cache could be combined with either per-channel INT8/INT4 weight-only quantization or per-group INT4 quantization (which is AWQ, actually).
-
-**INT8 KV cache + per-channel weight-only quantization**
-
-For example, you can enable INT8 KV cache together with per-channel INT8/INT4 weight-only quantization like the following command.
-
-**NOTE**: The whole checkpoint together with INT8 KV scales are passed to `--ft_model_dir`.
-```bash
-# Enable INT8 KV cache together with per-channel INT8 weight-only quantization
-python3 build.py --dtype=float16 \
-                 --log_level=verbose \
-                 --enable_context_fmha \
-                 --use_gpt_attention_plugin float16 \
-                 --use_gemm_plugin float16 \
-                 --max_batch_size=32 \
-                 --max_input_len=1919 \
-                 --max_output_len=128 \
-                 --remove_input_padding \
-                 --output_dir=gptj_engine_wo_int8_kv_cache \
-                 --use_weight_only \
-                 --weight_only_precision=int8 \
-                 --int8_kv_cache \
-                 --ft_model_dir=gptj_ft_model/1-gpu/
-```
-
-**INT8 KV cache + AWQ**
-
-In addition, you can enable INT8 KV cache together with AWQ (per-group INT4 weight-only quantization)like the following command.
-
-**NOTE**: AWQ checkpoint is passed through `--model_dir`, and the INT8 scales of KV cache is through `--ft_model_dir`.
-```bash
-# Enable INT8 KV cache together with AWQ
-python3 build.py --dtype=float16 \
-                 --log_level=verbose \
-                 --enable_context_fmha \
-                 --use_gpt_attention_plugin float16 \
-                 --use_gemm_plugin float16 \
-                 --max_batch_size=32 \
-                 --max_input_len=1919 \
-                 --max_output_len=128 \
-                 --remove_input_padding \
-                 --output_dir=gptj_engine_awq_int8_kv_cache/ \
-                 --use_weight_only \
-                 --per_group \
-                 --weight_only_precision=int4 \
-                 --model_dir=awq_int4_weight_only_quantized_models \
-                 --int8_kv_cache \
-                 --ft_model_dir=gptj_ft_model/1-gpu/
-```
-
-#### FP8 KV cache
-
-One can enable FP8 for KV cache to reduce memory footprint used by KV cache and improve the accuracy over INT8 KV cache. There are 3 options need to be added to the invocation of `build.py` for that:
-
-- `--enable_fp8` enables FP8 GEMMs in the network.
-- `--fp8_kv_cache` to enable FP8 accuracy for KV cache.
-- `--quantized_fp8_model_path` to provide path to the quantized model calibrated for FP8. For more details see [quantization docs](../quantization/README.md).
-
 #### AWQ INT4 weight only quantization
 
 One can enable AWQ INT4 weight only quantization with these 3 options when building engine with `build.py`:
@@ -242,6 +165,87 @@ python3 build.py --dtype float16 \
                  --quant_ckpt_path awq/gptj_tp1_rank0.npz \
                  --quantize_lm_head
 ```
+
+#### Fused MultiHead Attention (FMHA)
+
+You can enable the FMHA kernels for GPT by adding `--enable_context_fmha` to the invocation of `build.py`. Note that it is disabled by default because of possible accuracy issues due to the use of Flash Attention.
+
+If you find that the default fp16 accumulation (`--enable_context_fmha`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--enable_context_fmha_fp32_acc`. However, it is expected to see performance drop.
+
+Note `--enable_context_fmha` / `--enable_context_fmha_fp32_acc` has to be used together with `--use_gpt_attention_plugin float16`.
+
+#### INT8 KV cache
+INT8 KV cache could be enabled to reduce memory footprint. It will bring more performance gains when batch size gets larger.
+
+You can get the INT8 scale of KV cache through `hf_gptj_convert.py`:
+```bash
+# Enable INT8 calibration, and save scales
+python hf_gptj_convert.py -i gptj_model -o gptj_int8_kv --calibrate-kv-cache -t float16
+```
+Now the FT-format checkpoint with INT8 KV cache scales is saved to `gptj_int8_kv/1-gpu`.
+You can pass this `gptj_int8_kv/1-gpu` directory to `build.py` through the argument called `--ft_model_dir`.
+
+INT8 KV cache could be combined with either per-channel INT8/INT4 weight-only quantization or per-group INT4 quantization (which is AWQ, actually).
+
+**INT8 KV cache + per-channel weight-only quantization**
+
+For example, you can enable INT8 KV cache together with per-channel INT8/INT4 weight-only quantization like the following command.
+
+**NOTE**: The whole checkpoint together with INT8 KV scales are passed to `--ft_model_dir`.
+```bash
+# Enable INT8 KV cache together with per-channel INT8 weight-only quantization
+python3 build.py --dtype=float16 \
+                 --log_level=verbose \
+                 --enable_context_fmha \
+                 --use_gpt_attention_plugin float16 \
+                 --use_gemm_plugin float16 \
+                 --max_batch_size=32 \
+                 --max_input_len=1919 \
+                 --max_output_len=128 \
+                 --remove_input_padding \
+                 --output_dir=gptj_engine_wo_int8_kv_cache \
+                 --use_weight_only \
+                 --weight_only_precision=int8 \
+                 --int8_kv_cache \
+                 --ft_model_dir=gptj_int8_kv/1-gpu/
+```
+
+**INT8 KV cache + AWQ**
+
+In addition, you can enable INT8 KV cache together with AWQ (per-group INT4 weight-only quantization)like the following command.
+
+**NOTE**: AWQ checkpoint is passed through `--quant_ckpt_path`, and the INT8 scales of KV cache is through `--ft_model_dir`. Both files are generated with the same command as sections above.
+
+```bash
+# Enable INT8 KV cache together with AWQ
+python3 build.py --dtype=float16 \
+                 --log_level=verbose \
+                 --enable_context_fmha \
+                 --use_gpt_attention_plugin float16 \
+                 --use_gemm_plugin float16 \
+                 --max_batch_size=32 \
+                 --max_input_len=1919 \
+                 --max_output_len=128 \
+                 --remove_input_padding \
+                 --output_dir=gptj_engine_awq_int8_kv_cache/ \
+                 --use_weight_only \
+                 --per_group \
+                 --weight_only_precision int4_awq \
+                 --quant_ckpt_path awq/gptj_tp1_rank0.npz \
+                 --quantize_lm_head \
+                 --int8_kv_cache \
+                 --ft_model_dir gptj_int8_kv/1-gpu/ \
+                 --model_dir gptj_model
+```
+
+#### FP8 KV cache
+
+One can enable FP8 for KV cache to reduce memory footprint used by KV cache and improve the accuracy over INT8 KV cache. There are 3 options need to be added to the invocation of `build.py` for that:
+
+- `--enable_fp8` enables FP8 GEMMs in the network.
+- `--fp8_kv_cache` to enable FP8 accuracy for KV cache.
+- `--quantized_fp8_model_path` to provide path to the quantized model calibrated for FP8. For more details see [quantization docs](../quantization/README.md).
+
 
 ### 3. Run
 

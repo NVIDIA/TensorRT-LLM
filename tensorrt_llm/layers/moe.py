@@ -191,7 +191,6 @@ class MixtureOfExperts(Module):
                  tp_group: List[int] = None,
                  tp_size: int = 1,
                  tp_rank: int = 0,
-                 instance_id: int = 0,
                  quant_mode=QuantMode(0),
                  max_lora_rank=None):
         super().__init__()
@@ -208,7 +207,6 @@ class MixtureOfExperts(Module):
         self.tp_group = tp_group
         self.tp_size = tp_size
         self.tp_rank = tp_rank
-        self.instance_id = instance_id
         self.quant_mode = quant_mode
 
         self.experts_per_node = self.num_experts

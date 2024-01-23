@@ -175,7 +175,7 @@ TEST_P(ParamTest, Test)
     testDecoder(dtype, samplingConfig);
 }
 
-INSTANTIATE_TEST_SUITE_P(GptDecoderTest, ParamTest,
+INSTANTIATE_TEST_SUITE_P(DecoderTest, ParamTest,
     testing::Combine(testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF), testing::Values(1, 3)),
     [](const testing::TestParamInfo<ParamTest::ParamType>& info)
     {

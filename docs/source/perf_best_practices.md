@@ -62,7 +62,7 @@ The maximum number of tokens equals will not take effects when input padding is
 not removed. When input padding is removed (see [Remove Input
 Padding](#remove-input-padding)), the tokens from different sequences are
 packed together and the maximum number of the tokens can be set to a different
-(lower) value, which by default to be `min(max_input_len * max_batch_size, 4096)`.
+(lower) value, which by default to be `max_input_len * max_batch_size`.
 Note that it has to be higher than `max_input_len`.
 
 There are two aspects that must be considered. Firstly, some input sequences

@@ -26,8 +26,7 @@ import tensorrt_llm as tllm
 from tensorrt_llm import Mapping, Tensor
 from tensorrt_llm._ipc_utils import peer_access
 from tensorrt_llm.functional import AllReduceStrategy, allreduce
-from tensorrt_llm.plugin.plugin import (current_all_reduce_helper,
-                                        init_all_reduce_helper)
+from tensorrt_llm.plugin.plugin import current_all_reduce_helper
 
 
 def allreduce_benchmark(dtype: str, test_range: str = "10,10000000,10"):
@@ -49,10 +48,7 @@ def allreduce_benchmark(dtype: str, test_range: str = "10,10000000,10"):
 
     size = min_size
     dtype_size = torch.finfo(torch_dtype).bits // 8
-    init_all_reduce_helper()
     while size < max_size:
-        _buffers, workspace = current_all_reduce_helper().allocate_workspace(
-            mapping, size * dtype_size)
         input = torch.ones(size, dtype=torch_dtype, device="cuda")
 
         for strategy in [
@@ -61,7 +57,9 @@ def allreduce_benchmark(dtype: str, test_range: str = "10,10000000,10"):
         ]:
             builder = tllm.Builder()
             net = builder.create_network()
-            net.plugin_config.set_nccl_plugin(dtype)
+            net.plugin_config.set_nccl_plugin(dtype, use_custom_all_reduce=True)
+            _buffers, workspace = current_all_reduce_helper(
+            ).allocate_workspace(mapping, size * dtype_size)
 
             with tllm.net_guard(net):
                 network = tllm.default_trtnet()

@@ -23,18 +23,18 @@ import pytest
 
 # isort: off
 import torch
-import tensorrt as trt
 # isort: on
 from parameterized import parameterized
 from transformers import GPTNeoXConfig, GPTNeoXForCausalLM
 
 import tensorrt_llm
 from tensorrt_llm import Builder
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from examples.gptneox.weight import load_from_hf_gpt_neox
+from examples.gptneox.convert_checkpoint import convert_hf_gptneox
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import getSMVersion
@@ -75,40 +75,54 @@ class TestGPTNeoX(unittest.TestCase):
         vocab_size = gpt_config.vocab_size
         hidden_act = gpt_config.hidden_act
         max_position_embeddings = gpt_config.max_position_embeddings
-        rotary_dim = int((hidden_size // num_heads) * gpt_config.rotary_pct)
 
         list(range(tensor_parallel))
 
+        dtype = 'float16' if fp16 else 'float32'
+        config = {
+            'architecture': 'GPTNeoXForCausalLM',
+            'dtype': dtype,
+            "num_hidden_layers": num_layers,
+            "num_attention_heads": num_heads,
+            "hidden_size": hidden_size,
+            "vocab_size": vocab_size,
+            "position_embedding_type": "learned_absolute",
+            "max_position_embeddings": max_position_embeddings,
+            "rotary_emb_base": 10000,
+            "rotary_pct": gpt_config.rotary_pct,
+            "hidden_act": hidden_act,
+            "quantization": {
+                "use_weight_only": False,
+                "weight_only_precision": "int8"
+            },
+            "mapping": {
+                "world_size": tensor_parallel,
+                "tp_size": tensor_parallel
+            },
+            "use_parallel_embedding": False,
+            "embedding_sharding_dim": 0,
+            "share_embedding_table": False
+        }
+        config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
+        weights = convert_hf_gptneox(hf_gpt,
+                                     mapping=Mapping(rank=rank,
+                                                     world_size=tensor_parallel,
+                                                     tp_size=tensor_parallel),
+                                     dtype=dtype)
+        tensorrt_llm_gptneox = tensorrt_llm.models.GPTNeoXForCausalLM(config)
+        tensorrt_llm_gptneox.load(weights)
+
         with net_guard(network):
-            kv_dtype = trt.float16 if fp16 else trt.float32
-            # Initialize model
-            tensorrt_llm_gpt = tensorrt_llm.models.GPTNeoXForCausalLM(
-                num_layers=num_layers,
-                num_heads=num_heads,
-                hidden_size=hidden_size,
-                vocab_size=vocab_size,
-                hidden_act=hidden_act,
-                max_position_embeddings=max_position_embeddings,
-                rotary_dim=rotary_dim,
-                dtype=kv_dtype,
-                mapping=tensorrt_llm.Mapping(world_size=tensor_parallel,
-                                             tp_size=tensor_parallel),
-                apply_query_key_layer_scaling=apply_query_key_layer_scaling)
-            inputs = tensorrt_llm_gpt.prepare_inputs(batch_size,
-                                                     input_len,
-                                                     output_len,
-                                                     use_cache=True,
-                                                     max_beam_width=beam_width)
-            load_from_hf_gpt_neox(tensorrt_llm_gpt,
-                                  hf_gpt,
-                                  fp16=fp16,
-                                  rank=rank,
-                                  tp_size=tensor_parallel)
-
+            network.set_named_parameters(
+                tensorrt_llm_gptneox.named_parameters())
+            inputs = tensorrt_llm_gptneox.prepare_inputs(
+                max_batch_size=batch_size,
+                max_input_len=input_len,
+                max_seq_len=input_len + output_len,
+                use_cache=True,
+                max_beam_width=beam_width)
             # Prepare
-            network.set_named_parameters(tensorrt_llm_gpt.named_parameters())
-
-            tensorrt_llm_gpt(*inputs)
+            tensorrt_llm_gptneox(**inputs)
 
         return network
 
@@ -184,11 +198,7 @@ class TestGPTNeoX(unittest.TestCase):
 
         # Skip tests that are not supported in pre-ampere architecture
         if getSMVersion() < 80:
-            if context_fmha_flag == ContextFMHAType.enabled:
-                pytest.skip(
-                    "ContextFMHAType is not supported in pre-ampere architecture"
-                )
-            elif context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
+            if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
                 pytest.skip(
                     "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
                 )

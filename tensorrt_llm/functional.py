@@ -2190,9 +2190,11 @@ def constant_to_tensor_(input: Union[Tensor, int, float],
     if isinstance(input, int):
         return constant(int32_array([input]))
     elif isinstance(input, float):
-        assert dtype == trt.float32 or dtype == trt.float16
+        assert dtype == trt.float32 or dtype == trt.float16 or dtype == trt.bfloat16
         if dtype == trt.float32:
             return constant(fp32_array([input]))
+        elif dtype == trt.bfloat16:
+            return constant(bf16_array([input]))
         else:
             return constant(fp16_array([input]))
 
@@ -2775,8 +2777,6 @@ def conv2d(input: Tensor,
     ## TODO: Document that function!
     ##
 
-    assert not input.is_dynamic()
-
     ndim = input.ndim()
     if ndim == 3:
         input = expand_dims(input, 0)
@@ -3066,13 +3066,13 @@ def allreduce(tensor: Tensor,
 
     pfc = trt.PluginFieldCollection(pfc)
     ar_plug = allreduce_plg_creator.create_plugin("allreduce", pfc)
-    plug_inputs = [tensor.trt_tensor]
+    plug_inputs = [tensor.cast(p_dtype).trt_tensor]
     if strategy != AllReduceStrategy.RING:
         plug_inputs.append(workspace.trt_tensor)
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, ar_plug)
     _add_plugin_info(layer, allreduce_plg_creator, "allreduce", pfc)
-    return _create_tensor(layer.get_output(0), layer)
+    return _create_tensor(layer.get_output(0), layer).cast(tensor.dtype)
 
 
 def allgather(tensor: Tensor, group: List[int], gather_dim: int = 0) -> Tensor:
@@ -3128,12 +3128,12 @@ def allgather(tensor: Tensor, group: List[int], gather_dim: int = 0) -> Tensor:
 
     pfc = trt.PluginFieldCollection([group, pf_type])
     allgather = allgather_plg_creator.create_plugin("allgather", pfc)
-    plug_inputs = [tensor.trt_tensor]
+    plug_inputs = [tensor.cast(p_dtype).trt_tensor]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, allgather)
     _add_plugin_info(layer, allgather_plg_creator, "allgather", pfc)
 
-    x = _create_tensor(layer.get_output(0), layer)
+    x = _create_tensor(layer.get_output(0), layer).cast(tensor.dtype)
 
     # gather along a given dimension other than dim0
     if gather_dim != 0:
@@ -3199,11 +3199,11 @@ def send(tensor: Tensor, tgt: int) -> Tensor:
 
     pfc = trt.PluginFieldCollection([tgt, pf_type])
     send_plug = send_plg_creator.create_plugin("send", pfc)
-    plug_inputs = [tensor.trt_tensor]
+    plug_inputs = [tensor.cast(p_dtype).trt_tensor]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, send_plug)
     _add_plugin_info(layer, send_plg_creator, "send", pfc)
-    return _create_tensor(layer.get_output(0), layer)
+    return _create_tensor(layer.get_output(0), layer).cast(tensor.dtype)
 
 
 def recv(tensor: Tensor, src: int) -> Tensor:
@@ -3242,11 +3242,11 @@ def recv(tensor: Tensor, src: int) -> Tensor:
 
     pfc = trt.PluginFieldCollection([src, pf_type])
     recv_plug = recv_plg_creator.create_plugin("recv", pfc)
-    plug_inputs = [tensor.trt_tensor]
+    plug_inputs = [tensor.cast(p_dtype).trt_tensor]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, recv_plug)
     _add_plugin_info(layer, recv_plg_creator, "recv", pfc)
-    return _create_tensor(layer.get_output(0), layer)
+    return _create_tensor(layer.get_output(0), layer).cast(tensor.dtype)
 
 
 def bert_attention(tensor: Tensor,
@@ -4425,3 +4425,111 @@ def lora_plugin(
             _create_tensor(layer.get_output(i), layer)
             for i in range(num_lora_modules)
         ]
+
+
+def selective_scan(
+    input: Tensor,
+    state: Tensor,
+    delta: Tensor,
+    delta_bias: Tensor,
+    A: Tensor,
+    B: Tensor,
+    C: Tensor,
+    D: Tensor,
+    z: Tensor,
+    host_request_types: Tensor,
+    dim: int,
+    dstate: int,
+    is_variable_B: bool,
+    is_variable_C: bool,
+    delta_softplus: bool,
+):
+    '''
+    Parameters:
+        input : Tensor (On GPU)
+            The input tensor. Its shape is [batch_size, dim, seq_len]
+
+        state : Tensor (On GPU)
+            The ssm state tensor. Its shape is [batch_size, dim, dstate]
+
+        delta : Tensor (On GPU)
+            The delta tensor. Its shape is [batch_size, dim, seq_len]
+
+        delta_bias : Tensor (On GPU)
+            The delta bias tensor. Its shape is [dim]
+
+        A : Tensor (On GPU)
+            A matrix. Its shape is [dim, dstate]
+
+        B : Tensor (On GPU)
+            B matrix. Its shape is [batch_size, dstate, seq_len]
+
+        C : Tensor (On GPU)
+            C matrix. Its shape is [batch_size, dstate, seq_len]
+
+        D : Tensor (On GPU)
+            D matrix. Its shape is [dim]
+
+        z : Tensor (On GPU)
+            The z tensor. Its shape is [batch_size, dim, seq_len]
+
+        host_request_types : Tensor (On CPU)
+            The tensor on the host that indicates if a request is in context or
+            generation phase. Its shape is [batch_size]. See Inflight Batching
+            in docs/gpt_attention.md,
+
+        dim : int
+            The inner dimension of SSM block
+
+        dstate : int
+            The state dimension of SSM block
+
+        is_variable_B : bool
+            Is the matrix B a variable? Set to 'True' if B is a dynamic matrix
+            during inference, 'False' otherwise
+
+        is_variable_C : bool
+            Is the matrix C a variable? Set to 'True' if C is a dynamic matrix
+            during inference, 'False' otherwise
+
+        delta_softplus : bool
+            Do we apply softplus to the delta.
+    '''
+    assert host_request_types is not None
+    selective_scan_plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'SelectiveScan', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert selective_scan_plg_creator is not None
+
+    dim = trt.PluginField("dim", np.array(dim, dtype=np.int32),
+                          trt.PluginFieldType.INT32)
+    dstate = trt.PluginField("dstate", np.array(dstate, dtype=np.int32),
+                             trt.PluginFieldType.INT32)
+    is_variable_B = trt.PluginField(
+        "is_variable_B", np.array(np.int8(is_variable_B), dtype=np.int8),
+        trt.PluginFieldType.INT8)
+    is_variable_C = trt.PluginField(
+        "is_variable_C", np.array(np.int8(is_variable_C), dtype=np.int8),
+        trt.PluginFieldType.INT8)
+    delta_softplus = trt.PluginField(
+        "delta_softplus", np.array(np.int8(delta_softplus), dtype=np.int8),
+        trt.PluginFieldType.INT8)
+    p_dtype = default_net().plugin_config.selective_scan_plugin
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+
+    pfc = trt.PluginFieldCollection(
+        [dim, dstate, is_variable_B, is_variable_C, delta_softplus, pf_type])
+    selective_scan_plug = selective_scan_plg_creator.create_plugin(
+        "selectives_can", pfc)
+
+    plug_inputs = [
+        input, state, delta, delta_bias, A, B, C, D, z, host_request_types
+    ]
+    plug_inputs = [i.trt_tensor for i in plug_inputs]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs, selective_scan_plug)
+    _add_plugin_info(layer, selective_scan_plg_creator, "selectives_can", pfc)
+    output = _create_tensor(layer.get_output(0), layer)
+    present_state = _create_tensor(layer.get_output(1), layer)
+    return output, present_state

@@ -145,7 +145,7 @@ class Network(object):
         self._strongly_typed = trt.INetworkDefinition.get_flag(
             self._trt_network, trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
         self._unfilled_weights: Dict[str, Tuple[np.array, np.array]] = {}
-        self._autopp_config: Dict[str, Any] = None
+        self._auto_parallel_config: Dict[str, Any] = None
 
         return self
 
@@ -193,8 +193,8 @@ class Network(object):
         return self._strongly_typed
 
     @property
-    def autopp_config(self) -> Dict[str, Any]:
-        return self._autopp_config
+    def auto_parallel_config(self) -> Dict[str, Any]:
+        return self._auto_parallel_config
 
     def _add_input(self,
                    tensor,
@@ -279,7 +279,7 @@ class Network(object):
         input_tensors = self._inputs
         if len(input_tensors) == 0:
             return []
-        num_profiles = len(list(input_tensors.items())[0][1].profiles)
+        num_profiles = len(list(input_tensors.values())[0].profiles)
         profiles = []
         for i in range(num_profiles):
             logger.debug(f'Adding optimization profile {i+1}/{num_profiles}')
@@ -592,12 +592,12 @@ def net_guard(network):
 
 
 class _TrtLlmModuleCallStack(object):
-    call_stack = []
-    module_name_map = weakref.WeakKeyDictionary()
-    module_to_layer_range_map: Dict[str, range] = {}
 
     def __init__(self):
         super().__init__()
+        self.call_stack = []
+        self.module_name_map = weakref.WeakKeyDictionary()
+        self.module_to_layer_range_map: Dict[str, range] = {}
         self.mod_names_set = False
 
     def module_names_set(self):

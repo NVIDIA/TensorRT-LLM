@@ -75,7 +75,7 @@ public:
         , mLoraWeights(loraWeights)
         , mLoraConfig(loraConfig)
         , mReturnLogProbs(returnLogProbs)
-        , mContextChunkSize(mPromptLen)
+        , mContextChunkSize(std::nullopt)
         , mContextCurrentPosition(0)
         , mLogProbs(samplingConfig.beamWidth)
         , mCumLogProbs(samplingConfig.beamWidth)
@@ -248,7 +248,7 @@ public:
         }
         mState = REQUEST_STATE_CONTEXT_INIT;
         mContextCurrentPosition = 0;
-        mContextChunkSize = mPromptLen;
+        mContextChunkSize = std::nullopt;
         mSeqSlot = -1;
     }
 
@@ -389,54 +389,54 @@ public:
         mGenerationLogitsFragments.clear();
     }
 
-    SizeType getContextCurrentPosition() const
+    SizeType getContextCurrentPosition() const noexcept
     {
         return mContextCurrentPosition;
     }
 
+    SizeType getContextRemainingLength() const noexcept
+    {
+        return mPromptLen - getContextCurrentPosition();
+    }
+
     SizeType getContextChunkSize() const
     {
-        return mContextChunkSize;
+        TLLM_CHECK_WITH_INFO(mContextChunkSize, "The context has not been chunked yet.");
+        return mContextChunkSize.value();
     }
 
     void setContextChunkSize(SizeType size)
     {
-        assert(mContextCurrentPosition + size <= mPromptLen);
-        mContextChunkSize = size;
+        TLLM_CHECK_WITH_INFO(size >= 0, "The chunk size of context (%d) can't be negative.", size);
+        mContextChunkSize = std::min(size, getContextRemainingLength());
     }
 
     bool isFullContextRequest() const
     {
-        if (hasDraftTokens())
-        {
-            // Currently, chunked context can not be enabled with draft tokens.
-            return true;
-        }
-        if ((isFirstContextChunk() && mContextChunkSize == mPromptLen)
-            || (mContextCurrentPosition == mPromptLen && mContextChunkSize == 0))
-        {
-            return true;
-        }
-        return false;
+        return !mContextChunkSize;
     }
 
-    bool isLastContextChunk() const
+    bool isLastContextChunk() const noexcept
     {
-        assert(mContextCurrentPosition + mContextChunkSize <= mPromptLen);
-        return mContextCurrentPosition + mContextChunkSize == mPromptLen;
+        return isFullContextRequest() || getContextCurrentPosition() + getContextChunkSize() == mPromptLen;
     }
 
-    bool isFirstContextChunk() const
+    bool isFirstContextChunk() const noexcept
     {
-        return mContextCurrentPosition == 0;
+        return isFullContextRequest() || getContextCurrentPosition() == 0;
     }
 
     void moveToNextContextChunk()
     {
-        mContextCurrentPosition += mContextChunkSize;
-        if (mContextCurrentPosition + mContextChunkSize > mPromptLen)
+        if (mContextChunkSize)
         {
-            mContextChunkSize = mPromptLen - mContextCurrentPosition;
+            mContextCurrentPosition += getContextChunkSize();
+            setContextChunkSize(0);
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(mContextCurrentPosition == 0, "Full context out of bounds.");
+            mContextCurrentPosition = mPromptLen;
         }
     }
 
@@ -469,8 +469,9 @@ protected:
     bool mReturnLogProbs;
 
     // To enable chunked context, the FHMA paged kv-cache also needs to be enabled. Except for the last one,
-    // the size of the context chunk needs to be an integer multiple of the kv-cache block size.
-    SizeType mContextChunkSize;
+    // the size of the context chunk needs to be an integer multiple of the kv-cache block size. The meaning
+    // of null value is that the context is not chunked.
+    std::optional<SizeType> mContextChunkSize;
     SizeType mContextCurrentPosition;
 
     std::vector<VecLogProbs> mLogProbs; // [beamSize, seqLen]

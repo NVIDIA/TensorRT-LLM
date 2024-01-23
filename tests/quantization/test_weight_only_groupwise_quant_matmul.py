@@ -145,8 +145,8 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
 
         quant_algo = has_pre_quant * PRE_QUANT_SCALE + has_zero * ZERO + has_bias * BIAS
 
-        packer = torch.ops.fastertransformer.pack_int8_tensor_to_packed_int4
-        preprocessor = torch.ops.fastertransformer.preprocess_weights_for_mixed_gemm
+        packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
+        preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
         qweight_int8 = _utils.woq_groupwise_extract_int4(
             qweight_unprocessed, uint4_input).char()
         qweight_int4x2_interleaved = preprocessor(

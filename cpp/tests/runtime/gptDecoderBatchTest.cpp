@@ -546,7 +546,7 @@ TEST_P(ParamTest, Test)
     testDecoder(dtype, samplingConfigs, beamConfig.maxBeamWidth, computeLogProbs, true);
 }
 
-INSTANTIATE_TEST_SUITE_P(GptDecoderBwTest, ParamTest,
+INSTANTIATE_TEST_SUITE_P(DecoderBwTest, ParamTest,
     testing::Combine(testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF),
         testing::Values(BeamConfig{1, {1, 1, 1}}, BeamConfig{3, {3, 3, 3, 3}}, BeamConfig{4, {1, 1}},
             BeamConfig{4, {3, 3, 3}}, BeamConfig{4, {1, 2, 3, 4}}),
@@ -572,7 +572,7 @@ TEST_P(ParamWavefrontTest, Test)
     testDecoderWavefront(dtype, samplingConfigs, beamConfig.maxBeamWidth, computeLogProbs);
 }
 
-INSTANTIATE_TEST_SUITE_P(GptDecoderBwTest, ParamWavefrontTest,
+INSTANTIATE_TEST_SUITE_P(DecoderBwTest, ParamWavefrontTest,
     testing::Combine(testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF),
         testing::Values(BeamConfig{1, {1, 1, 1}}, BeamConfig{3, {3, 3, 3, 3}}, BeamConfig{4, {1, 1}},
             BeamConfig{4, {3, 3, 3}}, BeamConfig{4, {1, 2, 3, 4}}),
@@ -611,7 +611,7 @@ TEST_P(ParamDraftTest, Test)
         draftConfig.acceptedTokensPerStep, draftConfig.maxGeneratedTokensPerStep);
 }
 
-INSTANTIATE_TEST_SUITE_P(GptDecoderTest, ParamDraftTest,
+INSTANTIATE_TEST_SUITE_P(DecoderTest, ParamDraftTest,
     testing::Combine(testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF),
         testing::Values(BeamConfig{1, {1, 1, 1}}, BeamConfig{4, {1, 1, 1}}),
         testing::Values( //

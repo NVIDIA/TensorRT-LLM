@@ -4,7 +4,7 @@ This document shows how to build and run a Qwen model in TensorRT-LLM on both si
 
 ## Overview
 
-The TensorRT-LLM Qwen implementation can be found in [model.py](model.py). The TensorRT-LLM Qwen example code is located in [`examples/qwen`](./). There is one main file:
+The TensorRT-LLM Qwen implementation can be found in [model.py](../../tensorrt_llm/models/qwen/model.py). The TensorRT-LLM Qwen example code is located in [`examples/qwen`](./). There is one main file:
 
 * [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Qwen model.
 

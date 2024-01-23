@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 
-#include <memory>
 #include <pybind11/functional.h>
 #include <pybind11/operators.h>
 #include <pybind11/stl.h>
@@ -31,8 +30,8 @@
 #include "tensorrt_llm/pybind/utils/pathCaster.h"
 
 #include "tensorrt_llm/batch_manager/BatchManager.h"
-#include "tensorrt_llm/batch_manager/batchScheduler.h"
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
+#include "tensorrt_llm/batch_manager/schedulerPolicy.h"
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -162,7 +161,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property("max_batch_size", &tr::GptModelConfig::getMaxBatchSize, &tr::GptModelConfig::setMaxBatchSize)
         .def_property("max_beam_width", &tr::GptModelConfig::getMaxBeamWidth, &tr::GptModelConfig::setMaxBeamWidth)
         .def_property("max_input_len", &tr::GptModelConfig::getMaxInputLen, &tr::GptModelConfig::setMaxInputLen)
-        .def_property("max_output_len", &tr::GptModelConfig::getMaxOutputLen, &tr::GptModelConfig::setMaxOutputLen)
+        .def_property("max_seq_len", &tr::GptModelConfig::getMaxSequenceLen, &tr::GptModelConfig::getMaxSequenceLen)
         .def_property("max_num_tokens", &tr::GptModelConfig::getMaxNumTokens, &tr::GptModelConfig::setMaxNumTokens)
         .def_property("max_prompt_embedding_table_size", &tr::GptModelConfig::getMaxPromptEmbeddingTableSize,
             &tr::GptModelConfig::setMaxPromptEmbeddingTableSize)
@@ -312,11 +311,10 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .value("GUARANTEED_NO_EVICT", tbb::SchedulerPolicy::GUARANTEED_NO_EVICT);
 
     py::class_<tb::TrtGptModelOptionalParams>(m, "TrtGptModelOptionalParams")
-        .def(py::init<tbk::KvCacheConfig, std::optional<SizeType>, bool>(),
-            py::arg("kv_cache_config") = tbk::KvCacheConfig{}, py::arg("max_num_sequences") = py::none(),
+        .def(py::init<tbk::KvCacheConfig, bool>(),
+            py::arg_v("kv_cache_config", tbk::KvCacheConfig{}, "KvCacheConfig()"),
             py::arg("enable_trt_overlap") = false)
         .def_readwrite("kv_cache_config", &tb::TrtGptModelOptionalParams::kvCacheConfig)
-        .def_readwrite("max_num_sequences", &tb::TrtGptModelOptionalParams::maxNumSequences)
         .def_readwrite("enable_trt_overlap", &tb::TrtGptModelOptionalParams::enableTrtOverlap)
         .def_readwrite("device_ids", &tb::TrtGptModelOptionalParams::deviceIds)
         .def_readwrite("normalize_log_probs", &tb::TrtGptModelOptionalParams::normalizeLogProbs);

@@ -138,7 +138,11 @@ def parse_arguments():
 
 class TRTLLMEncDecModel:
 
-    def __init__(self, engine_name, engine_dir, debug_mode=False):
+    def __init__(self,
+                 engine_name,
+                 engine_dir,
+                 debug_mode=False,
+                 skip_encoder=False):
         # in multi-node setup, it's important to set_device at the very beginning so .to('cuda') refers to current device
         # accordingly, all input & output tensors should be moved to current device
         # otherwise, it's default to 'cuda:0'
@@ -146,6 +150,7 @@ class TRTLLMEncDecModel:
         device_id = self.runtime_rank % torch.cuda.device_count()
         torch.cuda.set_device(device_id)
         self.device = torch.cuda.current_device()
+        self.skip_encoder = skip_encoder
 
         engine_dir = Path(engine_dir)
 
@@ -175,20 +180,26 @@ class TRTLLMEncDecModel:
             return model_config, runtime_mapping, engine_buffer
 
         # Note: encoder and decoder doesn't necessarily have the same TP & PP config
-        self.encoder_model_config, self.encoder_runtime_mapping, encoder_engine_buffer = engine_setup(
-            component='encoder')
+
+        if not skip_encoder:
+            self.encoder_model_config, self.encoder_runtime_mapping, encoder_engine_buffer = engine_setup(
+                component='encoder')
+
+            # for Pipeline Parallelism in encoder
+            self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
+                self.encoder_runtime_mapping.tp_size,
+                self.encoder_runtime_mapping.pp_size,
+                self.encoder_runtime_mapping.rank)
+
+            # session setup
+            self.encoder_session = tensorrt_llm.runtime.Session.from_serialized_engine(
+                encoder_engine_buffer)
+        else:
+            self.encoder_model_config, self.encoder_runtime_mapping, encoder_engine_buffer = None, None, None
+            self.nccl_comm, self.encoder_session = None, None
+
         self.decoder_model_config, self.decoder_runtime_mapping, decoder_engine_buffer = engine_setup(
             component='decoder')
-
-        # for Pipeline Parallelism in encoder
-        self.nccl_comm = torch.classes.FasterTransformer.NcclCommunicatorOp(
-            self.encoder_runtime_mapping.tp_size,
-            self.encoder_runtime_mapping.pp_size,
-            self.encoder_runtime_mapping.rank)
-
-        # session setup
-        self.encoder_session = tensorrt_llm.runtime.Session.from_serialized_engine(
-            encoder_engine_buffer)
         self.decoder_session = tensorrt_llm.runtime.GenerationSession(
             self.decoder_model_config,
             decoder_engine_buffer,
@@ -197,8 +208,15 @@ class TRTLLMEncDecModel:
         self.stream = torch.cuda.current_stream().cuda_stream
 
     @classmethod
-    def from_engine(cls, engine_name, engine_dir, debug_mode=False):
-        return cls(engine_name, engine_dir, debug_mode=debug_mode)
+    def from_engine(cls,
+                    engine_name,
+                    engine_dir,
+                    debug_mode=False,
+                    skip_encoder=False):
+        return cls(engine_name,
+                   engine_dir,
+                   debug_mode=debug_mode,
+                   skip_encoder=skip_encoder)
 
     def process_input(self,
                       input_ids,
@@ -242,7 +260,8 @@ class TRTLLMEncDecModel:
                     debug_mode=False,
                     prompt_embedding_table=None,
                     prompt_tasks=None,
-                    prompt_vocab_size=None):
+                    prompt_vocab_size=None,
+                    attention_mask=None):
 
         # each engine has hidden_dim/TP, don't forget to multiply TP
         hidden_size = self.encoder_model_config.hidden_size * self.encoder_runtime_mapping.tp_size
@@ -290,6 +309,8 @@ class TRTLLMEncDecModel:
                 hidden_states_shape,
                 dtype=hidden_states_dtype('hidden_states_input'),
                 device=self.device).contiguous()
+        if attention_mask is not None:
+            inputs['attention_mask'] = attention_mask.contiguous()
 
         inputs['input_lengths'] = input_lengths
         # use shape info to pass max length info in remove padding mode
@@ -391,30 +412,57 @@ class TRTLLMEncDecModel:
         prompt_embedding_table=None,
         prompt_tasks=None,
         prompt_vocab_size=None,
+        attention_mask=None,
     ):
         ## ensure all externally provided tensors are on the correct device.
         encoder_input_ids = encoder_input_ids.to(self.device)
         decoder_input_ids = decoder_input_ids.to(self.device)
 
+        if attention_mask is not None:
+            attention_mask = torch.tensor(attention_mask,
+                                          dtype=torch.int32,
+                                          device=self.device)
+
         ## encoder run
-        logger.info(f"Rank {self.runtime_rank} Running encoder engine ...")
+        encoder_remove_input_padding = self.encoder_model_config.remove_input_padding if self.encoder_model_config else self.decoder_model_config.remove_input_padding
+
         encoder_input_ids, encoder_input_lengths, encoder_max_input_length, prompt_tasks = self.process_input(
-            encoder_input_ids, self.encoder_model_config.remove_input_padding,
-            pad_token_id, prompt_tasks)
-        encoder_output = self.encoder_run(
-            encoder_input_ids,
-            encoder_input_lengths,
-            encoder_max_input_length,
-            debug_mode=debug_mode,
-            prompt_embedding_table=prompt_embedding_table,
-            prompt_tasks=prompt_tasks,
-            prompt_vocab_size=prompt_vocab_size)
+            encoder_input_ids, encoder_remove_input_padding, pad_token_id,
+            prompt_tasks)
+
+        if not self.skip_encoder:
+            logger.info(f"Rank {self.runtime_rank} Running encoder engine ...")
+            encoder_output = self.encoder_run(
+                encoder_input_ids,
+                encoder_input_lengths,
+                encoder_max_input_length,
+                debug_mode=debug_mode,
+                prompt_embedding_table=prompt_embedding_table,
+                prompt_tasks=prompt_tasks,
+                prompt_vocab_size=prompt_vocab_size,
+                attention_mask=attention_mask)
+        else:
+            encoder_output = prompt_embedding_table
+            if encoder_input_ids.dim() > 1:
+                encoder_output = encoder_output.unsqueeze(0)
 
         ## decoder run
         logger.info(f"Rank {self.runtime_rank} Running decoder engine ...")
         decoder_input_ids, decoder_input_lengths, decoder_max_input_length, _ = self.process_input(
             decoder_input_ids, self.decoder_model_config.remove_input_padding,
             pad_token_id)
+
+        # `cross_attention_mask` in context phase [batch_size, query_len, encoder_input_len]
+        # where query_len happens to be 1 in current cases, but not necessarily always, and
+        # `cross_attention_mask` in generation phase [batch_size, 1, encoder_input_len] where
+        # the query_len is always 1 since we have kv cache.
+        cross_attention_mask = None
+        if attention_mask is not None:
+            cross_attention_mask = torch.tensor(attention_mask,
+                                                dtype=torch.int32,
+                                                device=self.device).reshape(
+                                                    attention_mask.shape[0], 1,
+                                                    attention_mask.shape[1])
 
         # generation config
         sampling_config = SamplingConfig(end_id=eos_token_id,
@@ -429,7 +477,8 @@ class TRTLLMEncDecModel:
             max_new_tokens,
             num_beams,
             max_attention_window_size=None,
-            encoder_max_input_length=encoder_max_input_length)
+            encoder_max_input_length=encoder_max_input_length,
+        )
         torch.cuda.synchronize()
 
         output_ids = self.decoder_session.decode(
@@ -438,7 +487,8 @@ class TRTLLMEncDecModel:
             sampling_config,
             encoder_output=encoder_output,
             encoder_input_lengths=encoder_input_lengths,
-            return_dict=return_dict)
+            return_dict=return_dict,
+            cross_attention_mask=cross_attention_mask)
         torch.cuda.synchronize()
 
         return output_ids
@@ -637,7 +687,7 @@ if __name__ == "__main__":
         eos_token_id=tokenizer.eos_token_id,
         debug_mode=args.debug_mode,
         return_dict=False,  # when set return_dict=True, get outputs by key
-    )
+        attention_mask=tokenized_inputs.attention_mask)
     tok = time.time()
 
     inference_dtype = tllm_model.encoder_model_config.dtype

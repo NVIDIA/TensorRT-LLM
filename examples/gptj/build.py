@@ -22,6 +22,7 @@ from pathlib import Path
 import torch
 import torch.multiprocessing as mp
 import tensorrt as trt
+from tensorrt_llm._common import check_max_num_tokens
 # isort: on
 from transformers import AutoModelForCausalLM
 from weight import (get_scaling_factors, load_from_awq_gpt_j,
@@ -137,12 +138,25 @@ def parse_arguments(args):
                         default=False,
                         action='store_true')
     parser.add_argument(
+        '--use_paged_context_fmha',
+        action='store_true',
+        help=
+        'Activates paged context FMHA. This mode of the context FMHA is required for chunked context, speculative decoding and reuse of KV cache blocks. Context FMHA performance is worse when this mode is on.'
+    )
+    parser.add_argument(
         '--multi_block_mode',
         default=False,
         action='store_true',
         help=
         'Split long kv sequence into multiple blocks (applied to generation MHA kernels). \
                         It is beneifical when batchxnum_heads cannot fully utilize GPU.'
+    )
+    parser.add_argument(
+        '--disable_xqa',
+        default=False,
+        action='store_true',
+        help=
+        'Disable XQA optimization for the generation MHA. See more details in docs/gpt_attention.'
     )
     parser.add_argument('--gpus_per_node', type=int, default=8)
     parser.add_argument(
@@ -195,7 +209,9 @@ def parse_arguments(args):
         '--max_num_tokens',
         type=int,
         default=None,
-        help='Define the max number of tokens supported by the engine')
+        help=
+        'Define the max number of tokens supported by the engine, note that it takes no effect if --remove_input_padding is not set'
+    )
     parser.add_argument(
         '--per_group',
         default=False,
@@ -268,7 +284,7 @@ def parse_arguments(args):
         args.inter_size = inter_size
         args.multi_query_mode = multi_query_mode
 
-    if args.quantize_lm_head and args.weight_only_precision == 'int4_awq':
+    if args.weight_only_precision == 'int4_awq':
         if args.vocab_size % 64 != 0:
             args.vocab_size = int((args.vocab_size + 63) / 64) * 64
             logger.info("To use awq we pad it to {}.".format(args.vocab_size))
@@ -287,12 +303,6 @@ def parse_arguments(args):
                 args.weight_only_precision == 'int4')
     else:
         args.quant_mode = QuantMode(0)
-
-    if args.weight_only_precision == 'int4_awq' and args.quantize_lm_head:
-        if args.vocab_size % 64 != 0:
-            args.vocab_size = int((args.vocab_size + 63) / 64) * 64
-            logger.info("To use awq we pad vocab_size to {}.".format(
-                args.vocab_size))
 
     if args.int8_kv_cache:
         args.quant_mode = args.quant_mode.set_int8_kv_cache()
@@ -319,8 +329,11 @@ def parse_arguments(args):
             args.paged_kv_cache = True
             logger.info("Using paged KV cache for inflight batching mode.")
 
-    if args.max_num_tokens is not None:
-        assert args.enable_context_fmha
+    args.max_num_tokens = check_max_num_tokens(
+        max_num_tokens=args.max_num_tokens,
+        max_batch_size=args.max_batch_size,
+        max_input_len=args.max_input_len,
+        remove_input_padding=args.remove_input_padding)
 
     assert (math.log2(args.tokens_per_block).is_integer()
             ), "tokens_per_block must be power of 2"
@@ -430,6 +443,12 @@ def build_rank_engine(builder: Builder,
         network.plugin_config.enable_remove_input_padding()
     if args.paged_kv_cache:
         network.plugin_config.enable_paged_kv_cache(args.tokens_per_block)
+    if not args.disable_xqa:
+        network.plugin_config.enable_xqa_optimization()
+
+    if args.use_paged_context_fmha:
+        assert args.enable_context_fmha or args.enable_context_fmha_fp32_acc, "context fmha must be enabled"
+        network.plugin_config.set_paged_context_fmha()
 
     with net_guard(network):
         # Prepare
@@ -437,11 +456,11 @@ def build_rank_engine(builder: Builder,
 
         # Forward
         inputs = tensorrt_llm_gpt.prepare_inputs(
-            args.max_batch_size,
-            args.max_input_len,
-            args.max_output_len,
-            True,
-            args.max_beam_width,
+            max_batch_size=args.max_batch_size,
+            max_input_len=args.max_input_len,
+            max_seq_len=args.max_input_len + args.max_output_len,
+            use_cache=True,
+            max_beam_width=args.max_beam_width,
             max_num_tokens=args.max_num_tokens)
 
         tensorrt_llm_gpt(*inputs)
@@ -523,8 +542,7 @@ def build(rank, args):
             paged_kv_cache=args.paged_kv_cache,
             max_batch_size=args.max_batch_size,
             max_beam_width=args.max_beam_width,
-            max_input_len=args.max_input_len,
-            max_output_len=args.max_output_len,
+            max_seq_len=args.max_input_len + args.max_output_len,
             local_num_kv_heads=local_num_kv_heads,
             head_size=args.n_embd / args.n_head,
             num_layers=args.n_layer)

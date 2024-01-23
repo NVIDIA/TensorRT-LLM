@@ -95,11 +95,14 @@ def parse_arguments():
                 f"fixing num_medusa_heads from {args.num_medusa_heads} to {args.fixed_num_medusa_heads}"
             )
             args.num_medusa_heads = args.fixed_num_medusa_heads
-    assert args.max_batch_size == 1, "Medusa only supports max_batch_size = 1 now, if need batch, please use example/llama/build.py."
     assert args.max_beam_width == 1, "Medusa only supports max_beam_width = 1 now, if need beam search, please use example/llama/build.py."
-    assert args.remove_input_padding == False, "Medusa only supports max_batch_size = 1 without remove_input_padding now."
     assert args.use_inflight_batching == False, "Medusa doesn't support inflight batching now."
     assert args.max_medusa_token_len > 0, "should have max_medusa_token_len > 0"
+
+    # Explicitly set max_num_tokens now for tests (default is 4096).
+    # FIXME: remove this when the max_num_tokens issue is fixed.
+    args.max_num_tokens = args.max_beam_width * args.max_batch_size * max(
+        args.max_input_len, args.max_medusa_token_len + 1)
 
     return args
 
@@ -148,7 +151,7 @@ def build_rank_engine(builder: Builder,
         inputs = tensorrt_llm_medusa.prepare_inputs(
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
-            max_new_tokens=args.max_output_len,
+            max_seq_len=args.max_input_len + args.max_output_len,
             use_cache=True,
             max_medusa_tokens_len=args.max_medusa_token_len,
             max_beam_width=args.max_beam_width,

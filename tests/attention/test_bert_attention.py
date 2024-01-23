@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import sys
 import unittest
 from itertools import product
 
@@ -25,6 +27,9 @@ from transformers.models.bert.modeling_bert import BertSelfAttention
 import tensorrt_llm
 from tensorrt_llm import Tensor
 from tensorrt_llm.plugin.plugin import ContextFMHAType
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import getSMVersion
 
 
 class TestFunctional(unittest.TestCase):
@@ -50,6 +55,12 @@ class TestFunctional(unittest.TestCase):
     @parameterized.expand(load_test_cases, name_func=custom_name_func)
     def test_bert_attention(self, batch_size, in_len, num_heads, head_size,
                             context_fmha_type, dtype):
+
+        if getSMVersion() < 80:
+            if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
+                self.skipTest(
+                    "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
+                )
 
         def _construct_execution(input_tensor, weight, bias, input_lengths,
                                  num_heads, hidden_size, output, dtype,

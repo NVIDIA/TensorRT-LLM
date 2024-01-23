@@ -41,7 +41,7 @@ def woq_conversion(weight, wTypeId):
         torch_wTypeId = torch.quint4x2
     else:
         assert (False)
-    return torch.ops.fastertransformer._symmetric_quantize_last_axis_of_batched_matrix(
+    return torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix(
         weight, torch_wTypeId)
 
 

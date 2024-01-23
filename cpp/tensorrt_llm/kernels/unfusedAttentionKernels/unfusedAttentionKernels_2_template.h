@@ -249,17 +249,16 @@ __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, KVCacheBuffer kvCacheBu
         const int batch_beam_idx = global_token_idx / seq_len;
         // TODO: optimize this for generation by using anther dimension of grid.
         const int seq_idx = global_token_idx % seq_len;
-        const int batch_idx = (!IS_GENERATE) ? batch_beam_idx : batch_beam_idx / beam_width;
-        const int final_kv_seq_len = (!IS_GENERATE) ? kv_seq_lens[batch_idx] : 0;
-        const int actual_seq_len = seq_lens[batch_idx];
+        const int final_kv_seq_len = (!IS_GENERATE) ? kv_seq_lens[batch_beam_idx] : 0;
+        const int actual_seq_len = seq_lens[batch_beam_idx];
         // Chunked attention: takes past_kv_sequence_length into consideration.
         const int token_idx_in_seq
             = (!IS_GENERATE) ? (final_kv_seq_len - actual_seq_len) + seq_idx : (actual_seq_len - seq_len + seq_idx);
         const bool valid_seq = IS_GENERATE || (token_idx_in_seq < actual_seq_len || !has_padding);
-        // NOTE: only medusa uses position ids right now.
-        // Shape of [1, generation_input_length] as only bs = 1 is supported for medusa currently.
+        // NOTE: only Medusa needs the position offsets.
+        // In the generation phase, we assume all sequences should have the same input length.
         const int rotary_position = medusa_position_offsets != nullptr && IS_GENERATE
-            ? (medusa_position_offsets[seq_idx] + actual_seq_len - seq_len)
+            ? (medusa_position_offsets[seq_idx + batch_beam_idx * seq_len] + actual_seq_len - seq_len)
             : token_idx_in_seq;
 
         // only update the base and/or scale if needed based on scale_type

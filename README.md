@@ -109,23 +109,26 @@ concepts used in TensorRT-LLM, we recommend you to read the following
 ## Installation
 
 After installing the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit),
-please run the following commands to install TensorRT-LLM.
+please run the following commands to install TensorRT-LLM for x86_64 users.
 
 ```bash
 # Obtain and start the basic docker image environment
 nvidia-docker run --entrypoint /bin/bash -it nvidia/cuda:12.1.0-devel-ubuntu22.04
+
 # Install dependencies, TensorRT-LLM requires Python 3.10
 apt-get update && apt-get -y install python3.10 python3-pip openmpi-bin libopenmpi-dev
+
 # Install the latest preview version (corresponding to the main branch) of TensorRT-LLM.
 # If you want to install the stable version (corresponding to the release branch), please
 # remove the `--pre` option.
 pip3 install tensorrt_llm -U --pre --extra-index-url https://pypi.nvidia.com
+
 # Check installation
 python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"
 ```
 
-For users who require the best performance or debugging capabilities, please refer to the instructions for
-[building from source code](docs/source/build_from_source.md).
+For developers who have the best performance requirements, debugging needs, or use the aarch64 architecture,
+please refer to the instructions for [building from source code](docs/source/build_from_source.md).
 
 For Windows installation, see [`Windows`](windows/README.md).
 
@@ -298,6 +301,15 @@ Note: [Encoder-Decoder](examples/enc_dec/) provides general encoder-decoder
 functionality that supports many encoder-decoder models such as T5 family, BART family, Whisper family, NMT family, etc. We
 unroll the exact model names in the list above to let users find specific
 models easier.
+
+The list of supported multi-modal models is:
+
+* [BLIP2 w/ OPT-2.7B](examples/multimodal)
+* [BLIP2 w/ T5-XL](examples/multimodal)
+* [LLaVA-v1.5-7B](examples/multimodal)
+* [Nougat family](examples/multimodal) Nougat-small, Nougat-base
+
+Note: Multi-modal provides general multi-modal functionality that supports many multi-modal architectures such as BLIP family, LLaVA family, etc. We unroll the exact model names in the list above to let users find specific models easier.
 
 ## Performance
 

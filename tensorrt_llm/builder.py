@@ -59,17 +59,28 @@ class BuilderConfig(object):
             "plugin_config": {
                 # the network plugin_config (if any) attached to this BuilderConfig object
                 # inside the Builder.build_engine
+            },
+            "auto_parallel_config": {
+                # the network auto_parallel_config (if any) attached to this BuilderConfig object
+                # inside the Builder.build_engine
             }
         }
         '''
         config = {'builder_config': {}}
         for k in self.__dict__.keys():
-            if k != '_trt_builder_config' and k != 'plugin_config':
+            if k not in [
+                    '_trt_builder_config', 'plugin_config',
+                    'auto_parallel_config'
+            ]:
                 config['builder_config'][k] = self.__getattribute__(k)
         if hasattr(self, 'plugin_config'):
             assert isinstance(self.plugin_config, PluginConfig), \
                 f"Found unexpected plugin_config object with type: {type(self.plugin_config)}"
             config['plugin_config'] = to_dict(self.plugin_config)
+        if self.auto_parallel_config is not None:
+            config['auto_parallel_config'] = self.auto_parallel_config
+            config['builder_config']['tensor_parallel'] = math.prod(
+                self.auto_parallel_config['mesh'])
         return config
 
 
@@ -203,7 +214,7 @@ class Builder():
         assert isinstance(builder_config, BuilderConfig)
         assert isinstance(network, Network)
         input_tensors = network._inputs
-        num_profiles = len(list(input_tensors.items())[0][1].profiles)
+        num_profiles = len(list(input_tensors.values())[0].profiles)
         for i in range(num_profiles):
             logger.debug(f'Adding optimization profile {i+1}/{num_profiles}')
             profile = self.trt_builder.create_optimization_profile()
@@ -212,8 +223,8 @@ class Builder():
                 min_shape = [*shape_profile.min]
                 opt_shape = [*shape_profile.opt]
                 max_shape = [*shape_profile.max]
-                if network._autopp_config is not None:
-                    io_shards = network._autopp_config["io_shards"]
+                if network._auto_parallel_config is not None:
+                    io_shards = network._auto_parallel_config["io_shards"]
                     if input_name in io_shards:
                         shards = io_shards[input_name]
                         for dim, shard_num in shards.items():
@@ -321,7 +332,7 @@ class Builder():
         '''
         assert isinstance(network, Network)
         builder_config.plugin_config = network.plugin_config
-        builder_config.autopp_config = network.autopp_config
+        builder_config.auto_parallel_config = network.auto_parallel_config
         if builder_config.trt_builder_config.num_optimization_profiles == 0:
             self._add_optimization_profile(network, builder_config)
         engine = None
@@ -449,6 +460,10 @@ class BuildConfig:
 
         use_custom_all_reduce = config.pop('use_custom_all_reduce', False)
         plugin_config.use_custom_all_reduce = use_custom_all_reduce
+
+        selective_scan_plugin = config.pop('selective_scan_plugin', False)
+        if selective_scan_plugin:
+            plugin_config.set_selective_scan_plugin(dtype=selective_scan_plugin)
 
         return cls(
             max_input_len=max_input_len,

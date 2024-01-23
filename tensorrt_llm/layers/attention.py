@@ -392,7 +392,6 @@ class Attention(Module):
         relative_attention=False,
         max_distance=0,
         num_buckets=0,
-        instance_id: int = 0,
         dense_bias=None,
         enable_pos_shift=False,
         dense_context_fmha=False,
@@ -418,7 +417,7 @@ class Attention(Module):
         if dense_bias is None:
             dense_bias = bias
         self.use_auto_parallel = use_auto_parallel
-        self.unfuse_qkv_gemm = use_auto_parallel
+        self.unfuse_qkv_gemm = use_auto_parallel and not cross_attention
         if self.use_auto_parallel:
             assert self.tp_size == 1, "please disable manual tp when enable auto_parallel"
 
@@ -453,7 +452,6 @@ class Attention(Module):
         self.embed_positions = None
         self.rotary_enabled = False
         self.rotary_embedding_dim = 0
-        self._layer_id = instance_id // 2
 
         if self.position_embedding_type.is_rope():
             self.rotary_embedding_dim = int(self.attention_head_size *
@@ -471,7 +469,6 @@ class Attention(Module):
                                                      dtype='float32')
         else:
             self.register_parameter('kv_cache_scaling_factor', None)
-        self.instance_id = instance_id
         # The output feature size is therefore (h/tp + 2*kvh/tp) * d, where h is num_heads,
         # d is head_size, kvh is the num_kv_heads and tp is tensor_parallel_size.
         # In ColumnLinear op, the output dim is calculated by (h + 2*kvh) * d / tp,
@@ -488,14 +485,14 @@ class Attention(Module):
                 dtype=dtype,
                 tp_group=tp_group,
                 tp_size=tp_size,
-                gather_output=False)
+                gather_output=False,
+                max_lora_rank=max_lora_rank)
             self.dense = FP8RowLinear(hidden_size,
                                       hidden_size,
                                       bias=dense_bias,
                                       dtype=dtype,
                                       tp_group=tp_group,
                                       tp_size=tp_size,
-                                      instance_id=instance_id,
                                       max_lora_rank=max_lora_rank)
         else:
             # out dim is not necessarily hidden_size + kv specific size (in MQA/GQA), but num_heads * heads_size
@@ -509,7 +506,8 @@ class Attention(Module):
                 dtype=dtype,
                 tp_group=tp_group,
                 tp_size=tp_size,
-                gather_output=False)
+                gather_output=False,
+                max_lora_rank=max_lora_rank)
             self.dense = RowLinear(tp_size * self.num_attention_heads *
                                    self.attention_head_size,
                                    hidden_size,
@@ -517,10 +515,10 @@ class Attention(Module):
                                    dtype=dtype,
                                    tp_group=tp_group,
                                    tp_size=tp_size,
-                                   instance_id=instance_id,
                                    max_lora_rank=max_lora_rank)
 
         if self.unfuse_qkv_gemm:
+            self.is_weight_rewritten = False
             linear_class = FP8Linear if self.use_fp8_qdq else ColumnLinear
             self.q = linear_class(hidden_size,
                                   hidden_size,
@@ -601,34 +599,35 @@ class Attention(Module):
                 0, "attn_qkv")
 
         unfuse_qkv_gemm = self.unfuse_qkv_gemm
-        if unfuse_qkv_gemm and self.cross_attention and encoder_output is not None:
-            unfuse_qkv_gemm = False
-            del self._modules['q']
-            del self._modules['k']
-            del self._modules['v']
         if unfuse_qkv_gemm:
             qkv_gemm = [self.q, self.k, self.v]
-            qkv_weight = self.qkv.weight.raw_value
-            if qkv_weight is not None:
-                weights = np.split(qkv_weight, [
-                    self.q.out_features,
-                    self.q.out_features + self.k.out_features,
-                ])
-                for gemm, weight in zip(qkv_gemm, weights):
-                    gemm.weight.value = weight
-            qkv_bias = self.qkv.bias.raw_value if self.qkv.bias is not None else None
-            if qkv_bias is not None:
-                biases = np.split(qkv_bias, [
-                    self.q.out_features,
-                    self.q.out_features + self.k.out_features,
-                ])
-                for gemm, bias in zip(qkv_gemm, biases):
-                    gemm.bias.value = bias
-            for name, parameter in self.qkv._parameters.items():
-                if name in ['weight', 'bias']:
-                    continue
-                for gemm in qkv_gemm:
-                    setattr(gemm, name, parameter)
+            if not self.is_weight_rewritten:
+                if self.qkv.weight.is_inited():
+                    qkv_weight = self.qkv.weight.raw_value
+                    weights = np.split(qkv_weight, [
+                        self.q.out_features,
+                        self.q.out_features + self.k.out_features,
+                    ])
+                    for gemm, weight in zip(qkv_gemm, weights):
+                        gemm.weight.value = weight
+                del self.qkv._parameters["weight"]
+
+                if self.qkv.bias is not None and self.qkv.bias.is_inited():
+                    qkv_bias = self.qkv.bias.raw_value
+                    biases = np.split(qkv_bias, [
+                        self.q.out_features,
+                        self.q.out_features + self.k.out_features,
+                    ])
+                    for gemm, bias in zip(qkv_gemm, biases):
+                        gemm.bias.value = bias
+                del self.qkv._parameters["bias"]
+
+                for name, parameter in self.qkv._parameters.items():
+                    for gemm in qkv_gemm:
+                        setattr(gemm, name, parameter)
+                    del self.qkv._parameters[name]
+
+                self.is_weight_rewritten = True
             qkv = [gemm(hidden_states) for gemm in qkv_gemm]
             if default_net(
             ).plugin_config.lora_plugin and qkv_lora_params is not None:
@@ -637,7 +636,6 @@ class Attention(Module):
                 qkv_lora = split(lora, [self.hidden_size, kv_size, kv_size],
                                  dim=1)
                 qkv = [tensor + lora for tensor, lora in zip(qkv, qkv_lora)]
-            del self._modules['qkv']
         else:
             qkv = self.qkv(hidden_states, qkv_lora_params)
 
@@ -701,8 +699,6 @@ class Attention(Module):
 
         past_key_value = None if kv_cache_params is None else kv_cache_params.get_first_past_key_value(
         )
-        if self.cross_attention and (past_key_value is not None):
-            past_key_value = kv_cache_params.past_key_value[1]
 
         # if cross attention, cross QKV only needs to be calculated once in the
         # 1st decoding step --> write to cross KV cache --> remains constant
@@ -719,6 +715,8 @@ class Attention(Module):
             cross_qkv = self.qkv(encoder_output)
 
         if default_net().plugin_config.gpt_attention_plugin:
+            if self.cross_attention and (past_key_value is not None):
+                past_key_value = kv_cache_params.past_key_value[1]
             assert self.attention_mask_type in [
                 AttentionMaskType.causal, AttentionMaskType.bidirectional,
                 AttentionMaskType.bidirectionalglm
@@ -781,8 +779,6 @@ class Attention(Module):
         else:
             # plain TensorRT mode
             assert paged_kv_cache == False
-            past_key_value = None if kv_cache_params is None else kv_cache_params.get_first_past_key_value(
-            )
 
             def transpose_for_scores(x,
                                      rotary: bool = False,
@@ -893,9 +889,7 @@ class Attention(Module):
                 key = key.permute([0, 2, 1, 3])
                 query = query.permute([0, 2, 1, 3])
 
-            past_key_value = None if kv_cache_params is None else kv_cache_params.get_first_past_key_value(
-            )
-            if past_key_value is not None:
+            if past_key_value is not None and not self.cross_attention:
                 if (self.use_fp8_qdq and self.quant_mode.has_kv_cache_quant()
                     ) or self.use_int8_kv_cache:
                     past_key_value = dequantize(
@@ -957,7 +951,7 @@ class Attention(Module):
             #
             # Note that when we added to another bias tensor B (for example, with AliBi), the values in the lower-
             # triangular part of the B tensor are not affected and the upper-triangular ones are set to +INF.
-            if self.attention_mask_type == AttentionMaskType.causal:
+            if self.attention_mask_type == AttentionMaskType.causal and not self.cross_attention:
                 if self.position_embedding_type.is_alibi():
                     query_length = shape(query, 2)
                     # bsz, tatget_length, past_key_value_length
@@ -984,7 +978,7 @@ class Attention(Module):
                     buffer = constant(mask_buf)
                     generated_mask = slice(buffer, starts, sizes)
 
-            elif self.attention_mask_type == AttentionMaskType.bidirectional:
+            elif self.attention_mask_type == AttentionMaskType.bidirectional and not self.cross_attention:
                 query_length = shape(query, 2)
                 zero_buf = np.expand_dims(
                     np.zeros((self.max_position_embeddings,
@@ -1005,7 +999,17 @@ class Attention(Module):
                 generated_mask = slice(mask, start, size)
 
             if attention_mask is not None:
-                attention_mask = expand_mask(attention_mask, shape(query, 2))
+                if self.cross_attention:
+                    batch_size = shape(attention_mask, 0)
+                    query_len = shape(attention_mask, 1)
+                    encoder_input_len = shape(attention_mask, 2)
+                    attention_mask = attention_mask.view(
+                        concat([batch_size, 1, query_len, encoder_input_len]))
+                    attention_mask = where(attention_mask == 0, float('-inf'),
+                                           (1 - attention_mask).cast('float32'))
+                else:
+                    attention_mask = expand_mask(attention_mask,
+                                                 shape(query, 2))
             bias = attention_mask
             if self.position_embedding_type.is_alibi():
                 alibi_biases = generate_alibi_biases(alibi_slopes, key_length)
@@ -1029,11 +1033,11 @@ class Attention(Module):
                 if self.attention_mask_type in [
                         AttentionMaskType.causal,
                         AttentionMaskType.bidirectional
-                ]:
+                ] and not self.cross_attention:
 
                     bias = generated_mask if bias is None else bias + generated_mask
 
-                if bias is not None and not self.cross_attention:
+                if bias is not None:
                     bias = cast(bias, attention_scores.dtype)
                     attention_scores = attention_scores + bias
 
@@ -1042,6 +1046,14 @@ class Attention(Module):
             if version.parse(trt_version(
             )).major > 9 or self.position_embedding_type.is_alibi():
                 # For trt_version() == 9.x and pos_embed == alibi, TRT has gpu buffer management issues. Need this WAR to avoid peak gpu mem regression.
+                # A dummy reshape WAR for mha fusion for 10.0
+                attention_probs = attention_probs.view(
+                    concat([
+                        shape(attention_probs, 0),
+                        shape(attention_probs, 1),
+                        shape(attention_probs, 2),
+                        shape(value, 2)
+                    ]))
                 context = matmul(attention_probs, value,
                                  use_fp32_acc=False).permute([0, 2, 1, 3])
             else:
@@ -1184,6 +1196,8 @@ class BertAttention(Module):
             attention_scores = attention_scores / self.norm_factor
 
             if attention_mask is not None:
+                attention_mask = expand_mask(attention_mask, shape(query, 2))
+                attention_mask = cast(attention_mask, attention_scores.dtype)
                 attention_scores = attention_scores + attention_mask
 
             attention_probs = softmax(attention_scores, dim=-1)

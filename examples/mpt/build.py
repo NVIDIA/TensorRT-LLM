@@ -22,6 +22,7 @@ import torch
 import torch.multiprocessing as mp
 
 import tensorrt_llm
+from tensorrt_llm._common import check_max_num_tokens
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.layers import PositionEmbeddingType
@@ -250,7 +251,9 @@ def parse_arguments(args):
         '--max_num_tokens',
         type=int,
         default=None,
-        help='Define the max number of tokens supported by the engine')
+        help=
+        'Define the max number of tokens supported by the engine, note that it takes no effect if --remove_input_padding is not set'
+    )
     parser.add_argument(
         '--max_prompt_embedding_table_size',
         type=int,
@@ -401,8 +404,11 @@ def parse_arguments(args):
     args.position_embedding_type = PositionEmbeddingType[
         args.position_embedding_type]
 
-    if args.max_num_tokens is not None:
-        assert args.enable_context_fmha
+    args.max_num_tokens = check_max_num_tokens(
+        max_num_tokens=args.max_num_tokens,
+        max_batch_size=args.max_batch_size,
+        max_input_len=args.max_input_len,
+        remove_input_padding=args.remove_input_padding)
 
     assert (math.log2(args.tokens_per_block).is_integer()
             ), "tokens_per_block must be power of 2"
@@ -442,7 +448,8 @@ def build_rank_engine(builder: Builder,
 
     if share_embedding_table:
         logger.info(
-            'Engine will share embedding and language modeling weights.')
+            'Engine will try to share embedding and language modeling weights. Note: Flag --use_lookup_plugin and --use_gemm_plugin are also needed for now.'
+        )
     # TP only
     mapping = Mapping(world_size=args.world_size,
                       rank=rank,
@@ -562,11 +569,11 @@ def build_rank_engine(builder: Builder,
 
         # Forward
         inputs = tensorrt_llm_gpt.prepare_inputs(
-            args.max_batch_size,
-            args.max_input_len,
-            args.max_output_len,
-            True,
-            args.max_beam_width,
+            max_batch_size=args.max_batch_size,
+            max_input_len=args.max_input_len,
+            max_seq_len=args.max_input_len + args.max_output_len,
+            use_cache=True,
+            max_beam_width=args.max_beam_width,
             max_num_tokens=args.max_num_tokens,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size)
         tensorrt_llm_gpt(*inputs)

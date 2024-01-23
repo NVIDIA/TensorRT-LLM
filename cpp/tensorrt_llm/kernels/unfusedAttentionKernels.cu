@@ -1705,13 +1705,18 @@ __global__ void addRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_
             // compute bias value on the fly (see bert_preprocess_kernels.cu::buildRelativeAttentionBias)
             int relative_buckets = 0;
             int relative_position = seq_j - seq_i;
+
+            // special logic in T5 relative attention. bidirectional=true for encoder, false for decoder
             if (bidirectional)
-            { // special logic in T5 relative attention, both encoder & decoder use this, because rel pos bias is
-                // pre-computed once and passed around
+            {
                 num_buckets /= 2;
                 relative_buckets += relative_position > 0 ? num_buckets : 0;
+                relative_position = abs(relative_position);
             }
-            relative_position = abs(relative_position);
+            else
+            {
+                relative_position = relative_position > 0 ? 0 : -relative_position;
+            }
 
             int max_exact = num_buckets / 2;
             bool is_small = relative_position < max_exact;

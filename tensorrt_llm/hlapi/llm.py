@@ -1,3 +1,4 @@
+import gc
 import json
 import os
 import tempfile
@@ -11,15 +12,17 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 import tensorrt as trt
 import torch
 
+from .._utils import mpi_rank, mpi_world_size
 from ..builder import (BuildConfig, Builder, BuilderConfig, PluginConfig,
                        QuantMode)
+from ..executor import GenerationExecutor, GenerationResult
 from ..logger import logger
 from ..mapping import Mapping
 from ..models.modeling_utils import PretrainedConfig
 from ..module import Module
 from ..runtime import (GenerationSession, ModelRunner, SamplingConfig,
                        model_runner)
-from .mpi_session import MpiSession, NodeSession, mpi_rank, mpi_size
+from .mpi_session import MpiSession, NodeSession
 from .tokenizer import TokenizerBase, TransformersTokenizer
 from .utils import (GenerationOutput, file_with_suffix_exists, get_device_count,
                     print_colored, print_traceback_on_error)
@@ -89,14 +92,15 @@ class QuantConfig:
 
 @dataclass
 class ModelConfig:
-    # ``model`` could either the model directory or a in-memory model.
-    # If ``model`` specifies the model kind like "llama-7B", etc.  The model will be download automatically from third-party
-    # model hub like www.modelscope.cn or huggingface
-    model: Optional[Union[str, Module]] = None
 
     # ``model_dir`` helps to locate a local model, the format of the model is determined by the model file itself.
     # Either HF model, TensorRT-LLM checkpoints or TensorRT-LLM engine format is supported.
     model_dir: Optional[str] = None
+
+    # ``model`` could either the model directory or a in-memory model.
+    # If ``model`` specifies the model kind like "llama-7B", etc.  The model will be download automatically from third-party
+    # model hub like www.modelscope.cn or huggingface
+    model: Optional[Union[str, Module]] = None
 
     parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
 
@@ -108,6 +112,11 @@ class ModelConfig:
     @property
     def is_multi_gpu(self) -> bool:
         return self.parallel_config.tp_size > 1
+
+    def __post_init__(self):
+        assert self.model_dir, "model_dir is required."
+        if self.model:
+            raise NotImplementedError("model is not supported yet.")
 
 
 class LLM:
@@ -122,13 +131,24 @@ class LLM:
     llm.generate(["What is your name?"]) # => ["My name is Llama."]
     '''
 
+    @dataclass
+    class AdditionalOptions:
+        kvcahe_free_gpu_memory_fraction: Optional[float] = None
+
+        def get_valid_options(self) -> List[str]:
+            return [
+                x for x in self.__dict__
+                if x != 'self' and not x.startswith('_')
+            ]
+
     def __init__(self,
                  config: ModelConfig,
                  tokenizer: Optional[TokenizerBase] = None,
                  enable_tokenizer: bool = True,
                  dump_model_processing_summary: Optional[str] = None,
                  async_mode: bool = False,
-                 async_engine_tmp_dir: Optional[str] = None):
+                 async_engine_tmp_dir: Optional[str] = None,
+                 **options):
         '''
         Args:
             config: The model config for the model.
@@ -138,9 +158,9 @@ class LLM:
             async_mode: Run the model in async mode.
             async_engine_tmp_dir: The temporary directory to save the async engine. Only for debugging.
         '''
-        from ..engine import AsyncLLMEngine
 
         self.config = config
+
         self._tokenizer = tokenizer
         self.enable_tokenizer = enable_tokenizer
         self.dump_model_processing_summary = dump_model_processing_summary
@@ -167,13 +187,29 @@ class LLM:
             self.mpi_session = MpiSession(
                 n_workers=self.config.parallel_config.tp_size)
 
-        self._async_engine: Optional[AsyncLLMEngine] = None
+        self._async_engine: Optional[GenerationExecutor] = None
+        self._additional_options = LLM.AdditionalOptions()
+
+        # set additional options for constructing the LLM pipeline
+        valid_options = self._additional_options.get_valid_options()
+
+        def set_option(key, value):
+            if key in valid_options:
+                logger.warning(
+                    f"Additionl option is a preview feature, setting {key}={value}"
+                )
+                setattr(self._additional_options, key, value)
+            else:
+                raise ValueError(f"Invalid option {key}")
+
+        for key, value in options.items():
+            set_option(key, value)
 
         self._build_model()
 
     def generate(
         self,
-        prompts: Iterable[str] | Iterable[List[int]],
+        prompts: Union[Iterable[str], Iterable[List[int]]],
         sampling_config: Optional[SamplingConfig] = None
     ) -> Iterable[GenerationOutput]:
         ''' Generate the output for the given inputs.
@@ -202,10 +238,10 @@ class LLM:
                 sampling_config,
                 max_batch_size=self._extra_build_config.max_batch_size)
 
-    async def generate_async(self,
-                             prompt: str | List[int],
-                             sampling_config: Optional[SamplingConfig] = None,
-                             streaming: bool = False):
+    def generate_async(self,
+                       prompt: Union[str, List[int]],
+                       sampling_config: Optional[SamplingConfig] = None,
+                       streaming: bool = False) -> GenerationResult:
         ''' Generate in asynchronuous mode. '''
         assert self._async_engine, "The async engine is not built yet."
 
@@ -215,12 +251,13 @@ class LLM:
         assert len(prompt) <= self._extra_build_config.max_num_tokens, \
             "The total input length is too large, not supported yet"
 
-        results = self._async_engine.generate(prompt,
-                                              streaming=streaming,
-                                              sampling_config=sampling_config)
-
-        async for output in results:
-            yield output
+        assert isinstance(prompt, str), "Only support str prompt for now"
+        results = self._async_engine.generate_async(
+            prompt,
+            streaming=streaming,
+            # TODO[chunweiy]: make executor support all the options in SamplingConfig
+            max_new_tokens=sampling_config.max_new_tokens)
+        return results
 
     @property
     def tokenizer(self) -> TokenizerBase:
@@ -291,29 +328,50 @@ class LLM:
 
         # TODO[chunweiy]: Support multi-gpu build
         def build_async():
-            from ..engine import AsyncLLMEngine
-
-            model_loader = ModelLoader(self.config,
-                                       self.enable_tokenizer,
-                                       tokenizer=self._tokenizer)
-
-            self.runtime_context = model_loader()
-            # runner is not needed for GptManager
-
             engine_dir = self.async_engine_tmp_dir
             if engine_dir is None:
                 temp_dir = tempfile.TemporaryDirectory()
                 engine_dir = temp_dir.name
 
-            # TODO[chunweiy]: Make GptManager support in-memory engine-buffer to save disk loading lantenecy
-            self.save(engine_dir)
-            # Once saved, the engine_buffer is not needed anymore
-            del self.runtime_context.runtime
+            model_format = ModelLoader.get_model_format(self.config.model_dir)
+            if model_format is not _ModelFormatKind.TLLM_ENGINE:
 
-            self._async_engine = AsyncLLMEngine(
-                engine_dir=engine_dir,
-                tokenizer=self.tokenizer,
-                max_beam_width=self._extra_build_config.max_beam_width)
+                with ModelLoader(self.config,
+                                 self.enable_tokenizer,
+                                 tokenizer=self._tokenizer) as model_loader:
+
+                    runtime_context = model_loader()
+                    # runner is not needed for GptManager
+
+                    # TODO[chunweiy]: Make GptManager support in-memory engine-buffer to save disk loading lantenecy
+                    ModelLoader.save(runtime_context,
+                                     self.config.model_dir,
+                                     engine_dir=engine_dir,
+                                     model_info=runtime_context.model_info)
+
+                    # Once saved, the engine_buffer is not needed anymore
+                    del runtime_context
+
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            tokenizer = self.tokenizer
+            if not isinstance(tokenizer, TokenizerBase):
+                tokenizer = ModelLoader.load_hf_tokenizer(self.config.model_dir)
+            assert isinstance(tokenizer, TokenizerBase)
+
+            import tensorrt_llm.bindings as tllm
+            executor_config = tllm.TrtGptModelOptionalParams()
+            if self._additional_options.kvcahe_free_gpu_memory_fraction is not None:
+                executor_config.kv_cache_config.free_gpu_memory_fraction = self._additional_options.kvcahe_free_gpu_memory_fraction
+
+            self._async_engine = GenerationExecutor(
+                engine_dir,
+                tokenizer=tokenizer,
+                max_beam_width=self._extra_build_config.max_beam_width,
+                executor_config=executor_config,
+                # TODO[chunweiy]: Expose more options
+            )
 
             return True
 
@@ -347,7 +405,7 @@ class LLM:
 
     @print_traceback_on_error
     @staticmethod
-    def _node_generation_task(prompts: List[str] | List[List[int]],
+    def _node_generation_task(prompts: Union[List[str], List[List[int]]],
                               sampling_config: Optional[SamplingConfig],
                               max_batch_size: int) -> List[GenerationOutput]:
         assert NodeSession.is_initialized(), "Model is not built yet."
@@ -371,7 +429,7 @@ class LLM:
                         tp_size: int):
         runtime_context: _ModelRuntimeContext = NodeSession.state
 
-        mapping = Mapping(world_size=mpi_size(),
+        mapping = Mapping(world_size=mpi_world_size(),
                           rank=mpi_rank(),
                           tp_size=tp_size,
                           pp_size=pp_size)
@@ -509,10 +567,10 @@ class _ModelRuntimeContext:
     ''' _ModelRuntimeContext holds the minimum runtime resources for running a model.
     It could be a runtime cache in MPI nodes.
     '''
-    runtime: Optional[ModelRunner | trt.IHostMemory] = None
+    runtime: Optional[Union[ModelRunner, trt.IHostMemory]] = None
     tokenizer: Optional[TokenizerBase] = None
     # engine_config is only used for saving the engine to disk
-    engine_config: Optional[dict | BuildConfig] = None
+    engine_config: Optional[Union[dict, BuildConfig]] = None
     model_info: Optional[_ModelInfo] = None
 
     @property
@@ -568,7 +626,7 @@ class ModelLoader:
             raise NotImplementedError()
 
         assert self._model_dir is not None, "The model_dir is not set yet."
-        self._model_format = self._get_model_format(self._model_dir)
+        self._model_format = ModelLoader.get_model_format(self._model_dir)
 
         if self._model_format is _ModelFormatKind.HF:
             ''' HF -> TFRT checkpoints -> engine '''
@@ -630,6 +688,19 @@ class ModelLoader:
                                     engine_config=config,
                                     model_info=self._model_info)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        for attr_name in dir(self):
+            if not callable(getattr(
+                    self, attr_name)) and not attr_name.startswith("__"):
+                if attr_name not in ('model_format', ):
+                    setattr(self, attr_name, None)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
     @property
     def model_format(self) -> _ModelFormatKind:
         return self._model_format
@@ -641,7 +712,7 @@ class ModelLoader:
              engine_dir: str,
              model_info: _ModelInfo,
              mapping=None):
-        ''' Save the built engine to the given path.  '''
+        ''' Save the built engine to the given path. '''
         mapping = mapping or Mapping()
         rank = mapping.rank if mapping else 0
 
@@ -696,9 +767,9 @@ class ModelLoader:
             if mapping is None or mapping.rank == 0:
                 copy_hf_tokenizer_data_to_engine_dir()
 
-    def _get_model_format(self, model_dir: str) -> _ModelFormatKind:
+    @staticmethod
+    def get_model_format(model_dir: str) -> _ModelFormatKind:
         ''' Tell the format of the model.  '''
-        assert isinstance(model_dir, str)
         # TODO[chunweiy]: Add checkpoint support
         if Path.exists(Path(model_dir) /
                        'generation_config.json') and file_with_suffix_exists(

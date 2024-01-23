@@ -49,8 +49,7 @@ class BloomDecoderLayer(Module):
             tp_group=tp_group,
             tp_size=tp_size,
             tp_rank=tp_rank,
-            quant_mode=config.quant_mode,
-            instance_id=2 * layer_idx)
+            quant_mode=config.quant_mode)
 
         mlp_hidden_size = hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
 
@@ -61,8 +60,7 @@ class BloomDecoderLayer(Module):
                        bias=True,
                        tp_group=tp_group,
                        tp_size=tp_size,
-                       quant_mode=config.quant_mode,
-                       instance_id=2 * layer_idx + 1)
+                       quant_mode=config.quant_mode)
         self.post_layernorm = LayerNorm(normalized_shape=hidden_size,
                                         dtype=dtype)
 

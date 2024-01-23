@@ -68,7 +68,7 @@ def split_qkv(v, tp_size, rank, hidden_size, num_heads, num_kv_heads):
 def load_quant_weight(src, value_dst, scale_dst, plugin_weight_only_quant_type):
     v = torch.transpose(src, dim0=0, dim1=1).contiguous()
     processed_torch_weights, torch_weight_scales = \
-        torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+        torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
             v, plugin_weight_only_quant_type)
     value_dst.value = torch_to_numpy(processed_torch_weights)
     scale_dst.value = torch_to_numpy(torch_weight_scales)
@@ -304,8 +304,6 @@ def load_from_hf(
         # Dense multiplication bias, only GLM-10B
         if model_name in ["glm_2b", "glm_10b", "glm_10b_chinese"]:
             v = hf_layer.attention.dense.bias.to(torch_type).detach()
-            v = split_qkv(v, mapping.tp_size, mapping.tp_rank, hidden_size,
-                          num_heads, num_kv_heads)
             layer.attention.dense.bias.value = torch_to_numpy(v)
             feed_weight_count += 1
 
@@ -366,8 +364,8 @@ def load_from_hf(
         # Multilayer perceptron h -> 4h bias, only GLM-10B
         if model_name in ["glm_2b", "glm_10b", "glm_10b_chinese"]:
             bias = hf_layer.mlp.dense_h_to_4h.bias.to(torch_type).detach()
-            split_bias = split_qkv(bias, mapping.tp_size, mapping.tp_rank,
-                                   hidden_size, num_heads, num_kv_heads)
+            split_bias = torch.chunk(bias, mapping.tp_size,
+                                     dim=0)[mapping.tp_rank]
             layer.mlp.fc.bias.value = torch_to_numpy(split_bias)
             feed_weight_count += 1
 
@@ -399,9 +397,7 @@ def load_from_hf(
         # Multilayer perceptron 4h -> h bias, only GLM-10B
         if model_name in ["glm_2b", "glm_10b", "glm_10b_chinese"]:
             bias = hf_layer.mlp.dense_4h_to_h.bias.to(torch_type).detach()
-            split_bias = split_qkv(bias, mapping.tp_size, mapping.tp_rank,
-                                   hidden_size, num_heads, num_kv_heads)
-            layer.mlp.proj.bias.value = torch_to_numpy(split_bias)
+            layer.mlp.proj.bias.value = torch_to_numpy(bias)
             feed_weight_count += 1
 
     del hf_model
@@ -461,8 +457,8 @@ def load_from_awq(
         awq_weight[name + ".weight_quantizer._amax"].numel()
 
     torch_dtype = str_dtype_to_torch(dtype)
-    int8_to_int4 = torch.ops.fastertransformer.pack_int8_tensor_to_packed_int4
-    int4_to_int4x2 = torch.ops.fastertransformer.preprocess_weights_for_mixed_gemm
+    int8_to_int4 = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
+    int4_to_int4x2 = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
 
     layers_per_pipeline_stage = num_layers // mapping.pp_size
     layers_range = list(

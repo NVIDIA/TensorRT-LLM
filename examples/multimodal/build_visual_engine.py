@@ -1,18 +1,22 @@
 import argparse
 import os
+import shutil
 from time import time
 
 import tensorrt as trt
 import torch
 from PIL import Image
-from transformers import Blip2ForConditionalGeneration, Blip2Processor
+from transformers import (AutoProcessor, Blip2ForConditionalGeneration,
+                          Blip2Processor, LlavaForConditionalGeneration,
+                          NougatProcessor, VisionEncoderDecoderModel)
 
 
 def export_visual_wrapper_onnx(visual_wrapper, image, output_dir):
     logger.log(trt.Logger.INFO, "Exporting onnx")
+    os.mkdir(f'{output_dir}/onnx')
     torch.onnx.export(visual_wrapper,
                       image,
-                      f'{output_dir}/visual_encoder.onnx',
+                      f'{output_dir}/onnx/visual_encoder.onnx',
                       opset_version=17,
                       input_names=['input'],
                       output_names=['output'],
@@ -21,15 +25,14 @@ def export_visual_wrapper_onnx(visual_wrapper, image, output_dir):
                       }})
 
 
-def build_trt_engine(part_id,
-                     img_height,
+def build_trt_engine(img_height,
                      img_width,
                      output_dir,
                      minBS=1,
                      optBS=2,
                      maxBS=4):
-    part_name = 'visual_encoder' if part_id == 0 else 'Qformer'
-    onnx_file = '%s/%s.onnx' % (output_dir, part_name)
+    part_name = 'visual_encoder'
+    onnx_file = '%s/onnx/%s.onnx' % (output_dir, part_name)
     engine_file = '%s/%s_fp16.engine' % (output_dir, part_name)
     logger.log(trt.Logger.INFO, "Building TRT engine for %s" % part_name)
 
@@ -49,6 +52,9 @@ def build_trt_engine(part_id,
                 logger.log(trt.Logger.ERROR, parser.get_error(error))
         logger.log(trt.Logger.INFO, "Succeeded parsing %s" % onnx_file)
 
+    # Delete onnx files since we don't need them now
+    shutil.rmtree(f'{output_dir}/onnx')
+
     nBS = -1
     nMinBS = minBS
     nOptBS = optBS
@@ -56,32 +62,11 @@ def build_trt_engine(part_id,
     logger.log(trt.Logger.INFO,
                f"Processed image dims {img_height}x{img_width}")
 
-    if part_id == 0:  # Feature extractor
-        H, W = img_height, img_width
-        inputT = network.get_input(0)
-        inputT.shape = [nBS, 3, H, W]
-        profile.set_shape(inputT.name, [nMinBS, 3, H, W], [nOptBS, 3, H, W],
-                          [nMaxBS, 3, H, W])
-    elif part_id == 1:  # BLIP Qformer
-        inputT = network.get_input(0)
-        dims = [32, 768]
-        inputT.shape = [nBS] + dims
-        profile.set_shape(inputT.name, [nMinBS] + dims, [nOptBS] + dims,
-                          [nMaxBS] + dims)
-
-        inputT = network.get_input(1)
-        dims = [257, 1408]
-        inputT.shape = [nBS] + dims
-        profile.set_shape(inputT.name, [nMinBS] + dims, [nOptBS] + dims,
-                          [nMaxBS] + dims)
-
-        inputT = network.get_input(2)
-        inputT.shape = [nBS, 257]
-        profile.set_shape(inputT.name, [nMinBS, inputT.shape[1]],
-                          [nOptBS, inputT.shape[1]], [nMaxBS, inputT.shape[1]])
-    else:
-        raise RuntimeError("Invalid part id")
-
+    H, W = img_height, img_width
+    inputT = network.get_input(0)
+    inputT.shape = [nBS, 3, H, W]
+    profile.set_shape(inputT.name, [nMinBS, 3, H, W], [nOptBS, 3, H, W],
+                      [nMaxBS, 3, H, W])
     config.add_optimization_profile(profile)
 
     t0 = time()
@@ -98,87 +83,96 @@ def build_trt_engine(part_id,
 
 def build_blip_engine(args):
     model_type = 'Salesforce/blip2-' + args.model_name
-    device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
     processor = Blip2Processor.from_pretrained(model_type)
     model = Blip2ForConditionalGeneration.from_pretrained(
         model_type, torch_dtype=torch.float16)
-    model.to(device)
+    model.to(args.device)
 
     raw_image = Image.new('RGB', [10, 10])  # dummy image
-    # image = vis_processors["eval"](image).unsqueeze(0).to(device)
     prompt = "Question: what is this? Answer:"
     inputs = processor(raw_image, prompt,
-                       return_tensors="pt").to(device, torch.float16)
+                       return_tensors="pt").to(args.device, torch.float16)
     image = inputs['pixel_values']
 
-    visual_wrapper = model.vision_model
-    image_embeds = visual_wrapper(image)[0]
-    export_visual_wrapper_onnx(visual_wrapper, image, args.output_dir)
-    build_trt_engine(0, image.shape[2], image.shape[3], args.output_dir)
+    class BlipVisionWrapper(torch.nn.Module):
 
-    class QformerWrapper(torch.nn.Module):
-
-        def __init__(self, Qformer, projector):
+        def __init__(self, model):
             super().__init__()
-            self.model = Qformer
-            self.projector = projector
+            self.vision_model = model.vision_model
+            self.qformer = model.qformer
+            self.projector = model.language_projection
+            self.query_tokens = model.query_tokens
 
-        def forward(self, query_tokens, image_embeds, image_atts):
-            query_output = self.model(query_embeds=query_tokens,
-                                      encoder_hidden_states=image_embeds,
-                                      encoder_attention_mask=image_atts,
-                                      return_dict=True)
-            return self.projector(query_output.last_hidden_state)
+        def forward(self, image):
+            features = self.vision_model(image)[0]
+            qformer_output = self.qformer(query_embeds=self.query_tokens,
+                                          encoder_hidden_states=features,
+                                          return_dict=True)
+            return self.projector(qformer_output.last_hidden_state)
 
-    projector = model.language_projection
-    q_wrapper = QformerWrapper(model.qformer, projector)
+    wrapper = BlipVisionWrapper(model)
 
-    image_atts = torch.ones(image_embeds.size()[:-1],
-                            dtype=torch.long).to(image.device)
-    query_tokens = model.query_tokens.expand(image_embeds.shape[0], -1, -1)
-
-    torch.onnx.export(
-        q_wrapper, (query_tokens, image_embeds, image_atts),
-        f'{args.output_dir}/Qformer.onnx',
-        opset_version=17,
-        input_names=['query_tokens', 'image_embeds', 'image_atts'],
-        output_names=['query_output'],
-        dynamic_axes={
-            'query_tokens': {
-                0: 'batch'
-            },
-            'image_embeds': {
-                0: 'batch'
-            },
-            'image_atts': {
-                0: 'batch'
-            }
-        })
-
-    build_trt_engine(1, image.shape[2], image.shape[3], args.output_dir)
+    export_visual_wrapper_onnx(wrapper, image, args.output_dir)
+    build_trt_engine(image.shape[2], image.shape[3], args.output_dir)
 
 
 def build_llava_engine(args):
-    # Import these here to avoid installing llava when running blip models only
-    from llava.mm_utils import get_model_name_from_path
-    from llava.model.builder import load_pretrained_model
+    processor = AutoProcessor.from_pretrained(args.model_path)
+    raw_image = Image.new('RGB', [10, 10])  # dummy image
+    image = processor(text="dummy", images=raw_image,
+                      return_tensors="pt")['pixel_values'].to(
+                          args.device, torch.float16)
 
-    model_name = get_model_name_from_path(args.model_path)
-    _, model, image_processor, _ = load_pretrained_model(
-        args.model_path, None, model_name)
+    class LlavaVisionWrapper(torch.nn.Module):
 
-    image = Image.new('RGB', [10, 10])  # dummy image
-    image = image_processor(image, return_tensors='pt')['pixel_values']
-    image = image.half().to(device)
+        def __init__(self, tower, projector, feature_layer):
+            super().__init__()
+            self.tower = tower
+            self.projector = projector
+            self.feature_layer = feature_layer
 
-    visual_wrapper = torch.nn.Sequential(model.get_vision_tower(),
-                                         model.get_model().mm_projector)
-    export_visual_wrapper_onnx(visual_wrapper, image, args.output_dir)
-    build_trt_engine(0, image.shape[2], image.shape[3], args.output_dir)
+        def forward(self, image):
+            all_hidden_states = self.tower(
+                image, output_hidden_states=True).hidden_states
+            features = all_hidden_states[self.feature_layer][:, 1:]
+            return self.projector(features)
+
+    model = LlavaForConditionalGeneration.from_pretrained(
+        args.model_path, torch_dtype=torch.float16)
+    model.to(args.device)
+    wrapper = LlavaVisionWrapper(model.vision_tower,
+                                 model.multi_modal_projector,
+                                 model.config.vision_feature_layer)
+
+    export_visual_wrapper_onnx(wrapper, image, args.output_dir)
+    build_trt_engine(image.shape[2], image.shape[3], args.output_dir)
+
+
+def build_nougat_engine(args):
+    processor = NougatProcessor.from_pretrained(args.model_path)
+    raw_image = Image.new('RGB', [10, 10])  # dummy image
+    image = processor(raw_image, return_tensors="pt")['pixel_values'].to(
+        args.device, torch.float16)
+
+    class SwinEncoderWrapper(torch.nn.Module):
+
+        def __init__(self, encoder):
+            super().__init__()
+            self.encoder = encoder
+
+        def forward(self, image):
+            return self.encoder(image).last_hidden_state
+
+    model = VisionEncoderDecoderModel.from_pretrained(args.model_path,
+                                                      torch_dtype=torch.float16)
+    swin_encoder = model.get_encoder().to(args.device)
+    wrapper = SwinEncoderWrapper(swin_encoder)
+
+    export_visual_wrapper_onnx(wrapper, image, args.output_dir)
+    build_trt_engine(image.shape[2], image.shape[3], args.output_dir)
 
 
 if __name__ == '__main__':
-    device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
     logger = trt.Logger(trt.Logger.ERROR)
 
     parser = argparse.ArgumentParser()
@@ -196,6 +190,8 @@ if __name__ == '__main__':
                         help="Directory where visual TRT engines are saved")
     args = parser.parse_args()
 
+    args.device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
+
     args.output_dir = args.output_dir + "/" + args.model_name
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
@@ -204,5 +200,7 @@ if __name__ == '__main__':
         build_blip_engine(args)
     elif 'llava' in args.model_name:
         build_llava_engine(args)
+    elif 'nougat' in args.model_name:
+        build_nougat_engine(args)
     else:
         raise RuntimeError(f"Invalid model name {args.model_name}")

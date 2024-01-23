@@ -195,74 +195,8 @@ class TestFunctional(unittest.TestCase):
         # add gpu_arch_lists for testing (help reducing workload if there are duplicates).
         test_cases = [("all", ) + case for case in test_cases]
 
-        # for XQA test
-        # all arches use the same kernel traits, we can split the workload into different gpu architectures.
-        test_cases += list(
-            product(
-                [80],
-                ['llama_attention'],
-                [ContextFMHAType.enabled],
-                ['float16'],
-                [None],
-                [2],
-                [165, 1025, 2543],
-                [16],
-                [128],
-                [2],
-                [False, True],
-                [False],
-                [1],
-                [False, True],
-                [False],
-                [10000.0],  # rope base
-                [  # rope scaling
-                    None,
-                ]))
-        test_cases += list(
-            product(
-                [89],
-                ['llama_attention'],
-                [ContextFMHAType.enabled],
-                ['bfloat16'],
-                [None],
-                [2],
-                [165, 1025, 2543],
-                [16],
-                [128],
-                [2],
-                [False, True],
-                [False],
-                [1],
-                [False, True],
-                [False],
-                [10000.0],  # rope base
-                [  # rope scaling
-                    None,
-                ]))
-
-        # for XQA multi batch split logic test
-        test_cases += list(
-            product(
-                [89],
-                ['llama_attention'],
-                [ContextFMHAType.enabled],
-                ['float16'],
-                [None],
-                [150],
-                [500],
-                [32],
-                [128],
-                [4],
-                [False, True],
-                [False],
-                [1],
-                [False],
-                [False],
-                [10000.0],  # rope base
-                [  # rope scaling
-                    None,
-                ]))
-
+        # For XQA kernels
+        # all arches use the same kernel traits, we can distribute the workloads.
         # for XQA int8/fp8 KVCache
         test_cases += list(
             product(
@@ -285,6 +219,7 @@ class TestFunctional(unittest.TestCase):
                 [  # rope scaling
                     None,
                 ]))
+
         test_cases += list(
             product(
                 [89],
@@ -307,10 +242,97 @@ class TestFunctional(unittest.TestCase):
                     None,
                 ]))
 
+        # Test case for GPT-J beam_width=4, used in MLPerf.
+        test_cases += list(
+            product([80], ['gptj_attention'], [ContextFMHAType.disabled],
+                    ['float16'], ['float16'], [2], [128], [4], [256], [0],
+                    [False], [False], [4], [True], [False]))
+        test_cases += list(
+            product([90], ['gptj_attention'], [ContextFMHAType.disabled],
+                    ['float16'], ['fp8'], [2], [128], [4], [256], [0], [False],
+                    [False], [4], [True], [False]))
+
         # split test cases into two partitions
         test_cases = [("partition0", ) + case if i % 2 == 0 else
                       ("partition1", ) + case
                       for i, case in enumerate(test_cases)]
+
+        # tests (h100 only)
+        # For warp-specialized kernels on Hopper.
+        test_cases += list(
+            product(
+                ['h100_only'],
+                [90],
+                ['llama_attention'],
+                [
+                    ContextFMHAType.enabled,
+                    ContextFMHAType.enabled_with_fp32_acc
+                ],
+                ['float16', 'bfloat16'],
+                [None],
+                [4],
+                [68, 2543],
+                [16],
+                [32, 64, 128, 256],
+                [2],
+                [False],
+                [False],
+                [1],
+                [False],
+                [False],
+                [10000.0],  # rope base
+                [  # rope scaling
+                    None,
+                ]))
+
+        # For XQA kernels
+        # all arches use the same kernel traits, we can assign some workloads to h100-only.
+        test_cases += list(
+            product(
+                ['h100_only'],
+                [90],
+                ['llama_attention'],
+                [ContextFMHAType.enabled],
+                ['float16', 'bfloat16'],
+                [None],
+                [2],
+                [165, 1025, 2543],
+                [16],
+                [128],
+                [2],
+                [False, True],
+                [False],
+                [1],
+                [False, True],
+                [False],
+                [10000.0],  # rope base
+                [  # rope scaling
+                    None,
+                ]))
+
+        # for XQA multi batch split logic test
+        test_cases += list(
+            product(
+                ['h100_only'],
+                [90],
+                ['llama_attention'],
+                [ContextFMHAType.enabled],
+                ['float16'],
+                [None],
+                [150],
+                [500],
+                [32],
+                [128],
+                [4],
+                [False, True],
+                [False],
+                [1],
+                [False],
+                [False],
+                [10000.0],  # rope base
+                [  # rope scaling
+                    None,
+                ]))
 
         return test_cases
 
@@ -351,7 +373,6 @@ class TestFunctional(unittest.TestCase):
         use_fp8_kv_cache = True if kv_cache_dtype == 'fp8' else False
         if kv_cache_dtype is None:
             kv_cache_dtype = dtype
-
         # skip tests based on the gpu_arch_lists
         if gpu_arch != 'all':
             assert gpu_arch in [70, 80, 86, 89, 90]
@@ -360,17 +381,16 @@ class TestFunctional(unittest.TestCase):
                     "Skip the test as the target gpu arch doesn't match this gpu arch."
                 )
 
+        if num_kv_heads == 0:
+            num_kv_heads = num_heads
+
         # Skip tests that are not supported in pre-ampere architecture
         if getSMVersion() < 80:
-            if context_fmha_type == ContextFMHAType.enabled:
-                pytest.skip(
-                    "ContextFMHAType is not supported in pre-ampere architecture"
-                )
-            elif context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
+            if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
                 pytest.skip(
                     "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
                 )
-            elif dtype == 'bfloat16':
+            if dtype == 'bfloat16':
                 pytest.skip(
                     "bfloat16 is not supported in pre-ampere architecture")
 
@@ -378,8 +398,6 @@ class TestFunctional(unittest.TestCase):
             if use_fp8_kv_cache:
                 pytest.skip("FP8 is not supported on pre-Ada architectures")
 
-        if num_kv_heads == 0:
-            num_kv_heads = num_heads
         # Skip duplicated tests.
         if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc and \
             dtype == 'bfloat16':
@@ -390,11 +408,6 @@ class TestFunctional(unittest.TestCase):
         if use_int8_kv_cache or use_fp8_kv_cache or True:
             # Fixing seed to avoid flakiness in tests with quantization
             torch.manual_seed(42)
-
-        if beam_width != 1 and paged_kv_cache:
-            pytest.skip(
-                "Beam search and paged kv cache are not supported in this test yet"
-            )
 
         tokens_per_block = 128 if paged_kv_cache else -1
 
@@ -1109,20 +1122,22 @@ class TestFunctional(unittest.TestCase):
                 del session
                 session = None
 
+                # Note: Volta has larger errors.
+                # We speculate it’s because Volta’s TC is smaller and more calculations are required,
+                # which may lead to more error accumulation.
                 if enable_remove_input_padding:
                     torch_output = remove_input_padding(torch_output)
                     np.testing.assert_allclose(
                         output.to(torch.float32).cpu().numpy(),
                         torch_output.to(torch.float32).cpu().numpy(),
-                        atol=5e-3)
+                        atol=5e-3 if getSMVersion() > 70 else 5e-2)
                 else:
                     np.testing.assert_allclose(
                         output[:, :in_len // 2, :].to(
                             torch.float32).cpu().numpy(),
                         torch_output[:, :in_len // 2, :].to(
                             torch.float32).cpu().numpy(),
-                        atol=5e-3)
-
+                        atol=5e-3 if getSMVersion() > 70 else 5e-2)
                 if attention_type == 'llama_attention':
                     verify_kv_cache(torch_present[0])
                 else:

@@ -29,7 +29,8 @@ from ..mapping import Mapping
 from ..quantization import QuantMode
 from .engine import Engine, get_engine_version
 from .generation import (ChatGLMGenerationSession, GenerationSession,
-                         LogitsProcessor, LoraManager, ModelConfig,
+                         LogitsProcessor, LoraManager,
+                         MambaLMHeadModelGenerationSession, ModelConfig,
                          QWenForCausalLMGenerationSession, SamplingConfig,
                          StoppingCriteria)
 
@@ -191,9 +192,9 @@ class ModelRunnerMixin:
             raise RuntimeError(
                 f"Maximum input length ({max_length}) exceeds the engine or specified limit ({self.max_input_len})"
             )
-        if sampling_config.max_new_tokens > self.max_output_len:
+        if max_length + sampling_config.max_new_tokens > self.max_seq_len:
             raise RuntimeError(
-                f"Maximum new tokens ({sampling_config.max_new_tokens}) exceeds the engine or specified limit ({self.max_output_len})"
+                f"Maximum input length ({max_length}) + maximum new tokens ({sampling_config.max_new_tokens}) exceeds the engine or specified limit ({self.max_seq_len})"
             )
         if sampling_config.num_beams > self.max_beam_width:
             raise RuntimeError(
@@ -301,7 +302,7 @@ class ModelRunner(ModelRunnerMixin):
                  session: GenerationSession,
                  max_batch_size: int,
                  max_input_len: int,
-                 max_output_len: int,
+                 max_seq_len: int,
                  max_beam_width: int,
                  lora_manager: Optional[LoraManager] = None) -> None:
         """
@@ -315,8 +316,8 @@ class ModelRunner(ModelRunnerMixin):
                 The maximum batch size allowed for the input.
             max_input_len (int):
                 The maximum input length allowed for the input.
-            max_output_len (int):
-                The maximum output length (new tokens).
+            max_seq_len (int):
+                The maximum sequence length (input + new tokens).
             max_beam_width (int):
                 The maximum beam width.
             lora_manager (LoraManager):
@@ -325,7 +326,7 @@ class ModelRunner(ModelRunnerMixin):
         self.session = session
         self.max_batch_size = max_batch_size
         self.max_input_len = max_input_len
-        self.max_output_len = max_output_len
+        self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
         self.lora_manager = lora_manager
 
@@ -400,6 +401,13 @@ class ModelRunner(ModelRunnerMixin):
             num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
             hidden_size = pretrained_config.hidden_size // tp_size
 
+            if pretrained_config.architecture == 'MambaLMHeadModel':
+                mamba_d_state = pretrained_config.ssm_cfg['d_state']
+                mamba_expand = pretrained_config.ssm_cfg['expand']
+                mamba_d_conv = pretrained_config.ssm_cfg['d_conv']
+            else:
+                mamba_d_state, mamba_expand, mamba_d_conv = 0, 0, 0
+
             model_config = ModelConfig(
                 vocab_size=pretrained_config.vocab_size,
                 num_layers=pretrained_config.num_hidden_layers,
@@ -418,12 +426,18 @@ class ModelRunner(ModelRunnerMixin):
                 dtype=pretrained_config.dtype,
                 max_prompt_embedding_table_size=build_config.
                 max_prompt_embedding_table_size,
+                mamba_d_state=mamba_d_state,
+                mamba_expand=mamba_expand,
+                mamba_d_conv=mamba_d_conv,
             )
             max_batch_size = build_config.max_batch_size
             max_input_len = build_config.max_input_len
             max_output_len = build_config.max_output_len
             max_beam_width = build_config.max_beam_width
-            session_cls = GenerationSession
+            if pretrained_config.architecture == 'MambaLMHeadModel':
+                session_cls = MambaLMHeadModelGenerationSession
+            else:
+                session_cls = GenerationSession
             engine_buffer = engine.engine
             runtime_mapping = pretrained_config.mapping
 
@@ -454,7 +468,7 @@ class ModelRunner(ModelRunnerMixin):
         return cls(session,
                    max_batch_size,
                    max_input_len,
-                   max_output_len,
+                   max_input_len + max_output_len,
                    max_beam_width,
                    lora_manager=lora_manager)
 
@@ -484,7 +498,7 @@ class ModelRunner(ModelRunnerMixin):
 
     @property
     def max_sequence_length(self) -> int:
-        return self.max_input_len + self.max_output_len
+        return self.max_seq_len
 
     @property
     def remove_input_padding(self) -> bool:
@@ -608,4 +622,4 @@ class ModelRunner(ModelRunnerMixin):
         Returns:
             bytes: The serialized engine.
         """
-        return self.session.runtime.serialize_engine()
+        return self.session.runtime._serialize_engine()

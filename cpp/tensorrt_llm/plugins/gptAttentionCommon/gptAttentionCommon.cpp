@@ -406,15 +406,51 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int num_heads, int num_kv_hea
     , mUseKVCache(use_cache)
     , mIsMedusaEnabled(is_medusa_enabled)
 {
-    // pre-check whether FMHA is supported in order to save memory allocation
-    mEnableContextFMHA = mEnableContextFMHA
-        && (mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16)
-        && MHARunner::fmha_supported(getHeadSize(), mSM) && !mCrossAttention
-        && mPositionEmbeddingType != tensorrt_llm::kernels::PositionEmbeddingType::kRELATIVE;
+    // pre-check whether FMHA is supported in order to save memory allocation.
+    if (mEnableContextFMHA)
+    {
+        mEnableContextFMHA = false;
+        if (!(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16))
+        {
+            TLLM_LOG_WARNING("Fall back to unfused MHA because of unsupported data type.");
+        }
+        else if (!MHARunner::fmha_supported(getHeadSize(), mSM))
+        {
+            TLLM_LOG_WARNING(
+                "Fall back to unfused MHA because of unsupported head size %d in sm_{%d}.", getHeadSize(), mSM);
+        }
+        else if (mCrossAttention)
+        {
+            TLLM_LOG_WARNING("Fall back to unfused MHA because of cross attention.");
+        }
+        else if (mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kRELATIVE)
+        {
+            TLLM_LOG_WARNING("Fall back to unfused MHA because of relative position embedding.");
+        }
+        else if (mSM == 70 && isALiBi())
+        {
+            TLLM_LOG_WARNING("Alibi is not supported for FMHA on Volta.");
+        }
+        else
+        {
+            mEnableContextFMHA = true;
+        }
+    }
 
     TLLM_CHECK(isRoPE() == (rotary_embedding_dim != 0));
     TLLM_CHECK_WITH_INFO((mSM >= 80) || (mType != nvinfer1::DataType::kBF16),
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
+
+    // Some features have not been implemented on Volta.
+    if (mSM == 70 && mEnableContextFMHA)
+    {
+        // Volta only has disablePagedKVContextFMHA implement
+        TLLM_CHECK_WITH_INFO(!(mPagedKVCache && mPagedContextFMHA), "PagedKV Context FMHA is not supported on Volta");
+        // Volta dose not support FP32 acc
+        TLLM_CHECK_WITH_INFO(!mFMHAForceFP32Acc, "FP32 Acc is not supported on Volta");
+
+        TLLM_LOG_WARNING("Note that alibi or sliding window attention are not supported for FMHA on Volta");
+    }
 }
 
 const int GPTAttentionPluginCommon::getHeadSize(bool checkInit) const
@@ -468,7 +504,11 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(const void* data, size_t leng
 
     mKVCacheQuantMode = tc::QuantMode(kvCacheQuantMode);
 
-    TLLM_CHECK(d == a + length);
+    TLLM_CHECK_WITH_INFO(d == a + length,
+        "Expected length (%d) != real length (%d). This is often "
+        "caused by using different TensorRT-LLM version to build "
+        "engine and run engine.",
+        (int) length, (int) (d - a));
     TLLM_CHECK_WITH_INFO((mSM >= 80) || (mType != nvinfer1::DataType::kBF16),
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
 }
@@ -673,10 +713,8 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
             * params.input_seq_length * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
     const size_t padding_offset_size
         = sizeof(int) * params.batch_size * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
-    // It is assumed that the number of tokens per paged kv block should be >= 128.
-    const size_t blocks_per_context_sequence = mPagedKVCache ? tc::divUp(params.input_seq_length, mTokensPerBlock) : 0;
     const size_t paged_kv_tma_desc_size = mPagedKVCache && mPagedContextFMHA
-        ? params.batch_size * 2 * TMA_DESC_SIZE_IN_BYTE * blocks_per_context_sequence
+        ? params.batch_size * 2 * TMA_DESC_SIZE_IN_BYTE * params.max_blocks_per_sequence
         : 0;
 
     const bool is_qk_buf_float_ = true;
@@ -780,7 +818,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
             0, cache_type, params.kv_scale_orig_quant, enablePagedKVContextFMHA, 1, mLaunchGridBlockCache, stream);
         sync_check_cuda_error();
 
-        //  It is not needed with packed QKV input.
+        // It is not needed with packed QKV input.
         if (enablePagedKVContextFMHA)
         {
             // to enable chunked attention,
@@ -801,7 +839,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
                 TLLM_LOG_ERROR("Cannot support StreamingLLM now when enabling paged KV context FMHA.");
             }
             mFMHARunner->setup_paged_kv(params.batch_size, params.input_seq_length, params.max_past_kv_len,
-                blocks_per_context_sequence, mTokensPerBlock, params.cyclic_attention_window_size, params.num_tokens,
+                params.max_blocks_per_sequence, mTokensPerBlock, params.cyclic_attention_window_size, params.num_tokens,
                 isALiBi(), isAliBiWithScale(), mTpSize, mTpRank);
             mFMHARunner->run_paged_kv(q_buf_2_, paged_kv_tma_desc, host_kv_cache_block_ptrs,
                 reinterpret_cast<KVBlockArray&>(kv_cache_buffer), cu_q_seqlens, cu_kv_seqlens, params.context_buf,
@@ -958,7 +996,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
                 invokeAddRelativeAttentionBiasUnaligned(qk_buf_float_, relative_attention_bias, params.batch_size,
                     mNumHeads, attention_seq_len_1,
                     isCrossAttention() ? params.cross_qkv_length : params.cyclic_attention_window_size, stream,
-                    max_distance > 0, relative_attention_bias_stride, max_distance, true /* bidirectional */);
+                    max_distance > 0, relative_attention_bias_stride, max_distance, false /* bidirectional */);
             }
 
             MaskedSoftmaxParam<T, float> param;
@@ -986,7 +1024,7 @@ int GPTAttentionPluginCommon::enqueueContext(const EnqueueContextParams<T, KVCac
                 invokeAddRelativeAttentionBiasUnaligned(qk_buf_, relative_attention_bias, params.batch_size, mNumHeads,
                     attention_seq_len_1,
                     isCrossAttention() ? params.cross_qkv_length : params.cyclic_attention_window_size, stream,
-                    max_distance > 0, relative_attention_bias_stride, max_distance, true /* bidirectional */);
+                    max_distance > 0, relative_attention_bias_stride, max_distance, false /* bidirectional */);
             }
 
             MaskedSoftmaxParam<T, T> param;

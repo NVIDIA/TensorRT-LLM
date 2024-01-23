@@ -156,11 +156,11 @@ class TopModelMixin:
 
             # Forward
             inputs = self.prepare_inputs(
-                batch_size,
-                input_len,
-                output_len,
-                True,
-                kwargs.get('max_beam_width', 1),
+                max_batch_size=batch_size,
+                max_input_len=input_len,
+                max_seq_len=input_len + output_len,
+                use_cache=True,
+                max_beam_width=kwargs.get('max_beam_width', 1),
                 max_num_tokens=kwargs.get("max_num_tokens",
                                           batch_size * input_len),
                 prompt_embedding_table_size=getattr(
@@ -414,7 +414,7 @@ class TopModelMixin:
         plugin_config.set_gpt_attention_plugin()
         plugin_config.set_gemm_plugin()
         # Quantization plugins.
-        plugin_config.set_context_fmha(ContextFMHAType.enabled_with_fp32_acc)
+        plugin_config.set_context_fmha(ContextFMHAType.enabled)
         if self.mapping.world_size > 1:
             plugin_config.set_nccl_plugin()
         plugin_config.enable_remove_input_padding()

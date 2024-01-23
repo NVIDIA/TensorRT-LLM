@@ -28,8 +28,7 @@ import tensorrt_llm as tllm
 from tensorrt_llm import Mapping, Tensor
 from tensorrt_llm._ipc_utils import peer_access
 from tensorrt_llm.functional import AllReduceStrategy, allreduce
-from tensorrt_llm.plugin.plugin import (current_all_reduce_helper,
-                                        init_all_reduce_helper)
+from tensorrt_llm.plugin.plugin import current_all_reduce_helper
 
 
 def custom_name_func(testcase_func, param_num, param):
@@ -71,10 +70,6 @@ class TestCommunicationPlugin(unittest.TestCase):
 
         torch_dtype = tllm._utils.str_dtype_to_torch(dtype)
         dtype_size = torch.finfo(torch_dtype).bits // 8
-        init_all_reduce_helper()
-        _, workspace = current_all_reduce_helper().allocate_workspace(
-            self.mapping, size * dtype_size)
-        print(workspace)
 
         allreduce_ref = torch.zeros(self.reference_tensors[0][:size].shape,
                                     dtype=torch_dtype,
@@ -85,7 +80,9 @@ class TestCommunicationPlugin(unittest.TestCase):
 
         builder = tllm.Builder()
         net = builder.create_network()
-        net.plugin_config.set_nccl_plugin(dtype)
+        net.plugin_config.set_nccl_plugin(dtype, use_custom_all_reduce=True)
+        _, workspace = current_all_reduce_helper().allocate_workspace(
+            self.mapping, size * dtype_size)
 
         input = self.reference_tensors[self.rank][:size].to(torch_dtype)
         inner_loop = 5

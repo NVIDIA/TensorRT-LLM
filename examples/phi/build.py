@@ -260,10 +260,12 @@ def build_rank_engine(builder: Builder,
         network.set_named_parameters(tensorrt_llm_gpt.named_parameters())
 
         # Forward
-        inputs = tensorrt_llm_gpt.prepare_inputs(args.max_batch_size,
-                                                 args.max_input_len,
-                                                 args.max_output_len, True,
-                                                 args.max_beam_width)
+        inputs = tensorrt_llm_gpt.prepare_inputs(
+            max_batch_size=args.max_batch_size,
+            max_input_len=args.max_input_len,
+            max_seq_len=args.max_input_len + args.max_output_len,
+            use_cache=True,
+            max_beam_width=args.max_beam_width)
         tensorrt_llm_gpt(*inputs)
         if args.enable_debug_output:
             # mark intermediate nodes' outputs

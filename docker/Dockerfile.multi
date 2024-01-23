@@ -1,6 +1,7 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG BASE_TAG=23.12-py3
+ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} as base
 
@@ -22,7 +23,11 @@ COPY docker/common/install_ccache.sh install_ccache.sh
 RUN bash ./install_ccache.sh && rm install_ccache.sh
 
 # Download & install internal TRT release
-ARG TRT_VER CUDA_VER CUDNN_VER NCCL_VER CUBLAS_VER
+ARG TRT_VER
+ARG CUDA_VER
+ARG CUDNN_VER
+ARG NCCL_VER
+ARG CUBLAS_VER
 COPY docker/common/install_tensorrt.sh install_tensorrt.sh
 RUN bash ./install_tensorrt.sh \
     --TRT_VER=${TRT_VER} \
@@ -45,7 +50,7 @@ ARG TORCH_INSTALL_TYPE="skip"
 COPY docker/common/install_pytorch.sh install_pytorch.sh
 RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh
 
-FROM devel as wheel
+FROM ${DEVEL_IMAGE} as wheel
 WORKDIR /src/tensorrt_llm
 COPY benchmarks benchmarks
 COPY cpp cpp
@@ -55,15 +60,35 @@ COPY tensorrt_llm tensorrt_llm
 COPY 3rdparty 3rdparty
 COPY setup.py requirements.txt requirements-dev.txt ./
 
-ARG BUILD_WHEEL_ARGS="--clean --trt_root /usr/local/tensorrt"
+ARG BUILD_WHEEL_ARGS="--clean --trt_root /usr/local/tensorrt --python_bindings --benchmarks"
 RUN python3 scripts/build_wheel.py ${BUILD_WHEEL_ARGS}
 
-FROM devel as release
+FROM ${DEVEL_IMAGE} as release
 
 WORKDIR /app/tensorrt_llm
 COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl .
-COPY --from=wheel /src/tensorrt_llm/cpp/include/ include/
 RUN pip install tensorrt_llm*.whl --extra-index-url https://pypi.nvidia.com && \
     rm tensorrt_llm*.whl
 COPY README.md ./
+COPY docs docs
+COPY cpp/include include
+ARG CPP_BUILD_DIR=/src/tensorrt_llm/cpp/build
+COPY --from=wheel \
+     ${CPP_BUILD_DIR}/tensorrt_llm/libtensorrt_llm.so \
+     ${CPP_BUILD_DIR}/tensorrt_llm/libtensorrt_llm_static.a \
+     lib/
+RUN ln -sv $(TRT_LLM_NO_LIB_INIT=1 python3 -c "import tensorrt_llm.plugin as tlp; print(tlp.plugin_lib_path())") lib/ && \
+    cp -Pv lib/libnvinfer_plugin_tensorrt_llm.so lib/libnvinfer_plugin_tensorrt_llm.so.9 && \
+    echo "/app/tensorrt_llm/lib" > /etc/ld.so.conf.d/tensorrt_llm.conf && \
+    ldconfig
+COPY --from=wheel \
+     ${CPP_BUILD_DIR}/benchmarks/bertBenchmark \
+     ${CPP_BUILD_DIR}/benchmarks/gptManagerBenchmark \
+     ${CPP_BUILD_DIR}/benchmarks/gptSessionBenchmark \
+     benchmarks/
 COPY examples examples
+RUN chmod -R a+w examples
+ARG GIT_COMMIT
+ARG TRT_LLM_VER
+ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
+    TRT_LLM_VERSION=${TRT_LLM_VER}

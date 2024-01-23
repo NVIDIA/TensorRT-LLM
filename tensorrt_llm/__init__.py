@@ -19,10 +19,11 @@ import tensorrt_llm.runtime as runtime
 import tensorrt_llm.tools as tools
 
 from ._common import _init, default_net, default_trtnet, precision
-# Disable flake8 on the line below because mpi_rank is not used in tensorrt_llm project
+# Disable flake8 on the line below because mpi_barrier is not used in tensorrt_llm project
 # but may be called in dependencies (such as examples)
-from ._utils import mpi_rank  # NOQA
-from ._utils import mpi_world_size, str_dtype_to_torch, str_dtype_to_trt  # NOQA
+from ._utils import mpi_barrier  # NOQA
+from ._utils import str_dtype_to_torch  # NOQA
+from ._utils import mpi_rank, mpi_world_size, str_dtype_to_trt
 from .builder import Builder, BuilderConfig
 from .functional import Tensor, constant
 from .hlapi.llm import LLM, ModelConfig
@@ -37,6 +38,7 @@ __all__ = [
     'logger',
     'str_dtype_to_trt',
     'str_dtype_to_torch'
+    'mpi_barrier',
     'mpi_rank',
     'mpi_world_size',
     'constant',
@@ -62,3 +64,12 @@ __all__ = [
 ]
 
 _init(log_level="error")
+
+print(f"[TensorRT-LLM] TensorRT-LLM version: {__version__}", end='')
+try:
+    import subprocess
+    print(
+        f", commit: {subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('ascii').strip()}"
+    )
+except:
+    print(f"")

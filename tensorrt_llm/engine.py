@@ -1,18 +1,16 @@
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Union
 
 import janus
 import torch
 
 import tensorrt_llm.bindings as tllm
 
+from .hlapi.tokenizer import TokenizerBase
 from .hlapi.utils import GenerationOutput
 from .logger import logger
 from .runtime import SamplingConfig
-
-# TODO[chuweiy]: fix circle import later
-# from .hlapi.tokenizer import TokenizerBase
 
 
 class AsyncLLMEngine:
@@ -20,14 +18,12 @@ class AsyncLLMEngine:
 
     def __init__(self,
                  engine_dir: Path,
-                 tokenizer: str | Path | Any,
+                 tokenizer: Union[str, Path, TokenizerBase],
                  max_beam_width: int = 1) -> None:
         self.requests: list[tllm.InferenceRequest] = []
         self.results: dict[int, janus.Queue] = {}
         self.stop_set: set[int] = set()
         self.stats: Optional[janus.LifoQueue] = None
-
-        from .hlapi.tokenizer import TokenizerBase
 
         self.tokenizer = tokenizer
         if not isinstance(tokenizer, TokenizerBase):
@@ -178,8 +174,6 @@ class AsyncLLMEngine:
         return self.stop_set
 
     def _handle_stats_callback(self, stats: str):
-        # TODO[chunweiy]: fix this
-        return
         if self.stats is None:
             self.stats = janus.LifoQueue()
 

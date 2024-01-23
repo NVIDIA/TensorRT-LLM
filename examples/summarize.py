@@ -115,7 +115,6 @@ def main(args):
             args.medusa_choices = ast.literal_eval(args.medusa_choices)
             assert args.use_py_session, "Medusa is only supported by py_session"
             assert args.temperature == 0, "Medusa should use temperature == 0"
-            assert args.batch_size == 1, "Medusa should use max_batch_size == 1"
             assert args.num_beams == 1, "Medusa should use num_beams == 1"
             runner_kwargs.update(medusa_choices=args.medusa_choices)
         if not args.use_py_session:

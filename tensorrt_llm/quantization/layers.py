@@ -18,7 +18,7 @@ import numpy as np
 import tensorrt as trt
 
 from .._common import default_net, precision
-from .._utils import str_dtype_to_trt
+from .._utils import fp32_array, str_dtype_to_trt
 from ..functional import (ACT2FN, Tensor, allgather, allreduce, cast, concat,
                           constant, generate_alibi_slopes, gpt_attention,
                           matmul, mul, shape, slice, softmax, split, where)
@@ -816,7 +816,6 @@ class FP8RowLinear(RowLinear):
         dtype=None,
         tp_group=None,
         tp_size=1,
-        instance_id: int = 0,
         max_lora_rank=None,
     ):
         super().__init__(in_features,
@@ -824,8 +823,7 @@ class FP8RowLinear(RowLinear):
                          bias=bias,
                          dtype=dtype,
                          tp_group=tp_group,
-                         tp_size=tp_size,
-                         instance_id=instance_id)
+                         tp_size=tp_size)
         self.activation_scaling_factor = Parameter(shape=(1, ),
                                                    dtype=trt.float32)
         self.weights_scaling_factor = Parameter(shape=(1, ), dtype=trt.float32)
@@ -1028,6 +1026,8 @@ class SmoothQuantAttention(Module):
         self,
         hidden_states: Tensor,
         attention_mask=None,
+        medusa_packed_mask=None,
+        medusa_position_offsets=None,
         use_cache=False,
         kv_cache_params=None,
         attention_params=None,
@@ -1068,7 +1068,9 @@ class SmoothQuantAttention(Module):
                 default_net().plugin_config.gpt_attention_plugin)
             assert self.attention_mask_type == AttentionMaskType.causal, \
                 'Plugin only support masked MHA.'
-            kv_quant_scale = 1.0 / self.kv_cache_scaling_factor.value if self.quant_mode.has_int8_kv_cache(
+            kv_quant_scale = constant(
+                fp32_array([1.0])
+            ) / self.kv_cache_scaling_factor.value if self.quant_mode.has_int8_kv_cache(
             ) else None
             kv_dequant_scale = self.kv_cache_scaling_factor.value if self.quant_mode.has_int8_kv_cache(
             ) else None
@@ -1104,7 +1106,9 @@ class SmoothQuantAttention(Module):
                 get_first_host_kv_cache_block_pointers(),
                 host_context_lengths=attention_params.host_context_lengths,
                 enable_pos_shift=self.enable_pos_shift,
-                dense_context_fmha=self.dense_context_fmha)
+                dense_context_fmha=self.dense_context_fmha,
+                medusa_position_offsets=medusa_position_offsets,
+                medusa_packed_mask=medusa_packed_mask)
         else:
             assert self.paged_kv_cache == False
 

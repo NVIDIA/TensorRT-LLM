@@ -43,11 +43,14 @@ protected:
     void SetUp() override
     {
         mDeviceCount = tc::getDeviceCount();
+        PinnedPoolAllocator::getPool().setChunkSize(kPinnedPoolChunkSize);
     }
 
     void TearDown() override {}
 
     int mDeviceCount;
+
+    static auto constexpr kPinnedPoolChunkSize = std::size_t(1) << 22;
 };
 
 TEST_F(TllmBuffersTest, Stream)
@@ -428,7 +431,7 @@ TEST_F(TllmBuffersTest, PinnedPoolAllocator)
     }
 
     auto const chunkSize = pool.getChunkSize();
-    auto constexpr initChunkSize = MemPool::kInitialChunkSize;
+    auto constexpr initChunkSize = kPinnedPoolChunkSize;
     EXPECT_EQ(chunkSize, initChunkSize);
 
     {

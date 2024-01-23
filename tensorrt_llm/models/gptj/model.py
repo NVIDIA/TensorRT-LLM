@@ -265,7 +265,7 @@ class GPTJForCausalLM(GPTJModel, GenerationMixin):
     def prepare_inputs(self,
                        max_batch_size,
                        max_input_len,
-                       max_new_tokens,
+                       max_seq_len,
                        use_cache,
                        max_beam_width,
                        max_num_tokens: int = None):
@@ -290,7 +290,7 @@ class GPTJForCausalLM(GPTJModel, GenerationMixin):
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
             max_input_len=max_input_len,
-            max_new_tokens=max_new_tokens,
+            max_seq_len=max_seq_len,
             num_kv_heads=num_heads_kv,
             head_size=head_size,
             num_layers=self._num_layers,

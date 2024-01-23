@@ -30,6 +30,7 @@ from weight import (get_scaling_factors, load_from_awq_internlm,
                     load_from_hf_internlm, load_from_meta_internlm)
 
 import tensorrt_llm
+from tensorrt_llm._common import check_max_num_tokens
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.layers.attention import PositionEmbeddingType
@@ -339,7 +340,9 @@ def parse_arguments():
         '--max_num_tokens',
         type=int,
         default=None,
-        help='Define the max number of tokens supported by the engine')
+        help=
+        'Define the max number of tokens supported by the engine, note that it takes no effect if --remove_input_padding is not set'
+    )
     parser.add_argument(
         '--strongly_typed',
         default=False,
@@ -479,8 +482,11 @@ def parse_arguments():
             logger.info("To use awq we pad vocab_size to {}.".format(
                 args.vocab_size))
 
-    if args.max_num_tokens is not None:
-        assert args.enable_context_fmha
+    args.max_num_tokens = check_max_num_tokens(
+        max_num_tokens=args.max_num_tokens,
+        max_batch_size=args.max_batch_size,
+        max_input_len=args.max_input_len,
+        remove_input_padding=args.remove_input_padding)
 
     assert (math.log2(args.tokens_per_block).is_integer()
             ), "tokens_per_block must be power of 2"
@@ -663,11 +669,13 @@ def build_rank_engine(builder: Builder,
         network.set_named_parameters(tensorrt_llm_internlm.named_parameters())
 
         # Forward
-        inputs = tensorrt_llm_internlm.prepare_inputs(args.max_batch_size,
-                                                      args.max_input_len,
-                                                      args.max_output_len, True,
-                                                      args.max_beam_width,
-                                                      args.max_num_tokens)
+        inputs = tensorrt_llm_internlm.prepare_inputs(
+            max_batch_size=args.max_batch_size,
+            max_input_len=args.max_input_len,
+            max_seq_len=args.max_input_len + args.max_output_len,
+            use_cache=True,
+            max_beam_width=args.max_beam_width,
+            max_num_tokens=args.max_num_tokens)
         tensorrt_llm_internlm(*inputs)
         if args.enable_debug_output:
             # mark intermediate nodes' outputs

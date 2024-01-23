@@ -447,7 +447,7 @@ def get_tllm_linear_weight(weight,
     if use_weight_only:
         v = weight.cpu().t().contiguous()
         processed_torch_weights, torch_weight_scales = \
-            torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 v, plugin_weight_only_quant_type)
         results[prefix + 'weight'] = processed_torch_weights
         results[prefix + 'per_channel_scale'] = torch_weight_scales
@@ -477,7 +477,7 @@ def add_tllm_weight(
             raise ValueError(
                 f'Invalid configuration, got quant_mode={quant_mode}')
         processed_torch_weights, torch_weight_scales = \
-            torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 param.t().contiguous(), quant_dtype)
         weights[name] = processed_torch_weights
         scale_name = name.replace('.weight', '.per_channel_scale')
@@ -1023,7 +1023,7 @@ def convert(worker_rank, args, convert_args):
 
 def main():
     # TODO(qijun): Currently, the convert script depends on a torch op:
-    # torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix,
+    # torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix,
     # which is included in tensorrt_llm Python package. Otherwise, the convert
     # script does not need to import tensorrt_llm. Will remove it after reimplementing
     # the op with PyTorch.

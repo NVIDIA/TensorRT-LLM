@@ -49,9 +49,10 @@ def run_command(command: _tp.Sequence[str],
                 cwd: _pl.Path,
                 *,
                 shell=False,
-                env=None) -> None:
+                env=None,
+                timeout=None) -> None:
     _log.info("Running: cd %s && %s", str(cwd), " ".join(command))
-    _sp.check_call(command, cwd=cwd, shell=shell, env=env)
+    _sp.check_call(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
 
 
 def build_trt_llm(python_exe: str,
@@ -83,23 +84,24 @@ def build_trt_llm(python_exe: str,
     if job_count is not None:
         build_wheel += ["-j", str(job_count)]
 
-    run_command(build_wheel, cwd=root_dir, env=_os.environ)
+    run_command(build_wheel, cwd=root_dir, env=_os.environ, timeout=2400)
 
     dist_dir = dist_dir if dist_dir.is_absolute() else root_dir / dist_dir
     wheels = _gl.glob(str(dist_dir / "tensorrt_llm-*.whl"))
     assert len(wheels) > 0, "No wheels found"
     install_wheel = [python_exe, "-m", "pip", "install", "--upgrade", *wheels]
-    run_command(install_wheel, cwd=root_dir)
+    run_command(install_wheel, cwd=root_dir, timeout=300)
 
 
 def run_tests(cuda_architectures: _tp.Optional[str] = None,
               build_dir: _tp.Optional[str] = None,
               dist_dir: _tp.Optional[str] = None,
               model_cache: _tp.Optional[str] = None,
-              skip_gpt=False,
-              skip_gptj=False,
-              skip_llama=False,
-              skip_chatglm=False,
+              skip_unit_tests=False,
+              run_gpt=False,
+              run_gptj=False,
+              run_llama=False,
+              run_chatglm=False,
               run_fp8=False,
               only_multi_gpu=False,
               trt_root: _tp.Optional[str] = None,
@@ -139,31 +141,36 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
         "--tp-size=2"
     ]
 
-    run_command(generate_lora_data_args_tp1, cwd=root_dir)
-    run_command(generate_lora_data_args_tp2, cwd=root_dir)
+    run_command(generate_lora_data_args_tp1, cwd=root_dir, timeout=100)
+    run_command(generate_lora_data_args_tp2, cwd=root_dir, timeout=100)
+
+    if not skip_unit_tests:
+        run_unit_tests(build_dir=build_dir)
+    else:
+        _log.info("Skipping unit tests")
 
     if not only_multi_gpu:
         prepare_all_model_tests(python_exe=python_exe,
                                 root_dir=root_dir,
                                 resources_dir=resources_dir,
                                 model_cache=model_cache,
-                                skip_gpt=skip_gpt,
-                                skip_gptj=skip_gptj,
-                                skip_llama=skip_llama,
-                                skip_chatglm=skip_chatglm,
+                                run_gpt=run_gpt,
+                                run_gptj=run_gptj,
+                                run_llama=run_llama,
+                                run_chatglm=run_chatglm,
                                 run_fp8=run_fp8)
 
         if build_only:
             return
 
-        run_google_tests(build_dir=build_dir,
-                         skip_gpt=skip_gpt,
-                         skip_gptj=skip_gptj,
-                         skip_llama=skip_llama,
-                         skip_chatglm=skip_chatglm,
-                         run_fp8=run_fp8)
+        run_single_gpu_tests(build_dir=build_dir,
+                             run_gpt=run_gpt,
+                             run_gptj=run_gptj,
+                             run_llama=run_llama,
+                             run_chatglm=run_chatglm,
+                             run_fp8=run_fp8)
 
-        if not skip_gpt:
+        if run_gpt:
             run_benchmarks(python_exe=python_exe,
                            root_dir=root_dir,
                            build_dir=build_dir,
@@ -187,15 +194,14 @@ def prepare_all_model_tests(python_exe: str,
                             root_dir: _pl.Path,
                             resources_dir: _pl.Path,
                             model_cache: _tp.Optional[str] = None,
-                            skip_gpt=False,
-                            skip_gptj=False,
-                            skip_llama=False,
-                            skip_chatglm=False,
+                            run_gpt=False,
+                            run_gptj=False,
+                            run_llama=False,
+                            run_chatglm=False,
                             run_fp8=False):
     model_cache_arg = ["--model_cache", model_cache] if model_cache else []
-    only_fp8_arg = ["--only_fp8"]
 
-    if not skip_gpt:
+    if run_gpt:
         prepare_model_tests(model_name="gpt",
                             python_exe=python_exe,
                             root_dir=root_dir,
@@ -204,13 +210,14 @@ def prepare_all_model_tests(python_exe: str,
     else:
         _log.info("Skipping GPT tests")
 
-    if not skip_gptj:
+    if run_gptj:
         prepare_model_tests(model_name="gptj",
                             python_exe=python_exe,
                             root_dir=root_dir,
                             resources_dir=resources_dir,
                             model_cache_arg=model_cache_arg)
         if run_fp8:
+            only_fp8_arg = ["--only_fp8"]
             prepare_model_tests(model_name="gptj",
                                 python_exe=python_exe,
                                 root_dir=root_dir,
@@ -220,7 +227,7 @@ def prepare_all_model_tests(python_exe: str,
     else:
         _log.info("Skipping GPT-J tests")
 
-    if not skip_llama:
+    if run_llama:
         prepare_model_tests(model_name="llama",
                             python_exe=python_exe,
                             root_dir=root_dir,
@@ -229,7 +236,7 @@ def prepare_all_model_tests(python_exe: str,
     else:
         _log.info("Skipping Lllama tests")
 
-    if not skip_chatglm:
+    if run_chatglm:
         prepare_model_tests(model_name="chatglm",
                             python_exe=python_exe,
                             root_dir=root_dir,
@@ -268,7 +275,7 @@ def prepare_model_tests(model_name: str,
         python_exe,
         str(scripts_dir / f"build_{model_name}_engines.py")
     ] + model_cache_arg + only_fp8_arg + only_multi_gpu_arg
-    run_command(build_engines, cwd=root_dir, env=model_env)
+    run_command(build_engines, cwd=root_dir, env=model_env, timeout=1800)
 
     model_env["PYTHONPATH"] = "examples"
     generate_expected_output = [
@@ -279,43 +286,70 @@ def prepare_model_tests(model_name: str,
         generate_expected_output = [
             "mpirun", "-n", "4", "--allow-run-as-root", "--timeout", "600"
         ] + generate_expected_output
-    run_command(generate_expected_output, cwd=root_dir, env=model_env)
+    run_command(generate_expected_output,
+                cwd=root_dir,
+                env=model_env,
+                timeout=600)
 
 
-def run_google_tests(build_dir: _pl.Path, skip_gpt, skip_gptj, skip_llama,
-                     skip_chatglm, run_fp8):
+def build_tests(build_dir: _pl.Path):
     make_google_tests = [
         "cmake", "--build", ".", "--config", "Release", "-j", "--target",
         "google-tests"
     ]
-    run_command(make_google_tests, cwd=build_dir)
+    run_command(make_google_tests, cwd=build_dir, timeout=300)
+
+
+def run_unit_tests(build_dir: _pl.Path):
+    build_tests(build_dir=build_dir)
 
     cpp_env = {**_os.environ}
-    ctest = ["ctest", "--output-on-failure", "--output-junit", "results.xml"]
+    ctest = [
+        "ctest", "--output-on-failure", "--output-junit",
+        "results-unit-tests.xml"
+    ]
     excluded_tests = []
-    if skip_gpt:
-        excluded_tests.append(
-            ".*GptTest.*|.*GptSessionTest.*|.*GptManagerTest.*|.*TrtGptModelTest.*"
-        )
-    if skip_gptj:
-        excluded_tests.append(".*Gptj.*")
-    if skip_llama:
-        excluded_tests.append(".*Llama.*")
-    if skip_chatglm:
-        excluded_tests.append(".*ChatGlm.*")
+    excluded_tests.append("Gpt[^j]")
+    excluded_tests.append("Gptj")
+    excluded_tests.append("Llama")
+    excluded_tests.append("ChatGlm")
+    ctest.extend(["-E", "|".join(excluded_tests)])
+    run_command(ctest, cwd=build_dir, env=cpp_env, timeout=1800)
+
+
+def run_single_gpu_tests(build_dir: _pl.Path, run_gpt, run_gptj, run_llama,
+                         run_chatglm, run_fp8):
+    build_tests(build_dir=build_dir)
+
+    cpp_env = {**_os.environ}
+    ctest = [
+        "ctest", "--output-on-failure", "--output-junit",
+        "results-single-gpu.xml"
+    ]
+
+    included_tests = []
+    if run_gpt:
+        included_tests.append("Gpt[^j]")
+    if run_gptj:
+        included_tests.append("Gptj")
+    if run_llama:
+        included_tests.append("Llama")
+    if run_chatglm:
+        included_tests.append("ChatGlm")
+
+    excluded_tests = []
     if not run_fp8:
-        excluded_tests.append(".*FP8.*")
-    if excluded_tests:
-        ctest.extend(["-E", "|".join(excluded_tests)])
-    run_command(ctest, cwd=build_dir, env=cpp_env)
+        excluded_tests.append("FP8")
+
+    if included_tests:
+        ctest.extend(["-R", "|".join(included_tests)])
+        if excluded_tests:
+            ctest.extend(["-E", "|".join(excluded_tests)])
+        run_command(ctest, cwd=build_dir, env=cpp_env, timeout=3600)
 
 
 def run_multi_gpu_tests(build_dir: _pl.Path):
-    make_google_tests = [
-        "cmake", "--build", ".", "--config", "Release", "-j", "--target",
-        "google-tests"
-    ]
-    run_command(make_google_tests, cwd=build_dir)
+    build_tests(build_dir=build_dir)
 
     tests_dir = build_dir / "tests"
     cpp_env = {**_os.environ}
@@ -323,7 +357,7 @@ def run_multi_gpu_tests(build_dir: _pl.Path):
         "mpirun", "-n", "4", "--allow-run-as-root", "gptSessionTest",
         "--gtest_filter=*TP*:*PP*"
     ]
-    run_command(session_test, cwd=tests_dir, env=cpp_env)
+    run_command(session_test, cwd=tests_dir, env=cpp_env, timeout=900)
 
 
 def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
@@ -334,7 +368,7 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
         "cmake", "--build", ".", "--config", "Release", "-j", "--target",
         "benchmarks"
     ]
-    run_command(make_benchmarks, cwd=build_dir)
+    run_command(make_benchmarks, cwd=build_dir, timeout=300)
 
     benchmark_exe_dir = build_dir / "benchmarks"
     gpt_engine_dir = resources_dir / "models" / "rt_engine" / "gpt2"
@@ -344,7 +378,7 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
         str(gpt_engine_dir / "fp16-plugin" / "tp1-pp1-gpu"), "--batch_size",
         "8", "--input_output_len", "10,20", "--duration", "10"
     ]
-    run_command(benchmark, cwd=root_dir)
+    run_command(benchmark, cwd=root_dir, timeout=600)
 
     prompt_flags = [None, "--long_prompt"]
     prompt_files = ["dummy_cnn.json", "dummy_long_cnn.json"]
@@ -360,7 +394,7 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
         ]
         if flag is not None:
             generate_batch_manager_data.append(flag)
-        run_command(generate_batch_manager_data, cwd=root_dir)
+        run_command(generate_batch_manager_data, cwd=root_dir, timeout=300)
 
         benchmark_src_dir = _pl.Path("benchmarks") / "cpp"
         data_dir = resources_dir / "data"
@@ -371,7 +405,7 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
             str(resources_dir / "models" / "gpt2"), "--output",
             str(data_dir / tokens_f)
         ]
-        run_command(prepare_dataset, cwd=root_dir)
+        run_command(prepare_dataset, cwd=root_dir, timeout=300)
 
         benchmark = [
             str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
@@ -380,7 +414,7 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
             "--type", "IFB", "--dataset",
             str(data_dir / tokens_f)
         ]
-        run_command(benchmark, cwd=root_dir)
+        run_command(benchmark, cwd=root_dir, timeout=600)
 
         benchmark = [
             str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
@@ -389,7 +423,7 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
             "--type", "V1", "--dataset",
             str(data_dir / tokens_f)
         ]
-        run_command(benchmark, cwd=root_dir)
+        run_command(benchmark, cwd=root_dir, timeout=600)
 
 
 if __name__ == "__main__":
@@ -418,30 +452,24 @@ if __name__ == "__main__":
     parser.add_argument("--model_cache",
                         type=str,
                         help="Directory where models are stored")
-    parser.add_argument("--only_gpt",
+    parser.add_argument("--skip_unit_tests",
                         action="store_true",
-                        help="Run only the tests for GPT")
-    parser.add_argument("--only_gptj",
+                        help="Skip unit tests. Only run model tests.")
+    parser.add_argument("--run_all_models",
                         action="store_true",
-                        help="Run only the tests for GPT-J")
-    parser.add_argument("--only_llama",
+                        help="Run the tests for all models")
+    parser.add_argument("--run_gpt",
                         action="store_true",
-                        help="Run only the tests for Llama")
-    parser.add_argument("--only_chatglm",
+                        help="Run the tests for GPT")
+    parser.add_argument("--run_gptj",
                         action="store_true",
-                        help="Run only the tests for ChatGLM")
-    parser.add_argument("--skip_gpt",
+                        help="Run the tests for GPT-J")
+    parser.add_argument("--run_llama",
                         action="store_true",
-                        help="Skip the tests for GPT")
-    parser.add_argument("--skip_gptj",
+                        help="Run the tests for Llama")
+    parser.add_argument("--run_chatglm",
                         action="store_true",
-                        help="Skip the tests for GPT-J")
-    parser.add_argument("--skip_llama",
-                        action="store_true",
-                        help="Skip the tests for Llama")
-    parser.add_argument("--skip_chatglm",
-                        action="store_true",
-                        help="Skip the tests for ChatGLM")
+                        help="Run the tests for ChatGLM")
     parser.add_argument(
         "--run_fp8",
         action="store_true",
@@ -456,33 +484,12 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if (args.only_gpt + args.only_gptj + args.only_llama + args.only_chatglm >
-            1):
-        parser.error('Cannot combine multiple only_* arguments.')
+    if args.run_all_models:
+        args.run_gpt = True
+        args.run_gptj = True
+        args.run_llama = True
+        args.run_chatglm = True
 
-    if args.only_gpt:
-        args.skip_gptj = True
-        args.skip_llama = True
-        args.skip_chatglm = True
-
-    if args.only_gptj:
-        args.skip_gpt = True
-        args.skip_llama = True
-        args.skip_chatglm = True
-
-    if args.only_llama:
-        args.skip_gpt = True
-        args.skip_gptj = True
-        args.skip_chatglm = True
-
-    if args.only_chatglm:
-        args.skip_gpt = True
-        args.skip_gptj = True
-        args.skip_llama = True
-
-    del args.only_gpt
-    del args.only_gptj
-    del args.only_llama
-    del args.only_chatglm
+    del args.run_all_models
 
     run_tests(**vars(args))

@@ -89,7 +89,7 @@ def load_encoder_weight(tensorrt_llm_whisper, model_metadata: dict,
         if t is not None:
             dst = tensorrt_llm_whisper.encoder_layers[i].attention.qkv.weight
             if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                     torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
                     plugin_weight_only_quant_type)
                 dst.value = processed_torch_weights.numpy()
@@ -117,7 +117,7 @@ def load_encoder_weight(tensorrt_llm_whisper, model_metadata: dict,
         if t is not None:
             dst = tensorrt_llm_whisper.encoder_layers[i].attention.dense.weight
             if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                     torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
                     plugin_weight_only_quant_type)
                 dst.value = processed_torch_weights.numpy()
@@ -144,7 +144,7 @@ def load_encoder_weight(tensorrt_llm_whisper, model_metadata: dict,
         if t is not None:
             dst = tensorrt_llm_whisper.encoder_layers[i].mlp.fc.weight
             if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                     torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
                     plugin_weight_only_quant_type)
                 dst.value = processed_torch_weights.numpy()
@@ -161,7 +161,7 @@ def load_encoder_weight(tensorrt_llm_whisper, model_metadata: dict,
         if t is not None:
             dst = tensorrt_llm_whisper.encoder_layers[i].mlp.proj.weight
             if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                     torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
                     plugin_weight_only_quant_type)
                 dst.value = processed_torch_weights.numpy()
@@ -222,7 +222,7 @@ def load_decoder_weight(
         if t is not None:
             dst = layer.self_attention.qkv.weight
             if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                     torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
                     plugin_weight_only_quant_type)
                 dst.value = torch.tensor(np.ascontiguousarray(t.transpose(
@@ -238,7 +238,7 @@ def load_decoder_weight(
         if t is not None:
             dst = layer.self_attention.dense.weight
             if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                     torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
                     plugin_weight_only_quant_type)
                 dst.value = torch.tensor(np.ascontiguousarray(t.transpose(
@@ -281,7 +281,7 @@ def load_decoder_weight(
         if t is not None:
             dst = layer.cross_attention.qkv.weight
             if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                     torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
                     plugin_weight_only_quant_type)
                 dst.value = torch.tensor(np.ascontiguousarray(t.transpose(
@@ -301,7 +301,7 @@ def load_decoder_weight(
         if t is not None:
             dst = layer.cross_attention.dense.weight
             if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                     torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
                     plugin_weight_only_quant_type)
                 dst.value = torch.tensor(np.ascontiguousarray(t.transpose(
@@ -342,7 +342,7 @@ def load_decoder_weight(
         if t is not None:
             dst = layer.mlp.fc.weight
             if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                     torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
                     plugin_weight_only_quant_type)
                 dst.value = torch.tensor(np.ascontiguousarray(t.transpose(
@@ -358,7 +358,7 @@ def load_decoder_weight(
         if t is not None:
             dst = layer.mlp.proj.weight
             if use_weight_only:
-                processed_torch_weights, torch_weight_scales = torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+                processed_torch_weights, torch_weight_scales = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                     torch.tensor(np.ascontiguousarray(t.transpose(1, 0))),
                     plugin_weight_only_quant_type)
                 dst.value = torch.tensor(np.ascontiguousarray(t.transpose(

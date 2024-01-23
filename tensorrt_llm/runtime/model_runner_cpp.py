@@ -51,7 +51,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                  session: GptSession,
                  max_batch_size: int,
                  max_input_len: int,
-                 max_output_len: int,
+                 max_seq_len: int,
                  max_beam_width: int,
                  lora_manager: Optional[LoraManager] = None) -> None:
         """
@@ -65,8 +65,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 The maximum batch size allowed for the input.
             max_input_len (int):
                 The maximum input length allowed for the input.
-            max_output_len (int):
-                The maximum output length (new tokens).
+            max_seq_len (int):
+                The maximum sequence length (input + generated tokens).
             max_beam_width (int):
                 The maximum beam width.
             lora_manager (LoraManager):
@@ -75,7 +75,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         self.session = session
         self.max_batch_size = max_batch_size
         self.max_input_len = max_input_len
-        self.max_output_len = max_output_len
+        self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
         self.lora_manager = lora_manager
 
@@ -130,9 +130,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
             ModelRunnerCpp: An instance of ModelRunnerCpp.
         """
         # session setup
-        engine_dir = Path(engine_dir)
-        config_path = engine_dir / "config.json"
-        json_config = GptJsonConfig.parse_file(str(config_path))
+        config_path = Path(engine_dir) / "config.json"
+        json_config = GptJsonConfig.parse_file(config_path)
         model_config = json_config.model_config
 
         tp_size = json_config.tensor_parallelism
@@ -141,7 +140,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                        pipeline_parallelism=pp_size)
         assert rank == world_config.rank
         engine_filename = json_config.engine_filename(world_config)
-        serialize_path = engine_dir / engine_filename
+        serialize_path = Path(engine_dir) / engine_filename
 
         profiler.start('load tensorrt_llm engine')
         if max_beam_width is None:
@@ -157,13 +156,13 @@ class ModelRunnerCpp(ModelRunnerMixin):
         else:
             assert max_input_len <= model_config.max_input_len
         if max_output_len is None:
-            max_output_len = model_config.max_output_len
+            max_seq_len = model_config.max_seq_len
         else:
-            assert max_output_len <= model_config.max_output_len
+            max_seq_len = max_input_len + max_output_len
+            assert max_seq_len <= model_config.max_seq_len
         session_config = GptSessionConfig(max_batch_size=max_batch_size,
                                           max_beam_width=max_beam_width,
-                                          max_sequence_length=max_input_len +
-                                          max_output_len)
+                                          max_sequence_length=max_seq_len)
         session_config.kv_cache_config = KvCacheConfig(
             max_attention_window=max_attention_window_size,
             sink_token_length=sink_token_length)
@@ -182,7 +181,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                    lora_manager=None,
                    max_batch_size=max_batch_size,
                    max_input_len=max_input_len,
-                   max_output_len=max_output_len,
+                   max_seq_len=max_seq_len,
                    max_beam_width=max_beam_width)
 
     @property
@@ -214,7 +213,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
     @property
     def max_sequence_length(self) -> int:
-        return self.max_input_len + self.max_output_len
+        return self.max_seq_len
 
     @property
     def remove_input_padding(self) -> bool:

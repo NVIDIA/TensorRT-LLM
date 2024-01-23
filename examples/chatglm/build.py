@@ -26,6 +26,7 @@ from weight import (get_scaling_factors, load_from_awq, load_from_gptq,
 
 import tensorrt_llm
 from tensorrt_llm import profiler
+from tensorrt_llm._common import check_max_num_tokens
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
@@ -228,7 +229,8 @@ def parse_arguments(args):
         '--max_num_tokens',
         type=int,
         default=2**32,
-        help='The max number of tokens supported by the engine',
+        help=
+        'Define the max number of tokens supported by the engine, note that it takes no effect if --remove_input_padding is not set'
     )
     parser.add_argument(
         '--use_gpt_attention_plugin',
@@ -451,6 +453,12 @@ def parse_arguments(args):
             "glm_10b_chinese",
     ]:
         assert args.max_input_len < js["max_sequence_length"]
+
+    args.max_num_tokens = check_max_num_tokens(
+        max_num_tokens=args.max_num_tokens,
+        max_batch_size=args.max_batch_size,
+        max_input_len=args.max_input_len,
+        remove_input_padding=args.remove_input_padding)
 
     if args.model_name in ["chatglm_6b"]:
         args.apply_query_key_layer_scaling = False
@@ -773,7 +781,7 @@ def build_rank_engine(
         inputs = trtllm_model.prepare_inputs(
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
-            max_output_len=args.max_output_len,
+            max_seq_len=args.max_input_len + args.max_output_len,
             use_cache=True,
             max_beam_width=args.max_beam_width,
             gather_context_logits=args.gather_context_logits,
@@ -889,8 +897,7 @@ def build(rank, args):
             paged_kv_cache=args.paged_kv_cache,
             max_batch_size=args.max_batch_size,
             max_beam_width=args.max_beam_width,
-            max_input_len=args.max_input_len,
-            max_output_len=args.max_output_len,
+            max_seq_len=args.max_input_len + args.max_output_len,
             local_num_kv_heads=local_num_kv_heads,
             head_size=args.hidden_size // args.num_heads,
             num_layers=args.num_layers)

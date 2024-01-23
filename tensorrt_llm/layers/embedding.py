@@ -39,8 +39,7 @@ class Embedding(Module):
                  tp_size=1,
                  tp_group=None,
                  sharding_dim=0,
-                 tp_rank=None,
-                 instance_id: int = 0):
+                 tp_rank=None):
         super().__init__()
         # num_embeddings records the total vocab size no matter using TP or not
         self.num_embeddings = num_embeddings
@@ -49,7 +48,6 @@ class Embedding(Module):
         self.tp_group = tp_group
         self.sharding_dim = sharding_dim
         self.tp_rank = tp_rank
-        self.instance_id = instance_id
 
         if sharding_dim == 1:
             self.weight = Parameter(shape=(self.num_embeddings,
@@ -86,10 +84,9 @@ class PromptTuningEmbedding(Embedding):
                  tp_size=1,
                  tp_group=None,
                  sharding_dim=0,
-                 tp_rank=0,
-                 instance_id: int = 0):
+                 tp_rank=0):
         super().__init__(num_embeddings, embedding_dim, dtype, tp_size,
-                         tp_group, sharding_dim, tp_rank, instance_id)
+                         tp_group, sharding_dim, tp_rank)
         if vocab_size is None:
             vocab_size = num_embeddings
         self.vocab_size = vocab_size

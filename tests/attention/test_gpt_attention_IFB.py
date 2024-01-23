@@ -192,11 +192,7 @@ class TestFunctional(unittest.TestCase):
 
         # Skip tests that are not supported in pre-ampere architecture
         if getSMVersion() < 80:
-            if context_fmha_type == ContextFMHAType.enabled:
-                pytest.skip(
-                    "ContextFMHAType is not supported in pre-ampere architecture"
-                )
-            elif context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
+            if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
                 pytest.skip(
                     "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
                 )

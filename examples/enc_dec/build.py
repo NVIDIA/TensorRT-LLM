@@ -262,10 +262,22 @@ def parse_arguments(component):
                         action='store_true',
                         default=False,
                         help='Gather generation logits')
+    parser.add_argument(
+        '--skip_encoder',
+        '--nougat',
+        default=False,
+        action="store_true",
+        help=
+        'Skip building encoder for nougat model. Encoder is not an LLM in nougat'
+    )
 
     # parse cmdline args
     args = parser.parse_args()
     logger.set_level(args.log_level)
+
+    if component == 'encoder' and args.skip_encoder:
+        # Skip further processing
+        return args
 
     # parse model config and add to args
     if args.weight_dir is not None:
@@ -287,7 +299,7 @@ def parse_arguments(component):
             )
             setattr(args, plugin_arg, args.dtype)
 
-    if args.dtype == 'bfloat16':
+    if args.dtype == 'bfloat16' and not args.model_type in ['bart']:
         assert args.use_gemm_plugin, "Please use gemm plugin when dtype is bfloat16"
 
     if args.gather_all_token_logits:
@@ -436,17 +448,18 @@ def build_rank_engine(builder: Builder,
         # Forward
         if args.component == 'encoder':
             inputs = tllm_model.prepare_inputs(
-                args.max_batch_size,
-                args.max_encoder_input_len,
-                args.max_prompt_embedding_table_size,
+                max_batch_size=args.max_batch_size,
+                max_input_len=args.max_encoder_input_len,
+                prompt_embedding_table_size=args.
+                max_prompt_embedding_table_size,
             )
         elif args.component == 'decoder':
             inputs = tllm_model.prepare_inputs(
-                args.max_batch_size,
-                args.max_beam_width,
-                args.max_decoder_input_len,
-                args.max_output_len,
-                args.max_encoder_input_len,
+                max_batch_size=args.max_batch_size,
+                max_beam_width=args.max_beam_width,
+                max_decoder_input_len=args.max_decoder_input_len,
+                max_new_tokens=args.max_output_len,
+                max_encoder_input_len=args.max_encoder_input_len,
                 gather_context_logits=args.gather_context_logits,
                 gather_generation_logits=args.gather_generation_logits)
 
@@ -540,6 +553,9 @@ def build(rank, args):
 def run_build(component):
     assert component == 'encoder' or component == 'decoder', 'Unsupported component!'
     args = parse_arguments(component)
+    if component == 'encoder' and args.skip_encoder:
+        logger.warning("Skipping build of encoder for Nougat model")
+        return
     args.component = component
 
     if args.random_seed is not None:

@@ -677,10 +677,12 @@ def build_gpt(args):
         network.set_named_parameters(tensorrt_llm_model.named_parameters())
 
         # Forward
-        inputs = tensorrt_llm_model.prepare_inputs(max_batch_size,
-                                                   max_input_len,
-                                                   max_output_len, True,
-                                                   max_beam_width)
+        inputs = tensorrt_llm_model.prepare_inputs(
+            max_batch_size=max_batch_size,
+            max_input_len=max_input_len,
+            max_seq_len=max_input_len + max_output_len,
+            use_cache=True,
+            max_beam_width=max_beam_width)
         if family in ['opt', 'bloom', 'falcon']:
             tensorrt_llm_model(**inputs)
         else:
@@ -985,16 +987,16 @@ def enc_dec_build_helper(component, config, args):
         # Forward
         if component == 'encoder':
             inputs = tllm_model.prepare_inputs(
-                config['max_batch_size'],
-                config['max_encoder_input_len'],
+                max_batch_size=config['max_batch_size'],
+                max_input_len=config['max_encoder_input_len'],
             )
         elif component == 'decoder':
             inputs = tllm_model.prepare_inputs(
-                config['max_batch_size'],
-                config['max_beam_width'],
-                config['max_decoder_input_len'],
-                config['max_output_len'],
-                config['max_encoder_input_len'],
+                max_batch_size=config['max_batch_size'],
+                max_beam_width=config['max_beam_width'],
+                max_decoder_input_len=config['max_decoder_input_len'],
+                max_new_tokens=config['max_output_len'],
+                max_encoder_input_len=config['max_encoder_input_len'],
             )
 
         tllm_model(*inputs)

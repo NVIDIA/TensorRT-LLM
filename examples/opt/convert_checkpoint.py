@@ -131,7 +131,7 @@ def get_tllm_linear_weight(weight,
     if use_weight_only:
         v = weight.t().contiguous()
         processed_torch_weights, torch_weight_scales = \
-            torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
+            torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
                 v, plugin_weight_only_quant_type)
         results[prefix + 'weight'] = processed_torch_weights
         results[prefix + 'per_channel_scale'] = torch_weight_scales
@@ -268,7 +268,7 @@ def convert_hf_opt(hf_model,
 
 if __name__ == '__main__':
     # TODO(qijun): Currently, the convert script depends on a torch op:
-    # torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix,
+    # torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix,
     # which is included in tensorrt_llm Python package. Otherwise, the convert
     # script does not need to import tensorrt_llm. Will remove it after reimplementing
     # the op with PyTorch.

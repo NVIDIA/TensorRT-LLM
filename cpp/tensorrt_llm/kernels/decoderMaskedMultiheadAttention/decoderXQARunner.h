@@ -142,7 +142,9 @@ public:
         {
             SUPPORT_RETURN_FALSE("data type");
         }
-        if (xqaParams.head_size != 128)
+        bool const isGPTJBeam4Kernel = (xqaParams.head_size == 256 && xqaParams.beam_width == 4
+            && (xqaParams.paged_kv_cache == 64 || xqaParams.paged_kv_cache == 128));
+        if (xqaParams.head_size != 128 && !isGPTJBeam4Kernel)
         {
             SUPPORT_RETURN_FALSE("head_size");
         }
@@ -171,7 +173,7 @@ public:
         {
             SUPPORT_RETURN_FALSE("host_past_key_value_lengths");
         }
-        if (xqaParams.beam_width != 1)
+        if (xqaParams.beam_width != 1 && !isGPTJBeam4Kernel)
         {
             SUPPORT_RETURN_FALSE("beam_width");
         }
@@ -191,7 +193,7 @@ public:
         const int nbQHeadsPerKV = nbQHeads / nbKVHeads;
         if (!xqaParams.multi_query_tokens)
         {
-            if (nbQHeadsPerKV != 8 || (nbKVHeads != 1 && nbKVHeads != 2 && nbKVHeads != 4 && nbKVHeads != 8))
+            if (nbQHeadsPerKV != 8 && nbQHeadsPerKV != 1)
             {
                 SUPPORT_RETURN_FALSE("nbHeads");
             }
@@ -202,12 +204,6 @@ public:
             if (!(nbQHeadsPerKV % 2 == 0 || nbQHeadsPerKV == 1))
             {
                 SUPPORT_RETURN_FALSE("nbHeads");
-            }
-
-            // TODO: add fp8/int8 kv cache kernels.
-            if (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 || xqaParams.kv_cache_data_type == DATA_TYPE_INT8)
-            {
-                SUPPORT_RETURN_FALSE("KV cache data type");
             }
         }
         return shouldUseImpl(xqaParams);

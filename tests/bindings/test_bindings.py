@@ -575,9 +575,6 @@ def test_trt_gpt_model_optional_params():
     opt_params.kv_cache_config = kv_cache_config
     assert opt_params.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
 
-    opt_params.max_num_sequences = 10
-    assert opt_params.max_num_sequences == 10
-
     opt_params.enable_trt_overlap = True
     assert opt_params.enable_trt_overlap
 

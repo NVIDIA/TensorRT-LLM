@@ -80,7 +80,11 @@ class TestMistral(unittest.TestCase):
             network.set_named_parameters(
                 tensorrt_llm_mistral.named_parameters())
             inputs = tensorrt_llm_mistral.prepare_inputs(
-                batch_size, input_len, output_len, True, beam_width)
+                max_batch_size=batch_size,
+                max_input_len=input_len,
+                max_seq_len=input_len + output_len,
+                use_cache=True,
+                max_beam_width=beam_width)
             # Forward
             tensorrt_llm_mistral(*inputs)
 
@@ -177,15 +181,11 @@ class TestMistral(unittest.TestCase):
 
         # Skip tests that are not supported in pre-ampere architecture
         if getSMVersion() < 80:
-            if context_fmha_flag == ContextFMHAType.enabled:
-                pytest.skip(
-                    "ContextFMHAType is not supported in pre-ampere architecture"
-                )
-            elif context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
+            if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
                 pytest.skip(
                     "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
                 )
-            elif dtype == 'bfloat16':
+            if dtype == 'bfloat16':
                 pytest.skip(
                     "bfloat16 is not supported in pre-ampere architecture")
 

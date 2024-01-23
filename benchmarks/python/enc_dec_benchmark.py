@@ -230,13 +230,22 @@ class EncDecBenchmark(BaseBenchmark):
         decoder_input_lengths = ((1 + (decoder_input_ids[:, 1:] != 0).sum(
             dim=1).type(torch.IntTensor).to(self.device)).clone().detach().to(
                 dtype=torch.int32, device=self.device))
+        # attention mask, always set 1 as if all are valid tokens
+        attention_mask = torch.ones(
+            (batch_size, encoder_input_len)).int().cuda()
+        # cross attention mask, always set 1 as if all are valid tokens
+        # [batch_size, query_len, encoder_input_len] currently, use query_len=1
+        cross_attention_mask = torch.ones(
+            (batch_size, 1, encoder_input_len)).int().cuda()
 
         stream = torch.cuda.current_stream().cuda_stream
         return (
             encoder_input_ids,
             encoder_input_lengths,
+            attention_mask,
             decoder_input_ids,
             decoder_input_lengths,
+            cross_attention_mask,
             stream,
         )
 
@@ -245,8 +254,10 @@ class EncDecBenchmark(BaseBenchmark):
         (
             encoder_input_ids,
             encoder_input_lengths,
+            attention_mask,
             decoder_input_ids,
             decoder_input_lengths,
+            cross_attention_mask,
             stream,
         ) = inputs
 
@@ -269,6 +280,9 @@ class EncDecBenchmark(BaseBenchmark):
             dtype=hidden_states_dtype("max_input_length"),
             device=self.device,
         ).contiguous()
+
+        if not self.encoder_model_config.gpt_attention_plugin:
+            inputs["attention_mask"] = attention_mask.contiguous()
 
         if self.encoder_model_config.has_position_embedding:
             bsz, seq_len = encoder_input_ids.shape[:2]
@@ -306,12 +320,15 @@ class EncDecBenchmark(BaseBenchmark):
         )
         torch.cuda.synchronize()
 
+        cross_attention_mask = None if self.decoder_model_config.gpt_attention_plugin else cross_attention_mask
+
         self.decoder_session.decode(
             decoder_input_ids,
             decoder_input_lengths,
             sampling_config,
             encoder_output=outputs["encoder_output"],
             encoder_input_lengths=encoder_input_lengths,
+            cross_attention_mask=cross_attention_mask,
         )
         torch.cuda.synchronize()
 

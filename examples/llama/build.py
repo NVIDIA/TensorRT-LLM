@@ -30,8 +30,15 @@ try:
     from transformers import MixtralForCausalLM
 except ImportError:
     MixtralForCausalLM = None
+
+try:
+    from transformers import LlavaConfig, LlavaForConditionalGeneration
+except ImportError:
+    pass
+
 import tensorrt_llm
 from tensorrt_llm import profiler
+from tensorrt_llm._common import check_max_num_tokens
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.layers import MoeConfig
@@ -209,19 +216,25 @@ def parse_arguments(cmd_args=None):
                         default=False,
                         action='store_true')
     parser.add_argument(
+        '--use_paged_context_fmha',
+        action='store_true',
+        help=
+        'Activates paged context FMHA. This mode of the context FMHA is required for chunked context, speculative decoding and reuse of KV cache blocks. Context FMHA performance is worse when this mode is on.'
+    )
+    parser.add_argument(
         '--multi_block_mode',
         default=False,
         action='store_true',
         help=
         'Split long kv sequence into multiple blocks (applied to generation MHA kernels). \
-                        It is beneifical when batchxnum_heads cannot fully utilize GPU.'
+                        It is beneficial when batch x num_heads cannot fully utilize GPU.'
     )
     parser.add_argument(
-        '--enable_xqa',
+        '--disable_xqa',
         default=False,
         action='store_true',
         help=
-        'XQA optimization for the generation MHA. See more details in docs/gpt_attention.'
+        'Disable XQA optimization for the generation MHA. See more details in docs/gpt_attention.'
     )
     parser.add_argument('--visualize', default=False, action='store_true')
     parser.add_argument('--load_by_shard',
@@ -391,7 +404,9 @@ def parse_arguments(cmd_args=None):
         '--max_num_tokens',
         type=int,
         default=None,
-        help='Define the max number of tokens supported by the engine')
+        help=
+        'Define the max number of tokens supported by the engine, note that it takes no effect if --remove_input_padding is not set'
+    )
     parser.add_argument(
         '--strongly_typed',
         default=False,
@@ -540,6 +555,12 @@ def parse_arguments(cmd_args=None):
 
     if args.model_dir is not None:
         hf_config = LlamaConfig.from_pretrained(args.model_dir)
+        if hf_config.model_type == "llava":
+            # LLaVA = Vision model + Llama LLM
+            # We load a llava config and use its' text config as llama config
+            hf_config = LlavaConfig.from_pretrained(args.model_dir).text_config
+            hf_config.model_type = "llava"  # Replace llama with llava
+
         args.inter_size = hf_config.intermediate_size  # override the inter_size for LLaMA
         args.n_embd = hf_config.hidden_size
         args.n_head = hf_config.num_attention_heads
@@ -637,16 +658,29 @@ def parse_arguments(cmd_args=None):
 
     args.lora_config = lora_config
 
-    if args.weight_only_precision == 'int4_awq' and args.quantize_lm_head:
-        if args.vocab_size % 64 != 0:
-            args.vocab_size = int((args.vocab_size + 63) / 64) * 64
-            logger.info("To use awq we pad vocab_size to {}.".format(
-                args.vocab_size))
+    if args.weight_only_precision == 'int4_awq':
+        inter_alignment = args.tp_size * 128
+        if args.inter_size % inter_alignment != 0:
+            args.inter_size = int((args.inter_size + inter_alignment - 1) /
+                                  inter_alignment) * inter_alignment
+            logger.info("To use awq we pad intermediate_size to {}.".format(
+                args.inter_size))
+
+        if args.quantize_lm_head:
+            vocab_alignment = args.tp_size * 64
+            if args.vocab_size % vocab_alignment != 0:
+                args.vocab_size = int((args.vocab_size + vocab_alignment - 1) /
+                                      vocab_alignment) * vocab_alignment
+                logger.info("To use awq we pad vocab_size to {}.".format(
+                    args.vocab_size))
 
     assert args.pp_size * args.tp_size == args.world_size
 
-    if args.max_num_tokens is not None:
-        assert args.enable_context_fmha
+    args.max_num_tokens = check_max_num_tokens(
+        max_num_tokens=args.max_num_tokens,
+        max_batch_size=args.max_batch_size,
+        max_input_len=args.max_input_len,
+        remove_input_padding=args.remove_input_padding)
 
     assert (math.log2(args.tokens_per_block).is_integer()
             ), "tokens_per_block must be power of 2"
@@ -761,18 +795,23 @@ def get_model_object(args, mapping, trt_dtype=None):
         logger.info(f'Loading HF LLaMA ... from {args.model_dir}')
         tik = time.time()
         if not args.load_by_shard:
-            hf_model = LlamaForCausalLM if args.model_type != "mixtral" else MixtralForCausalLM
-            hf_llama = hf_model.from_pretrained(
-                args.model_dir,
-                device_map={
-                    "model": "cpu",
-                    "lm_head": "cpu",
-                    "embed_tokens": "cpu",
-                    "layers": "cpu",
-                    "norm": "cpu",
-                },  # Load to CPU memory
-                torch_dtype='auto',
-            )
+            if args.model_type == "llava":
+                hf_llava = LlavaForConditionalGeneration.from_pretrained(
+                    args.model_dir, torch_dtype="auto")
+                hf_llama = hf_llava.language_model
+            else:
+                hf_model = LlamaForCausalLM if args.model_type != "mixtral" else MixtralForCausalLM
+                hf_llama = hf_model.from_pretrained(
+                    args.model_dir,
+                    device_map={
+                        "model": "cpu",
+                        "lm_head": "cpu",
+                        "embed_tokens": "cpu",
+                        "layers": "cpu",
+                        "norm": "cpu",
+                    },  # Load to CPU memory
+                    torch_dtype='auto',
+                )
             use_gemm_woq_plugin = not args.disable_weight_only_quant_plugin
             load_from_hf_llama(tensorrt_llm_llama,
                                hf_llama,
@@ -830,7 +869,7 @@ def update_plugin_configs(args, network):
             ContextFMHAType.enabled_with_fp32_acc)
     if args.multi_block_mode:
         network.plugin_config.enable_mmha_multi_block_mode()
-    if args.enable_xqa:
+    if not args.disable_xqa:
         network.plugin_config.enable_xqa_optimization()
 
     if args.use_weight_only and not args.disable_weight_only_quant_plugin:
@@ -880,18 +919,22 @@ def build_rank_engine(builder: Builder,
     network.trt_network.name = engine_name
     update_plugin_configs(args, network)
 
+    if args.use_paged_context_fmha:
+        assert args.enable_context_fmha or args.enable_context_fmha_fp32_acc, "context fmha must be enabled"
+        network.plugin_config.set_paged_context_fmha()
+
     with net_guard(network):
         # Prepare
         network.set_named_parameters(tensorrt_llm_llama.named_parameters())
 
         # Forward
         inputs = tensorrt_llm_llama.prepare_inputs(
-            args.max_batch_size,
-            args.max_input_len,
-            args.max_output_len,
-            True,
-            args.max_beam_width,
-            args.max_num_tokens,
+            max_batch_size=args.max_batch_size,
+            max_input_len=args.max_input_len,
+            max_seq_len=args.max_input_len + args.max_output_len,
+            use_cache=True,
+            max_beam_width=args.max_beam_width,
+            max_num_tokens=args.max_num_tokens,
             prompt_embedding_table_size=args.max_prompt_embedding_table_size,
             gather_context_logits=args.gather_context_logits,
             gather_generation_logits=args.gather_generation_logits,
@@ -969,8 +1012,7 @@ def get_builder_config_namespace(args, cache):
 def build(rank, args):
     torch.cuda.set_device(rank % args.gpus_per_node)
     logger.set_level(args.log_level)
-    if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
+    os.makedirs(args.output_dir, exist_ok=True)
 
     # when doing serializing build, all ranks share one engine
     builder = Builder()
@@ -1010,8 +1052,7 @@ def build(rank, args):
             paged_kv_cache=args.paged_kv_cache,
             max_batch_size=args.max_batch_size,
             max_beam_width=args.max_beam_width,
-            max_input_len=args.max_input_len,
-            max_output_len=args.max_output_len,
+            max_seq_len=args.max_input_len + args.max_output_len,
             local_num_kv_heads=local_num_kv_heads,
             head_size=args.n_embd / args.n_head,
             num_layers=args.n_layer)

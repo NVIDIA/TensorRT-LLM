@@ -36,7 +36,7 @@ net = None
 _inited = False
 
 
-def _init(log_level=None):
+def _init(log_level: object = None) -> None:
     global _inited
     if _inited:
         return
@@ -44,6 +44,10 @@ def _init(log_level=None):
     # Move to __init__
     if log_level is not None:
         logger.set_level(log_level)
+
+    if os.getenv("TRT_LLM_NO_LIB_INIT", "0") == "1":
+        logger.info('Skipping TensorRT-LLM init.')
+        return
 
     # load plugin lib
     _load_plugin_lib()
@@ -60,7 +64,6 @@ def _init(log_level=None):
         msg = '\nFATAL: Decoding operators failed to load. This may be caused by the incompatibility between PyTorch and TensorRT-LLM. Please rebuild and install TensorRT-LLM.'
         raise ImportError(str(e) + msg)
 
-    global net
     logger.info('TensorRT-LLM inited.')
 
 
@@ -189,3 +192,36 @@ def _is_building(f):
             return f(*args, **kwargs)
 
     return decorated
+
+
+def check_max_num_tokens(max_num_tokens, max_batch_size, max_input_len,
+                         remove_input_padding):
+    if not remove_input_padding:
+        if max_num_tokens is not None:
+            logger.warning("remove_input_padding is not enabled, the specified "
+                           "max_num_tokens will be ignored.")
+        return max_num_tokens
+    elif remove_input_padding and max_num_tokens is None:
+        max_num_tokens = max_input_len * max_batch_size
+        logger.warning(
+            "remove_input_padding is enabled, while max_num_tokens "
+            "is not set, setting to max_batch_size*max_input_len. \n"
+            "It may not be optimal to set max_num_tokens=max_batch_size*max_input_len "
+            "when remove_input_padding is enabled, because the number "
+            "of packed input tokens are very likely to be smaller, "
+            "we strongly recommend to set max_num_tokens according "
+            "to your workloads.")
+    if max_num_tokens > max_input_len * max_batch_size:
+        max_num_tokens = max_input_len * max_batch_size
+        logger.warning(
+            f"max_num_tokens ({max_num_tokens}) shouldn't be greater than "
+            f"max_input_len * max_batch_size ({max_input_len * max_batch_size}), "
+            f"specifying to max_input_len * max_batch_size ({max_input_len * max_batch_size})."
+        )
+    if max_num_tokens < max_input_len:
+        logger.warning(
+            f"max_num_tokens ({max_num_tokens}) should be greater than "
+            f"max_input_len ({max_input_len}), specifying to "
+            f"max_input_len ({max_input_len}).")
+        max_num_tokens = max_input_len
+    return max_num_tokens

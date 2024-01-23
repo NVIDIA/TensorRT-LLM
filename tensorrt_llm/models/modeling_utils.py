@@ -5,8 +5,6 @@ from typing import List, Optional
 
 import safetensors
 
-from tensorrt_llm.plugin.plugin import init_all_reduce_helper
-
 from .._common import default_net
 from .._utils import str_dtype_to_trt
 from ..functional import PositionEmbeddingType, Tensor, gather_last_token_logits
@@ -314,7 +312,7 @@ class PostInitCaller(type):
 
 class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
 
-    def __init__(self, config):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
 
@@ -365,7 +363,7 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
     def prepare_inputs(self,
                        max_batch_size,
                        max_input_len,
-                       max_new_tokens,
+                       max_seq_len,
                        use_cache,
                        max_beam_width: int = 1,
                        max_num_tokens: int = None,
@@ -395,7 +393,7 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
             max_input_len=max_input_len,
-            max_new_tokens=max_new_tokens,
+            max_seq_len=max_seq_len,
             num_kv_heads=self.config.num_key_value_heads,
             head_size=head_size,
             num_layers=self.config.num_hidden_layers,
@@ -488,7 +486,6 @@ class DecoderModelForCausalLM(PretrainedModel):
                 prompt_tasks: Optional[Tensor] = None,
                 prompt_vocab_size: Optional[Tensor] = None,
                 lora_params=None):
-        init_all_reduce_helper()
         kwargs = {
             'input_ids': input_ids,
             'position_ids': position_ids,
@@ -524,7 +521,7 @@ class DecoderModelForCausalLM(PretrainedModel):
         else:
             hidden_states.mark_output('hidden_states_output', self.config.dtype)
 
-        if use_cache and default_net().plugin_config.paged_kv_cache == False:
+        if use_cache and not default_net().plugin_config.paged_kv_cache:
             for i, present in zip(
                     self.config.mapping.pp_layers(
                         self.config.num_hidden_layers), presents):

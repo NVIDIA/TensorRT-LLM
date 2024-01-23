@@ -21,6 +21,7 @@
 #include "tensorrt_llm/runtime/common.h"
 
 #include <optional>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -33,24 +34,24 @@ public:
     using SizeType = tensorrt_llm::runtime::SizeType;
 
     explicit TrtGptModelOptionalParams(KvCacheConfig const& kvCacheConfig = KvCacheConfig{},
-        std::optional<SizeType> maxNumSequences = std::nullopt, bool enableTrtOverlap = false,
-        std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt, bool normalizeLogProbs = true,
-        bool logIterationData = false)
+        bool enableTrtOverlap = false, std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt,
+        bool normalizeLogProbs = true, bool logIterationData = false,
+        std::optional<SizeType> minCtxChunkSize = std::nullopt)
         : kvCacheConfig{kvCacheConfig}
-        , maxNumSequences{maxNumSequences}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(deviceIds)
         , normalizeLogProbs{normalizeLogProbs}
         , logIterationData{logIterationData}
+        , minCtxChunkSize{minCtxChunkSize}
     {
     }
 
     KvCacheConfig kvCacheConfig;
-    std::optional<SizeType> maxNumSequences;
     bool enableTrtOverlap;
     std::optional<std::vector<SizeType>> deviceIds;
     bool normalizeLogProbs;
     bool logIterationData;
+    std::optional<SizeType> minCtxChunkSize;
 };
 
 } // namespace tensorrt_llm::batch_manager

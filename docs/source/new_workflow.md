@@ -229,7 +229,7 @@ Here is the `config.json`:
 
 ## Build Checkpoint into TensorRT Engine
 
-TensorRT-LLM provides a unified build command: `trtllm-llm`. Before using it,
+TensorRT-LLM provides a unified build command: `trtllm-build`. Before using it,
 you may need to add it to the `PATH`
 
 ```bash
