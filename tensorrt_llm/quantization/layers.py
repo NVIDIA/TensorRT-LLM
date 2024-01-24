@@ -1035,6 +1035,8 @@ class SmoothQuantAttention(Module):
         position_embedding=None,
         norm_before_bmm1=False,
         lora_layer_params=None,
+        medusa_packed_mask=None,
+        medusa_position_offsets=None,
     ):
         assert lora_layer_params is None, "lora is not supported on SmoothQuantAttention now"
         # TODO add in-flight batching to SmoothQuant
