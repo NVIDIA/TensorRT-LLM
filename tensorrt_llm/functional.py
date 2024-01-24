@@ -76,7 +76,7 @@ class DimRange(object):
         for dim in shape:
             if isinstance(dim, (list, tuple)):
                 assert len(dim) == 3 and 0 <= dim[0] <= dim[1] <= dim[2], \
-                "Each dimension must specify a 3-elements tuple or list in the order of (min,opt,max), got {dim=}"
+                    "Each dimension must specify a 3-elements tuple or list in the order of (min,opt,max), got {dim=}"
                 self.min.append(dim[0])
                 self.opt.append(dim[1])
                 self.max.append(dim[2])
@@ -583,8 +583,8 @@ def _create_tensor(trt_tensor: trt.ITensor,
     default_net()._set_layer_name(producer)
     if default_net().dtype is not None and not default_net().strongly_typed:
         if producer.type not in [
-                trt.LayerType.SHAPE, trt.LayerType.CONSTANT,
-                trt.LayerType.GATHER, trt.LayerType.CONCATENATION
+            trt.LayerType.SHAPE, trt.LayerType.CONSTANT,
+            trt.LayerType.GATHER, trt.LayerType.CONCATENATION
         ]:
             producer.precision = default_net().dtype
     assert tensor is not None
@@ -869,8 +869,8 @@ def interpolate(input: Tensor,
 
     assert 2 < input_ndim < 6, "Only 3D, 4D and 5D input Tensors supported"
     assert (size is not None) ^ (
-        scale_factor
-        is not None), "Only one of out_shape or scales should be defined"
+            scale_factor
+            is not None), "Only one of out_shape or scales should be defined"
 
     assert mode in ('nearest', 'linear', 'bilinear', 'bicubic', 'trilinear',
                     'nearest-exact')
@@ -1439,7 +1439,7 @@ def expand_dims(input: Tensor, dim: Union[int, Sequence[int]]) -> Tensor:
         The tensor produced by the shuffle layer.
     '''
     if isinstance(dim, int):
-        dim = (dim, )
+        dim = (dim,)
 
     out_ndim = len(dim) + input.ndim()
 
@@ -2243,7 +2243,7 @@ def broadcast_helper(left: Union[Tensor, int, float],
 
 
 def elementwise_binary(left: Union[Tensor, int,
-                                   float], right: Union[Tensor, int, float],
+float], right: Union[Tensor, int, float],
                        op: trt.ElementWiseOperation) -> Tensor:
     '''
     Add an elementwise operation with two inputs.
@@ -2555,7 +2555,7 @@ def gelu(x: Tensor) -> Tensor:
     '''
     if not default_net().strongly_typed:
         return 0.5 * x * (
-            tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * pow(x, 3.0))) + 1.0)
+                tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * pow(x, 3.0))) + 1.0)
 
     array_fn = {
         trt.float32: fp32_array,
@@ -2569,6 +2569,21 @@ def gelu(x: Tensor) -> Tensor:
     v4 = constant(array_fn([3.0]))
     v5 = constant(array_fn([1.0]))
     return v1 * x * (tanh(v2 * (x + v3 * pow(x, v4))) + v5)
+
+
+def gelu_pytorch_tanh(x: Tensor) -> Tensor:
+    """
+    Add a gelu_pytorch_tanh operation. used by starcoder model
+
+    Parameters:
+        input : Tensor
+            The input tensor on which the activation function is applied.
+
+    Returns:
+        The tensor produced by the activation layer.
+    """
+    return 0.5 * x * (
+            tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * pow(x, 3.0))) + 1.0)
 
 
 def geglu(x: Tensor) -> Tensor:
@@ -2595,7 +2610,6 @@ def group_norm(input: Tensor,
                weight: Optional[Tensor] = None,
                bias: Optional[Tensor] = None,
                eps: float = 1e-05):
-
     ##
     ## TODO: Document that function!
     ##
@@ -2606,10 +2620,10 @@ def group_norm(input: Tensor,
     ndim = input.ndim()
     old_shape = shape(input)
     new_shape = concat([
-        input.size(0),
-        num_groups,
-        num_channels // num_groups,
-    ] + [input.size(i) for i in range(2, ndim)])
+                           input.size(0),
+                           num_groups,
+                           num_channels // num_groups,
+                       ] + [input.size(i) for i in range(2, ndim)])
     x = input.view(new_shape)
 
     reduce_dim = tuple(range(2, ndim + 1))
@@ -2687,7 +2701,6 @@ def avg_pool2d(input: Tensor,
                padding: Optional[Tuple[int]] = (0, 0),
                ceil_mode: bool = False,
                count_include_pad: bool = True) -> Tensor:
-
     ##
     ## TODO: Document that function!
     ##
@@ -2722,7 +2735,6 @@ def conv1d(input: Tensor,
            padding: int = 0,
            dilation: int = 1,
            groups: int = 1) -> Tensor:
-
     noutput = weight.size()[0]
     kernel_size = weight.size()[-2]
     is_weight_constant = (weight.producer is not None
@@ -3330,7 +3342,7 @@ def bert_attention(tensor: Tensor,
         "enable_qk_half_accum",
         np.array(np.int8(
             default_net().plugin_config.attention_qk_half_accumulation),
-                 dtype=np.int8), trt.PluginFieldType.INT8)
+            dtype=np.int8), trt.PluginFieldType.INT8)
     context_fmha_type = trt.PluginField(
         "context_fmha_type",
         np.array(np.int8(default_net().plugin_config.context_fmha_type),
@@ -3377,51 +3389,51 @@ def bert_attention(tensor: Tensor,
 
 @gw.record_signature
 def gpt_attention(
-    qkv: Tensor,
-    past_key_value: Tensor,
-    sequence_length: Tensor,
-    host_past_key_value_lengths: Optional[Tensor],
-    host_max_attention_window_sizes: Tensor,
-    host_sink_token_length: Tensor,
-    context_lengths: Optional[Tensor],
-    cache_indirection: Optional[Tensor],
-    host_request_types: Tensor,
-    num_heads: int,
-    num_kv_heads: int,
-    hidden_size_per_head: int,
-    q_scaling: float,
-    rotary_embedding_dim: int = 0,
-    rotary_embedding_base: float = 10000.0,
-    rotary_embedding_scale_type: RotaryScalingType = RotaryScalingType.none,
-    rotary_embedding_scale: float = 1.0,
-    rotary_embedding_max_positions: int = 1024,
-    position_embedding_type: PositionEmbeddingType = PositionEmbeddingType.
-    learned_absolute,
-    kv_orig_quant_scale: Optional[Tensor] = None,
-    kv_quant_orig_scale: Optional[Tensor] = None,
-    kv_cache_quant_mode: QuantMode = QuantMode(0),
-    max_context_length: Optional[int] = None,
-    mask_type: AttentionMaskType = AttentionMaskType.causal,
-    alibi_slopes: Optional[Tensor] = None,
-    tp_size: int = 1,
-    tp_rank: int = 0,
-    kv_cache_block_pointers: Optional[Tensor] = None,
-    host_kv_cache_block_pointers: Tensor = None,
-    do_cross_attention: bool = False,
-    cross_qkv: Optional[Tensor] = None,  # for cross attention
-    cross_qkv_length: Optional[Tensor] = None,  # for cross attention
-    encoder_input_lengths: Optional[Tensor] = None,  # for cross attention
-    relative_attention_bias: Optional[Tensor] = None,  # for relative attention
-    max_distance: int = 0,  # for relative attention
-    host_context_lengths: Optional[Tensor] = None,  # for pad-free input mode
-    enable_pos_shift: Optional[
-        bool] = False,  # for position shift attention mode in streamingllm
-    dense_context_fmha: Optional[
-        bool] = False,  # for dense fmha in context phase
-    qkv_bias: Optional[Tensor] = None,
-    use_cache: bool = True,
-    medusa_position_offsets: Tensor = None,
-    medusa_packed_mask: Tensor = None,
+        qkv: Tensor,
+        past_key_value: Tensor,
+        sequence_length: Tensor,
+        host_past_key_value_lengths: Optional[Tensor],
+        host_max_attention_window_sizes: Tensor,
+        host_sink_token_length: Tensor,
+        context_lengths: Optional[Tensor],
+        cache_indirection: Optional[Tensor],
+        host_request_types: Tensor,
+        num_heads: int,
+        num_kv_heads: int,
+        hidden_size_per_head: int,
+        q_scaling: float,
+        rotary_embedding_dim: int = 0,
+        rotary_embedding_base: float = 10000.0,
+        rotary_embedding_scale_type: RotaryScalingType = RotaryScalingType.none,
+        rotary_embedding_scale: float = 1.0,
+        rotary_embedding_max_positions: int = 1024,
+        position_embedding_type: PositionEmbeddingType = PositionEmbeddingType.
+        learned_absolute,
+        kv_orig_quant_scale: Optional[Tensor] = None,
+        kv_quant_orig_scale: Optional[Tensor] = None,
+        kv_cache_quant_mode: QuantMode = QuantMode(0),
+        max_context_length: Optional[int] = None,
+        mask_type: AttentionMaskType = AttentionMaskType.causal,
+        alibi_slopes: Optional[Tensor] = None,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        kv_cache_block_pointers: Optional[Tensor] = None,
+        host_kv_cache_block_pointers: Tensor = None,
+        do_cross_attention: bool = False,
+        cross_qkv: Optional[Tensor] = None,  # for cross attention
+        cross_qkv_length: Optional[Tensor] = None,  # for cross attention
+        encoder_input_lengths: Optional[Tensor] = None,  # for cross attention
+        relative_attention_bias: Optional[Tensor] = None,  # for relative attention
+        max_distance: int = 0,  # for relative attention
+        host_context_lengths: Optional[Tensor] = None,  # for pad-free input mode
+        enable_pos_shift: Optional[
+            bool] = False,  # for position shift attention mode in streamingllm
+        dense_context_fmha: Optional[
+            bool] = False,  # for dense fmha in context phase
+        qkv_bias: Optional[Tensor] = None,
+        use_cache: bool = True,
+        medusa_position_offsets: Tensor = None,
+        medusa_packed_mask: Tensor = None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     '''
     Add an operation that performs the multi-head attention in GPT-like models.
@@ -4076,18 +4088,18 @@ def generate_alibi_slopes(num_heads: int,
         start_head_id = rank_heads * tp_rank
         end_head_id = start_head_id + rank_heads
 
-    closest_power_of_2 = 2**np.floor(np.log2(num_heads))
+    closest_power_of_2 = 2 ** np.floor(np.log2(num_heads))
     # FT's implementation
     # https://github.com/NVIDIA/FasterTransformer/blob/main/src/fastertransformer/kernels/gen_relative_pos_bias.cu#L248
     slopes_ft = []
     for h_id in range(start_head_id, end_head_id):
         if h_id < closest_power_of_2:
             slopes_ft.append(
-                np.power(2**(-(2**-(np.log2(closest_power_of_2) - 3))),
+                np.power(2 ** (-(2 ** -(np.log2(closest_power_of_2) - 3))),
                          h_id + 1))
         else:
             slopes_ft.append(
-                np.power(2**(-(2**-(np.log2(closest_power_of_2 * 2) - 3))),
+                np.power(2 ** (-(2 ** -(np.log2(closest_power_of_2 * 2) - 3))),
                          (h_id - closest_power_of_2) * 2 + 1))
     slopes = np.asarray(slopes_ft, dtype=np.float32)
 
@@ -4230,8 +4242,8 @@ def gather_last_token_logits(hidden_states: Tensor, last_token_ids: Tensor,
             last_token_ids = last_token_ids - 1
             hidden_states = gather(
                 hidden_states, dim=1, indices=last_token_ids).view(
-                    concat([shape(hidden_states, 0),
-                            shape(hidden_states, 2)]))
+                concat([shape(hidden_states, 0),
+                        shape(hidden_states, 2)]))
         elif ndim == 2:  # speculative decoding needs last few token's logits
             # last_token_ids is of shape [batch_size, num_last_tokens]
             # So [batch_size, seqlen, hidden_size] -> [batch_size, num_last_tokens, hidden_size]
@@ -4261,6 +4273,7 @@ ACT2FN = {
     'squared-relu': squared_relu,
     'swiglu': swiglu,
     'fast-swiglu': swiglu,
+    'gelu_pytorch_tanh': gelu_pytorch_tanh,
 }
 
 GATED_ACT_2_ACT = {
@@ -4308,17 +4321,17 @@ def non_gated_version(activation):
 
 
 def lora_plugin(
-    input: Tensor = None,
-    in_hidden_size: int = 0,
-    out_hidden_sizes: List[int] = [0],
-    host_request_types: Tensor = None,
-    transa: bool = False,
-    transb: bool = False,
-    host_context_lengths: Tensor = None,  # for pad-free input mode
-    max_context_length: int = 0,
-    max_low_rank: int = 0,
-    lora_ranks: List[Tensor] = None,
-    lora_weights_pointers: List[Tensor] = None,
+        input: Tensor = None,
+        in_hidden_size: int = 0,
+        out_hidden_sizes: List[int] = [0],
+        host_request_types: Tensor = None,
+        transa: bool = False,
+        transb: bool = False,
+        host_context_lengths: Tensor = None,  # for pad-free input mode
+        max_context_length: int = 0,
+        max_low_rank: int = 0,
+        lora_ranks: List[Tensor] = None,
+        lora_weights_pointers: List[Tensor] = None,
 ):
     '''
     Parameters:
@@ -4404,9 +4417,9 @@ def lora_plugin(
         trt.PluginFieldType.INT32)
 
     pfc = trt.PluginFieldCollection([
-        in_hidden_size_field, transa, transb, num_lora_modules_field, pf_type,
-        remove_input_padding, max_context_length_field, max_low_rank_field
-    ] + out_hidden_size_field_list)
+                                        in_hidden_size_field, transa, transb, num_lora_modules_field, pf_type,
+                                        remove_input_padding, max_context_length_field, max_low_rank_field
+                                    ] + out_hidden_size_field_list)
     lora_plug = plg_creator.create_plugin("lora", pfc)
 
     plug_inputs = [input, host_request_types
@@ -4428,21 +4441,21 @@ def lora_plugin(
 
 
 def selective_scan(
-    input: Tensor,
-    state: Tensor,
-    delta: Tensor,
-    delta_bias: Tensor,
-    A: Tensor,
-    B: Tensor,
-    C: Tensor,
-    D: Tensor,
-    z: Tensor,
-    host_request_types: Tensor,
-    dim: int,
-    dstate: int,
-    is_variable_B: bool,
-    is_variable_C: bool,
-    delta_softplus: bool,
+        input: Tensor,
+        state: Tensor,
+        delta: Tensor,
+        delta_bias: Tensor,
+        A: Tensor,
+        B: Tensor,
+        C: Tensor,
+        D: Tensor,
+        z: Tensor,
+        host_request_types: Tensor,
+        dim: int,
+        dstate: int,
+        is_variable_B: bool,
+        is_variable_C: bool,
+        delta_softplus: bool,
 ):
     '''
     Parameters:
