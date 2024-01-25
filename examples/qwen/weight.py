@@ -12,8 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import configparser
 import time
+from glob import glob
 from operator import attrgetter
 from pathlib import Path
 
@@ -581,13 +583,25 @@ def load_from_gptq_qwen(
     tik = time.time()
 
     if quant_ckpt_path.endswith(".safetensors"):
-        groupwise_qweight_safetensors = safe_open(quant_ckpt_path,
-                                                  framework="pt",
-                                                  device='cpu')
-        model_params = {
-            key: groupwise_qweight_safetensors.get_tensor(key)
-            for key in groupwise_qweight_safetensors.keys()
-        }
+        model_params = {}
+
+        if os.path.exists(quant_ckpt_path):
+            groupwise_qweight_safetensors = safe_open(quant_ckpt_path,
+                                                    framework="pt",
+                                                    device='cpu')
+            model_params = {
+                key: groupwise_qweight_safetensors.get_tensor(key)
+                for key in groupwise_qweight_safetensors.keys()
+            }
+        else:
+            # /Qwen-VL-Chat-Int4/*.safetensors
+            for weight_path in glob(quant_ckpt_path):
+                groupwise_qweight_safetensors = safe_open(weight_path,
+                                                    framework="pt",
+                                                    device='cpu')
+
+                for key in groupwise_qweight_safetensors.keys():
+                    model_params[key] = groupwise_qweight_safetensors.get_tensor(key)
     elif quant_ckpt_path.endswith(".pt"):
         model_params = torch.load(quant_ckpt_path,
                                   map_location=torch.device("cpu"))

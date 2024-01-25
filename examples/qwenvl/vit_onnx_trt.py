@@ -57,24 +57,32 @@ class ONNX_TRT:
     def __init__(self, image_size):
         self.image_size = image_size
 
-    def export_onnx(self, onnx_file_path, pretrained_model_path, image_url):
-        print("Start converting ONNX model!")
-        image_pre_obj = Preprocss(self.image_size)
+    def extract_visual_model(self, pretrained_model_path):
         torch_dtype = str_dtype_to_torch("float16")
         model = AutoModelForCausalLM.from_pretrained(
             pretrained_model_path,
-            device_map="cuda",
+            device_map="cpu",
             torch_dtype=torch_dtype,
             fp16=True,
             trust_remote_code=True,
         ).eval()
+
+        model_visual = model.transformer.visual
+
+        return model_visual
+
+    def export_onnx(self, onnx_file_path, pretrained_model_path, image_url):
+        print("Start converting ONNX model!")
+        image_pre_obj = Preprocss(self.image_size)
+
         device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
         image = image_pre_obj.encode(image_url).to(device)
         if not os.path.exists('image.pt'):
             torch.save(image, 'image.pt')
 
-        model_visual = model.transformer.visual
+        model_visual = self.extract_visual_model(pretrained_model_path)
         model_visual.eval()
+        model_visual.cuda()
 
         torch.onnx.export(model_visual,
                           image.to('cuda'),
