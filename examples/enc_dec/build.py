@@ -26,7 +26,9 @@ from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models import quantize_model
 from tensorrt_llm.network import net_guard
+from tensorrt_llm.quantization import QuantMode
 
 from t5.weight import parse_t5_config, load_from_hf_t5, load_from_binary_t5  # isort:skip
 from bart.weight import parse_bart_config, load_from_binary_bart  # isort:skip
@@ -270,10 +272,48 @@ def parse_arguments(component):
         help=
         'Skip building encoder for nougat model. Encoder is not an LLM in nougat'
     )
+    parser.add_argument(
+        '--use_weight_only',
+        default=False,
+        action="store_true",
+        help='Quantize weights for the various GEMMs to INT4/INT8.'
+        'See --weight_only_precision to set the precision')
+    parser.add_argument(
+        '--disable_weight_only_quant_plugin',
+        default=False,
+        action="store_true",
+        help=
+        'By default, using plugin implementation for weight quantization. Enabling disable_weight_only_quant_plugin flag will use ootb implementation instead of plugin.'
+        'You must also use --use_weight_only for that argument to have an impact.'
+    )
+    parser.add_argument(
+        '--weight_only_precision',
+        const='int8',
+        type=str,
+        nargs='?',
+        default='int8',
+        choices=['int8', 'int4', 'int4_awq', 'int4_gptq'],
+        help=
+        'Define the precision for the weights when using weight-only quantization.'
+        'You must also use --use_weight_only for that argument to have an impact.'
+    )
 
     # parse cmdline args
     args = parser.parse_args()
     logger.set_level(args.log_level)
+
+    # TODO: Add quantization for encoder as well.
+    if args.use_weight_only and component == 'decoder':
+        args.quant_mode = QuantMode.from_description(
+            quantize_weights=True,
+            quantize_activations=False,
+            per_token=False,
+            per_channel=False,
+            per_group=False,
+            use_int4_weights='int4' in args.weight_only_precision,
+        )
+    else:
+        args.quant_mode = QuantMode(0)
 
     if component == 'encoder' and args.skip_encoder:
         # Skip further processing
@@ -392,7 +432,12 @@ def build_rank_engine(builder: Builder,
             mapping=mapping,
             rescale_before_lm_head=args.rescale_before_lm_head,
             dtype=dtype,
-            logits_dtype=args.logits_dtype)
+            logits_dtype=args.logits_dtype,
+            quant_mode=args.quant_mode)
+    
+    if args.quant_mode != QuantMode(0):
+        quantize_kwargs = {}
+        tllm_model = quantize_model(tllm_model, args.quant_mode, **quantize_kwargs)
 
     # No support for relative attention bias in plain TRT mode. Please use attention plugin
     # (If to add such support, need to add into
@@ -440,6 +485,8 @@ def build_rank_engine(builder: Builder,
     if args.world_size > 1:
         network.plugin_config.set_nccl_plugin(args.dtype,
                                               args.use_custom_all_reduce)
+    if args.use_weight_only:
+        network.plugin_config.set_weight_only_quant_matmul_plugin(dtype='float16')
 
     with net_guard(network):
         # Prepare
@@ -487,6 +534,8 @@ def build(rank, args):
     builder = Builder()
     apply_query_key_layer_scaling = False
 
+    int8_trt_flag = args.quant_mode.has_act_or_weight_quant()
+
     cache = None
     for cur_rank in range(args.world_size):
         # skip other ranks if parallel_build is enabled
@@ -524,7 +573,9 @@ def build(rank, args):
             gather_generation_logits=args.gather_generation_logits,
             max_prompt_embedding_table_size=(
                 args.max_prompt_embedding_table_size
-                if args.component == 'encoder' else 0))
+                if args.component == 'encoder' else 0),
+            int8=int8_trt_flag,
+            quant_mode = args.quant_mode)
 
         engine_name = get_engine_name(args.engine_name, args.dtype,
                                       args.tp_size, args.pp_size, cur_rank)

@@ -34,6 +34,7 @@ from tensorrt_llm.models.generation_mixin import GenerationMixin
 from tensorrt_llm.module import Module, ModuleList
 from tensorrt_llm.parameter import Parameter
 from tensorrt_llm.plugin.plugin import current_all_reduce_helper
+from tensorrt_llm.quantization import QuantMode
 
 layernorm_map = {
     LayerNormType.LayerNorm: LayerNorm,
@@ -288,7 +289,8 @@ class DecoderLayer(Module):
                  residual_scaling=1.0,
                  relative_attention=False,
                  max_distance=0,
-                 num_buckets=0):
+                 num_buckets=0,
+                 quant_mode: QuantMode = QuantMode(0)):
         super().__init__()
 
         # e.g. BART regular, T5 RMS
@@ -317,7 +319,8 @@ class DecoderLayer(Module):
             max_distance=max_distance,
             num_buckets=num_buckets,
             position_embedding_type=PositionEmbeddingType.relative
-            if relative_attention else PositionEmbeddingType.learned_absolute)
+            if relative_attention else PositionEmbeddingType.learned_absolute,
+            quant_mode=quant_mode)
 
         self.self_attention_layernorm = ln_type(normalized_shape=hidden_size,
                                                 eps=layernorm_eps,
@@ -348,7 +351,8 @@ class DecoderLayer(Module):
             False,  # Cross attention has no relative attention bias
             max_distance=max_distance,
             num_buckets=num_buckets,
-            position_embedding_type=PositionEmbeddingType.learned_absolute)
+            position_embedding_type=PositionEmbeddingType.learned_absolute,
+            quant_mode=quant_mode)
 
         self.cross_attention_layernorm = ln_type(normalized_shape=hidden_size,
                                                  eps=layernorm_eps,
@@ -365,6 +369,7 @@ class DecoderLayer(Module):
             tp_group=mapping.tp_group,
             tp_size=mapping.tp_size,
             dtype=dtype,
+            quant_mode=quant_mode,
         )
 
         self.mlp_layernorm = ln_type(normalized_shape=hidden_size,
@@ -804,13 +809,15 @@ class DecoderModel(Module, GenerationMixin):
                  residual_scaling=1.0,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
-                 mapping=Mapping()):
+                 mapping=Mapping(),
+                 quant_mode: QuantMode = QuantMode(0)):
         super().__init__()
         self.mapping = mapping
 
         self.has_position_embedding = has_position_embedding  # TODO: remove dup codes
         self.has_token_type_embedding = type_vocab_size is not None
         self.rescale_before_lm_head = rescale_before_lm_head
+        self.quant_mode = quant_mode
 
         # e.g. BART regular, T5 RMS
         self.layernorm_type = layernorm_type
@@ -895,7 +902,8 @@ class DecoderModel(Module, GenerationMixin):
                          residual_scaling=residual_scaling,
                          relative_attention=relative_attention,
                          max_distance=max_distance,
-                         num_buckets=num_buckets)
+                         num_buckets=num_buckets,
+                         quant_mode=quant_mode)
             for _ in self.mapping.pp_layers(self.total_num_layers)
         ])
 

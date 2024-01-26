@@ -22,12 +22,13 @@ import torch
 
 from tensorrt_llm import logger
 from tensorrt_llm._utils import (numpy_to_dtype, str_dtype_to_np,
-                                 str_dtype_to_torch, torch_to_numpy)
+                                 str_dtype_to_torch, torch_to_numpy, numpy_to_torch,)
 from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import (  # TODO: probably need to change model name to distinguish from other models
     DecoderModel, EncoderModel)
+from tensorrt_llm.quantization import QuantMode
 
 layernorm_type_map = {i.name: i.value for i in LayerNormType}
 layernorm_position_map = {i.name: i.value for i in LayerNormPositionType}
@@ -350,6 +351,13 @@ def load_from_binary_t5(tllm_model: Union[EncoderModel, DecoderModel],
 
     if mapping is None:
         mapping = Mapping()
+    
+    quant_mode = getattr(tllm_model, "quant_mode", QuantMode(0))
+    if quant_mode.is_int8_weight_only():
+        plugin_weight_only_quant_type = torch.int8
+    elif quant_mode.is_int4_weight_only():
+        plugin_weight_only_quant_type = torch.quint4x2
+    use_weight_only = quant_mode.is_weight_only()
 
     ckpt_np_dtype = str_dtype_to_np(args.ckpt_weight_dtype)
 
@@ -399,14 +407,42 @@ def load_from_binary_t5(tllm_model: Union[EncoderModel, DecoderModel],
 
         # self attention
         attention_hidden_size = args.n_head * args.head_size  # head size * num_heads not necessarily equals hidden_dim, such as Flan-T5
-        self_attention_layer.qkv.weight.value = fromfile(
+        t = fromfile(
             f'{layer_prefix}.layer.0.SelfAttention.qkv.weight',
-            shape=[
-                3 * attention_hidden_size // mapping.tp_size, args.hidden_size
-            ])
-        self_attention_layer.dense.weight.value = fromfile(
+            shape=[3 * attention_hidden_size // mapping.tp_size, args.hidden_size],
+        )
+        if use_weight_only:
+            t = numpy_to_torch(np.ascontiguousarray(t.transpose()))
+            (
+                processed_torch_weights,
+                torch_weight_scales,
+            ) = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
+                torch.tensor(t),
+                plugin_weight_only_quant_type,
+            )
+            self_attention_layer.qkv.weight.value = processed_torch_weights.numpy()
+            self_attention_layer.qkv.per_channel_scale.value = torch_to_numpy(torch_weight_scales)
+        else:
+            self_attention_layer.qkv.weight.value = t
+
+        t = fromfile(
             f'{layer_prefix}.layer.0.SelfAttention.o.weight',
-            shape=[args.hidden_size, attention_hidden_size // mapping.tp_size])
+            shape=[args.hidden_size, attention_hidden_size // mapping.tp_size],
+        )
+        if use_weight_only:
+            t = numpy_to_torch(np.ascontiguousarray(t.transpose()))
+            (
+                processed_torch_weights,
+                torch_weight_scales,
+            ) = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
+                torch.tensor(t),
+                plugin_weight_only_quant_type,
+            )
+            self_attention_layer.dense.weight.value = processed_torch_weights.numpy()
+            self_attention_layer.dense.per_channel_scale.value = torch_to_numpy(torch_weight_scales)
+        else:
+            self_attention_layer.dense.weight.value = t
+
         self_attention_layernorm = getattr(
             layer, 'self_attention_layernorm'
             if component == 'decoder' else 'attention_layernorm')
@@ -416,34 +452,106 @@ def load_from_binary_t5(tllm_model: Union[EncoderModel, DecoderModel],
         # cross attention
         if component == 'decoder':
             attention_hidden_size = args.n_head * args.head_size
-            layer.cross_attention.qkv.weight.value = fromfile(
+            t = fromfile(
                 f'{layer_prefix}.layer.1.EncDecAttention.qkv.weight',
-                shape=[
-                    3 * attention_hidden_size // mapping.tp_size,
-                    args.hidden_size
-                ])
-            layer.cross_attention.dense.weight.value = fromfile(
+                shape=[3 * attention_hidden_size // mapping.tp_size, args.hidden_size],
+            )
+            if use_weight_only:
+                t = numpy_to_torch(np.ascontiguousarray(t.transpose()))
+                (
+                    processed_torch_weights,
+                    torch_weight_scales,
+                ) = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
+                    torch.tensor(t),
+                    plugin_weight_only_quant_type,
+                )
+                layer.cross_attention.qkv.weight.value = processed_torch_weights.numpy()
+                layer.cross_attention.qkv.per_channel_scale.value = torch_to_numpy(torch_weight_scales)
+            else:
+                layer.cross_attention.qkv.weight.value = t
+
+            t = fromfile(
                 f'{layer_prefix}.layer.1.EncDecAttention.o.weight',
-                shape=[
-                    args.hidden_size, attention_hidden_size // mapping.tp_size
-                ])
+                shape=[args.hidden_size, attention_hidden_size // mapping.tp_size],
+            )
+            if use_weight_only:
+                t = numpy_to_torch(np.ascontiguousarray(t.transpose()))
+                (
+                    processed_torch_weights,
+                    torch_weight_scales,
+                ) = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
+                    torch.tensor(t),
+                    plugin_weight_only_quant_type,
+                )
+                layer.cross_attention.dense.weight.value = (
+                    processed_torch_weights.numpy()
+                )
+                layer.cross_attention.dense.per_channel_scale.value = torch_to_numpy(torch_weight_scales)
+            else:
+                layer.cross_attention.dense.weight.value = t
+
             layer.cross_attention_layernorm.weight.value = fromfile(
                 f'{layer_prefix}.layer.1.layer_norm.weight', split=False)
 
         # MLP
         hf_component_idx = 1 if component == 'encoder' else 2
-        layer.mlp.fc.weight.value = fromfile(
+        t = fromfile(
             f'{layer_prefix}.layer.{hf_component_idx}.DenseReluDense.wi.weight',
             shape=[args.ffn_hidden_size // mapping.tp_size, args.hidden_size])
+        if use_weight_only:
+            t = numpy_to_torch(np.ascontiguousarray(t.transpose()))
+            (
+                processed_torch_weights,
+                torch_weight_scales,
+            ) = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
+                torch.tensor(t),
+                plugin_weight_only_quant_type,
+            )
+            layer.mlp.fc.weight.value = processed_torch_weights.numpy()
+            scales = layer.mlp.fc.per_channel_scale
+            scales.value = torch_to_numpy(torch_weight_scales)
+        else:
+            layer.mlp.fc.weight.value = t
+
         if args.gated_act:
-            layer.mlp.gate.weight.value = fromfile(
+            t = fromfile(
                 f'{layer_prefix}.layer.{hf_component_idx}.DenseReluDense.wi2.weight',
                 shape=[
                     args.ffn_hidden_size // mapping.tp_size, args.hidden_size
                 ])
-        layer.mlp.proj.weight.value = fromfile(
+            if use_weight_only:
+                t = numpy_to_torch(np.ascontiguousarray(t.transpose()))
+                (
+                    processed_torch_weights,
+                    torch_weight_scales,
+                ) = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
+                    torch.tensor(t),
+                    plugin_weight_only_quant_type,
+                )
+                layer.mlp.gate.weight.value = processed_torch_weights.numpy()
+                scales = layer.mlp.gate.per_channel_scale
+                scales.value = torch_to_numpy(torch_weight_scales)
+            else:
+                layer.mlp.gate.weight.value = t
+        t = fromfile(
             f'{layer_prefix}.layer.{hf_component_idx}.DenseReluDense.wo.weight',
             shape=[args.hidden_size, args.ffn_hidden_size // mapping.tp_size])
+        
+        if use_weight_only:
+            t = numpy_to_torch(np.ascontiguousarray(t.transpose()))
+            (
+                processed_torch_weights,
+                torch_weight_scales,
+            ) = torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
+                torch.tensor(t),
+                plugin_weight_only_quant_type,
+            )
+            layer.mlp.proj.weight.value = processed_torch_weights.numpy()
+            scales = layer.mlp.proj.per_channel_scale
+            scales.value = torch_to_numpy(torch_weight_scales)
+        else:
+            layer.mlp.proj.weight.value = t
+
         layer.mlp_layernorm.weight.value = fromfile(
             f'{layer_prefix}.layer.{hf_component_idx}.layer_norm.weight',
             split=False)
