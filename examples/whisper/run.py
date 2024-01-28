@@ -33,7 +33,7 @@ from tensorrt_llm._utils import (str_dtype_to_torch, str_dtype_to_trt,
                                  trt_dtype_to_torch)
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.session import Session, TensorInfo
-
+from tensorrt_llm.quantization import QuantMode
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
@@ -158,6 +158,7 @@ class WhisperDecoding:
             decoder_config['has_position_embedding'],
             has_token_type_embedding=self.
             decoder_config['has_token_type_embedding'],
+            quant_mode=QuantMode(self.decoder_config['quant_mode']),
         )
         decoder_generation_session = tensorrt_llm.runtime.GenerationSession(
             decoder_model_config,

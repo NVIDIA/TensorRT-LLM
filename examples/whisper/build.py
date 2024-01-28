@@ -100,16 +100,6 @@ def parse_arguments():
         help=
         "Activates GEMM plugin. You can specify the plugin dtype or leave blank to use the model dtype."
     )
-    parser.add_argument(
-        '--use_layernorm_plugin',
-        nargs='?',
-        const=None,
-        type=str,
-        default=False,
-        choices=['float16', 'float32', 'bfloat16'],
-        help=
-        "Activates layernorm plugin. You can specify the plugin dtype or leave blank to use the model dtype."
-    )
     parser.add_argument('--remove_input_padding',
                         default=False,
                         action='store_true')
@@ -213,16 +203,17 @@ def build_encoder(model, args):
         tensorrt_llm_whisper_encoder = quantize_model(
             tensorrt_llm_whisper_encoder, args.quant_mode)
 
+    use_gemm_woq_plugin = args.use_gemm_plugin and args.use_weight_only
+
     load_encoder_weight(tensorrt_llm_whisper_encoder, model_metadata,
-                        model_params, model_metadata['n_audio_layer'])
+                        model_params, model_metadata['n_audio_layer'],
+                        use_gemm_woq_plugin
+                        )
 
     network = builder.create_network()
 
     if args.use_gemm_plugin:
         network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
-    if args.use_layernorm_plugin:
-        network.plugin_config.set_layernorm_plugin(
-            dtype=args.use_layernorm_plugin)
     if args.use_bert_attention_plugin:
         network.plugin_config.set_bert_attention_plugin(
             dtype=args.use_bert_attention_plugin)
@@ -285,7 +276,8 @@ def build_decoder(model, args):
         cross_attention=True,
         has_position_embedding=True,
         has_token_type_embedding=False,
-        int8=args.quant_mode.has_act_or_weight_quant(),
+        int8=(args.quant_mode.has_act_or_weight_quant() or args.quant_mode.has_int8_kv_cache()),
+        quant_mode=args.quant_mode,
     )
 
     tensorrt_llm_whisper_decoder = tensorrt_llm.models.DecoderModel(
@@ -315,31 +307,37 @@ def build_decoder(model, args):
         hidden_act="gelu",
         rescale_before_lm_head=False,
         dtype=str_dtype_to_trt(args.dtype),
-        logits_dtype=str_dtype_to_trt(args.dtype))
+        logits_dtype=str_dtype_to_trt(args.dtype),
+        quant_mode=args.quant_mode,)
 
     if args.use_weight_only:
         tensorrt_llm_whisper_decoder = quantize_model(
             tensorrt_llm_whisper_decoder, args.quant_mode)
-
+    
+    use_gemm_woq_plugin = args.use_gemm_plugin and args.use_weight_only
+    
     load_decoder_weight(
         tensorrt_llm_whisper_decoder,
         model_params,
+        use_gemm_woq_plugin
     )
 
     network = builder.create_network()
 
     if args.use_gemm_plugin:
         network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
-    if args.use_layernorm_plugin:
-        network.plugin_config.set_layernorm_plugin(
-            dtype=args.use_layernorm_plugin)
     if args.use_gpt_attention_plugin:
         network.plugin_config.set_gpt_attention_plugin(
             dtype=args.use_gpt_attention_plugin)
     if args.remove_input_padding:
         network.plugin_config.enable_remove_input_padding()
+    if args.use_weight_only:
+        network.plugin_config.set_weight_only_quant_matmul_plugin(
+            dtype=args.dtype)
 
     with net_guard(network):
+        network.set_named_parameters(tensorrt_llm_whisper_decoder.named_parameters())
+        
         inputs = tensorrt_llm_whisper_decoder.prepare_inputs(
             args.max_batch_size,
             args.max_beam_width,
@@ -353,6 +351,8 @@ def build_decoder(model, args):
         if args.debug_mode:
             for k, v in tensorrt_llm_whisper_decoder.named_network_outputs():
                 network._mark_output(v, k, str_dtype_to_trt(args.dtype))
+
+    tensorrt_llm.graph_rewriting.optimize(network)
 
     engine = None
     engine_name = get_engine_name(MODEL_DECODER_NAME, args.dtype, 1, 0)
