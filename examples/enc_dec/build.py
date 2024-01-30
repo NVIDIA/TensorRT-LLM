@@ -302,8 +302,7 @@ def parse_arguments(component):
     args = parser.parse_args()
     logger.set_level(args.log_level)
 
-    # TODO: Add quantization for encoder as well.
-    if args.use_weight_only and component == 'decoder':
+    if args.use_weight_only:
         args.quant_mode = QuantMode.from_description(
             quantize_weights=True,
             quantize_activations=False,
