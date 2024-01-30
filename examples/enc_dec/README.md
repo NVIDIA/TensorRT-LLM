@@ -123,6 +123,19 @@ python build.py --model_type bart \
                 --use_gemm_plugin \
                 --dtype float32 \
                 --max_beam_width 1
+
+# Example 5: build t5-small using weight-only int8 quantization
+python build.py --model_type t5 \
+                --weight_dir tmp/trt_models/t5-small/tp1 \
+                -o tmp/trt_engines/t5-small/int8/1-gpu \
+                --engine_name t5-small \
+                --remove_input_padding \
+                --use_bert_attention_plugin \
+                --use_gpt_attention_plugin \
+                --use_gemm_plugin \
+                --dtype float16 \
+                --use_weight_only \
+                --weight_only_precision int8
 ```
 
 ### Run
