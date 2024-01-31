@@ -12,6 +12,7 @@ The TensorRT-LLM Whisper example code is located in [`examples/whisper`](./). Th
 ## Support Matrix
   * FP16
   * INT8
+  * INT4
 
 ## Usage
 
@@ -37,16 +38,41 @@ TensorRT-LLM Whisper builds TensorRT engine(s) from the pytorch checkpoint.
 pip install -r requirements.txt
 
 # Build the large-v3 model using a single GPU with plugins.
-python3 build.py --output_dir whisper_large_v3 --use_gpt_attention_plugin --use_gemm_plugin --use_layernorm_plugin  --use_bert_attention_plugin
+python3 build.py --output_dir whisper_large_v3 --use_gpt_attention_plugin --use_gemm_plugin --use_bert_attention_plugin
 
-# Build the large-v3 model using a single GPU with plugins and weight-only quantization.
-python3 build.py --output_dir whisper_large_weight_only --use_gpt_attention_plugin --use_gemm_plugin --use_layernorm_plugin  --use_bert_attention_plugin --use_weight_only
+# Build the large-v3 model using a single GPU with plugins and int8 weight-only quantization.
+python3 build.py --output_dir whisper_large_weight_only --use_gpt_attention_plugin --use_gemm_plugin --use_bert_attention_plugin --use_weight_only
+
+# Build the large-v3 model using a single GPU with plugins and int4 weight-only quantization.
+python3 build.py --output_dir whisper_large_weight_only_int4 --use_gpt_attention_plugin --use_gemm_plugin --use_bert_attention_plugin --use_weight_only --weight_only_precision int4
+```
+
+#### INT8 KV cache
+INT8 KV cache could be enabled to reduce memory footprint. It will bring more performance gains when batch size gets larger.
+
+You can get the INT8 scale of KV cache through [`torch_whisper_convert.py`](./torch_whisper_convert.py), which features a
+`--calibrate-kv-cache, -kv` option. Setting `-kv` will calibrate the model,
+and then export the scaling factors needed for INT8 KV cache inference.
+
+Example:
+
+```bash
+python3 torch_whisper_convert.py -i large-v3 -o quantize --calibrate-kv-cache -p 1
+```
+
+[`build.py`](./build.py) add new options for the support of INT8 KV cache.
+
+`--int8_kv_cache` is the command-line option to enable INT8 KV cache
+
+```bash
+# Build model with both INT8 weight-only and INT8 KV cache enabled
+python3 build.py --output_dir whisper_large_weight_only_kv --use_gpt_attention_plugin --use_gemm_plugin  --use_bert_attention_plugin --use_weight_only --int8_kv_cache
 ```
 
 ### Run
 
 ```bash
-# choose the engine you build [./whisper_large_v3, ./whisper_large_weight_only]
+# choose the engine you build (for example [./whisper_large_v3])
 output_dir=./whisper_large_v3
 # decode a single audio file
 # If the input file does not have a .wav extension, ffmpeg needs to be installed with the following command:

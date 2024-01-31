@@ -33,6 +33,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.generation_mixin import GenerationMixin
 from tensorrt_llm.module import Module, ModuleList
 from tensorrt_llm.parameter import Parameter
+from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.plugin.plugin import current_all_reduce_helper
 
 layernorm_map = {
@@ -288,7 +289,8 @@ class DecoderLayer(Module):
                  residual_scaling=1.0,
                  relative_attention=False,
                  max_distance=0,
-                 num_buckets=0):
+                 num_buckets=0,
+                 quant_mode=QuantMode(0),):
         super().__init__()
 
         # e.g. BART regular, T5 RMS
@@ -312,6 +314,7 @@ class DecoderLayer(Module):
             tp_size=mapping.tp_size,
             tp_rank=mapping.tp_rank,
             dtype=dtype,
+            quant_mode=quant_mode,
             cross_attention=False,
             relative_attention=relative_attention,
             max_distance=max_distance,
@@ -343,6 +346,7 @@ class DecoderLayer(Module):
             tp_size=mapping.tp_size,
             tp_rank=mapping.tp_rank,
             dtype=dtype,
+            quant_mode=quant_mode,
             cross_attention=True,
             relative_attention=
             False,  # Cross attention has no relative attention bias
@@ -804,7 +808,8 @@ class DecoderModel(Module, GenerationMixin):
                  residual_scaling=1.0,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
-                 mapping=Mapping()):
+                 mapping=Mapping(),
+                 quant_mode=QuantMode(0),):
         super().__init__()
         self.mapping = mapping
 
@@ -829,8 +834,12 @@ class DecoderModel(Module, GenerationMixin):
             assert isinstance(dtype, trt.DataType)
             self._dtype = dtype
 
-        # no quantization considered for now
         self._kv_dtype = self._dtype
+        self.quant_mode = quant_mode
+        if quant_mode.has_int8_kv_cache():
+            self._kv_dtype = str_dtype_to_trt('int8')
+        elif quant_mode.has_fp8_kv_cache():
+            self._kv_dtype = str_dtype_to_trt('fp8')
 
         if isinstance(logits_dtype, str):
             self._logits_dtype = str_dtype_to_trt(logits_dtype)
@@ -895,7 +904,8 @@ class DecoderModel(Module, GenerationMixin):
                          residual_scaling=residual_scaling,
                          relative_attention=relative_attention,
                          max_distance=max_distance,
-                         num_buckets=num_buckets)
+                         num_buckets=num_buckets,
+                         quant_mode=quant_mode)
             for _ in self.mapping.pp_layers(self.total_num_layers)
         ])
 
@@ -1070,7 +1080,7 @@ class DecoderModel(Module, GenerationMixin):
         # No enable_two_optimization_profiles support yet
 
         encoder_input_len_range = [
-            0, (max_encoder_input_len + 1) // 2, max_encoder_input_len
+            1, (max_encoder_input_len + 1) // 2, max_encoder_input_len
         ]
         past_key_value = []
         sequence_length = None
