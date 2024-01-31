@@ -17,7 +17,7 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
-* [2024/30/01] [ New **XQA-kernel** provides **2.4x more Llama-70B throughput** within the same latency budget](./docs/source/blogs/XQA-kernel.md)
+* [2024/01/30] [ New **XQA-kernel** provides **2.4x more Llama-70B throughput** within the same latency budget](./docs/source/blogs/XQA-kernel.md)
 * [2023/12/04] [**Falcon-180B** on a **single H200** GPU with INT4 AWQ, and **6.7x faster Llama-70B** over A100](./docs/source/blogs/Falcon180B-H200.md)
 * [2023/11/27] [SageMaker LMI now supports TensorRT-LLM - improves throughput by 60%, compared to previous version](https://aws.amazon.com/blogs/machine-learning/boost-inference-performance-for-llms-with-new-amazon-sagemaker-containers/)
 * [2023/11/13] [H200 achieves nearly 12,000 tok/sec on Llama2-13B](./docs/source/blogs/H200launch.md)
