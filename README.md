@@ -118,7 +118,7 @@ apt-get update && apt-get -y install python3.10 python3-pip openmpi-bin libopenm
 pip3 install tensorrt_llm -U --pre --extra-index-url https://pypi.nvidia.com
 
 # Check installation
-python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"
+python3 -c "import tensorrt_llm"
 ```
 
 For developers who have the best performance requirements, debugging needs, or use the aarch64 architecture,
