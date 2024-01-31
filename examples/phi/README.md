@@ -1,13 +1,12 @@
 # Phi
 
 This document explains how to build the [Phi](https://huggingface.co/microsoft/phi-2) model using TensorRT-LLM and run on a single GPU.
-Note that both [Phi-2](https://huggingface.co/microsoft/phi-2) and [Phi-1.5](https://huggingface.co/microsoft/phi-1_5/) are supported.
 
 ## Overview
 
-The TensorRT-LLM Phi implementation can be found in [`tensorrt_llm/models/phi/model.py`](../../tensorrt_llm/models/phi/model.py). The TensorRT-LLM Phi example code is located in [`examples/phi`](./). There is one main file:
+The TensorRT-LLM Phi implementation can be found in [`tensorrt_llm/models/phi/model.py`](../../tensorrt_llm/models/phi/model.py). The TensorRT-LLM Phi example code is located in [`examples/phi`](./). There is one file:
 
-* [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Phi model.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format
 
 In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
 
@@ -21,12 +20,10 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 
 ## Usage
 
-### 1. Download weights from HuggingFace (HF) Transformers
+### 1. Convert weights from HF Transformers to TensorRT-LLM format
 
 ```bash
-# Make sure you have git-lfs installed (https://git-lfs.com)
-git lfs install
-git clone https://huggingface.co/microsoft/phi-2
+python ./convert_checkpoint.py --model_dir "microsoft/phi-2" --output_dir ./phi-2-checkpoint --dtype float16
 ```
 
 ### 2. Build TensorRT engine(s)
@@ -38,74 +35,27 @@ Examples of build invocations:
 ```bash
 # Build a float16 engine using a single GPU and HF weights.
 # Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
-python3 build.py --dtype=float16                    \
-                 --log_level=verbose                \
-                 --use_gpt_attention_plugin float16 \
-                 --use_gemm_plugin float16          \
-                 --max_batch_size=16                \
-                 --max_input_len=1024               \
-                 --max_output_len=1024              \
-                 --output_dir=phi_engine            \
-                 --model_dir=phi_model 2>&1 | tee build.log
-
-# Build a bfloat16 engine using a single GPU and HF weights.
-# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
-python3 build.py --dtype=bfloat16                    \
-                 --log_level=verbose                 \
-                 --use_gpt_attention_plugin bfloat16 \
-                 --use_gemm_plugin bfloat16          \
-                 --max_batch_size=16                 \
-                 --max_input_len=1024                \
-                 --max_output_len=1024               \
-                 --output_dir=phi_engine             \
-                 --model_dir=phi_model 2>&1 | tee build.log
-
-# Build a float16 engine using a single GPU and dummy weights.
-# Using dummy weights is useful for performance tests.
-# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
-python3 build.py --dtype=float16                    \
-                 --log_level=verbose                \
-                 --use_gpt_attention_plugin float16 \
-                 --use_gemm_plugin float16          \
-                 --max_batch_size=16                \
-                 --max_input_len=1024               \
-                 --max_output_len=1024              \
-                 --output_dir=phi_engine_dummy_weights 2>&1 | tee build.log
-
-# Build a float16 engine using 2-way tensor parallelism and HF weights.
-# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
-python3 build.py --dtype=float16                    \
-                 --log_level=verbose                \
-                 --use_gpt_attention_plugin float16 \
-                 --use_gemm_plugin float16          \
-                 --max_batch_size=16                \
-                 --max_input_len=1024               \
-                 --max_output_len=1024              \
-                 --world_size=2                     \
-                 --output_dir=phi_engine_tp2        \
-                 --model_dir=phi_model 2>&1 | tee build_tp2.log
+# workers == tp_size
+trtllm-build \
+    --checkpoint_dir ./phi-2-checkpoint \
+    --output_dir ./phi-2-engine \
+    --gemm_plugin float16 \
+    --gpt_attention_plugin float16 \
+    --max_batch_size 8 \
+    --max_input_len 1024 \
+    --max_output_len 1024 \
+    --workers 1
 ```
+
 #### Fused MultiHead Attention (FMHA)
 
-You can enable the FMHA kernels by adding `--enable_context_fmha` to the invocation of `build.py`. Note that it is disabled by default because of possible accuracy issues due to the use of Flash Attention.
+You can enable the FMHA kernels for phi by adding `--context_fmha enable` to the invocation of `trtllm-build`. Note that it is disabled by default because of possible accuracy issues due to the use of Flash Attention.
 
-If you find that the default fp16 accumulation (`--enable_context_fmha`) cannot meet accuracy requirements, you can try to enable fp32 accumulation by adding `--enable_context_fmha_fp32_acc`. However, it may have an impact on performance.
+If you find that the default fp16 accumulation (`--context_fmha enable`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--context_fmha_fp32_acc enable`. However, it is expected to see performance drop.
 
-Note `--enable_context_fmha` / `--enable_context_fmha_fp32_acc` have to be used together with `--use_gpt_attention_plugin float16`.
+Note `--context_fmha enable` / `--context_fmha_fp32_acc enable` has to be used together with `--gpt_attention_plugin float16`.
 
-### 3. Run
-
-To run a TensorRT-LLM Phi model using the engines generated by `build.py`:
-
-```bash
-# For a single GPU
-python3 ../run.py --max_output_len=50 --engine_dir=phi_engine --tokenizer_dir=phi_model
-
-# For 2-way tensor parallelism
-mpirun -n 2 --allow-run-as-root python3 ../run.py --max_output_len=50 --engine_dir=phi_engine_tp2 --tokenizer_dir=phi_model
-```
-
-### 4. Summarization using the Phi model
+### 3. Summarization using the Phi model
 
 The following section describes how to run a TensorRT-LLM Phi model to summarize the articles from the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset. For each summary, the script can compute the [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores and use the `ROUGE-1` score to validate the implementation.
 The script can also perform the same summarization using the HF Phi model.
@@ -120,30 +70,23 @@ The summarization can be done using the [`../summarize.py`](../summarize.py) scr
 
 ```bash
 # Run the summarization task using a TensorRT-LLM model and a single GPU.
-python3 ../summarize.py --engine_dir phi_engine             \
-                        --hf_model_dir phi_model            \
-                        --batch_size 1                      \
-                        --test_trt_llm                      \
-                        --tensorrt_llm_rouge1_threshold 14  \
-                        --data_type fp16                    \
-                        --check_accuracy 2>&1 | tee summary_trt_llm.log
-
-# Run the summarization task using a HF model and a single GPU.
-python3 ../summarize.py --engine_dir phi_engine             \
-                        --hf_model_dir phi_model            \
-                        --batch_size 1                      \
-                        --test_hf                           \
-                        --tensorrt_llm_rouge1_threshold 14  \
-                        --data_type fp16                    \
-                        --check_accuracy 2>&1 | tee summary_hf.log
+python3 ../summarize.py --engine_dir ./phi-2-engine \
+                        --hf_model_dir "microsoft/phi-2" \
+                        --batch_size 1 \
+                        --test_trt_llm \
+                        --test_hf \
+                        --data_type fp16 \
+                        --check_accuracy \
+                        --tensorrt_llm_rouge1_threshold=20
 
 # Run the summarization task using a TensorRT-LLM model and 2-way tensor parallelism.
 mpirun -n 2 --allow-run-as-root                             \
-python3 ../summarize.py --engine_dir phi_engine_tp2         \
-                        --hf_model_dir phi_model            \
+python3 ../summarize.py --engine_dir ./phi-2-engine-tp2  \
+                        --hf_model_dir "microsoft/phi-2"    \
                         --batch_size 1                      \
+                        --test_hf                           \
                         --test_trt_llm                      \
-                        --tensorrt_llm_rouge1_threshold 14  \
                         --data_type fp16                    \
-                        --check_accuracy 2>&1 | tee summary_trt_llm_tp2.log
+                        --check_accuracy                    \
+                        --tensorrt_llm_rouge1_threshold 20
 ```

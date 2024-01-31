@@ -236,8 +236,8 @@ you may need to add it to the `PATH`
 export PATH=/usr/local/bin:$PATH
 
 trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/2-gpu/ \
-                --use_gemm_plugin float16 \
-                --use_gpt_attention_plugin float16 \
+                --gemm_plugin float16 \
+                --gpt_attention_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
                 --max_output_len 100 \

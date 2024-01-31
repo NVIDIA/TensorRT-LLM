@@ -19,14 +19,14 @@
 
 3. Qwen
 - Quantize the weights to INT4 with GPTQ
-    1. Install the auto-gptq module
+    1. Install packages
     ```bash
-    pip install auto-gptq
+    pip install -r requirements.txt
     ```
     2. Weight quantization
     ```bash
-    python3 gptq_convert.py --hf_model_dir ./Qwen-VL-Chat --tokenizer_dir ./Qwen-VL-Chat \
-            --quant_ckpt_path ./Qwen-VL-Chat-4bit
+    python3 gptq_convert.py --pretrained_model_dir ./Qwen-VL-Chat \
+            --quantized_model_dir ./Qwen-VL-Chat-4bit
     ```
 
 - Build TRT-LLM engines (only need to add --max_prompt_embedding_table_size)
@@ -46,7 +46,6 @@
             --weight_only_precision int4_gptq \
             --per_group \
             --enable_context_fmha \
-            --use_rmsnorm_plugin \
             --log_level verbose \
             --use_lookup_plugin float16 \
             --max_prompt_embedding_table_size 2048 \

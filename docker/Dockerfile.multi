@@ -75,7 +75,6 @@ COPY cpp/include include
 ARG CPP_BUILD_DIR=/src/tensorrt_llm/cpp/build
 COPY --from=wheel \
      ${CPP_BUILD_DIR}/tensorrt_llm/libtensorrt_llm.so \
-     ${CPP_BUILD_DIR}/tensorrt_llm/libtensorrt_llm_static.a \
      lib/
 RUN ln -sv $(TRT_LLM_NO_LIB_INIT=1 python3 -c "import tensorrt_llm.plugin as tlp; print(tlp.plugin_lib_path())") lib/ && \
     cp -Pv lib/libnvinfer_plugin_tensorrt_llm.so lib/libnvinfer_plugin_tensorrt_llm.so.9 && \

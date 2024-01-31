@@ -21,6 +21,7 @@ import run
 
 def generate_output(engine: str,
                     num_beams: int,
+                    input_name: str,
                     output_name: str,
                     max_output_len: int = 8,
                     output_logits: bool = False):
@@ -33,7 +34,7 @@ def generate_output(engine: str,
     engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_dir
 
     data_dir = resources_dir / 'data'
-    input_file = data_dir / 'input_tokens.npy'
+    input_file = data_dir / (input_name + '.npy')
     model_data_dir = data_dir / model
     if num_beams <= 1:
         output_dir = model_data_dir / 'sampling'
@@ -65,36 +66,56 @@ def generate_outputs(num_beams):
     if num_beams == 1:
         generate_output(engine='fp32-default',
                         num_beams=num_beams,
+                        input_name='input_tokens',
                         output_name='output_tokens_fp32')
     generate_output(engine='fp32-plugin',
                     num_beams=num_beams,
+                    input_name='input_tokens',
                     output_name='output_tokens_fp32_plugin')
 
     print('Generating GPT2 FP16 outputs')
     if num_beams == 1:
         generate_output(engine='fp16-default',
                         num_beams=num_beams,
+                        input_name='input_tokens',
                         output_name='output_tokens_fp16')
     generate_output(engine='fp16-plugin',
                     num_beams=num_beams,
+                    input_name='input_tokens',
                     output_name='output_tokens_fp16_plugin')
     generate_output(engine='fp16-plugin-packed',
                     num_beams=num_beams,
+                    input_name='input_tokens',
                     output_name='output_tokens_fp16_plugin_packed')
     generate_output(engine='fp16-plugin-packed-paged-gather',
                     num_beams=num_beams,
+                    input_name='input_tokens',
                     output_name='output_tokens_fp16_plugin_packed_paged_gather',
                     output_logits=True)
     generate_output(
         engine='fp16-plugin-packed-paged-context-fmha-for-gen',
         num_beams=num_beams,
+        input_name='input_tokens',
         output_name=
         'output_tokens_fp16_plugin_packed_paged_context_fmha_for_gen',
         output_logits=False)
     generate_output(engine='fp16-plugin-packed-paged',
                     num_beams=num_beams,
+                    input_name='input_tokens',
                     output_name='output_tokens_fp16_plugin_packed_paged',
                     output_logits=False)
+    generate_output(engine='fp16-plugin-packed-paged',
+                    num_beams=num_beams,
+                    input_name='input_tokens',
+                    output_name='output_tokens_long_fp16_plugin_packed_paged',
+                    output_logits=False,
+                    max_output_len=128)
+    generate_output(
+        engine='fp16-plugin-packed-paged',
+        num_beams=num_beams,
+        input_name='input_tokens_long',
+        output_name='output_tokens_long_input_fp16_plugin_packed_paged',
+        output_logits=False)
 
 
 if __name__ == '__main__':

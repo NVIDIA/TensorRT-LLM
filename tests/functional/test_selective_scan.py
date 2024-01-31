@@ -103,7 +103,6 @@ class TestFunctional(unittest.TestCase):
         # construct trt network
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
-        net.plugin_config.set_selective_scan_plugin(dtype)
         with tensorrt_llm.net_guard(net):
             x_tensor = Tensor(name='input',
                               shape=x.shape,
@@ -142,7 +141,7 @@ class TestFunctional(unittest.TestCase):
                 x_tensor, state_tensor, dt_tensor, dt_bias_tensor, A_tensor,
                 B_tensor, C_tensor, D_tensor, z_tensor,
                 host_request_types_tensor, dim, dstate, is_variable_B,
-                is_variable_C, delta_softplus)
+                is_variable_C, delta_softplus, dtype)
             net._mark_output(outputs[0],
                              'output',
                              dtype=tensorrt_llm.str_dtype_to_trt(dtype))

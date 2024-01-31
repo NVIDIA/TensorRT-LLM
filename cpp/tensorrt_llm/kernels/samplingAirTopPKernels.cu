@@ -606,7 +606,7 @@ template <typename T, typename IdxT, typename AccT, int BitsPerPass, int BlockSi
 __global__ void airTopPSsampling(Counter<T, IdxT, AccT>* counters, AccT* histograms, IdxT* countHistograms, IdxT** ids,
     int* sequenceLengths, FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
     float* outputLogProbs, IdxT const* endIds, int const batchSize, bool const* skipDecode, int const pass, T* buf1,
-    IdxT* idxBuf1, T* buf2, IdxT* idxBuf2)
+    IdxT* idxBuf1, T* buf2, IdxT* idxBuf2, int32_t const* batchSlots)
 {
     assert(sequenceLengths != nullptr);
     static_assert(std::is_same_v<T, half> | std::is_same_v<T, float>, "T needs to be either half or float");
@@ -614,11 +614,12 @@ __global__ void airTopPSsampling(Counter<T, IdxT, AccT>* counters, AccT* histogr
 
     int const tid = threadIdx.x;
     int const batchId = blockIdx.y;
+    auto const batchSlot = batchSlots == nullptr ? batchId : batchSlots[batchId];
     auto counter = counters + batchId;
 
     // Skip kernel if this sampling method is not chosen
-    FinishedState const finishState = finishedInput != nullptr ? finishedInput[batchId] : FinishedState::empty();
-    if ((skipDecode != nullptr && skipDecode[batchId]) || (finishState.isSkipDecoding()))
+    FinishedState const finishState = finishedInput != nullptr ? finishedInput[batchSlot] : FinishedState::empty();
+    if ((skipDecode != nullptr && skipDecode[batchSlot]) || (finishState.isSkipDecoding()))
     {
         return;
     }
@@ -630,9 +631,9 @@ __global__ void airTopPSsampling(Counter<T, IdxT, AccT>* counters, AccT* histogr
         {
             if (finishedOutput != nullptr)
             {
-                finishedOutput[batchId] = finishState;
+                finishedOutput[batchSlot] = finishState;
             }
-            ids[batchId][sequenceLengths[batchId]] = endIds[batchId];
+            ids[batchSlot][sequenceLengths[batchSlot]] = endIds[batchSlot];
         }
         return;
     }
@@ -692,7 +693,7 @@ __global__ void airTopPSsampling(Counter<T, IdxT, AccT>* counters, AccT* histogr
     auto countHistogram = countHistograms + batchId * numBuckets;
 
     filterAndHistogram<T, IdxT, AccT, BitsPerPass>(inBuf, inIdxBuf, outBuf, outIdxBuf, previousLen, counter, histogram,
-        countHistogram, pass, outputLogProbs, cumLogProbs, ids, endIds, sequenceLengths, finishedOutput, batchId,
+        countHistogram, pass, outputLogProbs, cumLogProbs, ids, endIds, sequenceLengths, finishedOutput, batchSlot,
         earlyStop);
 
     __syncthreads();
@@ -744,7 +745,7 @@ __global__ void airTopPSsampling(Counter<T, IdxT, AccT>* counters, AccT* histogr
             {
                 lastFilter<T, IdxT, AccT, BitsPerPass>(outBuf ? outBuf : inBuf, outIdxBuf ? outIdxBuf : inIdxBuf,
                     outBuf ? currentLen : counter->oriLen, counter, outputLogProbs, cumLogProbs, ids, endIds,
-                    sequenceLengths, finishedOutput, batchId);
+                    sequenceLengths, finishedOutput, batchSlot);
 
                 __syncthreads();
             }
@@ -758,9 +759,10 @@ __global__ void airTopPSsampling(Counter<T, IdxT, AccT>* counters, AccT* histogr
 template <typename T, typename IdxT, typename AccT, int BitsPerPass, int BlockSize>
 __global__ void airTopPInitialize(Counter<T, IdxT, AccT>* counters, int const batchSize, int const len, T const* in,
     IdxT const* inIdx, float const topP, float const* topPs, curandState_t* curandstate, AccT* histograms,
-    IdxT* countHistograms)
+    IdxT* countHistograms, int32_t const* batchSlots)
 {
     auto const batchIdx = blockIdx.x;
+    auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
     Counter<T, IdxT, AccT>* counter = counters + batchIdx;
     IdxT offset = batchIdx * len;
     IdxT bufOffset = batchIdx * calcBufLen<T>(len);
@@ -777,8 +779,8 @@ __global__ void airTopPInitialize(Counter<T, IdxT, AccT>* counters, int const ba
         counter->oriLen = len;
         counter->previousLen = len;
 
-        float const probThreshold = (topPs != nullptr) ? topPs[batchIdx] : topP;
-        float const randP = curand_uniform(curandstate + batchIdx) * probThreshold;
+        float const probThreshold = (topPs != nullptr) ? topPs[batchSlot] : topP;
+        float const randP = curand_uniform(curandstate + batchSlot) * probThreshold;
         counter->p = randP;
         counter->sum = 0;
 
@@ -856,7 +858,8 @@ template <typename T>
 void invokeBatchAirTopPSampling(void* workspace, size_t& workspaceSize, int** outputIds, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     T const* logProbs, curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded, int const* endIds,
-    float const maxTopP, float const* topPs, cudaStream_t stream, int blockNum, bool const* skipDecode)
+    float const maxTopP, float const* topPs, cudaStream_t stream, int blockNum, bool const* skipDecode,
+    int32_t const* batchSlots)
 {
     using IdxT = int;
     using AccT = float;
@@ -900,7 +903,7 @@ void invokeBatchAirTopPSampling(void* workspace, size_t& workspaceSize, int** ou
 
     airTopPInitialize<T, IdxT, AccT, BitsPerPass, THREADS_PER_CTA_TOP_P_INIT>
         <<<batchSize, THREADS_PER_CTA_TOP_P_INIT, 0, stream>>>(counters, batchSize, vocabSize, logProbs, nullptr,
-            maxTopP, topPs, curandstate, histograms, countHistograms);
+            maxTopP, topPs, curandstate, histograms, countHistograms, batchSlots);
     sync_check_cuda_error();
 
     dim3 grid(blockNum, batchSize);
@@ -917,7 +920,7 @@ void invokeBatchAirTopPSampling(void* workspace, size_t& workspaceSize, int** ou
 
         kernel<<<grid, SAMPLING_BLOCK_SIZE, 0, stream>>>(counters, histograms, countHistograms, outputIds,
             sequenceLength, finishedInput, finishedOutput, cumLogProbs, outputLogProbs, endIds, batchSize, skipDecode,
-            pass, buf1, idxBuf1, buf2, idxBuf2);
+            pass, buf1, idxBuf1, buf2, idxBuf2, batchSlots);
         sync_check_cuda_error();
     }
 }
@@ -926,34 +929,36 @@ template void invokeBatchAirTopPSampling(void* workspace, size_t& workspaceSize,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     float const* logProbs, curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded,
     int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream, int blockNum,
-    bool const* skipDecode);
+    bool const* skipDecode, int32_t const* batchSlots);
 
 template void invokeBatchAirTopPSampling(void* workspace, size_t& workspaceSize, int** outputIds, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     half const* logProbs, curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded,
     int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream, int blockNum,
-    bool const* skipDecode);
+    bool const* skipDecode, int32_t const* batchSlots);
 
 template <typename T>
 void invokeAirTopPSampling(void* workspace, size_t& workspaceSize, int** outputIds, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     T const* logProbs, curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded, int const* endIds,
-    float const topP, cudaStream_t stream, int blockNum, bool const* skipDecode)
+    float const topP, cudaStream_t stream, int blockNum, bool const* skipDecode, int32_t const* batchSlots)
 {
     invokeBatchAirTopPSampling(workspace, workspaceSize, outputIds, sequenceLength, finishedInput, finishedOutput,
         cumLogProbs, outputLogProbs, logProbs, curandstate, batchSize, vocabSizePadded, endIds, topP, nullptr, stream,
-        blockNum, skipDecode);
+        blockNum, skipDecode, batchSlots);
 }
 
 template void invokeAirTopPSampling(void* workspace, size_t& workspaceSize, int** outputIds, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     float const* logProbs, curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded,
-    int const* endIds, float const topP, cudaStream_t stream, int blockNum, bool const* skipDecode);
+    int const* endIds, float const topP, cudaStream_t stream, int blockNum, bool const* skipDecode,
+    int32_t const* batchSlots);
 
 template void invokeAirTopPSampling(void* workspace, size_t& workspaceSize, int** outputIds, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     half const* logProbs, curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded,
-    int const* endIds, float const topP, cudaStream_t stream, int blockNum, bool const* skipDecode);
+    int const* endIds, float const topP, cudaStream_t stream, int blockNum, bool const* skipDecode,
+    int32_t const* batchSlots);
 
 template unsigned calcAirTopPBlockNum<float, int, float>(int batchSize, int len, int smCnt);
 template unsigned calcAirTopPBlockNum<half, int, float>(int batchSize, int len, int smCnt);

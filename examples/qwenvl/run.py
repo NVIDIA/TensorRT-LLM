@@ -99,6 +99,7 @@ class QWenInfer(object):
         assert world_size == tensorrt_llm.mpi_world_size(), \
             f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
         num_heads = config['builder_config']['num_heads'] // world_size
+        max_batch_size = config['builder_config']['max_batch_size']
         hidden_size = config['builder_config']['hidden_size'] // world_size
         vocab_size = config['builder_config']['vocab_size']
         num_layers = config['builder_config']['num_layers']
@@ -125,6 +126,7 @@ class QWenInfer(object):
         torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
 
         model_config = ModelConfig(
+            max_batch_size=max_batch_size,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             hidden_size=hidden_size,

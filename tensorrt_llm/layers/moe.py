@@ -94,6 +94,8 @@ def _moe_plugin(moe_config,
     if isinstance(dtype, str):
         dtype = str_dtype_to_trt(dtype)
 
+    if isinstance(weight_dtype, str):
+        weight_dtype = str_dtype_to_trt(weight_dtype)
     # Create the plugin with our required state
     num_experts = moe_config.num_experts
     # We pass the full number of experts (not divided by tp_size) even for EP mode
@@ -116,6 +118,7 @@ def _moe_plugin(moe_config,
     p_type_id = trt.PluginField("type_id", np.array([int(dtype)],
                                                     dtype=np.int32),
                                 trt.PluginFieldType.INT32)
+
     p_weight_type_id = trt.PluginField(
         "weight_type_id", np.array([int(weight_dtype)], dtype=np.int32),
         trt.PluginFieldType.INT32)

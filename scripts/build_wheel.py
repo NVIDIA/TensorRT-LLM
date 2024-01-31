@@ -62,8 +62,8 @@ def main(build_type: str = "Release",
     if not (project_dir / "3rdparty/cutlass/.git").exists():
         build_run('git submodule update --init --recursive')
 
-    requirements_filename = "requirements-dev-windows.txt" if platform.system(
-    ) == "Windows" else "requirements-dev.txt"
+    on_windows = platform.system() == "Windows"
+    requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"
     build_run(
         f"\"{sys.executable}\" -m pip install -r {requirements_filename} --extra-index-url https://pypi.ngc.nvidia.com"
     )
@@ -72,7 +72,7 @@ def main(build_type: str = "Release",
     installed_packages = [r.decode().split("==")[0] for r in reqs.split()]
     if "tensorrt" not in installed_packages:
         error_msg = "TensorRT was not installed properly."
-        if platform.system() == "Windows":
+        if on_windows:
             error_msg += (
                 " Please download the TensorRT zip file manually,"
                 " install it and relaunch build_wheel.py."
@@ -91,7 +91,7 @@ def main(build_type: str = "Release",
 
     hardware_arch = platform.machine()
 
-    if platform.system() == "Windows":
+    if on_windows:
         # Windows does not support multi-device currently.
         extra_cmake_vars.extend(["ENABLE_MULTI_DEVICE=0"])
 
@@ -163,7 +163,7 @@ def main(build_type: str = "Release",
             )
         build_run(
             f'cmake --build . --config {build_type} --parallel {job_count} '
-            f'--target tensorrt_llm tensorrt_llm_static nvinfer_plugin_tensorrt_llm {th_common_lib} {bindings_lib} {benchmarks_lib}'
+            f'--target tensorrt_llm nvinfer_plugin_tensorrt_llm {th_common_lib} {bindings_lib} {benchmarks_lib}'
             f'{" ".join(extra_make_targets)}')
 
     if cpp_only:
@@ -176,13 +176,15 @@ def main(build_type: str = "Release",
     if lib_dir.exists():
         rmtree(lib_dir)
     lib_dir.mkdir(parents=True)
-    if platform.system() == "Windows":
+    if on_windows:
         copy(build_dir / f"tensorrt_llm/thop/th_common.dll",
              lib_dir / "th_common.dll")
         copy(
             build_dir / f"tensorrt_llm/plugins/nvinfer_plugin_tensorrt_llm.dll",
             lib_dir / "nvinfer_plugin_tensorrt_llm.dll")
     else:
+        copy(build_dir / "tensorrt_llm/libtensorrt_llm.so",
+             lib_dir / "libtensorrt_llm.so")
         copy(build_dir / "tensorrt_llm/thop/libth_common.so",
              lib_dir / "libth_common.so")
         copy(
@@ -194,7 +196,7 @@ def main(build_type: str = "Release",
 
         def get_pybind_lib():
             pybind_build_dir = (build_dir / "tensorrt_llm" / "pybind")
-            if platform.system() == "Windows":
+            if on_windows:
                 pybind_lib = list(pybind_build_dir.glob("bindings.*.pyd"))
             else:
                 pybind_lib = list(pybind_build_dir.glob("bindings.*.so"))

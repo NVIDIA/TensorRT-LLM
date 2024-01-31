@@ -44,8 +44,8 @@ protected:
     {
         size_t workspaceSize;
         tk::invokeTopKSampling<T>(nullptr, workspaceSize, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-            nullptr, this->mMaxTopK, 1.0f, params.vocabSize, nullptr, this->mStream->get(), params.batchSize, nullptr,
-            true);
+            nullptr, this->mMaxTopK, 1.0f, params.vocabSize, nullptr, nullptr, this->mStream->get(), params.batchSize,
+            nullptr, true);
         return workspaceSize;
     }
 
@@ -68,8 +68,8 @@ protected:
             this->mCurandStatesDevice, this->mMaxTopK,
             hasDiffRuntimeArgs ? bufferCast<int32_t>(*this->mTopKsDevice) : nullptr, params.topP,
             hasDiffRuntimeArgs ? bufferCast<float>(*this->mTopPsDevice) : nullptr, params.vocabSize,
-            bufferCast<int32_t>(*this->mEndIdsDevice), this->mStream->get(), params.batchSize,
-            bufferCast<bool>(*this->mSkipDecodeDevice), params.normalizeLogProbs);
+            bufferCast<int32_t>(*this->mEndIdsDevice), bufferCast<int32_t>(*this->mBatchSlots), this->mStream->get(),
+            params.batchSize, bufferCast<bool>(*this->mSkipDecodeDevice), params.normalizeLogProbs);
     }
 };
 

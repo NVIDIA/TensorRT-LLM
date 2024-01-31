@@ -16,7 +16,7 @@
 from ..._utils import pad_vocab_size
 from ...functional import Tensor, allreduce, recv, send
 from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, KeyValueCacheParams, LayerNorm)
+                       Embedding, LayerNorm)
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig)
@@ -170,9 +170,6 @@ class FalconModel(Module):
                 kv_cache_params=None,
                 attention_params=None,
                 hidden_states=None):
-
-        kv_cache_params.fill_none_tensor_list(len(self.layers))
-
         if use_cache:
             presents = []
 
@@ -182,30 +179,14 @@ class FalconModel(Module):
             hidden_states = recv(hidden_states,
                                  self.config.mapping.prev_pp_rank())
 
-        for layer, past, pointer, host_pointer, max_attention_window_size in zip(
-                self.layers, kv_cache_params.past_key_value,
-                kv_cache_params.kv_cache_block_pointers,
-                kv_cache_params.host_kv_cache_block_pointers,
-                kv_cache_params.host_max_attention_window_sizes):
-            hidden_states = layer(
-                hidden_states,
-                use_cache=use_cache,
-                attention_mask=attention_mask,
-                kv_cache_params=KeyValueCacheParams(
-                    past_key_value=[past],
-                    host_past_key_value_lengths=kv_cache_params.
-                    host_past_key_value_lengths,
-                    host_max_attention_window_sizes=max_attention_window_size,
-                    host_sink_token_length=kv_cache_params.
-                    host_sink_token_length,
-                    kv_cache_block_pointers=[pointer],
-                    host_kv_cache_block_pointers=[host_pointer],
-                    cache_indirection=kv_cache_params.cache_indirection),
-                attention_params=attention_params)
+        hidden_states = self.layers(hidden_states,
+                                    use_cache=use_cache,
+                                    attention_mask=attention_mask,
+                                    kv_cache_params=kv_cache_params,
+                                    attention_params=attention_params)
 
-            if use_cache:
-                presents.append(hidden_states[1])
-                hidden_states = hidden_states[0]
+        if use_cache:
+            hidden_states, presents = hidden_states
 
         if self.config.mapping.is_last_pp_rank():
             hidden_states = self.ln_f(hidden_states)

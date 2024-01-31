@@ -32,12 +32,13 @@ public:
     explicit KvCacheConfig(std::optional<SizeType> maxTokens = std::nullopt,
         std::optional<SizeType> maxAttentionWindow = std::nullopt,
         std::optional<SizeType> sinkTokenLength = std::nullopt,
-        std::optional<float> freeGpuMemoryFraction = std::nullopt, bool enableBlockReuse = false)
+        std::optional<float> freeGpuMemoryFraction = std::nullopt, bool enableBlockReuse = false, bool useUvm = false)
         : maxTokens{maxTokens}
         , maxAttentionWindow{maxAttentionWindow}
         , sinkTokenLength{sinkTokenLength}
         , freeGpuMemoryFraction{freeGpuMemoryFraction}
         , enableBlockReuse(enableBlockReuse)
+        , useUvm(useUvm)
     {
     }
 
@@ -47,5 +48,6 @@ public:
     std::optional<float> freeGpuMemoryFraction;
     bool enableBlockReuse;
     static constexpr auto kDefaultGpuMemFraction = 0.9f;
+    bool useUvm;
 };
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

@@ -75,10 +75,12 @@ Using a more realistic value for `max_num_tokens` allows TensorRT-LLM to
 allocate more memory to store the KV cache and execute more requests together.
 It leads to an increased efficiency.
 
-Note that choosing a low value for `--max_num_tokens` will result in lower GPU
-utilization. When increasing `--max_num_tokens` to some point, GPU utilization
-will plateau, going beyond that saturation point may hurt both first token
-latency as well as total end-to-end latency.
+Increasing `max_num_tokens` appropriately will be beneficial to performance.
+When increasing `--max_num_tokens` to some point, GPU utilization will plateau,
+going beyond that saturation point may hurt both first token latency as well as
+total end-to-end latency.
+
+See also [chunked context](#chunked-context).
 
 ### Paged KV Cache
 
@@ -264,3 +266,13 @@ will be stored. If the input sequence length at runtime exceeds the
 runtime performance will be better (due to the reduction in terms of
 computations and GPU memory allocation). Users can modify that value to
 increase runtime performance at the expense of reduced accuracy.
+
+### Chunked Context
+
+Turning on context chunking by specifying `enable_chunked_context` in
+`TrtGptModelOptionalParams` will increase the chance of batch processing between
+the context and the generation phase, thereby balancing the calculation amount
+of each iteration and increasing throughput. When this function is turned on,
+different performance can be obtained by adjusting `max_num_tokens`. Usually
+its recommended value is `N * tokens_per_block`, and `N` is an integer that is
+recommended to start from `1` and increase until the best performance is achieved.

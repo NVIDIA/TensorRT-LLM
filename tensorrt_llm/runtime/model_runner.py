@@ -103,10 +103,12 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         num_kv_heads = 1
     num_heads = num_heads // tp_size
     num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
+    head_size = builder_config.get('head_size', None)
 
     hidden_size = builder_config['hidden_size'] // tp_size
     vocab_size = builder_config['vocab_size']
     num_layers = builder_config['num_layers']
+    max_batch_size = builder_config['max_batch_size']
 
     cross_attention = builder_config.get('cross_attention', False)
     has_position_embedding = builder_config.get('has_position_embedding', True)
@@ -137,11 +139,13 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         'use_context_fmha_for_generation')
 
     model_config = ModelConfig(
+        max_batch_size=max_batch_size,
         vocab_size=vocab_size,
         num_layers=num_layers,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         hidden_size=hidden_size,
+        head_size=head_size,
         gpt_attention_plugin=use_gpt_attention_plugin,
         remove_input_padding=remove_input_padding,
         model_name=model_name,
@@ -400,6 +404,7 @@ class ModelRunner(ModelRunnerMixin):
             num_kv_heads = pretrained_config.num_key_value_heads
             num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
             hidden_size = pretrained_config.hidden_size // tp_size
+            head_size = pretrained_config.head_size
 
             if pretrained_config.architecture == 'MambaLMHeadModel':
                 mamba_d_state = pretrained_config.ssm_cfg['d_state']
@@ -409,11 +414,13 @@ class ModelRunner(ModelRunnerMixin):
                 mamba_d_state, mamba_expand, mamba_d_conv = 0, 0, 0
 
             model_config = ModelConfig(
+                max_batch_size=build_config.max_batch_size,
                 vocab_size=pretrained_config.vocab_size,
                 num_layers=pretrained_config.num_hidden_layers,
                 num_heads=num_heads,
                 num_kv_heads=num_kv_heads,
                 hidden_size=hidden_size,
+                head_size=head_size,
                 gpt_attention_plugin=bool(
                     build_config.plugin_config.gpt_attention_plugin),
                 remove_input_padding=build_config.plugin_config.
@@ -429,12 +436,28 @@ class ModelRunner(ModelRunnerMixin):
                 mamba_d_state=mamba_d_state,
                 mamba_expand=mamba_expand,
                 mamba_d_conv=mamba_d_conv,
-            )
+                lora_plugin=build_config.plugin_config.lora_plugin,
+                lora_target_modules=pretrained_config.lora_target_modules
+                if hasattr(pretrained_config, 'lora_target_modules') else [],
+                hf_modules_to_trtllm_modules=pretrained_config.
+                hf_modules_to_trtllm_modules if hasattr(
+                    pretrained_config, 'hf_modules_to_trtllm_modules') else [],
+                trtllm_modules_to_hf_modules=pretrained_config.
+                trtllm_modules_to_hf_modules if hasattr(
+                    pretrained_config, 'trtllm_modules_to_hf_modules') else [],
+                max_medusa_tokens=pretrained_config.max_medusa_token_len
+                if hasattr(pretrained_config, 'max_medusa_token_len') else 0,
+                num_medusa_heads=pretrained_config.num_medusa_heads if hasattr(
+                    pretrained_config, 'num_medusa_heads') else 0)
             max_batch_size = build_config.max_batch_size
             max_input_len = build_config.max_input_len
             max_output_len = build_config.max_output_len
             max_beam_width = build_config.max_beam_width
-            if pretrained_config.architecture == 'MambaLMHeadModel':
+            if pretrained_config.architecture == 'ChatGLMForCausalLM' and pretrained_config.chatglm_version in [
+                    'glm', 'chatglm'
+            ]:
+                session_cls = ChatGLMGenerationSession
+            elif pretrained_config.architecture == 'MambaLMHeadModel':
                 session_cls = MambaLMHeadModelGenerationSession
             else:
                 session_cls = GenerationSession
@@ -443,6 +466,7 @@ class ModelRunner(ModelRunnerMixin):
 
         if medusa_choices is not None:
             assert session_cls == GenerationSession, "Medusa is only supported by GenerationSession"
+
             assert model_config.max_medusa_tokens > 0, \
                 "medusa_chioce is specified but model_config.max_medusa_tokens is 0."
 

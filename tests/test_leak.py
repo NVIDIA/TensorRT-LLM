@@ -10,18 +10,24 @@ def create_model():
     ''' Lots of parameters are created here, and thus memory increases
     '''
     profiler.print_memory_usage('Before creating Module')
+
+    config = {
+        'architecture': "LlamaForCausalLM",
+        'dtype': 'float32',
+        'num_hidden_layers': 2,
+        'num_attention_heads': 80,
+        'hidden_size': 12800,
+        'num_key_value_heads': 80,
+        'vocab_size': 50000,
+        'position_embedding_type': 'rope_gpt_neox',
+        'max_position_embeddings': 2048,
+        'hidden_act': 'silu'
+    }
+    config = tllm.models.PretrainedConfig.from_dict(config)
+
     # About 24GiB model size, big enough to detect leak and avoid noise and false positive
     # and small enough to make sure CI single-gpu machine can run it.
-    model = tllm.models.LLaMAForCausalLM(
-        num_layers=2,
-        num_heads=80,
-        num_kv_heads=80,
-        hidden_size=12800,
-        vocab_size=50000,
-        hidden_act='silu',
-        max_position_embeddings=2048,
-        dtype='float32',
-    )
+    model = tllm.models.LLaMAForCausalLM.from_config(config)
     profiler.print_memory_usage('After creating Module')
     return model
 
@@ -39,7 +45,7 @@ def create_optimize_network():
                                       max_seq_len=1024 + 32,
                                       use_cache=True,
                                       max_beam_width=1)
-        model(*inputs)
+        model(**inputs)
     profiler.print_memory_usage('After creating Network')
 
     # When the Network has gpt attention plugin layer, graph rewriting pattern matching is triggered,

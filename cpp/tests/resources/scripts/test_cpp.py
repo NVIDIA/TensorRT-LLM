@@ -400,10 +400,10 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
         data_dir = resources_dir / "data"
         prepare_dataset = [
             python_exe,
-            str(benchmark_src_dir / "prepare_dataset.py"), "--dataset",
-            str(data_dir / prompt_f), "--max_input_len", len, "--tokenizer_dir",
+            str(benchmark_src_dir / "prepare_dataset.py"), "--tokenizer",
             str(resources_dir / "models" / "gpt2"), "--output",
-            str(data_dir / tokens_f)
+            str(data_dir / tokens_f), "dataset", "--dataset",
+            str(data_dir / prompt_f), "--max-input-len", len
         ]
         run_command(prepare_dataset, cwd=root_dir, timeout=300)
 

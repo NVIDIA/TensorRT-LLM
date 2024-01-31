@@ -27,21 +27,28 @@ from build_engines_utils import run_command, wincopy
 import build as _egb  # isort:skip
 
 
-def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, world_size, *args):
+def build_engine(
+    weight_dir: _pl.Path,
+    engine_dir: _pl.Path,
+    world_size,
+    *args,
+    max_input_len=256,
+    max_output_len=128,
+):
     args = [
         '--log_level=error',
         '--model_dir',
         str(weight_dir),
         '--output_dir',
         str(engine_dir),
-        '--max_batch_size=256',
-        '--max_input_len=512',
-        '--max_output_len=20',
+        '--max_batch_size=64',
+        f'--max_input_len={max_input_len}',
+        f'--max_output_len={max_output_len}',
         '--max_beam_width=2',
         '--builder_opt=0',
         f'--world_size={world_size}',
     ] + list(args)
-    print("Running: " + " ".join(args))
+    print("Running: build " + " ".join(args))
     _egb.run_build(args)
 
 
@@ -108,8 +115,10 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
     weight_dir = models_dir / 'c-model' / model_name
     engine_dir = models_dir / 'rt_engine' / model_name
 
-    print("\nConverting to fp32")
     tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu"
+    tp_dir = f"{world_size}-gpu"
+
+    print("\nConverting to fp32")
     fp32_weight_dir = weight_dir / 'fp32'
     _egc.run_conversion(
         _egc.ProgArgs(in_file=str(hf_dir),
@@ -118,7 +127,6 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
                       tensor_parallelism=tp_size))
 
     print("\nBuilding fp32 engines")
-    tp_dir = f"{world_size}-gpu"
     fp32_weight_dir_x_gpu = fp32_weight_dir / tp_dir
     build_engine(fp32_weight_dir_x_gpu, engine_dir / 'fp32-default' / tp_pp_dir,
                  tp_size, '--dtype=float32')
@@ -158,6 +166,11 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
     build_engine(fp16_weight_dir_x_gpu,
                  engine_dir / 'fp16-plugin-packed-paged' / tp_pp_dir, tp_size,
                  '--max_draft_len=5', *ifb_args)
+    build_engine(fp16_weight_dir_x_gpu,
+                 engine_dir / 'fp16-plugin-packed-paged-in128' / tp_pp_dir,
+                 tp_size,
+                 max_input_len=128,
+                 *ifb_args)
 
     # We build almost the same engine twice. But this engine has gather_all_token_logits
     # to extract logits from python runtime and uses context FMHA for generation to match draft model executions,

@@ -245,12 +245,8 @@ def get_tokenizer(ckpt_path, max_seq_len):
 
 class Pipeline:
 
-    def __init__(self,
-                 tokenizer,
-                 model,
-                 pad_id,
-                 end_id,
-                 max_attention_window_size=2048):
+    def __init__(self, tokenizer, model, pad_id, end_id,
+                 max_attention_window_size):
         self.tokenizer = tokenizer
         self.model = model
         self.pad_id = pad_id
@@ -407,7 +403,8 @@ def main():
             model.generation_config = GenerationConfig.from_pretrained(
                 args.hf_model_dir, trust_remote_code=True)
 
-    pipeline = Pipeline(tokenizer, model, pad_id, end_id)
+    pipeline = Pipeline(tokenizer, model, pad_id, end_id,
+                        args.max_attention_window_size)
 
     for subject in tqdm(subjects):
         dev_df = pd.read_csv(os.path.join(args.data_dir, "dev",

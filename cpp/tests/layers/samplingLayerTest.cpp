@@ -47,20 +47,22 @@ void SamplingLayerTest<T>::setup(uint64_t seed, SamplingParams const& params)
     mPenaltyWorkspaceDevice
         = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSize}), nvinfer1::DataType::kINT32);
 
-    mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
-    mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
-    mFinishedDevice
-        = mBufferManager->gpu(ITensor::makeShape({mBatchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
-    mOutputIdsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mMaxSeqLen}), nvinfer1::DataType::kINT32);
-    mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
-    mIdsPtrHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT64);
+    mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+    mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+    mFinishedDevice = mBufferManager->gpu(
+        ITensor::makeShape({mMaxBatchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
+    mOutputIdsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mMaxSeqLen}), nvinfer1::DataType::kINT32);
+    mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+    mIdsPtrHost = mBufferManager->pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT64);
 
     mEmbeddingBiasHost = mBufferManager->pinned(ITensor::makeShape({mVocabSize}),
         std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
     mEmbeddingBiasDevice = mBufferManager->gpu(ITensor::makeShape({mVocabSize}),
         std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
 
-    mCumLogProbsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kFLOAT);
+    mCumLogProbsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kFLOAT);
+
+    mBatchSlots = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
 
     trk::invokeFill(*mSeqLengthsDevice, int32_t{0}, *mStream);
     trk::invokeFill(*mContextLengthDevice, int32_t{0}, *mStream);
@@ -70,9 +72,15 @@ void SamplingLayerTest<T>::setup(uint64_t seed, SamplingParams const& params)
     trk::invokeFill(*mCumLogProbsDevice, float{0.0f}, *mStream);
     trk::invokeFill(*mEndIdsDevice, int32_t{mEndId}, *mStream);
 
+    auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
+    for (SizeType bi = 0; bi < mBatchSize; ++bi)
+    {
+        batchSlotsPtr[bi] = 2 * bi;
+    }
+
     auto idsPtrHostPtr = reinterpret_cast<void**>(bufferCast<int64_t>(*mIdsPtrHost));
     auto outputIdsDevicePtr = bufferCast<int32_t>(*mOutputIdsDevice);
-    for (SizeType bi = 0; bi < mBatchSize; bi++)
+    for (SizeType bi = 0; bi < mMaxBatchSize; bi++)
     {
         idsPtrHostPtr[bi] = outputIdsDevicePtr + bi * mMaxSeqLen;
     }
@@ -112,7 +120,7 @@ void SamplingLayerTest<T>::setup(uint64_t seed, SamplingParams const& params)
     setupParams.top_p_reset_ids
         = params.topPResetIds.size() ? std::make_optional<std::vector<int32_t>>(params.topPResetIds) : std::nullopt;
 
-    mSamplingLayer->setup(mBatchSize, setupParams);
+    mSamplingLayer->setup(mBatchSize, batchSlotsPtr, setupParams);
 }
 
 template <typename T>
@@ -127,6 +135,10 @@ typename BaseSamplingLayer<T>::ForwardParams SamplingLayerTest<T>::createInputTe
     decodeInputTensors.input_lengths = tcc::toTllmTensor(*mContextLengthDevice);
 
     decodeInputTensors.finished = tcc::toTllmTensor(*mFinishedDevice);
+
+    decodeInputTensors.batch_slots = tcc::toTllmTensor(*mBatchSlots);
+
+    decodeInputTensors.batch_slots_host = tcc::toTllmTensor(*mBatchSlots);
 
     return decodeInputTensors;
 }
@@ -165,12 +177,14 @@ bool SamplingLayerTest<T>::checkResult(int32_t* outputIds, std::vector<std::set<
 {
     assert(expectedIds.size() == mMaxSeqLen * mBatchBeam);
     int failures = 0;
+    auto const batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
     for (int32_t i = 0; i < mMaxSeqLen * mBatchBeam; ++i)
     {
         int32_t s = i / mBatchBeam;
         int32_t b = i % mBatchBeam;
+        auto const batchSlot = batchSlotsPtr[b];
         std::set<int32_t> expts = expectedIds.at(i);
-        const auto outputId = outputIds[b * mMaxSeqLen + s];
+        const auto outputId = outputIds[batchSlot * mMaxSeqLen + s];
         if (expts.count(outputId) == 0)
         {
             if (failures < 10)

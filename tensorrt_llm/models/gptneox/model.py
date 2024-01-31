@@ -13,9 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import tensorrt as trt
-
-from ..._common import default_net
 from ..._utils import pad_vocab_size
 from ...functional import PositionEmbeddingType, Tensor
 from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
@@ -68,11 +65,6 @@ class GPTNeoXDecoderLayer(Module):
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None):
-        if not default_net(
-        ).plugin_config.layernorm_plugin and trt.__version__[:3] == '8.6':
-            raise AssertionError(
-                "You need to enable the LayerNorm plugin for GPT-NeoX with TensorRT 8.6. Please set plugin_config.layernorm_plugin"
-            )
         residual = hidden_states
 
         input_layernorm_output = self.input_layernorm(hidden_states)

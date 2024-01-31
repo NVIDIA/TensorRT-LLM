@@ -22,6 +22,8 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplPrecompiled.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/xqaParams.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
@@ -65,64 +67,6 @@ struct XQADispatchHelper<__nv_bfloat16, KVBlockArray>
 };
 #endif
 
-using XQADataType = Data_type;
-
-struct XQAParams
-{
-    XQADataType data_type = DATA_TYPE_FP16;
-    XQADataType kv_cache_data_type = DATA_TYPE_FP16;
-    void* output = nullptr;
-    const void* qkv = nullptr;
-    const int32_t* cache_indir = nullptr;
-    const float* kv_scale_orig_quant = nullptr;
-    const float* kv_scale_quant_orig = nullptr;
-    const int32_t* host_past_key_value_lengths = nullptr;
-    const int32_t* host_context_lengths = nullptr;
-    void* workspaces = nullptr;
-    uint32_t batch_size = 0;
-    int32_t beam_width = 0;
-    int32_t max_attention_window_size = 0;
-    int32_t cyclic_attention_window_size = 0;
-    int32_t sink_token_length = 0;
-    int timestep = 0;
-    const void* qkv_bias;
-    const int32_t* sequence_lengths;    //
-    const int32_t* context_lengths;     // maybe not used now
-    const void* alibi_slopes;           // maybe not used now
-    const int32_t* medusa_packed_mask;
-    const int* medusa_position_offsets; // rotary embedding.
-
-    // almost copy from GPTAttentionPluginCommon.
-    // maybe use one struct for parameters in GPTAttentionPluginCommon and share the same here.
-    int32_t generation_input_length;
-    int32_t num_q_heads = 0;
-    int32_t num_kv_heads = 0;
-    int32_t head_size = 0;
-    int unidirectional;
-    float q_scaling = 0;
-    int32_t rotary_embedding_dim = 0;
-    float rotary_embedding_base = 0.0f;
-    tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type;
-    float rotary_embedding_scale;
-    int rotary_embedding_max_positions;
-    tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type;
-    bool position_shift_enabled = false;
-    bool remove_padding = false;
-    tensorrt_llm::kernels::AttentionMaskType mask_type;
-    // Paged KV cache parameters.
-    bool paged_kv_cache;
-    int tokens_per_block;
-    int max_blocks_per_sequence;
-    tensorrt_llm::common::QuantMode kv_cache_quant_mode;
-    int tp_size = 1;
-    int tp_rank = 0;
-    bool qkv_bias_enabled;
-    bool cross_attention;
-    int max_distance = 0;
-    bool multi_block_mode;
-    bool multi_query_tokens = false;
-};
-
 #define SUPPORT_RETURN_FALSE(X)                                                                                        \
     {                                                                                                                  \
         return false;                                                                                                  \
@@ -135,16 +79,21 @@ public:
         const XQADataType data_type, int num_heads, int num_kv_heads, int head_size, bool multi_block_mode);
     ~DecoderXQARunner();
 
+    /**
+     * \param[in] xqaParams the xqaParams to be tested against.
+     * \param[in] forConfigurePlugin indicates whether this method is called in configurePlugin, or in
+     * enqueueGeneration.
+     */
     template <typename T>
-    bool shouldUse(const XQAParams& xqaParams)
+    bool shouldUse(const XQAParams& xqaParams, bool forConfigurePlugin)
     {
         if (!(xqaParams.data_type == DATA_TYPE_FP16 || xqaParams.data_type == DATA_TYPE_BF16))
         {
             SUPPORT_RETURN_FALSE("data type");
         }
         bool const isGPTJBeam4Kernel = (xqaParams.head_size == 256 && xqaParams.beam_width == 4
-            && (xqaParams.paged_kv_cache == 64 || xqaParams.paged_kv_cache == 128));
-        if (xqaParams.head_size != 128 && !isGPTJBeam4Kernel)
+            && xqaParams.paged_kv_cache && (xqaParams.tokens_per_block == 64 || xqaParams.tokens_per_block == 128));
+        if (xqaParams.head_size != 128 && xqaParams.head_size != 256 && !isGPTJBeam4Kernel)
         {
             SUPPORT_RETURN_FALSE("head_size");
         }
@@ -169,7 +118,7 @@ public:
         {
             SUPPORT_RETURN_FALSE("paged_kv_cache");
         }
-        if (xqaParams.host_past_key_value_lengths == nullptr)
+        if (!forConfigurePlugin && xqaParams.host_past_key_value_lengths == nullptr)
         {
             SUPPORT_RETURN_FALSE("host_past_key_value_lengths");
         }
@@ -211,15 +160,29 @@ public:
 
     size_t getWorkspaceSize(int max_batch_beam_size);
 
+    void prepare(const XQAParams& xqa_params)
+    {
+        if (!mPrepareCalled)
+        {
+            this->prepareForRun(xqa_params);
+            mPrepareCalled = true;
+        }
+    }
+
     template <typename KVCacheBuffer>
     void dispatch(const XQAParams& xqa_params, KVCacheBuffer& kv_cache_buffer, const cudaStream_t& stream)
     {
+        if (!mPrepareCalled)
+        {
+            TLLM_THROW("DecoderXQARunner::prepare() hasn't been called before DecoderXQARunner::dispatch().");
+        }
         sync_check_cuda_error();
         this->run(xqa_params, kv_cache_buffer, stream);
     }
 
 private:
-    bool shouldUseImpl(const XQAParams& xqaParams);
+    bool shouldUseImpl(const XQAParams& xqa_params);
+    void prepareForRun(const XQAParams& xqa_params);
 
     template <typename KVCacheBuffer>
     void run(const XQAParams& xqa_params, KVCacheBuffer& kv_cache_buffer, const cudaStream_t& stream);
@@ -230,14 +193,18 @@ private:
     //  invokeApplyBiasRopeUpdateKVCache.
     int2 mLaunchGridBlockCache = make_int2(0, 0);
 
-    class xqaImpl;
-    std::unique_ptr<xqaImpl> pimpl;
+    bool mPrepareCalled;
 
+    XQADataType mDataType;
     int mNumHeads;
     int mNumKVHeads;
     int mHeadSize;
     bool mMultiBlockMode;
     int mMultiProcessorCount;
+
+    std::unique_ptr<DecoderXQAImpl> mImpl;
+
+    friend DecoderXQAImplPrecompiled;
 };
 
 } // namespace kernels

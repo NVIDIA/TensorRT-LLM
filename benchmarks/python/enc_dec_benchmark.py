@@ -88,6 +88,7 @@ class EncDecBenchmark(BaseBenchmark):
                     num_kv_heads=num_kv_heads,
                     hidden_size=hidden_size,
                     head_size=config["builder_config"]["head_size"],
+                    max_batch_size=config["builder_config"]["max_batch_size"],
                     vocab_size=config["builder_config"]["vocab_size"],
                     num_layers=config["builder_config"]["num_layers"],
                     gpt_attention_plugin=config["plugin_config"]

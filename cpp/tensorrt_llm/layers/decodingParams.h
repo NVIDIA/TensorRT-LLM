@@ -50,9 +50,11 @@ public:
     // mandatory parameters
     int step;
     int ite;
-    tc::Tensor logits;                  // [local_batch_size, beam_width, vocab_size_padded]
-    tc::Tensor end_ids;                 // [local_batch_size]
-    std::optional<tc::Tensor> finished; // [batch_size * beam_width]
+    tc::Tensor logits;                          // [local_batch_size, beam_width, vocab_size_padded]
+    tc::Tensor end_ids;                         // [local_batch_size]
+    std::optional<tc::Tensor> batch_slots;      // [local_batch_size]
+    std::optional<tc::Tensor> batch_slots_host; // [local_batch_size]
+    std::optional<tc::Tensor> finished;         // [batch_size * beam_width]
 };
 
 class DecodingOutputParams

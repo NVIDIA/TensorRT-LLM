@@ -204,7 +204,8 @@ void GptDecoderBatch::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeTy
     {
         mStreams[i] = std::make_shared<CudaStream>();
         TLLM_CHECK(mStreams[i]->getDevice() == device);
-        mDecoders[i] = IGptDecoder::create(dtype, mVocabSize, mVocabSizePadded, mStreams[i]);
+        auto constexpr maxBatchSizePerDecoder = 1;
+        mDecoders[i] = IGptDecoder::create(dtype, maxBatchSizePerDecoder, mVocabSize, mVocabSizePadded, mStreams[i]);
         mDecodingInputs[i].reset();
         mDecodingOutputs[i].reset();
         mNbSteps[i] = 0;
@@ -354,11 +355,11 @@ void GptDecoderBatch::newRequest(
         if (samplingConfig.randomSeed.has_value())
         {
             tk::invokeCurandInitialize(
-                curandState, localBatchSize, samplingConfig.randomSeed.value()[0], stream->get());
+                curandState, nullptr, localBatchSize, samplingConfig.randomSeed.value()[0], stream->get());
         }
         else
         {
-            tk::invokeCurandInitialize(curandState, localBatchSize, 0, stream->get());
+            tk::invokeCurandInitialize(curandState, nullptr, localBatchSize, 0, stream->get());
         }
     }
 

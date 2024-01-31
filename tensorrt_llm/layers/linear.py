@@ -68,6 +68,7 @@ class Linear(Module):
                  out_features,
                  bias=True,
                  dtype=None,
+                 use_fp8=False,
                  tp_group=None,
                  tp_size=1,
                  gather_output=True,
@@ -78,10 +79,11 @@ class Linear(Module):
         self.in_features = in_features
         self.out_features = out_features // tp_size
         self.dtype = dtype
+        self.use_fp8 = use_fp8
 
         if not share_weight:
             self.weight = Parameter(shape=(self.out_features, self.in_features),
-                                    dtype=dtype)
+                                    dtype=('fp8' if use_fp8 else dtype))
         else:
             self.weight = share_weight
 
@@ -107,14 +109,13 @@ class Linear(Module):
                         x,
                         weight,
                         gemm_plugin,
-                        use_fp8=False,
                         lora_runtime_params: LoraRuntimeParams = None):
         hidden_state = x
         if gemm_plugin:
             x = _gemm_plugin(x,
                              weight,
                              transb=True,
-                             use_fp8=use_fp8,
+                             use_fp8=self.use_fp8,
                              strict_dtype=self.strict_dtype)
         else:
             x = matmul(x, weight, transb=True)
@@ -151,6 +152,7 @@ class RowLinear(Module):
                  out_features,
                  bias=True,
                  dtype=None,
+                 use_fp8=False,
                  tp_group=None,
                  tp_size=1,
                  strict_dtype: bool = False,
@@ -159,9 +161,10 @@ class RowLinear(Module):
         self.in_features = in_features // tp_size
         self.out_features = out_features
         self.dtype = dtype
+        self.use_fp8 = use_fp8
 
         self.weight = Parameter(shape=(self.out_features, self.in_features),
-                                dtype=dtype)
+                                dtype=('fp8' if use_fp8 else dtype))
 
         if bias:
             self.bias = Parameter(shape=(self.out_features, ), dtype=dtype)
@@ -191,7 +194,7 @@ class RowLinear(Module):
             x = _gemm_plugin(x,
                              weight,
                              transb=True,
-                             use_fp8=use_fp8,
+                             use_fp8=self.use_fp8,
                              strict_dtype=self.strict_dtype)
         else:
             x = matmul(x, weight, transb=True)

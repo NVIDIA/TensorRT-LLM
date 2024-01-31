@@ -86,6 +86,15 @@ void initCommMap(std::set<int> const& group)
     NCCLCHECK(ncclCommInitRank(&commMap[group], group.size(), id, groupRank));
 }
 
+void* tensorrt_llm::plugins::getCommSessionHandle()
+{
+#if ENABLE_MULTI_DEVICE
+    return &COMM_SESSION;
+#else
+    return nullptr;
+#endif // ENABLE_MULTI_DEVICE
+}
+
 #endif // ENABLE_MULTI_DEVICE
 
 namespace

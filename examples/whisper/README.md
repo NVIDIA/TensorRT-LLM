@@ -37,10 +37,10 @@ TensorRT-LLM Whisper builds TensorRT engine(s) from the pytorch checkpoint.
 pip install -r requirements.txt
 
 # Build the large-v3 model using a single GPU with plugins.
-python3 build.py --output_dir whisper_large_v3 --use_gpt_attention_plugin --use_gemm_plugin --use_layernorm_plugin  --use_bert_attention_plugin
+python3 build.py --output_dir whisper_large_v3 --use_gpt_attention_plugin --use_gemm_plugin --use_bert_attention_plugin
 
 # Build the large-v3 model using a single GPU with plugins and weight-only quantization.
-python3 build.py --output_dir whisper_large_weight_only --use_gpt_attention_plugin --use_gemm_plugin --use_layernorm_plugin  --use_bert_attention_plugin --use_weight_only
+python3 build.py --output_dir whisper_large_weight_only --use_gpt_attention_plugin --use_gemm_plugin --use_bert_attention_plugin --use_weight_only
 ```
 
 ### Run

@@ -237,7 +237,13 @@ def parse_arguments():
         help=
         "The number of gpus to be used for inference, only used when --build_only and --serial_build is specified"
     )
-
+    parser.add_argument(
+        '--debug_memory',
+        default=False,
+        action='store_true',
+        help=
+        "Check the estimated memory usage against the total GPU memory. Raise error if the estimated memory requirement is bigger than the total GPU memory"
+        "Warning: only GPT model family is supported for now")
     return parser.parse_args()
 
 
@@ -309,6 +315,8 @@ def main(args):
     benchmarker.print_report_header(args.csv,
                                     benchmark_profiler=benchmark_profiler)
     for config in benchmarker.get_config():
+        if isinstance(benchmarker, GPTBenchmark):
+            benchmarker.check_memory(config, raise_exception=args.debug_memory)
         try:
             inputs = benchmarker.prepare_inputs(config)
         except torch.cuda.OutOfMemoryError as e:
@@ -352,7 +360,8 @@ def main(args):
             )
 
         except Exception as e:
-            print("Found exception during benchmarking", e.with_traceback())
+            logger.error("Found exception during benchmarking",
+                         e.with_traceback())
             if not disable_mem_monitor:
                 memory_monitor.kill()
             raise e
@@ -367,6 +376,15 @@ def main(args):
         if benchmark_profiler is not None:
             benchmark_profiler.add_aux_info('iter_count', iter_idx)
             benchmark_profiler.stop()
+
+        # Print latencies to make it easier to check perf stability.
+        if len(latencies) <= 20:
+            latencies_str = str(latencies)
+        else:
+            latencies_str = ("[" + ", ".join([str(l) for l in latencies[:10]]) +
+                             "..." +
+                             ", ".join([str(l) for l in latencies[-10:]]) + "]")
+        logger.info(f"Latencies: {latencies_str}")
 
         latency = round(sum(latencies) / iter_idx, 3)
         latencies.sort()

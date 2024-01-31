@@ -19,10 +19,14 @@ from tensorrt_llm.mapping import Mapping
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_dir', type=str, default=None)
-    parser.add_argument('--world_size',
+    parser.add_argument('--tp_size',
                         type=int,
                         default=1,
-                        help='world size, only support tensor parallelism now')
+                        help='N-way tensor parallelism size')
+    parser.add_argument('--pp_size',
+                        type=int,
+                        default=1,
+                        help='N-way pipeline parallelism size')
     parser.add_argument('--dtype',
                         type=str,
                         default='float16',
@@ -44,10 +48,6 @@ def parse_arguments():
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
     )
-    parser.add_argument('--per_group',
-                        action="store_true",
-                        default=False,
-                        help='Use per group quantization')
     parser.add_argument('--ammo_quant_ckpt_path',
                         type=str,
                         default=None,
@@ -86,12 +86,6 @@ def parse_arguments():
         default=1,
         help='The number of workers for converting checkpoint in parallel')
     args = parser.parse_args()
-
-    if args.use_weight_only:
-        if args.per_group and args.weight_only_precision == 'int4':
-            args.weight_only_precision = 'int4_gptq'
-        elif args.weight_only_precision == 'int4_gptq':
-            args.per_group = True
 
     return args
 
@@ -178,6 +172,24 @@ def reorder_qkv_weight_or_bias(weight: torch.Tensor,
 
     qkv_out = (num_heads + 2 * num_kv_heads) // tp_size * head_dim
     return reordered.reshape((tp_size, qkv_out, -1))
+
+
+def get_gptq_gptneox_group_size(quant_ckpt_path, hf_config):
+    gptq_model = safe_open(quant_ckpt_path, framework="pt", device=0)
+    gptq_prefix = "gpt_neox."
+    split_sym = "."
+
+    def load(key, no_prefix=0):
+        if no_prefix:
+            return gptq_model.get_tensor(key).cpu()
+        else:
+            return gptq_model.get_tensor(gptq_prefix + key).cpu()
+
+    hidden_size = hf_config.hidden_size
+    prefix = "layers" + split_sym + "0" + split_sym
+
+    scales_fp16 = load(prefix + 'attention.query_key_value.scales')
+    return hidden_size // scales_fp16.shape[0]
 
 
 def load_from_gptq_gptneox(quant_ckpt_path,
@@ -643,10 +655,24 @@ if __name__ == '__main__':
     # the op with PyTorch.
     print(tensorrt_llm.__version__)
     args = parse_arguments()
+    world_size = args.tp_size * args.pp_size
+    assert args.pp_size == 1, "Pipeline parallelism is not supported."
+
     tik = time.time()
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
+
+    quant_algo = None
+    plugin_weight_only_quant_type = None
+    if args.use_weight_only and args.weight_only_precision == 'int8':
+        plugin_weight_only_quant_type = torch.int8
+        quant_algo = 'W8A16'
+    elif args.use_weight_only and args.weight_only_precision == 'int4':
+        plugin_weight_only_quant_type = torch.quint4x2
+        quant_algo = 'W4A16'
+    elif args.use_weight_only and args.weight_only_precision == 'int4_gptq':
+        quant_algo = 'W4A16_GPTQ'
 
     hf_config = AutoConfig.from_pretrained(args.model_dir)
     hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
@@ -665,37 +691,37 @@ if __name__ == '__main__':
         'rotary_pct': hf_config.rotary_pct,
         'hidden_act': hf_config.hidden_act,
         'quantization': {
-            'use_weight_only': args.use_weight_only,
-            'weight_only_precision': args.weight_only_precision,
+            'quant_algo': quant_algo,
         },
         'mapping': {
-            'world_size': args.world_size,
-            'tp_size': args.world_size,
+            'world_size': world_size,
+            'tp_size': args.tp_size,
+            'pp_size': args.pp_size,
         },
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
     }
     if args.use_weight_only and args.weight_only_precision == 'int4_gptq':
-        assert args.per_group
         config['quantization'].update({
-            'weight_only_precision': 'int4',
-            'per_group': args.per_group,
-            'zero': True,
+            'has_zero_point':
+            True,
+            'group_size':
+            get_gptq_gptneox_group_size(args.ammo_quant_ckpt_path, hf_config)
         })
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)
 
     def covert_and_save(rank):
-        mapping = Mapping(world_size=args.world_size,
+        mapping = Mapping(world_size=world_size,
                           rank=rank,
-                          tp_size=args.world_size,
-                          pp_size=1)
+                          tp_size=args.tp_size,
+                          pp_size=args.pp_size)
 
         try:
             if args.use_weight_only and args.weight_only_precision == 'int4_gptq':
-                weights = load_from_gptq_gptneox(
+                weights, group_size = load_from_gptq_gptneox(
                     args.ammo_quant_ckpt_path,
                     hf_config,
                     use_parallel_embedding=args.use_parallel_embedding,
@@ -704,11 +730,6 @@ if __name__ == '__main__':
                     mapping=mapping,
                     dtype=args.dtype)
             else:
-                if args.weight_only_precision == 'int4':
-                    plugin_weight_only_quant_type = torch.quint4x2
-                else:
-                    plugin_weight_only_quant_type = torch.int8
-
                 weights = convert_hf_gptneox(
                     hf_model,
                     mapping,
@@ -727,13 +748,12 @@ if __name__ == '__main__':
             tensorrt_llm.logger.info(f'Excepting when converting, {e}')
 
     if args.workers == 1:
-        for rank in range(args.world_size):
+        for rank in range(world_size):
             covert_and_save(rank)
     else:
         with ThreadPoolExecutor(max_workers=args.workers) as p:
             futures = [
-                p.submit(covert_and_save, rank)
-                for rank in range(args.world_size)
+                p.submit(covert_and_save, rank) for rank in range(world_size)
             ]
             wait(futures)
 

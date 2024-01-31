@@ -2,6 +2,8 @@
 
 This document shows how to run multimodal pipelines with TensorRT-LLM, e.g. from image+text input modalities to text output.
 
+Multimodal models' LLM part has an additional parameter `--max_multimodal_len` compared to LLM-only build commands. Under the hood, `max_multimodal_len` and `max_prompt_embedding_table_size` are effectively the same concept, i.e., prepended/concatenated embeddings (either multimodal feature embeddings or prompt tuning embeddings) to the LLM input embeddings. The multimodal features from the visual encoder of shape `[batch_size, num_visual_features, visual_hidden_dim]` is flattened as `[batch_size * num_visual_features, visual_hidden_dim]` and passed like a prompt embedding table.
+
 ## BLIP2-T5
 
 1. Download Huggingface weights and convert original checkpoint to TRT-LLM checkpoint format
@@ -18,10 +20,6 @@ This document shows how to run multimodal pipelines with TensorRT-LLM, e.g. from
 
 2. Build TRT-LLM engine from TRT-LLM checkpoint
 
-    Add an additional parameter `--max_prompt_embedding_table_size` compared to LLM build commands.
-    `max_prompt_embedding_table_size = visual_feature_dim * max_batch_size`,
-    so if you change max_batch_size, prompt table size must be reset accordingly.
-
     ```bash
     python ../enc_dec/build.py --model_type t5 \
         --weight_dir tmp/trt_models/${MODEL_NAME}/tp1 \
@@ -34,8 +32,12 @@ This document shows how to run multimodal pipelines with TensorRT-LLM, e.g. from
         --dtype bfloat16 \
         --max_beam_width 1 \
         --max_batch_size 8 \
-        --max_prompt_embedding_table_size 256 # 32 (visual_feature_dim) * 8 (max_batch_size)
+        --max_multimodal_len 256 \ # 8 (max_batch_size) * 32 (num_visual_features)
+        --max_encoder_input_len 924 \ # change if LLM text input range is known
+        --max_output_len 100
     ```
+
+    **NOTE**: `max_multimodal_len = max_batch_size * num_visual_features`, so if you change max_batch_size, max multimodal length **MUST** be changed accordingly.
 
     The built T5 engines are located in `./trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1`.
 
@@ -83,13 +85,13 @@ OPT pipeline needs few minor changes from T5 pipeline
     trtllm-build \
         --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
         --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
-        --use_gpt_attention_plugin float16 \
-        --use_gemm_plugin float16 \
-        --max_input_len 924 \
-        --max_output_len 100 \
+        --gpt_attention_plugin float16 \
+        --gemm_plugin float16 \
         --max_beam_width 1 \
         --max_batch_size 8 \
-        --max_prompt_embedding_table_size 256
+        --max_multimodal_len 256 \
+        --max_input_len 924 \
+        --max_output_len 100
 
     python build_visual_engine.py --model_name ${MODEL_NAME} --model_path tmp/hf_models/${MODEL_NAME}
 
@@ -108,20 +110,20 @@ OPT pipeline needs few minor changes from T5 pipeline
     python ../opt/convert_checkpoint.py \
         --model_dir tmp/hf_models/${MODEL_NAME} \
         --dtype float16 \
-        --output_dir tmp/trt_models/${MODEL_NAME}/int4_weightonly/1-gpu
+        --output_dir tmp/trt_models/${MODEL_NAME}/int4_weightonly/1-gpu \
         --use_weight_only \
         --weight_only_precision int4
 
     trtllm-build \
         --checkpoint_dir tmp/trt_models/${MODEL_NAME}/int4_weightonly/1-gpu \
         --output_dir trt_engines/${MODEL_NAME}/int4_weightonly/1-gpu \
-        --use_gpt_attention_plugin float16 \
-        --use_gemm_plugin float16 \
-        --max_input_len 924 \
-        --max_output_len 100 \
+        --gpt_attention_plugin float16 \
+        --gemm_plugin float16 \
         --max_beam_width 1 \
         --max_batch_size 8 \
-        --max_prompt_embedding_table_size 256
+        --max_multimodal_len 256 \
+        --max_input_len 924 \
+        --max_output_len 100
     ```
 
     The built OPT engines lie in `trt_engines/${MODEL_NAME}/int4_weightonly/1-gpu`.
@@ -147,12 +149,12 @@ OPT pipeline needs few minor changes from T5 pipeline
         --model_dir tmp/hf_models/${MODEL_NAME} \
         --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
         --dtype float16 \
-        --remove_input_padding \
-        --use_gpt_attention_plugin float16 \
-        --enable_context_fmha \
-        --use_gemm_plugin float16 \
+        --gpt_attention_plugin float16 \
+        --gemm_plugin float16 \
         --max_batch_size 1 \
-        --max_prompt_embedding_table_size 576 # 576 (visual_feature_dim) * 1 (max_batch_size)
+        --max_multimodal_len 576 \ # 1 (max_batch_size) * 576 (num_visual_features)
+        --max_input_len 2048 \
+        --max_output_len 512
     ```
 
 3.  Build TensorRT engines for visual components
@@ -198,15 +200,15 @@ OPT pipeline needs few minor changes from T5 pipeline
         --weight_dir tmp/trt_models/${MODEL_NAME}/tp1 \
         -o trt_engines/${MODEL_NAME}/1-gpu \
         --engine_name $MODEL_NAME \
-        --remove_input_padding \
-        --use_bert_attention_plugin \
-        --use_gpt_attention_plugin \
+        --bert_attention_plugin \
+        --gpt_attention_plugin \
         --use_gemm_plugin \
         --dtype bfloat16 \
         --max_beam_width 1 \
         --max_batch_size 1 \
         --nougat \
-        --max_prompt_embedding_table_size 588 # for max_batch_size = 1
+        --max_multimodal_len 588 \ # 1 (max_batch_size) * 588 (num_visual_features)
+        --max_output_len 100
     ```
 
 3. Generate TensorRT engines for visual components and combine everything into final pipeline.

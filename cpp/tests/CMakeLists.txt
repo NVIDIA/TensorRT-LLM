@@ -94,6 +94,7 @@ set(SAMPLING_KERNEL_TEST_SRC
 add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
 add_gtest(weightOnlyKernelTest kernels/weightOnly/weightOnlyKernelTest.cpp)
 add_gtest(decodingKernelsTest kernels/decodingKernelTest.cpp)
+add_gtest(banRepeatNGramsKernelsTest kernels/banRepeatNGramsKernelsTest.cpp)
 add_gtest(stopCriteriaKernelsTest kernels/stopCriteriaKernelsTest.cpp)
 add_gtest(shiftKCacheKernelTest kernels/shiftKCacheKernelTest.cu)
 set(SAMPLING_LAYER_TEST_SRC

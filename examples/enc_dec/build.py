@@ -176,26 +176,6 @@ def parse_arguments(component):
         "Activates GEMM plugin. You can specify the plugin dtype or leave blank to use the model dtype."
     )
     parser.add_argument(
-        '--use_layernorm_plugin',
-        nargs='?',
-        const=None,
-        type=str,
-        default=False,
-        choices=['float16', 'float32', 'bfloat16'],
-        help=
-        "Activates layernorm plugin. You can specify the plugin dtype or leave blank to use the model dtype."
-    )
-    parser.add_argument(
-        '--use_rmsnorm_plugin',
-        nargs='?',
-        const=None,
-        type=str,
-        default=False,
-        choices=['float16', 'float32', 'bfloat16'],
-        help=
-        "Activates rmsnorm plugin. You can specify the plugin dtype or leave blank to use the model dtype."
-    )
-    parser.add_argument(
         '--use_lookup_plugin',
         nargs='?',
         const=None,
@@ -217,9 +197,12 @@ def parse_arguments(component):
         'Seed to use when initializing the random number generator for torch.')
     parser.add_argument(
         '--max_prompt_embedding_table_size',
+        '--max_multimodal_len',
         type=int,
         default=0,
-        help='Setting to a value > 0 enables support for prompt tuning.')
+        help=
+        'Setting to a value > 0 enables support for prompt tuning or multimodal input.'
+    )
     parser.add_argument(
         '--use_parallel_embedding',
         action="store_true",
@@ -289,8 +272,7 @@ def parse_arguments(component):
 
     plugins_args = [
         'use_bert_attention_plugin', 'use_gpt_attention_plugin',
-        'use_gemm_plugin', 'use_layernorm_plugin', 'use_rmsnorm_plugin',
-        'use_lookup_plugin'
+        'use_gemm_plugin', 'use_lookup_plugin'
     ]
     for plugin_arg in plugins_args:
         if getattr(args, plugin_arg) is None:
@@ -417,6 +399,7 @@ def build_rank_engine(builder: Builder,
     # Module -> Network
     network = builder.create_network()
     network.trt_network.name = engine_name
+    network.plugin_config.to_legacy_setting()
     if args.use_bert_attention_plugin:
         network.plugin_config.set_bert_attention_plugin(
             dtype=args.use_bert_attention_plugin)
@@ -425,11 +408,6 @@ def build_rank_engine(builder: Builder,
             dtype=args.use_gpt_attention_plugin)
     if args.use_gemm_plugin:
         network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
-    if args.use_layernorm_plugin:
-        network.plugin_config.set_layernorm_plugin(
-            dtype=args.use_layernorm_plugin)
-    if args.use_rmsnorm_plugin:
-        network.plugin_config.set_rmsnorm_plugin(dtype=args.use_rmsnorm_plugin)
     if args.enable_qk_half_accum:
         network.plugin_config.enable_qk_half_accum()
     if args.remove_input_padding:
@@ -553,6 +531,17 @@ def build(rank, args):
 def run_build(component):
     assert component == 'encoder' or component == 'decoder', 'Unsupported component!'
     args = parse_arguments(component)
+
+    # special handling in prompt tuning / multimodal cases
+    if args.max_prompt_embedding_table_size > 0:
+        if component == 'decoder' and args.skip_encoder:
+            # for Nougat-like structure that only uses the decoder of enc-dec, encoder_output length equals to multimodal length, so max_encoder_input_len == max_encoder_output_len == max_multimodal_len == max_prompt_embedding_table_size MUST hold.
+            args.max_encoder_input_len = args.max_prompt_embedding_table_size
+            logger.warning(
+                "Forcing max_encoder_input_len equal to max_prompt_embedding_table_size"
+            )
+        # otherwise, e.g. for BLIP2-T5, the entire enc-dec is used, so multimodal length (visual output length) and encoder_output length (LLM input length) are two different things
+
     if component == 'encoder' and args.skip_encoder:
         logger.warning("Skipping build of encoder for Nougat model")
         return

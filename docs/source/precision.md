@@ -126,7 +126,7 @@ This release of TensorRT-LLM contains the following examples:
 | Falcon     |   Y   |   Y   |   Y   |   Y   |    .    |   Y   |   Y   |     Y     |     .      |
 | Flan-T5    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | GPT        |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     .     |     .      |
-| GPT-J      |   Y   |   Y   |   Y   |   Y   |    .    |   Y   |   Y   |     Y     |     .      |
+| GPT-J      |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
 | GPT-NeMo   |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | GPT-NeoX   |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     Y      |
 | InternLM   |   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     .     |     .      |

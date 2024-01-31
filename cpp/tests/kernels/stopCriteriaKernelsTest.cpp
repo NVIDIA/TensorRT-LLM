@@ -51,29 +51,41 @@ public:
     void initData(SizeType seed, const std::vector<std::vector<std::vector<SizeType>>>& stopWords,
         SizeType stopWordsLen, SizeType batchSize, SizeType beamWidth)
     {
+        auto const maxBatchSize = 2 * batchSize;
+
         std::mt19937 generator(seed);
         std::uniform_int_distribution<int> seqLenDistr(0, mMaxSeqLen);
 
         mSequenceLengths
-            = mBufferManager->pinned(ITensor::makeShape({batchSize, beamWidth}), nvinfer1::DataType::kINT32);
-        mSequenceLengthLimits = mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
+            = mBufferManager->pinned(ITensor::makeShape({maxBatchSize, beamWidth}), nvinfer1::DataType::kINT32);
+        mSequenceLengthLimits = mBufferManager->pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
         mFinished = mBufferManager->pinned(
-            ITensor::makeShape({batchSize, beamWidth}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
+            ITensor::makeShape({maxBatchSize, beamWidth}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
         mFinishedSum = mBufferManager->pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 
         mOutputIds = mBufferManager->pinned(
-            ITensor::makeShape({batchSize, beamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
-        mOutputIdsPtr = mBufferManager->pinned(ITensor::makeShape({batchSize, beamWidth}), nvinfer1::DataType::kINT64);
+            ITensor::makeShape({maxBatchSize, beamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
+        mOutputIdsPtr
+            = mBufferManager->pinned(ITensor::makeShape({maxBatchSize, beamWidth}), nvinfer1::DataType::kINT64);
 
         mParentIds = mBufferManager->pinned(
-            ITensor::makeShape({batchSize, beamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
-        mParentIdsPtr = mBufferManager->pinned(ITensor::makeShape({batchSize, beamWidth}), nvinfer1::DataType::kINT64);
+            ITensor::makeShape({maxBatchSize, beamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
+        mParentIdsPtr
+            = mBufferManager->pinned(ITensor::makeShape({maxBatchSize, beamWidth}), nvinfer1::DataType::kINT64);
 
         mRefOutputIds = mBufferManager->pinned(
-            ITensor::makeShape({batchSize, beamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({maxBatchSize, beamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
 
         mStopWords
-            = mBufferManager->pinned(ITensor::makeShape({batchSize, 2, stopWordsLen}), nvinfer1::DataType::kINT32);
+            = mBufferManager->pinned(ITensor::makeShape({maxBatchSize, 2, stopWordsLen}), nvinfer1::DataType::kINT32);
+
+        mBatchSlots = mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
+
+        auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
+        for (SizeType bi = 0; bi < batchSize; ++bi)
+        {
+            batchSlotsPtr[bi] = 2 * bi;
+        }
 
         auto sequenceLengthsPtr = bufferCast<SizeType>(*mSequenceLengths);
         auto sequenceLengthLimitsPtr = bufferCast<SizeType>(*mSequenceLengthLimits);
@@ -81,18 +93,20 @@ public:
             = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinished));
         auto finishedSumPtr = bufferCast<SizeType>(*mFinishedSum);
 
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType bi = 0; bi < maxBatchSize; ++bi)
         {
             for (SizeType ri = 0; ri < beamWidth; ri++)
             {
-                sequenceLengthsPtr[bi * beamWidth + ri]
-                    = stopWordsLen == 0 ? seqLenDistr(generator) : mMaxSeqLen - (bi + ri) % mMaxSeqLen;
+                sequenceLengthsPtr[bi * beamWidth + ri] = stopWordsLen == 0
+                    ? seqLenDistr(generator)
+                    : mMaxSeqLen - (static_cast<SizeType>(bi / 2) + ri) % mMaxSeqLen;
                 finishedPtr[bi * beamWidth + ri] = tk::FinishedState::empty();
             }
         }
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType bi = 0; bi < maxBatchSize; ++bi)
         {
-            sequenceLengthLimitsPtr[bi] = stopWordsLen == 0 ? seqLenDistr(generator) : mMaxSeqLen - bi % mMaxSeqLen;
+            sequenceLengthLimitsPtr[bi]
+                = stopWordsLen == 0 ? seqLenDistr(generator) : mMaxSeqLen - static_cast<SizeType>(bi / 2) % mMaxSeqLen;
         }
         finishedSumPtr[0] = 0;
 
@@ -105,13 +119,19 @@ public:
         // Tokens ids are
         // bi: 0, ri: 0: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         // bi: 0, ri: 1: [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
-        // bi: 1, ri: 0: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
-        // bi: 1, ri: 1: [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
-        // bi: 2, ri: 0: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
-        // bi: 2, ri: 1: [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
-        // bi: 3, ri: 0: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        // bi: 3, ri: 1: [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
-        for (SizeType bi = 0; bi < batchSize; bi++)
+        // bi: 1, ri: 0: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        // bi: 1, ri: 1: [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+        // bi: 2, ri: 0: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        // bi: 2, ri: 1: [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+        // bi: 3, ri: 0: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        // bi: 3, ri: 1: [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+        // bi: 4, ri: 0: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        // bi: 4, ri: 1: [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
+        // bi: 5, ri: 0: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        // bi: 5, ri: 1: [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
+        // bi: 6, ri: 0: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        // bi: 6, ri: 1: [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+        for (SizeType bi = 0; bi < maxBatchSize; bi++)
         {
             for (SizeType ri = 0; ri < beamWidth; ri++)
             {
@@ -124,7 +144,7 @@ public:
             }
         }
 
-        for (SizeType bi = 0; bi < batchSize; bi++)
+        for (SizeType bi = 0; bi < maxBatchSize; bi++)
         {
             outputIdsPtrsData[bi] = outputIdsData + bi * beamWidth * mMaxSeqLen;
             parentIdsPtrsData[bi] = parentIdsData + bi * beamWidth * mMaxSeqLen;
@@ -132,7 +152,7 @@ public:
 
         // Init stop words tensor
         auto stopWordsData = bufferCast<int32_t>(*mStopWords);
-        std::fill(stopWordsData, stopWordsData + batchSize * 2 * stopWordsLen, -1);
+        std::fill(stopWordsData, stopWordsData + maxBatchSize * 2 * stopWordsLen, -1);
         for (SizeType bi = 0; bi < stopWords.size(); bi++)
         {
             SizeType totalLen = 0;
@@ -166,17 +186,20 @@ public:
         auto finishedPtr
             = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinished));
         auto finishedSumPtr = bufferCast<SizeType>(*mFinishedSum);
+        auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
 
         int32_t refSumFinished = 0;
         for (SizeType bi = 0; bi < batchSize * beamWidth; ++bi)
         {
             auto const batchIdx = bi / beamWidth;
             auto const beamIdx = bi % beamWidth;
-            const auto limitExceeded = sequenceLengthsPtr[bi] >= sequenceLengthLimitsPtr[batchIdx];
+            auto const batchSlot = batchSlotsPtr[batchIdx];
+            auto const batchBeamIdx = batchSlot * beamWidth + beamIdx;
+            const auto limitExceeded = sequenceLengthsPtr[batchBeamIdx] >= sequenceLengthLimitsPtr[batchSlot];
             refSumFinished += limitExceeded;
             if (limitExceeded)
             {
-                EXPECT_TRUE(finishedPtr[bi].isFinishedMaxLength())
+                EXPECT_TRUE(finishedPtr[batchBeamIdx].isFinishedMaxLength())
                     << " batchIdx: " << batchIdx << " beamIdx: " << beamIdx << " seed: " << seed;
             }
         }
@@ -199,28 +222,30 @@ public:
         auto finishedPtr
             = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinished));
         auto sequenceLengthsPtr = bufferCast<SizeType>(*mSequenceLengths);
+        auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
 
         for (SizeType bi = 0; bi < batchSize; bi++)
         {
+            auto const batchSlot = batchSlotsPtr[bi];
             for (SizeType bwi = 0; bwi < beamWidth; bwi++)
             {
-                auto outputIdsBatchBeam = outputIdsData + bi * beamWidth * mMaxSeqLen + bwi * mMaxSeqLen;
+                auto outputIdsBatchBeam = outputIdsData + batchSlot * beamWidth * mMaxSeqLen + bwi * mMaxSeqLen;
                 bool found = false;
-                for (SizeType wi = 0; wi < stopWords[bi].size(); ++wi)
+                for (SizeType wi = 0; wi < stopWords[batchSlot].size(); ++wi)
                 {
-                    auto const wordLen = stopWords[bi][wi].size();
-                    auto const seqLen = sequenceLengthsPtr[bi * beamWidth + bwi];
+                    auto const wordLen = stopWords[batchSlot][wi].size();
+                    auto const seqLen = sequenceLengthsPtr[batchSlot * beamWidth + bwi];
                     auto const offset = seqLen - wordLen;
-                    found |= isSubsequence(outputIdsBatchBeam + offset, wordLen, stopWords[bi][wi]);
+                    found |= isSubsequence(outputIdsBatchBeam + offset, wordLen, stopWords[batchSlot][wi]);
                     if (found)
                     {
-                        EXPECT_TRUE(finishedPtr[bi * beamWidth + bwi].isFinishedStopWords());
+                        EXPECT_TRUE(finishedPtr[batchSlot * beamWidth + bwi].isFinishedStopWords());
                         break;
                     }
                 }
                 if (!found)
                 {
-                    EXPECT_FALSE(finishedPtr[bi * beamWidth + bwi].isFinished());
+                    EXPECT_FALSE(finishedPtr[batchSlot * beamWidth + bwi].isFinished());
                 }
             }
         }
@@ -249,7 +274,8 @@ public:
         tk::invokeStopWordsCriterion(reinterpret_cast<const int**>(bufferCast<int64_t>(*mOutputIdsPtr)),
             reinterpret_cast<const int**>(bufferCast<int64_t>(*mParentIdsPtr)), bufferCast<SizeType>(*mStopWords),
             reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinished)),
-            bufferCast<SizeType>(*mSequenceLengths), maxStopWordsLen, batchSize, beamWidth, mMaxSeqLen, mStream->get());
+            bufferCast<SizeType>(*mSequenceLengths), bufferCast<int32_t>(*mBatchSlots), maxStopWordsLen, batchSize,
+            beamWidth, mMaxSeqLen, mStream->get());
 
         verifyStopWordsStopCriteriaResults(0, stopWords, maxStopWordsLen, batchSize, beamWidth);
     }
@@ -262,7 +288,8 @@ public:
             reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinished)),
             bufferCast<SizeType>(*mFinishedSum),
             reinterpret_cast<const uint32_t*>(bufferCast<SizeType>(*mSequenceLengthLimits)),
-            bufferCast<SizeType>(*mSequenceLengths), batchSize, beamWidth, mStream->get());
+            bufferCast<SizeType>(*mSequenceLengths), bufferCast<int32_t>(*mBatchSlots), batchSize, beamWidth,
+            mStream->get());
 
         verifyMaxSeqLenStopCriteriaResults(seed, batchSize, beamWidth);
     }
@@ -282,6 +309,7 @@ protected:
     TensorPtr mParentIds;
     TensorPtr mParentIdsPtr;
     TensorPtr mStopWords;
+    TensorPtr mBatchSlots;
 
     static constexpr SizeType mMaxSeqLen{16};
     static constexpr SizeType mVocabSize{32};
@@ -336,7 +364,7 @@ TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS1SingleTokenSingleWordTest)
     constexpr SizeType batchSize = 1;
     constexpr SizeType beamWidth = 1;
     // Expected to not match any word
-    this->runStopWordsCriteriaTest({{{2}}}, batchSize, beamWidth);
+    this->runStopWordsCriteriaTest({{{2}}, {{2}}}, batchSize, beamWidth);
 }
 
 TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS1SingleTokenMultipleWordsTest)
@@ -344,7 +372,7 @@ TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS1SingleTokenMultipleWordsTest
     constexpr SizeType batchSize = 1;
     constexpr SizeType beamWidth = 1;
     // Expected to match 15
-    this->runStopWordsCriteriaTest({{{145}, {4}, {1}, {15}}}, batchSize, beamWidth);
+    this->runStopWordsCriteriaTest({{{145}, {4}, {1}, {15}}, {{}}}, batchSize, beamWidth);
 }
 
 TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS1MultipleTokensSingleWordTest)
@@ -352,7 +380,7 @@ TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS1MultipleTokensSingleWordTest
     constexpr SizeType batchSize = 1;
     constexpr SizeType beamWidth = 1;
     // Expected to not match any word
-    this->runStopWordsCriteriaTest({{{2, 3}}}, batchSize, beamWidth);
+    this->runStopWordsCriteriaTest({{{2, 3}}, {{}}}, batchSize, beamWidth);
 }
 
 TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS1MultipleTokensMultipleWordsMatchTest)
@@ -360,7 +388,7 @@ TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS1MultipleTokensMultipleWordsM
     constexpr SizeType batchSize = 1;
     constexpr SizeType beamWidth = 1;
     // Expected to match {13, 14, 15}
-    this->runStopWordsCriteriaTest({{{1, 4}, {2, 3}, {13, 14, 15}}}, batchSize, beamWidth);
+    this->runStopWordsCriteriaTest({{{1, 4}, {2, 3}, {13, 14, 15}}, {{}}}, batchSize, beamWidth);
 }
 
 TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS1MultipleTokensMultipleWordsNotMatchTest)
@@ -368,25 +396,27 @@ TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS1MultipleTokensMultipleWordsN
     constexpr SizeType batchSize = 1;
     constexpr SizeType beamWidth = 1;
     // Expected to not match any word
-    this->runStopWordsCriteriaTest({{{1, 4}, {2, 3}, {12, 14, 15}}}, batchSize, beamWidth);
+    this->runStopWordsCriteriaTest({{{1, 4}, {2, 3}, {12, 14, 15}}, {{}}}, batchSize, beamWidth);
 }
 
 TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS4MultipleTokensMultipleWordsTest)
 {
     constexpr SizeType batchSize = 4;
     constexpr SizeType beamWidth = 1;
-    // Expected to match {12, 13} for the 3rd instance in the batch
-    this->runStopWordsCriteriaTest({{{2}}, {{}}, {{15}, {12, 13}}, {{1}, {8, 9}}}, batchSize, beamWidth);
+    // Expected to match {12, 13} for the 5th instance in the batch
+    this->runStopWordsCriteriaTest(
+        {{{2}}, {{}}, {{}}, {{}}, {{15}, {12, 13}}, {{}}, {{1}, {8, 9}}, {{}}}, batchSize, beamWidth);
 }
 
 TEST_F(StopCriteriaKernelsTest, stopWordsCriteriaBS4BW2MultipleTokensMultipleWordsTest)
 {
     constexpr SizeType batchSize = 4;
     constexpr SizeType beamWidth = 2;
-    // Expected to match {12, 13} to {bi, bw}={{2, 0}}
-    // Expected to match {11, 12} to {bi, bw}={{3, 0}}
-    // Expected to match {27} to {bi, bw}={{3, 1}}
-    this->runStopWordsCriteriaTest({{{2}}, {{}}, {{11}, {12, 13}}, {{27}, {11, 12}}}, batchSize, beamWidth);
+    // Expected to match {12, 13} to {bi, bw}={{5, 0}}
+    // Expected to match {11, 12} to {bi, bw}={{7, 0}}
+    // Expected to match {27} to {bi, bw}={{5, 1}}
+    this->runStopWordsCriteriaTest(
+        {{{2}}, {{}}, {{}}, {{}}, {{11}, {12, 13}}, {{}}, {{27}, {11, 12}}, {{}}}, batchSize, beamWidth);
 }
 
 } // end of namespace

@@ -12,20 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import inspect
 from collections import OrderedDict
-from typing import Optional
 
 import tensorrt as trt
 
-from tensorrt_llm.models.generation_mixin import GenerationMixin
+from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size
-from ...functional import ACT2FN, Tensor, gather_last_token_logits, stack
+from ...functional import ACT2FN, Tensor, stack
 from ...layers import ColumnLinear
 from ...mapping import Mapping
 from ...module import Module, ModuleList
+from ..generation_mixin import GenerationMixin
 
 
 class MedusaLayer(Module):
@@ -45,7 +44,6 @@ class MedusaLayer(Module):
                                    tp_size=mapping.tp_size,
                                    gather_output=True)
         self.hidden_act = hidden_act
-        return
 
     def forward(self, x):
         return x + ACT2FN[self.hidden_act](self.linear(x))
@@ -85,92 +83,51 @@ class MedusaHead(Module):
         return self.lm_head(hidden_states)
 
 
-class MedusaLM(Module, GenerationMixin):
+class MedusaForCausalLm(LLaMAForCausalLM):
 
-    def __init__(
-        self,
-        base_model: Module,
-        mapping=Mapping(),
-        num_medusa_heads=4,
-        num_medusa_layers=1,
-        hidden_act='silu',
-    ):
-        super().__init__()
-        self.base_model = base_model
-        self.mapping = mapping
-        self.hidden_size = base_model.hidden_size
-        self.vocab_size = base_model.vocab_size
-        self.num_medusa_heads = num_medusa_heads
-        self.num_medusa_layers = num_medusa_layers
-        self.hidden_act = hidden_act
-        vocab_size_padded = pad_vocab_size(self.vocab_size, mapping.tp_size)
+    def __init__(self, config):
+
+        super().__init__(config)
+        self.num_medusa_heads = config.num_medusa_heads
+        self.num_medusa_layers = config.num_medusa_layers
+        self.hidden_size = config.hidden_size
+        self.vocab_size = config.vocab_size
+        vocab_size_padded = pad_vocab_size(self.vocab_size,
+                                           config.mapping.tp_size)
         self.medusa_heads = ModuleList([
-            MedusaHead(num_layers=num_medusa_layers,
-                       hidden_size=self.hidden_size,
+            MedusaHead(num_layers=self.num_medusa_layers,
+                       hidden_size=config.hidden_size,
                        vocab_size=vocab_size_padded,
-                       hidden_act=self.hidden_act,
-                       dtype=base_model.dtype,
-                       mapping=mapping) for _ in range(num_medusa_heads)
+                       hidden_act=config.hidden_act,
+                       dtype=config.dtype,
+                       mapping=config.mapping)
+            for _ in range(self.num_medusa_heads)
         ])
-        return
+        self.max_medusa_token_len = config.max_medusa_token_len
 
-    def forward(
-        self,
-        input_ids,
-        position_ids=None,
-        use_cache=False,
-        last_token_ids=None,
-        attention_mask=None,
-        medusa_position_offsets=None,
-        medusa_packed_mask=None,
-        kv_cache_params=None,
-        attention_params=None,
-        hidden_states=None,
-        prompt_embedding_table: Optional[Tensor] = None,
-        prompt_tasks: Optional[Tensor] = None,
-        prompt_vocab_size: Optional[Tensor] = None,
-        lora_params=None,
-        output_original=True,
-    ):
-        parent_model = inspect.getmro(type(
-            self.base_model))[1]  # get the pre-LMHead model
-        hidden_states = parent_model.forward(
-            self.base_model, input_ids, position_ids, use_cache, attention_mask,
-            medusa_position_offsets, medusa_packed_mask, kv_cache_params,
-            attention_params, hidden_states, prompt_embedding_table,
-            prompt_tasks, prompt_vocab_size, lora_params)
-        if use_cache:
-            hidden_states, presents = hidden_states
+    def forward(self, *args, **kwargs):
+        output_original = True
+        hidden_states = super().forward(*args, **kwargs)
+
+        if kwargs['use_cache']:
+            if default_net().plugin_config.paged_kv_cache:
+                lm_logits, hidden_states = hidden_states
+            else:
+                lm_logits, presents, hidden_states = hidden_states
 
         if self.mapping.is_last_pp_rank():
-            hidden_states = gather_last_token_logits(
-                hidden_states,
-                last_token_ids,
-                default_net().plugin_config.remove_input_padding,
-            )
-            # [batch_size, hidden_size] -> [batch_size, vocab_size]
-            if output_original:
-                lm_logits = self.base_model.lm_head(hidden_states)
-                lm_logits.mark_output('logits', self.base_model.logits_dtype)
-
             medusa_logits = []
             for i in range(self.num_medusa_heads):
                 medusa_logits.append(self.medusa_heads[i](hidden_states))
             # [num_medusa_heads, batch_size, num_medusa_tokens + 1, padded_vocab_size].
             # Remove padding [num_medusa_heads, batch_size * num_medusa_tokens + 1, padded_vocab_size].
             medusa_logits = stack(medusa_logits, dim=0)
-            medusa_logits.mark_output('medusa_logits',
-                                      self.base_model.logits_dtype)
+            medusa_logits.mark_output('medusa_logits', self.config.logits_dtype)
         else:
-            hidden_states.mark_output('hidden_states_output',
-                                      self.base_model.dtype)
+            hidden_states.mark_output('hidden_states_output', self.config.dtype)
 
-        if use_cache and default_net().plugin_config.paged_kv_cache == False:
-            for i, present in zip(
-                    self.mapping.pp_layers(self.base_model.num_layers),
-                    presents):
-                present.mark_output(f'present_key_value_{i}',
-                                    self.base_model.kv_dtype)
+        if kwargs['use_cache'] and default_net(
+        ).plugin_config.paged_kv_cache == False:
             if self.mapping.is_last_pp_rank():
                 if output_original:
                     return (medusa_logits, lm_logits, presents)
@@ -180,44 +137,26 @@ class MedusaLM(Module, GenerationMixin):
             if self.mapping.is_last_pp_rank():
                 if output_original:
                     return medusa_logits, lm_logits
-                return lm_logits
+                return medusa_logits
             return hidden_states
 
-    def prepare_inputs(
-        self,
-        max_batch_size,
-        max_input_len,
-        max_seq_len,
-        use_cache,
-        max_medusa_tokens_len,
-        max_beam_width,
-        max_num_tokens: int = None,
-        prompt_embedding_table_size: int = 0,
-    ):
-        base_model_inputs = self.base_model.prepare_inputs(
-            max_batch_size=max_batch_size,
-            max_input_len=max_input_len,
-            max_seq_len=max_seq_len,
-            use_cache=use_cache,
-            max_beam_width=max_beam_width,
-            max_num_tokens=max_num_tokens,
-            prompt_embedding_table_size=prompt_embedding_table_size,
-            max_draft_len=max_medusa_tokens_len)
-        num_profiles = len(base_model_inputs[0].profiles)
-        max_gen_token_len = max_medusa_tokens_len + 1
+    def prepare_inputs(self, *args, **kwargs):
+        inputs = super().prepare_inputs(*args, **kwargs)
+        num_profiles = len(inputs['input_ids'].profiles)
+        max_gen_token_len = self.max_medusa_token_len + 1
         medusa_mask_len_range = [[0, max_gen_token_len, max_gen_token_len]
                                  ] * num_profiles
         medusa_position_len_range = [[0, max_gen_token_len, max_gen_token_len]
                                      ] * num_profiles
-        # 32 bits packed mask aligned.
-        num_packed_medusa_masks = (max_medusa_tokens_len + 1 + 32 - 1) // 32
+        # # 32 bits packed mask aligned.
+        num_packed_medusa_masks = (self.max_medusa_token_len + 1 + 32 - 1) // 32
         packed_medusa_mask_len_range = [[0, 1, num_packed_medusa_masks]
                                         ] * num_profiles
 
         # batch beam range (different sequence may have different medusa offsets or packed masks).
-        bb_range_cxt = GenerationMixin.default_range(max_batch_size)
-        bb_range_gen = GenerationMixin.default_range(max_batch_size *
-                                                     max_beam_width)
+        bb_range_cxt = GenerationMixin.default_range(kwargs['max_batch_size'])
+        bb_range_gen = GenerationMixin.default_range(kwargs['max_batch_size'] *
+                                                     kwargs['max_beam_width'])
         # enable_two_optimization_profiles
         if num_profiles == 2:
             bb_range = [bb_range_cxt, bb_range_gen]
@@ -246,8 +185,6 @@ class MedusaLM(Module, GenerationMixin):
                 ('medusa_packed_mask_dim1', packed_medusa_mask_len_range),
             ]),
         )
-
-        return base_model_inputs[:5] + (
-            medusa_position_offsets,
-            medusa_packed_mask,
-        ) + base_model_inputs[5:]
+        inputs['medusa_packed_mask'] = medusa_packed_mask
+        inputs['medusa_position_offsets'] = medusa_position_offsets
+        return inputs

@@ -117,6 +117,22 @@ TEST_F(TllmBuffersTest, HostAllocator)
     EXPECT_EQ(allocator.getMemoryType(), MemoryType::kCPU);
 }
 
+TEST_F(TllmBuffersTest, UVMAllocator)
+{
+    auto constexpr size = 1024;
+    UVMAllocator allocator{};
+    auto& counters = MemoryCounters::getInstance();
+    EXPECT_EQ(counters.getUVM(), 0);
+    auto ptr = allocator.allocate(size);
+    EXPECT_NE(ptr, nullptr);
+    EXPECT_EQ(counters.getUVM(), size);
+    EXPECT_EQ(counters.getUVMDiff(), size);
+    EXPECT_NO_THROW(allocator.deallocate(ptr, size));
+    EXPECT_EQ(counters.getUVM(), 0);
+    EXPECT_EQ(counters.getUVMDiff(), -size);
+    EXPECT_EQ(allocator.getMemoryType(), MemoryType::kUVM);
+}
+
 TEST_F(TllmBuffersTest, CudaAllocatorAsync)
 {
     if (mDeviceCount == 0)

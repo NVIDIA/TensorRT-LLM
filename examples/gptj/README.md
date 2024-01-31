@@ -7,7 +7,7 @@ This document explains how to build the [GPT-J](https://huggingface.co/EleutherA
 The TensorRT-LLM GPT-J implementation can be found in [`tensorrt_llm/models/gptj/model.py`](../../tensorrt_llm/models/gptj/model.py). The TensorRT-LLM GPT-J example
 code is located in [`examples/gptj`](./). There is one main file:
 
-* [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the GPT-J model.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format.
 
 In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
 
@@ -16,11 +16,10 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 
 ## Support Matrix
   * FP16
-  * FP8
   * INT8 & INT4 per-channel weight-only
+  * FP8 (with FP8 kv cache)
   * Groupwise quantization (AWQ)
   * INT8 KV CACHE (+ AWQ/per-channel weight-only)
-  * FP8 KV CACHE
 
 ## Usage
 
@@ -48,53 +47,50 @@ Examples of build invocations:
 
 ```bash
 # Build a float16 engine using HF weights.
-# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
-
-python3 build.py --dtype=float16 \
-                 --log_level=verbose \
-                 --enable_context_fmha \
-                 --use_gpt_attention_plugin float16 \
-                 --use_gemm_plugin float16 \
-                 --max_batch_size=32 \
-                 --max_input_len=1919 \
-                 --max_output_len=128 \
-                 --remove_input_padding \
-                 --output_dir=gptj_engine \
-                 --model_dir=gptj_model 2>&1 | tee build.log
-
-# Build a float16 engine using dummy weights, useful for performance tests.
-# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
-
-python3 build.py --dtype=float16 \
-                 --log_level=verbose \
-                 --enable_context_fmha \
-                 --use_gpt_attention_plugin float16 \
-                 --use_gemm_plugin float16 \
-                 --max_batch_size=32 \
-                 --max_input_len=1919 \
-                 --max_output_len=128 \
-                 --remove_input_padding \
-                 --output_dir=gptj_engine_dummy_weights 2>&1 | tee build.log
-
-# Build an int4 weight only quantization engine using awq int4 weight only quantized weights.
-# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
-
-python3 build.py --dtype=float16 \
-                 --log_level=verbose \
-                 --enable_context_fmha \
-                 --use_gpt_attention_plugin float16 \
-                 --use_gemm_plugin float16 \
-                 --max_batch_size=32 \
-                 --max_input_len=1919 \
-                 --max_output_len=128 \
-                 --remove_input_padding \
-                 --output_dir=gptj_engine \
-                 --use_weight_only \
-                 --per_group \
-                 --weight_only_precision=int4 \
-                 --model_dir=awq_int4_weight_only_quantized_models 2>&1 | tee build.log
-
+python convert_checkpoint.py --model_dir ./gpt-j-6b \
+                             --dtype float16 \
+                             --output_dir ./trt_ckpt/gptj_fp16_tp1/
 ```
+
+***For all kinds of checkpoints, they share the same trtllm-build command like:***
+
+```bash
+# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
+trtllm-build --checkpoint_dir ./trt_ckpt/gptj_fp16_tp1/ \
+             --output_dir ./trt_engines/gptj_fp16_tp1/ \
+             --context_fmha enable \
+             --remove_input_padding enable \
+             --gemm_plugin float16 \
+             --gpt_attention_plugin float16 \
+             --max_batch_size=32 \
+             --max_input_len=1919 \
+             --max_output_len=128
+```
+
+INT8 weight-only
+
+```bash
+# Build an int8 weight-only engine using HF weights with TP=2
+python convert_checkpoint.py --model_dir ./gpt-j-6b \
+                             --dtype float16 \
+                             --use_weight_only \
+                             --weight_only_precision int8 \
+                             --output_dir ./trt_ckpt/gptj_int8_tp2/ \
+                             --tp_size 2
+```
+Building command is identical to the common one above.
+
+INT4 weight-only
+
+```bash
+# Build an int4 weight only quantization engine using int4 weight only quantized weights.
+python convert_checkpoint.py --model_dir ./gpt-j-6b \
+                             --dtype float16 \
+                             --use_weight_only \
+                             --weight_only_precision int4 \
+                             --output_dir ./trt_ckpt/gptj_int4wo_tp1/
+```
+Building command is identical to the common one above.
 
 #### FP8 Post-Training Quantization
 
@@ -102,69 +98,57 @@ The examples below uses the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit
 
 First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
-Now quantize HF GPT-J weights as follows.
-After successfully running the script, the output should be in .npz format, e.g. `quantized_fp8/gptj_tp1_rank0.npz`,
-where FP8 scaling factors are stored.
+One can quantize HF GPT-J weights in FP8 as follows.
 
 ```bash
 # Quantize HF GPT-J 6B checkpoint into FP8 format
-python examples/quantization/quantize.py --model_dir gptj_model \
-                                         --dtype float16 \
-                                         --qformat fp8 \
-                                         --export_path ./quantized_fp8 \
-                                         --calib_size 512
-
-# Build GPT-J 6B using original HF checkpoint + PTQ scaling factors
-python build.py --model_dir gptj_model \
-                --quantized_fp8_model_path ./quantized_fp8/gptj_tp1_rank0.npz \
-                --dtype float16 \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --output_dir gptj_engine_fp8_quantized \
-                --enable_fp8 \
-                --fp8_kv_cache \
-                --strongly_typed
+python ../quantization/quantize.py --model_dir ./gpt-j-6b \
+                                   --dtype float16 \
+                                   --qformat fp8 \
+                                   --kv_cache_dtype fp8 \
+                                   --output_dir ./trt_ckpt/gptj_fp8_tp1 \
+                                   --calib_size 512
 ```
+Building command is identical to the common one above.
 
 #### AWQ INT4 weight only quantization
 
-One can enable AWQ INT4 weight only quantization with these 3 options when building engine with `build.py`:
-
-- `--use_weight_only` enables weight only GEMMs in the network.
-- `--per_group` enable groupwise weight only quantization, for GPT-J example, we support AWQ with the group size default as 128.
-- `--weight_only_precision=int4` the precision of weight only quantization. Only int4 is supported for groupwise weight only quantization.
-
-The linear layer in the AWQ int4 weight only quantized weights should have 3 parameters:
-1. FP16 smoothed_weights (=weights/pre_quant_scale) with shape [n, k] ;
-2. FP16 amax (the max abs values of the smoothed_weights) with shape [n, k/group_size];
-3. FP16 pre_quant_scale (the smooth scales used to multiply by activation) with shape [k];
+One can enable AWQ INT4 weight only quantization like the following command.
 
 ```bash
-# Using AMMO to generate INT4_AWQ .npz file.
-python3 ../quantization/quantize.py --model_dir ./gpt-j-6b/ \
-                                    --export_path ./awq/ \
-                                    --qformat int4_awq \
-                                    --dtype float16 \
-                                    --quantize_lm_head
+# Enable AWQ int4 group-wise weight-only quantization.
+python ../quantization/quantize.py --model_dir ./gpt-j-6b \
+                                   --dtype float16 \
+                                   --qformat int4_awq \
+                                   --output_dir ./trt_ckpt/gptj_int4_awq_tp1 \
+                                   --calib_size 512
 ```
+
 ```bash
-# Build AWQ engine.
-python3 build.py --dtype float16 \
-                 --enable_context_fmha \
-                 --remove_input_padding \
-                 --use_gpt_attention_plugin float16 \
-                 --use_gemm_plugin float16 \
-                 --max_batch_size 32 \
-                 --max_input_len 2048 \
-                 --max_output_len 128 \
-                 --output_dir int4_awq \
-                 --use_weight_only \
-                 --weight_only_precision int4_awq \
-                 --per_group \
-                 --model_dir ./gpt-j-6b/ \
-                 --quant_ckpt_path awq/gptj_tp1_rank0.npz \
-                 --quantize_lm_head
+# Enable AWQ int4 group-wise weight-only quantization with tp2.
+python ../quantization/quantize.py --model_dir ./gpt-j-6b \
+                                   --dtype float16 \
+                                   --qformat int4_awq \
+                                   --tp_size 2 \
+                                   --output_dir ./trt_ckpt/gptj_int4_awq_tp2 \
+                                   --calib_size 512
 ```
+
+And build command is identical to the common one above.
+
+#### SmoothQuant (W8A8) quantization
+
+One can enable smoothquant W8A8 (weight per-channel, activation per-tensor) quantization like the following command.
+
+```bash
+# Enable smoothquant (W8A8 kernel).
+python ../quantization/quantize.py --model_dir ./gpt-j-6b \
+                                   --dtype float16 \
+                                   --qformat int8_sq \
+                                   --output_dir ./trt_ckpt/gptj_sq_tp1 \
+                                   --calib_size 512
+```
+Building command is identical to the common one above.
 
 #### Fused MultiHead Attention (FMHA)
 
@@ -177,74 +161,50 @@ Note `--enable_context_fmha` / `--enable_context_fmha_fp32_acc` has to be used t
 #### INT8 KV cache
 INT8 KV cache could be enabled to reduce memory footprint. It will bring more performance gains when batch size gets larger.
 
-You can get the INT8 scale of KV cache through `hf_gptj_convert.py`:
-```bash
-# Enable INT8 calibration, and save scales
-python hf_gptj_convert.py -i gptj_model -o gptj_int8_kv --calibrate-kv-cache -t float16
-```
-Now the FT-format checkpoint with INT8 KV cache scales is saved to `gptj_int8_kv/1-gpu`.
-You can pass this `gptj_int8_kv/1-gpu` directory to `build.py` through the argument called `--ft_model_dir`.
+You can get the INT8 scale of KV cache through AMMO:
 
-INT8 KV cache could be combined with either per-channel INT8/INT4 weight-only quantization or per-group INT4 quantization (which is AWQ, actually).
+```bash
+# INT8 calibration
+python ../quantization/quantize.py --model_dir ./gpt-j-6b \
+                                   --dtype float16 \
+                                   --kv_cache_dtype int8 \
+                                   --output_dir ./trt_ckpt/gptj_fp16_int8kv_tp1 \
+                                   --calib_size 512
+```
+
+And build command is identical to the common one above.
 
 **INT8 KV cache + per-channel weight-only quantization**
 
 For example, you can enable INT8 KV cache together with per-channel INT8/INT4 weight-only quantization like the following command.
 
-**NOTE**: The whole checkpoint together with INT8 KV scales are passed to `--ft_model_dir`.
 ```bash
 # Enable INT8 KV cache together with per-channel INT8 weight-only quantization
-python3 build.py --dtype=float16 \
-                 --log_level=verbose \
-                 --enable_context_fmha \
-                 --use_gpt_attention_plugin float16 \
-                 --use_gemm_plugin float16 \
-                 --max_batch_size=32 \
-                 --max_input_len=1919 \
-                 --max_output_len=128 \
-                 --remove_input_padding \
-                 --output_dir=gptj_engine_wo_int8_kv_cache \
-                 --use_weight_only \
-                 --weight_only_precision=int8 \
-                 --int8_kv_cache \
-                 --ft_model_dir=gptj_int8_kv/1-gpu/
+python ../quantization/quantize.py --model_dir ./gpt-j-6b \
+                                   --dtype float16 \
+                                   --qformat int4_wo \
+                                   --kv_cache_dtype int8 \
+                                   --output_dir ./trt_ckpt/gptj_int4wo_int8kv_tp1 \
+                                   --calib_size 512
 ```
+
+Building command is identical to the common one above.
 
 **INT8 KV cache + AWQ**
 
 In addition, you can enable INT8 KV cache together with AWQ (per-group INT4 weight-only quantization)like the following command.
 
-**NOTE**: AWQ checkpoint is passed through `--quant_ckpt_path`, and the INT8 scales of KV cache is through `--ft_model_dir`. Both files are generated with the same command as sections above.
-
 ```bash
-# Enable INT8 KV cache together with AWQ
-python3 build.py --dtype=float16 \
-                 --log_level=verbose \
-                 --enable_context_fmha \
-                 --use_gpt_attention_plugin float16 \
-                 --use_gemm_plugin float16 \
-                 --max_batch_size=32 \
-                 --max_input_len=1919 \
-                 --max_output_len=128 \
-                 --remove_input_padding \
-                 --output_dir=gptj_engine_awq_int8_kv_cache/ \
-                 --use_weight_only \
-                 --per_group \
-                 --weight_only_precision int4_awq \
-                 --quant_ckpt_path awq/gptj_tp1_rank0.npz \
-                 --quantize_lm_head \
-                 --int8_kv_cache \
-                 --ft_model_dir gptj_int8_kv/1-gpu/ \
-                 --model_dir gptj_model
+# Enable INT8 KV cache together with group-wise 4bit AWQ quantization
+python ../quantization/quantize.py --model_dir ./gpt-j-6b \
+                                   --dtype float16 \
+                                   --qformat int4_awq \
+                                   --kv_cache_dtype int8 \
+                                   --output_dir ./trt_ckpt/gptj_int4awq_int8kv_tp1 \
+                                   --calib_size 512
 ```
 
-#### FP8 KV cache
-
-One can enable FP8 for KV cache to reduce memory footprint used by KV cache and improve the accuracy over INT8 KV cache. There are 3 options need to be added to the invocation of `build.py` for that:
-
-- `--enable_fp8` enables FP8 GEMMs in the network.
-- `--fp8_kv_cache` to enable FP8 accuracy for KV cache.
-- `--quantized_fp8_model_path` to provide path to the quantized model calibrated for FP8. For more details see [quantization docs](../quantization/README.md).
+Building command is identical to the common one above.
 
 
 ### 3. Run
@@ -273,8 +233,8 @@ The summarization can be done using the [`../summarize.py`](../summarize.py) scr
 
 ```bash
 # Run the summarization task.
-python3 ../summarize.py --engine_dir gptj_engine \
-                        --hf_model_dir gptj_model \
+python3 ../summarize.py --engine_dir ./trt_engines/gptj_fp16_tp1 \
+                        --hf_model_dir ./gpt-j-6b \
                         --test_hf \
                         --batch_size 1 \
                         --test_trt_llm \

@@ -168,9 +168,13 @@ protected:
     template <typename T, typename KVCacheBuffer>
     int enqueueGeneration(const EnqueueGenerationParams<T, KVCacheBuffer>& params, cudaStream_t stream);
 
+    // Called in configurePlugin().
+    template <typename T, typename KVCacheBuffer>
+    void prepareEnqueueGeneration(const EnqueueGenerationParams<T, KVCacheBuffer>& params);
+
     template <typename T, typename KVCacheBuffer>
     bool convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams& xqaParams,
-        const EnqueueGenerationParams<T, KVCacheBuffer>& generationsParams);
+        const EnqueueGenerationParams<T, KVCacheBuffer>& generationsParams, bool forConfigurePlugin);
 
     bool isRelativePosition() const
     {

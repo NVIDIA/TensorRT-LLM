@@ -57,6 +57,7 @@ class TestPluginNoCache(unittest.TestCase):
             precision=dtype,
         )
         net = builder.create_network()
+        net.plugin_config.to_legacy_setting()
         net.plugin_config.set_gpt_attention_plugin(dtype)
         net.plugin_config.set_context_fmha(context_fmha_type)
         net.plugin_config.remove_input_padding = remove_input_padding

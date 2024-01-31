@@ -73,14 +73,12 @@ python3 convert_checkpoint.py --model_dir ./falcon/7b-instruct \
 python3 convert_checkpoint.py --model_dir ./falcon/40b-instruct \
                 --dtype bfloat16 \
                 --output_dir ./falcon/40b-instruct/trt_ckpt/bf16/tp2-pp1/ \
-                --world_size 2 \
                 --tp_size 2
 
 # falcon-40b-instruct: 2-way tensor parallelism and 2-way pipeline parallelism
 python3 convert_checkpoint.py --model_dir ./falcon/40b-instruct \
                 --dtype bfloat16 \
                 --output_dir ./falcon/40b-instruct/trt_ckpt/bf16/tp2-pp2/ \
-                --world_size 4 \
                 --tp_size 2 \
                 --pp_size 2
 
@@ -88,7 +86,6 @@ python3 convert_checkpoint.py --model_dir ./falcon/40b-instruct \
 python3 convert_checkpoint.py --model_dir ./falcon/180b \
                 --dtype bfloat16 \
                 --output_dir ./falcon/180b/trt_ckpt/bf16/tp8-pp1/ \
-                --world_size 8 \
                 --tp_size 8 \
                 --load_by_shard \
                 --workers 8
@@ -97,7 +94,6 @@ python3 convert_checkpoint.py --model_dir ./falcon/180b \
 python3 convert_checkpoint.py --model_dir ./falcon/180b \
                 --dtype bfloat16 \
                 --output_dir ./falcon/180b/trt_ckpt/bf16/tp4-pp2/ \
-                --world_size 8 \
                 --tp_size 4 \
                 --pp_size 2 \
                 --load_by_shard \
@@ -115,53 +111,53 @@ Normally, the `trtllm-build` command only requires a single GPU, but you can ena
 
 ```bash
 # falcon-rw-1b
-# It is recommend to use --remove_input_padding along with --use_gpt_attention_plugin for better performance
+# It is recommend to use --remove_input_padding along with --gpt_attention_plugin for better performance
 trtllm-build --checkpoint_dir ./falcon/rw-1b/trt_ckpt/fp16/1-gpu/ \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --use_gemm_plugin float16 \
+                --remove_input_padding enable \
+                --gpt_attention_plugin float16 \
+                --gemm_plugin float16 \
                 --output_dir ./falcon/rw-1b/trt_engines/fp16/1-gpu/
 
 # falcon-7b-instruct
-# Enabling --use_gpt_attention_plugin is necessary for rotary positional embedding (RoPE)
+# Enabling --gpt_attention_plugin is necessary for rotary positional embedding (RoPE)
 trtllm-build --checkpoint_dir ./falcon/7b-instruct/trt_ckpt/bf16/1-gpu/ \
-                --use_gemm_plugin bfloat16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin bfloat16 \
-                --enable_context_fmha \
+                --gemm_plugin bfloat16 \
+                --remove_input_padding enable \
+                --gpt_attention_plugin bfloat16 \
+                --context_fmha enable \
                 --output_dir ./falcon/7b-instruct/trt_engines/bf16/1-gpu/
 
 # falcon-40b-instruct: 2-way tensor parallelism
 trtllm-build --checkpoint_dir ./falcon/40b-instruct/trt_ckpt/bf16/tp2-pp1/ \
-                --use_gemm_plugin bfloat16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin bfloat16 \
-                --enable_context_fmha \
+                --gemm_plugin bfloat16 \
+                --remove_input_padding enable \
+                --gpt_attention_plugin bfloat16 \
+                --context_fmha enable \
                 --output_dir ./falcon/40b-instruct/trt_engines/bf16/tp2-pp1/
 
 # falcon-40b-instruct: 2-way tensor parallelism and 2-way pipeline parallelism
 trtllm-build --checkpoint_dir ./falcon/40b-instruct/trt_ckpt/bf16/tp2-pp2/ \
-                --use_gemm_plugin bfloat16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin bfloat16 \
-                --enable_context_fmha \
+                --gemm_plugin bfloat16 \
+                --remove_input_padding enable \
+                --gpt_attention_plugin bfloat16 \
+                --context_fmha enable \
                 --output_dir ./falcon/40b-instruct/trt_engines/bf16/tp2-pp2/
 
 # falcon-180b: 8-way tensor parallelism
 trtllm-build --checkpoint_dir ./falcon/180b/trt_ckpt/bf16/tp8-pp1/ \
-                --use_gemm_plugin bfloat16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin bfloat16 \
-                --enable_context_fmha \
+                --gemm_plugin bfloat16 \
+                --remove_input_padding enable \
+                --gpt_attention_plugin bfloat16 \
+                --context_fmha enable \
                 --output_dir ./falcon/180b/trt_engines/bf16/tp8-pp1/ \
                 --workers 8
 
 # falcon-180b: 4-way tensor parallelism and 2-way pipeline parallelism
 trtllm-build --checkpoint_dir ./falcon/180b/trt_ckpt/bf16/tp4-pp2/ \
-                --use_gemm_plugin bfloat16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin bfloat16 \
-                --enable_context_fmha \
+                --gemm_plugin bfloat16 \
+                --remove_input_padding enable \
+                --gpt_attention_plugin bfloat16 \
+                --context_fmha enable \
                 --output_dir ./falcon/180b/trt_engines/bf16/tp4-pp2/ \
                 --workers 8
 ```
@@ -236,46 +232,32 @@ The examples below use the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit 
 
 First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
-Now quantize HF Falcon weights as follows.
-After successfully running the script, the output should be in .npz format, e.g. `quantized_fp8/falcon_tp_1_rank0.npz`,
-where FP8 scaling factors are stored.
+Now quantize HF Falcon weights and export trtllm checkpoint.
 
 ```bash
-# Quantize HF Falcon 180B checkpoint into FP8 and export a single-rank checkpoint
-python examples/quantization/quantize.py --model_dir falcon/180b \
-                                         --dtype float16 \
-                                         --qformat fp8 \
-                                         --export_path quantized_fp8 \
-                                         --calib_size 16
-
-# Convert the HF weights and AMMO quantization scales to trtllm checkpoint
-python3 convert_checkpoint.py --model_dir ./falcon/180b \
+# Quantize HF Falcon 180B checkpoint into FP8 and export trtllm checkpoint
+python ../quantization/quantize.py --model_dir ./falcon/180b \
                 --dtype float16 \
-                --ammo_quant_ckpt_path ./quantized_fp8/falcon_tp1_rank0.npz \
-                --enable_fp8 \
-                --fp8_kv_cache \
-                --output_dir ./falcon/180b/trt_ckpt/fp8/tp8-pp1/ \
-                --world_size 8 \
-                --tp_size 4 \
-                --pp_size 2 \
-                --load_by_shard \
-                --workers 8
+                --qformat fp8 \
+                --kv_cache_dtype fp8 \
+                --output_dir ./falcon/180b/trt_ckpt/fp8/tp8-pp1 \
+                --tp_size 8
 
 # Build trtllm engines from the trtllm checkpoint
-trtllm-build --checkpoint_dir ./falcon/180b/trt_ckpt/fp8/tp8-pp1/ \
-                --use_gemm_plugin bfloat16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin bfloat16 \
-                --enable_context_fmha \
+trtllm-build --checkpoint_dir ./falcon/180b/trt_ckpt/fp8/tp8-pp1 \
+                --gemm_plugin float16 \
+                --remove_input_padding enable \
+                --gpt_attention_plugin float16 \
+                --context_fmha enable \
                 --strongly_typed \
-                --output_dir ./falcon/180b/trt_engines/bf16/tp4-pp2/ \
+                --output_dir ./falcon/180b/trt_engines/fp8/tp8-pp1 \
                 --workers 8
 
 # Run the summarization task
 mpirun -n 8 --allow-run-as-root --oversubscribe \
     python ../summarize.py --test_trt_llm \
-                           --hf_model_dir ./falcon/180b \
-                           --engine_dir ./falcon/180b/trt_engines/bf16/tp4-pp2/
+                --hf_model_dir ./falcon/180b \
+                --engine_dir ./falcon/180b/trt_engines/fp8/tp8-pp1
 ```
 
 ### Groupwise quantization (AWQ)
@@ -284,46 +266,30 @@ The examples below use the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit 
 
 First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
-Now quantize HF Falcon weights as follows.
-After successfully running the script, the output should be in .npz format, e.g. `quantized_int4_awq/falcon_tp1_rank0.npz`,
-where INT4 AWQ scaling factors are stored.
+Now quantize HF Falcon weights and export trtllm checkpoint.
 
 ```bash
-# Quantize HF Falcon 180B checkpoint into INT4-AWQ and export a single-rank checkpoint
-python quantize.py --model_dir ./falcon/180b \
-                   --dtype float16 \
-                   --qformat int4_awq \
-                   --export_path quantized_int4_awq \
-                   --calib_size 16
-
-# Convert the HF weights and AMMO quantization scales to trtllm checkpoint
-python3 convert_checkpoint.py --model_dir ./falcon/180b \
-                              --dtype float16 \
-                              --ammo_quant_ckpt_path ./quantized_int4_awq/falcon_tp1_rank0.npz \
-                              --use_weight_only \
-                              --weight_only_precision int4_awq \
-                              --per_group \
-                              --output_dir ./falcon/180b/trt_ckpt/int4_awq/tp2/ \
-                              --world_size 2 \
-                              --tp_size 2 \
-                              --pp_size 1 \
-                              --load_by_shard \
-                              --workers 2
+# Quantize HF Falcon 180B checkpoint into INT4-AWQ and export trtllm checkpoint
+python ../quantization/quantize.py --model_dir ./falcon/180b \
+                --dtype float16 \
+                --qformat int4_awq \
+                --output_dir ./falcon/180b/trt_ckpt/int4_awq/tp2 \
+                --tp_size 2
 
 # Build trtllm engines from the trtllm checkpoint
-trtllm-build --checkpoint_dir ./falcon/180b/trt_ckpt/int4_awq/tp2/ \
-             --use_gemm_plugin float16 \
-             --remove_input_padding \
-             --use_gpt_attention_plugin float16 \
-             --enable_context_fmha \
-             --output_dir ./falcon/180b/trt_engines/int4_awq/tp2/ \
-             --workers 2
+trtllm-build --checkpoint_dir ./falcon/180b/trt_ckpt/int4_awq/tp2 \
+                --gemm_plugin float16 \
+                --remove_input_padding enable \
+                --gpt_attention_plugin float16 \
+                --context_fmha enable \
+                --output_dir ./falcon/180b/trt_engines/int4_awq/tp2 \
+                --workers 2
 
 # Run the summarization task
 mpirun -n 2 --allow-run-as-root --oversubscribe \
     python ../summarize.py --test_trt_llm \
-                           --hf_model_dir ./falcon/180b \
-                           --engine_dir ./falcon/180b/trt_engines/int4_awq/tp2/
+                --hf_model_dir ./falcon/180b \
+                --engine_dir ./falcon/180b/trt_engines/int4_awq/tp2
 ```
 
 ## Troubleshooting

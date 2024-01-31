@@ -129,6 +129,28 @@ private:
     CudaStreamPtr mCudaStream;
 };
 
+class UVMAllocator : public BaseAllocator<UVMAllocator, MemoryType::kUVM>
+{
+    friend class BaseAllocator<UVMAllocator, MemoryType::kUVM>;
+
+public:
+    using Base = BaseAllocator<UVMAllocator, MemoryType::kUVM>;
+    UVMAllocator() noexcept = default;
+
+protected:
+    void allocateImpl(PointerType* ptr, SizeType n) // NOLINT(readability-convert-member-functions-to-static)
+    {
+        TLLM_CUDA_CHECK(::cudaMallocManaged(ptr, n));
+        // TLLM_CUDA_CHECK(::cudaMemAdvise(ptr, n, cudaMemAdviseSetPreferredLocation, 0));
+    }
+
+    void deallocateImpl( // NOLINT(readability-convert-member-functions-to-static)
+        PointerType ptr, [[maybe_unused]] SizeType n)
+    {
+        TLLM_CUDA_CHECK(::cudaFree(ptr));
+    }
+};
+
 class PinnedAllocator : public BaseAllocator<PinnedAllocator, MemoryType::kPINNED>
 {
     friend class BaseAllocator<PinnedAllocator, MemoryType::kPINNED>;
@@ -218,6 +240,8 @@ private:
 using CpuBorrowingAllocator = BorrowingAllocator<MemoryType::kCPU>;
 using GpuBorrowingAllocator = BorrowingAllocator<MemoryType::kGPU>;
 using PinnedBorrowingAllocator = BorrowingAllocator<MemoryType::kPINNED>;
+
+// using UVMBorrowingAllocator = BorrowingAllocator<MemoryType::kUVM>;
 
 /**
  * A memory manager that acts as a memory pool, preallocating a configurable
@@ -364,10 +388,10 @@ void MemoryPool<TAllocator>::allocateImpl(MemoryPool::PointerType* ptr, MemoryPo
         // chunkResizeFactor
         // Allocate more space in mChunkSize, and fulfill this request
         TLLM_LOG_DEBUG("MemoryPool: Needs more space to accommodate request of %zu B", requestedSize);
-        auto const chunkUnitSize = alignedRequest * kChunkResizeFactor;
-        if (mChunkSize < chunkUnitSize)
+        auto const minChunkSize = alignedRequest * kChunkResizeFactor;
+        if (mChunkSize < minChunkSize)
         {
-            mChunkSize = chunkUnitSize;
+            mChunkSize = minChunkSize;
             TLLM_LOG_DEBUG("MemoryPool: Increasing chunk size to %zu B", mChunkSize);
         }
         allocateChunk();
@@ -652,6 +676,7 @@ using DeviceBuffer = GenericBuffer<CudaAllocatorAsync>;
 using HostBuffer = GenericBuffer<HostAllocator>;
 using PinnedBuffer = GenericBuffer<PinnedAllocator>;
 using PinnedPoolBuffer = GenericBuffer<PinnedPoolAllocator>;
+using UVMBuffer = GenericBuffer<UVMAllocator>;
 
 template <typename T>
 typename std::make_unsigned<T>::type nonNegative(T value)
@@ -740,5 +765,6 @@ using DeviceTensor = GenericTensor<CudaAllocatorAsync>;
 using HostTensor = GenericTensor<HostAllocator>;
 using PinnedTensor = GenericTensor<PinnedAllocator>;
 using PinnedPoolTensor = GenericTensor<PinnedPoolAllocator>;
+using UVMTensor = GenericTensor<UVMAllocator>;
 
 } // namespace tensorrt_llm::runtime

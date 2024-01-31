@@ -152,19 +152,10 @@ find_library(
   CUDNN_LIB cudnn
   HINTS ${CUDNN_ROOT_DIR} ${CUDAToolkit_LIBRARY_DIR}
   PATH_SUFFIXES lib64 lib lib/x64)
-find_library(
-  CUBLAS_LIB cublas
-  HINTS ${CUDAToolkit_LIBRARY_DIR}
-  PATH_SUFFIXES lib64 lib lib/stubs)
-find_library(
-  CUBLASLT_LIB cublasLt
-  HINTS ${CUDAToolkit_LIBRARY_DIR}
-  PATH_SUFFIXES lib64 lib lib/stubs)
-find_library(
-  CUDA_DRV_LIB cuda
-  HINTS ${CUDAToolkit_LIBRARY_DIR}
-  PATH_SUFFIXES stubs lib lib64 lib/stubs lib64/stubs)
-
+set(CUBLAS_LIB CUDA::cublas)
+set(CUBLASLT_LIB CUDA::cublasLt)
+set(CUDA_DRV_LIB CUDA::cuda_driver)
+set(CUDA_RT_LIB CUDA::cudart_static)
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
 find_library(RT_LIB rt)

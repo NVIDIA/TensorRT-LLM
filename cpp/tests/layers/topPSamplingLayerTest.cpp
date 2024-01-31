@@ -35,8 +35,8 @@ class TopPSamplingLayerTest : public SamplingLayerTest<T>
         cudaGetDevice(&device);
         cudaGetDeviceProperties(&mDeviceProp, device);
 
-        this->mSamplingLayer = std::make_shared<tensorrt_llm::layers::TopPSamplingLayer<T>>(
-            this->mVocabSize, this->mVocabSizePadded, this->mStream->get(), this->mAllocator, false, &mDeviceProp);
+        this->mSamplingLayer = std::make_shared<tensorrt_llm::layers::TopPSamplingLayer<T>>(this->mMaxBatchSize,
+            this->mVocabSize, this->mVocabSizePadded, this->mStream->get(), this->mAllocator, &mDeviceProp);
     }
 
     struct cudaDeviceProp mDeviceProp;

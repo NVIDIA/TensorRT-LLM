@@ -43,7 +43,7 @@ python3 convert_checkpoint.py --model_dir ./gptneox_model \
 # With 2-way Tensor Parallel
 python3 convert_checkpoint.py --model_dir ./gptneox_model \
                               --dtype float16 \
-                              --world_size 2 \
+                              --tp_size 2 \
                               --workers 2 \
                               --output_dir ./gptneox/20B/trt_ckpt/fp16/2-gpu/
 # Single GPU with int8 weight only
@@ -55,7 +55,7 @@ python3 convert_checkpoint.py --model_dir ./gptneox_model \
 python3 convert_checkpoint.py --model_dir ./gptneox_model \
                               --dtype float16 \
                               --use_weight_only \
-                              --world_size 2 \
+                              --tp_size 2 \
                               --workers 2 \
                               --output_dir ./gptneox/20B/trt_ckpt/int8_wo/2-gpu/
 ```
@@ -64,16 +64,16 @@ python3 convert_checkpoint.py --model_dir ./gptneox_model \
 ```bash
 # Single GPU
 trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/fp16/1-gpu/ \
-             --use_gemm_plugin float16 \
-             --use_gpt_attention_plugin float16 \
+             --gemm_plugin float16 \
+             --gpt_attention_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
              --output_dir ./gptneox/20B/trt_engines/fp16/1-gpu/
 # With 2-way Tensor Parallel
 trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/fp16/2-gpu/ \
-             --use_gemm_plugin float16 \
-             --use_gpt_attention_plugin float16 \
+             --gemm_plugin float16 \
+             --gpt_attention_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -81,16 +81,16 @@ trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/fp16/2-gpu/ \
              --output_dir ./gptneox/20B/trt_engines/fp16/2-gpu/
 # Single GPU with int8 weight only
 trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int8_wo/1-gpu/ \
-             --use_gemm_plugin float16 \
-             --use_gpt_attention_plugin float16 \
+             --gemm_plugin float16 \
+             --gpt_attention_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
              --output_dir ./gptneox/20B/trt_engines/int8_wo/1-gpu/
 # With 2-way Tensor Parallel with int8 weight only
 trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int8_wo/2-gpu/ \
-             --use_gemm_plugin float16 \
-             --use_gpt_attention_plugin float16 \
+             --gemm_plugin float16 \
+             --gpt_attention_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -165,7 +165,7 @@ python3 convert_checkpoint.py --model_dir ./gptneox_model \
                               --dtype float16 \
                               --use_weight_only \
                               --weight_only_precision int4_gptq \
-                              --world_size 2 \
+                              --tp_size 2 \
                               --workers 2 \
                               --ammo_quant_ckpt_path ./gptneox_model/gptneox-20b-4bit-gs128.safetensors \
                               --output_dir ./gptneox/20B/trt_ckpt/int4_gptq/2-gpu/
@@ -178,16 +178,16 @@ The command to build TensorRT engines to apply GPTQ are almost no change:
 ```bash
 # Single GPU
 trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int4_gptq/1-gpu/ \
-             --use_gemm_plugin float16 \
-             --use_gpt_attention_plugin float16 \
+             --gemm_plugin float16 \
+             --gpt_attention_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
              --output_dir ./gptneox/20B/trt_engines/int4_gptq/1-gpu/
 # With 2-way Tensor Parallel
 trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int4_gptq/2-gpu/ \
-             --use_gemm_plugin float16 \
-             --use_gpt_attention_plugin float16 \
+             --gemm_plugin float16 \
+             --gpt_attention_plugin float16 \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \

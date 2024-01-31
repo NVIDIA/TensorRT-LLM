@@ -40,6 +40,7 @@ public:
         , mNbHeads(nbHeads)
         , mNbKvHeads(nbHeads)
         , mHiddenSize(hiddenSize)
+        , mSizePerHead(mHiddenSize / mNbHeads)
         , mDataType(dtype)
         , mUseGptAttentionPlugin(false)
         , mInputPacked{false}
@@ -60,7 +61,6 @@ public:
         , mUseContextFMHAForGeneration(false)
         , mPagedContextFMHA(false)
         , mUseLoraPlugin(false)
-        , mLoraModules(std::vector<LoraModule>{})
         , mMlpHiddenSize(0)
     {
     }
@@ -103,7 +103,12 @@ public:
 
     [[nodiscard]] SizeType constexpr getSizePerHead() const noexcept
     {
-        return mHiddenSize / mNbHeads;
+        return mSizePerHead;
+    }
+
+    void constexpr setSizePerHead(SizeType sizePerHead) noexcept
+    {
+        mSizePerHead = sizePerHead;
     }
 
     [[nodiscard]] nvinfer1::DataType constexpr getDataType() const noexcept
@@ -342,6 +347,7 @@ private:
     SizeType mNbHeads;
     SizeType mNbKvHeads;
     SizeType mHiddenSize;
+    SizeType mSizePerHead;
     nvinfer1::DataType mDataType;
     bool mUseGptAttentionPlugin;
     bool mInputPacked;

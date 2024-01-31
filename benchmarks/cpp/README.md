@@ -69,16 +69,44 @@ If you want to get the logits, you could run gptSessionBenchmark with `--print_a
 
 #### Prepare dataset
 
-Run a preprocessing script to prepare dataset. This script converts the prompts(string) in the dataset to input_ids.
+Run a preprocessing script to prepare/generate dataset into a json that gptManagerBenchmark can consume later. The processed output json has *input token ids, output tokens length and time delays* to control request rate by gptManagerBenchmark.
+
+This tool can be used in 2 different modes of traffic generation.
+
+1 – Dataset
+
+“Prompt”, “Instruction” (optional) and “Answer” specified as sentences in a Json file
+
+The tool will tokenize the words and instruct the model to generate a specified number of output tokens for a request.
+
 ```
 python3 prepare_dataset.py \
-    --dataset <path/to/dataset> \
-    --max_input_len 300 \
-    --tokenizer_dir <path/to/tokenizer> \
-    --tokenizer_type auto \
     --output preprocessed_dataset.json
+    --request-rate 10 \
+    --time-delay-dist exponential_dist \
+    --tokenizer <path/to/tokenizer> \
+    dataset
+    --dataset <path/to/dataset> \
+    --max-input-len 300
 ```
-For `tokenizer_dir`, specifying the path to the local tokenizer that have already been downloaded, or simply the name of the tokenizer from HuggingFace like `gpt2` will both work. The tokenizer will be downloaded automatically for the latter case.
+
+2 – Normal token length distribution
+
+This mode allows the user to generate normal token length distributions with a mean and std deviation specified.
+For example, setting mean=100 and std dev=10 would generate requests where 95.4% of values are in <80,120> range following the normal probability distribution. Setting std dev=0 will generate all requests with the same mean number of tokens.
+
+```
+ python prepare_dataset.py \
+  --output token-norm-dist.json \
+  --request-rate 10 \
+  --time-delay-dist constant \
+  --tokenizer <path/to/tokenizer> \
+   token-norm-dist \
+   --num-requests 100 \
+   --input-mean 100 --input-stdev 10 --output-mean 15 --output-stdev 0 --num-requests 100
+```
+
+For `tokenizer`, specifying the path to the local tokenizer that have already been downloaded, or simply the name of the tokenizer from HuggingFace like `meta-llama/Llama-2-7b` will both work. The tokenizer will be downloaded automatically for the latter case.
 
 #### Prepare TensorRT-LLM engines
 Please make sure that the engines are built with argument `--use_inflight_batching` and `--remove_input_padding` if you'd like to benchmark inflight batching, for more details, please see the document in TensorRT-LLM examples.
@@ -100,6 +128,7 @@ Take GPT-350M as an example for single GPU V1 batching
     --engine_dir ../../examples/gpt/trt_engine/gpt2/fp16/1-gpu/ \
     --type V1 \
     --dataset ../../benchmarks/cpp/preprocessed_dataset.json
+    --max_num_samples 500
 ```
 
 Take GPT-350M as an example for 2-GPU inflight batching
@@ -109,4 +138,5 @@ mpirun -n 2 ./benchmarks/gptManagerBenchmark \
     --engine_dir ../../examples/gpt/trt_engine/gpt2-ib/fp16/2-gpu/ \
     --type IFB \
     --dataset ../../benchmarks/cpp/preprocessed_dataset.json
+    --max_num_samples 500
 ```

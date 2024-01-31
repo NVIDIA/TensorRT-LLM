@@ -21,40 +21,45 @@ git lfs install
 git clone https://huggingface.co/mistralai/Mixtral-8x7B-v0.1
 ```
 
-We use the LLaMA `build.py` script to build the model. TensorRT-LLM LLaMA builds TensorRT engine(s) from HF checkpoint provided by `--model_dir`.
+We use the LLaMA `convert_checkpoint.py` script to convert and build the model. TensorRT-LLM LLaMA builds TensorRT engine(s) from HF checkpoint provided by `--model_dir`.
 If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
 
-`--use_inflight_batching` is a shortcut for `--use_gpt_attention_plugin`, `--remove_input_padding` and `--paged_kv_cache`
-
-`build.py` uses one GPU by default, but if you have already more GPUs available at build time,
-you may enable parallel builds to make the engine building process faster by adding the `--parallel_build` argument.
+`trtllm-build` uses one GPU by default, but if you have already more GPUs available at build time,
+you may enable parallel builds to make the engine building process faster by adding the `--workers` argument.
 
 Here are some examples:
+
 ```
 # Build Mixtral8x7B with pipeline parallelism
-python ../llama/build.py --model_dir ./Mixtral-8x7B-v0.1 \
-                --use_inflight_batching \
-                --enable_context_fmha \
-                --use_gemm_plugin \
-                --world_size 2 \
-                --pp_size 2 \
-                --output_dir ./trt_engines/mixtral/PP
+python convert_checkpoint.py --model_dir ./Mixtral-8x7B-v0.1 \
+                             --output_dir ./tllm_checkpoint_mixtral_2gpu \
+                             --dtype float16 \
+                             --world_size 2 \
+                             --Pp_size 2
+trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_2gpu \
+                 --output_dir ./trt_engines/mixtral/pp2 \
+                 --gpt_attention_plugin float16 \
+                 --gemm_plugin float16
 
+```
 
+```
 # Build Mixtral8x7B with tensor parallelism
-python ../llama/build.py --model_dir ./Mixtral-8x7B-v0.1 \
-                --use_inflight_batching \
-                --enable_context_fmha \
-                --use_gemm_plugin \
-                --world_size 2 \
-                --tp_size 2 \
-                --output_dir ./trt_engines/mixtral/TP
+python convert_checkpoint.py --model_dir ./Mixtral-8x7B-v0.1 \
+                             --output_dir ./tllm_checkpoint_mixtral_2gpu \
+                             --dtype float16 \
+                             --world_size 2 \
+                             --tp_size 2
+trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_2gpu \
+                 --output_dir ./trt_engines/mixtral/tp2 \
+                 --gpt_attention_plugin float16 \
+                 --gemm_plugin float16
 ```
 
 Then, you can test your engine with the [run.py](./examples/run.py) script:
 
 ```
-mpirun -n 2 python3 ../run.py --engine_dir ./trt_engines/mixtral/TP --tokenizer_dir ./Mixtral-8x7B-v0.1 --max_output_len 8 --input_text "I love french quiche"
+mpirun -n 2 python3 ../run.py --engine_dir ./trt_engines/mixtral/tp2 --tokenizer_dir ./Mixtral-8x7B-v0.1 --max_output_len 8 --input_text "I love french quiche"
 ```
 
 

@@ -59,7 +59,6 @@ typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferMan
     int localBatchSize, std::vector<int>& cpuOutputIds, std::vector<float> cpuLogits, int noRepeatNgramSizeValue = 0)
 {
     constexpr int endId = 1;
-    constexpr bool isFreeBufferAfterForward{false};
     cudaDeviceProp prop;
     tc::check_cuda_error(cudaGetDeviceProperties(&prop, 0));
 
@@ -97,11 +96,11 @@ typename tl::DynamicDecodeLayer<float>::OutputParams dynamicDecodeTest(BufferMan
     tc::Tensor noRepeatNgramSize{tc::MEMORY_GPU, tc::TYPE_INT32, {batchSize}, gpuNoRepeatNgramSize};
 
     auto ddLayer = tl::DynamicDecodeLayer<float>(
-        vocabSize, vocabSizePadded, manager.getStream().get(), allocator, isFreeBufferAfterForward, &prop);
+        batchSize, vocabSize, vocabSizePadded, manager.getStream().get(), allocator, &prop);
 
     typename tl::DynamicDecodeLayer<float>::SetupParams setupParams;
 
-    ddLayer.setup(batchSize, beamWidth, setupParams);
+    ddLayer.setup(batchSize, beamWidth, nullptr, setupParams);
 
     typename tl::DynamicDecodeLayer<float>::ForwardParams forwardParams(
         step, ite, maxInputLength, static_cast<int>(maxSeqLength), sinkTokenLength, localBatchSize, logits, endIds);

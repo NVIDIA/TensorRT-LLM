@@ -1,63 +1,75 @@
-#!/usr/bin/python
+from typing import Literal
 
-import argparse
-import json
+import click
+from pydantic import BaseModel, field_validator
+from transformers import AutoTokenizer
+from utils.prepare_real_data import dataset
+from utils.prepare_synthetic_data import token_norm_dist
+from utils.utils import get_req_time_interval
 
-from transformers import AutoTokenizer, LlamaTokenizer, T5Tokenizer
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset',
-                        type=str,
-                        required=True,
-                        help='Dataset path used for the test.')
-    parser.add_argument('--max_input_len',
-                        type=int,
-                        required=True,
-                        help='Specify max input length')
-    parser.add_argument('--tokenizer_dir',
-                        type=str,
-                        required=True,
-                        help='Specify tokenizer directory')
-    parser.add_argument('--tokenizer_type',
-                        type=str,
-                        default='auto',
-                        required=False,
-                        choices=['auto', 't5', 'llama'],
-                        help='Specify tokenizer type')
-    parser.add_argument('--output',
-                        type=str,
-                        default='preprocessed_dataset.json',
-                        help='Preprocessed dataset path.')
-    FLAGS = parser.parse_args()
+class RootArgs(BaseModel):
+    tokenizer: str
+    output: str
+    request_rate: float
+    mean_time_bet_reqs: float
+    time_delay_dist: Literal["constant", "exponential_dist"]
+    random_seed: int
 
-    if FLAGS.tokenizer_type == 't5':
-        tokenizer = T5Tokenizer(vocab_file=FLAGS.tokenizer_dir,
-                                padding_side='left')
-    elif FLAGS.tokenizer_type == 'auto':
-        tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer_dir,
-                                                  padding_side='left')
-    elif FLAGS.tokenizer_type == 'llama':
-        tokenizer = LlamaTokenizer.from_pretrained(FLAGS.tokenizer_dir,
-                                                   legacy=False,
-                                                   padding_side='left')
-    else:
-        raise AttributeError(
-            f'Unexpected tokenizer type: {FLAGS.tokenizer_type}')
-    tokenizer.pad_token = tokenizer.eos_token
+    @field_validator('tokenizer')
+    def get_tokenizer(cls, v: str):
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(v, padding_side='left')
+        except EnvironmentError:
+            raise ValueError(
+                "Cannot find a tokenizer from the given string. Please set tokenizer to the directory that contains the tokenizer, or set to a model name in HuggingFace."
+            )
+        tokenizer.pad_token = tokenizer.eos_token
+        return tokenizer
 
-    results = []
-    with open(FLAGS.dataset, 'r') as f:
-        data_dict = json.load(f)
-        for req in data_dict:
-            prompt = req['input'] + ' ' + req['instruction']
-            output = req['output']
-            line = tokenizer.encode(prompt)
-            if len(line) > FLAGS.max_input_len:
-                continue
-            # 1.3 is a magic number that converts number of words to number of tokens
-            output_len = int(len(output.split(' ')) * 1.3)
-            results.append({'input_ids': line, 'output_len': output_len})
 
-    with open(FLAGS.output, 'w') as f:
-        json.dump(results, f)
+@click.group()
+@click.option(
+    "--tokenizer",
+    required=True,
+    type=str,
+    help=
+    "Tokenizer dir for the model run by gptManagerBenchmark, or the model name from HuggingFace."
+)
+@click.option("--output",
+              type=str,
+              help="Output json filename.",
+              default="preprocessed_dataset.json")
+@click.option(
+    "--request-rate",
+    type=float,
+    help="# of reqs/sec. -1 indicates Speed of Light/Zero-delay injection rate",
+    default=-1.0)
+@click.option("--time-delay-dist",
+              type=click.Choice(["constant", "exponential_dist"]),
+              help="Distribution of the time delay.",
+              default="exponential_dist")
+@click.option(
+    "--random-seed",
+    required=False,
+    type=int,
+    help=
+    "random seed for exponential delays (dataset/norm-token-dist) and token_ids(norm-token-dist)",
+    default=420)
+@click.pass_context
+def cli(ctx, **kwargs):
+    """This script generates dataset input for gptManagerBenchmark."""
+    ctx.obj = RootArgs(tokenizer=kwargs['tokenizer'],
+                       output=kwargs['output'],
+                       request_rate=kwargs['request_rate'],
+                       mean_time_bet_reqs=get_req_time_interval(
+                           kwargs['request_rate']),
+                       time_delay_dist=kwargs['time_delay_dist'],
+                       random_seed=kwargs['random_seed'])
+
+
+cli.add_command(dataset)
+cli.add_command(token_norm_dist)
+
+if __name__ == "__main__":
+    cli()

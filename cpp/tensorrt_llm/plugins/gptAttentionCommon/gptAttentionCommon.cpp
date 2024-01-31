@@ -157,8 +157,8 @@ struct ConvertMMHAToXQAParamsHelper<__nv_bfloat16, KVBlockArray>
 #endif
 
 template <typename T, typename KVCacheBuffer>
-bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(
-    tensorrt_llm::kernels::XQAParams& xqaParams, const EnqueueGenerationParams<T, KVCacheBuffer>& generationsParams)
+bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams& xqaParams,
+    const EnqueueGenerationParams<T, KVCacheBuffer>& generationsParams, bool forConfigurePlugin)
 {
     bool retval = ConvertMMHAToXQAParamsHelper<T, KVCacheBuffer>::supported;
     if (!retval)
@@ -228,9 +228,12 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(
     xqaParams.sequence_lengths = generationsParams.sequence_lengths;
     xqaParams.context_lengths = generationsParams.context_lengths;
     xqaParams.alibi_slopes = generationsParams.alibi_slopes;
-    // Medusa (need to take new generated ids into consideration).
-    TLLM_CHECK_WITH_INFO(!mIsMedusaEnabled || generationsParams.medusa_packed_mask != nullptr,
-        "Medusa mode needs a valid packed_mask input tensor.");
+    if (!forConfigurePlugin)
+    {
+        // Medusa (need to take new generated ids into consideration).
+        TLLM_CHECK_WITH_INFO(!mIsMedusaEnabled || generationsParams.medusa_packed_mask != nullptr,
+            "Medusa mode needs a valid packed_mask input tensor.");
+    }
     xqaParams.medusa_packed_mask = generationsParams.medusa_packed_mask;
     xqaParams.medusa_position_offsets = generationsParams.medusa_position_offsets;
     return true;
@@ -1197,8 +1200,9 @@ int GPTAttentionPluginCommon::enqueueGeneration(
         // self attn
         XQAParams xqaParams{};
         if (tensorrt_llm::kernels::XQADispatchHelper<T, KVCacheBuffer>::CanSupport && mDecoderXQARunner.get() != nullptr
-            && this->template convertMMHAParamsToXQAParams<T, KVCacheBuffer>(xqaParams, params)
-            && mDecoderXQARunner->template shouldUse<T>(xqaParams))
+            && this->template convertMMHAParamsToXQAParams<T, KVCacheBuffer>(
+                xqaParams, params, /*forConfigurePlugin=*/false)
+            && mDecoderXQARunner->template shouldUse<T>(xqaParams, /*forConfigurePlugin=*/false))
         {
             TLLM_LOG_DEBUG("XQA kernels are selected in the generation phase.");
             mDecoderXQARunner->template dispatch<KVCacheBuffer>(xqaParams, kv_cache_buffer, stream);
@@ -1365,6 +1369,41 @@ template int GPTAttentionPluginCommon::enqueueGeneration<float, KVBlockArray>(
 #ifdef ENABLE_BF16
 template int GPTAttentionPluginCommon::enqueueGeneration<__nv_bfloat16, KVBlockArray>(
     const EnqueueGenerationParams<__nv_bfloat16, KVBlockArray>& params, cudaStream_t stream);
+#endif
+
+template <typename T, typename KVCacheBuffer>
+void GPTAttentionPluginCommon::prepareEnqueueGeneration(const EnqueueGenerationParams<T, KVCacheBuffer>& params)
+{
+    // self attn
+    XQAParams xqaParams{};
+    if (tensorrt_llm::kernels::XQADispatchHelper<T, KVCacheBuffer>::CanSupport && mDecoderXQARunner.get() != nullptr
+        && this->template convertMMHAParamsToXQAParams<T, KVCacheBuffer>(xqaParams, params, /*forConfigurePlugin=*/true)
+        && mDecoderXQARunner->template shouldUse<T>(xqaParams, /*forConfigurePlugin=*/true))
+    {
+        mDecoderXQARunner->prepare(xqaParams);
+    }
+}
+
+template void GPTAttentionPluginCommon::prepareEnqueueGeneration<half, KVLinearBuffer>(
+    const EnqueueGenerationParams<half, KVLinearBuffer>& params);
+
+template void GPTAttentionPluginCommon::prepareEnqueueGeneration<float, KVLinearBuffer>(
+    const EnqueueGenerationParams<float, KVLinearBuffer>& params);
+
+#ifdef ENABLE_BF16
+template void GPTAttentionPluginCommon::prepareEnqueueGeneration<__nv_bfloat16, KVLinearBuffer>(
+    const EnqueueGenerationParams<__nv_bfloat16, KVLinearBuffer>& params);
+#endif
+
+template void GPTAttentionPluginCommon::prepareEnqueueGeneration<half, KVBlockArray>(
+    const EnqueueGenerationParams<half, KVBlockArray>& params);
+
+template void GPTAttentionPluginCommon::prepareEnqueueGeneration<float, KVBlockArray>(
+    const EnqueueGenerationParams<float, KVBlockArray>& params);
+
+#ifdef ENABLE_BF16
+template void GPTAttentionPluginCommon::prepareEnqueueGeneration<__nv_bfloat16, KVBlockArray>(
+    const EnqueueGenerationParams<__nv_bfloat16, KVBlockArray>& params);
 #endif
 
 int GPTAttentionPluginCommon::initialize() noexcept

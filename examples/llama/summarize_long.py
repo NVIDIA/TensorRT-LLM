@@ -25,23 +25,19 @@ import tensorrt_llm.profiler as profiler
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization import QuantMode
 
-from build import get_engine_name  # isort:skip
-
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--hf_model_location',
                         type=str,
-                        default='/code/tensorrt_llm/models/Mistral-7B-v0.1')
+                        default='/tmp/models/Mistral-7B-v0.1')
     parser.add_argument('--test_hf', action='store_true')
     parser.add_argument('--test_trt_llm', action='store_true')
     parser.add_argument('--data_type',
                         type=str,
                         choices=['fp16'],
                         default='fp16')
-    parser.add_argument('--dataset_path',
-                        type=str,
-                        default='/code/tensorrt_llm/data')
+    parser.add_argument('--dataset_path', type=str, default='/tmp/data')
     parser.add_argument(
         '--max_attention_window_size',
         type=int,
@@ -75,29 +71,38 @@ def parse_args():
 
 
 def TRTLLaMA(args, config):
-    dtype = config['builder_config']['precision']
-    tp_size = config['builder_config']['tensor_parallel']
-    pp_size = config['builder_config']['pipeline_parallel']
+
+    pretrained_config = config['pretrained_config']
+    quantization_config = pretrained_config['quantization']
+
+    build_config = config['build_config']
+    plugin_config = build_config['plugin_config']
+
+    dtype = pretrained_config['dtype']
+    tp_size = pretrained_config['mapping']['tp_size']
+    pp_size = pretrained_config['mapping']['pp_size']
     world_size = tp_size * pp_size
 
     assert world_size == tensorrt_llm.mpi_world_size(), \
         f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
 
-    num_heads = config['builder_config']['num_heads'] // tp_size
-    hidden_size = config['builder_config']['hidden_size'] // tp_size
-    vocab_size = config['builder_config']['vocab_size']
-    num_layers = config['builder_config']['num_layers']
-    use_gpt_attention_plugin = bool(
-        config['plugin_config']['gpt_attention_plugin'])
-    remove_input_padding = config['plugin_config']['remove_input_padding']
-    num_kv_heads = config['builder_config'].get('num_kv_heads', num_heads)
-    paged_kv_cache = config['plugin_config']['paged_kv_cache']
-    tokens_per_block = config['plugin_config']['tokens_per_block']
-    use_custom_all_reduce = config['plugin_config'].get('use_custom_all_reduce',
-                                                        False)
+    num_heads = pretrained_config['num_attention_heads'] // tp_size
+    hidden_size = pretrained_config['hidden_size'] // tp_size
 
-    quant_mode = QuantMode(config['builder_config']['quant_mode'])
-    if config['builder_config'].get('multi_query_mode', False):
+    max_batch_size = build_config['max_batch_size']
+    vocab_size = pretrained_config['vocab_size']
+    num_layers = pretrained_config['num_hidden_layers']
+    use_gpt_attention_plugin = bool(plugin_config['gpt_attention_plugin'])
+    remove_input_padding = plugin_config['remove_input_padding']
+    num_kv_heads = pretrained_config['num_key_value_heads']
+    paged_kv_cache = plugin_config['paged_kv_cache']
+    tokens_per_block = plugin_config['tokens_per_block']
+    use_custom_all_reduce = plugin_config.get('use_custom_all_reduce', False)
+
+    quant_mode = QuantMode.from_quant_algo(
+        quant_algo=quantization_config['quant_algo'],
+        kv_cache_quant_algo=quantization_config['kv_cache_quant_algo'])
+    if pretrained_config.get('multi_query_mode', False):
         tensorrt_llm.logger.warning(
             "`multi_query_mode` config is deprecated. Please rebuild the engine."
         )
@@ -105,6 +110,7 @@ def TRTLLaMA(args, config):
     num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
 
     model_config = tensorrt_llm.runtime.ModelConfig(
+        max_batch_size=max_batch_size,
         vocab_size=vocab_size,
         num_layers=num_layers,
         num_heads=num_heads,
@@ -125,8 +131,7 @@ def TRTLLaMA(args, config):
                                            pp_size=pp_size)
     torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
 
-    engine_name = get_engine_name('llama', dtype, tp_size, pp_size,
-                                  runtime_rank)
+    engine_name = f'rank{runtime_rank}.engine'
     serialize_path = os.path.join(args.engine_dir, engine_name)
 
     tensorrt_llm.logger.set_level(args.log_level)

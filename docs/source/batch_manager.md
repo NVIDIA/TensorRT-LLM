@@ -136,6 +136,7 @@ When using V1 batching, the following additional statistics are reported per V1 
     - `freeGpuMemoryFraction` (default: 0.9) a number between 0 and 1 to indicate the maximum fraction of GPU memory (after loading the model) that may be used for KV cache. If `maxTokens` is specified, allocated KV cache is the minimum of `maxTokens` and the value inferred from `freeGpuMemoryFraction`.
     - `enableBlockReuse` (default: `false`) allow reuse of previously computed KV cache blocks across requests. This is expected to optimize memory use and computation.
   - `enableTrtOverlap` (default: `false`) when `true`, GptManager partitions available requests into 2 'microbatches' that can be run concurrently to hide exposed CPU runtime. However, it may not give performance benefits when the size of the model is not big enough to overlap the host overhead, or when the number of requests is too small.
+  - `enableChunkedContext` (default: `false`) Whether to enable context chunking. Context chunking increases the possibility of batching the context and generation phases, which in turn improves performance. When set to `false`, it indicates that the context chunk is disabled.
 
 ### Responses content
 The responses from `SendResponseCallback` are stored in a `std::shared_ptr<Tensor>` list, which contains the following tensors of a specific request:

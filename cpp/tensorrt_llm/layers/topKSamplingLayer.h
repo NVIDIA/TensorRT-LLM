@@ -27,48 +27,55 @@ namespace tensorrt_llm
 namespace layers
 {
 
+//! \brief Layer to randomly sample tokens from TopK logits.
+//! When both TopK and TopP are specified, layer jointly samples using TopK and TopP.
+//! When no TopK param is specified, sampling is skipped for particular request.
 template <typename T>
 class TopKSamplingLayer : public BaseSamplingLayer<T>
 {
 public:
-    static constexpr uint32_t TOP_K_MAX = 1024;
     using Base = BaseSamplingLayer<T>;
     using SetupParams = typename Base::SetupParams;
 
-    TopKSamplingLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator, bool is_free_buffer_after_forward);
+    TopKSamplingLayer(size_t maxBatchSize, size_t vocabSize, size_t vocabSizePadded, cudaStream_t stream,
+        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator);
     TopKSamplingLayer(TopKSamplingLayer<T> const& top_k_sampling_layer);
     ~TopKSamplingLayer();
 
-    void setup(size_t batch_size, SetupParams const& setupParams) override;
+    void setup(size_t batchSize, int const* batch_slots, SetupParams const& setupParams) override;
 
 protected:
-    void runSampling(DecodingOutputParams& outputs, DecodingParams const& params) override;
+    void runSampling(DecodingOutputParams& outputs, DecodingParams const& inputs) override;
 
     void freeBuffer() override;
 
-    bool normalize_log_probs = true;
-    uint32_t runtime_max_top_k_ = 1;
-    uint32_t* runtime_top_k_buf_ = nullptr;
-    float* runtime_top_p_buf_ = nullptr;
-    using Base::vocab_size_;
-    using Base::vocab_size_padded_;
+protected:
+    bool mNormalizeLogProbs = true;
+    uint32_t mRuntimeMaxTopK = 1;
+    uint32_t* mRuntimeTopKDevice = nullptr;
+    float* mRuntimeTopPDevice = nullptr;
+    void* mSetupWorkspaceDevice = nullptr;
 
-    using Base::sampling_workspace_size_;
-    using Base::sampling_workspace_;
-    using Base::curandstate_buf_;
-    using Base::random_seeds_buf_;
-    using Base::skip_decode_buf_;
-    using Base::skip_decode_;
-    using Base::skip_any_;
-    using Base::runtime_logits_buf_;
+    using Base::mMaxBatchSize;
+    using Base::mVocabSize;
+    using Base::mVocabSizePadded;
 
-    using Base::stream_;
-    using Base::allocator_;
-    using Base::is_allocate_buffer_;
+    using Base::mSamplingWorkspaceSize;
+    using Base::mSamplingWorkspaceDevice;
+    using Base::mCurandStatesDevice;
+    using Base::mSkipDecodeDevice;
+    using Base::mSkipDecodeHost;
+    using Base::mSkipAny;
+    using Base::mRuntimeLogitsDevice;
+
+    using Base::mStream;
+    using Base::mAllocator;
+    using Base::mIsAllocateBuffer;
+
+    static constexpr uint32_t TOP_K_MAX = 1024;
 
 private:
-    void allocateBuffer(size_t batch_size, std::vector<uint32_t> const& top_k);
+    void allocateBuffer(size_t batchSize);
 };
 
 } // namespace layers

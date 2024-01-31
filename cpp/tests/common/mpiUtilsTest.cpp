@@ -20,6 +20,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 
 #if ENABLE_MULTI_DEVICE
+#include "tensorrt_llm/plugins/common/plugin.h"
 #include <nccl.h>
 #endif // ENABLE_MULTI_DEVICE
 
@@ -81,6 +82,11 @@ TEST(MPIUtils, BroadcastNcclId)
     comm.bcast(id, root);
     EXPECT_TRUE(std::any_of(
         id.internal, id.internal + sizeof(id.internal) / sizeof(id.internal[0]), [](auto x) { return x != 0; }));
+}
+
+TEST(MPIUtils, GlobalSessionHandle)
+{
+    EXPECT_EQ(tensorrt_llm::plugins::getCommSessionHandle(), &COMM_SESSION);
 }
 #endif // ENABLE_MULTI_DEVICE
 

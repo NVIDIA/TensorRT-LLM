@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
@@ -23,10 +24,13 @@
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
 #include <NvInfer.h>
+#include <atomic>
 #include <chrono>
 #include <cxxopts.hpp>
+#include <future>
 #include <sstream>
 #include <string>
+#include <thread>
 
 using namespace tensorrt_llm::runtime;
 
@@ -35,6 +39,23 @@ namespace trt = nvinfer1;
 
 namespace
 {
+size_t monitorMemory(std::atomic_bool& done)
+{
+    // A simple memory monitor function that monitors peak GPU memory usage
+    size_t peakMem = 0;
+    while (!done)
+    {
+        auto const [freeMem, totalMem] = tc::getDeviceMemoryInfo(false);
+        if (totalMem - freeMem > peakMem)
+        {
+            peakMem = totalMem - freeMem;
+        }
+        // Sleep for 50 ms to avoid spamming getDeviceMemoryInfo to reduce overhead
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return peakMem;
+}
+
 void benchmarkGptSession(std::string const& modelName, std::filesystem::path const& dataPath,
     std::vector<int> const& batchSizes, int beamWidth, std::vector<std::vector<int>> const& inOutLen,
     std::shared_ptr<nvinfer1::ILogger> const& logger, int warmUp, int numRuns, int duration,
@@ -95,6 +116,8 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
             }
             try
             {
+                std::atomic_bool done = false;
+                auto peakMemFuture = std::async(&monitorMemory, std::ref(done));
                 TLLM_LOG_INFO(memoryCounter.toString());
 
                 std::vector<SizeType> inputLenghtsHost(batchSize, maxInputLength);
@@ -159,6 +182,7 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
 
                 int iterIdx = 0;
                 float curDuration = 0;
+                std::vector<float> latencies;
                 while (iterIdx < numRuns || curDuration / 1000 < duration)
                 {
                     auto const start = std::chrono::steady_clock::now();
@@ -171,21 +195,48 @@ void benchmarkGptSession(std::string const& modelName, std::filesystem::path con
                     auto const end = std::chrono::steady_clock::now();
 
                     iterIdx += 1;
-                    curDuration += std::chrono::duration<float, std::milli>(end - start).count();
+                    float latency = std::chrono::duration<float, std::milli>(end - start).count();
+                    curDuration += latency;
+                    latencies.emplace_back(latency);
                 }
 
                 TLLM_LOG_INFO(memoryCounter.toString());
+                done = true;
+                size_t peakMem = peakMemFuture.get();
 
                 printf("Benchmarking done. Iteration: %d, duration: %.2f sec.\n", iterIdx, curDuration / 1000);
+
+                // Print latencies to make it easier to identify perf stability issue.
+                printf("Latencies: [");
+                constexpr int maxPrintedLatencies{20};
+                for (int i = 0; i < latencies.size(); ++i)
+                {
+                    printf("%.2f", latencies[i]);
+                    if (i == latencies.size() - 1)
+                    {
+                        printf("]\n");
+                    }
+                    else if (latencies.size() > maxPrintedLatencies && i == (maxPrintedLatencies / 2 - 1))
+                    {
+                        printf(" ... ");
+                        i = latencies.size() - maxPrintedLatencies / 2;
+                    }
+                    else
+                    {
+                        printf(", ");
+                    }
+                }
 
                 if (worldConfig.getRank() == 0)
                 {
                     auto const averageLatency = curDuration / iterIdx;
                     float const tokensPerSec = batchSize * maxNewTokens / (averageLatency / 1000);
+                    // convert to GB
+                    float const peakMemGB = peakMem / 1e9;
                     printf(
                         "[BENCHMARK] batch_size %d input_length %d output_length %d latency(ms) %.2f tokensPerSec "
-                        "%.2f\n",
-                        batchSize, maxInputLength, maxNewTokens, averageLatency, tokensPerSec);
+                        "%.2f gpu_peak_mem(gb) %.2f\n",
+                        batchSize, maxInputLength, maxNewTokens, averageLatency, tokensPerSec, peakMemGB);
                 }
 
                 // logits are store in last rank

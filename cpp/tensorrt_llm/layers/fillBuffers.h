@@ -25,6 +25,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 
 namespace tensorrt_llm
 {
@@ -38,11 +39,11 @@ struct FillBuffers
 
     template <typename T>
     void operator()(std::optional<std::vector<T>> const& optParam, T const defaultValue, std::vector<T>& hostBuffer,
-        T*& deviceBuffer) const
+        T* deviceBuffer, void* deviceTmpBuffer, const int* batchSlots) const
     {
         using tensorrt_llm::common::cudaAutoCpy;
 
-        hostBuffer.resize(batch_size);
+        hostBuffer.resize(batchSize);
         if (!optParam)
         {
             std::fill(std::begin(hostBuffer), std::end(hostBuffer), defaultValue);
@@ -53,13 +54,22 @@ struct FillBuffers
         }
         else
         {
-            TLLM_CHECK_WITH_INFO(optParam->size() == batch_size, "Argument vector size mismatch.");
+            TLLM_CHECK_WITH_INFO(optParam->size() == batchSize, "Argument vector size mismatch.");
             std::copy(optParam->begin(), optParam->end(), std::begin(hostBuffer));
         }
-        cudaAutoCpy(deviceBuffer, hostBuffer.data(), batch_size, stream);
+        if (deviceTmpBuffer && batchSlots)
+        {
+            cudaAutoCpy(reinterpret_cast<T*>(deviceTmpBuffer), hostBuffer.data(), batchSize, stream);
+            tensorrt_llm::kernels::invokeScatterDecodingParams(
+                reinterpret_cast<T*>(deviceTmpBuffer), deviceBuffer, batchSlots, batchSize, stream);
+        }
+        else
+        {
+            cudaAutoCpy(deviceBuffer, hostBuffer.data(), batchSize, stream);
+        }
     }
 
-    size_t batch_size;
+    size_t batchSize;
     cudaStream_t stream;
 };
 

@@ -109,6 +109,9 @@ else()
   endif()
 endif()
 
+find_package(Threads REQUIRED)
+target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE Threads::Threads)
+
 if(NOT MSVC)
   if(USE_CXX11_ABI)
     add_custom_command(
@@ -140,8 +143,15 @@ set(TRTLLM_LINK_LIBS
     common_src
     kernels_src
     layers_src
-    runtime_src
-    ${BATCH_MANAGER_TARGET})
+    runtime_src)
+
+if(NOT MSVC) # Unix-like compilers
+  set(UNDEFINED_FLAG "-Wl,--no-undefined")
+  set(AS_NEEDED_FLAG "-Wl,--as-needed")
+else() # MSVC
+  set(UNDEFINED_FLAG "")
+  set(AS_NEEDED_FLAG "")
+endif()
 
 # ################################# SHARED LIBRARY
 # ##############################################################################
@@ -151,33 +161,47 @@ set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 add_library(${SHARED_TARGET} SHARED)
 
 set_target_properties(
-  ${SHARED_TARGET} PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES"
-                              CXX_EXTENSIONS "NO")
+  ${SHARED_TARGET}
+  PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
+             LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 
-if(NOT MSVC) # Unix-like compilers
-  set(UNDEFINED_FLAG "-Wl,--no-undefined")
-else() # MSVC
-  set(UNDEFINED_FLAG "")
+target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
+
+if(MSVC)
+  target_link_libraries(
+    ${SHARED_TARGET}
+    PRIVATE -WHOLEARCHIVE:$<TARGET_FILE:${BATCH_MANAGER_TARGET}>)
+else()
+  # Assume everything else is like gcc
+  target_link_libraries(
+    ${SHARED_TARGET}
+    PRIVATE "-Wl,--whole-archive" $<TARGET_FILE:${BATCH_MANAGER_TARGET}>
+            "-Wl,--no-whole-archive")
 endif()
 
-target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS}
-                                              ${UNDEFINED_FLAG})
 add_dependencies(${SHARED_TARGET} check_symbol)
 
 # ################################# STATIC LIBRARY
 # ##############################################################################
+if(MSVC)
 
-add_library(${STATIC_TARGET} STATIC)
+  add_library(${STATIC_TARGET} STATIC)
 
-set_target_properties(
-  ${STATIC_TARGET} PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES"
-                              CXX_EXTENSIONS "NO" POSITION_INDEPENDENT_CODE ON)
+  set_target_properties(
+    ${STATIC_TARGET}
+    PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES"
+               CXX_EXTENSIONS "NO" POSITION_INDEPENDENT_CODE ON)
 
-target_link_libraries(${STATIC_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
-add_dependencies(${STATIC_TARGET} check_symbol)
+  target_link_libraries(${STATIC_TARGET} PUBLIC ${TRTLLM_LINK_LIBS}
+                                                ${BATCH_MANAGER_TARGET})
+  # Cyclic dependency of batch manager on TRT-LLM
+  target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${STATIC_TARGET})
+  add_dependencies(${STATIC_TARGET} check_symbol)
+
+endif()
 
 # Cyclic dependency of batch manager on TRT-LLM
-target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${STATIC_TARGET})
+target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})
 
 if(BUILD_PYT)
   add_subdirectory(thop)

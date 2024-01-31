@@ -23,16 +23,24 @@ from build_engines_utils import run_command, wincopy
 
 
 def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, *args):
-    build_args = [_sys.executable, "examples/llama/build.py"] + (
+
+    covert_cmd = [_sys.executable, "examples/llama/convert_checkpoint.py"] + (
         ['--model_dir', str(weight_dir)] if weight_dir else []) + [
-            '--output_dir',
-            str(engine_dir), '--dtype=float16',
-            '--use_gpt_attention_plugin=float16', '--use_custom_all_reduce',
-            '--use_gemm_plugin=float16', '--max_batch_size=32',
-            '--max_input_len=40', '--max_output_len=20', '--max_beam_width=2',
-            '--log_level=error', '--use_inflight_batching', '--paged_kv_cache',
-            '--remove_input_padding'
+            '--output_dir', str(engine_dir), '--dtype=float16'
         ] + list(args)
+
+    run_command(covert_cmd)
+
+    build_args = ["trtllm-build"] + (
+        ['--checkpoint_dir', str(engine_dir)] if engine_dir else []) + [
+            '--output_dir',
+            str(engine_dir), '--gpt_attention_plugin=float16',
+            '--use_custom_all_reduce=enable', '--gemm_plugin=float16',
+            '--max_batch_size=32', '--max_input_len=40', '--max_output_len=20',
+            '--max_beam_width=2', '--log_level=error',
+            '--paged_kv_cache=enable', '--remove_input_padding=enable'
+        ]
+
     run_command(build_args)
 
 
@@ -65,12 +73,10 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
         tp_pp_sizes = [(1, 4), (4, 1), (2, 2)]
     for tp_size, pp_size in tp_pp_sizes:
         tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu"
-        world_size = tp_size * pp_size
         print(f"\nBuilding fp16 tp{tp_size} pp{pp_size} engine")
         build_engine(hf_dir,
                      engine_dir / f'fp16-plugin-packed-paged/{tp_pp_dir}',
-                     f'--world_size={world_size}', f'--tp_size={tp_size}',
-                     f'--pp_size={pp_size}')
+                     f'--tp_size={tp_size}', f'--pp_size={pp_size}')
 
     print("Done.")
 

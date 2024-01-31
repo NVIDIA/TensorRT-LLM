@@ -223,7 +223,7 @@ public:
         auto targetLogitsPtr = bufferCast<T>(*mTargetLogits);
         auto refTargetLogitsPtr = bufferCast<T>(*mRefTargetLogits);
 
-        tk::invokeCurandInitialize(mCurandStates, batchSize, seed, this->mStream->get());
+        tk::invokeCurandInitialize(mCurandStates, nullptr, batchSize, seed, this->mStream->get());
 
         // Init number of draft tokens
         for (SizeType bi = 0; bi < batchSize; ++bi)

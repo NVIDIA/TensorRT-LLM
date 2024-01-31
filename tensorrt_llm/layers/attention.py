@@ -17,14 +17,13 @@ from typing import List, Optional
 
 import numpy as np
 import tensorrt as trt
-from packaging import version
 
 from .._common import default_net, precision
 from .._utils import (fp32_array, int32_array, numpy_fp32_to_bf16,
-                      trt_dtype_to_np, trt_dtype_to_str, trt_version)
+                      preview_trt_version, trt_dtype_to_np, trt_dtype_to_str)
 from ..functional import (AttentionMaskType, PositionEmbeddingType,
                           RotaryScalingType, Tensor, arange, bert_attention,
-                          cast, concat, constant, embedding, expand,
+                          cast, clip, concat, constant, embedding, expand,
                           expand_dims, expand_mask, generate_alibi_biases,
                           generate_alibi_slopes, gpt_attention, matmul,
                           repeat_interleave, shape, slice, softmax, split,
@@ -396,6 +395,7 @@ class Attention(Module):
         enable_pos_shift=False,
         dense_context_fmha=False,
         max_lora_rank=None,
+        clip_qkv=None,
     ):
         super().__init__()
 
@@ -409,6 +409,7 @@ class Attention(Module):
             num_kv_heads + tp_size - 1
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
         self.hidden_size = hidden_size // tp_size
+        self.atten_head_size_all = self.attention_head_size * self.num_attention_heads
         self.max_position_embeddings = max_position_embeddings
         self.bias = bias
         self.tp_size = tp_size
@@ -487,7 +488,8 @@ class Attention(Module):
                 tp_size=tp_size,
                 gather_output=False,
                 max_lora_rank=max_lora_rank)
-            self.dense = FP8RowLinear(hidden_size,
+            self.dense = FP8RowLinear(tp_size * self.num_attention_heads *
+                                      self.attention_head_size,
                                       hidden_size,
                                       bias=dense_bias,
                                       dtype=dtype,
@@ -521,7 +523,7 @@ class Attention(Module):
             self.is_weight_rewritten = False
             linear_class = FP8Linear if self.use_fp8_qdq else ColumnLinear
             self.q = linear_class(hidden_size,
-                                  hidden_size,
+                                  self.atten_head_size_all,
                                   bias=bias,
                                   dtype=dtype,
                                   tp_group=tp_group,
@@ -564,6 +566,11 @@ class Attention(Module):
             ],
             max_low_rank=max_lora_rank,
         )
+
+        if clip_qkv is not None:
+            self.clip_qkv = fp32_array([clip_qkv])
+        else:
+            self.clip_qkv = None
 
     def forward(self,
                 hidden_states: Tensor,
@@ -633,11 +640,15 @@ class Attention(Module):
             ).plugin_config.lora_plugin and qkv_lora_params is not None:
                 lora = self.qkv.lora(hidden_states, qkv_lora_params)
                 kv_size = self.attention_head_size * self.num_attention_kv_heads
-                qkv_lora = split(lora, [self.hidden_size, kv_size, kv_size],
+                qkv_lora = split(lora,
+                                 [self.atten_head_size_all, kv_size, kv_size],
                                  dim=1)
                 qkv = [tensor + lora for tensor, lora in zip(qkv, qkv_lora)]
         else:
             qkv = self.qkv(hidden_states, qkv_lora_params)
+
+        if self.clip_qkv is not None:
+            qkv = clip(qkv, -self.clip_qkv, self.clip_qkv)
 
         if default_net().plugin_config.remove_input_padding:
             if unfuse_qkv_gemm:
@@ -803,16 +814,15 @@ class Attention(Module):
             if unfuse_qkv_gemm:
                 query, key, value = qkv[0], qkv[1], qkv[2]
             else:
-                query, key, value = split(qkv,
-                                          [self.hidden_size, kv_size, kv_size],
-                                          dim=2)
+                query, key, value = split(
+                    qkv, [self.atten_head_size_all, kv_size, kv_size], dim=2)
 
             # in cross attention mode, replace kv by encoder_output
             if self.cross_attention and encoder_output is not None:
                 encoder_qkv = self.qkv(encoder_output)
-                _, key, value = split(encoder_qkv,
-                                      [self.hidden_size, kv_size, kv_size],
-                                      dim=2)
+                _, key, value = split(
+                    encoder_qkv, [self.atten_head_size_all, kv_size, kv_size],
+                    dim=2)
 
             query = transpose_for_scores(query, rotary=self.rotary_enabled)
             key = transpose_for_scores(key,
@@ -1006,7 +1016,7 @@ class Attention(Module):
                     attention_mask = attention_mask.view(
                         concat([batch_size, 1, query_len, encoder_input_len]))
                     attention_mask = where(attention_mask == 0, float('-inf'),
-                                           (1 - attention_mask).cast('float32'))
+                                           0.0)
                 else:
                     attention_mask = expand_mask(attention_mask,
                                                  shape(query, 2))
@@ -1020,11 +1030,11 @@ class Attention(Module):
                 if norm_before_bmm1:
                     # Apply norm on query earlier to prevent matmul fp16 overflow.
                     query /= self.norm_factor
-                if version.parse(trt_version(
-                )).major > 9 or self.position_embedding_type.is_alibi():
+                if preview_trt_version(
+                ) or self.position_embedding_type.is_alibi():
                     attention_scores = matmul(query, key)
                 else:
-                    # For trt_version() == 9.x, need this WAR to fuse mha.
+                    # For TRT 9.x, OOTB need this WAR to fuse mha.
                     attention_scores = matmul(cast(query, 'float32'),
                                               cast(key, 'float32'))
                 if not norm_before_bmm1:
@@ -1043,8 +1053,7 @@ class Attention(Module):
 
             attention_probs = softmax(attention_scores, dim=-1)
 
-            if version.parse(trt_version(
-            )).major > 9 or self.position_embedding_type.is_alibi():
+            if preview_trt_version() or self.position_embedding_type.is_alibi():
                 # For trt_version() == 9.x and pos_embed == alibi, TRT has gpu buffer management issues. Need this WAR to avoid peak gpu mem regression.
                 # A dummy reshape WAR for mha fusion for 10.0
                 attention_probs = attention_probs.view(
@@ -1057,14 +1066,16 @@ class Attention(Module):
                 context = matmul(attention_probs, value,
                                  use_fp32_acc=False).permute([0, 2, 1, 3])
             else:
-                # For trt_version() == 9.x, need this WAR to fuse mha.
+                # For TRT 9.x, need this WAR to fuse mha.
                 context = matmul(attention_probs,
                                  cast(value, 'float32')).permute([0, 2, 1, 3])
                 if context.dtype != value.dtype:
                     context = cast(context, value.dtype)
             context = context.view(
-                concat([shape(context, 0),
-                        shape(context, 1), self.hidden_size]))
+                concat([
+                    shape(context, 0),
+                    shape(context, 1), self.atten_head_size_all
+                ]))
 
         dense_lora_params = None
         if lora_layer_params is not None:

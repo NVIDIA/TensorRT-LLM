@@ -41,8 +41,11 @@ def main(args):
     runtime_rank = tensorrt_llm.mpi_rank()
     logger.set_level(args.log_level)
 
-    model_name = read_model_name(args.engine_dir)
+    model_name, model_version = read_model_name(args.engine_dir)
     if args.hf_model_dir is None:
+        logger.warning(
+            "hf_model_dir is not specified. Try to infer from model_name, but this may be incorrect."
+        )
         args.hf_model_dir = DEFAULT_HF_MODEL_DIRS[model_name]
     if args.tokenizer_dir is None:
         args.tokenizer_dir = args.hf_model_dir
@@ -54,6 +57,7 @@ def main(args):
         tokenizer_dir=args.tokenizer_dir,
         vocab_file=args.vocab_file,
         model_name=model_name,
+        model_version=model_version,
     )
     profiler.stop('load tokenizer')
     logger.info(
@@ -137,10 +141,10 @@ def main(args):
             'bf16': 'bfloat16'
         }
         args.data_type = dtype_alias_mapping.get(args.data_type, args.data_type)
-        if model_name.startswith('chatglm'):
-            auto_model_cls = AutoModel
-        elif model_name.startswith('glm'):
+        if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
             auto_model_cls = AutoModelForSeq2SeqLM
+        elif model_name == 'ChatGLMForCausalLM' and model_version == 'chatglm':
+            auto_model_cls = AutoModel
         else:
             auto_model_cls = AutoModelForCausalLM
         model = auto_model_cls.from_pretrained(
@@ -150,7 +154,7 @@ def main(args):
             device_map='auto' if args.hf_device_map_auto else None)
         try:
             model.to_bettertransformer()
-        except ValueError as e:
+        except Exception as e:
             logger.warning(
                 f'Fail to call model.to_bettertransformer(), exception:\n{str(e)}'
             )
@@ -187,7 +191,9 @@ def main(args):
             curr_text = curr_text.strip().replace(" n't", "n't")
 
             # TODO: The below lines are used to be compatible with the original code; may need fix
-            if model_name.startswith(('chatglm2', 'chatglm3')):
+            if model_name == 'ChatGLMForCausalLM' and model_version in [
+                    'chatglm2', 'chatglm3'
+            ]:
                 input_ids = tokenizer.encode(curr_text,
                                              return_tensors='pt').squeeze(0)
                 input_ids = input_ids[:test_token_num]

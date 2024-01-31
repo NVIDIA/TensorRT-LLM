@@ -42,6 +42,7 @@ def TRTOPT(args, config):
     num_heads = config['pretrained_config']['num_attention_heads'] // world_size
     hidden_size = config['pretrained_config']['hidden_size'] // world_size
     vocab_size = config['pretrained_config']['vocab_size']
+    max_batch_size = config['build_config']['max_batch_size']
     num_layers = config['pretrained_config']['num_hidden_layers']
     remove_input_padding = config['build_config']['plugin_config'][
         'remove_input_padding']
@@ -49,6 +50,7 @@ def TRTOPT(args, config):
         'max_prompt_embedding_table_size', 0)
 
     model_config = tensorrt_llm.runtime.ModelConfig(
+        max_batch_size=max_batch_size,
         vocab_size=vocab_size,
         num_layers=num_layers,
         num_heads=num_heads,

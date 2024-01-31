@@ -148,6 +148,7 @@ class TestGPT(unittest.TestCase):
                 strongly_typed=fp16,
             )
             network = builder.create_network()
+            network.plugin_config.to_legacy_setting()
             if use_plugin:
                 network.plugin_config.set_gpt_attention_plugin(dtype)
             if fast_building:
@@ -851,7 +852,8 @@ class TestGPT(unittest.TestCase):
             log_level, dtype, world_size, rank, gpt_config, hf_gpt, model,
             use_plugin, batch_size, seq_len, max_new_tokens, use_refit)
 
-        model_config = ModelConfig(vocab_size=gpt_config.vocab_size,
+        model_config = ModelConfig(max_batch_size=batch_size,
+                                   vocab_size=gpt_config.vocab_size,
                                    num_layers=gpt_config.n_layer,
                                    num_heads=gpt_config.n_head,
                                    num_kv_heads=gpt_config.n_head,

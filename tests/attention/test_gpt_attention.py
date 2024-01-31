@@ -252,9 +252,8 @@ class TestFunctional(unittest.TestCase):
                     ['float16'], ['fp8'], [2], [128], [4], [256], [0], [False],
                     [False], [4], [True], [False]))
 
-        # split test cases into two partitions
-        test_cases = [("partition0", ) + case if i % 2 == 0 else
-                      ("partition1", ) + case
+        # split test cases into 4 partitions
+        test_cases = [(f"partition{int(i % 4)}", ) + case
                       for i, case in enumerate(test_cases)]
 
         # tests (h100 only)
@@ -310,24 +309,24 @@ class TestFunctional(unittest.TestCase):
                     None,
                 ]))
 
-        # for XQA multi batch split logic test
+        # d = 256 xqa kernels (limited number of tests).
         test_cases += list(
             product(
                 ['h100_only'],
                 [90],
                 ['llama_attention'],
                 [ContextFMHAType.enabled],
-                ['float16'],
-                [None],
-                [150],
-                [500],
-                [32],
-                [128],
-                [4],
+                ['float16', 'bfloat16'],
+                ['int8', 'fp8'],
+                [2],
+                [1025],
+                [16],
+                [256],
+                [2],
                 [False, True],
                 [False],
                 [1],
-                [False],
+                [False, True],
                 [False],
                 [10000.0],  # rope base
                 [  # rope scaling
@@ -367,7 +366,6 @@ class TestFunctional(unittest.TestCase):
         # if attention_type != "gpt_bigcode_attention" and attention_type != "llama_attention":
         #     assert num_kv_heads == 0 # safe guard against bad test case configs
 
-        os.environ['TRTLLM_ENABLE_XQA'] = '1'
         os.environ['TRTLLM_FORCE_XQA'] = '1'
         use_int8_kv_cache = True if kv_cache_dtype == 'int8' else False
         use_fp8_kv_cache = True if kv_cache_dtype == 'fp8' else False
@@ -430,10 +428,16 @@ class TestFunctional(unittest.TestCase):
             net.plugin_config.set_context_fmha(context_fmha_type)
             if enable_remove_input_padding:
                 net.plugin_config.enable_remove_input_padding()
+            else:
+                net.plugin_config.set_plugin("remove_input_padding", False)
             if paged_kv_cache:
                 net.plugin_config.enable_paged_kv_cache(tokens_per_block)
+            else:
+                net.plugin_config.set_plugin("paged_kv_cache", False)
             if enable_multi_block_mmha:
                 net.plugin_config.enable_mmha_multi_block_mode()
+            else:
+                net.plugin_config.set_plugin("multi_block_mode", False)
             # always enable xqa kernels for test.
             net.plugin_config.enable_xqa_optimization()
 

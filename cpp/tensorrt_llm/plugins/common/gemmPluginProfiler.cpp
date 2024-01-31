@@ -209,7 +209,7 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
             msg << "Cannot profile configuration " << ii << " (for"
                 << " m=" << m << ", n=" << n << ", k=" << k << ")"
                 << ", reason: \"" << e.what() << "\". Skipped";
-            TLLM_LOG_WARNING(msg.str());
+            TLLM_LOG_TRACE(msg.str());
             continue;
         }
 

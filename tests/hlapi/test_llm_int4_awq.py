@@ -1,11 +1,13 @@
 import os
+import sys
 import tempfile
 
 from tensorrt_llm.hlapi.llm import LLM, ModelConfig
 
-llm_models_root = os.environ.get('LLM_MODELS_ROOT',
-                                 '/scratch.trt_llm_data/llm-models/')
-llama_model_path = os.path.join(llm_models_root, "llama-models/llama-7b-hf")
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.llm_data import llm_models_root
+
+llama_model_path = str(llm_models_root() / "llama-models/llama-7b-hf")
 
 
 def _test_llm_int4_awq_quantization():

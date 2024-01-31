@@ -36,11 +36,12 @@
     # OPT-2.7B
     trtllm-build --checkpoint_dir=./opt/2.7B/trt_ckpt/fp16/1-gpu/ \
                     --max_batch_size 8 \
-                    --use_gpt_attention_plugin float16 \
-                    --use_gemm_plugin float16 \
+                    --gpt_attention_plugin float16 \
+                    --gemm_plugin float16 \
                     --max_input_len 924 \
                     --max_output_len 100 \
                     --max_beam_width 5 \
+                    --paged_kv_cache disable \
                     --output_dir ../blip2/trt_engine/blip-2-opt-2.7b/fp16/1-gpu \
                     --max_prompt_embedding_table_size 256 # 256 = 32 (query_token number) * 8 (max_batch_size)
     ```
@@ -57,11 +58,12 @@
 
     trtllm-build --checkpoint_dir=./opt/2.7B/trt_ckpt/int4_weightonly/1-gpu/ \
                     --max_batch_size 8 \
-                    --use_gpt_attention_plugin float16 \
-                    --use_gemm_plugin float16 \
+                    --gpt_attention_plugin float16 \
+                    --gemm_plugin float16 \
                     --max_input_len 924 \
                     --max_output_len 100 \
                     --max_beam_width 5 \
+                    --paged_kv_cache disable \
                     --output_dir ../blip2/trt_engine/blip-2-opt-2.7b/int4_weightonly/1-gpu \
                     --max_prompt_embedding_table_size 256 # 256 = 32 (query_token number) * 8 (max_batch_size)
     ```

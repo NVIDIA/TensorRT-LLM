@@ -161,6 +161,7 @@ class TestGPTNeoX(unittest.TestCase):
                 strongly_typed=fp16,
             )
             network = builder.create_network()
+            network.plugin_config.to_legacy_setting()
             if use_attention_plugin:
                 network.plugin_config.set_gpt_attention_plugin(dtype)
             if use_ln_gemm_plugin:

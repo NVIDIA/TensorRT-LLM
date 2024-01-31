@@ -104,10 +104,12 @@ void OnlineBeamSearchLayer<T>::setup(size_t batch_size, SetupParams const& setup
     mDiversityRate = setupParams.beam_search_diversity_rate.value_or(std::vector<float>(0.0f));
     mLengthPenalty = setupParams.length_penalty.value_or(std::vector<float>(0.0f));
 
-    FillBuffers const fillBuffers{batch_size, stream_};
+    FillBuffers const fillBuffers{batch_size, mStream};
 
-    fillBuffers(setupParams.beam_search_diversity_rate, 0.0f, mDiversityRate, diversity_rates_buf_);
-    fillBuffers(setupParams.length_penalty, 0.0f, mLengthPenalty, length_penalties_buf_);
+    fillBuffers(setupParams.beam_search_diversity_rate, 0.0f, mDiversityRate, diversity_rates_buf_, (float*) nullptr,
+        (int*) nullptr);
+    fillBuffers(
+        setupParams.length_penalty, 0.0f, mLengthPenalty, length_penalties_buf_, (float*) nullptr, (int*) nullptr);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -147,12 +149,12 @@ void OnlineBeamSearchLayer<T>::invokeSoftMax(BeamSearchOutputParams& outputs, So
     invokeTopkSoftMax(logits.template getPtr<T>(), (const T*) (nullptr), finished, sequence_lengths,
         outputs.cum_log_probs->template getPtr<float>(), output_log_probs, output_ids_ptr.getPtr<int*>(),
         topk_softmax_workspace_, topk_softmax_workspace_size_, &beamHypotheses, local_batch_size, beam_width,
-        vocab_size_padded_, end_ids, diversity_rates_buf_, length_penalties_buf_, stream_);
+        vocab_size_padded_, end_ids, diversity_rates_buf_, length_penalties_buf_, mStream);
     sync_check_cuda_error();
 
     invokeUpdate(finished, outputs.parent_ids_ptr.template getPtr<int*>(), sequence_lengths,
         output_ids_ptr.getPtr<int*>(), &beamHypotheses, local_batch_size, beam_width, vocab_size_padded_, end_ids,
-        max_seq_len, stream_);
+        max_seq_len, mStream);
     sync_check_cuda_error();
 }
 
@@ -166,11 +168,11 @@ void OnlineBeamSearchLayer<T>::allocateBuffer(size_t batch_size)
         + ceil(batch_size * (64 * 2) * SMALL_TOP_K_SOFTMAX_MAX_VOC_PARTS * (2 * (MAX_K * 2) + 2) / 4.) * 4);
 
     topk_softmax_workspace_ = reinterpret_cast<float*>(
-        allocator_->reMalloc(topk_softmax_workspace_, sizeof(float) * topk_softmax_workspace_size_, true));
-    diversity_rates_buf_ = allocator_->reMalloc(diversity_rates_buf_, sizeof(float) * batch_size, false);
-    length_penalties_buf_ = allocator_->reMalloc(length_penalties_buf_, sizeof(float) * batch_size, false);
+        mAllocator->reMalloc(topk_softmax_workspace_, sizeof(float) * topk_softmax_workspace_size_, true));
+    diversity_rates_buf_ = mAllocator->reMalloc(diversity_rates_buf_, sizeof(float) * batch_size, false);
+    length_penalties_buf_ = mAllocator->reMalloc(length_penalties_buf_, sizeof(float) * batch_size, false);
 
-    is_allocate_buffer_ = true;
+    mIsAllocateBuffer = true;
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -178,20 +180,20 @@ template <typename T>
 void OnlineBeamSearchLayer<T>::freeBuffer()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    if (is_allocate_buffer_)
+    if (mIsAllocateBuffer)
     {
-        allocator_->free((void**) (&topk_softmax_workspace_));
-        allocator_->free((void**) (&diversity_rates_buf_));
-        allocator_->free((void**) (&length_penalties_buf_));
-        is_allocate_buffer_ = false;
+        mAllocator->free((void**) (&topk_softmax_workspace_));
+        mAllocator->free((void**) (&diversity_rates_buf_));
+        mAllocator->free((void**) (&length_penalties_buf_));
+        mIsAllocateBuffer = false;
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-OnlineBeamSearchLayer<T>::OnlineBeamSearchLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-    std::shared_ptr<IAllocator> allocator, bool is_free_buffer_after_forward)
-    : BaseBeamSearchLayer<T>(vocab_size, vocab_size_padded, stream, std::move(allocator), is_free_buffer_after_forward)
+OnlineBeamSearchLayer<T>::OnlineBeamSearchLayer(
+    size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream, std::shared_ptr<IAllocator> allocator)
+    : BaseBeamSearchLayer<T>(vocab_size, vocab_size_padded, stream, std::move(allocator))
 {
 }
 

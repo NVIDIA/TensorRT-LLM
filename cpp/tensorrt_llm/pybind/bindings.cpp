@@ -127,8 +127,14 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("has_kv_cache_quant", &tc::QuantMode::hasKvCacheQuant)
         .def_static("from_description", &tc::QuantMode::fromDescription, py::arg("quantize_weights") = false,
             py::arg("quantize_activations") = false, py::arg("per_token") = false, py::arg("per_channel") = false,
-            py::arg("use_int4_weights") = false, py::arg("use_int8_kv_cache") = false,
+            py::arg("per_group") = false, py::arg("use_int4_weights") = false, py::arg("use_int8_kv_cache") = false,
             py::arg("use_fp8_kv_kache") = false, py::arg("use_fp8_qdq") = false)
+        .def_static("use_smooth_quant", &tc::QuantMode::useSmoothQuant, py::arg("per_token") = false,
+            py::arg("per_channel") = false)
+        .def_static("use_weight_only", &tc::QuantMode::useWeightOnly, py::arg("use_int4_weights") = false,
+            py::arg("per_group") = false)
+        .def_static("from_quant_algo", &tc::QuantMode::fromQuantAlgo, py::arg("quant_algo") = py::none(),
+            py::arg("kv_cache_quant_algo") = py::none())
         .def(py::self + py::self)
         .def(py::self += py::self)
         .def(py::self - py::self)
@@ -147,6 +153,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("size_per_head", &tr::GptModelConfig::getSizePerHead)
         .def_property_readonly("data_type", &tr::GptModelConfig::getDataType)
         .def_property("num_kv_heads", &tr::GptModelConfig::getNbKvHeads, &tr::GptModelConfig::setNbKvHeads)
+        .def_property("head_size", &tr::GptModelConfig::getSizePerHead, &tr::GptModelConfig::setSizePerHead)
         .def_property("use_gpt_attention_plugin",
             py::overload_cast<>(&tr::GptModelConfig::useGptAttentionPlugin, py::const_),
             py::overload_cast<bool>(&tr::GptModelConfig::useGptAttentionPlugin))
@@ -317,6 +324,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("kv_cache_config", &tb::TrtGptModelOptionalParams::kvCacheConfig)
         .def_readwrite("enable_trt_overlap", &tb::TrtGptModelOptionalParams::enableTrtOverlap)
         .def_readwrite("device_ids", &tb::TrtGptModelOptionalParams::deviceIds)
+        .def_readwrite("enable_chunked_context", &tb::TrtGptModelOptionalParams::enableChunkedContext)
         .def_readwrite("normalize_log_probs", &tb::TrtGptModelOptionalParams::normalizeLogProbs);
 
     tpb::GptManager::initBindings(m);

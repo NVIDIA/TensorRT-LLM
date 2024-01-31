@@ -154,16 +154,6 @@ def parse_arguments(args):
         help=
         "Activates GEMM plugin. You can specify the plugin dtype or leave blank to use the model dtype."
     )
-    parser.add_argument(
-        '--use_layernorm_plugin',
-        nargs='?',
-        const=None,
-        type=str,
-        default=False,
-        choices=['float16', 'float32', 'bfloat16'],
-        help=
-        "Activates layernorm plugin. You can specify the plugin dtype or leave blank to use the model dtype."
-    )
     parser.add_argument('--parallel_build', default=False, action='store_true')
     parser.add_argument('--enable_context_fmha',
                         default=False,
@@ -438,8 +428,8 @@ def parse_arguments(args):
 
     override_args_from_model_dir(args)
     plugins_args = [
-        'use_gpt_attention_plugin', 'use_gemm_plugin', 'use_layernorm_plugin',
-        'use_lookup_plugin', 'use_lora_plugin'
+        'use_gpt_attention_plugin', 'use_gemm_plugin', 'use_lookup_plugin',
+        'use_lora_plugin'
     ]
     for plugin_arg in plugins_args:
         if getattr(args, plugin_arg) is None:
@@ -477,7 +467,7 @@ def parse_arguments(args):
                                                      args.per_channel)
     elif args.use_weight_only:
         args.quant_mode = QuantMode.use_weight_only(
-            args.weight_only_precision == 'int4')
+            use_int4_weights=(args.weight_only_precision == 'int4'))
     else:
         args.quant_mode = QuantMode(0)
 
@@ -506,7 +496,9 @@ def parse_arguments(args):
         max_num_tokens=args.max_num_tokens,
         max_batch_size=args.max_batch_size,
         max_input_len=args.max_input_len,
-        remove_input_padding=args.remove_input_padding)
+        remove_input_padding=args.remove_input_padding,
+        enable_context_fmha=args.enable_context_fmha,
+        tokens_per_block=args.tokens_per_block)
 
     if args.moe_num_experts and args.moe_top_k == 0:
         args.moe_top_k = 1
@@ -615,6 +607,7 @@ def build_rank_engine(builder: Builder,
     # Module -> Network
     network = builder.create_network()
     network.trt_network.name = engine_name
+    network.plugin_config.to_legacy_setting()
     if args.use_gpt_attention_plugin:
         network.plugin_config.set_gpt_attention_plugin(
             dtype=args.use_gpt_attention_plugin)
@@ -624,9 +617,6 @@ def build_rank_engine(builder: Builder,
         else:
             logger.info(
                 "Gemm plugin does not support FP8. Disabled Gemm plugin.")
-    if args.use_layernorm_plugin:
-        network.plugin_config.set_layernorm_plugin(
-            dtype=args.use_layernorm_plugin)
     assert not (args.enable_context_fmha and args.enable_context_fmha_fp32_acc)
     if args.enable_context_fmha:
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)

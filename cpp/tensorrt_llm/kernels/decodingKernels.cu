@@ -448,52 +448,55 @@ void invokeInitializeOutput(int* outputIds, const int* endIds, int batchBeam, in
     initializeOutput<<<batchBeam, 256, 0, stream>>>(outputIds, endIds, maxSeqLen);
 }
 
-__global__ void copyNextStepIds(
-    int* nextStepIds, int** outputIdsPtr, const int* sequenceLengths, int batchSize, int beamWidth, int maxSeqLen)
+__global__ void copyNextStepIds(int* nextStepIds, int** outputIdsPtr, const int* sequenceLengths, const int* batchSlots,
+    int batchSize, int beamWidth, int maxSeqLen)
 {
     for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < batchSize * beamWidth;
          index += blockDim.x * gridDim.x)
     {
         const int batchIdx{index / beamWidth};
+        auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
         const int beamIdx{index % beamWidth};
-        nextStepIds[index] = outputIdsPtr[batchIdx][beamIdx * maxSeqLen + sequenceLengths[index] - 1];
+        auto const batchBeamIdx = batchSlot * beamWidth + beamIdx;
+        nextStepIds[batchBeamIdx] = outputIdsPtr[batchSlot][beamIdx * maxSeqLen + sequenceLengths[batchBeamIdx] - 1];
     }
 }
 
-void invokeCopyNextStepIds(int* nextStepIds, int** outputIdsPtr, const int* sequenceLengths, int batchSize,
-    int beamWidth, int maxSeqLen, cudaStream_t stream)
+void invokeCopyNextStepIds(int* nextStepIds, int** outputIdsPtr, const int* sequenceLengths, const int* batchSlots,
+    int batchSize, int beamWidth, int maxSeqLen, cudaStream_t stream)
 {
     dim3 block(min(256, batchSize * beamWidth));
     dim3 grid(divUp(batchSize * beamWidth, block.x));
     copyNextStepIds<<<grid, block, 0, stream>>>(
-        nextStepIds, outputIdsPtr, sequenceLengths, batchSize, beamWidth, maxSeqLen);
+        nextStepIds, outputIdsPtr, sequenceLengths, batchSlots, batchSize, beamWidth, maxSeqLen);
 }
 
-__global__ void transposeLogProbs(float* output_log_probs, float* output_log_probs_tiled, const int* sequence_lengths,
-    int batch_size, int beam_width, int max_seq_len)
+__global__ void transposeLogProbs(float* outputLogProbs, float* outputLogProbsTiled, const int* sequenceLengths,
+    const int* batchSlots, int batchSize, int beamWidth, int maxSeqLen)
 {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    const int batch_idx = index / (beam_width * max_seq_len);
-    const int tmp_idx = index % (beam_width * max_seq_len);
-    const int beam_idx = tmp_idx / max_seq_len;
-    const int pos = tmp_idx % max_seq_len;
+    const int batchIdx = index / (beamWidth * maxSeqLen);
+    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
+    const int tmpIdx = index % (beamWidth * maxSeqLen);
+    const int beamIdx = tmpIdx / maxSeqLen;
+    const int pos = tmpIdx % maxSeqLen;
 
-    if (batch_idx < batch_size && pos < sequence_lengths[batch_idx])
+    if (batchIdx < batchSize && pos < sequenceLengths[batchSlot])
     {
-
-        output_log_probs[index]
-            = output_log_probs_tiled[pos * batch_size * beam_width + batch_idx * beam_width + beam_idx];
+        auto const batchBeamIdx = batchSlot * beamWidth * maxSeqLen + beamIdx * maxSeqLen + pos;
+        outputLogProbs[batchBeamIdx]
+            = outputLogProbsTiled[pos * batchSize * beamWidth + batchSlot * beamWidth + beamIdx];
     }
 }
 
-void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_tiled, const int* sequence_lengths,
-    int batch_size, int beam_width, int max_seq_len, cudaStream_t stream)
+void invokeTransposeLogProbs(float* outputLogProbs, float* outputLogProbsTiled, const int* sequenceLengths,
+    const int* batchSlots, int batchSize, int beamWidth, int maxSeqLen, cudaStream_t stream)
 {
     dim3 block(256);
-    dim3 grid(divUp(batch_size * beam_width * max_seq_len, block.x));
+    dim3 grid(divUp(batchSize * beamWidth * maxSeqLen, block.x));
     transposeLogProbs<<<grid, block, 0, stream>>>(
-        output_log_probs, output_log_probs_tiled, sequence_lengths, batch_size, beam_width, max_seq_len);
+        outputLogProbs, outputLogProbsTiled, sequenceLengths, batchSlots, batchSize, beamWidth, maxSeqLen);
 }
 
 __global__ void acceptDraftTokensByIds(const int* draftIds, const int* targetIds, const int* contextLengths,
@@ -671,9 +674,9 @@ void acceptDraftTokensByLogits(T* draftLogits, T* targetLogits, T* draftProbs, T
 {
     TLLM_CHECK(beamWidth == 1);
     {
-        invokeAddBiasSoftMax(draftLogits, draftProbs, (T*) (nullptr), nullptr, finished,
+        invokeAddBiasSoftMax(draftLogits, draftProbs, (T*) (nullptr), nullptr, finished, nullptr,
             batchSize * beamWidth * maxDraftTokens, vocabSize, vocabSizePadded, stream);
-        invokeAddBiasSoftMax(targetLogits, targetProbs, (T*) (nullptr), nullptr, finished,
+        invokeAddBiasSoftMax(targetLogits, targetProbs, (T*) (nullptr), nullptr, finished, nullptr,
             batchSize * beamWidth * maxDraftTokens, vocabSize, vocabSizePadded, stream);
     }
     {

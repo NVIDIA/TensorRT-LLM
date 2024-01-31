@@ -175,9 +175,9 @@ def do_convert_from_ckpt(args):
 
 def convert(worker_rank, args, convert_args):
     convert_from_ckpt = do_convert_from_ckpt(args)
-    args.world_size = 1
+    world_size = 1
     args.workers = 1
-    for rank in range(worker_rank, args.world_size, args.workers):
+    for rank in range(worker_rank, world_size, args.workers):
         if convert_from_ckpt:
             weights = convert_from_hf_checkpoint(rank=rank, **convert_args)
         else:

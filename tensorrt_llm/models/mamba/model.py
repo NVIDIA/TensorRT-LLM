@@ -173,6 +173,7 @@ class MambaLMHeadModel(PretrainedModel):
                        max_beam_width: int = 1,
                        max_num_tokens: int = None,
                        prompt_embedding_table_size: int = 0,
+                       max_draft_len: int = 0,
                        gather_context_logits: bool = False,
                        gather_generation_logits: bool = False,
                        lora_target_modules: List[str] = None):

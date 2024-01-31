@@ -13,15 +13,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+from dataclasses import asdict
 from math import ceil
 
 import torch
 
 import tensorrt_llm
+from tensorrt_llm.profiler import bytes_to_target_unit
 
-from allowed_configs import get_build_config  # isort:skip
+from allowed_configs import get_build_config, BuildConfig  # isort:skip
 from base_benchmark import BaseBenchmark  # isort:skip
 from build import build_gpt, get_quant_mode  # isort:skip
+
+
+def element_size(dtype: str):
+    str_to_size_in_bytes = dict(float16=2,
+                                float32=4,
+                                int64=8,
+                                int32=4,
+                                int8=1,
+                                bool=1,
+                                bfloat16=2,
+                                fp8=1)
+    return str_to_size_in_bytes[dtype]
 
 
 class GPTBenchmark(BaseBenchmark):
@@ -36,6 +50,14 @@ class GPTBenchmark(BaseBenchmark):
         self.build_time = 0
 
         self.cuda_graph_mode = args.enable_cuda_graph
+        self.build_config = None
+        # this dtype may be modified based on quantization mode later, when the fp8/int8 kv cache is used
+        self.kv_dtype = args.dtype
+
+        # approximate the weights size in the engine by using engine size
+        # the actual weights size shall be smaller because there are some other data in the engine file.
+        # for large model, this approximate is close enough.
+        self.weights_size_approx = 0
 
         if args.engine_dir is not None:
             # Get build configs from engine directory is done in base class
@@ -44,8 +66,11 @@ class GPTBenchmark(BaseBenchmark):
                                                self.engine_name)
             with open(self.serialize_path, 'rb') as f:
                 engine_buffer = f.read()
+                self.weights_size_approx = len(engine_buffer)
         else:
-            for key, value in get_build_config(args.model).items():
+            self.build_config = get_build_config(args.model, return_dict=False)
+
+            for key, value in asdict(self.build_config).items():
                 setattr(self, key, value)
             if args.force_num_layer_1:
                 self.num_layers = 1
@@ -59,6 +84,10 @@ class GPTBenchmark(BaseBenchmark):
             self.quant_mode, _, _ = get_quant_mode(args.quantization)
             self.enable_fp8 = self.quant_mode.has_fp8_qdq()
             self.fp8_kv_cache = self.quant_mode.has_fp8_kv_cache()
+            if self.quant_mode.has_fp8_kv_cache():
+                self.kv_dtype = 'fp8'
+            if self.quant_mode.has_int8_kv_cache():
+                self.kv_dtype = 'int8'
 
             # Plugins
             self.use_gpt_attention_plugin = False
@@ -70,6 +99,7 @@ class GPTBenchmark(BaseBenchmark):
                 self.use_gpt_attention_plugin = True
 
             engine_buffer, build_time = build_gpt(args)
+            self.weights_size_approx = engine_buffer.nbytes
             self.build_time = build_time
 
         assert engine_buffer is not None
@@ -79,6 +109,7 @@ class GPTBenchmark(BaseBenchmark):
         if not hasattr(self, 'num_kv_heads') or self.num_kv_heads is None:
             self.num_kv_heads = self.num_heads
         model_config = tensorrt_llm.runtime.ModelConfig(
+            max_batch_size=self.max_batch_size,
             vocab_size=self.vocab_size,
             num_layers=self.num_layers,
             num_heads=self.num_heads // self.world_size,
@@ -107,6 +138,19 @@ class GPTBenchmark(BaseBenchmark):
                 top_p=args.top_p)
             self.decoder = tensorrt_llm.runtime.GenerationSession(
                 model_config, engine_buffer, self.runtime_mapping)
+        elif 'mamba' in args.model:
+            model_config.mamba_d_state = self.mamba_d_state
+            model_config.mamba_d_conv = self.mamba_d_conv
+            model_config.mamba_expand = self.mamba_expand
+            self.remove_input_padding = False
+            model_config.remove_input_padding = False
+            self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
+                end_id=0, pad_id=0, top_k=args.top_k, top_p=args.top_p)
+            self.decoder = tensorrt_llm.runtime.MambaLMHeadModelGenerationSession(
+                model_config,
+                engine_buffer,
+                self.runtime_mapping,
+                cuda_graph_mode=self.cuda_graph_mode)
         else:
             end_id = 50256
             pad_id = 50256
@@ -173,6 +217,68 @@ class GPTBenchmark(BaseBenchmark):
                                 self.sampling_config,
                                 benchmark_profiler=benchmark_profiler)
         torch.cuda.synchronize()
+
+    @staticmethod
+    def kv_cache_elem_per_token(config: BuildConfig, tp_size, pp_size) -> int:
+        # you need to multiply the size by element size, and multiply by the seq length
+        # Warning: this function returns the upper bound between different ranks when any one of the following is true:
+        # num_layer % pp_size !=0, hidden_size % num_kv_heads != 0, num_kv_heads % tp_size != 0
+        local_nlayers = ceil(config.num_layers / pp_size)
+        kv_heads = config.num_kv_heads if config.num_kv_heads is not None else config.num_heads
+        size_per_head = ceil(config.hidden_size / kv_heads)
+        local_heads = ceil(kv_heads / tp_size)
+        return 2 * local_nlayers * size_per_head * local_heads
+
+    def check_memory(self, io_shapes: list, raise_exception=False):
+        '''Compare the estimated GPU memory requirements for weights + activations + kv cache with the total GPU memory and log it.
+           Raise exception when the \p raise_exception parameter is true.
+        '''
+        # we don't want to block the test due to this
+        if self.build_config is None:
+            tensorrt_llm.logger.warning(
+                "Didn't have the build config object, skipping check the memory"
+            )
+            return
+        assert isinstance(self.build_config, BuildConfig)
+        batch_size, inlen, outlen = io_shapes[0], io_shapes[1], io_shapes[2]
+        kv_cache_size_in_bytes = batch_size*self.num_beams*(inlen + outlen)* \
+            self.kv_cache_elem_per_token(self.build_config, self.runtime_mapping.tp_size, self.runtime_mapping.pp_size) * element_size(self.kv_dtype)
+        # when MHA is OOTB, it requires 2x KV cache size, one for past as engine input, one for present as engine output
+        if not self.use_gpt_attention_plugin:
+            kv_cache_size_in_bytes *= 2
+        kv_cache_size_in_mb = bytes_to_target_unit(kv_cache_size_in_bytes,
+                                                   "MiB")
+        activation_size_in_mb = bytes_to_target_unit(
+            self.decoder.runtime.engine.device_memory_size, "MiB")
+        weights_size_in_mb = bytes_to_target_unit(self.weights_size_approx,
+                                                  "MiB")
+        total_memory_approx_in_mb = kv_cache_size_in_mb + activation_size_in_mb + weights_size_in_mb
+        _, _, total = tensorrt_llm.profiler.device_memory_info()
+        total_in_mb = bytes_to_target_unit(total, 'MiB')
+        prefix = "[Memory Estimation]"
+
+        mem_msg = f"{prefix} activation memory:{activation_size_in_mb:.3f} MiB, kv_cache:{kv_cache_size_in_mb:.3f} MiB, weights approximate:{weights_size_in_mb:.3f} MiB, " \
+                  f"approximate required GPU memory: {total_memory_approx_in_mb:.3f} MiB, total GPU memory: {total_in_mb:.3f} MiB"
+        tensorrt_llm.logger.info(mem_msg)
+
+        build_args = dict(batch_size=batch_size,
+                          num_beams=self.num_beams,
+                          input_length=inlen,
+                          output_length=outlen,
+                          max_batch_size=self.build_config.max_batch_size,
+                          max_input_len=self.build_config.max_input_len,
+                          max_output_len=self.build_config.max_output_len,
+                          max_beam_width=self.build_config.max_beam_width)
+        for k, v in build_args.items():
+            tensorrt_llm.logger.info(f"{prefix} {k}:{v}")
+
+        tensorrt_llm.logger.info(
+            "grep the \"Total Activation\" and \"Total Weights\" from verbose TRT engine build log to see the precise memory size for those."
+        )
+        if raise_exception and total_memory_approx_in_mb >= total_in_mb:
+            raise Exception(
+                "Total memory estimation bigger than total gpu memory, the case will likely to OOM, needs enhancement of waive the test case, see logs about the memory usage details"
+            )
 
     def report(self,
                config,

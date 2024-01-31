@@ -148,7 +148,8 @@ class Mamba(Module):
                                       self.d_state,
                                       is_variable_B=True,
                                       is_variable_C=True,
-                                      delta_softplus=True)
+                                      delta_softplus=True,
+                                      dtype=self.dtype)
 
         # out_proj
         out = self.out_proj(y.permute([0, 2, 1]))

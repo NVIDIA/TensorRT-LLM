@@ -32,7 +32,7 @@ class TopKSamplingLayerTest : public SamplingLayerTest<T>
         this->mAllocator = std::make_shared<tensorrt_llm::common::CudaAllocator>(*this->mBufferManager);
 
         this->mSamplingLayer = std::make_shared<tensorrt_llm::layers::TopKSamplingLayer<T>>(
-            this->mVocabSize, this->mVocabSizePadded, this->mStream->get(), this->mAllocator, false);
+            this->mMaxBatchSize, this->mVocabSize, this->mVocabSizePadded, this->mStream->get(), this->mAllocator);
     }
 };
 

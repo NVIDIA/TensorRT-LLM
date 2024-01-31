@@ -100,16 +100,6 @@ def parse_arguments():
         help=
         "Activates GEMM plugin. You can specify the plugin dtype or leave blank to use the model dtype."
     )
-    parser.add_argument(
-        '--use_layernorm_plugin',
-        nargs='?',
-        const=None,
-        type=str,
-        default=False,
-        choices=['float16', 'float32', 'bfloat16'],
-        help=
-        "Activates layernorm plugin. You can specify the plugin dtype or leave blank to use the model dtype."
-    )
     parser.add_argument('--remove_input_padding',
                         default=False,
                         action='store_true')
@@ -149,7 +139,7 @@ def parse_arguments():
     logger.set_level(args.log_level)
 
     plugins_args = [
-        'use_gemm_plugin', 'use_layernorm_plugin', 'use_gpt_attention_plugin',
+        'use_gemm_plugin', 'use_gpt_attention_plugin',
         'use_bert_attention_plugin'
     ]
     for plugin_arg in plugins_args:
@@ -217,12 +207,10 @@ def build_encoder(model, args):
                         model_params, model_metadata['n_audio_layer'])
 
     network = builder.create_network()
+    network.plugin_config.to_legacy_setting()
 
     if args.use_gemm_plugin:
         network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
-    if args.use_layernorm_plugin:
-        network.plugin_config.set_layernorm_plugin(
-            dtype=args.use_layernorm_plugin)
     if args.use_bert_attention_plugin:
         network.plugin_config.set_bert_attention_plugin(
             dtype=args.use_bert_attention_plugin)
@@ -327,12 +315,10 @@ def build_decoder(model, args):
     )
 
     network = builder.create_network()
+    network.plugin_config.to_legacy_setting()
 
     if args.use_gemm_plugin:
         network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
-    if args.use_layernorm_plugin:
-        network.plugin_config.set_layernorm_plugin(
-            dtype=args.use_layernorm_plugin)
     if args.use_gpt_attention_plugin:
         network.plugin_config.set_gpt_attention_plugin(
             dtype=args.use_gpt_attention_plugin)

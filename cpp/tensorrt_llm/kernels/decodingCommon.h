@@ -145,39 +145,52 @@ static_assert(FinishedState::finishedMaxLength().isFinishedMaxLength());
 
 //! \brief Initialize batchSize curand states with given seed.
 //!
-//! \param state output buffer [batchSize]. Curand states to be initialized
+//! \param state output buffer [maxBatchSize]. Curand states to be initialized
+//! \param batchSlots input buffer[batchSize], optional. Indices of rows of data in memory pool
 //! \param batchSize number of states to initialize
 //! \param randomSeed seed to initialize states
 //! \param stream stream
-void invokeCurandInitialize(curandState_t* state, const size_t batchSize, uint64_t randomSeed, cudaStream_t stream);
+void invokeCurandInitialize(
+    curandState_t* state, const int* batchSlots, const size_t batchSize, uint64_t randomSeed, cudaStream_t stream);
 
 //! \brief Initialize batchSize curand states with given seed per request.
 //!
-//! \param state output buffer [batchSize] of curand states to be initialized
+//! \param state output buffer [maxBatchSize] of curand states to be initialized
+//! \param batchSlots input buffer[batchSize], optional. Indices of rows of data in memory pool
 //! \param batchSize number of states to initialize
-//! \param randomSeeds input buffer [batchSize] with seeds
+//! \param randomSeeds input buffer [maxBatchSize] with seeds
 //! \param stream stream
-void invokeCurandBatchInitialize(
-    curandState_t* states, const size_t batchSize, const uint64_t* randomSeeds, cudaStream_t stream);
+void invokeCurandBatchInitialize(curandState_t* states, const int* batchSlots, const size_t batchSize,
+    const uint64_t* randomSeeds, cudaStream_t stream);
 
 //! \brief Applies mask, adds bias to logits and computes softmax values.
 //! Sets -MAX_FLT value for tokens in range [vocabSize; vocabSizePadded) to prevent them from being chosen.
 //! If request finished the generation, sets MAX_FLT to endId token and -MAX_FLT to all other tokens forcing to choose
 //! endId token. Otherwise, adds bias per token if bias pointer is not nullptr.
 //!
-//! \param logits input/output buffer [batchSize, vocabSize]. Logits to be modified by mask and bias.
-//! \param probs output buffer [batchSize, vocabSize]. Probabilities of logits compute by softmax.
+//! \param logits input/output buffer [maxBatchSize, vocabSize]. Logits to be modified by mask and bias.
+//! \param probs output buffer [maxBatchSize, vocabSize]. Probabilities of logits compute by softmax.
 //! Can be the same pointer as logits
 //! \param bias input buffer [vocabSize]. Bias to logit per token. Ignored if nullptr
-//! \param endIds input buffer [batchSize]. EOS token ids per request
-//! \param finished input buffer [batchSize] with flags set to true if request has finished the generation
+//! \param endIds input buffer [maxBatchSize]. EOS token ids per request
+//! \param finished input buffer [maxBatchSize] with flags set to true if request has finished the generation
+//! \param batchSlots input buffer[batchSize], optional. Indices of rows of data in memory pool
 //! \param batchSize batch size
 //! \param vocabSize unpadded vocab size
 //! \param vocabSizePadded padded vocab size
 //! \param stream stream
 template <typename T>
 void invokeAddBiasSoftMax(T* logits, T* probs, const T* bias, const int* endIds, const FinishedState* finished,
-    const int batchSize, const int vocabSize, const int vocabSizePadded, cudaStream_t stream);
+    const int* batchSlots, const int batchSize, const int vocabSize, const int vocabSizePadded, cudaStream_t stream);
 
+//! \brief Distributes values located in src to dst according to the indieces from batchSlots
+//!
+//! \param src input buffer [batchSize].
+//! \param dst output buffer [maxBatchSize].
+//! \param batchSlots input buffer [batchSize], optional. Indices of rows of data in memory pool
+//! \param batchSize batch size
+//! \param stream stream
+template <typename T>
+void invokeScatterDecodingParams(T const* src, T* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
 } // namespace kernels
 } // namespace tensorrt_llm
