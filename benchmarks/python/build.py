@@ -188,11 +188,11 @@ def get_quant_mode(quantization):
     elif quantization == "int8_weight_only":
         use_smooth_quant = False
         weight_only_precision = 'int8'
-        quant_mode = QuantMode.use_weight_only(False)
+        quant_mode = QuantMode.use_weight_only(use_int4_weights=False)
 
     elif quantization == "int4_weight_only":
         weight_only_precision = 'int4'
-        quant_mode = QuantMode.use_weight_only(True)
+        quant_mode = QuantMode.use_weight_only(use_int4_weights=True)
 
     elif quantization == "int4_weight_only_awq":
         weight_only_precision = 'int4_awq'
@@ -212,13 +212,36 @@ def get_quant_mode(quantization):
                                                 per_group=True,
                                                 use_int4_weights=True)
 
-    elif quantization == None:
+    elif quantization is None:
         pass
 
     else:
         raise Exception(f'Unexpected quantization: {quantization}')
 
     return quant_mode, use_smooth_quant, weight_only_precision
+
+
+def get_quant_algo(quantization):
+    if quantization == "fp8":
+        return "FP8", "FP8"
+    elif quantization == "fp8_gemm":
+        return "FP8", None
+    elif quantization == "fp8_kv_cache":
+        return None, "FP8"
+    elif quantization == "int8_sq_per_tensor":
+        return "W8A8_SQ_PER_TENSOR_PLUGIN", None
+    elif quantization == "int8_sq_per_token_channel":
+        return "W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN", None
+    elif quantization == "int8_weight_only":
+        return "W8A16", None
+    elif quantization == "int4_weight_only":
+        return "W4A16", None
+    elif quantization == "int4_weight_only_awq":
+        return "W4A16_AWQ", None
+    elif quantization == "int4_weight_only_gptq":
+        return "W4A16_GPTQ", None
+    elif quantization is None:
+        return None, None
 
 
 def build_gpt(args):
@@ -326,121 +349,195 @@ def build_gpt(args):
             'embedding_sharding_dim': 0,
             'do_layer_norm_before': build_config['do_layer_norm_before'],
             'quantization': {
-                'use_smooth_quant':
-                quant_mode.has_act_and_weight_quant(),
-                'per_channel':
-                quant_mode.has_per_channel_scaling(),
-                'per_token':
-                quant_mode.has_per_token_dynamic_scaling(),
-                'per_group':
-                quant_mode.has_per_group_scaling(),
-                'group_size':
-                128,
-                'int8_kv_cache':
-                quant_mode.has_int8_kv_cache(),
-                'enable_fp8':
-                quant_mode.has_fp8_qdq(),
-                'fp8_kv_cache':
-                quant_mode.has_fp8_kv_cache(),
-                'use_weight_only':
-                quant_mode.is_weight_only(),
-                'weight_only_precision':
-                'int8' if quant_mode.is_int8_weight_only() else 'int4',
+                'group_size': 128
             }
         }
+        quant_algo, kv_cache_quant_algo = get_quant_algo(args.quantization)
+        config['quantization']['quant_algo'] = quant_algo
+        config['quantization']['kv_cache_quant_algo'] = kv_cache_quant_algo
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.OPTForCausalLM(config)
     elif family == "llama":
-        tensorrt_llm_model = tensorrt_llm.models.LLaMAForCausalLM(
-            num_layers=build_config['num_layers'],
-            num_heads=build_config['num_heads'],
-            num_kv_heads=num_kv_heads,
-            hidden_size=build_config['hidden_size'],
-            vocab_size=build_config['vocab_size'],
-            hidden_act=build_config['hidden_act'],
-            max_position_embeddings=build_config['n_positions'],
-            dtype=kv_dtype,
-            mlp_hidden_size=build_config['inter_size'],
-            mapping=tensorrt_llm.Mapping(world_size=world_size,
-                                         tp_size=world_size),  # TP only
-            quant_mode=quant_mode,
-            use_fused_mlp=True,
-            moe_config=MoeConfig(build_config["moe_num_experts"],
-                                 build_config["moe_top_k"]))
+        config = {
+            'architecture':
+            'LLaMAForCausalLM',
+            'dtype':
+            args.dtype,
+            'num_hidden_layers':
+            build_config['num_layers'],
+            'num_attention_heads':
+            build_config['num_heads'],
+            'num_key_value_heads':
+            build_config['num_heads'] if build_config['num_kv_heads'] is None
+            else build_config['num_kv_heads'],
+            'hidden_size':
+            build_config['hidden_size'],
+            'vocab_size':
+            build_config['vocab_size'],
+            'position_embedding_type':
+            'rope_gpt_neox',
+            'max_position_embeddings':
+            build_config['n_positions'],
+            'hidden_act':
+            build_config['hidden_act'],
+            'quantization': {
+                'group_size': 128
+            },
+            'mapping': {
+                'world_size': world_size,
+                'tp_size': world_size
+            },
+            'use_fused_mlp':
+            True,
+            'moe_num_experts':
+            build_config["moe_num_experts"],
+            'moe_top_k':
+            build_config["moe_top_k"],
+        }
+        quant_algo, kv_cache_quant_algo = get_quant_algo(args.quantization)
+        config['quantization']['quant_algo'] = quant_algo
+        config['quantization']['kv_cache_quant_algo'] = kv_cache_quant_algo
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.LLaMAForCausalLM(config)
     elif family == "gptj":
-        tensorrt_llm_model = tensorrt_llm.models.GPTJForCausalLM(
-            num_layers=build_config['num_layers'],
-            num_heads=build_config['num_heads'],
-            hidden_size=build_config['hidden_size'],
-            vocab_size=build_config['vocab_size'],
-            hidden_act=build_config['hidden_act'],
-            max_position_embeddings=build_config['n_positions'],
-            rotary_dim=build_config['rotary_dim'],
-            dtype=kv_dtype,
-            mapping=tensorrt_llm.Mapping(world_size=world_size,
-                                         tp_size=world_size),  # TP only
-            quant_mode=quant_mode)
+        config = {
+            'architecture': 'OPTForCausalLM',
+            'dtype': args.dtype,
+            'vocab_size': build_config['vocab_size'],
+            'hidden_size': build_config['hidden_size'],
+            'num_hidden_layers': build_config['num_layers'],
+            'num_attention_heads': build_config['num_heads'],
+            'hidden_act': build_config['hidden_act'],
+            'max_position_embeddings': build_config['n_positions'],
+            'rotary_dim': build_config['rotary_dim'],
+            'mapping': {
+                'world_size': world_size,
+                'tp_size': world_size
+            },
+            'use_parallel_embedding': False,
+            'share_embedding_table': False,
+            'embedding_sharding_dim': 0,
+            'do_layer_norm_before': build_config['do_layer_norm_before'],
+            'quantization': {
+                'group_size': 128
+            }
+        }
+        quant_algo, kv_cache_quant_algo = get_quant_algo(args.quantization)
+        config['quantization']['quant_algo'] = quant_algo
+        config['quantization']['kv_cache_quant_algo'] = kv_cache_quant_algo
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.GPTJForCausalLM(config)
     elif family == "gptneox":
-        tensorrt_llm_model = tensorrt_llm.models.GPTNeoXForCausalLM(
-            num_layers=build_config['num_layers'],
-            num_heads=build_config['num_heads'],
-            hidden_size=build_config['hidden_size'],
-            vocab_size=build_config['vocab_size'],
-            hidden_act=build_config['hidden_act'],
-            max_position_embeddings=build_config['n_positions'],
-            rotary_dim=build_config['rotary_dim'],
-            dtype=kv_dtype,
-            mapping=tensorrt_llm.Mapping(world_size=world_size,
-                                         tp_size=world_size),  # TP only
-            apply_query_key_layer_scaling=builder_config.
-            apply_query_key_layer_scaling)
+        config = {
+            'architecture':
+            'GPTNeoXForCausalLM',
+            'dtype':
+            args.dtype,
+            'num_hidden_layers':
+            build_config['num_layers'],
+            'num_attention_heads':
+            build_config['num_heads'],
+            'hidden_size':
+            build_config['hidden_size'],
+            'vocab_size':
+            build_config['vocab_size'],
+            'position_embedding_type':
+            'learned_absolute',
+            'max_position_embeddings':
+            build_config['n_positions'],
+            'rotary_emb_base':
+            10000,
+            'rotary_pct':
+            1.0 * build_config['rotary_dim'] * build_config['num_heads'] /
+            build_config['hidden_size'],
+            'hidden_act':
+            build_config['hidden_act'],
+            'mapping': {
+                'world_size': world_size,
+                'tp_size': world_size
+            },
+            'use_parallel_embedding':
+            False,
+            'share_embedding_table':
+            False,
+            'embedding_sharding_dim':
+            0,
+            'quantization': {
+                'group_size': 128,
+            }
+        }
+        quant_algo, kv_cache_quant_algo = get_quant_algo(args.quantization)
+        config['quantization']['quant_algo'] = quant_algo
+        config['quantization']['kv_cache_quant_algo'] = kv_cache_quant_algo
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.GPTNeoXForCausalLM(config)
     elif family == "chatglm":
-        tensorrt_llm_model = tensorrt_llm.models.ChatGLMHeadModel(
-            num_layers=build_config['num_layers'],
-            num_heads=build_config['num_heads'],
-            hidden_size=build_config['hidden_size'],
-            vocab_size=build_config['vocab_size'],
-            hidden_act=build_config['hidden_act'],
-            max_position_embeddings=build_config['n_positions'],
-            dtype=kv_dtype,
-            mapping=tensorrt_llm.Mapping(world_size=world_size,
-                                         tp_size=world_size),  # TP only
-            apply_query_key_layer_scaling=builder_config.
-            apply_query_key_layer_scaling,
-            quant_mode=quant_mode,
-            model_name="chatglm_6b")
+        quant_algo, kv_cache_quant_algo = get_quant_algo(args.quantization)
+        config = {
+            'architecture': 'ChatGLMForCausalLM',
+            'dtype': args.dtype,
+            'num_hidden_layers': build_config['num_layers'],
+            'num_attention_heads': build_config['num_heads'],
+            'num_key_value_heads': build_config['num_kv_heads'],
+            'hidden_size': build_config['hidden_size'],
+            'intermediate_size': build_config['inter_size'],
+            'norm_epsilon': 1e-5,
+            'vocab_size': build_config['vocab_size'],
+            'position_embedding_type': 'chatglm',
+            'max_position_embeddings': build_config['n_positions'],
+            'hidden_act': build_config['hidden_act'],
+            'quantization': {
+                'quant_algo': quant_algo,
+                'kv_cache_quant_algo': kv_cache_quant_algo
+            },
+            'mapping': {
+                'world_size': world_size,
+                'tp_size': world_size
+            },
+            'chatglm_version': 'chatglm',
+            'add_bias_linear': True,
+            'add_qkv_bias': True,
+            'apply_query_key_layer_scaling': False,
+            'apply_residual_connection_post_layernorm': False,
+            'rmsnorm': False,
+            'rope_ratio': 1.0,
+        }
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.ChatGLMForCausalLM(config)
 
-    elif family == "chatglm2":
-        tensorrt_llm_model = tensorrt_llm.models.ChatGLMHeadModel(
-            num_layers=build_config['num_layers'],
-            num_heads=build_config['num_heads'],
-            hidden_size=build_config['hidden_size'],
-            vocab_size=build_config['vocab_size'],
-            hidden_act=build_config['hidden_act'],
-            max_position_embeddings=build_config['n_positions'],
-            dtype=kv_dtype,
-            mapping=tensorrt_llm.Mapping(world_size=world_size,
-                                         tp_size=world_size),  # TP only
-            apply_query_key_layer_scaling=builder_config.
-            apply_query_key_layer_scaling,
-            quant_mode=quant_mode,
-            model_name="chatglm2_6b")
-
-    elif family == "chatglm3":
-        tensorrt_llm_model = tensorrt_llm.models.ChatGLMHeadModel(
-            num_layers=build_config['num_layers'],
-            num_heads=build_config['num_heads'],
-            hidden_size=build_config['hidden_size'],
-            vocab_size=build_config['vocab_size'],
-            hidden_act=build_config['hidden_act'],
-            max_position_embeddings=build_config['n_positions'],
-            dtype=kv_dtype,
-            mapping=tensorrt_llm.Mapping(world_size=world_size,
-                                         tp_size=world_size),  # TP only
-            apply_query_key_layer_scaling=builder_config.
-            apply_query_key_layer_scaling,
-            quant_mode=quant_mode,
-            model_name="chatglm3_6b")
+    elif family in ["chatglm2", "chatglm3"]:
+        quant_algo, kv_cache_quant_algo = get_quant_algo(args.quantization)
+        config = {
+            'architecture': 'ChatGLMForCausalLM',
+            'dtype': args.dtype,
+            'num_hidden_layers': build_config['num_layers'],
+            'num_attention_heads': build_config['num_heads'],
+            'num_key_value_heads': build_config['num_kv_heads'],
+            'hidden_size': build_config['hidden_size'],
+            'intermediate_size': build_config['inter_size'],
+            'norm_epsilon': 1e-5,
+            'vocab_size': build_config['vocab_size'],
+            'position_embedding_type': 'rope_gptj',
+            'max_position_embeddings': build_config['n_positions'],
+            'hidden_act': build_config['hidden_act'],
+            'quantization': {
+                'quant_algo': quant_algo,
+                'kv_cache_quant_algo': kv_cache_quant_algo
+            },
+            'mapping': {
+                'world_size': world_size,
+                'tp_size': world_size
+            },
+            'chatglm_version': family,
+            'add_bias_linear': False,
+            'add_qkv_bias': True,
+            'apply_query_key_layer_scaling': False,
+            'apply_residual_connection_post_layernorm': False,
+            'rmsnorm': True,
+            'rope_ratio': 1.0,
+        }
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.ChatGLMForCausalLM(config)
 
     elif family == "bloom":
         config = {
@@ -460,28 +557,12 @@ def build_gpt(args):
             'share_embedding_table': False,
             'embedding_sharding_dim': 0,
             'quantization': {
-                'use_smooth_quant':
-                quant_mode.has_act_and_weight_quant(),
-                'per_channel':
-                quant_mode.has_per_channel_scaling(),
-                'per_token':
-                quant_mode.has_per_token_dynamic_scaling(),
-                'per_group':
-                quant_mode.has_per_group_scaling(),
-                'group_size':
-                128,
-                'int8_kv_cache':
-                quant_mode.has_int8_kv_cache(),
-                'enable_fp8':
-                quant_mode.has_fp8_qdq(),
-                'fp8_kv_cache':
-                quant_mode.has_fp8_kv_cache(),
-                'use_weight_only':
-                quant_mode.is_weight_only(),
-                'weight_only_precision':
-                'int8' if quant_mode.is_int8_weight_only() else 'int4',
+                'group_size': 128
             }
         }
+        quant_algo, kv_cache_quant_algo = get_quant_algo(args.quantization)
+        config['quantization']['quant_algo'] = quant_algo
+        config['quantization']['kv_cache_quant_algo'] = kv_cache_quant_algo
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.BloomForCausalLM(config)
     elif family == "falcon":
@@ -509,26 +590,7 @@ def build_gpt(args):
             'hidden_act':
             build_config['hidden_act'],
             'quantization': {
-                'use_smooth_quant':
-                quant_mode.has_act_and_weight_quant(),
-                'per_channel':
-                quant_mode.has_per_channel_scaling(),
-                'per_token':
-                quant_mode.has_per_token_dynamic_scaling(),
-                'per_group':
-                quant_mode.has_per_group_scaling(),
-                'group_size':
-                128,
-                'int8_kv_cache':
-                quant_mode.has_int8_kv_cache(),
-                'enable_fp8':
-                quant_mode.has_fp8_qdq(),
-                'fp8_kv_cache':
-                quant_mode.has_fp8_kv_cache(),
-                'use_weight_only':
-                quant_mode.is_weight_only(),
-                'weight_only_precision':
-                'int8' if quant_mode.is_int8_weight_only() else 'int4',
+                'group_size': 128
             },
             'mapping': {
                 'world_size': world_size,
@@ -541,9 +603,12 @@ def build_gpt(args):
             'new_decoder_architecture':
             build_config['new_decoder_architecture'],
         }
+        quant_algo, kv_cache_quant_algo = get_quant_algo(args.quantization)
+        config['quantization']['quant_algo'] = quant_algo
+        config['quantization']['kv_cache_quant_algo'] = kv_cache_quant_algo
         if quant_mode.is_weight_only() and quant_mode.has_per_group_scaling():
             config['quantization'].update({
-                'zero': False,
+                'has_zero_point': False,
                 'pre_quant_scale': True,
                 'exclude_modules': [],
             })
@@ -580,22 +645,55 @@ def build_gpt(args):
                                          tp_size=world_size),
             quant_mode=quant_mode)
     elif family == "internlm":
-        tensorrt_llm_model = tensorrt_llm.models.LLaMAForCausalLM(
-            num_layers=build_config['num_layers'],
-            num_heads=build_config['num_heads'],
-            num_kv_heads=num_kv_heads,
-            hidden_size=build_config['hidden_size'],
-            vocab_size=build_config['vocab_size'],
-            hidden_act=build_config['hidden_act'],
-            max_position_embeddings=build_config['n_positions'],
-            dtype=kv_dtype,
-            mlp_hidden_size=build_config['inter_size'],
-            mapping=tensorrt_llm.Mapping(world_size=world_size,
-                                         tp_size=world_size),  # TP only
-            quant_mode=quant_mode,
-            embedding_sharding_dim=1,
-            use_fused_mlp=False,
-            attn_bias=build_config['bias'])
+        config = {
+            'architecture':
+            'LLaMAForCausalLM',
+            'dtype':
+            args.dtype,
+            'num_hidden_layers':
+            build_config['num_layers'],
+            'num_attention_heads':
+            build_config['num_heads'],
+            'num_key_value_heads':
+            build_config['num_heads'] if build_config['num_kv_heads'] is None
+            else build_config['num_kv_heads'],
+            'hidden_size':
+            build_config['hidden_size'],
+            'vocab_size':
+            build_config['vocab_size'],
+            'position_embedding_type':
+            'rope_gpt_neox',
+            'max_position_embeddings':
+            build_config['n_positions'],
+            'hidden_act':
+            build_config['hidden_act'],
+            'quantization':
+            quant_mode.to_dict(),
+            'mapping': {
+                'world_size': world_size,
+                'tp_size': world_size
+            },
+            'use_fused_mlp':
+            False,
+            'attn_bias':
+            build_config['bias'],
+        }
+        if quant_mode.is_weight_only():
+            if weight_only_precision == 'int4_awq':
+                config['quantization'].update({
+                    "group_size": 128,
+                    "has_zero_point": False,
+                    "pre_quant_scale": True,
+                    "exclude_modules": [],
+                })
+            elif weight_only_precision == 'int4_gptq':
+                config['quantization'].update({
+                    "group_size": 128,
+                    "has_zero_point": True,
+                    "pre_quant_scale": False,
+                })
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.LLaMAForCausalLM(config)
     elif family == "qwen":
         tensorrt_llm_model = tensorrt_llm.models.QWenForCausalLM(
             num_layers=build_config['num_layers'],
@@ -614,31 +712,34 @@ def build_gpt(args):
             use_parallel_embedding=False,
             embedding_sharding_dim=1,
             quant_mode=quant_mode)
+    elif family == "mamba":
+        config = {
+            'architecture': 'MambaLMHeadModel',
+            'dtype': args.dtype,
+            'vocab_size': build_config['vocab_size'],
+            'hidden_size': build_config['hidden_size'],
+            'num_hidden_layers': build_config['num_layers'],
+            'num_attention_heads': build_config['num_heads'],
+            'hidden_act': build_config['hidden_act'],
+            "ssm_cfg": {},
+            "rms_norm": True,
+            "residual_in_fp32": True,
+            "pad_vocab_size_multiple": 8,
+        }
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.MambaLMHeadModel(config)
     else:
         raise Exception(f'Unexpected model: {args.model}')
 
     quant_kwargs = {}
-    if family == "llama" and use_weight_only:
-        if weight_only_precision == 'int4_awq':
-            quant_kwargs = {
-                "group_size": 128,
-                "zero": False,
-                "pre_quant_scale": True,
-                "exclude_modules": [],
-            }
-        elif weight_only_precision == 'int4_gptq':
-            quant_kwargs = {
-                "group_size": 128,
-                "zero": True,
-                "pre_quant_scale": False,
-            }
-    if family not in ['opt', 'bloom', 'falcon']:
+    if family not in ['opt', 'bloom', 'falcon', 'llama', 'gptj', 'internlm']:
         tensorrt_llm_model = quantize_model(tensorrt_llm_model, quant_mode,
                                             **quant_kwargs)
 
     # Module -> Network
     network = builder.create_network()
     network.trt_network.name = engine_name
+    network.plugin_config.to_legacy_setting()
 
     # Plugins
     if args.mode == 'plugin':
@@ -683,7 +784,10 @@ def build_gpt(args):
             max_seq_len=max_input_len + max_output_len,
             use_cache=True,
             max_beam_width=max_beam_width)
-        if family in ['opt', 'bloom', 'falcon']:
+        if family in [
+                'opt', 'bloom', 'falcon', 'llama', 'internlm', 'gptneox',
+                'gptj', "mamba"
+        ]:
             tensorrt_llm_model(**inputs)
         else:
             tensorrt_llm_model(*inputs)
@@ -709,6 +813,7 @@ def build_gpt(args):
 
 
 def build_bert(args):
+    family = get_model_family(args.model)
     build_config = get_build_config(args.model)
     if args.force_num_layer_1:
         build_config['num_layers'] = 1
@@ -762,11 +867,15 @@ def build_bert(args):
         hidden_act=build_config['hidden_act'],
         max_position_embeddings=build_config['n_positions'],
         type_vocab_size=build_config['type_vocab_size'],
+        pad_token_id=None
+        if family == 'bert' else 1,  # hard code for RoBERTa here
+        is_roberta=(family == 'roberta'),
         mapping=tensorrt_llm.Mapping(world_size=world_size, tp_size=world_size))
 
     # Module -> Network
     network = builder.create_network()
     network.trt_network.name = engine_name
+    network.plugin_config.to_legacy_setting()
 
     # Plugins
     if args.mode == 'plugin':
@@ -969,6 +1078,7 @@ def enc_dec_build_helper(component, config, args):
                                   runtime_rank)
     network = builder.create_network()
     network.trt_network.name = engine_name
+    network.plugin_config.to_legacy_setting()
 
     # Plugins
     if args.mode == 'plugin':
@@ -1016,6 +1126,7 @@ def enc_dec_build_helper(component, config, args):
         num_kv_heads=num_heads,
         hidden_size=hidden_size,
         head_size=builder_config.head_size,
+        max_batch_size=builder_config.max_batch_size,
         vocab_size=builder_config.vocab_size,
         num_layers=builder_config.num_layers,
         gpt_attention_plugin=network.plugin_config.gpt_attention_plugin,

@@ -102,6 +102,7 @@ def build_engine(builder: Builder, builder_config: BuilderConfig,
     # Module -> Network
     network = builder.create_network()
     network.trt_network.name = engine_name
+    network.plugin_config.to_legacy_setting()
     with net_guard(network):
         # Prepare
         inputs = layer.prepare_inputs(args.max_batch_size, args.max_seq_len)

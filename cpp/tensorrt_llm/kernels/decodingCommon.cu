@@ -26,52 +26,57 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-__global__ void curandInitialize(curandState_t* state, const int size, const uint64_t randomSeed)
+__global__ void curandInitialize(curandState_t* state, const int* batchSlots, const int size, const uint64_t randomSeed)
 {
-    if (threadIdx.x + blockIdx.x * blockDim.x < size)
+    int const idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < size)
     {
-        curand_init(randomSeed, 0, 0, &state[blockIdx.x * blockDim.x + threadIdx.x]);
+        auto const batchSlot = batchSlots != nullptr ? batchSlots[idx] : idx;
+        curand_init(randomSeed, 0, 0, &state[batchSlot]);
     }
 }
 
 void invokeCurandInitialize(
-    curandState_t* state, const size_t batchSize, const uint64_t randomSeed, cudaStream_t stream)
+    curandState_t* state, const int* batchSlots, const size_t batchSize, const uint64_t randomSeed, cudaStream_t stream)
 {
     dim3 block(256);
     dim3 grid((int) (ceil(batchSize * 1.0 / 256)));
-    curandInitialize<<<grid, block, 0, stream>>>(state, batchSize, randomSeed);
+    curandInitialize<<<grid, block, 0, stream>>>(state, batchSlots, batchSize, randomSeed);
 }
 
-__global__ void curandBatchInitialize(curandState_t* states, const int size, const uint64_t* randomSeeds)
+__global__ void curandBatchInitialize(
+    curandState_t* states, const int* batchSlots, const int size, const uint64_t* randomSeeds)
 {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    int const idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < size)
     {
-        curand_init(randomSeeds[idx], 0, 0, &states[idx]);
+        auto const batchSlot = batchSlots != nullptr ? batchSlots[idx] : idx;
+        curand_init(randomSeeds[batchSlot], 0, 0, &states[batchSlot]);
     }
 }
 
-void invokeCurandBatchInitialize(
-    curandState_t* states, const size_t batchSize, const uint64_t* randomSeeds, cudaStream_t stream)
+void invokeCurandBatchInitialize(curandState_t* states, const int* batchSlots, const size_t batchSize,
+    const uint64_t* randomSeeds, cudaStream_t stream)
 {
     dim3 block(256);
     dim3 grid((int) (ceil(batchSize * 1.0 / 256)));
-    curandBatchInitialize<<<grid, block, 0, stream>>>(states, batchSize, randomSeeds);
+    curandBatchInitialize<<<grid, block, 0, stream>>>(states, batchSlots, batchSize, randomSeeds);
 }
 
 template <typename T>
 __global__ void addBiasSoftMax(T* logits, T* probs, const T* bias, const int* endIds, const FinishedState* finished,
-    const int vocabSize, const int vocabSizePadded)
+    const int* batchSlots, const int vocabSize, const int vocabSizePadded)
 {
-    int bid = blockIdx.x;
-    const FinishedState finishState = finished != nullptr ? finished[bid] : FinishedState::empty();
+    auto const batchIdx = blockIdx.x;
+    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
+    const FinishedState finishState = finished != nullptr ? finished[batchSlot] : FinishedState::empty();
     if (finishState.isSkipDecoding())
     {
         return;
     }
 
     bool finish = finishState.isFinished();
-    int offset = bid * vocabSizePadded;
+    int offset = batchIdx * vocabSizePadded;
 
     float maxVal = -1 * FLT_MAX;
     const bool IS_FP16 = std::is_same<T, half>::value;
@@ -85,7 +90,7 @@ __global__ void addBiasSoftMax(T* logits, T* probs, const T* bias, const int* en
         {
             if (finish && endIds != nullptr)
             {
-                logits[offset + tid] = (tid == endIds[bid]) ? MAX_T_VAL : -MAX_T_VAL;
+                logits[offset + tid] = (tid == endIds[batchSlot]) ? MAX_T_VAL : -MAX_T_VAL;
             }
             else
             {
@@ -129,20 +134,49 @@ __global__ void addBiasSoftMax(T* logits, T* probs, const T* bias, const int* en
 
 template <typename T>
 void invokeAddBiasSoftMax(T* logits, T* probs, const T* bias, const int* endIds, const FinishedState* finished,
-    const int batchSize, const int vocabSize, const int vocabSizePadded, cudaStream_t stream)
+    const int* batchSlots, const int batchSize, const int vocabSize, const int vocabSizePadded, cudaStream_t stream)
 {
     dim3 grid(batchSize);
     auto const vocabRoundedToWarp = roundUp(vocabSize, 32);
     dim3 block(min(vocabRoundedToWarp, 1024));
     // vocabSize, e.g., 30000, 7000.... vocabSize is usually very big.
-    addBiasSoftMax<<<grid, block, 0, stream>>>(logits, probs, bias, endIds, finished, vocabSize, vocabSizePadded);
+    addBiasSoftMax<<<grid, block, 0, stream>>>(
+        logits, probs, bias, endIds, finished, batchSlots, vocabSize, vocabSizePadded);
 }
 
 template void invokeAddBiasSoftMax(float* logits, float* probs, const float* bias, const int* endIds,
-    const FinishedState* finished, const int m, const int nPadded, const int n, cudaStream_t stream);
+    const FinishedState* finished, const int* batchSlots, const int m, const int nPadded, const int n,
+    cudaStream_t stream);
 
 template void invokeAddBiasSoftMax(half* logits, half* probs, const half* bias, const int* endIds,
-    const FinishedState* finished, const int m, const int nPadded, const int n, cudaStream_t stream);
+    const FinishedState* finished, const int* batchSlots, const int m, const int nPadded, const int n,
+    cudaStream_t stream);
 
+template <typename T>
+__global__ void scatterDecodingParamsKernel(T const* src, T* dst, int const* batchSlots, int batchSize)
+{
+    auto const batchIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (batchIdx >= batchSize)
+    {
+        return;
+    }
+    auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
+    dst[batchSlot] = src[batchIdx];
+}
+
+template <typename T>
+void invokeScatterDecodingParams(T const* src, T* dst, int const* batchSlots, int batchSize, cudaStream_t stream)
+{
+    constexpr int THREADS_PER_CTA = 256;
+    dim3 grid(divUp(batchSize, THREADS_PER_CTA));
+    scatterDecodingParamsKernel<<<grid, THREADS_PER_CTA, 0, stream>>>(src, dst, batchSlots, batchSize);
+}
+
+template void invokeScatterDecodingParams(
+    float const* src, float* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
+template void invokeScatterDecodingParams(
+    uint32_t const* src, uint32_t* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
+template void invokeScatterDecodingParams(
+    int32_t const* src, int32_t* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
 } // namespace kernels
 } // namespace tensorrt_llm

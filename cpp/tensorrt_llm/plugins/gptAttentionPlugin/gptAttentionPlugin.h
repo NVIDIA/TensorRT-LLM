@@ -93,8 +93,6 @@ public:
 
     bool supportsFormatCombination(
         int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept override;
-    void configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
-        const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept override;
     size_t getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
         const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept override;
     int enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvinfer1::PluginTensorDesc* outputDesc,
@@ -108,6 +106,15 @@ public:
     int enqueueDispatchKVCacheType(const nvinfer1::PluginTensorDesc* inputDesc,
         const nvinfer1::PluginTensorDesc* outputDesc, const void* const* inputs, void* const* outputs, void* workspace,
         cudaStream_t stream);
+
+    template <typename T, typename KVCacheBuffer>
+    void configurePluginImpl(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
+        const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept;
+    template <typename T>
+    void configurePluginDispatchKVCacheType(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
+        const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept;
+    void configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
+        const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept override;
 
     // IPluginV2Ext Methods
     nvinfer1::DataType getOutputDataType(

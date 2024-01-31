@@ -68,8 +68,8 @@ public:
         SizeType vocabSizePadded, bool useRandomAcceptThreshold, float randomAcceptThreshold,
         curandState_t* curandState, BufferManager::CudaStreamPtr const& stream);
 
-    static std::unique_ptr<IGptDecoder> create(
-        nvinfer1::DataType dtype, size_t vocabSize, size_t vocabSizePadded, BufferManager::CudaStreamPtr const& stream);
+    static std::unique_ptr<IGptDecoder> create(nvinfer1::DataType dtype, size_t maxBatchSize, size_t vocabSize,
+        size_t vocabSizePadded, BufferManager::CudaStreamPtr const& stream);
 };
 
 template <typename T>
@@ -80,7 +80,7 @@ public:
     using CudaStreamPtr = BufferManager::CudaStreamPtr;
     using TensorPtr = std::shared_ptr<ITensor>;
 
-    GptDecoder(size_t vocabSize, size_t vocabSizePadded, CudaStreamPtr const& stream);
+    GptDecoder(size_t maxBatchSize, size_t vocabSize, size_t vocabSizePadded, CudaStreamPtr const& stream);
 
     void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType maxSequenceLength) override;
 
@@ -105,13 +105,15 @@ private:
     SamplingConfig mSamplingConfig;
 };
 
-inline std::unique_ptr<IGptDecoder> IGptDecoder::create(
-    nvinfer1::DataType dtype, size_t vocabSize, size_t vocabSizePadded, BufferManager::CudaStreamPtr const& stream)
+inline std::unique_ptr<IGptDecoder> IGptDecoder::create(nvinfer1::DataType dtype, size_t maxBatchSize, size_t vocabSize,
+    size_t vocabSizePadded, BufferManager::CudaStreamPtr const& stream)
 {
     switch (dtype)
     {
-    case nvinfer1::DataType::kFLOAT: return std::make_unique<GptDecoder<float>>(vocabSize, vocabSizePadded, stream);
-    case nvinfer1::DataType::kHALF: return std::make_unique<GptDecoder<half>>(vocabSize, vocabSizePadded, stream);
+    case nvinfer1::DataType::kFLOAT:
+        return std::make_unique<GptDecoder<float>>(maxBatchSize, vocabSize, vocabSizePadded, stream);
+    case nvinfer1::DataType::kHALF:
+        return std::make_unique<GptDecoder<half>>(maxBatchSize, vocabSize, vocabSizePadded, stream);
     default: return nullptr;
     }
 }

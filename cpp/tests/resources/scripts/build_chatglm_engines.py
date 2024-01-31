@@ -30,25 +30,28 @@ _sys.path.insert(0, str(resources_dir))
 
 engine_target_path = _pl.Path(__file__).parent.parent / "models/rt_engine"
 
-import build as _ecb
+
+def convert_ckpt(model_dir: str, output_dir: str, world_size: int):
+    convert_cmd = [
+        _sys.executable, "examples/chatglm/convert_checkpoint.py",
+        "--dtype=float16", f"--model_dir={model_dir}",
+        f"--output_dir={output_dir}", f"--tp_size={world_size}"
+    ]
+    print("Running: " + " ".join(convert_cmd))
+    run_command(convert_cmd)
 
 
-def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, world_size, *args):
-    args = [
-        '--log_level=error',
-        '--model_dir',
-        str(weight_dir),
-        '--output_dir',
-        str(engine_dir),
-        '--max_batch_size=2',
-        '--max_beam_width=2',
-        "--max_input_len=512",
-        "--max_output_len=512",
-        '--builder_opt=0',
-        f'--world_size={world_size}',
-    ] + list(args)
-    print("Running: " + " ".join(args))
-    _ecb.run_build(args)
+def build_engine(ckpt_dir: str, engine_dir: str):
+    build_cmd = [
+        "trtllm-build", f"--checkpoint_dir={ckpt_dir}",
+        f"--output_dir={engine_dir}", "--log_level=error", "--max_batch_size=2",
+        "--max_beam_width=2", "--max_input_len=512", "--max_output_len=512",
+        "--gpt_attention_plugin=float16", "--gemm_plugin=float16",
+        "--builder_opt=0", "--remove_input_padding=disable",
+        "--paged_kv_cache=disable"
+    ]
+    print("Running: " + " ".join(build_cmd))
+    run_command(build_cmd)
 
 
 def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
@@ -87,8 +90,9 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
             )
 
         # Build engines
-        print("Building %s" % model_name)
+        print(f"Building {model_name}")
         weight_dir = _Path(resources_dir) / model_name
+        ckpt_dir = _Path(resources_dir) / ("ckpt_" + model_name)
         trt_dir = _Path(resources_dir) / ("output_" + model_name)
 
         # fix remained error in chatglm_6b, hope to remove this in the future
@@ -98,7 +102,8 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
                 weight_dir,
             )
 
-        build_engine(weight_dir, trt_dir, world_size)
+        convert_ckpt(weight_dir, ckpt_dir, world_size)
+        build_engine(ckpt_dir, trt_dir)
         _shutil.move(trt_dir, engine_target_path / model_name)
 
     print("Done")

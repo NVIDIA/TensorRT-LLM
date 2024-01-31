@@ -30,85 +30,87 @@ namespace kernels
 {
 
 template <typename T>
-__global__ void batchApplyPenalty(T* logits, const T* biases, int* penalty_workspace, const int* penalty_workspace_prev,
-    const float* temperatures, const float* repetition_penalties, const float* presence_penalties,
-    const float* frequency_penalties, const bool accumulate_vocab, const int max_seq_len, const int vocab_size,
-    const int vocab_size_padded, const int** output_ids_ptr, const int** parent_ids_ptr, const int* input_lengths,
-    const int* sequence_lengths, const int* min_lengths, const int* end_ids)
+__global__ void batchApplyPenalty(T* logits, const T* biases, int* penaltyWorkspace, const int* penaltyWorkspacePrev,
+    const float* temperatures, const float* repetitionPenalties, const float* presencePenalties,
+    const float* frequencyPenalties, const bool accumulateVocab, const int maxSeqLen, const int vocabSize,
+    const int vocabSizePadded, const int** outputIdsPtr, const int** parentIdsPtr, const int* inputLengths,
+    const int* sequenceLengths, const int* minLengths, const int* endIds, const int* batchSlots)
 {
-    const int beam_width = gridDim.y;
-    const int batch_id = blockIdx.x;
-    const int beam_id = blockIdx.y;
-    const int bbid = batch_id * beam_width + beam_id;
-    const int input_len = input_lengths == nullptr ? 0 : input_lengths[bbid];
-    const int current_step = sequence_lengths == nullptr ? 0 : sequence_lengths[bbid];
+    const int beamWidth = gridDim.y;
+    const int batchIdx = blockIdx.x;
+    const int beamIdx = blockIdx.y;
+    const int batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
+    const int batchBeamIdx = batchIdx * beamWidth + beamIdx;
+    const int batchSlotBeamIdx = batchSlot * beamWidth + beamIdx;
+    const int inputLen = inputLengths == nullptr ? 0 : inputLengths[batchSlotBeamIdx];
+    const int currentStep = sequenceLengths == nullptr ? 0 : sequenceLengths[batchSlotBeamIdx];
     // Initialize or update the number of occurrences of tokens
-    if (accumulate_vocab)
+    if (accumulateVocab)
     {
-        penalty_workspace += bbid * vocab_size;
-        if (current_step <= input_len)
+        penaltyWorkspace += batchBeamIdx * vocabSize;
+        if (currentStep <= inputLen)
         { // Context phase
-            for (int index = threadIdx.x; index < vocab_size; index += blockDim.x)
+            for (int index = threadIdx.x; index < vocabSize; index += blockDim.x)
             {
-                penalty_workspace[index] = 0;
+                penaltyWorkspace[index] = 0;
             }
             __syncthreads();
-            for (int step = threadIdx.x; step < input_len; step += blockDim.x)
+            for (int step = threadIdx.x; step < inputLen; step += blockDim.x)
             {
                 // All beams in the context phase are identical
-                int penalty_index = output_ids_ptr[batch_id][beam_id * max_seq_len + step];
-                if (penalty_index < vocab_size)
+                int penaltyIndex = outputIdsPtr[batchSlot][beamIdx * maxSeqLen + step];
+                if (penaltyIndex < vocabSize)
                 {
-                    atomicAdd(&penalty_workspace[penalty_index], 1);
+                    atomicAdd(&penaltyWorkspace[penaltyIndex], 1);
                 }
             }
         }
         else
         { // Generation phase
-            if (beam_width > 1)
+            if (beamWidth > 1)
             {
-                int parent_beam = parent_ids_ptr[batch_id][beam_id * max_seq_len + current_step - 2];
-                penalty_workspace_prev += (batch_id * beam_width + parent_beam) * vocab_size;
-                for (int index = threadIdx.x; index < vocab_size; index += blockDim.x)
+                int parentBeam = parentIdsPtr[batchSlot][beamIdx * maxSeqLen + currentStep - 2];
+                penaltyWorkspacePrev += (batchIdx * beamWidth + parentBeam) * vocabSize;
+                for (int index = threadIdx.x; index < vocabSize; index += blockDim.x)
                 {
-                    penalty_workspace[index] = penalty_workspace_prev[index];
+                    penaltyWorkspace[index] = penaltyWorkspacePrev[index];
                 }
                 __syncthreads();
             }
             if (threadIdx.x == 0)
             {
-                int penalty_index = output_ids_ptr[batch_id][beam_id * max_seq_len + current_step - 1];
-                if (penalty_index < vocab_size)
+                int penaltyIndex = outputIdsPtr[batchSlot][beamIdx * maxSeqLen + currentStep - 1];
+                if (penaltyIndex < vocabSize)
                 {
-                    penalty_workspace[penalty_index] += 1;
+                    penaltyWorkspace[penaltyIndex] += 1;
                 }
             }
         }
         __syncthreads();
     }
     // Apply bias and penalties
-    logits += bbid * vocab_size_padded;
+    logits += batchBeamIdx * vocabSizePadded;
     const T MASK_VAL = (std::is_same<T, half>::value) ? -HALF_FLT_MAX : -FLT_MAX;
-    float inv_temperature, repetition_penalty, presence_penalty, frequency_penalty;
+    float invTemperature, repetitionPenalty, presencePenalty, frequencyPenalty;
     if (temperatures != nullptr)
     {
-        inv_temperature = 1.0f / (temperatures[batch_id] + 1e-6f);
+        invTemperature = 1.0f / (temperatures[batchSlot] + 1e-6f);
     }
-    if (repetition_penalties != nullptr)
+    if (repetitionPenalties != nullptr)
     {
-        repetition_penalty = repetition_penalties[batch_id];
+        repetitionPenalty = repetitionPenalties[batchSlot];
     }
-    if (presence_penalties != nullptr)
+    if (presencePenalties != nullptr)
     {
-        presence_penalty = presence_penalties[batch_id];
+        presencePenalty = presencePenalties[batchSlot];
     }
-    if (frequency_penalties != nullptr)
+    if (frequencyPenalties != nullptr)
     {
-        frequency_penalty = frequency_penalties[batch_id];
+        frequencyPenalty = frequencyPenalties[batchSlot];
     }
-    for (int index = threadIdx.x; index < vocab_size_padded; index += blockDim.x)
+    for (int index = threadIdx.x; index < vocabSizePadded; index += blockDim.x)
     {
-        if (index < vocab_size)
+        if (index < vocabSize)
         {
             float logit = (float) logits[index];
             // Bias
@@ -119,25 +121,25 @@ __global__ void batchApplyPenalty(T* logits, const T* biases, int* penalty_works
             // Temperature
             if (temperatures != nullptr)
             {
-                logit *= inv_temperature;
+                logit *= invTemperature;
             }
-            int num_occurences = penalty_workspace[index];
-            if (num_occurences > 0)
+            int numOccurences = penaltyWorkspace[index];
+            if (numOccurences > 0)
             {
                 // Repetition
-                if (repetition_penalties != nullptr)
+                if (repetitionPenalties != nullptr)
                 {
-                    logit = logit < 0.0f ? logit * repetition_penalty : logit / repetition_penalty;
+                    logit = logit < 0.0f ? logit * repetitionPenalty : logit / repetitionPenalty;
                 }
                 // Presence
-                if (presence_penalties != nullptr)
+                if (presencePenalties != nullptr)
                 {
-                    logit -= presence_penalty;
+                    logit -= presencePenalty;
                 }
                 // Frequency
-                if (frequency_penalties != nullptr)
+                if (frequencyPenalties != nullptr)
                 {
-                    logit -= frequency_penalty * num_occurences;
+                    logit -= frequencyPenalty * numOccurences;
                 }
             }
             logits[index] = logit;
@@ -147,13 +149,13 @@ __global__ void batchApplyPenalty(T* logits, const T* biases, int* penalty_works
             logits[index] = MASK_VAL;
         }
     }
-    if (min_lengths != nullptr)
+    if (minLengths != nullptr)
     {
         __syncthreads();
         // Min length
-        if ((threadIdx.x == 0) && (current_step - input_len < min_lengths[batch_id]))
+        if ((threadIdx.x == 0) && (currentStep - inputLen < minLengths[batchSlot]))
         {
-            logits[end_ids[batch_id]] = MASK_VAL;
+            logits[endIds[batchSlot]] = MASK_VAL;
         }
     }
 }
@@ -161,14 +163,14 @@ __global__ void batchApplyPenalty(T* logits, const T* biases, int* penalty_works
 template <typename T>
 void invokeBatchApplyPenalty(const InvokeBatchApplyPenaltyParams<T>& params)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     dim3 block(256);
-    dim3 grid(params.batch_size, params.beam_width);
-    batchApplyPenalty<T><<<grid, block, 0, params.stream>>>(params.logits, params.biases, params.penalty_workspace,
-        params.penalty_workspace_prev, params.temperatures, params.repetition_penalties, params.presence_penalties,
-        params.frequency_penalties, params.accumulate_vocab, params.max_seq_len, params.vocab_size,
-        params.vocab_size_padded, params.output_ids_ptr, params.parent_ids_ptr, params.input_lengths,
-        params.sequence_lengths, params.min_lengths, params.end_ids);
+    dim3 grid(params.batchSize, params.beamWidth);
+    batchApplyPenalty<T><<<grid, block, 0, params.stream>>>(params.logits, params.biases, params.penaltyWorkspace,
+        params.penaltyWorkspacePrev, params.temperatures, params.repetitionPenalties, params.presencePenalties,
+        params.frequencyPenalties, params.accumulateVocab, params.maxSeqLen, params.vocabSize, params.vocabSizePadded,
+        params.outputIdsPtr, params.parentIdsPtr, params.inputLengths, params.sequenceLengths, params.minLengths,
+        params.endIds, params.batchSlots);
 }
 
 template void invokeBatchApplyPenalty(const InvokeBatchApplyPenaltyParams<float>& params);

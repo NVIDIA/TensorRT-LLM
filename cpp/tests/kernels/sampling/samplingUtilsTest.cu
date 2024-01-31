@@ -53,7 +53,7 @@ TEST_F(SamplingUtilsKernelTest, CurandInitialize)
         curandState_t* curandStates;
         cudaMalloc(&curandStates, sizeof(curandState_t) * batchSize);
         // Initialize curand states.
-        tk::invokeCurandInitialize(curandStates, batchSize, seed, this->mStream->get());
+        tk::invokeCurandInitialize(curandStates, nullptr, batchSize, seed, this->mStream->get());
         sync_check_cuda_error();
 
         // Generate random numbers using initialized curand states.MemoryType
@@ -106,9 +106,17 @@ TEST_F(SamplingUtilsKernelTest, CurandBatchInitialize)
     }
     auto randomSeedsDevice = mBufferManager->copyFrom(*randomSeedsHost, MemoryType::kGPU);
 
+    auto batchSlots = mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
+
+    auto batchSlotsPtr = bufferCast<int32_t>(*batchSlots);
+    for (SizeType bi = 0; bi < batchSize; ++bi)
+    {
+        batchSlotsPtr[batchSize - bi - 1] = bi;
+    }
+
     // Initialize curand states.
-    tk::invokeCurandBatchInitialize(
-        curandStates, batchSize, reinterpret_cast<uint64_t*>(bufferCast<int64_t>(*randomSeedsDevice)), mStream->get());
+    tk::invokeCurandBatchInitialize(curandStates, batchSlotsPtr, batchSize,
+        reinterpret_cast<uint64_t*>(bufferCast<int64_t>(*randomSeedsDevice)), mStream->get());
     sync_check_cuda_error();
 
     // Generate random numbers using initialized curand states.
@@ -125,6 +133,7 @@ TEST_F(SamplingUtilsKernelTest, CurandBatchInitialize)
     {
         for (size_t j = 1; j < periodSize; ++j)
         {
+            // FIXME(nkorobov): this has to be accessed via batchSlot
             EXPECT_TRUE(randValsHostPtr[i] == randValsHostPtr[i + j])
                 << tc::fmtstr("Fail at val[%d]=%d <> val[%d]=%d", i, randValsHostPtr[i], i + j, randValsHostPtr[i + j]);
         }
@@ -179,9 +188,10 @@ class SamplingUtilsTypedKernelTest : public SamplingKernelTest<T>
 public:
     void testAddBiasEndMaskSoftmax(bool hasBias, bool computeSoftmax)
     {
-        int32_t batchSize = 16;
-        int32_t vocabSize = 51000;
-        int32_t vocabSizePadded = tc::divUp(vocabSize, 256) * 256;
+        int32_t const batchSize = 16;
+        int32_t const maxBatchSize = 2 * batchSize;
+        int32_t const vocabSize = 51000;
+        int32_t const vocabSizePadded = tc::divUp(vocabSize, 256) * 256;
 
         auto logitsHost = this->mBufferManager->pinned(ITensor::makeShape({batchSize, vocabSizePadded}),
             std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
@@ -189,9 +199,17 @@ public:
             ITensor::makeShape({batchSize, vocabSizePadded}), nvinfer1::DataType::kFLOAT);
         auto biasHost = this->mBufferManager->pinned(ITensor::makeShape({vocabSize}),
             std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
-        auto endIdsHost = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
+        auto endIdsHost = this->mBufferManager->pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
         auto finishedHost = this->mBufferManager->pinned(
-            ITensor::makeShape({batchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
+            ITensor::makeShape({maxBatchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
+
+        auto batchSlots = this->mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
+
+        auto batchSlotsPtr = bufferCast<int32_t>(*batchSlots);
+        for (SizeType bi = 0; bi < batchSize; ++bi)
+        {
+            batchSlotsPtr[bi] = 2 * bi;
+        }
 
         auto logitsHostPtr = bufferCast<T>(*logitsHost);
         auto refLogitsHostPtr = bufferCast<float>(*refLogitsHost);
@@ -211,7 +229,7 @@ public:
             0, vocabSize - 1); // -1 because uniform_int_distribution generates closed interval
         std::uniform_real_distribution<> finishedDist(0, 1); // uniform distribution between 0 and 1
 
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType bi = 0; bi < maxBatchSize; ++bi)
         {
             endIdsHostPtr[bi] = endIdsDistr(gen);
 
@@ -226,14 +244,14 @@ public:
         {
             tk::invokeAddBiasEndMask(bufferCast<T>(*logitsDevice), biasDevicePtr, bufferCast<int32_t>(*endIdsDevice),
                 reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*finishedDevice)),
-                batchSize, vocabSize, vocabSizePadded, this->mStream->get());
+                batchSlotsPtr, batchSize, vocabSize, vocabSizePadded, this->mStream->get());
         }
         else
         {
             tk::invokeAddBiasSoftMax(bufferCast<T>(*logitsDevice), bufferCast<T>(*logitsDevice), biasDevicePtr,
                 bufferCast<int32_t>(*endIdsDevice),
                 reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*finishedDevice)),
-                batchSize, vocabSize, vocabSizePadded, this->mStream->get());
+                batchSlotsPtr, batchSize, vocabSize, vocabSizePadded, this->mStream->get());
         }
 
         this->mStream->synchronize();
@@ -245,6 +263,7 @@ public:
         const T MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
         for (SizeType bi = 0; bi < batchSize; ++bi)
         {
+            auto const batchSlot = batchSlotsPtr[bi];
             float maxLogit = -1 * FLT_MAX;
             for (SizeType vi = 0; vi < vocabSizePadded; ++vi)
             {
@@ -254,9 +273,9 @@ public:
                 {
                     refLogit = -MAX_T_VAL;
                 }
-                else if (finishedHostPtr[bi].isFinished())
+                else if (finishedHostPtr[batchSlot].isFinished())
                 {
-                    refLogit = (vi == endIdsHostPtr[bi]) ? MAX_T_VAL : -MAX_T_VAL;
+                    refLogit = (vi == endIdsHostPtr[batchSlot]) ? MAX_T_VAL : -MAX_T_VAL;
                 }
                 else if (hasBias)
                 {
@@ -282,6 +301,9 @@ public:
                     refLogitsHostPtr[idx] = refLogit / (sumExp + 1e-6f);
                 }
             }
+        }
+        for (SizeType bi = 0; bi < batchSize; ++bi)
+        {
             for (SizeType vi = 0; vi < vocabSizePadded; ++vi)
             {
                 const auto idx = bi * vocabSizePadded + vi;

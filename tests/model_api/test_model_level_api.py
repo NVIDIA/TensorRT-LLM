@@ -1,12 +1,16 @@
 import asyncio
+import os
+import sys
 import tempfile
 
 import torch
-from llm_data import llm_models_root
 from profile_utils import profile
 
 import tensorrt_llm
 from tensorrt_llm.models import LLaMAForCausalLM
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.llm_data import llm_models_root
 
 
 def ammo_installed():

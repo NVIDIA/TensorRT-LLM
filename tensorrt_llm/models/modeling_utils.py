@@ -41,6 +41,8 @@ class PretrainedConfig:
                  use_parallel_embedding: bool = False,
                  embedding_sharding_dim: int = 0,
                  share_embedding_table: bool = False,
+                 max_lora_rank: int = 64,
+                 head_size: int = None,
                  **kwargs):
         self.architecture = architecture
         self.dtype = dtype
@@ -52,6 +54,7 @@ class PretrainedConfig:
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
+        self.head_size = hidden_size // num_attention_heads if head_size is None else head_size
         self.hidden_act = hidden_act
         self.intermediate_size = intermediate_size
         self.norm_epsilon = norm_epsilon
@@ -67,6 +70,7 @@ class PretrainedConfig:
         self.quant_mode = quant_mode
         self.quant_kwargs = quant_kwargs
         self.kv_dtype = self.dtype
+        self.max_lora_rank = max_lora_rank
         if self.quant_mode.has_int8_kv_cache():
             self.kv_dtype = 'int8'
         elif self.quant_mode.has_fp8_kv_cache():
@@ -123,62 +127,33 @@ class PretrainedConfig:
 
         quantization = config.pop(
             'quantization', {
-                'use_smooth_quant': False,
-                'per_channel': False,
-                'per_token': False,
-                'per_group': False,
+                'quant_algo': None,
+                'kv_cache_quant_algo': None,
                 'group_size': 128,
-                'zero': False,
+                'has_zero_point': False,
                 'pre_quant_scale': False,
                 'exclude_modules': None,
-                'int8_kv_cache': False,
-                'enable_fp8': False,
-                'fp8_kv_cache': False,
-                'use_weight_only': False,
-                'weight_only_precision': 'int8'
             })
-        use_smooth_quant = quantization.get('use_smooth_quant', False)
-        per_channel = quantization.get('per_channel', False)
-        per_token = quantization.get('per_token', False)
-        per_group = quantization.get('per_group', False)
+        quant_algo = quantization.get('quant_algo', None)
+        kv_cache_quant_algo = quantization.get('kv_cache_quant_algo', None)
         group_size = quantization.get('group_size', 128)
-        zero = quantization.get('zero', False)
+        has_zero_point = quantization.get('has_zero_point', False)
         pre_quant_scale = quantization.get('pre_quant_scale', False)
         exclude_modules = quantization.get('exclude_modules', None)
-        int8_kv_cache = quantization.get('int8_kv_cache', False)
-        enable_fp8 = quantization.get('enable_fp8', False)
-        fp8_kv_cache = quantization.get('fp8_kv_cache', False)
-        use_weight_only = quantization.get('use_weight_only', False)
-        weight_only_precision = quantization.get('weight_only_precision',
-                                                 'int8')
+        sq_use_plugin = quantization.get('sq_use_plugin', False)
 
-        quantize_weights, quantize_activations = False, False
-        if use_smooth_quant:
-            quantize_weights = True
-            quantize_activations = True
-        elif use_weight_only:
-            quantize_weights = True
-            per_token = False
-            per_channel = False
-
-        quant_mode = QuantMode.from_description(
-            quantize_weights=quantize_weights,
-            quantize_activations=quantize_activations,
-            per_token=per_token,
-            per_channel=per_channel,
-            per_group=per_group,
-            use_int4_weights=(weight_only_precision == 'int4'),
-            use_int8_kv_cache=int8_kv_cache,
-            use_fp8_kv_cache=fp8_kv_cache,
-            use_fp8_qdq=enable_fp8,
-        )
-
+        quant_mode = QuantMode.from_quant_algo(quant_algo, kv_cache_quant_algo)
         quant_kwargs = {
+            'quant_algo': quant_algo,
+            'kv_cache_quant_algo': kv_cache_quant_algo,
             'group_size': group_size,
-            'zero': zero,
+            'zero': has_zero_point,
             'pre_quant_scale': pre_quant_scale,
             'exclude_modules': exclude_modules,
+            'sq_use_plugin': sq_use_plugin,
         }
+
+        max_lora_rank = config.pop('max_lora_rank', 64)
 
         return cls(architecture, dtype, logits_dtype, vocab_size,
                    max_position_embeddings, hidden_size, num_hidden_layers,
@@ -186,7 +161,8 @@ class PretrainedConfig:
                    intermediate_size, norm_epsilon, position_embedding_type,
                    world_size, tp_size, pp_size, quant_mode, quant_kwargs,
                    use_prompt_tuning, use_parallel_embedding,
-                   embedding_sharding_dim, share_embedding_table, **config)
+                   embedding_sharding_dim, share_embedding_table, max_lora_rank,
+                   **config)
 
     @classmethod
     def from_json_file(cls, config_file: str):
@@ -206,32 +182,18 @@ class PretrainedConfig:
         output.pop('quant_mode')
         output.pop('quant_kwargs')
         output['quantization'] = {
-            'use_smooth_quant':
-            self.quant_mode.has_act_and_weight_quant(),
-            'per_channel':
-            self.quant_mode.has_per_channel_scaling(),
-            'per_token':
-            self.quant_mode.has_per_token_dynamic_scaling(),
-            'per_group':
-            self.quant_mode.has_per_group_scaling(),
+            'quant_algo':
+            self.quant_kwargs.get('quant_algo', None),
+            'kv_cache_quant_algo':
+            self.quant_kwargs.get('kv_cache_quant_algo', None),
             'group_size':
             self.quant_kwargs.get('group_size', 128),
-            'zero':
+            'has_zero_point':
             self.quant_kwargs.get('zero', False),
             'pre_quant_scale':
             self.quant_kwargs.get('pre_quant_scale', False),
             'exclude_modules':
             self.quant_kwargs.get('exclude_modules', None),
-            'int8_kv_cache':
-            self.quant_mode.has_int8_kv_cache(),
-            'enable_fp8':
-            self.quant_mode.has_fp8_qdq(),
-            'fp8_kv_cache':
-            self.quant_mode.has_fp8_kv_cache(),
-            'use_weight_only':
-            self.quant_mode.is_weight_only(),
-            'weight_only_precision':
-            'int8' if self.quant_mode.is_int8_weight_only() else 'int4',
         }
 
         return output
@@ -255,7 +217,9 @@ class DecoderLayerList(ModuleList):
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
-                lora_params=None):
+                lora_params=None,
+                medusa_position_offsets=None,
+                medusa_packed_mask=None):
         kv_cache_params.fill_none_tensor_list(len(self.layer_list))
 
         if use_cache:
@@ -269,13 +233,18 @@ class DecoderLayerList(ModuleList):
                         kv_cache_params.host_kv_cache_block_pointers,
                         kv_cache_params.host_max_attention_window_sizes)):
 
-            lora_param = None
+            lora_layer_params = None
             if lora_params is not None and lora_params.lora_ranks is not None:
-                lora_param = lora_params.get_layer_params(layer_idx)
+                lora_layer_params = lora_params.get_layer_params(layer_idx)
 
             kwargs = {}
-            if lora_param is not None:
-                kwargs['lora_param'] = lora_param
+
+            if lora_layer_params is not None:
+                kwargs['lora_layer_params'] = lora_layer_params
+            if medusa_position_offsets is not None:
+                kwargs['medusa_position_offsets'] = medusa_position_offsets
+            if medusa_packed_mask is not None:
+                kwargs['medusa_packed_mask'] = medusa_packed_mask
             hidden_states = layer(
                 hidden_states,
                 use_cache=use_cache,
@@ -319,6 +288,11 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
     def __post_init__(self):
         quantize(self, self.config.quant_mode, **self.config.quant_kwargs)
 
+    def check_config(self, config):
+        raise NotImplementedError(
+            f"{self.__class__} is an abstract class. Only classes inheriting this class can be called."
+        )
+
     @classmethod
     def from_config(cls, config: PretrainedConfig):
         return cls(config)
@@ -341,7 +315,6 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
                                    device='cpu') as f:
             for key in f.keys():
                 weights[key] = f.get_tensor(key)
-
         model.load(weights)
 
         return model
@@ -368,6 +341,8 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
                        max_beam_width: int = 1,
                        max_num_tokens: int = None,
                        prompt_embedding_table_size: int = 0,
+                       position_encoding_2d: bool = False,
+                       max_draft_len: int = 0,
                        gather_context_logits: bool = False,
                        gather_generation_logits: bool = False,
                        lora_target_modules: List[str] = None):
@@ -378,7 +353,6 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
         '''
 
         # Prepare inputs
-        head_size = self.config.hidden_size // self.config.num_attention_heads
         remove_input_padding = default_net().plugin_config.remove_input_padding
         use_gpt_attention_plugin = default_net(
         ).plugin_config.gpt_attention_plugin
@@ -395,7 +369,7 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
             max_input_len=max_input_len,
             max_seq_len=max_seq_len,
             num_kv_heads=self.config.num_key_value_heads,
-            head_size=head_size,
+            head_size=self.config.head_size,
             num_layers=self.config.num_hidden_layers,
             kv_dtype=str_dtype_to_trt(self.config.kv_dtype),
             remove_input_padding=remove_input_padding,
@@ -407,11 +381,13 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
             max_num_tokens=max_num_tokens,
             dtype=str_dtype_to_trt(self.config.dtype),
             prompt_embedding_table_size=prompt_embedding_table_size,
+            position_encoding_2d=position_encoding_2d,
             mapping=self.config.mapping,
             gather_context_logits=gather_context_logits,
             gather_generation_logits=gather_generation_logits,
             use_custom_all_reduce=use_custom_all_reduce,
             use_lora_plugin=use_lora_plugin,
+            max_draft_len=max_draft_len,
             lora_target_modules=lora_target_modules)
 
         result = {
@@ -485,7 +461,9 @@ class DecoderModelForCausalLM(PretrainedModel):
                 prompt_embedding_table: Optional[Tensor] = None,
                 prompt_tasks: Optional[Tensor] = None,
                 prompt_vocab_size: Optional[Tensor] = None,
-                lora_params=None):
+                lora_params=None,
+                medusa_position_offsets=None,
+                medusa_packed_mask=None):
         kwargs = {
             'input_ids': input_ids,
             'position_ids': position_ids,
@@ -504,6 +482,11 @@ class DecoderModelForCausalLM(PretrainedModel):
             kwargs['prompt_tasks'] = prompt_tasks
         if prompt_vocab_size is not None:
             kwargs['prompt_vocab_size'] = prompt_vocab_size
+
+        if medusa_position_offsets is not None:
+            kwargs['medusa_position_offsets'] = medusa_position_offsets
+        if medusa_packed_mask is not None:
+            kwargs['medusa_packed_mask'] = medusa_packed_mask
 
         hidden_states = self.transformer.forward(**kwargs)
 
@@ -528,9 +511,9 @@ class DecoderModelForCausalLM(PretrainedModel):
                 present.mark_output(f'present_key_value_{i}',
                                     self.config.kv_dtype)
             if self.config.mapping.is_last_pp_rank():
-                return (lm_logits, presents)
+                return (lm_logits, presents, hidden_states)
             return (hidden_states, presents)
         else:
             if self.config.mapping.is_last_pp_rank():
-                return lm_logits
+                return lm_logits, hidden_states
             return hidden_states

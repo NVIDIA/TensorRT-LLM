@@ -1,12 +1,32 @@
 import json
 import os
+import re
+import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 
-from .._utils import (fromfile, numpy_to_torch, str_dtype_to_np,
-                      str_dtype_to_torch, torch_to_numpy)
+from .._utils import str_dtype_to_torch, torch_to_numpy, unpack_nemo_ckpt
+
+
+def get_all_nemo_lora_weights(num_layers, lora_weights):
+    layer_weights = [{} for _ in range(2 * num_layers)]
+    adapter_key = "self_attention.adapter_layer.lora_kqv_adapter"
+    layer_pattern = re.compile(r'.*\.layers\.([0-9]+)\..*')
+    for key, weights in lora_weights.items():
+        if adapter_key in key:
+            if key.endswith('linear_in.weight'):
+                inout = 'in'
+            elif key.endswith('linear_out.weight'):
+                inout = 'out'
+            else:
+                continue
+            m = layer_pattern.match(key)
+            layer_idx = int(m.group(1))
+            layer_weights[layer_idx][inout] = weights
+    return layer_weights
 
 
 class LoraConfig(object):
@@ -73,6 +93,7 @@ class LoraConfig(object):
 
         lm_head_weight = None
         embedding_weight = None
+
         if os.path.exists(f"{hf_lora_dir}/adapter_model.bin"):
             lora_weight = torch.load(f"{hf_lora_dir}/adapter_model.bin")
 
@@ -141,86 +162,93 @@ class LoraManager(object):
         else:
             assert False, f"LoraManager does not support source {ckpt_source}"
 
-    def load_from_nemo(self, model_dirs, model_config, runtime_mapping):
-        '''
-        Load lora modules, could be move to client side
-        '''
-        self._model_config = model_config
-        model_dir = Path(model_dirs[0])
-
-        with open(model_dir / "lora_weights.json", 'r') as f:
-            config = json.load(f)
-        lora_config = config['lora_config']
-        precision = config.get('precision', 'float16')
-        for key in lora_config['lora_kqv_adapter']:
-            self._lora_uid_to_key[lora_config['lora_kqv_adapter'][key]
-                                  ['key']] = key
-
+    def load_from_nemo(self, model_files, model_config, runtime_mapping):
+        tp_size = runtime_mapping.tp_size
+        tp_rank = runtime_mapping.tp_rank
         lora_target_modules = model_config.lora_target_modules
         dtype = model_config.dtype
 
-        for layer_idx in range(model_config.num_layers):
-            self._lora_weights_pointers_list.append({})
+        uids = ["-1"]
+        for i in range(len(model_files)):
+            uids.append(str(i))
+        model_files = [""] + model_files
 
-            for uid, key in self._lora_uid_to_key.items():
+        for uid, model_file in zip(uids, model_files):
+            if uid not in self._lora_cpp_weights:
+                self._lora_cpp_weights[uid] = []
+            if uid not in self._lora_weight_config:
+                self._lora_weight_config[uid] = []
+
+            if model_file != "":
+                with tempfile.TemporaryDirectory() as unpack_out_dir:
+                    unpack_out_dir = Path(unpack_out_dir)
+                    unpack_nemo_ckpt(model_file, unpack_out_dir)
+
+                    model_weights_ckpt = "model_weights.ckpt"
+                    with open(unpack_out_dir / "model_config.yaml") as f:
+                        yaml.full_load(f)
+                    weight_path = unpack_out_dir / model_weights_ckpt
+                    nemo_weights = torch.load(
+                        weight_path,
+                        map_location=lambda storage, loc: storage.cpu())
+
+                all_lora_weights = get_all_nemo_lora_weights(
+                    model_config.num_layers, nemo_weights)
+            else:
+                all_lora_weights = None
+                nemo_weights = None
+
+            self._lora_uid_to_low_ranks[uid] = []
+            for layer_idx in range(model_config.num_layers):
+                self._lora_weights_pointers_list.append({})
                 self._lora_weights_pointers_list[layer_idx].update({uid: {}})
-                low_rank = int(lora_config['lora_kqv_adapter'][key]['low_rank'])
-                if uid not in self._lora_cpp_weights:
-                    self._lora_cpp_weights[uid] = []
-                if uid not in self._lora_weight_config:
-                    self._lora_weight_config[uid] = []
+
+                self._lora_uid_to_low_ranks[uid].append({})
 
                 for lora_module in lora_target_modules:
-                    if uid not in self._lora_uid_to_low_ranks:
-                        self._lora_uid_to_low_ranks.update(
-                            {uid: [{} for _ in range(model_config.num_layers)]})
-                    self._lora_uid_to_low_ranks[uid][layer_idx][
-                        lora_module] = low_rank
+                    if uid == "-1" or lora_module != "attn_qkv" or all_lora_weights is None:
+                        self._lora_uid_to_low_ranks[uid][layer_idx][
+                            lora_module] = 0
+                        continue
 
-                    prefix = f"model.model.language_model.encoder.layers.{layer_idx}.self_attention.adapter_layer.lora_kqv_adapter.{key}"
-                    t_in = numpy_to_torch(
-                        np.ascontiguousarray(
-                            fromfile(
-                                model_dir, f'{prefix}.linear_in.weight.bin',
-                                [model_config.hidden_size, low_rank],
-                                str_dtype_to_np(precision)).transpose(
-                                    1,
-                                    0))).cuda()  # t_in: [low_rank, hidden_size]
+                    if lora_module == "attn_qkv":
+                        t_in = all_lora_weights[layer_idx]["in"]
+                        t_out = all_lora_weights[layer_idx]["out"]
+                        assert t_out.shape[0] % tp_size == 0
+                        t_out = torch.split(t_out,
+                                            t_out.shape[0] // tp_size,
+                                            dim=0)[tp_rank].contiguous()
+                    else:
+                        t_in = None
+                        t_out = None
 
-                    t_out = numpy_to_torch(
-                        np.ascontiguousarray(
-                            fromfile(model_dir,
-                                     f'{prefix}.linear_out.weight.bin',
-                                     [low_rank, model_config.hidden_size * 3],
-                                     str_dtype_to_np(precision)).transpose(
-                                         1, 0))).cuda(
-                                         )  # t_in: [hidden_size * 3, low_rank]
-                    t_in = t_in.float().to(str_dtype_to_torch(dtype))
-                    t_out = t_out.float().to(str_dtype_to_torch(dtype))
+                    if t_in is not None and t_out is not None:
+                        t_in = t_in.cuda().to(
+                            str_dtype_to_torch(dtype)).contiguous()
+                        t_out = t_out.cuda().to(
+                            str_dtype_to_torch(dtype)).contiguous()
+                        rank = t_in.shape[0]
+                        self._lora_weights_pointers_list[layer_idx][uid].update(
+                            {lora_module: [t_in.data_ptr(),
+                                           t_out.data_ptr()]})
+                        self._lora_uid_to_low_ranks[uid][layer_idx][
+                            lora_module] = int(rank)
 
-                    self._lora_weights_pointers_list[layer_idx][uid].update({
-                        lora_module: [
-                            t_in.contiguous().data_ptr(),
-                            t_out.contiguous().data_ptr()
-                        ]
-                    })
+                        # prevent torch free this buffer
+                        self._lora_weights.append(t_in)
+                        self._lora_weights.append(t_out)
+                        self._lora_cpp_weights[uid].append(
+                            torch.concatenate([t_in.flatten(),
+                                               t_out.flatten()]))
+                        self._lora_weight_config[uid].append(
+                            np.array([
+                                LoraConfig.LORA_MODULE_IDS[lora_module],
+                                layer_idx,
+                                int(rank)
+                            ],
+                                     dtype=np.int32))
 
-                    self._lora_weights.append(t_in)
-                    self._lora_weights.append(t_out)
-                    self._lora_cpp_weights[uid].append(
-                        torch.concatenate([t_in.flatten(),
-                                           t_out.flatten()]))
-                    self._lora_weight_config[uid].append(
-                        np.array([
-                            LoraConfig.LORA_MODULE_IDS[lora_module], layer_idx,
-                            int(low_rank)
-                        ],
-                                 dtype=np.int32))
-
-            if "-1" not in self._lora_uid_to_low_ranks:
-                self._lora_uid_to_low_ranks.update(
-                    {"-1": [{} for _ in range(model_config.num_layers)]})
-            self._lora_uid_to_low_ranks["-1"][layer_idx][lora_module] = 0
+            del nemo_weights
 
     def load_from_hf(self, model_dirs, model_config, runtime_mapping):
         '''

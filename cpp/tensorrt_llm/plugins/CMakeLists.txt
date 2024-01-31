@@ -34,8 +34,6 @@ set(PLUGIN_LISTS
     gptAttentionCommon
     gptAttentionPlugin
     identityPlugin
-    layernormPlugin
-    rmsnormPlugin
     gemmPlugin
     smoothQuantGemmPlugin
     quantizePerTokenPlugin
@@ -102,7 +100,7 @@ else()
     ${PLUGIN_SHARED_TARGET}
     PROPERTIES
       LINK_FLAGS
-      "-Wl,--exclude-libs,ALL -Wl,--version-script=${PLUGIN_EXPORT_MAP} ${UNDEFINED_FLAG}"
+      "-Wl,--exclude-libs,ALL -Wl,--version-script=${PLUGIN_EXPORT_MAP} -Wl,-rpath,'$ORIGIN' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}"
   )
 endif()
 
@@ -119,7 +117,8 @@ target_link_libraries(
   ${CUDNN_LIB}
   nvinfer
   ${CUDA_DRV_LIB}
+  ${CUDA_RT_LIB}
   ${CMAKE_DL_LIBS}
   ${MPI_C_LIBRARIES}
   ${NCCL_LIB}
-  ${STATIC_TARGET})
+  ${SHARED_TARGET})

@@ -329,12 +329,6 @@ def parse_arguments():
         action='store_true',
         help=
         'Activates latency-optimized algorithm for all-reduce instead of NCCL.')
-    parser.add_argument('--use_rmsnorm_plugin',
-                        nargs='?',
-                        const='float16',
-                        type=str,
-                        default=False,
-                        choices=['float16', 'float32', 'bfloat16'])
     parser.add_argument(
         '--max_prompt_embedding_table_size',
         type=int,
@@ -387,7 +381,7 @@ def parse_arguments():
                 use_int4_weights=True)
         else:
             args.quant_mode = QuantMode.use_weight_only(
-                args.weight_only_precision == 'int4')
+                use_int4_weights=(args.weight_only_precision == 'int4'))
     else:
         args.quant_mode = QuantMode(0)
 
@@ -430,7 +424,9 @@ def parse_arguments():
         max_num_tokens=args.max_num_tokens,
         max_batch_size=args.max_batch_size,
         max_input_len=args.max_input_len,
-        remove_input_padding=args.remove_input_padding)
+        remove_input_padding=args.remove_input_padding,
+        enable_context_fmha=args.enable_context_fmha,
+        tokens_per_block=args.tokens_per_block)
 
     assert (math.log2(args.tokens_per_block).is_integer()
             ), "tokens_per_block must be power of 2"
@@ -551,6 +547,7 @@ def build_rank_engine(builder: Builder,
     # Module -> Network
     network = builder.create_network()
     network.trt_network.name = engine_name
+    network.plugin_config.to_legacy_setting()
     if args.use_gpt_attention_plugin:
         network.plugin_config.set_gpt_attention_plugin(
             dtype=args.use_gpt_attention_plugin)
@@ -583,8 +580,6 @@ def build_rank_engine(builder: Builder,
 
     if args.paged_kv_cache:
         network.plugin_config.enable_paged_kv_cache(args.tokens_per_block)
-    if args.use_rmsnorm_plugin:
-        network.plugin_config.set_rmsnorm_plugin(dtype=args.use_rmsnorm_plugin)
     if args.use_lookup_plugin:
         network.plugin_config.set_lookup_plugin(dtype=args.dtype)
 

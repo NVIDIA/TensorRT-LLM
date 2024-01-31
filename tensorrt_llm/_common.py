@@ -195,7 +195,8 @@ def _is_building(f):
 
 
 def check_max_num_tokens(max_num_tokens, max_batch_size, max_input_len,
-                         remove_input_padding):
+                         remove_input_padding, enable_context_fmha,
+                         tokens_per_block):
     if not remove_input_padding:
         if max_num_tokens is not None:
             logger.warning("remove_input_padding is not enabled, the specified "
@@ -218,10 +219,17 @@ def check_max_num_tokens(max_num_tokens, max_batch_size, max_input_len,
             f"max_input_len * max_batch_size ({max_input_len * max_batch_size}), "
             f"specifying to max_input_len * max_batch_size ({max_input_len * max_batch_size})."
         )
-    if max_num_tokens < max_input_len:
+    if max_num_tokens < max_input_len and not enable_context_fmha:
         logger.warning(
-            f"max_num_tokens ({max_num_tokens}) should be greater than "
-            f"max_input_len ({max_input_len}), specifying to "
+            f"When enable_context_fmha is not turned on, max_num_tokens ({max_num_tokens}) "
+            f"should be greater than max_input_len ({max_input_len}), specifying to "
             f"max_input_len ({max_input_len}).")
         max_num_tokens = max_input_len
+    elif max_num_tokens < tokens_per_block and enable_context_fmha:
+        logger.warning(
+            f"When enable_context_fmha is turned on, max_num_tokens ({max_num_tokens}) "
+            f"should be greater than tokens_per_block ({tokens_per_block}), specifying to "
+            f"tokens_per_block ({tokens_per_block}). At this time, you also need to enable "
+            f"context chunking at runtime, otherwise you may encounter errors.")
+        max_num_tokens = tokens_per_block
     return max_num_tokens

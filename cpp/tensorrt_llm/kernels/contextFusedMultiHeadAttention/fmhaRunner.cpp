@@ -241,7 +241,6 @@ public:
         // Determine launch parameters.
         mLaunchParams.set_default_kernel_selection_params();
 
-        TLLM_CHECK_WITH_INFO(tokens_per_kv_block >= 128, "FMHA with paged kv cache needs tokens_per_block >= 128 !");
         // Needed by TMA descriptors.
         mLaunchParams.blocks_per_context_sequence = blocks_per_context_sequence;
 
@@ -409,12 +408,12 @@ public:
         const uint32_t d_groups = d_in_bytes > 128 ? d_in_bytes / 128 : 1;
 
         uint32_t q_step = 0, kv_step = 0;
-        for (unsigned int i = 0u; i < sizeof(sTmaPagedKVMetaInfo) / sizeof(sTmaPagedKVMetaInfo[0]); ++i)
+        for (unsigned int i = 0u; i < sizeof(sTmaMetaInfo) / sizeof(sTmaMetaInfo[0]); ++i)
         {
-            if (sTmaPagedKVMetaInfo[i].mD == mPagedKVParams.d)
+            if (sTmaMetaInfo[i].mD == mPagedKVParams.d)
             {
-                q_step = sTmaPagedKVMetaInfo[i].mQStep;
-                kv_step = sTmaPagedKVMetaInfo[i].mKVStep;
+                q_step = sTmaMetaInfo[i].mQStep;
+                kv_step = sTmaMetaInfo[i].mKVStep;
                 break;
             }
         }
@@ -470,18 +469,24 @@ public:
 
         // Paged KV
         // Per batch tensor size.
+        uint32_t tokens_per_block = uint32_t(mPagedKVParams.paged_kv_cache.mTokensPerBlock);
         uint32_t tensor_size_kv[4];
         tensor_size_kv[3] = 1;
         tensor_size_kv[2] = mPagedKVParams.h_kv;
-        tensor_size_kv[1] = mPagedKVParams.paged_kv_cache.mTokensPerBlock;
+        tensor_size_kv[1] = tokens_per_block;
         tensor_size_kv[0] = mPagedKVParams.d;
 
         // Box size for k and v.
         uint32_t box_size_kv[4];
         box_size_kv[3] = 1;
         box_size_kv[2] = 1;
-        box_size_kv[1] = kv_step;
+        box_size_kv[1] = std::min(tokens_per_block, kv_step);
         box_size_kv[0] = mPagedKVParams.d / d_groups;
+
+        TLLM_CHECK_WITH_INFO(
+            tokens_per_block % 2 == 0, "FMHA with paged kv cache needs tokens_per_block to be power of 2 !");
+        mPagedKVParams.blocks_per_tma_load = std::max(1, int32_t(kv_step / tokens_per_block));
+        mPagedKVParams.blocks_per_tma_load_log2 = log2(mPagedKVParams.blocks_per_tma_load);
 
         // Stride size in bytes.
         uint64_t tensor_stride_kv[3];

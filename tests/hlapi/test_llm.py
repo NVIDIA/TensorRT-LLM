@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 import tempfile
 from typing import List
 
@@ -10,10 +11,15 @@ from transformers import AutoTokenizer
 from tensorrt_llm.hlapi.llm import (LLM, ModelConfig, SamplingConfig,
                                     TokenizerBase, TransformersTokenizer)
 
-llm_models_root = os.environ.get('LLM_MODELS_ROOT', None)
-llama_model_path = os.path.join(llm_models_root, "llama-models/llama-7b-hf")
-llm_engine_dir = os.environ.get('LLM_ENGINE_DIR', './tmp.engine')
 
+def get_model_path():
+    sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+    from utils.llm_data import llm_models_root
+    return str(llm_models_root() / "llama-models/llama-7b-hf")
+
+
+llama_model_path = get_model_path()
+llm_engine_dir = os.environ.get('LLM_ENGINE_DIR', './tmp.engine')
 prompts = ["Tell a story", "Who are you"]
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
@@ -117,8 +123,9 @@ def test_llm_generate_for_tp2():
         print(output)
 
 
-def test_llm_generate_async():
+def test_llm_generate_async(tp_size: int = 1):
     config = ModelConfig(llama_model_path)
+    config.parallel_config.tp_size = tp_size
     llm = LLM(
         config,
         async_mode=True,
@@ -144,16 +151,42 @@ def test_llm_generate_async():
         for prompt in prompts:
             future = llm.generate_async(prompt, streaming=streaming)
             for output in future:
-                print(output)
+                print('wait', output)
+
+    def test_non_streaming_usage_wait():
+        for prompt in prompts:
+            output = llm.generate_async(prompt, streaming=False)
+            print(output.text)
+
+    def test_future(streaming: bool):
+        for prompt in prompts:
+            future = llm.generate_async(prompt, streaming=streaming)
+            if streaming is True:
+                for output in future:
+                    # Do something else and then wait for the result if needed
+                    output = output.wait_completion(timeout=10)
+                    print('future', output.text)
+            else:
+                # Do something else and then wait for the result if needed
+                output = future.wait_completion(timeout=10)
+                print('future', output.text)
 
     test_async(streaming=True)
     test_async(streaming=False)
     test_wait(streaming=True)
     test_wait(streaming=False)
+    test_future(streaming=True)
+    test_future(streaming=False)
+    test_non_streaming_usage_wait()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="The test needs at least 2 GPUs, skipping")
+def test_llm_generate_async_tp2():
+    test_llm_generate_async(tp_size=2)
 
 
 # TODO[chunweiy]: Add test for loading inmemory model
-# TODO[chunweiy]: Add a multi-gpu test on loading engine
 
 if __name__ == '__main__':
-    test_llm_generate_async()
+    test_llm_generate_async_tp2()

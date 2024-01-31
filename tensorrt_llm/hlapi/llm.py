@@ -1,4 +1,3 @@
-import gc
 import json
 import os
 import tempfile
@@ -15,7 +14,8 @@ import torch
 from .._utils import mpi_rank, mpi_world_size
 from ..builder import (BuildConfig, Builder, BuilderConfig, PluginConfig,
                        QuantMode)
-from ..executor import GenerationExecutor, GenerationResult
+from ..executor import (GenerationExecutor, GenerationResult,
+                        ParallelGenerationExecutor)
 from ..logger import logger
 from ..mapping import Mapping
 from ..models.modeling_utils import PretrainedConfig
@@ -25,7 +25,7 @@ from ..runtime import (GenerationSession, ModelRunner, SamplingConfig,
 from .mpi_session import MpiSession, NodeSession
 from .tokenizer import TokenizerBase, TransformersTokenizer
 from .utils import (GenerationOutput, file_with_suffix_exists, get_device_count,
-                    print_colored, print_traceback_on_error)
+                    print_colored, print_traceback_on_error, release_gc)
 
 
 @dataclass
@@ -135,6 +135,8 @@ class LLM:
     class AdditionalOptions:
         kvcahe_free_gpu_memory_fraction: Optional[float] = None
 
+        # TODO[chunweiy]: Add other options including runtime configs and other LLM workflow related options
+
         def get_valid_options(self) -> List[str]:
             return [
                 x for x in self.__dict__
@@ -148,7 +150,7 @@ class LLM:
                  dump_model_processing_summary: Optional[str] = None,
                  async_mode: bool = False,
                  async_engine_tmp_dir: Optional[str] = None,
-                 **options):
+                 **kwargs):
         '''
         Args:
             config: The model config for the model.
@@ -170,24 +172,19 @@ class LLM:
         self._extra_build_config = ModelLoader.get_extra_build_configs(
             'llama7b', 'a100')
 
-        if self.async_mode and self.config.is_multi_gpu:
-            raise NotImplementedError(
-                f"Async mode is not supported for multi-gpu yet. {self.config.parallel_config}"
-            )
+        if self.config.is_multi_gpu:
+            if get_device_count() < self.config.parallel_config.world_size:
+                raise RuntimeError(
+                    f"Only {get_device_count()} GPUs are available, but {self.config.parallel_config.world_size} are required."
+                )
 
-        if not self.async_mode and self.config.is_multi_gpu:
-            import torch
-            assert torch.cuda.is_available(), "No CUDA device is available."
-            assert get_device_count() >= self.config.parallel_config.world_size, \
-                f"Only {get_device_count()} CUDA devices are available, but {self.config.parallel_config.world_size} are required."
-
-            logger.warning(
+            logger.info(
                 f'start MpiSession with {self.config.parallel_config.tp_size} workers'
             )
             self.mpi_session = MpiSession(
                 n_workers=self.config.parallel_config.tp_size)
 
-        self._async_engine: Optional[GenerationExecutor] = None
+        self._executor: Optional[GenerationExecutor] = None
         self._additional_options = LLM.AdditionalOptions()
 
         # set additional options for constructing the LLM pipeline
@@ -195,14 +192,14 @@ class LLM:
 
         def set_option(key, value):
             if key in valid_options:
-                logger.warning(
+                logger.debug(
                     f"Additionl option is a preview feature, setting {key}={value}"
                 )
                 setattr(self._additional_options, key, value)
             else:
                 raise ValueError(f"Invalid option {key}")
 
-        for key, value in options.items():
+        for key, value in kwargs.items():
             set_option(key, value)
 
         self._build_model()
@@ -243,7 +240,7 @@ class LLM:
                        sampling_config: Optional[SamplingConfig] = None,
                        streaming: bool = False) -> GenerationResult:
         ''' Generate in asynchronuous mode. '''
-        assert self._async_engine, "The async engine is not built yet."
+        assert self._executor, "The async engine is not built yet."
 
         sampling_config = sampling_config or self.get_default_sampling_config()
         assert sampling_config is not None
@@ -252,7 +249,7 @@ class LLM:
             "The total input length is too large, not supported yet"
 
         assert isinstance(prompt, str), "Only support str prompt for now"
-        results = self._async_engine.generate_async(
+        results = self._executor.generate_async(
             prompt,
             streaming=streaming,
             # TODO[chunweiy]: make executor support all the options in SamplingConfig
@@ -328,32 +325,47 @@ class LLM:
 
         # TODO[chunweiy]: Support multi-gpu build
         def build_async():
-            engine_dir = self.async_engine_tmp_dir
-            if engine_dir is None:
-                temp_dir = tempfile.TemporaryDirectory()
-                engine_dir = temp_dir.name
 
             model_format = ModelLoader.get_model_format(self.config.model_dir)
+
+            engine_dir = self.config.model_dir
+
             if model_format is not _ModelFormatKind.TLLM_ENGINE:
 
-                with ModelLoader(self.config,
-                                 self.enable_tokenizer,
-                                 tokenizer=self._tokenizer) as model_loader:
+                engine_dir = self.async_engine_tmp_dir
+                if engine_dir is None:
+                    temp_dir = tempfile.TemporaryDirectory()
+                    engine_dir = temp_dir.name
 
-                    runtime_context = model_loader()
-                    # runner is not needed for GptManager
+                if self.config.is_multi_gpu:
+                    self.mpi_session.submit_sync(
+                        LLM._node_build_task, self.config,
+                        self.enable_tokenizer,
+                        self.config.parallel_config.tp_size,
+                        self.config.parallel_config.pp_size, self._tokenizer)
+                    self.save(engine_dir)
 
-                    # TODO[chunweiy]: Make GptManager support in-memory engine-buffer to save disk loading lantenecy
-                    ModelLoader.save(runtime_context,
-                                     self.config.model_dir,
-                                     engine_dir=engine_dir,
-                                     model_info=runtime_context.model_info)
+                    self.mpi_session.submit_sync(LLM._node_free_state_task)
 
-                    # Once saved, the engine_buffer is not needed anymore
-                    del runtime_context
+                else:
 
-                gc.collect()
-                torch.cuda.empty_cache()
+                    with ModelLoader(self.config,
+                                     self.enable_tokenizer,
+                                     tokenizer=self._tokenizer) as model_loader:
+
+                        runtime_context = model_loader()
+                        # runner is not needed for GptManager
+
+                        # TODO[chunweiy]: Make GptManager support in-memory engine-buffer to save disk loading lantenecy
+                        ModelLoader.save(runtime_context,
+                                         self.config.model_dir,
+                                         engine_dir=engine_dir,
+                                         model_info=runtime_context.model_info)
+
+                        # Once saved, the engine_buffer is not needed anymore
+                        del runtime_context
+
+                    release_gc()
 
             tokenizer = self.tokenizer
             if not isinstance(tokenizer, TokenizerBase):
@@ -365,13 +377,24 @@ class LLM:
             if self._additional_options.kvcahe_free_gpu_memory_fraction is not None:
                 executor_config.kv_cache_config.free_gpu_memory_fraction = self._additional_options.kvcahe_free_gpu_memory_fraction
 
-            self._async_engine = GenerationExecutor(
-                engine_dir,
-                tokenizer=tokenizer,
-                max_beam_width=self._extra_build_config.max_beam_width,
-                executor_config=executor_config,
-                # TODO[chunweiy]: Expose more options
-            )
+            if self.config.is_multi_gpu:
+                self._executor = ParallelGenerationExecutor(
+                    tp_size=self.config.parallel_config.tp_size,
+                    engine_dir=engine_dir,
+                    tokenizer=tokenizer,
+                    max_beam_width=self._extra_build_config.max_beam_width,
+                    kvcache_free_gpu_memory_fraction=self._additional_options.
+                    kvcahe_free_gpu_memory_fraction,
+                )
+            else:
+
+                self._executor = GenerationExecutor(
+                    engine_dir,
+                    tokenizer=tokenizer,
+                    max_beam_width=self._extra_build_config.max_beam_width,
+                    executor_config=executor_config,
+                    # TODO[chunweiy]: Expose more options
+                )
 
             return True
 
@@ -428,6 +451,8 @@ class LLM:
     def _node_save_task(engine_dir: str, model_dir: str, pp_size: int,
                         tp_size: int):
         runtime_context: _ModelRuntimeContext = NodeSession.state
+        assert isinstance(runtime_context,
+                          _ModelRuntimeContext), "Model is not built yet."
 
         mapping = Mapping(world_size=mpi_world_size(),
                           rank=mpi_rank(),
@@ -438,6 +463,13 @@ class LLM:
                          engine_dir=engine_dir,
                          mapping=mapping,
                          model_info=runtime_context.model_info)
+
+    @print_traceback_on_error
+    @staticmethod
+    def _node_free_state_task():
+        NodeSession.state = None
+        # release the large resource explicitly and immediately, since the following LLM pipeline may need a lot of memory
+        release_gc()
 
     def __getstate__(self):
         raise RuntimeError("LLM object can not be pickled.")
@@ -529,6 +561,12 @@ class LLM:
 
         # TODO[chunweiy]: make sure that the root's output is always the first
         return res[0]
+
+    def __del__(self):
+        if self.config.is_multi_gpu:
+            self.mpi_session.shutdown()
+            if self._executor is not None:
+                self._executor.shutdown()
 
 
 class _ModelFormatKind(Enum):
@@ -698,8 +736,7 @@ class ModelLoader:
                 if attr_name not in ('model_format', ):
                     setattr(self, attr_name, None)
 
-        gc.collect()
-        torch.cuda.empty_cache()
+        release_gc()
 
     @property
     def model_format(self) -> _ModelFormatKind:
@@ -822,7 +859,9 @@ class ModelLoader:
         assert self._model_dir
         logger.info(f"Loading model runner from {self._model_dir}")
 
-        self.runner = ModelRunner.from_dir(self._model_dir)
+        self.runner = ModelRunner.from_dir(
+            self._model_dir,
+            rank=self.mapping.rank if self.mapping is not None else 0)
         self._engine = self.runner.session.runtime.engine
         with open(os.path.join(self._model_dir, 'config.json'), 'r') as f:
             self._engine_config: dict = json.load(f)
@@ -891,7 +930,13 @@ class ModelLoader:
 
     def _load_hf_tokenizer(self):
         assert self._model_dir
-        self.tokenizer = ModelLoader.load_hf_tokenizer(self._model_dir)
+        try:
+            self.tokenizer = ModelLoader.load_hf_tokenizer(self._model_dir)
+        except:
+            logger.error(
+                f"failed to load HuggingFace tokenizer from {self._model_dir}\n"
+                "You can also have a try to copy the tokenizer* files from HuggingFace model to the engine directory manually."
+            )
 
     @staticmethod
     def load_hf_tokenizer(model_dir):

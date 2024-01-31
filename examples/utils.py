@@ -21,25 +21,20 @@ from transformers import AutoTokenizer, T5Tokenizer
 
 import tensorrt_llm
 
+# TODO(enweiz): Update for refactered models
 DEFAULT_HF_MODEL_DIRS = {
     'baichuan': 'baichuan-inc/Baichuan-13B-Chat',
-    'bloom': 'bigscience/bloom-560m',
-    'chatglm_6b': 'THUDM/chatglm-6b',
-    'chatglm2_6b': 'THUDM/chatglm2-6b',
-    'chatglm2_6b_32k': 'THUDM/chatglm2-6b-32k',
-    'chatglm3_6b': 'THUDM/chatglm3-6b',
-    'chatglm3_6b_base': 'THUDM/chatglm3-6b-base',
-    'chatglm3_6b_32k': 'THUDM/chatglm3-6b-32k',
-    'falcon': 'tiiuae/falcon-rw-1b',
-    'glm_10b': 'THUDM/glm-10b',
+    'BloomForCausalLM': 'bigscience/bloom-560m',
+    'ChatGLMForCausalLM': 'THUDM/chatglm3-6b',
+    'FalconForCausalLM': 'tiiuae/falcon-rw-1b',
     'gpt': 'gpt2-medium',
-    'gptj': 'EleutherAI/gpt-j-6b',
-    'gptneox': 'EleutherAI/gpt-neox-20b',
+    'GPTJForCausalLM': 'EleutherAI/gpt-j-6b',
+    'GPTNeoXForCausalLM': 'EleutherAI/gpt-neox-20b',
     'internlm': 'internlm/internlm-chat-7b',
     'llama': 'meta-llama/Llama-2-7b-hf',
     'mpt': 'mosaicml/mpt-7b',
-    'phi': 'microsoft/phi-2',
-    'opt': 'facebook/opt-350m',
+    'PhiForCausalLM': 'microsoft/phi-2',
+    'OPTForCausalLM': 'facebook/opt-350m',
     'qwen': 'Qwen/Qwen-7B',
 }
 
@@ -58,9 +53,13 @@ def read_model_name(engine_dir: str):
         config = json.load(f)
 
     if engine_version is None:
-        return config['builder_config']['name']
+        return config['builder_config']['name'], None
 
-    return config['pretrained_config']['architecture']
+    model_arch = config['pretrained_config']['architecture']
+    model_version = None
+    if model_arch == 'ChatGLMForCausalLM':
+        model_version = config['pretrained_config']['chatglm_version']
+    return model_arch, model_version
 
 
 def throttle_generator(generator, stream_interval):
@@ -75,6 +74,7 @@ def throttle_generator(generator, stream_interval):
 def load_tokenizer(tokenizer_dir: Optional[str] = None,
                    vocab_file: Optional[str] = None,
                    model_name: str = 'gpt',
+                   model_version: Optional[str] = None,
                    tokenizer_type: Optional[str] = None):
     if vocab_file is None:
         use_fast = True
@@ -107,7 +107,7 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
             end_id = tokenizer.im_end_id
         else:
             raise Exception(f"unknown chat format: {chat_format}")
-    elif model_name == 'glm_10b':
+    elif model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
         pad_id = tokenizer.pad_token_id
         end_id = tokenizer.eop_token_id
     else:

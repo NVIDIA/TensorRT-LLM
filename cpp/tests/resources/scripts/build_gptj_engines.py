@@ -24,14 +24,30 @@ import typing as _tp
 from build_engines_utils import run_command, wincopy
 
 
-def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, *args):
-    build_args = [_sys.executable, "examples/gptj/build.py"] + (
-        ['--model_dir', str(weight_dir)] if weight_dir else []) + [
+def get_ckpt_without_quatization(model_dir, output_dir):
+    build_args = [_sys.executable, "examples/gptj/convert_checkpoint.py"] + [
+        '--model_dir={}'.format(model_dir),
+        '--output_dir={}'.format(output_dir),
+    ]
+    run_command(build_args)
+
+
+def get_ckpt_with_ammo_quant(model_dir, output_dir):
+    build_args = [_sys.executable, "examples/quantization/quantize.py"] + [
+        '--model_dir={}'.format(model_dir),
+        '--output_dir={}'.format(output_dir), '--qformat=fp8',
+        '--kv_cache_dtype=fp8'
+    ]
+    run_command(build_args)
+
+
+def build_engine(checkpoint_dir: _pl.Path, engine_dir: _pl.Path, *args):
+    build_args = ["trtllm-build"] + (
+        ['--checkpoint_dir', str(checkpoint_dir)] if checkpoint_dir else []) + [
             '--output_dir',
             str(engine_dir),
-            '--dtype=float16',
             '--logits_dtype=float16',
-            '--use_gemm_plugin=float16',
+            '--gemm_plugin=float16',
             '--max_batch_size=32',
             '--max_input_len=40',
             '--max_output_len=20',
@@ -106,25 +122,34 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
         # TODO: use dummy scales atm; to re-enable when data is uploaded to the model cache
         # quantized_fp8_model_arg = '--quantized_fp8_model_path=' + \
         #     str(_pl.Path(model_cache) / 'fp8-quantized-ammo' / 'gptj_tp1_rank0.npz')
-        build_engine(hf_dir, engine_dir / 'fp8-plugin' / tp_pp_dir,
-                     '--use_gpt_attention_plugin=float16', '--enable_fp8',
-                     '--fp8_kv_cache', '--use_inflight_batching',
-                     '--paged_kv_cache', '--remove_input_padding')
+        fp8_ckpt_path = engine_dir / 'fp8' / tp_pp_dir
+        get_ckpt_with_ammo_quant(hf_dir, fp8_ckpt_path)
+        build_engine(fp8_ckpt_path, engine_dir / 'fp8-plugin' / tp_pp_dir,
+                     '--gpt_attention_plugin=float16',
+                     '--paged_kv_cache=enable', '--remove_input_padding=enable',
+                     "--context_fmha=disable")
     else:
+        fp16_ckpt_path = engine_dir / 'fp16' / tp_pp_dir
+        get_ckpt_without_quatization(hf_dir, fp16_ckpt_path)
         print("\nBuilding fp16-plugin engine")
-        build_engine(hf_dir, engine_dir / 'fp16-plugin' / tp_pp_dir,
-                     '--use_gpt_attention_plugin=float16')
+        build_engine(fp16_ckpt_path, engine_dir / 'fp16-plugin' / tp_pp_dir,
+                     '--gpt_attention_plugin=float16',
+                     '--paged_kv_cache=disable',
+                     '--remove_input_padding=disable', "--context_fmha=disable")
 
         print("\nBuilding fp16-plugin-packed engine")
-        build_engine(hf_dir, engine_dir / 'fp16-plugin-packed' / tp_pp_dir,
-                     '--use_gpt_attention_plugin=float16',
-                     '--remove_input_padding')
+        build_engine(fp16_ckpt_path,
+                     engine_dir / 'fp16-plugin-packed' / tp_pp_dir,
+                     '--gpt_attention_plugin=float16',
+                     '--paged_kv_cache=disable',
+                     '--remove_input_padding=enable', "--context_fmha=disable")
 
         print("\nBuilding fp16-plugin-packed-paged engine")
-        build_engine(hf_dir,
+        build_engine(fp16_ckpt_path,
                      engine_dir / 'fp16-plugin-packed-paged' / tp_pp_dir,
-                     '--use_gpt_attention_plugin=float16',
-                     '--use_inflight_batching')
+                     '--gpt_attention_plugin=float16',
+                     '--paged_kv_cache=enable', '--remove_input_padding=enable',
+                     "--context_fmha=disable")
         print("Done.")
 
 

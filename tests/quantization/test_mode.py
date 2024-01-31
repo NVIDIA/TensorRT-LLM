@@ -63,7 +63,7 @@ class TestQuantMode(unittest.TestCase):
         self.assertEqual(qm, QuantMode.INT4_WEIGHTS)
 
         # Test weight only.
-        qm = QuantMode.use_weight_only(True)
+        qm = QuantMode.use_weight_only(use_int4_weights=True)
         # Make sure only the INT4_WEIGHTS flag is set.
         self.assertEqual(qm, QuantMode.INT4_WEIGHTS)
 

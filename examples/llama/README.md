@@ -6,7 +6,7 @@ This document shows how to build and run a LLaMA model in TensorRT-LLM on both s
 
 The TensorRT-LLM LLaMA implementation can be found in [tensorrt_llm/models/llama/model.py](../../tensorrt_llm/models/llama/model.py). The TensorRT-LLM LLaMA example code is located in [`examples/llama`](./). There is one main file:
 
-* [`build.py`](./build.py) to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the LLaMA model.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the LLaMA model into tensorrt-llm checkpoint format.
 
 In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
 
@@ -34,7 +34,7 @@ Need to prepare the HF LLaMA checkpoint first by following the guides here https
 
 TensorRT-LLM LLaMA builds TensorRT engine(s) from HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
 
-Normally `build.py` only requires single GPU, but if you've already got all the GPUs needed while inferencing, you could enable parallelly building to make the engine building process faster by adding `--parallel_build` argument. Please note that currently `parallel_build` feature only supports single node.
+Normally `trtllm-build` only requires single GPU, but if you've already got all the GPUs needed while inferencing, you could enable parallelly building to make the engine building process faster by adding `--workers` argument. Please note that currently `workers` feature only supports single node.
 
 `--use_fused_mlp` enables GEMM horizontal fusion in gated MLP layer, which reduces input traffic and potentially improves performance. For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded (accuracy 0.45734 vs 0.45755 for LLaMA-v2 7B using ammo/examples/hf/instruct_eval/mmlu.py).
 
@@ -44,69 +44,72 @@ Here're some examples:
 # Build a single-GPU float16 engine from HF weights.
 # use_gpt_attention_plugin is necessary in LLaMA.
 # Try use_gemm_plugin to prevent accuracy issue.
-# It is recommend to use --remove_input_padding along with --use_gpt_attention_plugin for better performance
+# It is recommend to use --remove_input_padding along with --gpt_attention_plugin for better performance
 
 # Build the LLaMA 7B model using a single GPU and FP16.
-python build.py --model_dir ./tmp/llama/7B/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir ./tmp/llama/7B/trt_engines/fp16/1-gpu/
+python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
+                              --output_dir ./tllm_checkpoint_1gpu_fp16 \
+                              --dtype float16
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp16 \
+            --output_dir ./tmp/llama/7B/trt_engines/fp16/1-gpu \
+            --gpt_attention_plugin float16 \
+            --gemm_plugin float16
 
 # Build the LLaMA 7B model using a single GPU and BF16.
-python build.py --model_dir ./tmp/llama/7B/ \
-                --dtype bfloat16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin bfloat16 \
-                --enable_context_fmha \
-                --use_gemm_plugin bfloat16 \
-                --output_dir ./tmp/llama/7B/trt_engines/bf16/1-gpu/
+python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
+                              --output_dir ./tllm_checkpoint_1gpu_bf16 \
+                              --dtype bfloat16
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_bf16 \
+            --output_dir ./tmp/llama/7B/trt_engines/bf16/1-gpu \
+            --gpt_attention_plugin bfloat16 \
+            --gemm_plugin bfloat16
 
 # Build the LLaMA 7B model using a single GPU and apply INT8 weight-only quantization.
-python build.py --model_dir ./tmp/llama/7B/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --use_weight_only \
-                --output_dir ./tmp/llama/7B/trt_engines/weight_only/1-gpu/
+python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
+                              --output_dir ./tllm_checkpoint_1gpu_fp16_wq \
+                              --dtype float16 \
+                              --use_weight_only \
+                              --weight_only_precision int8
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp16_wq \
+            --output_dir ./tmp/llama/7B/trt_engines/weight_only/1-gpu/ \
+            --gpt_attention_plugin float16 \
+            --gemm_plugin float16
 
 # Build LLaMA 7B using 2-way tensor parallelism.
-python build.py --model_dir ./tmp/llama/7B/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir ./tmp/llama/7B/trt_engines/fp16/2-gpu/ \
-                --world_size 2 \
-                --tp_size 2
+python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
+                            --output_dir ./tllm_checkpoint_2gpu_tp2 \
+                            --dtype float16 \
+                            --tp_size 2
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_tp2 \
+            --output_dir ./tmp/llama/7B/trt_engines/fp16/2-gpu/ \
+            --gpt_attention_plugin float16 \
+            --gemm_plugin float16
 
 # Build LLaMA 7B using 2-way tensor parallelism and 2-way pipeline parallelism.
-python build.py --model_dir ./tmp/llama/7B/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir ./tmp/llama/7B/trt_engines/fp16/2-gpu/ \
-                --world_size 4 \
-                --tp_size 2 \
-                --pp_size 2
+python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
+                            --output_dir ./tllm_checkpoint_4gpu_tp2_pp2 \
+                            --dtype float16 \
+                            --tp_size 2 \
+                            --pp_size 2
+trtllm-build --checkpoint_dir ./tllm_checkpoint_4gpu_tp2_pp2 \
+            --output_dir ./tmp/llama/7B/trt_engines/fp16/4-gpu/ \
+            --gpt_attention_plugin float16 \
+            --gemm_plugin float16
 
 # Build LLaMA 30B using 2-way tensor parallelism.
-python build.py --model_dir ./tmp/llama/30B/hf/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir ./tmp/llama/30B/trt_engines/fp16/2-gpu/ \
-                --world_size 2 \
-                --tp_size 2
+python convert_checkpoint.py --model_dir ./tmp/llama/30B/hf/ \
+                            --output_dir ./tllm_checkpoint_2gpu_tp2 \
+                            --dtype float16 \
+                            --tp_size 2
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_tp2 \
+            --output_dir ./tmp/llama/30B/trt_engines/fp16/2-gpu/ \
+            --gpt_attention_plugin float16 \
+            --gemm_plugin float16 \
 ```
 
 #### LLaMA v2 Updates
@@ -121,39 +124,38 @@ must be **divisible by the number of GPUs**. For example, since the 70B model ha
 
 ```bash
 # Build LLaMA 70B using 8-way tensor parallelism.
-python build.py --model_dir ./tmp/llama/70B/hf/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
-                --world_size 8 \
-                --tp_size 8
+python convert_checkpoint.py --model_dir ./tmp/llama/70B/hf/ \
+                            --output_dir ./tllm_checkpoint_8gpu_tp8 \
+                            --dtype float16 \
+                            --tp_size 8
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp8 \
+            --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
+            --gpt_attention_plugin float16 \
+            --gemm_plugin float16
 
 # Build LLaMA 70B using 4-way tensor parallelism and 2-way pipeline parallelism.
-python build.py --model_dir ./tmp/llama/70B/hf/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
-                --world_size 8 \
-                --tp_size 4 \
-                --pp_size 2
+python convert_checkpoint.py --model_dir ./tmp/llama/70B/hf/ \
+                            --output_dir ./tllm_checkpoint_8gpu_tp4_pp2 \
+                            --dtype float16 \
+                            --tp_size 4 \
+                            --pp_size 2
 
+trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp4_pp2 \
+            --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
+            --gpt_attention_plugin float16 \
+            --gemm_plugin float16
 
 # Build LLaMA 70B TP=8 using Meta checkpoints directly.
-python build.py --meta_ckpt_dir ./tmp/llama/70B \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
-                --world_size 8 \
-                --tp_size 8
+python convert_checkpoint.py --meta_ckpt_dir ./tmp/llama/70B/ \
+                            --output_dir ./tllm_checkpoint_8gpu_tp8 \
+                            --dtype float16 \
+                            --tp_size 8
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp8 \
+            --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
+            --gpt_attention_plugin float16 \
+            --gemm_plugin float16 \
 ```
 
 Same instructions can be applied to fine-tuned versions of the LLaMA v2 models (e.g. 7Bf or llama-2-7b-chat).
@@ -175,21 +177,18 @@ A few LLaMA models are fine-tuned for long context length that TRT-LLM can suppo
 
 ```bash
 # Build 8-GPU engine with long context LLaMA model
-python build.py --model_dir ./tmp/LongAlpaca-70B/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
-                --world_size 8 \
-                --tp_size 8 \
-                --pp_size 1 \
-                --multi_block_mode \
-                --max_input_len 32768 \
-                --max_output_len 16384 \
-                --vocab_size=32001 \
-                --rotary_scaling linear 8.0
+python convert_checkpoint.py --meta_ckpt_dir ./tmp/LongAlpaca-70B/ \
+                            --output_dir ./tllm_checkpoint_8gpu_tp8 \
+                            --dtype float16 \
+                            --tp_size 8 \
+                            --vocab_size=32001 \
+                            --rotary_scaling linear 8.0
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp8 \
+            --output_dir ./tmp/llama/70B/trt_engines/fp16/8-gpu/ \
+            --gpt_attention_plugin float16 \
+            --gemm_plugin float16 \
+            --multi_block_mode
 
 # Get the long text data from Gutenberg Project
 wget https://www.gutenberg.org/cache/epub/64317/pg64317.txt
@@ -226,20 +225,21 @@ The total number of tokens is determined by beam width, batch size, and maximum 
 #### INT8 KV cache
 INT8 KV cache could be enabled to reduce memory footprint. It will bring more performance gains when batch size gets larger.
 
-You can get the INT8 scale of KV cache through [`hf_llama_convert.py`](./hf_llama_convert.py), which features a
-`--calibrate-kv-cache, -kv` option. Setting `-kv` will calibrate the model,
+For INT8 KV cache, [`convert_checkpoint.py`](./convert_checkpoint.py) features a
+`--int8_kv_cache` option. Setting `--int8_kv_cache` will calibrate the model,
 and then export the scaling factors needed for INT8 KV cache inference.
-
 
 Example:
 
 ```bash
-python3 hf_llama_convert.py -i /llama-models/llama-7b-hf -o /llama/smooth_llama_7B/int8_kv_cache/ --calibrate-kv-cache -t fp16
+python convert_checkpoint.py --model_dir ./llama-models/llama-7b-hf   \
+                             --output_dir ./llama-models/llama-7b-hf/int8_kv_cache/ \
+                             --dtype float16  \
+                             --int8_kv_cache
 ```
 
-[`build.py`](./build.py) add new options for the support of INT8 KV cache.
+[`convert_checkpoint.py`](./convert_checkpoint.py) add new options for the support of INT8 KV cache.
 
-`--int8_kv_cache` is the command-line option to enable INT8 KV cache, and `--bin_model_dir` is the directory where the INT8 KV cache scales are located.
 
 **INT8 KV cache + per-channel weight-only quantization**
 
@@ -249,20 +249,25 @@ Examples of INT8 weight-only quantization + INT8 KV cache
 
 ```bash
 # Build model with both INT8 weight-only and INT8 KV cache enabled
-python build.py --bin_model_dir=/llama/smooth_llama_7B/int8_kv_cache/1-gpu/ \
-                --dtype float16 \
-                --use_gpt_attention_plugin float16 \
-                --use_gemm_plugin float16 \
-                --output_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_weight_only/1-gpu \
-                --int8_kv_cache \
-                --use_weight_only
+python convert_checkpoint.py --model_dir ./llama-models/llama-7b-hf   \
+                             --output_dir ./tllm_checkpoint_1gpu_int8_kv_wq \
+                             --dtype float16  \
+                             --int8_kv_cache \
+                             --use_weight_only \
+                             --weight_only_precision int8
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_int8_kv_wq \
+            --output_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_weight_only/1-gpu \
+            --gpt_attention_plugin float16 \
+            --gemm_plugin float16 \
+            --multi_block_mode
 ```
 
 Test with `../summarize.py`:
 
 ```bash
 python ../summarize.py --test_trt_llm \
-                       --hf_model_dir /llama-models/llama-7b-hf \
+                       --hf_model_dir ./llama-models/llama-7b-hf \
                        --data_type fp16 \
                        --engine_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_weight_only/1-gpu \
                        --test_hf
@@ -272,29 +277,26 @@ python ../summarize.py --test_trt_llm \
 
 In addition, you can enable INT8 KV cache together with AWQ (per-group INT4 weight-only quantization)like the following command.
 
-**NOTE**: AWQ checkpoint is passed through `--quant_ckpt_path`, and the INT8 scales for the KV cache are expected to be in the directory pointed by `--bin_model_dir`.
-
 ```bash
-python build.py --model_dir ./tmp/llama/7B/ \
-                --quant_ckpt_path ./llama-7b-4bit-gs128-awq.pt \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --use_weight_only \
-                --weight_only_precision int4_awq \
-                --per_group \
-                --output_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_int4_AWQ/1-gpu/
-                --int8_kv_cache \ # Turn on INT8 KV cache
-                --bin_model_dir /llama/smooth_llama_7B/int8_kv_cache/1-gpu/ # Directory to look for INT8 scale of KV cache
+python ../quantization/quantize.py --model_dir /tmp/llama-7b-hf \
+                                   --output_dir ./tllm_checkpoint_1gpu_awq_int8_kv_cache \
+                                   --dtype float16 \
+                                   --qformat int4_awq \
+                                   --awq_block_size 128 \
+                                   --kv_cache_dtype int8 \
+                                   --calib_size 32
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_awq_int8_kv_cache \
+            --output_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_int4_AWQ/1-gpu/ \
+            --gpt_attention_plugin float16 \
+            --gemm_plugin float16 \
 ```
 
 Test with `../summarize.py`:
 
 ```bash
 python ../summarize.py --test_trt_llm \
-                       --hf_model_dir /llama-models/llama-7b-hf \
+                       --hf_model_dir /tmp/llama-7b-hf \
                        --data_type fp16 \
                        --engine_dir ./tmp/llama/7B/trt_engines/int8_kv_cache_int4_AWQ/1-gpu \
                        --test_hf
@@ -306,12 +308,16 @@ The smoothquant supports both LLaMA v1 and LLaMA v2. Unlike the FP16 build where
 
 Example:
 ```bash
-python3 hf_llama_convert.py -i /llama-models/llama-7b-hf -o /llama/smooth_llama_7B/sq0.8/ -sq 0.8 --tensor-parallelism 1 --storage-type fp16
+python3 convert_checkpoint.py --model_dir /llama-models/llama-7b-hf  --output_dir /tmp/tllm_checkpoint_1gpu_sq --dtype float16 --smoothquant 0.5
+trtllm-build --checkpoint_dir /tmp/tllm_checkpoint_1gpu_sq \
+             --output_dir ./engine_outputs \
+             --gpt_attention_plugin float16  \
+             --gemm_plugin float16
 ```
 
-[`build.py`](./build.py) add new options for the support of INT8 inference of SmoothQuant models.
+[`convert_checkpoint.py`](./convert_checkpoint.py) add new options for the support of INT8 inference of SmoothQuant models.
 
-`--use_smooth_quant` is the starting point of INT8 inference. By default, it
+`--smoothquant` is the starting point of INT8 inference. By default, it
 will run the model in the _per-tensor_ mode.
 
 Then, you can add any combination of `--per-token` and `--per-channel` to get the corresponding behaviors.
@@ -320,16 +326,18 @@ Examples of build invocations:
 
 ```bash
 # Build model for SmoothQuant in the _per_token_ + _per_channel_ mode
-python3 build.py --bin_model_dir=/llama/smooth_llama_7B/sq0.8/1-gpu/ \
-                 --use_gpt_attention_plugin float16 \
-                 --remove_input_padding \
-                 --enable_context_fmha \
-                 --use_smooth_quant \
-                 --per_token \
-                 --per_channel
-```
+python3 convert_checkpoint.py --model_dir /llama-models/llama-7b-hf \
+                            --output_dir /tmp/tllm_checkpoint_1gpu_sq \
+                            --dtype float16 \
+                            --smoothquant 0.5 \
+                            --per_token \
+                            --per_channel
 
-Note we use `--bin_model_dir` instead of `--model_dir` and `--meta_ckpt_dir` since SmoothQuant model needs INT8 weights and various scales from the binary files.
+trtllm-build --checkpoint_dir /tmp/tllm_checkpoint_1gpu_sq \
+             --output_dir ./engine_outputs \
+             --gpt_attention_plugin float16  \
+             --gemm_plugin float16
+```
 
 #### FP8 Post-Training Quantization
 
@@ -337,40 +345,33 @@ The examples below uses the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit
 
 First make sure AMMO toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
-After successfully running the script, the output should be in .npz format, e.g. `quantized_fp8/llama_tp_1_rank0.npz`,
-where FP8 scaling factors are stored.
 
 ```bash
-# Quantize HF LLaMA 70B into FP8 and export a single-rank checkpoint
-python examples/quantization/quantize.py --model_dir ./tmp/llama/70B \
-                                         --dtype float16 \
-                                         --qformat fp8 \
-                                         --export_path ./quantized_fp8 \
-                                         --calib_size 512 \
+# Quantize HF LLaMA 70B into FP8 and export trtllm checkpoint
+python ../quantization/quantize.py --model_dir ./tmp/llama/70B \
+                                   --dtype float16 \
+                                   --qformat fp8 \
+                                   --kv_cache_dtype fp8 \
+                                   --output_dir ./tllm_checkpoint_2gpu_fp8 \
+                                   --calib_size 512 \
+                                   --tp_size 2
 
-# Build LLaMA 70B TP=2 using original HF checkpoint + PTQ scaling factors from the single-rank checkpoint
-python build.py --model_dir ./tmp/llama/70B \
-                --quantized_fp8_model_path ./quantized_fp8/llama_tp1_rank0.npz \
-                --dtype float16 \
-                --use_gpt_attention_plugin float16 \
-                --output_dir ./tmp/llama/70B/trt_engines/fp8/2-gpu/ \
-                --remove_input_padding \
-                --enable_context_fmha \
-                --enable_fp8 \
-                --fp8_kv_cache \
-                --strongly_typed \
-                --world_size 2 \
-                --tp_size 2 \
-                --parallel_build
+# Build trtllm engines from the trtllm checkpoint
+trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_fp8 \
+             --output_dir ./engine_outputs \
+             --gpt_attention_plugin float16  \
+             --gemm_plugin float16 \
+             --strongly_typed \
+             --workers 2
 ```
 
 #### Groupwise quantization (AWQ/GPTQ)
-One can enable AWQ/GPTQ INT4 weight only quantization with these options when building engine with `build.py`:
+One can enable AWQ/GPTQ INT4 weight only quantization with these options when building engine with `trtllm-build`:
 
 - `--use_weight_only` enables weight only GEMMs in the network.
 - `--per_group` enable groupwise weight only quantization, for GPT-J example, we support AWQ with the group size default as 128.
 - `--weight_only_precision` should specify the weight only quantization format. Supported formats are `int4_awq` or `int4_gptq`.
-- `--quant_ckpt_path` passes the quantized checkpoint to build the engine.
+- `--ammo_quant_ckpt_path` passes the quantized checkpoint to build the engine.
 
 AWQ/GPTQ examples below involves 2 steps:
 1. Weight quantization
@@ -383,28 +384,21 @@ AWQ/GPTQ examples below involves 2 steps:
 
     ```bash
     # Quantize HF LLaMA 7B checkpoint into INT4 AWQ format
-    python examples/quantization/quantize.py --model_dir ./tmp/llama/7B \
-                                             --dtype float16 \
-                                             --qformat int4_awq \
-                                             --export_path ./quantized_int4-awq \
-                                             --calib_size 32
+    python ../quantization/quantize.py --model_dir ./tmp/llama-7b-hf \
+                                       --dtype float16 \
+                                       --qformat int4_awq \
+                                       --awq_block_size 128 \
+                                       --output_dir ./quantized_int4-awq \
+                                       --calib_size 32
     ```
-    The quantized model checkpoint is saved to `./quantized_int4-awq/llama_tp1_rank0.npz` for future TRT-LLM engine build.
 
 2. Build TRT-LLM engine:
 
     ```bash
-    python build.py --model_dir ./tmp/llama/7B/ \
-                    --quant_ckpt_path ./quantized_int4-awq/llama_tp1_rank0.npz \
-                    --dtype float16 \
-                    --remove_input_padding \
-                    --use_gpt_attention_plugin float16 \
-                    --enable_context_fmha \
-                    --use_gemm_plugin float16 \
-                    --use_weight_only \
-                    --weight_only_precision int4_awq \
-                    --per_group \
-                    --output_dir ./tmp/llama/7B/trt_engines/int4_AWQ/1-gpu/
+    trtllm-build --checkpoint_dir ./quantized_int4-awq \
+                 --output_dir ./tmp/llama/7B/trt_engines/int4_AWQ/1-gpu/ \
+                 --gpt_attention_plugin float16 \
+                 --gemm_plugin float16
     ```
 
 ##### GPTQ
@@ -431,19 +425,19 @@ To run the GPTQ LLaMa example, the following steps are required:
     ```bash
     # Build the LLaMA 7B model using 2-way tensor parallelism and apply INT4 GPTQ quantization.
     # Compressed checkpoint safetensors are generated separately from GPTQ.
-    python build.py --model_dir ./tmp/llama/7B/ \
-                    --quant_ckpt_path ./llama-7b-4bit-gs128.safetensors \
-                    --dtype float16 \
-                    --remove_input_padding \
-                    --use_gpt_attention_plugin float16 \
-                    --enable_context_fmha \
-                    --use_gemm_plugin float16 \
-                    --use_weight_only \
-                    --weight_only_precision int4_gptq \
-                    --per_group \
-                    --world_size 2 \
-                    --tp_size 2 \
-                    --output_dir ./tmp/llama/7B/trt_engines/int4_GPTQ/2-gpu/
+    python convert_checkpoint.py --model_dir /tmp/llama-7b-hf \
+                                 --output_dir ./tllm_checkpoint_2gpu_gptq \
+                                 --dtype float16 \
+                                 --ammo_quant_ckpt_path ./llama-7b-4bit-gs128.safetensors  \
+                                 --use_weight_only \
+                                 --weight_only_precision int4_gptq \
+                                 --per_group \
+                                 --tp_size 2
+
+    trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_gptq \
+                --output_dir ./tmp/llama/7B/trt_engines/int4_GPTQ/2-gpu/ \
+                --gpt_attention_plugin float16 \
+                --gemm_plugin float16
     ```
 
 ### Run
@@ -499,14 +493,14 @@ The `--max_attention_window_size` parameter is set to the `sliding_window` value
 
 ```bash
 # Build Mistral 7B with max input length 32256
-python build.py --model_dir ./tmp/mistral/7B/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir ./tmp/mistral/7B/trt_engines/fp16/1-gpu/ \
-                --max_input_len 32256
+python convert_checkpoint.py --model_dir ./mistral-7b-v0.1 \
+                             --output_dir ./tllm_checkpoint_1gpu_mistral \
+                             --dtype float16
+trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_gptq \
+            --output_dir ./tmp/mistral/7B/trt_engines/fp16/1-gpu/ \
+            --gpt_attention_plugin float16 \
+            --gemm_plugin float16 \
+            --max_input_len 32256
 
 # Run Mistral 7B fp16 inference with sliding window/cache size 4096
 python3 run.py --max_output_len=50 \
@@ -528,27 +522,53 @@ _(1): Only applicable to 7b and 13b model sizes_. 34b model variants use `32000`
 
 ### Build
 Use the following command to build `CodeLlama-7b-Instruct`:
-```
-python build.py --meta_ckpt_dir ./CodeLlama-7b-Instruct/ --dtype float16 \
-    --remove_input_padding --use_gpt_attention_plugin float16 --use_gemm_plugin float16 \
-    --enable_context_fmha --output_dir codellama_7b --rotary_base 1000000 --vocab_size 32016
+```bash
+python convert_checkpoint.py --model_dir /tmp/CodeLlama-7b-Instruct-hf  \
+                             --output_dir ./tllm_checkpoint_1gpu_codellama \
+                             --dtype float16 \
+                             --rotary_base 1000000 \
+                             --vocab_size 32016
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_codellama \
+            --output_dir ./tmp/codellama/trt_engines/fp16/1-gpu/ \
+            --gpt_attention_plugin float16 \
+            --gemm_plugin float16 \
 ```
 Use the following command to build `CodeLlama-34b-Instruct` for 4 GPUs (TP=4):
-```
-python build.py --meta_ckpt_dir ./CodeLlama-34b-Instruct/ --dtype float16 \
-    --remove_input_padding --use_gpt_attention_plugin float16 --use_gemm_plugin float16 \
-    --enable_context_fmha --output_dir codellama_34b --rotary_base 1000000 --vocab_size 32000 --world_size 4 --tp_size 4
+```bash
+python convert_checkpoint.py --model_dir /tmp/CodeLlama-34b-Instruct-hf  \
+                             --output_dir ./tllm_checkpoint_4gpu_codellama \
+                             --dtype float16 \
+                             --rotary_base 1000000 \
+                             --vocab_size 32000 \
+                             --tp_size 4
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_4gpu_codellama \
+            --output_dir ./tmp/codellama/trt_engines/fp16/4-gpu/ \
+            --gpt_attention_plugin float16 \
+            --gemm_plugin float16 \
 ```
 
 NOTE: CodeLlama uses the `max_position_embeddings` of 16K.
 To build the engine for running similarly long input/output, you need to specify that during build.
 
 Use `--max_input_len` and `--max_output_len` (which defaults to `2048` and `512`, respectively) according to your use case, e.g.:
-```
-python build.py --meta_ckpt_dir ./CodeLlama-34b-Instruct/ --dtype float16 \
-    --remove_input_padding --use_gpt_attention_plugin float16 --use_gemm_plugin float16 \
-    --output_dir codellama_34b --rotary_base 1000000 --vocab_size 32000 --world_size 8 --tp_size 8 --parallel_build \
-    --enable_context_fmha --use_parallel_embedding --max_input_len 15360 --max_output_len 1024 --max_batch_size 4
+```bash
+python convert_checkpoint.py --model_dir /tmp/CodeLlama-34b-Instruct-hf  \
+                             --output_dir ./tllm_checkpoint_4gpu_codellama \
+                             --dtype float16 \
+                             --rotary_base 1000000 \
+                             --vocab_size 32000 \
+                             --tp_size 8 \
+                             --use_parallel_embedding
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_4gpu_codellama \
+            --output_dir ./tmp/codellama/trt_engines/fp16/4-gpu/ \
+            --gpt_attention_plugin float16 \
+            --gemm_plugin float16 \
+            --max_input_len 15360 \
+            --max_output_len 1024 \
+            --max_batch_size 4
 ```
 
 ### Run
@@ -575,20 +595,21 @@ git-lfs clone https://huggingface.co/hfl/chinese-llama-2-lora-13b
 * Build engine, setting `--use_lora_plugin` and `--hf_lora_dir`. If lora has separate lm_head and embedding, they will replace lm_head and embedding of base model.
 
 ```bash
-python build.py --model_dir llama-v2-13b-hf/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir "/tmp/new_lora_13b/trt_engines/fp16/2-gpu/" \
-                --max_batch_size 1 \
-                --max_input_len 512 \
-                --max_output_len 50 \
-                --use_lora_plugin float16 \
-                --hf_lora_dir "chinese-llama-2-lora-13b/" \
-                --world_size 2 --tp_size 2 --use_fused_mlp
+python convert_checkpoint.py --model_dir /tmp/llama-v2-13b-hf \
+                         --output_dir ./tllm_checkpoint_2gpu_lora \
+                         --dtype float16 \
+                         --tp_size 2 \
+                         --hf_lora_dir /tmp/chinese-llama-2-lora-13b \
+                         --use_fused_mlp
 
+trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_lora \
+            --output_dir /tmp/new_lora_13b/trt_engines/fp16/2-gpu/ \
+            --gpt_attention_plugin float16 \
+            --gemm_plugin float16 \
+            --lora_plugin float16 \
+            --max_batch_size 1 \
+            --max_input_len 512 \
+            --max_output_len 50
 ```
 
 * Run inference. Need to setup the `lora_dir`. Remember to use lora tokenizer because lora model has larger vocab size.
@@ -648,21 +669,20 @@ git-lfs clone https://huggingface.co/qychen/luotuo-lora-7b-0.1
 git-lfs clone https://huggingface.co/kunishou/Japanese-Alpaca-LoRA-7b-v0
 BASE_LLAMA_MODEL=llama-7b-hf/
 
-python build.py --model_dir ${BASE_LLAMA_MODEL} \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --output_dir "/tmp/llama_7b_with_lora_qkv/trt_engines/fp16/1-gpu/" \
-                --max_batch_size 128 \
-                --max_input_len 512 \
-                --max_output_len 50 \
-                --use_lora_plugin float16 \
-                --hf_lora_dir "Japanese-Alpaca-LoRA-7b-v0/" \
-                --lora_target_modules "attn_q" "attn_k" "attn_v" \
-                --max_lora_rank 8 \
-                --world_size 1 --tp_size 1
+python convert_checkpoint.py --model_dir ${BASE_LLAMA_MODEL} \
+                            --output_dir ./tllm_checkpoint_1gpu_lora_rank \
+                            --dtype float16 \
+                            --hf_lora_dir /tmp/Japanese-Alpaca-LoRA-7b-v0 \
+                            --max_lora_rank 8 \
+                            --lora_target_modules "attn_q" "attn_k" "attn_v"
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_lora_rank \
+            --output_dir /tmp/llama_7b_with_lora_qkv/trt_engines/fp16/1-gpu/ \
+            --gpt_attention_plugin float16 \
+            --gemm_plugin float16 \
+            --lora_plugin float16 \
+            --max_batch_size 1 \
+            --max_input_len 512 \
+            --max_output_len 50
 
 python ../run.py --engine_dir "/tmp/llama_7b_with_lora_qkv/trt_engines/fp16/1-gpu/" \
               --max_output_len 10 \
@@ -707,26 +727,28 @@ We can observe that `luotuo-lora-7b-0.1` produces correct answers on the first s
 
 ```bash
 # Build the LLaMA 7B model with StreamingLLM feature using a single GPU and FP16.
-python build.py --model_dir ./tmp/llama/7B/ \
-                --dtype float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
-                --use_gemm_plugin float16 \
-                --enable_pos_shift \
-                --dense_context_fmha \
-                --output_dir ./tmp/llama/7B/trt_engines/fp16_StreamingLLM/1-gpu/
+python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
+                         --output_dir ./tllm_checkpoint_1gpu_streamlingllm \
+                         --dtype float16 \
+                         --dense_context_fmha \
+                         --enable_pos_shift
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_streamlingllm \
+            --output_dir ./tmp/llama/7B/trt_engines/fp16_StreamingLLM/1-gpu/ \
+            --gpt_attention_plugin float16 \
+            --gemm_plugin float16
+
 ```
 
 * Run inference. Use `--sink_token_length` to set the number of sink tokens, and use `--max_attention_window_size` to set the `sliding_window` value.
 
 ```bash
 # Run LLaMA 7B fp16 inference with sliding window/cache size 2048 and sink token length 4.
-python3 run.py --max_output_len=50 \
-               --tokenizer_dir ./tmp/llama/7B/ \
-               --engine_dir=./tmp/llama/7B/trt_engines/fp16_StreamingLLM/1-gpu/ \
-               --max_attention_window_size=2048 \
-               --sink_token_length=4
+python3 ../run.py --max_output_len=50 \
+                  --tokenizer_dir ./tmp/llama/7B/ \
+                  --engine_dir=./tmp/llama/7B/trt_engines/fp16_StreamingLLM/1-gpu/ \
+                  --max_attention_window_size=2048 \
+                  --sink_token_length=4
 ```
 
 Note that the sink tokens is included in the sliding attention tokens, and there are at most `max_attention_window_size` tokens are stored in the KV cache.

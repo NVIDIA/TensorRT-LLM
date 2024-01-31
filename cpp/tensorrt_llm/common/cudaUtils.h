@@ -28,6 +28,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <sys/sysinfo.h>
 #include <vector>
 
 namespace tensorrt_llm::common
@@ -271,11 +272,27 @@ inline int getDeviceCount()
 
 /// Get the memory info
 /// \return The free and total amount of memory in bytes
-inline std::tuple<size_t, size_t> getDeviceMemoryInfo()
+inline std::tuple<size_t, size_t> getDeviceMemoryInfo(const bool useUvm)
 {
-    size_t free, total;
-    check_cuda_error(cudaMemGetInfo(&free, &total));
-    return {free, total};
+    if (useUvm)
+    {
+        size_t freeSysmem, totalSysmem;
+        struct sysinfo info;
+        sysinfo(&info);
+        totalSysmem = info.totalram * info.mem_unit;
+        freeSysmem = info.freeram * info.mem_unit;
+        TLLM_LOG_DEBUG("Using UVM based system memory for KV cache, total memory %0.2f GB, available memory %0.2f GB",
+            ((double) totalSysmem / 1e9), ((double) freeSysmem / 1e9));
+        return {freeSysmem, totalSysmem};
+    }
+    else
+    {
+        size_t free, total;
+        check_cuda_error(cudaMemGetInfo(&free, &total));
+        TLLM_LOG_DEBUG("Using GPU memory for KV cache, total memory %0.2f GB, available memory %0.2f GB",
+            ((double) total / 1e9), ((double) free / 1e9));
+        return {free, total};
+    }
 }
 
 inline int getMultiProcessorCount()

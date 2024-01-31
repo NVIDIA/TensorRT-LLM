@@ -55,6 +55,7 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
         # construct trt network
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
+        net.plugin_config.to_legacy_setting()
         net.plugin_config.set_gpt_attention_plugin(dtype)
         net.plugin_config.remove_input_padding = True
 

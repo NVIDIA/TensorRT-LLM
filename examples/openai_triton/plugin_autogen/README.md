@@ -4,6 +4,10 @@ In the previous [OpenAI Triton Plugin in TensorRT-LLM](../../openai_triton/READM
 
 In this example, we will introduce the usage of the PluginGen tool and demonstrate the integration of the [Fused Attention](../openai_triton/fmha_triton.py) kernel.
 
+
+To use the feature, you need a Triton version posterior to the [d0c35b3](https://github.com/openai/triton/commit/d0c35b3b7d6badf0c0d56a821dddab7ace73b4de) commit
+and this example has been tested on the [b43c28f](https://github.com/openai/triton/tree/b43c28fdd7a2f95b2e87180cba5d984732120d5c) commit.
+
 ## Introduction to the PluginGen Toolkit
 
 The PluginGen script can be found at `tensorrt_llm/tools/triton_integration/plugin_gen.py`. Its usage is as follows:

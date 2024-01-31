@@ -14,123 +14,92 @@
 # limitations under the License.
 import tempfile
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
-import tensorrt as trt
+from transformers import AutoConfig
+
+from tensorrt_llm.models.llama.weight import (load_from_awq_llama,
+                                              load_from_fp8_llama)
 
 from ... import profiler
-from ..._common import default_net
-from ..._utils import pad_vocab_size, str_dtype_to_trt
-from ...functional import (RotaryScalingType, Tensor, gather_last_token_logits,
-                           recv, send)
-from ...layers import (MOE, Attention, AttentionMaskType, AttentionParams,
-                       ColumnLinear, Embedding, FusedGatedMLP, GatedMLP,
-                       KeyValueCacheParams, LoraParams, MoeConfig,
+from ..._utils import pad_vocab_size
+from ...functional import RotaryScalingType, Tensor, recv, send
+from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
+                       Embedding, FusedGatedMLP, GatedMLP, MoeConfig,
                        PositionEmbeddingType, PromptTuningEmbedding, RmsNorm)
 from ...mapping import Mapping
-from ...models.quantized.quant import quantize_model
-from ...module import Module, ModuleList
+from ...module import Module
+from ...plugin import init_all_reduce_helper
 from ...quantization import QuantMode
 from ...runtime.lora_manager import LoraConfig
 from ...top_model_mixin import TopModelMixin
-from ..generation_mixin import GenerationMixin
-from ..modeling_utils import PretrainedConfig
-from .weight import get_scaling_factors, load_from_awq_llama, load_from_hf_llama
+from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
+                              PretrainedConfig)
+from .weight import load_from_hf_llama
 
 
 class LLaMADecoderLayer(Module):
 
-    def __init__(
-            self,
-            layer_id,
-            hidden_size,
-            num_attention_heads,
-            num_kv_heads=None,
-            max_position_embeddings=2048,
-            dtype=None,
-            attention_mask_type=AttentionMaskType.causal,
-            hidden_act='silu',
-            position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
-            rotary_base=10000.0,
-            rotary_scaling=None,
-            mlp_hidden_size=None,
-            tp_group=None,
-            tp_size=1,
-            tp_rank=0,
-            use_auto_parallel=False,
-            quant_mode=QuantMode(0),
-            rms_norm_eps=1e-06,
-            attn_bias=False,
-            mlp_bias=False,
-            use_fused_mlp=False,
-            enable_pos_shift=False,
-            dense_context_fmha=False,
-            moe_config: MoeConfig = MoeConfig(),
-            max_lora_rank=None,
-    ):
+    def __init__(self, config: PretrainedConfig, layer_idx: int):
         super().__init__()
-        self._layer_id = layer_id  # useful for debugging
-        # used for quantizing model
-        self.hidden_size = hidden_size
-        self.num_attention_heads = num_attention_heads
-        self.num_kv_heads = num_kv_heads
-        self.max_position_embeddings = max_position_embeddings
-        self.dtype = dtype
-        self.hidden_act = hidden_act
-        self.tp_group = tp_group
-        self.tp_size = tp_size
-        self.mlp_hidden_size = mlp_hidden_size
-        self.attention_mask_type = attention_mask_type
-        self.position_embedding_type = position_embedding_type
-        self.input_layernorm = RmsNorm(normalized_shape=hidden_size,
-                                       eps=rms_norm_eps,
-                                       dtype=dtype)
-        self.mlp_bias = mlp_bias
+        self.layer_idx = layer_idx
+        self.config = config
+
+        self.input_layernorm = RmsNorm(normalized_shape=config.hidden_size,
+                                       eps=config.norm_epsilon,
+                                       dtype=config.dtype)
+
         self.attention = Attention(
-            hidden_size,
-            num_attention_heads,
-            num_kv_heads,
-            max_position_embeddings,
-            dtype=dtype,
+            config.hidden_size,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            dtype=config.dtype,
             attention_mask_type=AttentionMaskType.causal,
-            bias=attn_bias,
-            position_embedding_type=position_embedding_type,
-            rotary_embedding_base=rotary_base,
-            rotary_embedding_scaling=rotary_scaling,
-            tp_group=tp_group,
-            tp_size=tp_size,
-            use_auto_parallel=use_auto_parallel,
-            quant_mode=quant_mode,
-            enable_pos_shift=enable_pos_shift,
-            dense_context_fmha=dense_context_fmha,
-            max_lora_rank=max_lora_rank,
-        )
-        if not mlp_hidden_size:
-            self.mlp_hidden_size = hidden_size * 4
+            bias=config.attn_bias,
+            position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
+            rotary_embedding_base=config.rotary_base,
+            rotary_embedding_scaling=config.rotary_scaling,
+            tp_group=config.mapping.tp_group,
+            tp_size=config.mapping.tp_size,
+            quant_mode=config.quant_mode,
+            enable_pos_shift=config.enable_pos_shift,
+            dense_context_fmha=config.dense_context_fmha,
+            max_lora_rank=config.max_lora_rank)
+
+        mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
 
         ClsMLP = GatedMLP
         mlp_kwargs = {}
-        if moe_config.has_moe():
+        if config.moe_num_experts > 1:
             ClsMLP = MOE
             mlp_kwargs = {
-                "moe_config": moe_config,
-                "tp_rank": tp_rank,
+                "moe_config":
+                MoeConfig(
+                    config.moe_num_experts,
+                    config.moe_top_k,
+                    config.moe_tp_mode,
+                    config.moe_normalization_mode,
+                ),
+                "tp_rank":
+                config.mapping.tp_rank,
             }
-        elif use_fused_mlp:
+        elif config.use_fused_mlp:
             ClsMLP = FusedGatedMLP
-        self.mlp = ClsMLP(hidden_size=hidden_size,
-                          ffn_hidden_size=self.mlp_hidden_size,
-                          hidden_act=hidden_act,
-                          dtype=dtype,
-                          bias=mlp_bias,
-                          tp_group=tp_group,
-                          tp_size=tp_size,
-                          quant_mode=quant_mode,
-                          max_lora_rank=max_lora_rank,
+
+        self.mlp = ClsMLP(hidden_size=config.hidden_size,
+                          ffn_hidden_size=mlp_hidden_size,
+                          hidden_act=config.hidden_act,
+                          dtype=config.dtype,
+                          bias=config.mlp_bias,
+                          tp_group=config.mapping.tp_group,
+                          tp_size=config.mapping.tp_size,
+                          quant_mode=config.quant_mode,
+                          max_lora_rank=config.max_lora_rank,
                           **mlp_kwargs)
-        self.post_layernorm = RmsNorm(normalized_shape=hidden_size,
-                                      eps=rms_norm_eps,
-                                      dtype=dtype)
+        self.post_layernorm = RmsNorm(normalized_shape=config.hidden_size,
+                                      eps=config.norm_epsilon,
+                                      dtype=config.dtype)
 
     def forward(
             self,
@@ -144,8 +113,6 @@ class LLaMADecoderLayer(Module):
             lora_layer_params=None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        if self._layer_id == 0:
-            self.register_network_output(f"norm0", hidden_states)
 
         attention_output = self.attention(
             hidden_states,
@@ -159,20 +126,14 @@ class LLaMADecoderLayer(Module):
 
         if use_cache:
             attention_output, presents = attention_output
-        if self._layer_id == 0:
-            self.register_network_output(f"attn", attention_output)
 
         hidden_states = residual + attention_output
 
         residual = hidden_states
         hidden_states = self.post_layernorm(hidden_states)
-        if self._layer_id == 0:
-            self.register_network_output(f"norm1", hidden_states)
 
         hidden_states = self.mlp(hidden_states,
                                  lora_layer_params=lora_layer_params)
-        if self._layer_id == 0:
-            self.register_network_output(f"mlp", hidden_states)
 
         hidden_states = residual + hidden_states
         if use_cache:
@@ -182,82 +143,32 @@ class LLaMADecoderLayer(Module):
 
 class LLaMAModel(Module):
 
-    def __init__(self,
-                 num_layers,
-                 num_heads,
-                 num_kv_heads,
-                 hidden_size,
-                 vocab_size,
-                 hidden_act,
-                 max_position_embeddings,
-                 dtype,
-                 mlp_hidden_size=None,
-                 position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
-                 rotary_base=10000.0,
-                 rotary_scaling=None,
-                 mapping=Mapping(),
-                 use_auto_parallel=False,
-                 quant_mode=QuantMode(0),
-                 use_parallel_embedding=False,
-                 embedding_sharding_dim=0,
-                 rms_norm_eps=1e-06,
-                 use_fused_mlp=False,
-                 attn_bias=False,
-                 mlp_bias=False,
-                 moe_config: MoeConfig = MoeConfig(),
-                 use_prompt_tuning: bool = False,
-                 enable_pos_shift=False,
-                 dense_context_fmha=False,
-                 max_lora_rank=None):
+    def __init__(self, config: PretrainedConfig) -> None:
         super().__init__()
-        self.mapping = mapping
-        self.use_prompt_tuning = use_prompt_tuning
+        init_all_reduce_helper()
 
-        EmbeddingCls = PromptTuningEmbedding if use_prompt_tuning else Embedding
+        self.mapping = config.mapping
+        self.use_prompt_tuning = config.use_prompt_tuning
+        EmbeddingCls = PromptTuningEmbedding if config.use_prompt_tuning else Embedding
         if self.mapping.is_first_pp_rank():
             self.vocab_embedding = EmbeddingCls(
-                num_embeddings=vocab_size,
-                embedding_dim=hidden_size,
-                dtype=dtype,
-                tp_size=mapping.tp_size if use_parallel_embedding else 1,
-                tp_group=mapping.tp_group if use_parallel_embedding else None,
-                sharding_dim=embedding_sharding_dim,
-                tp_rank=mapping.tp_rank,
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+                dtype=config.dtype,
+                tp_size=self.mapping.tp_size
+                if config.use_parallel_embedding else 1,
+                tp_group=self.mapping.tp_group
+                if config.use_parallel_embedding else None,
+                sharding_dim=config.embedding_sharding_dim,
+                tp_rank=self.mapping.tp_rank,
             )
 
-        self.layers = ModuleList([
-            LLaMADecoderLayer(
-                layer_id=i,
-                hidden_size=hidden_size,
-                num_attention_heads=num_heads,
-                num_kv_heads=num_kv_heads,
-                max_position_embeddings=max_position_embeddings,
-                dtype=dtype,
-                hidden_act=hidden_act,
-                mlp_hidden_size=mlp_hidden_size,
-                position_embedding_type=position_embedding_type,
-                rotary_base=rotary_base,
-                rotary_scaling=rotary_scaling,
-                tp_group=mapping.tp_group,
-                tp_size=mapping.tp_size,
-                tp_rank=mapping.tp_rank,
-                use_auto_parallel=use_auto_parallel,
-                quant_mode=quant_mode,
-                rms_norm_eps=rms_norm_eps,
-                attn_bias=attn_bias,
-                mlp_bias=mlp_bias,
-                use_fused_mlp=use_fused_mlp,
-                enable_pos_shift=enable_pos_shift,
-                dense_context_fmha=dense_context_fmha,
-                moe_config=moe_config,
-                max_lora_rank=max_lora_rank,
-            ) for i in self.mapping.pp_layers(num_layers)
-        ])
+        self.layers = DecoderLayerList(LLaMADecoderLayer, config)
 
         if self.mapping.is_last_pp_rank():
-            self.ln_f = RmsNorm(normalized_shape=hidden_size,
-                                eps=rms_norm_eps,
-                                dtype=dtype)
+            self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
+                                eps=config.norm_epsilon,
+                                dtype=config.dtype)
 
     def forward(
             self,
@@ -280,50 +191,27 @@ class LLaMAModel(Module):
         if use_cache:
             presents = []
 
-        ptuning_args = []
-        if self.use_prompt_tuning:
-            ptuning_args = [
-                prompt_embedding_table, prompt_tasks, prompt_vocab_size
-            ]
+        ptuning_args = [
+            prompt_embedding_table, prompt_tasks, prompt_vocab_size
+        ] if self.use_prompt_tuning else []
+
         if self.mapping.is_first_pp_rank():
             hidden_states = self.vocab_embedding(input_ids, *ptuning_args)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
-        self.register_network_output(f"embd", hidden_states)
 
-        for layer_idx, (
-                layer, past, pointer, host_pointer,
-                max_attention_window_size) in enumerate(
-                    zip(self.layers, kv_cache_params.past_key_value,
-                        kv_cache_params.kv_cache_block_pointers,
-                        kv_cache_params.host_kv_cache_block_pointers,
-                        kv_cache_params.host_max_attention_window_sizes)):
-            lora_layer_params = None
-            if lora_params is not None and lora_params.lora_ranks is not None:
-                lora_layer_params = lora_params.get_layer_params(layer_idx)
+        hidden_states = self.layers.forward(
+            hidden_states,
+            use_cache=use_cache,
+            attention_mask=attention_mask,
+            kv_cache_params=kv_cache_params,
+            attention_params=attention_params,
+            lora_params=lora_params,
+            medusa_position_offsets=medusa_position_offsets,
+            medusa_packed_mask=medusa_packed_mask)
 
-            hidden_states = layer(
-                hidden_states,
-                use_cache=use_cache,
-                attention_mask=attention_mask,
-                medusa_packed_mask=medusa_packed_mask,  # For Medusa support
-                medusa_position_offsets=medusa_position_offsets,
-                kv_cache_params=KeyValueCacheParams(
-                    past_key_value=[past],
-                    host_past_key_value_lengths=kv_cache_params.
-                    host_past_key_value_lengths,
-                    host_max_attention_window_sizes=max_attention_window_size,
-                    host_sink_token_length=kv_cache_params.
-                    host_sink_token_length,
-                    kv_cache_block_pointers=[pointer],
-                    host_kv_cache_block_pointers=[host_pointer],
-                    cache_indirection=kv_cache_params.cache_indirection),
-                attention_params=attention_params,
-                lora_layer_params=lora_layer_params)
-
-            if use_cache:
-                presents.append(hidden_states[1])
-                hidden_states = hidden_states[0]
+        if use_cache:
+            hidden_states, presents = hidden_states
 
         if self.mapping.is_last_pp_rank():
             hidden_states = self.ln_f(hidden_states)
@@ -335,263 +223,42 @@ class LLaMAModel(Module):
         return hidden_states
 
 
-class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopModelMixin):
+class LLaMAForCausalLM(DecoderModelForCausalLM, TopModelMixin):
 
-    def __init__(self,
-                 num_layers,
-                 num_heads,
-                 num_kv_heads,
-                 hidden_size,
-                 vocab_size,
-                 hidden_act,
-                 max_position_embeddings,
-                 dtype,
-                 logits_dtype="float32",
-                 mlp_hidden_size=None,
-                 position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
-                 rotary_base=10000.0,
-                 rotary_scaling=None,
-                 mapping=Mapping(),
-                 use_auto_parallel=False,
-                 quant_mode=QuantMode(0),
-                 use_parallel_embedding=False,
-                 embedding_sharding_dim=0,
-                 rms_norm_eps=1e-06,
-                 use_fused_mlp=False,
-                 attn_bias=False,
-                 mlp_bias=False,
-                 moe_config=MoeConfig(),
-                 use_prompt_tuning: bool = False,
-                 enable_pos_shift=False,
-                 dense_context_fmha=False,
-                 max_lora_rank=None):
-        config = PretrainedConfig(
-            architecture="LLaMAForCausalLM",
-            dtype=dtype,
-            logits_dtype=logits_dtype,
-            vocab_size=vocab_size,
-            max_position_embeddings=max_position_embeddings,
-            hidden_size=hidden_size,
-            num_hidden_layers=num_layers,
-            num_attention_heads=num_heads,
-            num_key_value_heads=num_kv_heads,
-            hidden_act=hidden_act,
-            intermediate_size=mlp_hidden_size,
-            norm_epsilon=rms_norm_eps,
-            position_embedding_type=str(position_embedding_type),
-            world_size=mapping.world_size,
-            tp_size=mapping.tp_size,
-            pp_size=mapping.pp_size,
-            quant_mode=quant_mode,
-            quant_kwargs={},
-            use_prompt_tuning=use_prompt_tuning,
-            use_parallel_embedding=use_parallel_embedding,
-            embedding_sharding_dim=embedding_sharding_dim)
-        self.config = config
-        # TODO: there is an issue of PretrainedConfig that it does not hold the info of "current rank"
-        # it internally constructs a mapping object from the world_size/tp_size/pp_size
-        # thus override the config.mapping here to the user provided one, which shall include current rank
-        self.config.mapping = mapping
-
-        if isinstance(dtype, str):
-            self.dtype = str_dtype_to_trt(dtype)
+    def __init__(self, config: PretrainedConfig):
+        self.check_config(config)
+        transformer = LLaMAModel(config)
+        vocab_size_padded = pad_vocab_size(config.vocab_size,
+                                           config.mapping.tp_size)
+        if config.mapping.is_last_pp_rank():
+            lm_head = ColumnLinear(config.hidden_size,
+                                   vocab_size_padded,
+                                   bias=False,
+                                   dtype=config.dtype,
+                                   tp_group=config.mapping.tp_group,
+                                   tp_size=config.mapping.tp_size,
+                                   gather_output=True)
         else:
-            assert isinstance(dtype, trt.DataType)
-            self.dtype = dtype
+            lm_head = None
+        self.quant_mode = config.quant_mode
+        self.mapping = config.mapping
+        super().__init__(config, transformer, lm_head)
 
-        if isinstance(logits_dtype, str):
-            self.logits_dtype = str_dtype_to_trt(logits_dtype)
-        else:
-            assert isinstance(logits_dtype, trt.DataType)
-            self.logits_dtype = logits_dtype
-
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        if num_kv_heads is None or num_kv_heads <= 0:
-            num_kv_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.hidden_size = hidden_size
-        self.vocab_size = vocab_size
-        self.tp_size = mapping.tp_size
-
-        self.kv_dtype = self.dtype
-        if quant_mode.has_int8_kv_cache():
-            self.kv_dtype = str_dtype_to_trt('int8')
-        elif quant_mode.has_fp8_kv_cache():
-            self.kv_dtype = str_dtype_to_trt('fp8')
-
-        self.quant_mode = quant_mode
-        self.use_parallel_embedding = use_parallel_embedding
-        self.embedding_sharding_dim = embedding_sharding_dim
-        self.moe_config = moe_config
-        self.use_fused_mlp = use_fused_mlp
-
-        super().__init__(num_layers, num_heads, num_kv_heads, hidden_size,
-                         vocab_size, hidden_act, max_position_embeddings, dtype,
-                         mlp_hidden_size, position_embedding_type, rotary_base,
-                         rotary_scaling, mapping, use_auto_parallel, quant_mode,
-                         use_parallel_embedding, embedding_sharding_dim,
-                         rms_norm_eps, use_fused_mlp, attn_bias, mlp_bias,
-                         moe_config, use_prompt_tuning, enable_pos_shift,
-                         dense_context_fmha, max_lora_rank)
-
-        vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
-        if self.mapping.is_last_pp_rank():
-            self.lm_head = ColumnLinear(hidden_size,
-                                        vocab_size_padded,
-                                        bias=False,
-                                        dtype=dtype,
-                                        tp_group=mapping.tp_group,
-                                        tp_size=mapping.tp_size,
-                                        gather_output=True)
-
-    def forward(self,
-                input_ids,
-                position_ids=None,
-                use_cache=False,
-                last_token_ids=None,
-                attention_mask=None,
-                kv_cache_params=None,
-                attention_params=None,
-                hidden_states=None,
-                prompt_embedding_table: Optional[Tensor] = None,
-                prompt_tasks: Optional[Tensor] = None,
-                prompt_vocab_size: Optional[Tensor] = None,
-                lora_params=None):
-        hidden_states = super().forward(
-            input_ids,
-            position_ids=position_ids,
-            use_cache=use_cache,
-            attention_mask=attention_mask,
-            kv_cache_params=kv_cache_params,
-            attention_params=attention_params,
-            hidden_states=hidden_states,
-            prompt_embedding_table=prompt_embedding_table,
-            prompt_tasks=prompt_tasks,
-            prompt_vocab_size=prompt_vocab_size,
-            lora_params=lora_params)
-
-        if use_cache:
-            hidden_states, presents = hidden_states
-
-        if self.mapping.is_last_pp_rank():
-            hidden_states = gather_last_token_logits(
-                hidden_states, last_token_ids,
-                default_net().plugin_config.remove_input_padding)
-
-            # [batch_size, hidden_size] -> [batch_size, vocab_size]
-            lm_logits = self.lm_head(hidden_states)
-            lm_logits.mark_output('logits', self.logits_dtype)
-        else:
-            hidden_states.mark_output('hidden_states_output', self.dtype)
-
-        if use_cache and default_net().plugin_config.paged_kv_cache == False:
-            for i, present in zip(self.mapping.pp_layers(self.num_layers),
-                                  presents):
-                present.mark_output(f'present_key_value_{i}', self.kv_dtype)
-            if self.mapping.is_last_pp_rank():
-                return (lm_logits, presents)
-            return (hidden_states, presents)
-        else:
-            if self.mapping.is_last_pp_rank():
-                return lm_logits
-            return hidden_states
-
-    def prepare_inputs(
-            self,
-            max_batch_size,
-            max_input_len,
-            max_seq_len,
-            use_cache,
-            max_beam_width,
-            max_num_tokens: int = None,
-            prompt_embedding_table_size: int = 0,
-            gather_context_logits: bool = False,
-            gather_generation_logits: bool = False,
-            lora_target_modules: List[str] = None,
-            max_draft_len=0,  # For Medusa support
-    ):
-        '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
-            ranges of the dimensions of when using TRT dynamic shapes.
-
-            @return: a list contains values which can be fed into the self.forward()
-        '''
-
-        # Prepare inputs
-        head_size = self.hidden_size // self.num_heads
-        remove_input_padding = default_net().plugin_config.remove_input_padding
-        use_gpt_attention_plugin = default_net(
-        ).plugin_config.gpt_attention_plugin
-        use_gemm_plugin = default_net().plugin_config.gemm_plugin
-        paged_kv_cache = default_net().plugin_config.paged_kv_cache
-        tokens_per_block = default_net().plugin_config.tokens_per_block
-        use_custom_all_reduce = default_net(
-        ).plugin_config.use_custom_all_reduce
-        use_lora_plugin = default_net().plugin_config.lora_plugin
-
-        model_inputs = self.prepare_basic_inputs(
-            max_batch_size=max_batch_size,
-            max_beam_width=max_beam_width,
-            max_input_len=max_input_len,
-            max_seq_len=max_seq_len,
-            num_kv_heads=self.num_kv_heads,
-            head_size=head_size,
-            num_layers=self.num_layers,
-            kv_dtype=self.kv_dtype,
-            remove_input_padding=remove_input_padding,
-            use_gpt_attention_plugin=use_gpt_attention_plugin,
-            use_gemm_plugin=use_gemm_plugin,
-            use_custom_all_reduce=use_custom_all_reduce,
-            paged_kv_cache=paged_kv_cache,
-            tokens_per_block=tokens_per_block,
-            dtype=self.dtype,
-            num_heads=self.num_heads,
-            mapping=self.mapping,
-            max_num_tokens=max_num_tokens,
-            prompt_embedding_table_size=prompt_embedding_table_size,
-            gather_context_logits=gather_context_logits,
-            gather_generation_logits=gather_generation_logits,
-            use_lora_plugin=use_lora_plugin,
-            lora_target_modules=lora_target_modules,
-            max_draft_len=max_draft_len,  # For Medusa support
-        )
-
-        return (
-            model_inputs['input_ids'],
-            model_inputs['position_ids'],
-            True,
-            model_inputs['last_token_ids'],
-            model_inputs['attention_mask'],
-            KeyValueCacheParams(
-                past_key_value=model_inputs['past_key_value'],
-                host_past_key_value_lengths=model_inputs[
-                    'host_past_key_value_lengths'],
-                host_max_attention_window_sizes=model_inputs[
-                    'host_max_attention_window_sizes'],
-                host_sink_token_length=model_inputs['host_sink_token_length'],
-                kv_cache_block_pointers=model_inputs[
-                    'kv_cache_block_pointers_list'],
-                host_kv_cache_block_pointers=model_inputs[
-                    'host_kv_cache_block_pointers_list'],
-                cache_indirection=model_inputs['cache_indirection'],
-            ),
-            AttentionParams(
-                sequence_length=model_inputs['sequence_length'],
-                context_lengths=model_inputs['context_lengths'],
-                host_context_lengths=model_inputs['host_context_lengths'],
-                max_context_length=max_input_len,
-                host_request_types=model_inputs['host_request_types']),
-            model_inputs['hidden_states_input'],
-            model_inputs['prompt_embedding_table'],
-            model_inputs['tasks'],
-            model_inputs['prompt_vocab_size'],
-            LoraParams(
-                model_inputs['lora_ranks'],
-                model_inputs['lora_weights_pointers'],
-                host_context_lengths=model_inputs['host_context_lengths'],
-                max_context_length=max_input_len,
-                host_request_types=model_inputs['host_request_types']),
-        )
+    def check_config(self, config):
+        config.set_if_not_exist('mlp_bias', False)
+        config.set_if_not_exist('attn_bias', False)
+        config.set_if_not_exist('rotary_base', 10000.0)
+        config.set_if_not_exist('rotary_scaling', None)
+        config.set_if_not_exist('enable_pos_shift', False)
+        config.set_if_not_exist('dense_context_fmha', False)
+        config.set_if_not_exist('use_fused_mlp', False)
+        config.set_if_not_exist('moe_num_experts', 0)
+        config.set_if_not_exist('moe_top_k', 0)
+        config.set_if_not_exist('moe_tp_mode',
+                                MoeConfig.ParallelismMode.TENSOR_PARALLEL)
+        config.set_if_not_exist(
+            'moe_normalization_mode',
+            MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE)
 
     @classmethod
     def from_hugging_face(cls,
@@ -603,6 +270,7 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopModelMixin):
         import transformers
         from transformers import LlamaConfig
 
+        from ...models.modeling_utils import PretrainedConfig
         cfg = LlamaConfig.from_pretrained(hf_model_dir)
 
         num_kv_heads = cfg.num_key_value_heads if hasattr(cfg, "num_key_value_heads") \
@@ -612,35 +280,69 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopModelMixin):
         if quant_mode is None:
             quant_mode = QuantMode(0)
 
-        tllm_llama = LLaMAForCausalLM(
-            num_layers=cfg.num_hidden_layers,
-            num_heads=cfg.num_attention_heads,
-            num_kv_heads=num_kv_heads,
-            hidden_size=cfg.hidden_size,
-            vocab_size=cfg.vocab_size,
-            hidden_act=cfg.hidden_act,
-            max_position_embeddings=cfg.max_position_embeddings,
-            dtype=dtype,
-            mlp_hidden_size=cfg.intermediate_size,
-            position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
-            mapping=mapping,
-            rotary_base=getattr(cfg, 'rotary_base', 10000.0),
-            rotary_scaling=getattr(cfg, 'rotary_scaling', None),
-            rms_norm_eps=cfg.rms_norm_eps,
-            # current load_from_hf_llama can read these, so need to set these here,
-            # ideally these attributes shall be set after the from_hugging_face returned an object to user
-            # since these attributes are not related to the hugging face model, they only affect the TRT-LLM module
-            # the weights transformation or any model optimization shall be done outside from_hugging_face
-            quant_mode=quant_mode,
-            use_parallel_embedding=kwargs.get("use_parallel_embedding", False),
-            embedding_sharding_dim=kwargs.get("embedding_sharding_dim", 0),
-            use_fused_mlp=kwargs.get("use_fused_mlp", False),
-            moe_config=kwargs.get("moe_config",
-                                  MoeConfig()),  # load weights use this
-            use_prompt_tuning=kwargs.get("use_prompt_tuning", False))
+        cfg.mapping = mapping
 
+        cfg.dtype = dtype
+        cfg.quant_mode = quant_mode
+        moe_config = kwargs.get("moe_config", MoeConfig())
+
+        cfg.norm_epsilon = cfg.rms_norm_eps
+
+        config = {
+            'architecture': cfg.architectures[0],
+            'dtype': cfg.dtype,
+            'logits_dtype': 'float32',
+            'num_hidden_layers': cfg.num_hidden_layers,
+            'num_attention_heads': cfg.num_attention_heads,
+            'hidden_size': cfg.hidden_size,
+            'intermediate_size': cfg.intermediate_size,
+            'num_key_value_heads': cfg.num_key_value_heads,
+            'vocab_size': cfg.vocab_size,
+            'position_embedding_type': 'rope_gpt_neox',
+            'max_position_embeddings': cfg.max_position_embeddings,
+            'hidden_act': cfg.hidden_act,
+            'rotary_base': getattr(cfg, 'rotary_base', 10000.0),
+            'rotary_scaling': getattr(cfg, 'rotary_scaling', None),
+            'norm_epsilon': cfg.rms_norm_eps,
+            'quantization': {
+                'group_size': 128,
+            },
+            'mapping': {
+                'world_size': mapping.world_size,
+                'tp_size': mapping.world_size,
+            },
+            'use_parallel_embedding': kwargs.get("use_parallel_embedding",
+                                                 False),
+            'embedding_sharding_dim': kwargs.get("embedding_sharding_dim", 0),
+            'use_prompt_tuning': kwargs.get("use_prompt_tuning", False),
+            'moe_num_experts': moe_config.num_experts,
+            'moe_top_k': moe_config.top_k,
+            'moe_tp_mode': moe_config.tp_mode,
+            'moe_normalization_mode': moe_config.normalization_mode,
+            'use_fused_mlp': kwargs.get("use_fused_mlp", False),
+            'enable_pos_shift': kwargs.get("enable_pos_shift", False),
+            'dense_context_fmha': kwargs.get("dense_context_fmha", False),
+        }
+        if quant_mode.is_int4_weight_only_per_group():
+            config['quantization'].update({
+                'quant_algo': 'W4A8_AWQ',
+                'has_zero_point': False,
+                'pre_quant_scale': True,
+                'exclude_modules': [],
+            })
+        elif quant_mode.has_fp8_qdq() and quant_mode.has_fp8_kv_cache():
+            config['quantization'].update({
+                'quant_algo': 'FP8',
+                'kv_cache_quant_algo': 'FP8'
+            })
+        else:
+            if quant_mode != QuantMode(0):
+                raise ValueError(f"Unsupported quantization mode: {quant_mode}")
+
+        tllm_llama = LLaMAForCausalLM(PretrainedConfig.from_dict(config))
+        q_weights = {}
         if quant_mode.has_any_quant():
-            tllm_llama._quantize(hf_model_dir, dtype, **kwargs)
+            q_weights = tllm_llama._quantize(hf_model_dir, dtype, cfg, **kwargs)
 
         # For debug purpose, skip weights loading to be faster
         if kwargs.get("skip_loading_weights", False):
@@ -663,7 +365,8 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopModelMixin):
                 },  # Load to CPU memory
                 torch_dtype='auto',
             )
-            load_from_hf_llama(
+
+            weights = load_from_hf_llama(
                 tllm_llama,
                 hf_llama,
                 mapping=mapping,
@@ -674,9 +377,13 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopModelMixin):
             )
             profiler.stop("Loading weights from HF")
             del hf_llama
+            weights.update(q_weights)
+            tllm_llama.load(weights)
+        else:
+            tllm_llama.load(q_weights)
         return tllm_llama
 
-    def _quantize(self, hf_model_dir, dtype, **kwargs):
+    def _quantize(self, hf_model_dir, dtype, cfg, **kwargs):
         '''Given the quant_mode set in the Module object, read from given hf model
            call AMMO to generate quantization scales, and set the scales back the module parameters.
         '''
@@ -686,7 +393,7 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopModelMixin):
         quantized_checkpoint_path = kwargs.get("quantization_cache_dir",
                                                quantized_temp_dir.name)
         quantize_lm_head = kwargs.get("quantize_lm_head", False)
-        quant_mode = self.quant_mode
+        quant_mode = cfg.quant_mode
         ammo_qformat = None
         calib_size = None
         if quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache():
@@ -710,30 +417,19 @@ class LLaMAForCausalLM(LLaMAModel, GenerationMixin, TopModelMixin):
         ckpt = Path(quantized_checkpoint_path) / "llama_tp1_rank0.npz"
         assert ckpt.exists(), f"The expecting checkpoint path {ckpt} does not exist" \
                   "it's likely quantization failed, pls check error logs"
+        hf_config = AutoConfig.from_pretrained(hf_model_dir,
+                                               trust_remote_code=True)
         if ammo_qformat == 'fp8':
-            quant_scales = get_scaling_factors(ckpt,
-                                               num_layers=self.num_layers,
-                                               quant_mode=quant_mode)
-            quantize_kwargs = {"quant_scales": quant_scales}
+            return load_from_fp8_llama(
+                str(ckpt),
+                hf_config,
+                cfg.mapping,
+                fp8_kv_cache=quant_mode.has_fp8_kv_cache())
         else:
-            assert ammo_qformat == 'int4_awq'
-            exclude_modules = ['lm_head'] if not quantize_lm_head else []
-            quantize_kwargs = {
-                "group_size": 128,  # default from examples/llama/build.py
-                "zero": False,
-                "pre_quant_scale": True,
-                "exclude_modules": exclude_modules,
-            }
-        # for fp8, the quantize_model only set scale factors to the model parameters
-        quantize_model(self, quant_mode, **quantize_kwargs)
-
-        if ammo_qformat == 'int4_awq':
-            load_from_awq_llama(tensorrt_llm_llama=self,
-                                quant_ckpt_path=str(ckpt),
-                                mapping=self.mapping,
-                                dtype=dtype,
-                                quantize_lm_head=quantize_lm_head,
-                                bin_model_dir=None)
+            return load_from_awq_llama(str(ckpt),
+                                       hf_config,
+                                       cfg.mapping,
+                                       dtype=dtype)
 
     # llama specific setters, user shall has the chance to change the module attributes after
     # from_hugging_face factory method created the model when these attributes is not included in the huggingface checkpoint

@@ -40,6 +40,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     SizeType constexpr nbLayers{2};
     SizeType constexpr nbHeads{16};
     SizeType constexpr hiddenSize{1024};
+    SizeType constexpr batchSize{4};
     GptModelConfig modelConfig{vocabSize, nbLayers, nbHeads, hiddenSize, dtype};
     modelConfig.useGptAttentionPlugin(false);
 
@@ -48,12 +49,11 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
 
     // create decoder
     auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
-    auto decoder = IGptDecoder::create(modelConfig.getDataType(), vocabSize, vocabSizePadded, streamPtr);
+    auto decoder = IGptDecoder::create(modelConfig.getDataType(), batchSize, vocabSize, vocabSizePadded, streamPtr);
     ASSERT_TRUE(static_cast<bool>(decoder));
 
     // setup decoder
     auto const beamWidth = samplingConfig.beamWidth;
-    SizeType constexpr batchSize{4};
 
     SizeType constexpr maxInputLength{8};
     SizeType constexpr maxNewTokens{2};

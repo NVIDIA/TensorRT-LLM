@@ -69,7 +69,7 @@ void StatefulGptDecoder::setup(SizeType maxBatchSize, SizeType maxBeamWidth, Siz
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(maxTokensPerStep == 1);
-    mDecoder = IGptDecoder::create(dtype, mVocabSize, mVocabSizePadded, mStream);
+    mDecoder = IGptDecoder::create(dtype, maxBatchSize, mVocabSize, mVocabSizePadded, mStream);
 
     reshapeBuffers(maxBatchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSequenceLength);
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
@@ -170,7 +170,7 @@ void StatefulGptDecoder::newBatch(
     dInput.maxLength = maxInputLength;
     dInput.maxAttentionWindow = mMaxAttentionWindow;
     dInput.sinkTokenLength = mSinkTokenLength;
-    dInput.batchSize = batchSize;
+    dInput.maxBatchSize = batchSize;
     kernels::invokeFill(const_cast<ITensor&>(*dInput.endIds), endId, *stream);
     dInput.embeddingBias = inputs.embeddingBias;
     dInput.badWordsList = inputs.badWordsList;

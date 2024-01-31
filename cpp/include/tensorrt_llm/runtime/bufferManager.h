@@ -72,6 +72,12 @@ public:
     //! \brief Allocates a pinned `ITensor` of the given dimensions on the CPU in the default memory pool.
     [[nodiscard]] static ITensorPtr pinnedPool(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
 
+    //! \brief Allocates an `IBuffer` of the given size in UVM.
+    [[nodiscard]] IBufferPtr managed(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE) const;
+
+    //! \brief Allocates an `ITensor` of the given dimensions in UVM.
+    [[nodiscard]] ITensorPtr managed(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE) const;
+
     //! \brief Allocates an `IBuffer` of the given size and memory type.
     [[nodiscard]] IBufferPtr allocate(
         MemoryType memoryType, std::size_t size, nvinfer1::DataType type = kBYTE_TYPE) const;

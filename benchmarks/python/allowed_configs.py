@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import asdict, dataclass
-from typing import Optional
+from typing import Dict, Optional, Union
 
 try:
     from typing import Literal
@@ -60,6 +60,9 @@ class BuildConfig:
     remove_input_padding: bool = None
     parallel_attention: bool = None
     new_decoder_architecture: bool = None
+    mamba_d_state: int = 0
+    mamba_d_conv: int = 0
+    mamba_expand: int = 0
 
 
 @dataclass
@@ -468,7 +471,9 @@ _allowed_configs = {
                 build_config=BuildConfig(
                     num_layers=28,
                     num_heads=32,
+                    num_kv_heads=32,
                     hidden_size=4096,
+                    inter_size=16384,
                     vocab_size=130528,
                     hidden_act='gelu',
                     n_positions=2048,
@@ -487,6 +492,7 @@ _allowed_configs = {
                     num_heads=32,
                     num_kv_heads=2,
                     hidden_size=4096,
+                    inter_size=13696,
                     vocab_size=65024,
                     hidden_act='swiglu',
                     n_positions=2048,
@@ -505,6 +511,7 @@ _allowed_configs = {
                     num_heads=32,
                     num_kv_heads=2,
                     hidden_size=4096,
+                    inter_size=13696,
                     vocab_size=65024,
                     hidden_act='swiglu',
                     n_positions=2048,
@@ -574,6 +581,24 @@ _allowed_configs = {
                     hidden_size=1024,
                     vocab_size=30522,
                     type_vocab_size=2,
+                    hidden_act='gelu',
+                    n_positions=1024,
+                    max_batch_size=64,
+                    max_input_len=512,
+                    builder_opt=None,
+                    enable_qk_half_accum=False,
+                    enable_context_fmha=False,
+                )),
+    "roberta_base":
+    ModelConfig(name="roberta_base",
+                family="roberta",
+                benchmark_type="bert",
+                build_config=BuildConfig(
+                    num_layers=12,
+                    num_heads=12,
+                    hidden_size=768,
+                    vocab_size=50265,
+                    type_vocab_size=1,
                     hidden_act='gelu',
                     n_positions=1024,
                     max_batch_size=64,
@@ -1059,6 +1084,96 @@ _allowed_configs = {
                     max_output_len=200,
                     builder_opt=None,
                 )),
+    "mamba_2.8b":
+    ModelConfig(name="mamba_2.8b",
+                family="mamba",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=64,
+                    num_heads=1,
+                    hidden_size=2560,
+                    vocab_size=50280,
+                    hidden_act="silu",
+                    n_positions=8192,
+                    max_batch_size=64,
+                    max_input_len=1024,
+                    max_output_len=1024,
+                    mamba_d_state=16,
+                    mamba_d_conv=4,
+                    mamba_expand=2,
+                )),
+    "mamba_1.4b":
+    ModelConfig(name="mamba_1.4b",
+                family="mamba",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=48,
+                    num_heads=1,
+                    hidden_size=2048,
+                    vocab_size=50280,
+                    hidden_act="silu",
+                    n_positions=8192,
+                    max_batch_size=64,
+                    max_input_len=1024,
+                    max_output_len=1024,
+                    mamba_d_state=16,
+                    mamba_d_conv=4,
+                    mamba_expand=2,
+                )),
+    "mamba_790m":
+    ModelConfig(name="mamba_790m",
+                family="mamba",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=48,
+                    num_heads=1,
+                    hidden_size=1536,
+                    vocab_size=50280,
+                    hidden_act="silu",
+                    n_positions=8192,
+                    max_batch_size=64,
+                    max_input_len=1024,
+                    max_output_len=1024,
+                    mamba_d_state=16,
+                    mamba_d_conv=4,
+                    mamba_expand=2,
+                )),
+    "mamba_370m":
+    ModelConfig(name="mamba_370m",
+                family="mamba",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=48,
+                    num_heads=1,
+                    hidden_size=1024,
+                    vocab_size=50280,
+                    hidden_act="silu",
+                    n_positions=8192,
+                    max_batch_size=64,
+                    max_input_len=1024,
+                    max_output_len=1024,
+                    mamba_d_state=16,
+                    mamba_d_conv=4,
+                    mamba_expand=2,
+                )),
+    "mamba_130m":
+    ModelConfig(name="mamba_130m",
+                family="mamba",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=24,
+                    num_heads=1,
+                    hidden_size=768,
+                    vocab_size=50280,
+                    hidden_act="silu",
+                    n_positions=8192,
+                    max_batch_size=64,
+                    max_input_len=1024,
+                    max_output_len=1024,
+                    mamba_d_state=16,
+                    mamba_d_conv=4,
+                    mamba_expand=2,
+                )),
 }
 
 
@@ -1070,9 +1185,12 @@ def get_allowed_models(benchmark_type=None):
                    if i.benchmark_type == benchmark_type)
 
 
-def get_build_config(model_name):
+def get_build_config(
+        model_name,
+        return_dict=True) -> Union[Dict, BuildConfig, EncDecBuildConfig]:
     if model_name in _allowed_configs:
-        return asdict(_allowed_configs[model_name].build_config)
+        cfg = _allowed_configs[model_name].build_config
+        return asdict(cfg) if return_dict else cfg
     else:
         raise KeyError(f'Unexpected model: {model_name}. Please add the model '
                        'to allowed_configs.py')

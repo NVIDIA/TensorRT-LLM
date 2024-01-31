@@ -102,9 +102,6 @@ def parse_arguments():
                         default=False,
                         action='store_true')
     parser.add_argument('--use_gemm_plugin', default=False, action='store_true')
-    parser.add_argument('--use_layernorm_plugin',
-                        default=False,
-                        action='store_true')
     parser.add_argument('--output_dir', type=str, default='gpt_outputs')
     return parser.parse_args()
 
@@ -207,12 +204,11 @@ if __name__ == '__main__':
 
     # Module -> Network
     network = builder.create_network()
+    network.plugin_config.to_legacy_setting()
     if args.use_gpt_attention_plugin:
         network.plugin_config.set_gpt_attention_plugin()
     if args.use_gemm_plugin:
         network.plugin_config.set_gemm_plugin()
-    if args.use_layernorm_plugin:
-        network.plugin_config.set_layernorm_plugin()
     with net_guard(network):
         # Prepare
         network.set_named_parameters(tensorrt_llm_gpt.named_parameters())

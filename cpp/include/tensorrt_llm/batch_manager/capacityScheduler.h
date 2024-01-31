@@ -22,7 +22,7 @@
 #include "tensorrt_llm/runtime/common.h"
 
 #include <list>
-#include <utility>
+#include <memory>
 
 namespace tensorrt_llm::batch_manager::batch_scheduler
 {
@@ -63,13 +63,13 @@ class MaxUtilizationScheduler : public CapacityScheduler
 {
 public:
     MaxUtilizationScheduler(
-        SizeType maxNumRequests, kv_cache_manager::KVCacheManager* const kvCacheManager, bool manyMicroBatches);
+        SizeType maxNumRequests, kv_cache_manager::KVCacheManager* kvCacheManager, bool manyMicroBatches);
 
     std::tuple<RequestList, RequestTable> scheduleRequests(const RequestList& activeRequests) override;
 
 private:
     bool trySchedulingRequestMaxUtilization(
-        const LlmRequest& req, SizeType& numScheduledRequests, SizeType& numScheduledBlocks);
+        std::shared_ptr<LlmRequest> const& req, RequestList& scheduledRequests, SizeType& numScheduledBlocks);
 
     SizeType mMaxNumRequests;
     kv_cache_manager::KVCacheManager* mKvCacheManager{nullptr};
@@ -81,7 +81,7 @@ private:
 class GuaranteedNoEvictScheduler : public CapacityScheduler
 {
 public:
-    GuaranteedNoEvictScheduler(SizeType maxNumRequests, kv_cache_manager::KVCacheManager* const kvCacheManager);
+    GuaranteedNoEvictScheduler(SizeType maxNumRequests, kv_cache_manager::KVCacheManager* kvCacheManager);
 
     std::tuple<RequestList, RequestTable> scheduleRequests(const RequestList& activeRequests) override;
 
@@ -91,7 +91,6 @@ private:
 };
 
 std::unique_ptr<CapacityScheduler> makeCapacityScheduler(tensorrt_llm::runtime::SizeType maxNumRequests,
-    kv_cache_manager::KVCacheManager* const kvCacheManager, SchedulerPolicy schedulerPolicy,
-    bool manyMicroBatches = false);
+    kv_cache_manager::KVCacheManager* kvCacheManager, SchedulerPolicy schedulerPolicy, bool manyMicroBatches = false);
 
 } // namespace tensorrt_llm::batch_manager::batch_scheduler

@@ -162,9 +162,7 @@ class TestLayer(unittest.TestCase):
                              param.args[1])
 
     @parameterized.expand([[tensorrt_llm.layers.GatedMLP, 'float32'],
-                           [tensorrt_llm.layers.FusedGatedMLP, 'float32'],
-                           [tensorrt_llm.layers.GatedMLP, 'fp8'],
-                           [tensorrt_llm.layers.FusedGatedMLP, 'fp8']],
+                           [tensorrt_llm.layers.GatedMLP, 'fp8']],
                           name_func=_gated_mlp_custom_id)
     def test_gated_mlp(self, ClsMLP, qformat):
         if getSMVersion() < 89 and qformat == 'fp8':
@@ -769,6 +767,7 @@ class TestLayer(unittest.TestCase):
         # construct trt network
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
+        net.plugin_config.to_legacy_setting()
         if use_plugin:
             net.plugin_config.gpt_attention_plugin = dtype
         with tensorrt_llm.net_guard(net):
@@ -1032,7 +1031,6 @@ class TestLayer(unittest.TestCase):
         # construct trt network
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
-        net.plugin_config.set_selective_scan_plugin(dtype)
         with tensorrt_llm.net_guard(net):
             hidden_states_tensor = Tensor(
                 name='hidden_states',

@@ -37,6 +37,7 @@ PAD_ID = 50256
 work_dir = Path(__file__).parent.resolve() / 'check_gpt'
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../utils'))
+from llm_data import llm_models_root
 from util import getSMVersion
 
 
@@ -58,10 +59,10 @@ def build_engine(weigth_dir: Path, engine_dir: Path, *args):
 
 
 def build_engines():
-    llm_models_root = os.environ.get("LLM_MODELS_ROOT", None)
-    gpt2_dir = f"{llm_models_root}/gpt2"
+    models_root = llm_models_root()
+    gpt2_dir = str(models_root / "gpt2")
     # clone if not exists in the cache or the cache is not set
-    if llm_models_root is None or not os.path.exists(gpt2_dir):
+    if models_root is None or not os.path.exists(gpt2_dir):
         gpt2_dir = work_dir / 'gpt2'
         print("Pulling gpt2 from huggingface")
         subprocess.check_call(["rm", "-rf", str(gpt2_dir)])
@@ -143,6 +144,7 @@ def check_accuracy(engine_dir, input_tokens, max_output_len):
         f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
     num_heads = config['builder_config']['num_heads'] // world_size
     hidden_size = config['builder_config']['hidden_size'] // world_size
+    max_batch_size = config['builder_config']['max_batch_size']
     vocab_size = config['builder_config']['vocab_size']
     num_layers = config['builder_config']['num_layers']
     num_kv_heads = config['builder_config']['num_kv_heads']
@@ -153,7 +155,8 @@ def check_accuracy(engine_dir, input_tokens, max_output_len):
                                            tp_size=world_size)
     torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
 
-    model_config = ModelConfig(num_heads=num_heads,
+    model_config = ModelConfig(max_batch_size=max_batch_size,
+                               num_heads=num_heads,
                                num_kv_heads=num_kv_heads,
                                hidden_size=hidden_size,
                                vocab_size=vocab_size,

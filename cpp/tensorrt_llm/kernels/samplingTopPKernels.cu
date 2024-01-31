@@ -63,13 +63,14 @@ void invokeTopPInitialize(int* topPIdValBuf, int* topPOffsetBuf, int* beginTopPO
     int const vocabSize, cudaStream_t stream)
 {
     // vocabSize: the column number of logits_buffer for top_p sampling
+    // TODO(nkorobov): launch based on available resources
     topPInitialize<<<32, 512, 0, stream>>>(topPIdValBuf, topPOffsetBuf, beginTopPOffsetBuf, batchSize, vocabSize);
 }
 
 template <typename T, int THREADBLOCK_SIZE>
-__launch_bounds__(THREADBLOCK_SIZE) __global__ void topPBeamTopKKernel(T const* logProbs, // prob.
-    int* topKTmpIdBuf, T* topKTmpValBuf, FinishedState const* finishedInput, int const vocabSize, int* offsetBuf,
-    int* beginOffsetBuf, float const topP, float const* topPs, bool const* skipDecode)
+__launch_bounds__(THREADBLOCK_SIZE) __global__ void topPBeamTopKKernel(const T* logProbs, // prob.
+    int* topKTmpIdBuf, T* topKTmpValBuf, const FinishedState* finishedInput, const int vocabSize, int* offsetBuf,
+    int* beginOffsetBuf, const float topP, const float* topPs, const bool* skipDecode, const int* batchSlots)
 {
     /**
      * Kernel performs top 1 search and saves the token with largest probability if it exceeds probability threshold
@@ -77,17 +78,18 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void topPBeamTopKKernel(T const* 
     int constexpr MAX_K = 1;
     int threadId = threadIdx.x;
     int batchId = blockIdx.x;
+    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchId] : batchId;
 
     // Skip decoding kernel if configured
-    if ((skipDecode != nullptr && skipDecode[batchId])
-        || (finishedInput != nullptr && finishedInput[batchId].isSkipDecoding()))
+    if ((skipDecode != nullptr && skipDecode[batchSlot])
+        || (finishedInput != nullptr && finishedInput[batchSlot].isSkipDecoding()))
     {
         // Required to skip radix sort
         beginOffsetBuf[batchId] += vocabSize;
         return;
     }
 
-    float pThreshold = (topPs != nullptr) ? topPs[batchId] : topP;
+    float pThreshold = (topPs != nullptr) ? topPs[batchSlot] : topP;
 
     typedef cub::BlockReduce<TopK<T, MAX_K>, THREADBLOCK_SIZE> BlockReduce;
     __shared__ typename BlockReduce::TempStorage temp_storage;
@@ -197,7 +199,7 @@ template <typename T, int blockSize>
 __global__ void topPSsampling(T* sortedLogProbs, int* sortedIdVals, int** ids, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     int const* beginOffsetBuf, int const* offsetBuf, int const vocabSize, curandState_t* curandstate, float const topP,
-    float const* topPs, int const* endIds, int const batchSize, bool const* skipDecode)
+    float const* topPs, int const* endIds, int const batchSize, bool const* skipDecode, int const* batchSlots)
 {
     /**
      * Each block processes one request row sorted in descending order by probabilities.
@@ -210,9 +212,10 @@ __global__ void topPSsampling(T* sortedLogProbs, int* sortedIdVals, int** ids, i
 
     int const tid = threadIdx.x;
     int const batchId = blockIdx.x;
+    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchId] : batchId;
     // Skip kernel if this sampling method is not chosen
-    FinishedState const finishState = finishedInput != nullptr ? finishedInput[batchId] : FinishedState::empty();
-    if ((skipDecode != nullptr && skipDecode[batchId]) || (finishState.isSkipDecoding()))
+    const FinishedState finishState = finishedInput != nullptr ? finishedInput[batchSlot] : FinishedState::empty();
+    if ((skipDecode != nullptr && skipDecode[batchSlot]) || (finishState.isSkipDecoding()))
     {
         return;
     }
@@ -224,19 +227,19 @@ __global__ void topPSsampling(T* sortedLogProbs, int* sortedIdVals, int** ids, i
         {
             if (finishedOutput != nullptr)
             {
-                finishedOutput[batchId] = finishState;
+                finishedOutput[batchSlot] = finishState;
             }
-            ids[batchId][sequenceLength[batchId]] = endIds[batchId];
         }
+        ids[batchSlot][sequenceLength[batchSlot]] = endIds[batchSlot];
         return;
     }
 
-    int constexpr WARP_SIZE = 32;
-    int constexpr NUM_WARPS = blockSize / WARP_SIZE;
-    int const laneId = threadIdx.x % WARP_SIZE;
-    int const warpId = threadIdx.x / WARP_SIZE;
-    float const probThreshold = (topPs != nullptr) ? topPs[batchId] : topP;
-    int const currentStep = sequenceLength[batchId];
+    constexpr int WARP_SIZE = 32;
+    constexpr int NUM_WARPS = blockSize / WARP_SIZE;
+    const int laneId = threadIdx.x % WARP_SIZE;
+    const int warpId = threadIdx.x / WARP_SIZE;
+    const float probThreshold = (topPs != nullptr) ? topPs[batchSlot] : topP;
+    const int currentStep = sequenceLength[batchSlot];
 
     // With P in (0.0; 1.0] we draw a random number P' in range (0.0; P]
     // We will sum all probs moving from the largest probability to the smallest and
@@ -254,7 +257,7 @@ __global__ void topPSsampling(T* sortedLogProbs, int* sortedIdVals, int** ids, i
         if (tid == 0)
         {
             int offset = batchId * vocabSize;
-            epilogue(batchId, currentStep, offset, ids, sortedIdVals, sortedLogProbs, cumLogProbs, outputLogProbs,
+            epilogue(batchSlot, currentStep, offset, ids, sortedIdVals, sortedLogProbs, cumLogProbs, outputLogProbs,
                 endIds, sequenceLength, finishedOutput);
         }
         return;
@@ -274,7 +277,7 @@ __global__ void topPSsampling(T* sortedLogProbs, int* sortedIdVals, int** ids, i
     __syncthreads();
 
     int offset = batchId * vocabSize;
-    ids[batchId][currentStep] = sortedIdVals[offset];
+    ids[batchSlot][currentStep] = sortedIdVals[offset];
     int end = ((vocabSize + blockSize - 1) / blockSize) * blockSize;
     int selectedTokenId = 0;
     // Cumulative sum
@@ -295,7 +298,7 @@ __global__ void topPSsampling(T* sortedLogProbs, int* sortedIdVals, int** ids, i
     // select first thread exceeded the prob threshold or the last thread in case of P=1.0f
     if (threadIdx.x == min(blockDim.x - count, blockDim.x - 1))
     {
-        epilogue(batchId, currentStep, offset + selectedTokenId, ids, sortedIdVals, sortedLogProbs, cumLogProbs,
+        epilogue(batchSlot, currentStep, offset + selectedTokenId, ids, sortedIdVals, sortedLogProbs, cumLogProbs,
             outputLogProbs, endIds, sequenceLength, finishedOutput);
     }
 }
@@ -305,7 +308,7 @@ void invokeBatchTopPSampling(void* workspace, size_t& workspaceSize, size_t& cub
     int* sequenceLength, FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
     float* outputLogProbs, T const* logProbs, int const* idVals, int* offsetBuf, int* beginOffsetBuf,
     curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded, int const* endIds,
-    float const maxTopP, float const* topPs, cudaStream_t stream, bool const* skipDecode)
+    float const maxTopP, float const* topPs, cudaStream_t stream, bool const* skipDecode, int const* batchSlots)
 {
     int const vocabSize = vocabSizePadded;
 
@@ -334,7 +337,7 @@ void invokeBatchTopPSampling(void* workspace, size_t& workspaceSize, size_t& cub
     // Performs Top K=1 search.
     // If the most probable token exceeds P, we skip sorting by setting beginOffsetBuf[bi] = offsetBuf[bi]
     topPBeamTopKKernel<T, BLOCK_SIZE><<<batchSize, BLOCK_SIZE, 0, stream>>>(logProbs, sortedIdVals, sortedLogProbs,
-        finishedInput, vocabSize, offsetBuf, beginOffsetBuf, maxTopP, topPs, skipDecode);
+        finishedInput, vocabSize, offsetBuf, beginOffsetBuf, maxTopP, topPs, skipDecode, batchSlots);
 
     // Sort tokens by probability in descending order
     check_cuda_error(cub::DeviceSegmentedRadixSort::SortPairsDescending(cubTempStorage, cubTempStorageSize, logProbs,
@@ -348,68 +351,72 @@ void invokeBatchTopPSampling(void* workspace, size_t& workspaceSize, size_t& cub
     // Sample with Top P given sorted tokens
     topPSsampling<T, SAMPLING_BLOCK_SIZE><<<grid, SAMPLING_BLOCK_SIZE, 0, stream>>>(sortedLogProbs, sortedIdVals,
         outputIds, sequenceLength, finishedInput, finishedOutput, cumLogProbs, outputLogProbs, beginOffsetBuf,
-        offsetBuf + 1, vocabSize, curandstate, maxTopP, topPs, endIds, batchSize, skipDecode);
+        offsetBuf + 1, vocabSize, curandstate, maxTopP, topPs, endIds, batchSize, skipDecode, batchSlots);
 }
 
 template void invokeBatchTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize,
     int** outputIds, int* sequenceLength, FinishedState const* finishedInput, FinishedState* finishedOutput,
     float* cumLogProbs, float* outputLogProbs, float const* logProbs, int const* idVals, int* offsetBuf,
     int* beginOffsetBuf, curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded,
-    int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream, bool const* skipDecode);
+    int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream, bool const* skipDecode,
+    int const* batchSlots);
 
 template void invokeBatchTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize,
     int** outputIds, int* sequenceLength, FinishedState const* finishedInput, FinishedState* finishedOutput,
     float* cumLogProbs, float* outputLogProbs, half const* logProbs, int const* idVals, int* offsetBuf,
     int* beginOffsetBuf, curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded,
-    int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream, bool const* skipDecode);
+    int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream, bool const* skipDecode,
+    int const* batchSlots);
 
 template <typename T>
 void invokeTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize, int** outputIds,
     int* sequenceLength, FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
     float* outputLogProbs, T const* logProbs, int const* idVals, int* offsetBuf, int* beginOffsetBuf,
     curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded, int const* endIds, float const topP,
-    cudaStream_t stream, bool const* skipDecode)
+    cudaStream_t stream, bool const* skipDecode, int const* batchSlots)
 {
     invokeBatchTopPSampling(workspace, workspaceSize, cubTempStorageSize, outputIds, sequenceLength, finishedInput,
         finishedOutput, cumLogProbs, outputLogProbs, logProbs, idVals, offsetBuf, beginOffsetBuf, curandstate,
-        batchSize, vocabSizePadded, endIds, topP, nullptr, stream, skipDecode);
+        batchSize, vocabSizePadded, endIds, topP, nullptr, stream, skipDecode, batchSlots);
 }
 
 template void invokeTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize, int** outputIds,
     int* sequenceLength, FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
     float* outputLogProbs, float const* logProbs, int const* idVals, int* offsetBuf, int* beginOffsetBuf,
     curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded, int const* endIds, float const topP,
-    cudaStream_t stream, bool const* skipDecode);
+    cudaStream_t stream, bool const* skipDecode, int const* batchSlots);
 
 template void invokeTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize, int** outputIds,
     int* sequenceLength, FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
     float* outputLogProbs, half const* logProbs, int const* idVals, int* offsetBuf, int* beginOffsetBuf,
     curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded, int const* endIds, float const topP,
-    cudaStream_t stream, bool const* skipDecode);
+    cudaStream_t stream, bool const* skipDecode, int const* batchSlots);
 
 __global__ void computeToppDecay(float* runtimeTopP, float const* runtimeInitialTopP, int const** outputIds,
-    float const* topPDecay, float const* topPMin, int32_t const* topPResetIds, int const* sequenceLengths)
+    float const* topPDecay, float const* topPMin, int32_t const* topPResetIds, int const* sequenceLengths,
+    int const* batchSlots)
 {
-    int idx = blockDim.x * blockIdx.x + threadIdx.x;
-    auto const currentStep{sequenceLengths[idx]};
-    if (outputIds[idx][currentStep] == topPResetIds[idx])
+    int const idx = blockDim.x * blockIdx.x + threadIdx.x;
+    auto const batchSlot = batchSlots != nullptr ? batchSlots[idx] : idx;
+    auto const currentStep{sequenceLengths[batchSlot]};
+    if (outputIds[batchSlot][currentStep] == topPResetIds[batchSlot])
     {
-        runtimeTopP[idx] = runtimeInitialTopP[idx];
+        runtimeTopP[batchSlot] = runtimeInitialTopP[batchSlot];
     }
     else
     {
-        runtimeTopP[idx] = max(runtimeTopP[idx] * topPDecay[idx], topPMin[idx]);
+        runtimeTopP[batchSlot] = max(runtimeTopP[batchSlot] * topPDecay[batchSlot], topPMin[batchSlot]);
     }
 }
 
 void invokeComputeToppDecay(float* runtimeTopP, float const* runtimeInitialTopP, int const** outputIds,
     float const* topPDecay, float const* topPMin, int32_t const* topPResetIds, int const* sequenceLengths,
-    int const local_batchSize, cudaStream_t stream)
+    int const* batchSlots, int const localBatchSize, cudaStream_t stream)
 {
-    dim3 block(min(local_batchSize, 512));
-    dim3 grid((local_batchSize + block.x - 1) / block.x);
+    dim3 block(min(localBatchSize, 512));
+    dim3 grid((localBatchSize + block.x - 1) / block.x);
     computeToppDecay<<<grid, block, 0, stream>>>(
-        runtimeTopP, runtimeInitialTopP, outputIds, topPDecay, topPMin, topPResetIds, sequenceLengths);
+        runtimeTopP, runtimeInitialTopP, outputIds, topPDecay, topPMin, topPResetIds, sequenceLengths, batchSlots);
 }
 
 } // namespace kernels

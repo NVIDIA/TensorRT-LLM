@@ -62,8 +62,8 @@ class FtDynamicDecode : public IFtDynamicDecode
 public:
     using SetupParams = typename tensorrt_llm::layers::DynamicDecodeLayer<T>::SetupParams;
 
-    FtDynamicDecode(const size_t vocab_size, const size_t vocab_size_padded, const int tensor_para_size,
-        const int pipeline_para_size);
+    FtDynamicDecode(const size_t max_batch_size, const size_t vocab_size, const size_t vocab_size_padded,
+        const int tensor_para_size, const int pipeline_para_size);
 
     void setup(size_t batch_size, size_t beam_width, th::optional<th::Tensor> runtime_top_k_opt,
         th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
@@ -104,8 +104,8 @@ private:
 class DynamicDecodeOp : public th::jit::CustomClassHolder
 {
 public:
-    DynamicDecodeOp(const int64_t vocab_size, const int64_t vocab_size_padded, const int64_t tensor_para_size,
-        const int64_t pipeline_para_size, at::ScalarType scalar_type);
+    DynamicDecodeOp(const int64_t max_batch_size, const int64_t vocab_size, const int64_t vocab_size_padded,
+        const int64_t tensor_para_size, const int64_t pipeline_para_size, at::ScalarType scalar_type);
 
     void setup(int64_t batch_size, int64_t beam_width, th::optional<th::Tensor> runtime_top_k_opt,
         th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
@@ -136,6 +136,7 @@ public:
         bool use_beam_hyps);
 
 private:
+    size_t const max_batch_size_;
     size_t const vocab_size_;
     size_t const vocab_size_padded_;
     int const tensor_para_size_;

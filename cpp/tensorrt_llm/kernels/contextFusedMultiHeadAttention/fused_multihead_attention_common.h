@@ -222,6 +222,10 @@ struct Fused_multihead_attention_paged_kv_params_v2
     //  and each points to [Tokens_per_block, H, D] contiguous memory.
     cudaTmaDesc* tma_desc_paged_kv;
 
+    // Paged KV load.
+    int blocks_per_tma_load;
+    int blocks_per_tma_load_log2;
+
     // In multi-query or grouped-query attention (MQA/GQA), several Q heads are associated with one KV head
     int h_kv = 0;
     int h_q_per_kv = 0;
@@ -258,6 +262,9 @@ struct Fused_multihead_attention_paged_kv_params_v2
         cu_seqlens = nullptr;
         cu_q_seqlens = nullptr;
         use_int8_scale_max = false;
+
+        blocks_per_tma_load = 1;
+        blocks_per_tma_load_log2 = 0;
 
         h_kv = 0;
         h_q_per_kv = 0;

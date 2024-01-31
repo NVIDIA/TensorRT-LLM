@@ -133,6 +133,7 @@ class TestBloom(unittest.TestCase):
                 strongly_typed=fp16,
             )
             network = builder.create_network()
+            network.plugin_config.to_legacy_setting()
             if use_plugin:
                 network.plugin_config.set_gpt_attention_plugin(dtype)
             if fast_building:
@@ -430,6 +431,7 @@ class TestBloom(unittest.TestCase):
             enable_remove_input_padding=enable_remove_input_padding)
 
         model_config = ModelConfig(
+            max_batch_size=batch_size,
             vocab_size=bloom_config.vocab_size,
             num_layers=bloom_config.n_layer,
             num_heads=bloom_config.n_head,

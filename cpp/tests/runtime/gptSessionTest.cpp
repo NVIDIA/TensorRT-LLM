@@ -338,6 +338,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
     sessionConfig.ctxMicroBatchSize = microBatchSizes.ctxMicroBatchSize;
     sessionConfig.genMicroBatchSize = microBatchSizes.genMicroBatchSize;
     sessionConfig.cudaGraphMode = cudaGraphMode;
+    sessionConfig.kvCacheConfig.useUvm = false;
 
     GptSession session{sessionConfig, modelConfig, worldConfig, enginePath.string(), logger};
     EXPECT_EQ(session.getDevice(), worldConfig.getDevice());

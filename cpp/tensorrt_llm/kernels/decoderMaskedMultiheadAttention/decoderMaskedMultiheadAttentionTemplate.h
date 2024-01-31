@@ -1198,6 +1198,43 @@ inline __device__ __host__ constexpr unsigned threads_per_key()
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Specialized launch bounds for certain cases, which helps increase occupancy.
+// Keep other cases untouched as there might be register spilling.
+
+template <typename T, typename Tcache, unsigned THREADS_PER_BLOCK, unsigned Dh_MAX, bool DO_CROSS_ATTENTION,
+    bool HAS_BEAMS, bool POS_SHIFT>
+struct Launch_bounds_config
+{
+    // By default, we will not use launch bounds.
+    static constexpr int MAX_THREADS_PER_BLOCK = 0;
+    static constexpr int MIN_BLOCKS_PER_SM = 0;
+};
+
+template <>
+struct Launch_bounds_config<uint16_t, __nv_fp8_e4m3, 256u, 64u, false, false, false>
+{
+    static constexpr int MAX_THREADS_PER_BLOCK = 256u;
+    static constexpr int MIN_BLOCKS_PER_SM = 4u;
+};
+
+// Llama with FP8 KV Cache.
+template <>
+struct Launch_bounds_config<uint16_t, __nv_fp8_e4m3, 256u, 128u, false, false, false>
+{
+    static constexpr int MAX_THREADS_PER_BLOCK = 256u;
+    static constexpr int MIN_BLOCKS_PER_SM = 4u;
+};
+
+// GPTJ With Beam Searching and FP8 KV Cache.
+template <>
+struct Launch_bounds_config<uint16_t, __nv_fp8_e4m3, 256u, 256u, false, true, false>
+{
+    static constexpr int MAX_THREADS_PER_BLOCK = 256u;
+    static constexpr int MIN_BLOCKS_PER_SM = 3u;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 inline __device__ constexpr uint32_t shfl_mask(int threads)
 {
     assert(threads <= 32);
@@ -1245,6 +1282,8 @@ template <
     bool DO_MULTI_BLOCK = false,
     // Whether enable position shift for streamingllm
     bool POS_SHIFT = false,
+    // Whether compute implicit relative attention bias on the fly.
+    bool IMPLICIT_REL_ATTN_BIAS = false,
     // The number of threads per key.
     unsigned THREADS_PER_KEY = threads_per_key<T, dh_max(Dh)>(),
     // The number of threads per value.
@@ -1253,8 +1292,15 @@ template <
     // Set it default to 4 for higher occupancy (by reducing registers usage).
     unsigned K_LOOP_UNROLL = 4,
     // The unroll factor for loading from V cache.
-    unsigned V_LOOP_UNROLL = 8>
-__global__ void masked_multihead_attention_kernel(
+    unsigned V_LOOP_UNROLL = 8,
+    // Launch bounds
+    unsigned MAX_THEADS_PER_BLOCK
+    = Launch_bounds_config<T, Tcache, THREADS_PER_BLOCK, dh_max(Dh), DO_CROSS_ATTENTION, HAS_BEAMS, POS_SHIFT>()
+          .MAX_THREADS_PER_BLOCK,
+    unsigned MIN_BLOCKS_PER_SM
+    = Launch_bounds_config<T, Tcache, THREADS_PER_BLOCK, dh_max(Dh), DO_CROSS_ATTENTION, HAS_BEAMS, POS_SHIFT>()
+          .MIN_BLOCKS_PER_SM>
+__global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) masked_multihead_attention_kernel(
     Multihead_attention_params<T, DO_CROSS_ATTENTION> params, KVCacheBuffer kvCacheBuffer, KCacheBuffer pastKCache)
 {
 
@@ -1278,6 +1324,8 @@ __global__ void masked_multihead_attention_kernel(
     constexpr bool IS_Dh_MAX = Dh == Dh_MAX;
     static_assert(Dh_MAX >= WARP_SIZE);
     static_assert(Dh_MAX >= Dh);
+    // Only instantiate few head sizes for implicit relative attention bias in order to save compilation time.
+    static_assert(!IMPLICIT_REL_ATTN_BIAS || Dh == 32 || Dh == 64 || Dh == 128);
 
     // The maximum sequence length in the cyclic kv_cache, i.e., an upper bound on L.
     // Note that the maximum sequence length supported by the model might be greater than this.
@@ -1419,10 +1467,10 @@ __global__ void masked_multihead_attention_kernel(
 
     // Do we have a relative attention bias?
     bool has_relative_attention_bias = params.relative_attention_bias != nullptr;
+    // IMPLICIT_REL_ATTN_BIAS:
     // Compute relative attention bias on the fly, with relative attention table [head_num/TP, num_buckets] passed in.
     // num_buckets passed as relative_attention_bias_stride, max_distance passed as params.max_distance
     // this is a common optimization for both self attention and cross attention
-    const bool implicit_rel_attn_bias = params.max_distance != 0 && has_relative_attention_bias;
     int relative_attention_bias_stride
         = params.relative_attention_bias_stride; // num_buckets might be modified below, save it beforehand
     int max_distance = params.max_distance;
@@ -1727,7 +1775,7 @@ __global__ void masked_multihead_attention_kernel(
     if (has_relative_attention_bias)
     {
         // "hi" is unsigned, subtracting int from unsigned int causes underflow. Cast to int
-        int64_t offset = implicit_rel_attn_bias
+        int64_t offset = IMPLICIT_REL_ATTN_BIAS
             ? ((int64_t) hi * relative_attention_bias_stride - tlength)
             : ((int64_t) hi * relative_attention_bias_stride + tlength) * relative_attention_bias_stride;
         relative_attention_bias_ptr = &params.relative_attention_bias[offset];
@@ -1867,7 +1915,7 @@ __global__ void masked_multihead_attention_kernel(
                 // Seq OOB values will be masked out when storing back to smem.
                 auto const jj = min(k_idx.y + k_vec_i * K_ELTS_PER_CHUNK, Dh - K_VEC_SIZE);
                 int valid_time_now = min(time_now + k_loop * K_PER_ITER, context_length - 1);
-                if (valid_time_now >= sink_token_len)
+                if (POS_SHIFT && valid_time_now >= sink_token_len)
                 {
                     // If one more block mode is enabled, we use the index in sequence as tokenIdx.
                     // Otherwise, we need to add the bubble length to the index
@@ -1907,7 +1955,7 @@ __global__ void masked_multihead_attention_kernel(
             // Is it active?
             const bool is_active = local_time_now < context_length;
 
-            if (implicit_rel_attn_bias)
+            if constexpr (IMPLICIT_REL_ATTN_BIAS)
             {
                 // Compute bias value on the fly (See bert_preprocess_kernels.cu::buildRelativeAttentionBias)
                 int relative_buckets = 0;
@@ -2014,7 +2062,7 @@ __global__ void masked_multihead_attention_kernel(
                 const int jj = min(k_idx.y + k_vec_i * K_ELTS_PER_CHUNK, Dh - K_VEC_SIZE);
                 int valid_time_now = min(time_now, kv_loop_length - 1);
                 int beam_offset = beam_indices[valid_time_now];
-                if (valid_time_now >= sink_token_len)
+                if (POS_SHIFT && valid_time_now >= sink_token_len)
                 {
                     // If one more block mode is enabled, we use the index in sequence as tokenIdx.
                     // Otherwise, we need to add the bubble length to the index
@@ -2036,7 +2084,7 @@ __global__ void masked_multihead_attention_kernel(
             // Is it active?
             const bool is_active = time_now >= context_length && time_now < kv_loop_length;
 
-            if (implicit_rel_attn_bias)
+            if constexpr (IMPLICIT_REL_ATTN_BIAS)
             {
                 // Compute bias value on the fly (See bert_preprocess_kernels.cu::buildRelativeAttentionBias)
                 int relative_buckets = 0;
@@ -2335,7 +2383,7 @@ __global__ void masked_multihead_attention_kernel(
                 // Fetch offset based on cache_indir when beam sampling
                 int time_idx = ti + v_loop * V_PER_ITER + (MULTI_BLOCK_FLAG ? c_tile_times_timesteps_per_block : 0);
                 time_idx = min(time_idx, kv_loop_length - 1);
-                if (time_idx >= sink_token_len)
+                if (POS_SHIFT && time_idx >= sink_token_len)
                 {
                     // If one more block mode is enabled, we use the index in sequence as tokenIdx.
                     // Otherwise, we need to add the bubble length to the index
@@ -2392,7 +2440,7 @@ __global__ void masked_multihead_attention_kernel(
                     }
                     int rowIdx = batch_idx * beam_width + beam_indices[time_idx];
 
-                    if (time_idx >= sink_token_len)
+                    if (POS_SHIFT && time_idx >= sink_token_len)
                     {
                         // If one more block mode is enabled, we use the index in sequence as tokenIdx.
                         // Otherwise, we need to add the bubble length to the index

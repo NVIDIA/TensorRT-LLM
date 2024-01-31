@@ -23,7 +23,6 @@
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
 #include "tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h"
 #include "tensorrt_llm/plugins/identityPlugin/identityPlugin.h"
-#include "tensorrt_llm/plugins/layernormPlugin/layernormPlugin.h"
 #include "tensorrt_llm/plugins/layernormQuantizationPlugin/layernormQuantizationPlugin.h"
 #include "tensorrt_llm/plugins/lookupPlugin/lookupPlugin.h"
 #include "tensorrt_llm/plugins/loraPlugin/loraPlugin.h"
@@ -37,7 +36,6 @@
 #endif // ENABLE_MULTI_DEVICE
 #include "tensorrt_llm/plugins/quantizePerTokenPlugin/quantizePerTokenPlugin.h"
 #include "tensorrt_llm/plugins/quantizeTensorPlugin/quantizeTensorPlugin.h"
-#include "tensorrt_llm/plugins/rmsnormPlugin/rmsnormPlugin.h"
 #include "tensorrt_llm/plugins/rmsnormQuantizationPlugin/rmsnormQuantizationPlugin.h"
 #include "tensorrt_llm/plugins/selectiveScanPlugin/selectiveScanPlugin.h"
 #include "tensorrt_llm/plugins/smoothQuantGemmPlugin/smoothQuantGemmPlugin.h"
@@ -146,8 +144,6 @@ extern "C"
         static tensorrt_llm::plugins::AllgatherPluginCreator allgatherPluginCreator;
         static tensorrt_llm::plugins::ReduceScatterPluginCreator reduceScatterPluginCreator;
 #endif // ENABLE_MULTI_DEVICE
-        static tensorrt_llm::plugins::LayernormPluginCreator layernormPluginCreator;
-        static tensorrt_llm::plugins::RmsnormPluginCreator rmsnormPluginCreator;
         static tensorrt_llm::plugins::SmoothQuantGemmPluginCreator smoothQuantGemmPluginCreator;
         static tensorrt_llm::plugins::LayernormQuantizationPluginCreator layernormQuantizationPluginCreator;
         static tensorrt_llm::plugins::QuantizePerTokenPluginCreator quantizePerTokenPluginCreator;
@@ -173,8 +169,6 @@ extern "C"
                   creatorPtr(allgatherPluginCreator),
                   creatorPtr(reduceScatterPluginCreator),
 #endif // ENABLE_MULTI_DEVICE
-                  creatorPtr(layernormPluginCreator),
-                  creatorPtr(rmsnormPluginCreator),
                   creatorPtr(smoothQuantGemmPluginCreator),
                   creatorPtr(layernormQuantizationPluginCreator),
                   creatorPtr(quantizePerTokenPluginCreator),

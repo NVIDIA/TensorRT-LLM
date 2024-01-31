@@ -54,11 +54,16 @@ py::object GptManager::enter()
 
 void GptManager::exit(py::handle type, py::handle value, py::handle traceback)
 {
+    shutdown();
+}
+
+void GptManager::shutdown()
+{
     // NOTE: we must release the GIL here. GptManager has spawned a thread for the execution loop. That thread must be
     // able to do forward progress for the shutdown process to succeed. It takes the GIL during its callbacks, so
     // we release it now. Note that we shouldn't do anything related to python objects after that.
     py::gil_scoped_release release;
-    shutdown();
+    tb::GptManager::shutdown();
 }
 
 tb::GetInferenceRequestsCallback callbackAdapter(GetInferenceRequestsCallback callback)
@@ -102,17 +107,7 @@ void GptManager::initBindings(py::module_& m)
             py::arg_v("optional_params", tb::TrtGptModelOptionalParams(), "TrtGptModelOptionalParams"),
             py::arg("terminate_req_id") = std::nullopt)
 
-        // Note: attempting to bind &GptManager::shutdown() will result in a compiler error:
-        //
-        //  pybind11.h:1482:56: error: static assertion failed: Cannot bind an inaccessible base class method; use a
-        //  lambda definition instead 1482 |         detail::is_accessible_base_of<Class, Derived>::value,
-        //      |                                                        ^~~~~
-        //
-        // The issue is that the parent class has no bindings and is therefore not visible to pybind11.
-        // To resolve, we can add something like:
-        //
-        //  py::class_<tensorrt_llm::batch_manager::GptManager>(m, "_GptManagerBase");
-        .def("shutdown", [](GptManager& self) { self.shutdown(); })
+        .def("shutdown", &GptManager::shutdown)
         .def("__enter__", &GptManager::enter)
         .def("__exit__", &GptManager::exit);
 }

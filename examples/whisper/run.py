@@ -146,6 +146,7 @@ class WhisperDecoding:
             decoder_engine_buffer = f.read()
 
         decoder_model_config = ModelConfig(
+            max_batch_size=self.decoder_config['max_batch_size'],
             num_heads=self.decoder_config['num_heads'],
             num_kv_heads=self.decoder_config['num_heads'],
             hidden_size=self.decoder_config['hidden_size'],

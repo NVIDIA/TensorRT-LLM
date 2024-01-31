@@ -24,3 +24,4 @@ transformers==4.36.1
 wheel
 optimum
 evaluate
+janus

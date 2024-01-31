@@ -286,6 +286,7 @@ class _Runtime(object):
 
 @dataclass
 class ModelConfig:
+    max_batch_size: int
     vocab_size: int
     num_layers: int
     num_heads: int
@@ -533,7 +534,8 @@ class GenerationSession(object):
                 )
                 self.decoder_logits_dtype = torch.float32
             self.dynamic_decoder = torch.classes.trtllm.DynamicDecodeOp(
-                self.vocab_size, self.vocab_size_padded, self.mapping.tp_size,
+                model_config.max_batch_size, self.vocab_size,
+                self.vocab_size_padded, self.mapping.tp_size,
                 self.mapping.pp_size, self.decoder_logits_dtype)
 
         if model_config.use_context_fmha_for_generation:
@@ -3136,8 +3138,9 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
             )
             self.decoder_logits_dtype = torch.float32
         self.dynamic_decoder = torch.classes.trtllm.DynamicDecodeOp(
-            self.vocab_size, self.vocab_size_padded, self.mapping.tp_size,
-            self.mapping.pp_size, self.decoder_logits_dtype)
+            model_config.max_batch_size, self.vocab_size,
+            self.vocab_size_padded, self.mapping.tp_size, self.mapping.pp_size,
+            self.decoder_logits_dtype)
 
         self.gather_tree = torch.ops.tensorrt_llm.gather_tree
 
@@ -3247,10 +3250,11 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
         for i in range(self.first_layer, self.last_layer):
             # we need two set of kv cache buffers, one for inputs, and the other for outputs.
             # They will take turns to act as input and output buffers.
+            dtype = self._tensor_dtype(f'present_conv_state_{i}')
             self.buffer[f'present_conv_state_{i}'] = torch.empty(
-                conv_state_shape, dtype=self.dtype, device=self.device)
+                conv_state_shape, dtype=dtype, device=self.device)
             self.buffer[f'1_present_conv_state_{i}'] = torch.empty(
-                conv_state_shape, dtype=self.dtype, device=self.device)
+                conv_state_shape, dtype=dtype, device=self.device)
             self.buffer[f'present_ssm_state_{i}'] = torch.empty(
                 ssm_state_shape, dtype=torch.float32, device=self.device)
 
@@ -3290,10 +3294,11 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
         batch_size = context_lengths.shape[0]
         for idx in range(self.first_layer, self.last_layer):
             # conv state
+            dtype = self._tensor_dtype(f'present_conv_state_{idx}')
             conv_state_shape = (batch_size, self.mamba_d_inner,
                                 self.mamba_d_conv - 1)
             conv_state = torch.zeros(conv_state_shape,
-                                     dtype=self.dtype,
+                                     dtype=dtype,
                                      device=self.device)
             add_tensor(conv_state, f'past_conv_state_{idx}')
             present = f'present_conv_state_{idx}'

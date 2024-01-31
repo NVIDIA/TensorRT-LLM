@@ -141,6 +141,16 @@ be relaxed in a future version.
 _(1) Padding sequences in the generation phase, that contain a single token, to
 the length of the maximum input sequence is inefficient use of resources_.
 
+## Chunked Context
+
+In the original state, the common behavior was to process all context tokens at
+once. This feature splits the context into several chunks. In this way, the
+context chunks can be batched with more tokens during the generation phase,
+which is expected to increase the total throughput. Chunking contexts also removes
+constraints on input length. To enable this feature, the FMHA paged kv-cache also
+needs to be enabled. Except for the last one, the size of the context chunk needs
+to be an integer multiple of the kv-cache block size.
+
 ## KV Cache(s)
 
 In the generation phase, a common optimization is to provide the MHA kernel

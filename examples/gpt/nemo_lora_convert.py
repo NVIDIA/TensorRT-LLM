@@ -16,7 +16,6 @@
 import argparse
 import datetime
 import logging
-import re
 import tempfile
 from pathlib import Path
 
@@ -27,7 +26,8 @@ from utils.convert import cpu_map_location
 from utils.nemo import unpack_nemo_ckpt
 
 from tensorrt_llm._utils import str_dtype_to_torch, to_json_file, torch_to_numpy
-from tensorrt_llm.runtime.lora_manager import LoraConfig
+from tensorrt_llm.runtime.lora_manager import (LoraConfig,
+                                               get_all_nemo_lora_weights)
 
 log_format = "%(asctime)s %(name)s [%(levelname)s] %(message)s"
 logging.basicConfig(format=log_format)
@@ -38,24 +38,6 @@ def get_lora_keys(layer_id):
     in_key = f'model.language_model.encoder.layers.{layer_id}.self_attention.adapter_layer.lora_kqv_adapter.linear_in.weight'
     out_key = f'model.language_model.encoder.layers.{layer_id}.self_attention.adapter_layer.lora_kqv_adapter.linear_out.weight'
     return in_key, out_key
-
-
-def get_all_lora_weights(num_layers, lora_weights):
-    layer_weights = [{} for _ in range(2 * num_layers)]
-    adapter_key = "self_attention.adapter_layer.lora_kqv_adapter"
-    layer_pattern = re.compile(r'.*\.layers\.([0-9]+)\..*')
-    for key, weights in lora_weights.items():
-        if adapter_key in key:
-            if key.endswith('linear_in.weight'):
-                inout = 'in'
-            elif key.endswith('linear_out.weight'):
-                inout = 'out'
-            else:
-                continue
-            m = layer_pattern.match(key)
-            layer_idx = int(m.group(1))
-            layer_weights[layer_idx][inout] = weights
-    return layer_weights
 
 
 def save_val(val, dir, key, tp_num=None, write_npy=False):
@@ -74,7 +56,7 @@ def lora_convert(out_dir, lora_config, lora_weights, customization_id,
     num_layers = int(lora_config["num_layers"])
     config = {"lora_config": {"lora_kqv_adapter": {}}}
     config['lora_config']['precision'] = precision
-    layer_weights = get_all_lora_weights(num_layers, lora_weights)
+    layer_weights = get_all_nemo_lora_weights(num_layers, lora_weights)
     for layer_id in range(num_layers):
         linear_in_weight = layer_weights[layer_id]['in']
         linear_out_weight = layer_weights[layer_id]['out']
@@ -111,7 +93,7 @@ def lora_convert_cpp_runtime(out_dir,
     num_layers = int(lora_config["num_layers"])
     weights = []
     weight_config = []
-    layer_weights = get_all_lora_weights(num_layers, lora_weights)
+    layer_weights = get_all_nemo_lora_weights(num_layers, lora_weights)
     for layer_id in range(num_layers):
         in_weights = layer_weights[layer_id]['in']
         out_weights = layer_weights[layer_id]['out']

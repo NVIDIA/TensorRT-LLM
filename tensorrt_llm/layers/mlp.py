@@ -12,9 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import numpy as np
 
-from .._utils import trt_dtype_to_np
 from ..functional import ACT2FN, concat
 from ..module import Module
 from ..quantization import QuantMode
@@ -198,7 +196,6 @@ class FusedGatedMLP(GatedMLP):
                          tp_size=tp_size,
                          quant_mode=quant_mode)
 
-        self.is_weight_rewritten = False
         if self.use_fp8_qdq:
             self.fused_fc = FP8Linear(
                 self.hidden_size,
@@ -219,7 +216,7 @@ class FusedGatedMLP(GatedMLP):
                 tp_size=self.tp_size,
                 gather_output=False,
             )
-
+        self.is_weight_rewritten = False
         if max_lora_rank is None:
             max_lora_rank = min(hidden_size, ffn_hidden_size // tp_size)
         self.mlp_in_lora = Lora(
@@ -240,33 +237,7 @@ class FusedGatedMLP(GatedMLP):
         #   SwiGLU(FusedFC(x))
         #
         # Upside is we don't need to modify 4 different weight loading paths just to concat weights
-
         if not self.is_weight_rewritten:
-            _np_dtype = trt_dtype_to_np(self.dtype)
-            if self.gate.weight.is_inited() or self.fc.weight.is_inited():
-                self.fused_fc.weight.value = np.concatenate(
-                    [self.gate.weight.raw_value, self.fc.weight.raw_value],
-                    axis=0).astype(_np_dtype)
-            if self.bias and (self.gate.bias.is_inited()
-                              or self.fc.bias.is_inited()):
-                self.fused_fc.bias.value = np.concatenate(
-                    [self.gate.bias.raw_value, self.fc.bias.raw_value],
-                    axis=0).astype(_np_dtype)
-
-            if self.use_fp8_qdq:
-                if self.gate.weights_scaling_factor.is_inited(
-                ) or self.fc.weights_scaling_factor.is_inited():
-                    # TODO: need to align with quantization toolkit; preferably put a constraint to equalize
-                    # fc/gate weight scaling factor to allow horizontal fusion without accuracy loss
-                    self.fused_fc.weights_scaling_factor.value = max(
-                        self.gate.weights_scaling_factor.raw_value,
-                        self.fc.weights_scaling_factor.raw_value,
-                    )
-                if self.gate.activation_scaling_factor.is_inited(
-                ) or self.fc.activation_scaling_factor.is_inited():
-                    assert self.fc.activation_scaling_factor.raw_value == self.gate.activation_scaling_factor.raw_value, "Activation scales should be identical"
-                    self.fused_fc.activation_scaling_factor.value = self.fc.activation_scaling_factor.raw_value
-
             del self._modules["gate"]
             del self._modules["fc"]
             self.is_weight_rewritten = True

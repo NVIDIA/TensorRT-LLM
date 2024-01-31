@@ -30,8 +30,8 @@ namespace torch_ext
 {
 
 template <typename T>
-FtDynamicDecode<T>::FtDynamicDecode(
-    const size_t vocab_size, const size_t vocab_size_padded, const int tensor_para_size, const int pipeline_para_size)
+FtDynamicDecode<T>::FtDynamicDecode(const size_t max_batch_size, const size_t vocab_size,
+    const size_t vocab_size_padded, const int tensor_para_size, const int pipeline_para_size)
     : vocab_size_(vocab_size)
     , vocab_size_padded_(vocab_size_padded)
     , finished_sum_(tr::BufferManager::pinned(tr::ITensor::makeShape({1}), nvinfer1::DataType::kINT32))
@@ -47,7 +47,7 @@ FtDynamicDecode<T>::FtDynamicDecode(
     tensorrt_llm::common::check_cuda_error(cudaGetDeviceProperties(&prop, 0));
 
     dynamic_decode_layer_ = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(
-        vocab_size_, vocab_size_padded_, stream, std::move(allocator), false, &prop_);
+        max_batch_size, vocab_size_, vocab_size_padded_, stream, std::move(allocator), &prop_);
 }
 
 namespace
@@ -127,7 +127,7 @@ void FtDynamicDecode<T>::setup(size_t batch_size, size_t beam_width, th::optiona
     safeInsert(beam_search_diversity_rate_opt, setupParams.beam_search_diversity_rate);
     safeInsert(length_penalty_opt, setupParams.length_penalty);
 
-    dynamic_decode_layer_->setup(batch_size, beam_width, setupParams);
+    dynamic_decode_layer_->setup(batch_size, beam_width, nullptr, setupParams);
 }
 
 template <typename T>
@@ -206,9 +206,11 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
     }
 }
 
-DynamicDecodeOp::DynamicDecodeOp(const int64_t vocab_size, const int64_t vocab_size_padded,
-    const int64_t tensor_para_size, const int64_t pipeline_para_size, at::ScalarType scalar_type)
-    : vocab_size_(static_cast<size_t>(vocab_size))
+DynamicDecodeOp::DynamicDecodeOp(const int64_t max_batch_size, const int64_t vocab_size,
+    const int64_t vocab_size_padded, const int64_t tensor_para_size, const int64_t pipeline_para_size,
+    at::ScalarType scalar_type)
+    : max_batch_size_(static_cast<size_t>(max_batch_size))
+    , vocab_size_(static_cast<size_t>(vocab_size))
     , vocab_size_padded_(static_cast<size_t>(vocab_size_padded))
     , tensor_para_size_(static_cast<int>(tensor_para_size))
     , pipeline_para_size_(static_cast<int>(pipeline_para_size))
@@ -225,11 +227,11 @@ void DynamicDecodeOp::createInstance()
     {
     case at::ScalarType::Float:
         dynamic_decode_ = std::make_unique<FtDynamicDecode<float>>(
-            vocab_size_, vocab_size_padded_, tensor_para_size_, pipeline_para_size_);
+            max_batch_size_, vocab_size_, vocab_size_padded_, tensor_para_size_, pipeline_para_size_);
         break;
     case at::ScalarType::Half:
         dynamic_decode_ = std::make_unique<FtDynamicDecode<half>>(
-            vocab_size_, vocab_size_padded_, tensor_para_size_, pipeline_para_size_);
+            max_batch_size_, vocab_size_, vocab_size_padded_, tensor_para_size_, pipeline_para_size_);
         break;
     default: throw std::runtime_error("Wrong tensor type.");
     }
@@ -350,6 +352,6 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
 
 static auto trtllmGptContextDecoderTHS
     = torch::jit::class_<torch_ext::DynamicDecodeOp>("trtllm", "DynamicDecodeOp")
-          .def(torch::jit::init<int64_t, int64_t, int64_t, int64_t, at::ScalarType>())
+          .def(torch::jit::init<int64_t, int64_t, int64_t, int64_t, int64_t, at::ScalarType>())
           .def("setup", &torch_ext::DynamicDecodeOp::setup)
           .def("forward", &torch_ext::DynamicDecodeOp::forward);

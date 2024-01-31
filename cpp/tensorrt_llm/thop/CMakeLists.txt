@@ -24,4 +24,11 @@ add_library(
   ncclCommunicatorOp.cpp parallelDecodeKVCacheUpdateOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils
-                                        ${Python3_LIBRARIES} ${STATIC_TARGET})
+                                        ${Python3_LIBRARIES} ${SHARED_TARGET})
+
+if(NOT MSVC)
+  set_target_properties(
+    th_common
+    PROPERTIES LINK_FLAGS
+               "-Wl,-rpath='$ORIGIN' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
+endif()

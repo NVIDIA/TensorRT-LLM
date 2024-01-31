@@ -45,8 +45,8 @@ template <typename T>
 class DynamicDecodeLayer : public BaseLayer
 {
 public:
-    DynamicDecodeLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-        std::shared_ptr<tc::IAllocator> allocator, bool is_free_buffer_after_forward, cudaDeviceProp* cuda_device_prop);
+    DynamicDecodeLayer(size_t max_batch_size, size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
+        std::shared_ptr<tc::IAllocator> allocator, cudaDeviceProp* cuda_device_prop);
 
     ~DynamicDecodeLayer() override;
     DynamicDecodeLayer(DynamicDecodeLayer const& dynamic_decode_layer);
@@ -77,7 +77,7 @@ public:
         std::optional<bool> normalize_log_probs;
     };
 
-    void setup(size_t batch_size, size_t beam_width, SetupParams const& setupParams);
+    void setup(size_t batch_size, size_t beam_width, int const* batch_slots, SetupParams const& setupParams);
 
     class ForwardParams
     {
@@ -158,6 +158,7 @@ private:
     std::unique_ptr<TopKSamplingLayer<T>> mTopKDecode;
     std::unique_ptr<TopPSamplingLayer<T>> mTopPDecode;
 
+    size_t max_batch_size_;
     size_t vocab_size_;
     size_t vocab_size_padded_;
     cudaDeviceProp* cuda_device_prop_;
@@ -170,6 +171,8 @@ private:
 
     bool has_diff_runtime_args_ = false;
     int* h_pinned_finished_sum_ = nullptr;
+
+    int mCyclicStep = 0;
 };
 
 } // namespace layers

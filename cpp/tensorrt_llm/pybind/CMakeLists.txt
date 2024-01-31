@@ -42,7 +42,14 @@ target_link_directories(${TRTLLM_PYBIND_MODULE} PUBLIC
                         "${TORCH_INSTALL_PREFIX}/lib")
 target_link_libraries(
   ${TRTLLM_PYBIND_MODULE}
-  PUBLIC ${STATIC_TARGET} ${Python3_LIBRARIES} ${TORCH_LIBRARIES} torch_python
+  PUBLIC ${SHARED_TARGET} ${Python3_LIBRARIES} ${TORCH_LIBRARIES} torch_python
          ${UNDEFINED_FLAG})
 target_compile_definitions(${TRTLLM_PYBIND_MODULE}
                            PUBLIC TRTLLM_PYBIND_MODULE=${TRTLLM_PYBIND_MODULE})
+
+if(NOT MSVC)
+  set_target_properties(
+    ${TRTLLM_PYBIND_MODULE}
+    PROPERTIES LINK_FLAGS
+               "-Wl,-rpath,'$ORIGIN/libs' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
+endif()

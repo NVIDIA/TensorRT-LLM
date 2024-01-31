@@ -15,7 +15,7 @@ The TensorRT-LLM Medusa Decoding implementation can be found in [tensorrt_llm/mo
   * Tensor Parallel
 
 ## Usage
-The TensorRT-LLM Medusa example code is located in [`examples/medusa`](./). There is one [`build.py`](./build.py) file to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run models with Medusa decoding support.
+The TensorRT-LLM Medusa example code is located in [`examples/medusa`](./). There is one [`convert_checkpoint.py`](./convert_checkpoint.py) file to convert and build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run models with Medusa decoding support.
 In our example, we use the model from huggingface [`FasterDecoding/medusa-vicuna-7b-v1.3`](https://huggingface.co/FasterDecoding/medusa-vicuna-7b-v1.3), which is a LLAMA based mode. So the `build.py` also depends on `../llama/build.py` for the base model.
 
 ### Build TensorRT engine(s)
@@ -29,35 +29,36 @@ git clone https://huggingface.co/lmsys/vicuna-7b-v1.3
 https://huggingface.co/FasterDecoding/medusa-vicuna-7b-v1.3
 ```
 
-We use `build.py` script to build the model for Medusa decoding.
+We use `convert_checkpoint.py` script to convert the model for Medusa decoding into tensorrt llm checkpoint format.
 Here we also add `--fixed_num_medusa_heads 4` as `medusa_num_heads` is 2 in `config.json` of `medusa-vicuna-7b-v1.3` but it actually has 4.
 
 Here is the example:
-```python
-# Build Medusa decoding support for vicuna-7b-v1.3
-python build.py --model_dir ./vicuna-7b-v1.3 \
-                --medusa_model_dir ./medusa-vicuna-7b-v1.3 \
-                --dtype float16 \
-                --use_gpt_attention_plugin float16 \
-                --max_batch_size 8 \
-                --remove_input_padding \
-                --enable_context_fmha \
-                --fixed_num_medusa_heads 4 \
-                --output_dir ./tmp/medusa/7B/trt_engines/fp16/1-gpu/
+```bash
+# Convert and Build Medusa decoding support for vicuna-7b-v1.3
+python convert_checkpoint.py --model_dir ./vicuna-7b-v1.3 \
+                            --medusa_model_dir medusa-vicuna-7b-v1.3 \
+                            --output_dir ./tllm_checkpoint_1gpu_medusa \
+                            --dtype float16 \
+                            --fixed_num_medusa_heads 4
 
-# Build Medusa decoding support for vicuna-13b-v1.3 with 4-way tensor parallelism.
-python build.py --model_dir ./vicuna-13b-v1.3 \
-                --medusa_model_dir ./medusa-vicuna-13b-v1.3 \
-                --dtype float16 \
-                --use_gpt_attention_plugin float16 \
-                --max_batch_size 8 \
-                --remove_input_padding \
-                --enable_context_fmha \
-                --fixed_num_medusa_heads 4 \
-                --world_size 4 \
-                --tp_size 4 \
-                --parallel_build \
-                --output_dir ./tmp/medusa/13B/trt_engines/fp16/4-gpu/
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_medusa \
+             --output_dir ./tmp/medusa/7B/trt_engines/fp16/1-gpu/ \
+             --gpt_attention_plugin float16 \
+             --gemm_plugin float16 \
+             --max_batch_size 8
+# Convert and Build Medusa decoding support for vicuna-13b-v1.3 with 4-way tensor parallelism.
+python convert_checkpoint.py --model_dir ./vicuna-7b-v1.3 \
+                            --medusa_model_dir medusa-vicuna-7b-v1.3 \
+                            --output_dir ./tllm_checkpoint_1gpu_medusa \
+                            --dtype float16 \
+                            --fixed_num_medusa_heads 4 \
+                            --tp_size 4 \
+                            --workers 4
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_medusa \
+             --output_dir ./tmp/medusa/7B/trt_engines/fp16/1-gpu/ \
+             --gpt_attention_plugin float16 \
+             --gemm_plugin float16 \
+             --max_batch_size 8
 ```
 
 ### Run
@@ -68,7 +69,7 @@ Note: Medusa decoding is only supported by Python runtime now. So need `--use_py
 
 Note: Medusa decoding only supporting `temperature=0.0` now. So also need `--temperature 0.0`.
 
-```python
+```bash
 # Medusa decoding using vicuna-7b-v1.3 model with 1 GPU
 python ../run.py --engine_dir ./tmp/medusa/7B/trt_engines/fp16/1-gpu/ \
                  --tokenizer_dir ./vicuna-7b-v1.3/ \
@@ -100,7 +101,7 @@ One day, while she was reading a book, she came across a passage that spoke to h
 
 ### Summarization using Medusa decoding
 
-```python
+```bash
 # Medusa decoding using vicuna-7b-v1.3 model with 1 GPU
 python ../summarize.py --engine_dir ./tmp/medusa/7B/trt_engines/fp16/1-gpu/ \
                        --hf_model_dir ./vicuna-7b-v1.3/ \

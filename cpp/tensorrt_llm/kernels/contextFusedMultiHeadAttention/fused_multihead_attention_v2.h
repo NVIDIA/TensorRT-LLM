@@ -49,16 +49,6 @@ static const struct TmaKernelMetaInfo
 } sTmaMetaInfo[] = {{32, 64, 256}, {64, 64, 256}, {128, 64, 128}, {256, 64, 64}};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// meta info for tma warp-specialized kernels that supports paged kv cache
-static const struct TmaPagedKVKernelMetaInfo
-{
-    unsigned int mD;
-    unsigned int mQStep;
-    unsigned int mKVStep;
-} sTmaPagedKVMetaInfo[] = {{32, 64, 128}, {64, 64, 128}, {128, 64, 128}, {256, 64, 64}};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 // Base Class
 
 template <typename TKernelMeta, typename TKernelParam>

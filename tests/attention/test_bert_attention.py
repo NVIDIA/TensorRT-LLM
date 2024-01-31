@@ -38,7 +38,7 @@ class TestFunctional(unittest.TestCase):
         tensorrt_llm.logger.set_level('error')
 
     def load_test_cases():
-        test_cases = [(1, 128, 12, 64, False, 'float32')]
+        test_cases = [(1, 128, 12, 64, ContextFMHAType.disabled, 'float32')]
         test_cases += list(
             product([1, 8], [64, 256, 512, 1024], [16], [32, 64], [
                 ContextFMHAType.disabled, ContextFMHAType.enabled,
@@ -69,6 +69,7 @@ class TestFunctional(unittest.TestCase):
             # construct trt network
             builder = tensorrt_llm.Builder()
             net = builder.create_network()
+            net.plugin_config.to_legacy_setting()
             net.plugin_config.set_bert_attention_plugin(dtype)
             net.plugin_config.set_context_fmha(context_fmha_type)
             with tensorrt_llm.net_guard(net):

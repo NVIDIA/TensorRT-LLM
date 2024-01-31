@@ -71,6 +71,7 @@ def read_config(config_path: Path):
     hidden_size = builder_config["hidden_size"]
     head_size = builder_config["head_size"]
     vocab_size = builder_config["vocab_size"]
+    max_batch_size = builder_config["max_batch_size"]
     num_layers = builder_config["num_layers"]
     num_kv_heads = builder_config.get('num_kv_heads', num_heads)
 
@@ -97,6 +98,7 @@ def read_config(config_path: Path):
         num_kv_heads=num_kv_heads,
         hidden_size=hidden_size,
         head_size=head_size,
+        max_batch_size=max_batch_size,
         vocab_size=vocab_size,
         num_layers=num_layers,
         gpt_attention_plugin=use_gpt_attention_plugin,

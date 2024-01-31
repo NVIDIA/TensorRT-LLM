@@ -45,15 +45,15 @@ Here're some examples:
 
 ```bash
 # Build a single-GPU float16 engine from HF weights.
-# Try use_gemm_plugin to prevent accuracy issue. TODO check this holds for BLOOM
+# Try gemm_plugin to prevent accuracy issue. TODO check this holds for BLOOM
 
 # Single GPU on BLOOM 560M
 python convert_checkpoint.py --model_dir ./bloom/560M/ \
                 --dtype float16 \
                 --output_dir ./bloom/560M/trt_ckpt/fp16/1-gpu/
 trtllm-build --checkpoint_dir ./bloom/560M/trt_ckpt/fp16/1-gpu/ \
-                --use_gemm_plugin float16 \
-                --use_gpt_attention_plugin float16 \
+                --gemm_plugin float16 \
+                --gpt_attention_plugin float16 \
                 --output_dir ./bloom/560M/trt_engines/fp16/1-gpu/
 
 # Build the BLOOM 560M using a single GPU and apply INT8 weight-only quantization.
@@ -62,18 +62,18 @@ python convert_checkpoint.py --model_dir ./bloom/560M/ \
                 --use_weight_only \
                 --output_dir ./bloom/560M/trt_ckpt/int8_weight_only/1-gpu/
 trtllm-build --checkpoint_dir ./bloom/560M/trt_ckpt/int8_weight_only/1-gpu/ \
-                --use_gemm_plugin float16 \
-                --use_gpt_attention_plugin float16 \
+                --gemm_plugin float16 \
+                --gpt_attention_plugin float16 \
                 --output_dir ./bloom/560M/trt_engines/int8_weight_only/1-gpu/
 
 # Use 2-way tensor parallelism on BLOOM 560M
 python convert_checkpoint.py --model_dir ./bloom/560M/ \
                 --dtype float16 \
                 --output_dir ./bloom/560M/trt_ckpt/fp16/2-gpu/ \
-                --world_size 2
+                --tp_size 2
 trtllm-build --checkpoint_dir ./bloom/560M/trt_ckpt/fp16/2-gpu/ \
-                --use_gemm_plugin float16 \
-                --use_gpt_attention_plugin float16 \
+                --gemm_plugin float16 \
+                --gpt_attention_plugin float16 \
                 --output_dir ./bloom/560M/trt_engines/fp16/2-gpu/
 
 # Use 8-way tensor parallelism on BLOOM 176B
@@ -84,13 +84,13 @@ trtllm-build --checkpoint_dir ./bloom/560M/trt_ckpt/fp16/2-gpu/ \
 python convert_checkpoint.py --model_dir ./bloom/176B/ \
                 --dtype float16 \
                 --output_dir ./bloom/176B/trt_ckpt/fp16/8-gpu/ \
-                --world_size 8 \
+                --tp_size 8 \
                 --use_parallel_embedding \
                 --embedding_sharding_dim 0
 trtllm-build --checkpoint_dir ./bloom/176B/trt_ckpt/fp16/8-gpu/ \
-                --use_gemm_plugin float16 \
-                --use_gpt_attention_plugin float16 \
-                --use_lookup_plugin float16 \
+                --gemm_plugin float16 \
+                --gpt_attention_plugin float16 \
+                --lookup_plugin float16 \
                 --output_dir ./bloom/176B/trt_engines/fp16/8-gpu/ \
                 --workers 2
 
@@ -98,12 +98,12 @@ trtllm-build --checkpoint_dir ./bloom/176B/trt_ckpt/fp16/8-gpu/ \
 python convert_checkpoint.py --model_dir ./bloom/176B/ \
                 --dtype float16 \
                 --output_dir ./bloom/176B/trt_ckpt/fp16/8-gpu/ \
-                --world_size 8 \
+                --tp_size 8 \
                 --use_parallel_embedding \
                 --embedding_sharding_dim 1
 trtllm-build --checkpoint_dir ./bloom/176B/trt_ckpt/fp16/8-gpu/ \
-                --use_gemm_plugin float16 \
-                --use_gpt_attention_plugin float16 \
+                --gemm_plugin float16 \
+                --gpt_attention_plugin float16 \
                 --output_dir ./bloom/176B/trt_engines/fp16/8-gpu/ \
                 --workers 2
 
@@ -112,14 +112,14 @@ trtllm-build --checkpoint_dir ./bloom/176B/trt_ckpt/fp16/8-gpu/ \
 python convert_checkpoint.py --model_dir ./bloom/176B/ \
                 --dtype float16 \
                 --output_dir ./bloom/176B/trt_ckpt/fp16/8-gpu/ \
-                --world_size 8 \
+                --tp_size 8 \
                 --use_parallel_embedding \
                 --embedding_sharding_dim 0 \
                 --use_embedding_sharing
 trtllm-build --checkpoint_dir ./bloom/176B/trt_ckpt/fp16/8-gpu/ \
-                --use_gemm_plugin float16 \
-                --use_gpt_attention_plugin float16 \
-                --use_lookup_plugin float16 \
+                --gemm_plugin float16 \
+                --gpt_attention_plugin float16 \
+                --lookup_plugin float16 \
                 --output_dir ./bloom/176B/trt_engines/fp16/8-gpu/ \
                 --workers 2
 ```
@@ -142,8 +142,8 @@ python convert_checkpoint.py --model_dir ./bloom/560m/ \
                 --int8_kv_cache \
                 --use_weight_only --output_dir ./bloom/560m/trt_ckpt/int8/1-gpu/
 trtllm-build --checkpoint_dir ./bloom/560m/trt_ckpt/int8/1-gpu/ \
-                --use_gemm_plugin float16 \
-                --use_gpt_attention_plugin float16 \
+                --gemm_plugin float16 \
+                --gpt_attention_plugin float16 \
                 --output_dir ./bloom/560m/trt_engines/int8/1-gpu/
 ```
 
@@ -154,7 +154,7 @@ Unlike the FP16 build where the HF weights are processed and loaded into the Ten
 
 Example:
 ```bash
-python convert_checkpoint.py --model_dir bloom/560M/  --output_dir tllm_checkpoint_1gpu --smoothquant 0.5 --per_token --per_channel --world_size 1
+python convert_checkpoint.py --model_dir bloom/560M/  --output_dir tllm_checkpoint_1gpu --smoothquant 0.5 --per_token --per_channel
 ```
 
 [`convert_checkpoint.py`](./convert_checkpoint.py) add new options for the support of INT8 inference of SmoothQuant models.
@@ -169,7 +169,7 @@ Then, you can add any combination of `--per-token` and `--per-channel` to get th
 ```bash
 # Build model for SmoothQuant with below command.
 
-trtllm-build  --checkpoint_dir tllm_checkpoint_1gpu  --output_dir ./engine_outputs --use_gpt_attention_plugin float16
+trtllm-build  --checkpoint_dir tllm_checkpoint_1gpu  --output_dir ./engine_outputs --gpt_attention_plugin float16
 ```
 Note that GPT attention plugin is required to be enabled for SmoothQuant for now.
 

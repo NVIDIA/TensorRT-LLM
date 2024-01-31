@@ -220,10 +220,77 @@ bool GPTAttentionPlugin::supportsFormatCombination(
     return false;
 }
 
-void GPTAttentionPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
+template <typename T, typename KVCacheBuffer>
+void GPTAttentionPlugin::configurePluginImpl(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
     const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
 {
     TLLM_CHECK(mHeadSize > 0);
+
+    const int beamWidth = useKVCache() ? in[getIdx(IdxEntry::CACHE_INDIR)].desc.dims.d[1] : 1;
+    // Commonly, cyclic_attention_window_size, and max_attention_window_size will be the same
+    // unless each layer has different attention window sizes.
+    // the kv_cache capacity.
+    int max_encoder_context_len = isCrossAttention() ? in[getIdx(IdxEntry::CROSS_QKV_LENGTH)].desc.dims.d[0] : 0;
+    const int max_attention_window_size = isCrossAttention()
+        ? max_encoder_context_len
+        : (useKVCache() ? in[getIdx(IdxEntry::CACHE_INDIR)].desc.dims.d[2] : 0);
+    const int cyclic_attention_window_size = max_attention_window_size;
+
+    const int num_requests = 256;
+    const int sink_token_length = 0;
+
+    EnqueueGenerationParams<T, KVCacheBuffer> enqueueParams{/*attention_input=*/nullptr,
+        /*qkv_bias=*/nullptr,
+        /*input_seq_length=*/0,
+        /*sequence_lengths=*/nullptr,
+        /*past_kv_length=*/0, beamWidth,
+        /*context_lengths=*/nullptr,
+        /*kv_scale_orig_quant=*/nullptr,
+        /*kv_scale_quant_orig=*/nullptr,
+        /*alibi_slopes=*/nullptr,
+        /*context_buf_=*/nullptr,
+        /*key_value_cache=*/nullptr,
+        /*block_pointers=*/nullptr, max_attention_window_size, cyclic_attention_window_size, sink_token_length,
+        num_requests,
+        /*max_blocks_per_sequence=*/0,
+        /*cache_indir=*/nullptr,
+        /*workspace=*/nullptr,
+        /*max_context_kv_len_list=*/nullptr};
+
+    prepareEnqueueGeneration(enqueueParams);
+}
+
+template <typename T>
+void GPTAttentionPlugin::configurePluginDispatchKVCacheType(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
+    const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
+{
+    if (mPagedKVCache)
+    {
+        configurePluginImpl<T, KVBlockArray>(in, nbInputs, out, nbOutputs);
+    }
+    else
+    {
+        configurePluginImpl<T, KVLinearBuffer>(in, nbInputs, out, nbOutputs);
+    }
+}
+
+void GPTAttentionPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
+    const nvinfer1::DynamicPluginTensorDesc* out, int nbOutputs) noexcept
+{
+    if (mType == nvinfer1::DataType::kHALF)
+    {
+        configurePluginDispatchKVCacheType<half>(in, nbInputs, out, nbOutputs);
+    }
+    else if (mType == nvinfer1::DataType::kFLOAT)
+    {
+        configurePluginDispatchKVCacheType<float>(in, nbInputs, out, nbOutputs);
+    }
+#ifdef ENABLE_BF16
+    else if (mType == nvinfer1::DataType::kBF16)
+    {
+        configurePluginDispatchKVCacheType<__nv_bfloat16>(in, nbInputs, out, nbOutputs);
+    }
+#endif
 }
 
 size_t GPTAttentionPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
@@ -395,7 +462,6 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             = static_cast<int32_t const*>(inputs[getIdx(IdxEntry::HOST_CONTEXT_LENGTH)]) + seqIdxBeg;
         return *std::max_element(host_context_lengths, host_context_lengths + localNbSeq);
     }();
-    TLLM_CHECK(max_context_q_len <= mMaxContextLength);
 
     int max_encoder_context_len = isCrossAttention() ? inputDesc[getIdx(IdxEntry::CROSS_QKV_LENGTH)].dims.d[0] : 0;
     // for enc-dec model, since decoder_input_ids could be longer than 1,
@@ -493,6 +559,8 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
     if (is_context) // context stage
     {
+        TLLM_CHECK(max_context_q_len <= mMaxContextLength);
+
         const int batch_size = localNbSeq;
         const int request_batch_size = batch_size;
         // num of total tokens (without paddings when remove paddings).

@@ -1,11 +1,16 @@
+import os
+import sys
+
 import torch
-from llm_data import llm_models_root
 from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm
 from tensorrt_llm import Mapping
 from tensorrt_llm._utils import mpi_barrier
 from tensorrt_llm.models import LLaMAForCausalLM
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.llm_data import llm_models_root
 
 tensorrt_llm.logger.set_level('verbose')
 

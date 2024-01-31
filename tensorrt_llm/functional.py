@@ -30,9 +30,8 @@ from . import graph_rewriting as gw
 from ._common import default_net, default_trtnet, precision
 from ._utils import (bf16_array, dim_resolve_negative, dim_to_trt_axes,
                      fp16_array, fp32_array, int32_array, np_dtype_to_trt,
-                     str_dtype_to_np, str_dtype_to_trt, torch_to_numpy,
-                     trt_dtype_to_np, trt_dtype_to_torch)
-from .logger import logger
+                     str_dtype_to_trt, torch_to_numpy, trt_dtype_to_np,
+                     trt_dtype_to_torch)
 from .network import PluginInfo, set_np_weight, set_plugin_info
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE, current_all_reduce_helper
 from .quantization import QuantMode
@@ -976,9 +975,12 @@ def matmul(input: Tensor,
         The tensor produced by the inserted layer.
     '''
     # This option is only supported for fp16, but not bf16 or any other precisions.
+    use_fp32_acc = use_fp32_acc and input.dtype == trt.DataType.HALF and mat2.dtype == trt.DataType.HALF
+
     # TODO: fp32 accum has issues with strongly_typed and it will be fixed in TensorRT 10.0
-    use_fp32_acc = use_fp32_acc and input.dtype == trt.DataType.HALF and mat2.dtype == trt.DataType.HALF and not default_net(
-    ).strongly_typed
+    if default_net().strongly_typed:
+        use_fp32_acc = False
+
     if use_fp32_acc:
         input = cast(input, 'float32')
         mat2 = cast(mat2, 'float32')
@@ -2190,13 +2192,13 @@ def constant_to_tensor_(input: Union[Tensor, int, float],
     if isinstance(input, int):
         return constant(int32_array([input]))
     elif isinstance(input, float):
-        assert dtype == trt.float32 or dtype == trt.float16 or dtype == trt.bfloat16
-        if dtype == trt.float32:
-            return constant(fp32_array([input]))
-        elif dtype == trt.bfloat16:
-            return constant(bf16_array([input]))
-        else:
-            return constant(fp16_array([input]))
+        array_fn_dict = {
+            trt.float32: fp32_array,
+            trt.float16: fp16_array,
+            trt.bfloat16: bf16_array,
+        }
+        assert dtype in array_fn_dict
+        return constant(array_fn_dict[dtype]([input]))
 
     return input
 
@@ -3881,54 +3883,20 @@ def layer_norm(input: Tensor,
     Returns:
         The output tensor of that operation.
     '''
-    if not default_net().plugin_config.layernorm_plugin:
-        input, weight = broadcast_helper(input, weight)
-        input, bias = broadcast_helper(input, bias)
-        if isinstance(normalized_shape, int):  # FIXME: better way?
-            axis = input.ndim() - 1
-        else:
-            axis = input.ndim() - len(normalized_shape)
-        axes_mask = 0
-        for i in range(axis, input.ndim()):
-            axes_mask |= 1 << i
-        layer = default_trtnet().add_normalization(input.trt_tensor,
-                                                   weight.trt_tensor,
-                                                   bias.trt_tensor, axes_mask)
-        layer.epsilon = eps
-        return _create_tensor(layer.get_output(0), layer)
+    input, weight = broadcast_helper(input, weight)
+    input, bias = broadcast_helper(input, bias)
+    if isinstance(normalized_shape, int):  # FIXME: better way?
+        axis = input.ndim() - 1
     else:
-        logger.warning("Layernorm plugin is going to be deprecated, "
-                       "disable it for better performance.")
-        plg_creator = trt.get_plugin_registry().get_plugin_creator(
-            'Layernorm', '1', TRT_LLM_PLUGIN_NAMESPACE)
-        assert plg_creator is not None
-
-        eps = trt.PluginField("eps", np.array(eps, dtype=np.float32),
-                              trt.PluginFieldType.FLOAT32)
-        use_diff_of_squares = trt.PluginField(
-            "use_diff_of_squares",
-            np.array([int(use_diff_of_squares)], dtype=np.int32),
-            trt.PluginFieldType.INT32)
-        p_dtype = default_net().plugin_config.layernorm_plugin
-        pf_type = trt.PluginField(
-            "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
-            trt.PluginFieldType.INT32)
-        pfc = trt.PluginFieldCollection([eps, use_diff_of_squares, pf_type])
-        layernorm_plug = plg_creator.create_plugin("layernorm", pfc)
-
-        normalized_shape = [normalized_shape] if isinstance(
-            normalized_shape, int) else normalized_shape
-        if weight is None:
-            weight = constant(
-                np.ones(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
-        if bias is None:
-            bias = constant(
-                np.zeros(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
-
-        plug_inputs = [input.trt_tensor, weight.trt_tensor, bias.trt_tensor]
-        layer = default_trtnet().add_plugin_v2(plug_inputs, layernorm_plug)
-        _add_plugin_info(layer, plg_creator, "layernorm", pfc)
-        return _create_tensor(layer.get_output(0), layer)
+        axis = input.ndim() - len(normalized_shape)
+    axes_mask = 0
+    for i in range(axis, input.ndim()):
+        axes_mask |= 1 << i
+    layer = default_trtnet().add_normalization(input.trt_tensor,
+                                               weight.trt_tensor,
+                                               bias.trt_tensor, axes_mask)
+    layer.epsilon = eps
+    return _create_tensor(layer.get_output(0), layer)
 
 
 def rms_norm(input: Tensor,
@@ -3964,60 +3932,33 @@ def rms_norm(input: Tensor,
     Returns:
         The output tensor of that operation.
     '''
-    if not default_net().plugin_config.rmsnorm_plugin:
-        normalized_shape = [normalized_shape] if isinstance(
-            normalized_shape, int) else normalized_shape
+    normalized_shape = [normalized_shape] if isinstance(
+        normalized_shape, int) else normalized_shape
 
-        dim = tuple([-i - 1 for i in range(len(normalized_shape))])
+    dim = tuple([-i - 1 for i in range(len(normalized_shape))])
 
-        if default_net().strongly_typed:
-            input_dtype = input.dtype
-            fp32_input = cast(input, "float32")
-            varx = pow(fp32_input, 2.0)
+    if default_net().strongly_typed:
+        input_dtype = input.dtype
+        fp32_input = cast(input, "float32")
+        varx = pow(fp32_input, 2.0)
 
+        varx = varx.mean(dim, keepdim=True)
+        denom = varx + eps
+        denom = denom.sqrt()
+        fp32_y = fp32_input / denom
+        y = cast(fp32_y, input_dtype)
+    else:
+        with precision("float32"):
+            varx = pow(input, 2.0)
             varx = varx.mean(dim, keepdim=True)
             denom = varx + eps
             denom = denom.sqrt()
-            fp32_y = fp32_input / denom
-            y = cast(fp32_y, input_dtype)
-        else:
-            with precision("float32"):
-                varx = pow(input, 2.0)
-                varx = varx.mean(dim, keepdim=True)
-                denom = varx + eps
-                denom = denom.sqrt()
-                y = input / denom
+            y = input / denom
 
-        if weight is not None:
-            y = y * weight
+    if weight is not None:
+        y = y * weight
 
-        return y
-    else:
-        logger.warning("RMSnorm plugin is going to be deprecated, "
-                       "disable it for better performance.")
-        plg_creator = trt.get_plugin_registry().get_plugin_creator(
-            'Rmsnorm', '1', TRT_LLM_PLUGIN_NAMESPACE)
-        assert plg_creator is not None
-
-        eps = trt.PluginField("eps", np.array(eps, dtype=np.float32),
-                              trt.PluginFieldType.FLOAT32)
-        p_dtype = default_net().plugin_config.rmsnorm_plugin
-        pf_type = trt.PluginField(
-            "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
-            trt.PluginFieldType.INT32)
-        pfc = trt.PluginFieldCollection([eps, pf_type])
-        rmsnorm_plug = plg_creator.create_plugin("rmsnorm", pfc)
-
-        normalized_shape = [normalized_shape] if isinstance(
-            normalized_shape, int) else normalized_shape
-        if weight is None:
-            weight = constant(
-                np.zeros(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
-
-        plug_inputs = [input.trt_tensor, weight.trt_tensor]
-        layer = default_trtnet().add_plugin_v2(plug_inputs, rmsnorm_plug)
-        _add_plugin_info(layer, plg_creator, "rmsnorm", pfc)
-        return _create_tensor(layer.get_output(0), layer)
+    return y
 
 
 def repeat_interleave(tensor: Tensor, repeats: int, dim: int) -> Tensor:
@@ -4159,7 +4100,7 @@ def expand_mask(mask: Tensor, tgt_len: Optional[Tensor] = None) -> Tensor:
     mask = mask.view(concat([bsz, 1, 1, src_len]))
 
     mask = expand(mask, concat([bsz, 1, tgt_len, src_len]))
-    mask = where(mask == 0, float('-inf'), (1 - mask).cast('float32'))
+    mask = where(mask == 0, float('-inf'), 0.0)
     return mask
 
 
@@ -4443,6 +4384,7 @@ def selective_scan(
     is_variable_B: bool,
     is_variable_C: bool,
     delta_softplus: bool,
+    dtype: str,
 ):
     '''
     Parameters:
@@ -4494,6 +4436,9 @@ def selective_scan(
 
         delta_softplus : bool
             Do we apply softplus to the delta.
+
+        dtype: str
+            data type
     '''
     assert host_request_types is not None
     selective_scan_plg_creator = trt.get_plugin_registry().get_plugin_creator(
@@ -4513,9 +4458,8 @@ def selective_scan(
     delta_softplus = trt.PluginField(
         "delta_softplus", np.array(np.int8(delta_softplus), dtype=np.int8),
         trt.PluginFieldType.INT8)
-    p_dtype = default_net().plugin_config.selective_scan_plugin
     pf_type = trt.PluginField(
-        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+        "type_id", np.array([int(str_dtype_to_trt(dtype))], np.int32),
         trt.PluginFieldType.INT32)
 
     pfc = trt.PluginFieldCollection(

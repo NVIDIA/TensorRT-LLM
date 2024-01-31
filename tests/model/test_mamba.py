@@ -37,7 +37,7 @@ from tensorrt_llm.network import net_guard
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 from examples.mamba.convert_checkpoint import (convert_from_hf_checkpoint,
                                                convert_hf_mamba)
-from tests.llm_data import llm_models_root
+from tests.utils.llm_data import llm_models_root
 from tests.utils.util import getSMVersion
 
 
@@ -95,7 +95,7 @@ class TestMamba(unittest.TestCase):
                 timing_cache='model.cache',
             )
             network = builder.create_network()
-            network.plugin_config.set_selective_scan_plugin(dtype)
+            network.plugin_config.to_legacy_setting()
             if gemm_plugin:
                 network.plugin_config.set_gemm_plugin(dtype)
 

@@ -41,7 +41,7 @@ if psutil is None:
                    "first, e.g, 'pip install psutil'.")
 if pynvml is None:
     logger.warning(
-        "A required package 'psutil' is not installed. Will not "
+        "A required package 'pynvml' is not installed. Will not "
         "monitor the device memory usages. Please install the package "
         "first, e.g, 'pip install pynvml>=11.5.0'.")
 elif pynvml.__version__ < '11.5.0':

@@ -26,7 +26,7 @@ from ._utils import mpi_rank
 from .builder import Builder
 from .mapping import Mapping
 from .network import net_guard
-from .plugin.plugin import ContextFMHAType, PluginConfig
+from .plugin.plugin import PluginConfig
 from .quantization.mode import QuantMode
 from .runtime import (GenerationSession, LoraManager, ModelRunner,
                       SamplingConfig, model_runner)
@@ -147,6 +147,7 @@ class TopModelMixin:
         # use default if user don't provide one
         network.plugin_config = plugin_config if plugin_config is not None else self.default_plugin_config(
             **kwargs)
+
         if self.quant_mode.has_fp8_qdq():
             network.plugin_config.set_gemm_plugin(False)
 
@@ -169,8 +170,8 @@ class TopModelMixin:
                                                  False),
                 gather_generation_logits=kwargs.get('gather_generation_logits',
                                                     False),
-                lora_target_modules=None)  # TODO: support lora
-            self(*inputs)
+                lora_target_modules=None)  #TODO: support lora
+            self(**inputs)
         engine = builder.build_engine(network, builder_config)
         self._trt_engine = engine
         self._builder_config = builder_config
@@ -408,15 +409,6 @@ class TopModelMixin:
 
     def default_plugin_config(self, **kwargs) -> 'PluginConfig':
         '''Return the default plugin config for this model, when the plugin_config value is not given in to_trt() call.
-           If user needs to set different plugin configs, can start from the return object and change it.
+           If users need to set different plugin configs, they can start from the return object and change it.
         '''
-        plugin_config = PluginConfig()
-        plugin_config.set_gpt_attention_plugin()
-        plugin_config.set_gemm_plugin()
-        # Quantization plugins.
-        plugin_config.set_context_fmha(ContextFMHAType.enabled)
-        if self.mapping.world_size > 1:
-            plugin_config.set_nccl_plugin()
-        plugin_config.enable_remove_input_padding()
-        plugin_config.enable_paged_kv_cache()
-        return plugin_config
+        return PluginConfig()

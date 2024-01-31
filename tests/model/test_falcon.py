@@ -164,6 +164,7 @@ class TestFalcon(unittest.TestCase):
         )
 
         network = builder.create_network()
+        network.plugin_config.to_legacy_setting()
         if use_gpt_attengion_plugin:
             network.plugin_config.set_gpt_attention_plugin(dtype)
         if use_gemm_plugin:
@@ -537,6 +538,7 @@ class TestFalcon(unittest.TestCase):
         device = hf_model.device
 
         model_config = ModelConfig(
+            max_batch_size=batch_size,
             model_name=model_name,
             vocab_size=hf_config.vocab_size,
             num_layers=hf_config.num_hidden_layers,

@@ -16,11 +16,12 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 
-#include <assert.h>
+#include <cassert>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -232,6 +233,7 @@ public:
         else
         {
             SizeType newPromptLen = std::min(maxInputLen, mPromptLen + getMaxNumGeneratedTokens());
+            TLLM_LOG_DEBUG("pause: id %lu, mPromptLen %d, newPromptLen %d", mRequestId, mPromptLen, newPromptLen);
             for (std::size_t beam = 0; beam < mTokens.size(); ++beam)
             {
                 auto& beamTokens = mTokens.at(beam);
@@ -389,45 +391,73 @@ public:
         mGenerationLogitsFragments.clear();
     }
 
+    bool isContextInitState() const noexcept
+    {
+        return mState == REQUEST_STATE_CONTEXT_INIT;
+    }
+
+    bool isGenerationInProgessState() const noexcept
+    {
+        return mState == REQUEST_STATE_GENERATION_IN_PROGRESS;
+    }
+
+    /// To determine whether the context is unchunked. When a context is chunked into only a part, it
+    /// is still different from the unchunked state, which indicates the initial status.
+    bool isFullContextRequest() const noexcept
+    {
+        return isContextInitState() && !mContextChunkSize;
+    }
+
+    /// When chunked, the position of the current chunk is returned. Otherwise, only the beginning
+    /// or end of the context is returned.
     SizeType getContextCurrentPosition() const noexcept
     {
         return mContextCurrentPosition;
     }
 
+    /// Return the length of the context that has not yet been processed.
     SizeType getContextRemainingLength() const noexcept
     {
         return mPromptLen - getContextCurrentPosition();
     }
 
+    /// To retrieve the context chunk size, throw an exception when the context is not chunked.
     SizeType getContextChunkSize() const
     {
-        TLLM_CHECK_WITH_INFO(mContextChunkSize, "The context has not been chunked yet.");
+        TLLM_CHECK_WITH_INFO(
+            isContextInitState() && mContextChunkSize, "The current request is not in context chunking state.");
         return mContextChunkSize.value();
     }
 
+    /// To set the context chunk size, throw an exception when the chunk size is negative. If the chunk
+    /// size is greater than the remaining length of the context, the size will be reduced to fit the
+    /// remaining length.
     void setContextChunkSize(SizeType size)
     {
+        TLLM_CHECK_WITH_INFO(isContextInitState(), "Chunking is only possible during the context phase.");
         TLLM_CHECK_WITH_INFO(size >= 0, "The chunk size of context (%d) can't be negative.", size);
         mContextChunkSize = std::min(size, getContextRemainingLength());
     }
 
-    bool isFullContextRequest() const
-    {
-        return !mContextChunkSize;
-    }
-
+    /// Determines whether the current position is only one chunk away from the end of the context.
+    /// It will return true when the context is not chunked.
     bool isLastContextChunk() const noexcept
     {
-        return isFullContextRequest() || getContextCurrentPosition() + getContextChunkSize() == mPromptLen;
+        return isFullContextRequest()
+            || (isContextInitState() && getContextCurrentPosition() + getContextChunkSize() == mPromptLen);
     }
 
+    /// Returns whether the position is at the beginning of the context. It will return true when the
+    /// context is not chunked.
     bool isFirstContextChunk() const noexcept
     {
         return isFullContextRequest() || getContextCurrentPosition() == 0;
     }
 
+    /// Move the cursor forward one chunk. When not chunked, move forward to the end of the context.
     void moveToNextContextChunk()
     {
+        TLLM_CHECK_WITH_INFO(isContextInitState(), "Chunking is only possible during the context phase.");
         if (mContextChunkSize)
         {
             mContextCurrentPosition += getContextChunkSize();

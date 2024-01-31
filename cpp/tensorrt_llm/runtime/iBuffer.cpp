@@ -106,6 +106,7 @@ char const* IBuffer::getMemoryTypeName() const
     case MemoryType::kPINNED: return MemoryTypeString<MemoryType::kPINNED>::value;
     case MemoryType::kCPU: return MemoryTypeString<MemoryType::kCPU>::value;
     case MemoryType::kGPU: return MemoryTypeString<MemoryType::kGPU>::value;
+    case MemoryType::kUVM: return MemoryTypeString<MemoryType::kUVM>::value;
     }
     TLLM_THROW("Unknown memory type");
 }

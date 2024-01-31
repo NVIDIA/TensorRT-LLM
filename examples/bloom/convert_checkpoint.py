@@ -158,10 +158,14 @@ def reorder_torch_qkv_weight_or_bias(v, model, is_bias=False):
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_dir', type=Path, default=None)
-    parser.add_argument('--world_size',
+    parser.add_argument('--tp_size',
                         type=int,
                         default=1,
-                        help='world size, only support tensor parallelism now')
+                        help='N-way tensor parallelism size')
+    parser.add_argument('--pp_size',
+                        type=int,
+                        default=1,
+                        help='N-way pipeline parallelism size')
     parser.add_argument('--dtype',
                         type=str,
                         default='float16',
@@ -1010,9 +1014,9 @@ def do_convert_from_ckpt(args):
             and not args.use_weight_only and not args.int8_kv_cache)
 
 
-def convert(worker_rank, args, convert_args):
+def convert(worker_rank, world_size, args, convert_args):
     convert_from_ckpt = do_convert_from_ckpt(args)
-    for rank in range(worker_rank, args.world_size, args.workers):
+    for rank in range(worker_rank, world_size, args.workers):
         if convert_from_ckpt:
             weights = convert_from_hf_checkpoint(rank=rank, **convert_args)
         else:
@@ -1030,10 +1034,35 @@ def main():
     print(tensorrt_llm.__version__)
 
     args = parse_arguments()
+    world_size = args.tp_size * args.pp_size
+    assert args.pp_size == 1, "Pipeline parallelism is not supported."
+
     logger.set_level(args.log_level)
     tik = time.time()
 
     args.output_dir.mkdir(exist_ok=True, parents=True)
+
+    quant_algo = None
+    plugin_weight_only_quant_type = None
+    if args.use_weight_only and args.weight_only_precision == 'int8':
+        plugin_weight_only_quant_type = torch.int8
+        quant_algo = 'W8A16'
+    elif args.use_weight_only and args.weight_only_precision == 'int4':
+        plugin_weight_only_quant_type = torch.quint4x2
+        quant_algo = 'W4A16'
+    elif args.smoothquant:
+        if args.per_channel and args.per_token:
+            quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN'
+        elif args.per_channel and not args.per_token:
+            quant_algo = 'W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN'
+        elif not args.per_channel and args.per_token:
+            quant_algo = 'W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN'
+        else:
+            quant_algo = 'W8A8_SQ_PER_TENSOR_PLUGIN'
+
+    kv_cache_quant_algo = None
+    if args.int8_kv_cache:
+        kv_cache_quant_algo = 'INT8'
 
     hf_config = BloomConfig.from_pretrained(args.model_dir)
     config = {
@@ -1049,16 +1078,13 @@ def main():
         'hidden_act': 'gelu',
         'intermediate_size': hf_config.hidden_size * 4,
         'quantization': {
-            'use_weight_only': args.use_weight_only,
-            'weight_only_precision': args.weight_only_precision,
-            'int8_kv_cache': args.int8_kv_cache,
-            'use_smooth_quant': args.smoothquant is not None,
-            'per_channel': args.smoothquant is not None and args.per_channel,
-            'per_token': args.smoothquant is not None and args.per_token,
+            'quant_algo': quant_algo,
+            'kv_cache_quant_algo': kv_cache_quant_algo,
         },
         'mapping': {
-            'world_size': args.world_size,
-            'tp_size': args.world_size,
+            'world_size': world_size,
+            'tp_size': args.tp_size,
+            'pp_size': args.pp_size,
         },
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
@@ -1097,15 +1123,8 @@ def main():
             smooth_bloom_model(hf_bloom, act_range, args.smoothquant,
                                bloom_qkv_param, bloom_smoother)
 
-    if args.weight_only_precision == 'int8':
-        plugin_weight_only_quant_type = torch.int8
-    elif args.weight_only_precision == 'int4':
-        plugin_weight_only_quant_type = torch.quint4x2
-    else:
-        plugin_weight_only_quant_type = None
-
     convert_args = dict(
-        tensor_parallel=args.world_size,
+        tensor_parallel=args.tp_size,
         dtype=args.dtype,
         use_weight_only=args.use_weight_only,
         plugin_weight_only_quant_type=plugin_weight_only_quant_type,
@@ -1126,13 +1145,15 @@ def main():
         convert_args['hf_bloom'] = hf_bloom
 
     if args.workers == 1:
-        convert(0, args, convert_args)
+        convert(0, world_size, args, convert_args)
     else:
-        if args.workers > args.world_size:
-            args.workers = args.world_size
+        if args.workers > world_size:
+            args.workers = world_size
         logger.info(f'Convert checkpoint using {args.workers} workers.')
         import torch.multiprocessing as mp
-        mp.spawn(convert, nprocs=args.workers, args=(args, convert_args))
+        mp.spawn(convert,
+                 nprocs=args.workers,
+                 args=(world_size, args, convert_args))
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

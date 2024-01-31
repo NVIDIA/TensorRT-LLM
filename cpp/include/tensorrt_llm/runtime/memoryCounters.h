@@ -49,6 +49,11 @@ public:
         return mPinned;
     }
 
+    [[nodiscard]] SizeType getUVM() const
+    {
+        return mUVM;
+    }
+
     [[nodiscard]] DiffType getGpuDiff() const
     {
         return mGpuDiff;
@@ -62,6 +67,11 @@ public:
     [[nodiscard]] DiffType getPinnedDiff() const
     {
         return mPinnedDiff;
+    }
+
+    [[nodiscard]] DiffType getUVMDiff() const
+    {
+        return mUVMDiff;
     }
 
     template <MemoryType T>
@@ -82,6 +92,11 @@ public:
         {
             mPinned += size;
             mPinnedDiff = sizeDiff;
+        }
+        else if constexpr (T == MemoryType::kUVM)
+        {
+            mUVM += size;
+            mUVMDiff = sizeDiff;
         }
         else
         {
@@ -110,6 +125,11 @@ public:
             mPinned -= std::min(size, mPinned);
             mPinnedDiff = sizeDiff;
         }
+        else if constexpr (T == MemoryType::kUVM)
+        {
+            mUVM -= std::min(size, mUVM);
+            mUVMDiff = sizeDiff;
+        }
         else
         {
             TLLM_THROW("Unknown memory type: %s", MemoryTypeString<T>::value);
@@ -131,8 +151,8 @@ public:
     [[nodiscard]] std::string toString() const;
 
 private:
-    SizeType mGpu{}, mCpu{}, mPinned{};
-    DiffType mGpuDiff{}, mCpuDiff{}, mPinnedDiff{};
+    SizeType mGpu{}, mCpu{}, mPinned{}, mUVM{};
+    DiffType mGpuDiff{}, mCpuDiff{}, mPinnedDiff{}, mUVMDiff{};
 };
 
 } // namespace tensorrt_llm::runtime

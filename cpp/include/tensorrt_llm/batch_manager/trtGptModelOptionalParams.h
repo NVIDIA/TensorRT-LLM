@@ -35,14 +35,13 @@ public:
 
     explicit TrtGptModelOptionalParams(KvCacheConfig const& kvCacheConfig = KvCacheConfig{},
         bool enableTrtOverlap = false, std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt,
-        bool normalizeLogProbs = true, bool logIterationData = false,
-        std::optional<SizeType> minCtxChunkSize = std::nullopt)
+        bool normalizeLogProbs = true, bool logIterationData = false, bool enableChunkedContext = false)
         : kvCacheConfig{kvCacheConfig}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(deviceIds)
         , normalizeLogProbs{normalizeLogProbs}
         , logIterationData{logIterationData}
-        , minCtxChunkSize{minCtxChunkSize}
+        , enableChunkedContext{enableChunkedContext}
     {
     }
 
@@ -51,7 +50,7 @@ public:
     std::optional<std::vector<SizeType>> deviceIds;
     bool normalizeLogProbs;
     bool logIterationData;
-    std::optional<SizeType> minCtxChunkSize;
+    bool enableChunkedContext;
 };
 
 } // namespace tensorrt_llm::batch_manager

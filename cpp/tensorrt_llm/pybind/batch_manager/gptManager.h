@@ -48,6 +48,7 @@ public:
 
     pybind11::object enter();
     void exit(pybind11::handle type, pybind11::handle value, pybind11::handle traceback);
+    void shutdown();
 
     static void initBindings(pybind11::module_& m);
 };

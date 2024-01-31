@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+from typing import Union
 
 import numpy as np
 import tensorrt as trt
@@ -649,18 +650,27 @@ class SmoothQuantMLP(Module):
         return output
 
 
+def is_same_dtype(type_a: Union[str, trt.DataType],
+                  type_b: Union[str, trt.DataType]) -> bool:
+    if isinstance(type_a, str):
+        type_a = str_dtype_to_trt(type_a)
+
+    if isinstance(type_b, str):
+        type_b = str_dtype_to_trt(type_b)
+
+    return type_a == type_b
+
+
 class Int8SmoothQuantRowLinear(RowLinear):
 
-    def __init__(
-        self,
-        in_features,
-        out_features,
-        bias=True,
-        dtype=None,
-        tp_group=None,
-        tp_size=1,
-        max_lora_rank=None,
-    ):
+    def __init__(self,
+                 in_features,
+                 out_features,
+                 bias=True,
+                 dtype=None,
+                 tp_group=None,
+                 tp_size=1,
+                 max_lora_rank=None):
         super().__init__(in_features,
                          out_features,
                          bias=bias,
@@ -673,13 +683,16 @@ class Int8SmoothQuantRowLinear(RowLinear):
                                                 dtype=trt.float32)
         self.prequant_scaling_factor = Parameter(shape=(self.in_features, ),
                                                  dtype=dtype)
+        self.weight = Parameter(shape=(self.out_features, self.in_features),
+                                dtype=trt.int8)
 
     def forward(self, x, lora_runtime_params=None):
         assert lora_runtime_params is None, "lora is not supported on Int8SmoothQuantRowLinear now"
 
         if default_net().strongly_typed:
-            assert x.dtype == self.dtype
-            assert x.dtype == self.weight.value.dtype
+            assert is_same_dtype(
+                x.dtype,
+                self.dtype), f"Got input type {x.dtype}, expecting {self.dtype}"
         x = mul(x, self.prequant_scaling_factor.value)
 
         activation_scaling_factor = cast(self.activation_scaling_factor.value,
@@ -690,11 +703,7 @@ class Int8SmoothQuantRowLinear(RowLinear):
 
         weights_scaling_factor = cast(self.weights_scaling_factor.value,
                                       self.dtype)
-        w_quant_out = quantize(self.weight.value,
-                               weights_scaling_factor,
-                               'int8',
-                               axis=0)
-        w_deq_out = dequantize(w_quant_out, weights_scaling_factor, 0,
+        w_deq_out = dequantize(self.weight.value, weights_scaling_factor, 0,
                                self.dtype)
 
         return super().multiply_reduce(dequantized_out, w_deq_out, False)
@@ -727,12 +736,15 @@ class Int8SmoothQuantLinear(Linear):
                                                 dtype=trt.float32)
         self.prequant_scaling_factor = Parameter(shape=(self.in_features, ),
                                                  dtype=dtype)
+        self.weight = Parameter(shape=(self.out_features, self.in_features),
+                                dtype=trt.int8)
 
     def forward(self, x, lora_runtime_params=None):
         assert lora_runtime_params is None, "lora is not supported on Int8SmoothQuantLinear now"
         if default_net().strongly_typed:
-            assert x.dtype == self.dtype
-            assert x.dtype == self.weight.value.dtype
+            assert is_same_dtype(
+                x.dtype,
+                self.dtype), f"Got input type {x.dtype}, expecting {self.dtype}"
         x = mul(x, self.prequant_scaling_factor.value)
 
         activation_scaling_factor = cast(self.activation_scaling_factor.value,
@@ -743,11 +755,7 @@ class Int8SmoothQuantLinear(Linear):
 
         weights_scaling_factor = cast(self.weights_scaling_factor.value,
                                       self.dtype)
-        w_quant_out = quantize(self.weight.value,
-                               weights_scaling_factor,
-                               'int8',
-                               axis=0)
-        w_deq_out = dequantize(w_quant_out, weights_scaling_factor, 0,
+        w_deq_out = dequantize(self.weight.value, weights_scaling_factor, 0,
                                self.dtype)
 
         return super().multiply_gather(dequantized_out, w_deq_out, False)
@@ -770,6 +778,7 @@ class FP8Linear(Linear):
                          out_features,
                          bias=bias,
                          dtype=dtype,
+                         use_fp8=True,
                          tp_group=tp_group,
                          tp_size=tp_size,
                          gather_output=gather_output)
@@ -780,13 +789,10 @@ class FP8Linear(Linear):
     def forward(self, x, lora_runtime_params=None):
         assert lora_runtime_params is None, "lora is not supported on FP8Linear now"
         if default_net().strongly_typed:
-            if isinstance(self.dtype, str):
-                assert x.dtype == str_dtype_to_trt(
-                    self.dtype
-                ), f"Got input type {x.dtype}, expecting {self.dtype}"
-            else:
-                assert x.dtype == self.dtype, f"Got input type {x.dtype}, expecting {self.dtype}"
-            assert x.dtype == self.weight.value.dtype, f"Got input type {x.dtype}, got weight dtype{self.weight.value.dtype}"
+            assert is_same_dtype(
+                x.dtype,
+                self.dtype), f"Got input type {x.dtype}, expecting {self.dtype}"
+
         activation_scaling_factor = cast(self.activation_scaling_factor.value,
                                          self.dtype)
         quantized_out = quantize(x, activation_scaling_factor, 'fp8')
@@ -795,15 +801,16 @@ class FP8Linear(Linear):
 
         weights_scaling_factor = cast(self.weights_scaling_factor.value,
                                       self.dtype)
-        w_quant_out = quantize(self.weight.value, weights_scaling_factor, 'fp8')
+        if self.weight.value.dtype != trt.fp8:
+            w_quant_out = quantize(self.weight.value, weights_scaling_factor,
+                                   'fp8')
+        else:
+            w_quant_out = self.weight.value
         w_deq_out = dequantize(w_quant_out, weights_scaling_factor, -1,
                                self.dtype)
 
         # TODO: allow gemm plugin default_net().plugin_config.gemm_plugin
-        return self.multiply_gather(dequantized_out,
-                                    w_deq_out,
-                                    False,
-                                    use_fp8=True)
+        return self.multiply_gather(dequantized_out, w_deq_out, False)
 
 
 class FP8RowLinear(RowLinear):
@@ -822,6 +829,7 @@ class FP8RowLinear(RowLinear):
                          out_features,
                          bias=bias,
                          dtype=dtype,
+                         use_fp8=True,
                          tp_group=tp_group,
                          tp_size=tp_size)
         self.activation_scaling_factor = Parameter(shape=(1, ),
@@ -831,12 +839,9 @@ class FP8RowLinear(RowLinear):
     def forward(self, x, lora_runtime_params=None):
         assert lora_runtime_params is None, "lora is not supported on FP8RowLinear now"
         if default_net().strongly_typed:
-            if isinstance(self.dtype, str):
-                assert x.dtype == str_dtype_to_trt(self.dtype)
-            else:
-                assert x.dtype == self.dtype
-
-            assert x.dtype == self.weight.value.dtype
+            assert is_same_dtype(
+                x.dtype,
+                self.dtype), f"Got input type {x.dtype}, expecting {self.dtype}"
 
         activation_scaling_factor = cast(self.activation_scaling_factor.value,
                                          self.dtype)
@@ -846,7 +851,11 @@ class FP8RowLinear(RowLinear):
 
         weights_scaling_factor = cast(self.weights_scaling_factor.value,
                                       self.dtype)
-        w_quant_out = quantize(self.weight.value, weights_scaling_factor, 'fp8')
+        if self.weight.value.dtype != trt.fp8:
+            w_quant_out = quantize(self.weight.value, weights_scaling_factor,
+                                   'fp8')
+        else:
+            w_quant_out = self.weight.value
         w_deq_out = dequantize(w_quant_out, weights_scaling_factor, -1,
                                self.dtype)
 

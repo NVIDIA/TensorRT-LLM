@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import shutil as _shutil
 from pathlib import Path as _Path
 
@@ -23,10 +22,9 @@ import torch
 import transformers
 
 import tensorrt_llm
-from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import (ChatGLMGenerationSession, GenerationSession,
                                   ModelConfig, SamplingConfig)
-from tensorrt_llm.runtime.model_runner import get_engine_name
+from tensorrt_llm.runtime.engine import Engine
 
 import run  # isort:skip
 
@@ -63,35 +61,49 @@ def generate(model_name, batch_size, beam_width):
     else:
         args.input_text += args.input_text[0] * (batch_size - 2)
 
-    config_path = _Path(args.engine_dir) / 'config.json'
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-    assert (config['builder_config']['name'] == model_name)
-    dtype = config['builder_config']['precision']
-    config['builder_config']['max_batch_size']
-    max_input_len = config['builder_config']['max_input_len']
-    max_output_len = config['builder_config']['max_output_len']
-    config['builder_config']['max_beam_width']
-    remove_input_padding = config['builder_config']['remove_input_padding']
-    use_gpt_attention_plugin = config['plugin_config']['gpt_attention_plugin']
-    world_size = config['builder_config']['tensor_parallel']
-    assert world_size == tensorrt_llm.mpi_world_size(
-    ), f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
-
     runtime_rank = tensorrt_llm.mpi_rank()
-    runtime_mapping = tensorrt_llm.Mapping(
-        world_size,
-        runtime_rank,
-        tp_size=world_size,
-    )
-    torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
+    engine = Engine.from_dir(engine_dir, runtime_rank)
+    pretrained_config = engine.config.pretrained_config
+    build_config = engine.config.build_config
+    plugin_config = build_config.plugin_config
 
-    engine_name = get_engine_name(model_name,
-                                  dtype=dtype,
-                                  tp_size=world_size,
-                                  pp_size=1,
-                                  rank=runtime_rank)
-    serialize_path = _Path(args.engine_dir) / engine_name
+    tp_size = pretrained_config.mapping.tp_size
+    num_heads = pretrained_config.num_attention_heads // tp_size
+    num_kv_heads = pretrained_config.num_key_value_heads
+    num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
+    hidden_size = pretrained_config.hidden_size // tp_size
+
+    model_config = ModelConfig(
+        max_batch_size=build_config.max_batch_size,
+        vocab_size=pretrained_config.vocab_size,
+        num_layers=pretrained_config.num_hidden_layers,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        hidden_size=hidden_size,
+        gpt_attention_plugin=bool(
+            build_config.plugin_config.gpt_attention_plugin),
+        remove_input_padding=build_config.plugin_config.remove_input_padding,
+        paged_kv_cache=build_config.plugin_config.paged_kv_cache,
+        tokens_per_block=build_config.plugin_config.tokens_per_block,
+        quant_mode=pretrained_config.quant_mode,
+        gather_context_logits=build_config.gather_context_logits,
+        gather_generation_logits=build_config.gather_generation_logits,
+        dtype=pretrained_config.dtype,
+        max_prompt_embedding_table_size=build_config.
+        max_prompt_embedding_table_size,
+    )
+    max_input_len = build_config.max_input_len
+    max_output_len = build_config.max_output_len
+    remove_input_padding = plugin_config.remove_input_padding
+    use_gpt_attention_plugin = plugin_config.gpt_attention_plugin
+
+    assert pretrained_config.architecture == 'ChatGLMForCausalLM'
+    chatglm_version = pretrained_config.chatglm_version
+    assert chatglm_version == model_name.split('_')[0]
+
+    runtime_mapping = pretrained_config.mapping
+    runtime_mapping.world_size == tensorrt_llm.mpi_world_size()
+    torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
 
     # fix remained error in chatglm_6b, hope to remove this in the future
     if model_name == "chatglm_6b":
@@ -156,20 +168,6 @@ def generate(model_name, batch_size, beam_width):
                 i, :len(sample[nPadding:])] = sample[nPadding:]
         input_ids = input_ids_padding_right
 
-    model_config = ModelConfig(
-        vocab_size=config['builder_config']['vocab_size'],
-        num_layers=config['builder_config']['num_layers'],
-        num_heads=config['builder_config']['num_heads'] // world_size,
-        num_kv_heads=config['builder_config']['num_kv_heads'] // world_size,
-        hidden_size=config['builder_config']['hidden_size'] // world_size,
-        gpt_attention_plugin=use_gpt_attention_plugin,
-        remove_input_padding=config['builder_config']['remove_input_padding'],
-        model_name=model_name,
-        paged_kv_cache=config['builder_config']['paged_kv_cache'],
-        quant_mode=QuantMode(config['builder_config']['quant_mode']),
-        dtype=dtype,
-    )
-
     sampling_config = SamplingConfig(
         end_id=eop_id if model_name in ["glm_10b"] else end_id,
         pad_id=pad_id,
@@ -180,8 +178,7 @@ def generate(model_name, batch_size, beam_width):
     )
     sampling_config.random_seed = args.random_seed
 
-    with open(serialize_path, 'rb') as f:
-        engine_buffer = f.read()
+    engine_buffer = engine.engine
 
     if model_name in ["chatglm_6b", "glm_10b"]:
         session = ChatGLMGenerationSession

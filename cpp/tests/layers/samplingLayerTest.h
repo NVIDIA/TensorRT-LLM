@@ -62,16 +62,16 @@ protected:
 
     int32_t seed = 0;
     const static uint64_t mMaxSeed = 32;
-    const int32_t mBatchSize = 6;
-    const int32_t mBeamWidth = 1;
-    const int32_t mBatchBeam = mBatchSize * mBeamWidth;
-    const int32_t mVocabSize = 8;
+    int32_t const mBatchSize = 6;
+    int32_t const mMaxBatchSize = 2 * mBatchSize;
+    int32_t const mBeamWidth = 1;
+    int32_t const mBatchBeam = mBatchSize * mBeamWidth;
+    int32_t const mVocabSize = 8;
+    int32_t const mVocabSizePadded = mVocabSize;
 
-    const int32_t mVocabSizePadded = mVocabSize;
-
-    const int32_t mMaxInputLen = 0; // has no effect.
-    const int32_t mMaxOutputLen = 4;
-    const int32_t mMaxSeqLen = mMaxInputLen + mMaxOutputLen;
+    int32_t const mMaxInputLen = 0; // has no effect.
+    int32_t const mMaxOutputLen = 4;
+    int32_t const mMaxSeqLen = mMaxInputLen + mMaxOutputLen;
     int32_t mEndId = mVocabSize;
 
     TensorPtr mLogitsDevice;
@@ -82,6 +82,7 @@ protected:
     TensorPtr mOutputIdsDevice;
     TensorPtr mEndIdsDevice;
     TensorPtr mIdsPtrHost;
+    TensorPtr mBatchSlots;
 
     TensorPtr mEmbeddingBiasHost;
     TensorPtr mEmbeddingBiasDevice;

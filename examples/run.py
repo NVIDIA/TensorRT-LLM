@@ -174,7 +174,8 @@ def parse_input(tokenizer,
                 max_input_length=923,
                 pad_id=None,
                 num_prepend_vtokens=[],
-                model_name=None):
+                model_name=None,
+                model_version=None):
     if pad_id is None:
         pad_id = tokenizer.pad_token_id
 
@@ -222,9 +223,11 @@ def parse_input(tokenizer,
             batch_input_ids[i] = list(
                 range(base_vocab_size,
                       base_vocab_size + length)) + batch_input_ids[i]
-    if model_name == 'glm_10b':
+
+    if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
         for ids in batch_input_ids:
             ids.append(tokenizer.sop_token_id)
+
     batch_input_ids = [
         torch.tensor(x, dtype=torch.int32) for x in batch_input_ids
     ]
@@ -300,14 +303,18 @@ def main(args):
     runtime_rank = tensorrt_llm.mpi_rank()
     logger.set_level(args.log_level)
 
-    model_name = read_model_name(args.engine_dir)
+    model_name, model_version = read_model_name(args.engine_dir)
     if args.tokenizer_dir is None:
+        logger.warning(
+            "tokenizer_dir is not specified. Try to infer from model_name, but this may be incorrect."
+        )
         args.tokenizer_dir = DEFAULT_HF_MODEL_DIRS[model_name]
 
     tokenizer, pad_id, end_id = load_tokenizer(
         tokenizer_dir=args.tokenizer_dir,
         vocab_file=args.vocab_file,
         model_name=model_name,
+        model_version=model_version,
         tokenizer_type=args.tokenizer_type,
     )
 
@@ -334,7 +341,8 @@ def main(args):
                                   max_input_length=args.max_input_length,
                                   pad_id=pad_id,
                                   num_prepend_vtokens=args.num_prepend_vtokens,
-                                  model_name=model_name)
+                                  model_name=model_name,
+                                  model_version=model_version)
     input_lengths = [x.size(0) for x in batch_input_ids]
 
     if not PYTHON_BINDINGS and not args.use_py_session:

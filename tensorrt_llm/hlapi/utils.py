@@ -1,3 +1,4 @@
+import gc
 import sys
 import traceback
 from dataclasses import dataclass, field
@@ -54,3 +55,11 @@ def print_traceback_on_error(func):
 
 def get_device_count() -> int:
     return torch.cuda.device_count() if torch.cuda.is_available() else 0
+
+
+def release_gc():
+    ''' Release memory allocated by PyTorch and Python garbage collector explicitly and immediately.
+    This could be used when some states might be kept in memory even after the variables are deleted.
+    '''
+    gc.collect()
+    torch.cuda.empty_cache()

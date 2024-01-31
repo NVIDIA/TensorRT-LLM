@@ -189,12 +189,10 @@ build directory is `cpp/build`, which may be overridden using the option
 `--build_dir`. Run `build_wheel.py --help` for an overview of all supported
 options.
 
-Clients may choose to link against the shared or the static version of the
-library. These libraries can be found in the following locations:
+The shared library can be found in the following location:
 
 ```bash
 cpp/build/tensorrt_llm/libtensorrt_llm.so
-cpp/build/tensorrt_llm/libtensorrt_llm_static.a
 ```
 
 In addition, one needs to link against the library containing the LLM plugins

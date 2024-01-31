@@ -17,8 +17,9 @@ import math
 import numpy as np
 
 from ..._common import default_net
-from ...functional import (bert_attention, concat, constant, expand, matmul,
-                           shape, slice, softmax, split)
+from ...functional import (ACT2FN, bert_attention, concat, constant, expand,
+                           expand_mask, matmul, select, shape, slice, softmax,
+                           split, unsqueeze)
 from ...layers import MLP, ColumnLinear, Embedding, LayerNorm, Linear, RowLinear
 from ...mapping import Mapping
 from ...module import Module, ModuleList
@@ -44,31 +45,7 @@ class BertEmbedding(Module):
 
         self.embedding_ln = LayerNorm(normalized_shape=hidden_size, dtype=dtype)
 
-    def forward(self, input_ids, position_ids=None, token_type_ids=None):
-        position_ids_buffer = constant(
-            np.expand_dims(
-                np.arange(self.max_position_embeddings).astype(np.int32), 0))
-
-        token_type_ids_buffer = constant(
-            np.expand_dims(
-                np.zeros(self.max_position_embeddings).astype(np.int32), 0))
-
-        seq_len_2d = concat([1, shape(input_ids, 1)])
-
-        if position_ids is None:
-            # slice
-            position_ids = slice(position_ids_buffer,
-                                 starts=[0, 0],
-                                 sizes=seq_len_2d)
-            position_ids = expand(position_ids, shape(input_ids))
-
-        if token_type_ids is None:
-            # slice
-            token_type_ids = slice(token_type_ids_buffer,
-                                   starts=[0, 0],
-                                   sizes=seq_len_2d)
-            token_type_ids = expand(token_type_ids, shape(input_ids))
-
+    def forward(self, input_ids, position_ids, token_type_ids):
         x = self.vocab_embedding(input_ids)
         x = x + self.position_embedding(position_ids)
         x = x + self.token_embedding(token_type_ids)
@@ -210,10 +187,15 @@ class BertModel(Module):
                  hidden_act,
                  max_position_embeddings,
                  type_vocab_size,
+                 pad_token_id=None,
+                 is_roberta=False,
                  mapping=Mapping(),
                  dtype=None):
         super().__init__()
 
+        self.max_position_embeddings = max_position_embeddings
+        self.padding_idx = pad_token_id
+        self.is_roberta = is_roberta
         self.embedding = BertEmbedding(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
@@ -234,14 +216,55 @@ class BertModel(Module):
     def forward(self,
                 input_ids=None,
                 input_lengths=None,
-                token_type_ids=None,
                 position_ids=None,
+                token_type_ids=None,
                 hidden_states=None):
+
+        seq_len_2d = concat([1, shape(input_ids, 1)])
+
+        # create position ids
+        position_ids_buffer = constant(
+            np.expand_dims(
+                np.arange(self.max_position_embeddings).astype(np.int32), 0))
+        tmp_position_ids = slice(position_ids_buffer,
+                                 starts=[0, 0],
+                                 sizes=seq_len_2d)
+        tmp_position_ids = expand(tmp_position_ids, shape(input_ids))  #BxL
+        tmp_input_lengths = unsqueeze(input_lengths, 1)  #Bx1
+        tmp_input_lengths = expand(tmp_input_lengths, shape(input_ids))  #BxL
+        mask = tmp_position_ids < tmp_input_lengths  # BxL
+        mask = mask.cast('int32')
+
+        if position_ids is None:
+            if self.is_roberta:
+                # see create_position_ids_from_input_ids() in https://github.com/huggingface/transformers/blob/main/src/transformers/models/roberta/modeling_roberta.py
+                position_ids = (tmp_position_ids + 1) * mask
+                position_ids = position_ids + self.padding_idx
+            else:
+                position_ids = slice(position_ids_buffer,
+                                     starts=[0, 0],
+                                     sizes=seq_len_2d)
+                position_ids = expand(position_ids, shape(input_ids))
+
+        # creat extended_attention_mask as https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_utils.py
+        extended_attention_mask = expand_mask(mask, tgt_len=1)  # BxL -> Bx1x1xL
+
+        # create token_type_ids
+        if token_type_ids is None:
+            token_type_ids_buffer = constant(
+                np.expand_dims(
+                    np.zeros(self.max_position_embeddings).astype(np.int32), 0))
+            token_type_ids = slice(token_type_ids_buffer,
+                                   starts=[0, 0],
+                                   sizes=seq_len_2d)
+            token_type_ids = expand(token_type_ids, shape(input_ids))
+
         hidden_states = self.embedding(input_ids, position_ids, token_type_ids)
 
         for layer in self.layers:
             hidden_states = layer(hidden_states=hidden_states,
-                                  input_lengths=input_lengths)
+                                  input_lengths=input_lengths,
+                                  attention_mask=extended_attention_mask)
 
         return hidden_states
 
@@ -256,6 +279,8 @@ class BertForQuestionAnswering(Module):
                  hidden_act,
                  max_position_embeddings,
                  type_vocab_size,
+                 pad_token_id=None,
+                 is_roberta=False,
                  num_labels=2,
                  mapping=Mapping(),
                  dtype=None):
@@ -267,6 +292,8 @@ class BertForQuestionAnswering(Module):
                               hidden_act=hidden_act,
                               max_position_embeddings=max_position_embeddings,
                               type_vocab_size=type_vocab_size,
+                              pad_token_id=pad_token_id,
+                              is_roberta=is_roberta,
                               mapping=mapping,
                               dtype=dtype)
         self.num_labels = num_labels
@@ -286,5 +313,97 @@ class BertForQuestionAnswering(Module):
                                           hidden_states=hidden_states)
 
         logits = self.qa_outputs(hidden_states)
+
+        return logits
+
+
+class BertPooler(Module):
+
+    def __init__(self, hidden_size, dtype):
+        super().__init__()
+        self.dense = Linear(hidden_size, hidden_size, dtype=dtype)
+        self.activation = ACT2FN['tanh']
+
+    def forward(self, hidden_states):
+        # We "pool" the model by simply taking the hidden state corresponding
+        # to the first token.
+        first_token_tensor = select(hidden_states, 1, 0)
+        pooled_output = self.dense(first_token_tensor)
+        pooled_output = self.activation(pooled_output)
+        return pooled_output
+
+
+class RobertaClassificationHead(Module):
+    """Head for sentence-level classification tasks."""
+
+    def __init__(self, hidden_size, dtype, num_labels):
+        super().__init__()
+        self.dense = Linear(hidden_size, hidden_size, dtype=dtype)
+        self.out_proj = Linear(hidden_size, num_labels)
+
+    def forward(self, features, **kwargs):
+        x = select(features, 1, 0)
+        x = self.dense(x)
+        x = ACT2FN['tanh'](x)
+        x = self.out_proj(x)
+        return x
+
+
+class BertForSequenceClassification(Module):
+
+    def __init__(self,
+                 num_layers,
+                 num_heads,
+                 hidden_size,
+                 vocab_size,
+                 hidden_act,
+                 max_position_embeddings,
+                 type_vocab_size,
+                 pad_token_id=None,
+                 is_roberta=False,
+                 num_labels=2,
+                 mapping=Mapping(),
+                 dtype=None):
+        super().__init__()
+        self.is_roberta = is_roberta
+        self.bert = BertModel(num_layers=num_layers,
+                              num_heads=num_heads,
+                              hidden_size=hidden_size,
+                              vocab_size=vocab_size,
+                              hidden_act=hidden_act,
+                              max_position_embeddings=max_position_embeddings,
+                              type_vocab_size=type_vocab_size,
+                              pad_token_id=pad_token_id,
+                              is_roberta=is_roberta,
+                              mapping=mapping,
+                              dtype=dtype)
+        self.num_labels = num_labels
+
+        if not is_roberta:
+            self.pooler = BertPooler(hidden_size=hidden_size, dtype=dtype)
+            self.classifier = Linear(hidden_size, num_labels, dtype=dtype)
+        else:
+            self.classifier = RobertaClassificationHead(hidden_size=hidden_size,
+                                                        num_labels=num_labels,
+                                                        dtype=dtype)
+
+    def forward(self,
+                input_ids=None,
+                input_lengths=None,
+                token_type_ids=None,
+                position_ids=None,
+                hidden_states=None):
+
+        hidden_states = self.bert.forward(input_ids=input_ids,
+                                          input_lengths=input_lengths,
+                                          token_type_ids=token_type_ids,
+                                          position_ids=position_ids,
+                                          hidden_states=hidden_states)
+
+        if not self.is_roberta:
+            pooled_output = self.pooler(hidden_states)
+            logits = self.classifier(pooled_output)
+        else:
+            logits = self.classifier(hidden_states)
 
         return logits

@@ -94,6 +94,7 @@ def quantize_and_export(
 
     model_cls_name = type(model).__name__
     model_lookup = {
+        ("xverse", ): "xverse",
         ("llama", "mistral"): "llama",
         ("gptj", ): "gptj",
         ("falcon", "rw"): "falcon",
@@ -128,6 +129,7 @@ def quantize_and_export(
                     torch.float16,
                     export_dir=export_path,
                     inference_tensor_parallel=tensor_parallel_size,
+                    export_npz=True,
                 )
         logger.info(f"Quantized model exported to :{export_path}")
     return model
