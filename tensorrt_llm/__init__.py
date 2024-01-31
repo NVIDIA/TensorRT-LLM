@@ -66,10 +66,3 @@ __all__ = [
 _init(log_level="error")
 
 print(f"[TensorRT-LLM] TensorRT-LLM version: {__version__}", end='')
-try:
-    import subprocess
-    print(
-        f", commit: {subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('ascii').strip()}"
-    )
-except:
-    print(f"")
