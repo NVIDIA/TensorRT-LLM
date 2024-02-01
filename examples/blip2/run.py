@@ -107,7 +107,7 @@ def ptuning_setup(prompt_table, dtype, hidden_size, tasks, input_ids,
     else:
         tasks = torch.zeros([num_sequences], dtype=torch.int32).cuda()
 
-    return [prompt_table, tasks, task_vocab_size]
+    return {'prompt_embedding_table': prompt_table, 'tasks': tasks, 'prompt_vocab_size': task_vocab_size}
 
 
 def parse_arguments():
@@ -282,11 +282,11 @@ if __name__ == '__main__':
 
             if tensorrt_llm_opt.remove_input_padding:
                 output_ids = tensorrt_llm_opt.decode_batch(
-                    input_ids, sampling_config, *ptuning_args)
+                    input_ids, sampling_config, **ptuning_args)
             else:
                 output_ids = tensorrt_llm_opt.decode(input_ids, input_lengths,
                                                      sampling_config,
-                                                     *ptuning_args)
+                                                     **ptuning_args)
 
             torch.cuda.synchronize()
 
