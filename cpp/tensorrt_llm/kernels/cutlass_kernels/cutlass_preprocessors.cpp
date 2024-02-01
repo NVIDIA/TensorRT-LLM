@@ -376,7 +376,7 @@ void subbyte_transpose(int8_t* transposed_quantized_tensor, const int8_t* quanti
     }
     else
     {
-        TLLM_CHECK_WITH_INFO(false, "Invalid quant_tye");
+        TLLM_CHECK_WITH_INFO(false, "Invalid quant_type");
     }
 }
 
