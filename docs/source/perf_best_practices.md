@@ -222,7 +222,7 @@ inputs and outputs.
 There currently are two batch scheduler policies: `MAX_UTILIZATION` and
 `GUARANTEED_NO_EVICT`.
 
-As explained in the [GPT Manager Ddesign](batch_manager.md#gptmanager-design)
+As explained in the [GPT Manager Design](batch_manager.md#gptmanager-design)
 section, the scheduling policy can be set to `MAX_UTILIZATION` to pack as many
 requests as possible at each iteration of the forward loop, when in-flight
 sequence batching is enabled. It maximizes the utilization of the GPUs by
