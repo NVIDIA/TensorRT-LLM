@@ -123,7 +123,7 @@ docker run -it -m 12g -v .\trt-llm-build:C:\workspace\trt-llm-build tensorrt-llm
 
 Clone and setup the TensorRT-LLM repository within the container:
 ```
-git clone https://github.com/NVIDIA/TensorRT-LLM.git
+git clone --branch rel https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
 git submodule update --init --recursive
 ```
