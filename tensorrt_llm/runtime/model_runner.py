@@ -250,13 +250,14 @@ class ModelRunnerMixin:
 
             if 'generation_logits' in outputs and isinstance(
                     self.session, GenerationSession):
-                generation_logits = torch.stack(outputs['generation_logits'],
-                                                dim=1)
-                batch_x_beam, max_gen_len, voc_size = generation_logits.size()
-                num_beams = batch_x_beam // batch_size
-                generation_logits = generation_logits.view(
-                    batch_size, num_beams, max_gen_len, voc_size)
-                outputs['generation_logits'] = generation_logits
+                if outputs['generation_logits']:
+                    generation_logits = torch.stack(outputs['generation_logits'],
+                                                    dim=1)
+                    batch_x_beam, max_gen_len, voc_size = generation_logits.size()
+                    num_beams = batch_x_beam // batch_size
+                    generation_logits = generation_logits.view(
+                        batch_size, num_beams, max_gen_len, voc_size)
+                    outputs['generation_logits'] = generation_logits
 
         return outputs
 
