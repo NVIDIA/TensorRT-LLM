@@ -10,7 +10,7 @@ from transformers import AutoModel
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="distil-large-v2", help="Model name")
+    parser.add_argument("--model_name", type=str, default="distil-whisper/distil-large-v2", help="Model name")
     parser.add_argument("--cache_dir", type=str, default=None, help="Cache directory")
     parser.add_argument("--output_dir", type=str, default="./assets/", help='Store the "translated" model here')
     parser.add_argument("--output_name", type=str, default="distil-large-v2", help="Output model name")
@@ -46,6 +46,7 @@ def main():
 
     for key, value in tqdm(original_model_state_dict.items()):
         new_state_dict[translate(key)] = value
+    print("Param keys have been changed. Saving the model...")
     
     pytorch_model = {
         "model_dims": model_dims,
@@ -54,9 +55,8 @@ def main():
 
     output_path = Path(output_dir) / f"{output_name}.pt"
     torch.save(pytorch_model, output_path)
-
-if __name__ == "__main__":
-    main()
+    print("Model saved to ", output_path)
+    print("Kindly use that to build the tensorrt_llm engine.")
 
 def translate(current_param):
     for pattern, repl in reverse_translation.items():
@@ -95,3 +95,6 @@ reverse_translation = OrderedDict({
     r"^decoder\.layers\.(\d+)\.fc2\.(\w+)$": r"decoder.blocks.\1.mlp.2.\2",
     r"^decoder\.layers\.(\d+)\.final_layer_norm\.(\w+)$": r"decoder.blocks.\1.mlp_ln.\2",
 })
+
+if __name__ == "__main__":
+    main()
