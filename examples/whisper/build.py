@@ -59,6 +59,7 @@ def parse_arguments():
                         choices=[
                             "large-v3",
                             "large-v2",
+                            "distil-large-v2"
                         ])
     parser.add_argument('--quantize_dir', type=str, default="quantize/1-gpu")
     parser.add_argument('--dtype',
