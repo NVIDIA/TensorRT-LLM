@@ -23,9 +23,11 @@ def main():
     output_name = args.output_name
     
     if cache_dir is not None:
-        model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir)
+        print("Trying to load the model from the cache")
+        model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir, use_safetensors=False)
     else:
-        model = AutoModel.from_pretrained(model_name)
+        print("Downloading the model:")
+        model = AutoModel.from_pretrained(model_name, use_safetensors=False)
     
     config = model.config
     model_dims = {
@@ -49,8 +51,8 @@ def main():
     print("Param keys have been changed. Saving the model...")
     
     pytorch_model = {
-        "model_dims": model_dims,
-        "state_dict": new_state_dict
+        "dims": model_dims,
+        "model_state_dict": new_state_dict
     }
 
     output_path = Path(output_dir) / f"{output_name}.pt"
