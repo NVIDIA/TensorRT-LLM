@@ -80,7 +80,6 @@ python3 convert_checkpoint.py --model_dir ./opt-66b \
 # OPT-125M
 trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/1-gpu/ \
                 --gemm_plugin float16 \
-                --gpt_attention_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
                 --max_output_len 100 \
@@ -89,7 +88,6 @@ trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/1-gpu/ \
 # OPT-350M
 trtllm-build --checkpoint_dir ./opt/350M/trt_ckpt/fp16/1-gpu/ \
                 --gemm_plugin float16 \
-                --gpt_attention_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
                 --max_output_len 100 \
@@ -98,7 +96,6 @@ trtllm-build --checkpoint_dir ./opt/350M/trt_ckpt/fp16/1-gpu/ \
 # OPT-2.7B
 trtllm-build --checkpoint_dir ./opt/2.7B/trt_ckpt/fp16/1-gpu/ \
                 --gemm_plugin float16 \
-                --gpt_attention_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
                 --max_output_len 100 \
@@ -107,7 +104,6 @@ trtllm-build --checkpoint_dir ./opt/2.7B/trt_ckpt/fp16/1-gpu/ \
 # OPT-66B
 trtllm-build --checkpoint_dir ./opt/66B/trt_ckpt/fp16/4-gpu/ \
                 --gemm_plugin float16 \
-                --gpt_attention_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
                 --max_output_len 100 \
@@ -176,7 +172,7 @@ Note `--context_fmha enable` / `--context_fmha_fp32_acc enable` has to be used t
 Since the embedding lookup table can be several gigabytes in size. We can distribute this weight across multiple GPUs in order to reduce the memory consumption per GPU.
 
 ### 1. Enable this feature
-To enable this feature, add the flag `--use_parallel_embedding` to `build.py`.
+To enable this feature, add the flag `--use_parallel_embedding` to `trtllm-build`.
 
 ### 2. Choose the dimension for tensor parallelism
 
@@ -208,7 +204,6 @@ python3 convert_checkpoint.py --model_dir ./opt-125m \
 
 trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/2-gpu/ \
                 --gemm_plugin float16 \
-                --gpt_attention_plugin float16 \
                 --lookup_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
@@ -231,7 +226,6 @@ mpirun -n 2 --allow-run-as-root \
 ```Bash
 trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/2-gpu/ \
                 --gemm_plugin float16 \
-                --gpt_attention_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
                 --max_output_len 100 \

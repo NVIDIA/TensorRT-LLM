@@ -40,7 +40,6 @@ trtllm-build \
     --checkpoint_dir ./phi-2-checkpoint \
     --output_dir ./phi-2-engine \
     --gemm_plugin float16 \
-    --gpt_attention_plugin float16 \
     --max_batch_size 8 \
     --max_input_len 1024 \
     --max_output_len 1024 \

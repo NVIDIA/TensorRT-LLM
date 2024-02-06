@@ -65,7 +65,7 @@ python3 convert_checkpoint.py --model_dir ./gptneox_model \
 # Single GPU
 trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/fp16/1-gpu/ \
              --gemm_plugin float16 \
-             --gpt_attention_plugin float16 \
+             --paged_kv_cache disable \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -73,7 +73,7 @@ trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/fp16/1-gpu/ \
 # With 2-way Tensor Parallel
 trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/fp16/2-gpu/ \
              --gemm_plugin float16 \
-             --gpt_attention_plugin float16 \
+             --paged_kv_cache disable \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -82,7 +82,7 @@ trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/fp16/2-gpu/ \
 # Single GPU with int8 weight only
 trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int8_wo/1-gpu/ \
              --gemm_plugin float16 \
-             --gpt_attention_plugin float16 \
+             --paged_kv_cache disable \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -90,7 +90,7 @@ trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int8_wo/1-gpu/ \
 # With 2-way Tensor Parallel with int8 weight only
 trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int8_wo/2-gpu/ \
              --gemm_plugin float16 \
-             --gpt_attention_plugin float16 \
+             --paged_kv_cache disable \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -179,7 +179,7 @@ The command to build TensorRT engines to apply GPTQ are almost no change:
 # Single GPU
 trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int4_gptq/1-gpu/ \
              --gemm_plugin float16 \
-             --gpt_attention_plugin float16 \
+             --paged_kv_cache disable \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \
@@ -187,7 +187,7 @@ trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int4_gptq/1-gpu/ \
 # With 2-way Tensor Parallel
 trtllm-build --checkpoint_dir ./gptneox/20B/trt_ckpt/int4_gptq/2-gpu/ \
              --gemm_plugin float16 \
-             --gpt_attention_plugin float16 \
+             --paged_kv_cache disable \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_output_len 100 \

@@ -5,17 +5,30 @@ import sys
 from argparse import ArgumentParser
 from typing import List, Optional
 
+import torch
+
 from tensorrt_llm import LLM, ModelConfig
+from tensorrt_llm.hlapi.utils import get_device_count
 
 # NOTE, Currently, the following examples are only available for LLaMA models.
 
 
 def run_llm_from_huggingface_model(prompts: List[str],
                                    llama_model_dir: str,
-                                   dump_engine_dir: Optional[str] = None):
+                                   dump_engine_dir: Optional[str] = None,
+                                   tp_size: int = 1):
     ''' Loading a HuggingFace model. '''
-    # Load the model from a local HuggingFace model
+    if get_device_count() < tp_size:
+        print(
+            "Skip the example for TP!!! Since the number of GPUs is less than required"
+        )
+        return
+    if tp_size > 1:
+        print(f'Running LLM with Tensor Parallel on {tp_size} GPUs.')
+
     config = ModelConfig(llama_model_dir)
+    config.parallel_config.tp_size = tp_size
+
     llm = LLM(config)
     if dump_engine_dir:
         llm.save(dump_engine_dir)
@@ -25,19 +38,9 @@ def run_llm_from_huggingface_model(prompts: List[str],
 
 
 def run_llm_from_tllm_engine(prompts: List[str], llama_engine_dir: str):
-    ''' Loading a built TensorRT-LLM engine.  '''
+    ''' Loading a built TensorRT-LLM engine. '''
+
     config = ModelConfig(llama_engine_dir)
-    llm = LLM(config)
-
-    for output in llm.generate(prompts):
-        print(output)
-
-
-def run_llm_on_tensor_parallel(prompts: List[str], llama_model_dir: str):
-    ''' Running LLM with Tensor Parallel on multiple GPUs. '''
-    config = ModelConfig(llama_model_dir)
-    config.parallel_config.tp_size = 2  # 2 GPUs
-
     llm = LLM(config)
 
     for output in llm.generate(prompts):
@@ -46,11 +49,22 @@ def run_llm_on_tensor_parallel(prompts: List[str], llama_model_dir: str):
 
 def run_llm_generate_async_example(prompts: List[str],
                                    llama_model_dir: str,
-                                   streaming: bool = False):
+                                   streaming: bool = False,
+                                   tp_size: int = 1):
     ''' Running LLM generation asynchronously. '''
-    config = ModelConfig(llama_model_dir)
 
-    llm = LLM(config, async_mode=True)
+    if get_device_count() < tp_size:
+        print(
+            "Skip the example for TP!!! Since the number of GPUs is less than required"
+        )
+        return
+    if tp_size > 1:
+        print(f'Running LLM with Tensor Parallel on {tp_size} GPUs.')
+
+    config = ModelConfig(llama_model_dir)
+    config.parallel_config.tp_size = tp_size
+
+    llm = LLM(config, async_mode=True, kvcahe_free_gpu_memory_fraction=0.4)
 
     async def task(prompt: str):
         outputs = []
@@ -67,17 +81,28 @@ def run_llm_generate_async_example(prompts: List[str],
 
 def run_llm_with_quantization(prompts: List[str],
                               llama_model_dir: str,
-                              engine_dump_dir: Optional[str] = None,
                               quant_type: str = 'int4_awq'):
     ''' Running LLM with quantization.
     quant_type could be 'int4_awq' or 'fp8'.
     '''
+
+    major, minor = torch.cuda.get_device_capability()
+    if not (major >= 8):
+        print("Quantization currently only supported on post Ampere")
+        return
+
+    if 'fp8' in quant_type:
+        if not (major > 8):
+            print("Hopper GPUs are required for fp8 quantization")
+            return
 
     config = ModelConfig(llama_model_dir)
     if quant_type == 'int4_awq':
         config.quant_config.init_from_description(quantize_weights=True,
                                                   use_int4_weights=True,
                                                   per_group=True)
+        config.quant_config.quantize_lm_head = True
+
     else:
         config.quant_config.set_fp8_qdq()
         config.quant_config.set_fp8_kv_cache()
@@ -100,6 +125,8 @@ def _parse_arguments():
                         default=None)
     parser.add_argument('--quant_type', type=str, choices=['int4_awq', 'fp8'])
     parser.add_argument('--prompt', type=str, required=True)
+    parser.add_argument('--tp_size', type=int, default=1)
+    parser.add_argument('--streaming', action='store_true')
     return parser.parse_args()
 
 
@@ -117,16 +144,19 @@ if __name__ == '__main__':
 
     tasks = dict(
         run_llm_from_huggingface_model=lambda: run_llm_from_huggingface_model(
-            [args.prompt], args.hf_model_dir, args.dump_engine_dir),
+            [args.prompt],
+            args.hf_model_dir,
+            args.dump_engine_dir,
+            tp_size=args.tp_size),
         run_llm_from_tllm_engine=lambda: run_llm_from_tllm_engine(
             [args.prompt], args.dump_engine_dir),
-        run_llm_on_tensor_parallel=lambda: run_llm_on_tensor_parallel(
-            [args.prompt], args.hf_model_dir),
         run_llm_generate_async_example=lambda: run_llm_generate_async_example(
-            [args.prompt], args.hf_model_dir),
-        run_llm_with_quantization=lambda: run_llm_with_quantization([
-            args.prompt
-        ], args.hf_model_dir, args.dump_engine_dir, args.quant_type),
+            [args.prompt],
+            args.hf_model_dir,
+            tp_size=args.tp_size,
+            streaming=args.streaming),
+        run_llm_with_quantization=lambda: run_llm_with_quantization(
+            [args.prompt], args.hf_model_dir, args.quant_type),
     )
 
     print(f'Running {args.task} ...')

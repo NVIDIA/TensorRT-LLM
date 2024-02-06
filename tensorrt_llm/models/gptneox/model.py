@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from ..._common import default_net
 from ..._utils import pad_vocab_size
 from ...functional import PositionEmbeddingType, Tensor
 from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
@@ -117,6 +118,8 @@ class GPTNeoXModel(Module):
                 attention_params=None):
         hidden_states = self.vocab_embedding(input_ids)
 
+        assert default_net(
+        ).plugin_config.paged_kv_cache == False, "Paged KV cache is not supported for this model yet, will add in future release"
         kv_cache_params.fill_none_tensor_list(len(self.layers))
 
         if use_cache:

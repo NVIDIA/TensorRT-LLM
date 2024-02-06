@@ -3773,9 +3773,10 @@ def gpt_attention(
             context_lengths,
             host_request_types,
         ]
-
     if use_cache:
         if paged_kv_cache_flag:
+            assert kv_cache_block_pointers is not None, "Paged kv cache is enabled, the kv_cache_block_pointers tensor shall not be None"
+            assert host_kv_cache_block_pointers is not None, "Paged kv cache is enabled, the host_kv_cache_block_pointers tensor shall not be None"
             plug_inputs += [
                 kv_cache_block_pointers, host_kv_cache_block_pointers
             ]
@@ -3804,6 +3805,9 @@ def gpt_attention(
         # add position_ids as well only if medusa mode
         assert medusa_position_offsets is not None
         plug_inputs += [medusa_packed_mask, medusa_position_offsets]
+
+    for idx, i in enumerate(plug_inputs):
+        assert i is not None, f"Found None input for {idx} th item in plugin inputs {plug_inputs}"
 
     plug_inputs = [i.trt_tensor for i in plug_inputs]
     layer = default_trtnet().add_plugin_v2(plug_inputs, attn_plug)

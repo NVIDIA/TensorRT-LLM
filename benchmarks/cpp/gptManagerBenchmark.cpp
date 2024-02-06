@@ -503,7 +503,8 @@ std::tuple<std::vector<std::vector<int32_t>>, std::vector<int32_t>, std::vector<
 std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId,
     std::tuple<std::vector<std::vector<int32_t>>, std::vector<int32_t>, std::vector<float>> const& dataset,
     std::size_t sample_idx, ITensor::SharedPtr const& beamWidthTensor, ITensor::SharedPtr const& eosId,
-    ITensor::SharedPtr const& padId, BufferManager const& bufferManager)
+    ITensor::SharedPtr const& padId, BufferManager const& bufferManager,
+    ITensor::SharedPtr const& returnContextLogits = nullptr, ITensor::SharedPtr const& returnGenerationLogits = nullptr)
 {
     auto request = std::make_shared<InferenceRequest>(reqId);
     auto const& inputIds = (std::get<0>(dataset))[sample_idx];
@@ -521,6 +522,14 @@ std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId,
     {
         request->setPadId(padId);
     }
+    if (returnContextLogits)
+    {
+        request->setReturnContextLogits(returnContextLogits);
+    }
+    if (returnGenerationLogits)
+    {
+        request->setReturnGenerationLogits(returnGenerationLogits);
+    }
     return request;
 }
 
@@ -528,7 +537,8 @@ void benchmarkGptManager([[maybe_unused]] std::string const& modelName, std::fil
     std::string const& type, std::string const& datasetPath, std::string const& opCsvFile, int maxNumSamples,
     int beamWidth, int warmUp, const std::optional<int32_t>& eosId, const std::optional<int32_t>& padId,
     std::shared_ptr<nvinfer1::ILogger> const& logger, TrtGptModelOptionalParams const& optionalParams,
-    batch_scheduler::SchedulerPolicy schedulerPolicy, int waitSleep)
+    batch_scheduler::SchedulerPolicy schedulerPolicy, int waitSleep, bool returnContextLogits,
+    bool returnGenerationLogits)
 {
     auto const worldConfig = WorldConfig::mpi();
 
@@ -567,6 +577,14 @@ void benchmarkGptManager([[maybe_unused]] std::string const& modelName, std::fil
     ITensor::SharedPtr padIdTensor{
         padId ? bufferManager.copyFrom(&padId.value(), ITensor::makeShape({1}), MemoryType::kPINNED) : nullptr};
 
+    ITensor::SharedPtr returnContextLogitsFlagTensor{returnContextLogits
+            ? bufferManager.copyFrom(&returnContextLogits, ITensor::makeShape({1}), MemoryType::kPINNED)
+            : nullptr};
+
+    ITensor::SharedPtr returnGenerationLogitsFlagTensor{returnGenerationLogits
+            ? bufferManager.copyFrom(&returnGenerationLogits, ITensor::makeShape({1}), MemoryType::kPINNED)
+            : nullptr};
+
     if (worldConfig.getRank() == 0)
     {
         // Warm up
@@ -585,7 +603,9 @@ void benchmarkGptManager([[maybe_unused]] std::string const& modelName, std::fil
         recorder->initialize();
         for (std::size_t i = 0; i < numSamples; ++i)
         {
-            auto request = makeRequest(i + 1, samples, i, beamWidthTensor, eosIdTensor, padIdTensor, bufferManager);
+            auto request = makeRequest(i + 1, samples, i, beamWidthTensor, eosIdTensor, padIdTensor, bufferManager,
+                returnContextLogitsFlagTensor, returnGenerationLogitsFlagTensor);
+
             gptServer->enqueue(request);
             auto delayInMs = int(std::get<2>(samples)[i] * 1000);
 
@@ -640,6 +660,10 @@ int main(int argc, char* argv[])
         "enable_trt_overlap", "Overlap TRT context preparation and execution", cxxopts::value<bool>());
     options.add_options()("enable_kv_cache_reuse", "Enables the KV cache reuse.", cxxopts::value<bool>());
     options.add_options()("enable_chunked_context", "Whether to enable context chunking.", cxxopts::value<bool>());
+    options.add_options()(
+        "return_context_logits", "Whether to return context logits.", cxxopts::value<bool>()->default_value("0"));
+    options.add_options()(
+        "return_generation_logits", "Whether to return generation logits.", cxxopts::value<bool>()->default_value("0"));
 
     options.add_options()("scheduler_policy", "Choose scheduler policy between max_utilization/guaranteed_no_evict.",
         cxxopts::value<std::string>()->default_value("guaranteed_no_evict"));
@@ -714,6 +738,18 @@ int main(int argc, char* argv[])
     {
         optionalParams.enableChunkedContext = result["enable_chunked_context"].as<bool>();
     }
+    // Argument: Enable return context logits
+    bool returnContextLogits = false;
+    if (result.count("return_context_logits"))
+    {
+        returnContextLogits = result["return_context_logits"].as<bool>();
+    }
+    // Argument: Enable return context logits
+    bool returnGenerationLogits = false;
+    if (result.count("return_generation_logits"))
+    {
+        returnGenerationLogits = result["return_generation_logits"].as<bool>();
+    }
 
     std::optional<int32_t> padId;
     // Argument: Padding token id
@@ -781,7 +817,7 @@ int main(int argc, char* argv[])
     {
         benchmarkGptManager(result["model"].as<std::string>(), result["engine_dir"].as<std::string>(), type,
             datasetPath, opCsvFile, maxNumSamples, beamWidth, result["warm_up"].as<int>(), eosId, padId, logger,
-            optionalParams, schedulerPolicy, waitSleep);
+            optionalParams, schedulerPolicy, waitSleep, returnContextLogits, returnGenerationLogits);
     }
     catch (const std::exception& e)
     {

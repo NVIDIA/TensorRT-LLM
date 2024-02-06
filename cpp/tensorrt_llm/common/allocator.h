@@ -69,7 +69,7 @@ public:
             else
             {
                 assert(realloc == ReallocType::REUSE);
-                TLLM_LOG_DEBUG("Reuse original buffer %p with size %d and do nothing for reMalloc.", ptr, sizeAligned);
+                TLLM_LOG_DEBUG("Reuse original buffer %p with size %lu and do nothing for reMalloc.", ptr, sizeAligned);
                 if (setZero)
                 {
                     memSet(ptr, 0, sizeAligned);

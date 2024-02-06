@@ -169,7 +169,7 @@ void DynamicDecodeLayer<T>::allocateBuffer(size_t batch_size, size_t beam_width,
     TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     mIdsPtrHost->resize(2 * batch_size);
     zero_parent_ids = mAllocator->reMalloc(zero_parent_ids, sizeof(int*) * 2 * batch_size, false);
-    const size_t workspace_size = sizeof(int*) * batch_size * beam_width * vocab_size_;
+    const size_t workspace_size = sizeof(int) * batch_size * beam_width * vocab_size_;
     if (beam_width == 1)
     { // sampling layers
         top_k_workspace = mAllocator->reMalloc(top_k_workspace, workspace_size, false);

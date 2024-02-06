@@ -25,8 +25,8 @@ from ... import profiler
 from ..._utils import pad_vocab_size
 from ...functional import RotaryScalingType, Tensor, recv, send
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, FusedGatedMLP, GatedMLP, MoeConfig,
-                       PositionEmbeddingType, PromptTuningEmbedding, RmsNorm)
+                       Embedding, GatedMLP, MoeConfig, PositionEmbeddingType,
+                       PromptTuningEmbedding, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module
 from ...plugin import init_all_reduce_helper
@@ -84,8 +84,6 @@ class LLaMADecoderLayer(Module):
                 "tp_rank":
                 config.mapping.tp_rank,
             }
-        elif config.use_fused_mlp:
-            ClsMLP = FusedGatedMLP
 
         self.mlp = ClsMLP(hidden_size=config.hidden_size,
                           ffn_hidden_size=mlp_hidden_size,
@@ -251,7 +249,6 @@ class LLaMAForCausalLM(DecoderModelForCausalLM, TopModelMixin):
         config.set_if_not_exist('rotary_scaling', None)
         config.set_if_not_exist('enable_pos_shift', False)
         config.set_if_not_exist('dense_context_fmha', False)
-        config.set_if_not_exist('use_fused_mlp', False)
         config.set_if_not_exist('moe_num_experts', 0)
         config.set_if_not_exist('moe_top_k', 0)
         config.set_if_not_exist('moe_tp_mode',
@@ -422,12 +419,13 @@ class LLaMAForCausalLM(DecoderModelForCausalLM, TopModelMixin):
         if ammo_qformat == 'fp8':
             return load_from_fp8_llama(
                 str(ckpt),
-                hf_config,
+                hf_config.num_hidden_layers,
                 cfg.mapping,
                 fp8_kv_cache=quant_mode.has_fp8_kv_cache())
         else:
             return load_from_awq_llama(str(ckpt),
-                                       hf_config,
+                                       hf_config.num_hidden_layers,
+                                       hf_config.vocab_size,
                                        cfg.mapping,
                                        dtype=dtype)
 

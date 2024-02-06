@@ -99,6 +99,7 @@ config.quant_config.init_from_description(
                        quantize_weights=True,
                        use_int4_weights=True,
                        per_group=True)
+config.quant_config.quantize_lm_head = True
 
 llm = LLM(config)
 ```

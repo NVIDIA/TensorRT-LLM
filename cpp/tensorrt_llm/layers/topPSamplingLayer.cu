@@ -134,8 +134,8 @@ void TopPSamplingLayer<T>::allocateBuffer(size_t batchSize)
     top_p_reset_ids_buf_ = mAllocator->reMalloc(top_p_reset_ids_buf_, deviceBufferSizes[9], false);
     setup_workspace_buf_ = mAllocator->reMalloc(setup_workspace_buf_, deviceBufferSizes[10], false);
 
-    auto const bytesAllocated = std::accumulate(deviceBufferSizes.begin(), deviceBufferSizes.end(), 0);
-    TLLM_LOG_DEBUG("topPSamplingLayer allocated %d bytes on GPU", bytesAllocated);
+    auto const bytesAllocated = std::accumulate(deviceBufferSizes.begin(), deviceBufferSizes.end(), (size_t) 0);
+    TLLM_LOG_DEBUG("topPSamplingLayer allocated %lu bytes on GPU", (size_t) bytesAllocated);
 
     mIsAllocateBuffer = true;
 }

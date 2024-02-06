@@ -2,7 +2,8 @@ import argparse
 import json
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
 
 import safetensors
@@ -658,6 +659,7 @@ if __name__ == '__main__':
     world_size = args.tp_size * args.pp_size
     assert args.pp_size == 1, "Pipeline parallelism is not supported."
 
+    tensorrt_llm.logger.set_level('info')
     tik = time.time()
 
     if not os.path.exists(args.output_dir):
@@ -719,43 +721,51 @@ if __name__ == '__main__':
                           tp_size=args.tp_size,
                           pp_size=args.pp_size)
 
-        try:
-            if args.use_weight_only and args.weight_only_precision == 'int4_gptq':
-                weights, group_size = load_from_gptq_gptneox(
-                    args.ammo_quant_ckpt_path,
-                    hf_config,
-                    use_parallel_embedding=args.use_parallel_embedding,
-                    sharding_dim=args.embedding_sharding_dim,
-                    share_embedding_table=args.use_embedding_sharing,
-                    mapping=mapping,
-                    dtype=args.dtype)
-            else:
-                weights = convert_hf_gptneox(
-                    hf_model,
-                    mapping,
-                    dtype=args.dtype,
-                    use_weight_only=args.use_weight_only,
-                    plugin_weight_only_quant_type=plugin_weight_only_quant_type,
-                    use_parallel_embedding=args.use_parallel_embedding,
-                    sharding_dim=args.embedding_sharding_dim,
-                    share_embedding_table=args.use_embedding_sharing)
-            safe_save_path = os.path.join(args.output_dir,
-                                          f'rank{rank}.safetensors')
-            tensorrt_llm.logger.info(f'Saving safetensors to: {safe_save_path}')
-            safetensors.torch.save_file(weights, safe_save_path)
-            tensorrt_llm.logger.info(f'Saved safetensors to: {safe_save_path}')
-        except Exception as e:
-            tensorrt_llm.logger.info(f'Excepting when converting, {e}')
+        if args.use_weight_only and args.weight_only_precision == 'int4_gptq':
+            weights = load_from_gptq_gptneox(
+                args.ammo_quant_ckpt_path,
+                hf_config,
+                use_parallel_embedding=args.use_parallel_embedding,
+                sharding_dim=args.embedding_sharding_dim,
+                share_embedding_table=args.use_embedding_sharing,
+                mapping=mapping,
+                dtype=args.dtype)
+        else:
+            weights = convert_hf_gptneox(
+                hf_model,
+                mapping,
+                dtype=args.dtype,
+                use_weight_only=args.use_weight_only,
+                plugin_weight_only_quant_type=plugin_weight_only_quant_type,
+                use_parallel_embedding=args.use_parallel_embedding,
+                sharding_dim=args.embedding_sharding_dim,
+                share_embedding_table=args.use_embedding_sharing)
+        safe_save_path = os.path.join(args.output_dir,
+                                      f'rank{rank}.safetensors')
+        tensorrt_llm.logger.info(f'Saving safetensors to: {safe_save_path}')
+        safetensors.torch.save_file(weights, safe_save_path)
+        tensorrt_llm.logger.info(f'Saved safetensors to: {safe_save_path}')
+        return True
 
     if args.workers == 1:
         for rank in range(world_size):
-            covert_and_save(rank)
+            passed = covert_and_save(rank)
+            assert passed, "Convert checkpoint failed"
     else:
         with ThreadPoolExecutor(max_workers=args.workers) as p:
             futures = [
                 p.submit(covert_and_save, rank) for rank in range(world_size)
             ]
-            wait(futures)
+            exceptions = []
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    traceback.print_exc()
+                    exceptions.append(e)
+            assert len(
+                exceptions
+            ) == 0, "Checkpoint conversion failed, please check error log."
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

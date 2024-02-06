@@ -32,9 +32,9 @@ Multimodal models' LLM part has an additional parameter `--max_multimodal_len` c
         --dtype bfloat16 \
         --max_beam_width 1 \
         --max_batch_size 8 \
-        --max_multimodal_len 256 \ # 8 (max_batch_size) * 32 (num_visual_features)
-        --max_encoder_input_len 924 \ # change if LLM text input range is known
-        --max_output_len 100
+        --max_encoder_input_len 924 \
+        --max_output_len 100 \
+        --max_multimodal_len 256 # 8 (max_batch_size) * 32 (num_visual_features)
     ```
 
     **NOTE**: `max_multimodal_len = max_batch_size * num_visual_features`, so if you change max_batch_size, max multimodal length **MUST** be changed accordingly.
@@ -44,16 +44,18 @@ Multimodal models' LLM part has an additional parameter `--max_multimodal_len` c
 3.  Build TensorRT engines for visual components
 
     ```bash
-    python build_visual_engine.py --model_name ${MODEL_NAME} --model_path tmp/hf_models/${MODEL_NAME}
+    python build_visual_engine.py --model_name ${MODEL_NAME} --model_path tmp/hf_models/${MODEL_NAME} --max_batch_size 8
     ```
 
     The built engines are located in `./visual_engines/${MODEL_NAME}`.
+
+    To run the BLIP2 pipeline with batch size > 1, change `--max_batch_size` argument to `build_visual_engine.py` accordingly.
 
 4. Assemble everything into BLIP2 pipeline
 
     ```bash
     python run.py \
-        --blip_encoder \
+        --blip2_encoder \
         --max_new_tokens 30 \
         --input_text "Question: which city is this? Answer:" \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
@@ -85,7 +87,6 @@ OPT pipeline needs few minor changes from T5 pipeline
     trtllm-build \
         --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
         --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
-        --gpt_attention_plugin float16 \
         --gemm_plugin float16 \
         --max_beam_width 1 \
         --max_batch_size 8 \
@@ -96,7 +97,7 @@ OPT pipeline needs few minor changes from T5 pipeline
     python build_visual_engine.py --model_name ${MODEL_NAME} --model_path tmp/hf_models/${MODEL_NAME}
 
     python run.py \
-        --blip_encoder \
+        --blip2_encoder \
         --max_new_tokens 30 \
         --input_text "Question: which city is this? Answer:" \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
@@ -117,7 +118,6 @@ OPT pipeline needs few minor changes from T5 pipeline
     trtllm-build \
         --checkpoint_dir tmp/trt_models/${MODEL_NAME}/int4_weightonly/1-gpu \
         --output_dir trt_engines/${MODEL_NAME}/int4_weightonly/1-gpu \
-        --gpt_attention_plugin float16 \
         --gemm_plugin float16 \
         --max_beam_width 1 \
         --max_batch_size 8 \
@@ -145,16 +145,20 @@ OPT pipeline needs few minor changes from T5 pipeline
 2. Generate TRT-LLM engine for LLaMA following example in `examples/llama/README.md`
 
     ```bash
-    python ../llama/build.py \
+    python ../llama/convert_checkpoint.py \
         --model_dir tmp/hf_models/${MODEL_NAME} \
+        --output_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
+        --dtype float16
+
+    trtllm-build \
+        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
         --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
-        --dtype float16 \
         --gpt_attention_plugin float16 \
         --gemm_plugin float16 \
         --max_batch_size 1 \
-        --max_multimodal_len 576 \ # 1 (max_batch_size) * 576 (num_visual_features)
         --max_input_len 2048 \
-        --max_output_len 512
+        --max_output_len 512 \
+        --max_multimodal_len 576 # 1 (max_batch_size) * 576 (num_visual_features)
     ```
 
 3.  Build TensorRT engines for visual components
@@ -174,6 +178,29 @@ OPT pipeline needs few minor changes from T5 pipeline
         --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
         --decoder_llm
     ```
+
+5. INT8/INT4 weight-only quantization for LLaMA can be enabled as follows (take `INT4` as an example, while `INT8` is the default precision for weight-only quantization):
+    ```bash
+    python ../llama/convert_checkpoint.py \
+        --model_dir tmp/hf_models/${MODEL_NAME} \
+        --dtype float16 \
+        --output_dir tmp/trt_models/${MODEL_NAME}/int4_weightonly/1-gpu \
+        --use_weight_only \
+        --weight_only_precision int4
+
+    trtllm-build \
+        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/int4_weightonly/1-gpu \
+        --output_dir trt_engines/${MODEL_NAME}/int4_weightonly/1-gpu \
+        --gpt_attention_plugin float16 \
+        --gemm_plugin float16 \
+        --max_batch_size 1 \
+        --max_input_len 924 \
+        --max_output_len 100 \
+        --max_multimodal_len 576
+    ```
+
+    The built engines lie in `trt_engines/${MODEL_NAME}/int4_weightonly/1-gpu`.
+    You should use this directory as `--llm_engine_dir` argument to `run.py`
 
 ## Nougat
 
@@ -201,14 +228,14 @@ OPT pipeline needs few minor changes from T5 pipeline
         -o trt_engines/${MODEL_NAME}/1-gpu \
         --engine_name $MODEL_NAME \
         --bert_attention_plugin \
-        --gpt_attention_plugin \
+        --use_gpt_attention_plugin \
         --use_gemm_plugin \
         --dtype bfloat16 \
         --max_beam_width 1 \
         --max_batch_size 1 \
         --nougat \
-        --max_multimodal_len 588 \ # 1 (max_batch_size) * 588 (num_visual_features)
-        --max_output_len 100
+        --max_output_len 100 \
+        --max_multimodal_len 588 # 1 (max_batch_size) * 588 (num_visual_features)
     ```
 
 3. Generate TensorRT engines for visual components and combine everything into final pipeline.

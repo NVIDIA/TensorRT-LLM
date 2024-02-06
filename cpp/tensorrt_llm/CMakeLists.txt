@@ -17,10 +17,6 @@ set(SHARED_TARGET ${TARGET_NAME})
 set(SHARED_TARGET
     ${SHARED_TARGET}
     PARENT_SCOPE)
-set(STATIC_TARGET ${TARGET_NAME}_static)
-set(STATIC_TARGET
-    ${STATIC_TARGET}
-    PARENT_SCOPE)
 set(API_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
 
 find_package(MPI REQUIRED)
@@ -112,7 +108,7 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE Threads::Threads)
 
-if(NOT MSVC)
+if(NOT WIN32)
   if(USE_CXX11_ABI)
     add_custom_command(
       OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol"
@@ -145,16 +141,13 @@ set(TRTLLM_LINK_LIBS
     layers_src
     runtime_src)
 
-if(NOT MSVC) # Unix-like compilers
+if(NOT WIN32) # Unix-like compilers
   set(UNDEFINED_FLAG "-Wl,--no-undefined")
   set(AS_NEEDED_FLAG "-Wl,--as-needed")
-else() # MSVC
+else() # Windows
   set(UNDEFINED_FLAG "")
   set(AS_NEEDED_FLAG "")
 endif()
-
-# ################################# SHARED LIBRARY
-# ##############################################################################
 
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
@@ -167,10 +160,12 @@ set_target_properties(
 
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
-if(MSVC)
-  target_link_libraries(
-    ${SHARED_TARGET}
-    PRIVATE -WHOLEARCHIVE:$<TARGET_FILE:${BATCH_MANAGER_TARGET}>)
+if(WIN32)
+  target_link_libraries(${SHARED_TARGET}
+                        PUBLIC $<TARGET_FILE:${BATCH_MANAGER_TARGET}>)
+  set_target_properties(
+    ${SHARED_TARGET} PROPERTIES LINK_FLAGS
+                                "/WHOLEARCHIVE:${BATCH_MANAGER_TARGET}")
 else()
   # Assume everything else is like gcc
   target_link_libraries(
@@ -180,25 +175,6 @@ else()
 endif()
 
 add_dependencies(${SHARED_TARGET} check_symbol)
-
-# ################################# STATIC LIBRARY
-# ##############################################################################
-if(MSVC)
-
-  add_library(${STATIC_TARGET} STATIC)
-
-  set_target_properties(
-    ${STATIC_TARGET}
-    PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES"
-               CXX_EXTENSIONS "NO" POSITION_INDEPENDENT_CODE ON)
-
-  target_link_libraries(${STATIC_TARGET} PUBLIC ${TRTLLM_LINK_LIBS}
-                                                ${BATCH_MANAGER_TARGET})
-  # Cyclic dependency of batch manager on TRT-LLM
-  target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${STATIC_TARGET})
-  add_dependencies(${STATIC_TARGET} check_symbol)
-
-endif()
 
 # Cyclic dependency of batch manager on TRT-LLM
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})

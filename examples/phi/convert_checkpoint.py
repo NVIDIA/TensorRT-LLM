@@ -16,7 +16,8 @@ import argparse
 import json
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import safetensors
@@ -286,7 +287,16 @@ if __name__ == '__main__':
             futures = [
                 p.submit(covert_and_save, rank) for rank in range(world_size)
             ]
-            wait(futures)
+            exceptions = []
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    traceback.print_exc()
+                    exceptions.append(e)
+            assert len(
+                exceptions
+            ) == 0, "Checkpoint conversion failed, please check error log."
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

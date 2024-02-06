@@ -1,11 +1,8 @@
-import numpy as np
-
 from ..layers import MLP, ColumnLinear, GatedMLP, LayerNorm, RmsNorm, RowLinear
-from ..parameter import Parameter
-from .layers import (FP8Linear, FP8RowLinear, Int8SmoothQuantLinear,
-                     Int8SmoothQuantRowLinear, SmoothQuantAttention,
-                     SmoothQuantGatedMLP, SmoothQuantLayerNorm, SmoothQuantMLP,
-                     SmoothQuantRmsNorm, WeightOnlyGroupwiseQuantColumnLinear,
+from .layers import (Int8SmoothQuantLinear, Int8SmoothQuantRowLinear,
+                     SmoothQuantAttention, SmoothQuantGatedMLP,
+                     SmoothQuantLayerNorm, SmoothQuantMLP, SmoothQuantRmsNorm,
+                     WeightOnlyGroupwiseQuantColumnLinear,
                      WeightOnlyGroupwiseQuantRowLinear,
                      WeightOnlyQuantColumnLinear, WeightOnlyQuantRowLinear)
 
@@ -170,10 +167,12 @@ def smooth_quantize_plugin(model, quant_mode):
         assert hasattr(layer, "attention"), "The layer has no attention"
         qkv_bias = layer.attention.qkv.bias is not None
         dense_bias = layer.attention.dense.bias is not None
+        head_size = config.head_size if hasattr(config, 'head_size') else None
         layer.attention = SmoothQuantAttention(
             config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
+            attention_head_size=head_size,
             max_position_embeddings=config.max_position_embeddings,
             num_layers=config.num_hidden_layers,
             dtype=config.dtype,
@@ -229,111 +228,12 @@ def smooth_quantize(model, quant_mode, use_plugin=False):
         return smooth_quantize_ootb(model, quant_mode)
 
 
-def _get_dummy_quant_scales(num_layers):
-    return {
-        'lm_head_act': 0.99,
-        'lm_head_weights': 0.99,
-        'fc_act': [0.99 for _ in range(num_layers)],
-        'fc_weights': [0.99 for _ in range(num_layers)],
-        'gate_act': [0.99 for _ in range(num_layers)],
-        'gate_weights': [0.99 for _ in range(num_layers)],
-        'proj_act': [0.99 for _ in range(num_layers)],
-        'proj_weights': [0.99 for _ in range(num_layers)],
-        'qkv_act': [0.99 for _ in range(num_layers)],
-        'qkv_weights': [0.99 for _ in range(num_layers)],
-        'qkv_output': [5.0 for _ in range(num_layers)],
-        'dense_act': [0.99 for _ in range(num_layers)],
-        'dense_weights': [0.99 for _ in range(num_layers)],
-    }
-
-
-def _quantize_layer(layer, layer_idx, quant_mode, quant_scales):
-    assert hasattr(layer, "mlp"), "The layer has no mlp"
-    fake_fp8_sf_dt = np.float32
-
-    assert isinstance(layer.mlp.fc, (FP8Linear, FP8RowLinear))
-    assert isinstance(layer.mlp.proj, (FP8Linear, FP8RowLinear))
-    layer.mlp.fc.activation_scaling_factor.value = np.array(
-        [quant_scales['fc_act'][layer_idx]], dtype=fake_fp8_sf_dt)
-    layer.mlp.fc.weights_scaling_factor.value = np.array(
-        [quant_scales['fc_weights'][layer_idx]], dtype=fake_fp8_sf_dt)
-    layer.mlp.proj.activation_scaling_factor.value = np.array(
-        [quant_scales['proj_act'][layer_idx]], dtype=fake_fp8_sf_dt)
-    layer.mlp.proj.weights_scaling_factor.value = np.array(
-        [quant_scales['proj_weights'][layer_idx]], dtype=fake_fp8_sf_dt)
-    if hasattr(layer.mlp, 'gate'):
-        assert isinstance(layer.mlp.gate, (FP8Linear, FP8RowLinear))
-        layer.mlp.gate.activation_scaling_factor.value = np.array(
-            [quant_scales['gate_act'][layer_idx]], dtype=fake_fp8_sf_dt)
-        layer.mlp.gate.weights_scaling_factor.value = np.array(
-            [quant_scales['gate_weights'][layer_idx]], dtype=fake_fp8_sf_dt)
-
-    assert hasattr(layer, "attention"), "The layer has no attention"
-    assert isinstance(layer.attention.qkv, (FP8Linear, FP8RowLinear))
-    assert isinstance(layer.attention.dense, (FP8Linear, FP8RowLinear))
-    layer.attention.qkv.activation_scaling_factor.value = np.array(
-        [quant_scales['qkv_act'][layer_idx]], dtype=fake_fp8_sf_dt)
-    layer.attention.qkv.weights_scaling_factor.value = np.array(
-        [quant_scales['qkv_weights'][layer_idx]], dtype=fake_fp8_sf_dt)
-    if quant_mode.has_fp8_kv_cache():
-        layer.attention.kv_cache_scaling_factor.value = np.array(
-            [1.0], dtype=fake_fp8_sf_dt)
-
-    layer.attention.dense.activation_scaling_factor.value = np.array(
-        [quant_scales['dense_act'][layer_idx]], dtype=fake_fp8_sf_dt)
-    layer.attention.dense.weights_scaling_factor.value = np.array(
-        [quant_scales['dense_weights'][layer_idx]], dtype=fake_fp8_sf_dt)
-
-    return layer
-
-
-def default_fp8_quantize(model, quant_mode, quant_scales: dict = None):
-    """
-    Quantize all linear layers (i.e., MLP, Attention QKV/Dense) and KV cache IO with dummy scales
-    This is used by benchmark script and therefore is intentionally decoupled from AMMO toolkit
-    """
-    if quant_scales is None:
-        quant_scales = _get_dummy_quant_scales(model.config.num_hidden_layers)
-
-    assert model.config.quant_mode == quant_mode, "Quant setting not consistent with model init setting"
-
-    use_fp8_qdq = quant_mode.has_fp8_qdq()
-    assert use_fp8_qdq
-
-    for layer_idx, layer in enumerate(model.transformer.layers):
-        layer = _quantize_layer(layer, layer_idx, quant_mode, quant_scales)
-
-    # TODO: add lm_head
-
-    return model
-
-
-def quantize_kv_cache(model, quant_mode):
-
-    for layer in model.transformer.layers:
-        if quant_mode.has_kv_cache_quant():
-            layer.attention.kv_cache_scaling_factor = Parameter(shape=(1, ),
-                                                                dtype='float32')
-        else:
-            layer.attention.register_parameter('kv_cache_scaling_factor', None)
-
-    return model
-
-
 def quantize(model, quant_mode, **kwargs):
-    quantize_kv_cache(model, quant_mode)
-
     if quant_mode.has_act_and_weight_quant():
         if 'sq_use_plugin' in kwargs and kwargs['sq_use_plugin']:
             smooth_quantize(model, quant_mode, use_plugin=True)
         else:
             smooth_quantize(model, quant_mode)
-    elif quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache():
-        # FIXME(guomingz): make llama use AMMO 0.7.0 new checkpoint directly
-        if model.config.architecture in [
-                'LlamaForCausalLM', 'InternLMForCausalLM', 'MedusaForCausalLM'
-        ]:
-            default_fp8_quantize(model, quant_mode)
     elif quant_mode.is_weight_only():
         if quant_mode.has_per_group_scaling():
             kwargs = {

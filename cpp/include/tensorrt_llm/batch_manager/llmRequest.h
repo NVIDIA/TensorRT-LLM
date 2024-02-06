@@ -56,6 +56,7 @@ public:
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType> promptVocabSize = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt, bool returnLogProbs = false,
+        bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
         std::optional<TensorPtr> draftLogits = std::nullopt)
         : mRequestId(requestId)
@@ -82,6 +83,8 @@ public:
         , mCumLogProbs(samplingConfig.beamWidth)
         , mDraftTokens(draftTokens.value_or(std::make_shared<VecTokens>()))
         , mDraftLogits(draftLogits)
+        , mReturnContextLogits(returnContextLogits)
+        , mReturnGenerationLogits(returnGenerationLogits)
     {
         mMaxSentTokenPos = mPromptLen - 1;
         // Scatter the input tokens to other beam
@@ -351,6 +354,26 @@ public:
         mDraftLogits = draftLogits;
     }
 
+    void setReturnContextLogits(const bool returnContextLogits)
+    {
+        mReturnContextLogits = returnContextLogits;
+    }
+
+    bool getReturnContextLogits() const
+    {
+        return mReturnContextLogits;
+    }
+
+    void setReturnGenerationLogits(const bool returnGenerationLogits)
+    {
+        mReturnGenerationLogits = returnGenerationLogits;
+    }
+
+    bool getReturnGenerationLogits() const
+    {
+        return mReturnGenerationLogits;
+    }
+
     TensorPtr const& getContextLogitsHost() const
     {
         return mContextLogitsHost;
@@ -510,6 +533,8 @@ protected:
     std::optional<TensorPtr> mDraftLogits;
 
     // Save logits
+    bool mReturnContextLogits;
+    bool mReturnGenerationLogits;
     TensorPtr mContextLogits;    // [mPromptLen, vocab_size_padded]
     TensorPtr mContextLogitsHost;
     TensorPtr mGenerationLogits; // [beam_size, mMaxNewTokens, vocab_size_padded]
@@ -536,11 +561,12 @@ public:
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType> promptVocabSize = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt, bool returnLogProbs = false,
+        bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
         std::optional<TensorPtr> draftLogits = std::nullopt)
         : Base(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming, endId, padId, embeddingBias,
             badWordsList, stopWordsList, promptEmbeddingTable, promptVocabSize, loraWeights, loraConfig, returnLogProbs,
-            draftTokens, draftLogits)
+            returnContextLogits, returnGenerationLogits, draftTokens, draftLogits)
     {
     }
 

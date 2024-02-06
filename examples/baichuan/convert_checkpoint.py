@@ -18,8 +18,9 @@ import functools
 import json
 import os
 import time
+import traceback
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -572,10 +573,13 @@ def get_tllm_linear_sq_weight(vals,
             np.array([cur_per_channel_value],
                      dtype=np.float32).reshape(col_shape)).contiguous()
 
-        results[last_prefix] = vals['scale_x_orig_quant'].float().contiguous()
+        results[last_prefix] = torch.from_numpy(
+            np.array([vals['scale_x_orig_quant']],
+                     dtype=np.float32)).contiguous()
 
-        results[prefix +
-                'act_scale'] = vals["scale_y_quant_orig"].float().contiguous()
+        results[prefix + 'act_scale'] = torch.from_numpy(
+            np.array([[vals["scale_y_quant_orig"]]],
+                     dtype=np.float32)).contiguous()
 
     if smoother_value is not None:
         cur_smoother_value = np.split(smoother_value,
@@ -833,7 +837,7 @@ def convert_hf_baichuan_sq(hf_model,
                 smoother_value=None,
                 smoother_shape=None,
                 rank=rank,
-                cat_dim=0))
+                cat_dim=-1))
 
         # input layer_norm
         input_ln_weight = get_weight(model_params, prefix + 'input_layernorm',
@@ -1295,7 +1299,16 @@ if __name__ == '__main__':
             futures = [
                 p.submit(covert_and_save, rank) for rank in range(world_size)
             ]
-            wait(futures)
+            exceptions = []
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    traceback.print_exc()
+                    exceptions.append(e)
+            assert len(
+                exceptions
+            ) == 0, "Checkpoint conversion failed, please check error log."
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

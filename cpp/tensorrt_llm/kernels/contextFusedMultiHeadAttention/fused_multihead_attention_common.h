@@ -283,6 +283,8 @@ struct Launch_params
     int kernel_s = 0;
     // kv_seq_length to set launch strategies.
     int kernel_kv_s = 0;
+    // padded head size (new power of 2) for tma descriptors.
+    int padded_d = 0;
     // flags to control small batch kernel choice
     // true: never unroll
     bool ignore_b1opt = false;
@@ -321,6 +323,7 @@ struct Launch_params
     {
         kernel_s = 0;
         kernel_kv_s = 0;
+        padded_d = 0;
         force_unroll = false;
         use_tma = false;
         flash_attention = false;

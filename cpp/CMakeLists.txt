@@ -228,7 +228,7 @@ if(WIN32)
   set(CMAKE_CXX_FLAGS "/DNOMINMAX ${CMAKE_CXX_FLAGS}")
 endif()
 
-if((MSVC))
+if((WIN32))
   if((MSVC_VERSION GREATER_EQUAL 1914))
     # MSVC does not apply the correct __cplusplus version per the C++ standard
     # by default. This is required for compiling CUTLASS 3.0 kernels on windows

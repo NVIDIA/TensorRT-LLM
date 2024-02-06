@@ -20,6 +20,7 @@
 #include <cassert>
 #include <cstring>
 #include <iostream>
+#include <math.h>
 #include <tuple>
 #include <vector>
 
@@ -160,6 +161,10 @@ public:
         // Hopper: fallback to original fmha_v2 when head_size <= 64 and seq_len <= 256
         mLaunchParams.set_default_kernel_selection_params();
 
+        // Next power of 2 head size.
+        TLLM_CHECK_WITH_INFO(mHeadSize > 0, "Head size should be greater than 0.");
+        mLaunchParams.padded_d = (mHeadSize & (mHeadSize - 1)) == 0 ? mHeadSize : pow(2, int(log2(mHeadSize)) + 1);
+
         const bool isSm70 = (sm == kSM_70);
         const bool isSm90 = (sm == kSM_90);
         const bool isSm8x = (sm == kSM_86 || sm == kSM_89);
@@ -170,7 +175,7 @@ public:
             mLaunchParams.force_unroll = true;          // need more profile
             mLaunchParams.useKernelWithoutAlibi = true; // Volta do not support alibi
         }
-        else if (isSm90 && mHeadSize <= 64 && s <= 256)
+        else if (isSm90 && (mHeadSize == 32 || mHeadSize == 64) && s <= 256)
         {
             mLaunchParams.flash_attention = false;
             // get max sequence length for non-flash-attentio
@@ -243,6 +248,9 @@ public:
 
         // Needed by TMA descriptors.
         mLaunchParams.blocks_per_context_sequence = blocks_per_context_sequence;
+        // Next power of 2 head size.
+        TLLM_CHECK_WITH_INFO(mHeadSize > 0, "Head size should be greater than 0.");
+        mLaunchParams.padded_d = (mHeadSize & (mHeadSize - 1)) == 0 ? mHeadSize : pow(2, int(log2(mHeadSize)) + 1);
 
         // Hopper: fallback to original fmha_v2 when head_size <= 64 and seq_len <= 256
         const bool isSm90 = (sm == kSM_90);
@@ -312,7 +320,7 @@ public:
     void set_tma_descriptors()
     {
         // split D into multiple groups in order to match the TMA swizzle mode (128B)
-        const uint32_t d_in_bytes = mParams.d * sizeof(uint16_t);
+        const uint32_t d_in_bytes = mLaunchParams.padded_d * sizeof(uint16_t);
         const uint32_t d_groups = d_in_bytes > 128 ? d_in_bytes / 128 : 1;
 
         // separate q, k, and v tma descriptors
@@ -339,7 +347,7 @@ public:
         // Update this on device?
         box_size[2] = 1;
         box_size[1] = 1;
-        box_size[0] = mParams.d / d_groups;
+        box_size[0] = mLaunchParams.padded_d / d_groups;
 
         // stride size in bytes. Assumes least significant dim is 1 (?)
         uint64_t tensor_stride_qkv[3];
@@ -357,7 +365,7 @@ public:
         uint32_t fp32_to_tf32 = 0;
 
         // gmma descriptor mode
-        const uint32_t d_bytes_per_group = (mParams.d * sizeof(uint16_t)) / d_groups;
+        const uint32_t d_bytes_per_group = (mLaunchParams.padded_d * sizeof(uint16_t)) / d_groups;
         const cudaTmaDescSwizzle swizzle_mode = (d_bytes_per_group > 64
                 ? cudaTmaDescSwizzle::SWIZZLE_128B
                 : (d_bytes_per_group > 32 ? cudaTmaDescSwizzle::SWIZZLE_64B : cudaTmaDescSwizzle::SWIZZLE_32B));
@@ -365,7 +373,7 @@ public:
         uint32_t q_step = 0, kv_step = 0;
         for (unsigned int i = 0u; i < sizeof(sTmaMetaInfo) / sizeof(sTmaMetaInfo[0]); ++i)
         {
-            if (sTmaMetaInfo[i].mD == mParams.d)
+            if (sTmaMetaInfo[i].mD == mLaunchParams.padded_d)
             {
                 q_step = sTmaMetaInfo[i].mQStep;
                 kv_step = sTmaMetaInfo[i].mKVStep;
@@ -404,13 +412,13 @@ public:
     void set_paged_kv_tma_descriptors(cudaStream_t stream)
     {
         // split D into multiple groups in order to match the TMA swizzle mode (128B)
-        const uint32_t d_in_bytes = mPagedKVParams.d * sizeof(uint16_t);
+        const uint32_t d_in_bytes = mLaunchParams.padded_d * sizeof(uint16_t);
         const uint32_t d_groups = d_in_bytes > 128 ? d_in_bytes / 128 : 1;
 
         uint32_t q_step = 0, kv_step = 0;
         for (unsigned int i = 0u; i < sizeof(sTmaMetaInfo) / sizeof(sTmaMetaInfo[0]); ++i)
         {
-            if (sTmaMetaInfo[i].mD == mPagedKVParams.d)
+            if (sTmaMetaInfo[i].mD == mLaunchParams.padded_d)
             {
                 q_step = sTmaMetaInfo[i].mQStep;
                 kv_step = sTmaMetaInfo[i].mKVStep;
@@ -435,7 +443,7 @@ public:
         box_size_q[3] = q_step;
         box_size_q[2] = 1;
         box_size_q[1] = 1;
-        box_size_q[0] = mPagedKVParams.d / d_groups;
+        box_size_q[0] = mLaunchParams.padded_d / d_groups;
 
         // stride size in bytes.
         uint64_t tensor_stride_q[3];
@@ -453,7 +461,7 @@ public:
         uint32_t fp32_to_tf32 = 0;
 
         // gmma descriptor mode
-        const uint32_t d_bytes_per_group = (mPagedKVParams.d * sizeof(uint16_t)) / d_groups;
+        const uint32_t d_bytes_per_group = (mLaunchParams.padded_d * sizeof(uint16_t)) / d_groups;
         const cudaTmaDescSwizzle swizzle_mode = (d_bytes_per_group > 64
                 ? cudaTmaDescSwizzle::SWIZZLE_128B
                 : (d_bytes_per_group > 32 ? cudaTmaDescSwizzle::SWIZZLE_64B : cudaTmaDescSwizzle::SWIZZLE_32B));
@@ -481,7 +489,7 @@ public:
         box_size_kv[3] = 1;
         box_size_kv[2] = 1;
         box_size_kv[1] = std::min(tokens_per_block, kv_step);
-        box_size_kv[0] = mPagedKVParams.d / d_groups;
+        box_size_kv[0] = mLaunchParams.padded_d / d_groups;
 
         TLLM_CHECK_WITH_INFO(
             tokens_per_block % 2 == 0, "FMHA with paged kv cache needs tokens_per_block to be power of 2 !");
@@ -690,12 +698,13 @@ bool MHARunner::fmha_supported(const int headSize, const int sm)
     }
     else if (sm == kSM_80 || sm == kSM_86 || sm == kSM_89)
     {
-        return (headSize == 16 || headSize == 32 || headSize == 40 || headSize == 64 || headSize == 80
-            || headSize == 128 || headSize == 160 || headSize == 256);
+        return (headSize == 16 || headSize == 32 || headSize == 40 || headSize == 64 || headSize == 80 || headSize == 96
+            || headSize == 104 || headSize == 128 || headSize == 160 || headSize == 256);
     }
     else if (sm == kSM_90)
     {
-        return (headSize == 32 || headSize == 64 || headSize == 128 || headSize == 256);
+        return (headSize == 32 || headSize == 40 || headSize == 64 || headSize == 80 || headSize == 96
+            || headSize == 104 || headSize == 128 || headSize == 160 || headSize == 256);
     }
 
     return false;

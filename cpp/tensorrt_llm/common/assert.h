@@ -30,7 +30,11 @@ namespace tensorrt_llm::common
 
 } // namespace tensorrt_llm::common
 
-extern bool CHECK_DEBUG_ENABLED;
+class DebugConfig
+{
+public:
+    static bool isCheckDebugEnabled();
+};
 
 #if defined(_WIN32)
 #define TLLM_LIKELY(x) (__assume((x) == 1), (x))
@@ -57,7 +61,7 @@ extern bool CHECK_DEBUG_ENABLED;
 #define TLLM_CHECK_DEBUG(val)                                                                                          \
     do                                                                                                                 \
     {                                                                                                                  \
-        if (CHECK_DEBUG_ENABLED)                                                                                       \
+        if (DebugConfig::isCheckDebugEnabled())                                                                        \
         {                                                                                                              \
             TLLM_LIKELY(static_cast<bool>(val)) ? ((void) 0)                                                           \
                                                 : tensorrt_llm::common::throwRuntimeError(__FILE__, __LINE__, #val);   \
@@ -67,7 +71,7 @@ extern bool CHECK_DEBUG_ENABLED;
 #define TLLM_CHECK_DEBUG_WITH_INFO(val, info)                                                                          \
     do                                                                                                                 \
     {                                                                                                                  \
-        if (CHECK_DEBUG_ENABLED)                                                                                       \
+        if (DebugConfig::isCheckDebugEnabled())                                                                        \
         {                                                                                                              \
             TLLM_LIKELY(static_cast<bool>(val)) ? ((void) 0)                                                           \
                                                 : tensorrt_llm::common::throwRuntimeError(__FILE__, __LINE__, info);   \

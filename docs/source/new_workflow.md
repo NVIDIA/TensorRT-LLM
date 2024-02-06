@@ -237,7 +237,6 @@ export PATH=/usr/local/bin:$PATH
 
 trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/2-gpu/ \
                 --gemm_plugin float16 \
-                --gpt_attention_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
                 --max_output_len 100 \

@@ -16,7 +16,8 @@ import argparse
 import copy
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor, wait
+import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from importlib.machinery import SourceFileLoader
 from multiprocessing import get_context
 from typing import Dict, Union
@@ -24,17 +25,18 @@ from typing import Dict, Union
 import safetensors
 import torch
 
-from tensorrt_llm._common import check_max_num_tokens
-from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.builder import BuildConfig, Builder
-from tensorrt_llm.graph_rewriting import optimize
-from tensorrt_llm.logger import logger
-from tensorrt_llm.models import MODEL_MAP, PretrainedConfig, PretrainedModel
-from tensorrt_llm.network import net_guard
-from tensorrt_llm.plugin import PluginConfig, add_plugin_argument
-from tensorrt_llm.quantization.mode import QuantMode
-from tensorrt_llm.runtime.engine import Engine, EngineConfig
-from tensorrt_llm.version import __version__
+from .._common import check_max_num_tokens
+from .._utils import str_dtype_to_torch
+from ..builder import BuildConfig, Builder
+from ..graph_rewriting import optimize
+from ..logger import logger
+from ..models import MODEL_MAP, PretrainedConfig, PretrainedModel
+from ..models.modeling_utils import optimize_model
+from ..network import net_guard
+from ..plugin import PluginConfig, add_plugin_argument
+from ..quantization import QuantMode
+from ..runtime.engine import Engine, EngineConfig
+from ..version import __version__
 
 
 def parse_arguments():
@@ -83,6 +85,13 @@ def parse_arguments():
         default=0,
         help=
         'Setting to a value > 0 enables support for prompt tuning or multimodal input.'
+    )
+    parser.add_argument(
+        '--use_fused_mlp',
+        default=False,
+        action='store_true',
+        help=
+        'Enable horizontal fusion in GatedMLP, reduces layer input traffic and potentially improves performance. '
     )
     parser.add_argument(
         '--gather_all_token_logits',
@@ -153,7 +162,8 @@ def build_model(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         else:
             network.plugin_config.set_plugin("weight_only_quant_matmul_plugin",
                                              model.config.dtype)
-    if use_smooth_quant:
+    if use_smooth_quant and model.config.quant_kwargs.get(
+            'sq_use_plugin', False):
         network.plugin_config.set_smooth_quant_plugins()
     nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else None
     network.plugin_config.set_nccl_plugin(
@@ -240,13 +250,16 @@ def build(build_config: BuildConfig,
 
     model = model_cls.from_config(rank_config)
     if ckpt_dir is not None:
-        weights = {}
-        with safetensors.safe_open(os.path.join(ckpt_dir,
-                                                f'rank{rank}.safetensors'),
-                                   framework='pt',
-                                   device='cpu') as f:
-            for key in f.keys():
-                weights[key] = f.get_tensor(key)
+        model_path = os.path.join(ckpt_dir, f'rank{rank}.safetensors')
+        if os.path.isfile(model_path):
+            weights = {}
+            with safetensors.safe_open(model_path, framework='pt',
+                                       device='cpu') as f:
+                for key in f.keys():
+                    weights[key] = f.get_tensor(key)
+        else:
+            logger.warning(
+                f"Cannot find {model_path}. Use dummy model weights.")
 
     if weights is not None:
         preprocess_weights(weights, rank_config)
@@ -257,6 +270,9 @@ def build(build_config: BuildConfig,
                 'kv_cache_quant_algo'] == 'FP8':
         build_config.strongly_typed = True
 
+    use_fused_mlp = kwargs.pop('use_fused_mlp', False)
+    model = optimize_model(model, use_fused_mlp=use_fused_mlp)
+
     return build_model(model, build_config)
 
 
@@ -264,6 +280,8 @@ def preprocess_weights(
         weights: Dict[str, torch.Tensor],
         model_config: PretrainedConfig) -> Dict[str, torch.Tensor]:
     quant_algo = model_config.quant_kwargs['quant_algo']
+    kv_cache_quant_algo = model_config.quant_kwargs['kv_cache_quant_algo']
+
     # INT4_AWQ
     if quant_algo == 'W4A16_AWQ':
         preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
@@ -284,6 +302,11 @@ def preprocess_weights(
         for name, param in weights.items():
             if name.endswith('weight') and param.dtype == torch.int8:
                 weights[name] = param.view(torch.float8_e4m3fn)
+        # lm_head is not quantized to FP8
+        assert weights['lm_head.weight'].dtype == str_dtype_to_torch(
+            model_config.dtype)
+        weights.pop('lm_head.weights_scaling_factor', None)
+        weights.pop('lm_head.activation_scaling_factor', None)
 
     # Weight only 4bit
     elif quant_algo == 'W4A16':
@@ -317,6 +340,12 @@ def preprocess_weights(
                 weights[name.replace(
                     '.weight', '.per_channel_scale')] = torch_weight_scales
 
+    # FP8 kv_cache_scaling_factor is always 1.0
+    if kv_cache_quant_algo == 'FP8':
+        for name, param in weights.items():
+            if name.endswith('kv_cache_scaling_factor'):
+                weights[name] = torch.tensor([1.0], dtype=torch.float32)
+
     # If layer_norm bias is None. (For MPT)
     if model_config.architecture == 'MPTForCausalLM':
         update_dict = {}
@@ -335,10 +364,11 @@ def preprocess_weights(
                                          'bias')] = torch.zeros_like(param)
         weights.update(update_dict)
 
-        if model_config.mapping.is_last_pp_rank(
-        ) and 'lm_head.weight' not in weights:
-            weights["lm_head.weight"] = weights[
-                "transformer.vocab_embedding.weight"].clone()
+    # For shared embedding.
+    if model_config.mapping.is_last_pp_rank(
+    ) and 'lm_head.weight' not in weights:
+        weights["lm_head.weight"] = weights[
+            "transformer.vocab_embedding.weight"].clone()
 
     # Parallel block rowlinear should not have duplicate bias.
     if model_config.architecture == 'GPTJForCausalLM':
@@ -358,7 +388,9 @@ def build_and_save(rank, gpu_id, ckpt_dir, build_config, output_dir, log_level,
                    model_config,
                    model_cls=model_cls,
                    **kwargs)
+    assert engine is not None
     engine.save(output_dir)
+    return True
 
 
 def parallel_build(ckpt_dir_or_model_config: str,
@@ -378,9 +410,10 @@ def parallel_build(ckpt_dir_or_model_config: str,
 
     if workers == 1:
         for rank in range(model_config.mapping.world_size):
-            build_and_save(rank, rank % workers, ckpt_dir, build_config,
-                           output_dir, log_level, model_config, model_cls,
-                           **kwargs)
+            passed = build_and_save(rank, rank % workers, ckpt_dir,
+                                    build_config, output_dir, log_level,
+                                    model_config, model_cls, **kwargs)
+            assert passed, "Engine building failed, please check error log."
     else:
         with ProcessPoolExecutor(mp_context=get_context('spawn'),
                                  max_workers=workers) as p:
@@ -390,7 +423,15 @@ def parallel_build(ckpt_dir_or_model_config: str,
                          model_cls, **kwargs)
                 for rank in range(model_config.mapping.world_size)
             ]
-            wait(futures)
+            exceptions = []
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    traceback.print_exc()
+                    exceptions.append(e)
+            assert len(exceptions
+                       ) == 0, "Engine building failed, please check error log."
 
 
 def main():
@@ -416,9 +457,8 @@ def main():
             max_num_tokens=args.max_num_tokens,
             max_batch_size=args.max_batch_size,
             max_input_len=args.max_input_len,
-            remove_input_padding=args.remove_input_padding,
-            enable_context_fmha=True
-            if args.context_fmha == "enable" else False,
+            remove_input_padding=(args.remove_input_padding == "enable"),
+            enable_context_fmha=(args.context_fmha == "enable"),
             tokens_per_block=args.tokens_per_block)
         build_config = BuildConfig.from_dict(
             {
@@ -443,7 +483,8 @@ def main():
     source = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_config
     kwargs = {
         'logits_dtype': args.logits_dtype,
-        'weight_only_precision': args.weight_only_precision
+        'use_fused_mlp': args.use_fused_mlp,
+        'weight_only_precision': args.weight_only_precision,
     }
     parallel_build(source, build_config, args.output_dir, workers,
                    args.log_level, model_cls, **kwargs)

@@ -67,7 +67,7 @@ list(APPEND PLUGIN_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/api/tllmPlugin.cpp")
 # ################################# SHARED LIBRARY
 # ##############################################################################
 
-if(MSVC)
+if(WIN32)
   set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS 1)
 endif()
 
@@ -91,7 +91,7 @@ set_target_properties(
              LIBRARY_OUTPUT_DIRECTORY "${TRT_OUT_DIR}"
              RUNTIME_OUTPUT_DIRECTORY "${TRT_OUT_DIR}")
 
-if(MSVC)
+if(WIN32)
   set_target_properties(
     ${PLUGIN_SHARED_TARGET}
     PROPERTIES LINK_FLAGS "/DEF:${PLUGIN_EXPORT_DEF} ${UNDEFINED_FLAG}")

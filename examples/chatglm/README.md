@@ -130,51 +130,29 @@ Normally, the `trtllm-build` command only requires a single GPU, but you can ena
 Using ChatGLM2-6B-32K / ChatGLM3-6B-32K models, we need to guarantee `max_batch_size * max_beam_width * (max_input_len + max_output_len) <= 78398 = 2^31 / (13696 * 2)` due to constrain of TensorRT. For example, we will fail to build engine while using default max_batch_size (8) and adding arguments `--max_beam_width=4 --max_input_len=20000 --max_output_len=100`.
 
 ```bash
-# ChatGLM3-6B: single-gpu engine with dtype float16, GPT Attention plugin, Gemm plugin
+# ChatGLM3-6B: single-gpu engine
 trtllm-build --checkpoint_dir trt_ckpt/chatglm3_6b/fp16/1-gpu \
-        --gpt_attention_plugin float16 \
         --gemm_plugin float16 \
-        --output_dir trt_engines/chatglm3_6b/fp16/1-gpu
-
-# ChatGLM3-6B: single-gpu engine with additional FMHA kernels (see introduction below)
-trtllm-build --checkpoint_dir trt_ckpt/chatglm3_6b/fp16/1-gpu \
-        --gpt_attention_plugin float16 \
-        --gemm_plugin float16 \
-        --context_fmha enable \
-        --output_dir trt_engines/chatglm3_6b/fp16/1-gpu
-
-# ChatGLM3-6B: single-gpu engine supporting In-flight-Batching (by enabling GPT Attention plugin, remove input padding, paged kv cache)
-trtllm-build --checkpoint_dir trt_ckpt/chatglm3_6b/fp16/1-gpu \
-        --gpt_attention_plugin float16 \
-        --gemm_plugin float16 \
-        --remove_input_padding enable \
-        --paged_kv_cache enable \
         --output_dir trt_engines/chatglm3_6b/fp16/1-gpu
 
 # ChatGLM3-6B: 2-way tensor parallelism
 trtllm-build --checkpoint_dir trt_ckpt/chatglm3_6b/fp16/2-gpu \
-        --gpt_attention_plugin float16 \
         --gemm_plugin float16 \
         --output_dir trt_engines/chatglm3_6b/fp16/2-gpu
 
 # ChatGLM2-6B: single-gpu engine with dtype float16, GPT Attention plugin, Gemm plugin
 trtllm-build --checkpoint_dir trt_ckpt/chatglm2_6b/fp16/1-gpu \
-        --gpt_attention_plugin float16 \
         --gemm_plugin float16 \
         --output_dir trt_engines/chatglm2_6b/fp16/1-gpu
 
 # ChatGLM-6B: single-gpu engine with dtype float16, GPT Attention plugin, Gemm plugin
 trtllm-build --checkpoint_dir trt_ckpt/chatglm_6b/fp16/1-gpu \
-        --gpt_attention_plugin float16 \
         --gemm_plugin float16 \
-        --context_fmha disable \
         --output_dir trt_engines/chatglm_6b/fp16/1-gpu
 
 # GLM-10B: single-gpu engine with dtype float16, GPT Attention plugin, Gemm plugin
 trtllm-build --checkpoint_dir trt_ckpt/glm_10b/fp16/1-gpu \
-        --gpt_attention_plugin float16 \
         --gemm_plugin float16 \
-        --context_fmha disable \
         --output_dir trt_engines/glm_10b/fp16/1-gpu
 ```
 
@@ -289,7 +267,6 @@ python3 convert_checkpoint.py --model_dir chatglm3_6b \
 
 # ChatGLM3-6B: single-gpu engine with int8 weight only quantization, GPT Attention plugin, Gemm plugin
 trtllm-build --checkpoint_dir trt_ckpt/chatglm3_6b/int8_wo/1-gpu \
-        --gpt_attention_plugin float16 \
         --gemm_plugin float16 \
         --output_dir trt_engines/chatglm3_6b/int8_wo/1-gpu
 
@@ -315,7 +292,6 @@ python3 convert_checkpoint.py --model_dir chatglm3_6b \
 
 # ChatGLM3-6B: single-gpu engine with int8 smooth quantization, GPT Attention plugin, Gemm plugin
 trtllm-build --checkpoint_dir trt_ckpt/chatglm3_6b/sq/1-gpu \
-        --gpt_attention_plugin float16 \
         --gemm_plugin float16 \
         --output_dir trt_engines/chatglm3_6b/sq/1-gpu
 
@@ -339,7 +315,6 @@ python ../quantization/quantize.py --model_dir chatglm3_6b \
 
 # ChatGLM3-6B: single-gpu engine with int4 awq quantization, GPT Attention plugin, Gemm plugin
 trtllm-build --checkpoint_dir trt_ckpt/chatglm3_6b/int4_awq/1-gpu \
-        --gpt_attention_plugin float16 \
         --gemm_plugin float16 \
         --output_dir trt_engines/chatglm3_6b/int4_awq/1-gpu
 
@@ -364,7 +339,6 @@ python ../quantization/quantize.py --model_dir chatglm3_6b \
 
 # ChatGLM3-6B: single-gpu engine with fp8 quantization, GPT Attention plugin, Gemm plugin
 trtllm-build --checkpoint_dir trt_ckpt/chatglm3_6b/fp8/1-gpu \
-        --gpt_attention_plugin float16 \
         --gemm_plugin float16 \
         --strongly_typed \
         --output_dir trt_engines/chatglm3_6b/fp8/1-gpu

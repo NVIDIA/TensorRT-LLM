@@ -47,7 +47,7 @@ target_link_libraries(
 target_compile_definitions(${TRTLLM_PYBIND_MODULE}
                            PUBLIC TRTLLM_PYBIND_MODULE=${TRTLLM_PYBIND_MODULE})
 
-if(NOT MSVC)
+if(NOT WIN32)
   set_target_properties(
     ${TRTLLM_PYBIND_MODULE}
     PROPERTIES LINK_FLAGS

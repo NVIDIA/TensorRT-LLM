@@ -12,6 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+
+def _add_trt_llm_dll_directory():
+    import platform
+    on_windows = platform.system() == "Windows"
+    if on_windows:
+        import os
+        import sysconfig
+        from pathlib import Path
+        os.add_dll_directory(
+            Path(sysconfig.get_paths()['purelib']) / "tensorrt_llm" / "libs")
+
+
+_add_trt_llm_dll_directory()
+
 import tensorrt_llm.functional as functional
 import tensorrt_llm.models as models
 import tensorrt_llm.quantization as quantization

@@ -5,7 +5,7 @@ import argparse
 import glob
 import logging
 import os
-import subprocess
+import subprocess  # nosec B404
 import sys
 from dataclasses import dataclass
 from typing import ClassVar, Iterable, List, Optional, Tuple, Union

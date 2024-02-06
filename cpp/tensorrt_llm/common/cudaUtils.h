@@ -28,8 +28,15 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#ifndef _WIN32 // Linux
 #include <sys/sysinfo.h>
+#endif         // not WIN32
 #include <vector>
+#ifdef _WIN32  // Windows
+#include <windows.h>
+#undef ERROR   // A Windows header file defines ERROR as 0, but it's used in our logger.h enum. Logging breaks without
+               // this undef.
+#endif         // WIN32
 
 namespace tensorrt_llm::common
 {
@@ -277,11 +284,20 @@ inline std::tuple<size_t, size_t> getDeviceMemoryInfo(const bool useUvm)
     if (useUvm)
     {
         size_t freeSysmem, totalSysmem;
+#ifndef _WIN32 // Linux
         struct sysinfo info;
         sysinfo(&info);
         totalSysmem = info.totalram * info.mem_unit;
         freeSysmem = info.freeram * info.mem_unit;
-        TLLM_LOG_DEBUG("Using UVM based system memory for KV cache, total memory %0.2f GB, available memory %0.2f GB",
+#else  // Windows
+        MEMORYSTATUSEX memInfo;
+        memInfo.dwLength = sizeof(memInfo);
+        GlobalMemoryStatusEx(&memInfo);
+        totalSysmem = memInfo.ullTotalPhys;
+        freeSysmem = memInfo.ullAvailPhys;
+#endif // WIN32
+
+        TLLM_LOG_INFO("Using UVM based system memory for KV cache, total memory %0.2f GB, available memory %0.2f GB",
             ((double) totalSysmem / 1e9), ((double) freeSysmem / 1e9));
         return {freeSysmem, totalSysmem};
     }

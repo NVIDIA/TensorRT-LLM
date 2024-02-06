@@ -53,7 +53,7 @@ inline size_t smem_size_in_bytes(const Multihead_attention_params<T, DO_CROSS_AT
 
     // The extra memory needed if we are not using floats for the final logits.
     size_t logits_sz = 0;
-#ifndef MMHA_USE_FP32_ACUM_FOR_LOGITS
+#ifndef MMHA_USE_FP32_ACCUM_FOR_LOGITS
     if (sizeof(Tk) != 4)
     {
         // TDOD

@@ -43,7 +43,7 @@ def parse_arguments():
         '--decoder_llm',
         action='store_true',
         help='Whether LLM is decoder-only or an encoder-decoder variant?')
-    parser.add_argument('--blip_encoder',
+    parser.add_argument('--blip2_encoder',
                         action='store_true',
                         help='Whether visual encoder is a BLIP2 model')
     parser.add_argument('--nougat',
@@ -146,7 +146,7 @@ class MultiModalModel:
         pre_input_ids = self.tokenizer(pre_prompt,
                                        return_tensors="pt",
                                        padding=True).input_ids.to("cuda")
-        if post_prompt is not None:
+        if post_prompt[0] is not None:
             post_input_ids = self.tokenizer(post_prompt,
                                             return_tensors="pt",
                                             padding=True).input_ids.to("cuda")
@@ -156,7 +156,8 @@ class MultiModalModel:
             post_input_ids = None
             length = pre_input_ids.shape[1] + visual_atts.shape[1]
 
-        input_lengths = torch.IntTensor([length]).to(torch.int32).to("cuda")
+        input_lengths = torch.IntTensor([length] * args.batch_size).to(
+            torch.int32).to("cuda")
         input_ids, ptuning_args = self.setup_fake_prompts(
             visual_features, pre_input_ids, post_input_ids, input_lengths)
 
@@ -168,7 +169,7 @@ class MultiModalModel:
         profiler.start("LLM")
         if self.args.decoder_llm:
             end_id = self.tokenizer.eos_token_id
-            if 'opt' in self.args.hf_model_dir and self.args.blip_encoder:
+            if 'opt' in self.args.hf_model_dir and self.args.blip2_encoder:
                 # For BLIP2-OPT, model outputs a "\n" at the end.
                 # we avoid it by using newline as the end token
                 end_id = self.tokenizer.encode("\n",
@@ -188,7 +189,7 @@ class MultiModalModel:
         else:
             if args.nougat:
                 # Trim encoder input_ids to match visual features shape
-                ids_shape = (self.args.batch_size, ptuning_args[0].shape[0])
+                ids_shape = (self.args.batch_size, visual_features.shape[1])
                 input_ids = torch.zeros(ids_shape, dtype=torch.int32).to("cuda")
 
             output_ids = self.model.generate(
@@ -330,7 +331,7 @@ if __name__ == '__main__':
     runtime_rank = tensorrt_llm.mpi_rank()
 
     image = load_test_image(args.hf_model_dir)
-    if args.blip_encoder:
+    if args.blip2_encoder:
         if 'opt-2.7b' in args.hf_model_dir:
             model_type = 'Salesforce/blip2-opt-2.7b'
         else:
@@ -338,13 +339,13 @@ if __name__ == '__main__':
 
         processor = Blip2Processor.from_pretrained(model_type)
 
-        prompt = "Question: which city is this in? Answer:"
-        inputs = processor(image, prompt, return_tensors="pt").to("cuda")
+        inputs = processor(image, args.input_text,
+                           return_tensors="pt").to("cuda")
         image = inputs['pixel_values']
         image = image.expand(args.batch_size, -1, -1,
                              -1).contiguous().to("cuda")
 
-        pre_prompt = [args.input_text] * args.batch_size
+        pre_prompt = args.input_text
         post_prompt = None
     elif args.nougat:
         image_processor = NougatProcessor.from_pretrained(args.hf_model_dir)
@@ -362,6 +363,11 @@ if __name__ == '__main__':
 
         pre_prompt = "USER:\n"
         post_prompt = args.input_text + " ASSISTANT:"
+
+    # Repeat inputs to match batch size
+    pre_prompt = [pre_prompt] * args.batch_size
+    post_prompt = [post_prompt] * args.batch_size
+    image = image.expand(args.batch_size, -1, -1, -1).contiguous()
 
     model = MultiModalModel(args)
 

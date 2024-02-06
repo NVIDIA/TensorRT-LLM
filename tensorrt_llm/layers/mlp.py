@@ -127,6 +127,7 @@ class GatedMLP(MLP):
         self.tp_group = tp_group
         self.tp_size = tp_size
         self.quant_mode = quant_mode
+        self.max_lora_rank = max_lora_rank
 
         if self.use_fp8_qdq:
             self.gate = FP8Linear(hidden_size,
@@ -173,7 +174,7 @@ class GatedMLP(MLP):
         return output
 
 
-class FusedGatedMLP(GatedMLP):
+class FusedGatedMLP(Module):
 
     def __init__(
             self,
@@ -187,14 +188,16 @@ class FusedGatedMLP(GatedMLP):
             quant_mode=QuantMode(0),
             max_lora_rank=None,
     ):
-        super().__init__(hidden_size,
-                         ffn_hidden_size,
-                         hidden_act,
-                         bias=bias,
-                         dtype=dtype,
-                         tp_group=tp_group,
-                         tp_size=tp_size,
-                         quant_mode=quant_mode)
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.ffn_hidden_size = ffn_hidden_size
+        self.hidden_act = hidden_act
+        self.bias = bias
+        self.dtype = dtype
+        self.tp_group = tp_group
+        self.tp_size = tp_size
+        self.quant_mode = quant_mode
+        self.use_fp8_qdq = quant_mode.has_fp8_qdq()
 
         if self.use_fp8_qdq:
             self.fused_fc = FP8Linear(
@@ -206,6 +209,13 @@ class FusedGatedMLP(GatedMLP):
                 tp_size=self.tp_size,
                 gather_output=False,
             )
+            self.proj = FP8RowLinear(ffn_hidden_size,
+                                     hidden_size,
+                                     bias=bias,
+                                     dtype=dtype,
+                                     tp_group=tp_group,
+                                     tp_size=tp_size,
+                                     max_lora_rank=max_lora_rank)
         else:
             self.fused_fc = ColumnLinear(
                 self.hidden_size,
@@ -216,7 +226,14 @@ class FusedGatedMLP(GatedMLP):
                 tp_size=self.tp_size,
                 gather_output=False,
             )
-        self.is_weight_rewritten = False
+            self.proj = RowLinear(ffn_hidden_size,
+                                  hidden_size,
+                                  bias=bias,
+                                  dtype=dtype,
+                                  tp_group=tp_group,
+                                  tp_size=tp_size,
+                                  max_lora_rank=max_lora_rank)
+
         if max_lora_rank is None:
             max_lora_rank = min(hidden_size, ffn_hidden_size // tp_size)
         self.mlp_in_lora = Lora(
@@ -237,10 +254,6 @@ class FusedGatedMLP(GatedMLP):
         #   SwiGLU(FusedFC(x))
         #
         # Upside is we don't need to modify 4 different weight loading paths just to concat weights
-        if not self.is_weight_rewritten:
-            del self._modules["gate"]
-            del self._modules["fc"]
-            self.is_weight_rewritten = True
 
         inter = self.fused_fc(hidden_states)
 

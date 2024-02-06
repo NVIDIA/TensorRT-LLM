@@ -144,7 +144,8 @@ The responses from `SendResponseCallback` are stored in a `std::shared_ptr<Tenso
 [1, beamWidth, maxSeqLength].
 * sequence length: a CPU tensor that indicates the length of inputID + outputID. Its shape is [1, 1].
 * context logits: a CPU tensor that contains context logits. Its shape is [1, promptLength, vocabSizePadded] if the engine is built with `gather_context_logits` or `gather_all_token_logits`. Otherwise, it is a dummy tensor with shape [1, 1, 1].
-* generation logits:  a CPU tensor that contains generation logits. Its shape is [1, beamWidth, outputLength, vocabSizePadded]. if the engine is built with `gather_generation_logits` or `gather_all_token_logits`. Otherwise, it is a dummy tensor with shape [1, 1, 1, 1].
+* generation logits:  a CPU tensor that contains generation logits. Its shape is [1, beamWidth, outputLength, vocabSizePadded]. if the engine is built with `gather_generation_logits` or `gather_all_token_logits`. Otherwise, it is a dummy tensor with shape [1, 1, 1, 1]. If you are using gptManagerBenchmark.cpp, please remember to pass corresponding parameters `--return-context-logits` and/or `--return-generation-logits` to obtain these logits. Note that enabling return logits will require more device memory for converting and storing logits. To reduce redundant memory buffer allocation as much as possible, we recommend that the `max_batch_size`, `max_beam_width`, `max_input_len`, `max_output_len`, and other parameters set when building the engine are close to the values required during actual inference.
+
 * logProb: a CPU tensor that stores the log-prob of the generated tokens. Its shape is [1, beamWidth, outputLength]
 * cumLogProb: a CPU tensor that stores the cumLogProb. Its shape is [1, beamWidth]
 

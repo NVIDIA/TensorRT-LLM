@@ -217,7 +217,7 @@ __global__ __launch_bounds__(Ktraits::kNThreads, Ktraits::kMinBlocks) void selec
             {
                 A_val[r] = A[state_idx * params.A_dstate_stride + r * params.A_d_stride];
                 // Multiply the real part of A with LOG2E so we can use exp2f instead of expf.
-                constexpr float kLog2e = M_LOG2E;
+                constexpr float kLog2e = 1.4426950408889634074; // log_2(e) = M_LOG2E
                 A_val[r] *= kLog2e;
             }
             // This variable holds B * C if both B and C are constant across seqlen. If only B varies
@@ -364,7 +364,7 @@ void selective_scan_fwd_launch(SSMParamsBase& params, cudaStream_t stream)
 {
     // Only kNRows == 1 is tested for now, which ofc doesn't differ from previously when we had each block
     // processing 1 row.
-    constexpr int kNRows = 1;
+    static constexpr int kNRows = 1;
     BOOL_SWITCH(params.seqlen % (kNThreads * kNItems) == 0, kIsEvenLen,
         [&]
         {
@@ -501,7 +501,7 @@ __global__ void selectiveScanUpdate(SSMParamsBase params)
         weight_t A_val = A[state_idx];
 
         // Multiply the real part of A with LOG2E so we can use exp2f instead of expf.
-        constexpr float kLog2e = M_LOG2E;
+        constexpr float kLog2e = 1.4426950408889634074; // log_2(e) = M_LOG2E
         A_val *= kLog2e;
 
         // dtA = exp(dt * A), dtB = dt * B

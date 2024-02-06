@@ -190,6 +190,7 @@ GptJsonConfig parseJson(InputType&& i)
     auto const tokensPerBlock = pluginConfig.at("tokens_per_block");
     auto const useCustomAllReduce = pluginConfig.at("use_custom_all_reduce").template get<bool>();
     auto const useContextFMHAForGeneration = pluginConfig.at("use_context_fmha_for_generation").template get<bool>();
+    auto const pagedContextFMHA = pluginConfig.at("use_paged_context_fmha").template get<bool>();
 
     modelConfig.useGptAttentionPlugin(useGptAttentionPlugin);
     modelConfig.usePackedInput(removeInputPadding);
@@ -197,12 +198,7 @@ GptJsonConfig parseJson(InputType&& i)
     modelConfig.setTokensPerBlock(tokensPerBlock);
     modelConfig.useCustomAllReduce(useCustomAllReduce);
     modelConfig.setUseContextFMHAForGeneration(useContextFMHAForGeneration);
-
-    if (engineVersionNone)
-    {
-        auto const pagedContextFMHA = pluginConfig.at("use_paged_context_fmha").template get<bool>();
-        modelConfig.setPagedContextFMHA(pagedContextFMHA);
-    }
+    modelConfig.setPagedContextFMHA(pagedContextFMHA);
 
     if (engineVersionNone)
     {

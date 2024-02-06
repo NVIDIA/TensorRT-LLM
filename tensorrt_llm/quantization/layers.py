@@ -938,6 +938,7 @@ class SmoothQuantAttention(Module):
         max_position_embeddings=1024,
         num_layers=1,
         apply_query_key_layer_scaling=False,
+        attention_head_size=None,
         attention_mask_type=AttentionMaskType.padding,
         bias=True,
         qkv_bias_only=False,
@@ -956,9 +957,9 @@ class SmoothQuantAttention(Module):
     ):
         super().__init__()
         self.attention_mask_type = attention_mask_type
-        self.attention_head_size = hidden_size // num_attention_heads
+        self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
         self.num_attention_heads = num_attention_heads // tp_size
-        self.num_kv_heads = (
+        self.num_attention_kv_heads = (
             num_kv_heads + tp_size - 1
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
         self.hidden_size = hidden_size // tp_size
@@ -1012,8 +1013,9 @@ class SmoothQuantAttention(Module):
 
         self.qkv = SmoothQuantColumnLinear(
             hidden_size,
-            hidden_size +
-            2 * self.num_kv_heads * tp_size * self.attention_head_size,
+            tp_size * self.num_attention_heads * self.attention_head_size +
+            (2 * tp_size * self.num_attention_kv_heads *
+             self.attention_head_size),
             bias=(bias or qkv_bias_only),
             dtype=dtype,
             tp_group=tp_group,
@@ -1021,7 +1023,8 @@ class SmoothQuantAttention(Module):
             gather_output=False,
             quant_mode=qkv_quant_mode)
 
-        self.dense = SmoothQuantRowLinear(hidden_size,
+        self.dense = SmoothQuantRowLinear(tp_size * self.num_attention_heads *
+                                          self.attention_head_size,
                                           hidden_size,
                                           bias=bias,
                                           dtype=dtype,
@@ -1096,7 +1099,7 @@ class SmoothQuantAttention(Module):
                 cache_indirection=kv_cache_params.cache_indirection,
                 host_request_types=attention_params.host_request_types,
                 num_heads=self.num_attention_heads,
-                num_kv_heads=self.num_kv_heads,
+                num_kv_heads=self.num_attention_kv_heads,
                 hidden_size_per_head=self.attention_head_size,
                 q_scaling=self.q_scaling,
                 rotary_embedding_dim=self.rotary_embedding_dim,

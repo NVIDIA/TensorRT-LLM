@@ -109,7 +109,6 @@ trtllm-build --checkpoint_dir=./ft_ckpts/mpt-7b/fp16/1-gpu \
              --max_batch_size 32 \
              --max_input_len 1024 \
              --max_output_len 512 \
-             --gpt_attention_plugin \
              --gemm_plugin
              --workers 1 \
              --output_dir ./trt_engines/mpt-7b/fp16/1-gpu
@@ -137,7 +136,6 @@ trtllm-build --checkpoint_dir ./ft_ckpts/mpt-30b/fp16_tp4 \
              --max_batch_size 32 \
              --max_input_len 1024 \
              --max_output_len 512 \
-             --gpt_attention_plugin \
              --gemm_plugin
              --workers 4 \
              --output_dir ./trt_engines/mpt-30b/fp16_tp4
@@ -174,7 +172,6 @@ trtllm-build --checkpoint_dir ./ft_ckpts/replit-code-v1_5-3b/bf16_tp2 \
              --max_batch_size 32 \
              --max_input_len 1024 \
              --max_output_len 512 \
-             --gpt_attention_plugin \
              --gemm_plugin \
              --workers 2 \
              --output_dir ./trt_engines/replit-code-v1_5-3b/bf16_tp2

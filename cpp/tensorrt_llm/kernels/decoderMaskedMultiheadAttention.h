@@ -224,6 +224,9 @@ using Cross_multihead_attention_params = Multihead_attention_params<T, true>;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Pre-check whether head size is supported when building engines.
+bool mmha_supported(int head_size);
+
 #define DECLARE_MMHA_NORMAL_AND_PAGED(T)                                                                               \
     void masked_multihead_attention(const Masked_multihead_attention_params<T>& params,                                \
         const KVBlockArray& block_array, const KVLinearBuffer& shift_k_cache, const cudaStream_t& stream);             \

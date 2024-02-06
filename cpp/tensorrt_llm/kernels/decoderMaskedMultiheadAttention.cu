@@ -69,10 +69,11 @@ void multihead_attention_(const KERNEL_PARAMS_TYPE& params, const KVCacheBuffer&
     case 64: MMHA_LAUNCH_KERNE_WITH_IMPLICIT_RELATIVE_ATTN(64);
     case 128: MMHA_LAUNCH_KERNE_WITH_IMPLICIT_RELATIVE_ATTN(128);
     case 256: MMHA_LAUNCH_KERNEL(256);
-#ifndef FAST_BUILD // skip mmha 48, 80, 96, 112, 144, 160, 192 and 224 for fast build
+#ifndef FAST_BUILD // skip mmha 48, 80, 96, 104, 112, 144, 160, 192 and 224 for fast build
     case 48: MMHA_LAUNCH_KERNEL(48);
     case 80: MMHA_LAUNCH_KERNEL(80);
     case 96: MMHA_LAUNCH_KERNEL(96);
+    case 104: MMHA_LAUNCH_KERNEL(104);
     case 112: MMHA_LAUNCH_KERNEL(112);
     case 144: MMHA_LAUNCH_KERNEL(144);
     case 160: MMHA_LAUNCH_KERNEL(160);
@@ -88,6 +89,15 @@ void multihead_attention_(const KERNEL_PARAMS_TYPE& params, const KVCacheBuffer&
 } // namespace
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static constexpr std::array<int, 13> MMHA_SUPPORTED_HEAD_SIZES{
+    32, 48, 64, 80, 96, 104, 112, 128, 144, 160, 192, 224, 256};
+
+bool mmha_supported(int head_size)
+{
+    return std::find(MMHA_SUPPORTED_HEAD_SIZES.begin(), MMHA_SUPPORTED_HEAD_SIZES.end(), head_size)
+        != MMHA_SUPPORTED_HEAD_SIZES.end();
+}
 
 #define INSTANTIATE_MMHA_NORMAL_AND_PAGED(T, CROSS_ATTENTION)                                                          \
     void masked_multihead_attention(const Multihead_attention_params<T, CROSS_ATTENTION>& params,                      \

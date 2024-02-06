@@ -23,9 +23,9 @@ runtime and, for some of them, decrease the engine build time.
 
 ### GPT Attention Plugin and Context Fused Multi-Head Attention
 
-It is recommended to enable the GPT attention plugin and fused  multi-head
-attention kernel, for the context phase, using the `--use_gpt_attention_plugin`
-and `--enable_context_fmha` arguments with `build.py`.
+The GPT attention plugin and fused  multi-head attention kernel are enabled by
+default. For the context phase, use the `--gpt_attention_plugin`
+and `--context_fmha` arguments with `trtllm-build` to control.
 
 The TensorRT-LLM GPT attention plugin uses efficient kernels and enables an
 in-place update of the KV cache. It results in reduced memory consumption as
@@ -38,8 +38,8 @@ details, see this [Document](gpt_attention.md#context-phase).
 
 ### Remove Input Padding
 
-It is recommended to remove input padding using the `--remove_input_padding`
-argument with `build.py`.
+The remove input padding feature is enabled by default, the `--remove_input_padding`
+argument in `trtllm-build` is used to control it.
 
 When input padding is removed, the different tokens are packed together. It
 reduces both the amount of computations and memory consumption. For more details, see
@@ -84,8 +84,8 @@ See also [chunked context](#chunked-context).
 
 ### Paged KV Cache
 
-It is recommended to enable paged KV cache using the `--paged_kv_cache` argument
-with `build.py`.
+Paged KV cache is enabled by default, the `--paged_kv_cache` argument in
+`trtllm-build` is used to control it.
 
 The paged KV cache helps manage memory for the KV cache more efficiently (see
 this [Document](gpt_attention.md#paged-kv-cache)). It usually leads to an
@@ -93,10 +93,9 @@ increase in the batch size and an improved efficiency.
 
 ### In-flight Sequence Batching
 
-It is recommended to enable in-flight sequence batching using the
-`--use_inflight_batching` argument with `build.py`. Note that this flag enables
-the GPT attention plugin, input padding removal and paged KV cache all
-together.
+In-flight sequence batching is enabled by default with `trtllm-build`,
+which requires that the GPT attention plugin, input padding removal and paged KV
+cache are all enabled together.
 
 In-flight sequence batching schedules sequences in context phase together with
 sequences in generation phase to increase efficiency and reduce latency, see
@@ -105,7 +104,7 @@ this [Document](gpt_attention.md#inflight-batching) for more details.
 ### Multi-Block Mode
 
 When the following conditions are met, it is recommended to try the
-`--multi_block_mode` argument with `build.py` and evaluate the impact on
+`--multi_block_mode` argument with `trtllm-build` and evaluate the impact on
 performance:
 
  1. `input_seq_len` > 1024 (An empirically derived value that indicates that the
@@ -123,7 +122,7 @@ efficiency.
 ### Custom AllReduce Plugin
 
 On NVLink-based nodes, it is recommended to enable the custom AllReduce plugin
-by using the `--use_custom_all_reduce` argument with `build.py`. On PCIE-based
+by using the `--use_custom_all_reduce` argument with `trtllm-build`. On PCIE-based
 nodes, it is not recommended to enabled that plugin.
 
 The custom AllReduce plugin activates a latency-optimized algorithm for
@@ -151,7 +150,7 @@ improve throughput. However, the following conditions have to be satisfied:
 To enable the features, use the `--use_parallel_embedding`,
 `--use_embedding_sharing`, `--use_lookup_plugin`, `--use_gemm_plugin`
 arguments, and set correct dimension to `--embedding_sharding_dim` argument
-with `build.py`. See those
+with `trtllm-build`. See those
 [Examples](../../examples/gpt/README.md#tensor-parallelism-for-embedding-lookup-table)
 for details.
 
@@ -160,15 +159,15 @@ for details.
 Horizontal fusion in Gated-MLP combines two Matmul operations into a single one
 followed by a separate SwiGLU kernel. If both model and batch sizes are large,
 it is recommended to enable the feature by using the `--use_fused_mlp` argument
-with `build.py`. When the workload is very small, it is not recommended to
+with `trtllm-build`. When the workload is very small, it is not recommended to
 enable that feature.
 
 ### BERT Attention Plugin and Context Fused Multi-Head Attention
 
 BERT attention plugin and context fused multi-head attention are both
-recommended for the BERT model. They must be enabled using the
-`--use_bert_attention_plugin` and `--enable_context_fmha` arguments with
-`build.py`.
+recommended for the BERT model. They are enabled by default using the
+`--bert_attention_plugin` and `--context_fmha` arguments with
+`trtllm-build`.
 
 ## Runtime Options to Optimize the Performance of TensorRT-LLM Models?
 
