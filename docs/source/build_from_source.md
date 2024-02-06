@@ -31,12 +31,12 @@ The first step to build TensorRT-LLM is to fetch the sources:
 ```bash
 # TensorRT-LLM uses git-lfs, which needs to be installed in advance.
 apt-get update && apt-get -y install git git-lfs
-
 git lfs install
-git lfs pull
+
 git clone https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
 git submodule update --init --recursive
+git lfs pull
 ```
 
 Note: There are two options to create TensorRT-LLM Docker image and approximate disk space required to build the image is 63 GB

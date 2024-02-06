@@ -17,7 +17,8 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
-* [2024/30/01] [ New **XQA-kernel** provides **2.4x more Llama-70B throughput** within the same latency budget](./docs/source/blogs/XQA-kernel.md)
+* [2024/02/06] [🚀 Speed up inference with SOTA quantization techniques in TRT-LLM](./docs/source/blogs/quantization-in-TRT-LLM.md)
+* [2024/01/30] [ New **XQA-kernel** provides **2.4x more Llama-70B throughput** within the same latency budget](./docs/source/blogs/XQA-kernel.md)
 * [2023/12/04] [**Falcon-180B** on a **single H200** GPU with INT4 AWQ, and **6.7x faster Llama-70B** over A100](./docs/source/blogs/Falcon180B-H200.md)
 * [2023/11/27] [SageMaker LMI now supports TensorRT-LLM - improves throughput by 60%, compared to previous version](https://aws.amazon.com/blogs/machine-learning/boost-inference-performance-for-llms-with-new-amazon-sagemaker-containers/)
 * [2023/11/13] [H200 achieves nearly 12,000 tok/sec on Llama2-13B](./docs/source/blogs/H200launch.md)
@@ -169,11 +170,10 @@ python convert_checkpoint.py --model_dir ./bloom/560M/ \
 # May need to add trtllm-build to PATH, export PATH=/usr/local/bin:$PATH
 trtllm-build --checkpoint_dir ./bloom/560M/trt_ckpt/fp16/1-gpu/ \
                 --gemm_plugin float16 \
-                --gpt_attention_plugin float16 \
                 --output_dir ./bloom/560M/trt_engines/fp16/1-gpu/
 ```
 
-See the BLOOM [example](examples/bloom) for more details and options regarding the `build.py` script.
+See the BLOOM [example](examples/bloom) for more details and options regarding the `trtllm-build` command.
 
 ***3. Run***
 
@@ -365,7 +365,7 @@ however, that it is recommended to use the C++ version.
 ```
 may happen. One possible solution is to reduce the amount of memory needed by
 reducing the maximum batch size, input and output lengths. Another option is to
-enable plugins, for example: `--use_gpt_attention_plugin`.
+enable plugins, for example: `--gpt_attention_plugin`.
 
 * MPI + Slurm
 

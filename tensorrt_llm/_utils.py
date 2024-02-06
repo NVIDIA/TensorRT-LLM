@@ -15,15 +15,15 @@
 import copy
 import json
 import math
-import os
 import struct
 import tarfile
 import weakref
 from functools import partial
 from pathlib import Path, PosixPath
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List
 
 import numpy as np
+import yaml
 from packaging import version
 
 # isort: off
@@ -382,41 +382,17 @@ def has_extra_attr(obj, attr_name):
     return attr_name in _extra_attrs_by_object[id(obj)]
 
 
-def unpack_nemo_ckpt(nemo_archive_path: Union[str, Path],
-                     out_dir_path: Union[str, Path]):
-    nemo_archive_path = Path(nemo_archive_path)
-    if not nemo_archive_path.exists():
-        raise FileNotFoundError(f"{nemo_archive_path} does not exist")
-
-    for tar_mode in ["r:", "r:gz"]:
+def unpack_nemo_weights(nemo_archive_path):
+    with tarfile.open(nemo_archive_path) as tar:
         try:
-            with tarfile.open(nemo_archive_path, mode=tar_mode) as tar_file:
-
-                def is_within_directory(directory, target):
-
-                    abs_directory = os.path.abspath(directory)
-                    abs_target = os.path.abspath(target)
-
-                    prefix = os.path.commonprefix([abs_directory, abs_target])
-
-                    return prefix == abs_directory
-
-                def safe_members(tar_file):
-                    members = []
-                    for member in tar_file.getmembers():
-                        member_path = os.path.join(out_dir_path, member.name)
-                        if not is_within_directory(out_dir_path, member_path):
-                            raise Exception(
-                                "Attempted Path Traversal in Tar File")
-                        members.append(member)
-                    return members
-
-                tar_file.extractall(out_dir_path,
-                                    members=safe_members(tar_file),
-                                    numeric_owner=False)
-
-            return out_dir_path
-        except tarfile.ReadError:
-            pass
-
-    raise RuntimeError(f"Could not unpack {nemo_archive_path}")
+            model_weights = tar.extractfile("model_weights.ckpt")
+            model_config = tar.extractfile("model_config.yaml")
+        except KeyError:
+            try:
+                model_weights = tar.extractfile("./model_weights.ckpt")
+                model_config = tar.extractfile("./model_config.yaml")
+            except KeyError:
+                err_str = "Both model_weights paths not found in the tar archive."
+                raise Exception(err_str)
+        return yaml.safe_load(model_config), torch.load(
+            model_weights, map_location=torch.device("cpu"))

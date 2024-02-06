@@ -25,12 +25,7 @@ def export_visual_wrapper_onnx(visual_wrapper, image, output_dir):
                       }})
 
 
-def build_trt_engine(img_height,
-                     img_width,
-                     output_dir,
-                     minBS=1,
-                     optBS=2,
-                     maxBS=4):
+def build_trt_engine(img_height, img_width, output_dir, max_batch_size):
     part_name = 'visual_encoder'
     onnx_file = '%s/onnx/%s.onnx' % (output_dir, part_name)
     engine_file = '%s/%s_fp16.engine' % (output_dir, part_name)
@@ -56,12 +51,12 @@ def build_trt_engine(img_height,
     shutil.rmtree(f'{output_dir}/onnx')
 
     nBS = -1
-    nMinBS = minBS
-    nOptBS = optBS
-    nMaxBS = maxBS
+    nMinBS = 1
+    nOptBS = max(nMinBS, int(max_batch_size / 2))
+    nMaxBS = max_batch_size
+
     logger.log(trt.Logger.INFO,
                f"Processed image dims {img_height}x{img_width}")
-
     H, W = img_height, img_width
     inputT = network.get_input(0)
     inputT.shape = [nBS, 3, H, W]
@@ -81,7 +76,7 @@ def build_trt_engine(img_height,
             f.write(engine_string)
 
 
-def build_blip_engine(args):
+def build_blip2_engine(args):
     model_type = 'Salesforce/blip2-' + args.model_name
     processor = Blip2Processor.from_pretrained(model_type)
     model = Blip2ForConditionalGeneration.from_pretrained(
@@ -94,7 +89,7 @@ def build_blip_engine(args):
                        return_tensors="pt").to(args.device, torch.float16)
     image = inputs['pixel_values']
 
-    class BlipVisionWrapper(torch.nn.Module):
+    class Blip2VisionWrapper(torch.nn.Module):
 
         def __init__(self, model):
             super().__init__()
@@ -110,10 +105,11 @@ def build_blip_engine(args):
                                           return_dict=True)
             return self.projector(qformer_output.last_hidden_state)
 
-    wrapper = BlipVisionWrapper(model)
+    wrapper = Blip2VisionWrapper(model)
 
     export_visual_wrapper_onnx(wrapper, image, args.output_dir)
-    build_trt_engine(image.shape[2], image.shape[3], args.output_dir)
+    build_trt_engine(image.shape[2], image.shape[3], args.output_dir,
+                     args.max_batch_size)
 
 
 def build_llava_engine(args):
@@ -145,7 +141,8 @@ def build_llava_engine(args):
                                  model.config.vision_feature_layer)
 
     export_visual_wrapper_onnx(wrapper, image, args.output_dir)
-    build_trt_engine(image.shape[2], image.shape[3], args.output_dir)
+    build_trt_engine(image.shape[2], image.shape[3], args.output_dir,
+                     args.max_batch_size)
 
 
 def build_nougat_engine(args):
@@ -169,7 +166,8 @@ def build_nougat_engine(args):
     wrapper = SwinEncoderWrapper(swin_encoder)
 
     export_visual_wrapper_onnx(wrapper, image, args.output_dir)
-    build_trt_engine(image.shape[2], image.shape[3], args.output_dir)
+    build_trt_engine(image.shape[2], image.shape[3], args.output_dir,
+                     args.max_batch_size)
 
 
 if __name__ == '__main__':
@@ -188,6 +186,10 @@ if __name__ == '__main__':
                         type=str,
                         default='visual_engines',
                         help="Directory where visual TRT engines are saved")
+    parser.add_argument('--max_batch_size',
+                        type=int,
+                        default=4,
+                        help="Maximum batch size for input images")
     args = parser.parse_args()
 
     args.device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
@@ -197,7 +199,7 @@ if __name__ == '__main__':
         os.makedirs(args.output_dir)
 
     if args.model_name in ['opt-2.7b', 'flan-t5-xl']:
-        build_blip_engine(args)
+        build_blip2_engine(args)
     elif 'llava' in args.model_name:
         build_llava_engine(args)
     elif 'nougat' in args.model_name:

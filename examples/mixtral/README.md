@@ -38,7 +38,6 @@ python convert_checkpoint.py --model_dir ./Mixtral-8x7B-v0.1 \
                              --Pp_size 2
 trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_2gpu \
                  --output_dir ./trt_engines/mixtral/pp2 \
-                 --gpt_attention_plugin float16 \
                  --gemm_plugin float16
 
 ```
@@ -52,7 +51,6 @@ python convert_checkpoint.py --model_dir ./Mixtral-8x7B-v0.1 \
                              --tp_size 2
 trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_2gpu \
                  --output_dir ./trt_engines/mixtral/tp2 \
-                 --gpt_attention_plugin float16 \
                  --gemm_plugin float16
 ```
 

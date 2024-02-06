@@ -321,28 +321,22 @@ class GenerationMixin:
         inlen_range_cxt = default_range(max_input_len)
         inlen_range_gen = [1, 1, max_draft_len + 1]
 
-        if max_num_tokens is None:
-            num_tokens_range_ctx = default_range(max_input_len * max_batch_size)
-            num_tokens_range_gen = default_range(
-                max_batch_size * (max_draft_len + 1) * max_beam_width)
-        else:
-            num_tokens_range_ctx = default_range(max_num_tokens)
-            num_tokens_range_gen = default_range(max_num_tokens)
-
         enable_two_optimization_profiles = GenerationMixin.has_two_optimization_profiles(
             use_gpt_attention_plugin, use_gemm_plugin, remove_input_padding,
             paged_kv_cache)
+        if max_num_tokens is None:
+            max_num_tokens = max(
+                max_input_len * max_batch_size,
+                max_beam_width * (max_draft_len + 1) * max_batch_size)
         if enable_two_optimization_profiles:
             bb_range = [bb_range_cxt, bb_range_gen]
             bbd_range = [bbd_range_ctx, bbd_range_gen]
             inlen_range = [inlen_range_cxt, inlen_range_gen]
             position_ids_inlen_range = [inlen_range_cxt, [1, 1, 1]]
+            num_tokens_range_ctx = default_range(max_num_tokens)
+            num_tokens_range_gen = default_range(
+                max_batch_size * (max_draft_len + 1) * max_beam_width)
             num_tokens_range = [num_tokens_range_ctx, num_tokens_range_gen]
-            position_ids_num_tokens_range = [
-                num_tokens_range_ctx,
-                default_range(max_batch_size * max_beam_width)
-                if max_num_tokens is None else default_range(max_num_tokens)
-            ]
             last_token_range = [last_token_range, last_token_range]
         else:
             bb_range = [bb_range_gen]
@@ -350,20 +344,10 @@ class GenerationMixin:
             last_token_range = [last_token_range]
             inlen_range = [[1, 1, max_input_len]]
             position_ids_inlen_range = [[1, 1, max_input_len]]
-            if max_num_tokens is None:
-                num_tokens_range = [[
-                    1, max_batch_size * max_beam_width,
-                    max(max_input_len * max_batch_size,
-                        max_beam_width * (max_draft_len + 1) * max_batch_size)
-                ]]
-                position_ids_num_tokens_range = [[
-                    1, max_batch_size * max_beam_width,
-                    max(max_input_len * max_batch_size,
-                        max_beam_width * max_batch_size)
-                ]]
-            else:
-                num_tokens_range = [num_tokens_range_ctx]
-                position_ids_num_tokens_range = num_tokens_range
+            num_tokens_range = [[
+                1, max_batch_size * max_beam_width, max_num_tokens
+            ]]
+        position_ids_num_tokens_range = num_tokens_range
 
         input_ids = None
         position_ids = None

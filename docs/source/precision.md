@@ -136,9 +136,10 @@ This release of TensorRT-LLM contains the following examples:
 | MPT        |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
 | OPT        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Phi        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| Replit Code|   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     .     |     .      |
-| SantaCoder |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
-| StarCoder  |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
+| Replit Code|   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| SantaCoder |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| Skywork    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| StarCoder  |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | T5         |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 
 

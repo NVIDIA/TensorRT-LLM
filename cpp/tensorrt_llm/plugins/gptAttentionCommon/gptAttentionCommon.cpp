@@ -409,7 +409,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int num_heads, int num_kv_hea
     , mUseKVCache(use_cache)
     , mIsMedusaEnabled(is_medusa_enabled)
 {
-    // pre-check whether FMHA is supported in order to save memory allocation.
+    // Pre-check whether FMHA is supported in order to save memory allocation.
     if (mEnableContextFMHA)
     {
         mEnableContextFMHA = false;
@@ -420,7 +420,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int num_heads, int num_kv_hea
         else if (!MHARunner::fmha_supported(getHeadSize(), mSM))
         {
             TLLM_LOG_WARNING(
-                "Fall back to unfused MHA because of unsupported head size %d in sm_{%d}.", getHeadSize(), mSM);
+                "Fall back to unfused MHA because of unsupported head size %d in sm_%d.", getHeadSize(), mSM);
         }
         else if (mCrossAttention)
         {
@@ -453,6 +453,12 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int num_heads, int num_kv_hea
         TLLM_CHECK_WITH_INFO(!mFMHAForceFP32Acc, "FP32 Acc is not supported on Volta");
 
         TLLM_LOG_WARNING("Note that alibi or sliding window attention are not supported for FMHA on Volta");
+    }
+
+    // Pre-check whether the head size is supported by MMHA.
+    if (!mmha_supported(getHeadSize()))
+    {
+        TLLM_CHECK_WITH_INFO(false, "Head size %d is not supported by MMHA.", getHeadSize());
     }
 }
 

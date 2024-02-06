@@ -178,8 +178,8 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
     # Currently the gather_all_token_logits is not supported with target model of speculative decoding
     build_engine(fp16_weight_dir_x_gpu,
                  engine_dir / 'fp16-plugin-packed-paged-gather' / tp_pp_dir,
-                 tp_size, '--gather_all_token_logits',
-                 '--use_context_fmha_for_generation', *ifb_args)
+                 tp_size, '--gather_all_token_logits', *ifb_args)
+    # '--use_context_fmha_for_generation', *ifb_args) # Commented out because of `--use_context_fmha_for_generation` has bugs now: https://nvbugspro.nvidia.com/bug/4476681
     build_engine(
         fp16_weight_dir_x_gpu, engine_dir /
         'fp16-plugin-packed-paged-context-fmha-for-gen' / tp_pp_dir, tp_size,

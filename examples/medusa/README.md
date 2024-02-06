@@ -43,7 +43,6 @@ python convert_checkpoint.py --model_dir ./vicuna-7b-v1.3 \
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_medusa \
              --output_dir ./tmp/medusa/7B/trt_engines/fp16/1-gpu/ \
-             --gpt_attention_plugin float16 \
              --gemm_plugin float16 \
              --max_batch_size 8
 # Convert and Build Medusa decoding support for vicuna-13b-v1.3 with 4-way tensor parallelism.
@@ -56,7 +55,6 @@ python convert_checkpoint.py --model_dir ./vicuna-7b-v1.3 \
                             --workers 4
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_medusa \
              --output_dir ./tmp/medusa/7B/trt_engines/fp16/1-gpu/ \
-             --gpt_attention_plugin float16 \
              --gemm_plugin float16 \
              --max_batch_size 8
 ```

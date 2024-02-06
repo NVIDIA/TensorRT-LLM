@@ -44,10 +44,8 @@ Example usage:
 """
 
 import argparse
-import json
 import os
 import random
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -57,7 +55,7 @@ from tqdm import tqdm
 from transformers import (AutoModel, AutoModelForCausalLM,
                           AutoModelForSeq2SeqLM, AutoTokenizer,
                           GenerationConfig)
-from utils import load_tokenizer
+from utils import load_tokenizer, read_model_name
 
 import tensorrt_llm
 from tensorrt_llm.runtime import ModelRunner
@@ -77,12 +75,6 @@ RAND_SEED = 1234
 
 def get_choices():
     return ["A", "B", "C", "D"]
-
-
-def read_model_name_from_config(config_path: Path):
-    with open(config_path, "r") as f:
-        config = json.load(f)
-    return config["builder_config"]["name"]
 
 
 def get_subcategories():
@@ -302,6 +294,8 @@ class Pipeline:
         return self.tokenizer.decode(output_ids, skip_special_tokens=True)
 
     def check_valid_length(self, prompt):
+        if isinstance(self.model, nn.Module):
+            return True
         return len(self.tokenizer.encode(prompt)) <= self.model.max_input_len
 
 
@@ -343,7 +337,11 @@ def parse_args():
         help=
         'The attention window size that controls the sliding window attention / cyclic kv cache behaviour'
     )
-
+    parser.add_argument(
+        '--tokenizer_dir',
+        default=None,
+        help='tokenizer path; defaults to hf_model_dir if left unspecified')
+    parser.add_argument('--vocab_file')
     parser.add_argument("--test_trt_llm", action="store_true")
     parser.add_argument("--test_hf", action="store_true")
 
@@ -353,6 +351,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.tokenizer_dir is None:
+        args.tokenizer_dir = args.hf_model_dir
     random.seed(RAND_SEED)
     np.random.seed(RAND_SEED)
     runtime_rank = tensorrt_llm.mpi_rank()
@@ -373,11 +373,14 @@ def main():
     }
     cat_cors = {cat: [] for cat in get_categories()}
 
-    model_ckpt_path = args.hf_model_dir
-    model_name = read_model_name_from_config(
-        Path(args.engine_dir) / "config.json")
-    tokenizer, pad_id, end_id = load_tokenizer(model_ckpt_path,
-                                               model_name=model_name)
+    model_name, model_version = read_model_name(args.engine_dir)
+    tokenizer, pad_id, end_id = load_tokenizer(
+        tokenizer_dir=args.tokenizer_dir,
+        vocab_file=args.vocab_file,
+        model_name=model_name,
+        model_version=model_version,
+    )
+
     if args.test_trt_llm:
         assert not args.test_hf, "Cannot test both TRT-LLM and HF"
         model = ModelRunner.from_dir(args.engine_dir,

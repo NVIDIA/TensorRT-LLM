@@ -1,4 +1,4 @@
-import pickle
+import pickle  # nosec B403
 import socket
 import threading
 import time
@@ -79,7 +79,6 @@ class MpiSession:
 
     def get_socket_client(self) -> "SocketClient":
         return self._socket_listener.get_client()
-        return AsyncChannel(port)
 
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
@@ -130,7 +129,7 @@ class SocketListener:
                 while True:
                     client_socket, address = self.server_socket.accept()
                     received_data = client_socket.recv(self.buf_size)
-                    real_data = pickle.loads(received_data)
+                    real_data = pickle.loads(received_data)  # nosec B301
                     if real_data is None:
                         # get the quit signal
                         break

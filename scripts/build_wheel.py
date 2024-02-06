@@ -177,6 +177,8 @@ def main(build_type: str = "Release",
         rmtree(lib_dir)
     lib_dir.mkdir(parents=True)
     if on_windows:
+        copy(build_dir / "tensorrt_llm/tensorrt_llm.dll",
+             lib_dir / "tensorrt_llm.dll")
         copy(build_dir / f"tensorrt_llm/thop/th_common.dll",
              lib_dir / "th_common.dll")
         copy(
@@ -209,24 +211,33 @@ def main(build_type: str = "Release",
         copy(get_pybind_lib(), pkg_dir)
 
         with working_directory(project_dir):
-            build_run(f"{sys.executable} -m pip install pybind11-stubgen")
+            build_run(f"\"{sys.executable}\" -m pip install pybind11-stubgen")
         with working_directory(pkg_dir):
-            stubgen = "stubgen.py"
-            # Loading torch, trt before bindings is required to avoid import errors on windows.
-            stubgen_contents = """
-            # isort: off
-            import torch
-            import tensorrt as trt
-            # isort: on
+            if on_windows:
+                stubgen = "stubgen.py"
+                stubgen_contents = """
+                # Loading torch, trt before bindings is required to avoid import errors on windows.
+                # isort: off
+                import torch
+                import tensorrt as trt
+                # isort: on
+                import os
+                import platform
 
-            from pybind11_stubgen import main
+                from pybind11_stubgen import main
 
-            if __name__ == "__main__":
-                main()
-            """
-            (pkg_dir / stubgen).write_text(dedent(stubgen_contents))
-            build_run(f"{sys.executable} {stubgen} -o . bindings")
-            (pkg_dir / stubgen).unlink()
+                if __name__ == "__main__":
+                    # Load dlls from `libs` directory before launching bindings.
+                    if platform.system() == "Windows":
+                        os.add_dll_directory(r\"{lib_dir}\")
+                    main()
+                """.format(lib_dir=lib_dir)
+                (pkg_dir / stubgen).write_text(dedent(stubgen_contents))
+                build_run(f"\"{sys.executable}\" {stubgen} -o . bindings")
+                (pkg_dir / stubgen).unlink()
+            else:
+                build_run(
+                    f"\"{sys.executable}\" -m pybind11_stubgen -o . bindings")
 
     if dist_dir is None:
         dist_dir = project_dir / "build"

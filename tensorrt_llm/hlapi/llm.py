@@ -42,8 +42,11 @@ class ParallelConfig:
 
 class QuantConfig:
 
-    def __init__(self, quant_mode: Optional[QuantMode] = None):
+    def __init__(self,
+                 quant_mode: Optional[QuantMode] = None,
+                 quantize_lm_head: bool = False):
         self._quant_mode = quant_mode or QuantMode(0)
+        self.quantize_lm_head = quantize_lm_head
 
     @property
     def quant_mode(self) -> QuantMode:
@@ -118,6 +121,11 @@ class ModelConfig:
         if self.model:
             raise NotImplementedError("model is not supported yet.")
 
+        # TODO[chunweiy]: unify the model_dir to Path
+        if self.model_dir is not None and not Path.exists(Path(self.model_dir)):
+            raise ValueError(
+                f"model_dir of path {self.model_dir} does not exist.")
+
 
 class LLM:
     '''
@@ -147,7 +155,6 @@ class LLM:
                  config: ModelConfig,
                  tokenizer: Optional[TokenizerBase] = None,
                  enable_tokenizer: bool = True,
-                 dump_model_processing_summary: Optional[str] = None,
                  async_mode: bool = False,
                  async_engine_tmp_dir: Optional[str] = None,
                  **kwargs):
@@ -156,7 +163,6 @@ class LLM:
             config: The model config for the model.
             tokenizer: User provided tokenizer, will override the default one
             enable_tokenizer: Turn on the preprocessing and postprocessing with a tokenizer to make the llm pipeline takes texts as input and produces text as output.
-            dump_model_processing_summary: Dump the summary of the model building into a log file.
             async_mode: Run the model in async mode.
             async_engine_tmp_dir: The temporary directory to save the async engine. Only for debugging.
         '''
@@ -165,7 +171,6 @@ class LLM:
 
         self._tokenizer = tokenizer
         self.enable_tokenizer = enable_tokenizer
-        self.dump_model_processing_summary = dump_model_processing_summary
         self.async_mode = async_mode
         self.async_engine_tmp_dir = async_engine_tmp_dir
         # TODO[chunweiy]: Support more models and gpus
@@ -186,6 +191,8 @@ class LLM:
 
         self._executor: Optional[GenerationExecutor] = None
         self._additional_options = LLM.AdditionalOptions()
+
+        self.runtime_context: Optional[_ModelRuntimeContext] = None
 
         # set additional options for constructing the LLM pipeline
         valid_options = self._additional_options.get_valid_options()
@@ -260,7 +267,7 @@ class LLM:
     def tokenizer(self) -> TokenizerBase:
         if self._tokenizer:
             return self._tokenizer
-        if hasattr(self, 'runtime_context'):
+        if self.runtime_context is not None:
             return self.runtime_context.tokenizer
 
     def save(self, engine_dir: str):
@@ -841,7 +848,8 @@ class ModelLoader:
         self.model = model2struct[model_arch].from_hugging_face(
             self._model_dir,
             mapping=self.mapping,
-            quant_mode=self.config.quant_config.quant_mode)
+            quant_mode=self.config.quant_config.quant_mode,
+            quantize_lm_head=self.config.quant_config.quantize_lm_head)
         self.pretrained_config = self.model.config
         self._model_info = _ModelInfo.from_pretrained_config(
             self.pretrained_config)
@@ -933,9 +941,9 @@ class ModelLoader:
         try:
             self.tokenizer = ModelLoader.load_hf_tokenizer(self._model_dir)
         except:
-            logger.error(
+            raise RuntimeError(
                 f"failed to load HuggingFace tokenizer from {self._model_dir}\n"
-                "You can also have a try to copy the tokenizer* files from HuggingFace model to the engine directory manually."
+                "You can also try to copy the tokenizer* files from HuggingFace model to the engine directory manually."
             )
 
     @staticmethod
@@ -946,16 +954,3 @@ class ModelLoader:
                                                      truncation_side='left',
                                                      trust_remote_code=True,
                                                      use_fast=True)
-
-    def _convert_hf_to_trtllm_checkpoints(self):
-        '''
-        Convert a HuggingFace model to a TensorRT-LLM checkpoints.
-        The checkpoints will be cached in the cache directory.
-        '''
-        raise NotImplementedError()
-
-    def _quantize(self):
-        ''' Quantize a TensorRT-LLM checkpoints from a TensorRT-LLM checkpoints.
-        The checkpoints will be cached in the cache directory.
-        '''
-        raise NotImplementedError()

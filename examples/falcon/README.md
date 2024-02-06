@@ -111,10 +111,7 @@ Normally, the `trtllm-build` command only requires a single GPU, but you can ena
 
 ```bash
 # falcon-rw-1b
-# It is recommend to use --remove_input_padding along with --gpt_attention_plugin for better performance
 trtllm-build --checkpoint_dir ./falcon/rw-1b/trt_ckpt/fp16/1-gpu/ \
-                --remove_input_padding enable \
-                --gpt_attention_plugin float16 \
                 --gemm_plugin float16 \
                 --output_dir ./falcon/rw-1b/trt_engines/fp16/1-gpu/
 
@@ -124,40 +121,31 @@ trtllm-build --checkpoint_dir ./falcon/7b-instruct/trt_ckpt/bf16/1-gpu/ \
                 --gemm_plugin bfloat16 \
                 --remove_input_padding enable \
                 --gpt_attention_plugin bfloat16 \
-                --context_fmha enable \
                 --output_dir ./falcon/7b-instruct/trt_engines/bf16/1-gpu/
 
 # falcon-40b-instruct: 2-way tensor parallelism
 trtllm-build --checkpoint_dir ./falcon/40b-instruct/trt_ckpt/bf16/tp2-pp1/ \
                 --gemm_plugin bfloat16 \
-                --remove_input_padding enable \
                 --gpt_attention_plugin bfloat16 \
-                --context_fmha enable \
                 --output_dir ./falcon/40b-instruct/trt_engines/bf16/tp2-pp1/
 
 # falcon-40b-instruct: 2-way tensor parallelism and 2-way pipeline parallelism
 trtllm-build --checkpoint_dir ./falcon/40b-instruct/trt_ckpt/bf16/tp2-pp2/ \
                 --gemm_plugin bfloat16 \
-                --remove_input_padding enable \
                 --gpt_attention_plugin bfloat16 \
-                --context_fmha enable \
                 --output_dir ./falcon/40b-instruct/trt_engines/bf16/tp2-pp2/
 
 # falcon-180b: 8-way tensor parallelism
 trtllm-build --checkpoint_dir ./falcon/180b/trt_ckpt/bf16/tp8-pp1/ \
                 --gemm_plugin bfloat16 \
-                --remove_input_padding enable \
                 --gpt_attention_plugin bfloat16 \
-                --context_fmha enable \
                 --output_dir ./falcon/180b/trt_engines/bf16/tp8-pp1/ \
                 --workers 8
 
 # falcon-180b: 4-way tensor parallelism and 2-way pipeline parallelism
 trtllm-build --checkpoint_dir ./falcon/180b/trt_ckpt/bf16/tp4-pp2/ \
                 --gemm_plugin bfloat16 \
-                --remove_input_padding enable \
                 --gpt_attention_plugin bfloat16 \
-                --context_fmha enable \
                 --output_dir ./falcon/180b/trt_engines/bf16/tp4-pp2/ \
                 --workers 8
 ```
@@ -246,9 +234,6 @@ python ../quantization/quantize.py --model_dir ./falcon/180b \
 # Build trtllm engines from the trtllm checkpoint
 trtllm-build --checkpoint_dir ./falcon/180b/trt_ckpt/fp8/tp8-pp1 \
                 --gemm_plugin float16 \
-                --remove_input_padding enable \
-                --gpt_attention_plugin float16 \
-                --context_fmha enable \
                 --strongly_typed \
                 --output_dir ./falcon/180b/trt_engines/fp8/tp8-pp1 \
                 --workers 8
@@ -279,9 +264,6 @@ python ../quantization/quantize.py --model_dir ./falcon/180b \
 # Build trtllm engines from the trtllm checkpoint
 trtllm-build --checkpoint_dir ./falcon/180b/trt_ckpt/int4_awq/tp2 \
                 --gemm_plugin float16 \
-                --remove_input_padding enable \
-                --gpt_attention_plugin float16 \
-                --context_fmha enable \
                 --output_dir ./falcon/180b/trt_engines/int4_awq/tp2 \
                 --workers 2
 

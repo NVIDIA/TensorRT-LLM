@@ -391,7 +391,9 @@ def test_llm_request():
         "embedding_bias": torch.tensor((10, 10)),
         "stop_words_list": torch.tensor((10, 10)),
         "bad_words_list": torch.tensor((10, 10)),
-        "return_log_probs": True
+        "return_log_probs": True,
+        "return_context_logits": False,
+        "return_generation_logits": False
     }
     llm_request = _tb.LlmRequest(**kwargs)
 

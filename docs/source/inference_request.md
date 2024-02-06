@@ -31,4 +31,6 @@ Optional tensors that can be supplied to `InferenceRequest` are shown below. Def
 | `lora_weights` | [ num_lora_modules_layers, D x Hi + Ho x D ] | `float` (model data type) | weights for a lora adapter. see [lora docs](lora.md#lora-tensor-format-details) for more details. |
 | `lora_config` | [3] | `int32_t` | lora configuration tensor. `[ module_id, layer_idx, adapter_size (D aka R value) ]` see [lora docs](lora.md#lora-tensor-format-details) for more details. |
 | `return_log_probs` | [1] | `bool` | When `true`, include log probs in the output |
+| `return_context_logits` | [1] | `bool` | When `true`, include context logits in the output |
+| `return_generation_logits` | [1] | `bool` | When `true`, include generation logits in the output |
 | `draft_input_ids` | [num_draft_tokens] | `int32_t` | Draft tokens to be leveraged in generation phase to potentially generate multiple output tokens in one inflight batching iteration |

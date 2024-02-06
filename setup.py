@@ -94,8 +94,8 @@ setup(
     keywords="nvidia tensorrt deeplearning inference",
     package_data={
         'tensorrt_llm': ([
-            'libs/th_common.dll', 'libs/nvinfer_plugin_tensorrt_llm.dll',
-            'bindings.*.pyd'
+            'libs/th_common.dll', 'libs/tensorrt_llm.dll',
+            'libs/nvinfer_plugin_tensorrt_llm.dll', 'bindings.*.pyd'
         ] if on_windows else [
             'libs/libtensorrt_llm.so',
             'libs/libth_common.so',

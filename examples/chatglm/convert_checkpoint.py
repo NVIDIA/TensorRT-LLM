@@ -3,8 +3,9 @@ import functools
 import json
 import os
 import time
+import traceback
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -1254,7 +1255,16 @@ if __name__ == '__main__':
             futures = [
                 p.submit(covert_and_save, rank) for rank in range(world_size)
             ]
-            wait(futures)
+            exceptions = []
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    traceback.print_exc()
+                    exceptions.append(e)
+            assert len(
+                exceptions
+            ) == 0, "Checkpoint conversion failed, please check error log."
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

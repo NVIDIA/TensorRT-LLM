@@ -35,6 +35,7 @@ from tensorrt_llm.layers import MoeConfig, PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import PretrainedConfig, quantize_model
+from tensorrt_llm.models.modeling_utils import optimize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
@@ -387,8 +388,6 @@ def build_gpt(args):
                 'world_size': world_size,
                 'tp_size': world_size
             },
-            'use_fused_mlp':
-            True,
             'moe_num_experts':
             build_config["moe_num_experts"],
             'moe_top_k':
@@ -401,7 +400,7 @@ def build_gpt(args):
         tensorrt_llm_model = tensorrt_llm.models.LLaMAForCausalLM(config)
     elif family == "gptj":
         config = {
-            'architecture': 'OPTForCausalLM',
+            'architecture': 'GPTJForCausalLM',
             'dtype': args.dtype,
             'vocab_size': build_config['vocab_size'],
             'hidden_size': build_config['hidden_size'],
@@ -673,8 +672,6 @@ def build_gpt(args):
                 'world_size': world_size,
                 'tp_size': world_size
             },
-            'use_fused_mlp':
-            False,
             'attn_bias':
             build_config['bias'],
         }
@@ -735,6 +732,10 @@ def build_gpt(args):
     if family not in ['opt', 'bloom', 'falcon', 'llama', 'gptj', 'internlm']:
         tensorrt_llm_model = quantize_model(tensorrt_llm_model, quant_mode,
                                             **quant_kwargs)
+
+    if family in ['llama']:
+        tensorrt_llm_model = optimize_model(tensorrt_llm_model,
+                                            use_fused_mlp=True)
 
     # Module -> Network
     network = builder.create_network()
@@ -870,7 +871,8 @@ def build_bert(args):
         pad_token_id=None
         if family == 'bert' else 1,  # hard code for RoBERTa here
         is_roberta=(family == 'roberta'),
-        mapping=tensorrt_llm.Mapping(world_size=world_size, tp_size=world_size))
+        mapping=tensorrt_llm.Mapping(world_size=world_size, tp_size=world_size),
+        dtype=str_dtype_to_trt(args.dtype))
 
     # Module -> Network
     network = builder.create_network()

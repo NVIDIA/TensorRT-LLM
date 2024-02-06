@@ -314,7 +314,8 @@ public:
 
             // 2 * 2 stands for kv cache and 2 bytes per element.
             size_t size_in_bytes = block_size.y * params.s * params.d * 2 * 2;
-            if (size_in_bytes <= launch_params.device_l2_cache_size)
+            // Take uGPU into consideration.
+            if (size_in_bytes <= launch_params.device_l2_cache_size / 2)
             {
                 // strategy 1: limit to only 1 wave
                 block_size.x = std::min(m_steps / NUM_COMPUTE_GROUPS, sms_per_head);
@@ -443,7 +444,8 @@ public:
 
             // 2 * 2 stands for kv cache and 2 bytes per element.
             size_t size_in_bytes = block_size.y * launch_params.kernel_kv_s * params.d * 2 * 2;
-            if (size_in_bytes <= launch_params.device_l2_cache_size)
+            // Take uGPU into consideration.
+            if (size_in_bytes <= launch_params.device_l2_cache_size / 2)
             {
                 // strategy 1: limit to only 1 wave
                 block_size.x = std::min(m_steps / NUM_COMPUTE_GROUPS, sms_per_head);

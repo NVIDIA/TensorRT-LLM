@@ -59,8 +59,8 @@ void BaseSamplingLayer<T>::allocateBuffer(size_t batchSize)
     mSkipDecodeDevice = mAllocator->reMalloc(mSkipDecodeDevice, deviceBufferSizes[8], false);
     mSetupWorkspaceDevice = mAllocator->reMalloc(mSetupWorkspaceDevice, deviceBufferSizes[9], false);
 
-    auto const bytesAllocated = std::accumulate(deviceBufferSizes.begin(), deviceBufferSizes.end(), 0);
-    TLLM_LOG_DEBUG("baseSamplingLayer allocated %d bytes on GPU", bytesAllocated);
+    auto const bytesAllocated = std::accumulate(deviceBufferSizes.begin(), deviceBufferSizes.end(), (size_t) 0);
+    TLLM_LOG_DEBUG("baseSamplingLayer allocated %lu bytes on GPU", (size_t) bytesAllocated);
 
     // host buffers.
     mSkipDecodeHost = (bool*) std::realloc(mSkipDecodeHost, sizeof(bool) * batchSize);

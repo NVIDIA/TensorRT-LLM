@@ -65,6 +65,11 @@ KV_CACHE_CFG = {
         "axis": None,
         "enable": True
     },
+    "*.W_pack.output_quantizer": {
+        "num_bits": 8,
+        "axis": None,
+        "enable": True
+    },
     "*.c_attn.output_quantizer": {
         "num_bits": 8,
         "axis": None,

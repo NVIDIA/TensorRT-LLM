@@ -1,14 +1,12 @@
 import json
 import os
 import re
-import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
-import yaml
 
-from .._utils import str_dtype_to_torch, torch_to_numpy, unpack_nemo_ckpt
+from .._utils import str_dtype_to_torch, torch_to_numpy, unpack_nemo_weights
 
 
 def get_all_nemo_lora_weights(num_layers, lora_weights):
@@ -180,18 +178,7 @@ class LoraManager(object):
                 self._lora_weight_config[uid] = []
 
             if model_file != "":
-                with tempfile.TemporaryDirectory() as unpack_out_dir:
-                    unpack_out_dir = Path(unpack_out_dir)
-                    unpack_nemo_ckpt(model_file, unpack_out_dir)
-
-                    model_weights_ckpt = "model_weights.ckpt"
-                    with open(unpack_out_dir / "model_config.yaml") as f:
-                        yaml.full_load(f)
-                    weight_path = unpack_out_dir / model_weights_ckpt
-                    nemo_weights = torch.load(
-                        weight_path,
-                        map_location=lambda storage, loc: storage.cpu())
-
+                _, nemo_weights = unpack_nemo_weights(model_file)
                 all_lora_weights = get_all_nemo_lora_weights(
                     model_config.num_layers, nemo_weights)
             else:

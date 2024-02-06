@@ -58,7 +58,7 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
     return std::make_shared<tb::LlmRequest>(mRequestId, mMaxNewTokens,
         std::make_shared<std::vector<TokenIdType>>(mTokens.at(0)), mSamplingConfig, mIsStreaming, mEndId, mPadId,
         embeddingBias, badWordsList, stopWordsList, promptEmbeddingTable, mPromptVocabSize, loraWeights, loraConfig,
-        mReturnLogProbs, mDraftTokens, draftLogits);
+        mReturnLogProbs, mReturnContextLogits, mReturnGenerationLogits, mDraftTokens, draftLogits);
 }
 
 void LlmRequest::initBindings(py::module_& m)
@@ -69,7 +69,7 @@ void LlmRequest::initBindings(py::module_& m)
                  std::optional<LlmRequest::TensorPtr>, std::optional<LlmRequest::TensorPtr>,
                  std::optional<LlmRequest::TensorPtr>, std::optional<LlmRequest::TensorPtr>,
                  std::optional<LlmRequest::SizeType>, std::optional<LlmRequest::TensorPtr>,
-                 std::optional<LlmRequest::TensorPtr>, bool, std::optional<LlmRequest::VecTokens>,
+                 std::optional<LlmRequest::TensorPtr>, bool, bool, bool, std::optional<LlmRequest::VecTokens>,
                  std::optional<LlmRequest::TensorPtr>>(),
             py::arg("request_id"), py::arg("max_new_tokens"), py::arg("input_tokens"), py::arg("sampling_config"),
             py::arg("is_streaming"), py::arg("end_id") = std::nullopt, py::arg("pad_id") = std::nullopt,
@@ -77,6 +77,7 @@ void LlmRequest::initBindings(py::module_& m)
             py::arg("stop_words_list") = std::nullopt, py::arg("prompt_embedding_table") = std::nullopt,
             py::arg("prompt_vocab_size") = std::nullopt, py::arg("lora_weights") = std::nullopt,
             py::arg("lora_config") = std::nullopt, py::arg("return_log_probs") = false,
+            py::arg("return_context_logits") = false, py::arg("return_generation_logits") = false,
             py::arg("draft_tokens") = std::nullopt, py::arg("draft_logits") = std::nullopt)
         .def("get_num_tokens", &LlmRequest::getNumTokens, py::arg("beam"))
         .def_property_readonly("max_beam_num_tokens", &LlmRequest::getMaxBeamNumTokens)
@@ -107,6 +108,8 @@ void LlmRequest::initBindings(py::module_& m)
         .def_readwrite("pad_id", &LlmRequest::mPadId)
         .def_readwrite("seq_slot", &LlmRequest::mSeqSlot)
         .def_property_readonly("return_log_probs", &LlmRequest::returnLogProbs)
+        .def_property_readonly("return_context_logits", &LlmRequest::setReturnContextLogits)
+        .def_property_readonly("return_generation_logits", &LlmRequest::setReturnGenerationLogits)
         .def_property_readonly("log_probs", py::overload_cast<>(&LlmRequest::getLogProbs, py::const_))
         .def("get_log_probs", py::overload_cast<SizeType>(&LlmRequest::getLogProbs, py::const_))
         .def("set_log_probs", &LlmRequest::setLogProbs, py::arg("log_probs"), py::arg("beam"))

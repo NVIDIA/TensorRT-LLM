@@ -71,8 +71,8 @@ class TestFunctional(unittest.TestCase):
             product(['llama_attention'], [
                 ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
             ], ['float16', 'bfloat16'], [None], [2], [90, 1024], [4],
-                    [32, 64, 80, 112, 128], [0], [False], [False, True], [1],
-                    [False], [False]))
+                    [32, 64, 80, 96, 104, 112, 128], [0], [False],
+                    [False, True], [1], [False], [False]))
 
         # Test cases for gptj rotary embedding.
         # The previous test cases have covered the gptneox rotary embedding.
@@ -272,7 +272,7 @@ class TestFunctional(unittest.TestCase):
                 [4],
                 [68, 2543],
                 [16],
-                [32, 64, 128, 256],
+                [32, 64, 96, 112, 128, 160, 256],
                 [2],
                 [False],
                 [False],

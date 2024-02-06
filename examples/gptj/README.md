@@ -58,10 +58,7 @@ python convert_checkpoint.py --model_dir ./gpt-j-6b \
 # Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
 trtllm-build --checkpoint_dir ./trt_ckpt/gptj_fp16_tp1/ \
              --output_dir ./trt_engines/gptj_fp16_tp1/ \
-             --context_fmha enable \
-             --remove_input_padding enable \
              --gemm_plugin float16 \
-             --gpt_attention_plugin float16 \
              --max_batch_size=32 \
              --max_input_len=1919 \
              --max_output_len=128
@@ -152,11 +149,11 @@ Building command is identical to the common one above.
 
 #### Fused MultiHead Attention (FMHA)
 
-You can enable the FMHA kernels for GPT by adding `--enable_context_fmha` to the invocation of `build.py`. Note that it is disabled by default because of possible accuracy issues due to the use of Flash Attention.
+You can enable the FMHA kernels for GPT by adding `--context_fmha` to the invocation of `trtllm-build`. Note that it is enabled by default.
 
-If you find that the default fp16 accumulation (`--enable_context_fmha`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--enable_context_fmha_fp32_acc`. However, it is expected to see performance drop.
+If you find that the default fp16 accumulation (`--context_fmha`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--context_fmha_fp32_acc enable`. However, it is expected to see performance drop.
 
-Note `--enable_context_fmha` / `--enable_context_fmha_fp32_acc` has to be used together with `--use_gpt_attention_plugin float16`.
+Note `--context_fmha` / `--context_fmha_fp32_acc` has to be used together with `--gpt_attention_plugin float16`.
 
 #### INT8 KV cache
 INT8 KV cache could be enabled to reduce memory footprint. It will bring more performance gains when batch size gets larger.

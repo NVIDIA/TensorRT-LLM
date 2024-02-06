@@ -36,7 +36,6 @@
     # OPT-2.7B
     trtllm-build --checkpoint_dir=./opt/2.7B/trt_ckpt/fp16/1-gpu/ \
                     --max_batch_size 8 \
-                    --gpt_attention_plugin float16 \
                     --gemm_plugin float16 \
                     --max_input_len 924 \
                     --max_output_len 100 \
@@ -58,7 +57,6 @@
 
     trtllm-build --checkpoint_dir=./opt/2.7B/trt_ckpt/int4_weightonly/1-gpu/ \
                     --max_batch_size 8 \
-                    --gpt_attention_plugin float16 \
                     --gemm_plugin float16 \
                     --max_input_len 924 \
                     --max_output_len 100 \

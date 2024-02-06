@@ -42,7 +42,7 @@ set(SRCS
 
 include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)
 
-if(NOT MSVC)
+if(NOT WIN32)
   # additional warnings
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
   if(WARNING_IS_ERROR)

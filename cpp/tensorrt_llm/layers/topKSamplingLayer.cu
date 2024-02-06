@@ -88,8 +88,8 @@ void TopKSamplingLayer<T>::allocateBuffer(size_t const batchSize)
     mRuntimeTopPDevice = mAllocator->reMalloc(mRuntimeTopPDevice, deviceBufferSizes[2], false);
     mSetupWorkspaceDevice = mAllocator->reMalloc(mSetupWorkspaceDevice, deviceBufferSizes[3], false);
 
-    auto const bytesAllocated = std::accumulate(deviceBufferSizes.begin(), deviceBufferSizes.end(), 0);
-    TLLM_LOG_DEBUG("topKSamplingLayer allocated %d bytes on GPU", bytesAllocated);
+    auto const bytesAllocated = std::accumulate(deviceBufferSizes.begin(), deviceBufferSizes.end(), (size_t) 0);
+    TLLM_LOG_DEBUG("topKSamplingLayer allocated %lu bytes on GPU", (size_t) bytesAllocated);
 
     mIsAllocateBuffer = true;
 }

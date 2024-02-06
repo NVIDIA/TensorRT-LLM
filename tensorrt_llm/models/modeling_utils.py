@@ -3,12 +3,16 @@ import json
 import os
 from typing import List, Optional
 
+import numpy as np
 import safetensors
+import torch
 
 from .._common import default_net
-from .._utils import str_dtype_to_trt
+from .._utils import (numpy_to_torch, str_dtype_to_torch, str_dtype_to_trt,
+                      trt_dtype_to_torch)
 from ..functional import PositionEmbeddingType, Tensor, gather_last_token_logits
-from ..layers import AttentionParams, KeyValueCacheParams, LoraParams
+from ..layers import (AttentionParams, FusedGatedMLP, GatedMLP,
+                      KeyValueCacheParams, LoraParams)
 from ..mapping import Mapping
 from ..module import Module, ModuleList
 from ..quantization import QuantMode
@@ -133,6 +137,7 @@ class PretrainedConfig:
                 'has_zero_point': False,
                 'pre_quant_scale': False,
                 'exclude_modules': None,
+                'sq_use_plugin': False,
             })
         quant_algo = quantization.get('quant_algo', None)
         kv_cache_quant_algo = quantization.get('kv_cache_quant_algo', None)
@@ -194,6 +199,8 @@ class PretrainedConfig:
             self.quant_kwargs.get('pre_quant_scale', False),
             'exclude_modules':
             self.quant_kwargs.get('exclude_modules', None),
+            'sq_use_plugin':
+            self.quant_kwargs.get('sq_use_plugin', False),
         }
 
         return output
@@ -517,3 +524,82 @@ class DecoderModelForCausalLM(PretrainedModel):
             if self.config.mapping.is_last_pp_rank():
                 return lm_logits, hidden_states
             return hidden_states
+
+
+def fuse_gate_mlp(model):
+    for layer in model.transformer.layers:
+        if not hasattr(layer, 'mlp'):
+            continue
+
+        quant_algo = model.config.quant_kwargs['quant_algo']
+        if isinstance(layer.mlp, GatedMLP):
+            fused_layer = FusedGatedMLP(
+                hidden_size=layer.mlp.hidden_size,
+                ffn_hidden_size=layer.mlp.ffn_hidden_size,
+                hidden_act=layer.mlp.hidden_act,
+                bias=layer.mlp.bias,
+                dtype=layer.mlp.dtype,
+                tp_group=layer.mlp.tp_group,
+                tp_size=layer.mlp.tp_size,
+                quant_mode=layer.mlp.quant_mode,
+                max_lora_rank=layer.mlp.max_lora_rank)
+
+            if quant_algo == 'FP8':
+                if isinstance(layer.mlp.dtype, str):
+                    dtype = str_dtype_to_torch(layer.mlp.dtype)
+                else:
+                    dtype = trt_dtype_to_torch(layer.mlp.dtype)
+
+                # dequantize
+                gate_weight = numpy_to_torch(
+                    layer.mlp.gate.weight.raw_value).to(dtype) * numpy_to_torch(
+                        layer.mlp.gate.weights_scaling_factor.raw_value)
+                fc_weight = numpy_to_torch(
+                    layer.mlp.fc.weight.raw_value).to(dtype) * numpy_to_torch(
+                        layer.mlp.fc.weights_scaling_factor.raw_value)
+
+                # concat
+                fused_weight = torch.cat([gate_weight, fc_weight], dim=0)
+
+                # quantize
+                fused_weight_scaling_factor = numpy_to_torch(
+                    max(
+                        layer.mlp.gate.weights_scaling_factor.raw_value,
+                        layer.mlp.fc.weights_scaling_factor.raw_value,
+                    ))
+                fused_weight = (fused_weight / fused_weight_scaling_factor).to(
+                    torch.float8_e4m3fn)
+
+                fused_layer.fused_fc.weight.value = fused_weight
+                fused_layer.fused_fc.weights_scaling_factor.value = fused_weight_scaling_factor
+
+                fused_layer.fused_fc.activation_scaling_factor.value = \
+                    max(layer.mlp.gate.activation_scaling_factor.raw_value,
+                        layer.mlp.fc.activation_scaling_factor.raw_value
+                    )
+            elif quant_algo is None:
+                fused_layer.fused_fc.weight.value = np.concatenate([
+                    layer.mlp.gate.weight.raw_value,
+                    layer.mlp.fc.weight.raw_value
+                ],
+                                                                   axis=0)
+                if layer.mlp.bias:
+                    fused_layer.fused_fc.bias.value = np.concatenate([
+                        layer.mlp.gate.bias.raw_value,
+                        layer.mlp.fc.bias.raw_value
+                    ],
+                                                                     axis=0)
+            else:
+                raise ValueError(f'Unsupported quant algo: {quant_algo}')
+
+            fused_layer.proj = layer.mlp.proj
+
+            layer.mlp = fused_layer
+
+    return model
+
+
+def optimize_model(model, use_fused_mlp=False):
+    if use_fused_mlp:
+        model = fuse_gate_mlp(model)
+    return model

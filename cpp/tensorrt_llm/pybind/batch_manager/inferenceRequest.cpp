@@ -111,6 +111,10 @@ void InferenceRequest::initBindings(py::module_& m)
         .def_property("random_seed", &InferenceRequest::getRandomSeedUnchecked, &InferenceRequest::setRandomSeed)
         .def_property(
             "return_log_probs", &InferenceRequest::getReturnLogProbsUnchecked, &InferenceRequest::setReturnLogProbs)
+        .def_property("return_context_logits", &InferenceRequest::getReturnContextLogitsUnchecked,
+            &InferenceRequest::setReturnContextLogits)
+        .def_property("return_generation_logits", &InferenceRequest::getReturnGenerationLogitsUnchecked,
+            &InferenceRequest::setReturnGenerationLogits)
         .def_property("prompt_embedding_table", &InferenceRequest::getPromptEmbeddingTableUnchecked,
             &InferenceRequest::setPromptEmbeddingTable)
         .def_property(

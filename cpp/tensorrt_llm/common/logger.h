@@ -33,7 +33,7 @@ class Logger
 // On Windows, the file wingdi.h is included which has
 // #define ERROR 0
 // This breaks everywhere ERROR is used in the Level enum
-#if _WIN32
+#ifdef _WIN32
 #undef ERROR
 #endif // _WIN32
 
