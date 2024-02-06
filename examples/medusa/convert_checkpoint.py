@@ -129,7 +129,7 @@ def parse_arguments():
         '--fp8_kv_cache',
         default=False,
         action="store_true",
-        help='By default, we use dtype for KV cache. fp8_kv_cache chooses int8 '
+        help='By default, we use dtype for KV cache. fp8_kv_cache chooses fp8 '
         'quantization for KV')
     parser.add_argument('--load_by_shard',
                         action='store_true',
