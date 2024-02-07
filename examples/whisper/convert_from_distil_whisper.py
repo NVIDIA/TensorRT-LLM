@@ -1,4 +1,5 @@
 import argparse
+import os
 import re
 
 from collections import OrderedDict
@@ -54,6 +55,13 @@ def main():
         "dims": model_dims,
         "model_state_dict": new_state_dict
     }
+
+    # Create the directory
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        print(f"Directory '{output_dir}' created successfully!")
+    else:
+        print(f"Directory '{output_dir}' already exists!")
 
     output_path = Path(output_dir) / f"{output_name}.pt"
     torch.save(pytorch_model, output_path)
