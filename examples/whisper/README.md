@@ -43,6 +43,21 @@ python3 build.py --output_dir whisper_large_v3 --use_gpt_attention_plugin --use_
 python3 build.py --output_dir whisper_large_weight_only --use_gpt_attention_plugin --use_gemm_plugin --use_bert_attention_plugin --use_weight_only
 ```
 
+TensorRT-LLM also supports using [distil-whisper's](https://github.com/huggingface/distil-whisper) different models by first converting their params and weights from huggingface's naming format to [openai whisper](https://github.com/openai/whisper) naming format.
+You can do so by running the script [convert_from_distil_whisper.py](./convert_from_distil_whisper.py) as follows:
+
+```bash
+# install requirements first
+pip install -r requirements.txt
+
+# will download the model weights from huggingface and convert them to openai-whisper's pytorch format
+# model is saved to ./assets/ by default
+python3 convert_from_distil_whisper.py --model_name distil-whisper/distil-large-v2
+
+# now we can build the model like before:
+python3 build.py --model_name distil-large-v2 --output_dir compiled-distil-large-v2 --use_gpt_attention_plugin --use_gemm_plugin --use_bert_attention_plugin
+```
+
 ### Run
 
 ```bash
