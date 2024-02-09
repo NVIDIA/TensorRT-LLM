@@ -60,7 +60,7 @@ git submodule update --init --recursive
 
 Download and unzip [TensorRT 9.1.0.4 for TensorRT-LLM](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/secure/9.1.0/tars/tensorrt-9.1.0.4.windows10.x86_64.cuda-12.2.llm.beta.zip). Move the folder to a location you can reference later, such as `%USERPROFILE%\inference\TensorRT`.
 
-Download and unzip [cuDNN](https://developer.nvidia.com/cudnn). Move the folder to a location you can reference later, such as `%USERPROFILE%\inference\cuDNN`.
+Download and unzip [cuDNN v8.9.7] from the Archive (requires login) (https://developer.nvidia.com/cudnn](https://developer.nvidia.com/rdp/cudnn-archive). Note that the current version 9.0.0 will not work. After download, move the folder to a location you can reference later, such as `%USERPROFILE%\inference\cuDNN`.
 
 You'll need to add libraries and binaries for TensorRT and cuDNN to your system's `Path` environment variable. To do so, click the Windows button and search for "environment variables." Select "Edit the system environment variables." A "System Properties" window will open. Select the "Environment Variables" button at the bottom right, then in the new window under "System variables" click "Path" then the "Edit" button. Add "New" lines for the `lib` dir of TensorRT and for the `bin` and `lib` dirs of cuDNN. Your `Path` should include lines like this:
 
