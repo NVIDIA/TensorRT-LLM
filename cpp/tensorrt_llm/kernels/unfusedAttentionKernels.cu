@@ -1697,8 +1697,8 @@ __global__ void addRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_
     for (int seq_j = threadIdx.x; seq_j < seq_len; seq_j += blockDim.x)
     {
 
-        const int qk_index
-            = batch_id * head_num * seq_len * seq_len + head_id * seq_len * seq_len + seq_i * seq_len + seq_j;
+        const int64_t qk_index
+            = static_cast<int64_t>(batch_id) * head_num * seq_len * seq_len + static_cast<int64_t>(head_id) * seq_len * seq_len + static_cast<int64_t>(seq_i) * seq_len + seq_j;
 
         if (implicit)
         {
@@ -1730,7 +1730,7 @@ __global__ void addRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_
         }
         else
         {
-            const int bias_index = head_id * max_seq_len * max_seq_len + seq_i * max_seq_len + seq_j;
+            const int64_t bias_index = static_cast<int64_t>(head_id) * max_seq_len * max_seq_len + static_cast<int64_t>(seq_i) * max_seq_len + seq_j;
             qk_buf[qk_index] = (T) add((T) relative_attention_bias[bias_index], qk_buf[qk_index]);
         }
     }
