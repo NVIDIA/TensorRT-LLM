@@ -230,17 +230,16 @@ class MixtureOfExperts(Module):
         if quant_mode.is_weight_only():
             self.weight_dtype = trt.int8
 
-        # TODO: benchmark the router and check best TP configuration
-        # Since output dimension is usually low (in the order of 10s), we split on input dim for the moment
-        # Maybe no TP at all is even more efficient
+        # Since output dimension is usually low (in the order of 10s), no TP at all is more efficient
+        # as no allreduce required in the end
         self.router = RowLinear(
             hidden_size,
             self.num_experts,
             bias=False,
             dtype=trt.
             float32,  # Routing is sensitive since it conditions what experts are used
-            tp_group=tp_group,
-            tp_size=tp_size,
+            tp_group=None,
+            tp_size=1,
             strict_dtype=True,
         )
 
@@ -293,10 +292,6 @@ class MixtureOfExperts(Module):
     def forward(self, hidden_states, finished=None, lora_layer_params=None):
         assert lora_layer_params is None, "LoRA + MoE is not supported for the moment"
         routing_input = cast(hidden_states, trt.float32)
-        if self.tp_size > 1:
-            routing_input = split(routing_input,
-                                  self.router.in_features,
-                                  dim=-1)[self.tp_rank]
         routing = self.router(routing_input)
         output = _moe_plugin(self.moe_config,
                              hidden_states,

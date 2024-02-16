@@ -1003,13 +1003,8 @@ def convert_hf_llama(hf_model,
 
             moe_experts_gate_weights = get_weight(
                 model_params, prefix + 'block_sparse_moe.gate', dtype)
-            v = split(moe_experts_gate_weights,
-                      mapping.tp_size,
-                      mapping.tp_rank,
-                      dim=-1)
-
             weights.update(
-                get_tllm_linear_weight(v.to(torch.float32),
+                get_tllm_linear_weight(moe_experts_gate_weights.to(torch.float32),
                                        tllm_prex + 'mlp.router.', None,
                                        use_weight_only,
                                        plugin_weight_only_quant_type, dtype,
