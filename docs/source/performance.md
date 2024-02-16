@@ -169,11 +169,11 @@ make -C docker run LOCAL_USER=1
 ```
 
 > [!WARNING]
-> If you have elevated privileges on your system, then skip the `make -C docker run LOCAL_USER=1`
-command above as it may make it so that you cannot access some required system libraries within the
-container because the build forces your UID and GID to match those that are set for your non-elevated
-user. There are cases where the container will be booted as root (i.e. on some SLURM systems with
-the pyxis plugin) which will cause libraries to be missing.
+> If you have elevated privileges on your system, then run `make -C docker run` instead of 
+`make -C docker run LOCAL_USER=1` command above as it may make it so that you cannot access some 
+required system libraries within the container because the build forces your UID and GID to match 
+those that are set for your non-elevated user. There are cases where the container will be booted 
+as root (i.e. on some SLURM systems with the pyxis plugin) which will cause libraries to be missing.
 
 If you are benchmarking in a shared environment, you need to specify the GPU indices that you would
 like the container to use, otherwise the Makefile defaults to loading the container with all GPUs on
