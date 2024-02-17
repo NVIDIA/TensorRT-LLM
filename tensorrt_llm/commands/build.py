@@ -379,9 +379,15 @@ def preprocess_weights(
 
 
 def build_and_save(rank, gpu_id, ckpt_dir, build_config, output_dir, log_level,
-                   model_config, model_cls, **kwargs):
+                   model_config, model_cls_file, model_cls_name, **kwargs):
     torch.cuda.set_device(gpu_id)
     logger.set_level(log_level)
+    model_cls = None
+    if model_cls_file is not None:
+        assert model_cls_name is not None
+        loader = SourceFileLoader('models', model_cls_file)
+        mod = loader.load_module()
+        model_cls = getattr(mod, model_cls_name)
     engine = build(build_config,
                    rank,
                    ckpt_dir,
@@ -398,7 +404,8 @@ def parallel_build(ckpt_dir_or_model_config: str,
                    output_dir: str,
                    workers: int = 1,
                    log_level: str = 'info',
-                   model_cls=None,
+                   model_cls_file=None,
+                   model_cls_name=None,
                    **kwargs):
     ckpt_dir = ckpt_dir_or_model_config
     if ckpt_dir_or_model_config.lower().endswith('.json'):
@@ -412,7 +419,8 @@ def parallel_build(ckpt_dir_or_model_config: str,
         for rank in range(model_config.mapping.world_size):
             passed = build_and_save(rank, rank % workers, ckpt_dir,
                                     build_config, output_dir, log_level,
-                                    model_config, model_cls, **kwargs)
+                                    model_config, model_cls_file, model_cls_name,
+                                    **kwargs)
             assert passed, "Engine building failed, please check error log."
     else:
         with ProcessPoolExecutor(mp_context=get_context('spawn'),
@@ -420,7 +428,7 @@ def parallel_build(ckpt_dir_or_model_config: str,
             futures = [
                 p.submit(build_and_save, rank, rank % workers, ckpt_dir,
                          build_config, output_dir, log_level, model_config,
-                         model_cls, **kwargs)
+                         model_cls_file, model_cls_name, **kwargs)
                 for rank in range(model_config.mapping.world_size)
             ]
             exceptions = []
@@ -441,13 +449,6 @@ def main():
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
-
-    model_cls = None
-    if args.model_cls_file is not None:
-        assert args.model_cls_name is not None
-        loader = SourceFileLoader('models', args.model_cls_file)
-        mod = loader.load_module()
-        model_cls = getattr(mod, args.model_cls_name)
 
     workers = min(torch.cuda.device_count(), args.workers)
 
@@ -487,7 +488,7 @@ def main():
         'weight_only_precision': args.weight_only_precision,
     }
     parallel_build(source, build_config, args.output_dir, workers,
-                   args.log_level, model_cls, **kwargs)
+                   args.log_level, args.model_cls_file, args.model_cls_name, **kwargs)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
