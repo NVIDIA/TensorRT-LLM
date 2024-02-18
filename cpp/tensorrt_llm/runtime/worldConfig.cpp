@@ -70,10 +70,6 @@ WorldConfig::WorldConfig(SizeType tensorParallelism, SizeType pipelineParallelis
 
     TLLM_CHECK(mTensorParallelism > 0);
     TLLM_CHECK(mPipelineParallelism > 0);
-
-    TLLM_CHECK_WITH_INFO(static_cast<SizeType>(numDevices) >= tensorParallelism * pipelineParallelism,
-        "Number of GPUs per node %d must be at least as large as TP (%d) * PP (%d)", mGpusPerNode, mTensorParallelism,
-        mPipelineParallelism);
 }
 
 bool WorldConfig::validConfig(SizeType tensorParallelism, SizeType pipelineParallelism)

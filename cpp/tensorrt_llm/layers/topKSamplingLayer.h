@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,46 +36,44 @@ class TopKSamplingLayer : public BaseSamplingLayer<T>
 public:
     using Base = BaseSamplingLayer<T>;
     using SetupParams = typename Base::SetupParams;
+    using ForwardParams = typename Base::ForwardParams;
 
     TopKSamplingLayer(size_t maxBatchSize, size_t vocabSize, size_t vocabSizePadded, cudaStream_t stream,
         std::shared_ptr<tensorrt_llm::common::IAllocator> allocator);
-    TopKSamplingLayer(TopKSamplingLayer<T> const& top_k_sampling_layer);
     ~TopKSamplingLayer();
 
-    void setup(size_t batchSize, int const* batch_slots, SetupParams const& setupParams) override;
+    void setup(size_t batchSize, int32_t const* batchSlots, SetupParams const& setupParams) override;
+    void forward(DecodingOutputParams& outputs, ForwardParams& inputs) override;
 
-protected:
-    void runSampling(DecodingOutputParams& outputs, DecodingParams const& inputs) override;
-
-    void freeBuffer() override;
+    const bool* getSkipDecodeHost() const
+    {
+        return mSkipDecodeHost;
+    }
 
 protected:
     bool mNormalizeLogProbs = true;
-    uint32_t mRuntimeMaxTopK = 1;
+    uint32_t mRuntimeMaxTopK = 0;
     uint32_t* mRuntimeTopKDevice = nullptr;
     float* mRuntimeTopPDevice = nullptr;
     void* mSetupWorkspaceDevice = nullptr;
+    bool* mSkipDecodeDevice = nullptr;
+    bool* mSkipDecodeHost = nullptr;
 
     using Base::mMaxBatchSize;
     using Base::mVocabSize;
     using Base::mVocabSizePadded;
 
     using Base::mSamplingWorkspaceSize;
-    using Base::mSamplingWorkspaceDevice;
-    using Base::mCurandStatesDevice;
-    using Base::mSkipDecodeDevice;
-    using Base::mSkipDecodeHost;
-    using Base::mSkipAny;
-    using Base::mRuntimeLogitsDevice;
+    using Base::mAllocatedSize;
 
     using Base::mStream;
     using Base::mAllocator;
-    using Base::mIsAllocateBuffer;
 
     static constexpr uint32_t TOP_K_MAX = 1024;
 
 private:
     void allocateBuffer(size_t batchSize);
+    void freeBuffer();
 };
 
 } // namespace layers

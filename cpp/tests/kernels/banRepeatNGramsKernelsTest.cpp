@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -51,6 +51,7 @@ public:
 
     void initData(const std::vector<std::vector<SizeType>>& outputIds, const std::vector<SizeType>& nGramSizes)
     {
+        auto const ptrType = TRTDataType<void*>::value;
         SizeType const batchSize = outputIds.size();
         auto const maxBatchSize = 2 * batchSize;
 
@@ -63,13 +64,11 @@ public:
 
         mOutputIds = mBufferManager->pinned(
             ITensor::makeShape({maxBatchSize, mBeamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
-        mOutputIdsPtr
-            = mBufferManager->pinned(ITensor::makeShape({maxBatchSize, mBeamWidth}), nvinfer1::DataType::kINT64);
+        mOutputIdsPtr = mBufferManager->pinned(ITensor::makeShape({maxBatchSize, mBeamWidth}), ptrType);
 
         mParentIds = mBufferManager->pinned(
             ITensor::makeShape({maxBatchSize, mBeamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
-        mParentIdsPtr
-            = mBufferManager->pinned(ITensor::makeShape({maxBatchSize, mBeamWidth}), nvinfer1::DataType::kINT64);
+        mParentIdsPtr = mBufferManager->pinned(ITensor::makeShape({maxBatchSize, mBeamWidth}), ptrType);
 
         mNGramSizes = mBufferManager->pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
 
@@ -106,8 +105,8 @@ public:
             logitsPtr[bi * mVocabSizePadded + lastId] = 1.f;
         }
 
-        auto outputIdsPtrsData = reinterpret_cast<void**>(bufferCast<int64_t>(*mOutputIdsPtr));
-        auto parentIdsPtrsData = reinterpret_cast<void**>(bufferCast<int64_t>(*mParentIdsPtr));
+        auto outputIdsPtrsData = BufferRange<void*>(*mOutputIdsPtr);
+        auto parentIdsPtrsData = BufferRange<void*>(*mParentIdsPtr);
         auto outputIdsData = bufferCast<int32_t>(*mOutputIds);
         auto parentIdsData = bufferCast<int32_t>(*mParentIds);
 
@@ -174,10 +173,10 @@ public:
         initData(outputIds, nGramSizes);
 
         tk::invokeBanRepeatNgram(bufferCast<float>(*mLogits),
-            reinterpret_cast<const int**>(bufferCast<int64_t>(*mOutputIdsPtr)),
+            reinterpret_cast<int32_t const**>(bufferCast<int64_t>(*mOutputIdsPtr)),
             reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinished)),
-            reinterpret_cast<const int**>(bufferCast<int64_t>(*mParentIdsPtr)), bufferCast<int32_t>(*mBatchSlots),
-            bufferCast<int32_t>(*mSequenceLengths), batchSize, batchSize, mBeamWidth, mMaxSeqLen,
+            reinterpret_cast<int32_t const**>(bufferCast<int64_t>(*mParentIdsPtr)), bufferCast<int32_t>(*mBatchSlots),
+            bufferCast<int32_t>(*mSequenceLengths), batchSize, mBeamWidth, mMaxSeqLen,
             bufferCast<int32_t>(*mNGramSizes), mVocabSizePadded, maxStep, mStream->get());
 
         mStream->synchronize();

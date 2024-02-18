@@ -381,6 +381,7 @@ def _weight_only_groupwise_quantize(model,
                                     group_size=128,
                                     pre_quant_scale=False,
                                     zero=False,
+                                    weight_only_precision="int4_awq",
                                     exclude_modules=None,
                                     current_key_name=None):
     exclude_modules = ['lm_head'
@@ -394,6 +395,7 @@ def _weight_only_groupwise_quantize(model,
         if len(list(module.children())) > 0:
             _weight_only_groupwise_quantize(module, quant_mode, group_size,
                                             pre_quant_scale, zero,
+                                            weight_only_precision,
                                             exclude_modules, current_key_name)
 
         if isinstance(module, ColumnLinear) and name not in exclude_modules:
@@ -406,6 +408,7 @@ def _weight_only_groupwise_quantize(model,
                     pre_quant_scale=pre_quant_scale,
                     zero=zero,
                     bias=module.bias is not None,
+                    use_w4a8_awq=weight_only_precision == 'w4a8_awq',
                     dtype=module.dtype,
                     tp_group=module.tp_group,
                     tp_size=module.tp_size,
@@ -420,6 +423,7 @@ def _weight_only_groupwise_quantize(model,
                     pre_quant_scale=pre_quant_scale,
                     zero=zero,
                     bias=module.bias is not None,
+                    use_w4a8_awq=weight_only_precision == 'w4a8_awq',
                     dtype=module.dtype,
                     tp_group=module.tp_group,
                     tp_size=module.tp_size)

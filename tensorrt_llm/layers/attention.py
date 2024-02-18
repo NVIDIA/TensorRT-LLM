@@ -19,13 +19,14 @@ import numpy as np
 import tensorrt as trt
 
 from .._common import default_net, precision
-from .._utils import (fp32_array, int32_array, numpy_fp32_to_bf16,
-                      preview_trt_version, trt_dtype_to_np, trt_dtype_to_str)
+from .._utils import (fp32_array, int32_array, is_same_dtype,
+                      numpy_fp32_to_bf16, preview_trt_version, trt_dtype_to_np,
+                      trt_dtype_to_str)
 from ..functional import (AttentionMaskType, PositionEmbeddingType,
                           RotaryScalingType, Tensor, arange, bert_attention,
                           cast, clip, concat, constant, embedding, expand,
                           expand_dims, expand_mask, generate_alibi_biases,
-                          generate_alibi_slopes, gpt_attention, matmul,
+                          generate_alibi_slopes, gpt_attention, matmul, minimum,
                           repeat_interleave, shape, slice, softmax, split,
                           unsqueeze, view, where)
 from ..module import Module
@@ -259,6 +260,70 @@ def make_causal_mask(bsz, tgt_len, past_key_values_length, dtype):
     return mask
 
 
+def compute_relative_bias(query_length,
+                          key_length,
+                          num_buckets,
+                          max_distance,
+                          bidirectional,
+                          rel_attn_table,
+                          tp_size=1,
+                          tp_group=None,
+                          tp_rank=None):
+
+    def make_relative_position_bucket(relative_position, bidirectional,
+                                      num_buckets, max_distance):
+        relative_buckets = 0
+        if bidirectional:
+            num_buckets //= 2
+            relative_buckets += where(relative_position > 0, num_buckets, 0)
+            relative_position = relative_position.abs()
+        else:
+            relative_position = 0 - minimum(relative_position, 0)
+
+        max_exact = num_buckets // 2
+        is_small = relative_position < max_exact
+
+        max_exact_fp = constant(fp32_array(max_exact))
+        tmp = cast(relative_position, "float32") / max_exact_fp
+        tmp = tmp.log()
+        const1 = math.log(max_distance / max_exact)
+        const2 = constant(fp32_array(num_buckets - max_exact))
+        relative_position_if_large = tmp / const1 * const2
+        relative_position_if_large = cast(relative_position_if_large, "int32")
+        relative_position_if_large = max_exact + relative_position_if_large
+        relative_position_if_large = minimum(relative_position_if_large,
+                                             num_buckets - 1)
+
+        relative_buckets += where(is_small, relative_position,
+                                  relative_position_if_large)
+        return relative_buckets
+
+    context_position = arange(start=constant(int32_array(0)),
+                              end=query_length,
+                              dtype=trt_dtype_to_str(trt.int32))
+    context_position = unsqueeze(context_position, -1)
+    memory_position = arange(start=constant(int32_array(0)),
+                             end=key_length,
+                             dtype=trt_dtype_to_str(trt.int32))
+    memory_position = unsqueeze(memory_position, 0)
+    relative_position = memory_position - context_position
+    relative_position_bucket = make_relative_position_bucket(
+        relative_position,  # shape (query_length, key_length)
+        bidirectional,
+        num_buckets,
+        max_distance,
+    )
+    # shape (query_length, key_length, num_heads)
+    values = embedding(relative_position_bucket,
+                       rel_attn_table,
+                       tp_size=tp_size,
+                       tp_group=tp_group,
+                       tp_rank=tp_rank)
+    # shape (1, num_heads, query_length, key_length)
+    values = unsqueeze(values.permute([2, 0, 1]), 0)
+    return values
+
+
 class AttentionParams(object):
 
     def __init__(self,
@@ -409,9 +474,10 @@ class Attention(Module):
             num_kv_heads + tp_size - 1
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
         self.hidden_size = hidden_size // tp_size
-        self.atten_head_size_all = self.attention_head_size * self.num_attention_heads
+        self.attention_hidden_size = self.attention_head_size * self.num_attention_heads
         self.max_position_embeddings = max_position_embeddings
         self.bias = bias
+        self.tp_group = tp_group
         self.tp_size = tp_size
         self.tp_rank = tp_rank
         self.dtype = dtype
@@ -440,6 +506,7 @@ class Attention(Module):
 
         self.relative_attention = relative_attention
         self.max_distance = max_distance
+        self.num_buckets = num_buckets
         self.rotary_embedding_base = rotary_embedding_base
         self.rotary_embedding_scale_type = RotaryScalingType.none
         self.rotary_embedding_scale = 1.0
@@ -523,7 +590,7 @@ class Attention(Module):
             self.is_weight_rewritten = False
             linear_class = FP8Linear if self.use_fp8_qdq else ColumnLinear
             self.q = linear_class(hidden_size,
-                                  self.atten_head_size_all,
+                                  self.attention_hidden_size,
                                   bias=bias,
                                   dtype=dtype,
                                   tp_group=tp_group,
@@ -641,7 +708,7 @@ class Attention(Module):
                 lora = self.qkv.lora(hidden_states, qkv_lora_params)
                 kv_size = self.attention_head_size * self.num_attention_kv_heads
                 qkv_lora = split(lora,
-                                 [self.atten_head_size_all, kv_size, kv_size],
+                                 [self.attention_hidden_size, kv_size, kv_size],
                                  dim=1)
                 qkv = [tensor + lora for tensor, lora in zip(qkv, qkv_lora)]
         else:
@@ -815,13 +882,13 @@ class Attention(Module):
                 query, key, value = qkv[0], qkv[1], qkv[2]
             else:
                 query, key, value = split(
-                    qkv, [self.atten_head_size_all, kv_size, kv_size], dim=2)
+                    qkv, [self.attention_hidden_size, kv_size, kv_size], dim=2)
 
             # in cross attention mode, replace kv by encoder_output
             if self.cross_attention and encoder_output is not None:
                 encoder_qkv = self.qkv(encoder_output)
                 _, key, value = split(
-                    encoder_qkv, [self.atten_head_size_all, kv_size, kv_size],
+                    encoder_qkv, [self.attention_hidden_size, kv_size, kv_size],
                     dim=2)
 
             query = transpose_for_scores(query, rotary=self.rotary_enabled)
@@ -831,7 +898,7 @@ class Attention(Module):
             value = transpose_for_scores(value, is_kv=True)
 
             if self.rotary_enabled:
-                if self.dtype == trt.bfloat16:
+                if is_same_dtype(self.dtype, trt.bfloat16):
                     embed_positions = numpy_fp32_to_bf16(
                         self.embed_positions.astype(np.float32))
                     embed_positions = constant(embed_positions)
@@ -1025,11 +1092,31 @@ class Attention(Module):
                 alibi_biases = generate_alibi_biases(alibi_slopes, key_length)
                 bias = alibi_biases if bias is None else bias + alibi_biases
 
+            if self.relative_attention:
+                query_length = shape(query, 2)
+                relative_bias = compute_relative_bias(
+                    query_length + key_length - 1,
+                    key_length,
+                    self.num_buckets,
+                    self.max_distance,
+                    False,  # bidirectional
+                    self.rel_attn_table.value.transpose(1, 0),
+                    tp_size=self.tp_size,
+                    tp_group=self.tp_group,
+                    tp_rank=self.tp_rank)
+                start = concat([0, 0, query_length + key_length - 2, 0])
+                size = concat([
+                    shape(relative_bias, 0),
+                    shape(relative_bias, 1), 1,
+                    shape(relative_bias, 3)
+                ])
+                relative_bias = slice(relative_bias, start, size)
+
             key = key.permute([0, 1, 3, 2])
             with precision('float32'):
                 if norm_before_bmm1:
                     # Apply norm on query earlier to prevent matmul fp16 overflow.
-                    query /= self.norm_factor
+                    query /= (self.q_scaling * self.norm_factor)
                 if preview_trt_version(
                 ) or self.position_embedding_type.is_alibi():
                     attention_scores = matmul(query, key)
@@ -1038,7 +1125,8 @@ class Attention(Module):
                     attention_scores = matmul(cast(query, 'float32'),
                                               cast(key, 'float32'))
                 if not norm_before_bmm1:
-                    attention_scores = attention_scores / self.norm_factor
+                    attention_scores = attention_scores / (self.q_scaling *
+                                                           self.norm_factor)
 
                 if self.attention_mask_type in [
                         AttentionMaskType.causal,
@@ -1050,6 +1138,9 @@ class Attention(Module):
                 if bias is not None:
                     bias = cast(bias, attention_scores.dtype)
                     attention_scores = attention_scores + bias
+
+                if self.relative_attention:
+                    attention_scores = attention_scores + relative_bias
 
             attention_probs = softmax(attention_scores, dim=-1)
 
@@ -1074,7 +1165,7 @@ class Attention(Module):
             context = context.view(
                 concat([
                     shape(context, 0),
-                    shape(context, 1), self.atten_head_size_all
+                    shape(context, 1), self.attention_hidden_size
                 ]))
 
         dense_lora_params = None
@@ -1117,8 +1208,10 @@ class BertAttention(Module):
             num_kv_heads + tp_size - 1
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
         self.hidden_size = hidden_size // tp_size
+        self.attention_hidden_size = self.attention_head_size * self.num_attention_heads
         self.max_position_embeddings = max_position_embeddings
         self.norm_factor = math.sqrt(self.attention_head_size)
+        self.tp_group = tp_group
         self.tp_size = tp_size
         self.tp_rank = tp_rank
 
@@ -1134,19 +1227,19 @@ class BertAttention(Module):
 
         self.relative_attention = relative_attention
         self.max_distance = max_distance
+        self.num_buckets = num_buckets
 
         # out dim is not necessarily hidden_size + kv specific size (in MQA/GQA), but num_heads * heads_size
         # example: d_model != num_heads * head_size in Flan-T5
-        self.qkv = ColumnLinear(
-            hidden_size,
-            tp_size * self.num_attention_heads * self.attention_head_size +
-            (2 * tp_size * self.num_attention_kv_heads *
-             self.attention_head_size),
-            bias=bias,
-            dtype=dtype,
-            tp_group=tp_group,
-            tp_size=tp_size,
-            gather_output=False)
+        self.qkv = ColumnLinear(hidden_size,
+                                tp_size * self.attention_hidden_size +
+                                (2 * tp_size * self.num_attention_kv_heads *
+                                 self.attention_head_size),
+                                bias=bias,
+                                dtype=dtype,
+                                tp_group=tp_group,
+                                tp_size=tp_size,
+                                gather_output=False)
         self.dense = RowLinear(tp_size * self.num_attention_heads *
                                self.attention_head_size,
                                hidden_size,
@@ -1197,14 +1290,32 @@ class BertAttention(Module):
                 ])
                 return x.view(new_x_shape).permute([0, 2, 1, 3])
 
-            query, key, value = split(qkv, self.hidden_size, dim=2)
+            kv_size = self.attention_head_size * self.num_attention_kv_heads
+            query, key, value = split(
+                qkv, [self.attention_hidden_size, kv_size, kv_size], dim=2)
             query = transpose_for_scores(query)
             key = transpose_for_scores(key)
             value = transpose_for_scores(value)
 
             key = key.permute([0, 1, 3, 2])
             attention_scores = matmul(query, key, use_fp32_acc=False)
-            attention_scores = attention_scores / self.norm_factor
+            attention_scores = attention_scores / (self.q_scaling *
+                                                   self.norm_factor)
+
+            if self.relative_attention:
+                query_len = shape(attention_scores, 2)
+                key_len = shape(attention_scores, 3)
+                bias = compute_relative_bias(
+                    query_len,
+                    key_len,
+                    self.num_buckets,
+                    self.max_distance,
+                    True,  # bidirectional
+                    self.rel_attn_table.value.transpose(1, 0),
+                    tp_size=self.tp_size,
+                    tp_group=self.tp_group,
+                    tp_rank=self.tp_rank)
+                attention_scores = attention_scores + bias
 
             if attention_mask is not None:
                 attention_mask = expand_mask(attention_mask, shape(query, 2))
@@ -1216,8 +1327,10 @@ class BertAttention(Module):
             context = matmul(attention_probs, value,
                              use_fp32_acc=False).permute([0, 2, 1, 3])
             context = context.view(
-                concat([shape(context, 0),
-                        shape(context, 1), self.hidden_size]))
+                concat([
+                    shape(context, 0),
+                    shape(context, 1), self.attention_hidden_size
+                ]))
 
         context = self.dense(context)
 

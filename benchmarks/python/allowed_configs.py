@@ -704,6 +704,7 @@ _allowed_configs = {
                     hidden_act="relu",
                     n_positions=512,
                     num_buckets=32,
+                    max_distance=128,
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
@@ -724,6 +725,7 @@ _allowed_configs = {
                     hidden_act="relu",
                     n_positions=512,
                     num_buckets=32,
+                    max_distance=128,
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
@@ -744,6 +746,7 @@ _allowed_configs = {
                     hidden_act="relu",
                     n_positions=512,
                     num_buckets=32,
+                    max_distance=128,
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
@@ -764,6 +767,7 @@ _allowed_configs = {
                     hidden_act="relu",
                     n_positions=512,
                     num_buckets=32,
+                    max_distance=128,
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
@@ -784,6 +788,7 @@ _allowed_configs = {
                     hidden_act="relu",
                     n_positions=512,
                     num_buckets=32,
+                    max_distance=128,
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
@@ -947,7 +952,7 @@ _allowed_configs = {
                 )),
     "baichuan_7b":
     ModelConfig(name="baichuan_7b",
-                family="baichuan_7b",
+                family="baichuan",
                 benchmark_type="gpt",
                 build_config=BuildConfig(
                     num_layers=32,
@@ -964,7 +969,7 @@ _allowed_configs = {
                 )),
     "baichuan2_7b_chat":
     ModelConfig(name="baichuan2_7b_chat",
-                family="baichuan_7b",
+                family="baichuan",
                 benchmark_type="gpt",
                 build_config=BuildConfig(
                     num_layers=32,
@@ -981,7 +986,7 @@ _allowed_configs = {
                 )),
     "baichuan_13b_chat":
     ModelConfig(name="baichuan_13b_chat",
-                family="baichuan_13b",
+                family="baichuan",
                 benchmark_type="gpt",
                 build_config=BuildConfig(
                     num_layers=40,
@@ -998,7 +1003,7 @@ _allowed_configs = {
                 )),
     "baichuan2_13b_chat":
     ModelConfig(name="baichuan2_13b_chat",
-                family="baichuan_13b",
+                family="baichuan",
                 benchmark_type="gpt",
                 build_config=BuildConfig(
                     num_layers=40,

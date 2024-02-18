@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,34 +34,20 @@ namespace tensorrt_llm
 namespace layers
 {
 
-static __global__ void set_topp_runtime_args(int batchSize, uint32_t top_k, uint32_t* top_ks, int top_ks_size,
-    float top_p, float* top_ps, int top_ps_size, bool* skip_decode, float* initial_top_p_buf, float* top_p_decay_buf,
-    float* top_p_min_buf, const int* batch_slots)
+static __global__ void setTopPRuntimeArgs(int batchSize, uint32_t topK, uint32_t* topKs, int topKsSize, float topP,
+    float* topPs, int topPsSize, bool* skipDecode, const int* batchSlots, float* initialTopPBuf)
 {
     /**
      * @brief Setup the runtime arguments for topp, broadcasting top_p to top_ps
-              and top_k to top_ks, verifying value ranges of top_p_decay/top_p_min.
-     *
-     * \param batchSize
-     * \param top_k
-     * \param top_ks                [batchSize]
-     * \param top_ks_size
-     * \param top_p
-     * \param top_ps                [batchSize]
-     * \param top_ps_size
-     * \param skip_decode           [batchSize]
-     * \param initial_top_p_buf     [batchSize]
-     * \param top_p_decay_buf       [batchSize]
-     * \param top_p_min_buf         [batchSize]
-     *
+              and top_k to top_ks.
      */
 
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     for (int bi = index; bi < batchSize; bi += gridDim.x * blockDim.x)
     {
-        auto const batch_slot = batch_slots != nullptr ? batch_slots[bi] : bi;
-        std::uint32_t k = top_ks_size > 1 ? top_ks[batch_slot] : top_k;
-        float p = top_ps_size > 1 ? top_ps[batch_slot] : top_p;
+        auto const batchSlot = batchSlots != nullptr ? batchSlots[bi] : bi;
+        std::uint32_t k = topKsSize > 1 ? topKs[batchSlot] : topK;
+        float p = topPsSize > 1 ? topPs[batchSlot] : topP;
         if (k == 0 && p == 0.0f)
         {
             // TensorRT-LLM's topp implementation does not support topp = 0.0f, but it
@@ -69,11 +55,11 @@ static __global__ void set_topp_runtime_args(int batchSize, uint32_t top_k, uint
             // solution.
             k = 1;
         }
-        top_ks[batch_slot] = k;
-        top_ps[batch_slot] = p;
-        skip_decode[batch_slot] = k > 0;
+        topKs[batchSlot] = k;
+        topPs[batchSlot] = p;
+        skipDecode[batchSlot] = k > 0;
 
-        initial_top_p_buf[batch_slot] = top_ps[batch_slot];
+        initialTopPBuf[batchSlot] = topPs[batchSlot];
     }
 }
 
@@ -81,10 +67,10 @@ template <typename T>
 void TopPSamplingLayer<T>::allocateBuffer(size_t batchSize)
 {
     TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
-    if (is_deterministic_)
+    if (mIsDeterministic)
     {
         invokeTopPSampling<T>(nullptr, // workspace
-            mSamplingWorkspaceSize, cub_temp_storage_size_,
+            mSamplingWorkspaceSize, mCubTempStorageSize,
             nullptr,                   // output_ids
             nullptr,                   // sequence_length
             nullptr,                   // finished_input_buffer
@@ -92,8 +78,8 @@ void TopPSamplingLayer<T>::allocateBuffer(size_t batchSize)
             nullptr,                   // cum_log_probs
             nullptr,                   // output_log_probs
             nullptr,                   // log_probs
-            topp_id_vals_buf_, topp_offset_buf_, begin_topp_offset_buf_, mCurandStatesDevice, batchSize,
-            mVocabSizePadded, nullptr, 0.f, mStream, mSkipDecodeDevice, nullptr);
+            mTopPIdValsDevice, mTopPOffsetDevice, mBeginTopPOffsetDevice, nullptr, batchSize, mVocabSizePadded, nullptr,
+            0.f, mStream, nullptr, nullptr);
     }
     else
     {
@@ -105,68 +91,63 @@ void TopPSamplingLayer<T>::allocateBuffer(size_t batchSize)
             nullptr, // cum_log_probs
             nullptr, // output_log_probs
             nullptr, // log_probs)
-            mCurandStatesDevice, batchSize, mVocabSizePadded, nullptr, 0.f, mStream, air_topp_block_num_,
-            mSkipDecodeDevice, nullptr);
+            nullptr, batchSize, mVocabSizePadded, nullptr, 0.f, mStream, mAirTopPBlockNum, nullptr, nullptr);
     }
 
     std::array<size_t, 11> deviceBufferSizes;
-    deviceBufferSizes[0] = mSamplingWorkspaceSize;
-    deviceBufferSizes[1] = sizeof(int32_t) * batchSize * mVocabSizePadded;
+    deviceBufferSizes[0] = sizeof(int32_t) * batchSize * mVocabSizePadded;
+    deviceBufferSizes[1] = sizeof(int32_t) * (batchSize + 1);
     deviceBufferSizes[2] = sizeof(int32_t) * (batchSize + 1);
-    deviceBufferSizes[3] = sizeof(int32_t) * (batchSize + 1);
-    deviceBufferSizes[4] = sizeof(uint32_t) * batchSize;
+    deviceBufferSizes[3] = sizeof(uint32_t) * batchSize;
+    deviceBufferSizes[4] = sizeof(float) * batchSize;
     deviceBufferSizes[5] = sizeof(float) * batchSize;
     deviceBufferSizes[6] = sizeof(float) * batchSize;
     deviceBufferSizes[7] = sizeof(float) * batchSize;
-    deviceBufferSizes[8] = sizeof(float) * batchSize;
-    deviceBufferSizes[9] = sizeof(int32_t) * batchSize;
-    deviceBufferSizes[10] = *std::max_element(&deviceBufferSizes[4], &deviceBufferSizes[10]);
+    deviceBufferSizes[8] = sizeof(int32_t) * batchSize;
+    deviceBufferSizes[9] = sizeof(bool) * batchSize;
+    deviceBufferSizes[10] = *std::max_element(&deviceBufferSizes[3], &deviceBufferSizes[9]);
 
-    mSamplingWorkspaceDevice = mAllocator->reMalloc(mSamplingWorkspaceDevice, deviceBufferSizes[0], true);
-    topp_id_vals_buf_ = mAllocator->reMalloc(topp_id_vals_buf_, deviceBufferSizes[1], false);
-    topp_offset_buf_ = mAllocator->reMalloc(topp_offset_buf_, deviceBufferSizes[2], false);
-    begin_topp_offset_buf_ = mAllocator->reMalloc(begin_topp_offset_buf_, deviceBufferSizes[3], false);
-    runtime_top_k_buf_ = mAllocator->reMalloc(runtime_top_k_buf_, deviceBufferSizes[4], false);
-    runtime_top_p_buf_ = mAllocator->reMalloc(runtime_top_p_buf_, deviceBufferSizes[5], false);
-    initial_top_p_buf_ = mAllocator->reMalloc(initial_top_p_buf_, deviceBufferSizes[6], false);
-    top_p_decay_buf_ = mAllocator->reMalloc(top_p_decay_buf_, deviceBufferSizes[7], false);
-    top_p_min_buf_ = mAllocator->reMalloc(top_p_min_buf_, deviceBufferSizes[8], false);
-    top_p_reset_ids_buf_ = mAllocator->reMalloc(top_p_reset_ids_buf_, deviceBufferSizes[9], false);
-    setup_workspace_buf_ = mAllocator->reMalloc(setup_workspace_buf_, deviceBufferSizes[10], false);
+    mTopPIdValsDevice = mAllocator->reMalloc(mTopPIdValsDevice, deviceBufferSizes[0], false);
+    mTopPOffsetDevice = mAllocator->reMalloc(mTopPOffsetDevice, deviceBufferSizes[1], false);
+    mBeginTopPOffsetDevice = mAllocator->reMalloc(mBeginTopPOffsetDevice, deviceBufferSizes[2], false);
+    mRuntimeTopKDevice = mAllocator->reMalloc(mRuntimeTopKDevice, deviceBufferSizes[3], false);
+    mRuntimeTopPDevice = mAllocator->reMalloc(mRuntimeTopPDevice, deviceBufferSizes[4], false);
+    mInitialTopPDevice = mAllocator->reMalloc(mInitialTopPDevice, deviceBufferSizes[5], false);
+    mTopPDecayDevice = mAllocator->reMalloc(mTopPDecayDevice, deviceBufferSizes[6], false);
+    mTopPMinDevice = mAllocator->reMalloc(mTopPMinDevice, deviceBufferSizes[7], false);
+    mTopPResetIdsDevice = mAllocator->reMalloc(mTopPResetIdsDevice, deviceBufferSizes[8], false);
+    mSkipDecodeDevice = mAllocator->reMalloc(mSkipDecodeDevice, deviceBufferSizes[9], false);
+    mSetupWorkspaceDevice = mAllocator->reMalloc(mSetupWorkspaceDevice, deviceBufferSizes[10], false);
 
-    auto const bytesAllocated = std::accumulate(deviceBufferSizes.begin(), deviceBufferSizes.end(), (size_t) 0);
-    TLLM_LOG_DEBUG("topPSamplingLayer allocated %lu bytes on GPU", (size_t) bytesAllocated);
+    mSkipDecodeHost = (bool*) std::realloc(mSkipDecodeHost, sizeof(bool) * batchSize);
+    std::fill(mSkipDecodeHost, mSkipDecodeHost + batchSize, true);
 
-    mIsAllocateBuffer = true;
+    mAllocatedSize = std::accumulate(deviceBufferSizes.begin(), deviceBufferSizes.end(), 0);
+    TLLM_LOG_DEBUG("topPSamplingLayer allocated %lu bytes on GPU", mAllocatedSize);
 }
 
 template <typename T>
 void TopPSamplingLayer<T>::freeBuffer()
 {
     TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
-    if (mIsAllocateBuffer)
-    {
-        mAllocator->free((void**) (&mSamplingWorkspaceDevice));
-        mAllocator->free((void**) (&topp_id_vals_buf_));
-        mAllocator->free((void**) (&topp_offset_buf_));
-        mAllocator->free((void**) (&begin_topp_offset_buf_));
-        mAllocator->free((void**) (&runtime_top_k_buf_));
-        mAllocator->free((void**) (&runtime_top_p_buf_));
-        mAllocator->free((void**) (&initial_top_p_buf_));
-        mAllocator->free((void**) (&top_p_decay_buf_));
-        mAllocator->free((void**) (&top_p_min_buf_));
-        mAllocator->free((void**) (&top_p_reset_ids_buf_));
-        mAllocator->free((void**) (&setup_workspace_buf_));
-    }
-    BaseSamplingLayer<T>::freeBuffer();
-    mIsAllocateBuffer = false;
+    mAllocator->free((void**) (&mTopPIdValsDevice));
+    mAllocator->free((void**) (&mTopPOffsetDevice));
+    mAllocator->free((void**) (&mBeginTopPOffsetDevice));
+    mAllocator->free((void**) (&mRuntimeTopKDevice));
+    mAllocator->free((void**) (&mRuntimeTopPDevice));
+    mAllocator->free((void**) (&mInitialTopPDevice));
+    mAllocator->free((void**) (&mTopPDecayDevice));
+    mAllocator->free((void**) (&mTopPMinDevice));
+    mAllocator->free((void**) (&mTopPResetIdsDevice));
+    mAllocator->free((void**) (&mSkipDecodeDevice));
+    mAllocator->free((void**) (&mSetupWorkspaceDevice));
+    std::free(mSkipDecodeHost);
 }
 
 template <typename T>
-void TopPSamplingLayer<T>::setup(size_t const batchSize, int const* batchSlots, SetupParams const& setupParams)
+void TopPSamplingLayer<T>::setup(size_t const batchSize, int32_t const* batchSlots, SetupParams const& setupParams)
 {
     TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
-    BaseSamplingLayer<T>::setupBase(batchSize, batchSlots, setupParams);
 
     uint32_t const defaultTopK = 0;
     auto runtimeTopK = setupParams.runtime_top_k.value_or(std::vector<uint32_t>{defaultTopK});
@@ -186,7 +167,16 @@ void TopPSamplingLayer<T>::setup(size_t const batchSize, int const* batchSlots, 
 
     if (runtimeTopPSize == 0)
     {
-        std::fill_n(mSkipDecodeHost, batchSize, true);
+        for (size_t bi = 0; bi < batchSize; ++bi)
+        {
+            int32_t bid = bi;
+            if (batchSlots)
+            {
+                bid = batchSlots[bi];
+            }
+            mSkipDecodeHost[bid] = true;
+        }
+        cudaAutoCpy(mSkipDecodeDevice, mSkipDecodeHost, mMaxBatchSize, mStream);
         return;
     }
 
@@ -224,17 +214,17 @@ void TopPSamplingLayer<T>::setup(size_t const batchSize, int const* batchSlots, 
     {
         TLLM_CHECK_WITH_INFO(runtimeTopK.size() == batchSize,
             fmtstr("runtimeTopK.size() (%lu) == batchSize (%lu) is not satisfied!", runtimeTopK.size(), batchSize));
-        cudaAutoCpy(reinterpret_cast<uint32_t*>(setup_workspace_buf_), runtimeTopK.data(), batchSize, mStream);
+        cudaAutoCpy(reinterpret_cast<uint32_t*>(mSetupWorkspaceDevice), runtimeTopK.data(), batchSize, mStream);
         invokeScatterDecodingParams(
-            reinterpret_cast<uint32_t*>(setup_workspace_buf_), runtime_top_k_buf_, batchSlots, batchSize, mStream);
+            reinterpret_cast<uint32_t*>(mSetupWorkspaceDevice), mRuntimeTopKDevice, batchSlots, batchSize, mStream);
     }
     if (runtimeTopPSize > 1)
     {
         TLLM_CHECK_WITH_INFO(runtimeTopP.size() == batchSize,
             fmtstr("runtime_top_p.size() (%lu) == batchSize (%lu) is not satisfied!", runtimeTopP.size(), batchSize));
-        cudaAutoCpy(reinterpret_cast<float*>(setup_workspace_buf_), runtimeTopP.data(), batchSize, mStream);
+        cudaAutoCpy(reinterpret_cast<float*>(mSetupWorkspaceDevice), runtimeTopP.data(), batchSize, mStream);
         invokeScatterDecodingParams(
-            reinterpret_cast<float*>(setup_workspace_buf_), runtime_top_p_buf_, batchSlots, batchSize, mStream);
+            reinterpret_cast<float*>(mSetupWorkspaceDevice), mRuntimeTopPDevice, batchSlots, batchSize, mStream);
     }
 
     auto fillBuffers
@@ -246,50 +236,66 @@ void TopPSamplingLayer<T>::setup(size_t const batchSize, int const* batchSlots, 
         invokeScatterDecodingParams(deviceTmpBuffer, deviceBuffer, batchSlots, batchSize, mStream);
     };
 
-    fillBuffers("top_p_decay", decayVec, reinterpret_cast<float*>(setup_workspace_buf_), top_p_decay_buf_);
+    fillBuffers("top_p_decay", decayVec, reinterpret_cast<float*>(mSetupWorkspaceDevice), mTopPDecayDevice);
 
-    fillBuffers("top_p_min", topPMinVec, reinterpret_cast<float*>(setup_workspace_buf_), top_p_min_buf_);
+    fillBuffers("top_p_min", topPMinVec, reinterpret_cast<float*>(mSetupWorkspaceDevice), mTopPMinDevice);
 
     fillBuffers(
-        "top_p_reset_ids", topPResetIdsVec, reinterpret_cast<int32_t*>(setup_workspace_buf_), top_p_reset_ids_buf_);
+        "top_p_reset_ids", topPResetIdsVec, reinterpret_cast<int32_t*>(mSetupWorkspaceDevice), mTopPResetIdsDevice);
 
-    dim3 block(std::min((int) batchSize, 256));
-    dim3 grid(divUp((int) batchSize, (int) block.x));
-    set_topp_runtime_args<<<grid, block, 0, mStream>>>(batchSize, topK, runtime_top_k_buf_, runtimeTopKSize, topP,
-        runtime_top_p_buf_, runtimeTopPSize, mSkipDecodeDevice, initial_top_p_buf_, top_p_decay_buf_, top_p_min_buf_,
-        batchSlots);
-    sync_check_cuda_error();
+    {
+        dim3 block(std::min((int) batchSize, 256));
+        dim3 grid(divUp((int) batchSize, (int) block.x));
+        setTopPRuntimeArgs<<<grid, block, 0, mStream>>>(batchSize, topK, mRuntimeTopKDevice, runtimeTopKSize, topP,
+            mRuntimeTopPDevice, runtimeTopPSize, mSkipDecodeDevice, batchSlots, mInitialTopPDevice);
+        sync_check_cuda_error();
+    }
 
     cudaAutoCpy(mSkipDecodeHost, mSkipDecodeDevice, mMaxBatchSize, mStream);
+    std::vector<float> runtimeTopPs(mMaxBatchSize);
+    cudaAutoCpy(runtimeTopPs.data(), mRuntimeTopPDevice, mMaxBatchSize, mStream);
+    {
+        float maxTopP = 0.f;
+        for (size_t bi = 0; bi < batchSize; ++bi)
+        {
+            int32_t bid = bi;
+            if (batchSlots)
+            {
+                bid = batchSlots[bi];
+            }
+            maxTopP = std::max(maxTopP, runtimeTopPs[bid]);
+        }
+        mRuntimeMaxTopP = std::max(mRuntimeMaxTopP, maxTopP);
+    }
 
-    std::vector<float> runtime_top_ps(mMaxBatchSize);
-    cudaAutoCpy(runtime_top_ps.data(), runtime_top_p_buf_, mMaxBatchSize, mStream);
-    // TODO(nkorobov): find maxTopP using batch slots
-    mRuntimeMaxTopP = *std::max_element(std::begin(runtime_top_ps), std::end(runtime_top_ps));
-
-    if (!is_deterministic_)
+    if (!mIsDeterministic)
     {
         int smCnt = mCudaDeviceProp->multiProcessorCount;
-        air_topp_block_num_ = calcAirTopPBlockNum<T, int, float>(batchSize, (int) mVocabSizePadded, smCnt);
+        mAirTopPBlockNum = calcAirTopPBlockNum<T, int, float>(batchSize, (int) mVocabSizePadded, smCnt);
     }
 }
 
 template <typename T>
-void TopPSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingParams const& inputs)
+void TopPSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams& inputs)
 {
     TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
 
     auto const batchSize = inputs.logits.shape[0];
 
-    // in case of skip any, the logit value is already copied and processed.
-    auto* logits = !mSkipAny ? inputs.logits.template getPtr<T>() : mRuntimeLogitsDevice;
-    auto* endIds = inputs.end_ids.template getPtr<const int>();
-    auto* batchSlots = inputs.batch_slots ? inputs.batch_slots->template getPtr<const int>() : nullptr;
+    // Probabilities must be already computed instead of logits
+    auto probs = inputs.logits.template getPtr<T>();
+    auto endIds = inputs.end_ids.template getPtr<const int>();
+    auto batchSlots = inputs.batch_slots ? inputs.batch_slots->template getPtr<const int>() : nullptr;
+    auto curandStatesDevice = inputs.curand_states;
+    auto samplingWorkspaceDevice = inputs.sampling_workspace;
 
-    if (is_deterministic_)
+    TLLM_CHECK_WITH_INFO(curandStatesDevice, "No curand states provided");
+    TLLM_CHECK_WITH_INFO(samplingWorkspaceDevice, "No sampling workspace provided");
+
+    if (mIsDeterministic)
     {
         invokeTopPInitialize(
-            topp_id_vals_buf_, topp_offset_buf_, begin_topp_offset_buf_, batchSize, mVocabSizePadded, mStream);
+            mTopPIdValsDevice, mTopPOffsetDevice, mBeginTopPOffsetDevice, batchSize, mVocabSizePadded, mStream);
         sync_check_cuda_error();
     }
 
@@ -299,33 +305,30 @@ void TopPSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingPa
     FinishedState* finishedOutput = (outputs.finished)
         ? reinterpret_cast<FinishedState*>(outputs.finished->template getPtr<FinishedState::UnderlyingType>())
         : nullptr;
-    invokeAddBiasSoftMax(logits, logits, (T*) (nullptr), endIds, finishedInput, batchSlots, batchSize, mVocabSize,
-        mVocabSizePadded, mStream);
-    sync_check_cuda_error();
 
     float* cumLogProbs = (outputs.cum_log_probs) ? outputs.cum_log_probs->template getPtr<float>() : nullptr;
     float* outputLogProbs = (outputs.output_log_probs) ? outputs.output_log_probs->template getPtr<float>() : nullptr;
     int* sequenceLength = (outputs.sequence_length) ? outputs.sequence_length->template getPtr<int>() : nullptr;
 
-    if (is_deterministic_)
+    if (mIsDeterministic)
     {
-        invokeBatchTopPSampling<T>(mSamplingWorkspaceDevice, mSamplingWorkspaceSize, cub_temp_storage_size_,
+        invokeBatchTopPSampling<T>(samplingWorkspaceDevice, mSamplingWorkspaceSize, mCubTempStorageSize,
             outputs.output_ids_ptr.template getPtr<int*>(), sequenceLength, finishedInput, finishedOutput, cumLogProbs,
-            outputLogProbs, logits, topp_id_vals_buf_, topp_offset_buf_, begin_topp_offset_buf_, mCurandStatesDevice,
-            batchSize, mVocabSizePadded, endIds, mRuntimeMaxTopP, runtime_top_p_buf_, mStream, mSkipDecodeDevice,
+            outputLogProbs, probs, mTopPIdValsDevice, mTopPOffsetDevice, mBeginTopPOffsetDevice, curandStatesDevice,
+            batchSize, mVocabSizePadded, endIds, mRuntimeMaxTopP, mRuntimeTopPDevice, mStream, mSkipDecodeDevice,
             batchSlots);
         sync_check_cuda_error();
-        invokeComputeToppDecay(runtime_top_p_buf_, initial_top_p_buf_,
-            outputs.output_ids_ptr.template getPtr<const int*>(), top_p_decay_buf_, top_p_min_buf_,
-            top_p_reset_ids_buf_, sequenceLength, batchSlots, batchSize, mStream);
+        invokeComputeToppDecay(mRuntimeTopPDevice, mInitialTopPDevice,
+            outputs.output_ids_ptr.template getPtr<const int*>(), mTopPDecayDevice, mTopPMinDevice, mTopPResetIdsDevice,
+            sequenceLength, batchSlots, batchSize, mStream);
         sync_check_cuda_error();
     }
     else
     {
-        invokeBatchAirTopPSampling<T>(mSamplingWorkspaceDevice, mSamplingWorkspaceSize,
+        invokeBatchAirTopPSampling<T>(samplingWorkspaceDevice, mSamplingWorkspaceSize,
             outputs.output_ids_ptr.template getPtr<int*>(), sequenceLength, finishedInput, finishedOutput, cumLogProbs,
-            outputLogProbs, logits, mCurandStatesDevice, batchSize, mVocabSizePadded, endIds, mRuntimeMaxTopP,
-            runtime_top_p_buf_, mStream, air_topp_block_num_, mSkipDecodeDevice, batchSlots);
+            outputLogProbs, probs, curandStatesDevice, batchSize, mVocabSizePadded, endIds, mRuntimeMaxTopP,
+            mRuntimeTopPDevice, mStream, mAirTopPBlockNum, mSkipDecodeDevice, batchSlots);
         sync_check_cuda_error();
     }
 }
@@ -334,14 +337,7 @@ template <typename T>
 TopPSamplingLayer<T>::TopPSamplingLayer(std::size_t maxBatchSize, std::size_t vocabSize, std::size_t vocabSizePadded,
     cudaStream_t stream, std::shared_ptr<IAllocator> allocator, cudaDeviceProp* prop, bool isDeterministic)
     : BaseSamplingLayer<T>(maxBatchSize, vocabSize, vocabSizePadded, stream, std::move(allocator), prop)
-    , is_deterministic_(isDeterministic)
-{
-    allocateBuffer(mMaxBatchSize);
-}
-
-template <typename T>
-TopPSamplingLayer<T>::TopPSamplingLayer(TopPSamplingLayer<T> const& top_p_sampling_layer)
-    : BaseSamplingLayer<T>(top_p_sampling_layer)
+    , mIsDeterministic(isDeterministic)
 {
     allocateBuffer(mMaxBatchSize);
 }

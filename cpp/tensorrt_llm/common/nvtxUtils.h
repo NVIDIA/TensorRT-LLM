@@ -25,7 +25,7 @@ namespace tensorrt_llm::common::nvtx
 {
 inline nvtx3::color nextColor()
 {
-#if !defined(NVTX_DISABLE)
+#ifndef NVTX_DISABLE
     constexpr std::array kColors{nvtx3::color{0xff00ff00}, nvtx3::color{0xff0000ff}, nvtx3::color{0xffffff00},
         nvtx3::color{0xffff00ff}, nvtx3::color{0xff00ffff}, nvtx3::color{0xffff0000}, nvtx3::color{0xffffffff}};
     constexpr auto numColors = kColors.size();

@@ -613,36 +613,42 @@ def build_gpt(args):
             })
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.FalconForCausalLM(config)
-    elif family == "baichuan_7b":
-        tensorrt_llm_model = tensorrt_llm.models.BaichuanForCausalLM(
-            num_layers=build_config['num_layers'],
-            num_heads=build_config['num_heads'],
-            num_kv_heads=None,
-            hidden_size=build_config['hidden_size'],
-            vocab_size=build_config['vocab_size'],
-            hidden_act=build_config['hidden_act'],
-            max_position_embeddings=build_config['n_positions'],
-            position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
-            dtype=kv_dtype,
-            mlp_hidden_size=build_config['inter_size'],
-            mapping=tensorrt_llm.Mapping(world_size=world_size,
-                                         tp_size=world_size),
-            quant_mode=quant_mode)
-    elif family == "baichuan_13b":
-        tensorrt_llm_model = tensorrt_llm.models.BaichuanForCausalLM(
-            num_layers=build_config['num_layers'],
-            num_heads=build_config['num_heads'],
-            num_kv_heads=None,
-            hidden_size=build_config['hidden_size'],
-            vocab_size=build_config['vocab_size'],
-            hidden_act=build_config['hidden_act'],
-            max_position_embeddings=build_config['n_positions'],
-            position_embedding_type=PositionEmbeddingType.alibi,
-            dtype=kv_dtype,
-            mlp_hidden_size=build_config['inter_size'],
-            mapping=tensorrt_llm.Mapping(world_size=world_size,
-                                         tp_size=world_size),
-            quant_mode=quant_mode)
+    elif family == "baichuan":
+        config = {
+            'architecture':
+            'BaichuanForCausalLM',
+            'dtype':
+            args.dtype,
+            'logits_dtype':
+            'float32',
+            'vocab_size':
+            build_config['vocab_size'],
+            'max_position_embeddings':
+            build_config['n_positions'],
+            'hidden_size':
+            build_config['hidden_size'],
+            'num_hidden_layers':
+            build_config['num_layers'],
+            'num_attention_heads':
+            build_config['num_heads'],
+            'num_key_value_heads':
+            build_config['num_heads'],
+            'hidden_act':
+            build_config['hidden_act'],
+            'intermediate_size':
+            build_config['inter_size'],
+            'position_embedding_type':
+            'alibi_with_scale' if '7b' in args.model else 'rope_gpt_neox',
+            'quantization': {
+                'group_size': 128
+            },
+            'mapping': {
+                'world_size': world_size,
+                'tp_size': world_size,
+            },
+        }
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.BaichuanForCausalLM(config)
     elif family == "internlm":
         config = {
             'architecture':
@@ -748,6 +754,8 @@ def build_gpt(args):
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
         network.plugin_config.enable_remove_input_padding()
         network.plugin_config.set_lookup_plugin(dtype=args.dtype)
+        network.plugin_config.set_moe_plugin(dtype=args.dtype)
+
         if args.quantization is None or "fp8" not in args.quantization:
             network.plugin_config.set_gemm_plugin(dtype=args.dtype)
 
@@ -787,7 +795,7 @@ def build_gpt(args):
             max_beam_width=max_beam_width)
         if family in [
                 'opt', 'bloom', 'falcon', 'llama', 'internlm', 'gptneox',
-                'gptj', "mamba"
+                'gptj', 'mamba', 'baichuan'
         ]:
             tensorrt_llm_model(**inputs)
         else:
@@ -1013,6 +1021,8 @@ def enc_dec_build_helper(component, config, args):
                       tp_size=world_size,
                       pp_size=1)  # TP only
 
+    fp16_clamping = (args.dtype == 'float16') and ('t5' in family)
+
     if component == 'encoder':
         tllm_model = tensorrt_llm.models.EncoderModel(
             num_layers=config['num_layers'],
@@ -1040,7 +1050,8 @@ def enc_dec_build_helper(component, config, args):
             dtype=dtype,
             use_parallel_embedding=False,  # by default
             embedding_sharding_dim=0,  # by default
-            mapping=mapping)
+            mapping=mapping,
+            fp16_clamping=fp16_clamping)
     elif component == 'decoder':
         tllm_model = tensorrt_llm.models.DecoderModel(
             num_layers=config['num_layers'],
@@ -1073,7 +1084,8 @@ def enc_dec_build_helper(component, config, args):
             embedding_sharding_dim=0,  # by default
             mapping=mapping,
             rescale_before_lm_head=rescale_before_lm_head,
-            logits_dtype='float32')  # by default
+            logits_dtype='float32',  # by default
+            fp16_clamping=fp16_clamping)
 
     # Module -> Network
     engine_name = get_engine_name(args.model, args.dtype, world_size,
@@ -1129,6 +1141,7 @@ def enc_dec_build_helper(component, config, args):
         hidden_size=hidden_size,
         head_size=builder_config.head_size,
         max_batch_size=builder_config.max_batch_size,
+        max_beam_width=builder_config.max_beam_width,
         vocab_size=builder_config.vocab_size,
         num_layers=builder_config.num_layers,
         gpt_attention_plugin=network.plugin_config.gpt_attention_plugin,

@@ -237,17 +237,23 @@ def get_tokenizer(ckpt_path, max_seq_len):
 
 class Pipeline:
 
-    def __init__(self, tokenizer, model, pad_id, end_id,
+    def __init__(self, tokenizer, model, model_name, pad_id, end_id,
                  max_attention_window_size):
         self.tokenizer = tokenizer
         self.model = model
+        self.model_name = model_name
         self.pad_id = pad_id
         self.end_id = end_id
         self.max_attention_window_size = max_attention_window_size
 
     def __call__(self, prompt):
         # Run the model in batch size 1 and beam size 1
-        inputs = self.tokenizer.encode(prompt, return_tensors="pt").squeeze(0)
+        if self.model_name == 'SpecialForCausalLM':
+            inputs = self.tokenizer.encode(prompt, add_special_tokens=False)
+            inputs = torch.tensor([self.tokenizer.bos_token_id] + inputs)
+        else:
+            inputs = self.tokenizer.encode(prompt,
+                                           return_tensors="pt").squeeze(0)
         batch_input_ids = [inputs]
 
         # For multi-choice tasks like MMLU, we don't need to adjust following parameters
@@ -406,7 +412,7 @@ def main():
             model.generation_config = GenerationConfig.from_pretrained(
                 args.hf_model_dir, trust_remote_code=True)
 
-    pipeline = Pipeline(tokenizer, model, pad_id, end_id,
+    pipeline = Pipeline(tokenizer, model, model_name, pad_id, end_id,
                         args.max_attention_window_size)
 
     for subject in tqdm(subjects):

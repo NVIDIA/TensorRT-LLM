@@ -23,7 +23,8 @@ from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType, PositionEmbeddingType, Tensor,
                                      assertion, gather_last_token_logits, gelu,
-                                     recv, send, shape, transpose)
+                                     maximum, minimum, recv, send, shape,
+                                     transpose)
 from tensorrt_llm.layers import (MLP, Attention, AttentionMaskType,
                                  AttentionParams, BertAttention, ColumnLinear,
                                  Conv1d, Embedding, FusedGatedMLP, GatedMLP,
@@ -173,7 +174,8 @@ class EncoderLayer(Module):
                  residual_scaling=1.0,
                  relative_attention=False,
                  max_distance=0,
-                 num_buckets=0):
+                 num_buckets=0,
+                 fp16_clamping=False):
         super().__init__()
 
         # e.g. BART regular, T5 RMS
@@ -223,6 +225,11 @@ class EncoderLayer(Module):
 
         self.residual_scaling = residual_scaling
 
+        # T5-series model(e.g. t5-large, t5-3b, flan-t5-small) has accuracy issue due to fp16 overflow
+        # after residual add. We add workaround for clamping fp16 range [-64000, 64000] after every
+        # residual add to avoid accuracy drop.
+        self.fp16_clamping = fp16_clamping
+
     def forward(self,
                 hidden_states: Tensor,
                 attention_mask=None,
@@ -245,6 +252,10 @@ class EncoderLayer(Module):
 
         hidden_states = residual + attention_output
 
+        if self.fp16_clamping:
+            hidden_states = maximum(-64000.0, hidden_states)
+            hidden_states = minimum(64000.0, hidden_states)
+
         if self.layernorm_position == LayerNormPositionType.post_layernorm:
             hidden_states = self.attention_layernorm(hidden_states)
 
@@ -259,6 +270,10 @@ class EncoderLayer(Module):
         self.register_network_output('mlp_output', hidden_states)
 
         hidden_states = residual + hidden_states
+
+        if self.fp16_clamping:
+            hidden_states = maximum(-64000.0, hidden_states)
+            hidden_states = minimum(64000.0, hidden_states)
 
         if self.layernorm_position == LayerNormPositionType.post_layernorm:
             hidden_states = self.mlp_layernorm(hidden_states)
@@ -288,7 +303,8 @@ class DecoderLayer(Module):
                  residual_scaling=1.0,
                  relative_attention=False,
                  max_distance=0,
-                 num_buckets=0):
+                 num_buckets=0,
+                 fp16_clamping=False):
         super().__init__()
 
         # e.g. BART regular, T5 RMS
@@ -373,6 +389,11 @@ class DecoderLayer(Module):
 
         self.residual_scaling = residual_scaling
 
+        # T5-series model(e.g. t5-large, t5-3b, flan-t5-small) has accuracy issue due to fp16 overflow
+        # after residual add. We add workaround for clamping fp16 range [-64000, 64000] after every
+        # residual add to avoid accuracy drop.
+        self.fp16_clamping = fp16_clamping
+
     def forward(self,
                 hidden_states: Tensor,
                 encoder_output: Optional[Tensor] = None,
@@ -406,6 +427,10 @@ class DecoderLayer(Module):
 
         hidden_states = residual + attention_output
 
+        if self.fp16_clamping:
+            hidden_states = maximum(-64000.0, hidden_states)
+            hidden_states = minimum(64000.0, hidden_states)
+
         if self.layernorm_position == LayerNormPositionType.post_layernorm:
             hidden_states = self.self_attention_layernorm(hidden_states)
 
@@ -430,6 +455,10 @@ class DecoderLayer(Module):
 
         hidden_states = residual + attention_output
 
+        if self.fp16_clamping:
+            hidden_states = maximum(-64000.0, hidden_states)
+            hidden_states = minimum(64000.0, hidden_states)
+
         if self.layernorm_position == LayerNormPositionType.post_layernorm:
             hidden_states = self.cross_attention_layernorm(hidden_states)
 
@@ -443,6 +472,10 @@ class DecoderLayer(Module):
         self.register_network_output('mlp_output', hidden_states)
 
         hidden_states = residual + hidden_states
+
+        if self.fp16_clamping:
+            hidden_states = maximum(-64000.0, hidden_states)
+            hidden_states = minimum(64000.0, hidden_states)
 
         if self.layernorm_position == LayerNormPositionType.post_layernorm:
             hidden_states = self.mlp_layernorm(hidden_states)
@@ -484,7 +517,8 @@ class EncoderModel(Module, GenerationMixin):
                  use_prompt_tuning=False,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
-                 mapping=Mapping()):
+                 mapping=Mapping(),
+                 fp16_clamping=False):
         super().__init__()
         self.mapping = mapping
 
@@ -555,7 +589,8 @@ class EncoderModel(Module, GenerationMixin):
                          residual_scaling=residual_scaling,
                          relative_attention=relative_attention,
                          max_distance=max_distance,
-                         num_buckets=num_buckets)
+                         num_buckets=num_buckets,
+                         fp16_clamping=fp16_clamping)
             for _ in self.mapping.pp_layers(self.total_num_layers)
         ])
 
@@ -804,7 +839,8 @@ class DecoderModel(Module, GenerationMixin):
                  residual_scaling=1.0,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
-                 mapping=Mapping()):
+                 mapping=Mapping(),
+                 fp16_clamping=False):
         super().__init__()
         self.mapping = mapping
 
@@ -895,7 +931,8 @@ class DecoderModel(Module, GenerationMixin):
                          residual_scaling=residual_scaling,
                          relative_attention=relative_attention,
                          max_distance=max_distance,
-                         num_buckets=num_buckets)
+                         num_buckets=num_buckets,
+                         fp16_clamping=fp16_clamping)
             for _ in self.mapping.pp_layers(self.total_num_layers)
         ])
 

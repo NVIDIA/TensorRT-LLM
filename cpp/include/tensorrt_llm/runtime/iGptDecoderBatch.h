@@ -141,11 +141,6 @@ public:
     using TensorPtr = std::shared_ptr<ITensor>;
     using TokenPtr = std::unique_ptr<decoder_batch::Token const>;
 
-    //! @brief Initialize the decoder at `batchIdx` with a new `request`.
-    virtual void newRequest(
-        SizeType batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig)
-        = 0;
-
     //! @brief Run one step for all requests without blocking the host process and return the token for synchronization.
     virtual TokenPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;
 
@@ -185,6 +180,11 @@ public:
     virtual TensorPtr getParentIds() const = 0;
 
     virtual std::vector<SizeType> getNbSteps() const = 0;
+
+    //! @brief Initialize batched decoder at seqSlots with a new `requests`.
+    virtual void newRequests(std::vector<SizeType> const& seqSlots, std::vector<decoder_batch::Request> const& requests,
+        std::vector<SamplingConfig> const& samplingConfigs)
+        = 0;
 
 protected:
     IGptDecoderBatch() = default;

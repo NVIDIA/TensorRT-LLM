@@ -122,7 +122,12 @@ def _prepare_attention_mask(input_ids: torch.Tensor,
                             pad_id: Optional[int] = None):
     is_pad_id_in_inputs = (pad_id is not None) and (pad_id in input_ids)
     if input_ids is not None and is_pad_id_in_inputs:
-        return input_ids.ne(pad_id).int()
+        mask = input_ids.ne(pad_id).int()
+        # for enc-dec models, pad_id could be the start token and should be always counted
+        # as valid token rather than padded token, so we force its mask to be 1.
+        # This doesn't impact the existing behavior
+        mask[:, 0] = 1
+        return mask
     else:
         return torch.ones(input_ids.shape,
                           dtype=torch.int32,
@@ -287,6 +292,7 @@ class _Runtime(object):
 @dataclass
 class ModelConfig:
     max_batch_size: int
+    max_beam_width: int
     vocab_size: int
     num_layers: int
     num_heads: int
@@ -534,8 +540,8 @@ class GenerationSession(object):
                 )
                 self.decoder_logits_dtype = torch.float32
             self.dynamic_decoder = torch.classes.trtllm.DynamicDecodeOp(
-                model_config.max_batch_size, self.vocab_size,
-                self.vocab_size_padded, self.mapping.tp_size,
+                model_config.max_batch_size, model_config.max_beam_width,
+                self.vocab_size, self.vocab_size_padded, self.mapping.tp_size,
                 self.mapping.pp_size, self.decoder_logits_dtype)
 
         if model_config.use_context_fmha_for_generation:
@@ -643,7 +649,7 @@ class GenerationSession(object):
                     for i in range(self.first_layer, self.last_layer)
                 ]
 
-        if model_config.max_medusa_tokens > 0:
+        if model_config.num_medusa_heads > 0:
             expected_tensor_names += [
                 'medusa_position_offsets', 'medusa_packed_mask', 'medusa_logits'
             ]
@@ -784,7 +790,7 @@ class GenerationSession(object):
 
     @property
     def is_medusa_mode(self):
-        return self.num_medusa_tokens > 0
+        return self.num_medusa_heads > 0
 
     @property
     def max_medusa_tokens(self):
@@ -1923,7 +1929,6 @@ class GenerationSession(object):
             ]
             for b in range(batch_size):
                 equality = input_paths[b][:, 1:] == new_paths[b][:, :-1]
-                # print(equality.int())
                 paths_correct_len = torch.cumprod(equality.int(),
                                                   dim=1).sum(dim=1)
                 best_path_len[b] = paths_correct_len.max().item() + 1
@@ -2157,8 +2162,8 @@ class GenerationSession(object):
             prompt_vocab_size: torch.Tensor, ite: int,
             sequence_limit_lengths: torch.Tensor,
             sequence_lengths: torch.Tensor,
-            next_step_tensors: Dict[str, RuntimeTensor], stop_words_list,
-            bad_words_list, no_repeat_ngram_size, encoder_output: torch.Tensor,
+            next_step_tensors: Dict[str, RuntimeTensor], stop_words_data,
+            bad_words_data, no_repeat_ngram_size, encoder_output: torch.Tensor,
             encoder_input_lengths: torch.Tensor,
             stopping_criteria: StoppingCriteria,
             logits_processor: LogitsProcessor, **kwargs):
@@ -2403,12 +2408,17 @@ class GenerationSession(object):
                          -1)).to(self.decoder_logits_dtype)
                     decode_step = step + max_context_length
 
+                    stop_words_list_ptrs, stop_words_lens, max_stop_words_len = stop_words_data
+                    bad_words_list_ptrs, bad_words_lens, max_bad_words_len = bad_words_data
+
                     should_stop = self.dynamic_decoder.forward(
                         next_token_logits, decode_step, max_context_length,
                         self.max_attention_window_size, self.sink_token_length,
                         ite, batch_size, self.end_ids, self.embedding_bias_opt,
                         context_lengths, sequence_limit_lengths,
-                        stop_words_list, bad_words_list, no_repeat_ngram_size,
+                        stop_words_list_ptrs, stop_words_lens,
+                        max_stop_words_len, bad_words_list_ptrs, bad_words_lens,
+                        max_bad_words_len, no_repeat_ngram_size,
                         this_src_cache_indirection, self.output_ids,
                         self.new_tokens, self.finished, self.finished,
                         self.sequence_length_buffer, self.cum_log_probs,
@@ -2497,8 +2507,8 @@ class GenerationSession(object):
                        prompt_vocab_size: torch.Tensor,
                        ite: int,
                        sequence_limit_lengths: torch.Tensor,
-                       stop_words_list,
-                       bad_words_list,
+                       stop_words_data,
+                       bad_words_data,
                        no_repeat_ngram_size,
                        output_sequence_lengths: bool = False,
                        return_dict: bool = False,
@@ -2554,8 +2564,8 @@ class GenerationSession(object):
                 prompt_embedding_table, tasks, context_lengths,
                 host_context_lengths, attention_mask, cross_attention_mask,
                 prompt_vocab_size, ite, sequence_limit_lengths,
-                sequence_lengths, next_step_tensors, stop_words_list,
-                bad_words_list, no_repeat_ngram_size, encoder_output,
+                sequence_lengths, next_step_tensors, stop_words_data,
+                bad_words_data, no_repeat_ngram_size, encoder_output,
                 encoder_input_lengths, stopping_criteria, logits_processor,
                 **kwargs)
             if step == 0:
@@ -2656,8 +2666,8 @@ class GenerationSession(object):
                       prompt_vocab_size: torch.Tensor,
                       ite: int,
                       sequence_limit_lengths: torch.Tensor,
-                      stop_words_list,
-                      bad_words_list,
+                      stop_words_data,
+                      bad_words_data,
                       no_repeat_ngram_size,
                       output_sequence_lengths: bool = False,
                       return_dict: bool = False,
@@ -2692,8 +2702,8 @@ class GenerationSession(object):
                 prompt_embedding_table, tasks, context_lengths,
                 host_context_lengths, attention_mask, cross_attention_mask,
                 prompt_vocab_size, ite, sequence_limit_lengths,
-                sequence_lengths, next_step_tensors, stop_words_list,
-                bad_words_list, no_repeat_ngram_size, encoder_output,
+                sequence_lengths, next_step_tensors, stop_words_data,
+                bad_words_data, no_repeat_ngram_size, encoder_output,
                 encoder_input_lengths, stopping_criteria, logits_processor)
             if step == 0:
                 context_logits = logits
@@ -2878,6 +2888,38 @@ class GenerationSession(object):
                     self.num_heads_kv, self.head_size, kv_cache_type,
                     past_key_value_list)
 
+        stop_words_lens = None
+        stop_words_list_ptrs = None
+        max_stop_words_len = 0
+        if stop_words_list is not None:
+            max_stop_words_len = stop_words_list.shape[2]
+            stop_words_lens = torch.full((batch_size, ),
+                                         max_stop_words_len,
+                                         dtype=torch.int32).to('cuda')
+            stop_words_list_ptrs = torch.zeros((batch_size), dtype=torch.int64)
+            for bi in range(batch_size):
+                stop_words_list_ptrs[bi] = stop_words_list.data_ptr(
+                ) + bi * 2 * max_stop_words_len
+            stop_words_list_ptrs = stop_words_list_ptrs.to('cuda')
+        stop_words_data = (stop_words_list_ptrs, stop_words_lens,
+                           max_stop_words_len)
+
+        bad_words_lens = None
+        bad_words_list_ptrs = None
+        max_bad_words_len = 0
+        if bad_words_list is not None:
+            max_bad_words_len = bad_words_list.shape[2]
+            bad_words_lens = torch.full((batch_size, ),
+                                        max_bad_words_len,
+                                        dtype=torch.int32).to('cuda')
+            bad_words_list_ptrs = torch.zeros((batch_size), dtype=torch.int64)
+            for bi in range(batch_size):
+                bad_words_list_ptrs[bi] = bad_words_list.data_ptr(
+                ) + bi * 2 * max_bad_words_len
+            bad_words_list_ptrs = bad_words_list_ptrs.to('cuda')
+        bad_words_data = (bad_words_list_ptrs, bad_words_lens,
+                          max_bad_words_len)
+
         # start context phase
         if streaming:
             return self.decode_stream(
@@ -2885,7 +2927,7 @@ class GenerationSession(object):
                 host_context_lengths, max_context_length, beam_width,
                 cache_indirections, input_ids, hidden_states,
                 prompt_embedding_table, tasks, prompt_vocab_size, ite,
-                sequence_limit_lengths, stop_words_list, bad_words_list,
+                sequence_limit_lengths, stop_words_data, bad_words_data,
                 no_repeat_ngram_size, output_sequence_lengths, return_dict,
                 encoder_output, encoder_input_lengths, stopping_criteria,
                 logits_processor, cross_attention_mask, **kwargs)
@@ -2895,7 +2937,7 @@ class GenerationSession(object):
                 host_context_lengths, max_context_length, beam_width,
                 cache_indirections, input_ids, hidden_states,
                 prompt_embedding_table, tasks, prompt_vocab_size, ite,
-                sequence_limit_lengths, stop_words_list, bad_words_list,
+                sequence_limit_lengths, stop_words_data, bad_words_data,
                 no_repeat_ngram_size, output_sequence_lengths, return_dict,
                 encoder_output, encoder_input_lengths, stopping_criteria,
                 logits_processor, cross_attention_mask, **kwargs)
@@ -3138,9 +3180,9 @@ class MambaLMHeadModelGenerationSession(GenerationSession):
             )
             self.decoder_logits_dtype = torch.float32
         self.dynamic_decoder = torch.classes.trtllm.DynamicDecodeOp(
-            model_config.max_batch_size, self.vocab_size,
-            self.vocab_size_padded, self.mapping.tp_size, self.mapping.pp_size,
-            self.decoder_logits_dtype)
+            model_config.max_batch_size, model_config.max_beam_width,
+            self.vocab_size, self.vocab_size_padded, self.mapping.tp_size,
+            self.mapping.pp_size, self.decoder_logits_dtype)
 
         self.gather_tree = torch.ops.tensorrt_llm.gather_tree
 

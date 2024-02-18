@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/runtime/decodingMode.h"
 #include "tensorrt_llm/runtime/generationInput.h"
 #include "tensorrt_llm/runtime/generationOutput.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -74,8 +75,9 @@ public:
     using TensorPtr = std::shared_ptr<ITensor>;
 
     //! Setup the decoder before calling `forward()`, also calls reshapeBuffers
-    virtual void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow,
-        SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep, nvinfer1::DataType dtype)
+    virtual void setup(DecodingMode const& mode, SizeType maxBatchSize, SizeType maxBeamWidth,
+        SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep,
+        bool fusedDecoder, nvinfer1::DataType dtype)
         = 0;
 
     //! @brief Initialize the decoder with new batch of inputs.

@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include "cutlass/numeric_types.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/enabled.h"
@@ -430,6 +431,11 @@ bool benchmark(int m, int n, int k, int group_size, int warmup, int iter)
 
 TEST(Kernel, WeightOnly)
 {
+    // Will re-enable 90 later when sm90 cuda kernels are ready
+    if (tensorrt_llm::common::getSMVersion() >= 90)
+    {
+        return;
+    }
     bool pass;
     int warmup = 10, iter = 30;
     std::vector<int> ms{1, 2, 4};

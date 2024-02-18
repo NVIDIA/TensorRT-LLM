@@ -432,6 +432,7 @@ class TestBloom(unittest.TestCase):
 
         model_config = ModelConfig(
             max_batch_size=batch_size,
+            max_beam_width=num_beams,
             vocab_size=bloom_config.vocab_size,
             num_layers=bloom_config.n_layer,
             num_heads=bloom_config.n_head,

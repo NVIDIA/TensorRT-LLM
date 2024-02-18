@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from tensorrt_llm.models.llama.weight import (load_from_awq_llama,
                                               load_from_fp8_llama)
@@ -62,6 +62,7 @@ class LLaMADecoderLayer(Module):
             rotary_embedding_scaling=config.rotary_scaling,
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
+            tp_rank=config.mapping.tp_rank,
             quant_mode=config.quant_mode,
             enable_pos_shift=config.enable_pos_shift,
             dense_context_fmha=config.dense_context_fmha,
@@ -264,11 +265,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM, TopModelMixin):
                           mapping: Optional[Mapping] = None,
                           quant_mode: Optional[QuantMode] = None,
                           **kwargs):
-        import transformers
-        from transformers import LlamaConfig
-
-        from ...models.modeling_utils import PretrainedConfig
-        cfg = LlamaConfig.from_pretrained(hf_model_dir)
+        cfg = AutoConfig.from_pretrained(hf_model_dir)
 
         num_kv_heads = cfg.num_key_value_heads if hasattr(cfg, "num_key_value_heads") \
             else cfg.num_attention_heads
@@ -281,10 +278,25 @@ class LLaMAForCausalLM(DecoderModelForCausalLM, TopModelMixin):
 
         cfg.dtype = dtype
         cfg.quant_mode = quant_mode
-        moe_config = kwargs.get("moe_config", MoeConfig())
 
         cfg.norm_epsilon = cfg.rms_norm_eps
 
+        if cfg.model_type == 'mixtral':
+            moe_config = MoeConfig(
+                num_experts=cfg.num_local_experts,
+                top_k=cfg.num_experts_per_tok,
+                tp_mode=kwargs.get("moe_tp_mode",
+                                   MoeConfig.ParallelismMode.TENSOR_PARALLEL),
+                normalization_mode=kwargs.get(
+                    "moe_normalization_mode",
+                    MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE),
+            ).validate()
+            # HF LLaMA-type models are implicitly using gated activation.
+            # With our MoE implementation, we must make it explicit
+            cfg.hidden_act = 'swiglu'
+            cfg.rotary_base = cfg.rope_theta
+        else:
+            moe_config = MoeConfig()
         config = {
             'architecture': cfg.architectures[0],
             'dtype': cfg.dtype,
@@ -306,7 +318,14 @@ class LLaMAForCausalLM(DecoderModelForCausalLM, TopModelMixin):
             },
             'mapping': {
                 'world_size': mapping.world_size,
-                'tp_size': mapping.world_size,
+                'tp_size': mapping.tp_size,
+                'pp_size': mapping.pp_size,
+            },
+            "moe_config": {
+                "num_experts": moe_config.num_experts,
+                "top_k": moe_config.top_k,
+                "tp_mode": moe_config.tp_mode,
+                "normalization_mode": moe_config.normalization_mode,
             },
             'use_parallel_embedding': kwargs.get("use_parallel_embedding",
                                                  False),
@@ -322,7 +341,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM, TopModelMixin):
         }
         if quant_mode.is_int4_weight_only_per_group():
             config['quantization'].update({
-                'quant_algo': 'W4A8_AWQ',
+                'quant_algo': 'W4A16_AWQ',
                 'has_zero_point': False,
                 'pre_quant_scale': True,
                 'exclude_modules': [],
@@ -336,7 +355,9 @@ class LLaMAForCausalLM(DecoderModelForCausalLM, TopModelMixin):
             if quant_mode != QuantMode(0):
                 raise ValueError(f"Unsupported quantization mode: {quant_mode}")
 
-        tllm_llama = LLaMAForCausalLM(PretrainedConfig.from_dict(config))
+        model_config = PretrainedConfig.from_dict(config)
+        model_config.set_rank(mapping.tp_rank)
+        tllm_llama = LLaMAForCausalLM(model_config)
         q_weights = {}
         if quant_mode.has_any_quant():
             q_weights = tllm_llama._quantize(hf_model_dir, dtype, cfg, **kwargs)
@@ -345,13 +366,10 @@ class LLaMAForCausalLM(DecoderModelForCausalLM, TopModelMixin):
         if kwargs.get("skip_loading_weights", False):
             return tllm_llama
 
-        # TODO: support mixtral
-
         # weights already loaded in _quantize for int4 weight only
         if not quant_mode.is_int4_weight_only_per_group():
-            hf_model = transformers.LlamaForCausalLM
             profiler.start("Loading weights from HF")
-            hf_llama = hf_model.from_pretrained(
+            hf_llama = AutoModelForCausalLM.from_pretrained(
                 hf_model_dir,
                 device_map={
                     "model": "cpu",

@@ -242,15 +242,20 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> con
     auto const maxAttentionWindow = maxSeqLength;
     SizeType const sinkTokenLength{0};
 
+    auto const decodingMode = maxBeamWidth == 1 ? DecodingMode::TopKTopP() : DecodingMode::BeamSearch();
+
     // set up decoder
     auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr);
-    decoder.setup(batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength, maxGeneratedTokensPerStep,
-        dataType);
+    decoder.setup(decodingMode, batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength,
+        maxGeneratedTokensPerStep, false, dataType);
 
+    std::vector<SizeType> seqSlots;
+    std::vector<decoder_batch::Request> decoderRequests;
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
-        decoder.newRequest(batchIdx, requests[batchIdx], samplingConfigs[batchIdx]);
+        seqSlots.push_back(batchIdx);
     }
+    decoder.newRequests(seqSlots, requests, samplingConfigs);
     cudaDeviceSynchronize();
 
     auto expectedLengths = tiledInputLengths;
@@ -286,7 +291,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> con
     EXPECT_NO_THROW(decoder.forward(outputs, inputs));
     checkSequenceLengths(*outputs.sequenceLengths, expectedLengths, manager);
 
-    decoder.newRequest(0, requests[0], samplingConfigs[0]);
+    decoder.newRequests({0}, {requests[0]}, {samplingConfigs[0]});
     EXPECT_FALSE(decoder.getFinished()[0]);
 }
 
@@ -354,10 +359,12 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     auto const maxAttentionWindow = maxSeqLength;
     SizeType const sinkTokenLength{0};
 
+    auto const decodingMode = maxBeamWidth == 1 ? DecodingMode::TopKTopP() : DecodingMode::BeamSearch();
+
     // set up decoder
     auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr);
-    decoder.setup(batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength, maxGeneratedTokensPerStep,
-        dataType);
+    decoder.setup(decodingMode, batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength,
+        maxGeneratedTokensPerStep, false, dataType);
 
     std::vector<SizeType> expectedSteps(batchSize, 0);
     auto expectedLengths = tiledInputLengths;
@@ -368,7 +375,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
 
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
-        decoder.newRequest(batchIdx, requests[batchIdx], samplingConfigs[batchIdx]);
+        decoder.newRequests({batchIdx}, {requests[batchIdx]}, {samplingConfigs[batchIdx]});
 
         decoder.forward(outputs, inputs);
 
@@ -411,6 +418,9 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     std::vector<SizeType> const& acceptedTokensPerStep, SizeType maxGeneratedTokensPerStep)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+
+    TLLM_CHECK(maxBeamWidth == 1);
+
     SizeType constexpr tensorParallelism{1};
     SizeType constexpr pipelineParallelism{1};
     SizeType constexpr localRank{0};
@@ -465,15 +475,18 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     auto const maxAttentionWindow = maxSeqLength;
     SizeType const sinkTokenLength{0};
 
+    auto const decodingMode = maxBeamWidth == 1 ? DecodingMode::TopKTopP() : DecodingMode::BeamSearch();
+
     // set up decoder
     auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr);
-    decoder.setup(batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength, maxGeneratedTokensPerStep,
-        dataType);
+    decoder.setup(decodingMode, batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength,
+        maxGeneratedTokensPerStep,
+        /* fused decoder */ true, dataType);
 
-    for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
-    {
-        decoder.newRequest(batchIdx, requests[batchIdx], samplingConfigs[batchIdx]);
-    }
+    std::vector<SizeType> seqSlots(batchSize);
+    std::iota(seqSlots.begin(), seqSlots.end(), 0);
+
+    decoder.newRequests(seqSlots, requests, samplingConfigs);
     cudaDeviceSynchronize();
 
     auto expectedLengths = tiledInputLengths;
@@ -548,8 +561,8 @@ TEST_P(ParamTest, Test)
 
 INSTANTIATE_TEST_SUITE_P(DecoderBwTest, ParamTest,
     testing::Combine(testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF),
-        testing::Values(BeamConfig{1, {1, 1, 1}}, BeamConfig{3, {3, 3, 3, 3}}, BeamConfig{4, {1, 1}},
-            BeamConfig{4, {3, 3, 3}}, BeamConfig{4, {1, 2, 3, 4}}),
+        testing::Values(
+            BeamConfig{1, {1, 1, 1}}, BeamConfig{3, {3, 3, 3, 3}}, BeamConfig{4, {3, 3, 3}}, BeamConfig{4, {2, 3, 4}}),
         testing::Values(false, true)),
     generateTestName);
 
@@ -574,8 +587,8 @@ TEST_P(ParamWavefrontTest, Test)
 
 INSTANTIATE_TEST_SUITE_P(DecoderBwTest, ParamWavefrontTest,
     testing::Combine(testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF),
-        testing::Values(BeamConfig{1, {1, 1, 1}}, BeamConfig{3, {3, 3, 3, 3}}, BeamConfig{4, {1, 1}},
-            BeamConfig{4, {3, 3, 3}}, BeamConfig{4, {1, 2, 3, 4}}),
+        testing::Values(
+            BeamConfig{1, {1, 1, 1}}, BeamConfig{3, {3, 3, 3, 3}}, BeamConfig{4, {3, 3, 3}}, BeamConfig{4, {2, 3, 4}}),
         testing::Values(false, true)),
     generateTestName);
 
@@ -613,7 +626,7 @@ TEST_P(ParamDraftTest, Test)
 
 INSTANTIATE_TEST_SUITE_P(DecoderTest, ParamDraftTest,
     testing::Combine(testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF),
-        testing::Values(BeamConfig{1, {1, 1, 1}}, BeamConfig{4, {1, 1, 1}}),
+        testing::Values(BeamConfig{1, {1, 1, 1}}),
         testing::Values( //
             DraftConfig{2, {1, 1, 1}, {0, 0, 0}}, DraftConfig{2, {2, 2, 2}, {1, 1, 1}},
             DraftConfig{4, {1, 2, 3}, {0, 0, 1}}

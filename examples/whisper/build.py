@@ -188,6 +188,7 @@ def build_encoder(model, args):
         num_heads=num_heads,
         hidden_size=hidden_states,
         max_batch_size=max_batch_size,
+        max_beam_width=args.max_beam_width,
         int8=args.quant_mode.has_act_or_weight_quant(),
         n_mels=model_metadata['n_mels'],
         num_languages=model_metadata['n_vocab'] - 51765 -
@@ -267,6 +268,7 @@ def build_decoder(model, args):
         max_position_embeddings=model_metadata['n_text_ctx'],
         apply_query_key_layer_scaling=False,
         max_batch_size=args.max_batch_size,
+        max_beam_width=args.max_beam_width,
         max_input_len=args.max_input_len,
         max_output_len=args.max_output_len,
         opt_level=None,

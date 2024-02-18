@@ -22,8 +22,7 @@ import tensorrt_llm
 from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.llama.weight import (load_from_fp8_llama,
-                                              load_from_gptq_llama,
+from tensorrt_llm.models.llama.weight import (load_from_gptq_llama,
                                               load_from_hf_checkpoint,
                                               load_from_meta_llama)
 from tensorrt_llm.models.modeling_utils import PretrainedConfig
@@ -113,17 +112,6 @@ def parse_arguments():
         'per_group chooses at run time, and for each group, a custom scaling factor. '
         'The flag is built for GPTQ/AWQ quantization.')
 
-    parser.add_argument(
-        '--enable_fp8',
-        default=False,
-        action='store_true',
-        help='Use FP8 Linear layer for Attention QKV/Dense and MLP.')
-    parser.add_argument(
-        '--fp8_kv_cache',
-        default=False,
-        action="store_true",
-        help='By default, we use dtype for KV cache. fp8_kv_cache chooses int8 '
-        'quantization for KV')
     parser.add_argument('--load_by_shard',
                         action='store_true',
                         help='Load a pretrained model shard-by-shard.')
@@ -209,15 +197,6 @@ def parse_arguments():
         type=int,
         help=
         'Controls renormalization after gate logits. Check layers/moe.py for accepted values',
-    )
-    parser.add_argument(
-        '--use_fused_mlp',
-        default=False,
-        action='store_true',
-        help=
-        'Enable horizontal fusion in GatedMLP, reduces layer input traffic and potentially improves performance. '
-        'For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded '
-        '(0.45734 vs 0.45755 for LLaMA-v2 7B using ammo/examples/hf/instruct_eval/mmlu.py).'
     )
     parser.add_argument('--enable_pos_shift',
                         default=False,
@@ -1354,12 +1333,6 @@ if __name__ == '__main__':
             'tp_size': args.tp_size,
             'pp_size': args.pp_size,
         },
-        "moe_config": {
-            "num_experts": args.moe_num_experts,
-            "top_k": args.moe_top_k,
-            "tp_mode": args.moe_tp_mode,
-            "normalization_mode": args.moe_renorm_mode
-        },
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
@@ -1368,7 +1341,6 @@ if __name__ == '__main__':
         'moe_top_k': args.moe_top_k,
         'moe_tp_mode': args.moe_tp_mode,
         'moe_normalization_mode': args.moe_renorm_mode,
-        'use_fused_mlp': args.use_fused_mlp,
         'enable_pos_shift': args.enable_pos_shift,
         'dense_context_fmha': args.dense_context_fmha,
         'max_lora_rank': args.max_lora_rank,
@@ -1400,12 +1372,9 @@ if __name__ == '__main__':
             else:
                 config['quantization'][
                     'quant_algo'] = 'W8A8_SQ_PER_TENSOR_PLUGIN'
-    elif args.enable_fp8:
-        config['quantization']['quant_algo'] = 'FP8'
+
     if args.int8_kv_cache:
         config['quantization']['kv_cache_quant_algo'] = 'INT8'
-    elif args.fp8_kv_cache:
-        config['quantization']['kv_cache_quant_algo'] = 'FP8'
 
     if args.weight_only_precision == 'int4_gptq':
         config['quantization'].update({
@@ -1502,41 +1471,6 @@ if __name__ == '__main__':
                     smoother=convert_args['internlm_smoother'],
                     moe_config=args.moe_config,
                     lora_config=args.lora_config)
-
-                if args.enable_fp8 or args.fp8_kv_cache:
-                    scales = load_from_fp8_llama(args.ammo_quant_ckpt_path,
-                                                 hf_config.num_hidden_layers,
-                                                 mapping, args.fp8_kv_cache)
-                    weights.update(scales)
-
-        if args.use_fused_mlp:
-            for l in range(args.n_layer):
-                tllm_prex = f'transformer.layers.{l}.'
-                weights[tllm_prex + 'mlp.fused_fc.weight'] = torch.cat(
-                    (weights[tllm_prex + 'mlp.gate.weight'],
-                     weights[tllm_prex + 'mlp.fc.weight']),
-                    dim=0)
-                if tllm_prex + 'mlp.gate.bias' in weights and tllm_prex + 'mlp.fc.bias' in weights:
-                    weights[tllm_prex + 'mlp.fused_fc.bias'] = torch.cat(
-                        (weights[tllm_prex + 'mlp.gate.bias'],
-                         weights[tllm_prex + 'mlp.fc.bias']),
-                        dim=0)
-                if args.enable_fp8 or args.fp8_kv_cache:
-                    weights[tllm_prex +
-                            'mlp.fused_fc.weights_scaling_factor'] = torch.cat(
-                                (weights[tllm_prex +
-                                         'mlp.gate.weights_scaling_factor'],
-                                 weights[tllm_prex +
-                                         'mlp.fc.weights_scaling_factor']),
-                                dim=0)
-                    weights[
-                        tllm_prex +
-                        'mlp.fused_fc.activation_scaling_factor'] = torch.cat(
-                            (weights[tllm_prex +
-                                     'mlp.gate.activation_scaling_factor'],
-                             weights[tllm_prex +
-                                     'mlp.fc.activation_scaling_factor']),
-                            dim=0)
 
         safetensors.torch.save_file(
             weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))

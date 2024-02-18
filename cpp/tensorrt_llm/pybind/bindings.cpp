@@ -85,6 +85,19 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("gen_micro_batch_size", &tr::GptSession::Config::genMicroBatchSize)
         .def_readwrite("kv_cache_config", &tr::GptSession::Config::kvCacheConfig);
 
+    py::class_<tr::DecodingMode>(m, "DecodingMode")
+        .def_static("none", &tr::DecodingMode::None)
+        .def_static("top_k", &tr::DecodingMode::TopK)
+        .def_static("top_p", &tr::DecodingMode::TopP)
+        .def_static("top_k_top_p", &tr::DecodingMode::TopKTopP)
+        .def_static("beam_search", &tr::DecodingMode::BeamSearch)
+        .def_property_readonly("is_none", &tr::DecodingMode::isNone)
+        .def_property_readonly("is_top_k", &tr::DecodingMode::isTopK)
+        .def_property_readonly("is_top_p", &tr::DecodingMode::isTopP)
+        .def_property_readonly("is_top_k_or_top_p", &tr::DecodingMode::isTopKorTopP)
+        .def_property_readonly("is_top_k_and_top_p", &tr::DecodingMode::isTopKandTopP)
+        .def_property_readonly("is_beam_search", &tr::DecodingMode::isBeamSearch);
+
     py::enum_<nvinfer1::DataType>(m, "DataType")
         .value("FLOAT", nvinfer1::DataType::kFLOAT)
         .value("HALF", nvinfer1::DataType::kHALF)
@@ -325,7 +338,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("enable_trt_overlap", &tb::TrtGptModelOptionalParams::enableTrtOverlap)
         .def_readwrite("device_ids", &tb::TrtGptModelOptionalParams::deviceIds)
         .def_readwrite("enable_chunked_context", &tb::TrtGptModelOptionalParams::enableChunkedContext)
-        .def_readwrite("normalize_log_probs", &tb::TrtGptModelOptionalParams::normalizeLogProbs);
+        .def_readwrite("normalize_log_probs", &tb::TrtGptModelOptionalParams::normalizeLogProbs)
+        .def_readwrite("decoding_mode", &tb::TrtGptModelOptionalParams::decodingMode);
 
     tpb::GptManager::initBindings(m);
 }

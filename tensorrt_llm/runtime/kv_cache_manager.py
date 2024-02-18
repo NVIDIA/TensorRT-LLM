@@ -417,6 +417,12 @@ class KVCacheUpdater:
     def update(self, accepted_draft_token_offsets,
                packed_accepted_draft_tokens_indices, sequence_length_buffer,
                rewind_tokens):
+        assert isinstance(rewind_tokens, torch.Tensor) or isinstance(
+            rewind_tokens, int)
+        rewind_tokens_tensor = rewind_tokens if isinstance(
+            rewind_tokens, torch.Tensor) else None
+        rewind_tokens_count = rewind_tokens if isinstance(rewind_tokens,
+                                                          int) else 0
         assert self.use_paged_kv_cache is not None
         if self.use_paged_kv_cache:
             host_kv_cache_block_pointers = self.kv_cache_manager.get_pointer_arrays(
@@ -431,8 +437,9 @@ class KVCacheUpdater:
                 True,
                 self.num_kv_heads,
                 self.head_dim * self.elt_size,
-                rewind_tokens,
+                rewind_tokens_count,
                 self.kv_cache_manager.max_attention_window_size,
+                rewind_tokens_tensor,
                 None,
                 kv_cache_block_pointers,
                 self.kv_cache_manager.blocks_manager.max_blocks_per_seq,
@@ -447,8 +454,9 @@ class KVCacheUpdater:
                 False,
                 self.num_kv_heads,
                 self.head_dim * self.elt_size,
-                rewind_tokens,
+                rewind_tokens_count,
                 self.max_kv_cache_length,
+                rewind_tokens_tensor,
                 self.past_key_value_list,
                 None,
                 None,

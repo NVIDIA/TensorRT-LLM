@@ -96,7 +96,6 @@ def choices_2_paths(num_medusa_heads, choices):
             if k not in all_paths:
                 all_paths[k] = c[:i + 1]
                 level_counts[i] += 1
-    # print(level_counts)
     return list(paths.values()), level_counts, paths, all_paths
 
 
@@ -105,7 +104,6 @@ def get_medusa_topks(num_medusa_heads, paths):
     for p in paths:
         for i, k in enumerate(p):
             medusa_topks[i] = max(medusa_topks[i], k + 1)
-    # print(medusa_topks)
     return medusa_topks
 
 
@@ -153,7 +151,6 @@ def _medusa_setup(choices_or_paths, num_medusa_heads=None):
     paths, level_counts, _, _ = choices_2_paths(num_medusa_heads,
                                                 sorted_choices)
     paths = sorted(paths, key=path_sorting_key)
-    # print(paths)
     medusa_topks = get_medusa_topks(num_medusa_heads, paths)
     medusa_tree_ids, medusa_position_offsets, tree_paths = get_medusa_tree(
         num_medusa_heads, medusa_topks, level_counts, paths)
@@ -170,6 +167,7 @@ def _medusa_setup(choices_or_paths, num_medusa_heads=None):
     medusa_position_offsets = torch.tensor([-1] + medusa_position_offsets) + 1
     medusa_mask = get_medusa_mask(medusa_tree_ids, medusa_paths)
     medusa_packed_mask = get_packed_mask(num_medusa_tokens, medusa_mask[1:, 1:])
+
     return Namespace(
         medusa_mask=medusa_mask.cuda(),
         medusa_packed_mask=medusa_packed_mask.cuda(),

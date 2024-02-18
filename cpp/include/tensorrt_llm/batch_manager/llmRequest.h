@@ -354,6 +354,11 @@ public:
         mDraftLogits = draftLogits;
     }
 
+    SizeType getNumDraftTokens() const
+    {
+        return mDraftTokens->size();
+    }
+
     void setReturnContextLogits(const bool returnContextLogits)
     {
         mReturnContextLogits = returnContextLogits;

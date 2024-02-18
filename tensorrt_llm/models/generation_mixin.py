@@ -42,6 +42,7 @@ class GenerationMixin:
         return [elem + offset for elem in result]
 
     def prepare_attention_inputs(self,
+                                 *,
                                  max_batch_size,
                                  max_beam_width,
                                  max_input_len,
@@ -280,6 +281,7 @@ class GenerationMixin:
         }
 
     def prepare_basic_inputs(self,
+                             *,
                              max_batch_size,
                              max_beam_width,
                              max_input_len,

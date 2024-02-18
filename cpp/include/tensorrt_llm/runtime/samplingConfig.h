@@ -26,10 +26,36 @@ namespace tensorrt_llm::runtime
 
 class SamplingConfig
 {
+private:
     using FloatType = float;
 
     template <typename T>
     using OptVec = std::optional<std::vector<T>>;
+
+private:
+    template <typename T>
+    static OptVec<T> fuseValues(
+        std::vector<SamplingConfig> const& configs, std::function<OptVec<T>(SizeType ci)> accessor)
+    {
+        std::vector<T> values;
+        auto const hasValues = accessor(0).has_value();
+        for (size_t ci = 0; ci < configs.size(); ++ci)
+        {
+            const auto& configValue = accessor(ci);
+            TLLM_CHECK(hasValues == configValue.has_value());
+            if (hasValues)
+            {
+                TLLM_CHECK(configValue.value().size() == 1);
+                values.push_back(configValue.value().front());
+            }
+        }
+
+        if (!hasValues)
+        {
+            return std::nullopt;
+        }
+        return std::make_optional<std::vector<T>>(values);
+    }
 
 public:
     explicit SamplingConfig(SizeType beamWidth = 1)
@@ -37,6 +63,30 @@ public:
     {
     }
 
+    explicit SamplingConfig(std::vector<SamplingConfig> const& configs)
+    {
+        TLLM_CHECK(configs.size() > 0);
+        beamWidth = configs.front().beamWidth;
+        temperature = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].temperature; });
+        minLength = fuseValues<SizeType>(configs, [&configs](SizeType ci) { return configs[ci].minLength; });
+        repetitionPenalty
+            = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].repetitionPenalty; });
+        presencePenalty
+            = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].presencePenalty; });
+        topK = fuseValues<SizeType>(configs, [&configs](SizeType ci) { return configs[ci].topK; });
+        topP = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].topP; });
+        randomSeed = fuseValues<uint64_t>(configs, [&configs](SizeType ci) { return configs[ci].randomSeed; });
+        topPDecay = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].topPDecay; });
+        topPMin = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].topPMin; });
+        topPResetIds = fuseValues<SizeType>(configs, [&configs](SizeType ci) { return configs[ci].topPResetIds; });
+        beamSearchDiversityRate
+            = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].beamSearchDiversityRate; });
+        lengthPenalty = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].lengthPenalty; });
+        draftAcceptanceThreshold
+            = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].draftAcceptanceThreshold; });
+    }
+
+public:
     SizeType beamWidth;
 
     OptVec<FloatType> temperature;       // [1] or [batch_size] on cpu

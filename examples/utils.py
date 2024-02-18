@@ -90,10 +90,10 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
                                                   use_fast=use_fast)
     else:
         # For gpt-next, directly load from tokenizer.model
-        assert model_name == 'gpt'
         tokenizer = T5Tokenizer(vocab_file=vocab_file,
                                 padding_side='left',
-                                truncation_side='left')
+                                truncation_side='left',
+                                legacy=False)
 
     if model_name == 'qwen':
         with open(Path(tokenizer_dir) / "generation_config.json") as f:
@@ -110,6 +110,11 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
     elif model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
         pad_id = tokenizer.pad_token_id
         end_id = tokenizer.eop_token_id
+    elif model_name == 'SpecialForCausalLM':
+        tokenizer.eos_token_id = tokenizer.sp_model.eos_id()
+        tokenizer.bos_token_id = tokenizer.sp_model.bos_id()
+        pad_id = tokenizer.pad_token_id
+        end_id = tokenizer.eos_token_id
     else:
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id

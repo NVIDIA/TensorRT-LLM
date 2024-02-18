@@ -73,7 +73,7 @@ Run a preprocessing script to prepare/generate dataset into a json that gptManag
 
 This tool can be used in 2 different modes of traffic generation.
 
-1 – Dataset
+##### 1 – Dataset
 
 “Prompt”, “Instruction” (optional) and “Answer” specified as sentences in a Json file
 
@@ -90,7 +90,7 @@ python3 prepare_dataset.py \
     --max-input-len 300
 ```
 
-2 – Normal token length distribution
+##### 2 – Normal token length distribution
 
 This mode allows the user to generate normal token length distributions with a mean and std deviation specified.
 For example, setting mean=100 and std dev=10 would generate requests where 95.4% of values are in <80,120> range following the normal probability distribution. Setting std dev=0 will generate all requests with the same mean number of tokens.
@@ -139,4 +139,18 @@ mpirun -n 2 ./benchmarks/gptManagerBenchmark \
     --type IFB \
     --dataset ../../benchmarks/cpp/preprocessed_dataset.json
     --max_num_samples 500
+```
+
+To emulate `gptSessionBenchmark` static batching, you can use the `--static_emulated_batch_size` and `--static_emulated-timeout` arguments.
+Given a `static_emulated_batch_size` of `n` the server will wait for `n` requests to arrive before submitting them to the batch manager at once. If the `static_emulated-timeout` (in ms) is reached before `n` requests are collected, the batch will be submitted prematurely with the current request count.
+
+Take GPT-350M as an example for single GPU with static batching
+```
+./benchmarks/gptManagerBenchmark \
+    --model gpt \
+    --engine_dir ../../examples/gpt/trt_engine/gpt2/fp16/1-gpu/ \
+    --type IFB \
+    --static_emulated_batch_size 32 \
+    --static_emulated_timeout 100 \
+    --dataset ../../benchmarks/cpp/preprocessed_dataset.json
 ```

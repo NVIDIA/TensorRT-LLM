@@ -20,6 +20,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
+#include "tensorrt_llm/runtime/decodingMode.h"
 #include "tensorrt_llm/runtime/generationInput.h"
 #include "tensorrt_llm/runtime/generationOutput.h"
 #include "tensorrt_llm/runtime/gptModelConfig.h"
@@ -90,6 +91,7 @@ public:
         KvCacheConfig kvCacheConfig{};
         std::optional<SizeType> ctxMicroBatchSize = std::nullopt;
         std::optional<SizeType> genMicroBatchSize = std::nullopt;
+        std::optional<DecodingMode> decodingMode = std::nullopt;
     };
 
     GptSession(Config const& sessionConfig, GptModelConfig const& modelConfig, WorldConfig const& worldConfig,
@@ -146,7 +148,8 @@ private:
     void createContexts();
     void createBuffers(SizeType numMicroBatches);
     void createDecoders(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow, SizeType sinkTokenLength,
-        SizeType maxSequenceLength, nvinfer1::DataType logitsType, bool decoderPerRequest, SizeType numMicroBatches);
+        SizeType maxSequenceLength, nvinfer1::DataType logitsType, bool decoderPerRequest, SizeType numMicroBatches,
+        DecodingMode const& decodingMode);
     void createKvCacheManager(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow,
         SizeType sinkTokenLength, SizeType maxSequenceLength, KvCacheConfig const& config);
     void createCustomAllReduceWorkspace(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength);

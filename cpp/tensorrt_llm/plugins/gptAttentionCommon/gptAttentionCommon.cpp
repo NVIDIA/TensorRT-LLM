@@ -523,10 +523,12 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(const void* data, size_t leng
 }
 
 size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t nbReq,
-    int32_t input_seq_length, int32_t max_attention_window, int32_t cross_qkv_length) const noexcept
+    int32_t input_seq_length, int32_t max_attention_window, int32_t cross_qkv_length,
+    int32_t max_num_tokens) const noexcept
 {
     const int local_hidden_units_qo = mNumHeads * getHeadSize();
     const int local_hidden_units_kv = mNumKVHeads * getHeadSize();
+    const bool chunked_context_support = mEnableContextFMHA && mPagedKVCache && mPagedContextFMHA;
 
     auto const size = tensorrt_llm::runtime::BufferDataType(type).getSize();
 
@@ -537,9 +539,9 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
         ? 0
         : size * batch_size * input_seq_length * (isCrossAttention() ? cross_qkv_length : input_seq_length);
     const size_t cu_seqlens_size = sizeof(int) * (batch_size + 1);
-    const size_t q_buf_2_size = (mEnableContextFMHA && mPagedKVCache && mPagedContextFMHA) || !mEnableContextFMHA
-        ? size * batch_size * input_seq_length * local_hidden_units_qo
-        : 0;
+    const size_t q_buf_2_size = chunked_context_support
+        ? size * max_num_tokens * local_hidden_units_qo
+        : (!mEnableContextFMHA ? size * batch_size * input_seq_length * local_hidden_units_qo : 0);
     const size_t k_buf_2_size = mEnableContextFMHA
         ? 0
         : size * batch_size * (isCrossAttention() ? cross_qkv_length : input_seq_length) * local_hidden_units_kv;

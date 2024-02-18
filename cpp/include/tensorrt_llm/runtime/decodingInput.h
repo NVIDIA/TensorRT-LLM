@@ -21,6 +21,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 
 #include <memory>
+#include <optional>
 
 namespace tensorrt_llm::runtime
 {
@@ -36,6 +37,8 @@ public:
         , maxAttentionWindow{maxAttentionWindow}
         , sinkTokenLength{sinkTokenLength}
         , maxBatchSize{maxBatchSize}
+        , maxStopWordsLen{0}
+        , maxBadWordsLen{0}
         , logits{std::move(logits)}
         , endIds{std::move(endIds)}
     {
@@ -49,20 +52,28 @@ public:
     SizeType maxAttentionWindow;
     SizeType sinkTokenLength;
     SizeType maxBatchSize;
-    TensorPtr logits; // [batchSize, beamWidth, vocabSizePadded], on gpu
-    TensorPtr endIds; // [batchSize * beamWidth], on gpu
+    SizeType maxStopWordsLen; // The maximum value in the `stopWordsLens` tensor
+    SizeType maxBadWordsLen;  // The maximum value in the `badWordsLens` tensor
+    TensorPtr logits;         // [batchSize, beamWidth, vocabSizePadded], on gpu
+    std::optional<std::vector<TensorPtr>>
+        logitsVec;            // vector of size [batchSize] contains logits of size [beamWidth, vocabSizePadded], on gpu
+    TensorPtr endIds;         // [maxBatchSize * beamWidth], on gpu
 
     // optional parameters
     TensorPtr finished;            // [maxBatchSize, beamWidth], finished states at current iteration.
                                    // If true for some request, the decoding step of it is skipped, on gpu
     TensorPtr sequenceLimitLength; // [maxBatchSize], on gpu
-    TensorPtr embeddingBias;       // [vocabSizePadded], on gpu
+    TensorPtr embeddingBias;       // [maxBatchSize, vocabSizePadded], on gpu
     TensorPtr lengths;             // [maxBatchSize, beamWidth], on gpu
-    TensorPtr badWordsList;        // [2, badWordsLength] or [batchSize, 2, badWordsLength], on gpu
+    TensorPtr badWordsList;        // [2, badWordsLength] or [maxBatchSize, 2, badWordsLength], on gpu
+    TensorPtr badWordsPtrs;        // [maxBatchSize][2, badWordsLength], on gpu
+    TensorPtr badWordsLens;        // [maxBatchSize], on gpu
     TensorPtr stopWordsList;       // [maxBatchSize, 2, stopWordsLength], on gpu
+    TensorPtr stopWordsPtrs;       // [maxBatchSize][2, stopWordsLength], on gpu
+    TensorPtr stopWordsLens;       // [maxBatchSize], on gpu
     TensorPtr noRepeatNgramSize;   // [maxBatchSize], on gpu
     TensorPtr
-        batchSlots; // [batchSize], optional, address map of the linear batch id to to the seq slots, int32_t, on gpu
+        batchSlots; // [batchSize], optional, address map of the linear batch id to to the seq slots, int32_t, pinned
 
     // parameters for beam search
     TensorPtr cacheIndirection; // [maxBatchSize, beamWidth, maxSeqLen] - the k/v cache index for beam search, on gpu

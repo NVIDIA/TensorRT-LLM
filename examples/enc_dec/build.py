@@ -281,9 +281,6 @@ def parse_arguments(component):
             )
             setattr(args, plugin_arg, args.dtype)
 
-    if args.dtype == 'bfloat16' and not args.model_type in ['bart']:
-        assert args.use_gemm_plugin, "Please use gemm plugin when dtype is bfloat16"
-
     if args.gather_all_token_logits:
         args.gather_context_logits = True
         args.gather_generation_logits = True
@@ -309,6 +306,8 @@ def build_rank_engine(builder: Builder,
 
     assert args.n_layer % args.pp_size == 0, \
         f"num_layers {args.n_layer} must be a multiple of pipeline parallelism size {args.pp_size}"
+
+    fp16_clamping = (args.dtype == 'float16') and (args.model_type == 't5')
 
     # Initialize Module
     if args.component == 'encoder':
@@ -340,7 +339,8 @@ def build_rank_engine(builder: Builder,
             use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
             use_parallel_embedding=args.use_parallel_embedding,
             embedding_sharding_dim=args.embedding_sharding_dim,
-            mapping=mapping)
+            mapping=mapping,
+            fp16_clamping=fp16_clamping)
     elif args.component == 'decoder':
         tllm_model = tensorrt_llm.models.DecoderModel(
             num_layers=args.n_layer,
@@ -374,14 +374,8 @@ def build_rank_engine(builder: Builder,
             mapping=mapping,
             rescale_before_lm_head=args.rescale_before_lm_head,
             dtype=dtype,
-            logits_dtype=args.logits_dtype)
-
-    # No support for relative attention bias in plain TRT mode. Please use attention plugin
-    # (If to add such support, need to add into
-    #   Attention and BertAttention at tensorrt_llm/layers/attention.py)
-    if args.relative_attention:
-        assert args.use_bert_attention_plugin, "Relative attention bias is only supported when using BertAttention Plugin"
-        assert args.use_gpt_attention_plugin, "Relative attention bias is only supported when using GPTAttention Plugin"
+            logits_dtype=args.logits_dtype,
+            fp16_clamping=fp16_clamping)
 
     if args.weight_from_pytorch_ckpt:
         assert args.tp_size == 1, "Loading from framework model via memory is for demonstration purpose. For multi-GPU inference, please use loading from binary for better performance."

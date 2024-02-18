@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -90,32 +90,27 @@ TYPED_TEST_SUITE(AirTopPSamplingKernelTest, FloatAndHalfTypes);
 
 TYPED_TEST(AirTopPSamplingKernelTest, CorrectnessSmallP)
 {
-    GTEST_SKIP() << "Disabled because of https://nvbugspro.nvidia.com/bug/4469821";
     this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(0).setTopP(0.2f).setOutputLen(1));
 };
 
 TYPED_TEST(AirTopPSamplingKernelTest, CorrectnessLargeP)
 {
-    GTEST_SKIP() << "Disabled because of https://nvbugspro.nvidia.com/bug/4469821";
     this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(0).setTopP(0.9f).setOutputLen(1));
 };
 
 TYPED_TEST(AirTopPSamplingKernelTest, CorrectnessAncestral)
 {
-    GTEST_SKIP() << "Disabled because of https://nvbugspro.nvidia.com/bug/4469821";
     this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(0).setTopP(1.0f).setOutputLen(1));
 };
 
 TYPED_TEST(AirTopPSamplingKernelTest, CorrectnessLargeVocabSmallP)
 {
-    GTEST_SKIP() << "Disabled because of https://nvbugspro.nvidia.com/bug/4469821";
     this->runTest(
         SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopK(0).setTopP(0.2f).setOutputLen(16));
 };
 
 TYPED_TEST(AirTopPSamplingKernelTest, CorrectnessLargeVocabLargeP)
 {
-    GTEST_SKIP() << "Disabled because of https://nvbugspro.nvidia.com/bug/4469821";
     this->runTest(
         SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopK(0).setTopP(0.9f).setOutputLen(16));
 };

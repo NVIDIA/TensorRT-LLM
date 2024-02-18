@@ -320,6 +320,19 @@ def main(args):
                 with open(f"{export_path}/config.json", "w") as f:
                     json.dump(tensorrt_llm_config, f, indent=4)
 
+            # TODO(enweiz): Remove if a newer AMMO version is released
+            # Workaround for baichuan
+            if model_type == 'baichuan':
+                with open(f"{export_path}/config.json", 'r') as f:
+                    tensorrt_llm_config = json.load(f)
+                if hasattr(model.model, "alibi_mask"):
+                    tensorrt_llm_config["position_embedding_type"] = 'alibi'
+                else:
+                    tensorrt_llm_config[
+                        "position_embedding_type"] = 'rope_gpt_neox'
+                with open(f"{export_path}/config.json", "w") as f:
+                    json.dump(tensorrt_llm_config, f, indent=4)
+
         end_time = time.time()
         print(
             "Quantized model exported to {} \nTotal time used {:.2f} s.".format(

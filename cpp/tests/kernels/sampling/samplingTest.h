@@ -35,6 +35,7 @@ namespace tensorrt_llm::tests::kernels::sampling
 typedef testing::Types<float, half> FloatAndHalfTypes;
 
 constexpr float EPSILON = 1e-20f;
+constexpr float HALF_FLT_MAX = 65504.f;
 
 inline bool almostEqual(float a, float b, float atol = 1e-5, float rtol = 1e-8)
 {
@@ -192,6 +193,7 @@ struct SamplingKernelTestParam
     float topP;
     int32_t outputLen;
     bool normalizeLogProbs = false;
+    bool logitsHasProbs = true;
 
     SamplingKernelTestParam& setBatchSize(int32_t bs)
     {

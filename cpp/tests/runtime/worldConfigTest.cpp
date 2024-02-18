@@ -34,10 +34,6 @@ TEST(WorldConfig, DeviceIds)
     EXPECT_NO_THROW(
         tr::WorldConfig(tensorParallelism, pipelineParallelism, rank, gpusPerNode, std::vector{0, 1, 2, 3, 4, 5}));
 
-    // Not enough GPUs
-    EXPECT_THROW(tr::WorldConfig(tensorParallelism, pipelineParallelism, rank, gpusPerNode, std::vector{0, 1, 2, 3, 4}),
-        tc::TllmException);
-
     // Too many GPUs
     EXPECT_THROW(tr::WorldConfig(
                      tensorParallelism, pipelineParallelism, rank, gpusPerNode, std::vector{0, 1, 2, 3, 4, 5, 6, 7, 7}),

@@ -127,6 +127,14 @@ class Parameter:
             )
         self._value = v
 
+    def set_value_or_dummy(self, v: Union[np.ndarray, torch.Tensor]):
+        v = self._regularize_value(v)
+        if v.shape != self._shape:
+            self.value = np.empty(self._shape, trt_dtype_to_np(self._dtype))
+            return
+
+        self.value = v
+
     def _get_weights(self) -> trt.Weights:
         if isinstance(self._value, Tensor):
             self._value.producer.__class__ = trt.IConstantLayer

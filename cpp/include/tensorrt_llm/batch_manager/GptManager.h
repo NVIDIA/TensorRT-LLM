@@ -72,6 +72,8 @@ public:
 
     BatchManagerErrorCode_t shutdown();
 
+    SizeType getNumActiveRequests();
+
     virtual ~GptManager();
 
 protected:

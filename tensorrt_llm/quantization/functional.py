@@ -110,6 +110,7 @@ def weight_only_groupwise_quant_matmul(input: Tensor,
                                        scales: Tensor,
                                        zeros: Tensor,
                                        biases: Tensor,
+                                       alpha: Tensor,
                                        quant_algo: int,
                                        group_size: int,
                                        dtype: str = 'float16') -> Tensor:
@@ -120,6 +121,9 @@ def weight_only_groupwise_quant_matmul(input: Tensor,
         weights = quantize(weights, scales, dtype='int8', axis=1)
         weights = dequantize(weights, scales, 1, input.dtype)
 
+        if quant_algo & 8:
+            # fp8_alpha
+            input = input * alpha
         if quant_algo & 4:
             # pre quant
             input = input * pre_quant_scale
@@ -155,15 +159,16 @@ def weight_only_groupwise_quant_matmul(input: Tensor,
 
         matmul_plug = plg_creator.create_plugin("woq_groupwise_matmul", pfc)
 
-        # quant_algo = pre_quant_scale * 4 + zero * 2 + bias
+        # quant_algo = fp8_alpha * 8 + pre_quant_scale * 4 + zero * 2 + bias
         plug_inputs = [input.trt_tensor]
 
         # Flags for indicating whether the corresponding inputs are applied in quant_algo
-        # quant_algo = pre_quant_scale * PRE_QUANT_SCALE + zero * ZERO + bias * BIAS
+        # quant_algo = fp8_alpha * FP8_ALPHA + pre_quant_scale * PRE_QUANT_SCALE + zero * ZERO + bias * BIAS
         # Here pre_quant_scale, zero and bias are boolean type
         BIAS = 1
         ZERO = 2
         PRE_QUANT_SCALE = 4
+        FP8_ALPHA = 8
 
         if quant_algo & PRE_QUANT_SCALE:
             plug_inputs += [pre_quant_scale.trt_tensor]
@@ -174,13 +179,11 @@ def weight_only_groupwise_quant_matmul(input: Tensor,
             plug_inputs += [zeros.trt_tensor]
         if quant_algo & BIAS:
             plug_inputs += [biases.trt_tensor]
+        if quant_algo & FP8_ALPHA:
+            plug_inputs += [alpha.trt_tensor]
 
         layer = default_trtnet().add_plugin_v2(plug_inputs, matmul_plug)
         _add_plugin_info(layer, plg_creator, "woq_groupwise_matmul", pfc)
-        if quant_algo & PRE_QUANT_SCALE:
-            layer.get_input(2).set_dynamic_range(-127, 127)
-        else:
-            layer.get_input(1).set_dynamic_range(-127, 127)
 
         return _create_tensor(layer.get_output(0), layer)
 

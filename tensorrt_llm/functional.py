@@ -434,6 +434,12 @@ class Tensor(object):
         '''
         return sqrt(self)
 
+    def log(self):
+        '''
+        See functional.log.
+        '''
+        return log(self)
+
     def cast(self, dtype):
         '''
         See functional.cast.
@@ -1932,6 +1938,44 @@ def cumsum(input: Tensor, dim: int) -> Tensor:
     return _create_tensor(loop_output_layer.get_output(0), loop_output_layer)
 
 
+def masked_scatter(input: Tensor, mask: Tensor, source: Tensor) -> Tensor:
+    '''
+    Add the masked_scatter base on PyTorch definition.
+
+    See https://pytorch.org/docs/stable/generated/torch.Tensor.masked_scatter_.html#torch.Tensor.masked_scatter_ for a
+    description of that function.
+
+    Parameters:
+        input : Tensor
+            The input tensor.
+
+        mask : Tensor
+            The boolean mask tensor that indicates elements to select.
+
+        source: Tensor
+            The tensor to copy from
+    Returns:
+        The tensor containing the source tensor selected by mask.
+
+    '''
+    assert input.rank() >= 1, "input should have rank >= 1"
+    input, mask = broadcast_helper(input, mask)
+    expanded_mask = expand(mask, shape(input))
+
+    non_zero_layer = default_trtnet().add_non_zero(expanded_mask.trt_tensor)
+
+    shuffle_layer = default_trtnet().add_shuffle(non_zero_layer.get_output(0))
+    shuffle_layer.second_transpose = (1, 0)
+    source = source.view([-1])
+
+    scatter_layer = default_trtnet().add_scatter(input.trt_tensor,
+                                                 shuffle_layer.get_output(0),
+                                                 source.trt_tensor,
+                                                 mode=trt.ScatterMode.ND)
+
+    return _create_tensor(scatter_layer.get_output(0), scatter_layer)
+
+
 def concat(inputs: Sequence[Union[Tensor, int]], dim: int = 0) -> Tensor:
     '''
     Add an operation to concatenate tensors.
@@ -2382,6 +2426,7 @@ def unary(input: Tensor, op: trt.UnaryOperation) -> Tensor:
         sin     for op=trt.UnaryOperation.SIN
         cos     for op=trt.UnaryOperation.COS
         abs     for op=trt.UnaryOperation.ABS
+        log     for op=trt.UnaryOperation.LOG
 
     It is implemented using the IUnaryLayer from TensorRT.
 
@@ -2405,6 +2450,7 @@ exp = partial(unary, op=trt.UnaryOperation.EXP)
 sin = partial(unary, op=trt.UnaryOperation.SIN)
 cos = partial(unary, op=trt.UnaryOperation.COS)
 abs = partial(unary, op=trt.UnaryOperation.ABS)
+log = partial(unary, op=trt.UnaryOperation.LOG)
 
 
 def mean(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
@@ -2466,6 +2512,38 @@ def max(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
 
     layer = default_trtnet().add_reduce(input.trt_tensor,
                                         trt.ReduceOperation.MAX,
+                                        axes,
+                                        keep_dims=keepdim)
+    return _create_tensor(layer.get_output(0), layer)
+
+
+def sum(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
+    '''
+    Add an operation to compute the sum along a dimension.
+
+    Computes the sum along the dimension 'dim' of the input tensor.
+
+    It is implemented using the IReduceLayer from TensorRT.
+
+    Parameters:
+        input : Tensor
+            The input tensor.
+
+        dim : int
+            The dimension along which the mean is computed.
+
+        keepdim : bool
+            Is the dimension kept in the reduced tensor? When True the
+            dimension is kept, it is removed from the shape otherwise.
+
+    Returns:
+        The tensor produced by this reduction operation.
+    '''
+    dim = dim_resolve_negative(dim, input.ndim())
+    axes = dim_to_trt_axes(dim)
+
+    layer = default_trtnet().add_reduce(input.trt_tensor,
+                                        trt.ReduceOperation.SUM,
                                         axes,
                                         keep_dims=keepdim)
     return _create_tensor(layer.get_output(0), layer)
@@ -4201,6 +4279,7 @@ ACT2FN = {
     'gelu_new': gelu,
     'gelu_fast': gelu,
     'geglu': geglu,
+    'identity': identity,
     'silu': silu,
     'softplus': softplus,
     'squared-relu': squared_relu,
@@ -4481,3 +4560,45 @@ def selective_scan(
     output = _create_tensor(layer.get_output(0), layer)
     present_state = _create_tensor(layer.get_output(1), layer)
     return output, present_state
+
+
+def topk(input: Tensor,
+         k: int,
+         dim: int,
+         largest: bool = True) -> Tuple[Tensor, Tensor]:
+    '''
+    Add an topk operation.
+
+    Retrieve the top-K largest elements along a specified axis.
+    Given an input tensor of shape [a_1, a_2, ..., a_n, r]
+    and integer argument k, return two outputs:
+    Value tensor of shape [a_1, a_2, ..., a_{axis-1}, k, a_{axis+1}, ... a_n] which contains the values of the top k elements along the specified axis
+    Index tensor of shape [a_1, a_2, ..., a_{axis-1}, k, a_{axis+1}, ... a_n] which contains the indices of the top k elements (original indices from the input tensor).
+
+    Parameters:
+        input : Tensor
+            The input tensor.
+
+        k : int
+            A single positive value corresponding to the number of top elements to retrieve
+
+        dim: int
+            The dimension in which to compute the topk indices.
+
+        largest: bool
+            Controls whether to return largest or smallest elements
+
+
+    Returns:
+        The tensor produced by this argmax operation.
+    '''
+    dim = dim_resolve_negative(dim, input.ndim())
+    axes = dim_to_trt_axes(dim)
+    layer = default_trtnet().add_topk(
+        input.trt_tensor,
+        trt.TopKOperation.MAX if largest else trt.TopKOperation.MIN,
+        k=k,
+        axes=axes)
+
+    return _create_tensor(layer.get_output(0),
+                          layer), _create_tensor(layer.get_output(1), layer)

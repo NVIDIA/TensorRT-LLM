@@ -51,6 +51,7 @@ def TRTOPT(args, config):
 
     model_config = tensorrt_llm.runtime.ModelConfig(
         max_batch_size=max_batch_size,
+        max_beam_width=args.num_beams,
         vocab_size=vocab_size,
         num_layers=num_layers,
         num_heads=num_heads,

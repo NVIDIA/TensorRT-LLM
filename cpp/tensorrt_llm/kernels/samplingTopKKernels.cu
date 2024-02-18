@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,59 +35,6 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-
-template <typename T>
-__global__ void addBiasEndMask(T* logits, const T* bias, const int* endIds, const FinishedState* finished,
-    const int* batchSlots, const int vocabSize, const int vocabSizePadded)
-{
-    auto const batchIdx = blockIdx.x;
-    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
-    FinishedState const finishState = finished != nullptr ? finished[batchSlot] : FinishedState::empty();
-    if (finishState.isSkipDecoding())
-    {
-        return;
-    }
-
-    bool finish = finishState.isFinished();
-    int offset = batchIdx * vocabSizePadded;
-
-    bool const IS_FP16 = std::is_same<T, half>::value;
-    T const MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
-    for (int tid = threadIdx.x; tid < vocabSizePadded; tid += blockDim.x)
-    {
-        if (tid >= vocabSize)
-        {
-            logits[offset + tid] = -MAX_T_VAL;
-        }
-        else if (finish)
-        {
-            logits[offset + tid] = (tid == endIds[batchSlot]) ? MAX_T_VAL : -MAX_T_VAL;
-        }
-        else
-        {
-            if (bias != nullptr)
-            {
-                logits[offset + tid] += bias[tid];
-            }
-        }
-    }
-}
-
-template <typename T>
-void invokeAddBiasEndMask(T* logits, const T* bias, const int* endIds, const FinishedState* finished,
-    const int* batchSlots, const int batchSize, const int vocabSize, const int vocabSizePadded, cudaStream_t stream)
-{
-    dim3 grid(batchSize);
-    dim3 block(min(vocabSizePadded, 1024));
-    // n is the vocabSize, e.g., 30000, 7000.... vocabSize is usually very big.
-    addBiasEndMask<<<grid, block, 0, stream>>>(logits, bias, endIds, finished, batchSlots, vocabSize, vocabSizePadded);
-}
-
-template void invokeAddBiasEndMask(float* logits, const float* bias, const int* endIds, const FinishedState* finished,
-    const int* batchSlots, const int batchSize, const int vocabSize, const int vocabSizePadded, cudaStream_t stream);
-
-template void invokeAddBiasEndMask(half* logits, const half* bias, const int* endIds, const FinishedState* finished,
-    const int* batchSlots, const int batchSize, const int vocabSize, const int vocabSizePadded, cudaStream_t stream);
 
 template <typename T, int BLOCK_SIZE_, int BLOCKS_PER_BEAM_>
 __global__ void topKStage1(const T* __restrict logProbs, T* tmpLogProbs, int* topKTmpIdBuf, T* topKTmpValBuf,
@@ -176,7 +123,7 @@ __global__ void topKStage2Sampling(const int* __restrict topKTmpIdBuf, T* topKTm
     int* sequenceLengths, const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
     float* outputLogProbs, const int maxTopK, const int* topKs, const float topP, const float* topPs,
     curandState_t* curandstate, const int* endIds, const int vocabSize, const bool* skipDecode, const int* batchSlots,
-    const bool normalizeLogProbs)
+    const bool normalizeLogProbs, const bool logitHasProbs)
 {
     bool const IS_FP16 = std::is_same<T, half>::value;
     T const MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
@@ -240,7 +187,7 @@ __global__ void topKStage2Sampling(const int* __restrict topKTmpIdBuf, T* topKTm
 
             // when cumLogProbs are computed, topKTmpValBuf (logits_buf_) are
             // already pre-processed by softmax_kernel
-            if (cumLogProbs == nullptr && outputLogProbs == nullptr)
+            if (!logitHasProbs)
             {
                 total.u = __expf(total.u - maxLogit);
             }
@@ -309,7 +256,8 @@ __global__ void topKStage2Sampling(const int* __restrict topKTmpIdBuf, T* topKTm
     topKStage2Sampling<T, BLOCK_SIZE_2_, BLOCKS_PER_BEAM_>                                                             \
         <<<batchSize, BLOCK_SIZE_2_, K_MAX * sizeof(int) + K_MAX * sizeof(float), stream>>>(topKTmpIdBuf,              \
             topKTmpValBuf, ids, sequenceLengths, finishedInput, finishedOutput, cumLogProbs, outputLogProbs, maxTopK,  \
-            topKs, topP, topPs, curandstate, endIds, vocabSize, skipDecode, batchSlots, normalizeLogProbs);            \
+            topKs, topP, topPs, curandstate, endIds, vocabSize, skipDecode, batchSlots, normalizeLogProbs,             \
+            logitsHasProbs);                                                                                           \
     break;
 
 template <typename T>
@@ -317,9 +265,9 @@ void invokeBatchTopKSampling(void* workspace, size_t& workspaceSize, const T* lo
     const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     curandState_t* curandstate, const int maxTopK, const int* topKs, const float topP, const float* topPs,
     const int vocabSizePadded, const int* endIds, const int* batchSlots, cudaStream_t stream, const int batchSize,
-    const bool* skipDecode, const bool normalizeLogProbs)
+    const bool* skipDecode, const bool normalizeLogProbs, const bool logitsHasProbs)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     // Not allow an ambiguous inputs topP and topPs.
     assert(topP == 1.0f || topPs == nullptr);
@@ -338,6 +286,11 @@ void invokeBatchTopKSampling(void* workspace, size_t& workspaceSize, const T* lo
     {
         workspaceSize
             = sizeof(T) * tempLogProbsBufSize + sizeof(int) * topKTmpIdsBufSize + sizeof(T) * topKTmpValBuf_size;
+        return;
+    }
+
+    if (maxTopK == 0)
+    {
         return;
     }
 
@@ -367,6 +320,8 @@ void invokeBatchTopKSampling(void* workspace, size_t& workspaceSize, const T* lo
         CASE_K(1024, 256, 256, 8, normalizeLogProbs);
     default: throw std::domain_error(fmtstr("top-k kernel supports 1<=k<=1024 but got k=%d", maxTopK));
     }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 #undef CASE_K
@@ -375,37 +330,37 @@ template void invokeBatchTopKSampling(void* workspace, size_t& workspaceSize, co
     int* sequenceLengths, const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
     float* outputLogProbs, curandState_t* curandstate, const int maxTopK, const int* topKs, const float topP,
     const float* topPs, const int vocabSizePadded, const int* endIds, const int* batchSlots, cudaStream_t stream,
-    const int batchSize, const bool* skipDecode, const bool normalizeLogProbs);
+    const int batchSize, const bool* skipDecode, const bool normalizeLogProbs, const bool logitsHasProbs);
 
 template void invokeBatchTopKSampling(void* workspace, size_t& workspaceSize, const half* logProbs, int** ids,
     int* sequenceLengths, const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
     float* outputLogProbs, curandState_t* curandstate, const int maxTopK, const int* topKs, const float topP,
     const float* topPs, const int vocabSizePadded, const int* endIds, const int* batchSlots, cudaStream_t stream,
-    const int batchSize, const bool* skipDecode, const bool normalizeLogProbs);
+    const int batchSize, const bool* skipDecode, const bool normalizeLogProbs, const bool logitsHasProbs);
 
 template <typename T>
 void invokeTopKSampling(void* workspace, size_t& workspaceSize, const T* logProbs, int** ids, int* sequenceLengths,
     const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     curandState_t* curandstate, const int topK, const float topP, const int vocabSizePadded, const int* endIds,
     const int* batchSlots, cudaStream_t stream, const int batchSize, const bool* skipDecode,
-    const bool normalizeLogProbs)
+    const bool normalizeLogProbs, const bool logitsHasProbs)
 {
     invokeBatchTopKSampling(workspace, workspaceSize, logProbs, ids, sequenceLengths, finishedInput, finishedOutput,
         cumLogProbs, outputLogProbs, curandstate, topK, nullptr, topP, nullptr, vocabSizePadded, endIds, batchSlots,
-        stream, batchSize, skipDecode, normalizeLogProbs);
+        stream, batchSize, skipDecode, normalizeLogProbs, logitsHasProbs);
 }
 
 template void invokeTopKSampling(void* workspace, size_t& workspaceSize, const float* logProbs, int** ids,
     int* sequenceLengths, const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
     float* outputLogProbs, curandState_t* curandstate, const int topK, const float topP, const int vocabSizePadded,
     const int* endIds, const int* batchSlots, cudaStream_t stream, const int batchSize, const bool* skipDecode,
-    const bool normalizeLogProbs);
+    const bool normalizeLogProbs, const bool logitsHasProbs);
 
 template void invokeTopKSampling(void* workspace, size_t& workspaceSize, const half* logProbs, int** ids,
     int* sequenceLengths, const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
     float* outputLogProbs, curandState_t* curandstate, const int topK, const float topP, const int vocabSizePadded,
     const int* endIds, const int* batchSlots, cudaStream_t stream, const int batchSize, const bool* skipDecode,
-    const bool normalizeLogProbs);
+    const bool normalizeLogProbs, const bool logitsHasProbs);
 
 } // namespace kernels
 } // namespace tensorrt_llm

@@ -274,6 +274,35 @@ mpirun -n 2 --allow-run-as-root --oversubscribe \
                 --engine_dir ./falcon/180b/trt_engines/int4_awq/tp2
 ```
 
+#### W4A16 AWQ with FP8 GEMM (W4A8 AWQ)
+For Hopper GPUs, TRT-LLM also supports employing FP8 GEMM for accelerating linear layers. This mode is noted with `w4a8_awq` for AMMO and TRT-LLM, in which both weights and activations are converted from W4A16 to FP8 for GEMM calculation.
+
+Please make sure your system contains a Hopper GPU before trying the commands below.
+
+```bash
+# Quantize HF Falcon 180B checkpoint into W4A8-AWQ and export trtllm checkpoint
+python ../quantization/quantize.py --model_dir ./falcon/180b \
+                --dtype float16 \
+                --qformat w4a8_awq \
+                --output_dir ./falcon/180b/trt_ckpt/w4a8_awq/tp2 \
+                --tp_size 2
+
+# Build trtllm engines from the trtllm checkpoint
+trtllm-build --checkpoint_dir ./falcon/180b/trt_ckpt/w4a8_awq/tp2 \
+                --use_gemm_plugin float16 \
+                --remove_input_padding \
+                --use_gpt_attention_plugin float16 \
+                --enable_context_fmha \
+                --output_dir ./falcon/180b/trt_engines/w4a8_awq/tp2 \
+                --workers 2
+
+# Run the summarization task
+mpirun -n 2 --allow-run-as-root --oversubscribe \
+    python ../summarize.py --test_trt_llm \
+                --hf_model_dir ./falcon/180b \
+                --engine_dir ./falcon/180b/trt_engines/w4a8_awq/tp2
+```
+
 ## Troubleshooting
 
 ### 1. The HuggingFace Falcon may raise an error when using  the `accelerate` package.

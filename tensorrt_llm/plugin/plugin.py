@@ -78,6 +78,7 @@ class PluginConfig:
     weight_only_quant_matmul_plugin: str = None
     quantize_per_token_plugin: bool = False
     quantize_tensor_plugin: bool = False
+    moe_plugin: str = "float16"
 
     # Features
     context_fmha: bool = True
@@ -214,6 +215,10 @@ class PluginConfig:
         self.set_plugin("gemm_plugin", dtype)
         return self
 
+    def set_moe_plugin(self, dtype='float16'):
+        self.moe_plugin = dtype
+        return self
+
     def set_smooth_quant_gemm_plugin(self, dtype='float16'):
         self.set_plugin("smooth_quant_gemm_plugin", dtype)
         return self
@@ -275,6 +280,7 @@ cli_plugin_args = [
     "gemm_plugin",
     "lookup_plugin",
     "lora_plugin",
+    "moe_plugin",
 
     # Features
     "context_fmha",

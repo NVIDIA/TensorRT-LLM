@@ -3,10 +3,11 @@
 This document elaborates how to build the [Skywork](https://huggingface.co/Skywork/) model to runnable engines on single GPU node and perform a summarization task using these engines.
 
 ## Overview
+The TensorRT-LLM Skywork implementation is based on the LLaMA model. The implementation can
+be found in [tensorrt_llm/models/llama/model.py](../../tensorrt_llm/models/llama/model.py).
+The TensorRT-LLM Skywork example code lies in [`examples/skywork`](./):
 
-The TensorRT-LLM Skywork implementation can be found in [`tensorrt_llm/models/skywork/model.py`](../../tensorrt_llm/models/skywork/model.py). The TensorRT-LLM Skywork example code lies in [`examples/skywork`](./):
-
-* [`convert_checkpoint.py`](./convert_checkpoint.py) converts the Huggingface Model of Skywork into TensorRT-LLM checkpoint.
+* [`convert_checkpoint.py`](../llama/convert_checkpoint.py) converts the Huggingface Model of Skywork into TensorRT-LLM checkpoint.
 
 In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
 
@@ -38,6 +39,8 @@ git clone https://huggingface.co/Skywork/Skywork-13B-base
 ### 2. Convert HF Model to TRT Checkpoint
 
 ```bash
+cd examples/llama
+
 # fp16 model
 python3 convert_checkpoint.py --model_dir ./Skywork-13B-base \
                 --dtype float16 \

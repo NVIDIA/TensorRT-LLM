@@ -172,8 +172,12 @@ get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
 include_directories(
-  ${CUDAToolkit_INCLUDE_DIRS} ${CUDNN_ROOT_DIR}/include ${NCCL_INCLUDE_DIR}
-  ${3RDPARTY_DIR}/cutlass/include ${3RDPARTY_DIR}/NVTX/include
+  ${CUDAToolkit_INCLUDE_DIRS}
+  ${CUDNN_ROOT_DIR}/include
+  ${NCCL_INCLUDE_DIR}
+  ${3RDPARTY_DIR}/cutlass/include
+  ${3RDPARTY_DIR}/cutlass/tools/util/include
+  ${3RDPARTY_DIR}/NVTX/include
   ${3RDPARTY_DIR}/json/include)
 
 # TRT dependencies

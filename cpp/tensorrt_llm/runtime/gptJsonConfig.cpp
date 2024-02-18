@@ -17,7 +17,6 @@
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 
 #include "gptModelConfig.h"
-#include "loraManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
@@ -117,48 +116,49 @@ GptJsonConfig parseJson(InputType&& i)
 
     auto modelConfig = [&engineVersionNone, &json, &builderConfig, &tensorParallelism, &dataType]()
     {
-        if (engineVersionNone)
+        auto const& config = engineVersionNone ? builderConfig : json.at("pretrained_config");
+
+        std::string const numLayersField = engineVersionNone ? "num_layers" : "num_hidden_layers";
+        std::string const numHeadsField = engineVersionNone ? "num_heads" : "num_attention_heads";
+        std::string const numKvHeadsField = engineVersionNone ? "num_kv_heads" : "num_key_value_heads";
+        std::string const mlpHiddenSizeField = engineVersionNone ? "mlp_hidden_size" : "intermediate_size";
+
+        auto const numLayers = config.at(numLayersField).template get<SizeType>();
+        auto const numHeads = config.at(numHeadsField).template get<SizeType>() / tensorParallelism;
+
+        auto const vocabSize = config.at("vocab_size").template get<SizeType>();
+        auto const hiddenSize = config.at("hidden_size").template get<SizeType>() / tensorParallelism;
+        auto const sizePerHead = parseJsonFieldOr(config, "head_size", hiddenSize / numHeads);
+        auto const loraMaxRank = parseJsonFieldOr(config, "max_lora_rank", SizeType{0});
+        auto const loraTargetModules = parseJsonFieldOptional<std::vector<std::string>>(config, "lora_target_modules");
+
+        // TODO:
+        // Code crashes when numKvHeads <= 0. Clamping downwards to 1 prevents that, make sure this is best fix.
+        auto const numKvHeads
+            = std::max(parseJsonFieldOr(config, numKvHeadsField, numHeads * tensorParallelism) / tensorParallelism, 1);
+
+        auto const mlpHiddenSize = parseJsonFieldOptional<SizeType>(config, mlpHiddenSizeField);
+
+        auto modelConfig = GptModelConfig{vocabSize, numLayers, numHeads, hiddenSize, dataType};
+        modelConfig.setSizePerHead(sizePerHead);
+        modelConfig.setNbKvHeads(numKvHeads);
+
+        if (mlpHiddenSize.has_value())
         {
-            auto const vocabSize = builderConfig.at("vocab_size").template get<SizeType>();
-            auto const numLayers = builderConfig.at("num_layers").template get<SizeType>();
-            auto const numHeads = builderConfig.at("num_heads").template get<SizeType>() / tensorParallelism;
-            auto const hiddenSize = builderConfig.at("hidden_size").template get<SizeType>() / tensorParallelism;
-
-            auto modelConfig = GptModelConfig{vocabSize, numLayers, numHeads, hiddenSize, dataType};
-
-            auto const sizePerHead = parseJsonFieldOr(builderConfig, "head_size", hiddenSize / numHeads);
-            modelConfig.setSizePerHead(sizePerHead);
-
-            // TODO:
-            // Code crashes when numKvHeads <= 0. Clamping downwards to 1 prevents that, make sure this is best fix.
-            auto const numKvHeads = std::max(
-                parseJsonFieldOr(builderConfig, "num_kv_heads", numHeads * tensorParallelism) / tensorParallelism, 1);
-            modelConfig.setNbKvHeads(numKvHeads);
-
-            return modelConfig;
+            modelConfig.setMlpHiddenSize(mlpHiddenSize.value() / tensorParallelism);
         }
-        else
+
+        if (loraTargetModules.has_value())
         {
-            auto const& pretrainedConfig = json.at("pretrained_config");
 
-            auto const vocabSize = pretrainedConfig.at("vocab_size").template get<SizeType>();
-            auto const numLayers = pretrainedConfig.at("num_hidden_layers").template get<SizeType>();
-            auto const numHeads
-                = pretrainedConfig.at("num_attention_heads").template get<SizeType>() / tensorParallelism;
-            auto const hiddenSize = pretrainedConfig.at("hidden_size").template get<SizeType>() / tensorParallelism;
-            auto modelConfig = GptModelConfig{vocabSize, numLayers, numHeads, hiddenSize, dataType};
-
-            auto const sizePerHead = parseJsonFieldOr(pretrainedConfig, "head_size", hiddenSize / numHeads);
-            modelConfig.setSizePerHead(sizePerHead);
-
-            // TODO:
-            // Code crashes when numKvHeads <= 0. Clamping downwards to 1 prevents that, make sure this is best fix.
-            auto const numKvHeads
-                = std::max(pretrainedConfig.at("num_key_value_heads").template get<SizeType>() / tensorParallelism, 1);
-            modelConfig.setNbKvHeads(numKvHeads);
-
-            return modelConfig;
+            modelConfig.setLoraModules(LoraModule::createLoraModules(loraTargetModules.value(),
+                modelConfig.getHiddenSize(), modelConfig.getMlpHiddenSize(), modelConfig.getNbHeads(),
+                modelConfig.getNbKvHeads(), modelConfig.getSizePerHead(), tensorParallelism));
         }
+
+        modelConfig.setMaxLoraRank(loraMaxRank);
+
+        return modelConfig;
     }();
 
     auto const maxBatchSize = parseJsonFieldOr(builderConfig, "max_batch_size", 0);
@@ -200,29 +200,17 @@ GptJsonConfig parseJson(InputType&& i)
     modelConfig.setUseContextFMHAForGeneration(useContextFMHAForGeneration);
     modelConfig.setPagedContextFMHA(pagedContextFMHA);
 
-    if (engineVersionNone)
+    auto useLoraPlugin = !pluginConfig.at("lora_plugin").is_null();
+    if (useLoraPlugin)
     {
-        auto const mlpHiddenSize = parseJsonFieldOr(builderConfig, "mlp_hidden_size", SizeType{0}) / tensorParallelism;
-        modelConfig.setMlpHiddenSize(mlpHiddenSize);
 
-        auto useLoraPlugin = !pluginConfig.at("lora_plugin").is_null();
-        if (useLoraPlugin)
+        if (modelConfig.getLoraModules().empty() || modelConfig.getMaxLoraRank() == 0)
         {
-            auto const loraTargetModules
-                = parseJsonFieldOr(builderConfig, "lora_target_modules", std::vector<std::string>{});
-
-            modelConfig.setLoraModules(LoraModule::createLoraModules(loraTargetModules, modelConfig.getHiddenSize(),
-                mlpHiddenSize, modelConfig.getNbHeads(), modelConfig.getNbKvHeads(), modelConfig.getSizePerHead(),
-                tensorParallelism));
-
-            if (modelConfig.getLoraModules().empty())
-            {
-                TLLM_LOG_WARNING("lora_plugin enabled, but no lora module enabled: setting useLoraPlugin to false");
-                useLoraPlugin = false;
-            }
+            TLLM_LOG_WARNING("lora_plugin enabled, but no lora module enabled: setting useLoraPlugin to false");
+            useLoraPlugin = false;
         }
-        modelConfig.useLoraPlugin(useLoraPlugin);
     }
+    modelConfig.useLoraPlugin(useLoraPlugin);
 
     if (engineVersionNone)
     {
@@ -258,6 +246,21 @@ GptJsonConfig parseJson(InputType&& i)
                 modelConfig.setModelVariant(GptModelConfig::ModelVariant::kGlm);
                 // kGlm is only for ChatGLM-6B and GLM-10B
             }
+        }
+    }
+
+    if (!engineVersionNone)
+    {
+        auto const& pretrainedConfig = json.at("pretrained_config");
+        auto const medusaHeads = parseJsonFieldOptional<SizeType>(pretrainedConfig, "num_medusa_heads");
+        auto const maxDraftLen = parseJsonFieldOptional<SizeType>(pretrainedConfig, "max_draft_len");
+        TLLM_CHECK_WITH_INFO((medusaHeads.has_value() ^ maxDraftLen.has_value()) == 0,
+            "Either both num_medusa_heads and max_draft_len or none have to be provided");
+        if (medusaHeads.has_value() && medusaHeads.value() > 0)
+        {
+            modelConfig.setMaxDraftLen(maxDraftLen.value());
+            auto medusaModule = MedusaModule(medusaHeads.value(), maxDraftLen.value());
+            modelConfig.setMedusaModule(medusaModule);
         }
     }
 

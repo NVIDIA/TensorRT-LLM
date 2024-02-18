@@ -138,6 +138,7 @@ set(TRTLLM_LINK_LIBS
     ${TRT_LIB}
     common_src
     kernels_src
+    cutlass_src
     layers_src
     runtime_src)
 

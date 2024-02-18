@@ -62,3 +62,8 @@ mpirun -n 2 python3 ../run.py --engine_dir ./trt_engines/mixtral/tp2 --tokenizer
 
 
 For more examples see [`examples/llama/README.md`](../llama/README.md)
+
+
+### OOTB
+
+Mixtral supports OOTB operation without the plugin, however this comes at a significant performance cost. Users should prefer using the plugin path whenever possible

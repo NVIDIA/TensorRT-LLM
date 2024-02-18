@@ -24,43 +24,44 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-__global__ void stopWordsCriterion(const int** outputIds, const int** parentIds, const int* stopWords,
-    FinishedState* finished, const int* sequenceLengths, const int* batchSlots, size_t stopWordsLen, int batchSize,
-    int beamWidth, int maxSeqLen)
+__global__ void stopWordsCriterion(int32_t const** outputIds, int32_t const** parentIds, int32_t const** stopWords,
+    FinishedState* finished, int32_t const* sequenceLengths, int32_t const* batchSlots, int32_t const* stopWordsLens,
+    int32_t batchSize, int32_t beamWidth, int32_t maxSeqLen)
 {
-    int const id = blockIdx.x * blockDim.x + threadIdx.x;
-    int const batchIdx = blockIdx.y / beamWidth;
-    int const beamIdx = blockIdx.y % beamWidth;
+    int32_t const id = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t const batchIdx = blockIdx.y / beamWidth;
+    int32_t const beamIdx = blockIdx.y % beamWidth;
     auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
     auto const batchBeamIdx = batchSlot * beamWidth + beamIdx;
 
-    int const* baseStopWords = stopWords + batchSlot * 2 * stopWordsLen;
-    int const* baseOffsets = baseStopWords + stopWordsLen;
+    auto const* baseStopWords = stopWords[batchSlot];
+    auto const stopWordsLen = stopWordsLens[batchSlot];
+    auto const* baseOffsets = baseStopWords + stopWordsLen;
 
     if (id >= stopWordsLen || baseOffsets[id] < 0)
     {
         return;
     }
 
-    int const itemEnd = baseOffsets[id];
-    int const itemStart = (id > 0) ? baseOffsets[id - 1] : 0;
-    int const itemSize = itemEnd - itemStart;
+    auto const itemEnd = baseOffsets[id];
+    auto const itemStart = (id > 0) ? baseOffsets[id - 1] : 0;
+    auto const itemSize = itemEnd - itemStart;
 
     // The single-token case unconditionally bans the token
     bool shouldStop = false;
 
     // Need to minus 1 because the sequenceLengths is updated in this step
-    int const currentStep = sequenceLengths[batchBeamIdx] - 1;
+    auto const currentStep = sequenceLengths[batchBeamIdx] - 1;
     // Enough previously generated tokens to look for a match
     if (currentStep + 1 >= itemSize)
     {
         shouldStop = true;
-        int parentId = beamIdx;
+        auto parentId = beamIdx;
         bool const gatherBeam = beamWidth > 1;
 
-        for (int tokenIdx = itemSize - 1; tokenIdx >= 0; tokenIdx--)
+        for (int32_t tokenIdx = itemSize - 1; tokenIdx >= 0; tokenIdx--)
         {
-            int const previousToken
+            auto const previousToken
                 = outputIds[batchSlot][parentId * maxSeqLen + currentStep - (itemSize - 1) + tokenIdx];
             if (previousToken != baseStopWords[itemStart + tokenIdx])
             {
@@ -88,15 +89,16 @@ __global__ void stopWordsCriterion(const int** outputIds, const int** parentIds,
     }
 }
 
-void invokeStopWordsCriterion(const int** outputIds, const int** parentIds, const int* stopWords,
-    FinishedState* finished, const int* sequenceLengths, const int* batchSlots, size_t stopWordsLen, int batchSize,
-    int beamWidth, int maxSeqLen, cudaStream_t stream)
+void invokeStopWordsCriterion(int32_t const** outputIds, int32_t const** parentIds, int32_t const** stopWords,
+    FinishedState* finished, int32_t const* sequenceLengths, int32_t const* batchSlots, int32_t const* stopWordsLen,
+    int32_t maxStopWordsLen, int32_t batchSize, int32_t beamWidth, int32_t maxSeqLen, cudaStream_t stream)
 {
     // Check if we have sampled a word from the stopWords list. If so, stop the sequence.
     dim3 block, grid;
-    constexpr size_t maxBlockSize{256};
-    block.x = min(((stopWordsLen + 32 - 1) / 32) * 32, maxBlockSize);
-    grid.x = (stopWordsLen + block.x - 1) / block.x;
+    constexpr int32_t maxBlockSize{256};
+
+    block.x = min(((maxStopWordsLen + 32 - 1) / 32) * 32, maxBlockSize);
+    grid.x = (maxStopWordsLen + block.x - 1) / block.x;
     grid.y = batchSize * beamWidth;
 
     stopWordsCriterion<<<grid, block, 0, stream>>>(outputIds, parentIds, stopWords, finished, sequenceLengths,
@@ -104,15 +106,15 @@ void invokeStopWordsCriterion(const int** outputIds, const int** parentIds, cons
     sync_check_cuda_error();
 }
 
-__global__ void lengthCriterion(FinishedState* finished, int* finishedSum, const uint32_t* sequenceLimitLength,
-    const int* sequenceLengths, const int* batchSlots, int batchSize, int beamWidth)
+__global__ void lengthCriterion(FinishedState* finished, int32_t* finishedSum, uint32_t const* sequenceLimitLength,
+    int32_t const* sequenceLengths, int32_t const* batchSlots, int32_t batchSize, int32_t beamWidth)
 {
-    int threadFinishedCount = 0;
-    for (int index = threadIdx.x; index < batchSize * beamWidth; index += blockDim.x)
+    int32_t threadFinishedCount = 0;
+    auto const batchIdx = blockIdx.x;
+    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
+
+    for (int32_t beamIdx = threadIdx.x; beamIdx < beamWidth; beamIdx += blockDim.x)
     {
-        int const batchIdx = index / beamWidth;
-        int const beamIdx = index % beamWidth;
-        auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
         auto const batchSlotBeamWidthIdx = batchSlot * beamWidth + beamIdx;
 
         auto finishState = finished[batchSlotBeamWidthIdx];
@@ -140,19 +142,20 @@ __global__ void lengthCriterion(FinishedState* finished, int* finishedSum, const
 
         if (threadIdx.x == 0)
         {
-            finishedSum[0] = blockFinishedCount;
+            finishedSum[batchSlot] = blockFinishedCount;
         }
     }
 }
 
-void invokeLengthCriterion(FinishedState* finished, int* finishedSum, const uint32_t* sequenceLimitLength,
-    const int* sequenceLengths, const int* batchSlots, int batchSize, int beamWidth, cudaStream_t stream)
+void invokeLengthCriterion(FinishedState* finished, int32_t* finishedSum, uint32_t const* sequenceLimitLength,
+    int32_t const* sequenceLengths, int32_t const* batchSlots, int32_t batchSize, int32_t beamWidth,
+    cudaStream_t stream)
 {
     // Check if we have attained the sequence length limit. If so, stop the
     // sequence. In addition, check if all sequences are stopped and return the
     // result in shouldStop
-    dim3 block{min(512, uint32_t(batchSize * beamWidth))};
-    dim3 grid{1};
+    dim3 block{min(512, uint32_t(beamWidth))};
+    dim3 grid{uint32_t(batchSize)};
 
     lengthCriterion<<<grid, block, 0, stream>>>(
         finished, finishedSum, sequenceLimitLength, sequenceLengths, batchSlots, batchSize, beamWidth);

@@ -30,7 +30,7 @@ void SamplingKernelTest<T>::SetUp()
     mStream = std::make_shared<tensorrt_llm::runtime::CudaStream>();
     mBufferManager = std::make_shared<tensorrt_llm::runtime::BufferManager>(mStream);
 
-    int device;
+    int32_t device;
     cudaGetDevice(&device);
     cudaGetDeviceProperties(&mDeviceProp, device);
 }
@@ -44,6 +44,9 @@ template <typename T>
 void SamplingKernelTest<T>::allocateBuffers(
     int32_t batchSize, int32_t maxBatchSize, int32_t vocabSize, int32_t maxSeqLen, int32_t outputLen)
 {
+    auto const dataType = TRTDataType<T>::value;
+    auto const ptrType = TRTDataType<T*>::value;
+
     // Allocate GPU data
     mSeqLengthsHost = mBufferManager->pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
     mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
@@ -56,10 +59,8 @@ void SamplingKernelTest<T>::allocateBuffers(
     mOutputIdsHost = mBufferManager->pinned(ITensor::makeShape({maxBatchSize, maxSeqLen}), nvinfer1::DataType::kINT32);
     mOutputIdsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, maxSeqLen}), nvinfer1::DataType::kINT32);
 
-    mProbsHost = mBufferManager->pinned(ITensor::makeShape({batchSize, vocabSize}),
-        std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
-    mProbsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize, vocabSize}),
-        std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
+    mProbsHost = mBufferManager->pinned(ITensor::makeShape({batchSize, vocabSize}), dataType);
+    mProbsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize, vocabSize}), dataType);
 
     mCumLogProbsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
     mOutputLogProbsDevice
@@ -71,11 +72,9 @@ void SamplingKernelTest<T>::allocateBuffers(
     mBeginOffsetsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize + 1}), nvinfer1::DataType::kINT32);
     mEndOffsetsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize + 1}), nvinfer1::DataType::kINT32);
 
-    mLogitsHost = mBufferManager->pinned(ITensor::makeShape({batchSize, vocabSize}),
-        std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
-    mLogProbsHost = mBufferManager->pinned(ITensor::makeShape({batchSize, vocabSize}),
-        std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
-    mIdsPtrHost = mBufferManager->pinned(ITensor::makeShape({2 * maxBatchSize}), nvinfer1::DataType::kINT64);
+    mLogitsHost = mBufferManager->pinned(ITensor::makeShape({batchSize, vocabSize}), dataType);
+    mLogProbsHost = mBufferManager->pinned(ITensor::makeShape({batchSize, vocabSize}), dataType);
+    mIdsPtrHost = mBufferManager->pinned(ITensor::makeShape({2 * maxBatchSize}), ptrType);
 
     mEndIdsHost = mBufferManager->pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
     mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
@@ -138,7 +137,7 @@ void SamplingKernelTest<T>::setupBuffers(int32_t batchSize, int32_t maxBatchSize
     mMaxTopP = *std::max_element(topPsHostPtr, topPsHostPtr + maxBatchSize);
 
     // Setup pointers to output ids for each request in batch
-    auto idsPtrHostPtr = reinterpret_cast<void**>(bufferCast<int64_t>(*mIdsPtrHost));
+    auto idsPtrHostPtr = BufferRange<void*>(*mIdsPtrHost);
     auto outputIdsDevicePtr = bufferCast<int32_t>(*mOutputIdsDevice);
     auto zeroParentIdsDevicePtr = bufferCast<int32_t>(*mZeroParentIdsDevice);
     for (SizeType bi = 0; bi < maxBatchSize; bi++)
@@ -160,7 +159,7 @@ template <typename T>
 void SamplingKernelTest<T>::verifyCurrentStep(int32_t batchSize, int32_t maxBatchSize, int32_t vocabSize,
     int32_t maxSeqLen, int32_t step, bool greedySearch, bool useSkipDecode, bool hasDiffRuntimeArgs,
     std::vector<tk::FinishedState>& refFinished, std::vector<int32_t>& refSeqLength,
-    const std::vector<tk::FinishedState>& finishedCurrentStep)
+    std::vector<tk::FinishedState> const& finishedCurrentStep)
 {
     auto const batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
     auto const outputIdsHostPtr = bufferCast<int32_t>(*mOutputIdsHost);
@@ -176,7 +175,7 @@ void SamplingKernelTest<T>::verifyCurrentStep(int32_t batchSize, int32_t maxBatc
     {
         auto const batchSlot = batchSlotsPtr[bi];
         // Set reference finished state to true if we finished before or at current step
-        const bool generatedEOS = outputIdsHostPtr[batchSlot * maxSeqLen + step] == endIdsHostPtr[batchSlot];
+        bool const generatedEOS = outputIdsHostPtr[batchSlot * maxSeqLen + step] == endIdsHostPtr[batchSlot];
         bool finishedThisStep = finishedCurrentStep[batchSlot].isFinished() || generatedEOS;
         refFinished[batchSlot] = generatedEOS ? tk::FinishedState::finishedEOS() : refFinished[batchSlot];
 
@@ -197,7 +196,11 @@ void SamplingKernelTest<T>::verifyCurrentStep(int32_t batchSize, int32_t maxBatc
                 EXPECT_EQ(finishedHostPtr[batchSlot].isFinished(), refFinished[batchSlot].isFinished());
             }
 
-            int idx = bi * vocabSize + outputIdsHostPtr[batchSlot * maxSeqLen + step];
+            // Check the range of the returned token ([0, vocabSize))
+            auto const outputId = outputIdsHostPtr[batchSlot * maxSeqLen + step];
+            EXPECT_TRUE((outputId >= 0) && (outputId < vocabSize));
+            int idx = bi * vocabSize + outputId;
+
             // Compute reference cumLogProb by summing all logProbs up to the stop token
             expectedCumLogProbsHostPtr[batchSlot]
                 += step < refSeqLength[batchSlot] || finishedThisStep ? (float) logProbsHostPtr[idx] : 0.0f;
@@ -217,16 +220,16 @@ void SamplingKernelTest<T>::verifyCurrentStep(int32_t batchSize, int32_t maxBatc
 template <typename T>
 void SamplingKernelTest<T>::runTest(const SamplingKernelTestParam& param, bool hasDiffRuntimeArgs, bool useSkipDecode)
 {
-    const auto batchSize = param.batchSize;
-    const auto maxBatchSize = 2 * batchSize;
-    const auto vocabSize = param.vocabSize;
-    const auto outputLen = param.outputLen;
-    const auto maxSeqLen = outputLen;
+    auto const batchSize = param.batchSize;
+    auto const maxBatchSize = 2 * batchSize;
+    auto const vocabSize = param.vocabSize;
+    auto const outputLen = param.outputLen;
+    auto const maxSeqLen = outputLen;
 
-    const auto topK = param.topK;
-    const auto topP = param.topP;
+    auto const topK = param.topK;
+    auto const topP = param.topP;
 
-    const bool greedySearch = topK == 1 && hasDiffRuntimeArgs == false && useSkipDecode == false;
+    bool const greedySearch = topK == 1 && hasDiffRuntimeArgs == false && useSkipDecode == false;
 
     std::mt19937 gen(42);
     std::uniform_real_distribution<> finishedDist(0, 1); // uniform distribution between 0 and 1
@@ -239,14 +242,14 @@ void SamplingKernelTest<T>::runTest(const SamplingKernelTestParam& param, bool h
     // Setup buffers
     setupBuffers(batchSize, maxBatchSize, vocabSize, maxSeqLen, outputLen, topK, topP, useSkipDecode,
         hasDiffRuntimeArgs, gen, endIdsDistr);
-    const auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
+    auto const batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
 
     // Allocate internal state holders for reference
     std::vector<int32_t> refSeqLength(maxBatchSize);
     std::vector<tk::FinishedState> refFinished(maxBatchSize, tk::FinishedState::empty());
 
     // retrieve the workspace size of the sampling kernel.
-    const auto workspaceSize = getWorkspaceSize(param);
+    auto const workspaceSize = getWorkspaceSize(param);
     TensorPtr workspaceDevice
         = mBufferManager->gpu(ITensor::makeShape({static_cast<int32_t>(workspaceSize)}), nvinfer1::DataType::kINT8);
 
@@ -299,7 +302,7 @@ void SamplingKernelTest<T>::runTest(const SamplingKernelTestParam& param, bool h
         verifyCurrentStep(batchSize, maxBatchSize, vocabSize, maxSeqLen, step, greedySearch, useSkipDecode,
             hasDiffRuntimeArgs, refFinished, refSeqLength, finishedCurrentStep);
     }
-    const auto cumLogProbsHost = mBufferManager->copyFrom(*mCumLogProbsDevice, MemoryType::kCPU);
+    auto const cumLogProbsHost = mBufferManager->copyFrom(*mCumLogProbsDevice, MemoryType::kCPU);
 
     mStream->synchronize();
 

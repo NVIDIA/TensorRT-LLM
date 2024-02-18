@@ -41,19 +41,20 @@ class GptDecoderBatch : public IGptDecoderBatch
 public:
     using CudaStreamPtr = std::shared_ptr<CudaStream>;
     using TensorPtr = ITensor::SharedPtr;
+    using SharedConstPtr = ITensor::SharedConstPtr;
 
     GptDecoderBatch(std::size_t vocabSize, std::size_t vocabSizePadded, CudaStreamPtr stream);
 
     //! Setup the decoder before calling `forward()`
-    void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow, SizeType sinkTokenLength,
-        SizeType maxSequenceLength, SizeType maxTokensPerStep, nvinfer1::DataType dtype) override;
-
-    //! @brief Initialize the decoder at `batchIdx` with a new `request`.
-    void newRequest(
-        SizeType batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig) override;
+    void setup(DecodingMode const& mode, SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow,
+        SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep, bool fusedDecoder,
+        nvinfer1::DataType dtype) override;
 
     void newBatch(
         GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig) override;
+
+    void newRequests(std::vector<SizeType> const& seqSlots, std::vector<decoder_batch::Request> const& requests,
+        std::vector<SamplingConfig> const& samplingConfigs) override;
 
     TokenPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) override;
 
@@ -161,6 +162,9 @@ private:
     //! @brief Gather final beam search results for request `batchIdx`.
     CudaEvent postProcessRequest(SizeType batchIdx) const;
 
+    //! @brief Initialize the decoder at `batchIdx` with a new `request`.
+    void newRequest(SizeType batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig);
+
 private:
     std::size_t const mVocabSize;
     std::size_t const mVocabSizePadded;
@@ -180,8 +184,6 @@ private:
     DecodingInputPtr mJointDecodingInput;
     DecodingOutputPtr mJointDecodingOutput;
 
-    std::vector<TensorPtr> mDraftTokenIds;
-    std::vector<TensorPtr> mDraftLogits;
     std::vector<bool> mAcceptByLogits;
     TensorPtr mNumDraftTokens;
     TensorPtr mCurandStates;
@@ -193,16 +195,28 @@ private:
     std::vector<SizeType> mBeamWidths;
     std::vector<SizeType> mGeneratedTokensPerStep;
 
-    TensorPtr mFinishedSteps; // [maxTokensPerStep, batchSize, beamWidth] finished states of type FinishedState
-                              // for each generated token of maxTokensPerStep, on gpu
-    TensorPtr mDraftProbs;    // [batchSize, maxDraftTokens, beamWidth, vocabPadded], temporary data for speculative
-                              // decoding accept by logits kernel, on gpu
-    TensorPtr mTargetProbs;   // [batchSize, maxDraftTokens+1, beamWidth, vocabPadded], temporary data for speculative
-                              // decoding accept by logits kernel, on gpu
+    TensorPtr mFinishedSteps;   // [maxTokensPerStep, batchSize, beamWidth] finished states of type FinishedState
+                                // for each generated token of maxTokensPerStep, on gpu
+    TensorPtr mDraftProbs;      // [batchSize, maxDraftTokens+1, beamWidth, vocabPadded], temporary data for speculative
+                                // decoding accept by logits kernel, on gpu
+    TensorPtr mTargetProbs;     // [batchSize, maxDraftTokens+1, beamWidth, vocabPadded], temporary data for speculative
+                                // decoding accept by logits kernel, on gpu
+    TensorPtr mDraftTokenIds;   // [batchSize, maxDraftTokens+1], draft token indices, on gpu
+    TensorPtr mDraftLogits;     // [batchSize, maxDraftTokens+1, vocabSizePadded], draft token logits, on gpu
+
+    TensorPtr mBatchSlotsSetup; // [maxBatchSize], int32_t, address map, pinned
+    TensorPtr mBatchSlotsDecoder;      // [maxBatchSize], int32_t, address map, pinned
+    TensorPtr mBatchSlotsAcceptTokens; // [maxBatchSize], int32_t, address map, pinned
+    TensorPtr mBatchSlotsAcceptLogits; // [maxBatchSize], int32_t, address map, pinned
+    TensorPtr mTargetLogitsPtrs;       // [maxBatchSize], float*, pointers to target logits, pinned
     SizeType mMaxSequenceLength{};
     SizeType mMaxAttentionWindow{};
     SizeType mSinkTokenLength{};
     SizeType mActualBatchSize{};
     SizeType mMaxTokensPerStep{};
+    SizeType mMaxStopWordsLen{};
+    SizeType mMaxBadWordsLen{};
+
+    bool mFusedDecoder{false};
 };
 } // namespace tensorrt_llm::runtime

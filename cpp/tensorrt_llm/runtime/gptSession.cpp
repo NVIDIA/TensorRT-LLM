@@ -146,7 +146,7 @@ void GptSession::createBuffers(SizeType numMicroBatches)
 
 void GptSession::createDecoders(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow,
     SizeType sinkTokenLength, SizeType maxSequenceLength, nvinfer1::DataType logitsType, bool decoderPerRequest,
-    SizeType numMicroBatches)
+    SizeType numMicroBatches, DecodingMode const& decodingMode)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const vocabSize = mModelConfig.getVocabSize();
@@ -162,8 +162,8 @@ void GptSession::createDecoders(SizeType batchSize, SizeType beamWidth, SizeType
         else
             mDecoders.emplace_back(std::make_shared<StatefulGptDecoder>(vocabSize, vocabSizePadded, stream));
         constexpr SizeType maxTokensPerStep = 1;
-        mDecoders.back()->setup(
-            batchSize, beamWidth, maxAttentionWindow, sinkTokenLength, maxSequenceLength, maxTokensPerStep, logitsType);
+        mDecoders.back()->setup(decodingMode, batchSize, beamWidth, maxAttentionWindow, sinkTokenLength,
+            maxSequenceLength, maxTokensPerStep, /* fusedDecoder*/ false, logitsType);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -316,8 +316,11 @@ void GptSession::setup(Config const& sessionConfig)
     if (mWorldConfig.isLastPipelineParallelRank())
     {
         auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
+        DecodingMode decodingMode = sessionConfig.decodingMode.value_or(
+            maxBeamWidth == 1 ? DecodingMode::TopKTopP() : DecodingMode::BeamSearch());
         createDecoders(mMicroBatchConfig.genBatchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength,
-            maxSequenceLength, logitsType, sessionConfig.decoderPerRequest, mMicroBatchConfig.numGenBatches);
+            maxSequenceLength, logitsType, sessionConfig.decoderPerRequest, mMicroBatchConfig.numGenBatches,
+            decodingMode);
     }
 
     if (mWorldConfig.isPipelineParallel() || mMicroBatchConfig.numGenBatches > 1)

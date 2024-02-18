@@ -62,9 +62,19 @@ public:
         tkc::CutlassGemmConfig gemmConfig, char* workspace_ptr, const size_t workspace_bytes, cudaStream_t stream)
         = 0;
 
+    virtual void gemm(const void* A, const void* B, const void* weight_scales, const float alpha, void* C, int m, int n,
+        int k, tkc::CutlassGemmConfig gemmConfig, char* workspace_ptr, const size_t workspace_bytes,
+        cudaStream_t stream)
+        = 0;
+
     virtual void gemm(const void* A, const void* B, const void* weight_scales, const void* weight_zero_points,
         const void* biases, void* C, int m, int n, int k, const int group_size, tkc::CutlassGemmConfig gemmConfig,
         char* workspace_ptr, const size_t workspace_bytes, cudaStream_t stream)
+        = 0;
+
+    virtual void gemm(const void* A, const void* B, const void* weight_scales, const void* weight_zero_points,
+        const void* biases, const float alpha, void* C, int m, int n, int k, const int group_size,
+        tkc::CutlassGemmConfig gemmConfig, char* workspace_ptr, const size_t workspace_bytes, cudaStream_t stream)
         = 0;
 
     // Returns desired workspace size in bytes.
@@ -78,7 +88,8 @@ protected:
     static constexpr int MIN_N_TILE = 64;
 };
 
-template <typename T, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp>
+template <typename ActivationType, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp,
+    typename ScaleZeroType = ActivationType, typename BiasType = ActivationType, typename OutputType = ActivationType>
 class CutlassFpAIntBGemmRunner : public virtual CutlassFpAIntBGemmRunnerInterface
 {
 public:
@@ -89,9 +100,18 @@ public:
         tkc::CutlassGemmConfig gemmConfig, char* workspace_ptr, const size_t workspace_bytes,
         cudaStream_t stream) override;
 
+    void gemm(const void* A, const void* B, const void* weight_scales, const float alpha, void* C, int m, int n, int k,
+        tkc::CutlassGemmConfig gemmConfig, char* workspace_ptr, const size_t workspace_bytes,
+        cudaStream_t stream) override;
+
     void gemm(const void* A, const void* B, const void* weight_scales, const void* weight_zero_points,
         const void* biases, void* C, int m, int n, int k, const int group_size, tkc::CutlassGemmConfig gemmConfig,
         char* workspace_ptr, const size_t workspace_bytes, cudaStream_t stream) override;
+
+    void gemm(const void* A, const void* B, const void* weight_scales, const void* weight_zero_points,
+        const void* biases, const float alpha, void* C, int m, int n, int k, const int group_size,
+        tkc::CutlassGemmConfig gemmConfig, char* workspace_ptr, const size_t workspace_bytes,
+        cudaStream_t stream) override;
 
     // Disabled since the fused GEMM, activation kernels will not be used in v1.
 
@@ -106,9 +126,10 @@ public:
 
 private:
     template <typename EpilogueTag>
-    void dispatch_to_arch(const T* A, const WeightType* B, const T* weight_scales, const T* weight_zero_points,
-        const T* biases, T* C, int m, int n, int k, const int group_size, tkc::CutlassGemmConfig gemm_config,
-        char* workspace_ptr, const size_t workspace_bytes, cudaStream_t stream, int* occupancy = nullptr);
+    void dispatch_to_arch(const ActivationType* A, const WeightType* B, const ScaleZeroType* weight_scales,
+        const ScaleZeroType* weight_zero_points, const BiasType* biases, const float alpha, OutputType* C, int m, int n,
+        int k, const int group_size, tkc::CutlassGemmConfig gemm_config, char* workspace_ptr,
+        const size_t workspace_bytes, cudaStream_t stream, int* occupancy = nullptr);
 
 private:
     int sm_;

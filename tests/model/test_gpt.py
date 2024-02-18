@@ -853,6 +853,7 @@ class TestGPT(unittest.TestCase):
             use_plugin, batch_size, seq_len, max_new_tokens, use_refit)
 
         model_config = ModelConfig(max_batch_size=batch_size,
+                                   max_beam_width=num_beams,
                                    vocab_size=gpt_config.vocab_size,
                                    num_layers=gpt_config.n_layer,
                                    num_heads=gpt_config.n_head,
