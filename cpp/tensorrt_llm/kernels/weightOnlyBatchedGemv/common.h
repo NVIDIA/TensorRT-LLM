@@ -56,7 +56,8 @@ enum class WeightOnlyActivationFunctionType
 enum class WeightOnlyActivationType
 {
     FP16,
-    BF16
+    BF16,
+    FP8
 };
 
 struct WeightOnlyParams

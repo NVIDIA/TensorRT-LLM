@@ -23,7 +23,7 @@ from functools import partial
 from multiprocessing import cpu_count
 from pathlib import Path
 from shutil import copy, rmtree
-from subprocess import check_output, run
+from subprocess import CalledProcessError, check_output, run
 from textwrap import dedent
 from typing import List
 
@@ -54,7 +54,8 @@ def main(build_type: str = "Release",
          install: bool = False,
          skip_building_wheel: bool = False,
          python_bindings: bool = True,
-         benchmarks: bool = False):
+         benchmarks: bool = False,
+         nvtx: bool = False):
     project_dir = Path(__file__).parent.resolve().parent
     os.chdir(project_dir)
     build_run = partial(run, shell=True, check=True)
@@ -153,12 +154,13 @@ def main(build_type: str = "Release",
     build_pybind = "OFF" if cpp_only else "ON"
     bindings_lib = "" if cpp_only else "bindings"
     benchmarks_lib = "benchmarks" if benchmarks else ""
+    disable_nvtx = "OFF" if nvtx else "ON"
 
     with working_directory(build_dir):
         cmake_def_args = " ".join(cmake_def_args)
         if clean or first_build:
             build_run(
-                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
+                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}" -DNVTX_DISABLE="{disable_nvtx}"'
                 f' {cmake_cuda_architectures} {cmake_def_args} {cmake_generator} -S "{source_dir}"'
             )
         build_run(
@@ -236,8 +238,16 @@ def main(build_type: str = "Release",
                 build_run(f"\"{sys.executable}\" {stubgen} -o . bindings")
                 (pkg_dir / stubgen).unlink()
             else:
-                build_run(
-                    f"\"{sys.executable}\" -m pybind11_stubgen -o . bindings")
+                env_ld = os.environ.copy()
+                env_ld[
+                    "LD_LIBRARY_PATH"] = f"/usr/local/cuda/compat/lib.real:{env_ld['LD_LIBRARY_PATH']}"
+                try:
+                    build_run(
+                        f"\"{sys.executable}\" -m pybind11_stubgen -o . bindings",
+                        env=env_ld)
+                except CalledProcessError as ex:
+                    print(f"Failed to build pybind11 stubgen: {ex}",
+                          file=sys.stderr)
 
     if dist_dir is None:
         dist_dir = project_dir / "build"
@@ -315,5 +325,8 @@ if __name__ == "__main__":
     parser.add_argument("--benchmarks",
                         action="store_true",
                         help="Build the benchmarks for the C++ runtime.")
+    parser.add_argument("--nvtx",
+                        action="store_true",
+                        help="Enable NVTX features.")
     args = parser.parse_args()
     main(**vars(args))

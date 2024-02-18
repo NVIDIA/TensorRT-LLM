@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 
@@ -32,9 +33,9 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-template <typename T>
+template <typename T_in, typename T_out = T_in>
 void apply_per_channel_scale_kernel_launcher(
-    T* smoothed_act, const T* act, const T* per_channel_scale, int rows, int cols, cudaStream_t stream = 0);
+    T_out* smoothed_act, const T_in* act, const T_in* per_channel_scale, int rows, int cols, cudaStream_t stream = 0);
 
 } // namespace kernels
 } // namespace tensorrt_llm

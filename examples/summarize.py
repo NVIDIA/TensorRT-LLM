@@ -41,17 +41,20 @@ def main(args):
     runtime_rank = tensorrt_llm.mpi_rank()
     logger.set_level(args.log_level)
 
+    test_hf = args.test_hf and runtime_rank == 0  # only run hf on rank 0
+    test_trt_llm = args.test_trt_llm
     model_name, model_version = read_model_name(args.engine_dir)
     if args.hf_model_dir is None:
         logger.warning(
             "hf_model_dir is not specified. Try to infer from model_name, but this may be incorrect."
         )
-        args.hf_model_dir = DEFAULT_HF_MODEL_DIRS[model_name]
+        if model_name in DEFAULT_HF_MODEL_DIRS:
+            args.hf_model_dir = DEFAULT_HF_MODEL_DIRS[model_name]
+        else:
+            args.hf_model_dir = None
     if args.tokenizer_dir is None:
         args.tokenizer_dir = args.hf_model_dir
 
-    test_hf = args.test_hf and runtime_rank == 0  # only run hf on rank 0
-    test_trt_llm = args.test_trt_llm
     profiler.start('load tokenizer')
     tokenizer, pad_id, end_id = load_tokenizer(
         tokenizer_dir=args.tokenizer_dir,
@@ -105,69 +108,6 @@ def main(args):
     presence_penalty = args.presence_penalty
     frequency_penalty = args.frequency_penalty
 
-    if test_trt_llm:
-        if not PYTHON_BINDINGS and not args.use_py_session:
-            logger.warning(
-                "Python bindings of C++ session is unavailable, fallback to Python session."
-            )
-            args.use_py_session = True
-        runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
-        runner_kwargs = dict(engine_dir=args.engine_dir,
-                             rank=runtime_rank,
-                             debug_mode=args.debug_mode)
-        if args.medusa_choices is not None:
-            args.medusa_choices = ast.literal_eval(args.medusa_choices)
-            assert args.use_py_session, "Medusa is only supported by py_session"
-            assert args.temperature == 0, "Medusa should use temperature == 0"
-            assert args.num_beams == 1, "Medusa should use num_beams == 1"
-            runner_kwargs.update(medusa_choices=args.medusa_choices)
-        if not args.use_py_session:
-            runner_kwargs.update(
-                max_batch_size=max_batch_size,
-                max_input_len=test_token_num,
-                max_output_len=output_len,
-                max_beam_width=num_beams,
-                max_attention_window_size=max_attention_window_size,
-                sink_token_length=sink_token_length)
-        runner = runner_cls.from_dir(**runner_kwargs)
-        assert not (args.eval_ppl and not (runner.gather_context_logits and runner.gather_generation_logits)), \
-            "PPL evaluation requires engine built with gather_all_token_logits enabled"
-
-    if test_hf:
-        profiler.start('load HF model')
-        dtype_alias_mapping = {
-            'fp32': 'float32',
-            'fp16': 'float16',
-            'bf16': 'bfloat16'
-        }
-        args.data_type = dtype_alias_mapping.get(args.data_type, args.data_type)
-        if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
-            auto_model_cls = AutoModelForSeq2SeqLM
-        elif model_name == 'ChatGLMForCausalLM' and model_version == 'chatglm':
-            auto_model_cls = AutoModel
-        else:
-            auto_model_cls = AutoModelForCausalLM
-        model = auto_model_cls.from_pretrained(
-            args.hf_model_dir,
-            trust_remote_code=True,
-            torch_dtype=str_dtype_to_torch(args.data_type),
-            device_map='auto' if args.hf_device_map_auto else None)
-        try:
-            model.to_bettertransformer()
-        except Exception as e:
-            logger.warning(
-                f'Fail to call model.to_bettertransformer(), exception:\n{str(e)}'
-            )
-        if not args.hf_device_map_auto:
-            model.cuda()
-        if model_name == 'qwen':
-            model.generation_config = GenerationConfig.from_pretrained(
-                args.hf_model_dir, trust_remote_code=True)
-        profiler.stop('load HF model')
-        logger.info(
-            f'Load HF model takes: {profiler.elapsed_time_in_sec("load HF model")} sec'
-        )
-
     output_dir = Path(args.output_dir) if args.output_dir else None
     if output_dir is not None:
         output_dir.mkdir(exist_ok=True, parents=True)
@@ -179,6 +119,15 @@ def main(args):
             with (output_dir / 'hf.out').open('w') as f:
                 f.write(f'Model path: {args.hf_model_dir}\n')
                 f.write(f'Tokenizer path: {args.tokenizer_dir}\n')
+
+    # TODO: Add random_seed flag in gptj
+    metric_tensorrt_llm = [evaluate.load("rouge") for _ in range(num_beams)]
+    metric_hf = [evaluate.load("rouge") for _ in range(num_beams)]
+    for i in range(num_beams):
+        metric_tensorrt_llm[i].seed = 0
+        metric_hf[i].seed = 0
+    ppls_trt_llm = [[] for _ in range(num_beams)]
+    ppls_hf = [[] for _ in range(num_beams)]
 
     def _prepare_inputs(batch_input_texts,
                         eval_task='summarize',
@@ -208,6 +157,13 @@ def main(args):
                     max_input_length=test_token_num,
                 )
                 input_ids = torch.tensor(input_id_list)
+            elif model_name == 'SpecialForCausalLM':
+                input_ids = tokenizer.encode(
+                    curr_text,
+                    add_special_tokens=add_special_tokens,
+                    truncation=True,
+                    max_length=test_token_num)
+                input_ids = torch.tensor([tokenizer.bos_token_id] + input_ids)
             else:
                 input_ids = tokenizer.encode(
                     curr_text,
@@ -384,6 +340,33 @@ def main(args):
         return output_lines_list, tokens_list, ppls
 
     if test_trt_llm:
+        if not PYTHON_BINDINGS and not args.use_py_session:
+            logger.warning(
+                "Python bindings of C++ session is unavailable, fallback to Python session."
+            )
+            args.use_py_session = True
+        runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
+        runner_kwargs = dict(engine_dir=args.engine_dir,
+                             rank=runtime_rank,
+                             debug_mode=args.debug_mode)
+        if args.medusa_choices is not None:
+            args.medusa_choices = ast.literal_eval(args.medusa_choices)
+            assert args.use_py_session, "Medusa is only supported by py_session"
+            assert args.temperature == 0, "Medusa should use temperature == 0"
+            assert args.num_beams == 1, "Medusa should use num_beams == 1"
+            runner_kwargs.update(medusa_choices=args.medusa_choices)
+        if not args.use_py_session:
+            runner_kwargs.update(
+                max_batch_size=max_batch_size,
+                max_input_len=test_token_num,
+                max_output_len=output_len,
+                max_beam_width=num_beams,
+                max_attention_window_size=max_attention_window_size,
+                sink_token_length=sink_token_length)
+        runner = runner_cls.from_dir(**runner_kwargs)
+        assert not (args.eval_ppl and not (runner.gather_context_logits and runner.gather_generation_logits)), \
+            "PPL evaluation requires engine built with gather_all_token_logits enabled"
+
         datapoint = dataset[0:1]
         output, *_ = eval_trt_llm(datapoint,
                                   eval_task=args.eval_task,
@@ -399,39 +382,17 @@ def main(args):
             logger.info(
                 "---------------------------------------------------------")
 
-    if test_hf:
-        datapoint = dataset[0:1]
-        output, *_ = eval_hf(datapoint,
-                             eval_task=args.eval_task,
-                             eval_ppl=args.eval_ppl,
-                             add_special_tokens=args.add_special_tokens)
-        logger.info("---------------------------------------------------------")
-        logger.info("HF Generated : ")
-        logger.info(f" Input : {datapoint[dataset_input_key]}")
-        logger.info(f"\n Reference : {datapoint[dataset_output_key]}")
-        logger.info(f"\n Output : {output}")
-        logger.info("---------------------------------------------------------")
+        ite_count = 0
+        data_point_idx = 0
+        total_output_token_count_trt_llm = 0  # only valid for runtime_rank == 0
+        while (data_point_idx < len(dataset)) and (ite_count < args.max_ite):
+            if runtime_rank == 0:
+                logger.debug(
+                    f"run data_point {data_point_idx} ~ {data_point_idx + max_batch_size}"
+                )
+            datapoint = dataset[data_point_idx:(data_point_idx +
+                                                max_batch_size)]
 
-    # TODO: Add random_seed flag in gptj
-    metric_tensorrt_llm = [evaluate.load("rouge") for _ in range(num_beams)]
-    metric_hf = [evaluate.load("rouge") for _ in range(num_beams)]
-    for i in range(num_beams):
-        metric_tensorrt_llm[i].seed = 0
-        metric_hf[i].seed = 0
-    ppls_trt_llm = [[] for _ in range(num_beams)]
-    ppls_hf = [[] for _ in range(num_beams)]
-
-    ite_count = 0
-    data_point_idx = 0
-    total_output_token_count_trt_llm = 0  # only valid for runtime_rank == 0
-    while (data_point_idx < len(dataset)) and (ite_count < args.max_ite):
-        if runtime_rank == 0:
-            logger.debug(
-                f"run data_point {data_point_idx} ~ {data_point_idx + max_batch_size}"
-            )
-        datapoint = dataset[data_point_idx:(data_point_idx + max_batch_size)]
-
-        if test_trt_llm:
             profiler.start('tensorrt_llm')
             output_tensorrt_llm, output_ids_trt_llm, curr_ppls_trt_llm, lengths_info = eval_trt_llm(
                 datapoint,
@@ -447,17 +408,7 @@ def main(args):
                     for idx in range(len(input_lengths)))
                 total_output_token_count_trt_llm += output_token_count_trt_llm
 
-        if test_hf:
-            profiler.start('hf')
-            output_hf, _, curr_ppls_hf = eval_hf(
-                datapoint,
-                eval_task=args.eval_task,
-                eval_ppl=args.eval_ppl,
-                add_special_tokens=args.add_special_tokens)
-            profiler.stop('hf')
-
-        if runtime_rank == 0:
-            if test_trt_llm:
+            if runtime_rank == 0:
                 for batch_idx in range(len(output_tensorrt_llm)):
                     for beam_idx in range(num_beams):
                         metric_tensorrt_llm[beam_idx].add_batch(
@@ -471,13 +422,89 @@ def main(args):
                             ppls_trt_llm[beam_idx].append(
                                 curr_ppls_trt_llm[batch_idx][beam_idx])
                 if output_dir is not None:
-                    # yapf: disable
                     for i in range(len(output_tensorrt_llm[0])):
                         for beam_idx in range(num_beams):
                             with (output_dir / 'trtllm.out').open('a') as f:
-                                f.write(f'[{data_point_idx + i}] [Beam {beam_idx}] {output_tensorrt_llm[beam_idx][i]}\n')
-                    # yapf: enable
-            if test_hf:
+                                f.write(
+                                    f'[{data_point_idx + i}] [Beam {beam_idx}] {output_tensorrt_llm[beam_idx][i]}\n'
+                                )
+
+                logger.debug('-' * 100)
+                logger.debug(f"Input : {datapoint[dataset_input_key]}")
+                logger.debug(f'TensorRT-LLM Output: {output_tensorrt_llm}')
+                logger.debug(f"Reference : {datapoint[dataset_output_key]}")
+
+            data_point_idx += max_batch_size
+            ite_count += 1
+        del runner
+
+    if test_hf:
+        profiler.start('load HF model')
+        dtype_alias_mapping = {
+            'fp32': 'float32',
+            'fp16': 'float16',
+            'bf16': 'bfloat16'
+        }
+        args.data_type = dtype_alias_mapping.get(args.data_type, args.data_type)
+        if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
+            auto_model_cls = AutoModelForSeq2SeqLM
+        elif model_name == 'ChatGLMForCausalLM' and model_version == 'chatglm':
+            auto_model_cls = AutoModel
+        else:
+            auto_model_cls = AutoModelForCausalLM
+        model = auto_model_cls.from_pretrained(
+            args.hf_model_dir,
+            trust_remote_code=True,
+            torch_dtype=str_dtype_to_torch(args.data_type),
+            device_map='auto' if args.hf_device_map_auto else None)
+        try:
+            model.to_bettertransformer()
+        except Exception as e:
+            logger.warning(
+                f'Fail to call model.to_bettertransformer(), exception:\n{str(e)}'
+            )
+        if not args.hf_device_map_auto:
+            model.cuda()
+        if model_name == 'qwen':
+            model.generation_config = GenerationConfig.from_pretrained(
+                args.hf_model_dir, trust_remote_code=True)
+        profiler.stop('load HF model')
+        logger.info(
+            f'Load HF model takes: {profiler.elapsed_time_in_sec("load HF model")} sec'
+        )
+
+        datapoint = dataset[0:1]
+        output, *_ = eval_hf(datapoint,
+                             eval_task=args.eval_task,
+                             eval_ppl=args.eval_ppl,
+                             add_special_tokens=args.add_special_tokens)
+        logger.info("---------------------------------------------------------")
+        logger.info("HF Generated : ")
+        logger.info(f" Input : {datapoint[dataset_input_key]}")
+        logger.info(f"\n Reference : {datapoint[dataset_output_key]}")
+        logger.info(f"\n Output : {output}")
+        logger.info("---------------------------------------------------------")
+
+        ite_count = 0
+        data_point_idx = 0
+        total_output_token_count_trt_llm = 0  # only valid for runtime_rank == 0
+        while (data_point_idx < len(dataset)) and (ite_count < args.max_ite):
+            if runtime_rank == 0:
+                logger.debug(
+                    f"run data_point {data_point_idx} ~ {data_point_idx + max_batch_size}"
+                )
+            datapoint = dataset[data_point_idx:(data_point_idx +
+                                                max_batch_size)]
+
+            profiler.start('hf')
+            output_hf, _, curr_ppls_hf = eval_hf(
+                datapoint,
+                eval_task=args.eval_task,
+                eval_ppl=args.eval_ppl,
+                add_special_tokens=args.add_special_tokens)
+            profiler.stop('hf')
+
+            if runtime_rank == 0:
                 for beam_idx in range(num_beams):
                     for batch_idx in range(len(output_hf[beam_idx])):
                         metric_hf[beam_idx].add_batch(
@@ -489,23 +516,21 @@ def main(args):
                             ppls_hf[beam_idx].append(
                                 curr_ppls_hf[batch_idx][beam_idx])
                 if output_dir is not None:
-                    # yapf: disable
                     for i in range(len(output_hf[0])):
                         for beam_idx in range(num_beams):
                             with (output_dir / 'hf.out').open('a') as f:
-                                f.write(f'[{data_point_idx + i}] [Beam {beam_idx}] {output_hf[beam_idx][i]}\n')
-                    # yapf: enable
+                                f.write(
+                                    f'[{data_point_idx + i}] [Beam {beam_idx}] {output_hf[beam_idx][i]}\n'
+                                )
 
-            logger.debug('-' * 100)
-            logger.debug(f"Input : {datapoint[dataset_input_key]}")
-            if test_trt_llm:
-                logger.debug(f'TensorRT-LLM Output: {output_tensorrt_llm}')
-            if test_hf:
+                logger.debug('-' * 100)
+                logger.debug(f"Input : {datapoint[dataset_input_key]}")
                 logger.debug(f'HF Output: {output_hf}')
-            logger.debug(f"Reference : {datapoint[dataset_output_key]}")
+                logger.debug(f"Reference : {datapoint[dataset_output_key]}")
 
-        data_point_idx += max_batch_size
-        ite_count += 1
+            data_point_idx += max_batch_size
+            ite_count += 1
+        del model
 
     if runtime_rank == 0:
         if test_trt_llm:

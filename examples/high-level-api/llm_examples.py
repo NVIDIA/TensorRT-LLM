@@ -37,10 +37,13 @@ def run_llm_from_huggingface_model(prompts: List[str],
         print(output)
 
 
-def run_llm_from_tllm_engine(prompts: List[str], llama_engine_dir: str):
+def run_llm_from_tllm_engine(prompts: List[str],
+                             llama_engine_dir: str,
+                             tp_size: int = 1):
     ''' Loading a built TensorRT-LLM engine. '''
 
     config = ModelConfig(llama_engine_dir)
+    config.parallel_config.tp_size = tp_size
     llm = LLM(config)
 
     for output in llm.generate(prompts):
@@ -149,7 +152,10 @@ if __name__ == '__main__':
             args.dump_engine_dir,
             tp_size=args.tp_size),
         run_llm_from_tllm_engine=lambda: run_llm_from_tllm_engine(
-            [args.prompt], args.dump_engine_dir),
+            [args.prompt],
+            args.dump_engine_dir,
+            tp_size=args.tp_size,
+        ),
         run_llm_generate_async_example=lambda: run_llm_generate_async_example(
             [args.prompt],
             args.hf_model_dir,

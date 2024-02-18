@@ -1,3 +1,5 @@
+import random
+
 import pytest
 import torch
 
@@ -26,11 +28,13 @@ def is_float_type(torch_dtype):
 @pytest.mark.parametrize("batch_size", [1, 5])
 @pytest.mark.parametrize("kv_cache_type", [torch.int8, torch.float16])
 @pytest.mark.parametrize("rewind_draft_token_count", [5, 63])
+@pytest.mark.parametrize("separate_draft_count", [False, True])
 @pytest.mark.parametrize("max_kv_cache_length", [100, 200])
 def test_linear_kvcache_update(num_kv_heads: int, head_dim: int,
                                layer_count: int, batch_size: int,
                                kv_cache_type: torch.dtype,
                                rewind_draft_token_count: int,
+                               separate_draft_count: bool,
                                max_kv_cache_length: int):
     torch.cuda.set_device(0)
     torch.cuda.manual_seed(1234)
@@ -57,11 +61,23 @@ def test_linear_kvcache_update(num_kv_heads: int, head_dim: int,
         ]
     else:
         raise ValueError("dtype is neither float or integer.")
-    accepted_draft_token_counts = torch.randint(0,
-                                                rewind_draft_token_count,
-                                                (batch_size, ),
-                                                dtype=torch.int32,
-                                                device='cuda')
+    rewind_draft_token_count_tensor_cuda = None
+    if separate_draft_count:
+        rewind_draft_token_count_tensor_cpu = torch.randint(
+            1, rewind_draft_token_count, (batch_size, ), dtype=torch.int32)
+        rewind_draft_token_count_tensor_cuda = rewind_draft_token_count_tensor_cpu.cuda(
+        )
+    else:
+        rewind_draft_token_count_tensor_cpu = torch.full(
+            (batch_size, ), rewind_draft_token_count, dtype=torch.int32)
+    rewind_draft_token_tensor_list = rewind_draft_token_count_tensor_cpu.tolist(
+    )
+    accepted_draft_token_counts_list = [
+        random.randint(0, rewind_draft_token_tensor_list_value) for
+        rewind_draft_token_tensor_list_value in rewind_draft_token_tensor_list
+    ]
+    accepted_draft_token_counts = torch.tensor(accepted_draft_token_counts_list,
+                                               dtype=torch.int32).cuda()
     accepted_draft_token_offsets = torch.zeros(batch_size + 1,
                                                dtype=torch.int32,
                                                device='cuda')
@@ -73,7 +89,8 @@ def test_linear_kvcache_update(num_kv_heads: int, head_dim: int,
         accepted_draft_token_offsets_cpu[batch_size], dtype=torch.int32)
 
     for seq_idx in range(batch_size):
-        rand_perm = torch.randperm(rewind_draft_token_count, dtype=torch.int32)
+        rand_perm = torch.randperm(rewind_draft_token_tensor_list[seq_idx],
+                                   dtype=torch.int32)
         seq_start = accepted_draft_token_offsets_cpu[seq_idx]
         seq_end = accepted_draft_token_offsets_cpu[seq_idx + 1]
         packed_accepted_draft_tokens_indices_cpu[
@@ -99,7 +116,8 @@ def test_linear_kvcache_update(num_kv_heads: int, head_dim: int,
                 relative_draft_idx = packed_accepted_draft_tokens_indices_cpu[
                     token_start + relative_target_idx]
                 past_key_value_len = past_key_value_lengths_cpu[seq_idx]
-                rewind_key_value_len = past_key_value_len - rewind_draft_token_count
+                rewind_key_value_len = past_key_value_len - rewind_draft_token_tensor_list[
+                    seq_idx]
                 new_layer_past_key_value[
                     seq_idx, :, :, rewind_key_value_len +
                     relative_target_idx] = layer_past_key_value[
@@ -116,8 +134,9 @@ def test_linear_kvcache_update(num_kv_heads: int, head_dim: int,
         False,
         num_kv_heads,
         head_dim * elt_size,
-        rewind_draft_token_count,
+        0 if separate_draft_count else rewind_draft_token_count,
         max_kv_cache_length,
+        rewind_draft_token_count_tensor_cuda if separate_draft_count else None,
         past_key_values,
         None,
         None,

@@ -169,19 +169,28 @@ void invokeCurandBatchInitialize(curandState_t* states, const int* batchSlots, c
 //! endId token. Otherwise, adds bias per token if bias pointer is not nullptr.
 //!
 //! \param logits input/output buffer [maxBatchSize, vocabSize]. Logits to be modified by mask and bias.
+//! If nullptr, logitsPtrs has to be provided.
+//! \param logitsPtrs input/output buffer [maxBatchSize][vocabSize]. Vector of pointers to the logits.
+//! If nullptr, logits has to be provided.
 //! \param probs output buffer [maxBatchSize, vocabSize]. Probabilities of logits compute by softmax.
 //! Can be the same pointer as logits
 //! \param bias input buffer [vocabSize]. Bias to logit per token. Ignored if nullptr
 //! \param endIds input buffer [maxBatchSize]. EOS token ids per request
 //! \param finished input buffer [maxBatchSize] with flags set to true if request has finished the generation
 //! \param batchSlots input buffer[batchSize], optional. Indices of rows of data in memory pool
-//! \param batchSize batch size
+//! \param batchSize current batch size
+//! \param maxBatchSize max batch size
+//! \param beamWidth beam width
 //! \param vocabSize unpadded vocab size
 //! \param vocabSizePadded padded vocab size
+//! \param skipSoftMax flag to skip softmax computation
+//! \param batchSlotsLogits flag to use batchSlot as index for logits and probs
 //! \param stream stream
 template <typename T>
-void invokeAddBiasSoftMax(T* logits, T* probs, const T* bias, const int* endIds, const FinishedState* finished,
-    const int* batchSlots, const int batchSize, const int vocabSize, const int vocabSizePadded, cudaStream_t stream);
+void invokeAddBiasSoftMax(T* logits, T** logitsPtrs, T* probs, T const* bias, int32_t const* endIds,
+    FinishedState const* finished, int32_t const* batchSlots, int32_t batchSize, int32_t maxBatchSize,
+    int32_t beamWidth, int32_t vocabSize, int32_t vocabSizePadded, bool skipSoftMax, bool batchSlotsLogits,
+    cudaStream_t stream);
 
 //! \brief Distributes values located in src to dst according to the indieces from batchSlots
 //!

@@ -302,8 +302,9 @@ size_t GPTAttentionPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* in
     auto const type = inputs[getIdx(IdxEntry::QKV_TENSOR)].type;
     const int max_kv_cache_length
         = isCrossAttention() ? cross_qkv_length : (useKVCache() ? inputs[getIdx(IdxEntry::CACHE_INDIR)].dims.d[2] : 0);
-    size_t const context_workspace_size
-        = getWorkspaceSizeForContext(type, nbReq, max_context_length, max_kv_cache_length, cross_qkv_length);
+    const int max_num_tokens = inputs[getIdx(IdxEntry::QKV_TENSOR)].dims.d[0];
+    size_t const context_workspace_size = getWorkspaceSizeForContext(
+        type, nbReq, max_context_length, max_kv_cache_length, cross_qkv_length, max_num_tokens);
 
     const int total_num_seq = inputs[getIdx(IdxEntry::CONTEXT_LENGTHS)].dims.d[0];
     size_t const generation_workspace_size = getWorkspaceSizeForGeneration(type, total_num_seq, max_kv_cache_length);

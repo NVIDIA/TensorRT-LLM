@@ -656,7 +656,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_lora_rank \
             --output_dir /tmp/llama_7b_with_lora_qkv/trt_engines/fp16/1-gpu/ \
             --gemm_plugin float16 \
             --lora_plugin float16 \
-            --max_batch_size 1 \
+            --max_batch_size 8 \
             --max_input_len 512 \
             --max_output_len 50
 

@@ -12,13 +12,14 @@ from tensorrt_llm.hlapi.llm import (LLM, ModelConfig, SamplingConfig,
                                     TokenizerBase, TransformersTokenizer)
 
 
-def get_model_path():
+def get_model_path(model_name):
     sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
     from utils.llm_data import llm_models_root
-    return str(llm_models_root() / "llama-models/llama-7b-hf")
+    return str(llm_models_root() / model_name)
 
 
-llama_model_path = get_model_path()
+default_model_name = "llama-models/llama-7b-hf"
+llama_model_path = get_model_path(default_model_name)
 llm_engine_dir = os.environ.get('LLM_ENGINE_DIR', './tmp.engine')
 prompts = ["Tell a story", "Who are you"]
 
@@ -104,8 +105,10 @@ def test_llm_without_tokenizer():
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="The test needs at least 2 GPUs, skipping")
-def test_llm_build_engine_for_tp2():
-    config = ModelConfig(llama_model_path)
+@pytest.mark.parametrize("model_name",
+                         [default_model_name, "Mixtral-8x7B-v0.1"])
+def test_llm_build_engine_for_tp2(model_name):
+    config = ModelConfig(get_model_path(model_name))
     config.parallel_config.tp_size = 2
     llm = LLM(config)
 
@@ -115,15 +118,17 @@ def test_llm_build_engine_for_tp2():
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="The test needs at least 2 GPUs, skipping")
-def test_llm_generate_for_tp2():
-    config = ModelConfig(llama_model_path)
+@pytest.mark.parametrize("model_name",
+                         [default_model_name, "Mixtral-8x7B-v0.1"])
+def test_llm_generate_for_tp2(model_name):
+    config = ModelConfig(get_model_path(model_name))
     config.parallel_config.tp_size = 2
     llm = LLM(config)
     for output in llm.generate(prompts):
         print(output)
 
 
-def test_llm_generate_async(tp_size: int = 1):
+def test_llm_generate_async(model_name=default_model_name, tp_size: int = 1):
     config = ModelConfig(llama_model_path)
     config.parallel_config.tp_size = tp_size
     llm = LLM(
@@ -182,11 +187,13 @@ def test_llm_generate_async(tp_size: int = 1):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="The test needs at least 2 GPUs, skipping")
-def test_llm_generate_async_tp2():
-    test_llm_generate_async(tp_size=2)
+@pytest.mark.parametrize("model_name",
+                         [default_model_name, "Mixtral-8x7B-v0.1"])
+def test_llm_generate_async_tp2(model_name):
+    test_llm_generate_async(model_name, tp_size=2)
 
 
 # TODO[chunweiy]: Add test for loading inmemory model
 
 if __name__ == '__main__':
-    test_llm_generate_async_tp2()
+    test_llm_generate_async_tp2(default_model_name)

@@ -539,6 +539,7 @@ class TestFalcon(unittest.TestCase):
 
         model_config = ModelConfig(
             max_batch_size=batch_size,
+            max_beam_width=beam_width,
             model_name=model_name,
             vocab_size=hf_config.vocab_size,
             num_layers=hf_config.num_hidden_layers,

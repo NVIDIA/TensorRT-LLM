@@ -501,10 +501,7 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
             f'model.layers.{l}.block_sparse_moe.experts.w2.weight'] = w2
 
     torch_dtype = str_dtype_to_torch(dtype)
-    layers_per_pipeline_stage = hf_llama.config.num_hidden_layers // mapping.pp_size
-    layers_range = list(
-        range(mapping.pp_rank * layers_per_pipeline_stage,
-              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
+    layers_range = mapping.pp_layers(hf_llama.config.num_hidden_layers)
 
     vocab_size = hf_llama.config.vocab_size
     weights = {}
@@ -564,7 +561,7 @@ def load_from_hf_llama(tensorrt_llm_llama: 'LLaMAForCausalLM',
             layer_idx = extract_layer_idx(k)
             if layer_idx is None or int(layer_idx) not in layers_range:
                 continue
-            idx = int(layer_idx) - mapping.pp_rank * layers_per_pipeline_stage
+            idx = int(layer_idx) - layers_range[0]
             if 'input_layernorm.weight' in k:
                 weights['transformer.layers.{}.input_layernorm.weight'.format(
                     idx)] = v
@@ -1152,10 +1149,7 @@ def load_from_meta_llama(meta_ckpt_dir, mapping=Mapping(), config=None):
 
     head_size = config.hidden_size // config.num_attention_heads
     ckpt = get_current_weights(num_ckpts)
-    layers_per_pipeline_stage = config.num_hidden_layers // mapping.pp_size
-    layers_range = list(
-        range(mapping.pp_rank * layers_per_pipeline_stage,
-              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
+    layers_range = mapping.pp_layers(config.num_hidden_layers)
 
     for l in layers_range:
         prefix = f'layers.{l}.attention.'
@@ -1230,7 +1224,7 @@ def load_from_meta_llama(meta_ckpt_dir, mapping=Mapping(), config=None):
 
             if layer_idx is None or int(layer_idx) not in layers_range:
                 continue
-            idx = int(layer_idx) - mapping.pp_rank * layers_per_pipeline_stage
+            idx = int(layer_idx) - layers_range[0]
             tllm_prex = f'transformer.layers.{idx}.'
 
             if 'attention_norm.weight' in k:
@@ -1487,13 +1481,10 @@ def load_from_awq_llama(quant_ckpt_path,
         weights['transformer.ln_f.weight'] = v.to(torch_dtype)
 
     # 4. Weights inside each layer
-    layers_per_pipeline_stage = num_hidden_layers // mapping.pp_size
-    layers_range = list(
-        range(mapping.pp_rank * layers_per_pipeline_stage,
-              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
+    layers_range = mapping.pp_layers(num_hidden_layers)
 
     for l in layers_range:
-        layer_idx = l - mapping.pp_rank * layers_per_pipeline_stage
+        layer_idx = l - layers_range[0]
         prefix = "layers" + split_sym + str(layer_idx) + split_sym
         tllm_prex = f'transformer.layers.{l-layers_range[0]}'
 

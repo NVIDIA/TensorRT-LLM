@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,29 +39,31 @@ struct FillBuffers
 
     template <typename T>
     void operator()(std::optional<std::vector<T>> const& optParam, T const defaultValue, std::vector<T>& hostBuffer,
-        T* deviceBuffer, void* deviceTmpBuffer, const int* batchSlots) const
+        T* deviceBuffer, int32_t const* batchSlots) const
     {
         using tensorrt_llm::common::cudaAutoCpy;
 
-        hostBuffer.resize(batchSize);
-        if (!optParam)
+        for (size_t bi = 0; bi < batchSize; ++bi)
         {
-            std::fill(std::begin(hostBuffer), std::end(hostBuffer), defaultValue);
+            auto const batchSlot = batchSlots ? batchSlots[bi] : bi;
+            if (!optParam)
+            {
+                hostBuffer[batchSlot] = defaultValue;
+            }
+            else if (optParam->size() == 1)
+            {
+                hostBuffer[batchSlot] = optParam->front();
+            }
+            else
+            {
+                TLLM_CHECK_WITH_INFO(optParam->size() == batchSize, "Argument vector size mismatch.");
+                hostBuffer[batchSlot] = optParam.value()[bi];
+            }
         }
-        else if (optParam->size() == 1)
+
+        if (batchSlots)
         {
-            std::fill(std::begin(hostBuffer), std::end(hostBuffer), optParam->front());
-        }
-        else
-        {
-            TLLM_CHECK_WITH_INFO(optParam->size() == batchSize, "Argument vector size mismatch.");
-            std::copy(optParam->begin(), optParam->end(), std::begin(hostBuffer));
-        }
-        if (deviceTmpBuffer && batchSlots)
-        {
-            cudaAutoCpy(reinterpret_cast<T*>(deviceTmpBuffer), hostBuffer.data(), batchSize, stream);
-            tensorrt_llm::kernels::invokeScatterDecodingParams(
-                reinterpret_cast<T*>(deviceTmpBuffer), deviceBuffer, batchSlots, batchSize, stream);
+            cudaAutoCpy(deviceBuffer, hostBuffer.data(), maxBatchSize, stream);
         }
         else
         {
@@ -70,6 +72,7 @@ struct FillBuffers
     }
 
     size_t batchSize;
+    size_t maxBatchSize;
     cudaStream_t stream;
 };
 

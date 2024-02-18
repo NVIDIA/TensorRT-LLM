@@ -27,12 +27,13 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <chrono>
+#include <cstdint>
 #include <cxxopts.hpp>
 #include <iostream>
 #include <nlohmann/json.hpp>
-#include <random>
 #include <string>
 #include <thread>
+#include <utility>
 
 using namespace tensorrt_llm::batch_manager;
 using namespace tensorrt_llm::runtime;
@@ -104,7 +105,7 @@ public:
 
     void push(std::shared_ptr<InferenceRequest> request, uint64_t requestId)
     {
-        std::lock_guard<std::mutex> lk(mMutex);
+        std::lock_guard<std::mutex> lock(mMutex);
         TLLM_CHECK_WITH_INFO(!hasInProgressReqId(requestId) && !hasPendingReqId(requestId),
             "requestId %lu is already in progress, request is ignored.", requestId);
 
@@ -119,14 +120,14 @@ public:
     /// has been marked in progress
     std::tuple<std::shared_ptr<WorkItem>, bool> pop()
     {
-        std::lock_guard<std::mutex> lk(mMutex);
+        std::lock_guard<std::mutex> lock(mMutex);
 
         auto workItem = mPendingWorkItems.front();
         mPendingWorkItems.pop_front();
         mPendingWorkItemsReqIds.erase(workItem->requestId());
 
-        bool markedInProgress;
-        mInProgressWorkItems.emplace(std::make_pair(workItem->requestId(), workItem));
+        bool markedInProgress = false;
+        mInProgressWorkItems.emplace(workItem->requestId(), workItem);
         markedInProgress = true;
 
         return {workItem, markedInProgress};
@@ -134,19 +135,19 @@ public:
 
     size_t numPendingWorkItems() const
     {
-        std::lock_guard<std::mutex> lk(mMutex);
+        std::lock_guard<std::mutex> lock(mMutex);
         return mPendingWorkItems.size();
     }
 
     size_t numInProgressWorkItems() const
     {
-        std::lock_guard<std::mutex> lk(mMutex);
+        std::lock_guard<std::mutex> lock(mMutex);
         return mInProgressWorkItems.size();
     }
 
     size_t size() const
     {
-        std::lock_guard<std::mutex> lk(mMutex);
+        std::lock_guard<std::mutex> lock(mMutex);
         return mPendingWorkItems.size() + mInProgressWorkItems.size();
     }
 
@@ -154,7 +155,7 @@ public:
     /// @param requestId
     void markFinished(const uint64_t requestId)
     {
-        std::lock_guard<std::mutex> lk(mMutex);
+        std::lock_guard<std::mutex> lock(mMutex);
         if (hasInProgressReqId(requestId))
         {
             mInProgressWorkItems.erase(requestId);
@@ -175,12 +176,13 @@ private:
 
 struct BenchInfo
 {
-    BenchInfo() {}
+    BenchInfo() = default;
 
     BenchInfo(int _inputLength, int _outputLength, std::chrono::time_point<std::chrono::steady_clock> _start)
         : inputLength(_inputLength)
         , outputLength(_outputLength)
         , start(_start)
+        , latency()
     {
     }
 
@@ -194,9 +196,9 @@ struct BenchInfo
 class Recorder
 {
 public:
-    Recorder(std::string opCsvFile)
+    explicit Recorder(std::string opCsvFile)
+        : mOpCsvFile(std::move(opCsvFile))
     {
-        mOpCsvFile = opCsvFile;
     }
 
     void initialize()
@@ -286,11 +288,11 @@ private:
 
     std::chrono::time_point<std::chrono::steady_clock> mStart;
     std::chrono::time_point<std::chrono::steady_clock> mEnd;
-    int mNumSamples;
-    float mTotalLatency;
-    float mSeqThroughput;
-    float mAvgSeqLatency;
-    float mTokenThroughput;
+    int mNumSamples{};
+    float mTotalLatency{};
+    float mSeqThroughput{};
+    float mAvgSeqLatency{};
+    float mTokenThroughput{};
     std::string mOpCsvFile;
 }; // class Recorder
 
@@ -299,25 +301,39 @@ class GptServer
 public:
     GptServer(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, int32_t maxBeamWidth,
         batch_scheduler::SchedulerPolicy schedulerPolicy, TrtGptModelOptionalParams const& optionalParams,
-        std::shared_ptr<Recorder> recorder, std::optional<uint64_t> terminateReqId, int waitSleep)
+        std::shared_ptr<Recorder> recorder, std::optional<uint64_t> terminateReqId, std::chrono::milliseconds waitSleep,
+        std::optional<uint64_t> const staticEmulatedBatchSize, int const staticEmulatedTimeoutMs)
+        : mRecorder(std::move(recorder))
+        , mTerminateReqId(terminateReqId)
+        , mWaitSleep(waitSleep)
+        , mStaticEmulatedBatchSize(staticEmulatedBatchSize)
+        , mEmulatedBatchEndTimestamp(
+              std::chrono::steady_clock::now() + std::chrono::milliseconds(staticEmulatedTimeoutMs))
+        , mStaticEmulatedTimeoutMs(staticEmulatedTimeoutMs)
+        , mActiveCount(0)
     {
-        ReturnBatchManagerStatsCallback iterationDataCallback{nullptr};
-        if (optionalParams.logIterationData)
+        ReturnBatchManagerStatsCallback iterationDataCallback = [this, &optionalParams](std::string const& log)
         {
-            iterationDataCallback = [this](const std::string& s) { return TLLM_LOG_INFO(s); };
-        }
+            if (optionalParams.logIterationData)
+            {
+                TLLM_LOG_INFO(log);
+            }
+
+            if (mStaticEmulatedBatchSize)
+            {
+                auto const json = nlohmann::json::parse(log);
+                auto const activeRequests = json["Active Request Count"];
+                TLLM_CHECK(activeRequests <= mStaticEmulatedBatchSize.value());
+            }
+        };
 
         mBatchManager = std::make_shared<GptManager>(
             trtEnginePath, modelType, maxBeamWidth, schedulerPolicy,
             [this](int max_num_requests) { return getInferenceRequests(max_num_requests); },
-            [this](uint64_t requestId, std::list<NamedTensor> response_tensors, bool final_response,
-                const std::string& errMsg)
+            [this](uint64_t requestId, std::list<NamedTensor> const& response_tensors, bool final_response,
+                std::string const& errMsg)
             { return sendResponse(requestId, response_tensors, final_response, errMsg); },
             nullptr, iterationDataCallback, optionalParams, terminateReqId);
-
-        mRecorder = recorder;
-        mTerminateReqId = terminateReqId;
-        mWaitSleep = waitSleep;
     }
 
     ~GptServer()
@@ -353,16 +369,20 @@ public:
 
     void waitForEmpty() const
     {
-        while (mWorkItemsQueue.size() > 0)
+        while (!mWorkItemsQueue.empty())
         {
-            std::chrono::milliseconds timespan(mWaitSleep);
-            std::this_thread::sleep_for(timespan);
+            std::this_thread::sleep_for(mWaitSleep);
         }
     }
 
     void waitBatchManager() const
     {
         mBatchManager->waitUntilTerminate();
+    }
+
+    void shutdown() const
+    {
+        mBatchManager->shutdown();
     }
 
     // Return up to max_num_requests inference requests.
@@ -376,17 +396,40 @@ public:
             auto rank = comm.getRank();
             if (rank == 0)
             {
-                auto num_new_work_items = std::min(static_cast<int64_t>(mWorkItemsQueue.numPendingWorkItems()),
+                auto numNewWorkItems = std::min(static_cast<int64_t>(mWorkItemsQueue.numPendingWorkItems()),
                     static_cast<int64_t>(max_num_requests));
                 if (world_size > 1)
                 {
-                    comm.bcast(&num_new_work_items, 1, mpi::MpiType::kINT64, 0);
+                    comm.bcast(&numNewWorkItems, 1, mpi::MpiType::kINT64, 0);
                 }
 
-                if (num_new_work_items > 0)
+                bool readyForNextBatch = numNewWorkItems > 0;
+                if (mStaticEmulatedBatchSize)
+                {
+                    if (numNewWorkItems > 0)
+                    {
+                        bool const timeout = std::chrono::steady_clock::now() > mEmulatedBatchEndTimestamp;
+                        bool const previousBatchFinished = mActiveCount == 0;
+                        bool const haveEnoughForNextBatch = numNewWorkItems >= mStaticEmulatedBatchSize.value();
+                        readyForNextBatch = previousBatchFinished && (timeout || haveEnoughForNextBatch);
+                    }
+                    if (numNewWorkItems == 0 || readyForNextBatch)
+                    {
+                        // Timeout should only begin once we have at least 1 pending request.
+                        // Reset timeout when no requests are pending or we submit a new batch.
+                        mEmulatedBatchEndTimestamp
+                            = std::chrono::steady_clock::now() + std::chrono::milliseconds(mStaticEmulatedTimeoutMs);
+                    }
+                }
+
+                if (readyForNextBatch)
                 {
                     int count = 0;
-                    while (count < num_new_work_items)
+                    // Only add a single batch at a time when emulating static batching
+                    auto const numItemsToAdd = std::min(
+                        numNewWorkItems, static_cast<int64_t>(mStaticEmulatedBatchSize.value_or(numNewWorkItems)));
+                    mActiveCount += numItemsToAdd;
+                    while (count < numItemsToAdd)
                     {
                         auto [workItem, markedInProgress] = mWorkItemsQueue.pop();
 
@@ -420,14 +463,14 @@ public:
             else
             {
                 // subordinate ranks hang until master rank sends work
-                int64_t num_new_work_items;
-                comm.bcast(&num_new_work_items, 1, mpi::MpiType::kINT64, 0);
-                if (num_new_work_items > 0)
+                int64_t numNewWorkItems = 0;
+                comm.bcast(&numNewWorkItems, 1, mpi::MpiType::kINT64, 0);
+                if (numNewWorkItems > 0)
                 {
                     std::vector<int64_t> packed;
                     comm.bcast(packed, 0);
                     int64_t* packed_ptr = packed.data();
-                    for (int64_t count = 0; count < num_new_work_items; ++count)
+                    for (int64_t count = 0; count < numNewWorkItems; ++count)
                     {
                         int64_t n = *(packed_ptr++);
                         auto ir = InferenceRequest::deserialize(packed_ptr);
@@ -453,6 +496,7 @@ public:
             {
                 mWorkItemsQueue.markFinished(requestId);
                 mRecorder->recordEnd(requestId);
+                mActiveCount--;
             }
         }
         catch (const std::exception& e)
@@ -466,15 +510,27 @@ private:
     std::shared_ptr<Recorder> mRecorder;
     WorkItemsQueue mWorkItemsQueue;
     std::optional<uint64_t> mTerminateReqId;
-    int mWaitSleep;
+    std::chrono::milliseconds mWaitSleep;
+    std::optional<int> mStaticEmulatedBatchSize;
+    std::chrono::time_point<std::chrono::steady_clock> mEmulatedBatchEndTimestamp;
+    int32_t mStaticEmulatedTimeoutMs;
+    std::atomic<uint64_t> mActiveCount;
 
 }; // class GptServer
 
 namespace
 {
 
-std::tuple<std::vector<std::vector<int32_t>>, std::vector<int32_t>, std::vector<float>> parseWorkloadJson(
-    std::filesystem::path const& datasetPath, int maxNumSamples)
+struct Sample
+{
+    std::vector<int32_t> inputIds;
+    int32_t outputLen;
+    float delay;
+};
+
+using Samples = std::vector<Sample>;
+
+Samples parseWorkloadJson(std::filesystem::path const& datasetPath, int maxNumSamples)
 {
     auto constexpr allowExceptions = true;
     auto constexpr ignoreComments = true;
@@ -482,37 +538,29 @@ std::tuple<std::vector<std::vector<int32_t>>, std::vector<int32_t>, std::vector<
     std::ifstream jsonStream(datasetPath);
     auto json = nlohmann::json::parse(jsonStream, nullptr, allowExceptions, ignoreComments);
 
-    std::vector<std::vector<int32_t>> inputIds;
-    std::vector<int32_t> outputLens;
-    std::vector<float> delays;
+    Samples samples;
 
-    long int numSamples = 0;
-
-    for (auto& sample : json["samples"])
+    for (auto const& sample : json["samples"])
     {
-        if (numSamples >= maxNumSamples)
+        if (samples.size() >= maxNumSamples)
             break;
-        numSamples++;
-        inputIds.push_back(sample["input_ids"]);
-        outputLens.push_back(sample["output_len"]);
-        delays.push_back(sample["delay"]);
+        samples.emplace_back(Sample{sample["input_ids"], sample["output_len"], sample["delay"]});
     }
-    return std::make_tuple(inputIds, outputLens, delays);
+    return samples;
 }
 
-std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId,
-    std::tuple<std::vector<std::vector<int32_t>>, std::vector<int32_t>, std::vector<float>> const& dataset,
-    std::size_t sample_idx, ITensor::SharedPtr const& beamWidthTensor, ITensor::SharedPtr const& eosId,
-    ITensor::SharedPtr const& padId, BufferManager const& bufferManager,
-    ITensor::SharedPtr const& returnContextLogits = nullptr, ITensor::SharedPtr const& returnGenerationLogits = nullptr)
+std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId, Sample const& sample,
+    ITensor::SharedPtr const& beamWidthTensor, ITensor::SharedPtr const& eosId, ITensor::SharedPtr const& padId,
+    BufferManager const& bufferManager, ITensor::SharedPtr const& returnContextLogits = nullptr,
+    ITensor::SharedPtr const& returnGenerationLogits = nullptr)
 {
     auto request = std::make_shared<InferenceRequest>(reqId);
-    auto const& inputIds = (std::get<0>(dataset))[sample_idx];
+    auto const& inputIds = sample.inputIds;
     request->setInputIds(bufferManager.copyFrom(
         inputIds, ITensor::makeShape({static_cast<SizeType>(inputIds.size())}), MemoryType::kPINNED));
-    auto const request_output_len = (std::get<1>(dataset))[sample_idx];
+    auto const requestOutputLen = sample.outputLen;
     request->setMaxNewTokens(
-        bufferManager.copyFrom(&request_output_len, ITensor::makeShape({1, 1}), MemoryType::kPINNED));
+        bufferManager.copyFrom(&requestOutputLen, ITensor::makeShape({1, 1}), MemoryType::kPINNED));
     request->setBeamWidth(beamWidthTensor);
     if (eosId != nullptr)
     {
@@ -533,28 +581,14 @@ std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId,
     return request;
 }
 
-void benchmarkGptManager([[maybe_unused]] std::string const& modelName, std::filesystem::path const& engineDir,
-    std::string const& type, std::string const& datasetPath, std::string const& opCsvFile, int maxNumSamples,
-    int beamWidth, int warmUp, const std::optional<int32_t>& eosId, const std::optional<int32_t>& padId,
-    std::shared_ptr<nvinfer1::ILogger> const& logger, TrtGptModelOptionalParams const& optionalParams,
-    batch_scheduler::SchedulerPolicy schedulerPolicy, int waitSleep, bool returnContextLogits,
-    bool returnGenerationLogits)
+void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType modelType,
+    std::string const& datasetPath, std::string const& opCsvFile, int maxNumSamples, int beamWidth, int warmUp,
+    const std::optional<int32_t>& eosId, const std::optional<int32_t>& padId,
+    TrtGptModelOptionalParams const& optionalParams, batch_scheduler::SchedulerPolicy schedulerPolicy,
+    std::chrono::milliseconds waitSleep, bool returnContextLogits, bool returnGenerationLogits,
+    std::optional<int> const staticEmulatedBatchSize, int const staticEmulatedTimeoutMs)
 {
     auto const worldConfig = WorldConfig::mpi();
-
-    TrtGptModelType modelType;
-    if (type == "V1")
-    {
-        modelType = TrtGptModelType::V1;
-    }
-    else if (type == "IFB")
-    {
-        modelType = TrtGptModelType::InflightFusedBatching;
-    }
-    else
-    {
-        TLLM_LOG_ERROR("Unexpected batching type: %s", type.c_str());
-    }
 
     BufferManager bufferManager{std::make_shared<CudaStream>()}; // the stream is not used
 
@@ -563,14 +597,13 @@ void benchmarkGptManager([[maybe_unused]] std::string const& modelName, std::fil
 
     // Load dataset
     const auto samples = parseWorkloadJson(datasetPath, maxNumSamples);
-    const auto numSamples = (std::get<0>(samples)).size();
+    const auto numSamples = samples.size();
 
     const int maxBeamWidth = beamWidth;
     auto recorder = std::make_shared<Recorder>(opCsvFile);
     uint64_t terminateReqId = numSamples + 1;
-
-    auto gptServer = std::make_shared<GptServer>(
-        engineDir, modelType, maxBeamWidth, schedulerPolicy, optionalParams, recorder, terminateReqId, waitSleep);
+    auto gptServer = std::make_shared<GptServer>(engineDir, modelType, maxBeamWidth, schedulerPolicy, optionalParams,
+        recorder, terminateReqId, waitSleep, staticEmulatedBatchSize, staticEmulatedTimeoutMs);
 
     ITensor::SharedPtr eosIdTensor{
         eosId ? bufferManager.copyFrom(&eosId.value(), ITensor::makeShape({1}), MemoryType::kPINNED) : nullptr};
@@ -594,7 +627,7 @@ void benchmarkGptManager([[maybe_unused]] std::string const& modelName, std::fil
             ++reqId;
             if (i == terminateReqId)
                 ++reqId;
-            auto request = makeRequest(reqId, samples, 0, beamWidthTensor, eosIdTensor, padIdTensor, bufferManager);
+            auto request = makeRequest(reqId, samples[0], beamWidthTensor, eosIdTensor, padIdTensor, bufferManager);
             gptServer->enqueue(request);
         }
         gptServer->waitForEmpty();
@@ -603,11 +636,10 @@ void benchmarkGptManager([[maybe_unused]] std::string const& modelName, std::fil
         recorder->initialize();
         for (std::size_t i = 0; i < numSamples; ++i)
         {
-            auto request = makeRequest(i + 1, samples, i, beamWidthTensor, eosIdTensor, padIdTensor, bufferManager,
+            auto request = makeRequest(i + 1, samples[i], beamWidthTensor, eosIdTensor, padIdTensor, bufferManager,
                 returnContextLogitsFlagTensor, returnGenerationLogitsFlagTensor);
-
             gptServer->enqueue(request);
-            auto delayInMs = int(std::get<2>(samples)[i] * 1000);
+            auto delayInMs = static_cast<int>(samples[i].delay * 1000);
 
             if (delayInMs != 0)
             {
@@ -635,6 +667,7 @@ int main(int argc, char* argv[])
     cxxopts::Options options(
         "TensorRT-LLM BatchManager Benchmark", "TensorRT-LLM BatchManager Benchmark for GPT and GPT-like models.");
     options.add_options()("h,help", "Print usage");
+    // TODO(rkobus): remove because unused
     options.add_options()(
         "m,model", "Model name specified for engines.", cxxopts::value<std::string>()->default_value("gpt_350m"));
     options.add_options()("engine_dir", "Directory that store the engines.", cxxopts::value<std::string>());
@@ -668,6 +701,11 @@ int main(int argc, char* argv[])
     options.add_options()("scheduler_policy", "Choose scheduler policy between max_utilization/guaranteed_no_evict.",
         cxxopts::value<std::string>()->default_value("guaranteed_no_evict"));
 
+    options.add_options()("static_emulated_batch_size",
+        "Emulate static batching performance with the provided batch size.", cxxopts::value<int>());
+    options.add_options()("static_emulated_timeout",
+        "Timeout (ms) before launching a partial batch in emulated static batching mode",
+        cxxopts::value<int>()->default_value("500"));
     options.add_options()("log_level", "Choose log level between verbose/info/warning/error/internal_error.",
         cxxopts::value<std::string>()->default_value("error"));
     options.add_options()(
@@ -693,6 +731,20 @@ int main(int argc, char* argv[])
 
     // Argument: Batching Type
     auto const type = result["type"].as<std::string>();
+    TrtGptModelType modelType{TrtGptModelType::V1};
+    if (type == "V1")
+    {
+        modelType = TrtGptModelType::V1;
+    }
+    else if (type == "IFB")
+    {
+        modelType = TrtGptModelType::InflightFusedBatching;
+    }
+    else
+    {
+        TLLM_LOG_ERROR("Unexpected batching type: %s", type.c_str());
+        return 1;
+    }
 
     // Argument: Dataset
     auto const datasetPath = result["dataset"].as<std::string>();
@@ -705,7 +757,7 @@ int main(int argc, char* argv[])
     auto const beamWidth = result["beam_width"].as<int>();
 
     // Argument: wait_sleep
-    auto const waitSleep = result["wait_sleep"].as<int>();
+    auto const waitSleep = std::chrono::milliseconds(result["wait_sleep"].as<int>());
 
     TrtGptModelOptionalParams optionalParams;
     // Argument: Max tokens in paged K-V Cache
@@ -765,6 +817,14 @@ int main(int argc, char* argv[])
         eosId = result["eos_id"].as<int>();
     }
 
+    std::optional<int> staticEmulatedBatchSize;
+    // Argument: Static emulated batch size
+    if (result.count("static_emulated_batch_size"))
+    {
+        staticEmulatedBatchSize = result["static_emulated_batch_size"].as<int>();
+    }
+    auto const staticEmulatedTimeout = result["static_emulated_timeout"].as<int>();
+
     // Argument: Scheduler policy
     batch_scheduler::SchedulerPolicy schedulerPolicy;
     auto const schedulerPolicyArg = result["scheduler_policy"].as<std::string>();
@@ -815,9 +875,9 @@ int main(int argc, char* argv[])
 
     try
     {
-        benchmarkGptManager(result["model"].as<std::string>(), result["engine_dir"].as<std::string>(), type,
-            datasetPath, opCsvFile, maxNumSamples, beamWidth, result["warm_up"].as<int>(), eosId, padId, logger,
-            optionalParams, schedulerPolicy, waitSleep, returnContextLogits, returnGenerationLogits);
+        benchmarkGptManager(result["engine_dir"].as<std::string>(), modelType, datasetPath, opCsvFile, maxNumSamples,
+            beamWidth, result["warm_up"].as<int>(), eosId, padId, optionalParams, schedulerPolicy, waitSleep,
+            returnContextLogits, returnGenerationLogits, staticEmulatedBatchSize, staticEmulatedTimeout);
     }
     catch (const std::exception& e)
     {

@@ -30,11 +30,12 @@ namespace torch_ext
 {
 
 template <typename T>
-FtDynamicDecode<T>::FtDynamicDecode(const size_t max_batch_size, const size_t vocab_size,
+FtDynamicDecode<T>::FtDynamicDecode(const size_t max_batch_size, const size_t max_beam_width, const size_t vocab_size,
     const size_t vocab_size_padded, const int tensor_para_size, const int pipeline_para_size)
     : vocab_size_(vocab_size)
     , vocab_size_padded_(vocab_size_padded)
-    , finished_sum_(tr::BufferManager::pinned(tr::ITensor::makeShape({1}), nvinfer1::DataType::kINT32))
+    , finished_sum_(tr::BufferManager::pinned(
+          tr::ITensor::makeShape({static_cast<int32_t>(max_batch_size)}), nvinfer1::DataType::kINT32))
 {
     TLLM_CHECK_WITH_INFO(vocab_size_padded_ % tensor_para_size == 0,
         tensorrt_llm::common::fmtstr(
@@ -46,8 +47,8 @@ FtDynamicDecode<T>::FtDynamicDecode(const size_t max_batch_size, const size_t vo
     cudaDeviceProp prop;
     tensorrt_llm::common::check_cuda_error(cudaGetDeviceProperties(&prop, 0));
 
-    dynamic_decode_layer_ = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(
-        max_batch_size, vocab_size_, vocab_size_padded_, stream, std::move(allocator), &prop_);
+    dynamic_decode_layer_ = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(tr::DecodingMode::None(),
+        max_batch_size, max_beam_width, vocab_size_, vocab_size_padded_, stream, std::move(allocator), &prop_);
 }
 
 namespace
@@ -134,8 +135,10 @@ template <typename T>
 void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width, hidden_size)
     int step, int max_input_length, int max_attention_window, int sink_token_length, uint64_t ite, int local_batch_size,
     th::Tensor end_id, th::optional<th::Tensor> embedding_bias_opt, th::optional<th::Tensor> input_lengths_opt,
-    th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
-    th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
+    th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_ptrs_opt,
+    th::optional<th::Tensor> stop_words_lens_opt, int32_t max_stop_words_len,
+    th::optional<th::Tensor> bad_words_list_ptrs_opt, th::optional<th::Tensor> bad_words_lens_opt,
+    int32_t max_bad_words_len, th::optional<th::Tensor> no_repeat_ngram_size_opt,
     th::optional<th::Tensor> src_cache_indirection_opt,
     // Outputs
     th::Tensor& output_token_ids, th::Tensor& newTokens, th::Tensor& should_stop,
@@ -152,15 +155,19 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
     auto const& logits_converted = convert_tensor<float>(logits);
     auto const& end_ids_converted = convert_tensor<int>(end_id);
     typename tensorrt_llm::layers::DynamicDecodeLayer<T>::ForwardParams forwardParams{step, static_cast<int>(ite),
-        max_input_length, max_attention_window, sink_token_length, local_batch_size, logits_converted,
-        end_ids_converted};
+        max_input_length, max_attention_window, sink_token_length, local_batch_size, end_ids_converted};
 
+    forwardParams.logits = logits_converted;
     safeUpdate<int>(src_cache_indirection_opt, forwardParams.src_cache_indirection);
     safeUpdate<int>(sequence_limit_length_opt, forwardParams.sequence_limit_length);
     safeUpdate<T>(embedding_bias_opt, forwardParams.embedding_bias);
     safeUpdate<int>(input_lengths_opt, forwardParams.input_lengths);
-    safeUpdate<int>(bad_words_list_opt, forwardParams.bad_words_list);
-    safeUpdate<int>(stop_words_list_opt, forwardParams.stop_words_list);
+    safeUpdate<uint64_t>(bad_words_list_ptrs_opt, forwardParams.bad_words_ptr);
+    safeUpdate<int>(bad_words_lens_opt, forwardParams.bad_words_lengths);
+    forwardParams.max_bad_words_len = max_bad_words_len;
+    safeUpdate<uint64_t>(stop_words_list_ptrs_opt, forwardParams.stop_words_ptr);
+    safeUpdate<int>(stop_words_lens_opt, forwardParams.stop_words_lengths);
+    forwardParams.max_stop_words_len = max_stop_words_len;
     safeUpdate<int>(no_repeat_ngram_size_opt, forwardParams.no_repeat_ngram_size);
     safeUpdate<uint8_t>(finished_input, forwardParams.finished);
 
@@ -174,7 +181,10 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
     {
         outputParams.finished_sum = tcc::toTllmTensor(*finished_sum_);
         finished_sum_host = tr::bufferCast<std::int32_t>(*finished_sum_);
-        *finished_sum_host = 0;
+        for (int32_t bi = 0; bi < local_batch_size; ++bi)
+        {
+            finished_sum_host[bi] = 0;
+        }
     }
     safeUpdate<int>(sequence_lengths_opt, outputParams.sequence_length);
     safeUpdate<int>(parent_ids_opt, outputParams.parent_ids);
@@ -199,17 +209,23 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
     dynamic_decode_layer_->forward(outputParams, forwardParams);
     if (finished_sum_host)
     {
+        int32_t finished_sum = 0;
+        for (int32_t bi = 0; bi < local_batch_size; ++bi)
+        {
+            finished_sum += finished_sum_host[bi];
+        }
         auto const numToFinish = outputParams.finished->size();
         TLLM_CUDA_CHECK(::cudaStreamSynchronize(dynamic_decode_layer_->getStream()));
         auto should_stop_accessor = should_stop.accessor<bool, 1>();
-        should_stop_accessor[0] = numToFinish == *finished_sum_host;
+        should_stop_accessor[0] = numToFinish == finished_sum;
     }
 }
 
-DynamicDecodeOp::DynamicDecodeOp(const int64_t max_batch_size, const int64_t vocab_size,
+DynamicDecodeOp::DynamicDecodeOp(const int64_t max_batch_size, const int64_t max_beam_width, const int64_t vocab_size,
     const int64_t vocab_size_padded, const int64_t tensor_para_size, const int64_t pipeline_para_size,
     at::ScalarType scalar_type)
     : max_batch_size_(static_cast<size_t>(max_batch_size))
+    , max_beam_width_(static_cast<size_t>(max_beam_width))
     , vocab_size_(static_cast<size_t>(vocab_size))
     , vocab_size_padded_(static_cast<size_t>(vocab_size_padded))
     , tensor_para_size_(static_cast<int>(tensor_para_size))
@@ -227,11 +243,11 @@ void DynamicDecodeOp::createInstance()
     {
     case at::ScalarType::Float:
         dynamic_decode_ = std::make_unique<FtDynamicDecode<float>>(
-            max_batch_size_, vocab_size_, vocab_size_padded_, tensor_para_size_, pipeline_para_size_);
+            max_batch_size_, max_beam_width_, vocab_size_, vocab_size_padded_, tensor_para_size_, pipeline_para_size_);
         break;
     case at::ScalarType::Half:
         dynamic_decode_ = std::make_unique<FtDynamicDecode<half>>(
-            max_batch_size_, vocab_size_, vocab_size_padded_, tensor_para_size_, pipeline_para_size_);
+            max_batch_size_, max_beam_width_, vocab_size_, vocab_size_padded_, tensor_para_size_, pipeline_para_size_);
         break;
     default: throw std::runtime_error("Wrong tensor type.");
     }
@@ -271,8 +287,10 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
     int64_t max_attention_window, int64_t sink_token_length, int64_t ite, int64_t local_batch_size, th::Tensor end_id,
     th::optional<th::Tensor> embedding_bias_opt,
     th::optional<th::Tensor> input_lengths_opt, // length of input contexts.
-    th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
-    th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
+    th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_ptrs_opt,
+    th::optional<th::Tensor> stop_words_lens_opt, int64_t max_stop_words_len,
+    th::optional<th::Tensor> bad_words_list_ptrs_opt, th::optional<th::Tensor> bad_words_lens_opt,
+    int64_t max_bad_words_len, th::optional<th::Tensor> no_repeat_ngram_size_opt,
     th::optional<th::Tensor> src_cache_indirection_opt,
     // output buffers.
     th::Tensor output_token_ids, th::Tensor newTokens, th::optional<th::Tensor> finished_input,
@@ -292,8 +310,10 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
     //     embedding_bias: [vocab_size_padded], T, optional
     //     input_lengths: [batch_size * beam_width], int, optional
     //     sequence_limit_length: [batch_size], int, optional
-    //     stop_words_list: [batch_size, 2, stop_words_length], int, optional
-    //     bad_words_list: [2, stop_words_length], int, optional
+    //     stop_words_list_ptrs: [batch_size][2, stop_words_length], int, optional
+    //     stop_words_lens_ptrs: [batch_size], int, optional
+    //     bad_words_list_ptrs: [batch_size][2, bad_words_length], int, optional
+    //     bad_words_lens: [batch_size], int, optional
     //     src_cache_indirection: [local_batch_size, beam_width, memory_length],
     //     int, optional output_token_ids: [max_seq_length, batch_size,
     //     beam_width], int finished: [batch_size * beam_width], bool, optional
@@ -316,8 +336,10 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
 
     CHECK_OPTIONAL_INPUT(input_lengths_opt, torch::kInt32);
     CHECK_OPTIONAL_INPUT(sequence_limit_length_opt, torch::kInt32);
-    CHECK_OPTIONAL_INPUT(stop_words_list_opt, torch::kInt32);
-    CHECK_OPTIONAL_INPUT(bad_words_list_opt, torch::kInt32);
+    CHECK_OPTIONAL_INPUT(stop_words_list_ptrs_opt, torch::kInt64);
+    CHECK_OPTIONAL_INPUT(stop_words_lens_opt, torch::kInt32);
+    CHECK_OPTIONAL_INPUT(bad_words_list_ptrs_opt, torch::kInt64);
+    CHECK_OPTIONAL_INPUT(bad_words_lens_opt, torch::kInt32);
     CHECK_OPTIONAL_INPUT(no_repeat_ngram_size_opt, torch::kInt32);
     CHECK_OPTIONAL_INPUT(src_cache_indirection_opt, torch::kInt32);
 
@@ -336,8 +358,9 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
         // Inputs
         logits, static_cast<int>(step), static_cast<int>(max_input_length), static_cast<int>(max_attention_window),
         static_cast<int>(sink_token_length), static_cast<uint32_t>(ite), static_cast<int>(local_batch_size), end_id,
-        embedding_bias_opt, input_lengths_opt, sequence_limit_length_opt, stop_words_list_opt, bad_words_list_opt,
-        no_repeat_ngram_size_opt, src_cache_indirection_opt,
+        embedding_bias_opt, input_lengths_opt, sequence_limit_length_opt, stop_words_list_ptrs_opt, stop_words_lens_opt,
+        static_cast<int32_t>(max_stop_words_len), bad_words_list_ptrs_opt, bad_words_lens_opt,
+        static_cast<int32_t>(max_bad_words_len), no_repeat_ngram_size_opt, src_cache_indirection_opt,
         // Outputs
         output_token_ids, newTokens, should_stop, finished_input, finished_output, seuqence_lengths_opt,
         cum_log_probs_opt, output_log_probs_opt, parent_ids_opt, tgt_cache_indirection_opt,
@@ -352,6 +375,6 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
 
 static auto trtllmGptContextDecoderTHS
     = torch::jit::class_<torch_ext::DynamicDecodeOp>("trtllm", "DynamicDecodeOp")
-          .def(torch::jit::init<int64_t, int64_t, int64_t, int64_t, int64_t, at::ScalarType>())
+          .def(torch::jit::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, at::ScalarType>())
           .def("setup", &torch_ext::DynamicDecodeOp::setup)
           .def("forward", &torch_ext::DynamicDecodeOp::forward);

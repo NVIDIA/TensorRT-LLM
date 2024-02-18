@@ -74,25 +74,24 @@ size_t padVocabSize(size_t vocabSize, size_t pad = 8)
 }
 
 template <typename T>
-void initLogitsAndBias(
-    T* logits, T* bias, const size_t batchSize, const size_t vocabSize, const size_t mVocabSizepadded)
+void initLogitsAndBias(T* logits, T* bias, const size_t batchSize, const size_t vocabSize, const size_t vocabSizePadded)
 {
-    initRandom(logits, batchSize * mVocabSizepadded, -5.0f, 5.0f);
+    initRandom(logits, batchSize * vocabSizePadded, -5.0f, 5.0f);
     if (bias != nullptr)
     {
-        initRandom(bias, vocabSize, -5.0f, 5.0f);
+        initRandom(bias, batchSize * vocabSizePadded, -5.0f, 5.0f);
     }
     bool is_half = sizeof(T) == 2;
     for (size_t i = 0; i < batchSize; ++i)
     {
-        for (size_t j = 0; j < mVocabSizepadded; ++j)
+        for (size_t j = 0; j < vocabSizePadded; ++j)
         {
             if (j >= vocabSize)
             {
-                logits[i * mVocabSizepadded + j] = static_cast<T>(is_half ? -65504.f : -FLT_MAX);
+                logits[i * vocabSizePadded + j] = static_cast<T>(is_half ? -HALF_FLT_MAX : -FLT_MAX);
                 if (bias != nullptr && i == 0)
                 {
-                    bias[j] = (T) 0.0f;
+                    bias[i * vocabSizePadded + j] = (T) 0.0f;
                 }
             }
         }
@@ -116,6 +115,9 @@ protected:
     using SamplingKernelTest<T>::mLogitsHost;
 
     TensorPtr mLogitsDevice;
+    TensorPtr mOutLogitsDevice;
+    TensorPtr mLogitsRefHost;
+    TensorPtr mLogitsPtrs;
     TensorPtr mPenaltyWorkspaceDevice;
     TensorPtr mBiasHost;
     TensorPtr mBiasDevice;
@@ -124,23 +126,25 @@ protected:
 
     void subsetup(const TemperatureTestParam& param)
     {
+        auto const dataType = TRTDataType<T>::value;
+        auto const ptrType = TRTDataType<T*>::value;
+
         mBatchSize = param.batchSize;
         mMaxBatchSize = 2 * mBatchSize;
         mVocabSize = param.vocabSize;
         mVocabSizePadded = padVocabSize(mVocabSize);
 
-        mLogitsHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize, mVocabSizePadded}),
-            std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
-        mLogitsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSizePadded}),
-            std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
+        mLogitsHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize, mVocabSizePadded}), dataType);
+        mLogitsRefHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize, mVocabSizePadded}), dataType);
+        mLogitsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSizePadded}), dataType);
+        mOutLogitsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSizePadded}), dataType);
+        mLogitsPtrs = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), ptrType);
 
         mPenaltyWorkspaceDevice
-            = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSize}), nvinfer1::DataType::kINT32);
+            = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mVocabSizePadded}), nvinfer1::DataType::kINT32);
 
-        mBiasHost = mBufferManager->pinned(ITensor::makeShape({mVocabSizePadded}),
-            std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
-        mBiasDevice = mBufferManager->gpu(ITensor::makeShape({mVocabSizePadded}),
-            std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
+        mBiasHost = mBufferManager->pinned(ITensor::makeShape({mMaxBatchSize, mVocabSizePadded}), dataType);
+        mBiasDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mVocabSizePadded}), dataType);
 
         mBatchSlots = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
 
@@ -154,6 +158,13 @@ protected:
             bufferCast<T>(*mLogitsHost), bufferCast<T>(*mBiasHost), mBatchSize, mVocabSize, mVocabSizePadded);
 
         mBufferManager->copy(*mLogitsHost, *mLogitsDevice);
+
+        auto logitsPtrs = BufferRange<T*>(*mLogitsPtrs);
+        for (SizeType bi = 0; bi < mBatchSize; ++bi)
+        {
+            logitsPtrs[bi] = bufferCast<T>(*mLogitsDevice) + (mBatchSize - bi - 1) * mVocabSizePadded;
+        }
+
         mBufferManager->copy(*mBiasHost, *mBiasDevice);
 
         ASSERT_EQ(param.temperaturesSize, mMaxBatchSize) << "Invalid test configuration.";
@@ -162,25 +173,37 @@ protected:
         mBufferManager->copy(*param.temperatures, *mTemperaturesDevice);
     }
 
-    void computeReference(T* logits, const T* bias, const float* temperatures, const size_t temperaturesSize)
+    void computeReference(T const* const inLogits, T* const outLogits, T const* const bias,
+        float const* const temperatures, size_t const temperaturesSize)
     {
-        const bool IS_FP16 = std::is_same<T, half>::value;
-        const T MAX_T_VAL = (IS_FP16) ? 65504.F : FLT_MAX;
+        bool const IS_FP16 = std::is_same<T, half>::value;
+        T const MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
         auto const batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
+
+        for (int32_t bi = 0; bi < mBatchSize; ++bi)
+        {
+            for (int32_t vi = 0; vi < mVocabSizePadded; ++vi)
+            {
+                auto const srcIdx = (mBatchSize - bi - 1) * mVocabSizePadded + vi;
+                auto const dstIdx = bi * mVocabSizePadded + vi;
+                outLogits[dstIdx] = inLogits[srcIdx];
+            }
+        }
+
         for (size_t bi = 0; bi < mBatchSize; ++bi)
         {
             auto const batchSlot = batchSlotsPtr[bi];
-            float temperature = temperatures[batchSlot];
+            auto temperature = temperatures[batchSlot];
             ASSERT_GT(temperature, 0.0f) << "temperature should be positive but got " << temperature;
             for (size_t j = 0; j < mVocabSizePadded; ++j)
             {
                 size_t index = bi * mVocabSizePadded + j;
-                float logit = static_cast<float>(logits[index]);
+                auto logit = static_cast<float>(outLogits[index]);
                 if (j < mVocabSize && bias != nullptr)
                 {
-                    logit += static_cast<float>(bias[j]);
+                    logit += static_cast<float>(bias[batchSlot * mVocabSizePadded + j]);
                 }
-                logits[index] = j < mVocabSize ? static_cast<T>(logit / temperature) : -MAX_T_VAL;
+                outLogits[index] = j < mVocabSize ? static_cast<T>(logit / temperature) : -MAX_T_VAL;
             }
         }
     }
@@ -190,20 +213,21 @@ public:
     {
         subsetup(param);
         // Do test
-        InvokeBatchApplyPenaltyParams<T> penalty_params{bufferCast<T>(*mLogitsDevice), bufferCast<T>(*mBiasDevice),
+        InvokeBatchApplyPenaltyParams<T> penalty_params{reinterpret_cast<T**>(bufferCast<int64_t>(*mLogitsPtrs)),
+            bufferCast<T>(*mOutLogitsDevice), bufferCast<T>(*mBiasDevice),
             bufferCast<int32_t>(*mPenaltyWorkspaceDevice), nullptr, bufferCast<float>(*mTemperaturesDevice), nullptr,
             nullptr, nullptr, false, static_cast<size_t>(mBatchSize), 1, 1, static_cast<size_t>(mVocabSize),
             static_cast<size_t>(mVocabSizePadded), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
             bufferCast<int32_t>(*mBatchSlots), mStream->get()};
         tk::invokeBatchApplyPenalty(penalty_params);
-        auto logitsOutHost = mBufferManager->copyFrom(*mLogitsDevice, MemoryType::kCPU);
+        auto logitsOutHost = mBufferManager->copyFrom(*mOutLogitsDevice, MemoryType::kCPU);
 
         mStream->synchronize();
 
-        computeReference(bufferCast<T>(*mLogitsHost), bufferCast<T>(*mBiasHost), bufferCast<float>(*param.temperatures),
-            param.temperaturesSize);
+        computeReference(bufferCast<T>(*mLogitsHost), bufferCast<T>(*mLogitsRefHost), bufferCast<T>(*mBiasHost),
+            bufferCast<float>(*param.temperatures), param.temperaturesSize);
 
-        bool passed = checkResult(param.toString(), bufferCast<T>(*logitsOutHost), bufferCast<T>(*mLogitsHost),
+        bool passed = checkResult(param.toString(), bufferCast<T>(*logitsOutHost), bufferCast<T>(*mLogitsRefHost),
             mBatchSize * mVocabSizePadded);
         EXPECT_TRUE(passed);
     }
@@ -391,6 +415,9 @@ protected:
     using SamplingKernelTest<T>::mLogitsHost;
 
     TensorPtr mLogitsDevice;
+    TensorPtr mOutLogitsDevice;
+    TensorPtr mLogitsRefHost;
+    TensorPtr mLogitsPtrs;
     TensorPtr mPenaltyWorkspaceDevice;
 
     TensorPtr mOutputIdsHost;
@@ -412,6 +439,9 @@ protected:
 
     void subsetup(RepetitionPenaltyTestCase param)
     {
+        auto const dataType = TRTDataType<T>::value;
+        auto const ptrType = TRTDataType<T*>::value;
+
         mBatchSize = param.batchSize;
         mMaxBatchSize = 2 * mBatchSize;
         mVocabSize = param.vocabSize;
@@ -419,10 +449,11 @@ protected:
         mMaxInputLength = param.maxInputLength;
         mSequenceLength = 2 * mMaxInputLength; // input + output
 
-        mLogitsHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize, mVocabSizePadded}),
-            std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
-        mLogitsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSizePadded}),
-            std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
+        mLogitsHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize, mVocabSizePadded}), dataType);
+        mLogitsRefHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize, mVocabSizePadded}), dataType);
+        mLogitsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSizePadded}), dataType);
+        mOutLogitsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSizePadded}), dataType);
+        mLogitsPtrs = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), ptrType);
 
         mPenaltyWorkspaceDevice
             = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSize}), nvinfer1::DataType::kINT32);
@@ -438,8 +469,8 @@ protected:
         mContextLengthHost = mBufferManager->pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
         mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
 
-        mIdsPtrHost = mBufferManager->pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT64);
-        mIdsPtrDevice = mBufferManager->pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT64);
+        mIdsPtrHost = mBufferManager->pinned(ITensor::makeShape({mMaxBatchSize}), ptrType);
+        mIdsPtrDevice = mBufferManager->pinned(ITensor::makeShape({mMaxBatchSize}), ptrType);
 
         mBatchSlots = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
 
@@ -458,7 +489,7 @@ protected:
             bufferCast<int32_t>(*mContextLengthHost)[i] = bufferCast<int32_t>(*mSeqLengthHost)[i];
         }
 
-        auto idsPtrHostPtr = reinterpret_cast<void**>(bufferCast<int64_t>(*mIdsPtrHost));
+        auto idsPtrHostPtr = BufferRange<void*>(*mIdsPtrHost);
         auto outputIdsDevicePtr = bufferCast<int32_t>(*mOutputIdsDevice);
         for (SizeType bi = 0; bi < mMaxBatchSize; bi++)
         {
@@ -470,6 +501,12 @@ protected:
         mBufferManager->copy(*mContextLengthHost, *mContextLengthDevice);
         mBufferManager->copy(*mSeqLengthHost, *mSeqLengthDevice);
         mBufferManager->copy(*mIdsPtrHost, *mIdsPtrDevice);
+
+        auto logitsPtrs = BufferRange<T*>(*mLogitsPtrs);
+        for (SizeType bi = 0; bi < mBatchSize; ++bi)
+        {
+            logitsPtrs[bi] = bufferCast<T>(*mLogitsDevice) + (mBatchSize - bi - 1) * mVocabSizePadded;
+        }
 
         ASSERT_EQ(param.repetitionPenaltiesSize, mMaxBatchSize) << "Invalid test configuration.";
         ASSERT_EQ(param.presencePenaltiesSize, mMaxBatchSize) << "Invalid test configuration.";
@@ -485,12 +522,25 @@ protected:
         mBufferManager->copy(*param.frequencyPenalties, *mFrequencyPenaltiesDevice);
     }
 
-    void computeReference(T* logits, const int* outputIds, const int* sequenceLengths, const float* repetitionPenalties,
-        const float* presencePenalties, const float* frequencyPenalties, const int32_t repetitionPenaltiesSize,
-        const int32_t presencePenaltiesSize, const int32_t frequencyPenaltiesSize)
+    void computeReference(T const* const inLogits, T* const outLogits, int32_t const* const outputIds,
+        int32_t const* const sequenceLengths, float const* const repetitionPenalties,
+        float const* const presencePenalties, float const* const frequencyPenalties,
+        int32_t const repetitionPenaltiesSize, int32_t const presencePenaltiesSize,
+        int32_t const frequencyPenaltiesSize)
     {
         std::vector<bool> penalized(mVocabSize);
         auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
+
+        for (int32_t bi = 0; bi < mBatchSize; ++bi)
+        {
+            for (int32_t vi = 0; vi < mVocabSizePadded; ++vi)
+            {
+                auto const srcIdx = (mBatchSize - bi - 1) * mVocabSizePadded + vi;
+                auto const dstIdx = bi * mVocabSizePadded + vi;
+                outLogits[dstIdx] = inLogits[srcIdx];
+            }
+        }
+
         for (int32_t bi = 0; bi < mBatchSize; ++bi)
         {
             auto const batchSlot = batchSlotsPtr[bi];
@@ -501,18 +551,18 @@ protected:
 
             std::fill(penalized.begin(), penalized.end(), false);
             size_t offset = bi * mVocabSizePadded;
-            const auto step = sequenceLengths[batchSlot];
+            auto const step = sequenceLengths[batchSlot];
             for (int32_t t = 0; t < step; ++t)
             {
-                int tokenId = outputIds[batchSlot * mSequenceLength + t];
+                auto tokenId = outputIds[batchSlot * mSequenceLength + t];
                 if (!penalized[tokenId])
                 {
-                    float logit = static_cast<float>(logits[offset + tokenId]);
-                    logits[offset + tokenId] = static_cast<T>(
+                    auto logit = static_cast<float>(outLogits[offset + tokenId]);
+                    outLogits[offset + tokenId] = static_cast<T>(
                         (logit < 0.0f ? logit * repetitionPenalty : logit / repetitionPenalty) - presencePenalty);
                     penalized[tokenId] = true;
                 }
-                logits[offset + tokenId] -= frequencyPenalty;
+                outLogits[offset + tokenId] -= frequencyPenalty;
             }
         }
     }
@@ -521,26 +571,27 @@ public:
     void runTest(RepetitionPenaltyTestCase param)
     {
         subsetup(param);
-        InvokeBatchApplyPenaltyParams<T> penalty_params{bufferCast<T>(*mLogitsDevice), nullptr,
-            bufferCast<int32_t>(*mPenaltyWorkspaceDevice), nullptr, nullptr,
+        InvokeBatchApplyPenaltyParams<T> penalty_params{reinterpret_cast<T**>(bufferCast<int64_t>(*mLogitsPtrs)),
+            bufferCast<T>(*mOutLogitsDevice), nullptr, bufferCast<int32_t>(*mPenaltyWorkspaceDevice), nullptr, nullptr,
             bufferCast<float>(*mRepetitionPenaltiesDevice), bufferCast<float>(*mPresencePenaltiesDevice),
             bufferCast<float>(*mFrequencyPenaltiesDevice), true, static_cast<size_t>(mBatchSize), 1, mSequenceLength,
             static_cast<size_t>(mVocabSize), static_cast<size_t>(mVocabSizePadded),
-            reinterpret_cast<const int32_t**>(bufferCast<int64_t>(*mIdsPtrDevice)), nullptr,
+            reinterpret_cast<int32_t const**>(bufferCast<int64_t>(*mIdsPtrDevice)), nullptr,
             bufferCast<int32_t>(*mContextLengthDevice), bufferCast<int32_t>(*mSeqLengthDevice), nullptr, nullptr,
             bufferCast<int32_t>(*mBatchSlots), mStream->get()};
         tk::invokeBatchApplyPenalty(penalty_params);
 
-        auto logitsOutHost = mBufferManager->copyFrom(*mLogitsDevice, MemoryType::kCPU);
+        auto logitsOutHost = mBufferManager->copyFrom(*mOutLogitsDevice, MemoryType::kCPU);
 
-        computeReference(bufferCast<T>(*mLogitsHost), bufferCast<int32_t>(*mOutputIdsHost),
-            bufferCast<int32_t>(*mSeqLengthHost), bufferCast<float>(*param.repetitionPenalties),
-            bufferCast<float>(*param.presencePenalties), bufferCast<float>(*param.frequencyPenalties),
-            param.repetitionPenaltiesSize, param.presencePenaltiesSize, param.frequencyPenaltiesSize);
+        computeReference(bufferCast<T>(*mLogitsHost), bufferCast<T>(*mLogitsRefHost),
+            bufferCast<int32_t>(*mOutputIdsHost), bufferCast<int32_t>(*mSeqLengthHost),
+            bufferCast<float>(*param.repetitionPenalties), bufferCast<float>(*param.presencePenalties),
+            bufferCast<float>(*param.frequencyPenalties), param.repetitionPenaltiesSize, param.presencePenaltiesSize,
+            param.frequencyPenaltiesSize);
 
         mStream->synchronize();
 
-        bool passed = checkResult(param.toString(), bufferCast<T>(*logitsOutHost), bufferCast<T>(*mLogitsHost),
+        bool passed = checkResult(param.toString(), bufferCast<T>(*logitsOutHost), bufferCast<T>(*mLogitsRefHost),
             mBatchSize * mVocabSizePadded);
         EXPECT_TRUE(passed);
     }
@@ -932,6 +983,9 @@ protected:
     using SamplingKernelTest<T>::mLogitsHost;
 
     TensorPtr mLogitsDevice;
+    TensorPtr mOutLogitsDevice;
+    TensorPtr mLogitsRefHost;
+    TensorPtr mLogitsPtrs;
     TensorPtr mPenaltyWorkspaceDevice;
 
     TensorPtr mContextLengthHost;
@@ -950,6 +1004,9 @@ protected:
 
     void subsetup(MinLengthPenaltyTestParams param)
     {
+        auto const dataType = TRTDataType<T>::value;
+        auto const ptrType = TRTDataType<T*>::value;
+
         mBatchSize = param.batchSize;
         mMaxBatchSize = 2 * mBatchSize;
         mVocabSize = param.vocabSize;
@@ -957,10 +1014,11 @@ protected:
         mMaxInputLength = param.maxSeqLength;
         mSequenceLength = 2 * mMaxInputLength; // input + output
 
-        mLogitsHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize, mVocabSizePadded}),
-            std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
-        mLogitsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSizePadded}),
-            std::is_same_v<T, float> ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kHALF);
+        mLogitsHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize, mVocabSizePadded}), dataType);
+        mLogitsRefHost = mBufferManager->pinned(ITensor::makeShape({mBatchSize, mVocabSizePadded}), dataType);
+        mLogitsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSizePadded}), dataType);
+        mOutLogitsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSizePadded}), dataType);
+        mLogitsPtrs = mBufferManager->pinned(ITensor::makeShape({mBatchSize}), ptrType);
 
         mPenaltyWorkspaceDevice
             = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mVocabSize}), nvinfer1::DataType::kINT32);
@@ -1008,23 +1066,39 @@ protected:
         mBufferManager->copy(*mContextLengthHost, *mContextLengthDevice);
         mBufferManager->copy(*mSeqLengthHost, *mSeqLengthDevice);
         mBufferManager->copy(*mEndIdsHost, *mEndIdsDevice);
+
+        auto logitsPtrs = BufferRange<T*>(*mLogitsPtrs);
+        for (SizeType bi = 0; bi < mBatchSize; ++bi)
+        {
+            logitsPtrs[bi] = bufferCast<T>(*mLogitsDevice) + (mBatchSize - bi - 1) * mVocabSizePadded;
+        }
     }
 
-    void computeReference(
-        T* logits, const int* minSeqLen, const int* endIds, const int* sequenceLengths, const int* contextLengths)
+    void computeReference(T const* const inLogits, T* const outLogits, int32_t const* const minSeqLen,
+        int32_t const* const endIds, int32_t const* const sequenceLengths, int32_t const* const contextLengths)
     {
-        const bool IS_FP16 = std::is_same<T, half>::value;
-        const T MAX_T_VAL = (IS_FP16) ? 65504.F : FLT_MAX;
+        bool const IS_FP16 = std::is_same<T, half>::value;
+        T const MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
         auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
 
         for (int32_t bi = 0; bi < mBatchSize; ++bi)
         {
+            for (int32_t vi = 0; vi < mVocabSizePadded; ++vi)
+            {
+                auto const srcIdx = (mBatchSize - bi - 1) * mVocabSizePadded + vi;
+                auto const dstIdx = bi * mVocabSizePadded + vi;
+                outLogits[dstIdx] = inLogits[srcIdx];
+            }
+        }
+
+        for (int32_t bi = 0; bi < mBatchSize; ++bi)
+        {
             auto const batchSlot = batchSlotsPtr[bi];
-            const auto generatedSeqLen = sequenceLengths[batchSlot] - contextLengths[batchSlot];
-            const auto endId = endIds[batchSlot];
+            auto const generatedSeqLen = sequenceLengths[batchSlot] - contextLengths[batchSlot];
+            auto const endId = endIds[batchSlot];
             if (generatedSeqLen < minSeqLen[batchSlot])
             {
-                logits[bi * mVocabSizePadded + endId] = -MAX_T_VAL;
+                outLogits[bi * mVocabSizePadded + endId] = -MAX_T_VAL;
             }
         }
     }
@@ -1033,25 +1107,26 @@ public:
     void runTest(MinLengthPenaltyTestParams param)
     {
         subsetup(param);
-        InvokeBatchApplyPenaltyParams<T> penalty_params{bufferCast<T>(*mLogitsDevice), nullptr,
-            bufferCast<int32_t>(*mPenaltyWorkspaceDevice), nullptr, nullptr, nullptr, nullptr, nullptr, false,
-            static_cast<size_t>(mBatchSize), 1, mSequenceLength, static_cast<size_t>(mVocabSize),
-            static_cast<size_t>(mVocabSizePadded), nullptr, nullptr, bufferCast<int32_t>(*mContextLengthDevice),
-            bufferCast<int32_t>(*mSeqLengthDevice), bufferCast<int32_t>(*mMinLengthDevice),
-            bufferCast<int32_t>(*mEndIdsDevice), bufferCast<int32_t>(*mBatchSlots), mStream->get()};
+        InvokeBatchApplyPenaltyParams<T> penalty_params{reinterpret_cast<T**>(bufferCast<int64_t>(*mLogitsPtrs)),
+            bufferCast<T>(*mOutLogitsDevice), nullptr, bufferCast<int32_t>(*mPenaltyWorkspaceDevice), nullptr, nullptr,
+            nullptr, nullptr, nullptr, false, static_cast<size_t>(mBatchSize), 1, mSequenceLength,
+            static_cast<size_t>(mVocabSize), static_cast<size_t>(mVocabSizePadded), nullptr, nullptr,
+            bufferCast<int32_t>(*mContextLengthDevice), bufferCast<int32_t>(*mSeqLengthDevice),
+            bufferCast<int32_t>(*mMinLengthDevice), bufferCast<int32_t>(*mEndIdsDevice),
+            bufferCast<int32_t>(*mBatchSlots), mStream->get()};
         tk::invokeBatchApplyPenalty(penalty_params);
 
         mStream->synchronize();
 
-        computeReference(bufferCast<T>(*mLogitsHost), bufferCast<int32_t>(*mMinLengthHost),
-            bufferCast<int32_t>(*mEndIdsHost), bufferCast<int32_t>(*mSeqLengthHost),
-            bufferCast<int32_t>(*mContextLengthHost));
+        computeReference(bufferCast<T>(*mLogitsHost), bufferCast<T>(*mLogitsRefHost),
+            bufferCast<int32_t>(*mMinLengthHost), bufferCast<int32_t>(*mEndIdsHost),
+            bufferCast<int32_t>(*mSeqLengthHost), bufferCast<int32_t>(*mContextLengthHost));
 
-        auto logitsOutHost = mBufferManager->copyFrom(*mLogitsDevice, MemoryType::kCPU);
+        auto logitsOutHost = mBufferManager->copyFrom(*mOutLogitsDevice, MemoryType::kCPU);
 
         mStream->synchronize();
 
-        bool passed = checkResult(param.toString(), bufferCast<T>(*logitsOutHost), bufferCast<T>(*mLogitsHost),
+        bool passed = checkResult(param.toString(), bufferCast<T>(*logitsOutHost), bufferCast<T>(*mLogitsRefHost),
             mBatchSize * mVocabSizePadded);
         EXPECT_TRUE(passed);
     }

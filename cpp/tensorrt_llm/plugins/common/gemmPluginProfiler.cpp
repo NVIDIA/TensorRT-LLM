@@ -160,6 +160,7 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
     }
 
     const int mRounded = std::min(nextPowerOfTwo(m), MAX_PROFILE_M);
+    fflush(stdout);
     return mMNKProfileMap->getMProfileMap(gemmId)->at(mRounded);
 }
 

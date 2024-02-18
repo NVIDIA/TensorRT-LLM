@@ -75,6 +75,7 @@ def generate(model_name, batch_size, beam_width):
 
     model_config = ModelConfig(
         max_batch_size=build_config.max_batch_size,
+        max_beam_width=build_config.max_beam_width,
         vocab_size=pretrained_config.vocab_size,
         num_layers=pretrained_config.num_hidden_layers,
         num_heads=num_heads,

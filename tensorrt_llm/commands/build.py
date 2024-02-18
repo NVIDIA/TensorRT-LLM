@@ -26,7 +26,7 @@ import safetensors
 import torch
 
 from .._common import check_max_num_tokens
-from .._utils import str_dtype_to_torch
+from .._utils import str_dtype_to_torch, str_dtype_to_trt
 from ..builder import BuildConfig, Builder
 from ..graph_rewriting import optimize
 from ..logger import logger
@@ -62,6 +62,9 @@ def parse_arguments():
         help=
         'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
     )
+    parser.add_argument('--enable_debug_output',
+                        default=False,
+                        action='store_true')
     parser.add_argument(
         '--output_dir',
         type=str,
@@ -116,6 +119,13 @@ def parse_arguments():
                         type=str,
                         default=None,
                         choices=['int8', 'int4'])
+    parser.add_argument(
+        '--max_draft_len',
+        type=int,
+        default=0,
+        help=
+        'Maximum lengths of draft tokens for speculative decoding target model.'
+    )
 
     plugin_config_parser = parser.add_argument_group("plugin_config")
     add_plugin_argument(plugin_config_parser)
@@ -128,11 +138,15 @@ def parse_arguments():
     return args
 
 
-def build_model(model: PretrainedModel, build_config: BuildConfig) -> Engine:
+def build_model(model: PretrainedModel,
+                build_config: BuildConfig,
+                use_refit: bool = False) -> Engine:
     builder = Builder()
     builder_config = builder.create_builder_config(
         precision=model.config.dtype,
-        int8=model.config.quant_mode.has_act_or_weight_quant()
+        use_refit=use_refit,
+        int8=(model.config.quant_mode.has_act_or_weight_quant()
+              and not model.config.quant_mode.has_per_group_scaling())
         or model.config.quant_mode.has_int8_kv_cache(),
         strongly_typed=build_config.strongly_typed,
         opt_level=build_config.builder_opt,
@@ -144,6 +158,8 @@ def build_model(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         if hasattr(model.config, 'hf_modules_to_trtllm_modules') else [],
         trtllm_modules_to_hf_modules=model.config.lora_target_modules
         if hasattr(model.config, 'trtllm_modules_to_hf_modules') else [],
+        max_lora_rank=model.config.max_lora_rank if hasattr(
+            model.config, 'max_lora_rank') else 64,
     )
 
     network = builder.create_network()
@@ -184,13 +200,16 @@ def build_model(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             max_num_tokens=build_config.max_num_tokens,
             prompt_embedding_table_size=build_config.
             max_prompt_embedding_table_size,
-            max_draft_len=model.config.max_medusa_token_len if hasattr(
-                model.config, 'max_medusa_token_len') else 0,
+            max_draft_len=build_config.max_draft_len,
             gather_context_logits=build_config.gather_context_logits,
             gather_generation_logits=build_config.gather_generation_logits,
             lora_target_modules=model.config.lora_target_modules if hasattr(
                 model.config, 'lora_target_modules') else [])
         model(**inputs)
+
+        if build_config.enable_debug_output:
+            for k, v in model.named_network_outputs():
+                network._mark_output(v, k, str_dtype_to_trt(model.config.dtype))
 
     optimize(network)
 
@@ -261,19 +280,23 @@ def build(build_config: BuildConfig,
             logger.warning(
                 f"Cannot find {model_path}. Use dummy model weights.")
 
+    is_checkpoint_pruned = getattr(rank_config, 'is_pruned', False)
     if weights is not None:
         preprocess_weights(weights, rank_config)
-        model.load(weights)
+        model.load(weights, is_checkpoint_pruned)
 
     if model.config.quant_kwargs[
             'quant_algo'] == 'FP8' or model.config.quant_kwargs[
                 'kv_cache_quant_algo'] == 'FP8':
         build_config.strongly_typed = True
 
+    if hasattr(model.config, 'max_medusa_token_len'):
+        build_config.max_draft_len = model.config.max_medusa_token_len
+
     use_fused_mlp = kwargs.pop('use_fused_mlp', False)
     model = optimize_model(model, use_fused_mlp=use_fused_mlp)
 
-    return build_model(model, build_config)
+    return build_model(model, build_config, use_refit=is_checkpoint_pruned)
 
 
 def preprocess_weights(
@@ -283,7 +306,7 @@ def preprocess_weights(
     kv_cache_quant_algo = model_config.quant_kwargs['kv_cache_quant_algo']
 
     # INT4_AWQ
-    if quant_algo == 'W4A16_AWQ':
+    if quant_algo == 'W4A8_AWQ' or quant_algo == 'W4A16_AWQ':
         preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
         for name, param in weights.items():
             if 'weight' in name and param.dtype == torch.int8:
@@ -474,6 +497,8 @@ def main():
                 'strongly_typed': args.strongly_typed,
                 'builder_opt': args.builder_opt,
                 'profiling_verbosity': args.profiling_verbosity,
+                'enable_debug_output': args.enable_debug_output,
+                'max_draft_len': args.max_draft_len,
             },
             plugin_config=plugin_config)
     else:

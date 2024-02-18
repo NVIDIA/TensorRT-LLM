@@ -31,6 +31,7 @@ set(SRCS
     iTensor.cpp
     ipcUtils.cpp
     memoryCounters.cpp
+    medusaModule.cpp
     ncclCommunicator.cpp
     promptTuningParams.cpp
     runtimeBuffers.cpp

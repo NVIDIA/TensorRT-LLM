@@ -346,8 +346,12 @@ class Builder():
         # Rename weights
         if network.named_parameters is not None:
             for name, param in network.named_parameters:
-                if param._get_weights(
-                ) is None or not network.trt_network.set_weights_name(
+                if param._get_weights() is None:
+                    logger.info(
+                        f"Parameter {name} {param.raw_value.shape} {param.raw_value.dtype} was not materialized to TRT network"
+                    )
+                    continue
+                if not network.trt_network.set_weights_name(
                         param._get_weights(), name):
                     raise RuntimeError(f'Failed to set weight: {name}')
 
@@ -405,7 +409,9 @@ class BuildConfig:
     gather_generation_logits: int = False
     strongly_typed: bool = False
     builder_opt: Optional[int] = None
-    profiling_verbosity: str = "layer_names_only"
+    profiling_verbosity: str = 'layer_names_only'
+    enable_debug_output: bool = False
+    max_draft_len: int = 0
     plugin_config: PluginConfig = PluginConfig()
 
     @classmethod
@@ -422,7 +428,9 @@ class BuildConfig:
         strongly_typed = config.pop('strongly_typed', False)
         builder_opt = config.pop('builder_opt', None)
         profiling_verbosity = config.pop('profiling_verbosity',
-                                         "layer_names_only")
+                                         'layer_names_only')
+        enable_debug_output = config.pop('enable_debug_output', False)
+        max_draft_len = config.pop('max_draft_len', 0)
 
         if plugin_config is None:
             plugin_config = PluginConfig()
@@ -440,6 +448,8 @@ class BuildConfig:
             strongly_typed=strongly_typed,
             builder_opt=builder_opt,
             profiling_verbosity=profiling_verbosity,
+            enable_debug_output=enable_debug_output,
+            max_draft_len=max_draft_len,
             plugin_config=plugin_config)
 
     @classmethod

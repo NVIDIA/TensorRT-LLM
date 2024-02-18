@@ -109,6 +109,7 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     vocab_size = builder_config['vocab_size']
     num_layers = builder_config['num_layers']
     max_batch_size = builder_config['max_batch_size']
+    max_beam_width = builder_config['max_beam_width']
 
     cross_attention = builder_config.get('cross_attention', False)
     has_position_embedding = builder_config.get('has_position_embedding', True)
@@ -125,7 +126,7 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         'hf_modules_to_trtllm_modules')
     lora_trtllm_modules_to_hf_modules = builder_config.get(
         'trtllm_modules_to_hf_modules')
-    max_medusa_token_len = builder_config.get('max_medusa_token_len', 0)
+    max_medusa_token_len = builder_config.get('max_draft_len', 0)
     num_medusa_heads = builder_config.get('num_medusa_heads', 0)
 
     plugin_config = config['plugin_config']
@@ -140,6 +141,7 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
 
     model_config = ModelConfig(
         max_batch_size=max_batch_size,
+        max_beam_width=max_beam_width,
         vocab_size=vocab_size,
         num_layers=num_layers,
         num_heads=num_heads,
@@ -415,6 +417,7 @@ class ModelRunner(ModelRunnerMixin):
 
             model_config = ModelConfig(
                 max_batch_size=build_config.max_batch_size,
+                max_beam_width=build_config.max_beam_width,
                 vocab_size=pretrained_config.vocab_size,
                 num_layers=pretrained_config.num_hidden_layers,
                 num_heads=num_heads,
@@ -445,8 +448,8 @@ class ModelRunner(ModelRunnerMixin):
                 trtllm_modules_to_hf_modules=pretrained_config.
                 trtllm_modules_to_hf_modules if hasattr(
                     pretrained_config, 'trtllm_modules_to_hf_modules') else [],
-                max_medusa_tokens=pretrained_config.max_medusa_token_len
-                if hasattr(pretrained_config, 'max_medusa_token_len') else 0,
+                max_medusa_tokens=pretrained_config.max_draft_len if hasattr(
+                    pretrained_config, 'max_draft_len') else 0,
                 num_medusa_heads=pretrained_config.num_medusa_heads if hasattr(
                     pretrained_config, 'num_medusa_heads') else 0)
             max_batch_size = build_config.max_batch_size
@@ -489,11 +492,11 @@ class ModelRunner(ModelRunnerMixin):
         else:
             lora_manager = None
 
-        return cls(session,
-                   max_batch_size,
-                   max_input_len,
-                   max_input_len + max_output_len,
-                   max_beam_width,
+        return cls(session=session,
+                   max_batch_size=max_batch_size,
+                   max_input_len=max_input_len,
+                   max_seq_len=max_input_len + max_output_len,
+                   max_beam_width=max_beam_width,
                    lora_manager=lora_manager)
 
     @property

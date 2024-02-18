@@ -19,6 +19,7 @@
 
 #include <memory>
 
+#include "tensorrt_llm/layers/samplingLayer.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
 #include "tensorrt_llm/layers/topPSamplingLayer.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -39,6 +40,41 @@
 namespace tensorrt_llm::tests::layers::sampling
 {
 
+constexpr float EPSILON = 1e-20f;
+
+template <typename T>
+void computeProb(T* probs, const T* logits, int batchSize, int vocabSize)
+{
+    // Compute the log probability from logits.
+    //   logits = batchSize x vocabSize.
+    //   probs =  softmax(logits) (softmax along with vocab dimension)
+    // float is used for either T=float or half, since operations of half are
+    // not fully supported in a host function.
+    for (int bidx = 0; bidx < batchSize; ++bidx)
+    {
+        float maxval = -FLT_MAX;
+        for (int i = 0; i < vocabSize; ++i)
+        {
+            float logit = static_cast<float>(logits[bidx * vocabSize + i]);
+            if (logit > maxval)
+            {
+                maxval = logit;
+            }
+        }
+        float sum = 0.0f;
+        for (int i = 0; i < vocabSize; ++i)
+        {
+            sum += expf(static_cast<float>(logits[bidx * vocabSize + i]) - maxval);
+        }
+        for (int i = 0; i < vocabSize; ++i)
+        {
+            int idx = bidx * vocabSize + i;
+            float logit = static_cast<float>(logits[idx]) - maxval;
+            probs[idx] = static_cast<T>(expf(logit) / (sum + EPSILON));
+        }
+    }
+}
+
 struct SamplingParams
 {
     std::vector<uint32_t> topKs;
@@ -55,10 +91,11 @@ struct SamplingParams
 };
 
 template <typename T>
-class SamplingLayerTest : public testing::Test
+class BaseSamplingLayerTest : public testing::Test
 {
 protected:
     using TensorPtr = tensorrt_llm::runtime::ITensor::SharedPtr;
+    using BufferPtr = tensorrt_llm::runtime::IBuffer::SharedPtr;
 
     int32_t seed = 0;
     const static uint64_t mMaxSeed = 32;
@@ -74,8 +111,9 @@ protected:
     int32_t const mMaxSeqLen = mMaxInputLen + mMaxOutputLen;
     int32_t mEndId = mVocabSize;
 
+    bool mComputeProbs = false;
+
     TensorPtr mLogitsDevice;
-    TensorPtr mPenaltyWorkspaceDevice;
     TensorPtr mContextLengthDevice;
     TensorPtr mSeqLengthsDevice;
     TensorPtr mFinishedDevice;
@@ -89,6 +127,10 @@ protected:
 
     TensorPtr mCumLogProbsDevice;
 
+    TensorPtr mCurandStatesDevice;
+    TensorPtr mPenaltyWorkspaceDevice;
+    BufferPtr mSamplingWorkspaceDevice;
+
     const tensorrt_llm::common::DataType data_type = tensorrt_llm::common::getTensorType<T>();
 
     // Order is important because we pass mAllocator to mSamplingLayer and it is used in destructor
@@ -100,6 +142,8 @@ protected:
     std::vector<T> mTestLogitsInit;
 
     void setup(uint64_t seed, SamplingParams const& params);
+
+    virtual void initLayer(SamplingParams const& params) = 0;
 
     typename tensorrt_llm::layers::BaseSamplingLayer<T>::ForwardParams createInputTensors(int32_t step);
 

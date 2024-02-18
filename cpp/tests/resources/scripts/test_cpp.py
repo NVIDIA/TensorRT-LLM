@@ -102,6 +102,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
               run_gptj=False,
               run_llama=False,
               run_chatglm=False,
+              run_medusa=False,
               run_fp8=False,
               only_multi_gpu=False,
               trt_root: _tp.Optional[str] = None,
@@ -158,6 +159,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                                 run_gptj=run_gptj,
                                 run_llama=run_llama,
                                 run_chatglm=run_chatglm,
+                                run_medusa=run_medusa,
                                 run_fp8=run_fp8)
 
         if build_only:
@@ -168,6 +170,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                              run_gptj=run_gptj,
                              run_llama=run_llama,
                              run_chatglm=run_chatglm,
+                             run_medusa=run_medusa,
                              run_fp8=run_fp8)
 
         if run_gpt:
@@ -198,6 +201,7 @@ def prepare_all_model_tests(python_exe: str,
                             run_gptj=False,
                             run_llama=False,
                             run_chatglm=False,
+                            run_medusa=False,
                             run_fp8=False):
     model_cache_arg = ["--model_cache", model_cache] if model_cache else []
 
@@ -244,6 +248,15 @@ def prepare_all_model_tests(python_exe: str,
                             model_cache_arg=model_cache_arg)
     else:
         _log.info("Skipping ChatGLM tests")
+
+    if run_medusa:
+        prepare_model_tests(model_name="medusa",
+                            python_exe=python_exe,
+                            root_dir=root_dir,
+                            resources_dir=resources_dir,
+                            model_cache_arg=model_cache_arg)
+    else:
+        _log.info("Skipping Medusa tests")
 
 
 def prepare_multi_gpu_model_tests(python_exe: str,
@@ -313,12 +326,13 @@ def run_unit_tests(build_dir: _pl.Path):
     excluded_tests.append("Gptj")
     excluded_tests.append("Llama")
     excluded_tests.append("ChatGlm")
+    excluded_tests.append("Medusa")
     ctest.extend(["-E", "|".join(excluded_tests)])
     run_command(ctest, cwd=build_dir, env=cpp_env, timeout=1800)
 
 
 def run_single_gpu_tests(build_dir: _pl.Path, run_gpt, run_gptj, run_llama,
-                         run_chatglm, run_fp8):
+                         run_chatglm, run_medusa, run_fp8):
     build_tests(build_dir=build_dir)
 
     cpp_env = {**_os.environ}
@@ -336,6 +350,8 @@ def run_single_gpu_tests(build_dir: _pl.Path, run_gpt, run_gptj, run_llama,
         included_tests.append("Llama")
     if run_chatglm:
         included_tests.append("ChatGlm")
+    if run_medusa:
+        included_tests.append("Medusa")
 
     excluded_tests = []
     if not run_fp8:
@@ -425,6 +441,15 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
         ]
         run_command(benchmark, cwd=root_dir, timeout=600)
 
+    benchmark = [
+        str(benchmark_exe_dir / "gptManagerBenchmark"), "--model", "gpt",
+        "--engine_dir",
+        str(gpt_engine_dir / "fp16-plugin-packed-paged" / "tp1-pp1-gpu"),
+        "--type", "IFB", "--static_emulated_batch_size", "50", "--dataset",
+        str(data_dir / "prepared_dummy_cnn.json")
+    ]
+    run_command(benchmark, cwd=root_dir)
+
 
 if __name__ == "__main__":
     _log.basicConfig(level=_log.INFO)
@@ -470,6 +495,9 @@ if __name__ == "__main__":
     parser.add_argument("--run_chatglm",
                         action="store_true",
                         help="Run the tests for ChatGLM")
+    parser.add_argument("--run_medusa",
+                        action="store_true",
+                        help="Run the tests for Medusa")
     parser.add_argument(
         "--run_fp8",
         action="store_true",

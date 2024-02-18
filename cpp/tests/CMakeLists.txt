@@ -71,6 +71,7 @@ add_gtest(runtimeKernelTest runtime/runtimeKernelTest.cpp)
 add_gtest(samplingTest runtime/samplingTest.cpp)
 add_gtest(iTensorTest runtime/iTensorTest.cpp)
 add_gtest(worldConfigTest runtime/worldConfigTest.cpp)
+add_gtest(medusaModuleTest runtime/medusaModuleTest.cpp)
 add_gtest(mixtureOfExpertsTest kernels/mixtureOfExpertsTest.cu)
 if(${BUILD_PYT})
   add_gtest(torchTest runtime/torchTest.cpp)
@@ -90,9 +91,10 @@ add_gtest(banRepeatNGramsKernelsTest kernels/banRepeatNGramsKernelsTest.cpp)
 add_gtest(stopCriteriaKernelsTest kernels/stopCriteriaKernelsTest.cpp)
 add_gtest(shiftKCacheKernelTest kernels/shiftKCacheKernelTest.cu)
 set(SAMPLING_LAYER_TEST_SRC
-    layers/samplingLayerTest.cpp layers/topKSamplingLayerTest.cpp
-    layers/topPSamplingLayerTest.cpp)
+    layers/baseSamplingLayerTest.cpp layers/samplingLayerTest.cpp
+    layers/topKSamplingLayerTest.cpp layers/topPSamplingLayerTest.cpp)
 add_gtest(samplingLayerTest "${SAMPLING_LAYER_TEST_SRC}")
+add_gtest(dynamicDecodeLayerTest layers/dynamicDecodeLayerTest.cpp)
 
 if(BUILD_BATCH_MANAGER)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)

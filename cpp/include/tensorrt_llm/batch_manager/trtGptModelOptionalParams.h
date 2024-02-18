@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/decodingMode.h"
 
 #include <optional>
 #include <vector>
@@ -35,13 +36,15 @@ public:
 
     explicit TrtGptModelOptionalParams(KvCacheConfig const& kvCacheConfig = KvCacheConfig{},
         bool enableTrtOverlap = false, std::optional<std::vector<SizeType>> const& deviceIds = std::nullopt,
-        bool normalizeLogProbs = true, bool logIterationData = false, bool enableChunkedContext = false)
+        bool normalizeLogProbs = true, bool logIterationData = false, bool enableChunkedContext = false,
+        std::optional<runtime::DecodingMode> const& decodingMode = std::nullopt)
         : kvCacheConfig{kvCacheConfig}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(deviceIds)
         , normalizeLogProbs{normalizeLogProbs}
         , logIterationData{logIterationData}
         , enableChunkedContext{enableChunkedContext}
+        , decodingMode{decodingMode}
     {
     }
 
@@ -51,6 +54,7 @@ public:
     bool normalizeLogProbs;
     bool logIterationData;
     bool enableChunkedContext;
+    std::optional<runtime::DecodingMode> decodingMode;
 };
 
 } // namespace tensorrt_llm::batch_manager

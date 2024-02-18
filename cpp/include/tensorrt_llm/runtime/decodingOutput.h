@@ -75,7 +75,7 @@ public:
                         // Set to true by decoding if any of the stop conditions are met or if DecodingInput.finished is
                         // true. In beam search and to determine whether to stop according to
                         // DecodingInput.sequenceLimitLength, on gpu
-    TensorPtr finishedSum; // [1], the sum of finished sequences, in pinned memory
+    TensorPtr finishedSum; // [batchSize], the sum of finished sequences per request, in pinned memory
 
     // mandatory parameters for beam search
     TensorPtr logProbs;         // [batchSize, beamWidth, maxSeqLen], must be float*, on gpu

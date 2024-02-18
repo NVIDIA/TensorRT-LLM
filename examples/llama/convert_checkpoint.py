@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import LlamaConfig, LlamaForCausalLM, LlamaTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.pytorch_utils import Conv1D
 
@@ -24,8 +24,7 @@ from tensorrt_llm._utils import pad_vocab_size
 from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.llama.weight import (load_from_fp8_llama,
-                                              load_from_gptq_llama,
+from tensorrt_llm.models.llama.weight import (load_from_gptq_llama,
                                               load_from_hf_checkpoint,
                                               load_from_meta_llama)
 from tensorrt_llm.models.modeling_utils import PretrainedConfig
@@ -817,18 +816,14 @@ def convert_hf_llama(hf_model,
     intermediate_size = hf_model.config.intermediate_size
     num_key_value_heads = hf_model.config.num_key_value_heads
     mha_mode = (num_key_value_heads == num_attention_heads)
-
-    layers_per_pipeline_stage = hf_model.config.num_hidden_layers // mapping.pp_size
-    layers_range = list(
-        range(mapping.pp_rank * layers_per_pipeline_stage,
-              (mapping.pp_rank + 1) * layers_per_pipeline_stage, 1))
+    layers_range = mapping.pp_layers(hf_model.config.num_hidden_layers)
 
     if moe_config and moe_config.has_moe():
         rank_experts = list(range(moe_config.num_experts))
         if moe_config.tp_mode == moe_config.ParallelismMode.EXPERT_PARALLEL:
             rank_experts = mapping.ep_experts(moe_config.num_experts)
 
-        for l in range(hf_model.config.num_hidden_layers):
+        for l in layers_range:
             for suffix in ["w1", "w2", "w3"]:
                 model_params[f'model.layers.{l}.block_sparse_moe.experts.{suffix}.weight'] = \
                             torch.stack(list(model_params[f'model.layers.{l}.block_sparse_moe.experts.{expert}.{suffix}.weight']
@@ -849,12 +844,9 @@ def convert_hf_llama(hf_model,
             model_params[
                 f'model.layers.{l}.block_sparse_moe.experts.w2.weight'] = w2
 
-    for l in range(hf_model.config.num_hidden_layers):
-        if l not in layers_range:
-            continue
+    for l in layers_range:
         prefix = f'model.layers.{l}.'
-        idx = int(l) - mapping.pp_rank * layers_per_pipeline_stage
-        tllm_prex = f'transformer.layers.{idx}.'
+        tllm_prex = f'transformer.layers.{l - layers_range[0]}.'
         q_weight = get_weight(model_params, prefix + 'self_attn.q_proj', dtype)
         k_weight = get_weight(model_params, prefix + 'self_attn.k_proj', dtype)
         v_weight = get_weight(model_params, prefix + 'self_attn.v_proj', dtype)
@@ -1203,7 +1195,8 @@ def main():
         os.makedirs(args.output_dir)
     hf_config = None
     if args.model_dir is not None:
-        hf_config = LlamaConfig.from_pretrained(args.model_dir)
+        hf_config = AutoConfig.from_pretrained(args.model_dir,
+                                               trust_remote_code=True)
         if hf_config.model_type == "llava":
             # LLaVA = Vision model + Llama LLM
             # We load a llava config and use its' text config as llama config
@@ -1330,12 +1323,6 @@ def main():
             'tp_size': args.tp_size,
             'pp_size': args.pp_size,
         },
-        "moe_config": {
-            "num_experts": args.moe_num_experts,
-            "top_k": args.moe_top_k,
-            "tp_mode": args.moe_tp_mode,
-            "normalization_mode": args.moe_renorm_mode
-        },
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
@@ -1377,12 +1364,9 @@ def main():
             else:
                 config['quantization'][
                     'quant_algo'] = 'W8A8_SQ_PER_TENSOR_PLUGIN'
-    elif args.enable_fp8:
-        config['quantization']['quant_algo'] = 'FP8'
+
     if args.int8_kv_cache:
         config['quantization']['kv_cache_quant_algo'] = 'INT8'
-    elif args.fp8_kv_cache:
-        config['quantization']['kv_cache_quant_algo'] = 'FP8'
 
     if args.weight_only_precision == 'int4_gptq':
         config['quantization'].update({
@@ -1415,18 +1399,11 @@ def main():
                 args.model_dir, torch_dtype="auto")
             model = hf_llava.language_model
         else:
-            hf_model = LlamaForCausalLM if args.model_type != "mixtral" else MixtralForCausalLM
-            model = hf_model.from_pretrained(
+            model = AutoModelForCausalLM.from_pretrained(
                 args.model_dir,
-                # device_map={
-                #     "model": "cpu",
-                #     "lm_head": "cpu",
-                #     "embed_tokens": "cpu",
-                #     "layers": "cpu",
-                #     "norm": "cpu",
-                # },  # Load to CPU memory
                 device_map='auto',
-                torch_dtype='auto',
+                torch_dtype='auto' if not args.smoothquant else torch.float16,
+                trust_remote_code=True,
             )
 
         if args.smoothquant is not None or args.int8_kv_cache:
@@ -1442,8 +1419,10 @@ def main():
 
             act_range = capture_activation_range(
                 model,
-                LlamaTokenizer.from_pretrained(args.model_dir,
-                                               padding_side='left'), dataset)
+                AutoTokenizer.from_pretrained(args.model_dir,
+                                              trust_remote_code=True,
+                                              use_fast=False,
+                                              padding_side='left'), dataset)
             if args.smoothquant is not None:
                 smooth_llama_model(model, act_range, args.smoothquant,
                                    llama_qkv_para, llama_smoother)
@@ -1471,12 +1450,6 @@ def main():
             weights = load_from_meta_llama(
                 args.meta_ckpt_dir, mapping,
                 PretrainedConfig.from_dict(copy.deepcopy(config)))
-
-            if args.enable_fp8 or args.fp8_kv_cache:
-                scales = load_from_fp8_llama(args.ammo_quant_ckpt_path,
-                                             args.n_layer, mapping,
-                                             args.fp8_kv_cache)
-                weights.update(scales)
 
         else:
             if args.load_by_shard:
@@ -1507,12 +1480,6 @@ def main():
                     smoother=convert_args['llama_smoother'],
                     moe_config=args.moe_config,
                     lora_config=args.lora_config)
-
-                if args.enable_fp8 or args.fp8_kv_cache:
-                    scales = load_from_fp8_llama(args.ammo_quant_ckpt_path,
-                                                 args.n_layer, mapping,
-                                                 args.fp8_kv_cache)
-                    weights.update(scales)
 
         safetensors.torch.save_file(
             weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,22 +31,22 @@ namespace kernels
 struct gatherTreeParam
 {
     // TODO rename the parameters
-    int* beams = nullptr;              // [batchSize, beamWidth, maxSeqLen], workspace to put intermediate outputIds
-    int* sequenceLengths = nullptr;    // [batchSize, beamWidth], total lengths of each query
-    int maxSequenceLengthFinalStep = 0;
-    const int* inputLengths = nullptr; // [batchSize, beamWidth]
+    int32_t* beams = nullptr;              // [batchSize, beamWidth, maxSeqLen], workspace to put intermediate outputIds
+    int32_t* sequenceLengths = nullptr;    // [batchSize, beamWidth], total lengths of each query
+    int32_t maxSequenceLengthFinalStep = 0;
+    int32_t const* inputLengths = nullptr; // [batchSize, beamWidth]
     // response input lengths (used to slice the ids during postprocessing)
-    int* responseInputLengths = nullptr;
-    int maxSeqLen = 0;
-    int batchSize = 0;
-    int beamWidth = 0;
-    const int* stepIds = nullptr;   // [maxSeqLen, batchSize, beamWidth]
-    const int* parentIds = nullptr; // [maxSeqLen, batchSize, beamWidth]
-    const int* endTokens = nullptr; // [batchSize], end token ids of each query
-    int* outputIds = nullptr;       // the buffer to put finalized ids
+    int32_t* responseInputLengths = nullptr;
+    int32_t maxSeqLen = 0;
+    int32_t batchSize = 0;
+    int32_t beamWidth = 0;
+    int32_t const* stepIds = nullptr;   // [maxSeqLen, batchSize, beamWidth]
+    int32_t const* parentIds = nullptr; // [maxSeqLen, batchSize, beamWidth]
+    int32_t const* endTokens = nullptr; // [batchSize], end token ids of each query
+    int32_t* outputIds = nullptr;       // the buffer to put finalized ids
     cudaStream_t stream;
-    float* cumLogProbs = nullptr;   // [batchSize, beamWidth]
-    float lengthPenalty = 1.0f;     // on cpu
+    float* cumLogProbs = nullptr;       // [batchSize, beamWidth]
+    float lengthPenalty = 1.0f;         // on cpu
 };
 
 /*
@@ -54,15 +54,16 @@ Do gatherTree on beam search to get final result.
 */
 void invokeGatherTree(gatherTreeParam param);
 
-void invokeFinalize(int* outputIds, int* sequenceLengths, float* cumLogProbs, float* outputLogProbs,
-    const int* topKOutputIds, const int* topKSequenceLengths, const float* scores, const float* topKCumLogProbs,
-    const float* topKLogProbs, const int* numBeams, const int* inputLengths, const int beamWidth, const int maxSeqLen,
-    const int batchSize, cudaStream_t stream);
+void invokeFinalize(int32_t* outputIds, int32_t* sequenceLengths, float* cumLogProbs, float* outputLogProbs,
+    int32_t const* topKOutputIds, int32_t const* topKSequenceLengths, float const* scores, float const* topKCumLogProbs,
+    float const* topKLogProbs, int32_t const* numBeams, int32_t const* inputLengths, int32_t beamWidth,
+    int32_t maxSeqLen, int32_t batchSize, cudaStream_t stream);
 
-void invokeInitializeOutput(int* outputIds, const int* endIds, int batchBeam, int maxSeqLen, cudaStream_t stream);
+void invokeInitializeOutput(
+    int32_t* outputIds, const int32_t* endIds, int batchBeam, int maxSeqLen, cudaStream_t stream);
 
-void invokeCopyNextStepIds(int* nextStepIds, int** outputIdsPtr, const int* sequenceLengths, const int* batchSlots,
-    int batchSize, int beamWidth, int maxSeqLen, cudaStream_t stream);
+void invokeCopyNextStepIds(int32_t* nextStepIds, int32_t** outputIdsPtr, int32_t const* sequenceLengths,
+    int32_t const* batchSlots, int32_t batchSize, int32_t beamWidth, int32_t maxSeqLen, cudaStream_t stream);
 
 //! \brief Accepts or rejects draft tokens based on the equality of draft and target tokens
 //! for speculative decoding. Target token is accepted if targetToken == draftToken.
@@ -79,14 +80,17 @@ void invokeCopyNextStepIds(int* nextStepIds, int** outputIdsPtr, const int* sequ
 //! \param finished input buffer [maxDraftTokens + 1, batchSize] finished states at each decoding iteration
 //! \param finishedFinal output buffer [batchSize] finished states after accepting/rejecting tokens
 //! \param finishedSum output buffer [1] total number of requests in batch that finished the execution
-//! \param batchSize batch size
+//! \param batchSlots
+//! \param batchSize current batch size
+//! \param maxBatchSize maximum batch size
 //! \param beamWidth beam width
 //! \param maxSeqLen maximum sequence length
 //! \param maxDraftTokens maximum number of draft tokens
 //! \param stream stream
-void invokeAcceptDraftTokensByIds(const int* draftIds, const int* targetIds, const int* contextLengths,
-    const int* numsDraftTokens, int* sequenceLengths, const FinishedState* finished, FinishedState* finishedFinal,
-    int* finishedSum, int batchSize, int beamWidth, int maxSeqLen, int maxDraftTokens, cudaStream_t stream);
+void invokeAcceptDraftTokensByIds(int32_t const* draftIds, int32_t const* targetIds, int32_t const* contextLengths,
+    int32_t const* numsDraftTokens, int32_t* sequenceLengths, FinishedState const* finished,
+    FinishedState* finishedFinal, int32_t* finishedSum, int32_t const* batchSlots, int32_t batchSize,
+    int32_t maxBatchSize, int32_t beamWidth, int32_t maxSeqLen, int32_t maxDraftTokens, cudaStream_t stream);
 
 //! \brief Performs probabilistic acceptance of draft tokens based on their probability distributions.
 //! Corrects targetLogits for the next to the last accepted token
@@ -94,7 +98,8 @@ void invokeAcceptDraftTokensByIds(const int* draftIds, const int* targetIds, con
 //!
 //! \param draftLogits input/output buffer [draftTokens, batchSize, beamWidth, vocabSize].
 //! Initially contains token logits of the draft model.
-//! \param targetLogits input/output buffer [draftTokens+1, batchSize, beamWidth, vocabSize].
+//! \param targetLogits input/output buffer [batchSize][draftTokens+1, beamWidth, vocabSize].
+//! Vector of pointers to the logits.
 //! Initially contains token logits of the target model.
 //! It is modified in-place for next to the last accepted token such as
 //! P'(x) = norm(max(0, P_{n+1}(x) - Q_{n+1}(x))), where N < maxDraftTokens is number of accepted tokens.
@@ -107,7 +112,9 @@ void invokeAcceptDraftTokensByIds(const int* draftIds, const int* targetIds, con
 //! At each step sets to NOT_FINISHED if token is accepted or SKIP_DECODING if token is not accepted
 //! \param curandState input buffer [batchSize]. Curand states properly
 //! initialized using invokeCurandInitialize per request.
-//! \param batchSize batch size
+//! \param batchSlots
+//! \param batchSize current batch size
+//! \param maxBatchSize maximum batch size
 //! \param beamWidth beam width
 //! \param vocabSize unpadded vocab size
 //! \param vocabSizePadded padded vocab size
@@ -116,17 +123,18 @@ void invokeAcceptDraftTokensByIds(const int* draftIds, const int* targetIds, con
 //! \param constantThreshold threshold used to accept tokens if randomThreshold is false
 //! \param stream stream
 template <typename T>
-void acceptDraftTokensByLogits(T* draftLogits, T* targetLogits, T* draftProbs, T* targetProbs,
-    const int* numsDraftTokens, FinishedState* finished, curandState_t* curandState, int batchSize, int beamWidth,
-    int vocabSize, int vocabSizePadded, int maxDraftTokens, bool randomThreshold, float constantThreshold,
+void acceptDraftTokensByLogits(T* draftLogits, T** targetLogits, T* draftProbs, T* targetProbs,
+    int32_t const* numsDraftTokens, FinishedState* finished, curandState_t* curandState, int32_t const* batchSlots,
+    int32_t batchSize, int32_t maxBatchSize, int32_t beamWidth, int32_t vocabSize, int32_t vocabSizePadded,
+    int32_t maxDraftTokens, bool randomThreshold, float constantThreshold, cudaStream_t stream);
+
+void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_tiled, int32_t const* sequence_lengths,
+    int32_t const* batchSlots, int32_t batch_size, int32_t beam_width, int32_t max_seq_len, cudaStream_t stream);
+
+void invokeAcceptTokens(int32_t const* draft_tokens, int32_t const* target_tokens, int32_t const* context_lengths,
+    int32_t const* nums_draft_tokens, int32_t* sequence_lengths, bool const* finished, bool* finished_final,
+    int32_t* finished_sum, int32_t batch_size, int32_t beam_width, int32_t max_seq_len, int32_t max_draft_tokens,
     cudaStream_t stream);
-
-void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_tiled, const int* sequence_lengths,
-    const int* batchSlots, int batch_size, int beam_width, int max_seq_len, cudaStream_t stream);
-
-void invokeAcceptTokens(const int* draft_tokens, const int* target_tokens, const int* context_lengths,
-    const int* nums_draft_tokens, int* sequence_lengths, const bool* finished, bool* finished_final, int* finished_sum,
-    int batch_size, int beam_width, int max_seq_len, int max_draft_tokens, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

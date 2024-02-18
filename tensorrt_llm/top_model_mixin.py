@@ -216,6 +216,7 @@ class TopModelMixin:
             self.tokenizer = tokenizer
 
         if getattr(self, 'runner', None) is None:
+            rank = mpi_rank()
             if engine_dir is not None:  # read from the engine_dir, use ModelRunner
                 assert Path(engine_dir).exists(
                 ), f"Invalid engine_dir argument, the path does not exist {engine_dir}"
@@ -223,6 +224,7 @@ class TopModelMixin:
                     Path(engine_dir) / "config.json")
                 self.runner = ModelRunner.from_dir(
                     engine_dir=engine_dir,
+                    rank=rank,
                     lora_dir=getattr(self, 'lora_dir', None),
                     lora_ckpt_source=getattr(self, "lora_ckpt_source", 'hf'))
             else:
@@ -244,7 +246,6 @@ class TopModelMixin:
                 max_input_len = other_config.get('max_input_len')
                 max_output_len = other_config.get('max_output_len')
                 max_beam_width = other_config.get('max_beam_width')
-                rank = mpi_rank()
                 runtime_mapping = Mapping(world_size=world_size,
                                           rank=rank,
                                           tp_size=tp_size,
@@ -261,9 +262,14 @@ class TopModelMixin:
                         model_config=model_config,
                         runtime_mapping=runtime_mapping,
                         ckpt_source=self.lora_ckpt_source)
-                self.runner = ModelRunner(session, max_batch_size,
-                                          max_input_len, max_output_len,
-                                          max_beam_width, lora_manager)
+                self.runner = ModelRunner(
+                    session=session,
+                    max_batch_size=max_batch_size,
+                    max_input_len=max_input_len,
+                    max_seq_len=max_input_len + max_output_len,
+                    max_beam_width=max_beam_width,
+                    lora_manager=lora_manager,
+                )
         assert self.runner is not None
 
         tokenizer = self.tokenizer

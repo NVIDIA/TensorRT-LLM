@@ -134,9 +134,8 @@ __global__ void ban_repeat_ngram(T* logits, const int** output_ids_buf, const Fi
 
 template <typename T>
 void invokeBanRepeatNgram(T* logits, const int** output_ids_buf, const FinishedState* finished_buf,
-    const int** parent_ids_buf, const int* batch_slot, const int* sequence_lengths, int batch_size,
-    int local_batch_size, int beam_width, int max_seq_len, const int* no_repeat_ngram_size_buf, int vocab_size_padded,
-    size_t max_step, cudaStream_t stream)
+    const int** parent_ids_buf, const int* batch_slot, const int* sequence_lengths, int batch_size, int beam_width,
+    int max_seq_len, const int* no_repeat_ngram_size_buf, int vocab_size_padded, size_t max_step, cudaStream_t stream)
 {
     // each input in the local batch can have different no_repeat_ngram_size. Use max for shmem allocation
     // getting the max of current batch and allocate shmem as needed is ideal. But here the ngram_buf is on GPU, while
@@ -149,7 +148,7 @@ void invokeBanRepeatNgram(T* logits, const int** output_ids_buf, const FinishedS
     constexpr size_t max_blocks{256};
     block.x = min(((max_step + 32 - 1) / 32) * 32, max_blocks);
     grid.x = (max_step + block.x - 1) / block.x;
-    grid.y = local_batch_size * beam_width;
+    grid.y = batch_size * beam_width;
 
     // dynamically allocate shared memory of int[blockDim + 2*(ngram_size - 1)], where ngram_size - 1 is for boundary
     // token's ngram and for most recent tokens
@@ -162,8 +161,8 @@ void invokeBanRepeatNgram(T* logits, const int** output_ids_buf, const FinishedS
 #define INVOKE_BAN_REPEAT_NGRAM(T)                                                                                     \
     template void invokeBanRepeatNgram(T* logits, const int** output_ids_buf, const FinishedState* finished_buf,       \
         const int** parent_ids_buf, const int* batch_slot, const int* sequence_lengths, int batch_size,                \
-        int local_batch_size, int beam_width, int max_seq_len, const int* no_repeat_ngram_size_buf,                    \
-        int vocab_size_padded, size_t max_step, cudaStream_t stream);
+        int beam_width, int max_seq_len, const int* no_repeat_ngram_size_buf, int vocab_size_padded, size_t max_step,  \
+        cudaStream_t stream);
 
 INVOKE_BAN_REPEAT_NGRAM(float)
 INVOKE_BAN_REPEAT_NGRAM(half)

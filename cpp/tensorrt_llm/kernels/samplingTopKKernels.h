@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2024, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,7 +34,7 @@ namespace kernels
 //! buffer.
 //! \param workspaceSize size of the workspace in bytes
 //! \param logProbs input buffer [batchSize x vocabSizePadded].
-//! Log probabilities of each token in the vocab. If cumLogProbs or outputLogProbs are specified,
+//! Log probabilities of each token in the vocab. If logitsHasProbs is true,
 //! logProbs must contain **just** probabilities instead of log probabilities.
 //! \param outputIds output buffer [maxBatchSize][maxSeqLen]. Contains pointers to rows with output tokens per request
 //! \param sequenceLength input/output buffer [maxBatchSize]. Current sequence length of the request up to, but excluding endId token
@@ -61,13 +61,14 @@ namespace kernels
 //! \param batchSize batch size
 //! \param skipDecode input buffer [maxBatchSize]. Flags whether to skip decoding per request
 //! \param normalizeLogProbs when set to True outputLogProbs are normalized to TopK
+//! \param logitsHasProbs flag to highlight that logProbs contains probabilities
 // clang-format on
 template <typename T>
 void invokeBatchTopKSampling(void* workspace, size_t& workspaceSize, const T* logProbs, int** ids, int* sequenceLengths,
     const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     curandState_t* curandstate, const int maxTopK, const int* topKs, const float topP, const float* topPs,
     const int vocabSizePadded, const int* endIds, const int* batchSlots, cudaStream_t stream, const int batchSize,
-    const bool* skipDecode, const bool normalizeLogProbs);
+    const bool* skipDecode, const bool normalizeLogProbs, const bool logitsHasProbs);
 
 //! \brief Specialization of invokeBatchTopKSampling with topPs=nullptr and topKs=nullptr
 template <typename T>
@@ -75,24 +76,7 @@ void invokeTopKSampling(void* workspace, size_t& workspaceSize, const T* logProb
     const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     curandState_t* curandstate, const int topK, const float topP, const int vocabSizePadded, const int* endIds,
     const int* batchSlots, cudaStream_t stream, const int batchSize, const bool* skipDecode,
-    const bool normalizeLogProbs);
-
-//! \brief Applies mask and bias to logits. Sets -MAX_FLT value for tokens in range [vocabSize; vocabSizePadded) to
-//! prevent them being chosen If request finished the generation, sets MAX_FLT to endId token and -MAX_FLT to all other
-//! tokens forcing to choose endId token. Otherwise, adds bias per token if bias pointer is not nullptr.
-//!
-//! \param logits input/output buffer [batchSize, vocabSize]. Logits to be modified.
-//! \param bias input buffer [vocabSize]. Bias to logit per token. Ignored if nullptr
-//! \param endIds input buffer [maxBatchSize]. EOS token ids per request
-//! \param finished input buffer [maxBatchSize] with flags set to true if request has finished the generation
-//! \param batchSlots input buffer[batchSize], optional. Indices of rows of data in memory pool
-//! \param batchSize batch size
-//! \param vocabSize unpadded vocab size
-//! \param vocabSizePadded padded vocab size
-//! \param stream stream
-template <typename T>
-void invokeAddBiasEndMask(T* logits, const T* bias, const int* endIds, const FinishedState* finished,
-    const int* batchSlots, const int batchSize, const int vocabSize, const int vocabSizePadded, cudaStream_t stream);
+    const bool normalizeLogProbs, const bool logitsHasProbs);
 
 } // namespace kernels
 } // namespace tensorrt_llm

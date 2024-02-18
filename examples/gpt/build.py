@@ -744,6 +744,7 @@ def build(rank, args):
             quant_mode=args.quant_mode,
             use_parallel_embedding=args.use_parallel_embedding,
             lora_target_modules=args.lora_target_modules,
+            max_lora_rank=args.max_lora_rank,
         )
 
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.world_size,

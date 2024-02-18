@@ -19,6 +19,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/runtime/decodingMode.h"
 #include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tensorrt_llm/runtime/iStatefulGptDecoder.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -39,8 +40,9 @@ public:
     StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabSizePadded, CudaStreamPtr stream);
 
     //! Setup the decoder before calling `forward()`
-    void setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow, SizeType sinkTokenLength,
-        SizeType maxSequenceLength, SizeType maxTokensPerStep, nvinfer1::DataType dtype) override;
+    void setup(DecodingMode const& mode, SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow,
+        SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep, bool fusedDecoder,
+        nvinfer1::DataType dtype) override;
 
     //! @brief Initialize the decoder with new batch of inputs.
     void newBatch(
@@ -94,7 +96,7 @@ public:
     //! @returns [1], number of finished sequences, in pinned host memory
     [[nodiscard]] TensorPtr getNbFinished() const override
     {
-        return mDecodingOutput->finishedSum;
+        return mFinishedSum;
     }
 
 private:
@@ -114,6 +116,8 @@ private:
     using DecodingOutputPtr = std::unique_ptr<DecodingOutput>;
     DecodingOutputPtr mDecodingOutput;
     CudaEvent mDecodedEvent{};
+
+    TensorPtr mFinishedSum;
 
     SizeType mNbSteps;
     SizeType mMaxSequenceLength{};

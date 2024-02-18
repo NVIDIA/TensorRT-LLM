@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -101,15 +101,13 @@ void OnlineBeamSearchLayer<T>::setup(size_t batch_size, SetupParams const& setup
     BaseBeamSearchLayer<T>::setupBase(batch_size, setupParams);
     allocateBuffer(batch_size);
 
-    mDiversityRate = setupParams.beam_search_diversity_rate.value_or(std::vector<float>(0.0f));
-    mLengthPenalty = setupParams.length_penalty.value_or(std::vector<float>(0.0f));
+    mDiversityRate.resize(batch_size);
+    mLengthPenalty.resize(batch_size);
 
-    FillBuffers const fillBuffers{batch_size, mStream};
+    FillBuffers const fillBuffers{batch_size, batch_size, mStream};
 
-    fillBuffers(setupParams.beam_search_diversity_rate, 0.0f, mDiversityRate, diversity_rates_buf_, (float*) nullptr,
-        (int*) nullptr);
-    fillBuffers(
-        setupParams.length_penalty, 0.0f, mLengthPenalty, length_penalties_buf_, (float*) nullptr, (int*) nullptr);
+    fillBuffers(setupParams.beam_search_diversity_rate, 0.0f, mDiversityRate, diversity_rates_buf_, (int*) nullptr);
+    fillBuffers(setupParams.length_penalty, 0.0f, mLengthPenalty, length_penalties_buf_, (int*) nullptr);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 

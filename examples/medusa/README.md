@@ -5,7 +5,7 @@ This document shows how to build and run a model using Medusa decoding([`Github`
 ## Overview
 Different from other models, Medusa decoding need a base model and Medusa heads.
 
-The TensorRT-LLM Medusa Decoding implementation can be found in [tensorrt_llm/models/medusa/model.py](../../tensorrt_llm/models/medusa/model.py), which actually adds MedusaHeads to a base mode.
+The TensorRT-LLM Medusa Decoding implementation can be found in [tensorrt_llm/models/medusa/model.py](../../tensorrt_llm/models/medusa/model.py), which actually adds MedusaHeads to a base model.
 
 ## Support Matrix
   * GPU Compute Capability >= 8.0 (Ampere or newer)
@@ -16,7 +16,7 @@ The TensorRT-LLM Medusa Decoding implementation can be found in [tensorrt_llm/mo
 
 ## Usage
 The TensorRT-LLM Medusa example code is located in [`examples/medusa`](./). There is one [`convert_checkpoint.py`](./convert_checkpoint.py) file to convert and build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run models with Medusa decoding support.
-In our example, we use the model from huggingface [`FasterDecoding/medusa-vicuna-7b-v1.3`](https://huggingface.co/FasterDecoding/medusa-vicuna-7b-v1.3), which is a LLAMA based mode. So the `build.py` also depends on `../llama/build.py` for the base model.
+In our example, we use the model from huggingface [`FasterDecoding/medusa-vicuna-7b-v1.3`](https://huggingface.co/FasterDecoding/medusa-vicuna-7b-v1.3), which is a LLAMA based model.
 
 ### Build TensorRT engine(s)
 Get the weights by downloading base model [`vicuna-7b-v1.3`](https://huggingface.co/lmsys/vicuna-7b-v1.3) and Medusa Heads [`medusa-vicuna-7b-v1.3`](https://huggingface.co/FasterDecoding/medusa-vicuna-7b-v1.3) from HF.
@@ -29,7 +29,7 @@ git clone https://huggingface.co/lmsys/vicuna-7b-v1.3
 https://huggingface.co/FasterDecoding/medusa-vicuna-7b-v1.3
 ```
 
-We use `convert_checkpoint.py` script to convert the model for Medusa decoding into tensorrt llm checkpoint format.
+We use `convert_checkpoint.py` script to convert the model for Medusa decoding into TensorRT-LLM checkpoint format.
 Here we also add `--fixed_num_medusa_heads 4` as `medusa_num_heads` is 2 in `config.json` of `medusa-vicuna-7b-v1.3` but it actually has 4.
 
 Here is the example:
@@ -45,6 +45,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_medusa \
              --output_dir ./tmp/medusa/7B/trt_engines/fp16/1-gpu/ \
              --gemm_plugin float16 \
              --max_batch_size 8
+
 # Convert and Build Medusa decoding support for vicuna-13b-v1.3 with 4-way tensor parallelism.
 python convert_checkpoint.py --model_dir ./vicuna-7b-v1.3 \
                             --medusa_model_dir medusa-vicuna-7b-v1.3 \
@@ -53,6 +54,7 @@ python convert_checkpoint.py --model_dir ./vicuna-7b-v1.3 \
                             --fixed_num_medusa_heads 4 \
                             --tp_size 4 \
                             --workers 4
+
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_medusa \
              --output_dir ./tmp/medusa/7B/trt_engines/fp16/1-gpu/ \
              --gemm_plugin float16 \
@@ -90,8 +92,7 @@ mpirun -np 4 --allow-run-as-root --oversubscribe \
 
 And you will see output like this if run successfully:
 ```text
-/usr/local/lib/python3.10/dist-packages/tensorrt_llm/runtime/generation.py:2126: UserWarning: The PyTorch API of nested tensors is in prototype stage and will change in the near future. (Triggered internally at /opt/pytorch/pytorch/aten/src/ATen/NestedTensorImpl.cpp:178.)
-  torch.nested.nested_tensor(next_main_tokens, dtype=torch.int32),
+......
 Input [Text 0]: "<s> Once upon"
 Output [Text 0 Beam 0]: "a time, there was a young girl who loved to read. She would spend hours in the library, devouring books of all genres. She had a special love for fairy tales, and would often dream of living in a magical world where she could meet princes and princesses, and have adventures with talking animals.
 One day, while she was reading a book, she came across a passage that spoke to her heart. It said, "You are the author of"

@@ -1221,6 +1221,7 @@ if __name__ == '__main__':
         'num_key_value_heads': hf_config.num_attention_heads,
         'hidden_act': hf_config.hidden_act,
         'intermediate_size': hf_config.intermediate_size,
+        'norm_epsilon': hf_config.rms_norm_eps,
         'position_embedding_type': position_embedding_type,
         'quantization': {
             'quant_algo': quant_algo,
@@ -1267,10 +1268,6 @@ if __name__ == '__main__':
                                              args.per_token,
                                              args.calibrate_kv_cache, act_range,
                                              baichuan_smoother)
-            for k in weights.keys():
-                print(k)
-                print(weights[k])
-                print("-------------------------------------")
         elif args.use_weight_only and args.weight_only_precision == 'int4_gptq':
             weights = convert_baichuan_gptq(hf_config,
                                             args.quant_ckpt_path,

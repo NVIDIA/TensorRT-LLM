@@ -28,7 +28,7 @@ namespace cutlass_kernels
 
 std::vector<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> get_candidate_configs(int sm,
     const bool is_weight_only, const bool simt_configs_only, const bool int8_configs_only = false,
-    const int max_split_k = 1);
+    const int max_split_k = 1, const bool enable_hopper_gmma = false);
 
 tensorrt_llm::cutlass_extensions::CutlassGemmConfig estimate_best_config_from_occupancies(
     const std::vector<tensorrt_llm::cutlass_extensions::CutlassGemmConfig>& candidate_configs,

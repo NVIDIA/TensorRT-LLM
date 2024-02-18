@@ -23,8 +23,7 @@ import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.llama.weight import (load_from_fp8_llama,
-                                              load_from_gptq_llama,
+from tensorrt_llm.models.llama.weight import (load_from_gptq_llama,
                                               load_from_hf_checkpoint)
 from tensorrt_llm.models.modeling_utils import PretrainedConfig
 
@@ -116,17 +115,7 @@ def parse_arguments():
         'By default, we use a single static scaling factor to scale weights in the int4 range. '
         'per_group chooses at run time, and for each group, a custom scaling factor. '
         'The flag is built for GPTQ/AWQ quantization.')
-    parser.add_argument(
-        '--enable_fp8',
-        default=False,
-        action='store_true',
-        help='Use FP8 Linear layer for Attention QKV/Dense and MLP.')
-    parser.add_argument(
-        '--fp8_kv_cache',
-        default=False,
-        action="store_true",
-        help='By default, we use dtype for KV cache. fp8_kv_cache chooses int8 '
-        'quantization for KV')
+
     parser.add_argument('--load_by_shard',
                         action='store_true',
                         help='Load a pretrained model shard-by-shard.')
@@ -188,15 +177,6 @@ def parse_arguments():
         default=1,
         help='The number of workers for converting checkpoint in parallel')
 
-    parser.add_argument(
-        '--use_fused_mlp',
-        default=False,
-        action='store_true',
-        help=
-        'Enable horizontal fusion in GatedMLP, reduces layer input traffic and potentially improves performance. '
-        'For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded '
-        '(0.45734 vs 0.45755 for LLaMA-v2 7B using ammo/examples/hf/instruct_eval/mmlu.py).'
-    )
     parser.add_argument('--enable_pos_shift',
                         default=False,
                         action='store_true',
@@ -704,7 +684,6 @@ def get_tllm_linear_sq_weight(vals,
             cur_weights = cur_weights.reshape(hidden_dim, -1)
         results[prefix +
                 'weight'] = torch.from_numpy(cur_weights).t().contiguous()
-        # 'weight'] = torch.from_numpy(cur_weights).t().contiguous()
 
         cur_per_channel_value = vals["scale_y_accum_quant"]
 
@@ -1177,10 +1156,9 @@ if __name__ == '__main__':
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
         'use_prompt_tuning': args.use_prompt_tuning,
-        'use_fused_mlp': args.use_fused_mlp,
         'enable_pos_shift': args.enable_pos_shift,
         'dense_context_fmha': args.dense_context_fmha,
-        'max_medusa_token_len': args.max_medusa_token_len,
+        'max_draft_len': args.max_medusa_token_len,
         'num_medusa_heads': args.num_medusa_heads,
         'num_medusa_layers': args.num_medusa_layers
     }
@@ -1205,12 +1183,9 @@ if __name__ == '__main__':
             else:
                 config['quantization'][
                     'quant_algo'] = 'W8A8_SQ_PER_TENSOR_PLUGIN'
-    elif args.enable_fp8:
-        config['quantization']['quant_algo'] = 'FP8'
+
     if args.int8_kv_cache:
         config['quantization']['kv_cache_quant_algo'] = 'INT8'
-    elif args.fp8_kv_cache:
-        config['quantization']['kv_cache_quant_algo'] = 'FP8'
 
     if args.weight_only_precision == 'int4_gptq':
         config['quantization'].update({
@@ -1358,12 +1333,6 @@ if __name__ == '__main__':
                                                     mapping,
                                                     dtype=args.dtype)
                     weights.update(medusa_weights)
-
-                if args.enable_fp8 or args.fp8_kv_cache:
-                    scales = load_from_fp8_llama(args.ammo_quant_ckpt_path,
-                                                 hf_config.num_hidden_layers,
-                                                 mapping, args.fp8_kv_cache)
-                    weights.update(scales)
 
         safetensors.torch.save_file(
             weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))

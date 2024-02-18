@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -310,6 +310,8 @@ void invokeBatchTopPSampling(void* workspace, size_t& workspaceSize, size_t& cub
     curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded, int const* endIds,
     float const maxTopP, float const* topPs, cudaStream_t stream, bool const* skipDecode, int const* batchSlots)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     int const vocabSize = vocabSizePadded;
 
     size_t sortedLogProbBufSize = batchSize * vocabSize * sizeof(T);  // type T
@@ -338,6 +340,7 @@ void invokeBatchTopPSampling(void* workspace, size_t& workspaceSize, size_t& cub
     // If the most probable token exceeds P, we skip sorting by setting beginOffsetBuf[bi] = offsetBuf[bi]
     topPBeamTopKKernel<T, BLOCK_SIZE><<<batchSize, BLOCK_SIZE, 0, stream>>>(logProbs, sortedIdVals, sortedLogProbs,
         finishedInput, vocabSize, offsetBuf, beginOffsetBuf, maxTopP, topPs, skipDecode, batchSlots);
+    sync_check_cuda_error();
 
     // Sort tokens by probability in descending order
     check_cuda_error(cub::DeviceSegmentedRadixSort::SortPairsDescending(cubTempStorage, cubTempStorageSize, logProbs,
@@ -352,6 +355,9 @@ void invokeBatchTopPSampling(void* workspace, size_t& workspaceSize, size_t& cub
     topPSsampling<T, SAMPLING_BLOCK_SIZE><<<grid, SAMPLING_BLOCK_SIZE, 0, stream>>>(sortedLogProbs, sortedIdVals,
         outputIds, sequenceLength, finishedInput, finishedOutput, cumLogProbs, outputLogProbs, beginOffsetBuf,
         offsetBuf + 1, vocabSize, curandstate, maxTopP, topPs, endIds, batchSize, skipDecode, batchSlots);
+    sync_check_cuda_error();
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template void invokeBatchTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize,

@@ -147,6 +147,39 @@ def test_quant_mode():
     assert _tb.QuantMode.none() == _tb.QuantMode.none()
 
 
+def test_decoding_mode():
+    assert _tb.DecodingMode.none().is_none
+    assert not _tb.DecodingMode.none().is_top_k
+    assert not _tb.DecodingMode.none().is_top_p
+    assert not _tb.DecodingMode.none().is_beam_search
+
+    assert _tb.DecodingMode.top_k().is_top_k
+    assert _tb.DecodingMode.top_k().is_top_k_or_top_p
+    assert not _tb.DecodingMode.top_k().is_top_p
+    assert not _tb.DecodingMode.top_k().is_top_k_and_top_p
+    assert not _tb.DecodingMode.top_k().is_none
+    assert not _tb.DecodingMode.top_k().is_beam_search
+
+    assert _tb.DecodingMode.top_p().is_top_p
+    assert _tb.DecodingMode.top_p().is_top_k_or_top_p
+    assert not _tb.DecodingMode.top_p().is_top_k
+    assert not _tb.DecodingMode.top_p().is_top_k_and_top_p
+    assert not _tb.DecodingMode.top_p().is_none
+    assert not _tb.DecodingMode.top_p().is_beam_search
+
+    assert _tb.DecodingMode.top_k_top_p().is_top_p
+    assert _tb.DecodingMode.top_k_top_p().is_top_k
+    assert _tb.DecodingMode.top_k_top_p().is_top_k_or_top_p
+    assert _tb.DecodingMode.top_k_top_p().is_top_k_and_top_p
+    assert not _tb.DecodingMode.top_k_top_p().is_none
+    assert not _tb.DecodingMode.top_k_top_p().is_beam_search
+
+    assert _tb.DecodingMode.beam_search().is_beam_search
+    assert not _tb.DecodingMode.beam_search().is_none
+    assert not _tb.DecodingMode.beam_search().is_top_k
+    assert not _tb.DecodingMode.beam_search().is_top_p
+
+
 def test_gpt_model_config():
     vocab_size = 10000
     num_layers = 12

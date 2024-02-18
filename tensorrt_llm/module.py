@@ -110,7 +110,11 @@ class Module(object):
                 memo.add(module)
                 yield name, module
 
-    def _named_members(self, get_members_fn, prefix='', recurse=True):
+    def _named_members(self,
+                       get_members_fn,
+                       prefix='',
+                       recurse=True,
+                       with_cls=False):
         memo = set()
         modules = self.named_modules(prefix=prefix) if recurse else [(prefix,
                                                                       self)]
@@ -121,7 +125,10 @@ class Module(object):
                     continue
                 memo.add(v)
                 name = module_prefix + ('.' if module_prefix else '') + k
-                yield name, v
+                if with_cls:
+                    yield name, module.__class__, v
+                else:
+                    yield name, v
 
     def parameter(self, recurse=True):
         for name, param in self.named_parameters():
@@ -131,6 +138,14 @@ class Module(object):
         gen = self._named_members(lambda module: module._parameters.items(),
                                   prefix=prefix,
                                   recurse=recurse)
+        for elem in gen:
+            yield elem
+
+    def named_parameters_with_cls(self, prefix='', recurse=True):
+        gen = self._named_members(lambda module: module._parameters.items(),
+                                  prefix=prefix,
+                                  recurse=recurse,
+                                  with_cls=True)
         for elem in gen:
             yield elem
 

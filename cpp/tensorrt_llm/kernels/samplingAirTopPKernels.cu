@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -301,7 +301,7 @@ __device__ void vectorizedProcess(size_t threadRank, size_t numThreads, T const*
 }
 
 /**
- * Fused filtering of the current pass and building histogram for the next pass (see steps 4 & 1 in `airTopPSsampling`
+ * Fused filtering of the current pass and building histogram for the next pass (see steps 4 & 1 in `airTopPSampling`
  * description).
  */
 template <typename T, typename IdxT, typename AccT, int BitsPerPass>
@@ -418,7 +418,7 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, IdxT const* i
 }
 
 /**
- *  Replace histogram with its own prefix sum (step 2 in `airTopPSsampling` description)
+ *  Replace histogram with its own prefix sum (step 2 in `airTopPSampling` description)
  */
 template <typename IdxT, int BitsPerPass, int BlockSize>
 __device__ void scan(volatile IdxT* histogram)
@@ -472,7 +472,7 @@ __device__ void scan(volatile IdxT* histogram)
 
 /**
  * Calculate in which bucket the k-th value will fall
- *  (steps 3 in `airTopPSsampling` description)
+ *  (steps 3 in `airTopPSampling` description)
  */
 template <typename T, typename IdxT, typename AccT, int BitsPerPass>
 __device__ void chooseBucket(
@@ -486,13 +486,17 @@ __device__ void chooseBucket(
 
         // one and only one thread will satisfy this condition, so counter is
         // written by only one thread
-        if ((prev < sum && cur >= sum) || (sum <= 0 && i == 0))
+        // Add strict check for negetive cases.
+        if ((sum > 0 && prev < sum && cur >= sum) || (sum <= 0 && prev == 0 && cur != 0))
         {
-            counter->sum = sum - prev;        // how many values still are there to find
-            counter->len = countHistogram[i]; // cur - prev; // number of values in next pass
-            typename cub::Traits<T>::UnsignedBits bucket = i;
-            int startBit = calcsStartBit<T, BitsPerPass>(pass);
-            counter->kthValueBits |= bucket << startBit;
+            if (countHistogram[i])                // Only check meaningful ones
+            {
+                counter->sum = sum - prev;        // how many values still are there to find
+                counter->len = countHistogram[i]; // cur - prev; // number of values in next pass
+                typename cub::Traits<T>::UnsignedBits bucket = i;
+                int startBit = calcsStartBit<T, BitsPerPass>(pass);
+                counter->kthValueBits |= bucket << startBit;
+            }
         }
     }
 }
@@ -533,7 +537,7 @@ __device__ void epilogue(T const value, IdxT const index, float* outputLogProbs,
 
 /**
  *  Find the target element.
- *  (steps 4 in `airTopPSsampling` description)
+ *  (steps 4 in `airTopPSampling` description)
  */
 template <typename T, typename IdxT, typename AccT, int BitsPerPass>
 __device__ void lastFilter(T const* inBuf, IdxT const* inIdxBuf, IdxT currentLen, Counter<T, IdxT, AccT>* counter,
@@ -603,7 +607,7 @@ __device__ void lastFilter(T const* inBuf, IdxT const* inIdxBuf, IdxT currentLen
  * their indices.
  */
 template <typename T, typename IdxT, typename AccT, int BitsPerPass, int BlockSize, bool is_fused_filter = false>
-__global__ void airTopPSsampling(Counter<T, IdxT, AccT>* counters, AccT* histograms, IdxT* countHistograms, IdxT** ids,
+__global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, AccT* histograms, IdxT* countHistograms, IdxT** ids,
     int* sequenceLengths, FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
     float* outputLogProbs, IdxT const* endIds, int const batchSize, bool const* skipDecode, int const pass, T* buf1,
     IdxT* idxBuf1, T* buf2, IdxT* idxBuf2, int32_t const* batchSlots)
@@ -697,6 +701,7 @@ __global__ void airTopPSsampling(Counter<T, IdxT, AccT>* counters, AccT* histogr
         earlyStop);
 
     __syncthreads();
+    __threadfence();
 
     bool isLastBlock = false;
     if (threadIdx.x == 0)
@@ -711,13 +716,42 @@ __global__ void airTopPSsampling(Counter<T, IdxT, AccT>* counters, AccT* histogr
         {
             return;
         }
+
+        __shared__ IdxT maxBucket;
+        if (pass > 0)
+        {
+            // Avoid the scenario where currentSum is larger than the meaningful maximum prefix sum.
+            // This situation happens because these two values are calculted in different ways.
+            // So the precision loss during the calculation is also different.
+
+            if (threadIdx.x == 0)
+            {
+                maxBucket = 0;
+            }
+            __syncthreads();
+            for (int i = threadIdx.x; i < numBuckets; i += blockDim.x)
+            {
+                if (countHistogram[i])
+                {
+                    atomicMax(&maxBucket, i);
+                }
+            }
+            __syncthreads();
+        }
+
         scan<AccT, BitsPerPass, BlockSize>(histogram);
         __syncthreads();
         if (pass == 0)
         {
             currentSum = histogram[numBuckets - 1] * counter->p;
         }
-        __syncthreads();
+        else
+        {
+            if (currentSum > histogram[maxBucket])
+            {
+                currentSum = histogram[maxBucket];
+            }
+        }
 
         chooseBucket<T, IdxT, AccT, BitsPerPass>(counter, histogram, countHistogram, currentSum, pass);
         __syncthreads();
@@ -818,7 +852,7 @@ unsigned calcAirTopPBlockNum(int batchSize, IdxT len, int smCnt)
 
     int activeBlocks;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &activeBlocks, airTopPSsampling<T, IdxT, AccT, BitsPerPass, BlockSize, false>, BlockSize, 0);
+        &activeBlocks, airTopPSampling<T, IdxT, AccT, BitsPerPass, BlockSize, false>, BlockSize, 0);
     activeBlocks *= smCnt;
 
     IdxT bestNumBlocks = 0;
@@ -909,13 +943,13 @@ void invokeBatchAirTopPSampling(void* workspace, size_t& workspaceSize, int** ou
     dim3 grid(blockNum, batchSize);
     // Sample with Top P given sorted tokens
     int constexpr numPasses = calcNumPasses<T, BitsPerPass>();
-    auto kernel = airTopPSsampling<T, IdxT, AccT, BitsPerPass, SAMPLING_BLOCK_SIZE, false>;
+    auto kernel = airTopPSampling<T, IdxT, AccT, BitsPerPass, SAMPLING_BLOCK_SIZE, false>;
 
     for (int pass = 0; pass < numPasses; ++pass)
     {
         if (pass == numPasses - 1)
         {
-            kernel = airTopPSsampling<T, IdxT, AccT, BitsPerPass, SAMPLING_BLOCK_SIZE, true>;
+            kernel = airTopPSampling<T, IdxT, AccT, BitsPerPass, SAMPLING_BLOCK_SIZE, true>;
         }
 
         kernel<<<grid, SAMPLING_BLOCK_SIZE, 0, stream>>>(counters, histograms, countHistograms, outputIds,

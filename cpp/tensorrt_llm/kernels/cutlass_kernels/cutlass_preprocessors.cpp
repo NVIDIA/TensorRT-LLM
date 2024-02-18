@@ -138,9 +138,13 @@ LayoutDetails getLayoutDetailsForTransform(QuantType quant_type)
     {
         return getLayoutDetailsForArch<cutlass::arch::Sm75>(quant_type);
     }
-    else if (arch >= 80 && arch <= 90)
+    else if (arch >= 80 && arch <= 89)
     {
         return getLayoutDetailsForArch<cutlass::arch::Sm80>(quant_type);
+    }
+    else if (arch == 90)
+    {
+        return getLayoutDetailsForArch<cutlass::arch::Sm90>(quant_type);
     }
     else
     {
@@ -532,6 +536,7 @@ void interleave_column_major_tensor(int8_t* interleaved_quantized_tensor, const 
 void preprocess_weights_for_mixed_gemm(int8_t* preprocessed_quantized_weight, const int8_t* row_major_quantized_weight,
     const std::vector<size_t>& shape, QuantType quant_type)
 {
+    const int arch = getSMVersion();
     LayoutDetails details = getLayoutDetailsForTransform(quant_type);
 
     TLLM_CHECK_WITH_INFO(shape.size() == 2 || shape.size() == 3, "Shape must be 2-D or 3-D");
@@ -551,7 +556,6 @@ void preprocess_weights_for_mixed_gemm(int8_t* preprocessed_quantized_weight, co
     // Works on row major data, so issue this permutation first.
     if (details.uses_imma_ldsm)
     {
-        const int arch = getSMVersion();
         permute_B_rows_for_mixed_gemm(dst_buf.data(), src_buf.data(), shape, quant_type, arch);
         src_buf.swap(dst_buf);
     }
@@ -568,7 +572,10 @@ void preprocess_weights_for_mixed_gemm(int8_t* preprocessed_quantized_weight, co
         src_buf.swap(dst_buf);
     }
 
-    add_bias_and_interleave_quantized_tensor_inplace(src_buf.data(), num_elts, quant_type);
+    if (arch >= 70 && arch < 90)
+    {
+        add_bias_and_interleave_quantized_tensor_inplace(src_buf.data(), num_elts, quant_type);
+    }
     std::copy(src_buf.begin(), src_buf.end(), preprocessed_quantized_weight);
 }
 

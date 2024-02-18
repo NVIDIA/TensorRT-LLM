@@ -48,6 +48,7 @@ template tensorrt_llm::common::Tensor convert_tensor<__nv_bfloat16>(torch::Tenso
 template tensorrt_llm::common::Tensor convert_tensor<int>(torch::Tensor tensor);
 template tensorrt_llm::common::Tensor convert_tensor<unsigned long long int>(torch::Tensor tensor);
 template tensorrt_llm::common::Tensor convert_tensor<unsigned int>(torch::Tensor tensor);
+template tensorrt_llm::common::Tensor convert_tensor<uint64_t>(torch::Tensor tensor);
 template tensorrt_llm::common::Tensor convert_tensor<bool>(torch::Tensor tensor);
 
 template <typename T>

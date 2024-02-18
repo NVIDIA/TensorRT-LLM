@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,60 +29,60 @@ namespace layers
 {
 
 //! \brief Layer to randomly sample tokens from TopP logits.
+//! Layer expects probs precomputed in "logits" tensor
 template <typename T>
 class TopPSamplingLayer : public BaseSamplingLayer<T>
 {
 public:
     using Base = BaseSamplingLayer<T>;
     using SetupParams = typename Base::SetupParams;
+    using ForwardParams = typename Base::ForwardParams;
 
     TopPSamplingLayer(std::size_t maxBatchSize, std::size_t vocabSize, std::size_t vocabSizePadded, cudaStream_t stream,
         std::shared_ptr<tensorrt_llm::common::IAllocator> allocator, cudaDeviceProp* prop, bool isDeterministic = true);
-    TopPSamplingLayer(TopPSamplingLayer<T> const& top_p_sampling_layer);
     ~TopPSamplingLayer();
 
-    void setup(std::size_t batchSize, int const* batch_slots, SetupParams const& setupParams) override;
+    void setup(std::size_t batchSize, int32_t const* batchSlots, SetupParams const& setupParams) override;
+    void forward(DecodingOutputParams& outputs, ForwardParams& inputs) override;
+
+    const bool* getSkipDecodeHost() const
+    {
+        return mSkipDecodeHost;
+    }
 
 protected:
-    void runSampling(DecodingOutputParams& outputs, DecodingParams const& inputs) override;
-    void freeBuffer() override;
+    uint32_t* mRuntimeTopKDevice = nullptr;
+    float* mRuntimeTopPDevice = nullptr;
+    float mRuntimeMaxTopP{0.f};
+    float* mInitialTopPDevice = nullptr;
+    float* mTopPDecayDevice = nullptr;
+    float* mTopPMinDevice = nullptr;
+    int32_t* mTopPResetIdsDevice = nullptr;
+    void* mSetupWorkspaceDevice = nullptr;
 
-protected:
-    uint32_t* runtime_top_k_buf_ = nullptr;
-    float* runtime_top_p_buf_ = nullptr;
-    float mRuntimeMaxTopP;
-    float* initial_top_p_buf_ = nullptr;
-    float* top_p_decay_buf_ = nullptr;
-    float* top_p_min_buf_ = nullptr;
-    int32_t* top_p_reset_ids_buf_ = nullptr;
-    void* setup_workspace_buf_ = nullptr;
-
-    int32_t* topp_id_vals_buf_ = nullptr;
-    int32_t* topp_offset_buf_ = nullptr;
-    int32_t* begin_topp_offset_buf_ = nullptr;
-    std::size_t cub_temp_storage_size_;
-    bool is_deterministic_ = true;
-    int air_topp_block_num_;
+    int32_t* mTopPIdValsDevice = nullptr;
+    int32_t* mTopPOffsetDevice = nullptr;
+    int32_t* mBeginTopPOffsetDevice = nullptr;
+    bool* mSkipDecodeDevice = nullptr;
+    bool* mSkipDecodeHost = nullptr;
+    size_t mCubTempStorageSize;
+    bool mIsDeterministic = true;
+    int mAirTopPBlockNum;
 
     using Base::mMaxBatchSize;
     using Base::mVocabSize;
     using Base::mVocabSizePadded;
 
     using Base::mSamplingWorkspaceSize;
-    using Base::mSamplingWorkspaceDevice;
-    using Base::mCurandStatesDevice;
-    using Base::mSkipDecodeDevice;
-    using Base::mSkipDecodeHost;
-    using Base::mSkipAny;
-    using Base::mRuntimeLogitsDevice;
+    using Base::mAllocatedSize;
 
     using Base::mStream;
     using Base::mAllocator;
-    using Base::mIsAllocateBuffer;
     using Base::mCudaDeviceProp;
 
 private:
     void allocateBuffer(std::size_t batchSize);
+    void freeBuffer();
 };
 
 } // namespace layers

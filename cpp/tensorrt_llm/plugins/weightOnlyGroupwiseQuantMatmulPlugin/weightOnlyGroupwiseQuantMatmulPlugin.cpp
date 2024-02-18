@@ -16,6 +16,7 @@
  */
 #include "weightOnlyGroupwiseQuantMatmulPlugin.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/enabled.h"
+#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/sm90/kernelLauncher.h"
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::common;
@@ -30,6 +31,7 @@ using tensorrt_llm::plugins::WeightOnlyGroupwiseQuantGemmPluginProfiler;
 static constexpr int BIAS = int(1) << 0;
 static constexpr int ZERO = int(1) << 1;
 static constexpr int PRE_QUANT_SCALE = int(1) << 2;
+static constexpr int FP8_ALPHA = int(1) << 3;
 using tensorrt_llm::plugins::read;
 using tensorrt_llm::plugins::write;
 
@@ -133,46 +135,97 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
     mQuantAlgo = quant_algo;
     mGroupSize = group_size;
 
-    // quant_algo = pre_quant_scale * 4 + zero * 2 + bias
+    // quant_algo = fp8_alpha * 8 + pre_quant_scale * 4 + zero * 2 + bias
     mPreQuantScaleInputIdx = (quant_algo & PRE_QUANT_SCALE) ? 1 : 0;
     mWeightInputIdx = mPreQuantScaleInputIdx + 1;
     mScalesInputIdx = mWeightInputIdx + 1;
     mZerosInputIdx = (quant_algo & ZERO) ? mScalesInputIdx + 1 : mScalesInputIdx;
     mBiasesInputIdx = (quant_algo & BIAS) ? mZerosInputIdx + 1 : mZerosInputIdx;
+    mAlphaInputIdx = (quant_algo & FP8_ALPHA) ? mBiasesInputIdx + 1 : mBiasesInputIdx;
 
     if (mType == nvinfer1::DataType::kHALF)
     {
-        if (quant_algo & ZERO)
+        if (quant_algo & FP8_ALPHA)
         {
-            // has zeros
-            m_weightOnlyGroupwiseGemmRunner
-                = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<half,
-                    cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS>>();
+            // Hopper style kernels
+            if (getSMVersion() < 90)
+            {
+                TLLM_THROW("W4A(fp)8 kernel is unsupported on pre-Hopper architectures!");
+            }
+            if (quant_algo & ZERO)
+            {
+                // has zeros
+                m_weightOnlyGroupwiseGemmRunner
+                    = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_fp8_e4m3,
+                        cutlass::int4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS, half, half, half>>();
+            }
+            else
+            {
+                // no zeros
+                m_weightOnlyGroupwiseGemmRunner
+                    = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_fp8_e4m3,
+                        cutlass::int4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, half, half, half>>();
+            }
         }
         else
         {
-            // no zeros
-            m_weightOnlyGroupwiseGemmRunner
-                = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<half,
-                    cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>>();
+            if (quant_algo & ZERO)
+            {
+                // has zeros
+                m_weightOnlyGroupwiseGemmRunner
+                    = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<half,
+                        cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS>>();
+            }
+            else
+            {
+                // no zeros
+                m_weightOnlyGroupwiseGemmRunner
+                    = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<half,
+                        cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>>();
+            }
         }
     }
 #if defined(ENABLE_BF16)
     else if (mType == nvinfer1::DataType::kBF16)
     {
-        if (quant_algo & ZERO)
+        if (quant_algo & FP8_ALPHA)
         {
-            // has zeros
-            m_weightOnlyGroupwiseGemmRunner
-                = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_bfloat16,
-                    cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS>>();
+            // Hopper style kernels
+            if (getSMVersion() < 90)
+            {
+                TLLM_THROW("FP8 is unsupported on pre-Hopper architectures!");
+            }
+            if (quant_algo & ZERO)
+            {
+                // has zeros
+                m_weightOnlyGroupwiseGemmRunner
+                    = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_fp8_e4m3,
+                        cutlass::int4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS, half, half, half>>();
+            }
+            else
+            {
+                // no zeros
+                m_weightOnlyGroupwiseGemmRunner
+                    = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_fp8_e4m3,
+                        cutlass::int4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, half, half, half>>();
+            }
         }
         else
         {
-            // no zeros
-            m_weightOnlyGroupwiseGemmRunner
-                = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_bfloat16,
-                    cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>>();
+            if (quant_algo & ZERO)
+            {
+                // has zeros
+                m_weightOnlyGroupwiseGemmRunner
+                    = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_bfloat16,
+                        cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS>>();
+            }
+            else
+            {
+                // no zeros
+                m_weightOnlyGroupwiseGemmRunner
+                    = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_bfloat16,
+                        cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>>();
+            }
         }
     }
 #endif
@@ -211,10 +264,11 @@ nvinfer1::DimsExprs WeightOnlyGroupwiseQuantMatmulPlugin::getOutputDimensions(
     //   3 scales           [K // group_size, N]
     //   4 zeros            [K // group_size, N] (optional)
     //   5 biases           [M] (optional)
+    //   6 alpha            [1] (optional)
 
     try
     {
-        TLLM_CHECK(nbInputs == mBiasesInputIdx + 1);
+        TLLM_CHECK(nbInputs == mAlphaInputIdx + 1);
         TLLM_CHECK(outputIndex == 0);
         const int nbDimsA = inputs[0].nbDims;
         const int nbDimsB = inputs[mWeightInputIdx].nbDims;
@@ -242,13 +296,17 @@ nvinfer1::DimsExprs WeightOnlyGroupwiseQuantMatmulPlugin::getOutputDimensions(
 bool WeightOnlyGroupwiseQuantMatmulPlugin::supportsFormatCombination(
     int pos, const nvinfer1::PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept
 {
-    if (pos < mBiasesInputIdx + 2)
+    if (pos < mAlphaInputIdx + 2)
     {
         if (pos == mWeightInputIdx)
         {
             // weights
             return inOut[mWeightInputIdx].type == nvinfer1::DataType::kHALF
                 && inOut[mWeightInputIdx].format == TensorFormat::kLINEAR;
+        }
+        else if ((mQuantAlgo & FP8_ALPHA) && pos == mAlphaInputIdx)
+        {
+            return inOut[pos].type == nvinfer1::DataType::kFLOAT && inOut[pos].format == TensorFormat::kLINEAR;
         }
         else
         {
@@ -305,6 +363,7 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
     //   3 scales           [K // group_size, N]
     //   4 zeros            [K // group_size, N]
     //   5 biases           [M]
+    //   6 alpha            [1]
     // outputs
     //   mat                [M, N]
 
@@ -321,6 +380,11 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
     const half* zeros_ptr = (mQuantAlgo & ZERO) ? reinterpret_cast<const half*>(inputs[mZerosInputIdx]) : nullptr;
     const half* biases_ptr = (mQuantAlgo & BIAS) ? reinterpret_cast<const half*>(inputs[mBiasesInputIdx]) : nullptr;
     const half* act_ptr = reinterpret_cast<const half*>(inputs[0]);
+    float alpha = 1.0;
+    if (mQuantAlgo & FP8_ALPHA)
+    {
+        cudaMemcpy(&alpha, const_cast<void*>(inputs[mAlphaInputIdx]), sizeof(float), cudaMemcpyDeviceToHost);
+    }
 
     if (use_pre_quant_scale && !use_cuda_kernel)
     {
@@ -328,16 +392,34 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
         act_ptr = reinterpret_cast<const half*>(workspace);
         if (mType == nvinfer1::DataType::kHALF)
         {
-            tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<half>(reinterpret_cast<half*>(workspace),
-                reinterpret_cast<const half*>(inputs[0]), reinterpret_cast<const half*>(inputs[mPreQuantScaleInputIdx]),
-                m, k, stream);
+            if (mQuantAlgo & FP8_ALPHA)
+            {
+                tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<half, __nv_fp8_e4m3>(
+                    reinterpret_cast<__nv_fp8_e4m3*>(workspace), reinterpret_cast<const half*>(inputs[0]),
+                    reinterpret_cast<const half*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
+            }
+            else
+            {
+                tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<half, half>(
+                    reinterpret_cast<half*>(workspace), reinterpret_cast<const half*>(inputs[0]),
+                    reinterpret_cast<const half*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
+            }
         }
 #if defined(ENABLE_BF16)
         else if (mType == nvinfer1::DataType::kBF16)
         {
-            tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<__nv_bfloat16>(
-                reinterpret_cast<__nv_bfloat16*>(workspace), reinterpret_cast<const __nv_bfloat16*>(inputs[0]),
-                reinterpret_cast<const __nv_bfloat16*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
+            if (mQuantAlgo & FP8_ALPHA)
+            {
+                tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<__nv_bfloat16, __nv_fp8_e4m3>(
+                    reinterpret_cast<__nv_fp8_e4m3*>(workspace), reinterpret_cast<const __nv_bfloat16*>(inputs[0]),
+                    reinterpret_cast<const __nv_bfloat16*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
+            }
+            else
+            {
+                tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<__nv_bfloat16, __nv_bfloat16>(
+                    reinterpret_cast<__nv_bfloat16*>(workspace), reinterpret_cast<const __nv_bfloat16*>(inputs[0]),
+                    reinterpret_cast<const __nv_bfloat16*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
+            }
         }
 #endif
     }
@@ -360,36 +442,82 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
     {
         weight_only_act_type = tensorrt_llm::kernels::WeightOnlyActivationType::BF16;
     }
-    if (use_cuda_kernel)
+
+    if (getSMVersion() == 90)
     {
-        // Use CUDA kernels for small batch size
-        // The CUDA kernel is designed for ColumnMajorTileInterleave weight layout used in fpAIntB cutlass kernel
-        // when sm >= 75 and the preprocessing of cutlass on sm70 does not interleave the weights.
-        const void* pre_quant_scale = nullptr;
-        if (use_pre_quant_scale)
-            pre_quant_scale = inputs[mPreQuantScaleInputIdx];
-        tensorrt_llm::kernels::WeightOnlyParams params{reinterpret_cast<const uint8_t*>(inputs[mWeightInputIdx]),
-            inputs[mScalesInputIdx], zeros_ptr, act_ptr, pre_quant_scale, biases_ptr, outputs[0], m, real_n, k,
-            mGroupSize, tensorrt_llm::kernels::WeightOnlyQuantType::Int4b,
-            tensorrt_llm::kernels::WeightOnlyType::GroupWise,
-            tensorrt_llm::kernels::WeightOnlyActivationFunctionType::Identity, weight_only_act_type};
-        tensorrt_llm::kernels::weight_only_batched_gemv_launcher(params, stream);
+        // Hopper style kernels
+        if (use_cuda_kernel)
+        {
+            // Use CUDA kernels for small batch size
+            // The CUDA kernel is designed for ColumnMajorTileInterleave weight layout used in fpAIntB cutlass kernel
+            // when sm >= 75 and the preprocessing of cutlass on sm70 does not interleave the weights.
+            const void* pre_quant_scale_ptr = nullptr;
+            if (use_pre_quant_scale)
+                pre_quant_scale_ptr = inputs[mPreQuantScaleInputIdx];
+            void* cuda_kernel_act_ptr = const_cast<void*>(reinterpret_cast<const void*>(inputs[0]));
+            void* cuda_kernel_act_scale_ptr = const_cast<void*>(reinterpret_cast<const void*>(pre_quant_scale_ptr));
+            void* cuda_kernel_weight_ptr = const_cast<void*>(reinterpret_cast<const void*>(inputs[mWeightInputIdx]));
+            void* cuda_kernel_scales_ptr = const_cast<void*>(reinterpret_cast<const void*>(inputs[mScalesInputIdx]));
+            void* cuda_kernel_zeros_ptr = const_cast<void*>(reinterpret_cast<const void*>(zeros_ptr));
+            void* cuda_kernel_bias_ptr = const_cast<void*>(reinterpret_cast<const void*>(biases_ptr));
+            void* cuda_kernel_out_ptr = const_cast<void*>(reinterpret_cast<const void*>(outputs[0]));
+
+            tensorrt_llm::kernels::weight_only::Params params{cuda_kernel_act_ptr, cuda_kernel_act_scale_ptr,
+                cuda_kernel_weight_ptr, cuda_kernel_scales_ptr, cuda_kernel_zeros_ptr, cuda_kernel_bias_ptr,
+                cuda_kernel_out_ptr, alpha, m, real_n, k, mGroupSize,
+                tensorrt_llm::kernels::weight_only::KernelType::W4A16};
+            tensorrt_llm::kernels::weight_only::kernel_launcher(params, stream);
+        }
+        else
+        {
+            // Use cutlass kernels for large batch size
+            const int ws_bytes = m_weightOnlyGroupwiseGemmRunner->getWorkspaceSize(m, n, k);
+
+            int32_t* weight_ptr = const_cast<int32_t*>(reinterpret_cast<const int32_t*>(inputs[mWeightInputIdx]));
+
+            const auto& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
+            TLLM_CHECK_WITH_INFO(bestTactic, "No valid weight only groupwise GEMM tactic");
+            m_weightOnlyGroupwiseGemmRunner->gemm(act_ptr, weight_ptr, inputs[mScalesInputIdx], zeros_ptr, biases_ptr,
+                alpha, outputs[0], m, real_n, k, mGroupSize, *bestTactic,
+                reinterpret_cast<char*>(workspace) + m * k * sizeof(half), ws_bytes, stream);
+        }
     }
     else
     {
-        // Use cutlass kernels for large batch size
-        const int ws_bytes = m_weightOnlyGroupwiseGemmRunner->getWorkspaceSize(m, n, k);
+        // Pre-Hopper architectures
+        if (use_cuda_kernel)
+        {
+            // Use CUDA kernels for small batch size
+            // The CUDA kernel is designed for ColumnMajorTileInterleave weight layout used in fpAIntB cutlass kernel
+            // when sm >= 75 and the preprocessing of cutlass on sm70 does not interleave the weights.
+            const void* pre_quant_scale = nullptr;
+            if (use_pre_quant_scale)
+                pre_quant_scale = inputs[mPreQuantScaleInputIdx];
+            tensorrt_llm::kernels::WeightOnlyParams params{reinterpret_cast<const uint8_t*>(inputs[mWeightInputIdx]),
+                inputs[mScalesInputIdx], zeros_ptr, act_ptr, pre_quant_scale, biases_ptr, outputs[0], m, real_n, k,
+                mGroupSize, tensorrt_llm::kernels::WeightOnlyQuantType::Int4b,
+                tensorrt_llm::kernels::WeightOnlyType::GroupWise,
+                tensorrt_llm::kernels::WeightOnlyActivationFunctionType::Identity, weight_only_act_type};
+            tensorrt_llm::kernels::weight_only_batched_gemv_launcher(params, stream);
+        }
+        else
+        {
+            // Use cutlass kernels for large batch size
+            const int ws_bytes = m_weightOnlyGroupwiseGemmRunner->getWorkspaceSize(m, n, k);
 
-        int32_t* weight_ptr = const_cast<int32_t*>(reinterpret_cast<const int32_t*>(inputs[mWeightInputIdx]));
+            int32_t* weight_ptr = const_cast<int32_t*>(reinterpret_cast<const int32_t*>(inputs[mWeightInputIdx]));
 
-        const auto& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
-        TLLM_CHECK_WITH_INFO(bestTactic,
-            "No valid weight only groupwise GEMM tactic(It is usually caused by the failure to execute all candidate "
-            "configurations of the CUTLASS kernel, please pay attention to the warning information when building the "
-            "engine.)");
-        m_weightOnlyGroupwiseGemmRunner->gemm(act_ptr, weight_ptr, inputs[mScalesInputIdx], zeros_ptr, biases_ptr,
-            outputs[0], m, real_n, k, mGroupSize, *bestTactic,
-            reinterpret_cast<char*>(workspace) + m * k * sizeof(half), ws_bytes, stream);
+            const auto& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
+            TLLM_CHECK_WITH_INFO(bestTactic,
+                "No valid weight only groupwise GEMM tactic(It is usually caused by the failure to execute all "
+                "candidate "
+                "configurations of the CUTLASS kernel, please pay attention to the warning information when building "
+                "the "
+                "engine.)");
+            m_weightOnlyGroupwiseGemmRunner->gemm(act_ptr, weight_ptr, inputs[mScalesInputIdx], zeros_ptr, biases_ptr,
+                outputs[0], m, real_n, k, mGroupSize, *bestTactic,
+                reinterpret_cast<char*>(workspace) + m * k * sizeof(half), ws_bytes, stream);
+        }
     }
 
     return 0;
@@ -430,9 +558,9 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::terminate() noexcept {}
 
 size_t WeightOnlyGroupwiseQuantMatmulPlugin::getSerializationSize() const noexcept
 {
-    return sizeof(int) +                                // mQuantAlgo
+    return sizeof(nvinfer1::DataType) +                 // mType
+        sizeof(int) +                                   // mQuantAlgo
         sizeof(int) +                                   // mGroupSize
-        sizeof(nvinfer1::DataType) +                    // mType
         sizeof(mDims) +                                 // Dimensions
         mPluginProfiler->getSerializationSize(mGemmId); // selected tactics container size
 }

@@ -72,6 +72,7 @@ def read_config(config_path: Path):
     head_size = builder_config["head_size"]
     vocab_size = builder_config["vocab_size"]
     max_batch_size = builder_config["max_batch_size"]
+    max_beam_width = builder_config["max_beam_width"]
     num_layers = builder_config["num_layers"]
     num_kv_heads = builder_config.get('num_kv_heads', num_heads)
 
@@ -99,6 +100,7 @@ def read_config(config_path: Path):
         hidden_size=hidden_size,
         head_size=head_size,
         max_batch_size=max_batch_size,
+        max_beam_width=max_beam_width,
         vocab_size=vocab_size,
         num_layers=num_layers,
         gpt_attention_plugin=use_gpt_attention_plugin,
@@ -311,7 +313,7 @@ class TRTLLMEncDecModel:
                 hidden_states_shape,
                 dtype=hidden_states_dtype('hidden_states_input'),
                 device=self.device).contiguous()
-        if attention_mask is not None:
+        if attention_mask is not None and not self.encoder_model_config.gpt_attention_plugin:
             inputs['attention_mask'] = attention_mask.contiguous()
 
         inputs['input_lengths'] = input_lengths

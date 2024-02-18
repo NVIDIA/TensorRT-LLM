@@ -295,7 +295,7 @@ class LLM:
         if not tokenizer:
             try:
                 tokenizer = ModelLoader.load_hf_tokenizer(self.config.model_dir)
-            except:
+            except Exception:
                 return None
 
         return SamplingConfig(
@@ -771,7 +771,7 @@ class ModelLoader:
 
             engine_dir = Path(engine_dir)
             if not engine_dir.exists():
-                engine_dir.mkdir()
+                engine_dir.mkdir(exist_ok=True)
             config_path = engine_dir / 'config.json'
 
             assert model.model_info is not None
@@ -780,13 +780,14 @@ class ModelLoader:
                 mapping.pp_size, rank)
             builder = Builder()
             # write config.json
-            if isinstance(model.engine_config, BuilderConfig):
-                builder.save_config(model.engine_config, config_path)
-            elif isinstance(model.engine_config, dict):
-                with open(config_path, 'w') as f:
-                    json.dump(model.engine_config, f)
-            else:
-                raise ValueError("wrong engine_config type")
+            if rank == 0:
+                if isinstance(model.engine_config, BuilderConfig):
+                    builder.save_config(model.engine_config, config_path)
+                elif isinstance(model.engine_config, dict):
+                    with open(config_path, 'w') as f:
+                        json.dump(model.engine_config, f)
+                else:
+                    raise ValueError("wrong engine_config type")
 
             logger.debug(f"Saving engine to {engine_path}")
             with open(engine_path, 'wb') as f:
@@ -807,17 +808,16 @@ class ModelLoader:
                         shutil.copy2(src, dst)
 
         save_engine_to_dir(engine_dir)
-        if isinstance(model.tokenizer, TransformersTokenizer):
-            if mapping is None or mapping.rank == 0:
-                copy_hf_tokenizer_data_to_engine_dir()
+        if rank == 0 and isinstance(model.tokenizer, TransformersTokenizer):
+            copy_hf_tokenizer_data_to_engine_dir()
 
     @staticmethod
     def get_model_format(model_dir: str) -> _ModelFormatKind:
         ''' Tell the format of the model.  '''
         # TODO[chunweiy]: Add checkpoint support
-        if Path.exists(Path(model_dir) /
-                       'generation_config.json') and file_with_suffix_exists(
-                           model_dir, '.bin'):
+        if (Path.exists(Path(model_dir) / 'generation_config.json')
+                and (file_with_suffix_exists(model_dir, '.bin')
+                     or file_with_suffix_exists(model_dir, '.safetensors'))):
             return _ModelFormatKind.HF
         if Path.exists(
                 Path(model_dir) / 'config.json') and file_with_suffix_exists(
@@ -840,10 +840,16 @@ class ModelLoader:
 
         # TODO[chunweiy]: inspect from hf model/config
         model_arch = _pretrained_config.architectures[0]
-        assert 'llama' in model_arch.lower(), "Only LLaMA is supported now"
 
         # TODO[chunweiy]: add more models if ready
-        model2struct = dict(LlamaForCausalLM=LLaMAForCausalLM)
+        model2struct = dict(
+            LlamaForCausalLM=LLaMAForCausalLM,
+            MixtralForCausalLM=LLaMAForCausalLM,
+        )
+        if model_arch not in model2struct:
+            raise KeyError(
+                f"Unsupported model architecture: {model_arch}, "
+                f"only {', '.join(model2struct.keys())} are supported now.")
 
         self.model = model2struct[model_arch].from_hugging_face(
             self._model_dir,
@@ -859,7 +865,9 @@ class ModelLoader:
         self.model = self.config.model.from_hugging_face(
             self._model_dir,
             mapping=self.mapping,
-            quant_mode=self.config.quant_config.quant_mode)
+            quant_mode=self.config.quant_config.quant_mode,
+            quantize_lm_head=self.config.quant_config.quantize_lm_head,
+        )
         self._model_info = _ModelInfo.from_module(self.model)
 
     def _load_model_runner(self):
@@ -933,14 +941,19 @@ class ModelLoader:
         runtime_mapping = self.mapping or Mapping()
         session = GenerationSession(model_config, self._engine, runtime_mapping)
         # TODO[chunweiy]: switch to model_runner_cpp, currently it lacks serialize_engine support
-        self.runner = ModelRunner(session, max_batch_size, max_input_len,
-                                  max_output_len, max_beam_width)
+        self.runner = ModelRunner(
+            session=session,
+            max_batch_size=max_batch_size,
+            max_input_len=max_input_len,
+            max_seq_len=max_input_len + max_output_len,
+            max_beam_width=max_beam_width,
+        )
 
     def _load_hf_tokenizer(self):
         assert self._model_dir
         try:
             self.tokenizer = ModelLoader.load_hf_tokenizer(self._model_dir)
-        except:
+        except Exception:
             raise RuntimeError(
                 f"failed to load HuggingFace tokenizer from {self._model_dir}\n"
                 "You can also try to copy the tokenizer* files from HuggingFace model to the engine directory manually."

@@ -326,7 +326,7 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
 
         return model
 
-    def load(self, weights):
+    def load(self, weights, from_pruned=False):
         expected_names = set([name for name, param in self.named_parameters()])
         provided_names = set(weights.keys())
         if provided_names != expected_names:
@@ -338,7 +338,10 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
             raise RuntimeError(err_msg)
 
         for name, param in self.named_parameters():
-            param.value = weights[name]
+            if not from_pruned:
+                param.value = weights[name]
+            else:
+                param.set_value_or_dummy(weights[name])
 
     def prepare_inputs(self,
                        max_batch_size,
