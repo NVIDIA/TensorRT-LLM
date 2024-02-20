@@ -298,7 +298,7 @@ struct packed_type<half, 8>
 {
     using type = uint4;
 };
-
+#ifdef ENABLE_BF16
 template <>
 struct packed_type<__nv_bfloat16, 2>
 {
@@ -316,7 +316,7 @@ struct packed_type<__nv_bfloat16, 8>
 {
     using type = bf16_8_t;
 };
-
+#endif
 template <>
 struct packed_type<float, 2>
 {
@@ -392,7 +392,6 @@ inline __device__ float4 add(float4 a, float4 b)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#ifdef ENABLE_FP8
 inline __device__ Float8_ add(Float8_ a, Float8_ b)
 {
     Float8_ c;
@@ -402,7 +401,6 @@ inline __device__ Float8_ add(Float8_ a, Float8_ b)
     c.w = add(a.w, b.w);
     return c;
 }
-#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

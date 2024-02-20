@@ -43,9 +43,9 @@
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/util_type.cuh>
 #else
-#include "3rdparty/cub/cub.cuh"
-#include "3rdparty/cub/device/device_radix_sort.cuh"
-#include "3rdparty/cub/util_type.cuh"
+#include "cub/cub.cuh"
+#include "cub/device/device_radix_sort.cuh"
+#include "cub/util_type.cuh"
 #endif
 
 using namespace tensorrt_llm::kernels;

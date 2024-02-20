@@ -145,6 +145,7 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
 
     if (mType == nvinfer1::DataType::kHALF)
     {
+#ifdef ENABLE_FP8
         if (quant_algo & FP8_ALPHA)
         {
             // Hopper style kernels
@@ -168,6 +169,7 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
             }
         }
         else
+#endif // ENABLE_FP8
         {
             if (quant_algo & ZERO)
             {
@@ -188,6 +190,7 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
 #if defined(ENABLE_BF16)
     else if (mType == nvinfer1::DataType::kBF16)
     {
+#ifdef ENABLE_FP8
         if (quant_algo & FP8_ALPHA)
         {
             // Hopper style kernels
@@ -211,6 +214,7 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
             }
         }
         else
+#endif
         {
             if (quant_algo & ZERO)
             {
@@ -392,6 +396,7 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
         act_ptr = reinterpret_cast<const half*>(workspace);
         if (mType == nvinfer1::DataType::kHALF)
         {
+#ifdef ENABLE_FP8
             if (mQuantAlgo & FP8_ALPHA)
             {
                 tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<half, __nv_fp8_e4m3>(
@@ -399,6 +404,7 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
                     reinterpret_cast<const half*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
             }
             else
+#endif
             {
                 tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<half, half>(
                     reinterpret_cast<half*>(workspace), reinterpret_cast<const half*>(inputs[0]),
@@ -408,6 +414,7 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
 #if defined(ENABLE_BF16)
         else if (mType == nvinfer1::DataType::kBF16)
         {
+#ifdef ENABLE_FP8
             if (mQuantAlgo & FP8_ALPHA)
             {
                 tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<__nv_bfloat16, __nv_fp8_e4m3>(
@@ -415,6 +422,7 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
                     reinterpret_cast<const __nv_bfloat16*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
             }
             else
+#endif
             {
                 tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<__nv_bfloat16, __nv_bfloat16>(
                     reinterpret_cast<__nv_bfloat16*>(workspace), reinterpret_cast<const __nv_bfloat16*>(inputs[0]),
@@ -442,7 +450,7 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
     {
         weight_only_act_type = tensorrt_llm::kernels::WeightOnlyActivationType::BF16;
     }
-
+#ifdef ENABLE_FP8
     if (getSMVersion() == 90)
     {
         // Hopper style kernels
@@ -483,6 +491,7 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(const nvinfer1::PluginTensorDe
         }
     }
     else
+#endif
     {
         // Pre-Hopper architectures
         if (use_cuda_kernel)

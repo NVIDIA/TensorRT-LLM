@@ -17,7 +17,9 @@
 #pragma once
 
 #include <cuda_fp16.h>
+#ifdef ENABLE_FP8
 #include <cuda_fp8.h>
+#endif // ENABLE_FP8
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 

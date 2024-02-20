@@ -126,6 +126,10 @@ def main(build_type: str = "Release",
             trt_lib_dir = trt_lib_dir_candidates[0]
         cmake_def_args.append(f"-DTRT_LIB_DIR={trt_lib_dir}")
         cmake_def_args.append(f"-DTRT_INCLUDE_DIR={trt_root}/include")
+    elif platform.machine() == "aarch64":
+        cmake_def_args.append(f"-DTRT_INCLUDE_DIR=/usr/include/aarch64-linux-gnu")
+    elif platform.machine() == "x86_64":
+        cmake_def_args.append(f"-DTRT_INCLUDE_DIR=/usr/include/x86_64-linux-gnu")
 
     if nccl_root is not None:
         cmake_def_args.append(f"-DNCCL_LIB_DIR={nccl_root}/lib")

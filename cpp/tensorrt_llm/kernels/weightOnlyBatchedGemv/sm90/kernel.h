@@ -252,7 +252,7 @@ struct Fp16Details
         load<AccessTypeAct, CtaM, true>(dst, reinterpret_cast<ActDataType*>(src), stride);
     }
 };
-
+#ifdef ENABLE_FP8
 struct Fp8Details
 {
     using ActDataType = __nv_fp8_e4m3;
@@ -298,6 +298,7 @@ struct Fp8Details
         }
     }
 };
+#endif // ENABLE_FP8
 
 template <typename Details, int CtaM, int CtaN, int Threads, int GroupSize, bool EnableActScale, bool EnableZero,
     bool EnableBias>

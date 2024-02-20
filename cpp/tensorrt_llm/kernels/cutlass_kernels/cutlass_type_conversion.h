@@ -18,7 +18,10 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+
+#ifdef ENABLE_FP8
 #include <cuda_fp8.h>
+#endif 
 
 #include "cutlass/bfloat16.h"
 #include "cutlass/float8.h"
@@ -91,7 +94,7 @@ struct CutlassToTllmTypeAdapter<cutlass::bfloat16_t>
 };
 #endif
 
-#if defined(ENABLE_FP8)
+#ifdef ENABLE_FP8
 template <>
 struct CutlassToTllmTypeAdapter<cutlass::float_e4m3_t>
 {
@@ -103,7 +106,7 @@ struct CutlassToTllmTypeAdapter<cutlass::float_e5m2_t>
 {
     using type = __nv_fp8_e5m2;
 };
-#endif
+#endif // ENABLE_FP8
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 

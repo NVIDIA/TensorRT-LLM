@@ -23,7 +23,9 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#ifdef ENABLE_FP8
 #include <cuda_fp8.h>
+#endif
 #include <functional>
 #include <mutex>
 
@@ -37,7 +39,11 @@
 std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap()
 {
     static std::unordered_map<nvinfer1::DataType, ncclDataType_t> dtypeMap = {{nvinfer1::DataType::kFLOAT, ncclFloat32},
-        {nvinfer1::DataType::kHALF, ncclFloat16}, {nvinfer1::DataType::kBF16, ncclBfloat16}};
+        {nvinfer1::DataType::kHALF, ncclFloat16}
+#if defined(NV_TENSORRT_MAJOR) && NV_TENSORRT_MAJOR >= 9
+        , {nvinfer1::DataType::kBF16, ncclBfloat16}
+#endif
+        };
     return &dtypeMap;
 }
 

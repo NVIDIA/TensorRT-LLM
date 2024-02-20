@@ -1021,8 +1021,7 @@ def constant(ndarray: np.ndarray) -> Tensor:
     Returns:
         The tensor produced by the inserted layer.
     '''
-    weights = trt.Weights(np_dtype_to_trt(ndarray.dtype), ndarray.ctypes.data,
-                          ndarray.size)
+    weights = trt.Weights(ndarray)
     # Prevent underlying numpy array from going out of scope
     default_net().register_ndarray(ndarray)
     layer = default_trtnet().add_constant(trt.Dims(ndarray.shape), weights)

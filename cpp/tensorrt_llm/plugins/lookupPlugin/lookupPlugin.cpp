@@ -147,13 +147,14 @@ int LookupPlugin::enqueue(const nvinfer1::PluginTensorDesc* inputDesc, const nvi
         float* output = reinterpret_cast<float*>(outputs[0]);
         invokeLookUp<float, int>(output, input, weight, batchSize, offset, localVocabSize, hidden, stream);
     }
+#if defined(NV_TENSORRT_MAJOR) && NV_TENSORRT_MAJOR >= 9
     else if (mType == DataType::kBF16)
     {
         const __nv_bfloat16* weight = reinterpret_cast<const __nv_bfloat16*>(inputs[1]);
         __nv_bfloat16* output = reinterpret_cast<__nv_bfloat16*>(outputs[0]);
         invokeLookUp<__nv_bfloat16, int>(output, input, weight, batchSize, offset, localVocabSize, hidden, stream);
     }
-
+#endif
     return 0;
 }
 

@@ -21,7 +21,7 @@
 #elif (CUDART_VERSION >= 11050)
 #include <cub/cub.cuh>
 #else
-#include "3rdparty/cub/cub.cuh"
+#include "cub/cub.cuh"
 #endif
 
 #include "tensorrt_llm/common/logger.h"

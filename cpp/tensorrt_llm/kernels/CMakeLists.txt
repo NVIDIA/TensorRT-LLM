@@ -21,6 +21,8 @@ file(GLOB_RECURSE SRC_CU *.cu)
 # Exclude files in the cutlass_kernels folder
 list(FILTER SRC_CPP EXCLUDE REGEX "cutlass_kernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "cutlass_kernels/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX ".*sm89.*|.*sm90.*|.*sm_89.*|.*sm_90.*")
+list(FILTER SRC_CU EXCLUDE REGEX ".*sm89.*|.*sm90.*|.*sm_89.*|.*sm_90.*")
 
 # skip mmha 48, 80, 96, 112, 144, 160, 192 and 224 for fast build
 if(FAST_BUILD)

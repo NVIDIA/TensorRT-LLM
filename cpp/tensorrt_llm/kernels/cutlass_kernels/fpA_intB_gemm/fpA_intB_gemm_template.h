@@ -295,7 +295,12 @@ void dispatch_gemm_config(const T* A, const WeightType* B, const T* weight_scale
 template <typename T>
 constexpr bool is_fp8()
 {
+#ifdef ENABLE_FP8
     return std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>;
+#else
+    return false;
+#endif // ENABLE_FP8
+
 }
 
 template <typename ActivationType, typename WeightType, typename ScaleZeroType, typename BiasType, typename OutputType,

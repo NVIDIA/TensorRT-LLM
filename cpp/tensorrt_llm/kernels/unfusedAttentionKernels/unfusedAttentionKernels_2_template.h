@@ -154,7 +154,7 @@ struct Rotary_vec_t<__nv_bfloat16, 256>
     static constexpr int size = 8;
 };
 
-#endif
+#endif // ENABLE_BF16
 
 template <typename T, typename T_cache, int Dh_MAX, bool ADD_BIAS, bool STORE_QKV, bool POS_SHIFT,
     typename KVCacheBuffer, bool IS_GENERATE>

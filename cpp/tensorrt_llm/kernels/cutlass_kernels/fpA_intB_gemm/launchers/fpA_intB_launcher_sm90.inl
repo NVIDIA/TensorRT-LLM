@@ -92,13 +92,19 @@ void sm90_generic_mixed_gemm_kernelLauncher(const ActivationType* A, const Weigh
 
         static_assert(std::is_same_v<CutlassActivationType, cutlass::half_t>
                 || std::is_same_v<CutlassActivationType, cutlass::bfloat16_t>
+#ifdef ENABLE_FP8
                 || std::is_same_v<CutlassActivationType, cutlass::float_e4m3_t>
-                || std::is_same_v<CutlassActivationType, cutlass::float_e5m2_t>,
+                || std::is_same_v<CutlassActivationType, cutlass::float_e5m2_t>
+#endif
+                ,
             "Activation type must be bfloat16, half, FP8");
 
         static_assert(std::is_same_v<CutlassWeightType, int8_t> || std::is_same_v<CutlassWeightType, cutlass::int4b_t>
+#ifdef ENABLE_FP8
                 || std::is_same_v<CutlassWeightType, cutlass::float_e4m3_t>
-                || std::is_same_v<CutlassWeightType, cutlass::float_e5m2_t>,
+                || std::is_same_v<CutlassWeightType, cutlass::float_e5m2_t>
+#endif
+                ,
             "Weight type must be fp8, int8_t or int4_t");
 
         using LayoutA = cutlass::layout::RowMajor; // Layout type for A matrix operand

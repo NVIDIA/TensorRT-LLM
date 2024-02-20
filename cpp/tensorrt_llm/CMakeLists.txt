@@ -54,11 +54,6 @@ if(NOT WIN32) # Linux
     set(BATCH_MANAGER_TARGET_ARCH "x86_64-linux-gnu")
   elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
     set(BATCH_MANAGER_TARGET_ARCH "aarch64-linux-gnu")
-    if(NOT ${OS_ID} MATCHES "ubuntu" OR ${OS_VERSION_ID} VERSION_LESS 22.04)
-      message(
-        FATAL_ERROR
-          "The minimum system requirement for aarch64 is Ubuntu 22.04.")
-    endif()
   else()
     message(
       FATAL_ERROR

@@ -16,7 +16,7 @@
 
 #pragma once
 
-#if ENABLE_BF16
+#ifdef ENABLE_BF16
 #include <cuda_bf16.h>
 #endif // ENABLE_BF16
 #include <cuda_fp16.h>
@@ -28,7 +28,7 @@
 
 namespace tensorrt_llm::common
 {
-#if ENABLE_BF16
+#ifdef ENABLE_BF16
 static inline std::basic_ostream<char>& operator<<(std::basic_ostream<char>& stream, __nv_bfloat16 const& val)
 {
     stream << __bfloat162float(val);

@@ -89,7 +89,11 @@ bool AllreducePlugin::supportsFormatCombination(
 
     if (nbInputs == 2 && pos == 1)
     {
-        return (inOut[pos].type == nvinfer1::DataType::kINT64) && (inOut[pos].format == TensorFormat::kLINEAR);
+        return 
+#ifdef ENABLE_BF16
+            (inOut[pos].type == nvinfer1::DataType::kINT64) && 
+#endif    
+            (inOut[pos].format == TensorFormat::kLINEAR);
     }
     else
     {

@@ -1210,6 +1210,7 @@ struct Launch_bounds_config
     static constexpr int MIN_BLOCKS_PER_SM = 0;
 };
 
+#ifdef ENABLE_FP8
 template <>
 struct Launch_bounds_config<uint16_t, __nv_fp8_e4m3, 256u, 64u, false, false, false>
 {
@@ -1232,6 +1233,7 @@ struct Launch_bounds_config<uint16_t, __nv_fp8_e4m3, 256u, 256u, false, true, fa
     static constexpr int MAX_THREADS_PER_BLOCK = 256u;
     static constexpr int MIN_BLOCKS_PER_SM = 3u;
 };
+#endif // ENABLE_FP8
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1309,8 +1311,13 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     static constexpr bool ENABLE_8BITS_K_CACHE = sizeof(TKcache) == 1;
     static constexpr bool ENABLE_8BITS_KV_CACHE = sizeof(Tcache) == 1;
     // FP8 KV Cache.
+#ifdef ENABLE_FP8
     static constexpr bool FP8_K_CACHE = std::is_same<TKcache, __nv_fp8_e4m3>::value;
     static constexpr bool FP8_KV_CACHE = std::is_same<Tcache, __nv_fp8_e4m3>::value;
+#else
+    static constexpr bool FP8_K_CACHE = false;
+    static constexpr bool FP8_KV_CACHE = false;
+#endif
     // INT8 KV Cache.
     static constexpr bool INT8_KV_CACHE = std::is_same<Tcache, int8_t>::value;
 

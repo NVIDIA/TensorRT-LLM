@@ -113,10 +113,12 @@ void kernel_launcher(Params& params, cudaStream_t s)
     {
         select_gs<Fp16Details>(params, s);
     }
+#ifdef ENABLE_FP8
     else if (params.type == KernelType::W4A8)
     {
         select_gs<Fp8Details>(params, s);
     }
+#endif
 }
 } // namespace weight_only
 } // namespace kernels

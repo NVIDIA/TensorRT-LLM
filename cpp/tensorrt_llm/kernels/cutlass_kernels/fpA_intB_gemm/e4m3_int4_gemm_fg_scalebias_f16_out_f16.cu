@@ -29,7 +29,7 @@ template class CutlassFpAIntBGemmRunner<__nv_fp8_e4m3,             /*Activation 
     half,                                                          /*Bias type Type*/
     half                                                           /*Output type Type*/
     >;
-#endif
+#endif // ENABLE_FP8
 } // namespace cutlass_kernels
 } // namespace kernels
 } // namespace tensorrt_llm

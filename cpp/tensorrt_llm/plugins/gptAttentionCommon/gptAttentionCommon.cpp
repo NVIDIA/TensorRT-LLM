@@ -27,6 +27,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <type_traits>
+#ifdef ENABLE_BF16
+#include <cuda_bf16.h>
+#endif
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::kernels;

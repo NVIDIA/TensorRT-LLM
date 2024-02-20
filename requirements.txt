@@ -13,7 +13,6 @@ polygraphy
 psutil
 pynvml>=11.5.0
 sentencepiece>=0.1.99
-tensorrt==9.2.0.post12.dev5
 torch<=2.2.0a
 nvidia-ammo~=0.7.0; platform_machine=="x86_64"
 transformers==4.36.1

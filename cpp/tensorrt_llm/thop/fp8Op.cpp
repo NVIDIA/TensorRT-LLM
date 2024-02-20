@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
+#ifdef ENABLE_FP8
 #if defined(TORCH_VERSION_MAJOR)                                                                                       \
     && ((TORCH_VERSION_MAJOR > 1) || ((TORCH_VERSION_MAJOR == 1) && (TORCH_VERSION_MINOR >= 9)))
 #define TORCH_IS_AT_LEAST_v190
@@ -225,3 +226,4 @@ static auto symmetric_dequantize_activation
 
 static auto symmetric_dequantize_per_tensor
     = torch::RegisterOperators("tensorrt_llm::dequantize_e4m3_per_tensor", &torch_ext::symmetric_dequantize_per_tensor);
+#endif // ENABLE_FP8

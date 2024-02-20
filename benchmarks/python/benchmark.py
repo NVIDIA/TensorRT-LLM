@@ -289,7 +289,7 @@ def main(args):
     # TODO: Re-enable memory monitor for multi-gpu benchmarks.
     # Current Mem Monitor will cause benchmark script hang
     # because MPI does not work well with multiprocessing.
-    disable_mem_monitor = world_size > 1
+    disable_mem_monitor = True
     if not disable_mem_monitor:
         from mem_monitor import MemoryMonitor
 

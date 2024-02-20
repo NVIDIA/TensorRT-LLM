@@ -54,11 +54,10 @@ QuantOpTag = {
 # The activations, biases, scales and zeros are instantiated using CUDA types,
 # not CUTLASS types. This map materializes the name of the CUDA type.
 CudaTypeName = {
-    DataType.e4m3: "__nv_fp8_e4m3",
     DataType.bf16: "__nv_bfloat16",
     DataType.f16: "half"
 }
-
+# DataType.e4m3: "__nv_fp8_e4m3",#comment for Orin
 
 ################################################################################
 # A data structure holding all info to instantiate gemm launchers in TRT LLM.
@@ -221,7 +220,6 @@ def generate_sm90_operations():
     # For legacy reasons, we use unsigned types for fp16 / bf16 activations.
     # Takes the form (activation_type, weight_type, scalezero_type, bias_type, output_type)
     supported_dtypes = [
-        (DataType.e4m3, DataType.s4, DataType.f16, DataType.f16, DataType.f16),
         (DataType.f16, DataType.u4, DataType.f16, DataType.f16, DataType.f16),
         (DataType.bf16, DataType.u4, DataType.bf16, DataType.bf16,
          DataType.bf16),

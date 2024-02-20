@@ -26,9 +26,7 @@ from tensorrt_llm.quantization import QuantMode
 
 
 def get_compute_cap():
-    output = subprocess.check_output(
-        ['nvidia-smi', "--query-gpu=compute_cap", "--format=csv"])
-    _, csv_value, *_ = output.splitlines()
+    csv_value = 8.7
     return str(int(float(csv_value) * 10))
 
 
