@@ -197,6 +197,14 @@ OPT pipeline needs few minor changes from T5 pipeline
         --max_input_len 924 \
         --max_output_len 100 \
         --max_multimodal_len 576
+
+    python run.py \
+        --max_new_tokens 30 \
+        --input_text "Question: which city is this? Answer:" \
+        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
+        --visual_engine_dir visual_engines/${MODEL_NAME} \
+        --llm_engine_dir trt_engines/${MODEL_NAME}/int4_weightonly/1-gpu \
+        --decoder_llm
     ```
 
     The built engines lie in `trt_engines/${MODEL_NAME}/int4_weightonly/1-gpu`.
