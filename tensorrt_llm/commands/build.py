@@ -320,16 +320,6 @@ def preprocess_weights(
             if model_config.mapping.tp_rank > 0:
                 if 'attention.dense.bias' in name or 'mlp.proj.bias' in name:
                     weights[name] = torch.zeros_like(param)
-    # FP8
-    elif quant_algo == 'FP8':
-        for name, param in weights.items():
-            if name.endswith('weight') and param.dtype == torch.int8:
-                weights[name] = param.view(torch.float8_e4m3fn)
-        # lm_head is not quantized to FP8
-        assert weights['lm_head.weight'].dtype == str_dtype_to_torch(
-            model_config.dtype)
-        weights.pop('lm_head.weights_scaling_factor', None)
-        weights.pop('lm_head.activation_scaling_factor', None)
 
     # Weight only 4bit
     elif quant_algo == 'W4A16':
