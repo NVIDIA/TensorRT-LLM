@@ -56,7 +56,6 @@ class PluginInfo:
         self.plugin_creator = plugin_creator
         self.plugin_name = plugin_name
         self.pfc = pfc
-        self._parse_pfc(pfc)
 
     def _parse_pfc(self, pfc: trt.PluginFieldCollection):
         self.pfc_as_ndarray = {}

@@ -41,8 +41,6 @@ def torch_to_numpy(x: torch.Tensor):
         f'x must be a torch.Tensor object, but got {type(x)}.'
     if x.dtype == torch.bfloat16:
         return x.view(torch.int16).detach().cpu().numpy().view(np_bfloat16)
-    elif x.dtype == torch.float8_e4m3fn:
-        return x.view(torch.int8).detach().cpu().numpy().view(np_float8)
     else:
         return x.detach().cpu().numpy()
 
@@ -50,8 +48,6 @@ def torch_to_numpy(x: torch.Tensor):
 def numpy_to_torch(x):
     if x.dtype == np_bfloat16:
         return torch.tensor(x.view(np.int16)).view(torch.bfloat16)
-    elif x.dtype == np_float8:
-        return torch.tensor(x.view(np.int8)).view(torch.float8_e4m3fn)
     else:
         return torch.tensor(x)
 
@@ -80,8 +76,6 @@ def bf16_array(x):
 def copy_torch_to_numpy(x: torch.Tensor, ndarray: np.array):
     if x.dtype == torch.bfloat16:
         torch.from_numpy(ndarray.view(np.int16)).copy_(x.view(torch.int16))
-    elif x.dtype == torch.float8_e4m3fn:
-        torch.from_numpy(ndarray.view(np.int8)).copy_(x.view(torch.int8))
     else:
         torch.from_numpy(ndarray).copy_(x)
     return ndarray
@@ -131,7 +125,6 @@ _str_to_torch_dtype_dict = dict(
     int32=torch.int32,
     int8=torch.int8,
     bool=torch.bool,
-    fp8=torch.float8_e4m3fn,
 )
 
 
@@ -218,7 +211,6 @@ _torch_to_np_dtype_dict = {
     torch.int64: np.int64,
     torch.float16: np.float16,
     torch.bfloat16: np_bfloat16,
-    torch.float8_e4m3fn: np_float8,
     torch.float32: np.float32,
     torch.float64: np.float64,
     torch.complex64: np.complex64,
@@ -240,7 +232,6 @@ _trt_to_torch_dtype_dict = {
     trt.int8: torch.int8,
     trt.bool: torch.bool,
     trt.bfloat16: torch.bfloat16,
-    trt.fp8: torch.float8_e4m3fn,
 }
 
 

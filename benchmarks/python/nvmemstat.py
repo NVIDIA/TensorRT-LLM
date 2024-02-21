@@ -1,4 +1,18 @@
-#!/usr/bin/env python
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import getopt
 import time
 import errno
@@ -39,10 +53,6 @@ def human(num_str, power="Ki", units=None):
     else:
         return "%.f" % ((num * 1024) / units)
 
-
-
-
-
 def runCmd(cmd):
     out = "-1"
     try:
@@ -75,11 +85,6 @@ def NvMap():
     max_total_system_avail = max(max_total_system_avail,total_mem_cpu_gpu_value)
     
     sys.stdout.write("Total system avalible memory: " + total_mem_cpu_gpu.decode('utf-8') + "\n")
-    
-    
-
-
-
 
 import signal        
 def signal_handler(sig,frame):
@@ -99,7 +104,7 @@ def main():
     cmd = "cat /sys/kernel/debug/nvmap/iovmm/clients"
     out = runCmd(cmd)
     decoded_out = out.decode("utf-8")
-    lines = decoded_out.splitlines()  # 将字符串按行分割成列表
+    lines = decoded_out.splitlines() 
     for line in lines:
         print(line)
     print("=================Check end========================================")
