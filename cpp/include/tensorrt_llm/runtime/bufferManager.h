@@ -73,10 +73,10 @@ public:
     [[nodiscard]] static ITensorPtr pinnedPool(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates an `IBuffer` of the given size in UVM.
-    [[nodiscard]] IBufferPtr managed(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE) const;
+    [[nodiscard]] static IBufferPtr managed(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates an `ITensor` of the given dimensions in UVM.
-    [[nodiscard]] ITensorPtr managed(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE) const;
+    [[nodiscard]] static ITensorPtr managed(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates an `IBuffer` of the given size and memory type.
     [[nodiscard]] IBufferPtr allocate(

@@ -3,3 +3,4 @@ datasets
 kaldialign
 openai-whisper
 soundfile
+safetensors

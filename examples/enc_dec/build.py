@@ -27,6 +27,7 @@ from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.network import net_guard
+from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 from t5.weight import parse_t5_config, load_from_hf_t5, load_from_binary_t5  # isort:skip
 from bart.weight import parse_bart_config, load_from_binary_bart  # isort:skip
@@ -183,6 +184,12 @@ def parse_arguments(component):
         choices=['float16', 'float32', 'bfloat16'],
         help="Activates the lookup plugin which enables embedding sharding.")
     parser.add_argument('--enable_qk_half_accum',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--enable_context_fmha',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--enable_context_fmha_fp32_acc',
                         default=False,
                         action='store_true')
     parser.add_argument('--builder_opt', type=int, default=None)
@@ -404,6 +411,14 @@ def build_rank_engine(builder: Builder,
         network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
     if args.enable_qk_half_accum:
         network.plugin_config.enable_qk_half_accum()
+    assert not (args.enable_context_fmha and args.enable_context_fmha_fp32_acc)
+    if args.enable_context_fmha and not args.relative_attention:
+        logger.warning("Only non-T5 enc-dec models support FMHA")
+        network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
+    if args.enable_context_fmha_fp32_acc and not args.relative_attention:
+        logger.warning("Only non-T5 enc-dec models support FMHA")
+        network.plugin_config.set_context_fmha(
+            ContextFMHAType.enabled_with_fp32_acc)
     if args.remove_input_padding:
         network.plugin_config.enable_remove_input_padding()
     if args.use_lookup_plugin:

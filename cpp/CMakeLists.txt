@@ -60,6 +60,20 @@ else()
   message(STATUS "Importing batch manager")
 endif()
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/executor/CMakeLists.txt")
+  set(BUILD_EXECUTOR_DEFAULT ON)
+else()
+  set(BUILD_EXECUTOR_DEFAULT OFF)
+endif()
+
+option(BUILD_EXECUTOR "Build executor from source" ${BUILD_EXECUTOR_DEFAULT})
+
+if(BUILD_EXECUTOR)
+  message(STATUS "Building executor")
+else()
+  message(STATUS "Importing executor")
+endif()
+
 if(BUILD_PYT)
   message(STATUS "Building PyTorch")
 else()

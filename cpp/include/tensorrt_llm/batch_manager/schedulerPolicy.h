@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "tensorrt_llm/executor/types.h"
+
 namespace tensorrt_llm::batch_manager::batch_scheduler
 {
 
@@ -24,5 +26,9 @@ enum class SchedulerPolicy
     MAX_UTILIZATION,
     GUARANTEED_NO_EVICT,
 };
+
+SchedulerPolicy execToBatchManagerSchedPolicy(executor::SchedulerPolicy policy);
+
+executor::SchedulerPolicy batchManagerToExecSchedPolicy(SchedulerPolicy policy);
 
 } // namespace tensorrt_llm::batch_manager::batch_scheduler

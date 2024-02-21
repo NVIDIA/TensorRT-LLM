@@ -19,6 +19,7 @@ from .bloom.model import BloomForCausalLM, BloomModel
 from .chatglm.model import ChatGLMForCausalLM, ChatGLMModel
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
 from .falcon.model import FalconForCausalLM, FalconModel
+from .gemma.model import GemmaForCausalLM
 from .gpt.model import GPTLMHeadModel, GPTModel
 from .gptj.model import GPTJForCausalLM, GPTJModel
 from .gptneox.model import GPTNeoXForCausalLM, GPTNeoXModel
@@ -68,6 +69,7 @@ __all__ = [
     'MPTForCausalLM',
     'MPTModel',
     'SkyworkForCausalLM',
+    'GemmaForCausalLM',
 ]
 
 MODEL_MAP = {
@@ -87,4 +89,5 @@ MODEL_MAP = {
     'MedusaForCausalLM': MedusaForCausalLm,
     'BaichuanForCausalLM': BaichuanForCausalLM,
     'SkyworkForCausalLM': LLaMAForCausalLM,
+    'GemmaForCausalLM': GemmaForCausalLM,
 }

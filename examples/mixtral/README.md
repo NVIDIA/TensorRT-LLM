@@ -34,8 +34,7 @@ Here are some examples:
 python convert_checkpoint.py --model_dir ./Mixtral-8x7B-v0.1 \
                              --output_dir ./tllm_checkpoint_mixtral_2gpu \
                              --dtype float16 \
-                             --world_size 2 \
-                             --Pp_size 2
+                             --pp_size 2
 trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_2gpu \
                  --output_dir ./trt_engines/mixtral/pp2 \
                  --gemm_plugin float16
@@ -47,7 +46,6 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_2gpu \
 python convert_checkpoint.py --model_dir ./Mixtral-8x7B-v0.1 \
                              --output_dir ./tllm_checkpoint_mixtral_2gpu \
                              --dtype float16 \
-                             --world_size 2 \
                              --tp_size 2
 trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_2gpu \
                  --output_dir ./trt_engines/mixtral/tp2 \

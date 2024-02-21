@@ -113,6 +113,7 @@ python build.py --model_type t5 \
                 --max_beam_width 3
 
 # Example 4: build bart-large-cnn using a single GPU, FP32, running greedy search
+# Note: non-T5 models can enable FMHA for the encoder part, for FP16/BF16
 python build.py --model_type bart \
                 --weight_dir tmp/trt_models/bart-large-cnn/tp1 \
                 -o tmp/trt_engines/bart-large-cnn/1-gpu \
@@ -120,6 +121,7 @@ python build.py --model_type bart \
                 --remove_input_padding \
                 --use_bert_attention_plugin \
                 --use_gpt_attention_plugin \
+                --enable_context_fmha \
                 --use_gemm_plugin \
                 --dtype float32 \
                 --max_beam_width 1
@@ -237,12 +239,14 @@ pushd tmp && (git clone https://github.com/facebookresearch/fairseq.git || true)
 python nmt/convert.py -i tmp/fairseq_models/wmt14 -o tmp/trt_models/wmt14 --weight_data_type float32 --inference_tensor_para_size 1
 
 # Build TensorRT engine(s)
+# Note: non-T5 models can enable FMHA for the encoder part, although only FP16/BF16 precisions are valid
 python build.py --model_type nmt \
         --weight_dir tmp/trt_models/wmt14/tp1/  \
         -o  tmp/trt_engines/wmt14/1-gpu  \
         --engine_name wmt14 \
         --use_bert_attention_plugin \
         --use_gpt_attention_plugin \
+        --enable_context_fmha \
         --dtype float32 \
         --max_beam_width 1
 

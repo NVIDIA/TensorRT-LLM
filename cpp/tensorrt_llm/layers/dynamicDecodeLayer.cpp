@@ -372,7 +372,8 @@ void DynamicDecodeLayer<T>::forward(OutputParams& outputs, ForwardParams const& 
     checkStopCriteria(outputs, params, batchSlots, batchSize, beamWidth, maxSeqLen, mStream);
 
     // Copy nextIds and transpose logits when needed
-    prepareOutputData(outputs, params, mIdsPtrHost, batchSlots, batchSize, beamWidth, maxSeqLen, mCyclicStep, mStream);
+    prepareOutputData(
+        outputs, params, mIdsPtrHost, batchSlots, batchSize, mMaxBatchSize, beamWidth, maxSeqLen, mCyclicStep, mStream);
 
     mCyclicStep += 1;
 
@@ -489,10 +490,8 @@ void DynamicDecodeLayer<T>::layersForward(Tensor& logits, OutputParams& outputs,
         }
         if (outputs.output_log_probs_tiled)
         {
-            TLLM_CHECK(0 <= mCyclicStep && mCyclicStep < maxSeqLen);
             Tensor& output_log_probs = outputs.output_log_probs_tiled.value();
-            size_t step_offset = mCyclicStep * batchSize * beamWidth;
-            decode_outputs.output_log_probs = output_log_probs.slice({1, localBatchSize * beamWidth}, step_offset);
+            decode_outputs.output_log_probs = output_log_probs.slice({1, localBatchSize * beamWidth}, 0);
         }
 
         // Run TopK + TopP decode layers.
@@ -697,8 +696,8 @@ void DynamicDecodeLayer<T>::prepareIdsPtrs(
 
 template <typename T>
 void DynamicDecodeLayer<T>::prepareOutputData(OutputParams& outputs, ForwardParams const& params,
-    runtime::ITensor::SharedPtr const& idsPtrsHost, int32_t const* batchSlots, size_t batchSize, size_t beamWidth,
-    size_t maxSeqLen, int32_t cyclicStep, cudaStream_t stream)
+    runtime::ITensor::SharedPtr const& idsPtrsHost, int32_t const* batchSlots, size_t batchSize, size_t maxBatchSize,
+    size_t beamWidth, size_t maxSeqLen, int32_t cyclicStep, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto idsPtrHostSlice = ITensor::slice(idsPtrsHost, cyclicStep, 1);
@@ -713,8 +712,8 @@ void DynamicDecodeLayer<T>::prepareOutputData(OutputParams& outputs, ForwardPara
 
         invokeTransposeLogProbs(outputs.output_log_probs.value().template getPtr<float>(),
             outputs.output_log_probs_tiled.value().template getPtr<float>(),
-            outputs.sequence_length->template getPtr<int>(), batchSlots, batchSize, beamWidth, logProbsMaxSeqLen,
-            stream);
+            outputs.sequence_length->template getPtr<int>(), batchSlots, batchSize, maxBatchSize, beamWidth,
+            logProbsMaxSeqLen, stream);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

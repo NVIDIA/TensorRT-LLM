@@ -248,7 +248,7 @@ class Pipeline:
 
     def __call__(self, prompt):
         # Run the model in batch size 1 and beam size 1
-        if self.model_name == 'SpecialForCausalLM':
+        if self.model_name == 'GemmaForCausalLM':
             inputs = self.tokenizer.encode(prompt, add_special_tokens=False)
             inputs = torch.tensor([self.tokenizer.bos_token_id] + inputs)
         else:

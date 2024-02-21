@@ -43,6 +43,7 @@ protected:
 private:
     size_t getWorkspaceSize(const SamplingKernelTestParam& params) override
     {
+        auto const maxBatchSize = 2 * params.batchSize;
         size_t workspaceSize;
         size_t cubTempStorageSize;
         tk::invokeBatchTopPSampling<T>(nullptr, // workspace
@@ -55,7 +56,7 @@ private:
             nullptr,                            // output_log_probs
             nullptr,                            // log_probs
             bufferCast<int32_t>(*this->mTopPIdValsDevice), bufferCast<int32_t>(*this->mEndOffsetsDevice),
-            bufferCast<int32_t>(*this->mBeginOffsetsDevice), this->mCurandStatesDevice, params.batchSize,
+            bufferCast<int32_t>(*this->mBeginOffsetsDevice), this->mCurandStatesDevice, params.batchSize, maxBatchSize,
             params.vocabSize, nullptr, this->mMaxTopP, bufferCast<float>(*this->mTopPsDevice), this->mStream->get(),
             nullptr, nullptr);
         return workspaceSize;
@@ -64,6 +65,7 @@ private:
     void callTestedFunction(const SamplingKernelTestParam& params, bool hasDiffRuntimeArgs, size_t workspaceSize,
         tensorrt_llm::runtime::ITensor::SharedPtr& workspaceDevice) override
     {
+        auto const maxBatchSize = 2 * params.batchSize;
         size_t cubTempStorageSize;
         tk::invokeBatchTopPSampling<T>(nullptr, // workspace
             workspaceSize, cubTempStorageSize,
@@ -75,7 +77,7 @@ private:
             nullptr,                            // output_log_probs
             nullptr,                            // log_probs
             bufferCast<int32_t>(*this->mTopPIdValsDevice), bufferCast<int32_t>(*this->mEndOffsetsDevice),
-            bufferCast<int32_t>(*this->mBeginOffsetsDevice), this->mCurandStatesDevice, params.batchSize,
+            bufferCast<int32_t>(*this->mBeginOffsetsDevice), this->mCurandStatesDevice, params.batchSize, maxBatchSize,
             params.vocabSize, nullptr, this->mMaxTopP, bufferCast<float>(*this->mTopPsDevice), this->mStream->get(),
             nullptr, nullptr);
 
@@ -98,8 +100,9 @@ private:
             // preprocesses log_prob_buf when those are provided.
             bufferCast<T>(*this->mProbsDevice), bufferCast<int32_t>(*this->mTopPIdValsDevice),
             bufferCast<int32_t>(*this->mEndOffsetsDevice), bufferCast<int32_t>(*this->mBeginOffsetsDevice),
-            this->mCurandStatesDevice, params.batchSize, params.vocabSize, bufferCast<int32_t>(*this->mEndIdsDevice),
-            this->mMaxTopP, hasDiffRuntimeArgs ? bufferCast<float>(*this->mTopPsDevice) : nullptr, this->mStream->get(),
+            this->mCurandStatesDevice, params.batchSize, maxBatchSize, params.vocabSize,
+            bufferCast<int32_t>(*this->mEndIdsDevice), this->mMaxTopP,
+            hasDiffRuntimeArgs ? bufferCast<float>(*this->mTopPsDevice) : nullptr, this->mStream->get(),
             bufferCast<bool>(*this->mSkipDecodeDevice), bufferCast<int32_t>(*this->mBatchSlots));
     }
 };

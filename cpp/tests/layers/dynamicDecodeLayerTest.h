@@ -70,7 +70,7 @@ private:
     int32_t const mMaxBatchSize = 2 * mBatchSize;
     int32_t const mBeamWidth = 1;
     int32_t const mBatchBeam = mBatchSize * mBeamWidth;
-    int32_t const mVocabSize = 8;
+    int32_t const mVocabSize = 9;
     int32_t const mVocabSizePadded = mVocabSize;
 
     int32_t const mMaxInputLen = 0; // has no effect.
@@ -82,6 +82,7 @@ private:
     bool mUseLogitsVec = false;
 
     TensorPtr mLogitsDevice;
+    TensorPtr mRuntimeLogitsHost;
     TensorPtr mLogitsRefHost;
     TensorPtr mContextLengthDevice;
     TensorPtr mSeqLengthsDevice;
@@ -102,6 +103,10 @@ private:
 
     TensorPtr mEmbeddingBiasHost;
     TensorPtr mEmbeddingBiasDevice;
+
+    TensorPtr mRefLogProbsHost;
+    TensorPtr mOutputLogProbsDevice;
+    TensorPtr mOutputLogProbsTiledDevice;
 
     TensorPtr mCumLogProbsDevice;
 
@@ -134,14 +139,18 @@ private:
     typename tensorrt_llm::layers::DynamicDecodeLayer<T>::OutputParams createOutputTensors();
 
     void batchCopy(int32_t step);
-    bool checkResult(int32_t* outputIds, std::vector<std::set<int32_t>>& expectedIds, int32_t* seqLens,
+    bool checkResult(int32_t* outputIds, std::vector<std::set<int32_t>> const& expectedIds, int32_t* seqLens,
         int32_t leadingDim, int32_t stride, int32_t step);
 
     void runTestImpl(
-        std::vector<std::set<int32_t>> expectedOutputIds, SamplingParams const& params, int32_t endId = -1);
+        std::vector<std::set<int32_t>> const& expectedOutputIds, SamplingParams const& params, int32_t endId = -1);
+
+    void fillRefLogits(
+        int32_t const* seqLenHost, std::vector<std::set<int32_t>> const& expectedOutputIds, int32_t step);
 
 public:
-    void runTest(std::vector<std::set<int32_t>> expectedOutputIds, SamplingParams const& params, int32_t endId = -1);
+    void runTest(
+        std::vector<std::set<int32_t>> const& expectedOutputIds, SamplingParams const& params, int32_t endId = -1);
 };
 
 typedef testing::Types<float, half> FloatAndHalfTypes;

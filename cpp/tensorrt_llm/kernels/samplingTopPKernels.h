@@ -63,6 +63,7 @@ void invokeTopPInitialize(int* topPIdValBuf, int* topPOffsetBuf, int* beginTopPO
 //! \param curandstate input buffer [maxBatchSize]. Curand states properly initialized using
 //! invokeCurandInitialize per request.
 //! \param batchSize batch size
+//! \param maxBatchSize maximum batch size
 //! \param vocabSizePadded size of padded vocab
 //! \param endIds input buffer [maxBatchSize]. EOS token ids per request
 //! \param maxTopP maximum among all topPs P for topP sampling
@@ -77,7 +78,7 @@ template <typename T>
 void invokeBatchTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize, int** outputIds,
     int* sequenceLength, FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
     float* outputLogProbs, T const* logProbs, int const* idVals, int* offsetBuf, int* beginOffsetBuf,
-    curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded, int const* endIds,
+    curandState_t* curandstate, int const batchSize, int maxBatchSize, size_t const vocabSizePadded, int const* endIds,
     float const maxTopP, float const* topPs, cudaStream_t stream, bool const* skipDecode, int const* batchSlots);
 
 //! \brief Specialization of invokeBatchTopPSampling with topPs=nullptr
@@ -85,8 +86,8 @@ template <typename T>
 void invokeTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempStorageSize, int** outputIds,
     int* sequenceLength, FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
     float* outputLogProbs, T const* logProbs, int const* idVals, int* offsetBuf, int* beginOffsetBuf,
-    curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded, int const* endIds, float const topPp,
-    cudaStream_t stream, bool const* skipDecode, int const* batchSlots);
+    curandState_t* curandstate, int const batchSize, int maxBatchSize, size_t const vocabSizePadded, int const* endIds,
+    float const topPp, cudaStream_t stream, bool const* skipDecode, int const* batchSlots);
 
 //! \brief Given logProbs, performs top P sampling.
 //! Note different from invokeTopPSampling() and invokeBatchTopPSampling() there two functions invokeAirTopPSampling
@@ -116,6 +117,7 @@ void invokeTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempS
 //! \param curandstate input buffer [batchSize]. Curand states properly initialized using invokeCurandInitialize per
 //! request.
 //! \param batchSize batch size
+//! \param maxBatchSize max batch size
 //! \param vocabSizePadded size of padded vocab
 //! \param endIds input buffer [batchSize]. EOS token ids per request
 //! \param maxTopP maximum among all topPs P for topP sampling
@@ -128,16 +130,17 @@ void invokeTopPSampling(void* workspace, size_t& workspaceSize, size_t& cubTempS
 template <typename T>
 void invokeBatchAirTopPSampling(void* workspace, size_t& workspaceSize, int** outputIds, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    T const* logProbs, curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded, int const* endIds,
-    float const maxTopP, float const* topPs, cudaStream_t stream, int blockNum, bool const* skipDecode,
-    int32_t const* batchSlots);
+    T const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize, size_t const vocabSizePadded,
+    int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream, int blockNum,
+    bool const* skipDecode, int32_t const* batchSlots);
 
 //! \brief Specialization of invokeBatchAirTopPSampling with topPs=nullptr
 template <typename T>
 void invokeAirTopPSampling(void* workspace, size_t& workspaceSize, int** outputIds, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    T const* logProbs, curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded, int const* endIds,
-    float const topP, cudaStream_t stream, int blockNum, bool const* skipDecode, int32_t const* batchSlots);
+    T const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize, size_t const vocabSizePadded,
+    int const* endIds, float const topP, cudaStream_t stream, int blockNum, bool const* skipDecode,
+    int32_t const* batchSlots);
 
 //! \brief  Calculate the number of blocks based on the number of multiprocessors, batchSize and vocabSize.
 //! \tparam T the data type of value

@@ -417,6 +417,7 @@ class TRTLLMEncDecModel:
         prompt_tasks=None,
         prompt_vocab_size=None,
         attention_mask=None,
+        time_encoder=False,
     ):
         ## ensure all externally provided tensors are on the correct device.
         encoder_input_ids = encoder_input_ids.to(self.device)
@@ -436,6 +437,8 @@ class TRTLLMEncDecModel:
 
         if not self.skip_encoder:
             logger.info(f"Rank {self.runtime_rank} Running encoder engine ...")
+            if time_encoder:
+                tik = time.time()
             encoder_output = self.encoder_run(
                 encoder_input_ids,
                 encoder_input_lengths,
@@ -445,6 +448,9 @@ class TRTLLMEncDecModel:
                 prompt_tasks=prompt_tasks,
                 prompt_vocab_size=prompt_vocab_size,
                 attention_mask=attention_mask)
+            if time_encoder:
+                tok = time.time()
+                print(f"TRT-LLM Encoder time {(tok-tik)*1000}ms")
         else:
             encoder_output = prompt_embedding_table
             if encoder_input_ids.dim() > 1:
@@ -472,7 +478,10 @@ class TRTLLMEncDecModel:
         sampling_config = SamplingConfig(end_id=eos_token_id,
                                          pad_id=pad_token_id,
                                          num_beams=num_beams,
-                                         min_length=1)
+                                         min_length=1,
+                                         return_dict=return_dict)
+        sampling_config.update(output_cum_log_probs=False,
+                               output_log_probs=False)
 
         # decoder autoregressive generation
         self.decoder_session.setup(
@@ -485,7 +494,7 @@ class TRTLLMEncDecModel:
         )
         torch.cuda.synchronize()
 
-        output_ids = self.decoder_session.decode(
+        output = self.decoder_session.decode(
             decoder_input_ids,
             decoder_input_lengths,
             sampling_config,
@@ -495,7 +504,7 @@ class TRTLLMEncDecModel:
             cross_attention_mask=cross_attention_mask)
         torch.cuda.synchronize()
 
-        return output_ids
+        return output
 
 
 def test_fairseq_models(args):
@@ -545,8 +554,9 @@ def test_fairseq_models(args):
 
     inference_dtype = tllm_model.encoder_model_config.dtype
 
+    return_dict = False  # when set return_dict=True, get outputs by key
     tik = time.time()
-    tllm_output_ids = tllm_model.generate(
+    tllm_output = tllm_model.generate(
         encoder_input_ids=input_ids,
         decoder_input_ids=decoder_input_ids,
         max_new_tokens=max_new_tokens,
@@ -557,6 +567,12 @@ def test_fairseq_models(args):
         debug_mode=args.debug_mode,
     )
     tok = time.time()
+
+    if return_dict:
+        tllm_output_ids = tllm_output['output_ids']
+    else:
+        tllm_output_ids = tllm_output
+
     output_ids = tllm_output_ids[:, 0, :]
     output_ids = output_ids[output_ids != eos_token_id]
     fairseq_output_ids = fairseq_output_ids[fairseq_output_ids != eos_token_id]
@@ -680,8 +696,10 @@ if __name__ == "__main__":
     tllm_model = TRTLLMEncDecModel.from_engine(args.engine_name,
                                                args.engine_dir,
                                                debug_mode=args.debug_mode)
+
+    return_dict = False  # when set return_dict=True, get outputs by key
     tik = time.time()
-    tllm_output_ids = tllm_model.generate(
+    tllm_output = tllm_model.generate(
         encoder_input_ids=input_ids,
         decoder_input_ids=decoder_input_ids,
         max_new_tokens=max_new_tokens,
@@ -690,9 +708,15 @@ if __name__ == "__main__":
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
         debug_mode=args.debug_mode,
-        return_dict=False,  # when set return_dict=True, get outputs by key
-        attention_mask=tokenized_inputs.attention_mask)
+        return_dict=return_dict,
+        attention_mask=tokenized_inputs.attention_mask,
+        time_encoder=True)
     tok = time.time()
+
+    if return_dict:
+        tllm_output_ids = tllm_output['output_ids']
+    else:
+        tllm_output_ids = tllm_output
 
     inference_dtype = tllm_model.encoder_model_config.dtype
 

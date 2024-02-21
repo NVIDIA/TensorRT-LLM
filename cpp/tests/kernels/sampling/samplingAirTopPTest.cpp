@@ -43,6 +43,7 @@ protected:
 private:
     size_t getWorkspaceSize(const SamplingKernelTestParam& params) override
     {
+        auto const maxBatchSize = 2 * params.batchSize;
         size_t sampling_workspace_size_;
         tk::invokeAirTopPSampling<T>(nullptr, sampling_workspace_size_,
             nullptr, // output_ids
@@ -52,7 +53,7 @@ private:
             nullptr, // cum_log_probs
             nullptr, // output_log_probs
             nullptr, // log_probs)
-            this->mCurandStatesDevice, params.batchSize, params.vocabSize, nullptr, this->mMaxTopP,
+            this->mCurandStatesDevice, params.batchSize, maxBatchSize, params.vocabSize, nullptr, this->mMaxTopP,
             this->mStream->get(), 0, nullptr, nullptr);
         return sampling_workspace_size_;
     }
@@ -65,6 +66,7 @@ private:
         int smCnt;
         TLLM_CUDA_CHECK(cudaGetDevice(&dev));
         TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&smCnt, cudaDevAttrMultiProcessorCount, dev));
+        auto const maxBatchSize = 2 * params.batchSize;
 
         int blockNum = tk::calcAirTopPBlockNum<T, int, float>(params.batchSize, params.vocabSize, smCnt);
         // Perform batched TopP sampling
@@ -79,8 +81,8 @@ private:
             // log-prob if cum_log_probs or output_log_probs are
             // provided. It's because the sampling layer already
             // preprocesses log_prob_buf when those are provided.
-            bufferCast<T>(*this->mProbsDevice), this->mCurandStatesDevice, params.batchSize, params.vocabSize,
-            bufferCast<int32_t>(*this->mEndIdsDevice), this->mMaxTopP,
+            bufferCast<T>(*this->mProbsDevice), this->mCurandStatesDevice, params.batchSize, maxBatchSize,
+            params.vocabSize, bufferCast<int32_t>(*this->mEndIdsDevice), this->mMaxTopP,
             hasDiffRuntimeArgs ? bufferCast<float>(*this->mTopPsDevice) : nullptr, this->mStream->get(), blockNum,
             bufferCast<bool>(*this->mSkipDecodeDevice), bufferCast<int32_t>(*this->mBatchSlots));
     }

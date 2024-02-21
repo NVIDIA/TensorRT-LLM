@@ -42,16 +42,18 @@ protected:
 
     size_t getWorkspaceSize(const SamplingKernelTestParam& params) override
     {
+        auto const maxBatchSize = 2 * params.batchSize;
         size_t workspaceSize;
         tk::invokeTopKSampling<T>(nullptr, workspaceSize, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
             nullptr, this->mMaxTopK, 1.0f, params.vocabSize, nullptr, nullptr, this->mStream->get(), params.batchSize,
-            nullptr, true, false);
+            maxBatchSize, nullptr, true, false);
         return workspaceSize;
     }
 
     void callTestedFunction(const SamplingKernelTestParam& params, bool hasDiffRuntimeArgs, size_t workspaceSize,
         tensorrt_llm::runtime::ITensor::SharedPtr& workspaceDevice) override
     {
+        auto const maxBatchSize = 2 * params.batchSize;
         // Perform batched TopK sampling
         tk::invokeBatchTopKSampling(workspaceDevice->data(), workspaceSize,
             // Note that the kernel needs vocab probs instead of
@@ -69,7 +71,7 @@ protected:
             hasDiffRuntimeArgs ? bufferCast<int32_t>(*this->mTopKsDevice) : nullptr, params.topP,
             hasDiffRuntimeArgs ? bufferCast<float>(*this->mTopPsDevice) : nullptr, params.vocabSize,
             bufferCast<int32_t>(*this->mEndIdsDevice), bufferCast<int32_t>(*this->mBatchSlots), this->mStream->get(),
-            params.batchSize, bufferCast<bool>(*this->mSkipDecodeDevice), params.normalizeLogProbs,
+            params.batchSize, maxBatchSize, bufferCast<bool>(*this->mSkipDecodeDevice), params.normalizeLogProbs,
             params.logitsHasProbs);
     }
 };

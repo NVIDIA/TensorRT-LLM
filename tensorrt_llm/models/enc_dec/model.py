@@ -1107,7 +1107,7 @@ class DecoderModel(Module, GenerationMixin):
         # No enable_two_optimization_profiles support yet
 
         encoder_input_len_range = [
-            0, (max_encoder_input_len + 1) // 2, max_encoder_input_len
+            1, (max_encoder_input_len + 1) // 2, max_encoder_input_len
         ]
         past_key_value = []
         sequence_length = None

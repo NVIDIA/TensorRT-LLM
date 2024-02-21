@@ -57,9 +57,9 @@ python3 convert_checkpoint.py --model_dir ./Skywork-13B-base \
 ```bash
 # fp16
 trtllm-build --checkpoint_dir ./skywork-13b-base/trt_ckpt/fp16 \
-                --use_gemm_plugin float16 \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
+                --gemm_plugin float16 \
+                --gpt_attention_plugin float16 \
+                --context_fmha enable \
                 --max_batch_size 32 \
                 --max_input_len 512 \
                 --max_output_len 512 \
@@ -67,9 +67,9 @@ trtllm-build --checkpoint_dir ./skywork-13b-base/trt_ckpt/fp16 \
 
 # bf16
 trtllm-build --checkpoint_dir ./skywork-13b-base/trt_ckpt/bf16 \
-                --use_gemm_plugin bfloat16 \
-                --use_gpt_attention_plugin bfloat16 \
-                --enable_context_fmha \
+                --gemm_plugin bfloat16 \
+                --gpt_attention_plugin bfloat16 \
+                --context_fmha enable \
                 --max_batch_size 32 \
                 --max_input_len 512 \
                 --max_output_len 512 \
@@ -85,23 +85,23 @@ After building TRT engines, we can use them to perform various tasks. TensorRT-L
 python ../summarize.py --hf_model_dir ./Skywork-13B-base \
                        --test_hf \
                        --batch_size 32 \
-                       --max_input_length 512
+                       --max_input_length 512 \
                        --output_len 512 \
                        --test_trt_llm \
                        --engine_dir ./skywork-13b-base/trt_engine/fp16 \
                        --data_type fp16 \
-                       -check_accuracy \
+                       --check_accuracy \
                        --tensorrt_llm_rouge1_threshold=14
 
 # bf16
 python ../summarize.py --hf_model_dir ./Skywork-13B-base \
                        --test_hf \
                        --batch_size 32 \
-                       --max_input_length 512
+                       --max_input_length 512 \
                        --output_len 512 \
                        --test_trt_llm \
                        --engine_dir ./skywork-13b-base/trt_engine/bf16 \
                        --data_type bf16 \
-                       -check_accuracy \
+                       --check_accuracy \
                        --tensorrt_llm_rouge1_threshold=14
 ```

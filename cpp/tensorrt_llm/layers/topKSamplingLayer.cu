@@ -74,8 +74,8 @@ void TopKSamplingLayer<T>::allocateBuffer(size_t const batchSize)
 {
     TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     invokeTopKSampling<T>(nullptr, mSamplingWorkspaceSize, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-        nullptr, nullptr, TOP_K_MAX, 1.0f, mVocabSizePadded, nullptr, nullptr, mStream, batchSize, nullptr,
-        mNormalizeLogProbs, false);
+        nullptr, nullptr, TOP_K_MAX, 1.0f, mVocabSizePadded, nullptr, nullptr, mStream, batchSize, mMaxBatchSize,
+        nullptr, mNormalizeLogProbs, false);
 
     std::array<size_t, 4> deviceBufferSizes;
     deviceBufferSizes[0] = sizeof(uint32_t) * batchSize;
@@ -213,7 +213,7 @@ void TopKSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams&
     invokeBatchTopKSampling(samplingWorkspaceDevice, mSamplingWorkspaceSize, logits,
         outputs.output_ids_ptr.template getPtr<int*>(), sequenceLength, finishedInput, finishedOutput, cumLogProbs,
         outputLogProbs, curandStatesDevice, (int) mRuntimeMaxTopK, (int*) (mRuntimeTopKDevice), 1.0f,
-        mRuntimeTopPDevice, mVocabSizePadded, endIds, batchSlots, mStream, batchSize, mSkipDecodeDevice,
+        mRuntimeTopPDevice, mVocabSizePadded, endIds, batchSlots, mStream, batchSize, mMaxBatchSize, mSkipDecodeDevice,
         mNormalizeLogProbs, probsComputed);
     sync_check_cuda_error();
 }

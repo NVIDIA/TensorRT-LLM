@@ -472,31 +472,35 @@ void invokeCopyNextStepIds(int* nextStepIds, int** outputIdsPtr, const int* sequ
 }
 
 __global__ void transposeLogProbs(float* outputLogProbs, float* outputLogProbsTiled, const int* sequenceLengths,
-    const int* batchSlots, int batchSize, int beamWidth, int maxSeqLen)
+    const int* batchSlots, int batchSize, int maxBatchSize, int beamWidth, int maxSeqLen)
 {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    const int batchIdx = index / (beamWidth * maxSeqLen);
-    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
-    const int tmpIdx = index % (beamWidth * maxSeqLen);
-    const int beamIdx = tmpIdx / maxSeqLen;
-    const int pos = tmpIdx % maxSeqLen;
+    int const batchIdx = index / (beamWidth * maxSeqLen);
+    int const tmpIdx = index % (beamWidth * maxSeqLen);
+    int const beamIdx = tmpIdx / maxSeqLen;
+    int const pos = tmpIdx % maxSeqLen;
+    if (batchIdx >= batchSize)
+    {
+        return;
+    }
 
-    if (batchIdx < batchSize && pos < sequenceLengths[batchSlot])
+    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
+    if (pos < sequenceLengths[batchSlot])
     {
         auto const batchBeamIdx = batchSlot * beamWidth * maxSeqLen + beamIdx * maxSeqLen + pos;
         outputLogProbs[batchBeamIdx]
-            = outputLogProbsTiled[pos * batchSize * beamWidth + batchSlot * beamWidth + beamIdx];
+            = outputLogProbsTiled[pos * maxBatchSize * beamWidth + batchSlot * beamWidth + beamIdx];
     }
 }
 
 void invokeTransposeLogProbs(float* outputLogProbs, float* outputLogProbsTiled, const int* sequenceLengths,
-    const int* batchSlots, int batchSize, int beamWidth, int maxSeqLen, cudaStream_t stream)
+    const int* batchSlots, int batchSize, int maxBatchSize, int beamWidth, int maxSeqLen, cudaStream_t stream)
 {
     dim3 block(256);
     dim3 grid(divUp(batchSize * beamWidth * maxSeqLen, block.x));
-    transposeLogProbs<<<grid, block, 0, stream>>>(
-        outputLogProbs, outputLogProbsTiled, sequenceLengths, batchSlots, batchSize, beamWidth, maxSeqLen);
+    transposeLogProbs<<<grid, block, 0, stream>>>(outputLogProbs, outputLogProbsTiled, sequenceLengths, batchSlots,
+        batchSize, maxBatchSize, beamWidth, maxSeqLen);
 }
 
 __global__ void acceptDraftTokensByIds(int32_t const* draftIds, int32_t const* targetIds, int32_t const* contextLengths,
