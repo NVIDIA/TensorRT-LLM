@@ -21,7 +21,7 @@ docker run --gpus all --ipc=host --ulimit memlock=-1 --shm-size=20g -it <the doc
 
 ```bash
 # Install AMMO
-pip install --no-cache-dir --extra-index-url https://pypi.nvidia.com nvidia-ammo~=0.7.0
+pip install --no-cache-dir --extra-index-url https://pypi.nvidia.com nvidia-ammo~=0.7.3
 # Install the additional requirements
 cd <this example folder>
 pip install -r requirements.txt
