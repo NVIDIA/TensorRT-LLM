@@ -144,12 +144,13 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
     th::Tensor& output_token_ids, th::Tensor& newTokens, th::Tensor& should_stop,
     th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
     th::optional<th::Tensor> sequence_lengths_opt, th::optional<th::Tensor> cum_log_probs_opt,
-    th::optional<th::Tensor> output_log_probs_opt, th::optional<th::Tensor> parent_ids_opt,
-    th::optional<th::Tensor> tgt_cache_indirection_opt, th::optional<th::Tensor> beam_hyps_output_ids_tgt_opt,
-    th::optional<th::Tensor> beam_hyps_sequence_lengths_tgt_opt, th::optional<th::Tensor> beam_hyps_cum_log_probs_opt,
-    th::optional<th::Tensor> beam_hyps_normed_scores_opt, th::optional<th::Tensor> beam_hyps_log_probs_opt,
-    th::optional<th::Tensor> beam_hyps_min_normed_scores_opt, th::optional<th::Tensor> beam_hyps_num_beams_opt,
-    th::optional<th::Tensor> beam_hyps_is_done_opt, bool use_beam_hyps)
+    th::optional<th::Tensor> output_log_probs_opt, th::optional<th::Tensor> output_log_probs_tiled_opt,
+    th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,
+    th::optional<th::Tensor> beam_hyps_output_ids_tgt_opt, th::optional<th::Tensor> beam_hyps_sequence_lengths_tgt_opt,
+    th::optional<th::Tensor> beam_hyps_cum_log_probs_opt, th::optional<th::Tensor> beam_hyps_normed_scores_opt,
+    th::optional<th::Tensor> beam_hyps_log_probs_opt, th::optional<th::Tensor> beam_hyps_min_normed_scores_opt,
+    th::optional<th::Tensor> beam_hyps_num_beams_opt, th::optional<th::Tensor> beam_hyps_is_done_opt,
+    bool use_beam_hyps)
 
 {
     auto const& logits_converted = convert_tensor<float>(logits);
@@ -190,6 +191,7 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
     safeUpdate<int>(parent_ids_opt, outputParams.parent_ids);
     safeUpdate<float>(cum_log_probs_opt, outputParams.cum_log_probs);
     safeUpdate<float>(output_log_probs_opt, outputParams.output_log_probs);
+    safeUpdate<float>(output_log_probs_tiled_opt, outputParams.output_log_probs_tiled);
     safeUpdate<int>(tgt_cache_indirection_opt, outputParams.tgt_cache_indirection);
 
     if (use_beam_hyps)
@@ -297,12 +299,12 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
     th::optional<th::Tensor> finished_output,
     th::optional<th::Tensor> seuqence_lengths_opt, // length of the current sequences.
     th::optional<th::Tensor> cum_log_probs_opt, th::optional<th::Tensor> output_log_probs_opt,
-    th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,
-    th::optional<th::Tensor> beam_hyps_output_ids_tgt_opt, th::optional<th::Tensor> beam_hyps_sequence_lengths_tgt_opt,
-    th::optional<th::Tensor> beam_hyps_cum_log_probs_opt, th::optional<th::Tensor> beam_hyps_normed_scores_opt,
-    th::optional<th::Tensor> beam_hyps_log_probs_opt, th::optional<th::Tensor> beam_hyps_min_normed_scores_opt,
-    th::optional<th::Tensor> beam_hyps_num_beams_opt, th::optional<th::Tensor> beam_hyps_is_done_opt,
-    bool use_beam_hyps)
+    th::optional<th::Tensor> output_log_probs_tiled_opt, th::optional<th::Tensor> parent_ids_opt,
+    th::optional<th::Tensor> tgt_cache_indirection_opt, th::optional<th::Tensor> beam_hyps_output_ids_tgt_opt,
+    th::optional<th::Tensor> beam_hyps_sequence_lengths_tgt_opt, th::optional<th::Tensor> beam_hyps_cum_log_probs_opt,
+    th::optional<th::Tensor> beam_hyps_normed_scores_opt, th::optional<th::Tensor> beam_hyps_log_probs_opt,
+    th::optional<th::Tensor> beam_hyps_min_normed_scores_opt, th::optional<th::Tensor> beam_hyps_num_beams_opt,
+    th::optional<th::Tensor> beam_hyps_is_done_opt, bool use_beam_hyps)
 {
     // Input Arguments:
     //     logits: [batch_size, beam_width, vocab_size_padded], T
@@ -349,6 +351,7 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
     CHECK_OPTIONAL_INPUT(seuqence_lengths_opt, torch::kInt32);
     CHECK_OPTIONAL_INPUT(cum_log_probs_opt, torch::kFloat32);
     CHECK_OPTIONAL_INPUT(output_log_probs_opt, torch::kFloat32);
+    CHECK_OPTIONAL_INPUT(output_log_probs_tiled_opt, torch::kFloat32);
     CHECK_OPTIONAL_INPUT(parent_ids_opt, torch::kInt32);
     CHECK_OPTIONAL_INPUT(tgt_cache_indirection_opt, torch::kInt32);
 
@@ -363,7 +366,7 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
         static_cast<int32_t>(max_bad_words_len), no_repeat_ngram_size_opt, src_cache_indirection_opt,
         // Outputs
         output_token_ids, newTokens, should_stop, finished_input, finished_output, seuqence_lengths_opt,
-        cum_log_probs_opt, output_log_probs_opt, parent_ids_opt, tgt_cache_indirection_opt,
+        cum_log_probs_opt, output_log_probs_opt, output_log_probs_tiled_opt, parent_ids_opt, tgt_cache_indirection_opt,
         beam_hyps_output_ids_tgt_opt, beam_hyps_sequence_lengths_tgt_opt, beam_hyps_cum_log_probs_opt,
         beam_hyps_normed_scores_opt, beam_hyps_log_probs_opt, beam_hyps_min_normed_scores_opt, beam_hyps_num_beams_opt,
         beam_hyps_is_done_opt, use_beam_hyps);

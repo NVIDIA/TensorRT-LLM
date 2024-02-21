@@ -308,7 +308,7 @@ template <typename T, typename IdxT, typename AccT, int BitsPerPass>
 __device__ __forceinline__ void filterAndHistogram(T const* inBuf, IdxT const* inIdxBuf, T* outBuf, IdxT* outIdxBuf,
     int previousLen, Counter<T, IdxT, AccT>* counter, AccT* histogram, IdxT* countHistogram, int pass,
     float* outputLogProbs, float* cumLogProbs, IdxT** ids, IdxT const* endIds, IdxT* sequenceLengths,
-    FinishedState* finishedOutput, int const batchId, bool earlyStop)
+    FinishedState* finishedOutput, int const batchId, int maxBatchSize, bool earlyStop)
 {
     static_assert(std::is_same_v<T, half> | std::is_same_v<T, float>, "T needs to be either half or float");
     static_assert(std::is_same_v<AccT, float>, "AccT needs to be float");
@@ -359,7 +359,7 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, IdxT const* i
         // See the remark above on the distributed execution of `f` using
         // vectorizedProcess.
         auto f = [inIdxBuf, outBuf, outIdxBuf, selectMin, startBit, mask, previousStartBit, kthValueBits, pFilterCnt,
-                     outputLogProbs, cumLogProbs, ids, endIds, sequenceLengths, finishedOutput, batchId,
+                     outputLogProbs, cumLogProbs, ids, endIds, sequenceLengths, finishedOutput, batchId, maxBatchSize,
                      earlyStop](T value, IdxT i)
         {
             auto const previousBits = (twiddleIn(value, selectMin) >> previousStartBit) << previousStartBit;
@@ -370,8 +370,8 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, IdxT const* i
                     int const currentStep = sequenceLengths[batchId];
                     IdxT index = inIdxBuf ? inIdxBuf[i] : i;
                     ids[batchId][currentStep] = index;
-                    epilogue(
-                        value, index, outputLogProbs, cumLogProbs, endIds, sequenceLengths, finishedOutput, batchId);
+                    epilogue(value, index, outputLogProbs, cumLogProbs, endIds, sequenceLengths, finishedOutput,
+                        batchId, maxBatchSize);
                 }
                 if (outBuf)
                 {
@@ -506,14 +506,14 @@ __device__ void chooseBucket(
  */
 template <typename T, typename IdxT>
 __device__ void epilogue(T const value, IdxT const index, float* outputLogProbs, float* cumLogProbs, IdxT const* endIds,
-    IdxT* sequenceLengths, FinishedState* finishedOutput, int const batchId)
+    IdxT* sequenceLengths, FinishedState* finishedOutput, int const batchId, int maxBatchSize)
 {
     if (outputLogProbs != nullptr || cumLogProbs != nullptr)
     {
         float res = logf(value);
         if (outputLogProbs)
         {
-            outputLogProbs[batchId] = res;
+            outputLogProbs[sequenceLengths[batchId] * maxBatchSize + batchId] = res;
         }
         if (cumLogProbs)
         {
@@ -542,7 +542,7 @@ __device__ void epilogue(T const value, IdxT const index, float* outputLogProbs,
 template <typename T, typename IdxT, typename AccT, int BitsPerPass>
 __device__ void lastFilter(T const* inBuf, IdxT const* inIdxBuf, IdxT currentLen, Counter<T, IdxT, AccT>* counter,
     float* outputLogProbs, float* cumLogProbs, IdxT** ids, IdxT const* endIds, IdxT* sequenceLengths,
-    FinishedState* finishedOutput, int const batchId)
+    FinishedState* finishedOutput, int const batchId, int maxBatchSize)
 {
     auto const kthValueBits = counter->kthValueBits;
     auto const equalValue = twiddleOut<T>(kthValueBits, false);
@@ -565,7 +565,8 @@ __device__ void lastFilter(T const* inBuf, IdxT const* inIdxBuf, IdxT currentLen
 
     if (threadIdx.x == 0)
     {
-        epilogue(equalValue, *outIdx, outputLogProbs, cumLogProbs, endIds, sequenceLengths, finishedOutput, batchId);
+        epilogue(equalValue, *outIdx, outputLogProbs, cumLogProbs, endIds, sequenceLengths, finishedOutput, batchId,
+            maxBatchSize);
     }
 }
 
@@ -609,7 +610,7 @@ __device__ void lastFilter(T const* inBuf, IdxT const* inIdxBuf, IdxT currentLen
 template <typename T, typename IdxT, typename AccT, int BitsPerPass, int BlockSize, bool is_fused_filter = false>
 __global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, AccT* histograms, IdxT* countHistograms, IdxT** ids,
     int* sequenceLengths, FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
-    float* outputLogProbs, IdxT const* endIds, int const batchSize, bool const* skipDecode, int const pass, T* buf1,
+    float* outputLogProbs, IdxT const* endIds, int const maxBatchSize, bool const* skipDecode, int const pass, T* buf1,
     IdxT* idxBuf1, T* buf2, IdxT* idxBuf2, int32_t const* batchSlots)
 {
     assert(sequenceLengths != nullptr);
@@ -698,7 +699,7 @@ __global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, AccT* histogra
 
     filterAndHistogram<T, IdxT, AccT, BitsPerPass>(inBuf, inIdxBuf, outBuf, outIdxBuf, previousLen, counter, histogram,
         countHistogram, pass, outputLogProbs, cumLogProbs, ids, endIds, sequenceLengths, finishedOutput, batchSlot,
-        earlyStop);
+        maxBatchSize, earlyStop);
 
     __syncthreads();
     __threadfence();
@@ -779,7 +780,7 @@ __global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, AccT* histogra
             {
                 lastFilter<T, IdxT, AccT, BitsPerPass>(outBuf ? outBuf : inBuf, outIdxBuf ? outIdxBuf : inIdxBuf,
                     outBuf ? currentLen : counter->oriLen, counter, outputLogProbs, cumLogProbs, ids, endIds,
-                    sequenceLengths, finishedOutput, batchSlot);
+                    sequenceLengths, finishedOutput, batchSlot, maxBatchSize);
 
                 __syncthreads();
             }
@@ -891,9 +892,9 @@ unsigned calcAirTopPBlockNum(int batchSize, IdxT len, int smCnt)
 template <typename T>
 void invokeBatchAirTopPSampling(void* workspace, size_t& workspaceSize, int** outputIds, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    T const* logProbs, curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded, int const* endIds,
-    float const maxTopP, float const* topPs, cudaStream_t stream, int blockNum, bool const* skipDecode,
-    int32_t const* batchSlots)
+    T const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize, size_t const vocabSizePadded,
+    int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream, int blockNum,
+    bool const* skipDecode, int32_t const* batchSlots)
 {
     using IdxT = int;
     using AccT = float;
@@ -953,46 +954,47 @@ void invokeBatchAirTopPSampling(void* workspace, size_t& workspaceSize, int** ou
         }
 
         kernel<<<grid, SAMPLING_BLOCK_SIZE, 0, stream>>>(counters, histograms, countHistograms, outputIds,
-            sequenceLength, finishedInput, finishedOutput, cumLogProbs, outputLogProbs, endIds, batchSize, skipDecode,
-            pass, buf1, idxBuf1, buf2, idxBuf2, batchSlots);
+            sequenceLength, finishedInput, finishedOutput, cumLogProbs, outputLogProbs, endIds, maxBatchSize,
+            skipDecode, pass, buf1, idxBuf1, buf2, idxBuf2, batchSlots);
         sync_check_cuda_error();
     }
 }
 
 template void invokeBatchAirTopPSampling(void* workspace, size_t& workspaceSize, int** outputIds, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    float const* logProbs, curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded,
-    int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream, int blockNum,
-    bool const* skipDecode, int32_t const* batchSlots);
+    float const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize,
+    size_t const vocabSizePadded, int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream,
+    int blockNum, bool const* skipDecode, int32_t const* batchSlots);
 
 template void invokeBatchAirTopPSampling(void* workspace, size_t& workspaceSize, int** outputIds, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    half const* logProbs, curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded,
-    int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream, int blockNum,
-    bool const* skipDecode, int32_t const* batchSlots);
+    half const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize,
+    size_t const vocabSizePadded, int const* endIds, float const maxTopP, float const* topPs, cudaStream_t stream,
+    int blockNum, bool const* skipDecode, int32_t const* batchSlots);
 
 template <typename T>
 void invokeAirTopPSampling(void* workspace, size_t& workspaceSize, int** outputIds, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    T const* logProbs, curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded, int const* endIds,
-    float const topP, cudaStream_t stream, int blockNum, bool const* skipDecode, int32_t const* batchSlots)
+    T const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize, size_t const vocabSizePadded,
+    int const* endIds, float const topP, cudaStream_t stream, int blockNum, bool const* skipDecode,
+    int32_t const* batchSlots)
 {
     invokeBatchAirTopPSampling(workspace, workspaceSize, outputIds, sequenceLength, finishedInput, finishedOutput,
-        cumLogProbs, outputLogProbs, logProbs, curandstate, batchSize, vocabSizePadded, endIds, topP, nullptr, stream,
-        blockNum, skipDecode, batchSlots);
+        cumLogProbs, outputLogProbs, logProbs, curandstate, batchSize, maxBatchSize, vocabSizePadded, endIds, topP,
+        nullptr, stream, blockNum, skipDecode, batchSlots);
 }
 
 template void invokeAirTopPSampling(void* workspace, size_t& workspaceSize, int** outputIds, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    float const* logProbs, curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded,
-    int const* endIds, float const topP, cudaStream_t stream, int blockNum, bool const* skipDecode,
-    int32_t const* batchSlots);
+    float const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize,
+    size_t const vocabSizePadded, int const* endIds, float const topP, cudaStream_t stream, int blockNum,
+    bool const* skipDecode, int32_t const* batchSlots);
 
 template void invokeAirTopPSampling(void* workspace, size_t& workspaceSize, int** outputIds, int* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    half const* logProbs, curandState_t* curandstate, int const batchSize, size_t const vocabSizePadded,
-    int const* endIds, float const topP, cudaStream_t stream, int blockNum, bool const* skipDecode,
-    int32_t const* batchSlots);
+    half const* logProbs, curandState_t* curandstate, int const batchSize, int maxBatchSize,
+    size_t const vocabSizePadded, int const* endIds, float const topP, cudaStream_t stream, int blockNum,
+    bool const* skipDecode, int32_t const* batchSlots);
 
 template unsigned calcAirTopPBlockNum<float, int, float>(int batchSize, int len, int smCnt);
 template unsigned calcAirTopPBlockNum<half, int, float>(int batchSize, int len, int smCnt);

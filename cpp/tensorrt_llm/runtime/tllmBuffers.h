@@ -240,6 +240,7 @@ private:
 using CpuBorrowingAllocator = BorrowingAllocator<MemoryType::kCPU>;
 using GpuBorrowingAllocator = BorrowingAllocator<MemoryType::kGPU>;
 using PinnedBorrowingAllocator = BorrowingAllocator<MemoryType::kPINNED>;
+using ManagedBorrowingAllocator = BorrowingAllocator<MemoryType::kUVM>;
 
 // using UVMBorrowingAllocator = BorrowingAllocator<MemoryType::kUVM>;
 

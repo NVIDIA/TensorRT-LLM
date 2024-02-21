@@ -78,8 +78,8 @@ void TopPSamplingLayer<T>::allocateBuffer(size_t batchSize)
             nullptr,                   // cum_log_probs
             nullptr,                   // output_log_probs
             nullptr,                   // log_probs
-            mTopPIdValsDevice, mTopPOffsetDevice, mBeginTopPOffsetDevice, nullptr, batchSize, mVocabSizePadded, nullptr,
-            0.f, mStream, nullptr, nullptr);
+            mTopPIdValsDevice, mTopPOffsetDevice, mBeginTopPOffsetDevice, nullptr, batchSize, mMaxBatchSize,
+            mVocabSizePadded, nullptr, 0.f, mStream, nullptr, nullptr);
     }
     else
     {
@@ -91,7 +91,8 @@ void TopPSamplingLayer<T>::allocateBuffer(size_t batchSize)
             nullptr, // cum_log_probs
             nullptr, // output_log_probs
             nullptr, // log_probs)
-            nullptr, batchSize, mVocabSizePadded, nullptr, 0.f, mStream, mAirTopPBlockNum, nullptr, nullptr);
+            nullptr, batchSize, mMaxBatchSize, mVocabSizePadded, nullptr, 0.f, mStream, mAirTopPBlockNum, nullptr,
+            nullptr);
     }
 
     std::array<size_t, 11> deviceBufferSizes;
@@ -315,8 +316,8 @@ void TopPSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams&
         invokeBatchTopPSampling<T>(samplingWorkspaceDevice, mSamplingWorkspaceSize, mCubTempStorageSize,
             outputs.output_ids_ptr.template getPtr<int*>(), sequenceLength, finishedInput, finishedOutput, cumLogProbs,
             outputLogProbs, probs, mTopPIdValsDevice, mTopPOffsetDevice, mBeginTopPOffsetDevice, curandStatesDevice,
-            batchSize, mVocabSizePadded, endIds, mRuntimeMaxTopP, mRuntimeTopPDevice, mStream, mSkipDecodeDevice,
-            batchSlots);
+            batchSize, mMaxBatchSize, mVocabSizePadded, endIds, mRuntimeMaxTopP, mRuntimeTopPDevice, mStream,
+            mSkipDecodeDevice, batchSlots);
         sync_check_cuda_error();
         invokeComputeToppDecay(mRuntimeTopPDevice, mInitialTopPDevice,
             outputs.output_ids_ptr.template getPtr<const int*>(), mTopPDecayDevice, mTopPMinDevice, mTopPResetIdsDevice,
@@ -327,8 +328,8 @@ void TopPSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams&
     {
         invokeBatchAirTopPSampling<T>(samplingWorkspaceDevice, mSamplingWorkspaceSize,
             outputs.output_ids_ptr.template getPtr<int*>(), sequenceLength, finishedInput, finishedOutput, cumLogProbs,
-            outputLogProbs, probs, curandStatesDevice, batchSize, mVocabSizePadded, endIds, mRuntimeMaxTopP,
-            mRuntimeTopPDevice, mStream, mAirTopPBlockNum, mSkipDecodeDevice, batchSlots);
+            outputLogProbs, probs, curandStatesDevice, batchSize, mMaxBatchSize, mVocabSizePadded, endIds,
+            mRuntimeMaxTopP, mRuntimeTopPDevice, mStream, mAirTopPBlockNum, mSkipDecodeDevice, batchSlots);
         sync_check_cuda_error();
     }
 }

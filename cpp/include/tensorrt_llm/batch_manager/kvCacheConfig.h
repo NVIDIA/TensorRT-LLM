@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 
 #include <optional>
@@ -39,6 +40,13 @@ public:
         , freeGpuMemoryFraction{freeGpuMemoryFraction}
         , enableBlockReuse(enableBlockReuse)
         , useUvm(useUvm)
+    {
+    }
+
+    explicit KvCacheConfig(executor::KvCacheConfig const& kvCacheConfig)
+        : KvCacheConfig(kvCacheConfig.getMaxTokens(), kvCacheConfig.getMaxAttentionWindow(),
+            kvCacheConfig.getSinkTokenLength(), kvCacheConfig.getFreeGpuMemoryFraction(),
+            kvCacheConfig.getEnableBlockReuse(), kvCacheConfig.getUseUvm())
     {
     }
 

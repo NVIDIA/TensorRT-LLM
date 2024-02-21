@@ -64,7 +64,7 @@ void SamplingKernelTest<T>::allocateBuffers(
 
     mCumLogProbsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
     mOutputLogProbsDevice
-        = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, outputLen}), nvinfer1::DataType::kFLOAT);
+        = mBufferManager->gpu(ITensor::makeShape({maxSeqLen, maxBatchSize}), nvinfer1::DataType::kFLOAT);
 
     mZeroParentIdsDevice
         = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, maxSeqLen}), nvinfer1::DataType::kINT32);

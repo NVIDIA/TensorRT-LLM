@@ -21,25 +21,25 @@ from transformers import AutoTokenizer, T5Tokenizer
 
 import tensorrt_llm
 
-# TODO(enweiz): Update for refactered models
+# TODO(enweiz): Update for refactored models
 DEFAULT_HF_MODEL_DIRS = {
-    'baichuan': 'baichuan-inc/Baichuan-13B-Chat',
+    'BaichuanForCausalLM': 'baichuan-inc/Baichuan-13B-Chat',
     'BloomForCausalLM': 'bigscience/bloom-560m',
     'ChatGLMForCausalLM': 'THUDM/chatglm3-6b',
     'FalconForCausalLM': 'tiiuae/falcon-rw-1b',
     'gpt': 'gpt2-medium',
     'GPTJForCausalLM': 'EleutherAI/gpt-j-6b',
     'GPTNeoXForCausalLM': 'EleutherAI/gpt-neox-20b',
-    'internlm': 'internlm/internlm-chat-7b',
-    'llama': 'meta-llama/Llama-2-7b-hf',
-    'mpt': 'mosaicml/mpt-7b',
+    'InternLMForCausalLM': 'internlm/internlm-chat-7b',
+    'LlamaForCausalLM': 'meta-llama/Llama-2-7b-hf',
+    'MPTForCausalLM': 'mosaicml/mpt-7b',
     'PhiForCausalLM': 'microsoft/phi-2',
     'OPTForCausalLM': 'facebook/opt-350m',
     'qwen': 'Qwen/Qwen-7B',
 }
 
 DEFAULT_PROMPT_TEMPLATES = {
-    'internlm':
+    'InternLMForCausalLM':
     "<|User|>:{input_text}<eoh>\n<|Bot|>:",
     'qwen':
     "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{input_text}<|im_end|>\n<|im_start|>assistant\n",
@@ -110,7 +110,7 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
     elif model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
         pad_id = tokenizer.pad_token_id
         end_id = tokenizer.eop_token_id
-    elif model_name == 'SpecialForCausalLM':
+    elif model_name == 'GemmaForCausalLM':
         tokenizer.eos_token_id = tokenizer.sp_model.eos_id()
         tokenizer.bos_token_id = tokenizer.sp_model.bos_id()
         pad_id = tokenizer.pad_token_id

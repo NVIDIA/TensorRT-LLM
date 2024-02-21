@@ -129,7 +129,8 @@ void acceptDraftTokensByLogits(T* draftLogits, T** targetLogits, T* draftProbs, 
     int32_t maxDraftTokens, bool randomThreshold, float constantThreshold, cudaStream_t stream);
 
 void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_tiled, int32_t const* sequence_lengths,
-    int32_t const* batchSlots, int32_t batch_size, int32_t beam_width, int32_t max_seq_len, cudaStream_t stream);
+    int32_t const* batchSlots, int32_t batch_size, int32_t max_batch_size, int32_t beam_width, int32_t max_seq_len,
+    cudaStream_t stream);
 
 void invokeAcceptTokens(int32_t const* draft_tokens, int32_t const* target_tokens, int32_t const* context_lengths,
     int32_t const* nums_draft_tokens, int32_t* sequence_lengths, bool const* finished, bool* finished_final,

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
@@ -58,7 +59,7 @@ public:
         std::optional<TensorPtr> loraConfig = std::nullopt, bool returnLogProbs = false,
         bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
-        std::optional<TensorPtr> draftLogits = std::nullopt)
+        std::optional<TensorPtr> draftLogits = std::nullopt, bool excludeInputFromOutput = false)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -68,7 +69,8 @@ public:
         , mEndId(endId)
         , mPadId(padId)
         , mSeqSlot(-1)
-        , mOrigPromptLen(inputTokens->size())
+        , mOrigPromptLen(mPromptLen)
+        , mMaxSentTokenPos(mPromptLen - 1)
         , mEmbeddingBias(embeddingBias)
         , mBadWordsList(badWordsList)
         , mStopWordsList(stopWordsList)
@@ -85,27 +87,112 @@ public:
         , mDraftLogits(draftLogits)
         , mReturnContextLogits(returnContextLogits)
         , mReturnGenerationLogits(returnGenerationLogits)
+        , mExcludeInputFromOutput(excludeInputFromOutput)
     {
-        mMaxSentTokenPos = mPromptLen - 1;
-        // Scatter the input tokens to other beam
-        mTokens = BeamTokens(mSamplingConfig.beamWidth, *inputTokens);
+        initialize(*inputTokens);
+    }
 
-        if ((mPromptEmbeddingTable.has_value() && !mPromptVocabSize.has_value())
-            || (!mPromptEmbeddingTable.has_value() && mPromptVocabSize.has_value()))
+    GenericLlmRequest(RequestIdType requestId, executor::Request const& req)
+        : mRequestId(requestId)
+        , mPromptLen(req.getInputTokenIds().size())
+        , mMaxNewTokens(req.getMaxNewTokens())
+        , mSamplingConfig(req.getSamplingConfig(), req.getSpeculativeDecodingConfig())
+        , mState(REQUEST_STATE_CONTEXT_INIT)
+        , mIsStreaming(req.getStreaming())
+        , mEndId(req.getEndId())
+        , mPadId(req.getPadId())
+        , mSeqSlot(-1)
+        , mOrigPromptLen(mPromptLen)
+        , mMaxSentTokenPos(mPromptLen - 1)
+        , mReturnLogProbs(req.getOutputConfig().returnLogProbs)
+        , mContextChunkSize(std::nullopt)
+        , mContextCurrentPosition(0)
+        , mLogProbs(mSamplingConfig.beamWidth)
+        , mCumLogProbs(mSamplingConfig.beamWidth)
+        , mDraftTokens(std::make_shared<VecTokens>())
+        , mReturnContextLogits(req.getOutputConfig().returnContextLogits)
+        , mReturnGenerationLogits(req.getOutputConfig().returnGenerationLogits)
+        , mExcludeInputFromOutput(req.getOutputConfig().excludeInputFromOutput)
+    {
+        if (req.getEmbeddingBias())
         {
-            std::string errStr
-                = "Prompt embedding table and prompt vocab size tensors must both be provided for requests with prompt "
-                  "tuning enabled.";
-            TLLM_LOG_ERROR(errStr);
-            throw std::runtime_error(errStr);
+            mEmbeddingBias = executor::detail::toITensor(*(req.getEmbeddingBias().value()));
+            // Add leading 1 dimension since that's what IFB code expects
+            mEmbeddingBias.value()->unsqueeze(0);
+        }
+        if (req.getBadWords())
+        {
+            mBadWordsList = createListTensor(req.getBadWords().value());
+        }
+        if (req.getStopWords())
+        {
+            mStopWordsList = createListTensor(req.getStopWords().value());
         }
 
-        if (draftLogits.has_value() && !draftTokens.has_value())
+        auto pTuningConfig = req.getPromptTuningConfig();
+        if (pTuningConfig)
         {
-            std::string errStr = "Draft tokens must be specified when draft logits are given.";
-            TLLM_LOG_ERROR(errStr);
-            throw std::runtime_error(errStr);
+            mPromptEmbeddingTable = executor::detail::toITensor(*pTuningConfig.value().getEmbeddingTable());
+            TLLM_CHECK(mPromptEmbeddingTable.value()->getShape().nbDims == 2);
+            mPromptVocabSize = mPromptEmbeddingTable.value()->getShape().d[0];
+            mPromptEmbeddingTable.value()->unsqueeze(0);
         }
+
+        auto loraConfig = req.getLoraConfig();
+        if (loraConfig)
+        {
+            mLoraWeights = executor::detail::toITensor(*loraConfig.value().getWeights());
+            mLoraWeights.value()->unsqueeze(0);
+
+            mLoraConfig = executor::detail::toITensor(*loraConfig.value().getConfig());
+            mLoraConfig.value()->unsqueeze(0);
+        }
+
+        auto speculativeDecodingConfig = req.getSpeculativeDecodingConfig();
+        if (speculativeDecodingConfig)
+        {
+            mDraftTokens = std::make_shared<VecTokens>(speculativeDecodingConfig.value().getTokens());
+
+            if (speculativeDecodingConfig.value().getLogits())
+            {
+                mDraftLogits = executor::detail::toITensor(*speculativeDecodingConfig.value().getLogits().value());
+            }
+
+            // NOTE: Draft acceptance threshold is stored in mSamplingConfig
+        }
+
+        initialize(req.getInputTokenIds());
+    }
+
+    void validate(SizeType maxInputLen, SizeType maxSequenceLen)
+    {
+        if (mPromptLen > maxInputLen)
+        {
+            TLLM_THROW("Prompt length (%d) exceeds maximum input length (%d).", mPromptLen, maxInputLen);
+        }
+
+        if (mPromptLen + mMaxNewTokens > maxSequenceLen)
+        {
+            auto const maxNewTokens = maxSequenceLen - mPromptLen;
+            TLLM_LOG_WARNING(
+                "Number of requested output tokens (%d) exceeds maximum sequence length (%d). "
+                "Number of requested output tokens is changed to (%d).",
+                mMaxNewTokens, maxSequenceLen, maxNewTokens);
+            mMaxNewTokens = maxNewTokens;
+        }
+
+        if (mSamplingConfig.beamWidth <= 0)
+        {
+            TLLM_THROW(
+                "Requested value: %d for beamWidth is invalid. To de-activate beam searching "
+                "set beamWidth to 1 instead.",
+                mSamplingConfig.beamWidth);
+        }
+    }
+
+    void setExcludeInputFromOutput(bool exclude)
+    {
+        mExcludeInputFromOutput = exclude;
     }
 
     /// @brief Get total number of tokens for this req (prompt + generated)
@@ -236,7 +323,6 @@ public:
         else
         {
             SizeType newPromptLen = std::min(maxInputLen, mPromptLen + getMaxNumGeneratedTokens());
-            TLLM_LOG_DEBUG("pause: id %lu, mPromptLen %d, newPromptLen %d", mRequestId, mPromptLen, newPromptLen);
             for (std::size_t beam = 0; beam < mTokens.size(); ++beam)
             {
                 auto& beamTokens = mTokens.at(beam);
@@ -288,9 +374,29 @@ public:
         return mLoraWeights;
     }
 
+    void setLoraWeights(TensorPtr weights)
+    {
+        mLoraWeights = weights;
+    }
+
+    void clearLoraWeights()
+    {
+        mLoraWeights = std::nullopt;
+    }
+
     std::optional<TensorPtr> getLoraConfig() const
     {
         return mLoraConfig;
+    }
+
+    void setLoraConfig(TensorPtr config)
+    {
+        mLoraConfig = config;
+    }
+
+    void clearLoraConfig()
+    {
+        mLoraConfig = std::nullopt;
     }
 
     std::optional<TensorPtr> getEmbeddingBias() const
@@ -389,6 +495,12 @@ public:
         mContextLogitsHost = std::move(contextLogitsHost);
     }
 
+    void allocContextLogitsHost(SizeType vocabSizePadded, nvinfer1::DataType logitsDataType)
+    {
+        mContextLogitsHost = runtime::BufferManager::pinned(
+            runtime::ITensor::makeShape({mPromptLen, vocabSizePadded}), logitsDataType);
+    }
+
     TensorPtr const& getGenerationLogitsHost() const
     {
         return mGenerationLogitsHost;
@@ -397,6 +509,12 @@ public:
     void setGenerationLogitsHost(TensorPtr generationLogitsHost)
     {
         mGenerationLogitsHost = std::move(generationLogitsHost);
+    }
+
+    void allocGenerationLogitsHost(SizeType vocabSizePadded, nvinfer1::DataType logitsDataType)
+    {
+        mGenerationLogitsHost = runtime::BufferManager::pinned(
+            runtime::ITensor::makeShape({mSamplingConfig.beamWidth, mMaxNewTokens, vocabSizePadded}), logitsDataType);
     }
 
     std::vector<TensorPtr> const& getGenerationLogitsFragments() const
@@ -498,6 +616,84 @@ public:
         }
     }
 
+    /// @brief  Create a Response from the current state of the request
+    /// @return An optional Response
+    std::optional<executor::Response> createResponse()
+    {
+        if (mState == batch_manager::REQUEST_STATE_GENERATION_COMPLETE
+            || (mIsStreaming && mState == batch_manager::REQUEST_STATE_GENERATION_IN_PROGRESS))
+        {
+            executor::Result result;
+            result.isFinal = mState == batch_manager::REQUEST_STATE_GENERATION_COMPLETE ? true : false;
+
+            auto nbBeams = mSamplingConfig.beamWidth;
+            auto maxNbTokens = getMaxBeamNumTokens();
+            // FIXME(nkorobov): For streaming we do not allow beam search and
+            // streaming index calculation here applies only for sampling
+            int nbTokensOut = mIsStreaming ? 1 : maxNbTokens;
+            if (mExcludeInputFromOutput && !mIsStreaming)
+            {
+                nbTokensOut -= getOrigPromptLen();
+            }
+
+            result.outputTokenIds.resize(nbBeams);
+            SizeType tokenPos = maxNbTokens - nbTokensOut;
+
+            bool shouldSendResponse = (mState == batch_manager::REQUEST_STATE_GENERATION_COMPLETE)
+                || (mIsStreaming && tokenPos > getMaxSentTokenPos());
+
+            if (!shouldSendResponse)
+            {
+                return std::nullopt;
+            }
+            else
+            {
+                for (SizeType beam = 0; beam < nbBeams; ++beam)
+                {
+                    auto tokens = getTokens(beam);
+                    auto nbTokens = mIsStreaming ? (tokenPos - getMaxSentTokenPos()) : tokens.size();
+                    if (mExcludeInputFromOutput && !mIsStreaming)
+                    {
+                        nbTokens -= getOrigPromptLen();
+                    }
+                    if (nbTokens > 0)
+                    {
+                        result.outputTokenIds.at(beam).assign(
+                            tokens.data() + tokenPos, tokens.data() + tokenPos + nbTokens);
+                    }
+                }
+
+                if (returnLogProbs())
+                {
+                    result.cumLogProbs = getCumLogProbs();
+                    result.logProbs = getLogProbs();
+                }
+
+                if (getReturnContextLogits())
+                {
+                    result.contextLogits
+                        = std::make_shared<executor::Tensor>(executor::detail::ofITensor(getContextLogitsHost()));
+                }
+
+                if (getReturnGenerationLogits())
+                {
+                    result.generationLogits
+                        = std::make_shared<executor::Tensor>(executor::detail::ofITensor(getGenerationLogitsHost()));
+                }
+
+                // Update position of last sent response
+                mMaxSentTokenPos = tokenPos;
+
+                auto response = executor::Response(mRequestId, std::move(result));
+                return response;
+            }
+        }
+        else
+        {
+            return std::nullopt;
+        }
+    }
+
     RequestIdType mRequestId;
     SizeType mPromptLen;
     SizeType mMaxNewTokens;
@@ -545,6 +741,55 @@ protected:
     TensorPtr mGenerationLogits; // [beam_size, mMaxNewTokens, vocab_size_padded]
     TensorPtr mGenerationLogitsHost;
     std::vector<TensorPtr> mGenerationLogitsFragments;
+
+    bool mExcludeInputFromOutput;
+
+private:
+    void initialize(VecTokens const& inputTokens)
+    {
+        // Scatter the input tokens to other beam
+        mTokens = BeamTokens(mSamplingConfig.beamWidth, inputTokens);
+
+        if ((mPromptEmbeddingTable.has_value() && !mPromptVocabSize.has_value())
+            || (!mPromptEmbeddingTable.has_value() && mPromptVocabSize.has_value()))
+        {
+            std::string errStr
+                = "Prompt embedding table and prompt vocab size tensors must both be provided for requests with "
+                  "prompt "
+                  "tuning enabled.";
+            TLLM_THROW(errStr);
+        }
+
+        if (mDraftLogits.has_value() && mDraftTokens->empty())
+        {
+            TLLM_THROW("Draft tokens must be specified when draft logits are given.");
+        }
+    }
+
+    TensorPtr createListTensor(std::list<VecTokens> const& wordsList)
+    {
+        std::vector<SizeType> offsets;
+        VecTokens words;
+        SizeType offsetCnt = 0;
+        for (auto const& tokens : wordsList)
+        {
+            offsetCnt += tokens.size();
+            offsets.push_back(offsetCnt);
+            words.insert(words.end(), tokens.begin(), tokens.end());
+        }
+        offsets.resize(words.size(), -1);
+
+        SizeType numWords = static_cast<SizeType>(words.size());
+        auto shape = runtime::ITensor::makeShape({2, numWords});
+        auto tensor = runtime::BufferManager::pinnedPool(shape, nvinfer1::DataType::kINT32);
+        auto data = runtime::bufferCast<int32_t>(*tensor);
+        std::memcpy(data, words.data(), numWords * sizeof(int32_t));
+        std::memcpy(data + numWords, offsets.data(), numWords * sizeof(int32_t));
+        // Add leading dim of 1
+        tensor->unsqueeze(0);
+
+        return tensor;
+    }
 };
 
 class LlmRequest : public GenericLlmRequest<runtime::ITensor::SharedPtr>
@@ -568,10 +813,15 @@ public:
         std::optional<TensorPtr> loraConfig = std::nullopt, bool returnLogProbs = false,
         bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
-        std::optional<TensorPtr> draftLogits = std::nullopt)
+        std::optional<TensorPtr> draftLogits = std::nullopt, bool excludeInputFromOutput = false)
         : Base(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming, endId, padId, embeddingBias,
             badWordsList, stopWordsList, promptEmbeddingTable, promptVocabSize, loraWeights, loraConfig, returnLogProbs,
-            returnContextLogits, returnGenerationLogits, draftTokens, draftLogits)
+            returnContextLogits, returnGenerationLogits, draftTokens, draftLogits, excludeInputFromOutput)
+    {
+    }
+
+    LlmRequest(RequestIdType requestId, executor::Request const& Request)
+        : Base(requestId, Request)
     {
     }
 

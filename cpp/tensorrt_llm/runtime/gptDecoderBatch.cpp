@@ -297,6 +297,12 @@ void GptDecoderBatch::newRequest(
         = ITensor::slice(constPointerCast(dJointInput.embeddingBias), batchIdx, localBatchSize);
     if (request.embeddingBias)
     {
+        TLLM_CHECK(request.embeddingBias->getShape().nbDims == 2);
+        TLLM_CHECK(request.embeddingBias->getShape().d[0] == 1);
+        TLLM_CHECK_WITH_INFO(request.embeddingBias->getShape().d[1] == static_cast<SizeType>(mVocabSize),
+            "The embedding bias shape is not as expected. Expected last dimension to be same as vocab size: %lu.",
+            mVocabSize);
+
         manager.copy(*request.embeddingBias, *embeddingBiasSlice);
         dInput->embeddingBias = embeddingBiasSlice;
     }

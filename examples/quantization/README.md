@@ -20,8 +20,8 @@ docker run --gpus all --ipc=host --ulimit memlock=-1 --shm-size=20g -it <the doc
 2. Install the quantization toolkit `ammo` and the related dependencies on top of the TensorRT-LLM installation or docker file.
 
 ```bash
-# Obtain the python version from the system.
-pip install --no-cache-dir --extra-index-url https://pypi.nvidia.com nvidia-ammo~=0.5.0
+# Install AMMO
+pip install --no-cache-dir --extra-index-url https://pypi.nvidia.com nvidia-ammo~=0.7.0
 # Install the additional requirements
 cd <this example folder>
 pip install -r requirements.txt
@@ -29,7 +29,7 @@ pip install -r requirements.txt
 
 ## APIs
 
-[`ammo.py`](../../tensorrt_llm/models/quantized/ammo.py) uses the quantization toolkit to calibrate the PyTorch models, and generate a model config, saved as a json (for the model structure) and npz files (for the model weights) that TensorRT-LLM could parse. The model config includes everything needed by TensorRT-LLM to build the TensorRT inference engine, as explained below.
+[`quantize.py`](./quantize.py) uses the quantization toolkit to calibrate the PyTorch models and export TensorRT-LLM checkpoints. Each TensorRT-LLM checkpoint contains a config file (in .json format) and one or several rank weight files (in .safetensors format). The checkpoints can be directly used by `trtllm-build` command to build TensorRT-LLM engines. See this [`doc`](../../docs/source/new_workflow.md) for more details on the TensorRT-LLM checkpoint format.
 
 > *This quantization step may take a long time to finish and requires large GPU memory. Please use a server grade GPU if a GPU out-of-memory error occurs*
 
@@ -41,33 +41,35 @@ pip install -r requirements.txt
 PTQ can be achieved with simple calibration on a small set of training or evaluation data (typically 128-512 samples) after converting a regular PyTorch model to a quantized model.
 
 ```python
+import torch
+from torch.utils.data import DataLoader
+from transformers import AutoModelForCausalLM
 import ammo.torch.quantization as atq
 
-model = AutoModelForCausalLM.from_pretrained("...")
+model = AutoModelForCausalLM.from_pretrained(...)
 
 # Select the quantization config, for example, FP8
 config = atq.FP8_DEFAULT_CFG
 
 
 # Prepare the calibration set and define a forward loop
-def forward_loop():
-    for data in calib_set:
+calib_dataloader = DataLoader(...)
+def calibrate_loop():
+    for data in calib_dataloader:
         model(data)
 
 
 # PTQ with in-place replacement to quantized modules
 with torch.no_grad():
-    atq.quantize(model, config, forward_loop)
+    atq.quantize(model, config, forward_loop=calibrate_loop)
 ```
 
 ### Export Quantized Model
 
-After the model is quantized, the model config can be stored. The model config files include all the information needed by TensorRT-LLM to generate the deployable engine, including the quantized scaling factors.
+After the model is quantized, it can be exported to a TensorRT-LLM checkpoint, which includes
 
-The exported model config are stored as
-
-- A single JSON file recording the model structure and metadata and
-- A group of npz files each recording the model on a single tensor parallel rank (model weights, scaling factors per GPU).
+- One json file recording the model structure and metadata, and
+- One or several rank weight files storing quantized model weights and scaling factors.
 
 The export API is
 
@@ -80,6 +82,8 @@ with torch.inference_mode():
         decoder_type,  # The type of the model as str, e.g gptj, llama or gptnext.
         dtype,  # The exported weights data type as torch.dtype.
         export_dir,  # The directory where the exported files will be stored.
-        inference_gpus,  # The number of GPUs used in the inference time for tensor parallelism.
+        inference_tensor_parallel=tp_size,  # The tensor parallelism size for inference.
+        inference_pipeline_parallel=pp_size,  # The pipeline parallelism size for inference.
+        export_tensorrt_llm_config=True,  # Enable exporting TensorRT-LLM checkpoint config file.
     )
 ```

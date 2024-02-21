@@ -80,12 +80,12 @@ BufferManager::ITensorPtr BufferManager::pinnedPool(nvinfer1::Dims dims, nvinfer
     return std::make_unique<PinnedPoolTensor>(dims, type);
 }
 
-BufferManager::IBufferPtr BufferManager::managed(std::size_t size, nvinfer1::DataType type) const
+BufferManager::IBufferPtr BufferManager::managed(std::size_t size, nvinfer1::DataType type)
 {
     return std::make_unique<UVMBuffer>(size, type);
 }
 
-BufferManager::ITensorPtr BufferManager::managed(nvinfer1::Dims dims, nvinfer1::DataType type) const
+BufferManager::ITensorPtr BufferManager::managed(nvinfer1::Dims dims, nvinfer1::DataType type)
 {
     return std::make_unique<UVMTensor>(dims, type);
 }
@@ -149,8 +149,10 @@ BufferManager::IBufferPtr BufferManager::allocate(
     case MemoryType::kCPU: return cpu(size, type);
     case MemoryType::kGPU: return gpu(size, type);
     case MemoryType::kPINNED: return pinned(size, type);
-    default: TLLM_THROW("Unknown memory type");
+    case MemoryType::kUVM: return managed(size, type);
     }
+
+    TLLM_THROW("Unknown memory type");
 }
 
 BufferManager::ITensorPtr BufferManager::allocate(
@@ -161,8 +163,10 @@ BufferManager::ITensorPtr BufferManager::allocate(
     case MemoryType::kCPU: return cpu(dims, type);
     case MemoryType::kGPU: return gpu(dims, type);
     case MemoryType::kPINNED: return pinned(dims, type);
-    default: TLLM_THROW("Unknown memory type");
+    case MemoryType::kUVM: return managed(dims, type);
     }
+
+    TLLM_THROW("Unknown memory type");
 }
 
 BufferManager::IBufferPtr BufferManager::copyFrom(IBuffer const& src, MemoryType memoryType) const

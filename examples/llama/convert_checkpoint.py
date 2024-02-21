@@ -31,11 +31,6 @@ from tensorrt_llm.models.modeling_utils import PretrainedConfig
 from tensorrt_llm.runtime.lora_manager import LoraConfig
 
 try:
-    from transformers import MixtralForCausalLM
-except ImportError:
-    MixtralForCausalLM = None
-
-try:
     from transformers import LlavaConfig, LlavaForConditionalGeneration
 except ImportError:
     pass

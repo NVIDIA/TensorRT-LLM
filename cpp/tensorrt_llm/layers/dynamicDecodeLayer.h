@@ -150,7 +150,7 @@ public:
         std::optional<tc::Tensor>
             output_log_probs_tiled; // [request_output_length, batch_size, beam_width], must be float*, optional
         std::optional<tc::Tensor>
-            output_log_probs;       // [batchSize, beam_width, request_ouptut_length], must be float*, optional
+            output_log_probs;       // [batch_size, beam_width, request_output_length], must be float*, optional
         std::optional<tc::Tensor>
             tgt_cache_indirection;  // [local_batch_size, beam_width, max_seq_len], the k/v cache index for beam search
         std::shared_ptr<kernels::BeamHypotheses>
@@ -163,6 +163,11 @@ public:
     void forward(OutputParams& outputs, ForwardParams const& params);
     void allocateBuffer();
     void freeBuffer();
+
+    T* getRuntimeLogitsDevice()
+    {
+        return mRuntimeLogitsDevice;
+    }
 
 private:
     void initialize();
@@ -197,8 +202,8 @@ private:
     void prepareIdsPtrs(
         OutputParams& outputs, int32_t const* batchSlots, size_t batchSize, size_t beamWidth, size_t maxSeqLen);
     static void prepareOutputData(OutputParams& outputs, ForwardParams const& params,
-        runtime::ITensor::SharedPtr const& idsPtrsHost, int32_t const* batchSlots, size_t batchSize, size_t beamWidth,
-        size_t maxSeqLen, int32_t cyclicStep, cudaStream_t stream);
+        runtime::ITensor::SharedPtr const& idsPtrsHost, int32_t const* batchSlots, size_t batchSize,
+        size_t maxBatchSize, size_t beamWidth, size_t maxSeqLen, int32_t cyclicStep, cudaStream_t stream);
 
 private:
     std::unique_ptr<OnlineBeamSearchLayer<T>> mOnlineBeamSearchDecode;

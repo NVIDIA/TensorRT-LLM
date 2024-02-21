@@ -59,6 +59,7 @@ namespace kernels
 //! \param batchSlots input buffer[batchSize], optional. Indices of rows of data in memory pool
 //! \param stream cuda stream
 //! \param batchSize batch size
+//! \param maxBatchSize maximum batch size
 //! \param skipDecode input buffer [maxBatchSize]. Flags whether to skip decoding per request
 //! \param normalizeLogProbs when set to True outputLogProbs are normalized to TopK
 //! \param logitsHasProbs flag to highlight that logProbs contains probabilities
@@ -68,14 +69,14 @@ void invokeBatchTopKSampling(void* workspace, size_t& workspaceSize, const T* lo
     const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     curandState_t* curandstate, const int maxTopK, const int* topKs, const float topP, const float* topPs,
     const int vocabSizePadded, const int* endIds, const int* batchSlots, cudaStream_t stream, const int batchSize,
-    const bool* skipDecode, const bool normalizeLogProbs, const bool logitsHasProbs);
+    int maxBatchSize, const bool* skipDecode, const bool normalizeLogProbs, const bool logitsHasProbs);
 
 //! \brief Specialization of invokeBatchTopKSampling with topPs=nullptr and topKs=nullptr
 template <typename T>
 void invokeTopKSampling(void* workspace, size_t& workspaceSize, const T* logProbs, int** outputIds, int* sequenceLength,
     const FinishedState* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
     curandState_t* curandstate, const int topK, const float topP, const int vocabSizePadded, const int* endIds,
-    const int* batchSlots, cudaStream_t stream, const int batchSize, const bool* skipDecode,
+    const int* batchSlots, cudaStream_t stream, const int batchSize, int maxBatchSize, const bool* skipDecode,
     const bool normalizeLogProbs, const bool logitsHasProbs);
 
 } // namespace kernels

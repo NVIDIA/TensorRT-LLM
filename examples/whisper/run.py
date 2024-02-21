@@ -19,13 +19,14 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
+import numpy as np
 import torch
 from datasets import load_dataset
 from tokenizer import get_tokenizer
 from torch.utils.data import DataLoader
 from whisper.normalizers import EnglishTextNormalizer
-from whisper_utils import (log_mel_spectrogram, store_transcripts,
-                           write_error_stats)
+from whisper_utils import (N_SAMPLES, log_mel_spectrogram, pad_or_trim,
+                           store_transcripts, write_error_stats)
 
 import tensorrt_llm
 import tensorrt_llm.logger as logger
@@ -291,12 +292,18 @@ def decode_wav_file(
 
 
 def collate_wrapper(batch):
-    speeches, labels, ids = [], [], []
+    speeches, durations, labels, ids = [], [], [], []
     for item in batch:
-        speeches.append(item["audio"]["array"])
+        speech = item["audio"]["array"]
+        duration = speech.shape[-1]
+        speech = pad_or_trim(speech, N_SAMPLES)
+        speech = speech.astype(np.float32)
+        speech = torch.from_numpy(speech)
+        speeches.append(speech)
+        durations.append(duration)
         labels.append(item["text"])
         ids.append(item["id"])
-    return speeches, labels, ids
+    return speeches, durations, labels, ids
 
 
 def decode_dataset(
@@ -319,9 +326,12 @@ def decode_dataset(
     results = []
     total_duration = 0
     for batch in data_loader:
-        waveforms, texts, ids = batch
-        total_duration += sum([wave.shape[0]
-                               for wave in waveforms]) / sample_rate
+        waveforms, durations, texts, ids = batch
+        total_duration += sum(durations) / sample_rate
+
+        for wave in waveforms:
+            assert wave.is_pinned()
+
         features = [
             log_mel_spectrogram(wave,
                                 model.n_mels,

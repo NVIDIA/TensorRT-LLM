@@ -992,7 +992,7 @@ class SmoothQuantAttention(Module):
         self.rotary_embedding_base = rotary_embedding_base
         self.rotary_embedding_dim = 0
         if self.position_embedding_type.is_rope():
-            self.rotary_embedding_dim = hidden_size // num_attention_heads
+            self.rotary_embedding_dim = self.attention_head_size
 
         self.quant_mode = quant_mode
         self.dtype = dtype

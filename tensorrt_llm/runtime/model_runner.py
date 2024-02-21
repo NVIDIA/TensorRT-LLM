@@ -451,7 +451,10 @@ class ModelRunner(ModelRunnerMixin):
                 max_medusa_tokens=pretrained_config.max_draft_len if hasattr(
                     pretrained_config, 'max_draft_len') else 0,
                 num_medusa_heads=pretrained_config.num_medusa_heads if hasattr(
-                    pretrained_config, 'num_medusa_heads') else 0)
+                    pretrained_config, 'num_medusa_heads') else 0,
+                use_custom_all_reduce=build_config.plugin_config.
+                use_custom_all_reduce,
+            )
             max_batch_size = build_config.max_batch_size
             max_input_len = build_config.max_input_len
             max_output_len = build_config.max_output_len

@@ -214,7 +214,7 @@ def parse_input(tokenizer,
         else:
             print('Input file format not supported.')
             raise SystemExit
-    if model_name == 'SpecialForCausalLM':
+    if model_name == 'GemmaForCausalLM':
         batch_input_ids[0] = [tokenizer.bos_token_id] + batch_input_ids[0]
 
     if num_prepend_vtokens:

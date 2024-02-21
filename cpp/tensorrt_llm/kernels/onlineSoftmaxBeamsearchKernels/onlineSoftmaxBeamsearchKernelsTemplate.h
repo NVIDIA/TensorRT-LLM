@@ -138,7 +138,8 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
     __shared__ typename BlockReduce::TempStorage temp_storage;
     __shared__ int selected_beams;
     __shared__ float old_cum_log_probs[MAX_K2];
-    __shared__ cub_kvp cta_topk[MAX_K2];
+    __shared__ char cta_topk_store[MAX_K2 * sizeof(cub_kvp)];
+    auto* cta_topk = reinterpret_cast<cub_kvp*>(cta_topk_store);
 
     if (thread_id == 0)
     {
@@ -687,7 +688,8 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beam_online_softmax_topk_sta
     MD partial_md{-MAX_T_VAL, 0.0f};
     cub_kvp total_topk{V - 1, -MAX_T_VAL};
 
-    __shared__ cub_kvp buf_smem_kv[MAX_K2];
+    __shared__ char buf_smem_kv_store[MAX_K2 * sizeof(cub_kvp)];
+    auto* buf_smem_kv = reinterpret_cast<cub_kvp*>(buf_smem_kv_store);
 
     // load and unpack into registers through smem
     for (int idx = thread_id; idx < PACKED_TOP_KMD_SIZE * parts_per_beam; idx += THREADBLOCK_SIZE)

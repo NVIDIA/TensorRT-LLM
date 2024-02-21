@@ -154,3 +154,5 @@ Take GPT-350M as an example for single GPU with static batching
     --static_emulated_timeout 100 \
     --dataset ../../benchmarks/cpp/preprocessed_dataset.json
 ```
+
+`gptManagerBenchmark` can also be used with the high-level C++ API defined by the `executor::Executor` class (see `cpp/include/tensorrt_llm/executor/executor.h`). This can be done by passing the argument `--api executor`. Note that the Executor class is still under development and currently does not support models with tp or pp > 1.

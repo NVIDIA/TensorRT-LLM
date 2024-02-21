@@ -110,6 +110,7 @@ MODEL_NAME_PATTERN_MAP = {
     "Bloom": "bloom",
     "ChatGLM": "chatglm",
     "QWen": "qwen",
+    "Gemma": "gemma",
 }
 
 
@@ -296,7 +297,7 @@ def main(args):
             torch.save(model.state_dict(), export_path)
         else:
             export_npz = (model_type not in [
-                'gptj', 'falcon', 'chatglm', 'mpt', 'llama', 'baichuan'
+                'gptj', 'falcon', 'chatglm', 'mpt', 'llama', 'baichuan', 'gemma'
             ])
             export_model_config(model,
                                 model_type,
@@ -317,19 +318,6 @@ def main(args):
                     tensorrt_llm_config["quantization"]["quant_algo"] = 'W4A16'
                 else:
                     tensorrt_llm_config["quantization"]["quant_algo"] = None
-                with open(f"{export_path}/config.json", "w") as f:
-                    json.dump(tensorrt_llm_config, f, indent=4)
-
-            # TODO(enweiz): Remove if a newer AMMO version is released
-            # Workaround for baichuan
-            if model_type == 'baichuan':
-                with open(f"{export_path}/config.json", 'r') as f:
-                    tensorrt_llm_config = json.load(f)
-                if hasattr(model.model, "alibi_mask"):
-                    tensorrt_llm_config["position_embedding_type"] = 'alibi'
-                else:
-                    tensorrt_llm_config[
-                        "position_embedding_type"] = 'rope_gpt_neox'
                 with open(f"{export_path}/config.json", "w") as f:
                     json.dump(tensorrt_llm_config, f, indent=4)
 

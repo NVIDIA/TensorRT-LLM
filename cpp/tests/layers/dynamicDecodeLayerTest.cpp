@@ -15,6 +15,7 @@
  */
 
 #include "tests/layers/dynamicDecodeLayerTest.h"
+#include <algorithm>
 
 namespace tensorrt_llm::tests::layers::sampling
 {
@@ -25,7 +26,7 @@ namespace tensorrt_llm::tests::layers::sampling
 // - finished sum
 // - max length
 // - repeat n grams
-// - output logits
+// - padded vocab
 // - beam search
 
 using namespace tensorrt_llm::runtime;
@@ -129,17 +130,19 @@ void DynamicDecodeLayerTest<T>::setup(uint64_t seed, SamplingParams const& param
 
     // clang-format off
 
-    // prob = (0.0, 0.0, 0.0, 0.0, 0.4, 0.3, 0.2, 0.1)
+    // prob = (0.0, 0.0, 0.0, 0.0, 0.4, 0.3, 0.2, 0.1, 0.0)
     mTestLogitsInit = {
-            -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX, -0.9163, -1.2040, -1.6094, -2.3026, // step 0
-            -0.9163, -1.2040, -1.6094, -2.3026, -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX, // step 1
-            -FLT_MAX, -FLT_MAX, -0.9163, -1.2040, -1.6094, -2.3026, -FLT_MAX, -FLT_MAX, // step 2
-            -0.9163, -1.2040, -1.6094, -2.3026, -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX  // step 3
+            -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX, -0.9163, -1.2040, -1.6094, -2.3026, -FLT_MAX, // step 0
+            -0.9163, -1.2040, -1.6094, -2.3026, -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX, // step 1
+            -FLT_MAX, -FLT_MAX, -0.9163, -1.2040, -1.6094, -2.3026, -FLT_MAX, -FLT_MAX, -FLT_MAX, // step 2
+            -0.9163, -1.2040, -1.6094, -2.3026, -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX  // step 3
     };
 
     // clang-format on
 
     mLogitsDevice = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mBeamWidth, mVocabSizePadded}), dataType);
+    mRuntimeLogitsHost
+        = mBufferManager->pinned(ITensor::makeShape({mBatchSize, mBeamWidth, mVocabSizePadded}), dataType);
 
     mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
     mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
@@ -153,6 +156,13 @@ void DynamicDecodeLayerTest<T>::setup(uint64_t seed, SamplingParams const& param
 
     mEmbeddingBiasHost = mBufferManager->pinned(ITensor::makeShape({mMaxBatchSize, mVocabSizePadded}), dataType);
     mEmbeddingBiasDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mVocabSizePadded}), dataType);
+
+    mRefLogProbsHost
+        = mBufferManager->pinned(ITensor::makeShape({mMaxBatchSize, mMaxSeqLen}), nvinfer1::DataType::kFLOAT);
+    mOutputLogProbsDevice
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mMaxSeqLen}), nvinfer1::DataType::kFLOAT);
+    mOutputLogProbsTiledDevice
+        = mBufferManager->gpu(ITensor::makeShape({mMaxSeqLen, mMaxBatchSize}), nvinfer1::DataType::kFLOAT);
 
     mCumLogProbsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kFLOAT);
 
@@ -177,6 +187,9 @@ void DynamicDecodeLayerTest<T>::setup(uint64_t seed, SamplingParams const& param
     trk::invokeFill(*mOutputIdsDevice, int32_t{0}, *mStream);
     trk::invokeFill(*mEmbeddingBiasDevice, T{0.0f}, *mStream);
     trk::invokeFill(*mCumLogProbsDevice, float{0.0f}, *mStream);
+    trk::invokeFill(*mOutputLogProbsDevice, float{0.0f}, *mStream);
+    trk::invokeFill(*mOutputLogProbsTiledDevice, float{0.0f}, *mStream);
+    trk::invokeFill(*mRefLogProbsHost, float{0.0f}, *mStream);
     trk::invokeFill(*mEndIdsDevice, int32_t{mEndId}, *mStream);
 
     auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
@@ -229,6 +242,7 @@ void DynamicDecodeLayerTest<T>::setup(uint64_t seed, SamplingParams const& param
         = params.minTopP.size() ? std::make_optional<std::vector<float>>(params.minTopP) : std::nullopt;
     setupParams.top_p_reset_ids
         = params.topPResetIds.size() ? std::make_optional<std::vector<int32_t>>(params.topPResetIds) : std::nullopt;
+    setupParams.normalize_log_probs = {false};
 
     initXWordsTensors(batchSlotsPtr, bufferCast<SizeType>(*mBadWords),
         reinterpret_cast<SizeType**>(bufferCast<int64_t>(*mBadWordsPtrs)), bufferCast<SizeType>(*mBadWordsLens),
@@ -350,10 +364,12 @@ typename DynamicDecodeLayer<T>::OutputParams DynamicDecodeLayerTest<T>::createOu
 
     outputParams.newTokens = tcc::toTllmTensor(*mNewTokens);
 
+    outputParams.output_log_probs = tcc::toTllmTensor(*mOutputLogProbsDevice);
+
+    outputParams.output_log_probs_tiled = tcc::toTllmTensor(*mOutputLogProbsTiledDevice);
+
     // TODO(nkorobov): extend to
     // std::optional<tc::Tensor> parent_ids;
-    // std::optional<tc::Tensor> output_log_probs_tiled;
-    // std::optional<tc::Tensor> output_log_probs;
     // std::optional<tc::Tensor> tgt_cache_indirection;
     // std::shared_ptr<kernels::BeamHypotheses> beamHypotheses;
 
@@ -375,7 +391,7 @@ void DynamicDecodeLayerTest<T>::batchCopy(int32_t step)
 }
 
 template <typename T>
-bool DynamicDecodeLayerTest<T>::checkResult(int32_t* outputIds, std::vector<std::set<int32_t>>& expectedIds,
+bool DynamicDecodeLayerTest<T>::checkResult(int32_t* outputIds, std::vector<std::set<int32_t>> const& expectedIds,
     int32_t* seqLens, int32_t leadingDim, int32_t stride, int32_t step)
 {
     assert(expectedIds.size() == leadingDim * stride);
@@ -416,10 +432,34 @@ bool DynamicDecodeLayerTest<T>::checkResult(int32_t* outputIds, std::vector<std:
 }
 
 template <typename T>
-void DynamicDecodeLayerTest<T>::runTestImpl(
-    std::vector<std::set<int32_t>> expectedOutputIds, SamplingParams const& params, int32_t endId)
+void DynamicDecodeLayerTest<T>::fillRefLogits(
+    int32_t const* seqLenHost, std::vector<std::set<int32_t>> const& expectedOutputIds, SizeType step)
 {
-    mEndId = endId;
+    auto const batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
+    auto const runtimeLogitsHost = bufferCast<T>(*mRuntimeLogitsHost);
+    for (SizeType bi = 0; bi < mBatchBeam; ++bi)
+    {
+        auto const batchSlot = batchSlotsPtr[bi];
+        if (seqLenHost[batchSlot] <= step)
+        {
+            continue;
+        }
+        auto& expectedSet = expectedOutputIds[step * mBatchBeam + bi];
+        TLLM_CHECK(expectedSet.size() == 1);
+        auto expectedToken = *expectedSet.begin();
+        bufferCast<float>(*mRefLogProbsHost)[batchSlot * mMaxSeqLen + step]
+            = logf(runtimeLogitsHost[bi * mVocabSizePadded + expectedToken]);
+    }
+}
+
+template <typename T>
+void DynamicDecodeLayerTest<T>::runTestImpl(
+    std::vector<std::set<int32_t>> const& expectedOutputIds, SamplingParams const& params, int32_t endId)
+{
+    mEndId = endId == -1 ? mVocabSize - 1 : endId;
+
+    bool greedySearch
+        = std::all_of(expectedOutputIds.begin(), expectedOutputIds.end(), [](auto v) { return v.size() == 1; });
     for (uint64_t seed = 0; seed < mMaxSeed; ++seed)
     {
         setup(seed, params);
@@ -439,6 +479,14 @@ void DynamicDecodeLayerTest<T>::runTestImpl(
             auto const seqLenHost
                 = mBufferManager->copyFrom(*mSeqLengthsDevice, tensorrt_llm::runtime::MemoryType::kCPU);
             auto const logitsHost = mBufferManager->copyFrom(*mLogitsDevice, tensorrt_llm::runtime::MemoryType::kCPU);
+            mBufferManager->copy(
+                mDecodeLayer->getRuntimeLogitsDevice(), *mRuntimeLogitsHost, tensorrt_llm::runtime::MemoryType::kGPU);
+            mStream->synchronize();
+
+            if (greedySearch)
+            {
+                fillRefLogits(bufferCast<int32_t>(*seqLenHost), expectedOutputIds, step);
+            }
 
             {
                 bool passed = checkResult(bufferCast<int32_t>(*newTokensHost), expectedOutputIds,
@@ -462,24 +510,35 @@ void DynamicDecodeLayerTest<T>::runTestImpl(
 
         mStream->synchronize();
 
-        const auto outputIdsHost = mBufferManager->copyFrom(*mOutputIdsDevice, tensorrt_llm::runtime::MemoryType::kCPU);
-        const auto seqLenHost = mBufferManager->copyFrom(*mSeqLengthsDevice, tensorrt_llm::runtime::MemoryType::kCPU);
+        auto const outputIdsHost = mBufferManager->copyFrom(*mOutputIdsDevice, tensorrt_llm::runtime::MemoryType::kCPU);
+        auto const seqLenHost = mBufferManager->copyFrom(*mSeqLengthsDevice, tensorrt_llm::runtime::MemoryType::kCPU);
+        auto const logProbsHost
+            = mBufferManager->copyFrom(*mOutputLogProbsDevice, tensorrt_llm::runtime::MemoryType::kCPU);
 
-        bool passed = checkResult(bufferCast<int32_t>(*outputIdsHost), expectedOutputIds,
-            bufferCast<int32_t>(*seqLenHost), mMaxSeqLen, mBatchBeam, /* step */ 0);
-        EXPECT_TRUE(passed) << "Output Ids check failed at seed " << seed;
-        if (!passed)
         {
-            std::stringstream ss;
-            ss << "Actual output ids:" << std::endl << *outputIdsHost;
-            TLLM_LOG_DEBUG(ss.str());
+            bool passed = checkResult(bufferCast<int32_t>(*outputIdsHost), expectedOutputIds,
+                bufferCast<int32_t>(*seqLenHost), mMaxSeqLen, mBatchBeam, /* step */ 0);
+            EXPECT_TRUE(passed) << "Output Ids check failed at seed " << seed;
+            if (!passed)
+            {
+                std::stringstream ss;
+                ss << "Actual output ids:" << std::endl << *outputIdsHost;
+                TLLM_LOG_DEBUG(ss.str());
+            }
+        }
+
+        if (greedySearch)
+        {
+            bool passed = compareValues(
+                bufferCast<float>(*logProbsHost), bufferCast<float>(*mRefLogProbsHost), mMaxSeqLen * mMaxBatchSize);
+            EXPECT_TRUE(passed) << "Log probs check failed at seed " << seed;
         }
     }
 }
 
 template <typename T>
 void DynamicDecodeLayerTest<T>::runTest(
-    std::vector<std::set<int32_t>> expectedOutputIds, SamplingParams const& params, int32_t endId)
+    std::vector<std::set<int32_t>> const& expectedOutputIds, SamplingParams const& params, int32_t endId)
 {
     TLLM_LOG_DEBUG("Run test with linear logits");
     mUseLogitsVec = false;

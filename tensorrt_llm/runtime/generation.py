@@ -1013,11 +1013,16 @@ class GenerationSession(object):
 
         if scfg.output_log_probs:
             self.log_probs = torch.zeros(
-                (self.max_new_tokens, batch_size, scfg.num_beams),
+                (batch_size, scfg.num_beams, self.max_seq_length),
+                dtype=torch.float32,
+                device=self.device)
+            self.log_probs_tiled = torch.zeros(
+                (self.max_seq_length, batch_size, scfg.num_beams),
                 dtype=torch.float32,
                 device=self.device)
         else:
             self.log_probs = None
+            self.log_probs_tiled = None
 
         self.finished = torch.zeros((batch_size, scfg.num_beams),
                                     dtype=torch.uint8,
@@ -2422,7 +2427,7 @@ class GenerationSession(object):
                         this_src_cache_indirection, self.output_ids,
                         self.new_tokens, self.finished, self.finished,
                         self.sequence_length_buffer, self.cum_log_probs,
-                        self.log_probs, self.parent_ids,
+                        self.log_probs, self.log_probs_tiled, self.parent_ids,
                         this_tgt_cache_indirection,
                         self.beam_hyps_output_ids_tgt,
                         self.beam_hyps_sequence_lengths_tgt,
@@ -2527,6 +2532,10 @@ class GenerationSession(object):
         def get_outputs_dict(output_ids):
             outputs = {}
             outputs['output_ids'] = output_ids
+            if scfg.output_log_probs:
+                outputs['log_probs'] = self.log_probs
+            if scfg.output_cum_log_probs:
+                outputs['cum_log_probs'] = self.cum_log_probs
             if output_sequence_lengths:
                 outputs[
                     'sequence_lengths'] = self.sequence_length_buffer.reshape(
