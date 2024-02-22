@@ -65,7 +65,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_output_len 100 \
-             --context_fmha enable \
              --output_dir ${ENGINE_PATH}
 ```
 
@@ -162,7 +161,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_output_len 100 \
-             --context_fmha enable \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -209,7 +207,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_output_len 100 \
-             --context_fmha enable \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -259,7 +256,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_output_len 100 \
-             --context_fmha enable \
              --enable_xqa enable \
              --output_dir ${ENGINE_PATH}
 
@@ -305,7 +301,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
                  --max_batch_size 32 \
                  --max_input_len 3000 \
                  --max_output_len 100 \
-                 --context_fmha enable \
                  --enable_xqa enable \
                  --output_dir ${ENGINE_PATH}
 
@@ -347,7 +342,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
                  --max_batch_size 32 \
                  --max_input_len 3000 \
                  --max_output_len 100 \
-                 --context_fmha enable \
                  --enable_xqa enable \
                  --output_dir ${ENGINE_PATH}
 
@@ -391,7 +385,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 32 \
              --max_input_len 3000 \
              --max_output_len 100 \
-             --context_fmha enable \
              --enable_xqa enable \
              --strongly_type \
              --output_dir ${ENGINE_PATH}
@@ -438,7 +431,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_output_len 100 \
-             --context_fmha enable \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -484,7 +476,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_output_len 100 \
-             --context_fmha enable \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -526,7 +517,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_output_len 100 \
-             --context_fmha enable \
              --enable_xqa enable \
              --output_dir ${ENGINE_PATH}
 
@@ -573,7 +563,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
                  --max_batch_size 32 \
                  --max_input_len 3000 \
                  --max_output_len 100 \
-                 --context_fmha enable \
                  --enable_xqa enable \
                  --output_dir ${ENGINE_PATH}
 
@@ -615,7 +604,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
                  --max_batch_size 32 \
                  --max_input_len 3000 \
                  --max_output_len 100 \
-                 --context_fmha enable \
                  --enable_xqa enable \
                  --output_dir ${ENGINE_PATH}
 
@@ -659,7 +647,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 32 \
              --max_input_len 3000 \
              --max_output_len 100 \
-             --context_fmha enable \
              --enable_xqa enable \
              --strongly_type \
              --output_dir ${ENGINE_PATH}
@@ -708,7 +695,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_output_len 100 \
-             --context_fmha enable \
              --output_dir ${ENGINE_PATH}
 ```
 
@@ -721,7 +707,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_output_len 100 \
-             --context_fmha enable \
              --enable_xqa enable \
              --output_dir ${ENGINE_PATH}
 ```
