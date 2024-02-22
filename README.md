@@ -107,7 +107,6 @@ After installing the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacent
 please run the following commands to install TensorRT-LLM for x86_64 users.
 
 ```bash
-# Please use the `nvidia-docker` application, using only `docker` may cause exceptions.
 # Obtain and start the basic docker image environment.
 docker run --rm --runtime=nvidia --gpus all --entrypoint /bin/bash -it nvidia/cuda:12.1.0-devel-ubuntu22.04
 
