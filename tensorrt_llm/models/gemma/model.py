@@ -34,7 +34,7 @@ from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime.lora_manager import LoraConfig
 from tensorrt_llm.top_model_mixin import TopModelMixin
 
-from .weight import load_from_fp8_llama, load_from_hf_llama
+from .weight import load_from_fp8_llama, load_from_hf_gemma
 
 
 class GemmaDecoderLayer(Module):
@@ -261,10 +261,10 @@ class GemmaForCausalLM(DecoderModelForCausalLM, TopModelMixin):
                           quant_mode: Optional[QuantMode] = None,
                           **kwargs):
         import transformers
-        from transformers import LlamaConfig
+        from transformers import GemmaConfig
 
         from ...models.modeling_utils import PretrainedConfig
-        cfg = LlamaConfig.from_pretrained(hf_model_dir)
+        cfg = GemmaConfig.from_pretrained(hf_model_dir)
 
         num_kv_heads = cfg.num_key_value_heads if hasattr(cfg, "num_key_value_heads") \
             else cfg.num_attention_heads
@@ -334,7 +334,7 @@ class GemmaForCausalLM(DecoderModelForCausalLM, TopModelMixin):
 
         # weights already loaded in _quantize for int4 weight only
         if not quant_mode.is_int4_weight_only_per_group():
-            hf_model = transformers.LlamaForCausalLM
+            hf_model = transformers.GemmaForCausalLM
             profiler.start("Loading weights from HF")
             hf_llama = hf_model.from_pretrained(
                 hf_model_dir,
@@ -348,7 +348,7 @@ class GemmaForCausalLM(DecoderModelForCausalLM, TopModelMixin):
                 torch_dtype='auto',
             )
 
-            weights = load_from_hf_llama(
+            weights = load_from_hf_gemma(
                 tllm_llama,
                 hf_llama,
                 mapping=mapping,
