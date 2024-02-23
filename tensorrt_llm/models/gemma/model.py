@@ -287,6 +287,7 @@ class GemmaForCausalLM(DecoderModelForCausalLM, TopModelMixin):
             'logits_dtype': 'float32',
             'num_hidden_layers': cfg.num_hidden_layers,
             'num_attention_heads': cfg.num_attention_heads,
+            'head_size': cfg.head_dim,
             'hidden_size': cfg.hidden_size,
             'intermediate_size': cfg.intermediate_size,
             'num_key_value_heads': cfg.num_key_value_heads,
