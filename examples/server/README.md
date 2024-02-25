@@ -14,7 +14,7 @@ Due to limitation from the HLAPI implementation, currently only LLaMA models are
 
 ### Start the server
 
-`python3 -m examples.server.server <path_to_tllm_engine_dir> <tokenizer_type> &`
+`python3 server.py --engine_path <path_to_tllm_engine_dir> --tokenizer_path <tokenizer_type>`
 
 ### Send requests
 
