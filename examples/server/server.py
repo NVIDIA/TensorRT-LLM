@@ -3,6 +3,8 @@ import asyncio
 import json
 from typing import AsyncGenerator
 
+from tensorrt_llm.hlapi.tokenizer import TransformersTokenizer
+
 import uvicorn
 from tensorrt_llm.executor import GenerationExecutor
 from fastapi import FastAPI, Request
@@ -57,8 +59,9 @@ async def generate(request: Request) -> Response:
 
 async def main(args):
     global executor
+    
 
-    executor = GenerationExecutor(args.model_dir, args.tokenizer_type,
+    executor = GenerationExecutor(args.engine_path, TransformersTokenizer.from_pretrained(args.tokenizer_path),
                                   args.max_beam_width)
     config = uvicorn.Config(app,
                             host=args.host,
@@ -70,8 +73,8 @@ async def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("model_dir")
-    parser.add_argument("tokenizer_type")
+    parser.add_argument("--engine_path", type=str)
+    parser.add_argument("--tokenizer_path", type=str)
     parser.add_argument("--host", type=str, default=None)
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--max_beam_width", type=int, default=1)
