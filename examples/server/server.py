@@ -4,7 +4,7 @@ import json
 from typing import AsyncGenerator
 
 import uvicorn
-from executor import GenerationExecutor
+from tensorrt_llm.executor import GenerationExecutor
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
