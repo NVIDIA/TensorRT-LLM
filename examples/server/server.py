@@ -41,6 +41,10 @@ async def generate(request: Request) -> Response:
     request_dict = await request.json()
 
     streaming = request_dict.pop("streaming", False)
+    print(request_dict)
+    print(request_dict['prompt'])
+    print(request_dict['max_new_tokens'])
+    print(streaming)
     promise = executor.generate_async(prompt=request_dict.pop("prompt"),
                                       max_new_tokens=request_dict.pop("max_num_tokens", 8),
                                       streaming=streaming)
