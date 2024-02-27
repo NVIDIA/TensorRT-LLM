@@ -343,7 +343,8 @@ class ModelRunner(ModelRunnerMixin):
                  rank: int = 0,
                  debug_mode: bool = False,
                  lora_ckpt_source: str = "hf",
-                 medusa_choices: List[List[int]] = None) -> 'ModelRunner':
+                 medusa_choices: List[List[int]] = None,
+                 stream: torch.cuda.Stream = None) -> 'ModelRunner':
         """
         Create a ModelRunner instance from an engine directory.
 
@@ -358,6 +359,8 @@ class ModelRunner(ModelRunnerMixin):
                 Whether or not to turn on the debug mode.
             medusa_choices (List[List[int]]):
                 Medusa choices to use when in Medusa decoding
+            stream (torch.cuda.Stream):
+                Stream to use.
         Returns:
             ModelRunner: An instance of ModelRunner.
         """
@@ -480,7 +483,8 @@ class ModelRunner(ModelRunnerMixin):
         session = session_cls(model_config,
                               engine_buffer,
                               runtime_mapping,
-                              debug_mode=debug_mode)
+                              debug_mode=debug_mode,
+                              stream=stream)
         profiler.stop('load tensorrt_llm engine')
         loading_time = profiler.elapsed_time_in_sec("load tensorrt_llm engine")
         logger.info(f'Load engine takes: {loading_time} sec')

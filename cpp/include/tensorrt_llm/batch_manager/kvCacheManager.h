@@ -326,7 +326,7 @@ private:
     //! \param seqSlotIdx Batch slot of sequence to which blocks are assigned.
     //! \return Number of matched tokens from loaded blocks.
     SizeType loadOrAllocateBlocks(
-        std::list<VecTokens> blockedTokens, GenerationRequest& sequence, SizeType beamIdx, SizeType seqSlotIdx);
+        std::list<VecTokens> const& blockedTokens, GenerationRequest& sequence, SizeType beamIdx, SizeType seqSlotIdx);
 
     //! \brief Find block least likely to be reused, free it if necessary and return.
     [[nodiscard]] BlockPtr getFreeBlock();
@@ -362,9 +362,9 @@ public:
     using CudaStreamPtr = std::shared_ptr<runtime::CudaStream>;
 
     KVCacheManager(SizeType numLayers, SizeType numKvHeads, SizeType sizePerHead, SizeType tokensPerBlock,
-        SizeType maxNumBlocks, SizeType maxNumSequences, SizeType maxBeamWidth, SizeType maxBlocksPerSeq,
-        SizeType maxAttentionWindow, SizeType sinkTokenLength, bool useOneMoreBlock, nvinfer1::DataType dtype,
-        CudaStreamPtr stream, bool enableBlockReuse = false, bool useUvm = false);
+        SizeType maxNumBlocks, SizeType maxNumSequences, SizeType maxBeamWidth, SizeType maxAttentionWindow,
+        SizeType sinkTokenLength, bool useOneMoreBlock, nvinfer1::DataType dtype, CudaStreamPtr stream,
+        bool enableBlockReuse = false, bool useUvm = false);
 
     void startScheduling();
 
@@ -405,6 +405,11 @@ public:
         return mBlockSize;
     }
 
+    [[nodiscard]] SizeType getMaxBlocksPerSeq() const
+    {
+        return mMaxBlocksPerSeq;
+    }
+
     [[nodiscard]] BlockManager const& getBlockManager() const
     {
         return mBlockManager;
@@ -414,13 +419,13 @@ public:
     /// iterations
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
     /// @return  The number of blocks
-    SizeType getNeededBlocksOneStep(LlmRequest const& req, bool twoStepsLookAhead) const;
+    [[nodiscard]] SizeType getNeededBlocksOneStep(LlmRequest const& req, bool twoStepsLookAhead) const;
 
     /// @brief  Function that computes the number of KV cache blocks needed to advance a request to completion (i.e. for
     /// maxNewTokens)
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
     /// @return  The number of blocks
-    SizeType getNeededBlocksToCompletion(LlmRequest const& req) const;
+    [[nodiscard]] SizeType getNeededBlocksToCompletion(LlmRequest const& req) const;
 
     [[nodiscard]] std::vector<runtime::ITensor::SharedPtr> const& getMemoryPools() const
     {
@@ -458,7 +463,7 @@ public:
             * modelConfig.getSizePerHead();
     }
 
-    [[nodiscard]] static SizeType getMaxNumTokens(KvCacheConfig const& config, nvinfer1::DataType dtype,
+    [[nodiscard]] static SizeType calculateMaxNumBlocks(KvCacheConfig const& config, nvinfer1::DataType dtype,
         tensorrt_llm::runtime::GptModelConfig const& modelConfig, tensorrt_llm::runtime::WorldConfig const& worldConfig,
         runtime::BufferManager const& bufferManager);
 
@@ -491,10 +496,8 @@ private:
     // Maximum kv cache length per sequence
     // Enable cyclic kv cache when it exceeds
     SizeType mMaxAttentionWindow;
-    // Sink token length in the kv cache per sequence
-    SizeType mSinkTokenLength;
-    // Bubble token length
-    SizeType mBubbleLength;
+    // Number of tokens to fill up the sink tokens to a full block size
+    SizeType mSinkBubbleLength;
     // Maximum token length (including bubble)
     SizeType mMaxTokenNum;
     // Number of tokens in the sink blocks

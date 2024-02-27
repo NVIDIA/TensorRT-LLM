@@ -3466,6 +3466,7 @@ def gpt_attention(
     context_lengths: Optional[Tensor],
     cache_indirection: Optional[Tensor],
     host_request_types: Tensor,
+    layer_idx: int,
     num_heads: int,
     num_kv_heads: int,
     hidden_size_per_head: int,
@@ -3553,6 +3554,9 @@ def gpt_attention(
             generation phase. Its shape is [batch_size]. See Inflight Batching
             in docs/gpt_attention.md,
 
+        layer_idx: int
+            The index of this attention layer, used to access kv_cache_block_pointers,
+
         num_heads: int
             The number of heads,
 
@@ -3632,7 +3636,7 @@ def gpt_attention(
 
         kv_cache_block_pointers:
             The tensor of block pointers for the KV cache. Its shape is
-            [max_batch_size, max_beam_width, 2, max_blocks_per_sequence * 2]
+            [num_layers, max_batch_size, max_beam_width, 2, max_blocks_per_sequence * 2]
             See KV cache section in docs/gpt_attention.md, on gpu
 
         host_kv_cache_block_pointers:
@@ -3707,6 +3711,9 @@ def gpt_attention(
         "unfuse_qkv_gemm", np.array(np.int8(is_unfuse_qkv_gemm), dtype=np.int8),
         trt.PluginFieldType.INT8)
 
+    layer_idx = trt.PluginField("layer_idx", np.array(layer_idx,
+                                                      dtype=np.int32),
+                                trt.PluginFieldType.INT32)
     nheads = trt.PluginField("num_heads", np.array(num_heads, dtype=np.int32),
                              trt.PluginFieldType.INT32)
     num_kv_heads = trt.PluginField("num_kv_heads",
@@ -3820,7 +3827,7 @@ def gpt_attention(
                                    trt.PluginFieldType.INT32)
 
     pfc = trt.PluginFieldCollection([
-        nheads, num_kv_heads, head_size, unidirectional, q_scaling,
+        layer_idx, nheads, num_kv_heads, head_size, unidirectional, q_scaling,
         position_embedding_type, rotary_embedding_dim, rotary_embedding_base,
         rotary_embedding_scale_type, rotary_embedding_scale,
         rotary_embedding_max_positions, tp_size, tp_rank, unfuse_qkv_gemm,

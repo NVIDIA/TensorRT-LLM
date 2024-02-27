@@ -32,8 +32,8 @@ th::Tensor gatherTree(th::Tensor& sequence_lengths, th::Tensor& output_ids, th::
     th::optional<th::Tensor> beam_hyps_cum_log_probs, th::optional<th::Tensor> beam_hyps_normed_scores,
     th::optional<th::Tensor> beam_hyps_log_probs, th::optional<th::Tensor> beam_hyps_min_normed_scores,
     th::optional<th::Tensor> beam_hyps_num_beams, th::optional<th::Tensor> beam_hyps_is_done,
-    th::optional<th::Tensor> finished, th::Tensor& length_penalty, int64_t batch_size, int64_t beam_width,
-    int64_t max_seq_len, bool use_beam_hyps)
+    th::optional<th::Tensor> finished, th::Tensor& length_penalty, th::Tensor& early_stopping, int64_t batch_size,
+    int64_t beam_width, int64_t max_seq_len, bool use_beam_hyps)
 {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     th::Tensor final_output_ids = torch::zeros(
@@ -50,6 +50,7 @@ th::Tensor gatherTree(th::Tensor& sequence_lengths, th::Tensor& output_ids, th::
         beamHypotheses.log_probs_src = nullptr;
         beamHypotheses.max_seq_len = max_seq_len;
         beamHypotheses.length_penalties = get_ptr<float>(length_penalty);
+        beamHypotheses.early_stoppings = get_ptr<int32_t>(early_stopping);
 
         beamHypotheses.output_ids_tgt = get_ptr<int32_t>(beam_hyps_output_ids_tgt.value());
         beamHypotheses.sequence_lengths_tgt = get_ptr<int32_t>(beam_hyps_sequence_lengths_tgt.value());
@@ -102,6 +103,7 @@ th::Tensor gatherTree(th::Tensor& sequence_lengths, th::Tensor& output_ids, th::
         param.outputIds = get_ptr<int32_t>(final_output_ids);
         param.cumLogProbs = cum_log_probs_opt.has_value() ? get_ptr<float>(cum_log_probs_opt.value()) : nullptr;
         param.lengthPenalty = get_val<float>(length_penalty, 0);
+        param.earlyStopping = get_val<int>(early_stopping, 1);
 
         // NOTE: need to remove all prompt virtual tokens
         tl::kernels::invokeGatherTree(param);

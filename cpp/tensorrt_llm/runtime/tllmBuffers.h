@@ -19,7 +19,6 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -30,7 +29,6 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <limits>
 #include <list>
 #include <memory>
 #include <mutex>

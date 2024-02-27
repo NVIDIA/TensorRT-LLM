@@ -102,6 +102,7 @@ cp tokenization_chatglm.py chatglm_6b
 ```
 
 ### 2. Convert weights from HF Transformers to TensorRT-LLM format
+
 The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT-LLM checkpoints. The number of checkpoint files (in .safetensors format) is same to the number of GPUs used to run inference.
 
 ```bash
@@ -121,8 +122,8 @@ python3 convert_checkpoint.py --model_dir chatglm_6b --output_dir trt_ckpt/chatg
 python3 convert_checkpoint.py --model_dir glm_10b --output_dir trt_ckpt/glm_10b/fp16/1-gpu
 ```
 
-
 ### 3. Build TensorRT engine(s)
+
 The `trtllm-build` command builds TensorRT-LLM engines from TensorRT-LLM checkpoints. The number of engine files is also same to the number of GPUs used to run inference.
 
 Normally, the `trtllm-build` command only requires a single GPU, but you can enable parallel building by passing the number of GPUs to the `--workers` argument.
@@ -157,7 +158,8 @@ trtllm-build --checkpoint_dir trt_ckpt/glm_10b/fp16/1-gpu \
 ```
 
 If the engines are run successfully, you will see output like (ChatGLM3-6B as the example):
-```
+
+```txt
 ......
 [01/26/2024-02:40:36] [TRT] [I] Engine generation completed in 136.52 seconds.
 [01/26/2024-02:40:36] [TRT] [I] [MemUsageStats] Peak memory usage of TRT CPU/GPU memory allocators: CPU 1016 MiB, GPU 11909 MiB
@@ -169,22 +171,20 @@ If the engines are run successfully, you will see output like (ChatGLM3-6B as th
 [01/26/2024-02:42:30] [TRT-LLM] [I] Total time of building all engines: 00:05:19
 ```
 
-
 #### Enable plugins
 
 * Use `--gpt_attention_plugin <DataType>` to configure GPT Attention plugin (default as float16)
 * Use `--gemm_plugin <DataType>` to configure GEMM plugin (default as float16)
 * Use `--context_fmha enable` or `--context_fmha_fp32_acc enable` to enable FMHA kernels, which can provide better performance and low GPU memory occupation.
-    * `--gpt_attention_plugin float16` must be used when using FMHA.
-    * `--context_fmha enable` uses FP16 accumulator, which might cause low accuracy. In this case, `--context_fmha_fp32_acc enable` should be used to protect accuracy at a cost of small performance drop.
+  * `--gpt_attention_plugin float16` must be used when using FMHA.
+  * `--context_fmha enable` uses FP16 accumulator, which might cause low accuracy. In this case, `--context_fmha_fp32_acc enable` should be used to protect accuracy at a cost of small performance drop.
 
 #### In-flight batching
 
 * The engine(s) must be built accordingly if [in-flight batching in C++ runtime](../../docs/in_flight_batching.md) will be used.
 * Use `--gpt_attention_plugin float16`, `--paged_kv_cache enable`, `--remove_input_padding enable` to build engine(s) supporting In-flight Batching.
-    * It is possible to use `--gpt_attention_plugin float32` In-flight Batching.
-    * The size of the block in paged KV cache can be conteoled additionally by using `--tokens_per_block=N`.
-
+  * It is possible to use `--gpt_attention_plugin float32` In-flight Batching.
+  * The size of the block in paged KV cache can be conteoled additionally by using `--tokens_per_block=N`.
 
 ### 4. Run inference
 
@@ -226,7 +226,8 @@ mpirun -n 2 \
 * `--allow-run-as-root` might be needed if using `mpirun` as root.
 
 If the engines are run successfully, you will see output like (ChatGLM3-6B as the example):
-```
+
+```txt
 ......
 Input [Text 0]: "[gMASK]sop What's new between ChatGLM3-6B and ChatGLM2-6B?"
 Output [Text 0 Beam 0]: "There is no new information provided in the official documentation, but I found some differences in the code. The ChatGLM3-6B has an additional parameter called 'config', which is not present in ChatGLM2-6B. Additionally"
@@ -242,7 +243,8 @@ python3 ../summarize.py --test_trt_llm \
 ```
 
 If the engines are run successfully, you will see output like (ChatGLM3-6B as the example):
-```
+
+```txt
 ......
 [01/26/2024-02:51:56] [TRT-LLM] [I] TensorRT-LLM (total latency: 12.688004493713379 sec)
 [01/26/2024-02:51:56] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 1390)
@@ -276,7 +278,6 @@ python3 ../run.py --input_text "What's new between ChatGLM3-6B and ChatGLM2-6B?"
         --tokenizer_dir chatglm3_6b \
         --engine_dir trt_engines/chatglm3_6b/int8_wo/1-gpu
 ```
-
 
 ### Smooth Quantization (SQ)
 
@@ -349,7 +350,6 @@ python3 ../run.py --input_text "What's new between ChatGLM3-6B and ChatGLM2-6B?"
         --tokenizer_dir chatglm3_6b \
         --engine_dir trt_engines/chatglm3_6b/fp8/1-gpu
 ```
-
 
 ## Benchmark
 

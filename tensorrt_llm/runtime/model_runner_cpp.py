@@ -363,6 +363,7 @@ def _populate_sampling_config(
         sampling_config.beam_search_diversity_rate
     ]
     gpt_sampling_config.length_penalty = [sampling_config.length_penalty]
+    gpt_sampling_config.early_stopping = [sampling_config.early_stopping]
     gpt_sampling_config.min_length = [sampling_config.min_length]
     # TODO: cannot set presence_penalty and frequency_penalty?
     # gpt_sampling_config.presence_penalty = [sampling_config.presence_penalty]

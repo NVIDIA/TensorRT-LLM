@@ -251,6 +251,7 @@ void DynamicDecodeLayer<T>::setupLayers(
 
         beamSearchParams.beam_search_diversity_rate = setupParams.beam_search_diversity_rate;
         beamSearchParams.length_penalty = setupParams.length_penalty;
+        beamSearchParams.early_stopping = setupParams.early_stopping;
 
         mHasDiffRuntimeArgs = hasDiffRuntimeArgs(beamSearchParams);
         mOnlineBeamSearchDecode->setup(batchSize, beamSearchParams);

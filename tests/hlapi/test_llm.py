@@ -194,6 +194,5 @@ def test_llm_generate_async_tp2(model_name):
 
 
 # TODO[chunweiy]: Add test for loading inmemory model
-
 if __name__ == '__main__':
     test_llm_generate_async_tp2(default_model_name)

@@ -160,8 +160,8 @@ def gpt_to_ft_name(orig_name):
     if orig_name in global_weights:
         return global_weights[orig_name]
 
-    _, _, layer_id, *weight_name = orig_name.split(".")
-    layer_id = int(layer_id)
+    _, _, layer_idx, *weight_name = orig_name.split(".")
+    layer_idx = int(layer_idx)
     weight_name = "transformer." + ".".join(weight_name)
 
     per_layer_weights = {
@@ -182,7 +182,7 @@ def gpt_to_ft_name(orig_name):
         "transformer.mlp.c_proj.bias": "mlp.dense_4h_to_h.bias",
         "transformer.mlp.c_proj.weight": "mlp.dense_4h_to_h.weight",
     }
-    return f"layers.{layer_id}.{per_layer_weights[weight_name]}"
+    return f"layers.{layer_idx}.{per_layer_weights[weight_name]}"
 
 
 @torch.no_grad()

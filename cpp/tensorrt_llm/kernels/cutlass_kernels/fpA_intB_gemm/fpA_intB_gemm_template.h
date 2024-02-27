@@ -324,6 +324,26 @@ void dispatch_gemm_to_cutlass(const ActivationType* A, const WeightType* B, cons
         // best for mixed type gemms.
         switch (gemm_config.tile_config)
         {
+        case tkc::CutlassTileConfig::CtaShape16x128x64_WarpShape16x32x64:
+            TLLM_CHECK_WITH_INFO(arch::kMinComputeCapability >= 75, "Invalid config on Volta");
+            if constexpr (arch::kMinComputeCapability >= 75)
+            {
+                dispatch_gemm_config<ActivationType, WeightType, arch, QuantOp, EpilogueTag,
+                    cutlass::gemm::GemmShape<16, 128, 64>, cutlass::gemm::GemmShape<16, 32, 64>>(A, B, weight_scales,
+                    weight_zero_points, biases, alpha, C, m, n, k, group_size, gemm_config, workspace, workspace_bytes,
+                    stream, occupancy);
+            }
+            break;
+        case tkc::CutlassTileConfig::CtaShape16x256x64_WarpShape16x64x64:
+            TLLM_CHECK_WITH_INFO(arch::kMinComputeCapability >= 75, "Invalid config on Volta");
+            if constexpr (arch::kMinComputeCapability >= 75)
+            {
+                dispatch_gemm_config<ActivationType, WeightType, arch, QuantOp, EpilogueTag,
+                    cutlass::gemm::GemmShape<16, 256, 64>, cutlass::gemm::GemmShape<16, 64, 64>>(A, B, weight_scales,
+                    weight_zero_points, biases, alpha, C, m, n, k, group_size, gemm_config, workspace, workspace_bytes,
+                    stream, occupancy);
+            }
+            break;
         case tkc::CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64:
             dispatch_gemm_config<ActivationType, WeightType, arch, QuantOp, EpilogueTag,
                 cutlass::gemm::GemmShape<32, 128, 64>, cutlass::gemm::GemmShape<32, 32, 64>>(A, B, weight_scales,
@@ -337,11 +357,8 @@ void dispatch_gemm_to_cutlass(const ActivationType* A, const WeightType* B, cons
                 stream, occupancy);
             break;
         case tkc::CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64:
-            if (arch::kMinComputeCapability < 75)
-            {
-                TLLM_CHECK_WITH_INFO(false, "Invalid config on Volta");
-            }
-            else
+            TLLM_CHECK_WITH_INFO(arch::kMinComputeCapability >= 75, "Invalid config on Volta");
+            if constexpr (arch::kMinComputeCapability >= 75)
             {
                 dispatch_gemm_config<ActivationType, WeightType, arch, QuantOp, EpilogueTag,
                     cutlass::gemm::GemmShape<128, 128, 64>, cutlass::gemm::GemmShape<128, 32, 64>>(A, B, weight_scales,
@@ -432,41 +449,6 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
             "GEMM");
     }
 }
-
-// Disabled since the fused GEMM, activation kernels will not be used in v1.
-
-// template <typename T, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp>
-// void CutlassFpAIntBGemmRunner<T, WeightType, QuantOp>::gemm_bias_act(const T* A, const WeightType* B, const T*
-// weight_scales,
-//     const T* biases, T* C, int m, int n, int k, ActivationType activation_type, char* workspace_ptr,
-//     const size_t workspace_bytes, cudaStream_t stream)
-// {
-//     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-
-//     switch (activation_type)
-//     {
-//     case ActivationType::Relu:
-//         run_gemm<tkc::EpilogueOpBiasReLU>(
-//             A, B, weight_scales, biases, C, m, n, k, workspace_ptr, workspace_bytes, stream);
-//         break;
-//     case ActivationType::Gelu:
-//         run_gemm<tkc::EpilogueOpBiasFtGelu>(
-//             A, B, weight_scales, biases, C, m, n, k, workspace_ptr, workspace_bytes, stream);
-//         break;
-//     case ActivationType::Silu:
-//         run_gemm<tkc::EpilogueOpBiasSilu>(
-//             A, B, weight_scales, biases, C, m, n, k, workspace_ptr, workspace_bytes, stream);
-//         break;
-//     case ActivationType::Identity:
-//         run_gemm<tkc::EpilogueOpBias>(A, B, weight_scales, biases, C, m, n, k, workspace_ptr, workspace_bytes,
-//         stream); break;
-//     case ActivationType::InvalidType: TLLM_CHECK_WITH_INFO(false, "Activation type for fpA_intB must be
-//     valid."); break; default:
-//     {
-//         TLLM_CHECK_WITH_INFO(false, "Invalid activation type.");
-//     }
-//     }
-// }
 
 template <typename ActivationType, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp, typename ScaleZeroType,
     typename BiasType, typename OutputType>

@@ -24,6 +24,7 @@
 
 #include <ATen/ops/tensor.h>
 #include <functional>
+#include <memory>
 
 namespace tensorrt_llm::pybind::batch_manager
 {
@@ -31,18 +32,18 @@ namespace tensorrt_llm::pybind::batch_manager
 using GetInferenceRequestsCallback = std::function<std::list<InferenceRequest>(int32_t)>;
 using SendResponseCallback = std::function<void(uint64_t, std::list<NamedTensor> const&, bool, const std::string&)>;
 
-tensorrt_llm::batch_manager::GetInferenceRequestsCallback callbackAdapter(GetInferenceRequestsCallback callback);
-tensorrt_llm::batch_manager::SendResponseCallback callbackAdapter(SendResponseCallback callback);
+tensorrt_llm::batch_manager::GetInferenceRequestsCallback callbackAdapter(GetInferenceRequestsCallback const& callback);
+tensorrt_llm::batch_manager::SendResponseCallback callbackAdapter(SendResponseCallback const& callback);
 
-class GptManager : tensorrt_llm::batch_manager::GptManager
+class GptManager
 {
 public:
     GptManager(std::filesystem::path const& trtEnginePath, tensorrt_llm::batch_manager::TrtGptModelType modelType,
         int32_t maxBeamWidth, tensorrt_llm::batch_manager::batch_scheduler::SchedulerPolicy schedulerPolicy,
-        GetInferenceRequestsCallback getInferenceRequestsCb, SendResponseCallback sendResponseCb,
-        tensorrt_llm::batch_manager::PollStopSignalCallback pollStopSignalCb = nullptr,
-        tensorrt_llm::batch_manager::ReturnBatchManagerStatsCallback returnBatchManagerStatsCb = nullptr,
-        const tensorrt_llm::batch_manager::TrtGptModelOptionalParams& optionalParams
+        GetInferenceRequestsCallback const& getInferenceRequestsCb, SendResponseCallback const& sendResponseCb,
+        tensorrt_llm::batch_manager::PollStopSignalCallback const& pollStopSignalCb = nullptr,
+        tensorrt_llm::batch_manager::ReturnBatchManagerStatsCallback const& returnBatchManagerStatsCb = nullptr,
+        tensorrt_llm::batch_manager::TrtGptModelOptionalParams const& optionalParams
         = tensorrt_llm::batch_manager::TrtGptModelOptionalParams(),
         std::optional<uint64_t> terminateReqId = std::nullopt);
 
@@ -51,6 +52,9 @@ public:
     void shutdown();
 
     static void initBindings(pybind11::module_& m);
+
+private:
+    std::unique_ptr<tensorrt_llm::batch_manager::GptManager> mManager;
 };
 
 } // namespace tensorrt_llm::pybind::batch_manager

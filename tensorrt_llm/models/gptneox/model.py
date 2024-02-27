@@ -41,6 +41,7 @@ class GPTNeoXDecoderLayer(Module):
                                                   dtype=dtype)
 
         self.attention = Attention(
+            layer_idx=layer_idx,
             hidden_size=hidden_size,
             num_attention_heads=config.num_attention_heads,
             rotary_embedding_percentage=config.rotary_pct,
@@ -125,9 +126,7 @@ class GPTNeoXModel(Module):
         if use_cache:
             presents = []
 
-        for layer, past, max_attention_window_size in zip(
-                self.layers, kv_cache_params.past_key_value,
-                kv_cache_params.host_max_attention_window_sizes):
+        for layer, past in zip(self.layers, kv_cache_params.past_key_value):
             hidden_states = layer(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -136,7 +135,8 @@ class GPTNeoXModel(Module):
                     past_key_value=[past],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
-                    host_max_attention_window_sizes=max_attention_window_size,
+                    host_max_attention_window_sizes=kv_cache_params.
+                    host_max_attention_window_sizes,
                     host_sink_token_length=kv_cache_params.
                     host_sink_token_length,
                     cache_indirection=kv_cache_params.cache_indirection),

@@ -16,8 +16,8 @@
 
 #pragma once
 
+#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/namedTensor.h"
-#include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
 #include <algorithm>
@@ -48,6 +48,7 @@ auto constexpr kTemperatureTensorName = "temperature";
 auto constexpr kRuntimeTopKTensorName = "runtime_top_k";
 auto constexpr kRuntimeTopPTensorName = "runtime_top_p";
 auto constexpr kLengthPenaltyTensorName = "len_penalty";
+auto constexpr kEarlyStoppingTensorName = "early_stopping";
 auto constexpr kRepetitionPenaltyTensorName = "repetition_penalty";
 auto constexpr kMinLengthTensorName = "min_length";
 auto constexpr kPresencePenaltyTensorName = "presence_penalty";
@@ -74,6 +75,11 @@ auto constexpr kLoraWeights = "lora_weights";
 // "mlp_h_to_4h": 5  # for llama2 adapter for gated mlp layer after attention / RMSNorm: up projection
 // "mlp_4h_to_h": 6  # for llama2 adapter for gated mlp layer after attention / RMSNorm: down projection
 // "mlp_gate": 7     # for llama2 adapter for gated mlp later after attention / RMSNorm: gate
+// "cross_attn_qkv": 8 # for enc-dec adapter for cross attention in decoder
+// "cross_attn_q": 9   # for enc-dec adapter for cross attention in decoder
+// "cross_attn_k": 10  # for enc-dec adapter for cross attention in decoder
+// "cross_attn_v": 11  # for enc-dec adapter for cross attention in decoder
+// "cross_attn_dense": 12 # for enc-dec adapter for cross attention in decoder
 //
 // last dim holds [ module_id, layer_idx, adapter_size (D / R value) ]
 auto constexpr kLoraConfig = "lora_config"; // [num_lora_modules_layers, 3]
@@ -91,24 +97,29 @@ auto constexpr kGenerationLogitsName = "generation_logits";
 
 } // namespace inference_request
 
-template <typename TTensor, typename TNamedTensor>
+template <typename TTensor, typename TNamedTensor, typename TStream = runtime::BufferManager::CudaStreamPtr>
 class GenericInferenceRequest
 {
 public:
     using TensorPtr = TTensor;
     using NamedTensorType = TNamedTensor;
     using TensorMap = std::unordered_map<std::string, TTensor>;
+    using LogitsPostProcessor = typename GenericLlmRequest<TensorPtr, TStream>::LogitsPostProcessor;
 
-    explicit GenericInferenceRequest(uint64_t requestId)
+    explicit GenericInferenceRequest(
+        uint64_t requestId, std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt)
         : mRequestId{requestId}
         , mIsStreaming{false}
+        , mlogitsPostProcessor(logitsPostProcessor)
     {
     }
 
-    GenericInferenceRequest(uint64_t requestId, TensorMap&& tensorMap)
+    GenericInferenceRequest(uint64_t requestId, TensorMap&& tensorMap,
+        std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt)
         : mRequestId{requestId}
         , mIsStreaming{false}
         , mInputTensors{std::move(tensorMap)}
+        , mlogitsPostProcessor(logitsPostProcessor)
     {
         for (auto const& [name, tensor] : mInputTensors)
         {
@@ -116,8 +127,9 @@ public:
         }
     }
 
-    GenericInferenceRequest(uint64_t requestId, TensorMap const& tensorMap)
-        : GenericInferenceRequest(requestId, TensorMap{tensorMap})
+    GenericInferenceRequest(uint64_t requestId, TensorMap const& tensorMap,
+        std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt)
+        : GenericInferenceRequest(requestId, TensorMap{tensorMap}, logitsPostProcessor)
     {
     }
 
@@ -141,6 +153,16 @@ public:
         return mInputTensors;
     }
 
+    void setLogitsPostProcessor(std::optional<LogitsPostProcessor> cb)
+    {
+        mlogitsPostProcessor = cb;
+    }
+
+    std::optional<LogitsPostProcessor> getLogitsPostProcessor()
+    {
+        return mlogitsPostProcessor;
+    }
+
     static std::array constexpr kTensorNames = {
         inference_request::kInputIdsTensorName,
         inference_request::kDraftInputIdsTensorName,
@@ -156,6 +178,7 @@ public:
         inference_request::kRuntimeTopKTensorName,
         inference_request::kRuntimeTopPTensorName,
         inference_request::kLengthPenaltyTensorName,
+        inference_request::kEarlyStoppingTensorName,
         inference_request::kRepetitionPenaltyTensorName,
         inference_request::kMinLengthTensorName,
         inference_request::kPresencePenaltyTensorName,
@@ -200,7 +223,10 @@ public:
                                                                                                                        \
     void set##funcName(TensorPtr const& tensor)                                                                        \
     {                                                                                                                  \
-        TLLM_CHECK_WITH_INFO(tensor, "Cannot set nullptr when calling %s", __FUNCTION__);                              \
+        if constexpr (std::is_same_v<TensorPtr, tensorrt_llm::runtime::ITensor::SharedPtr>)                            \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(tensor, "Cannot set nullptr when calling %s", __FUNCTION__);                          \
+        }                                                                                                              \
         mInputTensors[tensorName] = tensor;                                                                            \
     }
 
@@ -218,6 +244,7 @@ public:
     TENSOR_GETTER_SETTER(RuntimeTopK, inference_request::kRuntimeTopKTensorName)
     TENSOR_GETTER_SETTER(RuntimeTopP, inference_request::kRuntimeTopPTensorName)
     TENSOR_GETTER_SETTER(LengthPenalty, inference_request::kLengthPenaltyTensorName)
+    TENSOR_GETTER_SETTER(EarlyStopping, inference_request::kEarlyStoppingTensorName)
     TENSOR_GETTER_SETTER(RepetitionPenalty, inference_request::kRepetitionPenaltyTensorName)
     TENSOR_GETTER_SETTER(MinLength, inference_request::kMinLengthTensorName)
     TENSOR_GETTER_SETTER(PresencePenalty, inference_request::kPresencePenaltyTensorName)
@@ -243,6 +270,7 @@ protected:
     uint64_t mRequestId;
     bool mIsStreaming;
     TensorMap mInputTensors;
+    std::optional<LogitsPostProcessor> mlogitsPostProcessor;
 };
 
 class InferenceRequest : public GenericInferenceRequest<tensorrt_llm::runtime::ITensor::SharedPtr, NamedTensor>

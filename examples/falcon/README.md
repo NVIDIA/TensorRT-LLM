@@ -289,10 +289,7 @@ python ../quantization/quantize.py --model_dir ./falcon/180b \
 
 # Build trtllm engines from the trtllm checkpoint
 trtllm-build --checkpoint_dir ./falcon/180b/trt_ckpt/w4a8_awq/tp2 \
-                --use_gemm_plugin float16 \
-                --remove_input_padding \
-                --use_gpt_attention_plugin float16 \
-                --enable_context_fmha \
+                --gemm_plugin float16 \
                 --output_dir ./falcon/180b/trt_engines/w4a8_awq/tp2 \
                 --workers 2
 

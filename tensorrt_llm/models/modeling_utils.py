@@ -232,13 +232,8 @@ class DecoderLayerList(ModuleList):
         if use_cache:
             presents = []
 
-        for layer_idx, (
-                layer, past, pointer, host_pointer,
-                max_attention_window_size) in enumerate(
-                    zip(self, kv_cache_params.past_key_value,
-                        kv_cache_params.kv_cache_block_pointers,
-                        kv_cache_params.host_kv_cache_block_pointers,
-                        kv_cache_params.host_max_attention_window_sizes)):
+        for layer_idx, (layer, past) in enumerate(
+                zip(self, kv_cache_params.past_key_value)):
 
             lora_layer_params = None
             if lora_params is not None and lora_params.lora_ranks is not None:
@@ -260,11 +255,14 @@ class DecoderLayerList(ModuleList):
                     past_key_value=[past],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
-                    host_max_attention_window_sizes=max_attention_window_size,
+                    host_max_attention_window_sizes=kv_cache_params.
+                    host_max_attention_window_sizes,
                     host_sink_token_length=kv_cache_params.
                     host_sink_token_length,
-                    kv_cache_block_pointers=[pointer],
-                    host_kv_cache_block_pointers=[host_pointer],
+                    kv_cache_block_pointers=kv_cache_params.
+                    kv_cache_block_pointers,
+                    host_kv_cache_block_pointers=kv_cache_params.
+                    host_kv_cache_block_pointers,
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
                 **kwargs)
@@ -326,7 +324,7 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
 
         return model
 
-    def load(self, weights, from_pruned=False):
+    def load(self, weights):
         expected_names = set([name for name, param in self.named_parameters()])
         provided_names = set(weights.keys())
         if provided_names != expected_names:
@@ -338,10 +336,7 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
             raise RuntimeError(err_msg)
 
         for name, param in self.named_parameters():
-            if not from_pruned:
-                param.value = weights[name]
-            else:
-                param.set_value_or_dummy(weights[name])
+            param.value = weights[name]
 
     def prepare_inputs(self,
                        max_batch_size,
@@ -419,10 +414,9 @@ class PretrainedModel(Module, GenerationMixin, metaclass=PostInitCaller):
                 host_max_attention_window_sizes=model_inputs[
                     'host_max_attention_window_sizes'],
                 host_sink_token_length=model_inputs['host_sink_token_length'],
-                kv_cache_block_pointers=model_inputs[
-                    'kv_cache_block_pointers_list'],
+                kv_cache_block_pointers=model_inputs['kv_cache_block_pointers'],
                 host_kv_cache_block_pointers=model_inputs[
-                    'host_kv_cache_block_pointers_list'],
+                    'host_kv_cache_block_pointers'],
                 cache_indirection=model_inputs['cache_indirection'],
             ),
             'attention_params':

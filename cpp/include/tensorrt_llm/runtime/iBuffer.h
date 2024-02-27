@@ -31,7 +31,6 @@
 #include <cuda_fp16.h>
 #include <memory>
 #include <ostream>
-#include <stdexcept>
 #include <type_traits>
 #include <typeinfo>
 #include <vector>

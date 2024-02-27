@@ -168,6 +168,7 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     memset(&xqaParams, 0, sizeof(XQAParams));
     xqaParams.data_type = ConvertMMHAToXQAParamsHelper<T, KVCacheBuffer>::data_type;
 
+    xqaParams.layer_idx = mLayerIdx;
     xqaParams.num_q_heads = mNumHeads;
     xqaParams.num_kv_heads = mNumKVHeads;
     xqaParams.head_size = mHeadSize;
@@ -363,8 +364,8 @@ INSTANTIATE_MMHA_DISPATCH(__nv_bfloat16, __nv_bfloat16)
 #endif
 #undef INSTANTIATE_MMHA_DISPATCH
 
-GPTAttentionPluginCommon::GPTAttentionPluginCommon(int num_heads, int num_kv_heads, int head_size, int unidirectional,
-    float q_scaling, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads, int num_kv_heads, int head_size,
+    int unidirectional, float q_scaling, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
     int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
     float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
     float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
@@ -374,7 +375,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int num_heads, int num_kv_hea
     bool paged_kv_cache, int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length,
     bool qkv_bias_enabled, bool cross_attention, int max_distance, bool pos_shift_enabled, bool dense_context_fmha,
     bool use_paged_context_fmha, bool use_cache, bool is_medusa_enabled)
-    : mNumHeads(num_heads)
+    : mLayerIdx(layer_idx)
+    , mNumHeads(num_heads)
     , mNumKVHeads(num_kv_heads)
     , mHeadSize(head_size)
     , mUnidirectional(unidirectional)
@@ -477,6 +479,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(const void* data, size_t leng
     const char *d = reinterpret_cast<const char*>(data), *a = d;
     unsigned int kvCacheQuantMode;
 
+    read(d, mLayerIdx);
     read(d, mNumHeads);
     read(d, mNumKVHeads);
     read(d, mHeadSize);
@@ -1490,11 +1493,12 @@ void GPTAttentionPluginCommon::destroy() noexcept
 
 size_t GPTAttentionPluginCommon::getCommonSerializationSize() noexcept
 {
-    return sizeof(mNumHeads) + sizeof(mNumKVHeads) + sizeof(mHeadSize) + sizeof(mUnidirectional) + sizeof(mQScaling)
-        + sizeof(mPositionEmbeddingType) + sizeof(mRotaryEmbeddingDim) + sizeof(mRotaryEmbeddingBase)
-        + sizeof(mRotaryEmbeddingScaleType) + sizeof(mRotaryEmbeddingScale) + sizeof(mRotaryEmbeddingMaxPositions)
-        + sizeof(mTpSize) + sizeof(mTpRank) + sizeof(mEnableContextFMHA) + sizeof(mFMHAForceFP32Acc)
-        + sizeof(mMultiBlockMode) + sizeof(mEnableXQA) + sizeof(unsigned int) // mKVCacheQuantMode
+    return sizeof(mLayerIdx) + sizeof(mNumHeads) + sizeof(mNumKVHeads) + sizeof(mHeadSize) + sizeof(mUnidirectional)
+        + sizeof(mQScaling) + sizeof(mPositionEmbeddingType) + sizeof(mRotaryEmbeddingDim)
+        + sizeof(mRotaryEmbeddingBase) + sizeof(mRotaryEmbeddingScaleType) + sizeof(mRotaryEmbeddingScale)
+        + sizeof(mRotaryEmbeddingMaxPositions) + sizeof(mTpSize) + sizeof(mTpRank) + sizeof(mEnableContextFMHA)
+        + sizeof(mFMHAForceFP32Acc) + sizeof(mMultiBlockMode) + sizeof(mEnableXQA)
+        + sizeof(unsigned int) // mKVCacheQuantMode
         + sizeof(mRemovePadding) + sizeof(mMaskType) + sizeof(mPagedKVCache) + sizeof(mTokensPerBlock) + sizeof(mType)
         + sizeof(mMaxContextLength) + sizeof(mQKVBiasEnabled) + sizeof(mCrossAttention) + sizeof(mMaxDistance)
         + sizeof(mPosShiftEnabled) + sizeof(mDenseContextFMHA) + sizeof(mPagedContextFMHA) + sizeof(mUseKVCache)
@@ -1504,6 +1508,7 @@ size_t GPTAttentionPluginCommon::getCommonSerializationSize() noexcept
 void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
 {
     char *d = static_cast<char*>(buffer), *a = d;
+    write(d, mLayerIdx);
     write(d, mNumHeads);
     write(d, mNumKVHeads);
     write(d, mHeadSize);

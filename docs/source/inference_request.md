@@ -16,6 +16,7 @@ Optional tensors that can be supplied to `InferenceRequest` are shown below. Def
 | `runtime_top_k` | [1] | `int32_t` | Sampling Config param: `topK` |
 | `runtime_top_p` | [1] | `float` | Sampling Config param: `topP` |
 | `len_penalty` | [1] | `float` | Sampling Config param: `lengthPenalty` |
+| `early_stopping` | [1] | `int` | Sampling Config param: `earlyStopping` |
 | `repetition_penalty` | [1] | `float` | Sampling Config param: `repetitionPenalty` |
 | `min_length` | [1] | `int32_t` | Sampling Config param: `minLength` |
 | `presence_penalty` | [1] | `float` | Sampling Config param: `presencePenalty` |

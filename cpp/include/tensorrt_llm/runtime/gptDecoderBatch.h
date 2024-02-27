@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -25,11 +24,7 @@
 #include "tensorrt_llm/runtime/iGptDecoderBatch.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
-#include <cstdint>
 #include <memory>
-#include <optional>
-#include <tuple>
-#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::runtime
@@ -58,7 +53,7 @@ public:
 
     TokenPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) override;
 
-    void forwardSync(decoder_batch::Token const& e) override;
+    void forwardSync(decoder_batch::Token const& token) override;
 
     void forwardAsync(decoder::Output& output, decoder::Input const& input) override;
 
@@ -89,7 +84,7 @@ public:
 
     //! @brief Gather final beam search results for request `batchIdx`.
     //! Result will only be available after event returned.
-    [[nodiscard]] CudaEvent finalize(SizeType batchIdx) const;
+    [[nodiscard]] CudaEvent finalize(SizeType batchIdx) const override;
 
     //! @brief Gather final beam search results for all requests.
     void finalize() const override;
@@ -108,7 +103,7 @@ public:
     }
 
     //! @returns [maxBeamWidth], cumulative log probabilities (per beam), on gpu
-    [[nodiscard]] TensorPtr getCumLogProbs(SizeType batchIdx) const
+    [[nodiscard]] TensorPtr getCumLogProbs(SizeType batchIdx) const override
     {
         auto tensor = ITensor::slice(mJointDecodingOutput->cumLogProbs, batchIdx, 1);
         tensor->squeeze(0);
@@ -122,7 +117,7 @@ public:
     }
 
     //! @returns [maxBeamWidth, maxSequenceLength], log probabilities (per beam), on gpu
-    [[nodiscard]] TensorPtr getLogProbs(SizeType batchIdx) const
+    [[nodiscard]] TensorPtr getLogProbs(SizeType batchIdx) const override
     {
         auto tensor = ITensor::slice(mJointDecodingOutput->logProbs, batchIdx, 1);
         tensor->squeeze(0);
@@ -141,7 +136,7 @@ public:
     //! @returns [batchSize, beamWidth], tokens generated in `iter` (per beam), on gpu
     [[nodiscard]] TensorPtr getNewTokens(SizeType iter = 0) const override
     {
-        TensorPtr newTokensView = std::move(ITensor::slice(mJointDecodingOutput->newTokensSteps, iter, 1));
+        TensorPtr newTokensView = ITensor::slice(mJointDecodingOutput->newTokensSteps, iter, 1);
         newTokensView->squeeze(0);
         return ITensor::slice(newTokensView, 0, mActualBatchSize);
     }
@@ -149,7 +144,7 @@ public:
     //! @returns [batchSize], the number of generation steps executed on each request
     [[nodiscard]] std::vector<SizeType> getNbSteps() const override
     {
-        return std::vector<SizeType>(mNbSteps.begin(), mNbSteps.begin() + mActualBatchSize);
+        return {mNbSteps.begin(), mNbSteps.begin() + mActualBatchSize};
     }
 
     //! @returns [1], number of finished sequences, in pinned host memory
@@ -160,7 +155,7 @@ public:
 
 private:
     //! @brief Gather final beam search results for request `batchIdx`.
-    CudaEvent postProcessRequest(SizeType batchIdx) const;
+    [[nodiscard]] CudaEvent postProcessRequest(SizeType batchIdx) const;
 
     //! @brief Initialize the decoder at `batchIdx` with a new `request`.
     void newRequest(SizeType batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig);

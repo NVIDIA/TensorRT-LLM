@@ -1,4 +1,5 @@
 import time
+from ast import literal_eval
 from os import path
 from pathlib import Path
 from typing import Optional, Union
@@ -73,6 +74,13 @@ def parse_bart_config(config, component, args):
                                       'relative_attention_max_distance',
                                       fallback=0)
     args.ckpt_weight_dtype = config.get(component, 'weight_data_type')
+    args.max_lora_rank = config.getint(component, 'max_lora_rank', fallback=0)
+    args.lora_target_modules = literal_eval(
+        config.get(component, 'lora_target_modules'))
+    args.hf_modules_to_trtllm_modules = literal_eval(
+        config.get(component, 'hf_modules_to_trtllm_modules'))
+    args.trtllm_modules_to_hf_modules = literal_eval(
+        config.get(component, 'trtllm_modules_to_hf_modules'))
 
     if component == 'decoder':
         args.rescale_before_lm_head = config.getboolean(

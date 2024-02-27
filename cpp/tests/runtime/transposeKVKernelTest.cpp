@@ -24,8 +24,6 @@
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::kernels;
 
-namespace tc = tensorrt_llm::common;
-
 namespace
 {
 

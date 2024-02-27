@@ -84,7 +84,7 @@ public:
 
 protected:
     static constexpr int SPLIT_K_LIMIT = 7;
-    static constexpr int MIN_M_TILE = 32;
+    static constexpr int MIN_M_TILE = 16;
     static constexpr int MIN_N_TILE = 64;
 };
 

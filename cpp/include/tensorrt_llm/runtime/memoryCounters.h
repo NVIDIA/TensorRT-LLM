@@ -19,8 +19,8 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
-#include <algorithm>
-#include <cstdint>
+#include <atomic>
+#include <cstddef>
 #include <string>
 
 namespace tensorrt_llm::runtime
@@ -112,22 +112,22 @@ public:
         auto const sizeDiff = -static_cast<DiffType>(size);
         if constexpr (T == MemoryType::kGPU)
         {
-            mGpu -= std::min(size, mGpu);
+            mGpu -= size;
             mGpuDiff = sizeDiff;
         }
         else if constexpr (T == MemoryType::kCPU)
         {
-            mCpu -= std::min(size, mCpu);
+            mCpu -= size;
             mCpuDiff = sizeDiff;
         }
         else if constexpr (T == MemoryType::kPINNED)
         {
-            mPinned -= std::min(size, mPinned);
+            mPinned -= size;
             mPinnedDiff = sizeDiff;
         }
         else if constexpr (T == MemoryType::kUVM)
         {
-            mUVM -= std::min(size, mUVM);
+            mUVM -= size;
             mUVMDiff = sizeDiff;
         }
         else
@@ -138,11 +138,7 @@ public:
 
     void deallocate(MemoryType memoryType, SizeType size);
 
-    static MemoryCounters& getInstance()
-    {
-        static thread_local MemoryCounters mInstance;
-        return mInstance;
-    }
+    static MemoryCounters& getInstance();
 
     static std::string bytesToString(SizeType bytes, int precision = 2);
 
@@ -151,8 +147,8 @@ public:
     [[nodiscard]] std::string toString() const;
 
 private:
-    SizeType mGpu{}, mCpu{}, mPinned{}, mUVM{};
-    DiffType mGpuDiff{}, mCpuDiff{}, mPinnedDiff{}, mUVMDiff{};
+    std::atomic<SizeType> mGpu{}, mCpu{}, mPinned{}, mUVM{};
+    std::atomic<DiffType> mGpuDiff{}, mCpuDiff{}, mPinnedDiff{}, mUVMDiff{};
 };
 
 } // namespace tensorrt_llm::runtime

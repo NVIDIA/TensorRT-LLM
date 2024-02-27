@@ -18,17 +18,12 @@
 
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
-#include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/decodingMode.h"
 #include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tensorrt_llm/runtime/iStatefulGptDecoder.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
-#include <cstdint>
 #include <memory>
-#include <optional>
-#include <utility>
-#include <vector>
 
 namespace tensorrt_llm::runtime
 {
@@ -88,7 +83,7 @@ public:
     //! @returns [batchSize, maxBeamWidth], tokens generated in last forward pass, on gpu
     [[nodiscard]] TensorPtr getAllNewTokens() const override
     {
-        TensorPtr newTokens = std::move(ITensor::view(mDecodingOutput->newTokensSteps));
+        TensorPtr newTokens = ITensor::view(mDecodingOutput->newTokensSteps);
         newTokens->unsqueeze(0);
         return newTokens;
     }

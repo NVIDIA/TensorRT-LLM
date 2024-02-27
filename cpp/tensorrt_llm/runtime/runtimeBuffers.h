@@ -99,11 +99,11 @@ public:
                                  // still point to `allGenerationLogits` and bring overwrite conflict.
 
     std::vector<TensorPtr> presentKeysVals;
-    std::vector<TensorPtr> presentKeysValsAlt;  // without attention plugin
-    std::vector<TensorPtr> maxAttentionWindows; // with attention plugin, host tensor
-    TensorPtr sinkTokenLengths;                 // with attention plugin, host tensor
-    TensorPtr kvCacheBlockPointersHost;         // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
-    TensorPtr kvCacheBlockPointersDevice;       // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
+    std::vector<TensorPtr> presentKeysValsAlt; // without attention plugin
+    TensorPtr maxAttentionWindows;             // with attention plugin, host tensor
+    TensorPtr sinkTokenLengths;                // with attention plugin, host tensor
+    TensorPtr kvCacheBlockPointersHost;        // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
+    TensorPtr kvCacheBlockPointersDevice;      // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
 
     // References to tmp buffers
     TensorPtr newTokens;
@@ -147,7 +147,8 @@ public:
         SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSequenceLength, BufferManager& manager);
 
     //! \brief Reshape buffers based on current GenerationConfig
-    void reshape(GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
+    void reshape(
+        KvCacheManager const* kvCacheManager, GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void reset(BufferManager& manager);
 

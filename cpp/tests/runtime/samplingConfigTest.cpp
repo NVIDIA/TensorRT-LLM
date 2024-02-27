@@ -54,9 +54,11 @@ TEST(samplingConfigTest, validInputs)
         texec::FloatType presencePenalty = 0.22;
         texec::FloatType frequencyPenalty = 0.33;
         texec::FloatType lengthPenalty = 0.44;
+        texec::SizeType earlyStopping = 1;
 
         texec::SamplingConfig execSamplingCfg(1, topK, topP, topPMin, topPResetIds, topPDecay, randomSeed, temperature,
-            minLength, beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencyPenalty, lengthPenalty);
+            minLength, beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencyPenalty, lengthPenalty,
+            earlyStopping);
         texec::SpeculativeDecodingConfig specCfg({1}, std::nullopt, 0.5);
         tr::SamplingConfig samplingCfg(execSamplingCfg, specCfg);
         EXPECT_EQ(samplingCfg.beamWidth, execSamplingCfg.getBeamWidth());
@@ -73,5 +75,6 @@ TEST(samplingConfigTest, validInputs)
         EXPECT_THAT(samplingCfg.topPResetIds.value(), testing::ElementsAre(topPResetIds));
         EXPECT_THAT(samplingCfg.beamSearchDiversityRate.value(), testing::ElementsAre(beamSearchDiversityRate));
         EXPECT_THAT(samplingCfg.lengthPenalty.value(), testing::ElementsAre(lengthPenalty));
+        EXPECT_THAT(samplingCfg.earlyStopping.value(), testing::ElementsAre(earlyStopping));
     }
 }

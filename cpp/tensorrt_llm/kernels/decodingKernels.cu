@@ -121,7 +121,7 @@ __global__ void gatherTree(gatherTreeParam param)
 template <typename T>
 __device__ __forceinline__ T applyLengthPenalty(T logProb, int length, float lengthPenalty)
 {
-    // score = log(prob) / (length)^lengthPenalty.
+    // score = log(prob) / (length ^ lengthPenalty)
     if (lengthPenalty == 0.0f || length == 1)
     {
         return logProb;

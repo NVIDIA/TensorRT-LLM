@@ -19,16 +19,14 @@
 #include "namedTensor.h"
 #include "tensorrt_llm/batch_manager/GptManager.h"
 #include "tensorrt_llm/batch_manager/callbacks.h"
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/pybind/utils/pathCaster.h"
 
 #include <pybind11/functional.h>
-#include <pybind11/operators.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
 
-#include <ATen/ATen.h>
-
-#include <ATen/ops/tensor.h>
 #include <memory>
 #include <optional>
 
@@ -38,17 +36,19 @@ namespace tensorrt_llm::pybind::batch_manager
 {
 
 GptManager::GptManager(std::filesystem::path const& trtEnginePath, tb::TrtGptModelType modelType, int32_t maxBeamWidth,
-    tb::batch_scheduler::SchedulerPolicy schedulerPolicy, GetInferenceRequestsCallback getInferenceRequestsCb,
-    SendResponseCallback sendResponseCb, tb::PollStopSignalCallback pollStopSignalCb,
-    tb::ReturnBatchManagerStatsCallback returnBatchManagerStatsCb, const tb::TrtGptModelOptionalParams& optionalParams,
-    std::optional<uint64_t> terminateReqId)
-    : tb::GptManager(trtEnginePath, modelType, maxBeamWidth, schedulerPolicy, callbackAdapter(getInferenceRequestsCb),
-        callbackAdapter(sendResponseCb), pollStopSignalCb, returnBatchManagerStatsCb, optionalParams, terminateReqId)
+    tb::batch_scheduler::SchedulerPolicy schedulerPolicy, GetInferenceRequestsCallback const& getInferenceRequestsCb,
+    SendResponseCallback const& sendResponseCb, const tb::PollStopSignalCallback& pollStopSignalCb,
+    tb::ReturnBatchManagerStatsCallback const& returnBatchManagerStatsCb,
+    tb::TrtGptModelOptionalParams const& optionalParams, std::optional<uint64_t> terminateReqId)
 {
+    mManager = std::make_unique<tb::GptManager>(trtEnginePath, modelType, maxBeamWidth, schedulerPolicy,
+        callbackAdapter(getInferenceRequestsCb), callbackAdapter(sendResponseCb), pollStopSignalCb,
+        returnBatchManagerStatsCb, optionalParams, terminateReqId);
 }
 
 py::object GptManager::enter()
 {
+    TLLM_CHECK(static_cast<bool>(mManager));
     return py::cast(this);
 }
 
@@ -62,11 +62,14 @@ void GptManager::shutdown()
     // NOTE: we must release the GIL here. GptManager has spawned a thread for the execution loop. That thread must be
     // able to do forward progress for the shutdown process to succeed. It takes the GIL during its callbacks, so
     // we release it now. Note that we shouldn't do anything related to python objects after that.
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     py::gil_scoped_release release;
-    tb::GptManager::shutdown();
+    mManager->shutdown();
+    mManager = nullptr;
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 }
 
-tb::GetInferenceRequestsCallback callbackAdapter(GetInferenceRequestsCallback callback)
+tb::GetInferenceRequestsCallback callbackAdapter(GetInferenceRequestsCallback const& callback)
 {
     return [callback](int32_t max_sequences)
     {
@@ -82,14 +85,14 @@ tb::GetInferenceRequestsCallback callbackAdapter(GetInferenceRequestsCallback ca
     };
 }
 
-tb::SendResponseCallback callbackAdapter(SendResponseCallback callback)
+tb::SendResponseCallback callbackAdapter(SendResponseCallback const& callback)
 {
     return [callback](uint64_t id, std::list<tb::NamedTensor> const& cppTensors, bool isOk, const std::string& errMsg)
     {
         std::list<NamedTensor> pythonList{};
         for (const auto& cppNamedTensor : cppTensors)
         {
-            pythonList.push_back(NamedTensor{cppNamedTensor});
+            pythonList.emplace_back(cppNamedTensor);
         }
         callback(id, pythonList, isOk, errMsg);
     };

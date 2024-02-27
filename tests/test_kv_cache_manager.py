@@ -297,14 +297,14 @@ class TestKVCacheManager(unittest.TestCase):
                 else:
                     self.assertEqual(sequence[bi], 0)
 
-        arrays = manager.get_pointer_arrays(beam_width=1)
-        arrays = [arr.view(dtype=torch.int64) for arr in arrays]
+        array = manager.get_block_pointers(beam_width=1)
+        array = array.view(dtype=torch.int64)
 
-        # Expect 2 arrays for 2 memory pools
-        self.assertEqual(len(arrays), 2)
-        check_amount_of_blocks(arrays[0][0][0][0], 1)
-        check_amount_of_blocks(arrays[0][1][0][0], 2)
-        check_amount_of_blocks(arrays[0][2][0][0], 1)
+        # Expect array for 2 layers
+        self.assertEqual(array.size(0), 2)
+        check_amount_of_blocks(array[0][0][0][0], 1)
+        check_amount_of_blocks(array[0][1][0][0], 2)
+        check_amount_of_blocks(array[0][2][0][0], 1)
         self.assertEqual(manager.lens[0], 30)
         self.assertEqual(manager.lens[1], 35)
         self.assertEqual(manager.lens[2], 31)
@@ -313,11 +313,11 @@ class TestKVCacheManager(unittest.TestCase):
         for _ in range(3):
             manager.step([False, False, False])
 
-        arrays = manager.get_pointer_arrays(beam_width=1)
-        arrays = [arr.view(dtype=torch.int64) for arr in arrays]
-        check_amount_of_blocks(arrays[0][0][0][0], 2)
-        check_amount_of_blocks(arrays[0][1][0][0], 2)
-        check_amount_of_blocks(arrays[0][2][0][0], 2)
+        array = manager.get_block_pointers(beam_width=1)
+        array = array.view(dtype=torch.int64)
+        check_amount_of_blocks(array[0][0][0][0], 2)
+        check_amount_of_blocks(array[0][1][0][0], 2)
+        check_amount_of_blocks(array[0][2][0][0], 2)
         self.assertEqual(manager.lens[0], 33)
         self.assertEqual(manager.lens[1], 38)
         self.assertEqual(manager.lens[2], 34)
@@ -327,26 +327,26 @@ class TestKVCacheManager(unittest.TestCase):
 
         self.assertEqual(len(manager.sequences), 2)
         self.assertEqual(len(manager.lens), 2)
-        arrays = manager.get_pointer_arrays(beam_width=1)
-        arrays = [arr.view(dtype=torch.int64) for arr in arrays]
+        array = manager.get_block_pointers(beam_width=1)
+        array = array.view(dtype=torch.int64)
 
         self.assertEqual(manager.lens[0], 34)
         self.assertEqual(manager.lens[1], 35)
 
-        check_amount_of_blocks(arrays[0][0][0][0], 2)
-        check_amount_of_blocks(arrays[0][1][0][0], 2)
+        check_amount_of_blocks(array[0][0][0][0], 2)
+        check_amount_of_blocks(array[0][1][0][0], 2)
 
         # Second sequence finishes
         manager.step([False, True])
 
         self.assertEqual(len(manager.sequences), 1)
         self.assertEqual(len(manager.lens), 1)
-        arrays = manager.get_pointer_arrays(beam_width=1)
-        arrays = [arr.view(dtype=torch.int64) for arr in arrays]
+        array = manager.get_block_pointers(beam_width=1)
+        array = array.view(dtype=torch.int64)
 
         self.assertEqual(manager.lens[0], 35)
 
-        check_amount_of_blocks(arrays[0][0][0][0], 2)
+        check_amount_of_blocks(array[0][0][0][0], 2)
 
 
 if __name__ == '__main__':

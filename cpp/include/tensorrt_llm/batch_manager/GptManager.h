@@ -51,7 +51,7 @@ public:
         batch_scheduler::SchedulerPolicy schedulerPolicy, GetInferenceRequestsCallback getInferenceRequestsCb,
         SendResponseCallback sendResponseCb, PollStopSignalCallback pollStopSignalCb = nullptr,
         ReturnBatchManagerStatsCallback returnBatchManagerStatsCb = nullptr,
-        const TrtGptModelOptionalParams& optionalParams = TrtGptModelOptionalParams(),
+        TrtGptModelOptionalParams const& optionalParams = TrtGptModelOptionalParams(),
         std::optional<uint64_t> terminateReqId = std::nullopt, std::optional<SizeType> maxDraftTokens = std::nullopt,
         bool excludeInputInOutput = false);
 
@@ -82,9 +82,9 @@ protected:
     virtual BatchManagerErrorCode_t step(RequestList& activeRequests, std::set<uint64_t>& activeRequestsIds);
 
 private:
-    SizeType getMaxInputLen() const;
-    SizeType getMaxSequenceLen() const;
-    SizeType getMaxNumSequences() const;
+    [[nodiscard]] SizeType getMaxInputLen() const;
+    [[nodiscard]] SizeType getMaxSequenceLen() const;
+    [[nodiscard]] SizeType getMaxNumSequences() const;
 
     void validateLlmRequest(LlmRequest& newReq) const;
     static std::shared_ptr<LlmRequest> fillLlmRequest(std::shared_ptr<InferenceRequest> newReq);

@@ -58,9 +58,10 @@ class ChatGLMDecoderLayer(Module):
         )
 
         self.attention = Attention(
-            hidden_size,
-            config.num_attention_heads,
-            config.num_key_value_heads,
+            layer_idx=layer_idx,
+            hidden_size=hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             num_layers=config.num_hidden_layers,
             apply_query_key_layer_scaling=config.apply_query_key_layer_scaling,
@@ -245,11 +246,7 @@ class ChatGLMModel(Module):
         if use_cache:
             presents = []
 
-        for layer, past, pointer, host_pointer, max_attention_window_size in zip(
-                self.layers, kv_cache_params.past_key_value,
-                kv_cache_params.kv_cache_block_pointers,
-                kv_cache_params.host_kv_cache_block_pointers,
-                kv_cache_params.host_max_attention_window_sizes):
+        for layer, past in zip(self.layers, kv_cache_params.past_key_value):
             layer_output = layer(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -257,13 +254,16 @@ class ChatGLMModel(Module):
                 use_cache=use_cache,
                 kv_cache_params=KeyValueCacheParams(
                     past_key_value=[past],
-                    kv_cache_block_pointers=[pointer],
-                    host_kv_cache_block_pointers=[host_pointer],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
-                    host_max_attention_window_sizes=max_attention_window_size,
+                    host_max_attention_window_sizes=kv_cache_params.
+                    host_max_attention_window_sizes,
                     host_sink_token_length=kv_cache_params.
                     host_sink_token_length,
+                    kv_cache_block_pointers=kv_cache_params.
+                    kv_cache_block_pointers,
+                    host_kv_cache_block_pointers=kv_cache_params.
+                    host_kv_cache_block_pointers,
                     cache_indirection=kv_cache_params.cache_indirection,
                 ),
                 attention_params=attention_params,

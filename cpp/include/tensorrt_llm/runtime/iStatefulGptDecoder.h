@@ -23,10 +23,8 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 
-#include <cstdint>
 #include <memory>
 #include <utility>
-#include <vector>
 
 #include <NvInferRuntime.h>
 
@@ -102,25 +100,25 @@ public:
     virtual void finalize() const = 0;
 
     //! @returns [batchSize, beamWidth, maxSequenceLength], all token ids, on gpu
-    virtual TensorPtr getOutputIds() const = 0;
+    [[nodiscard]] virtual TensorPtr getOutputIds() const = 0;
 
     //! @returns [batchSize, maxBeamWidth], cumulative log probabilities (per beam), on gpu
-    virtual TensorPtr getCumLogProbs() const = 0;
+    [[nodiscard]] virtual TensorPtr getCumLogProbs() const = 0;
 
     //! @returns [batchSize, maxBeamWidth, maxSequenceLength], log probabilities (per beam), on gpu
-    virtual TensorPtr getLogProbs() const = 0;
+    [[nodiscard]] virtual TensorPtr getLogProbs() const = 0;
 
     //! @brief Get tokens generated in one step of last forward pass
     //! @param iter The iteration within [0; maxTokensPerStep) for which to get the tokens
     //! @returns [batchSize, beamWidth], tokens generated in `iter` (per beam), on gpu
-    virtual TensorPtr getNewTokens(SizeType iter = 0) const = 0;
+    [[nodiscard]] virtual TensorPtr getNewTokens(SizeType iter = 0) const = 0;
 
     //! @brief Get maxTokensPerStep tokens generated in the last forward pass
     //! @returns [maxTokensPerStep, batchSize, maxBeamWidth], tokens generated in last forward pass, on gpu
-    virtual TensorPtr getAllNewTokens() const = 0;
+    [[nodiscard]] virtual TensorPtr getAllNewTokens() const = 0;
 
     //! @returns [1], number of finished sequences, in pinned host memory
-    virtual TensorPtr getNbFinished() const = 0;
+    [[nodiscard]] virtual TensorPtr getNbFinished() const = 0;
 
     virtual ~IStatefulGptDecoder() = default;
 
