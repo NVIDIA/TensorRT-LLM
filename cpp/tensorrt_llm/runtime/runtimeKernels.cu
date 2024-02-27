@@ -417,6 +417,21 @@ void invokeInclusiveSum(IBuffer& output, IBuffer const& input, BufferManager con
     cub::DeviceScan::InclusiveSum(tempStorageData, tempStorageBytes, inputData, outputData, size, stream.get());
 }
 
+void invokeInclusiveSum(IBuffer& output, IBuffer& tmpBuffer, IBuffer const& input, CudaStream const& stream)
+{
+    TLLM_CHECK_WITH_INFO(nvinfer1::DataType::kUINT8 == tmpBuffer.getDataType(), "tmpBuffer has wrong data type");
+
+    auto const size = input.getSize();
+    auto const* inputData = bufferCast<SizeType>(input);
+    auto* outputData = bufferCast<SizeType>(output);
+
+    std::size_t tempStorageBytes{0};
+    cub::DeviceScan::InclusiveSum(nullptr, tempStorageBytes, inputData, outputData, size, stream.get());
+    tmpBuffer.resize(tempStorageBytes);
+    auto* tmpBufferPtr = bufferCast<std::uint8_t>(tmpBuffer);
+    cub::DeviceScan::InclusiveSum(tmpBufferPtr, tempStorageBytes, inputData, outputData, size, stream.get());
+}
+
 namespace
 {
 __global__ void buildTokenMask(SizeType* tokenMask, SizeType const* inputLengths, SizeType const batchSize,
@@ -752,7 +767,7 @@ void initOutputIds(ITensor& outputIds, ITensor const& inputIds, ITensor const& i
     ITensor const& inputOffsets, TokenIdType const padId, TokenIdType const endId, SizeType const maxInputLength,
     bool const inputPacked, CudaStream const& stream)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     kernels::invokeFill(outputIds, endId, stream);
 
     if (inputPacked)
@@ -763,7 +778,7 @@ void initOutputIds(ITensor& outputIds, ITensor const& inputIds, ITensor const& i
     {
         kernels::invokeCopyInputToOutput(outputIds, inputIds, inputLengths, padId, stream);
     }
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 namespace

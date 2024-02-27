@@ -14,28 +14,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import argparse as _arg
-import pathlib as _pl
-import platform as _pf
-import shutil as _shutil
-import sys as _sys
-import typing as _tp
-from pathlib import Path as _Path
+import argparse
+import platform
+import shutil
+import sys
+import typing
+from pathlib import Path
 
 from build_engines_utils import run_command, wincopy
 
-resources_dir = _pl.Path(
+resources_dir = Path(
     __file__).parent.parent.parent.parent.parent / "examples/chatglm"
-_sys.path.insert(0, str(resources_dir))
+sys.path.insert(0, str(resources_dir))
 
-engine_target_path = _pl.Path(__file__).parent.parent / "models/rt_engine"
+engine_target_path = Path(__file__).parent.parent / "models/rt_engine"
 
 
 def convert_ckpt(model_dir: str, output_dir: str, world_size: int):
     convert_cmd = [
-        _sys.executable, "examples/chatglm/convert_checkpoint.py",
-        "--dtype=float16", f"--model_dir={model_dir}",
-        f"--output_dir={output_dir}", f"--tp_size={world_size}"
+        sys.executable,
+        str(resources_dir / "convert_checkpoint.py"), "--dtype=float16",
+        f"--model_dir={model_dir}", f"--output_dir={output_dir}",
+        f"--tp_size={world_size}"
     ]
     print("Running: " + " ".join(convert_cmd))
     run_command(convert_cmd)
@@ -45,7 +45,7 @@ def build_engine(ckpt_dir: str, engine_dir: str):
     build_cmd = [
         "trtllm-build", f"--checkpoint_dir={ckpt_dir}",
         f"--output_dir={engine_dir}", "--log_level=error", "--max_batch_size=2",
-        "--max_beam_width=2", "--max_input_len=512", "--max_output_len=512",
+        "--max_beam_width=4", "--max_input_len=512", "--max_output_len=512",
         "--gpt_attention_plugin=float16", "--gemm_plugin=float16",
         "--builder_opt=0", "--remove_input_padding=disable",
         "--paged_kv_cache=disable"
@@ -54,8 +54,9 @@ def build_engine(ckpt_dir: str, engine_dir: str):
     run_command(build_cmd)
 
 
-def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
-    _Path(engine_target_path).mkdir(parents=True, exist_ok=True)
+def build_engines(model_cache: typing.Optional[str] = None,
+                  world_size: int = 1):
+    Path(engine_target_path).mkdir(parents=True, exist_ok=True)
 
     run_command(
         ["pip", "install", "-r",
@@ -64,10 +65,10 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
 
     for model_name in ["chatglm_6b", "chatglm2_6b", "chatglm3_6b"]:
         # Get original model
-        model_cache_dir = _pl.Path(model_cache) / model_name.replace("_", "-")
+        model_cache_dir = Path(model_cache) / model_name.replace("_", "-")
         if model_cache_dir.is_dir():
             print("Copy model from model_cache")
-            if _pf.system() == "Windows":
+            if platform.system() == "Windows":
                 wincopy(source=str(model_cache_dir),
                         dest=model_name,
                         isdir=True,
@@ -76,8 +77,8 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
                 run_command(
                     ["rsync", "-av", str(model_cache_dir), "."],
                     cwd=resources_dir)
-            _shutil.move(resources_dir / model_name.replace("_", "-"),
-                         resources_dir / model_name)
+            shutil.move(resources_dir / model_name.replace("_", "-"),
+                        resources_dir / model_name)
         else:
             print("Clone model from HF")
             run_command(
@@ -91,26 +92,26 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
 
         # Build engines
         print(f"Building {model_name}")
-        weight_dir = _Path(resources_dir) / model_name
-        ckpt_dir = _Path(resources_dir) / ("ckpt_" + model_name)
-        trt_dir = _Path(resources_dir) / ("output_" + model_name)
+        weight_dir = Path(resources_dir) / model_name
+        ckpt_dir = Path(resources_dir) / "trt_ckpt" / model_name
+        trt_dir = Path(resources_dir) / "trt_engines" / model_name
 
         # fix remained error in chatglm_6b, hope to remove this in the future
         if model_name == "chatglm_6b":
-            _shutil.copy(
-                _Path(resources_dir) / "tokenization_chatglm.py",
+            shutil.copy(
+                Path(resources_dir) / "tokenization_chatglm.py",
                 weight_dir,
             )
 
         convert_ckpt(weight_dir, ckpt_dir, world_size)
         build_engine(ckpt_dir, trt_dir)
-        _shutil.move(trt_dir, engine_target_path / model_name)
+        shutil.move(trt_dir, engine_target_path)
 
     print("Done")
 
 
 if __name__ == "__main__":
-    parser = _arg.ArgumentParser()
+    parser = argparse.ArgumentParser()
     parser.add_argument("--model_cache",
                         type=str,
                         help="Directory where models are stored")

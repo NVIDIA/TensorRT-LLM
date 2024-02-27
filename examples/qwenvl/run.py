@@ -140,7 +140,7 @@ class QWenInfer(object):
             quant_mode=quant_mode,
             use_custom_all_reduce=use_custom_all_reduce,
             max_prompt_embedding_table_size=max_prompt_embedding_table_size,
-        )
+            max_beam_width=self.num_beams)
         sampling_config = SamplingConfig(
             end_id=eos_token_id,
             pad_id=pad_token_id,
@@ -396,12 +396,14 @@ def parse_arguments():
                         type=str,
                         default="Describe the picture")
     parser.add_argument('--images_path',
-                        type=list,
+                        nargs='+',
+                        type=json.loads,
                         default=[{
                             'image': './pics/demo.jpeg'
                         }])
     parser.add_argument('--input_dir',
-                        type=list,
+                        nargs='+',
+                        type=json.loads,
                         default=[{
                             'image': 'image.pt'
                         }])

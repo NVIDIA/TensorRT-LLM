@@ -333,7 +333,7 @@ def main(args: argparse.Namespace):
     elif args.backend == "hf":
         elapsed_time, total_num_tokens = run_hf(
             requests=requests,
-            model=args.hf_model_dir,
+            model=args.model_dir,
             tokenizer=tokenizer,
             n=args.n,
             max_batch_size=args.hf_max_batch_size,
@@ -358,7 +358,7 @@ if __name__ == "__main__":
                             now_dir,
                             "ShareGPT_V3_unfiltered_cleaned_split.json"),
                         help="Path to the dataset.")
-    parser.add_argument("--hf_model_dir", type=str, default=None)
+    parser.add_argument("--model_dir", type=str, default=None)
     parser.add_argument("--tokenizer_dir",
                         type=str,
                         default=".",

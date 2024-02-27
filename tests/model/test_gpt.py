@@ -551,31 +551,29 @@ class TestGPT(unittest.TestCase):
             if enable_paged_kv_cache:
                 assert beam_width == 1
                 # for beam_width > 1 the argument must be '1' in ctx phase and 'beam_width' in gen phase
-                host_kv_cache_block_pointers = kv_cache_manager.get_pointer_arrays(
+                host_kv_cache_block_pointers = kv_cache_manager.get_block_pointers(
                     1)
-                kv_cache_block_pointers = [
-                    x.to('cuda') for x in host_kv_cache_block_pointers
-                ]
+                kv_cache_block_pointers = host_kv_cache_block_pointers.to(
+                    'cuda')
 
-                for idx in range(gpt_config.n_layer):
-                    shape = kv_cache_block_pointers[idx].shape
-                    shape = [shape[0] * shape[1], *shape[2:]]
-                    ctx_buffer[
-                        f'kv_cache_block_pointers_{idx}'] = kv_cache_block_pointers[
-                            idx].reshape(shape).contiguous()
-                    ctx_buffer[
-                        f'host_kv_cache_block_pointers_{idx}'] = host_kv_cache_block_pointers[
-                            idx].reshape(shape).contiguous()
-                    ctx_buffer[
-                        f'host_max_attention_window_size_{idx}'] = host_max_attention_window_sizes
+                shape = kv_cache_block_pointers.shape
+                shape = [shape[0], shape[1] * shape[2], *shape[3:]]
+                ctx_buffer[
+                    f'kv_cache_block_pointers'] = kv_cache_block_pointers.reshape(
+                        shape).contiguous()
+                ctx_buffer[
+                    f'host_kv_cache_block_pointers'] = host_kv_cache_block_pointers.reshape(
+                        shape).contiguous()
+                ctx_buffer[
+                    f'host_max_attention_window_sizes'] = host_max_attention_window_sizes
             else:
                 for i in range(gpt_config.n_layer):
                     ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[
                         i]
                     ctx_buffer[
                         f'present_key_value_{i}'] = key_value_cache_buffers[i]
-                    ctx_buffer[
-                        f'host_max_attention_window_size_{i}'] = host_max_attention_window_sizes
+                ctx_buffer[
+                    f'host_max_attention_window_sizes'] = host_max_attention_window_sizes
 
             ctx_shape = {
                 key: buffer.shape
@@ -623,7 +621,8 @@ class TestGPT(unittest.TestCase):
                 ctx_last_token_ids = torch.cumsum(ctx_last_token_ids,
                                                   dim=0).int()
 
-            host_max_attention_window_sizes = torch.tensor([total_length],
+            host_max_attention_window_sizes = torch.tensor([total_length] *
+                                                           gpt_config.n_layer,
                                                            dtype=torch.int32)
             host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
@@ -698,7 +697,8 @@ class TestGPT(unittest.TestCase):
             host_past_key_value_lengths = torch.tensor([seq_len + step - 1] *
                                                        batch_size,
                                                        dtype=torch.int32)
-            host_max_attention_window_sizes = torch.tensor([seq_len + step],
+            host_max_attention_window_sizes = torch.tensor([seq_len + step] *
+                                                           gpt_config.n_layer,
                                                            dtype=torch.int32)
             host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
@@ -775,7 +775,8 @@ class TestGPT(unittest.TestCase):
                 [0] * num_context_input + [seq_len] * num_generation_input,
                 dtype=torch.int32)
 
-            host_max_attention_window_sizes = torch.tensor([total_length],
+            host_max_attention_window_sizes = torch.tensor([total_length] *
+                                                           gpt_config.n_layer,
                                                            dtype=torch.int32)
 
             host_sink_token_length = torch.tensor([0], dtype=torch.int32)

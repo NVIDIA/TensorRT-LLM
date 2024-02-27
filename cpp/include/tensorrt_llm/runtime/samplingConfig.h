@@ -72,6 +72,7 @@ public:
     {
         TLLM_CHECK(configs.size() > 0);
         beamWidth = configs.front().beamWidth;
+        normalizeLogProbs = configs.front().normalizeLogProbs;
         temperature = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].temperature; });
         minLength = fuseValues<SizeType>(configs, [&configs](SizeType ci) { return configs[ci].minLength; });
         repetitionPenalty
@@ -87,6 +88,7 @@ public:
         beamSearchDiversityRate
             = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].beamSearchDiversityRate; });
         lengthPenalty = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].lengthPenalty; });
+        earlyStopping = fuseValues<SizeType>(configs, [&configs](SizeType ci) { return configs[ci].earlyStopping; });
         draftAcceptanceThreshold
             = fuseValues<FloatType>(configs, [&configs](SizeType ci) { return configs[ci].draftAcceptanceThreshold; });
     }
@@ -121,6 +123,7 @@ public:
         SET_FROM_OPTIONAL(presencePenalty, PresencePenalty, FloatType)
         SET_FROM_OPTIONAL(frequencyPenalty, FrequencyPenalty, FloatType)
         SET_FROM_OPTIONAL(lengthPenalty, LengthPenalty, FloatType)
+        SET_FROM_OPTIONAL(earlyStopping, EarlyStopping, SizeType)
 #undef SET_FROM_OPTIONAL
     }
 
@@ -142,11 +145,12 @@ public:
     OptVec<SizeType> topPResetIds; // [batch_size]
 
     // beam search layer
-    OptVec<FloatType> beamSearchDiversityRate;
-    OptVec<FloatType> lengthPenalty;
+    OptVec<FloatType> beamSearchDiversityRate; // [1] or [batch_size]
+    OptVec<FloatType> lengthPenalty;           // [1] or [batch_size]
+    OptVec<SizeType> earlyStopping;            // [1] or [batch_size]
 
-    // speculative decoding
-    OptVec<FloatType> draftAcceptanceThreshold;
+    // speculative decoding, only the first value is used (in gptDecoderBatch.cpp)
+    OptVec<FloatType> draftAcceptanceThreshold; // [1] or [batch_size]
 
     std::optional<bool> normalizeLogProbs;
 };

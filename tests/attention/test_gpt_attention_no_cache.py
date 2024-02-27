@@ -101,7 +101,7 @@ class TestPluginNoCache(unittest.TestCase):
             sequence_length = inputs['sequence_length']
             host_context_lengths = inputs['host_context_lengths']
             host_max_attention_window_sizes = inputs[
-                'host_max_attention_window_sizes'][0]
+                'host_max_attention_window_sizes']
             host_sink_token_length = inputs['host_sink_token_length']
             context_lengths = inputs['context_lengths']
             host_request_types = inputs['host_request_types']
@@ -122,6 +122,7 @@ class TestPluginNoCache(unittest.TestCase):
                 context_lengths=context_lengths,
                 cache_indirection=cache_indirection,
                 host_request_types=host_request_types,
+                layer_idx=0,
                 num_heads=num_kv_heads,
                 num_kv_heads=num_kv_heads,
                 hidden_size_per_head=head_size,
@@ -220,7 +221,7 @@ class TestPluginNoCache(unittest.TestCase):
         session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
         inputs = {
             'qkv': qkv,
-            'host_max_attention_window_size_0': host_max_attention_window_sizes,
+            'host_max_attention_window_sizes': host_max_attention_window_sizes,
             'host_sink_token_length': host_sink_token_length,
             'context_lengths': context_lengths,
             'host_request_types': host_request_types,
@@ -258,7 +259,7 @@ class TestPluginNoCache(unittest.TestCase):
             'qkv': qkv,
             'sequence_length': sequence_length,
             'host_past_key_value_lengths': host_past_key_value_lengths,
-            'host_max_attention_window_size_0': host_max_attention_window_sizes,
+            'host_max_attention_window_sizes': host_max_attention_window_sizes,
             'host_sink_token_length': host_sink_token_length,
             'context_lengths': context_lengths,
             'cache_indirection': cache_indirection,

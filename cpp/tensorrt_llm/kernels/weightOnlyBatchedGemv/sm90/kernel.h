@@ -113,7 +113,7 @@ __device__ __forceinline__ void apply_scale(void* act, void* act_scale)
 }
 
 template <int N, int K, bool EnableZero>
-__device__ __forceinline__ void dequantize(void* w, void* quantized_w, void* scales, void* zeros)
+__device__ __forceinline__ void dequantize(void* w, void* quantized_w, void* scales, void* zeros, half alpha)
 {
     using Converter = ConverterI4ToF16;
     static_assert(K % 2 == 0);
@@ -123,11 +123,11 @@ __device__ __forceinline__ void dequantize(void* w, void* quantized_w, void* sca
     {
         ConverterI4ToF16::convert<K>(
             reinterpret_cast<uint8_t*>(quantized_w) + n * K / 2, reinterpret_cast<half*>(w) + n * K);
-        half2 vec_scale = __half2half2(reinterpret_cast<half*>(scales)[n]);
+        half2 vec_scale = __half2half2(reinterpret_cast<half*>(scales)[n] * alpha);
         half2 vec_zero = __half2half2(__float2half_rn(0.f));
         if constexpr (EnableZero)
         {
-            vec_zero = __half2half2(reinterpret_cast<half*>(zeros)[n]);
+            vec_zero = __half2half2(reinterpret_cast<half*>(zeros)[n] * alpha);
         }
 #pragma unroll
         for (int k = 0; k < VecK; ++k)
@@ -186,7 +186,7 @@ __device__ __forceinline__ T warp_reduce_sum(T& val)
 }
 
 template <int CtaM, int CtaN, int Threads, bool EnableBias>
-__device__ __forceinline__ void epilogue(void* out, int stride, void* tile_acc, void* bias, float alpha)
+__device__ __forceinline__ void epilogue(void* out, int stride, void* tile_acc, void* bias)
 {
     static constexpr int WarpSize = 32;
     static constexpr int WarpNum = Threads / WarpSize;
@@ -224,7 +224,7 @@ __device__ __forceinline__ void epilogue(void* out, int stride, void* tile_acc, 
         {
             val += shmem[jj * AlignShmemSize + ii];
         }
-        reinterpret_cast<half*>(out)[m * stride + n] = __float2half_rn(alpha * val + v_bias);
+        reinterpret_cast<half*>(out)[m * stride + n] = __float2half_rn(val + v_bias);
     }
 }
 
@@ -348,15 +348,17 @@ __global__ void kernel(typename Details::ActDataType* act, half* act_scale, uint
         load<half, CtaN, Mandatory>(vec_scale, scales + idx_k / GroupSize * n, 1);
         load<half, CtaN, EnableZero>(vec_zero, zeros + idx_k / GroupSize * n, 1);
         // Dequantize Data
+        // W4A8 checkpoints have larger activation and weight values. In order to prevent the warp-level FP16
+        // accumulator from overflow, the multiplication of alpha is moved from epilogue to dequantize
         apply_scale<CtaM, StepK, EnableActScale>(tile_a, vec_act_scale);
-        dequantize<CtaN, StepK, EnableZero>(tile_w, tile_w_quantized, vec_scale, vec_zero);
+        dequantize<CtaN, StepK, EnableZero>(tile_w, tile_w_quantized, vec_scale, vec_zero, __float2half_rn(alpha));
         // Rearrange
         pack_to_vec2<CtaN, StepK>(tile_w_pack2, tile_w);
         // MMA
         mma<CtaM, CtaN, StepK>(tile_acc, tile_w_pack2, tile_a);
     }
     // Epilogue
-    epilogue<CtaM, CtaN, Threads, EnableBias>(out, n, tile_acc, bias, alpha);
+    epilogue<CtaM, CtaN, Threads, EnableBias>(out, n, tile_acc, bias);
 }
 
 template <typename Details, int CtaM, int CtaN, int Threads, int GroupSize, bool EnableActScale, bool EnableZero,

@@ -57,6 +57,13 @@ def parse_arguments():
                         type=str,
                         default='float16',
                         choices=['float16'])
+    parser.add_argument('--accuracy_check',
+                        action='store_true',
+                        help="only for CI test")
+    parser.add_argument('--tokenizer_name',
+                        type=str,
+                        default="multilingual",
+                        choices=['multilingual', 'gpt2'])
     return parser.parse_args()
 
 
@@ -189,6 +196,10 @@ class WhisperDecoding:
                                              device='cuda')
         decoder_max_input_length = torch.max(decoder_input_lengths).item()
 
+        cross_attention_mask = torch.ones(
+            [encoder_outputs.shape[0], 1,
+             encoder_outputs.shape[1]]).int().cuda()
+
         # generation config
         sampling_config = SamplingConfig(end_id=eot_id,
                                          pad_id=eot_id,
@@ -209,6 +220,7 @@ class WhisperDecoding:
             sampling_config,
             encoder_output=encoder_outputs,
             encoder_input_lengths=encoder_input_lengths,
+            cross_attention_mask=cross_attention_mask,
         )
         torch.cuda.synchronize()
 
@@ -219,7 +231,11 @@ class WhisperDecoding:
 
 class WhisperTRTLLM(object):
 
-    def __init__(self, engine_dir, debug_mode=False, assets_dir=None):
+    def __init__(self,
+                 engine_dir,
+                 tokenizer_name="multilingual",
+                 debug_mode=False,
+                 assets_dir=None):
         world_size = 1
         runtime_rank = tensorrt_llm.mpi_rank()
         runtime_mapping = tensorrt_llm.Mapping(world_size, runtime_rank)
@@ -231,7 +247,8 @@ class WhisperTRTLLM(object):
                                        runtime_mapping,
                                        debug_mode=False)
         self.n_mels = self.encoder.n_mels
-        self.tokenizer = get_tokenizer(num_languages=self.encoder.num_languages,
+        self.tokenizer = get_tokenizer(name=tokenizer_name,
+                                       num_languages=self.encoder.num_languages,
                                        tokenizer_dir=assets_dir)
         self.eot_id = self.tokenizer.encode(
             "<|endoftext|>",
@@ -354,7 +371,8 @@ def decode_dataset(
 if __name__ == '__main__':
     args = parse_arguments()
     tensorrt_llm.logger.set_level(args.log_level)
-    model = WhisperTRTLLM(args.engine_dir, args.debug, args.assets_dir)
+    model = WhisperTRTLLM(args.engine_dir, args.tokenizer_name, args.debug,
+                          args.assets_dir)
     normallizer = EnglishTextNormalizer()
     if args.enable_warmup:
         results, total_duration = decode_dataset(
@@ -394,8 +412,8 @@ if __name__ == '__main__':
                                              "test-set",
                                              results,
                                              enable_log=True)
-        if args.dataset == "hf-internal-testing/librispeech_asr_dummy" and not args.input_file:
-            assert total_error_rate <= 3.1, f"Word Error rate using whisper large model should be less than 3.1% but got {total_error_rate}"
+        if args.accuracy_check and args.dataset == "hf-internal-testing/librispeech_asr_dummy" and not args.input_file:
+            assert total_error_rate <= 2.5, f"Word Error rate using whisper large-v3 model should be less than 2.5% but got {total_error_rate}"
 
     rtf = elapsed / total_duration
     s = f"RTF: {rtf:.4f}\n"

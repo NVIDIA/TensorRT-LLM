@@ -18,7 +18,6 @@
 #pragma once
 
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
-#include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 

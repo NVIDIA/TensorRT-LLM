@@ -104,6 +104,7 @@ def main(args):
     temperature = args.temperature
     num_beams = args.num_beams
     length_penalty = args.length_penalty
+    early_stopping = args.early_stopping
     repetition_penalty = args.repetition_penalty
     presence_penalty = args.presence_penalty
     frequency_penalty = args.frequency_penalty
@@ -199,6 +200,7 @@ def main(args):
                 top_p=top_p,
                 num_beams=num_beams,
                 length_penalty=length_penalty,
+                early_stopping=early_stopping,
                 repetition_penalty=repetition_penalty,
                 presence_penalty=presence_penalty,
                 frequency_penalty=frequency_penalty,
@@ -289,8 +291,8 @@ def main(args):
                                      pad_token_id=pad_id,
                                      num_beams=num_beams,
                                      num_return_sequences=num_beams,
-                                     early_stopping=True,
                                      length_penalty=length_penalty,
+                                     early_stopping=early_stopping,
                                      output_scores=True,
                                      return_dict_in_generate=True)
             if eval_ppl and batch_size == 1:
@@ -636,6 +638,12 @@ if __name__ == '__main__':
     parser.add_argument('--repetition_penalty', type=float, default=1.0)
     parser.add_argument('--presence_penalty', type=float, default=0.0)
     parser.add_argument('--frequency_penalty', type=float, default=0.0)
+    parser.add_argument('--early_stopping',
+                        type=int,
+                        help='Use early stopping if num_beams > 1'
+                        '1 for early-stopping, 0 for non-early-stopping'
+                        'other values for stopping by length',
+                        default=1)
     parser.add_argument('--debug_mode',
                         default=False,
                         action='store_true',

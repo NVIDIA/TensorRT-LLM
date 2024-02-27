@@ -3,6 +3,7 @@ import json
 import pickle
 import tempfile
 from pathlib import Path
+from typing import List
 
 import numpy as np
 import torch
@@ -320,6 +321,7 @@ def test_sampling_config():
     check_empty_then_set("top_p_reset_ids", size_t_array)
     check_empty_then_set("beam_search_diversity_rate", float_array)
     check_empty_then_set("length_penalty", float_array)
+    check_empty_then_set("early_stopping", size_t_array)
 
 
 def test_gpt_json_config():
@@ -490,8 +492,15 @@ def test_llm_request():
 
 def test_inference_request():
     input_ids = torch.tensor((10, 10))
-    vm = {_tb.tensor_names.INPUT_IDS: input_ids}
-    ir = _tb.InferenceRequest(42, vm)
+
+    def logits_post_processor(req_id: int, logits: torch.Tensor,
+                              ids: List[List[int]]):
+        del req_id, ids
+        return logits
+
+    ir = _tb.InferenceRequest(42, logits_post_processor)
+    setattr(ir, _tb.tensor_names.INPUT_IDS, input_ids)
+
     assert ir.request_id == 42
     assert ir.input_ids is not None
     assert torch.equal(ir.input_ids, input_ids)
@@ -529,6 +538,10 @@ def test_inference_request():
     assert ir.length_penalty is None
     ir.length_penalty = data_tensor
     assert torch.equal(ir.length_penalty, data_tensor)
+
+    assert ir.early_stopping is None
+    ir.early_stopping = data_tensor
+    assert torch.equal(ir.early_stopping, data_tensor)
 
     assert ir.max_new_tokens is None
     ir.max_new_tokens = data_tensor
@@ -594,6 +607,7 @@ def test_inference_request():
     ir.temperature = data_tensor
     assert torch.equal(ir.temperature, data_tensor)
 
+    ir.logits_post_processor = None
     serialized = pickle.dumps(ir)
     deserialized = pickle.loads(serialized)
 

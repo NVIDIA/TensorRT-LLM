@@ -24,7 +24,9 @@ def generate_output(engine: str,
                     input_name: str,
                     output_name: str,
                     max_output_len: int = 8,
-                    output_logits: bool = False):
+                    output_logits: bool = False,
+                    output_cum_log_probs: bool = False,
+                    output_log_probs: bool = False):
     tp_size = 1
     pp_size = 1
     model = 'gpt2'
@@ -47,7 +49,7 @@ def generate_output(engine: str,
     if output_logits:
         output_logits_npy = str(output_dir / (output_name + '_logits' + '.npy'))
 
-    args = run.parse_arguments([
+    args_list = [
         '--engine_dir',
         str(engine_dir), '--input_file',
         str(input_file), '--tokenizer_dir',
@@ -57,7 +59,24 @@ def generate_output(engine: str,
         str(max_output_len), '--num_beams',
         str(num_beams), '--output_logits_npy',
         str(output_logits_npy), '--use_py_session'
-    ])
+    ]
+
+    output_cum_log_probs_npy = None
+    if output_cum_log_probs:
+        output_cum_log_probs_npy = str(
+            output_dir / (output_name + '_cum_log_probs' + '.npy'))
+        args_list.extend(
+            ['--output_cum_log_probs_npy',
+             str(output_cum_log_probs_npy)])
+
+    output_log_probs_npy = None
+    if output_log_probs:
+        output_log_probs_npy = str(output_dir /
+                                   (output_name + '_log_probs' + '.npy'))
+        args_list.extend(['--output_log_probs_npy', str(output_log_probs_npy)])
+
+    args = run.parse_arguments(args_list)
+
     run.main(args)
 
 
@@ -103,7 +122,9 @@ def generate_outputs(num_beams):
                     num_beams=num_beams,
                     input_name='input_tokens',
                     output_name='output_tokens_fp16_plugin_packed_paged',
-                    output_logits=False)
+                    output_logits=False,
+                    output_log_probs=(num_beams == 1),
+                    output_cum_log_probs=(num_beams == 1))
     generate_output(engine='fp16-plugin-packed-paged',
                     num_beams=num_beams,
                     input_name='input_tokens',

@@ -85,8 +85,9 @@ WorldConfig WorldConfig::mpi(SizeType gpusPerNode, std::optional<SizeType> tenso
     auto const mpiSize = comm.getSize();
     auto const mpiRank = comm.getRank();
     TLLM_LOG_INFO("MPI size: %d, rank: %d", mpiSize, mpiRank);
-    auto pp = pipelineParallelism.value_or(1);
-    auto tp = tensorParallelism.value_or(mpiSize / pp);
+    auto const pp = pipelineParallelism.value_or(1);
+    auto const tp = tensorParallelism.value_or(mpiSize / pp);
+    TLLM_LOG_DEBUG("TP: %d, PP: %d", tp, pp);
     TLLM_CHECK(mpiSize == tp * pp);
 
     return WorldConfig{tp, pp, mpiRank, gpusPerNode, deviceIds};

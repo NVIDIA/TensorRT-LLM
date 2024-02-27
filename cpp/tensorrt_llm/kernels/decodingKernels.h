@@ -46,7 +46,8 @@ struct gatherTreeParam
     int32_t* outputIds = nullptr;       // the buffer to put finalized ids
     cudaStream_t stream;
     float* cumLogProbs = nullptr;       // [batchSize, beamWidth]
-    float lengthPenalty = 1.0f;         // on cpu
+    float lengthPenalty = 1.0f;
+    int earlyStopping = 1;
 };
 
 /*

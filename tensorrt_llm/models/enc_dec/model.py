@@ -14,7 +14,7 @@
 # limitations under the License.
 import math
 from collections import OrderedDict
-from typing import Optional
+from typing import List, Optional
 
 import tensorrt as trt
 
@@ -29,7 +29,7 @@ from tensorrt_llm.layers import (MLP, Attention, AttentionMaskType,
                                  AttentionParams, BertAttention, ColumnLinear,
                                  Conv1d, Embedding, FusedGatedMLP, GatedMLP,
                                  GroupNorm, KeyValueCacheParams, LayerNorm,
-                                 PromptTuningEmbedding, RmsNorm)
+                                 LoraParams, PromptTuningEmbedding, RmsNorm)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.generation_mixin import GenerationMixin
 from tensorrt_llm.module import Module, ModuleList
@@ -175,7 +175,8 @@ class EncoderLayer(Module):
                  relative_attention=False,
                  max_distance=0,
                  num_buckets=0,
-                 fp16_clamping=False):
+                 fp16_clamping=False,
+                 max_lora_rank=None):
         super().__init__()
 
         # e.g. BART regular, T5 RMS
@@ -200,7 +201,8 @@ class EncoderLayer(Module):
             dtype=dtype,
             relative_attention=relative_attention,
             max_distance=max_distance,
-            num_buckets=num_buckets)
+            num_buckets=num_buckets,
+            max_lora_rank=max_lora_rank)
 
         self.attention_layernorm = ln_type(normalized_shape=hidden_size,
                                            eps=layernorm_eps,
@@ -217,6 +219,7 @@ class EncoderLayer(Module):
             tp_group=mapping.tp_group,
             tp_size=mapping.tp_size,
             dtype=dtype,
+            max_lora_rank=max_lora_rank,
         )
 
         self.mlp_layernorm = ln_type(normalized_shape=hidden_size,
@@ -234,7 +237,8 @@ class EncoderLayer(Module):
                 hidden_states: Tensor,
                 attention_mask=None,
                 input_lengths=None,
-                max_input_length=None):
+                max_input_length=None,
+                lora_layer_params=None):
         assert isinstance(hidden_states, Tensor)
 
         # self attention
@@ -246,7 +250,8 @@ class EncoderLayer(Module):
         attention_output = self.attention(hidden_states,
                                           attention_mask=attention_mask,
                                           input_lengths=input_lengths,
-                                          max_input_length=max_input_length)
+                                          max_input_length=max_input_length,
+                                          lora_layer_params=lora_layer_params)
 
         self.register_network_output('attention_output', attention_output)
 
@@ -265,7 +270,8 @@ class EncoderLayer(Module):
         if self.layernorm_position == LayerNormPositionType.pre_layernorm:
             hidden_states = self.mlp_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states,
+                                 lora_layer_params=lora_layer_params)
 
         self.register_network_output('mlp_output', hidden_states)
 
@@ -284,6 +290,8 @@ class EncoderLayer(Module):
 class DecoderLayer(Module):
 
     def __init__(self,
+                 *,
+                 layer_idx,
                  hidden_size,
                  ffn_hidden_size,
                  num_attention_heads,
@@ -304,7 +312,8 @@ class DecoderLayer(Module):
                  relative_attention=False,
                  max_distance=0,
                  num_buckets=0,
-                 fp16_clamping=False):
+                 fp16_clamping=False,
+                 max_lora_rank=None):
         super().__init__()
 
         # e.g. BART regular, T5 RMS
@@ -316,8 +325,9 @@ class DecoderLayer(Module):
 
         # e.g. BART q_scaling = 1.f, T5 q_scaling = 1.f/sqrt(head_size)
         self.self_attention = Attention(
-            hidden_size,
-            num_attention_heads,
+            layer_idx=layer_idx,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
             attention_head_size=head_size,
             num_kv_heads=num_kv_heads,
             max_position_embeddings=max_position_embeddings,
@@ -333,7 +343,8 @@ class DecoderLayer(Module):
             max_distance=max_distance,
             num_buckets=num_buckets,
             position_embedding_type=PositionEmbeddingType.relative
-            if relative_attention else PositionEmbeddingType.learned_absolute)
+            if relative_attention else PositionEmbeddingType.learned_absolute,
+            max_lora_rank=max_lora_rank)
 
         self.self_attention_layernorm = ln_type(normalized_shape=hidden_size,
                                                 eps=layernorm_eps,
@@ -347,8 +358,9 @@ class DecoderLayer(Module):
         #
         # e.g. BART q_scaling = 1.f, T5 q_scaling = 1.f/sqrt(head_size)
         self.cross_attention = Attention(
-            hidden_size,
-            num_attention_heads,
+            layer_idx=layer_idx,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
             attention_head_size=head_size,
             num_kv_heads=num_kv_heads,
             max_position_embeddings=max_position_embeddings,
@@ -364,7 +376,8 @@ class DecoderLayer(Module):
             False,  # Cross attention has no relative attention bias
             max_distance=max_distance,
             num_buckets=num_buckets,
-            position_embedding_type=PositionEmbeddingType.learned_absolute)
+            position_embedding_type=PositionEmbeddingType.learned_absolute,
+            max_lora_rank=max_lora_rank)
 
         self.cross_attention_layernorm = ln_type(normalized_shape=hidden_size,
                                                  eps=layernorm_eps,
@@ -381,6 +394,7 @@ class DecoderLayer(Module):
             tp_group=mapping.tp_group,
             tp_size=mapping.tp_size,
             dtype=dtype,
+            max_lora_rank=max_lora_rank,
         )
 
         self.mlp_layernorm = ln_type(normalized_shape=hidden_size,
@@ -401,7 +415,8 @@ class DecoderLayer(Module):
                 cross_attention_mask=None,
                 use_cache=False,
                 kv_cache_params=None,
-                attention_params=None):
+                attention_params=None,
+                lora_layer_params=None):
         assert isinstance(hidden_states, Tensor)
 
         if encoder_output:
@@ -418,7 +433,8 @@ class DecoderLayer(Module):
             attention_mask=attention_mask,
             use_cache=use_cache,
             kv_cache_params=kv_cache_params,
-            attention_params=attention_params)
+            attention_params=attention_params,
+            lora_layer_params=lora_layer_params)
 
         if use_cache:
             attention_output, presents_self = attention_output
@@ -446,7 +462,8 @@ class DecoderLayer(Module):
             encoder_output=encoder_output,
             use_cache=use_cache,
             kv_cache_params=kv_cache_params,
-            attention_params=attention_params)
+            attention_params=attention_params,
+            lora_layer_params=lora_layer_params)
 
         if use_cache:
             attention_output, presents_cross = attention_output
@@ -468,7 +485,8 @@ class DecoderLayer(Module):
         if self.layernorm_position == LayerNormPositionType.pre_layernorm:
             hidden_states = self.mlp_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states,
+                                 lora_layer_params=lora_layer_params)
         self.register_network_output('mlp_output', hidden_states)
 
         hidden_states = residual + hidden_states
@@ -518,7 +536,8 @@ class EncoderModel(Module, GenerationMixin):
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
                  mapping=Mapping(),
-                 fp16_clamping=False):
+                 fp16_clamping=False,
+                 max_lora_rank=None):
         super().__init__()
         self.mapping = mapping
 
@@ -590,7 +609,8 @@ class EncoderModel(Module, GenerationMixin):
                          relative_attention=relative_attention,
                          max_distance=max_distance,
                          num_buckets=num_buckets,
-                         fp16_clamping=fp16_clamping)
+                         fp16_clamping=fp16_clamping,
+                         max_lora_rank=max_lora_rank)
             for _ in self.mapping.pp_layers(self.total_num_layers)
         ])
 
@@ -610,7 +630,8 @@ class EncoderModel(Module, GenerationMixin):
                 prompt_embedding_table=None,
                 prompt_tasks=None,
                 prompt_vocab_size=None,
-                attention_mask=None):
+                attention_mask=None,
+                lora_params: LoraParams = None):
 
         # In PP, layer 0 has ids as inputs, all other layers have hidden_states as inputs
         if self.mapping.is_first_pp_rank():
@@ -623,11 +644,15 @@ class EncoderModel(Module, GenerationMixin):
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
-        for encoder_layer in self.encoder_layers:
+        for layer_idx, encoder_layer in enumerate(self.encoder_layers):
+            lora_layer_params = None
+            if lora_params is not None and lora_params.lora_ranks is not None:
+                lora_layer_params = lora_params.get_layer_params(layer_idx)
             hidden_states = encoder_layer(hidden_states=hidden_states,
                                           attention_mask=attention_mask,
                                           input_lengths=input_lengths,
-                                          max_input_length=max_input_length)
+                                          max_input_length=max_input_length,
+                                          lora_layer_params=lora_layer_params)
 
         if self.mapping.is_last_pp_rank():
             if self.has_model_final_layernorm:
@@ -642,7 +667,8 @@ class EncoderModel(Module, GenerationMixin):
     def prepare_inputs(self,
                        max_batch_size,
                        max_input_len,
-                       prompt_embedding_table_size: int = 0):
+                       prompt_embedding_table_size: int = 0,
+                       lora_target_modules: List[str] = None):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -663,6 +689,7 @@ class EncoderModel(Module, GenerationMixin):
         remove_input_padding = default_net().plugin_config.remove_input_padding
         use_custom_all_reduce = default_net(
         ).plugin_config.use_custom_all_reduce
+        use_lora_plugin = default_net().plugin_config.lora_plugin
 
         attention_mask = None
         if remove_input_padding:
@@ -795,10 +822,75 @@ class EncoderModel(Module, GenerationMixin):
                                        dtype=trt.int32,
                                        shape=[1],
                                        dim_range=OrderedDict([('size', [1])]))
+        '''
+        LoRA plugin related inputs:
+        lora_target_modules for BART-encoder:
+            ['attn_q', 'attn_v']
+        For BART-decoder, the lora_target_modules is different.
+        See comments in the DecoderModel.prepare_inputs() for more details.
+        '''
+        lora_weights_pointers = None
+        lora_ranks = None
+        lora_params = None
+        if use_lora_plugin:
+            lora_weights_pointers = []
+            lora_ranks = []
+            # In current design, q_lora_params, k_lora_params and v_lora_params should be all enabled or all disabled at the same time.
+            # However, BART lora modules only contain two of them, so we use zero tensor to fill the missing ones.
+            missing_qkv_modules = []
+            if any(x in lora_target_modules
+                   for x in ["attn_q", "attn_k", "attn_v"]):
+                for lora_module in ["attn_q", "attn_k", "attn_v"]:
+                    if lora_module not in lora_target_modules:
+                        missing_qkv_modules.append(lora_module)
+
+            layers_range = self.mapping.pp_layers(self.total_num_layers)
+            for i in layers_range:
+                lora_weight_pointer_dict = {}
+                lora_rank_dict = {}
+                for lora_module in (lora_target_modules + missing_qkv_modules):
+                    lora_weight_pointer = Tensor(
+                        name=f'{lora_module}_lora_weights_pointers_{i}',
+                        dtype=trt.int64,
+                        shape=[-1, 2],
+                        dim_range=OrderedDict([('batch_size_beam_width',
+                                                [bs_range]), ('in_out', [2])]))
+                    lora_weight_pointer_dict.update({
+                        f'{lora_module}_lora_weights_pointers':
+                        lora_weight_pointer
+                    })
+
+                    lora_rank = Tensor(name=f'{lora_module}_lora_ranks_{i}',
+                                       dtype=trt.int32,
+                                       shape=[-1],
+                                       dim_range=OrderedDict([
+                                           ('batch_size_beam_width', [bs_range])
+                                       ]))
+                    lora_rank_dict.update(
+                        {f'{lora_module}_lora_ranks': lora_rank})
+
+                lora_weights_pointers.append(lora_weight_pointer_dict)
+                lora_ranks.append(lora_rank_dict)
+
+            host_request_types = Tensor(name='host_request_types',
+                                        dtype=trt.int32,
+                                        shape=[-1],
+                                        dim_range=OrderedDict([
+                                            ('batch_size_beam_width',
+                                             [bs_range])
+                                        ]))
+
+            # TODO: add host_context_lengths after remove_input_padding is added to BERT.
+            lora_params = LoraParams(
+                lora_ranks=lora_ranks,
+                lora_weights_pointers=lora_weights_pointers,
+                max_context_length=max_input_len,
+                host_request_types=host_request_types,
+            )
 
         return (input_ids, input_lengths, position_ids, token_type_ids,
                 hidden_states, max_input_length, prompt_embedding_table, tasks,
-                prompt_vocab_size, attention_mask)
+                prompt_vocab_size, attention_mask, lora_params)
 
 
 class DecoderModel(Module, GenerationMixin):
@@ -840,7 +932,8 @@ class DecoderModel(Module, GenerationMixin):
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
                  mapping=Mapping(),
-                 fp16_clamping=False):
+                 fp16_clamping=False,
+                 max_lora_rank=None):
         super().__init__()
         self.mapping = mapping
 
@@ -912,28 +1005,32 @@ class DecoderModel(Module, GenerationMixin):
                 mapping=self.mapping)
 
         self.decoder_layers = ModuleList([
-            DecoderLayer(hidden_size=hidden_size,
-                         ffn_hidden_size=ffn_hidden_size,
-                         num_attention_heads=num_heads,
-                         num_kv_heads=self.num_kv_heads,
-                         head_size=self.head_size,
-                         max_position_embeddings=max_position_embeddings,
-                         q_scaling=q_scaling,
-                         has_attention_qkvo_bias=has_attention_qkvo_bias,
-                         has_mlp_bias=has_mlp_bias,
-                         layernorm_position=layernorm_position,
-                         layernorm_eps=layernorm_eps,
-                         layernorm_type=layernorm_type,
-                         hidden_act=hidden_act,
-                         mlp_type=mlp_type,
-                         mapping=self.mapping,
-                         dtype=dtype,
-                         residual_scaling=residual_scaling,
-                         relative_attention=relative_attention,
-                         max_distance=max_distance,
-                         num_buckets=num_buckets,
-                         fp16_clamping=fp16_clamping)
-            for _ in self.mapping.pp_layers(self.total_num_layers)
+            DecoderLayer(
+                layer_idx=layer_idx,
+                hidden_size=hidden_size,
+                ffn_hidden_size=ffn_hidden_size,
+                num_attention_heads=num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                max_position_embeddings=max_position_embeddings,
+                q_scaling=q_scaling,
+                has_attention_qkvo_bias=has_attention_qkvo_bias,
+                has_mlp_bias=has_mlp_bias,
+                layernorm_position=layernorm_position,
+                layernorm_eps=layernorm_eps,
+                layernorm_type=layernorm_type,
+                hidden_act=hidden_act,
+                mlp_type=mlp_type,
+                mapping=self.mapping,
+                dtype=dtype,
+                residual_scaling=residual_scaling,
+                relative_attention=relative_attention,
+                max_distance=max_distance,
+                num_buckets=num_buckets,
+                fp16_clamping=fp16_clamping,
+                max_lora_rank=max_lora_rank,
+            ) for layer_idx in range(
+                len(self.mapping.pp_layers(self.total_num_layers)))
         ])
 
         if self.mapping.is_last_pp_rank():
@@ -963,7 +1060,8 @@ class DecoderModel(Module, GenerationMixin):
                 last_token_ids=None,
                 kv_cache_params=None,
                 attention_params=None,
-                hidden_states=None):
+                hidden_states=None,
+                lora_params: LoraParams = None):
         if self.mapping.is_first_pp_rank():
             assert isinstance(decoder_input_ids, Tensor)
         else:
@@ -983,9 +1081,13 @@ class DecoderModel(Module, GenerationMixin):
         if use_cache:
             presents = []
 
-        for i, (decoder_layer, past, max_attention_window_size) in enumerate(
-                zip(self.decoder_layers, kv_cache_params.past_key_value,
-                    kv_cache_params.host_max_attention_window_sizes)):
+        for i, (decoder_layer, past) in enumerate(
+                zip(self.decoder_layers, kv_cache_params.past_key_value)):
+
+            lora_layer_params = None
+            if lora_params is not None and lora_params.lora_ranks is not None:
+                lora_layer_params = lora_params.get_layer_params(i)
+
             hidden_states = decoder_layer(
                 hidden_states,
                 encoder_output=encoder_output,
@@ -996,11 +1098,13 @@ class DecoderModel(Module, GenerationMixin):
                     past_key_value=past,
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
-                    host_max_attention_window_sizes=max_attention_window_size,
+                    host_max_attention_window_sizes=kv_cache_params.
+                    host_max_attention_window_sizes,
                     host_sink_token_length=kv_cache_params.
                     host_sink_token_length,
                     cache_indirection=kv_cache_params.cache_indirection),
-                attention_params=attention_params)
+                attention_params=attention_params,
+                lora_layer_params=lora_layer_params)
 
             if use_cache:
                 presents_self, presents_cross = hidden_states[1], hidden_states[
@@ -1059,6 +1163,7 @@ class DecoderModel(Module, GenerationMixin):
         max_encoder_input_len,
         gather_context_logits: bool = False,
         gather_generation_logits: bool = False,
+        lora_target_modules: List[str] = None,
     ):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
@@ -1119,6 +1224,7 @@ class DecoderModel(Module, GenerationMixin):
         remove_input_padding = default_net().plugin_config.remove_input_padding
         use_custom_all_reduce = default_net(
         ).plugin_config.use_custom_all_reduce
+        use_lora_plugin = default_net().plugin_config.lora_plugin
 
         input_ids, position_ids, token_type_ids, hidden_states = None, None, None, None
         if remove_input_padding:
@@ -1319,24 +1425,89 @@ class DecoderModel(Module, GenerationMixin):
                 self.mapping, False)
 
         layers_range = self.mapping.pp_layers(self.total_num_layers)
+        num_pp_layers = len(layers_range)
 
         host_max_attention_window_sizes = None
         host_sink_token_length = None
         if use_gpt_attention_plugin:
-            host_max_attention_window_sizes = []
-            for i in layers_range:
-                host_attention_window_size_tensor = Tensor(
-                    name=f'host_max_attention_window_size_{i}',
-                    dtype=trt.int32,
-                    shape=[1],
-                    dim_range=OrderedDict([('scalar', [1])]))
-                host_max_attention_window_sizes.append(
-                    host_attention_window_size_tensor)
+            host_max_attention_window_sizes = Tensor(
+                name=f'host_max_attention_window_sizes',
+                dtype=trt.int32,
+                shape=[num_pp_layers],
+                dim_range=OrderedDict([('num_layers', [num_pp_layers])]))
             host_sink_token_length = Tensor(name='host_sink_token_length',
                                             dtype=trt.int32,
                                             shape=[1],
                                             dim_range=OrderedDict([('scalar',
                                                                     [1])]))
+        '''
+        LoRA plugin related inputs:
+        lora_target_modules for BART-decoder:
+            ['attn_q', 'cross_attn_q',
+             'attn_v', 'cross_attn_v']
+        This is NOT directly loaded from the adapter-config file
+        We make it this way because BART has LoRA weights for both self-attention and cross-attention in decoder
+        '''
+        lora_weights_pointers = None
+        lora_ranks = None
+        lora_params = None
+        if use_lora_plugin:
+            lora_weights_pointers = []
+            lora_ranks = []
+            # In current design, q_lora_params, k_lora_params and v_lora_params should be all enabled or all disabled at the same time.
+            # However, BART lora modules only contain two of them, so we use zero tensor to fill the missing ones.
+            missing_qkv_modules = []
+            if any(x in lora_target_modules
+                   for x in ["attn_q", "attn_k", "attn_v"]):
+                for lora_module in [
+                        "attn_q",
+                        "attn_k",
+                        "attn_v",
+                ]:
+                    if lora_module not in lora_target_modules:
+                        missing_qkv_modules.append(lora_module)
+            if any(x in lora_target_modules
+                   for x in ["cross_attn_q", "cross_attn_k", "cross_attn_v"]):
+                for lora_module in [
+                        "cross_attn_q", "cross_attn_k", "cross_attn_v"
+                ]:
+                    if lora_module not in lora_target_modules:
+                        missing_qkv_modules.append(lora_module)
+
+            for i in layers_range:
+                lora_weight_pointer_dict = {}
+                lora_rank_dict = {}
+                for lora_module in (lora_target_modules + missing_qkv_modules):
+                    lora_weight_pointer = Tensor(
+                        name=f'{lora_module}_lora_weights_pointers_{i}',
+                        dtype=trt.int64,
+                        shape=[-1, 2],
+                        dim_range=OrderedDict([('batch_size_beam_width',
+                                                [bb_range]), ('in_out', [2])]))
+                    lora_weight_pointer_dict.update({
+                        f'{lora_module}_lora_weights_pointers':
+                        lora_weight_pointer
+                    })
+
+                    lora_rank = Tensor(name=f'{lora_module}_lora_ranks_{i}',
+                                       dtype=trt.int32,
+                                       shape=[-1],
+                                       dim_range=OrderedDict([
+                                           ('batch_size_beam_width', [bb_range])
+                                       ]))
+                    lora_rank_dict.update(
+                        {f'{lora_module}_lora_ranks': lora_rank})
+
+                lora_weights_pointers.append(lora_weight_pointer_dict)
+                lora_ranks.append(lora_rank_dict)
+
+            lora_params = LoraParams(
+                lora_ranks=lora_ranks,
+                lora_weights_pointers=lora_weights_pointers,
+                host_context_lengths=host_context_lengths,
+                max_context_length=max_decoder_input_len,
+                host_request_types=host_request_types,
+            )
 
         for i in layers_range:
             kv_dim_range = OrderedDict([
@@ -1395,7 +1566,7 @@ class DecoderModel(Module, GenerationMixin):
 
         return (input_ids, encoder_output, position_ids, token_type_ids, True,
                 attention_mask, cross_attention_mask, last_token_ids,
-                kv_cache_params, attention_params, hidden_states)
+                kv_cache_params, attention_params, hidden_states, lora_params)
 
 
 class WhisperEncoder(Module):

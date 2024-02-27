@@ -49,9 +49,10 @@ class GemmaDecoderLayer(Module):
                                        dtype=config.dtype)
 
         self.attention = Attention(
-            config.hidden_size,
-            config.num_attention_heads,
-            config.num_key_value_heads,
+            layer_idx=layer_idx,
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
             attention_head_size=config.head_size,
             max_position_embeddings=config.max_position_embeddings,
             dtype=config.dtype,

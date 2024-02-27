@@ -41,6 +41,7 @@ public:
     public:
         std::optional<std::vector<float>> beam_search_diversity_rate; // [1] or [batch_size] on cpu
         std::optional<std::vector<float>> length_penalty;             // [1] or [batch_size] on cpu
+        std::optional<std::vector<int>> early_stopping;               // [1] or [batch_size] on cpu
     };
 
     OnlineBeamSearchLayer(
@@ -71,8 +72,10 @@ protected:
 
     std::vector<float> mDiversityRate;
     std::vector<float> mLengthPenalty;
+    std::vector<int> mEarlyStopping;
     float* diversity_rates_buf_;
     float* length_penalties_buf_;
+    int* early_stoppings_buf_;
 
 private:
     void allocateBuffer(size_t batch_size);

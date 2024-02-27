@@ -39,7 +39,7 @@ namespace kernels
 template <typename T>
 __device__ __forceinline__ T apply_length_penalty(T log_prob, int length, float length_penalty)
 {
-    // score = log(prob) / (length)^length_penalty.
+    // score = log(prob) / (length ^ length_penalty)
     if (length_penalty == 0.0f || length == 1)
     {
         return log_prob;

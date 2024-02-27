@@ -341,13 +341,14 @@ class TestLLaMA(unittest.TestCase):
 
         kv_shape = (batch_size, 2, llama_config.num_key_value_heads,
                     max_seq_len, head_size)
+        ctx_buffer[f'host_max_attention_window_sizes'] = torch.tensor(
+            [max_seq_len] * llama_config.num_hidden_layers, dtype=torch.int32)
+        ctx_shape[f'host_max_attention_window_sizes'] = (
+            llama_config.num_hidden_layers, )
         for i in range(llama_config.num_hidden_layers):
             ctx_shape[f'past_key_value_{i}'] = kv_shape
             ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             ctx_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
-            ctx_buffer[f'host_max_attention_window_size_{i}'] = torch.tensor(
-                [max_seq_len], dtype=torch.int32)
-            ctx_shape[f'host_max_attention_window_size_{i}'] = (1, )
         ctx_buffer['sequence_length'] = sequence_length_buffer
         ctx_shape['sequence_length'] = ctx_buffer['sequence_length'].shape
         ctx_shape['host_past_key_value_lengths'] = (batch_size, )
@@ -405,17 +406,18 @@ class TestLLaMA(unittest.TestCase):
 
         step1_shape = {k: v.shape for k, v in step1_buffer.items()}
 
+        step1_shape[f'host_max_attention_window_sizes'] = (
+            llama_config.num_hidden_layers, )
         for i in range(llama_config.num_hidden_layers):
             step1_shape[f'past_key_value_{i}'] = kv_shape
-            step1_shape[f'host_max_attention_window_size_{i}'] = (1, )
         step1_shape['sequence_length'] = (batch_size, )
         step1_shape['host_past_key_value_lengths'] = (batch_size, )
         step1_shape['host_sink_token_length'] = (1, )
+        step1_buffer[f'host_max_attention_window_sizes'] = torch.tensor(
+            [max_seq_len] * llama_config.num_hidden_layers, dtype=torch.int32)
         for i in range(llama_config.num_hidden_layers):
             step1_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
             step1_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[i]
-            step1_buffer[f'host_max_attention_window_size_{i}'] = torch.tensor(
-                [max_seq_len], dtype=torch.int32)
         step1_buffer[
             'host_past_key_value_lengths'] = sequence_length_buffer.cpu()
         sequence_length_buffer = torch.add(sequence_length_buffer, step)

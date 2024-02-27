@@ -117,6 +117,21 @@ When using V1 batching, the following additional statistics are reported per V1 
   * `Total Context Tokens`, total number of tokens across requests in context phase
   * `Empty Generation Slots`, total number of padded Slots during generation phase
 
+### Logits Post-Processor (optional)
+
+Users can alter the logits produced the network, with a callback attached to an `InferenceRequest`:
+
+```
+  using LogitsPostProcessor = std::function<TensorPtr(RequestIdType, TensorPtr&, BeamTokens const&, TStream)>;
+```
+
+The first argument is the request id, second is the logits tensor, third are the tokens produced by the request so far, and last one is the operation stream used by the logits tensor.
+
+Users *must* use the stream to access the logits tensor. For example, performing a addition with a bias tensor should be enqueued on that stream.
+Alternatively, users may call `stream->synchronize()`, however, that will slow down the entire execution pipeline.
+
+Note: this feature isn't supported with the `V1` batching scheme for the moment.
+
 ### Other mandatory GptManager parameters
 * `trtEnginePath`, path to the directory containing the TRT-LLM engine that GptManager wraps
 * `modelType`, batching scheme - V1, InflightBatching or InflightFusedBatching.

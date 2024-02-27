@@ -339,6 +339,7 @@ class TestFunctional(unittest.TestCase):
                     context_lengths=input_lengths_tensor,
                     cache_indirection=cache_indirection_tensor,
                     host_request_types=host_request_types_tensor,
+                    layer_idx=0,
                     num_heads=num_heads,
                     num_kv_heads=num_kv_heads,
                     hidden_size_per_head=head_size,
@@ -783,7 +784,7 @@ class TestFunctional(unittest.TestCase):
                 kv_cache_manager.add_sequence(sequence, in_len_req.clone())
 
             # Get arrays of pointers to the "pages" of KV values
-            pointer_arrays = kv_cache_manager.get_pointer_arrays(beam_width)[0]
+            pointer_arrays = kv_cache_manager.get_block_pointers(beam_width)[0]
             dense_pointer_arrays = pointer_arrays[sequence_selection]
 
             host_input_lengths = np.concatenate(input_length_list)

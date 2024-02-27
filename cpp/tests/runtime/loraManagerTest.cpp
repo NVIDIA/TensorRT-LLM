@@ -91,6 +91,11 @@ TEST_F(LoraManagerTest, moduleParsing)
         LoraModule(LoraModule::ModuleType::kMLP_GATE, 2048, 4096, false, true, -1, 0),
         LoraModule(LoraModule::ModuleType::kMLP_H_TO_4H, 2048, 4096, false, true, -1, 0),
         LoraModule(LoraModule::ModuleType::kMLP_4H_TO_H, 4096, 2048, false, true, 1, -1),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_QKV, 2048, 6144, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_Q, 2048, 2048, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_K, 2048, 2048, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_V, 2048, 2048, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_DENSE, 2048, 2048, false, true, 1, -1),
     };
     ASSERT_EQ(expectedModules.size(), loraModules.size());
     for (size_t i = 0; i < expectedModules.size(); ++i)
@@ -119,15 +124,20 @@ TEST_F(LoraManagerTest, formatTensors_tp1)
         LoraModule(LoraModule::ModuleType::kMLP_H_TO_4H, 16, 32, false, true, -1, 0),
         LoraModule(LoraModule::ModuleType::kMLP_4H_TO_H, 32, 16, false, true, 1, -1),
         LoraModule(LoraModule::ModuleType::kMLP_GATE, 16, 32, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_QKV, 16, 3 * 16, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_Q, 16, 16, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_K, 16, 16, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_V, 16, 16, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_DENSE, 16, 16, false, true, 1, -1),
     };
     modelConfig.setLoraModules(modules);
     loraManager.create(modelConfig, worldConfig, *mManager);
 
-    TensorPtr loraReqWeights = utils::loadNpy(*mManager, TEST_SOURCE_LORA_TP1, MemoryType::kGPU);
+    TensorPtr loraReqWeights = utils::loadNpy(*mManager, TEST_SOURCE_LORA_TP1.string(), MemoryType::kGPU);
     loraReqWeights->unsqueeze(0);
-    TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP1, MemoryType::kCPU);
+    TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP1.string(), MemoryType::kCPU);
     loraReqKeys->unsqueeze(0);
-    TensorPtr loraTargetTensors = utils::loadNpy(*mManager, TEST_DEST_LORA_TP1, MemoryType::kCPU);
+    TensorPtr loraTargetTensors = utils::loadNpy(*mManager, TEST_DEST_LORA_TP1.string(), MemoryType::kCPU);
 
     loraManager.formatTaskTensors(loraReqWeights, loraReqKeys, modelConfig, worldConfig, *mManager);
     TensorPtr hostWeights = mManager->copyFrom(*loraReqWeights, MemoryType::kCPU);
@@ -157,15 +167,20 @@ TEST_F(LoraManagerTest, formatTensors_tp2)
         LoraModule(LoraModule::ModuleType::kMLP_H_TO_4H, 16, 32, false, true, -1, 0),
         LoraModule(LoraModule::ModuleType::kMLP_4H_TO_H, 32, 16, false, true, 1, -1),
         LoraModule(LoraModule::ModuleType::kMLP_GATE, 16, 32, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_QKV, 16, 3 * 16, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_Q, 16, 16, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_K, 16, 16, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_V, 16, 16, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_DENSE, 16, 16, false, true, 1, -1),
     };
     modelConfig.setLoraModules(modules);
     loraManager.create(modelConfig, worldConfig, *mManager);
 
-    TensorPtr loraReqWeights = utils::loadNpy(*mManager, TEST_SOURCE_LORA_TP2, MemoryType::kGPU);
+    TensorPtr loraReqWeights = utils::loadNpy(*mManager, TEST_SOURCE_LORA_TP2.string(), MemoryType::kGPU);
     loraReqWeights->unsqueeze(0);
-    TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP2, MemoryType::kCPU);
+    TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP2.string(), MemoryType::kCPU);
     loraReqKeys->unsqueeze(0);
-    TensorPtr loraTargetTensors = utils::loadNpy(*mManager, TEST_DEST_LORA_TP2, MemoryType::kCPU);
+    TensorPtr loraTargetTensors = utils::loadNpy(*mManager, TEST_DEST_LORA_TP2.string(), MemoryType::kCPU);
 
     loraManager.formatTaskTensors(loraReqWeights, loraReqKeys, modelConfig, worldConfig, *mManager);
     TensorPtr hostWeights = mManager->copyFrom(*loraReqWeights, MemoryType::kCPU);
@@ -343,6 +358,11 @@ TEST_F(LoraManagerTest, fillInputTensors_tp1_pp1)
         LoraModule(LoraModule::ModuleType::kMLP_H_TO_4H, 16, 32, false, true, -1, 0),
         LoraModule(LoraModule::ModuleType::kMLP_GATE, 16, 32, false, true, -1, 0),
         LoraModule(LoraModule::ModuleType::kMLP_4H_TO_H, 32, 16, false, true, 1, -1),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_QKV, 16, 3 * 16, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_Q, 16, 16, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_K, 16, 16, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_V, 16, 16, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_DENSE, 16, 16, false, true, 1, -1),
     };
     modelConfig.setLoraModules(modules);
     loraManager.create(modelConfig, worldConfig, *mManager);
@@ -362,8 +382,8 @@ TEST_F(LoraManagerTest, fillInputTensors_tp1_pp1)
     std::vector<SizeType> reqBeamWidth{1, 2, 1};
     std::vector<bool> loraEnabled{true, true, false};
 
-    TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP1, MemoryType::kCPU);
-    TensorPtr loraWeights = utils::loadNpy(*mManager, TEST_DEST_LORA_TP1, MemoryType::kGPU);
+    TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP1.string(), MemoryType::kCPU);
+    TensorPtr loraWeights = utils::loadNpy(*mManager, TEST_DEST_LORA_TP1.string(), MemoryType::kGPU);
 
     loraManager.addTask(1, loraWeights, loraReqKeys);
     loraManager.addTask(2, loraWeights, loraReqKeys);
@@ -399,6 +419,16 @@ TEST_F(LoraManagerTest, fillInputTensors_tp1_pp1)
         8, 8, 8, 0, // mlp_gate layer 1
         8, 8, 8, 0, // mlp_4h_to_h layer 0
         8, 8, 8, 0, // mlp_4h_to_h layer 1
+        8, 8, 8, 0, // cross_attn_qkv layer 0
+        8, 8, 8, 0, // cross_attn_qkv layer 1
+        4, 4, 4, 0, // cross_attn_q layer 0
+        4, 4, 4, 0, // cross_attn_q layer 1
+        4, 4, 4, 0, // cross_attn_k layer 0
+        4, 4, 4, 0, // cross_attn_k layer 1
+        4, 4, 4, 0, // cross_attn_v layer 0
+        4, 4, 4, 0, // cross_attn_v layer 1
+        8, 8, 8, 0, // cross_attn_dense layer 0
+        8, 8, 8, 0, // cross_attn_dense layer 1
     };
 
     std::vector<int64_t> targetPtrs{
@@ -561,6 +591,106 @@ TEST_F(LoraManagerTest, fillInputTensors_tp1_pp1)
         reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(13, 8 * 32, weightsRowSize)),
         0,
         0,
+
+        // cross_attn_qkv layer 0
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(16, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(16, 8 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(16, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(16, 8 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(16, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(16, 8 * 16, weightsRowSize)),
+        0,
+        0,
+
+        // cross_attn_qkv layer 1
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(17, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(17, 8 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(17, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(17, 8 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(17, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(17, 8 * 16, weightsRowSize)),
+        0,
+        0,
+
+        // cross_attn_q layer 0
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(18, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(18, 4 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(18, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(18, 4 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(18, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(18, 4 * 16, weightsRowSize)),
+        0,
+        0,
+
+        // cross_attn_q layer 1
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(19, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(19, 4 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(19, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(19, 4 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(19, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(19, 4 * 16, weightsRowSize)),
+        0,
+        0,
+
+        // cross_attn_k layer 0
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(20, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(20, 4 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(20, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(20, 4 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(20, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(20, 4 * 16, weightsRowSize)),
+        0,
+        0,
+
+        // cross_attn_k layer 1
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(21, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(21, 4 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(21, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(21, 4 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(21, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(21, 4 * 16, weightsRowSize)),
+        0,
+        0,
+
+        // cross_attn_v layer 0
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(22, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(22, 4 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(22, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(22, 4 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(22, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(22, 4 * 16, weightsRowSize)),
+        0,
+        0,
+
+        // cross_attn_v layer 1
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(23, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(23, 4 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(23, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(23, 4 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(23, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(23, 4 * 16, weightsRowSize)),
+        0,
+        0,
+
+        // cross_attn_dense layer 0
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(24, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(24, 8 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(24, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(24, 8 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(24, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(24, 8 * 16, weightsRowSize)),
+        0,
+        0,
+
+        // cross_attn_dense layer 1
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(25, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(25, 8 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(25, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(25, 8 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(25, 0, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(25, 8 * 16, weightsRowSize)),
+        0,
+        0,
     };
 
     checkLoraTensors(loraManager, targetPtrs, weightsPtrs, targetAdapterSizes, adapterSizes, modelConfig, worldConfig,
@@ -582,6 +712,11 @@ TEST_F(LoraManagerTest, fillInputTensors_tp2_pp2)
         LoraModule(LoraModule::ModuleType::kMLP_H_TO_4H, 16, 32, false, true, -1, 0),
         LoraModule(LoraModule::ModuleType::kMLP_GATE, 16, 32, false, true, -1, 0),
         LoraModule(LoraModule::ModuleType::kMLP_4H_TO_H, 32, 16, false, true, 1, -1),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_QKV, 16, 3 * 16, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_Q, 16, 16, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_K, 16, 16, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_V, 16, 16, false, true, -1, 0),
+        LoraModule(LoraModule::ModuleType::kCROSS_ATTN_DENSE, 16, 16, false, true, 1, -1),
     };
     modelConfig.setLoraModules(modules);
     loraManager.create(modelConfig, worldConfig, *mManager);
@@ -601,8 +736,8 @@ TEST_F(LoraManagerTest, fillInputTensors_tp2_pp2)
     std::vector<SizeType> reqBeamWidth{1, 2, 1};
     std::vector<bool> loraEnabled{true, true, false};
 
-    TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP2, MemoryType::kCPU);
-    TensorPtr loraWeights = utils::loadNpy(*mManager, TEST_DEST_LORA_TP2, MemoryType::kGPU);
+    TensorPtr loraReqKeys = utils::loadNpy(*mManager, TEST_KEYS_LORA_TP2.string(), MemoryType::kCPU);
+    TensorPtr loraWeights = utils::loadNpy(*mManager, TEST_DEST_LORA_TP2.string(), MemoryType::kGPU);
 
     loraManager.addTask(1, loraWeights, loraReqKeys);
     loraManager.addTask(2, loraWeights, loraReqKeys);
@@ -630,6 +765,11 @@ TEST_F(LoraManagerTest, fillInputTensors_tp2_pp2)
         8, 8, 8, 0, // mlp_h_to_4h layer 1
         8, 8, 8, 0, // mlp_gate layer 1
         8, 8, 8, 0, // mlp_4h_to_h layer 1
+        8, 8, 8, 0, // cross_attn_qkv layer 1
+        4, 4, 4, 0, // cross_attn_q layer 1
+        4, 4, 4, 0, // cross_attn_k layer 1
+        4, 4, 4, 0, // cross_attn_v layer 1
+        8, 8, 8, 0, // cross_attn_dense layer 1
     };
 
     SizeType attnQkvInRank1Off = 0;
@@ -722,6 +862,56 @@ TEST_F(LoraManagerTest, fillInputTensors_tp2_pp2)
         reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(13, mlp4htohOutRank1Off, weightsRowSize)),
         reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(13, mlp4htohInRank1Off, weightsRowSize)),
         reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(13, mlp4htohOutRank1Off, weightsRowSize)),
+        0,
+        0,
+
+        // cross_attn_qkv layer 1
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(17, attnQkvInRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(17, attnQkvOutRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(17, attnQkvInRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(17, attnQkvOutRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(17, attnQkvInRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(17, attnQkvOutRank1Off, weightsRowSize)),
+        0,
+        0,
+
+        // cross_attn_q layer 1
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(19, attnQInRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(19, attnQOutRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(19, attnQInRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(19, attnQOutRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(19, attnQInRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(19, attnQOutRank1Off, weightsRowSize)),
+        0,
+        0,
+
+        // cross_attn_k layer 1
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(21, attnQInRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(21, attnQOutRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(21, attnQInRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(21, attnQOutRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(21, attnQInRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(21, attnQOutRank1Off, weightsRowSize)),
+        0,
+        0,
+
+        // cross_attn_v layer 1
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(23, attnQInRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(23, attnQOutRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(23, attnQInRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(23, attnQOutRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(23, attnQInRank1Off, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(23, attnQOutRank1Off, weightsRowSize)),
+        0,
+        0,
+
+        // cross_attn_dense layer 1
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(25, 4 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(25, 8 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(25, 4 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(25, 8 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(25, 4 * 16, weightsRowSize)),
+        reinterpret_cast<int64_t>(inputWeightsPtrs + common::flat_index2(25, 8 * 16, weightsRowSize)),
         0,
         0,
     };

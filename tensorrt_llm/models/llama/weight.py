@@ -222,16 +222,16 @@ class QkvWeightHelper:
             self._qkv_weights[i] = {}
         self._qkv_weights[i][tag] = weight
 
-    def is_qkv_prepared(self, layer_id):
-        if layer_id not in self._qkv_weights:
+    def is_qkv_prepared(self, layer_idx):
+        if layer_idx not in self._qkv_weights:
             return False
-        weights = self._qkv_weights[layer_id]
+        weights = self._qkv_weights[layer_idx]
         return 'q' in weights and 'k' in weights and 'v' in weights
 
-    def split_qkv_weights(self, layer_id):
-        if not self.is_qkv_prepared(layer_id):
+    def split_qkv_weights(self, layer_idx):
+        if not self.is_qkv_prepared(layer_idx):
             return None
-        weights = self._qkv_weights.pop(layer_id)  # to prevent memory leak.
+        weights = self._qkv_weights.pop(layer_idx)  # to prevent memory leak.
         q, k, v = (torch.tensor(weights[t]) for t in ['q', 'k', 'v'])
 
         if not self.is_mha:
@@ -293,13 +293,13 @@ def load_from_hf_checkpoint(model_dir,
         model_params = load_state_dict(model_file, dtype=dtype)
         for name, param in model_params.items():
             tensorrt_llm.logger.debug(f'Converting weight {name}...')
-            i = retrieved_layer_index_from_name(name)
-            if i is None:
+            layer_idx = retrieved_layer_index_from_name(name)
+            if layer_idx is None:
                 layer = None
             else:
-                if i not in layers_range:
+                if layer_idx not in layers_range:
                     continue
-            tllm_prex = f'transformer.layers.{i}.'
+            tllm_prex = f'transformer.layers.{layer_idx}.'
 
             if 'model.embed_tokens.weight' in name:
                 if lora_config.is_valid and lora_config.embedding_weight is not None:
@@ -349,10 +349,10 @@ def load_from_hf_checkpoint(model_dir,
             elif 'post_attention_layernorm.weight' in name:
                 weights[tllm_prex + 'post_layernorm.weight'] = param
             elif qkv_weight_helper.is_qkv_weight(name):
-                qkv_weight_helper.add_weight(i, name, param)
-                if not qkv_weight_helper.is_qkv_prepared(i):
+                qkv_weight_helper.add_weight(layer_idx, name, param)
+                if not qkv_weight_helper.is_qkv_prepared(layer_idx):
                     continue
-                split_v = qkv_weight_helper.split_qkv_weights(i)
+                split_v = qkv_weight_helper.split_qkv_weights(layer_idx)
                 if use_weight_only:
                     param = split_v.transpose()
                     processed_torch_weights, torch_weight_scales = \

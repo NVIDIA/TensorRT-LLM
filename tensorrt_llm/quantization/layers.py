@@ -699,17 +699,22 @@ class Int8SmoothQuantRowLinear(RowLinear):
                 self.dtype), f"Got input type {x.dtype}, expecting {self.dtype}"
         x = mul(x, self.prequant_scaling_factor.value)
 
-        activation_scaling_factor = cast(self.activation_scaling_factor.value,
-                                         self.dtype)
-        quantized_out = quantize(x, activation_scaling_factor, 'int8')
-        dequantized_out = dequantize(quantized_out, activation_scaling_factor,
-                                     -1, self.dtype)
+        x = cast(x, self.activation_scaling_factor.value.dtype)
 
-        weights_scaling_factor = cast(self.weights_scaling_factor.value,
-                                      self.dtype)
-        w_deq_out = dequantize(self.weight.value, weights_scaling_factor, 0,
-                               self.dtype)
+        quantized_out = quantize(x, self.activation_scaling_factor.value,
+                                 'int8')
 
+        dequantized_out = dequantize(quantized_out,
+                                     self.activation_scaling_factor.value, -1,
+                                     self.activation_scaling_factor.value.dtype)
+
+        dequantized_out = cast(dequantized_out, self.dtype)
+
+        w_deq_out = dequantize(self.weight.value,
+                               self.weights_scaling_factor.value, 0,
+                               self.weights_scaling_factor.value.dtype)
+
+        w_deq_out = cast(w_deq_out, self.dtype)
         return super().multiply_reduce(dequantized_out, w_deq_out, False)
 
 
@@ -750,17 +755,21 @@ class Int8SmoothQuantLinear(Linear):
                 x.dtype,
                 self.dtype), f"Got input type {x.dtype}, expecting {self.dtype}"
         x = mul(x, self.prequant_scaling_factor.value)
+        x = cast(x, self.activation_scaling_factor.value.dtype)
 
-        activation_scaling_factor = cast(self.activation_scaling_factor.value,
-                                         self.dtype)
-        quantized_out = quantize(x, activation_scaling_factor, 'int8')
-        dequantized_out = dequantize(quantized_out, activation_scaling_factor,
-                                     -1, self.dtype)
+        quantized_out = quantize(x, self.activation_scaling_factor.value,
+                                 'int8')
 
-        weights_scaling_factor = cast(self.weights_scaling_factor.value,
-                                      self.dtype)
-        w_deq_out = dequantize(self.weight.value, weights_scaling_factor, 0,
-                               self.dtype)
+        dequantized_out = dequantize(quantized_out,
+                                     self.activation_scaling_factor.value, -1,
+                                     self.activation_scaling_factor.value.dtype)
+
+        dequantized_out = cast(dequantized_out, self.dtype)
+
+        w_deq_out = dequantize(self.weight.value,
+                               self.weights_scaling_factor.value, 0,
+                               self.weights_scaling_factor.value.dtype)
+        w_deq_out = cast(w_deq_out, self.dtype)
 
         return super().multiply_gather(dequantized_out, w_deq_out, False)
 
@@ -936,6 +945,8 @@ class SmoothQuantAttention(Module):
 
     def __init__(
         self,
+        *,
+        layer_idx,
         hidden_size,
         num_attention_heads,
         num_kv_heads=None,
@@ -960,6 +971,7 @@ class SmoothQuantAttention(Module):
         max_lora_rank=None,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
         self.attention_mask_type = attention_mask_type
         self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
         self.num_attention_heads = num_attention_heads // tp_size
@@ -1101,6 +1113,7 @@ class SmoothQuantAttention(Module):
                 context_lengths=attention_params.context_lengths,
                 cache_indirection=kv_cache_params.cache_indirection,
                 host_request_types=attention_params.host_request_types,
+                layer_idx=self.layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=self.num_attention_kv_heads,
                 hidden_size_per_head=self.attention_head_size,
@@ -1115,10 +1128,9 @@ class SmoothQuantAttention(Module):
                 alibi_slopes=alibi_slopes,
                 tp_size=self.tp_size,
                 tp_rank=self.tp_rank,
-                kv_cache_block_pointers=kv_cache_params.
-                get_first_kv_cache_block_pointers(),
+                kv_cache_block_pointers=kv_cache_params.kv_cache_block_pointers,
                 host_kv_cache_block_pointers=kv_cache_params.
-                get_first_host_kv_cache_block_pointers(),
+                host_kv_cache_block_pointers,
                 host_context_lengths=attention_params.host_context_lengths,
                 enable_pos_shift=self.enable_pos_shift,
                 dense_context_fmha=self.dense_context_fmha,

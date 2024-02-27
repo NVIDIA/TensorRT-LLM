@@ -815,8 +815,9 @@ class TestLayer(unittest.TestCase):
                 mask_type = tensorrt_llm.layers.AttentionMaskType.causal
 
             attn_layer = tensorrt_llm.layers.Attention(
-                hidden_size,
-                head_num,
+                layer_idx=0,
+                hidden_size=hidden_size,
+                num_attention_heads=head_num,
                 max_position_embeddings=seq_len,
                 attention_mask_type=mask_type,
                 position_embedding_type=pos_emb_type,

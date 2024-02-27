@@ -33,7 +33,7 @@ from ...quantization.layers import (SmoothQuantAttention, SmoothQuantGatedMLP,
 
 def _smooth_quantize_gpt(model, quant_mode):
     assert quant_mode.has_act_and_weight_quant()
-    for layer in model.layers:
+    for layer_idx, layer in enumerate(model.layers):
         assert hasattr(layer,
                        "input_layernorm"), "The layer has no input_layernorm"
         layer.input_layernorm = SmoothQuantLayerNorm(
@@ -42,7 +42,8 @@ def _smooth_quantize_gpt(model, quant_mode):
             quant_mode=quant_mode)
         assert hasattr(layer, "attention"), "The layer has no attention"
         layer.attention = SmoothQuantAttention(
-            layer.hidden_size,
+            layer_idx=layer_idx,
+            hidden_size=layer.hidden_size,
             num_attention_heads=layer.num_attention_heads,
             num_kv_heads=layer.attention.num_attention_kv_heads * layer.tp_size,
             max_position_embeddings=layer.max_position_embeddings,
@@ -79,7 +80,7 @@ def _smooth_quantize_gpt(model, quant_mode):
 
 def _smooth_quantize_llama(model, quant_mode):
     assert quant_mode.has_act_and_weight_quant()
-    for layer in model.layers:
+    for layer_idx, layer in enumerate(model.layers):
         assert hasattr(layer,
                        "input_layernorm"), "The layer has no input_layernorm"
         layer.input_layernorm = SmoothQuantRmsNorm(
@@ -88,7 +89,8 @@ def _smooth_quantize_llama(model, quant_mode):
             quant_mode=quant_mode)
         assert hasattr(layer, "attention"), "The layer has no attention"
         layer.attention = SmoothQuantAttention(
-            layer.hidden_size,
+            layer_idx=layer_idx,
+            hidden_size=layer.hidden_size,
             num_attention_heads=layer.num_attention_heads,
             num_kv_heads=layer.num_kv_heads,
             max_position_embeddings=layer.max_position_embeddings,
@@ -127,7 +129,7 @@ def _smooth_quantize_llama(model, quant_mode):
 
 def _smooth_quantize_bloom(model, quant_mode):
     assert quant_mode.has_act_and_weight_quant()
-    for layer in model.layers:
+    for layer_idx, layer in enumerate(model.layers):
         assert hasattr(layer,
                        "input_layernorm"), "The layer has no input_layernorm"
         layer.input_layernorm = SmoothQuantLayerNorm(
@@ -136,7 +138,8 @@ def _smooth_quantize_bloom(model, quant_mode):
             quant_mode=quant_mode)
         assert hasattr(layer, "attention"), "The layer has no attention"
         layer.attention = SmoothQuantAttention(
-            layer.hidden_size,
+            layer_idx=layer_idx,
+            hidden_size=layer.hidden_size,
             num_attention_heads=layer.num_attention_heads,
             max_position_embeddings=layer.max_position_embeddings,
             num_layers=layer.num_layers,
@@ -170,7 +173,7 @@ def _smooth_quantize_bloom(model, quant_mode):
 
 def _smooth_quantize_baichuan(model, quant_mode):
     assert quant_mode.has_act_and_weight_quant()
-    for layer in model.layers:
+    for layer_idx, layer in enumerate(model.layers):
         assert hasattr(layer,
                        "input_layernorm"), "The layer has no input_layernorm"
         layer.input_layernorm = SmoothQuantRmsNorm(
@@ -179,7 +182,8 @@ def _smooth_quantize_baichuan(model, quant_mode):
             quant_mode=quant_mode)
         assert hasattr(layer, "attention"), "The layer has no attention"
         layer.attention = SmoothQuantAttention(
-            layer.hidden_size,
+            layer_idx=layer_idx,
+            hidden_size=layer.hidden_size,
             num_attention_heads=layer.num_attention_heads,
             num_kv_heads=layer.num_kv_heads,
             max_position_embeddings=layer.max_position_embeddings,
@@ -219,7 +223,7 @@ def _smooth_quantize_baichuan(model, quant_mode):
 
 def _smooth_quantize_internlm(model, quant_mode):
     assert quant_mode.has_act_and_weight_quant()
-    for layer in model.layers:
+    for layer_idx, layer in enumerate(model.layers):
         assert hasattr(layer,
                        "input_layernorm"), "The layer has no input_layernorm"
         layer.input_layernorm = SmoothQuantRmsNorm(
@@ -228,7 +232,8 @@ def _smooth_quantize_internlm(model, quant_mode):
             quant_mode=quant_mode)
         assert hasattr(layer, "attention"), "The layer has no attention"
         layer.attention = SmoothQuantAttention(
-            layer.hidden_size,
+            layer_idx=layer_idx,
+            hidden_size=layer.hidden_size,
             num_attention_heads=layer.num_attention_heads,
             num_kv_heads=layer.num_kv_heads,
             max_position_embeddings=layer.max_position_embeddings,
@@ -264,15 +269,16 @@ def _smooth_quantize_internlm(model, quant_mode):
 
 def _smooth_quantize_qwen(model, quant_mode):
     assert quant_mode.has_act_and_weight_quant()
-    for layer in model.layers:
+    for layer_idx, layer in enumerate(model.layers):
         assert hasattr(layer, "ln_1"), "The layer has no ln_1"
         layer.ln_1 = SmoothQuantRmsNorm(normalized_shape=layer.hidden_size,
                                         dtype=layer.dtype,
                                         quant_mode=quant_mode)
         assert hasattr(layer, "attention"), "The layer has no attention"
         layer.attention = SmoothQuantAttention(
-            layer.hidden_size,
-            layer.num_attention_heads,
+            layer_idx=layer_idx,
+            hidden_size=layer.hidden_size,
+            num_attention_heads=layer.num_attention_heads,
             max_position_embeddings=layer.max_position_embeddings,
             num_layers=layer.num_layers,
             apply_query_key_layer_scaling=layer.apply_query_key_layer_scaling,
@@ -305,7 +311,7 @@ def _smooth_quantize_qwen(model, quant_mode):
 
 def _smooth_quantize_chatglm(model, quant_mode):
     assert quant_mode.has_act_and_weight_quant()
-    for layer in model.layers:
+    for layer_idx, layer in enumerate(model.layers):
         assert hasattr(layer,
                        "input_layernorm"), "The layer has no input_layernorm"
         layer.input_layernorm = SmoothQuantRmsNorm(
@@ -315,6 +321,7 @@ def _smooth_quantize_chatglm(model, quant_mode):
         )
         assert hasattr(layer, "attention"), "The layer has no attention"
         layer.attention = SmoothQuantAttention(
+            layer_idx=layer_idx,
             hidden_size=layer.hidden_size,
             num_attention_heads=layer.num_heads,
             num_kv_heads=layer.num_kv_heads,

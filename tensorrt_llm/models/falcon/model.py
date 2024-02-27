@@ -47,9 +47,10 @@ class FalconDecoderLayer(Module):
             # allreduce applies after those layer.
             tp_group = None
         self.attention = Attention(
-            hidden_size,
-            config.num_attention_heads,
-            config.num_key_value_heads,
+            layer_idx=layer_idx,
+            hidden_size=hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             attention_mask_type=AttentionMaskType.causal,
             dtype=dtype,

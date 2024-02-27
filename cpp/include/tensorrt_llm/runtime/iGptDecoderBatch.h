@@ -16,14 +16,12 @@
 
 #pragma once
 
-#include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iStatefulGptDecoder.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/sessionUtils.h"
 
-#include <cstdint>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -156,30 +154,30 @@ public:
     //! @param batchIdx index of the batch
     //! @returns [maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token
     //! ids without padding for request `batchIdx`, on gpu
-    virtual TensorPtr getOutputIds(SizeType batchIdx) const = 0;
+    [[nodiscard]] virtual TensorPtr getOutputIds(SizeType batchIdx) const = 0;
 
     //! @brief Gather final beam search results for request `batchIdx`.
     //! Result will only be available after event returned
-    virtual CudaEvent finalize(SizeType batchIdx) const = 0;
+    [[nodiscard]] virtual CudaEvent finalize(SizeType batchIdx) const = 0;
 
     //! @returns [batchSize (actual)], marks finished requests (per batch)
-    virtual std::vector<bool> getFinished() const = 0;
+    [[nodiscard]] virtual std::vector<bool> getFinished() const = 0;
 
     //! @returns [batchSize, beamWidth], cumulative log probabilities (per beam), on gpu
-    virtual TensorPtr getCumLogProbs() const = 0;
+    [[nodiscard]] virtual TensorPtr getCumLogProbs() const = 0;
 
     //! @returns [beamWidth], cumulative log probabilities (per beam) for request batchIdx, on gpu
-    virtual TensorPtr getCumLogProbs(SizeType batchIdx) const = 0;
+    [[nodiscard]] virtual TensorPtr getCumLogProbs(SizeType batchIdx) const = 0;
 
     //! @returns [batchSize, beamWidth, maxSeqLen], log probabilities (per beam), on gpu
-    virtual TensorPtr getLogProbs() const = 0;
+    [[nodiscard]] virtual TensorPtr getLogProbs() const = 0;
 
     //! @returns [beamWidth, maxSeqLen], cumulative log probabilities (per beam) for request batchIdx, on gpu
-    virtual TensorPtr getLogProbs(SizeType batchIdx) const = 0;
+    [[nodiscard]] virtual TensorPtr getLogProbs(SizeType batchIdx) const = 0;
 
-    virtual TensorPtr getParentIds() const = 0;
+    [[nodiscard]] virtual TensorPtr getParentIds() const = 0;
 
-    virtual std::vector<SizeType> getNbSteps() const = 0;
+    [[nodiscard]] virtual std::vector<SizeType> getNbSteps() const = 0;
 
     //! @brief Initialize batched decoder at seqSlots with a new `requests`.
     virtual void newRequests(std::vector<SizeType> const& seqSlots, std::vector<decoder_batch::Request> const& requests,

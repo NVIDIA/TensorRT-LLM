@@ -99,12 +99,9 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
         with open(Path(tokenizer_dir) / "generation_config.json") as f:
             gen_config = json.load(f)
         chat_format = gen_config['chat_format']
-        if chat_format == 'raw':
+        if chat_format == 'raw' or chat_format == 'chatml':
             pad_id = gen_config['pad_token_id']
             end_id = gen_config['eos_token_id']
-        elif chat_format == 'chatml':
-            pad_id = tokenizer.im_end_id
-            end_id = tokenizer.im_end_id
         else:
             raise Exception(f"unknown chat format: {chat_format}")
     elif model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
